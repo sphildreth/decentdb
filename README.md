@@ -125,7 +125,7 @@ Agents should implement the project by working the phases in order. The canonica
 
 Phase map:
 - [x] Phase 0: Foundations (project + test harness + VFS)
-- [ ] Phase 1: DB File + Pager + Page Cache (read/write pages)
+- [x] Phase 1: DB File + Pager + Page Cache (read/write pages)
 - [ ] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [ ] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
 - [ ] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP

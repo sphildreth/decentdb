@@ -18,12 +18,18 @@ template withFileLock(file: VfsFile, body: untyped) =
 method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[VfsFile] =
   var f: File
   try:
-    if not fileExists(path):
+    var openMode = mode
+    let exists = fileExists(path)
+    if not exists:
       if not create:
         return err[VfsFile](ERR_IO, "File does not exist", path)
-      discard open(f, path, fmWrite)
+      if not open(f, path, fmWrite):
+        return err[VfsFile](ERR_IO, "Failed to create file", path)
       close(f)
-    discard open(f, path, mode)
+    if mode == fmReadWrite:
+      openMode = fmReadWriteExisting
+    if not open(f, path, openMode):
+      return err[VfsFile](ERR_IO, "Failed to open file", path)
   except OSError:
     return err[VfsFile](ERR_IO, "Failed to open file", path)
   let vf = VfsFile(path: path, file: f)

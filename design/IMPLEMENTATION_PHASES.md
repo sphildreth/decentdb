@@ -23,7 +23,7 @@ Instructions to update the phase map:
 - Do not delete completed items; only append.
 
 - [x] Phase 0: Foundations (project + test harness + VFS)
-- [ ] Phase 1: DB File + Pager + Page Cache (read/write pages)
+- [x] Phase 1: DB File + Pager + Page Cache (read/write pages)
 - [ ] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [ ] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
 - [ ] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
@@ -63,8 +63,8 @@ Non-goals:
 ---
 
 ## Phase 1: DB File + Pager + Page Cache (read/write pages)
-Status: Not started
-Completed:
+Status: Done
+Completed: 2026-01-28 (local change)
 
 Goal: Create/open a database file, read/write fixed-size pages safely, and manage a small page cache.
 
@@ -75,12 +75,12 @@ Deliverables:
 - Freelist allocation/freeing.
 
 Checklist:
-- [ ] Implement DB header layout (128 bytes) + CRC-32C checksum; validate on open.
-- [ ] Implement DB create/open rules: magic, format version, page size, schema cookie.
-- [ ] Implement pager read/write of pages (default 4096 bytes) with bounds checks.
-- [ ] Implement page cache: pin/unpin, per-page latch, global eviction lock, simple clock/LRU.
-- [ ] Implement freelist (MVP may be a single chain): allocate/free pages; update header freelist pointers.
-- [ ] Add deterministic page-level tests: roundtrip reads/writes, eviction correctness, freelist allocate/free.
+- [x] Implement DB header layout (128 bytes) + CRC-32C checksum; validate on open.
+- [x] Implement DB create/open rules: magic, format version, page size, schema cookie.
+- [x] Implement pager read/write of pages (default 4096 bytes) with bounds checks.
+- [x] Implement page cache: pin/unpin, per-page latch, global eviction lock, simple clock/LRU.
+- [x] Implement freelist (MVP may be a single chain): allocate/free pages; update header freelist pointers.
+- [x] Add deterministic page-level tests: roundtrip reads/writes, eviction correctness, freelist allocate/free.
 
 Acceptance tests:
 - Unit: pager page roundtrip, cache eviction correctness, freelist allocate/free (see `design/TESTING_STRATEGY.md` §2.1).
