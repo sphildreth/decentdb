@@ -26,7 +26,7 @@ Instructions to update the phase map:
 - [x] Phase 1: DB File + Pager + Page Cache (read/write pages)
 - [x] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [x] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
-- [ ] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
+- [~] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
 - [ ] Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
 - [ ] Phase 6: Checkpointing + Bulk Load + Performance + Hardening
 
@@ -152,7 +152,7 @@ Non-goals:
 ---
 
 ## Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
-Status: Not started
+Status: In progress
 Completed:
 
 Goal: Make the database useful: DDL/DML, table/index metadata, and a minimal query engine.
@@ -164,17 +164,17 @@ Deliverables:
 - Volcano execution engine operators (see `design/SPEC.md` §2.1 exec/).
 
 Checklist (implement in order):
-- [ ] B+Tree write primitives: insert + split (merge/rebalance is post-MVP).
-- [ ] Row storage: table rows addressed by rowid/PK; secondary index entries point to rowid.
+- [x] B+Tree write primitives: insert + split (merge/rebalance is post-MVP).
+- [x] Row storage: table rows addressed by rowid/PK; secondary index entries point to rowid.
 - [ ] Catalog: create system tables; store table/column/index metadata; maintain schema cookie.
-- [ ] SQL parsing decision:
+- [x] SQL parsing decision:
   - Default: libpg_query FFI (see `design/SPEC.md` §6.1). If adding a new dependency, create/confirm an ADR.
 - [ ] Binder: name resolution (tables/columns), type checking for MVP types.
-- [ ] Planner (rule-based): TableScan vs IndexSeek, Filter, Project; NestedLoopJoin scaffolding.
-- [ ] Exec operators: TableScan, IndexSeek, Filter, Project, Limit/Offset.
-- [ ] Add Sort operator with spill-to-disk (external merge sort) if needed for ORDER BY (see `design/SPEC.md` §2.1 and §11).
-- [ ] Implement JOINs (INNER/LEFT) on equality predicates with NestedLoopJoin + index on inner side.
-- [ ] Implement aggregates: COUNT/SUM/AVG/MIN/MAX with GROUP BY and HAVING.
+- [x] Planner (rule-based): TableScan vs IndexSeek, Filter, Project; NestedLoopJoin scaffolding.
+- [x] Exec operators: TableScan, IndexSeek, Filter, Project, Limit/Offset.
+- [x] Add Sort operator with spill-to-disk (external merge sort) if needed for ORDER BY (see `design/SPEC.md` §2.1 and §11).
+- [x] Implement JOINs (INNER/LEFT) on equality predicates with NestedLoopJoin + index on inner side.
+- [x] Implement aggregates: COUNT/SUM/AVG/MIN/MAX with GROUP BY and HAVING.
 - [ ] Implement statement-level rollback semantics on errors (see `design/SPEC.md` §13.2).
 
 Acceptance tests:
