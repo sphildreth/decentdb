@@ -3,6 +3,7 @@ import strutils
 import tables
 import parsecsv
 import streams
+import times
 import ./engine
 import ./errors
 import ./catalog/catalog
@@ -25,11 +26,13 @@ proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): Js
 # Main SQL Execution Command
 # ============================================================================
 
-proc cliMain(db: string = "", sql: string = "", openClose: bool = false): int =
+proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing: bool = false): int =
   ## DecentDb CLI v0.0.1 - ACID-first embedded relational database
   ## 
   ## Execute SQL statements against a DecentDb database file.
   ## All output is JSON formatted for programmatic use.
+  
+  let startTime = if timing: epochTime() else: 0.0
   
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
@@ -43,14 +46,31 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false): int =
   let database = openRes.value
   
   if not openClose and sql.len > 0:
+    let queryStart = if timing: epochTime() else: 0.0
     let execRes = execSql(database, sql)
+    let queryEnd = if timing: epochTime() else: 0.0
+    
     if not execRes.ok:
       discard closeDb(database)
       echo resultJson(false, execRes.err)
       return 1
+    
     let rows = execRes.value
     discard closeDb(database)
-    echo resultJson(true, rows = rows)
+    
+    # Add timing info to JSON output if requested
+    if timing:
+      let totalTime = (epochTime() - startTime) * 1000.0  # Convert to ms
+      let queryTime = (queryEnd - queryStart) * 1000.0
+      let timingInfo = %*{
+        "total_ms": totalTime,
+        "query_ms": queryTime
+      }
+      var result = resultJson(true, rows = rows)
+      result["timing"] = timingInfo
+      echo result
+    else:
+      echo resultJson(true, rows = rows)
     return 0
 
   discard closeDb(database)
@@ -483,9 +503,11 @@ when isMainModule:
     help = {
       "db": "Path to database file (required)",
       "sql": "SQL statement to execute",
-      "openClose": "Open and close database without executing SQL (testing mode)"
+      "openClose": "Open and close database without executing SQL (testing mode)",
+      "timing": "Show query execution timing in milliseconds"
     },
     short = {
       "db": 'd',
-      "sql": 's'
+      "sql": 's',
+      "timing": 't'
     }

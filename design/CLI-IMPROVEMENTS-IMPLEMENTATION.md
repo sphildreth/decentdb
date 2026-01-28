@@ -147,8 +147,13 @@ Ran 2 tests in 0.058s - OK
 $ ./decentdb_cli --help
 ✅ Shows formatted help with version
 
-$ ./decentdb_cli -d test.db -s "CREATE TABLE users (...)"
+$ ./decentdb_cli -d test.db -s "CREATE TABLE test (...)"
 ✅ Works exactly as before
+
+$ ./decentdb_cli -d test.db -s "SELECT * FROM test" --timing
+✅ Returns JSON with timing info:
+   {"ok":true,"rows":[...],
+    "timing":{"total_ms":0.35,"query_ms":0.21}}
 
 $ ./decentdb_cli --unknown-flag
 ✅ Error: Unknown option (cligen error handling)
@@ -316,7 +321,19 @@ The following items from the design document are deferred:
 
 ## Conclusion
 
-✅ **Phase 1 Complete**: Core CLI improvements implemented successfully with full backward compatibility. The foundation is laid for future enhancements through modular command functions ready for exposure in subsequent phases.
+✅ **Phase 1 Complete**: Core CLI improvements implemented successfully with full backward compatibility.  
+✅ **Phase 2 Partial**: Query timing diagnostics implemented.
+
+### Phase 1 Deliverables
+- Modern CLI with help and version support
+- Schema introspection tool (list-tables, describe, list-indexes)
+- Data import/export tool (CSV import/export, SQL dump)
+
+### Phase 2 Deliverables
+- ✅ **Query Timing** (`--timing` flag) - Measures and reports total and query execution time in milliseconds
+- ⏭️ **Cache Configuration** - Deferred (requires engine API changes to `openDb`)
+- ⏭️ **WAL Checkpoint Control** - Deferred (requires WAL API exposure)
+- ⏭️ **Transaction Control** - Deferred (requires transaction state management in Db object)
 
 **Compliance**: No ADR required (UI-only changes, no engine modifications)  
 **Test Coverage**: 100% of existing tests pass  
