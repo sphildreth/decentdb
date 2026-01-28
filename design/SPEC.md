@@ -263,8 +263,9 @@ Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
 ### 6.2 Supported SQL subset (MVP)
-- DDL: `CREATE TABLE`, `CREATE INDEX`
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+- Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `LIKE`
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`

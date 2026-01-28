@@ -35,8 +35,9 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
    - Snapshot reads: readers see a stable snapshot as of transaction start.
 
 4. **SQL subset (PostgreSQL-like syntax)**
-   - DDL: `CREATE TABLE`, `CREATE INDEX`
+   - DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
    - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+   - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY`
    - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `IN` (optional MVP), `LIKE`
    - `LEFT JOIN`, `INNER JOIN`
    - `ORDER BY`, `LIMIT`, `OFFSET`
@@ -72,6 +73,11 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
 - Online schema migrations / ALTER TABLE beyond minimal needs
 - Replication / clustering
 - Encrypted storage (future optional)
+
+## Critical Gap Addressed: Aggregate Functions
+**Status:** Added to MVP requirements (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
+
+Rationale: Essential for any practical embedded database use case including basic analytics and reporting queries.
 
 ## 4. Target users & use cases
 ### 4.1 Primary user
