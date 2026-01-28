@@ -25,7 +25,7 @@ Instructions to update the phase map:
 - [x] Phase 0: Foundations (project + test harness + VFS)
 - [x] Phase 1: DB File + Pager + Page Cache (read/write pages)
 - [x] Phase 2: Records + Overflow Pages + B+Tree Read Path
-- [ ] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
+- [x] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
 - [ ] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
 - [ ] Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
 - [ ] Phase 6: Checkpointing + Bulk Load + Performance + Hardening
@@ -121,8 +121,8 @@ Non-goals:
 ---
 
 ## Phase 3: WAL + Transactions + Recovery + Snapshot Reads
-Status: Not started
-Completed:
+Status: Done
+Completed: 2026-01-28 (local change)
 
 Goal: Durable commits, crash recovery, and snapshot isolation for multiple concurrent readers.
 
@@ -133,12 +133,12 @@ Deliverables:
 - Active reader tracking (snapshot LSNs) to support safe truncation later (see `design/SPEC.md` §4.3).
 
 Checklist:
-- [ ] Implement WAL append of frames with checksum validation and torn-write detection.
-- [ ] Implement `wal_end_lsn` as `AtomicU64` updated only after frame is fully written and indexed.
-- [ ] Implement in-memory `walIndex` overlay for reads: page_id -> latest frame at/before snapshot.
-- [ ] Implement transactions: BEGIN/COMMIT/ROLLBACK (single writer), snapshot reads for readers.
-- [ ] Implement crash recovery: scan/validate, build walIndex view, stop at last COMMIT boundary.
-- [ ] Add crash-injection failpoints around WAL writes/commit/fsync (see `design/TESTING_STRATEGY.md` §2.3).
+- [x] Implement WAL append of frames with checksum validation and torn-write detection.
+- [x] Implement `wal_end_lsn` as `AtomicU64` updated only after frame is fully written and indexed.
+- [x] Implement in-memory `walIndex` overlay for reads: page_id -> latest frame at/before snapshot.
+- [x] Implement transactions: BEGIN/COMMIT/ROLLBACK (single writer), snapshot reads for readers.
+- [x] Implement crash recovery: scan/validate, build walIndex view, stop at last COMMIT boundary.
+- [x] Add crash-injection failpoints around WAL writes/commit/fsync (see `design/TESTING_STRATEGY.md` §2.3).
 
 Acceptance tests:
 - Crash-injection: committed visible, uncommitted not visible, no corruption across all WAL failpoints.
