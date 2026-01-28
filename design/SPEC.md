@@ -172,9 +172,7 @@ Alternative:
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
 
 ### 6.3 Parameterization
-Pick one:
 - `$1, $2, ...` positional (Postgres style) OR
-- named parameters `:name` (common in app layers)
 Document and test thoroughly.
 
 ---
