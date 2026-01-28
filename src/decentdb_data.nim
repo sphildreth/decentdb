@@ -1,3 +1,5 @@
+## DecentDb Data Tool - Import/Export utilities
+
 import json
 import strutils
 import tables
@@ -6,7 +8,6 @@ import streams
 import ./engine
 import ./errors
 import ./catalog/catalog
-import ./pager/pager
 import ./record/record
 import ./storage/storage
 
@@ -20,143 +21,6 @@ proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): Js
     "error": errorNode,
     "rows": rows
   }
-
-# ============================================================================
-# Main SQL Execution Command
-# ============================================================================
-
-proc cliMain(db: string = "", sql: string = "", openClose: bool = false): int =
-  ## DecentDb CLI v0.0.1 - ACID-first embedded relational database
-  ## 
-  ## Execute SQL statements against a DecentDb database file.
-  ## All output is JSON formatted for programmatic use.
-  
-  if db.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
-    return 1
-
-  let openRes = openDb(db)
-  if not openRes.ok:
-    echo resultJson(false, openRes.err)
-    return 1
-
-  let database = openRes.value
-  
-  if not openClose and sql.len > 0:
-    let execRes = execSql(database, sql)
-    if not execRes.ok:
-      discard closeDb(database)
-      echo resultJson(false, execRes.err)
-      return 1
-    let rows = execRes.value
-    discard closeDb(database)
-    echo resultJson(true, rows = rows)
-    return 0
-
-  discard closeDb(database)
-  echo resultJson(true)
-  return 0
-
-# ============================================================================
-# Schema Introspection Commands
-# ============================================================================
-
-proc schemaListTables(db: string = ""): int =
-  ## List all tables in the database
-  if db.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
-    return 1
-
-  let openRes = openDb(db)
-  if not openRes.ok:
-    echo resultJson(false, openRes.err)
-    return 1
-
-  let database = openRes.value
-  var tables: seq[string] = @[]
-  
-  for tableName, _ in database.catalog.tables:
-    tables.add(tableName)
-  
-  discard closeDb(database)
-  echo resultJson(true, rows = tables)
-  return 0
-
-proc schemaDescribe(table: string, db: string = ""): int =
-  ## Show table structure (columns, types, constraints)
-  if db.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
-    return 1
-  
-  if table.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing table name argument"))
-    return 1
-
-  let openRes = openDb(db)
-  if not openRes.ok:
-    echo resultJson(false, openRes.err)
-    return 1
-
-  let database = openRes.value
-  
-  if not database.catalog.tables.hasKey(table):
-    discard closeDb(database)
-    echo resultJson(false, DbError(code: ERR_SQL, message: "Table not found", context: table))
-    return 1
-  
-  let tableMeta = database.catalog.tables[table]
-  var output: seq[string] = @[]
-  output.add("Column|Type|NotNull|PrimaryKey|Unique|RefTable|RefColumn")
-  
-  for col in tableMeta.columns:
-    let colType = case col.kind
-      of ctInt64: "INT64"
-      of ctBool: "BOOL"
-      of ctFloat64: "FLOAT64"
-      of ctText: "TEXT"
-      of ctBlob: "BLOB"
-    
-    let notNull = if col.notNull: "YES" else: "NO"
-    let primaryKey = if col.primaryKey: "YES" else: "NO"
-    let unique = if col.unique: "YES" else: "NO"
-    let refTable = col.refTable
-    let refColumn = col.refColumn
-    
-    output.add("$1|$2|$3|$4|$5|$6|$7" % [col.name, colType, notNull, primaryKey, unique, refTable, refColumn])
-  
-  discard closeDb(database)
-  echo resultJson(true, rows = output)
-  return 0
-
-proc schemaListIndexes(db: string = "", table: string = ""): int =
-  ## List all indexes, optionally filtered by table
-  if db.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
-    return 1
-
-  let openRes = openDb(db)
-  if not openRes.ok:
-    echo resultJson(false, openRes.err)
-    return 1
-
-  let database = openRes.value
-  var output: seq[string] = @[]
-  output.add("Index|Table|Column|Type|Unique")
-  
-  for indexName, indexMeta in database.catalog.indexes:
-    if table.len > 0 and indexMeta.table != table:
-      continue
-    
-    let indexType = case indexMeta.kind
-      of ikBtree: "btree"
-      of ikTrigram: "trigram"
-    
-    let unique = if indexMeta.unique: "YES" else: "NO"
-    output.add("$1|$2|$3|$4|$5" % [indexName, indexMeta.table, indexMeta.column, indexType, unique])
-  
-  discard closeDb(database)
-  echo resultJson(true, rows = output)
-  return 0
 
 # ============================================================================
 # Import/Export Commands
@@ -468,24 +332,42 @@ proc dumpSql(db: string = "", output: string = ""): int =
     echo resultJson(true, rows = sqlStatements)
     return 0
 
-# ============================================================================
-# Main Entry Point - Backward Compatible Mode
-# ============================================================================
-
 when isMainModule:
   import cligen
   
-  # For now, use simple dispatch for backward compatibility with test harness
-  # The subcommand functions (schemaListTables, etc.) remain available for
-  # future migration to dispatchMulti when test harness is updated
-  
-  dispatch cliMain,
-    help = {
-      "db": "Path to database file (required)",
-      "sql": "SQL statement to execute",
-      "openClose": "Open and close database without executing SQL (testing mode)"
-    },
-    short = {
-      "db": 'd',
-      "sql": 's'
-    }
+  dispatchMulti(
+    ["multi", doc="DecentDb Data Tool v" & Version],
+    [importCsv,
+     cmdName = "import",
+     help = {
+       "table": "Table name to import into",
+       "csvFile": "CSV file path",
+       "db": "Path to database file (required)",
+       "batchSize": "Number of rows per batch (default: 10000)"
+     },
+     short = {
+       "db": 'd',
+       "table": 't'
+     }],
+    [exportCsv,
+     cmdName = "export",
+     help = {
+       "table": "Table name to export",
+       "csvFile": "Output CSV file path",
+       "db": "Path to database file (required)"
+     },
+     short = {
+       "db": 'd',
+       "table": 't'
+     }],
+    [dumpSql,
+     cmdName = "dump",
+     help = {
+       "db": "Path to database file (required)",
+       "output": "Output SQL file path (optional, defaults to stdout)"
+     },
+     short = {
+       "db": 'd',
+       "output": 'o'
+     }]
+  )

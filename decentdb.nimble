@@ -3,7 +3,7 @@ author        = "DecentDb contributors"
 description   = "DecentDb engine (pre-alpha)"
 license       = "Apache-2.0"
 srcDir        = "src"
-bin           = @["decentdb_cli"]
+bin           = @["decentdb_cli", "decentdb_schema", "decentdb_data"]
 
 requires "nim >= 1.6.0"
 requires "cligen >= 1.7.0"
