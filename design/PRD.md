@@ -53,7 +53,9 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
 - Cross-platform: Linux/Windows/macOS
 - Deterministic tests: reproducible failure cases with seeded randomness
 - Measurable performance:
-  - point lookups and FK-join queries should be “snappy”
+  - point lookups: P95 < 10ms on target dataset (9.5M tracks)
+  - FK-join queries (artist→albums→tracks): P95 < 100ms
+  - substring search with trigram index: P95 < 200ms
   - writes should be durable by default (fsync on commit)
 
 ## 3. Non-goals (MVP)
@@ -109,6 +111,13 @@ AND al.name like '%COLDSPRING%'
 AND a.name like '%JOEL%'
 ORDER BY a.name, al.name, t.trackNumber;
 ```
+
+### 5.4 Performance targets (acceptance criteria)
+- Point lookup by primary key: P95 < 10ms
+- FK join expansion (artist→albums→tracks): P95 < 100ms
+- Substring search with trigram index: P95 < 200ms
+- Bulk load (100k records): < 30 seconds
+- Crash recovery time: < 5 seconds for 100MB database
 
 ## 6. MVP milestones (phased delivery)
 ### M0 — Project skeleton + testing foundation
