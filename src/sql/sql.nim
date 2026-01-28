@@ -52,6 +52,15 @@ type Expr* = ref object
 type ColumnDef* = object
   name*: string
   typeName*: string
+  notNull*: bool
+  unique*: bool
+  primaryKey*: bool
+  refTable*: string
+  refColumn*: string
+
+type SqlIndexKind* = enum
+  ikBtree
+  ikTrigram
 
 type OrderItem* = object
   expr*: Expr
@@ -91,6 +100,8 @@ type Statement* = ref object
     indexName*: string
     indexTableName*: string
     columnName*: string
+    indexKind*: SqlIndexKind
+    unique*: bool
   of skDropTable:
     dropTableName*: string
   of skDropIndex:
@@ -151,6 +162,8 @@ proc nodeStringOr(node: JsonNode, key: string, fallback: string): string =
 proc parseExprNode(node: JsonNode): Result[Expr]
 
 proc parseAConst(node: JsonNode): Result[Expr] =
+  if nodeHas(node, "isnull") and node["isnull"].getBool:
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
   if nodeHas(node, "ival"):
     let intNode = node["ival"]
     if nodeHas(intNode, "ival"):
@@ -176,6 +189,8 @@ proc parseAConst(node: JsonNode): Result[Expr] =
   if nodeHas(valNode, "Boolean"):
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: valNode["Boolean"]["boolval"].getBool)))
   if nodeHas(valNode, "Null"):
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
+  if nodeHas(node, "Null"):
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
   err[Expr](ERR_SQL, "Unsupported A_Const")
 
@@ -234,6 +249,10 @@ proc parseAExpr(node: JsonNode): Result[Expr] =
   var op = ""
   if nameArr.kind == JArray and nameArr.len > 0:
     op = nodeString(nameArr[0])
+  if op == "~~":
+    op = "LIKE"
+  elif op == "~~*":
+    op = "ILIKE"
   let leftRes = parseExprNode(nodeGet(node, "lexpr"))
   if not leftRes.ok:
     return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
@@ -459,6 +478,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   var columns: seq[ColumnDef] = @[]
+  var tableConstraints: seq[JsonNode] = @[]
   let elts = nodeGet(node, "tableElts")
   if elts.kind == JArray:
     for entry in elts:
@@ -473,7 +493,55 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
           let typeNames = nodeGet(typeNode, "names")
           if typeNames.kind == JArray and typeNames.len > 0:
             typeName = nodeString(typeNames[^1])
-        columns.add(ColumnDef(name: name, typeName: typeName))
+        var def = ColumnDef(name: name, typeName: typeName)
+        let constraints = nodeGet(col, "constraints")
+        if constraints.kind == JArray:
+          for cons in constraints:
+            if nodeHas(cons, "Constraint"):
+              let constraint = cons["Constraint"]
+              let contype = nodeGet(constraint, "contype").getStr
+              case contype
+              of "CONSTR_NOTNULL":
+                def.notNull = true
+              of "CONSTR_UNIQUE":
+                def.unique = true
+              of "CONSTR_PRIMARY":
+                def.primaryKey = true
+                def.unique = true
+                def.notNull = true
+              of "CONSTR_FOREIGN":
+                if nodeHas(constraint, "pktable"):
+                  let pkRes = parseRangeVar(constraint["pktable"])
+                  if pkRes.ok:
+                    def.refTable = pkRes.value[0]
+                let attrs = nodeGet(constraint, "pk_attrs")
+                if attrs.kind == JArray and attrs.len > 0:
+                  def.refColumn = nodeString(attrs[0])
+              else:
+                discard
+        columns.add(def)
+      elif nodeHas(entry, "Constraint"):
+        tableConstraints.add(entry["Constraint"])
+  for constraint in tableConstraints:
+    let contype = nodeGet(constraint, "contype").getStr
+    if contype in ["CONSTR_UNIQUE", "CONSTR_PRIMARY"]:
+      let keys = nodeGet(constraint, "keys")
+      if keys.kind != JArray or keys.len != 1:
+        return err[Statement](ERR_SQL, "Only single-column constraints supported")
+      let colName = nodeString(keys[0])
+      var found = false
+      for i, col in columns:
+        if col.name == colName:
+          found = true
+          columns[i].unique = true
+          if contype == "CONSTR_PRIMARY":
+            columns[i].primaryKey = true
+            columns[i].notNull = true
+          break
+      if not found:
+        return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
+    elif contype == "CONSTR_FOREIGN":
+      return err[Statement](ERR_SQL, "Table-level foreign keys not supported")
   ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
@@ -488,7 +556,14 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     let param = params[0]["IndexElem"]
     if nodeHas(param, "name"):
       columnName = param["name"].getStr
-  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnName: columnName))
+  var kind = ikBtree
+  let methodName = nodeGet(node, "accessMethod").getStr
+  if methodName.len > 0:
+    let methodLower = methodName.toLowerAscii()
+    if methodLower == "trigram":
+      kind = ikTrigram
+  let unique = nodeHas(node, "unique") and node["unique"].getBool
+  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnName: columnName, indexKind: kind, unique: unique))
 
 proc parseDropStmt(node: JsonNode): Result[Statement] =
   let removeType = nodeGet(node, "removeType").getStr

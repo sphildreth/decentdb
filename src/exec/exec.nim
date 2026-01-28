@@ -1,4 +1,5 @@
 import os
+import options
 import strutils
 import tables
 import algorithm
@@ -10,6 +11,7 @@ import ../pager/pager
 import ../pager/db_header
 import ../storage/storage
 import ../planner/planner
+import ../search/search
 
 type Row* = object
   rowid*: uint64
@@ -33,6 +35,34 @@ proc valueToString*(value: Value): string =
     s
   else:
     ""
+
+proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
+  var t = text
+  var p = pattern
+  if caseInsensitive:
+    t = t.toUpperAscii()
+    p = p.toUpperAscii()
+  var i = 0
+  var j = 0
+  var star = -1
+  var match = 0
+  while i < t.len:
+    if j < p.len and (p[j] == '_' or p[j] == t[i]):
+      i.inc
+      j.inc
+    elif j < p.len and p[j] == '%':
+      star = j
+      j.inc
+      match = i
+    elif star != -1:
+      j = star + 1
+      match.inc
+      i = match
+    else:
+      return false
+  while j < p.len and p[j] == '%':
+    j.inc
+  j == p.len
 
 proc makeRow(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
   Row(rowid: rowid, columns: columns, values: values)
@@ -136,6 +166,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) > 0))
     of ">=":
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) >= 0))
+    of "LIKE", "ILIKE":
+      let leftStr = valueToString(leftRes.value)
+      let rightStr = valueToString(rightRes.value)
+      return ok(Value(kind: vkBool, boolVal: likeMatch(leftStr, rightStr, true)))
     else:
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:
@@ -180,6 +214,81 @@ proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     if valueIndex >= 0:
       if compareValues(readRes.value.values[valueIndex], value) != 0:
         continue
+    var cols: seq[string] = @[]
+    for col in table.columns:
+      cols.add(prefix & "." & col.name)
+    rows.add(makeRow(cols, readRes.value.values, rowid))
+  ok(rows)
+
+proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: string, column: string, pattern: string, caseInsensitive: bool): Result[seq[Row]] =
+  let tableRes = catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[seq[Row]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  let indexOpt = catalog.getTrigramIndexForColumn(tableName, column)
+  if isNone(indexOpt):
+    return err[seq[Row]](ERR_SQL, "Trigram index not found", tableName & "." & column)
+  let idx = indexOpt.get
+  var columnIndex = -1
+  for i, col in table.columns:
+    if col.name == column:
+      columnIndex = i
+      break
+  if columnIndex < 0:
+    return err[seq[Row]](ERR_SQL, "Column not found", column)
+  var stripped = ""
+  for ch in pattern:
+    if ch != '%' and ch != '_':
+      stripped.add(ch)
+  let normalized = canonicalize(stripped)
+  if normalized.len < 3:
+    let rowsRes = tableScanRows(pager, catalog, tableName, alias)
+    if not rowsRes.ok:
+      return err[seq[Row]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    var filtered: seq[Row] = @[]
+    for row in rowsRes.value:
+      let text = valueToString(row.values[columnIndex])
+      if likeMatch(text, pattern, caseInsensitive):
+        filtered.add(row)
+    return ok(filtered)
+  let grams = trigrams(normalized)
+  if grams.len == 0:
+    return ok(newSeq[Row]())
+  var postingsLists: seq[seq[uint64]] = @[]
+  var rarestCount = -1
+  for g in grams:
+    let postRes = getTrigramPostings(pager, idx, g)
+    if not postRes.ok:
+      return err[seq[Row]](postRes.err.code, postRes.err.message, postRes.err.context)
+    let list = postRes.value
+    if list.len == 0:
+      return ok(newSeq[Row]())
+    postingsLists.add(list)
+    if rarestCount < 0 or list.len < rarestCount:
+      rarestCount = list.len
+  let threshold = DefaultPostingsThreshold
+  if normalized.len <= 5 and rarestCount >= threshold:
+    let rowsRes = tableScanRows(pager, catalog, tableName, alias)
+    if not rowsRes.ok:
+      return err[seq[Row]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    var filtered: seq[Row] = @[]
+    for row in rowsRes.value:
+      let text = valueToString(row.values[columnIndex])
+      if likeMatch(text, pattern, caseInsensitive):
+        filtered.add(row)
+    return ok(filtered)
+  var candidates = intersectPostings(postingsLists)
+  if normalized.len > 5 and rarestCount >= threshold and candidates.len > threshold:
+    candidates.setLen(threshold)
+  var rows: seq[Row] = @[]
+  let prefix = if alias.len > 0: alias else: tableName
+  for rowid in candidates:
+    let readRes = readRowAt(pager, table, rowid)
+    if not readRes.ok:
+      continue
+    let text = valueToString(readRes.value.values[columnIndex])
+    if not likeMatch(text, pattern, caseInsensitive):
+      continue
     var cols: seq[string] = @[]
     for col in table.columns:
       cols.add(prefix & "." & col.name)
@@ -417,6 +526,12 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
     if not valueRes.ok:
       return err[seq[Row]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
     return indexSeekRows(pager, catalog, plan.table, plan.alias, plan.column, valueRes.value)
+  of pkTrigramSeek:
+    let patternRes = evalExpr(Row(), plan.likeExpr, params)
+    if not patternRes.ok:
+      return err[seq[Row]](patternRes.err.code, patternRes.err.message, patternRes.err.context)
+    let pattern = valueToString(patternRes.value)
+    return trigramSeekRows(pager, catalog, plan.table, plan.alias, plan.column, pattern, plan.likeInsensitive)
   of pkFilter:
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:

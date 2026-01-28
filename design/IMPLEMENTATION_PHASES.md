@@ -27,7 +27,7 @@ Instructions to update the phase map:
 - [x] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [x] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
 - [x] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
-- [ ] Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
+- [x] Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
 - [ ] Phase 6: Checkpointing + Bulk Load + Performance + Hardening
 
 ---
@@ -190,8 +190,8 @@ Non-goals:
 ---
 
 ## Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
-Status: Not started
-Completed:
+Status: Done
+Completed: 2026-01-28 (local change)
 
 Goal: Enforce relational integrity and accelerate `LIKE '%pattern%'` for selected TEXT columns.
 
@@ -201,14 +201,14 @@ Deliverables:
 - Trigram inverted index: postings B+Tree, delta+varint compression, query-time intersection + verification, and broad-pattern guardrails (see `design/SPEC.md` §8).
 
 Checklist:
-- [ ] Implement NOT NULL/UNIQUE checks and error messages with context.
-- [ ] Implement FK enforcement at statement time for INSERT/UPDATE/DELETE.
-- [ ] Enforce/auto-create supporting indexes for FK checks (parent key index required; create child index if missing; naming `fk_<table>_<column>_idx`).
-- [ ] Implement trigram canonicalization and generation (uppercase normalization per SPEC).
-- [ ] Implement postings encode/decode: sorted rowids, delta encoding, varints.
-- [ ] Implement postings storage: B+Tree keyed by trigram -> postings blob.
-- [ ] Implement query evaluation: rarest-first intersection, candidate cap/thresholding, final substring verification.
-- [ ] Implement guardrails for broad patterns and for patterns shorter than 3 chars.
+- [x] Implement NOT NULL/UNIQUE checks and error messages with context.
+- [x] Implement FK enforcement at statement time for INSERT/UPDATE/DELETE.
+- [x] Enforce/auto-create supporting indexes for FK checks (parent key index required; create child index if missing; naming `fk_<table>_<column>_idx`).
+- [x] Implement trigram canonicalization and generation (uppercase normalization per SPEC).
+- [x] Implement postings encode/decode: sorted rowids, delta encoding, varints.
+- [x] Implement postings storage: B+Tree keyed by trigram -> postings blob.
+- [x] Implement query evaluation: rarest-first intersection, candidate cap/thresholding, final substring verification.
+- [x] Implement guardrails for broad patterns and for patterns shorter than 3 chars.
 
 Acceptance tests:
 - Unit: trigram generation + postings encode/decode + intersection correctness (see `design/TESTING_STRATEGY.md` §2.1).

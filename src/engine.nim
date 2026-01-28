@@ -1,6 +1,7 @@
 import os
 import strutils
 import tables
+import options
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
@@ -135,6 +136,96 @@ proc typeCheckValue(expected: ColumnType, value: Value): Result[Void] =
     if value.kind in {vkBlob, vkNull}: return okVoid()
   err[Void](ERR_SQL, "Type mismatch")
 
+proc valuesEqual(a: Value, b: Value): bool =
+  if a.kind == vkNull and b.kind == vkNull:
+    return true
+  if a.kind != b.kind:
+    return false
+  case a.kind
+  of vkInt64:
+    a.int64Val == b.int64Val
+  of vkBool:
+    a.boolVal == b.boolVal
+  of vkFloat64:
+    a.float64Val == b.float64Val
+  of vkText, vkBlob:
+    a.bytes == b.bytes
+  else:
+    false
+
+proc enforceNotNull(table: TableMeta, values: seq[Value]): Result[Void] =
+  for i, col in table.columns:
+    if col.notNull and values[i].kind == vkNull:
+      return err[Void](ERR_CONSTRAINT, "NOT NULL constraint failed", table.name & "." & col.name)
+  okVoid()
+
+proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value], rowid: uint64 = 0): Result[Void] =
+  for i, col in table.columns:
+    if col.unique or col.primaryKey:
+      if values[i].kind == vkNull:
+        continue
+      let matchesRes = indexSeek(pager, catalog, table.name, col.name, values[i])
+      if not matchesRes.ok:
+        return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
+      for existing in matchesRes.value:
+        if rowid == 0 or existing != rowid:
+          return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+  okVoid()
+
+proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value]): Result[Void] =
+  for i, col in table.columns:
+    if col.refTable.len == 0 or col.refColumn.len == 0:
+      continue
+    if values[i].kind == vkNull:
+      continue
+    let matchesRes = indexSeek(pager, catalog, col.refTable, col.refColumn, values[i])
+    if not matchesRes.ok:
+      return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
+    if matchesRes.value.len == 0:
+      return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
+  okVoid()
+
+proc referencingChildren(catalog: Catalog, table: string, column: string): seq[(string, string)] =
+  for _, meta in catalog.tables:
+    for col in meta.columns:
+      if col.refTable == table and col.refColumn == column:
+        result.add((meta.name, col.name))
+
+proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, oldValues: seq[Value], newValues: seq[Value]): Result[Void] =
+  for i, col in table.columns:
+    let children = referencingChildren(catalog, table.name, col.name)
+    if children.len == 0:
+      continue
+    let oldVal = oldValues[i]
+    let newVal = newValues[i]
+    if valuesEqual(oldVal, newVal):
+      continue
+    if oldVal.kind == vkNull:
+      continue
+    for child in children:
+      let matchesRes = indexSeek(pager, catalog, child[0], child[1], oldVal)
+      if not matchesRes.ok:
+        return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
+      if matchesRes.value.len > 0:
+        return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+  okVoid()
+
+proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, oldValues: seq[Value]): Result[Void] =
+  for i, col in table.columns:
+    let children = referencingChildren(catalog, table.name, col.name)
+    if children.len == 0:
+      continue
+    let oldVal = oldValues[i]
+    if oldVal.kind == vkNull:
+      continue
+    for child in children:
+      let matchesRes = indexSeek(pager, catalog, child[0], child[1], oldVal)
+      if not matchesRes.ok:
+        return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
+      if matchesRes.value.len > 0:
+        return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+  okVoid()
+
 proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
   var values: seq[Value] = @[]
   for expr in stmt.insertValues:
@@ -144,10 +235,10 @@ proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
     values.add(valueFromSql(res.value))
   ok(values)
 
-proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
+proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] =
   if not db.isOpen:
     return err[seq[string]](ERR_INTERNAL, "Database not open")
-  let parseRes = parseSql(sql)
+  let parseRes = parseSql(sqlText)
   if not parseRes.ok:
     return err[seq[string]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
   var output: seq[string] = @[]
@@ -166,11 +257,38 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
         let typeRes = parseColumnType(col.typeName)
         if not typeRes.ok:
           return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-        columns.add(Column(name: col.name, kind: typeRes.value))
+        columns.add(Column(name: col.name, kind: typeRes.value, notNull: col.notNull, unique: col.unique, primaryKey: col.primaryKey, refTable: col.refTable, refColumn: col.refColumn))
       let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
       let saveRes = db.catalog.saveTable(db.pager, meta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+      for col in columns:
+        if col.primaryKey or col.unique:
+          let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
+          if isNone(db.catalog.getIndexByName(idxName)):
+            let idxRootRes = initTableRoot(db.pager)
+            if not idxRootRes.ok:
+              return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+            if not buildRes.ok:
+              return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: idxRootRes.value, kind: catalog.ikBtree, unique: true)
+            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+            if not idxSaveRes.ok:
+              return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+        if col.refTable.len > 0 and col.refColumn.len > 0:
+          if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
+            let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
+            let idxRootRes = initTableRoot(db.pager)
+            if not idxRootRes.ok:
+              return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+            if not buildRes.ok:
+              return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: idxRootRes.value, kind: catalog.ikBtree, unique: false)
+            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+            if not idxSaveRes.ok:
+              return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
       let bumpRes = schemaBump(db)
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
@@ -191,10 +309,39 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
       let indexRootRes = initTableRoot(db.pager)
       if not indexRootRes.ok:
         return err[seq[string]](indexRootRes.err.code, indexRootRes.err.message, indexRootRes.err.context)
-      let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
-      if not buildRes.ok:
-        return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: indexRootRes.value)
+      if bound.unique:
+        let tableRes = db.catalog.getTable(bound.indexTableName)
+        if not tableRes.ok:
+          return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+        let table = tableRes.value
+        var colIndex = -1
+        for i, col in table.columns:
+          if col.name == bound.columnName:
+            colIndex = i
+            break
+        if colIndex < 0:
+          return err[seq[string]](ERR_SQL, "Column not found", bound.columnName)
+        let rowsRes = scanTable(db.pager, table)
+        if not rowsRes.ok:
+          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        var seen = initTable[uint64, bool]()
+        for row in rowsRes.value:
+          if row.values[colIndex].kind == vkNull:
+            continue
+          let key = indexKeyFromValue(row.values[colIndex])
+          if seen.hasKey(key):
+            return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
+          seen[key] = true
+      if bound.indexKind == sql.ikTrigram:
+        let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
+        if not buildRes.ok:
+          return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      else:
+        let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
+        if not buildRes.ok:
+          return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
+      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: indexRootRes.value, kind: idxKind, unique: bound.unique)
       let saveRes = db.catalog.createIndexMeta(idxMeta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
@@ -220,6 +367,15 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
         let typeRes = typeCheckValue(col.kind, values[i])
         if not typeRes.ok:
           return err[seq[string]](typeRes.err.code, typeRes.err.message, col.name)
+      let notNullRes = enforceNotNull(tableRes.value, values)
+      if not notNullRes.ok:
+        return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+      let uniqueRes = enforceUnique(db.catalog, db.pager, tableRes.value, values)
+      if not uniqueRes.ok:
+        return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+      let fkRes = enforceForeignKeys(db.catalog, db.pager, tableRes.value, values)
+      if not fkRes.ok:
+        return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
       let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
       if not insertRes.ok:
         return err[seq[string]](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -231,7 +387,7 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
       let rowsRes = scanTable(db.pager, table)
       if not rowsRes.ok:
         return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      var updates: seq[(uint64, seq[Value])] = @[]
+      var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
       for stored in rowsRes.value:
         var cols: seq[string] = @[]
         for col in table.columns:
@@ -257,9 +413,22 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
             if not typeRes.ok:
               return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
             newValues[idx] = evalRes.value
-        updates.add((stored.rowid, newValues))
+        updates.add((stored.rowid, stored.values, newValues))
       for entry in updates:
-        let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[1])
+        let notNullRes = enforceNotNull(table, entry[2])
+        if not notNullRes.ok:
+          return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+        let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
+        if not uniqueRes.ok:
+          return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+        let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
+        if not fkRes.ok:
+          return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+        let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+        if not restrictRes.ok:
+          return err[seq[string]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+      for entry in updates:
+        let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
         if not upRes.ok:
           return err[seq[string]](upRes.err.code, upRes.err.message, upRes.err.context)
     of skDelete:
@@ -270,7 +439,7 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
       let rowsRes = scanTable(db.pager, table)
       if not rowsRes.ok:
         return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      var deletions: seq[uint64] = @[]
+      var deletions: seq[StoredRow] = @[]
       for stored in rowsRes.value:
         var cols: seq[string] = @[]
         for col in table.columns:
@@ -281,9 +450,13 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
           return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
         if bound.deleteWhere != nil and not valueToBool(whereRes.value):
           continue
-        deletions.add(stored.rowid)
-      for rowid in deletions:
-        let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, rowid)
+        deletions.add(stored)
+      for row in deletions:
+        let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
+        if not restrictRes.ok:
+          return err[seq[string]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+      for row in deletions:
+        let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
         if not delRes.ok:
           return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
     of skSelect:
@@ -300,8 +473,8 @@ proc execSql*(db: Db, sql: string, params: seq[Value]): Result[seq[string]] =
         output.add(parts.join("|"))
   ok(output)
 
-proc execSql*(db: Db, sql: string): Result[seq[string]] =
-  execSql(db, sql, @[])
+proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
+  execSql(db, sqlText, @[])
 
 proc closeDb*(db: Db): Result[Void] =
   if not db.isOpen:

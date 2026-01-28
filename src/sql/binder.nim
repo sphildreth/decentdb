@@ -190,10 +190,29 @@ proc bindDelete(catalog: Catalog, stmt: Statement): Result[Statement] =
   ok(stmt)
 
 proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
+  var primaryCount = 0
   for col in stmt.columns:
     let typeRes = parseColumnType(col.typeName)
     if not typeRes.ok:
       return err[Statement](typeRes.err.code, typeRes.err.message, col.typeName)
+    if col.primaryKey:
+      primaryCount.inc
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      let parentRes = catalog.getTable(col.refTable)
+      if not parentRes.ok:
+        return err[Statement](parentRes.err.code, parentRes.err.message, col.refTable)
+      var parentHasColumn = false
+      for parentCol in parentRes.value.columns:
+        if parentCol.name == col.refColumn:
+          parentHasColumn = true
+          break
+      if not parentHasColumn:
+        return err[Statement](ERR_SQL, "Referenced column not found", col.refTable & "." & col.refColumn)
+      let parentIdx = catalog.getBtreeIndexForColumn(col.refTable, col.refColumn)
+      if isNone(parentIdx) or not parentIdx.get.unique:
+        return err[Statement](ERR_SQL, "Referenced column must be indexed uniquely", col.refTable & "." & col.refColumn)
+  if primaryCount > 1:
+    return err[Statement](ERR_SQL, "Multiple primary keys not supported")
   ok(stmt)
 
 proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
@@ -201,11 +220,17 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   var found = false
+  var columnType = ctInt64
   for col in tableRes.value.columns:
     if col.name == stmt.columnName:
       found = true
+      columnType = col.kind
   if not found:
     return err[Statement](ERR_SQL, "Unknown column", stmt.columnName)
+  if stmt.indexKind == sql.ikTrigram and columnType != ctText:
+    return err[Statement](ERR_SQL, "Trigram index only supported on TEXT columns", stmt.columnName)
+  if stmt.indexKind == sql.ikTrigram and stmt.unique:
+    return err[Statement](ERR_SQL, "Trigram index cannot be UNIQUE", stmt.columnName)
   ok(stmt)
 
 proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =

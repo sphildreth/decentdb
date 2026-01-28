@@ -78,3 +78,27 @@ suite "DB Header":
     let reopen = openDb(tempPath)
     check not reopen.ok
     check reopen.err.code == ERR_CORRUPTION
+
+  test "unsupported format version fails open":
+    let tempPath = getTempDir() / "decentdb_header_old_version.db"
+    if fileExists(tempPath):
+      removeFile(tempPath)
+    let vfs = newOsVfs()
+    let openRes = vfs.open(tempPath, fmReadWrite, true)
+    check openRes.ok
+    let header = DbHeader(
+      formatVersion: FormatVersion - 1,
+      pageSize: DefaultPageSize,
+      schemaCookie: 0,
+      rootCatalog: 0,
+      rootFreelist: 0,
+      freelistHead: 0,
+      freelistCount: 0,
+      lastCheckpointLsn: 0
+    )
+    let writeRes = writeHeader(vfs, openRes.value, header)
+    check writeRes.ok
+    discard vfs.close(openRes.value)
+    let reopen = openDb(tempPath)
+    check not reopen.ok
+    check reopen.err.code == ERR_CORRUPTION

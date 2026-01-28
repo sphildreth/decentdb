@@ -44,7 +44,7 @@ MVP scope: single process, multi-threaded readers, single writer.
 
 6. **catalog/**
    - System tables and schema management
-   - Stores table/column/index/fk metadata
+   - Stores table/column/index/fk metadata (including constraints and index kind)
    - Schema versioning cookie
 
 7. **sql/**
@@ -112,6 +112,30 @@ Offset  Size  Field
 ```
 
 See ADR-0016 for checksum calculation details.
+
+**Format version notes:**
+- v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
+- v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
+
+### 3.4 Catalog record encoding (v2)
+Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
+
+**Table record:**
+- kind = `"table"`
+- name
+- root page id
+- next row id
+- columns encoded as `name:type[:flags]` with `;` separators
+  - flags: `nn`, `unique`, `pk`, `ref=parent_table.parent_column`
+
+**Index record:**
+- kind = `"index"`
+- name
+- table
+- column
+- root page id
+- kind (`"btree"` or `"trigram"`)
+- unique flag (0/1)
 
 ### 3.3 Page types
 - B+Tree internal page
@@ -579,4 +603,3 @@ db.set_config("trigram_postings_threshold", 50000)
 - Not implemented in MVP to simplify code
 - Compaction provides equivalent space recovery
 - Future: implement merge for delete-heavy workloads
-

@@ -14,9 +14,18 @@ type ColumnType* = enum
   ctText
   ctBlob
 
+type IndexKind* = enum
+  ikBtree
+  ikTrigram
+
 type Column* = object
   name*: string
   kind*: ColumnType
+  notNull*: bool
+  unique*: bool
+  primaryKey*: bool
+  refTable*: string
+  refColumn*: string
 
 type TableMeta* = object
   name*: string
@@ -29,6 +38,8 @@ type IndexMeta* = object
   table*: string
   column*: string
   rootPage*: PageId
+  kind*: IndexKind
+  unique*: bool
 
 type Catalog* = ref object
   tables*: Table[string, TableMeta]
@@ -70,7 +81,17 @@ proc columnTypeToText(kind: ColumnType): string =
 proc encodeColumns(columns: seq[Column]): seq[byte] =
   var parts: seq[string] = @[]
   for col in columns:
-    parts.add(col.name & ":" & columnTypeToText(col.kind))
+    var flags: seq[string] = @[]
+    if col.notNull:
+      flags.add("nn")
+    if col.unique:
+      flags.add("unique")
+    if col.primaryKey:
+      flags.add("pk")
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      flags.add("ref=" & col.refTable & "." & col.refColumn)
+    let flagPart = if flags.len > 0: ":" & flags.join(",") else: ""
+    parts.add(col.name & ":" & columnTypeToText(col.kind) & flagPart)
   let joined = parts.join(";")
   var bytes: seq[byte] = @[]
   for ch in joined:
@@ -86,10 +107,28 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
   let parts = s.split(";")
   for part in parts:
     let pieces = part.split(":")
-    if pieces.len == 2:
+    if pieces.len >= 2:
       let typeRes = parseColumnType(pieces[1])
       if typeRes.ok:
-        result.add(Column(name: pieces[0], kind: typeRes.value))
+        var col = Column(name: pieces[0], kind: typeRes.value)
+        if pieces.len >= 3:
+          let flags = pieces[2].split(",")
+          for flag in flags:
+            case flag
+            of "nn":
+              col.notNull = true
+            of "unique":
+              col.unique = true
+            of "pk":
+              col.primaryKey = true
+            else:
+              if flag.startsWith("ref="):
+                let target = flag[4 .. ^1]
+                let parts = target.split(".")
+                if parts.len == 2:
+                  col.refTable = parts[0]
+                  col.refColumn = parts[1]
+        result.add(col)
 
 proc stringToBytes(text: string): seq[byte] =
   for ch in text:
@@ -109,13 +148,15 @@ proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns:
   ]
   encodeRecord(values)
 
-proc makeIndexRecord(name: string, table: string, column: string, rootPage: PageId): seq[byte] =
+proc makeIndexRecord(name: string, table: string, column: string, rootPage: PageId, kind: IndexKind, unique: bool): seq[byte] =
   let values = @[
     Value(kind: vkText, bytes: stringToBytes("index")),
     Value(kind: vkText, bytes: stringToBytes(name)),
     Value(kind: vkText, bytes: stringToBytes(table)),
     Value(kind: vkText, bytes: stringToBytes(column)),
-    Value(kind: vkInt64, int64Val: int64(rootPage))
+    Value(kind: vkInt64, int64Val: int64(rootPage)),
+    Value(kind: vkText, bytes: stringToBytes(if kind == ikTrigram: "trigram" else: "btree")),
+    Value(kind: vkInt64, int64Val: int64(if unique: 1 else: 0))
   ]
   encodeRecord(values)
 
@@ -146,7 +187,15 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let tableName = bytesToString(values[2].bytes)
     let columnName = bytesToString(values[3].bytes)
     let rootPage = PageId(values[4].int64Val)
-    return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, column: columnName, rootPage: rootPage)))
+    var kind = ikBtree
+    var unique = false
+    if values.len >= 6:
+      let kindText = bytesToString(values[5].bytes).toLowerAscii()
+      if kindText == "trigram":
+        kind = ikTrigram
+    if values.len >= 7:
+      unique = values[6].int64Val != 0
+    return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, column: columnName, rootPage: rootPage, kind: kind, unique: unique)))
   err[CatalogRecord](ERR_CORRUPTION, "Unknown catalog record type", recordType)
 
 proc initCatalog*(pager: Pager): Result[Catalog] =
@@ -200,7 +249,17 @@ proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
-  let record = makeIndexRecord(index.name, index.table, index.column, index.rootPage)
+  let record = makeIndexRecord(index.name, index.table, index.column, index.rootPage, index.kind, index.unique)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  okVoid()
+
+proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
+  catalog.indexes[index.name] = index
+  let key = uint64(crc32c(stringToBytes("index:" & index.name)))
+  discard delete(catalog.catalogTree, key)
+  let record = makeIndexRecord(index.name, index.table, index.column, index.rootPage, index.kind, index.unique)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -226,8 +285,19 @@ proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
   okVoid()
 
-proc getIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
+proc getBtreeIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
   for _, idx in catalog.indexes:
-    if idx.table == table and idx.column == column:
+    if idx.table == table and idx.column == column and idx.kind == ikBtree:
       return some(idx)
+  none(IndexMeta)
+
+proc getTrigramIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
+  for _, idx in catalog.indexes:
+    if idx.table == table and idx.column == column and idx.kind == ikTrigram:
+      return some(idx)
+  none(IndexMeta)
+
+proc getIndexByName*(catalog: Catalog, name: string): Option[IndexMeta] =
+  if catalog.indexes.hasKey(name):
+    return some(catalog.indexes[name])
   none(IndexMeta)

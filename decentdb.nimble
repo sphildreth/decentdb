@@ -13,6 +13,8 @@ task test, "Run Nim + Python unit tests":
   exec "nim c -r tests/nim/test_btree.nim"
   exec "nim c -r tests/nim/test_wal.nim"
   exec "nim c -r tests/nim/test_sql_exec.nim"
+  exec "nim c -r tests/nim/test_constraints.nim"
+  exec "nim c -r tests/nim/test_trigram.nim"
   exec "python -m unittest tests/harness/test_runner.py"
 
 task test_nim, "Run Nim unit tests":
@@ -23,6 +25,8 @@ task test_nim, "Run Nim unit tests":
   exec "nim c -r tests/nim/test_btree.nim"
   exec "nim c -r tests/nim/test_wal.nim"
   exec "nim c -r tests/nim/test_sql_exec.nim"
+  exec "nim c -r tests/nim/test_constraints.nim"
+  exec "nim c -r tests/nim/test_trigram.nim"
 
 task test_py, "Run Python harness tests":
   exec "python -m unittest tests/harness/test_runner.py"
@@ -44,6 +48,7 @@ task lint, "Static checks for Nim + Python":
   exec "nim check src/sql/binder.nim"
   exec "nim check src/planner/planner.nim"
   exec "nim check src/exec/exec.nim"
+  exec "nim check src/search/search.nim"
   exec "nim check src/wal/wal.nim"
   exec "nim check tests/nim/test_faulty_vfs.nim"
   exec "nim check tests/nim/test_db_header.nim"
@@ -52,4 +57,6 @@ task lint, "Static checks for Nim + Python":
   exec "nim check tests/nim/test_btree.nim"
   exec "nim check tests/nim/test_wal.nim"
   exec "nim check tests/nim/test_sql_exec.nim"
+  exec "nim check tests/nim/test_constraints.nim"
+  exec "nim check tests/nim/test_trigram.nim"
   exec "python -m compileall tests/harness"
