@@ -4,6 +4,7 @@ import engine
 import pager/pager
 import btree/btree
 import pager/db_header
+import errors
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
@@ -128,5 +129,70 @@ suite "BTree":
         continue
       seen.add(nextRes.value[0])
     check seen.len == 199
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "delete affecting root":
+    let path = makeTempDb("decentdb_btree_root_delete.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 4)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let rootRes = allocatePage(pager)
+    check rootRes.ok
+    let root = rootRes.value
+    var rootBuf = newSeq[byte](pager.pageSize)
+    rootBuf[0] = PageTypeLeaf
+    writeU32LE(rootBuf, 4, 0)
+    check writePage(pager, root, rootBuf).ok
+    let tree = newBTree(pager, root)
+    
+    # Insert 1 item
+    check insert(tree, 1, @[byte(1)]).ok
+    
+    # Verify we can find it
+    check find(tree, 1).ok
+    
+    # Delete it
+    check delete(tree, 1).ok
+    
+    # Verify we can't find it
+    check not find(tree, 1).ok
+    
+    # Iterating empty tree
+    let cursorRes = openCursor(tree)
+    check cursorRes.ok
+    let cursor = cursorRes.value
+    let nextRes = cursorNext(cursor)
+    if nextRes.ok:
+      echo "Cursor found unexpected item: ", nextRes.value
+    check not nextRes.ok
+    
+    discard closePager(pager)
+    discard closeDb(db)
+  
+  test "iterate empty tree":
+    let path = makeTempDb("decentdb_btree_empty.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let rootRes = allocatePage(pager)
+    check rootRes.ok
+    let root = rootRes.value
+    var rootBuf = newSeq[byte](pager.pageSize)
+    rootBuf[0] = PageTypeLeaf
+    writeU32LE(rootBuf, 4, 0)
+    check writePage(pager, root, rootBuf).ok
+    let tree = newBTree(pager, root)
+    
+    let cursorRes = openCursor(tree)
+    check cursorRes.ok
+    check not cursorNext(cursorRes.value).ok
+    
     discard closePager(pager)
     discard closeDb(db)

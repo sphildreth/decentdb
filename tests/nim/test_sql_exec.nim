@@ -3,6 +3,7 @@ import os
 import strutils
 import engine
 import record/record
+import errors
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
@@ -74,3 +75,58 @@ suite "SQL Exec":
     check rows.ok
     check splitRow(rows.value[0])[0] == "X"
     discard closeDb(db)
+
+  test "where clause complex logic":
+    let path = makeTempDb("decentdb_sql_where.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE items (id INT, val INT)").ok
+    check execSql(db, "INSERT INTO items (id, val) VALUES (1, 10)").ok
+    check execSql(db, "INSERT INTO items (id, val) VALUES (2, 20)").ok
+    check execSql(db, "INSERT INTO items (id, val) VALUES (3, 30)").ok
+    
+    # OR
+    let res1 = execSql(db, "SELECT id FROM items WHERE id = 1 OR id = 3")
+    check res1.ok
+    check res1.value.len == 2
+    
+    # AND
+    let res2 = execSql(db, "SELECT id FROM items WHERE val > 15 AND val < 25")
+    check res2.ok
+    check res2.value.len == 1
+    check splitRow(res2.value[0])[0] == "2"
+    
+    # NULL logic
+    check execSql(db, "INSERT INTO items (id, val) VALUES (4, NULL)").ok
+    let res3 = execSql(db, "SELECT id FROM items WHERE val IS NULL")
+    check res3.ok
+    check res3.value.len == 1
+    check splitRow(res3.value[0])[0] == "4"
+    
+    discard closeDb(db)
+  
+  test "type mismatch handling":
+    let path = makeTempDb("decentdb_sql_types.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, flag BOOL)").ok
+    
+    # Insert wrong type (text for int)
+    let badInsert = execSql(db, "INSERT INTO t (id, flag) VALUES ('bad', true)")
+    check not badInsert.ok
+    check badInsert.err.code == ERR_SQL
+    
+    let validInsert = execSql(db, "INSERT INTO t (id, flag) VALUES (1, true)")
+    if not validInsert.ok:
+      echo "Valid insert failed: ", validInsert.err.message
+    check validInsert.ok
+    
+    # Update wrong type
+    let badUpdate = execSql(db, "UPDATE t SET flag = 1 WHERE id = 1") # 1 is int, not bool in strict mode?
+    check not badUpdate.ok
+    check badUpdate.err.code == ERR_SQL
+    
+    discard closeDb(db)
+

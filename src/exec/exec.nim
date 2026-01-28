@@ -134,19 +134,23 @@ proc valueToBool*(value: Value): bool =
   else: false
 
 proc compareValues*(a: Value, b: Value): int =
-  if a.kind == vkText or a.kind == vkBlob:
-    let aStr = valueToString(a)
-    let bStr = valueToString(b)
-    return cmp(aStr, bStr)
-  if a.kind == vkFloat64 or b.kind == vkFloat64:
-    let af = if a.kind == vkFloat64: a.float64Val else: float(a.int64Val)
-    let bf = if b.kind == vkFloat64: b.float64Val else: float(b.int64Val)
-    return cmp(af, bf)
-  if a.kind == vkInt64 and b.kind == vkInt64:
-    return cmp(a.int64Val, b.int64Val)
-  if a.kind == vkBool and b.kind == vkBool:
-    return cmp(a.boolVal, b.boolVal)
-  0
+  if a.kind != b.kind:
+    return cmp(a.kind, b.kind)
+  case a.kind
+  of vkNull: 0
+  of vkBool: cmp(a.boolVal, b.boolVal)
+  of vkInt64: cmp(a.int64Val, b.int64Val)
+  of vkFloat64: cmp(a.float64Val, b.float64Val)
+  of vkText, vkBlob:
+    var lenA = a.bytes.len
+    var lenB = b.bytes.len
+    var minLen = min(lenA, lenB)
+    if minLen > 0:
+      let c = cmpMem(unsafeAddr a.bytes[0], unsafeAddr b.bytes[0], minLen)
+      if c != 0: return c
+    return cmp(lenA, lenB)
+  else:
+    0
 
 proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
   if expr == nil:
@@ -159,6 +163,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return err[Value](ERR_SQL, "Missing parameter", $expr.index)
     return ok(params[expr.index - 1])
   of ekColumn:
+    if expr.table.len == 0:
+      let lower = expr.name.toLowerAscii()
+      if lower == "true": return ok(Value(kind: vkBool, boolVal: true))
+      if lower == "false": return ok(Value(kind: vkBool, boolVal: false))
     let idxRes = columnIndex(row, expr.table, expr.name)
     if not idxRes.ok:
       return err[Value](idxRes.err.code, idxRes.err.message, idxRes.err.context)
@@ -198,6 +206,14 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       let leftStr = valueToString(leftRes.value)
       let rightStr = valueToString(rightRes.value)
       return ok(Value(kind: vkBool, boolVal: likeMatch(leftStr, rightStr, true)))
+    of "IS":
+       if rightRes.value.kind == vkNull:
+         return ok(Value(kind: vkBool, boolVal: leftRes.value.kind == vkNull))
+       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) == 0))
+    of "IS NOT":
+       if rightRes.value.kind == vkNull:
+         return ok(Value(kind: vkBool, boolVal: leftRes.value.kind != vkNull))
+       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) != 0))
     else:
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:

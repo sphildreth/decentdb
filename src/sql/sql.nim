@@ -201,6 +201,10 @@ proc parseAConst(node: JsonNode): Result[Expr] =
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
   if nodeHas(node, "Null"):
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
+  if nodeHas(node, "boolval"):
+    let boolNode = node["boolval"]
+    if nodeHas(boolNode, "boolval"):
+      return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: boolNode["boolval"].getBool)))
   err[Expr](ERR_SQL, "Unsupported A_Const")
 
 proc parseColumnRef(node: JsonNode): Result[Expr] =
@@ -280,6 +284,16 @@ proc parseTypeCast(node: JsonNode): Result[Expr] =
     return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
   ok(argRes.value)
 
+proc parseNullTest(node: JsonNode): Result[Expr] =
+  let argRes = parseExprNode(node["arg"])
+  if not argRes.ok:
+    return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+  let typeStr = nodeString(node["nulltesttype"])
+  var op = "IS"
+  if typeStr == "IS_NOT_NULL":
+    op = "IS NOT"
+  ok(Expr(kind: ekBinary, op: op, left: argRes.value, right: Expr(kind: ekLiteral, value: SqlValue(kind: svNull))))
+
 proc parseExprNode(node: JsonNode): Result[Expr] =
   if node.kind == JObject:
     if nodeHas(node, "A_Const"):
@@ -296,6 +310,8 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseParamRef(node["ParamRef"])
     if nodeHas(node, "TypeCast"):
       return parseTypeCast(node["TypeCast"])
+    if nodeHas(node, "NullTest"):
+      return parseNullTest(node["NullTest"])
   err[Expr](ERR_SQL, "Unsupported expression node")
 
 proc unwrapRangeVar(node: JsonNode): JsonNode =
@@ -381,20 +397,23 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
   var whereExpr: Expr = nil
   if nodeHas(node, "whereClause"):
     let whereRes = parseExprNode(node["whereClause"])
-    if whereRes.ok:
-      whereExpr = whereRes.value
+    if not whereRes.ok:
+      return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+    whereExpr = whereRes.value
   var groupBy: seq[Expr] = @[]
   let groupClause = nodeGet(node, "groupClause")
   if groupClause.kind == JArray:
     for g in groupClause:
       let gRes = parseExprNode(g)
-      if gRes.ok:
-        groupBy.add(gRes.value)
+      if not gRes.ok:
+        return err[Statement](gRes.err.code, gRes.err.message, gRes.err.context)
+      groupBy.add(gRes.value)
   var havingExpr: Expr = nil
   if nodeHas(node, "havingClause"):
     let hRes = parseExprNode(node["havingClause"])
-    if hRes.ok:
-      havingExpr = hRes.value
+    if not hRes.ok:
+      return err[Statement](hRes.err.code, hRes.err.message, hRes.err.context)
+    havingExpr = hRes.value
   var orderBy: seq[OrderItem] = @[]
   let sortClause = nodeGet(node, "sortClause")
   if sortClause.kind == JArray:
@@ -465,8 +484,9 @@ proc parseUpdateStmt(node: JsonNode): Result[Statement] =
   var whereExpr: Expr = nil
   if nodeHas(node, "whereClause"):
     let whereRes = parseExprNode(node["whereClause"])
-    if whereRes.ok:
-      whereExpr = whereRes.value
+    if not whereRes.ok:
+      return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+    whereExpr = whereRes.value
   ok(Statement(kind: skUpdate, updateTable: tableRes.value[0], assignments: assigns, updateWhere: whereExpr))
 
 proc parseDeleteStmt(node: JsonNode): Result[Statement] =
@@ -477,9 +497,13 @@ proc parseDeleteStmt(node: JsonNode): Result[Statement] =
   var whereExpr: Expr = nil
   if nodeHas(node, "whereClause"):
     let whereRes = parseExprNode(node["whereClause"])
-    if whereRes.ok:
-      whereExpr = whereRes.value
+    if not whereRes.ok:
+      return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+    whereExpr = whereRes.value
   ok(Statement(kind: skDelete, deleteTable: tableRes.value[0], deleteWhere: whereExpr))
+# ... Rest of file is identical, assume parseCreateStmt etc don't need changes as they don't have expression parsing flaws in context
+# Actually, parseCreateStmt etc. are fine.
+# I will output the whole file content to be safe.
 
 proc parseCreateStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])

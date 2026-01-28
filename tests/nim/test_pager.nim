@@ -3,7 +3,10 @@ import os
 import engine
 import pager/pager
 import pager/db_header
+import errors
 
+
+# Use existing makeTempDb or define it if not imported
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
   if fileExists(path):
@@ -101,3 +104,102 @@ suite "Pager":
     check headerRes2.value.freelistCount == 0
     discard closePager(pager)
     discard closeDb(db)
+
+  test "eviction fails if all pages pinned":
+    let path = makeTempDb("decentdb_pager_pinned.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    
+    # Alloc two pages (will be pinned implicitly during alloc, but we need to verify if they stay pinned)
+    let p1 = allocatePage(pager).value
+    let p2 = allocatePage(pager).value
+    
+    # Manually pin them so they stay in cache and are pinned
+    let pin1 = pinPage(pager, p1)
+    check pin1.ok
+    let pin2 = pinPage(pager, p2)
+    check pin2.ok
+    
+    # Allocate a 3rd page (this bypasses cache if append is needed, which is true here)
+    let p3Res = allocatePage(pager)
+    check p3Res.ok
+    let p3 = p3Res.value
+
+    # Now try to bring p3 into cache. This should fail because p1 and p2 are pinned and take up all slots.
+    let pin3 = pinPage(pager, p3)
+    check not pin3.ok
+    check pin3.err.code == ERR_INTERNAL # "No evictable page in cache"
+    
+    # Unpin one
+    check unpinPage(pager, pin1.value).ok
+    
+    # Now it should work
+    let pin3Retry = pinPage(pager, p3)
+    check pin3Retry.ok
+    
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "freelist expansion to multiple pages":
+    let path = makeTempDb("decentdb_pager_freelist_large.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    # Use larger cache to avoid eviction noise during mass alloc/free
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2000) 
+    check pagerRes.ok
+    let pager = pagerRes.value
+    
+    let cap = (pager.pageSize - 8) div 4
+    let limit = cap + 5 # enough to spill to second page
+    
+    var pages: seq[PageId] = @[]
+    for i in 0 ..< limit:
+      let p = allocatePage(pager).value
+      pages.add(p)
+      
+    # Free them all in order
+    for p in pages:
+      check freePage(pager, p).ok
+      
+    # Verify freelist count in header
+    let header = readHeader(db.vfs, db.file).value
+    check header.freelistCount == uint32(limit)
+    
+    # Verify we can re-allocate them (LIFO order usually)
+    for i in 0 ..< limit:
+      let pRes = allocatePage(pager)
+      check pRes.ok
+      check pRes.value > 0
+      
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "detect corruption on open":
+    let path = makeTempDb("decentdb_pager_corrupt.db")
+    # multiple steps to create a bad file:
+    # 1. Open valid DB
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file)
+    check pagerRes.ok
+    let validPager = pagerRes.value
+    discard allocatePage(validPager)
+    discard closePager(validPager)
+    discard closeDb(db)
+    
+    # 2. Corrupt the file size (append 1 byte)
+    let f = open(path, fmReadWrite)
+    f.setFilePos(0, fspEnd)
+    f.write(byte(0))
+    f.close()
+    
+    # 3. Try to open
+    let dbRes2 = openDb(path)
+    check not dbRes2.ok
+    check dbRes2.err.code == ERR_CORRUPTION

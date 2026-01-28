@@ -372,8 +372,9 @@ proc delete*(tree: BTree, key: uint64): Result[Void] =
   var (keys, values, overflows, nextLeaf) = parsed.value
   for i in 0 ..< keys.len:
     if keys[i] == key:
-      values[i] = @[]
-      overflows[i] = 0
+      keys.delete(i)
+      values.delete(i)
+      overflows.delete(i)
       let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
       if not encodeRes.ok:
         return err[Void](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)

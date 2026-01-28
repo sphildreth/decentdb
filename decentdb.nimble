@@ -5,6 +5,9 @@ license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["decentdb_cli"]
 
+requires "nim >= 1.6.0"
+requires "cligen >= 1.7.0"
+
 task test, "Run Nim + Python unit tests":
   exec "nim c -r tests/nim/test_faulty_vfs.nim"
   exec "nim c -r tests/nim/test_db_header.nim"
