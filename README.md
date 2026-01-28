@@ -168,6 +168,7 @@ Planned developer dependencies (see `design/SPEC.md` and `design/TESTING_STRATEG
 Prerequisites:
 - Nim (includes `nim` and `nimble`)
 - Python 3
+- `libpg_query` (C library + headers)
 
 Common commands:
 - Build CLI: `nimble build`
@@ -178,6 +179,7 @@ Common commands:
 
 Notes:
 - The engine is still a stub; `decentdb_cli` currently supports open/close and a stubbed `--sql` path.
+- `nim.cfg` enables `-d:libpg_query` and links `-lpg_query`. If headers/libs are in a non-standard path, set `CFLAGS`/`LDFLAGS` or `NIMFLAGS` accordingly.
 
 ## Contributing
 This repo is optimized for incremental, test-driven implementation.

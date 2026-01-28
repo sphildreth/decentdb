@@ -1,3 +1,4 @@
+import options
 import ../errors
 import ../pager/pager
 import ../pager/db_header
@@ -109,6 +110,8 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
   let (keys, values, overflows, _) = parsed.value
   for i in 0 ..< keys.len:
     if keys[i] == key:
+      if values[i].len == 0 and overflows[i] == 0'u32:
+        return err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
       return ok((keys[i], values[i], overflows[i]))
   err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
 
@@ -159,3 +162,221 @@ proc cursorNext*(cursor: BTreeCursor): Result[(uint64, seq[byte], uint32)] =
   cursor.nextLeaf = nextLeaf
   cursor.index = 0
   cursorNext(cursor)
+
+proc encodeLeaf(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32], nextLeaf: PageId, pageSize: int): Result[seq[byte]] =
+  if keys.len != values.len or keys.len != overflows.len:
+    return err[seq[byte]](ERR_INTERNAL, "Leaf encode length mismatch")
+  var buf = newSeq[byte](pageSize)
+  buf[0] = PageTypeLeaf
+  buf[1] = 0
+  let count = uint16(keys.len)
+  buf[2] = byte(count and 0xFF)
+  buf[3] = byte((count shr 8) and 0xFF)
+  writeU32LE(buf, 4, uint32(nextLeaf))
+  var offset = 8
+  for i in 0 ..< keys.len:
+    let valueLen = values[i].len
+    if offset + 16 + valueLen > pageSize:
+      return err[seq[byte]](ERR_IO, "Leaf overflow")
+    writeU64LE(buf, offset, keys[i])
+    writeU32LE(buf, offset + 8, uint32(valueLen))
+    writeU32LE(buf, offset + 12, overflows[i])
+    offset += 16
+    if valueLen > 0:
+      copyMem(addr buf[offset], unsafeAddr values[i][0], valueLen)
+      offset += valueLen
+  ok(buf)
+
+proc encodeInternal(keys: seq[uint64], children: seq[uint32], rightChild: uint32, pageSize: int): Result[seq[byte]] =
+  if children.len != keys.len:
+    return err[seq[byte]](ERR_INTERNAL, "Internal encode length mismatch")
+  var buf = newSeq[byte](pageSize)
+  buf[0] = PageTypeInternal
+  buf[1] = 0
+  let count = uint16(keys.len)
+  buf[2] = byte(count and 0xFF)
+  buf[3] = byte((count shr 8) and 0xFF)
+  writeU32LE(buf, 4, rightChild)
+  var offset = 8
+  for i in 0 ..< keys.len:
+    if offset + 12 > pageSize:
+      return err[seq[byte]](ERR_IO, "Internal overflow")
+    writeU64LE(buf, offset, keys[i])
+    writeU32LE(buf, offset + 8, children[i])
+    offset += 12
+  ok(buf)
+
+type SplitResult = object
+  promoted: uint64
+  newPage: PageId
+
+proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte]): Result[Option[SplitResult]] =
+  let pageRes = readPage(tree.pager, pageId)
+  if not pageRes.ok:
+    return err[Option[SplitResult]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  let page = pageRes.value
+  if page[0] == PageTypeLeaf:
+    let parsed = readLeafCells(page)
+    if not parsed.ok:
+      return err[Option[SplitResult]](parsed.err.code, parsed.err.message, parsed.err.context)
+    var (keys, values, overflows, nextLeaf) = parsed.value
+    for i in 0 ..< keys.len:
+      if keys[i] == key:
+        values[i] = value
+        overflows[i] = 0
+        let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+        if not encodeRes.ok:
+          return err[Option[SplitResult]](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)
+        discard writePage(tree.pager, pageId, encodeRes.value)
+        return ok(none(SplitResult))
+    var inserted = false
+    for i in 0 ..< keys.len:
+      if key <= keys[i]:
+        keys.insert(key, i)
+        values.insert(value, i)
+        overflows.insert(0'u32, i)
+        inserted = true
+        break
+    if not inserted:
+      keys.add(key)
+      values.add(value)
+      overflows.add(0)
+    let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+    if encodeRes.ok:
+      discard writePage(tree.pager, pageId, encodeRes.value)
+      return ok(none(SplitResult))
+    let mid = keys.len div 2
+    let leftKeys = keys[0 ..< mid]
+    let leftVals = values[0 ..< mid]
+    let leftOv = overflows[0 ..< mid]
+    let rightKeys = keys[mid ..< keys.len]
+    let rightVals = values[mid ..< values.len]
+    let rightOv = overflows[mid ..< overflows.len]
+    let newRes = allocatePage(tree.pager)
+    if not newRes.ok:
+      return err[Option[SplitResult]](newRes.err.code, newRes.err.message, newRes.err.context)
+    let newPage = newRes.value
+    let rightBufRes = encodeLeaf(rightKeys, rightVals, rightOv, nextLeaf, tree.pager.pageSize)
+    if not rightBufRes.ok:
+      return err[Option[SplitResult]](rightBufRes.err.code, rightBufRes.err.message, rightBufRes.err.context)
+    discard writePage(tree.pager, newPage, rightBufRes.value)
+    let leftBufRes = encodeLeaf(leftKeys, leftVals, leftOv, newPage, tree.pager.pageSize)
+    if not leftBufRes.ok:
+      return err[Option[SplitResult]](leftBufRes.err.code, leftBufRes.err.message, leftBufRes.err.context)
+    discard writePage(tree.pager, pageId, leftBufRes.value)
+    return ok(some(SplitResult(promoted: rightKeys[0], newPage: newPage)))
+  let internalRes = readInternalCells(page)
+  if not internalRes.ok:
+    return err[Option[SplitResult]](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+  var (keys, children, rightChild) = internalRes.value
+  var childIndex = keys.len
+  for i in 0 ..< keys.len:
+    if key < keys[i]:
+      childIndex = i
+      break
+  let childPage = if childIndex == keys.len: PageId(rightChild) else: PageId(children[childIndex])
+  let splitRes = insertRecursive(tree, childPage, key, value)
+  if not splitRes.ok:
+    return err[Option[SplitResult]](splitRes.err.code, splitRes.err.message, splitRes.err.context)
+  if splitRes.value.isNone:
+    return ok(none(SplitResult))
+  let split = splitRes.value.get
+  if childIndex == keys.len:
+    keys.add(split.promoted)
+    children.add(uint32(childPage))
+    rightChild = uint32(split.newPage)
+  else:
+    keys.insert(split.promoted, childIndex)
+    children.insert(uint32(childPage), childIndex)
+    children[childIndex + 1] = uint32(split.newPage)
+  let encodeRes = encodeInternal(keys, children, rightChild, tree.pager.pageSize)
+  if encodeRes.ok:
+    discard writePage(tree.pager, pageId, encodeRes.value)
+    return ok(none(SplitResult))
+  let mid = keys.len div 2
+  let promoted = keys[mid]
+  let leftKeys = keys[0 ..< mid]
+  let rightKeys = keys[mid + 1 ..< keys.len]
+  let leftChildren = children[0 ..< mid]
+  let rightChildren = children[mid + 1 ..< children.len]
+  let leftRightChild = if mid < children.len: children[mid] else: rightChild
+  let rightRightChild = rightChild
+  let newRes = allocatePage(tree.pager)
+  if not newRes.ok:
+    return err[Option[SplitResult]](newRes.err.code, newRes.err.message, newRes.err.context)
+  let newPage = newRes.value
+  let leftBufRes = encodeInternal(leftKeys, leftChildren, leftRightChild, tree.pager.pageSize)
+  let rightBufRes = encodeInternal(rightKeys, rightChildren, rightRightChild, tree.pager.pageSize)
+  if not leftBufRes.ok:
+    return err[Option[SplitResult]](leftBufRes.err.code, leftBufRes.err.message, leftBufRes.err.context)
+  if not rightBufRes.ok:
+    return err[Option[SplitResult]](rightBufRes.err.code, rightBufRes.err.message, rightBufRes.err.context)
+  discard writePage(tree.pager, pageId, leftBufRes.value)
+  discard writePage(tree.pager, newPage, rightBufRes.value)
+  ok(some(SplitResult(promoted: promoted, newPage: newPage)))
+
+proc insert*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
+  let splitRes = insertRecursive(tree, tree.root, key, value)
+  if not splitRes.ok:
+    return err[Void](splitRes.err.code, splitRes.err.message, splitRes.err.context)
+  if splitRes.value.isSome:
+    let split = splitRes.value.get
+    let newRootRes = allocatePage(tree.pager)
+    if not newRootRes.ok:
+      return err[Void](newRootRes.err.code, newRootRes.err.message, newRootRes.err.context)
+    let newRoot = newRootRes.value
+    let keys = @[split.promoted]
+    let children = @[uint32(tree.root)]
+    let rightChild = uint32(split.newPage)
+    let bufRes = encodeInternal(keys, children, rightChild, tree.pager.pageSize)
+    if not bufRes.ok:
+      return err[Void](bufRes.err.code, bufRes.err.message, bufRes.err.context)
+    discard writePage(tree.pager, newRoot, bufRes.value)
+    tree.root = newRoot
+  okVoid()
+
+proc update*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
+  let leafRes = findLeaf(tree, key)
+  if not leafRes.ok:
+    return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  let pageId = leafRes.value
+  let pageRes = readPage(tree.pager, pageId)
+  if not pageRes.ok:
+    return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  let parsed = readLeafCells(pageRes.value)
+  if not parsed.ok:
+    return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+  var (keys, values, overflows, nextLeaf) = parsed.value
+  for i in 0 ..< keys.len:
+    if keys[i] == key:
+      values[i] = value
+      overflows[i] = 0
+      let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+      if not encodeRes.ok:
+        return err[Void](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)
+      discard writePage(tree.pager, pageId, encodeRes.value)
+      return okVoid()
+  err[Void](ERR_IO, "Key not found")
+
+proc delete*(tree: BTree, key: uint64): Result[Void] =
+  let leafRes = findLeaf(tree, key)
+  if not leafRes.ok:
+    return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  let pageId = leafRes.value
+  let pageRes = readPage(tree.pager, pageId)
+  if not pageRes.ok:
+    return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  let parsed = readLeafCells(pageRes.value)
+  if not parsed.ok:
+    return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+  var (keys, values, overflows, nextLeaf) = parsed.value
+  for i in 0 ..< keys.len:
+    if keys[i] == key:
+      values[i] = @[]
+      overflows[i] = 0
+      let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+      if not encodeRes.ok:
+        return err[Void](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)
+      discard writePage(tree.pager, pageId, encodeRes.value)
+      return okVoid()
+  err[Void](ERR_IO, "Key not found")
