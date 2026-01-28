@@ -1,0 +1,24 @@
+import locks
+import ../errors
+
+type VfsFile* = ref object
+  path*: string
+  file*: File
+  lock*: Lock
+
+type Vfs* = ref object of RootObj
+
+method open*(vfs: Vfs, path: string, mode: FileMode, create: bool): Result[VfsFile] {.base.} =
+  err[VfsFile](ERR_INTERNAL, "VFS.open not implemented", path)
+
+method read*(vfs: Vfs, file: VfsFile, offset: int64, buf: var openArray[byte]): Result[int] {.base.} =
+  err[int](ERR_INTERNAL, "VFS.read not implemented", file.path)
+
+method write*(vfs: Vfs, file: VfsFile, offset: int64, buf: openArray[byte]): Result[int] {.base.} =
+  err[int](ERR_INTERNAL, "VFS.write not implemented", file.path)
+
+method fsync*(vfs: Vfs, file: VfsFile): Result[Void] {.base.} =
+  err[Void](ERR_INTERNAL, "VFS.fsync not implemented", file.path)
+
+method close*(vfs: Vfs, file: VfsFile): Result[Void] {.base.} =
+  err[Void](ERR_INTERNAL, "VFS.close not implemented", file.path)

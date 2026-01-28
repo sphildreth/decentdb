@@ -124,7 +124,7 @@ The test pyramid (see `design/TESTING_STRATEGY.md`) includes:
 Agents should implement the project by working the phases in order. The canonical checklist lives in `design/IMPLEMENTATION_PHASES.md`.
 
 Phase map:
-- [ ] Phase 0: Foundations (project + test harness + VFS)
+- [x] Phase 0: Foundations (project + test harness + VFS)
 - [ ] Phase 1: DB File + Pager + Page Cache (read/write pages)
 - [ ] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [ ] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
@@ -163,6 +163,21 @@ Planned developer dependencies (see `design/SPEC.md` and `design/TESTING_STRATEG
 - Nim compiler (engine)
 - Python 3 (test harness)
 - PostgreSQL 15.x (differential testing; CI should cover PG14/PG15/PG16)
+
+## Developer Onboarding
+Prerequisites:
+- Nim (includes `nim` and `nimble`)
+- Python 3
+
+Common commands:
+- Build CLI: `nimble build`
+- Run all unit tests: `nimble test`
+- Run Nim unit tests only: `nimble test_nim`
+- Run Python harness tests only: `nimble test_py`
+- Run lint/static checks: `nimble lint`
+
+Notes:
+- The engine is still a stub; `decentdb_cli` currently supports open/close and a stubbed `--sql` path.
 
 ## Contributing
 This repo is optimized for incremental, test-driven implementation.

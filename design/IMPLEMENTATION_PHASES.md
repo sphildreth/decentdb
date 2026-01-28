@@ -22,7 +22,7 @@ Instructions to update the phase map:
 - If a phase’s scope changes, update *both* the phase checklist and the acceptance tests for that phase.
 - Do not delete completed items; only append.
 
-- [ ] Phase 0: Foundations (project + test harness + VFS)
+- [x] Phase 0: Foundations (project + test harness + VFS)
 - [ ] Phase 1: DB File + Pager + Page Cache (read/write pages)
 - [ ] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [ ] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
@@ -33,8 +33,8 @@ Instructions to update the phase map:
 ---
 
 ## Phase 0: Foundations (project + test harness + VFS)
-Status: Not started
-Completed:
+Status: Done
+Completed: 2026-01-28 (local change)
 
 Goal: Establish deterministic tests, failure injection, and a stable set of core abstractions.
 
@@ -44,13 +44,13 @@ Deliverables:
 - A test-only Faulty VFS with failpoints and partial-write injection.
 
 Checklist:
-- [ ] Create/confirm module layout: `vfs/`, `pager/`, `wal/`, `btree/`, `record/`, `catalog/`, `sql/`, `planner/`, `exec/`, `search/`.
-- [ ] Implement `vfs/` interface: open/read/write/fsync/close + intra-process locking.
-- [ ] Implement Faulty VFS hooks (test-only): partial writes, injected errors, dropped fsync, labeled failpoints; log all fault decisions for replay.
-- [ ] Establish error type conventions and codes (see `design/SPEC.md` §13): `ERR_IO`, `ERR_CORRUPTION`, `ERR_CONSTRAINT`, `ERR_TRANSACTION`, `ERR_SQL`, `ERR_INTERNAL`.
-- [ ] Add minimal engine entrypoint used by tests (CLI or test binary): open DB, exec SQL, close.
-- [ ] Create Python harness layout: `tests/harness/runner.py`, `tests/harness/scenarios/`, `tests/harness/postgres_ref/`, `tests/harness/datasets/`.
-- [ ] Add seed logging + deterministic rerun plumbing for property/fuzz style tests.
+- [x] Create/confirm module layout: `vfs/`, `pager/`, `wal/`, `btree/`, `record/`, `catalog/`, `sql/`, `planner/`, `exec/`, `search/`.
+- [x] Implement `vfs/` interface: open/read/write/fsync/close + intra-process locking.
+- [x] Implement Faulty VFS hooks (test-only): partial writes, injected errors, dropped fsync, labeled failpoints; log all fault decisions for replay.
+- [x] Establish error type conventions and codes (see `design/SPEC.md` §13): `ERR_IO`, `ERR_CORRUPTION`, `ERR_CONSTRAINT`, `ERR_TRANSACTION`, `ERR_SQL`, `ERR_INTERNAL`.
+- [x] Add minimal engine entrypoint used by tests (CLI or test binary): open DB, exec SQL, close.
+- [x] Create Python harness layout: `tests/harness/runner.py`, `tests/harness/scenarios/`, `tests/harness/postgres_ref/`, `tests/harness/datasets/`.
+- [x] Add seed logging + deterministic rerun plumbing for property/fuzz style tests.
 
 Acceptance tests (must pass before Phase 1 starts):
 - Unit: Faulty VFS exercises (partial write, dropped fsync, failpoint triggers) are deterministic and replayable.
