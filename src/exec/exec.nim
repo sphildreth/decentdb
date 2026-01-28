@@ -140,8 +140,6 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:
     return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
-  else:
-    err[Value](ERR_SQL, "Unsupported expression")
 
 proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: string): Result[seq[Row]] =
   let tableRes = catalog.getTable(tableName)
