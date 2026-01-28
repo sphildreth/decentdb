@@ -3,6 +3,7 @@ import locks
 import tables
 import atomics
 import options
+import times
 import ../errors
 import ../pager/pager
 import ../pager/db_header
@@ -35,9 +36,17 @@ type Wal* = ref object
   index*: Table[PageId, seq[WalIndexEntry]]
   lock*: Lock
   readerLock*: Lock
-  readers*: Table[int, uint64]
+  readers*: Table[int, tuple[snapshot: uint64, started: float]]
   nextReaderId*: int
   failpoints*: Table[string, WalFailpoint]
+  checkpointPending*: bool
+  lastCheckpointAt*: float
+  checkpointEveryBytes*: int64
+  checkpointEveryMs*: int64
+  readerWarnMs*: int64
+  readerTimeoutMs*: int64
+  forceTruncateOnTimeout*: bool
+  warnings*: seq[string]
 
 const HeaderSize = 1 + 4 + 4
 const TrailerSize = 8 + 8
@@ -88,7 +97,16 @@ proc newWal*(vfs: Vfs, path: string): Result[Wal] =
   let fileRes = vfs.open(path, fmReadWrite, true)
   if not fileRes.ok:
     return err[Wal](fileRes.err.code, fileRes.err.message, fileRes.err.context)
-  let wal = Wal(vfs: vfs, file: fileRes.value, path: path, index: initTable[PageId, seq[WalIndexEntry]](), readers: initTable[int, uint64](), failpoints: initTable[string, WalFailpoint]())
+  let wal = Wal(
+    vfs: vfs,
+    file: fileRes.value,
+    path: path,
+    index: initTable[PageId, seq[WalIndexEntry]](),
+    readers: initTable[int, tuple[snapshot: uint64, started: float]](),
+    failpoints: initTable[string, WalFailpoint](),
+    warnings: @[],
+    lastCheckpointAt: epochTime()
+  )
   initLock(wal.lock)
   initLock(wal.readerLock)
   wal.nextLsn = 1
@@ -100,6 +118,15 @@ proc setFailpoint*(wal: Wal, label: string, fp: WalFailpoint) =
 
 proc clearFailpoints*(wal: Wal) =
   wal.failpoints.clear()
+
+proc recordWarningLocked(wal: Wal, message: string) =
+  wal.warnings.add(message)
+
+proc takeWarnings*(wal: Wal): seq[string] =
+  acquire(wal.lock)
+  result = wal.warnings
+  wal.warnings = @[]
+  release(wal.lock)
 
 proc applyFailpoint(wal: Wal, label: string, buffer: seq[byte]): Result[int] =
   if not wal.failpoints.hasKey(label):
@@ -130,6 +157,114 @@ proc appendFrame(wal: Wal, frameType: WalFrameType, pageId: uint32, payload: seq
   if writeLen < frame.len:
     return err[uint64](ERR_IO, "Partial frame write", "wal_write_frame")
   ok(lsn)
+
+proc encodeCheckpointPayload(lsn: uint64): seq[byte] =
+  result = newSeq[byte](8)
+  writeU64LE(result, 0, lsn)
+
+proc readersOverThreshold*(wal: Wal, thresholdMs: int64): seq[tuple[snapshot: uint64, ageMs: int64]] =
+  if thresholdMs <= 0:
+    return @[]
+  let now = epochTime()
+  acquire(wal.readerLock)
+  for _, info in wal.readers:
+    let elapsedMs = int64((now - info.started) * 1000)
+    if elapsedMs >= thresholdMs:
+      result.add((snapshot: info.snapshot, ageMs: elapsedMs))
+  release(wal.readerLock)
+
+proc minReaderSnapshot*(wal: Wal): Option[uint64] =
+  acquire(wal.readerLock)
+  var minSnap: uint64 = 0
+  var has = false
+  for _, info in wal.readers:
+    if not has or info.snapshot < minSnap:
+      minSnap = info.snapshot
+      has = true
+  release(wal.readerLock)
+  if has: some(minSnap) else: none(uint64)
+
+proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
+  acquire(wal.lock)
+  wal.checkpointPending = true
+  defer:
+    wal.checkpointPending = false
+    release(wal.lock)
+  let lastCommit = wal.walEnd.load(moAcquire)
+  if lastCommit == 0:
+    wal.lastCheckpointAt = epochTime()
+    return ok(lastCommit)
+  var forceTruncate = false
+  if wal.readerWarnMs > 0:
+    let warningReaders = wal.readersOverThreshold(wal.readerWarnMs)
+    for info in warningReaders:
+      wal.recordWarningLocked("Long-running reader snapshot=" & $info.snapshot & " age_ms=" & $info.ageMs)
+  if wal.readerTimeoutMs > 0:
+    let timedOut = wal.readersOverThreshold(wal.readerTimeoutMs)
+    if timedOut.len > 0:
+      for info in timedOut:
+        wal.recordWarningLocked("Reader timeout snapshot=" & $info.snapshot & " age_ms=" & $info.ageMs)
+      if wal.forceTruncateOnTimeout:
+        forceTruncate = true
+  for pageId, entries in wal.index.pairs:
+    var bestLsn: uint64 = 0
+    var bestPayload: seq[byte] = @[]
+    for entry in entries:
+      if entry.lsn <= lastCommit and entry.lsn >= bestLsn:
+        bestLsn = entry.lsn
+        bestPayload = entry.payload
+    if bestLsn == 0:
+      continue
+    let failRes = applyFailpoint(wal, "checkpoint_write_page", bestPayload)
+    if not failRes.ok:
+      return err[uint64](failRes.err.code, failRes.err.message, failRes.err.context)
+    let writeRes = writePage(pager, pageId, bestPayload)
+    if not writeRes.ok:
+      return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+  let flushRes = flushAll(pager)
+  if not flushRes.ok:
+    return err[uint64](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+  let fsyncFail = applyFailpoint(wal, "checkpoint_fsync", @[])
+  if not fsyncFail.ok:
+    return err[uint64](fsyncFail.err.code, fsyncFail.err.message, fsyncFail.err.context)
+  pager.header.lastCheckpointLsn = lastCommit
+  let headerRes = writeHeader(pager.vfs, pager.file, pager.header)
+  if not headerRes.ok:
+    return err[uint64](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+  let chkRes = appendFrame(wal, wfCheckpoint, 0, encodeCheckpointPayload(lastCommit))
+  if not chkRes.ok:
+    return err[uint64](chkRes.err.code, chkRes.err.message, chkRes.err.context)
+  let walSyncFail = applyFailpoint(wal, "checkpoint_wal_fsync", @[])
+  if not walSyncFail.ok:
+    return err[uint64](walSyncFail.err.code, walSyncFail.err.message, walSyncFail.err.context)
+  let walSync = wal.vfs.fsync(wal.file)
+  if not walSync.ok:
+    return err[uint64](walSync.err.code, walSync.err.message, walSync.err.context)
+  wal.lastCheckpointAt = epochTime()
+  let minSnap = wal.minReaderSnapshot()
+  if forceTruncate or minSnap.isNone or minSnap.get >= lastCommit:
+    let truncRes = wal.vfs.truncate(wal.file, 0)
+    if not truncRes.ok:
+      return err[uint64](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    wal.index.clear()
+  ok(lastCommit)
+
+proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
+  var trigger = false
+  if wal.checkpointEveryBytes > 0:
+    let info = getFileInfo(wal.path)
+    if info.size >= wal.checkpointEveryBytes:
+      trigger = true
+  if wal.checkpointEveryMs > 0:
+    let elapsedMs = int64((epochTime() - wal.lastCheckpointAt) * 1000)
+    if elapsedMs >= wal.checkpointEveryMs:
+      trigger = true
+  if not trigger:
+    return ok(false)
+  let chkRes = checkpoint(wal, pager)
+  if not chkRes.ok:
+    return err[bool](chkRes.err.code, chkRes.err.message, chkRes.err.context)
+  ok(true)
 
 proc recover*(wal: Wal): Result[Void] =
   wal.index.clear()
@@ -166,17 +301,37 @@ proc beginRead*(wal: Wal): uint64 =
   acquire(wal.readerLock)
   let readerId = wal.nextReaderId
   wal.nextReaderId.inc
-  wal.readers[readerId] = snapshot
+  wal.readers[readerId] = (snapshot: snapshot, started: epochTime())
   release(wal.readerLock)
   snapshot
 
 proc endRead*(wal: Wal, snapshot: uint64) =
   acquire(wal.readerLock)
   for key, value in wal.readers.pairs:
-    if value == snapshot:
+    if value.snapshot == snapshot:
       wal.readers.del(key)
       break
   release(wal.readerLock)
+
+proc readerCount*(wal: Wal): int =
+  acquire(wal.readerLock)
+  let count = wal.readers.len
+  release(wal.readerLock)
+  count
+
+proc readersOverTimeout*(wal: Wal): seq[uint64] =
+  if wal.readerTimeoutMs <= 0:
+    return @[]
+  let over = wal.readersOverThreshold(wal.readerTimeoutMs)
+  for info in over:
+    result.add(info.snapshot)
+
+proc setCheckpointConfig*(wal: Wal, everyBytes: int64, everyMs: int64, readerWarnMs: int64 = 0, readerTimeoutMs: int64 = 0, forceTruncateOnTimeout: bool = false) =
+  wal.checkpointEveryBytes = everyBytes
+  wal.checkpointEveryMs = everyMs
+  wal.readerWarnMs = readerWarnMs
+  wal.readerTimeoutMs = readerTimeoutMs
+  wal.forceTruncateOnTimeout = forceTruncateOnTimeout
 
 proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[byte]] =
   if not wal.index.hasKey(pageId):

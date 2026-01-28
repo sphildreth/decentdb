@@ -199,7 +199,7 @@ proc scanTable*(pager: Pager, table: TableMeta): Result[seq[StoredRow]] =
     rows.add(StoredRow(rowid: nextRes.value[0], values: decoded.value))
   ok(rows)
 
-proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
+proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool): Result[uint64] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
     return err[uint64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -209,19 +209,20 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
   let rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
   var indexKeys: seq[(IndexMeta, uint64)] = @[]
   var trigramValues: seq[(IndexMeta, Value)] = @[]
-  for _, idx in catalog.indexes:
-    if idx.table != tableName:
-      continue
-    var valueIndex = -1
-    for i, col in table.columns:
-      if col.name == idx.column:
-        valueIndex = i
-        break
-    if valueIndex >= 0:
-      if idx.kind == ikBtree:
-        indexKeys.add((idx, indexKeyFromValue(values[valueIndex])))
-      else:
-        trigramValues.add((idx, values[valueIndex]))
+  if updateIndexes:
+    for _, idx in catalog.indexes:
+      if idx.table != tableName:
+        continue
+      var valueIndex = -1
+      for i, col in table.columns:
+        if col.name == idx.column:
+          valueIndex = i
+          break
+      if valueIndex >= 0:
+        if idx.kind == ikBtree:
+          indexKeys.add((idx, indexKeyFromValue(values[valueIndex])))
+        else:
+          trigramValues.add((idx, values[valueIndex]))
   let normalizedRes = normalizeValues(pager, values)
   if not normalizedRes.ok:
     return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
@@ -230,35 +231,42 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
   let insertRes = insert(tree, rowid, record)
   if not insertRes.ok:
     return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
-  for entry in indexKeys:
-    let idxTree = newBTree(pager, entry[0].rootPage)
-    let idxInsert = insert(idxTree, entry[1], encodeRowId(rowid))
-    if not idxInsert.ok:
-      return err[uint64](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
-    let syncRes = syncIndexRoot(catalog, entry[0].name, idxTree)
-    if not syncRes.ok:
-      return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
-  for entry in trigramValues:
-    if entry[1].kind != vkText:
-      continue
-    let idxTree = newBTree(pager, entry[0].rootPage)
-    let grams = uniqueTrigrams(valueText(entry[1]))
-    for g in grams:
-      let postingsRes = loadPostings(idxTree, g)
-      if not postingsRes.ok:
-        return err[uint64](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
-      let updatedRes = addRowid(postingsRes.value, rowid)
-      if not updatedRes.ok:
-        return err[uint64](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
-      let storeRes = storePostings(idxTree, g, updatedRes.value)
-      if not storeRes.ok:
-        return err[uint64](storeRes.err.code, storeRes.err.message, storeRes.err.context)
-    let syncRes = syncIndexRoot(catalog, entry[0].name, idxTree)
-    if not syncRes.ok:
-      return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+  if updateIndexes:
+    for entry in indexKeys:
+      let idxTree = newBTree(pager, entry[0].rootPage)
+      let idxInsert = insert(idxTree, entry[1], encodeRowId(rowid))
+      if not idxInsert.ok:
+        return err[uint64](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
+      let syncRes = syncIndexRoot(catalog, entry[0].name, idxTree)
+      if not syncRes.ok:
+        return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+    for entry in trigramValues:
+      if entry[1].kind != vkText:
+        continue
+      let idxTree = newBTree(pager, entry[0].rootPage)
+      let grams = uniqueTrigrams(valueText(entry[1]))
+      for g in grams:
+        let postingsRes = loadPostings(idxTree, g)
+        if not postingsRes.ok:
+          return err[uint64](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
+        let updatedRes = addRowid(postingsRes.value, rowid)
+        if not updatedRes.ok:
+          return err[uint64](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
+        let storeRes = storePostings(idxTree, g, updatedRes.value)
+        if not storeRes.ok:
+          return err[uint64](storeRes.err.code, storeRes.err.message, storeRes.err.context)
+      let syncRes = syncIndexRoot(catalog, entry[0].name, idxTree)
+      if not syncRes.ok:
+        return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
   table.nextRowId = rowid + 1
   discard catalog.saveTable(pager, table)
   ok(rowid)
+
+proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
+  insertRowInternal(pager, catalog, tableName, values, true)
+
+proc insertRowNoIndexes*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
+  insertRowInternal(pager, catalog, tableName, values, false)
 
 proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64, values: seq[Value]): Result[Void] =
   let tableRes = catalog.getTable(tableName)
@@ -350,10 +358,10 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
   okVoid()
 
-proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[Void] =
+proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[PageId] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
-    return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    return err[PageId](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
   var columnIndex = -1
   for i, col in table.columns:
@@ -361,22 +369,22 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
       columnIndex = i
       break
   if columnIndex < 0:
-    return err[Void](ERR_SQL, "Column not found", columnName)
+    return err[PageId](ERR_SQL, "Column not found", columnName)
   let rowsRes = scanTable(pager, table)
   if not rowsRes.ok:
-    return err[Void](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
   let idxTree = newBTree(pager, indexRoot)
   for row in rowsRes.value:
     let key = indexKeyFromValue(row.values[columnIndex])
     let insertRes = insert(idxTree, key, encodeRowId(row.rowid))
     if not insertRes.ok:
-      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
-  okVoid()
+      return err[PageId](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  ok(idxTree.root)
 
-proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[Void] =
+proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[PageId] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
-    return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    return err[PageId](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
   var columnIndex = -1
   for i, col in table.columns:
@@ -384,10 +392,10 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
       columnIndex = i
       break
   if columnIndex < 0:
-    return err[Void](ERR_SQL, "Column not found", columnName)
+    return err[PageId](ERR_SQL, "Column not found", columnName)
   let rowsRes = scanTable(pager, table)
   if not rowsRes.ok:
-    return err[Void](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
   let idxTree = newBTree(pager, indexRoot)
   for row in rowsRes.value:
     if row.values[columnIndex].kind != vkText:
@@ -396,13 +404,44 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
     for g in grams:
       let postingsRes = loadPostings(idxTree, g)
       if not postingsRes.ok:
-        return err[Void](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
+        return err[PageId](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
       let updatedRes = addRowid(postingsRes.value, row.rowid)
       if not updatedRes.ok:
-        return err[Void](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
+        return err[PageId](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
       let storeRes = storePostings(idxTree, g, updatedRes.value)
       if not storeRes.ok:
-        return storeRes
+        return err[PageId](storeRes.err.code, storeRes.err.message, storeRes.err.context)
+  ok(idxTree.root)
+
+proc resetIndexRoot(pager: Pager, root: PageId): Result[Void] =
+  var buf = newSeq[byte](pager.pageSize)
+  buf[0] = PageTypeLeaf
+  buf[2] = 0
+  buf[3] = 0
+  writeU32LE(buf, 4, 0'u32)
+  writePage(pager, root, buf)
+
+proc rebuildIndex*(pager: Pager, catalog: Catalog, index: IndexMeta): Result[Void] =
+  let resetRes = resetIndexRoot(pager, index.rootPage)
+  if not resetRes.ok:
+    return err[Void](resetRes.err.code, resetRes.err.message, resetRes.err.context)
+  var newRoot = index.rootPage
+  if index.kind == ikTrigram:
+    let buildRes = buildTrigramIndexForColumn(pager, catalog, index.table, index.column, index.rootPage)
+    if not buildRes.ok:
+      return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+    newRoot = buildRes.value
+  else:
+    let buildRes = buildIndexForColumn(pager, catalog, index.table, index.column, index.rootPage)
+    if not buildRes.ok:
+      return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+    newRoot = buildRes.value
+  if newRoot != index.rootPage:
+    var meta = index
+    meta.rootPage = newRoot
+    let saveRes = catalog.saveIndexMeta(meta)
+    if not saveRes.ok:
+      return err[Void](saveRes.err.code, saveRes.err.message, saveRes.err.context)
   okVoid()
 
 proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: string, value: Value): Result[seq[uint64]] =

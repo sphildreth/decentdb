@@ -2,6 +2,7 @@ import os
 import strutils
 import tables
 import options
+import sets
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
@@ -14,6 +15,7 @@ import ./planner/planner
 import ./exec/exec
 import ./record/record
 import ./storage/storage
+import ./wal/wal
 
 type Db* = ref object
   path*: string
@@ -25,6 +27,21 @@ type Db* = ref object
   schemaCookie*: uint32
   pager*: Pager
   catalog*: Catalog
+
+type DurabilityMode* = enum
+  dmFull
+  dmDeferred
+  dmNone
+
+type BulkLoadOptions* = object
+  batchSize*: int
+  syncInterval*: int
+  disableIndexes*: bool
+  checkpointOnComplete*: bool
+  durability*: DurabilityMode
+
+proc defaultBulkLoadOptions*(): BulkLoadOptions =
+  BulkLoadOptions(batchSize: 10000, syncInterval: 10, disableIndexes: true, checkpointOnComplete: true, durability: dmDeferred)
 
 proc openDb*(path: string): Result[Db] =
   let vfs = newOsVfs()
@@ -272,7 +289,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
             let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
             if not buildRes.ok:
               return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: idxRootRes.value, kind: catalog.ikBtree, unique: true)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
             let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
             if not idxSaveRes.ok:
               return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
@@ -285,7 +302,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
             let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
             if not buildRes.ok:
               return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: idxRootRes.value, kind: catalog.ikBtree, unique: false)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
             let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
             if not idxSaveRes.ok:
               return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
@@ -332,16 +349,19 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           if seen.hasKey(key):
             return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
           seen[key] = true
+      var finalRoot = indexRootRes.value
       if bound.indexKind == sql.ikTrigram:
         let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
         if not buildRes.ok:
           return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        finalRoot = buildRes.value
       else:
         let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
         if not buildRes.ok:
           return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        finalRoot = buildRes.value
       let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
-      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: indexRootRes.value, kind: idxKind, unique: bound.unique)
+      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
       let saveRes = db.catalog.createIndexMeta(idxMeta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
@@ -475,6 +495,90 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
 
 proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
   execSql(db, sqlText, @[])
+
+proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLoadOptions = defaultBulkLoadOptions(), wal: Wal = nil): Result[Void] =
+  let tableRes = db.catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  let batchSize = if options.batchSize <= 0: 1 else: options.batchSize
+  let syncInterval = if options.syncInterval <= 0: 1 else: options.syncInterval
+
+  var uniqueCols: seq[int] = @[]
+  for i, col in table.columns:
+    if col.unique or col.primaryKey:
+      uniqueCols.add(i)
+  var seen: seq[HashSet[uint64]] = newSeq[HashSet[uint64]](uniqueCols.len)
+  for i in 0 ..< seen.len:
+    seen[i] = initHashSet[uint64]()
+  if uniqueCols.len > 0:
+    let existingRes = scanTable(db.pager, table)
+    if not existingRes.ok:
+      return err[Void](existingRes.err.code, existingRes.err.message, existingRes.err.context)
+    for row in existingRes.value:
+      for idx, colIndex in uniqueCols:
+        if row.values[colIndex].kind == vkNull:
+          continue
+        seen[idx].incl(indexKeyFromValue(row.values[colIndex]))
+
+  var batchCount = 0
+  var pendingInBatch = 0
+  for values in rows:
+    if values.len != table.columns.len:
+      return err[Void](ERR_SQL, "Column count mismatch", tableName)
+    for i, col in table.columns:
+      let typeRes = typeCheckValue(col.kind, values[i])
+      if not typeRes.ok:
+        return err[Void](typeRes.err.code, typeRes.err.message, col.name)
+    let notNullRes = enforceNotNull(table, values)
+    if not notNullRes.ok:
+      return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+    if not fkRes.ok:
+      return err[Void](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    for idx, colIndex in uniqueCols:
+      if values[colIndex].kind == vkNull:
+        continue
+      let key = indexKeyFromValue(values[colIndex])
+      if key in seen[idx]:
+        return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & table.columns[colIndex].name)
+      seen[idx].incl(key)
+    let insertRes = if options.disableIndexes:
+      insertRowNoIndexes(db.pager, db.catalog, tableName, values)
+    else:
+      insertRow(db.pager, db.catalog, tableName, values)
+    if not insertRes.ok:
+      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+    pendingInBatch.inc
+    if pendingInBatch >= batchSize:
+      pendingInBatch = 0
+      batchCount.inc
+      if options.durability == dmFull:
+        let flushRes = flushAll(db.pager)
+        if not flushRes.ok:
+          return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+      elif options.durability == dmDeferred:
+        if batchCount mod syncInterval == 0:
+          let flushRes = flushAll(db.pager)
+          if not flushRes.ok:
+            return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+  if options.durability in {dmFull, dmDeferred}:
+    let flushRes = flushAll(db.pager)
+    if not flushRes.ok:
+      return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+
+  if options.disableIndexes:
+    for _, idx in db.catalog.indexes:
+      if idx.table == tableName:
+        let rebuildRes = rebuildIndex(db.pager, db.catalog, idx)
+        if not rebuildRes.ok:
+          return rebuildRes
+
+  if options.checkpointOnComplete and wal != nil:
+    let ckRes = checkpoint(wal, db.pager)
+    if not ckRes.ok:
+      return err[Void](ckRes.err.code, ckRes.err.message, ckRes.err.context)
+  okVoid()
 
 proc closeDb*(db: Db): Result[Void] =
   if not db.isOpen:

@@ -20,5 +20,8 @@ method write*(vfs: Vfs, file: VfsFile, offset: int64, buf: openArray[byte]): Res
 method fsync*(vfs: Vfs, file: VfsFile): Result[Void] {.base.} =
   err[Void](ERR_INTERNAL, "VFS.fsync not implemented", file.path)
 
+method truncate*(vfs: Vfs, file: VfsFile, size: int64): Result[Void] {.base.} =
+  err[Void](ERR_INTERNAL, "VFS.truncate not implemented", file.path)
+
 method close*(vfs: Vfs, file: VfsFile): Result[Void] {.base.} =
   err[Void](ERR_INTERNAL, "VFS.close not implemented", file.path)

@@ -2,6 +2,10 @@ import os
 import locks
 import ./types
 import ../errors
+when defined(windows):
+  import winlean
+else:
+  import posix
 
 type OsVfs* = ref object of Vfs
 
@@ -68,6 +72,22 @@ method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
       flushFile(file.file)
     except OSError:
       return err[Void](ERR_IO, "Fsync failed", file.path)
+  okVoid()
+
+method truncate*(vfs: OsVfs, file: VfsFile, size: int64): Result[Void] =
+  withFileLock(file):
+    try:
+      when defined(windows):
+        setFilePos(file.file, size)
+        let handle = get_osfhandle(file.file.getFileHandle())
+        if setEndOfFile(handle) == 0:
+          return err[Void](ERR_IO, "Truncate failed", file.path)
+      else:
+        let fd = cast[cint](file.file.getFileHandle())
+        if ftruncate(fd, size.Off) == -1:
+          return err[Void](ERR_IO, "Truncate failed", file.path)
+    except OSError:
+      return err[Void](ERR_IO, "Truncate failed", file.path)
   okVoid()
 
 method close*(vfs: OsVfs, file: VfsFile): Result[Void] =

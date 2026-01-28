@@ -67,6 +67,34 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
 proc makeRow(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
   Row(rowid: rowid, columns: columns, values: values)
 
+const SortBufferBytes = 16 * 1024 * 1024
+const SortMaxRuns = 64
+
+proc varintLen(value: uint64): int =
+  var v = value
+  result = 1
+  while v >= 0x80'u64:
+    v = v shr 7
+    result.inc
+
+proc estimateRowBytes(row: Row): int =
+  result = varintLen(uint64(row.values.len))
+  for value in row.values:
+    result.inc
+    var payloadLen = 0
+    case value.kind
+    of vkNull:
+      payloadLen = 0
+    of vkBool:
+      payloadLen = 1
+    of vkInt64, vkFloat64:
+      payloadLen = 8
+    of vkText, vkBlob:
+      payloadLen = value.bytes.len
+    of vkTextOverflow, vkBlobOverflow:
+      payloadLen = 8
+    result += varintLen(uint64(payloadLen)) + payloadLen
+
 proc columnIndex(row: Row, table: string, name: string): Result[int] =
   if table.len > 0:
     let key = table & "." & name
@@ -185,10 +213,10 @@ proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     return err[seq[Row]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
   var rows: seq[Row] = @[]
   let prefix = if alias.len > 0: alias else: tableName
+  var cols: seq[string] = @[]
+  for col in table.columns:
+    cols.add(prefix & "." & col.name)
   for stored in rowsRes.value:
-    var cols: seq[string] = @[]
-    for col in table.columns:
-      cols.add(prefix & "." & col.name)
     rows.add(makeRow(cols, stored.values, stored.rowid))
   ok(rows)
 
@@ -202,6 +230,9 @@ proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     return err[seq[Row]](rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context)
   var rows: seq[Row] = @[]
   let prefix = if alias.len > 0: alias else: tableName
+  var cols: seq[string] = @[]
+  for col in table.columns:
+    cols.add(prefix & "." & col.name)
   var valueIndex = -1
   for i, col in table.columns:
     if col.name == column:
@@ -214,9 +245,6 @@ proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     if valueIndex >= 0:
       if compareValues(readRes.value.values[valueIndex], value) != 0:
         continue
-    var cols: seq[string] = @[]
-    for col in table.columns:
-      cols.add(prefix & "." & col.name)
     rows.add(makeRow(cols, readRes.value.values, rowid))
   ok(rows)
 
@@ -282,6 +310,9 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
     candidates.setLen(threshold)
   var rows: seq[Row] = @[]
   let prefix = if alias.len > 0: alias else: tableName
+  var cols: seq[string] = @[]
+  for col in table.columns:
+    cols.add(prefix & "." & col.name)
   for rowid in candidates:
     let readRes = readRowAt(pager, table, rowid)
     if not readRes.ok:
@@ -289,9 +320,6 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
     let text = valueToString(readRes.value.values[columnIndex])
     if not likeMatch(text, pattern, caseInsensitive):
       continue
-    var cols: seq[string] = @[]
-    for col in table.columns:
-      cols.add(prefix & "." & col.name)
     rows.add(makeRow(cols, readRes.value.values, rowid))
   ok(rows)
 
@@ -422,9 +450,9 @@ proc writeRowChunk(path: string, rows: seq[Row]) =
   var f: File
   if not open(f, path, fmWrite):
     return
+  var lenBuf = newSeq[byte](4)
   for row in rows:
     let data = encodeRecord(row.values)
-    var lenBuf = newSeq[byte](4)
     writeU32LE(lenBuf, 0, uint32(data.len))
     discard f.writeBuffer(lenBuf[0].addr, lenBuf.len)
     if data.len > 0:
@@ -435,8 +463,8 @@ proc readRowChunk(path: string, columns: seq[string]): seq[Row] =
   var f: File
   if not open(f, path, fmRead):
     return @[]
+  var lenBuf = newSeq[byte](4)
   while true:
-    var lenBuf = newSeq[byte](4)
     let readLen = f.readBuffer(lenBuf[0].addr, 4)
     if readLen < 4:
       break
@@ -462,21 +490,35 @@ proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Resu
       if c != 0:
         return if item.asc: c else: -c
     0
-  let threshold = 1000
-  if rows.len <= threshold:
+  if rows.len <= 1:
     var sorted = rows
     sorted.sort(proc(x, y: Row): int = cmpRows(x, y))
     return ok(sorted)
   var tempFiles: seq[string] = @[]
-  var chunkStart = 0
-  while chunkStart < rows.len:
-    let chunkEnd = min(chunkStart + threshold, rows.len)
-    var chunk = rows[chunkStart ..< chunkEnd]
+  var chunk: seq[Row] = @[]
+  var chunkBytes = 0
+  for row in rows:
+    let rowBytes = estimateRowBytes(row)
+    if chunk.len > 0 and chunkBytes + rowBytes > SortBufferBytes:
+      chunk.sort(proc(x, y: Row): int = cmpRows(x, y))
+      let path = getTempDir() / ("decentdb_sort_" & $tempFiles.len & ".tmp")
+      writeRowChunk(path, chunk)
+      tempFiles.add(path)
+      chunk = @[]
+      chunkBytes = 0
+      if tempFiles.len > SortMaxRuns:
+        return err[seq[Row]](ERR_SQL, "Sort exceeded spill run limit", "max_runs=" & $SortMaxRuns)
+    chunk.add(row)
+    chunkBytes += rowBytes
+  if tempFiles.len == 0:
+    var sorted = rows
+    sorted.sort(proc(x, y: Row): int = cmpRows(x, y))
+    return ok(sorted)
+  if chunk.len > 0:
     chunk.sort(proc(x, y: Row): int = cmpRows(x, y))
-    let path = getTempDir() / ("decentdb_sort_" & $chunkStart & ".tmp")
+    let path = getTempDir() / ("decentdb_sort_" & $tempFiles.len & ".tmp")
     writeRowChunk(path, chunk)
     tempFiles.add(path)
-    chunkStart = chunkEnd
   var readers: seq[seq[Row]] = @[]
   var indices: seq[int] = @[]
   let columns = if rows.len > 0: rows[0].columns else: @[]

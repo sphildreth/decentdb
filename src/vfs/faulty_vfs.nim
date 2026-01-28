@@ -6,6 +6,7 @@ type FaultOp* = enum
   foRead
   foWrite
   foFsync
+  foTruncate
   foClose
 
 type FaultActionKind* = enum
@@ -129,6 +130,18 @@ method fsync*(fv: FaultyVfs, file: VfsFile): Result[Void] =
     fv.record(foFsync, action.label, action, 0, 0, ERR_INTERNAL)
   else:
     fv.record(foFsync, action.label, action, 0, 0, res.err.code)
+  res
+
+method truncate*(fv: FaultyVfs, file: VfsFile, size: int64): Result[Void] =
+  let action = fv.nextAction(foTruncate, 0)
+  if action.kind == faError:
+    fv.record(foTruncate, action.label, action, 0, 0, action.errorCode)
+    return err[Void](action.errorCode, "Injected error on truncate", file.path)
+  let res = fv.inner.truncate(file, size)
+  if res.ok:
+    fv.record(foTruncate, action.label, action, 0, 0, ERR_INTERNAL)
+  else:
+    fv.record(foTruncate, action.label, action, 0, 0, res.err.code)
   res
 
 method close*(fv: FaultyVfs, file: VfsFile): Result[Void] =

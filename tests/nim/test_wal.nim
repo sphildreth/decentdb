@@ -123,3 +123,189 @@ suite "WAL":
     wal.endRead(snapNew)
     discard closePager(pager)
     discard closeDb(db)
+
+  test "checkpoint truncates WAL when no readers":
+    let path = makeTempDb("decentdb_wal_checkpoint.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 3
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    check commit(writer).ok
+    let ckRes = checkpoint(wal, pager)
+    check ckRes.ok
+    let info = getFileInfo(path & ".wal")
+    check info.size == 0
+    let readRes = readPage(pager, pageId)
+    check readRes.ok
+    check readRes.value == data
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "checkpoint skips truncation with active readers":
+    let path = makeTempDb("decentdb_wal_checkpoint_readers.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 4
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    let snap = wal.beginRead()
+    check commit(writer).ok
+    let ckRes = checkpoint(wal, pager)
+    check ckRes.ok
+    let info = getFileInfo(path & ".wal")
+    check info.size > 0
+    wal.endRead(snap)
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "checkpoint failpoint returns error":
+    let path = makeTempDb("decentdb_wal_checkpoint_fail.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 5
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    check commit(writer).ok
+    wal.setFailpoint("checkpoint_write_page", WalFailpoint(kind: wfError))
+    let ckRes = checkpoint(wal, pager)
+    check not ckRes.ok
+    check pager.header.lastCheckpointLsn == 0
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "checkpoint fsync failpoint returns error":
+    let path = makeTempDb("decentdb_wal_checkpoint_fsync_fail.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 8
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    check commit(writer).ok
+    wal.setFailpoint("checkpoint_fsync", WalFailpoint(kind: wfError))
+    let ckRes = checkpoint(wal, pager)
+    check not ckRes.ok
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "checkpoint warns on long-running readers":
+    let path = makeTempDb("decentdb_wal_checkpoint_warn.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    wal.setCheckpointConfig(0, 0, readerWarnMs = 1)
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 6
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    let snap = wal.beginRead()
+    sleep(20)
+    check commit(writer).ok
+    let ckRes = checkpoint(wal, pager)
+    check ckRes.ok
+    let warnings = wal.takeWarnings()
+    check warnings.len > 0
+    wal.endRead(snap)
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "checkpoint can force truncate on timeout":
+    let path = makeTempDb("decentdb_wal_checkpoint_force.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    wal.setCheckpointConfig(0, 0, readerWarnMs = 0, readerTimeoutMs = 1, forceTruncateOnTimeout = true)
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 7
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    let snap = wal.beginRead()
+    sleep(20)
+    check commit(writer).ok
+    let ckRes = checkpoint(wal, pager)
+    check ckRes.ok
+    let info = getFileInfo(path & ".wal")
+    check info.size == 0
+    wal.endRead(snap)
+    discard closePager(pager)
+    discard closeDb(db)

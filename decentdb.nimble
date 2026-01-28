@@ -15,6 +15,7 @@ task test, "Run Nim + Python unit tests":
   exec "nim c -r tests/nim/test_sql_exec.nim"
   exec "nim c -r tests/nim/test_constraints.nim"
   exec "nim c -r tests/nim/test_trigram.nim"
+  exec "nim c -r tests/nim/test_bulk_load.nim"
   exec "python -m unittest tests/harness/test_runner.py"
 
 task test_nim, "Run Nim unit tests":
@@ -27,6 +28,7 @@ task test_nim, "Run Nim unit tests":
   exec "nim c -r tests/nim/test_sql_exec.nim"
   exec "nim c -r tests/nim/test_constraints.nim"
   exec "nim c -r tests/nim/test_trigram.nim"
+  exec "nim c -r tests/nim/test_bulk_load.nim"
 
 task test_py, "Run Python harness tests":
   exec "python -m unittest tests/harness/test_runner.py"
@@ -59,4 +61,14 @@ task lint, "Static checks for Nim + Python":
   exec "nim check tests/nim/test_sql_exec.nim"
   exec "nim check tests/nim/test_constraints.nim"
   exec "nim check tests/nim/test_trigram.nim"
+  exec "nim check tests/nim/test_bulk_load.nim"
+  exec "nim check tests/bench/bench.nim"
+  exec "python -m compileall tests/bench"
   exec "python -m compileall tests/harness"
+
+task bench, "Run microbenchmarks":
+  exec "nim c -r tests/bench/bench.nim -- tests/bench/results.json"
+
+task bench_compare, "Run microbenchmarks and compare to baseline":
+  exec "nim c -r tests/bench/bench.nim -- tests/bench/results.json"
+  exec "python tests/bench/compare_bench.py tests/bench/results.json tests/bench/baseline.json tests/bench/thresholds.json"
