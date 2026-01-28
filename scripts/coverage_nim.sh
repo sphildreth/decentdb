@@ -30,7 +30,12 @@ TESTS=(
   tests/nim/test_record.nim
   tests/nim/test_btree.nim
   tests/nim/test_wal.nim
+  tests/nim/test_wal_extra.nim
   tests/nim/test_sql_exec.nim
+  tests/nim/test_binder.nim
+  tests/nim/test_sql_parser.nim
+  tests/nim/test_catalog.nim
+  tests/nim/test_engine.nim
   tests/nim/test_constraints.nim
   tests/nim/test_trigram.nim
   tests/nim/test_exec.nim
