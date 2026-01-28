@@ -1,5 +1,6 @@
 ## {Decision Title}
-**Date:** 2026-01-28
+**Date:** YYYY-MM-DD
+**Status:** Proposed | Accepted | Superseded | Rejected
 
 ### Decision
 

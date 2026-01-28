@@ -16,7 +16,7 @@ If you are unsure, **create an ADR**.
 
 ## How to create an ADR
 1. Copy the template:
-   - `docs/adr/0000-template.md` → `docs/adr/NNNN-short-title.md`
+   - `design/adr/0000-template.md` → `design/adr/NNNN-short-title.md`
 2. Choose the next sequential number `NNNN` (4 digits).
 3. Use a short, kebab-case title:
    - Example: `0003-wal-frame-format.md`
