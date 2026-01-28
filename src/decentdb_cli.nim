@@ -16,15 +16,39 @@ proc main() =
   var sql = ""
   var openClose = false
 
+  var nextIsDb = false
+  var nextIsSql = false
+
   for kind, key, val in getOpt():
-    case key
-    of "db":
-      dbPath = val
-    of "sql":
-      sql = val
-    of "open-close":
-      openClose = true
-    else:
+    if nextIsDb:
+      dbPath = key
+      nextIsDb = false
+      continue
+    if nextIsSql:
+      sql = key
+      nextIsSql = false
+      continue
+      
+    case kind
+    of cmdLongOption, cmdShortOption:
+      case key
+      of "db":
+        if val.len > 0:
+          dbPath = val
+        else:
+          nextIsDb = true
+      of "sql":
+        if val.len > 0:
+          sql = val
+        else:
+          nextIsSql = true
+      of "open-close":
+        openClose = true
+    of cmdArgument:
+      # If we have free arguments, maybe first is db? But usually options are flagged.
+      # Ignore unexpected arguments.
+      discard
+    of cmdEnd:
       discard
 
   if dbPath.len == 0:

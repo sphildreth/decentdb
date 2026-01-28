@@ -90,6 +90,9 @@ type StatementKind* = enum
   skSelect
   skUpdate
   skDelete
+  skBegin
+  skCommit
+  skRollback
 
 type Statement* = ref object
   case kind*: StatementKind
@@ -128,6 +131,12 @@ type Statement* = ref object
   of skDelete:
     deleteTable*: string
     deleteWhere*: Expr
+  of skBegin:
+    discard
+  of skCommit:
+    discard
+  of skRollback:
+    discard
 
 type SqlAst* = ref object
   statements*: seq[Statement]
@@ -395,7 +404,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       if not exprRes.ok:
         return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
       let dir = nodeStringOr(sortBy, "sortby_dir", "")
-      let asc = dir != "SORTBY_DESC"
+      let asc = dir != "SORTBY_DESC" and dir != "2"
       orderBy.add(OrderItem(expr: exprRes.value, asc: asc))
   var limit = -1
   var offset = -1
@@ -577,6 +586,19 @@ proc parseDropStmt(node: JsonNode): Result[Statement] =
     return ok(Statement(kind: skDropIndex, dropIndexName: name))
   ok(Statement(kind: skDropTable, dropTableName: name))
 
+proc parseTransactionStmt(node: JsonNode): Result[Statement] =
+  let kindStr = nodeString(node["kind"])
+  var kind = skBegin
+  if kindStr == "TRANS_STMT_COMMIT":
+    kind = skCommit
+  elif kindStr == "TRANS_STMT_ROLLBACK":
+    kind = skRollback
+  elif kindStr == "TRANS_STMT_START" or kindStr == "TRANS_STMT_BEGIN":
+    kind = skBegin
+  else:
+    return err[Statement](ERR_SQL, "Unsupported transaction statement", kindStr)
+  ok(Statement(kind: kind))
+
 proc parseStatementNode(node: JsonNode): Result[Statement] =
   if nodeHas(node, "SelectStmt"):
     return parseSelectStmt(node["SelectStmt"])
@@ -592,6 +614,8 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
     return parseIndexStmt(node["IndexStmt"])
   if nodeHas(node, "DropStmt"):
     return parseDropStmt(node["DropStmt"])
+  if nodeHas(node, "TransactionStmt"):
+    return parseTransactionStmt(node["TransactionStmt"])
   err[Statement](ERR_SQL, "Unsupported statement node")
 
 proc parseSql*(sql: string): Result[SqlAst] =

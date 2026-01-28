@@ -353,7 +353,11 @@ proc projectRows(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): Re
         let evalRes = evalExpr(row, item.expr, params)
         if not evalRes.ok:
           return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-        let name = if item.alias.len > 0: item.alias else: "expr"
+        var name = if item.alias.len > 0: item.alias else: ""
+        if name.len == 0 and item.expr.kind == ekColumn:
+          name = item.expr.name
+        if name.len == 0:
+          name = "expr"
         cols.add(name)
         vals.add(evalRes.value)
     resultRows.add(makeRow(cols, vals))
@@ -459,25 +463,79 @@ proc writeRowChunk(path: string, rows: seq[Row]) =
       discard f.writeBuffer(data[0].addr, data.len)
   close(f)
 
-proc readRowChunk(path: string, columns: seq[string]): seq[Row] =
+type ChunkReader = ref object
+  file: File
+  columns: seq[string]
+  peeked: Option[Row]
+  finished: bool
+
+proc openChunkReader(path: string, columns: seq[string]): ChunkReader =
   var f: File
   if not open(f, path, fmRead):
-    return @[]
+    return ChunkReader(finished: true)
+  result = ChunkReader(file: f, columns: columns, finished: false)
+  
+  # Read first row
   var lenBuf = newSeq[byte](4)
-  while true:
-    let readLen = f.readBuffer(lenBuf[0].addr, 4)
-    if readLen < 4:
-      break
-    let length = int(readU32LE(lenBuf, 0))
-    var data = newSeq[byte](length)
-    if length > 0:
-      let readData = f.readBuffer(data[0].addr, length)
-      if readData < length:
-        break
-    let decoded = decodeRecord(data)
-    if decoded.ok:
-      result.add(makeRow(columns, decoded.value))
-  close(f)
+  let readLen = result.file.readBuffer(lenBuf[0].addr, 4)
+  if readLen < 4:
+    result.finished = true
+    close(result.file)
+    return
+
+  let length = int(readU32LE(lenBuf, 0))
+  var data = newSeq[byte](length)
+  if length > 0:
+    let readData = result.file.readBuffer(data[0].addr, length)
+    if readData < length:
+      result.finished = true
+      close(result.file)
+      return
+
+  let decoded = decodeRecord(data)
+  if decoded.ok:
+    result.peeked = some(makeRow(columns, decoded.value))
+  else:
+    result.finished = true
+    close(result.file)
+
+proc next(reader: ChunkReader): Option[Row] =
+  if reader.finished:
+    return none(Row)
+  
+  result = reader.peeked
+  
+  # Advance to next
+  var lenBuf = newSeq[byte](4)
+  let readLen = reader.file.readBuffer(lenBuf[0].addr, 4)
+  if readLen < 4:
+    reader.finished = true
+    close(reader.file)
+    reader.peeked = none(Row)
+    return
+
+  let length = int(readU32LE(lenBuf, 0))
+  var data = newSeq[byte](length)
+  if length > 0:
+    let readData = reader.file.readBuffer(data[0].addr, length)
+    if readData < length:
+      reader.finished = true
+      close(reader.file)
+      reader.peeked = none(Row)
+      return
+
+  let decoded = decodeRecord(data)
+  if decoded.ok:
+    reader.peeked = some(makeRow(reader.columns, decoded.value))
+  else:
+    reader.finished = true
+    close(reader.file)
+    reader.peeked = none(Row)
+
+proc close(reader: ChunkReader) =
+  if not reader.finished:
+    close(reader.file)
+    reader.finished = true
 
 proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Result[seq[Row]] =
   proc cmpRows(a, b: Row): int =
@@ -519,21 +577,21 @@ proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Resu
     let path = getTempDir() / ("decentdb_sort_" & $tempFiles.len & ".tmp")
     writeRowChunk(path, chunk)
     tempFiles.add(path)
-  var readers: seq[seq[Row]] = @[]
-  var indices: seq[int] = @[]
+  var readers: seq[ChunkReader] = @[]
   let columns = if rows.len > 0: rows[0].columns else: @[]
   for path in tempFiles:
-    let chunk = readRowChunk(path, columns)
-    readers.add(chunk)
-    indices.add(0)
+    readers.add(openChunkReader(path, columns))
+  
   var resultRows: seq[Row] = @[]
   while true:
     var bestIdx = -1
     var bestRow: Row
-    for i, chunk in readers:
-      if indices[i] >= chunk.len:
+    
+    for i, reader in readers:
+      if reader.peeked.isNone:
         continue
-      let candidate = chunk[indices[i]]
+        
+      let candidate = reader.peeked.get
       if bestIdx < 0:
         bestIdx = i
         bestRow = candidate
@@ -541,10 +599,15 @@ proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Resu
         if cmpRows(candidate, bestRow) < 0:
           bestIdx = i
           bestRow = candidate
+          
     if bestIdx < 0:
       break
+      
     resultRows.add(bestRow)
-    indices[bestIdx].inc
+    discard next(readers[bestIdx])
+
+  for reader in readers:
+    reader.close()
   for path in tempFiles:
     if fileExists(path):
       removeFile(path)

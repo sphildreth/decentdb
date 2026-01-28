@@ -247,5 +247,5 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     bindCreateTable(catalog, stmt)
   of skCreateIndex:
     bindCreateIndex(catalog, stmt)
-  of skDropTable, skDropIndex:
+  of skDropTable, skDropIndex, skBegin, skCommit, skRollback:
     ok(stmt)
