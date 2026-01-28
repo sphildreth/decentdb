@@ -30,6 +30,29 @@ proc randUpperString(minLen: int, maxLen: int): string =
     result.add(char(ord('A') + rand(25)))
 
 suite "Trigram":
+  test "canonicalize and short trigrams":
+    check canonicalize("aBc") == "ABC"
+    check trigrams("ab").len == 0
+    check trigrams("abc").len == 1
+
+  test "postings edge cases":
+    let postings = encodePostings(@[1'u64, 2'u64])
+    let added = addRowid(postings, 2'u64)
+    check added.ok
+    check added.value == postings
+    let removed = removeRowid(postings, 3'u64)
+    check removed.ok
+    let removedDecoded = decodePostings(removed.value)
+    check removedDecoded.ok
+    check removedDecoded.value == @[1'u64, 2'u64]
+    let bad = @[byte(0x80)]
+    check postingsCount(bad) == 0
+    let badRes = decodePostings(bad)
+    check not badRes.ok
+    let emptyLists: seq[seq[uint64]] = @[]
+    let emptyResult: seq[uint64] = @[]
+    check intersectPostings(emptyLists) == emptyResult
+
   test "postings encode/decode and intersection":
     let postings = encodePostings(@[1'u64, 2'u64, 10'u64])
     let decoded = decodePostings(postings)

@@ -34,20 +34,36 @@ def is_project_source(decoded: str) -> bool:
     return path.startswith("src/") or "/src/" in path
 
 
-def parse_gcov_file(path: Path) -> tuple[int, int]:
-    total = 0
-    covered = 0
+def parse_gcov_file(path: Path) -> dict[int, tuple[bool, bool]]:
+    # Returns map: line_no -> (executable, covered)
+    lines: dict[int, tuple[bool, bool]] = {}
     for line in path.read_text(errors="replace").splitlines():
         parts = line.split(":", 2)
         if len(parts) < 3:
             continue
         count = parts[0].strip()
+        line_no_str = parts[1].strip()
+        if not line_no_str.isdigit():
+            continue
+        line_no = int(line_no_str)
         if count in {"-", "====="}:
             continue
-        total += 1
-        if count != "#####":
-            covered += 1
-    return covered, total
+        executable = True
+        covered = False
+        if count == "#####":
+            covered = False
+        else:
+            try:
+                covered = int(count) > 0
+            except ValueError:
+                covered = False
+        prev = lines.get(line_no)
+        if prev is None:
+            lines[line_no] = (executable, covered)
+        else:
+            prev_exec, prev_cov = prev
+            lines[line_no] = (prev_exec or executable, prev_cov or covered)
+    return lines
 
 
 def main() -> int:
@@ -63,21 +79,42 @@ def main() -> int:
     total_covered = 0
     total_lines = 0
 
-    for gcov_file in sorted(gcov_dir.glob("*.gcov")):
+    coverage_by_file: dict[str, dict[int, tuple[bool, bool]]] = {}
+
+    for gcov_file in sorted(gcov_dir.rglob("*.gcov")):
         decoded = decode_name(gcov_file.name)
         if not is_project_source(decoded):
             continue
-        covered, lines = parse_gcov_file(gcov_file)
-        if lines == 0:
+        line_map = parse_gcov_file(gcov_file)
+        if not line_map:
+            continue
+        file_map = coverage_by_file.get(decoded)
+        if file_map is None:
+            coverage_by_file[decoded] = line_map
+        else:
+            for line_no, (executable, covered) in line_map.items():
+                prev_exec, prev_cov = file_map.get(line_no, (False, False))
+                file_map[line_no] = (prev_exec or executable, prev_cov or covered)
+
+    for decoded, line_map in sorted(coverage_by_file.items()):
+        total = 0
+        covered = 0
+        for _, (executable, is_covered) in line_map.items():
+            if not executable:
+                continue
+            total += 1
+            if is_covered:
+                covered += 1
+        if total == 0:
             continue
         total_covered += covered
-        total_lines += lines
+        total_lines += total
         entries.append(
             {
                 "file": display_path(decoded),
                 "covered": covered,
-                "total": lines,
-                "percent": round(covered / lines * 100.0, 2),
+                "total": total,
+                "percent": round(covered / total * 100.0, 2),
             }
         )
 

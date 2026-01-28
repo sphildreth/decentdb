@@ -20,5 +20,8 @@ tests/harness/seed.log
 build/coverage/
 --
 tests/nim/
+!tests/nim/
+tests/nim/*
+!tests/nim/*.nim
 decentdb_cli
 test.db

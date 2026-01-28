@@ -18,6 +18,9 @@ task test, "Run Nim + Python unit tests":
   exec "nim c -r tests/nim/test_sql_exec.nim"
   exec "nim c -r tests/nim/test_constraints.nim"
   exec "nim c -r tests/nim/test_trigram.nim"
+  exec "nim c -r tests/nim/test_exec.nim"
+  exec "nim c -r tests/nim/test_storage.nim"
+  exec "nim c -r tests/nim/test_sort_spill.nim"
   exec "nim c -r tests/nim/test_bulk_load.nim"
   exec "python -m unittest tests/harness/test_runner.py"
 
@@ -31,6 +34,9 @@ task test_nim, "Run Nim unit tests":
   exec "nim c -r tests/nim/test_sql_exec.nim"
   exec "nim c -r tests/nim/test_constraints.nim"
   exec "nim c -r tests/nim/test_trigram.nim"
+  exec "nim c -r tests/nim/test_exec.nim"
+  exec "nim c -r tests/nim/test_storage.nim"
+  exec "nim c -r tests/nim/test_sort_spill.nim"
   exec "nim c -r tests/nim/test_bulk_load.nim"
 
 task test_py, "Run Python harness tests":
@@ -67,6 +73,9 @@ task lint, "Static checks for Nim + Python":
   exec "nim check tests/nim/test_sql_exec.nim"
   exec "nim check tests/nim/test_constraints.nim"
   exec "nim check tests/nim/test_trigram.nim"
+  exec "nim check tests/nim/test_exec.nim"
+  exec "nim check tests/nim/test_storage.nim"
+  exec "nim check tests/nim/test_sort_spill.nim"
   exec "nim check tests/nim/test_bulk_load.nim"
   exec "nim check tests/bench/bench.nim"
   exec "python -m compileall tests/bench"

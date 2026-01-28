@@ -33,18 +33,23 @@ TESTS=(
   tests/nim/test_sql_exec.nim
   tests/nim/test_constraints.nim
   tests/nim/test_trigram.nim
+  tests/nim/test_exec.nim
+  tests/nim/test_storage.nim
+  tests/nim/test_sort_spill.nim
   tests/nim/test_bulk_load.nim
 )
 
 for test in "${TESTS[@]}"; do
   name="$(basename "$test" .nim)"
-  nim c -r "${COVERAGE_FLAGS[@]}" --nimcache:"$NIMCACHE_ROOT/$name" "$ROOT/$test"
+  cache_dir="$NIMCACHE_ROOT/$name"
+  out_dir="$GCOV_DIR/$name"
+  mkdir -p "$cache_dir" "$out_dir"
+  nim c -r "${COVERAGE_FLAGS[@]}" --nimcache:"$cache_dir" "$ROOT/$test"
+  while IFS= read -r -d '' obj; do
+    obj_dir="$(dirname "$obj")"
+    (cd "$out_dir" && gcov -o "$obj_dir" "$obj" >/dev/null)
+  done < <(find "$cache_dir" -name '*.c.o' -print0)
 done
-
-while IFS= read -r -d '' obj; do
-  obj_dir="$(dirname "$obj")"
-  (cd "$GCOV_DIR" && gcov -o "$obj_dir" "$obj" >/dev/null)
-done < <(find "$NIMCACHE_ROOT" -name '*.c.o' -print0)
 
 python "$ROOT/scripts/coverage_summary.py" "$GCOV_DIR" "$ROOT" "$SUMMARY" "$SUMMARY_JSON"
 

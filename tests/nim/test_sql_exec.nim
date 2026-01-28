@@ -4,6 +4,11 @@ import strutils
 import engine
 import record/record
 import errors
+import tables
+import sql/sql
+import planner/planner
+import catalog/catalog
+import pager/pager
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
@@ -61,6 +66,139 @@ suite "SQL Exec":
     check countRes.ok
     check splitRow(countRes.value[0])[0] == "1"
     discard closeDb(db)
+
+proc makeCatalog(): Catalog =
+  Catalog(
+    tables: initTable[string, TableMeta](),
+    indexes: initTable[string, IndexMeta](),
+    catalogTree: nil
+  )
+
+proc addTable(catalog: Catalog, name: string) =
+  catalog.tables[name] = TableMeta(
+    name: name,
+    rootPage: PageId(1),
+    nextRowId: 1,
+    columns: @[]
+  )
+
+proc addBtreeIndex(catalog: Catalog, name: string, table: string, column: string) =
+  catalog.indexes[name] = IndexMeta(
+    name: name,
+    table: table,
+    column: column,
+    rootPage: PageId(1),
+    kind: ikBtree,
+    unique: false
+  )
+
+proc addTrigramIndex(catalog: Catalog, name: string, table: string, column: string) =
+  catalog.indexes[name] = IndexMeta(
+    name: name,
+    table: table,
+    column: column,
+    rootPage: PageId(1),
+    kind: ikTrigram,
+    unique: false
+  )
+
+proc parseSingle(sqlText: string): Statement =
+  let astRes = parseSql(sqlText)
+  check astRes.ok
+  check astRes.value.statements.len == 1
+  astRes.value.statements[0]
+
+suite "Planner":
+  test "uses index seek for equality predicate":
+    var catalog = makeCatalog()
+    addTable(catalog, "users")
+    addBtreeIndex(catalog, "users_id_idx", "users", "id")
+    let stmt = parseSingle("SELECT id FROM users WHERE id = 10")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkProject
+    check p.left.kind == pkIndexSeek
+    check p.left.table == "users"
+    check p.left.column == "id"
+    check p.left.valueExpr != nil
+
+  test "uses trigram seek for LIKE predicate":
+    var catalog = makeCatalog()
+    addTable(catalog, "docs")
+    addTrigramIndex(catalog, "docs_body_trgm", "docs", "body")
+    let stmt = parseSingle("SELECT id FROM docs WHERE body ILIKE '%abc%'")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkProject
+    check p.left.kind == pkTrigramSeek
+    check p.left.table == "docs"
+    check p.left.column == "body"
+    check p.left.likeExpr != nil
+    check p.left.likeInsensitive
+
+  test "adds filter when no usable index":
+    var catalog = makeCatalog()
+    addTable(catalog, "items")
+    let stmt = parseSingle("SELECT id FROM items WHERE id = 10")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkProject
+    check p.left.kind == pkFilter
+    check p.left.predicate != nil
+    check p.left.left.kind == pkTableScan
+
+  test "join uses index seek on right when available":
+    var catalog = makeCatalog()
+    addTable(catalog, "users")
+    addTable(catalog, "orders")
+    addBtreeIndex(catalog, "orders_user_idx", "orders", "user_id")
+    let stmt = parseSingle("SELECT users.id, orders.id FROM users INNER JOIN orders ON orders.user_id = users.id")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkProject
+    check p.left.kind == pkJoin
+    check p.left.joinType == jtInner
+    check p.left.right.kind == pkIndexSeek
+    check p.left.right.table == "orders"
+    check p.left.right.column == "user_id"
+
+  test "aggregate plan used for GROUP BY and HAVING":
+    var catalog = makeCatalog()
+    addTable(catalog, "orders")
+    let stmt = parseSingle("SELECT user_id, COUNT(*) FROM orders GROUP BY user_id HAVING COUNT(*) > 1")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkAggregate
+    check p.groupBy.len == 1
+    check p.having != nil
+    check p.left.kind == pkTableScan
+
+  test "sort and limit wrap projection":
+    var catalog = makeCatalog()
+    addTable(catalog, "users")
+    let stmt = parseSingle("SELECT id FROM users ORDER BY id DESC LIMIT 5 OFFSET 2")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkLimit
+    check p.limit == 5
+    check p.offset == 2
+    check p.left.kind == pkSort
+    check p.left.left.kind == pkProject
+    check p.left.left.left.kind == pkTableScan
+
+  test "non-select statements return statement plan":
+    var catalog = makeCatalog()
+    addTable(catalog, "users")
+    let stmt = parseSingle("INSERT INTO users (id) VALUES (1)")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    check planRes.value.kind == pkStatement
 
   test "statement rollback on bind error":
     let path = makeTempDb("decentdb_sql_rollback.db")
@@ -129,4 +267,3 @@ suite "SQL Exec":
     check badUpdate.err.code == ERR_SQL
     
     discard closeDb(db)
-
