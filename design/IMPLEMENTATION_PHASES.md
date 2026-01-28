@@ -28,7 +28,7 @@ Instructions to update the phase map:
 - [x] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
 - [x] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
 - [x] Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
-- [ ] Phase 6: Checkpointing + Bulk Load + Performance + Hardening
+- [x] Phase 6: Checkpointing + Bulk Load + Performance + Hardening
 
 ---
 
@@ -223,8 +223,8 @@ Non-goals:
 ---
 
 ## Phase 6: Checkpointing + Bulk Load + Performance + Hardening
-Status: Not started
-Completed:
+Status: Done
+Completed: 2026-01-28 (local change)
 
 Goal: Keep WAL bounded, make bulk ingest fast, and harden concurrency/performance to the PRD targets.
 
@@ -235,13 +235,13 @@ Deliverables:
 - Memory budgets and spill behavior enforced (see `design/SPEC.md` §11 and §14).
 
 Checklist:
-- [ ] Implement checkpoint protocol: block new writers, copy committed pages, write CHECKPOINT frame, truncate only up to `min(active_reader_snapshot_lsn)`.
-- [ ] Implement reader tracking and reporting (long-running reader warnings, configurable timeouts; see WAL growth prevention notes).
-- [ ] Implement configurable checkpoint triggers (timeout / size thresholds).
-- [ ] Implement bulk load API with batching and configurable fsync interval; crash loses all progress (no partial commits).
-- [ ] Implement benchmark suite and CI regression checks (P50/P95 thresholds per testing strategy).
-- [ ] Performance passes for target workload heuristics (see `design/SPEC.md` §9) and reduce per-row allocations.
-- [ ] Expand crash-injection coverage to include checkpoint write paths.
+- [x] Implement checkpoint protocol: block new writers, copy committed pages, write CHECKPOINT frame, truncate only up to `min(active_reader_snapshot_lsn)`.
+- [x] Implement reader tracking and reporting (long-running reader warnings, configurable timeouts; see WAL growth prevention notes).
+- [x] Implement configurable checkpoint triggers (timeout / size thresholds).
+- [x] Implement bulk load API with batching and configurable fsync interval; crash loses all progress (no partial commits).
+- [x] Implement benchmark suite and CI regression checks (P50/P95 thresholds per testing strategy).
+- [x] Performance passes for target workload heuristics (see `design/SPEC.md` §9) and reduce per-row allocations.
+- [x] Expand crash-injection coverage to include checkpoint write paths.
 
 Acceptance tests:
 - Crash-injection: checkpoint paths do not corrupt DB; committed state preserved.
