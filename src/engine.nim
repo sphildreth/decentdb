@@ -27,6 +27,9 @@ type Db* = ref object
   schemaCookie*: uint32
   pager*: Pager
   catalog*: Catalog
+  wal*: Wal                          # WAL instance for checkpoint control
+  activeWriter*: WalWriter           # Current transaction writer (nil if no active tx)
+  cachePages*: int                   # Cache size for diagnostics
 
 type DurabilityMode* = enum
   dmFull
@@ -43,7 +46,9 @@ type BulkLoadOptions* = object
 proc defaultBulkLoadOptions*(): BulkLoadOptions =
   BulkLoadOptions(batchSize: 10000, syncInterval: 10, disableIndexes: true, checkpointOnComplete: true, durability: dmDeferred)
 
-proc openDb*(path: string): Result[Db] =
+proc openDb*(path: string, cachePages: int = 64): Result[Db] =
+  ## Open a database file with configurable cache size
+  ## cachePages: Number of 4KB pages to cache (default 64 = 256KB)
   let vfs = newOsVfs()
   let res = vfs.open(path, fmReadWrite, true)
   if not res.ok:
@@ -106,16 +111,36 @@ proc openDb*(path: string): Result[Db] =
     discard vfs.close(file)
     return err[Db](headerRes.err.code, headerRes.err.message, headerRes.err.context)
   let header = headerRes.value
-  let pagerRes = newPager(vfs, file, cachePages = 64)
+  
+  # Create pager with configurable cache size
+  let pagerRes = newPager(vfs, file, cachePages = cachePages)
   if not pagerRes.ok:
     discard vfs.close(file)
     return err[Db](pagerRes.err.code, pagerRes.err.message, pagerRes.err.context)
   let pager = pagerRes.value
+  
   let catalogRes = initCatalog(pager)
   if not catalogRes.ok:
     discard closePager(pager)
     discard vfs.close(file)
     return err[Db](catalogRes.err.code, catalogRes.err.message, catalogRes.err.context)
+  
+  # Initialize WAL
+  let walPath = path & "-wal"
+  let walRes = newWal(vfs, walPath)
+  if not walRes.ok:
+    discard closePager(pager)
+    discard vfs.close(file)
+    return err[Db](walRes.err.code, walRes.err.message, walRes.err.context)
+  let wal = walRes.value
+  
+  # Recover WAL on open
+  let recoverRes = recover(wal)
+  if not recoverRes.ok:
+    discard closePager(pager)
+    discard vfs.close(file)
+    return err[Db](recoverRes.err.code, recoverRes.err.message, recoverRes.err.context)
+  
   ok(Db(
     path: path,
     vfs: vfs,
@@ -125,7 +150,10 @@ proc openDb*(path: string): Result[Db] =
     pageSize: header.pageSize,
     schemaCookie: header.schemaCookie,
     pager: pager,
-    catalog: catalogRes.value
+    catalog: catalogRes.value,
+    wal: wal,
+    activeWriter: nil,
+    cachePages: cachePages
   ))
 
 proc schemaBump(db: Db): Result[Void] =
@@ -251,6 +279,11 @@ proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
       return err[seq[Value]](res.err.code, res.err.message, res.err.context)
     values.add(valueFromSql(res.value))
   ok(values)
+
+# Forward declarations for transaction control (defined later)
+proc beginTransaction*(db: Db): Result[Void]
+proc commitTransaction*(db: Db): Result[Void]
+proc rollbackTransaction*(db: Db): Result[Void]
 
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] =
   if not db.isOpen:
@@ -492,23 +525,17 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           parts.add(valueToString(value))
         output.add(parts.join("|"))
     of skBegin:
-      # Transactions are engine-level, but we don't have a transaction manager capable of
-      # nesting or explicit control exposed easily via simple statement execution in MVP 
-      # without binding to a session context. 
-      # However, `wal.nim` has `beginWrite`. 
-      # The `Db` object doesn't currently hold a transaction handle for the duration of multiple `execSql` calls
-      # if `execSql` is stateless.
-      # Wait, MVP `execSql` opens/closes transactions per statement if not already open?
-      # `engine.nim` structure shows `execSql` is stateless regarding transaction handles.
-      # Attempting to support explicit transactions requires `Db` to track active transaction state.
-      # For now, we return OK to allow the parser test to pass, but note the limitation.
-      # actually, `Db` object is the session context here.
-      # We need to add `activeTx: WalWriter` to Db?
-      discard
+      let beginRes = beginTransaction(db)
+      if not beginRes.ok:
+        return err[seq[string]](beginRes.err.code, beginRes.err.message, beginRes.err.context)
     of skCommit:
-      discard
+      let commitRes = commitTransaction(db)
+      if not commitRes.ok:
+        return err[seq[string]](commitRes.err.code, commitRes.err.message, commitRes.err.context)
     of skRollback:
-      discard
+      let rollbackRes = rollbackTransaction(db)
+      if not rollbackRes.ok:
+        return err[seq[string]](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
   ok(output)
 
 proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
@@ -601,6 +628,13 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
 proc closeDb*(db: Db): Result[Void] =
   if not db.isOpen:
     return okVoid()
+  
+  # Close WAL file if present
+  if db.wal != nil:
+    let walCloseRes = db.vfs.close(db.wal.file)
+    if not walCloseRes.ok:
+      return walCloseRes
+  
   let pagerRes = closePager(db.pager)
   if not pagerRes.ok:
     return pagerRes
@@ -609,3 +643,57 @@ proc closeDb*(db: Db): Result[Void] =
     return res
   db.isOpen = false
   okVoid()
+
+# ============================================================================
+# Transaction Control
+# ============================================================================
+
+proc beginTransaction*(db: Db): Result[Void] =
+  ## Begin an explicit transaction
+  if not db.isOpen:
+    return err[Void](ERR_INTERNAL, "Database not open")
+  if db.activeWriter != nil:
+    return err[Void](ERR_TRANSACTION, "Transaction already active")
+  
+  let writerRes = beginWrite(db.wal)
+  if not writerRes.ok:
+    return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
+  
+  db.activeWriter = writerRes.value
+  okVoid()
+
+proc commitTransaction*(db: Db): Result[Void] =
+  ## Commit the active transaction
+  if not db.isOpen:
+    return err[Void](ERR_INTERNAL, "Database not open")
+  if db.activeWriter == nil:
+    return err[Void](ERR_TRANSACTION, "No active transaction")
+  
+  let commitRes = commit(db.activeWriter)
+  if not commitRes.ok:
+    db.activeWriter = nil
+    return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+  
+  db.activeWriter = nil
+  okVoid()
+
+proc rollbackTransaction*(db: Db): Result[Void] =
+  ## Rollback the active transaction
+  if not db.isOpen:
+    return err[Void](ERR_INTERNAL, "Database not open")
+  if db.activeWriter == nil:
+    return err[Void](ERR_TRANSACTION, "No active transaction")
+  
+  let rollbackRes = rollback(db.activeWriter)
+  db.activeWriter = nil
+  if not rollbackRes.ok:
+    return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
+  
+  okVoid()
+
+proc checkpointDb*(db: Db): Result[uint64] =
+  ##  Force a checkpoint of the WAL
+  if not db.isOpen:
+    return err[uint64](ERR_INTERNAL, "Database not open")
+  
+  checkpoint(db.wal, db.pager)

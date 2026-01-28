@@ -26,7 +26,8 @@ proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): Js
 # Main SQL Execution Command
 # ============================================================================
 
-proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing: bool = false): int =
+proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing: bool = false, 
+             cachePages: int = 64, cacheMb: int = 0, checkpoint: bool = false): int =
   ## DecentDb CLI v0.0.1 - ACID-first embedded relational database
   ## 
   ## Execute SQL statements against a DecentDb database file.
@@ -38,12 +39,29 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
     return 1
 
-  let openRes = openDb(db)
+  # Calculate cache size (cacheMb takes precedence if specified)
+  let actualCachePages = if cacheMb > 0:
+    (cacheMb * 1024 * 1024) div 4096  # Convert MB to 4KB pages
+  else:
+    cachePages
+
+  let openRes = openDb(db, cachePages = actualCachePages)
   if not openRes.ok:
     echo resultJson(false, openRes.err)
     return 1
 
   let database = openRes.value
+  
+  # Handle checkpoint request
+  if checkpoint:
+    let ckRes = checkpointDb(database)
+    if not ckRes.ok:
+      discard closeDb(database)
+      echo resultJson(false, ckRes.err)
+      return 1
+    discard closeDb(database)
+    echo resultJson(true, rows = @["Checkpoint completed at LSN " & $ckRes.value])
+    return 0
   
   if not openClose and sql.len > 0:
     let queryStart = if timing: epochTime() else: 0.0
@@ -64,7 +82,9 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing:
       let queryTime = (queryEnd - queryStart) * 1000.0
       let timingInfo = %*{
         "total_ms": totalTime,
-        "query_ms": queryTime
+        "query_ms": queryTime,
+        "cache_pages": actualCachePages,
+        "cache_mb": (actualCachePages * 4096) div (1024 * 1024)
       }
       var result = resultJson(true, rows = rows)
       result["timing"] = timingInfo
@@ -504,7 +524,10 @@ when isMainModule:
       "db": "Path to database file (required)",
       "sql": "SQL statement to execute",
       "openClose": "Open and close database without executing SQL (testing mode)",
-      "timing": "Show query execution timing in milliseconds"
+      "timing": "Show query execution timing in milliseconds",
+      "cachePages": "Number of 4KB pages to cache (default: 64 = 256KB)",
+      "cacheMb": "Cache size in megabytes (overrides --cache-pages if specified)",
+      "checkpoint": "Force a WAL checkpoint and exit"
     },
     short = {
       "db": 'd',
