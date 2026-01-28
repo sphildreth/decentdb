@@ -7,17 +7,23 @@ import ../sql/sql
 import ../catalog/catalog
 import ../record/record
 import ../pager/pager
+import ../pager/db_header
 import ../storage/storage
 import ../planner/planner
 
 type Row* = object
+  rowid*: uint64
   columns*: seq[string]
   values*: seq[Value]
 
 proc valueToString*(value: Value): string =
   case value.kind
   of vkNull: "NULL"
-  of vkBool: if value.boolVal: "true" else: "false"
+  of vkBool:
+    if value.boolVal:
+      "true"
+    else:
+      "false"
   of vkInt64: $value.int64Val
   of vkFloat64: $value.float64Val
   of vkText, vkBlob:
@@ -28,8 +34,8 @@ proc valueToString*(value: Value): string =
   else:
     ""
 
-proc makeRow(columns: seq[string], values: seq[Value]): Row =
-  Row(columns: columns, values: values)
+proc makeRow(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
+  Row(rowid: rowid, columns: columns, values: values)
 
 proc columnIndex(row: Row, table: string, name: string): Result[int] =
   if table.len > 0:
@@ -71,9 +77,9 @@ proc valueToBool*(value: Value): bool =
 
 proc compareValues*(a: Value, b: Value): int =
   if a.kind == vkText or a.kind == vkBlob:
-    let as = valueToString(a)
-    let bs = valueToString(b)
-    return cmp(as, bs)
+    let aStr = valueToString(a)
+    let bStr = valueToString(b)
+    return cmp(aStr, bStr)
   if a.kind == vkFloat64 or b.kind == vkFloat64:
     let af = if a.kind == vkFloat64: a.float64Val else: float(a.int64Val)
     let bf = if b.kind == vkFloat64: b.float64Val else: float(b.int64Val)
@@ -151,7 +157,7 @@ proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     var cols: seq[string] = @[]
     for col in table.columns:
       cols.add(prefix & "." & col.name)
-    rows.add(makeRow(cols, stored.values))
+    rows.add(makeRow(cols, stored.values, stored.rowid))
   ok(rows)
 
 proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: string, column: string, value: Value): Result[seq[Row]] =
@@ -179,27 +185,27 @@ proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     var cols: seq[string] = @[]
     for col in table.columns:
       cols.add(prefix & "." & col.name)
-    rows.add(makeRow(cols, readRes.value.values))
+    rows.add(makeRow(cols, readRes.value.values, rowid))
   ok(rows)
 
 proc applyFilter(rows: seq[Row], expr: Expr, params: seq[Value]): Result[seq[Row]] =
   if expr == nil:
     return ok(rows)
-  var out: seq[Row] = @[]
+  var resultRows: seq[Row] = @[]
   for row in rows:
     let evalRes = evalExpr(row, expr, params)
     if not evalRes.ok:
       return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
     if valueToBool(evalRes.value):
-      out.add(row)
-  ok(out)
+      resultRows.add(row)
+  ok(resultRows)
 
 proc projectRows(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): Result[seq[Row]] =
   if items.len == 0:
     return ok(rows)
   if items.len == 1 and items[0].isStar:
     return ok(rows)
-  var out: seq[Row] = @[]
+  var resultRows: seq[Row] = @[]
   for row in rows:
     var cols: seq[string] = @[]
     var vals: seq[Value] = @[]
@@ -215,8 +221,8 @@ proc projectRows(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): Re
         let name = if item.alias.len > 0: item.alias else: "expr"
         cols.add(name)
         vals.add(evalRes.value)
-    out.add(makeRow(cols, vals))
-  ok(out)
+    resultRows.add(makeRow(cols, vals))
+  ok(resultRows)
 
 type AggState = object
   count: int64
@@ -245,8 +251,8 @@ proc aggregateRows(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], h
     state.count.inc
     for item in items:
       if item.expr != nil and item.expr.kind == ekFunc:
-        let func = item.expr.funcName
-        if func == "COUNT":
+        let funcName = item.expr.funcName
+        if funcName == "COUNT":
           discard
         else:
           let arg = if item.expr.args.len > 0: item.expr.args[0] else: nil
@@ -255,38 +261,38 @@ proc aggregateRows(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], h
             if not evalRes.ok:
               return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
             let val = evalRes.value
-            if func == "SUM" or func == "AVG":
+            if funcName == "SUM" or funcName == "AVG":
               let addVal = if val.kind == vkFloat64: val.float64Val else: float(val.int64Val)
               state.sum += addVal
-            if func == "MIN":
+            if funcName == "MIN":
               if not state.initialized or compareValues(val, state.min) < 0:
                 state.min = val
-            if func == "MAX":
+            if funcName == "MAX":
               if not state.initialized or compareValues(val, state.max) > 0:
                 state.max = val
             state.initialized = true
     groups[key] = state
-  var out: seq[Row] = @[]
+  var resultRows: seq[Row] = @[]
   for key, state in groups:
     var cols: seq[string] = @[]
     var vals: seq[Value] = @[]
     for item in items:
       if item.expr != nil and item.expr.kind == ekFunc:
-        let func = item.expr.funcName
-        if func == "COUNT":
+        let funcName = item.expr.funcName
+        if funcName == "COUNT":
           cols.add("count")
           vals.add(Value(kind: vkInt64, int64Val: state.count))
-        elif func == "SUM":
+        elif funcName == "SUM":
           cols.add("sum")
           vals.add(Value(kind: vkFloat64, float64Val: state.sum))
-        elif func == "AVG":
+        elif funcName == "AVG":
           cols.add("avg")
           let avg = if state.count == 0: 0.0 else: state.sum / float(state.count)
           vals.add(Value(kind: vkFloat64, float64Val: avg))
-        elif func == "MIN":
+        elif funcName == "MIN":
           cols.add("min")
           vals.add(state.min)
-        elif func == "MAX":
+        elif funcName == "MAX":
           cols.add("max")
           vals.add(state.max)
       else:
@@ -302,8 +308,8 @@ proc aggregateRows(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], h
         return err[seq[Row]](havingRes.err.code, havingRes.err.message, havingRes.err.context)
       if not valueToBool(havingRes.value):
         continue
-    out.add(row)
-  ok(out)
+    resultRows.add(row)
+  ok(resultRows)
 
 proc writeRowChunk(path: string, rows: seq[Row]) =
   var f: File
@@ -371,7 +377,7 @@ proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Resu
     let chunk = readRowChunk(path, columns)
     readers.add(chunk)
     indices.add(0)
-  var out: seq[Row] = @[]
+  var resultRows: seq[Row] = @[]
   while true:
     var bestIdx = -1
     var bestRow: Row
@@ -388,21 +394,21 @@ proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Resu
           bestRow = candidate
     if bestIdx < 0:
       break
-    out.add(bestRow)
+    resultRows.add(bestRow)
     indices[bestIdx].inc
   for path in tempFiles:
     if fileExists(path):
       removeFile(path)
-  ok(out)
+  ok(resultRows)
 
 proc applyLimit(rows: seq[Row], limit: int, offset: int): seq[Row] =
   var start = if offset >= 0: offset else: 0
-  var end = rows.len
+  var endIndex = rows.len
   if limit >= 0:
-    end = min(start + limit, rows.len)
+    endIndex = min(start + limit, rows.len)
   if start >= rows.len:
     return @[]
-  rows[start ..< end]
+  rows[start ..< endIndex]
 
 proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[seq[Row]] =
   case plan.kind
@@ -432,7 +438,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
     let leftRes = execPlan(pager, catalog, plan.left, params)
     if not leftRes.ok:
       return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
-    var out: seq[Row] = @[]
+    var resultRows: seq[Row] = @[]
     var rightColumns: seq[string] = @[]
     if plan.right.table.len > 0:
       let tableRes = catalog.getTable(plan.right.table)
@@ -465,14 +471,14 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           return err[seq[Row]](predRes.err.code, predRes.err.message, predRes.err.context)
         if valueToBool(predRes.value):
           matched = true
-          out.add(merged)
+          resultRows.add(merged)
       if plan.joinType == jtLeft and not matched:
         var nullVals: seq[Value] = @[]
         for _ in rightColumns:
           nullVals.add(Value(kind: vkNull))
         let merged = Row(columns: lrow.columns & rightColumns, values: lrow.values & nullVals)
-        out.add(merged)
-    ok(out)
+        resultRows.add(merged)
+    ok(resultRows)
   of pkSort:
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:
@@ -484,4 +490,4 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
     return ok(applyLimit(inputRes.value, plan.limit, plan.offset))
   of pkStatement:
-    return ok(@[])
+    return ok(newSeq[Row]())

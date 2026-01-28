@@ -46,11 +46,11 @@ type CatalogRecord = object
 
 proc parseColumnType*(text: string): Result[ColumnType] =
   case text.toUpperAscii()
-  of "INT", "INT64", "BIGINT":
+  of "INT", "INT64", "BIGINT", "INT4", "INT8":
     ok(ctInt64)
   of "BOOL", "BOOLEAN":
     ok(ctBool)
-  of "FLOAT", "FLOAT64", "DOUBLE":
+  of "FLOAT", "FLOAT64", "DOUBLE", "FLOAT8", "FLOAT4", "REAL":
     ok(ctFloat64)
   of "TEXT":
     ok(ctText)

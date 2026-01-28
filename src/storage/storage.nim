@@ -1,3 +1,5 @@
+import options
+import tables
 import ../errors
 import ../record/record
 import ../pager/pager
@@ -42,8 +44,23 @@ proc indexKeyFromValue(value: Value): uint64 =
     cast[uint64](value.float64Val)
   of vkText, vkBlob:
     uint64(crc32c(value.bytes))
+  of vkTextOverflow, vkBlobOverflow:
+    0'u64
   else:
     0'u64
+
+proc normalizeValues(pager: Pager, values: seq[Value]): Result[seq[Value]] =
+  var resultValues: seq[Value] = @[]
+  for value in values:
+    if value.kind in {vkText, vkBlob} and value.bytes.len > (pager.pageSize - 128):
+      let pageRes = writeOverflowChain(pager, value.bytes)
+      if not pageRes.ok:
+        return err[seq[Value]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+      let overflowKind = if value.kind == vkText: vkTextOverflow else: vkBlobOverflow
+      resultValues.add(Value(kind: overflowKind, overflowPage: pageRes.value, overflowLen: uint32(value.bytes.len)))
+    else:
+      resultValues.add(value)
+  ok(resultValues)
 
 proc readRowAt*(pager: Pager, table: TableMeta, rowid: uint64): Result[StoredRow] =
   let tree = newBTree(pager, table.rootPage)
@@ -85,11 +102,7 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
   if values.len != table.columns.len:
     return err[uint64](ERR_SQL, "Column count mismatch", tableName)
   let rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
-  let record = encodeRecord(values)
-  let tree = newBTree(pager, table.rootPage)
-  let insertRes = insert(tree, rowid, record)
-  if not insertRes.ok:
-    return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  var indexKeys: seq[(IndexMeta, uint64)] = @[]
   for _, idx in catalog.indexes:
     if idx.table != tableName:
       continue
@@ -99,11 +112,20 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
         valueIndex = i
         break
     if valueIndex >= 0:
-      let idxTree = newBTree(pager, idx.rootPage)
-      let key = indexKeyFromValue(values[valueIndex])
-      let idxInsert = insert(idxTree, key, encodeRowId(rowid))
-      if not idxInsert.ok:
-        return err[uint64](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
+      indexKeys.add((idx, indexKeyFromValue(values[valueIndex])))
+  let normalizedRes = normalizeValues(pager, values)
+  if not normalizedRes.ok:
+    return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+  let record = encodeRecord(normalizedRes.value)
+  let tree = newBTree(pager, table.rootPage)
+  let insertRes = insert(tree, rowid, record)
+  if not insertRes.ok:
+    return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  for entry in indexKeys:
+    let idxTree = newBTree(pager, entry[0].rootPage)
+    let idxInsert = insert(idxTree, entry[1], encodeRowId(rowid))
+    if not idxInsert.ok:
+      return err[uint64](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
   table.nextRowId = rowid + 1
   discard catalog.saveTable(pager, table)
   ok(rowid)
@@ -115,8 +137,30 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
   let table = tableRes.value
   if values.len != table.columns.len:
     return err[Void](ERR_SQL, "Column count mismatch", tableName)
+  let oldRes = readRowAt(pager, table, rowid)
+  if not oldRes.ok:
+    return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
+  for _, idx in catalog.indexes:
+    if idx.table != tableName:
+      continue
+    var valueIndex = -1
+    for i, col in table.columns:
+      if col.name == idx.column:
+        valueIndex = i
+        break
+    if valueIndex >= 0:
+      let idxTree = newBTree(pager, idx.rootPage)
+      let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
+      discard delete(idxTree, oldKey)
+      let newKey = indexKeyFromValue(values[valueIndex])
+      let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
+      if not idxInsert.ok:
+        return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
+  let normalizedRes = normalizeValues(pager, values)
+  if not normalizedRes.ok:
+    return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
   let tree = newBTree(pager, table.rootPage)
-  let updateRes = update(tree, rowid, encodeRecord(values))
+  let updateRes = update(tree, rowid, encodeRecord(normalizedRes.value))
   if not updateRes.ok:
     return err[Void](updateRes.err.code, updateRes.err.message, updateRes.err.context)
   okVoid()
@@ -126,10 +170,48 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
   if not tableRes.ok:
     return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
+  let oldRes = readRowAt(pager, table, rowid)
+  if not oldRes.ok:
+    return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
+  for _, idx in catalog.indexes:
+    if idx.table != tableName:
+      continue
+    var valueIndex = -1
+    for i, col in table.columns:
+      if col.name == idx.column:
+        valueIndex = i
+        break
+    if valueIndex >= 0:
+      let idxTree = newBTree(pager, idx.rootPage)
+      let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
+      discard delete(idxTree, oldKey)
   let tree = newBTree(pager, table.rootPage)
   let delRes = delete(tree, rowid)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  okVoid()
+
+proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[Void] =
+  let tableRes = catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  var columnIndex = -1
+  for i, col in table.columns:
+    if col.name == columnName:
+      columnIndex = i
+      break
+  if columnIndex < 0:
+    return err[Void](ERR_SQL, "Column not found", columnName)
+  let rowsRes = scanTable(pager, table)
+  if not rowsRes.ok:
+    return err[Void](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  let idxTree = newBTree(pager, indexRoot)
+  for row in rowsRes.value:
+    let key = indexKeyFromValue(row.values[columnIndex])
+    let insertRes = insert(idxTree, key, encodeRowId(row.rowid))
+    if not insertRes.ok:
+      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   okVoid()
 
 proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: string, value: Value): Result[seq[uint64]] =
@@ -137,7 +219,7 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   if not tableRes.ok:
     return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let indexOpt = catalog.getIndexForColumn(tableName, column)
-  if indexOpt.isNone:
+  if isNone(indexOpt):
     return err[seq[uint64]](ERR_SQL, "Index not found", tableName & "." & column)
   let idx = indexOpt.get
   let idxTree = newBTree(pager, idx.rootPage)

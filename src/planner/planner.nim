@@ -1,3 +1,4 @@
+import options
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
@@ -48,12 +49,17 @@ proc isSimpleEquality(expr: Expr, table: string, columnOut: var string, valueOut
   false
 
 proc planSelect(catalog: Catalog, stmt: Statement): Plan =
+  proc hasAggregate(items: seq[SelectItem]): bool =
+    for item in items:
+      if item.expr != nil and item.expr.kind == ekFunc:
+        return true
+    false
   var base: Plan = nil
   var idxColumn = ""
   var idxValue: Expr = nil
   if isSimpleEquality(stmt.whereExpr, stmt.fromTable, idxColumn, idxValue):
     let idxOpt = catalog.getIndexForColumn(stmt.fromTable, idxColumn)
-    if idxOpt.isSome:
+    if isSome(idxOpt):
       base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
   if base == nil:
     base = Plan(kind: pkTableScan, table: stmt.fromTable, alias: stmt.fromAlias)
@@ -65,12 +71,12 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     var joinIdxVal: Expr = nil
     if isSimpleEquality(join.onExpr, join.table, joinIdxCol, joinIdxVal):
       let idxOpt = catalog.getIndexForColumn(join.table, joinIdxCol)
-      if idxOpt.isSome:
+      if isSome(idxOpt):
         rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
     if rightPlan == nil:
       rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
     base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
-  if stmt.groupBy.len > 0:
+  if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
     base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
   else:
     base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)

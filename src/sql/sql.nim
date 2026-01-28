@@ -29,7 +29,6 @@ type ExprKind* = enum
   ekParam
 
 type Expr* = ref object
-  kind*: ExprKind
   case kind*: ExprKind
   of ekLiteral:
     value*: SqlValue
@@ -84,14 +83,13 @@ type StatementKind* = enum
   skDelete
 
 type Statement* = ref object
-  kind*: StatementKind
   case kind*: StatementKind
   of skCreateTable:
-    tableName*: string
+    createTableName*: string
     columns*: seq[ColumnDef]
   of skCreateIndex:
     indexName*: string
-    tableName*: string
+    indexTableName*: string
     columnName*: string
   of skDropTable:
     dropTableName*: string
@@ -133,7 +131,16 @@ proc nodeString(node: JsonNode): string =
   if node.kind == JString:
     return node.str
   if nodeHas(node, "String"):
-    return node["String"]["str"].str
+    if node["String"].kind == JString:
+      return node["String"].str
+    if nodeHas(node["String"], "str"):
+      return node["String"]["str"].str
+    if nodeHas(node["String"], "sval"):
+      return node["String"]["sval"].str
+  if nodeHas(node, "str"):
+    return node["str"].str
+  if nodeHas(node, "sval"):
+    return node["sval"].str
   ""
 
 proc nodeStringOr(node: JsonNode, key: string, fallback: string): string =
@@ -144,6 +151,20 @@ proc nodeStringOr(node: JsonNode, key: string, fallback: string): string =
 proc parseExprNode(node: JsonNode): Result[Expr]
 
 proc parseAConst(node: JsonNode): Result[Expr] =
+  if nodeHas(node, "ival"):
+    let intNode = node["ival"]
+    if nodeHas(intNode, "ival"):
+      return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: int64(intNode["ival"].getInt))))
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: int64(intNode.getInt))))
+  if nodeHas(node, "sval"):
+    let strNode = node["sval"]
+    if nodeHas(strNode, "sval"):
+      return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: strNode["sval"].getStr)))
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: strNode.getStr)))
+  if nodeHas(node, "fval"):
+    let floatNode = node["fval"]
+    let strVal = if nodeHas(floatNode, "fval"): floatNode["fval"].getStr else: floatNode.getStr
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svFloat, floatVal: parseFloat(strVal))))
   let valNode = nodeGet(node, "val")
   if nodeHas(valNode, "Integer"):
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: int64(valNode["Integer"]["ival"].getInt))))
@@ -249,18 +270,26 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseTypeCast(node["TypeCast"])
   err[Expr](ERR_SQL, "Unsupported expression node")
 
+proc unwrapRangeVar(node: JsonNode): JsonNode =
+  if nodeHas(node, "RangeVar"):
+    return node["RangeVar"]
+  node
+
 proc parseRangeVar(node: JsonNode): Result[(string, string)] =
-  let relname = nodeGet(node, "relname").getStr
+  let rangeNode = unwrapRangeVar(node)
+  let relname = nodeGet(rangeNode, "relname").getStr
   var alias = ""
-  if nodeHas(node, "alias"):
-    let aliasNode = node["alias"]["Alias"]
+  if nodeHas(rangeNode, "alias"):
+    var aliasNode = rangeNode["alias"]
+    if nodeHas(aliasNode, "Alias"):
+      aliasNode = aliasNode["Alias"]
     if nodeHas(aliasNode, "aliasname"):
       alias = aliasNode["aliasname"].getStr
   ok((relname, alias))
 
 proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string, joins: var seq[JoinClause]): Result[Void] =
-  if nodeHas(node, "RangeVar"):
-    let rvRes = parseRangeVar(node["RangeVar"])
+  if nodeHas(node, "RangeVar") or nodeHas(node, "relname"):
+    let rvRes = parseRangeVar(node)
     if not rvRes.ok:
       return err[Void](rvRes.err.code, rvRes.err.message, rvRes.err.context)
     if baseTable.len == 0:
@@ -278,20 +307,19 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
     var rightAlias = ""
     if nodeHas(join, "rarg"):
       let rarg = join["rarg"]
-      if nodeHas(rarg, "RangeVar"):
-        let rvRes = parseRangeVar(rarg["RangeVar"])
-        if rvRes.ok:
-          rightTable = rvRes.value[0]
-          rightAlias = rvRes.value[1]
-    let jointype = if nodeHas(join, "jointype"): join["jointype"].getStr else: ""
-    let joinType = if jointype == "JOIN_LEFT": jtLeft else: jtInner
+      let rvRes = parseRangeVar(rarg)
+      if rvRes.ok:
+        rightTable = rvRes.value[0]
+        rightAlias = rvRes.value[1]
+    let joinKindStr = if nodeHas(join, "jointype"): join["jointype"].getStr else: ""
+    let joinKind = if joinKindStr == "JOIN_LEFT": jtLeft else: jtInner
     var onExpr: Expr = nil
     if nodeHas(join, "quals"):
       let onRes = parseExprNode(join["quals"])
       if onRes.ok:
         onExpr = onRes.value
     if rightTable.len > 0:
-      joins.add(JoinClause(joinType: joinType, table: rightTable, alias: rightAlias, onExpr: onExpr))
+      joins.add(JoinClause(joinType: joinKind, table: rightTable, alias: rightAlias, onExpr: onExpr))
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
 
@@ -363,7 +391,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
   ok(Statement(kind: skSelect, selectItems: items, fromTable: fromTable, fromAlias: fromAlias, joins: joins, whereExpr: whereExpr, groupBy: groupBy, havingExpr: havingExpr, orderBy: orderBy, limit: limit, offset: offset))
 
 proc parseInsertStmt(node: JsonNode): Result[Statement] =
-  let rel = node["relation"]["RangeVar"]
+  let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -380,8 +408,11 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
     let valuesLists = nodeGet(selectStmt, "valuesLists")
     if valuesLists.kind == JArray and valuesLists.len > 0:
       let first = valuesLists[0]
-      if first.kind == JArray:
-        for v in first:
+      var itemsNode = first
+      if nodeHas(first, "List"):
+        itemsNode = nodeGet(first["List"], "items")
+      if itemsNode.kind == JArray:
+        for v in itemsNode:
           let exprRes = parseExprNode(v)
           if not exprRes.ok:
             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
@@ -389,7 +420,7 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
   ok(Statement(kind: skInsert, insertTable: tableRes.value[0], insertColumns: cols, insertValues: values))
 
 proc parseUpdateStmt(node: JsonNode): Result[Statement] =
-  let rel = node["relation"]["RangeVar"]
+  let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -411,7 +442,7 @@ proc parseUpdateStmt(node: JsonNode): Result[Statement] =
   ok(Statement(kind: skUpdate, updateTable: tableRes.value[0], assignments: assigns, updateWhere: whereExpr))
 
 proc parseDeleteStmt(node: JsonNode): Result[Statement] =
-  let rel = node["relation"]["RangeVar"]
+  let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -423,7 +454,7 @@ proc parseDeleteStmt(node: JsonNode): Result[Statement] =
   ok(Statement(kind: skDelete, deleteTable: tableRes.value[0], deleteWhere: whereExpr))
 
 proc parseCreateStmt(node: JsonNode): Result[Statement] =
-  let rel = node["relation"]["RangeVar"]
+  let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -436,15 +467,18 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         let name = col["colname"].getStr
         var typeName = ""
         if nodeHas(col, "typeName"):
-          let typeNames = col["typeName"]["TypeName"]["names"]
+          var typeNode = col["typeName"]
+          if nodeHas(typeNode, "TypeName"):
+            typeNode = typeNode["TypeName"]
+          let typeNames = nodeGet(typeNode, "names")
           if typeNames.kind == JArray and typeNames.len > 0:
             typeName = nodeString(typeNames[^1])
         columns.add(ColumnDef(name: name, typeName: typeName))
-  ok(Statement(kind: skCreateTable, tableName: tableRes.value[0], columns: columns))
+  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let idxName = nodeGet(node, "idxname").getStr
-  let rel = node["relation"]["RangeVar"]
+  let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -454,7 +488,7 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     let param = params[0]["IndexElem"]
     if nodeHas(param, "name"):
       columnName = param["name"].getStr
-  ok(Statement(kind: skCreateIndex, indexName: idxName, tableName: tableRes.value[0], columnName: columnName))
+  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnName: columnName))
 
 proc parseDropStmt(node: JsonNode): Result[Statement] =
   let removeType = nodeGet(node, "removeType").getStr
@@ -488,13 +522,13 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
 proc parseSql*(sql: string): Result[SqlAst] =
   when not defined(libpg_query):
     return err[SqlAst](ERR_INTERNAL, "libpg_query required", "build with -d:libpg_query and link libpg_query")
-  let result = pg_query_parse(sql.cstring)
-  defer: pg_query_free_parse_result(result)
-  if result.error.message != nil:
-    return err[SqlAst](ERR_SQL, $result.error.message)
-  if result.parse_tree == nil:
+  let parseResult = pg_query_parse(sql.cstring)
+  defer: pg_query_free_parse_result(parseResult)
+  if parseResult.error.message != nil:
+    return err[SqlAst](ERR_SQL, $parseResult.error.message)
+  if parseResult.parse_tree == nil:
     return err[SqlAst](ERR_SQL, "Empty parse tree")
-  let jsonText = $result.parse_tree
+  let jsonText = $parseResult.parse_tree
   let root = parseJson(jsonText)
   let stmts = nodeGet(root, "stmts")
   var statements: seq[Statement] = @[]
