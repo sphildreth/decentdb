@@ -36,6 +36,9 @@ task test_nim, "Run Nim unit tests":
 task test_py, "Run Python harness tests":
   exec "python -m unittest tests/harness/test_runner.py"
 
+task coverage_nim, "Run Nim unit tests with gcov coverage report":
+  exec "scripts/coverage_nim.sh"
+
 task lint, "Static checks for Nim + Python":
   exec "nim check src/decentdb_cli.nim"
   exec "nim check src/engine.nim"

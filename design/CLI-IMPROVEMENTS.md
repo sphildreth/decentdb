@@ -9,7 +9,6 @@ This document outlines the plan to enhance the `decentdb_cli` tool with comprehe
 - Standard flags (`--help`, `--version`)
 - Schema introspection (`--list-tables`, `--describe`, `--list-indexes`)
 - Data import/export (`--import`, `--export`, `--bulk-load`, `--dump-sql`)
-- Improved usability while maintaining backward compatibility with the existing test harness
 
 The implementation will upgrade from manual `parseopt` parsing to the modern `cligen` framework with subcommands.
 
@@ -48,8 +47,7 @@ $ decentdb_cli --typo-in-flag-name
 2. Generate formatted help text automatically from code documentation
 3. **Improve error messages for invalid or missing arguments** (detect typos, suggest correct flags)
 4. Support short flags for common options (`-d` for `--db`, `-s` for `--sql`)
-5. Maintain 100% backward compatibility with existing test harness (`tests/harness/runner.py`)
-6. Enable future extensibility (subcommands, additional options)
+5. Enable future extensibility (subcommands, additional options)
 
 ## 3. Current Implementation Analysis
 
@@ -237,7 +235,6 @@ requires "cligen >= 1.7.0"  # Add this line
 - ✅ JSON output format unchanged
 - ✅ Exit codes unchanged (0 = success, 1 = error)
 - ✅ Same core logic for opening DB and executing SQL
-- ✅ Backward compatible with test harness invocation
 
 ### Phase 3: Validation Testing
 
@@ -287,13 +284,7 @@ requires "cligen >= 1.7.0"  # Add this line
        )
        self.assertEqual(result.returncode, 0)
        self.assertIn("Usage:", result.stdout)
-       self.assertIn("--db", result.stdout)
-   ```
-
-3. **Backward compatibility regression test**
-   - Run full existing test suite
-   - Ensure all Python harness scenarios pass unchanged
-
+       
 ### Phase 4: Documentation Updates
 
 **Files to update:**
@@ -354,6 +345,8 @@ task test, "Run Nim + Python unit tests":
 - JSON schema unchanged
 - Exit codes unchanged
 - Flag syntax backward compatible
+
+Tests will need to be modified to use the new CLI interface.
 
 ## 7. Risks & Mitigations
 
@@ -421,7 +414,6 @@ This is a **user interface enhancement** that:
 - Does not change database file formats, durability, or ACID guarantees
 - Does not affect SQL semantics or query execution
 - Adds a UI-only dependency (cligen) with no core engine coupling
-- Maintains full backward compatibility
 
 ## 10. Implementation Scope (Extended Phase 1)
 

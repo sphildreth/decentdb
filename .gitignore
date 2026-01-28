@@ -17,6 +17,7 @@ __pycache__/
 .env
 .DS_Store
 tests/harness/seed.log
+build/coverage/
 --
 tests/nim/
 decentdb_cli

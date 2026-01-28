@@ -164,6 +164,10 @@ Scenario DSL (example):
 
 ## 5. Coverage and CI
 - Coverage target: set a baseline early and raise gradually.
+- Coverage reporting (Nim unit tests):
+  - Run `nimble coverage_nim`.
+  - Output: `build/coverage/summary.txt` and `build/coverage/summary.json`.
+  - Notes: coverage is collected via `gcov` on Nim's C backend; treat the numbers as a trend signal for test completeness.
 - CI:
   - PR: unit + small property suite on all OSes
   - nightly: extended crash suite + long property runs + fuzz (if adopted)
