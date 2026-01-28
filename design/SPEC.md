@@ -6,8 +6,9 @@
 This document defines the MVP engineering design for DecentDb:
 - Embedded DB engine in **Nim**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
-- ACID via **WAL-only** design
-- Storage: **paged file + B+Trees**, with **trigram inverted index** for substring searches
+- ACID via **WAL-based** design
+- Storage: **paged file + B+Trees**, with **trigram inverted index** for search
+- **Mandatory Overflow Pages** for BLOB/Large TEXT support
 
 MVP scope: single process, multi-threaded readers, single writer.
 
@@ -39,7 +40,7 @@ MVP scope: single process, multi-threaded readers, single writer.
 
 5. **record/**
    - Record encoding/decoding: varint lengths + typed fields
-   - Overflow pages for large TEXT/BLOB (optional MVP+; allow inline with max threshold initially)
+   - Overflow pages for large TEXT/BLOB (Mandatory MVP - see ADR-0020)
 
 6. **catalog/**
    - System tables and schema management
@@ -61,7 +62,7 @@ MVP scope: single process, multi-threaded readers, single writer.
    - Volcano (iterator) engine operators:
      - TableScan, IndexSeek, Filter, Project
      - NestedLoopJoin (MVP)
-     - Sort (in-memory), Limit/Offset
+     - Sort (External Merge Sort capable, see ADR-0022), Limit/Offset
    - Row materialization in reusable buffers (avoid per-row heap alloc)
 
 10. **search/**
@@ -115,7 +116,7 @@ See ADR-0016 for checksum calculation details.
 ### 3.3 Page types
 - B+Tree internal page
 - B+Tree leaf page
-- Overflow page (optional MVP+)
+- Overflow page (Mandatory MVP)
 - Freelist trunk/leaf (or single freelist chain for MVP)
 
 ---
@@ -161,44 +162,26 @@ Maintain in-memory `walIndex: page_id -> list/latest frame offsets` (store lates
 
 **Atomicity guarantee**: The `wal_end_lsn` is an `AtomicU64` that is incremented only after the WAL frame is fully written and the in-memory index is updated. Readers use `load_acquire()` to ensure they see all prior writes.
 
-### 4.3 Checkpointing (MVP)
-Checkpointing copies committed WAL frames back to the main database file and truncates the WAL.
+### 4.3 Checkpointing and WAL Retention
+Checkpointed pages are copied to the main database file.
 
-**Atomic Reader Counter:**
-- `active_readers`: AtomicU32 tracking concurrent read transactions
-- `checkpoint_epoch`: AtomicU64 incremented on each checkpoint
-- Readers increment counter on start, decrement on end
-- Checkpoint waits for counter to reach 0 (up to timeout)
-
-See ADR-0018 for detailed protocol.
+**Reader Protection Rule (ADR-0019):**
+- The WAL must **never** be truncated if it contains frames required by an active reader (i.e., frame LSN > `min(active_reader_snapshot_lsn)`).
+- If a reader falls far behind, the WAL file may grow indefinitely until the reader finishes.
 
 **Checkpoint Protocol:**
-1. Set `checkpoint_pending` flag to block new write transactions
-2. Wait for `active_readers` to reach 0 (or timeout expires)
-3. If timeout expires: use forced checkpoint with copy-on-write semantics
-4. Copy pages with LSN <= last_commit_lsn to main DB file
-5. Write CHECKPOINT frame to WAL
-6. Truncate WAL and reset `wal_end_lsn`
-7. Clear `checkpoint_pending` flag
+1. Set `checkpoint_pending` flag to block new write transactions.
+2. Copy committed pages to main DB file (up to last commit).
+3. Determine `safe_truncate_lsn = min(active_readers_snapshot_lsn)`.
+   - If no readers, `safe_truncate_lsn = last_commit_lsn`.
+4. Write CHECKPOINT frame to WAL.
+5. **Conditionally Truncate:**
+   - If `safe_truncate_lsn` allows, truncate the WAL file.
+   - If readers are blocking truncation, the WAL remains large until the next checkpoint opportunistically truncates it.
+6. Clear `checkpoint_pending` flag.
 
-**WAL size management**:
-- Configurable WAL size threshold (default: 100MB)
-- If WAL exceeds threshold:
-  - Block new writes until checkpoint completes
-  - Wait up to `checkpoint_timeout` (default: 30 seconds) for readers to drain
-  - If timeout expires, force checkpoint with readers active
-- After checkpoint, truncate WAL to zero and reset `wal_end_lsn`
-
-**Checkpoint triggers**:
-- Manual checkpoint via API call
-- Automatic checkpoint when WAL size exceeds threshold
-- Automatic checkpoint on database close
-
-**Forced Checkpoint (timeout case):**
-- Increment checkpoint epoch
-- Copy pages atomically using copy-on-write
-- Active readers continue with old page versions via WAL overlay
-- No blocking of readers
+**Forced Checkpoint (Timeout):**
+- If we must checkpoint while readers are active, we proceed with the copy based on the `writer`'s LSN, but we **skip the WAL truncation** step for any portion needed by readers.
 
 ### 4.4 Bulk Load API
 Dedicated API for high-throughput data loading with deferred durability.
@@ -450,7 +433,7 @@ Track:
 **Memory Usage Budgets:**
 - Peak memory during queries: must not exceed 2x configured cache size
 - Query execution memory: abort if exceeds `max_query_memory` (default: 64MB)
-- Sort operations: spill to disk if exceeds `sort_buffer_size` (default: 1MB)
+- Sort operations: **External Merge Sort** (ADR-0022). Spills to disk if `sort_buffer_size` (default: 16MB) is exceeded. Max 64 spill files (approx 1GB capacity with default buffer).
 - Join operations: use nested-loop with index, materialize only when necessary
 - Memory tracking: report in benchmark results, fail if >20% over budget
 
@@ -541,9 +524,9 @@ Database-level configuration (set at open time):
 - `page_size`: 4096, 8192, or 16384 (default: 4096)
 - `cache_size_mb`: Maximum page cache size in MB (default: 4MB)
 - `wal_sync_mode`: `FULL` (fsync), `NORMAL` (fdatasync), `TESTING_ONLY_UNSAFE_NOSYNC` (requires compile flag)
-- `checkpoint_threshold_mb`: WAL size before auto-checkpoint (default: 100MB)
 - `checkpoint_timeout_sec`: Max wait for readers before forced checkpoint (default: 30)
 - `trigram_postings_threshold`: Max postings before requiring additional filters (default: 100000)
+- `temp_dir`: Directory for temporary sort files (default: system temp)
 
 **Safety Note:** `TESTING_ONLY_UNSAFE_NOSYNC` requires the engine to be compiled with `-d:allowUnsafeSyncMode` flag. This mode provides no durability guarantees and must never be used in production.
 

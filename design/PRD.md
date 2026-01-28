@@ -9,6 +9,7 @@ DecentDb is an embedded, single-machine relational database engine focused on:
 - **Single writer + many concurrent readers** (MVP: single process, multi-threaded)
 - **PostgreSQL-like SQL syntax** (subset, “good enough” for common CRUD + joins)
 - **Efficient substring search** for user-facing “contains” queries (e.g., `LIKE '%FOO%'`) on selected text columns
+- **WAL-based durability** (Write-Ahead Log) for ACID compliance
 
 The initial target workload is music-library style data:
 - ~25k artists, ~80k albums, ~9.5M tracks (initial)
@@ -24,8 +25,8 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
    - Foreign keys with enforcement (MVP: `RESTRICT` / `NO ACTION`; optional `CASCADE` later)
    - Secondary indexes (B+Tree)
 
-2. **Transactions & durability**
-   - ACID semantics with **WAL-only** (Write-Ahead Log)
+   - **Transactions & durability**
+   - ACID semantics with **WAL-based** persistence
    - `BEGIN`, `COMMIT`, `ROLLBACK`
    - Crash-safe: committed transactions survive crash; uncommitted do not.
 
@@ -161,6 +162,7 @@ ORDER BY a.name, al.name, t.trackNumber;
 
 ### M4 — B+Tree write path + DDL/DML subset
 - Insert/update/delete basic operations
+- **Overflow pages** for BLOB/Large TEXT support
 - Create table/index metadata
 - Simple SELECT execution pipeline
 

@@ -27,6 +27,7 @@ Runs on every PR.
 - record:
   - type encode/decode
   - boundary values
+  - overflow chain implementation (write/read large blob)
 - search:
   - trigram generation canonicalization
   - postings encode/decode
@@ -115,6 +116,7 @@ For supported subset only.
    - Used for: Performance benchmarks, FK constraint testing
 - File handle leaks:
   - Track all file opens/closes
+  - **Verify sort temp files deleted**: after spill tests, ensure `temp_dir` is empty
   - Assert all handles closed after each test
   - Use OS-level tools (lsof, handle.exe) in CI
 - Memory leaks:
