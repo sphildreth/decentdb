@@ -24,7 +24,7 @@ Instructions to update the phase map:
 
 - [x] Phase 0: Foundations (project + test harness + VFS)
 - [x] Phase 1: DB File + Pager + Page Cache (read/write pages)
-- [ ] Phase 2: Records + Overflow Pages + B+Tree Read Path
+- [x] Phase 2: Records + Overflow Pages + B+Tree Read Path
 - [ ] Phase 3: WAL + Transactions + Recovery + Snapshot Reads
 - [ ] Phase 4: B+Tree Write Path + Catalog + SQL/Exec MVP
 - [ ] Phase 5: Constraints + Foreign Keys + Trigram Search (v1)
@@ -93,8 +93,8 @@ Non-goals:
 ---
 
 ## Phase 2: Records + Overflow Pages + B+Tree Read Path
-Status: Not started
-Completed:
+Status: Done
+Completed: 2026-01-28 (local change)
 
 Goal: Encode/decode rows and support reading tables/indexes via B+Tree traversal.
 
@@ -104,11 +104,11 @@ Deliverables:
 - B+Tree read traversal + cursor iteration for table and secondary index.
 
 Checklist:
-- [ ] Implement record encoding/decoding for MVP types: NULL, INT64, BOOL, FLOAT64, TEXT (UTF-8), BLOB.
-- [ ] Implement overflow page chain read/write and pointer encoding in records.
-- [ ] Define B+Tree page layouts for internal/leaf pages (do not change without ADR; changes are persistent format).
-- [ ] Implement B+Tree lookup and in-order cursor iteration (table + index).
-- [ ] Add unit tests: type boundaries, overflow chain roundtrip, btree search correctness, cursor ordering, split-friendly read invariants (even before writes exist).
+- [x] Implement record encoding/decoding for MVP types: NULL, INT64, BOOL, FLOAT64, TEXT (UTF-8), BLOB.
+- [x] Implement overflow page chain read/write and pointer encoding in records.
+- [x] Define B+Tree page layouts for internal/leaf pages (do not change without ADR; changes are persistent format).
+- [x] Implement B+Tree lookup and in-order cursor iteration (table + index).
+- [x] Add unit tests: type boundaries, overflow chain roundtrip, btree search correctness, cursor ordering, split-friendly read invariants (even before writes exist).
 
 Acceptance tests:
 - Unit: record encode/decode + overflow chain tests.

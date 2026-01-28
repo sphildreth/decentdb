@@ -1,5 +1,204 @@
-type Record* = ref object
-  bytes*: seq[byte]
+import ../errors
+import ../pager/pager
+import ../pager/db_header
 
-proc newRecord*(): Record =
-  Record(bytes: @[])
+type ValueKind* = enum
+  vkNull
+  vkInt64
+  vkBool
+  vkFloat64
+  vkText
+  vkBlob
+  vkTextOverflow
+  vkBlobOverflow
+
+type Value* = object
+  kind*: ValueKind
+  int64Val*: int64
+  boolVal*: bool
+  float64Val*: float64
+  bytes*: seq[byte]
+  overflowPage*: PageId
+  overflowLen*: uint32
+
+proc encodeVarint*(value: uint64): seq[byte] =
+  var v = value
+  result = @[]
+  while true:
+    var b = byte(v and 0x7F)
+    v = v shr 7
+    if v != 0:
+      b = b or 0x80
+    result.add(b)
+    if v == 0:
+      break
+
+proc decodeVarint*(data: openArray[byte], offset: var int): Result[uint64] =
+  var shift = 0
+  var value: uint64 = 0
+  while offset < data.len:
+    let b = data[offset]
+    offset.inc
+    value = value or (uint64(b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      return ok(value)
+    shift += 7
+    if shift > 63:
+      return err[uint64](ERR_CORRUPTION, "Varint overflow")
+  err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
+
+proc encodeValue*(value: Value): seq[byte] =
+  var payload: seq[byte] = @[]
+  case value.kind
+  of vkNull:
+    payload = @[]
+  of vkBool:
+    payload = @[byte(if value.boolVal: 1 else: 0)]
+  of vkInt64:
+    payload = newSeq[byte](8)
+    writeU64LE(payload, 0, cast[uint64](value.int64Val))
+  of vkFloat64:
+    payload = newSeq[byte](8)
+    writeU64LE(payload, 0, cast[uint64](value.float64Val))
+  of vkText, vkBlob:
+    payload = if value.bytes.len == 0: @[] else: value.bytes
+  of vkTextOverflow, vkBlobOverflow:
+    payload = newSeq[byte](8)
+    writeU32LE(payload, 0, uint32(value.overflowPage))
+    writeU32LE(payload, 4, value.overflowLen)
+  result = @[byte(value.kind)]
+  result.add(encodeVarint(uint64(payload.len)))
+  result.add(payload)
+
+proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
+  if offset >= data.len:
+    return err[Value](ERR_CORRUPTION, "Unexpected end of record")
+  let kindValue = int(data[offset])
+  if kindValue < 0 or kindValue > ord(high(ValueKind)):
+    return err[Value](ERR_CORRUPTION, "Unknown value kind")
+  let kind = ValueKind(kindValue)
+  offset.inc
+  let lenRes = decodeVarint(data, offset)
+  if not lenRes.ok:
+    return err[Value](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+  let length = int(lenRes.value)
+  if offset + length > data.len:
+    return err[Value](ERR_CORRUPTION, "Record field length out of bounds")
+  let payload = data[offset ..< offset + length]
+  offset += length
+  var value = Value(kind: kind)
+  case kind
+  of vkNull:
+    discard
+  of vkBool:
+    if payload.len != 1:
+      return err[Value](ERR_CORRUPTION, "Invalid BOOL length")
+    value.boolVal = payload[0] != 0
+  of vkInt64:
+    if payload.len != 8:
+      return err[Value](ERR_CORRUPTION, "Invalid INT64 length")
+    value.int64Val = cast[int64](readU64LE(payload, 0))
+  of vkFloat64:
+    if payload.len != 8:
+      return err[Value](ERR_CORRUPTION, "Invalid FLOAT64 length")
+    value.float64Val = cast[float64](readU64LE(payload, 0))
+  of vkText, vkBlob:
+    value.bytes = @payload
+  of vkTextOverflow, vkBlobOverflow:
+    if payload.len != 8:
+      return err[Value](ERR_CORRUPTION, "Invalid overflow pointer length")
+    value.overflowPage = PageId(readU32LE(payload, 0))
+    value.overflowLen = readU32LE(payload, 4)
+  ok(value)
+
+proc encodeRecord*(values: seq[Value]): seq[byte] =
+  result = @[]
+  result.add(encodeVarint(uint64(values.len)))
+  for value in values:
+    result.add(encodeValue(value))
+
+proc decodeRecord*(data: openArray[byte]): Result[seq[Value]] =
+  var offset = 0
+  let countRes = decodeVarint(data, offset)
+  if not countRes.ok:
+    return err[seq[Value]](countRes.err.code, countRes.err.message, countRes.err.context)
+  let count = int(countRes.value)
+  var values: seq[Value] = @[]
+  for _ in 0 ..< count:
+    let valueRes = decodeValue(data, offset)
+    if not valueRes.ok:
+      return err[seq[Value]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    values.add(valueRes.value)
+  ok(values)
+
+proc writeOverflowChain*(pager: Pager, data: openArray[byte]): Result[PageId] =
+  if data.len == 0:
+    return ok(PageId(0))
+  let payloadSize = pager.pageSize - 8
+  var offset = 0
+  var firstPage: PageId = 0
+  var prevPage: PageId = 0
+  while offset < data.len:
+    let chunkSize = min(payloadSize, data.len - offset)
+    let pageRes = allocatePage(pager)
+    if not pageRes.ok:
+      return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    let pageId = pageRes.value
+    var buf = newSeq[byte](pager.pageSize)
+    writeU32LE(buf, 0, 0)
+    writeU32LE(buf, 4, uint32(chunkSize))
+    for i in 0 ..< chunkSize:
+      buf[8 + i] = data[offset + i]
+    let writeRes = writePage(pager, pageId, buf)
+    if not writeRes.ok:
+      return err[PageId](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    if prevPage != 0:
+      let prevRes = readPage(pager, prevPage)
+      if not prevRes.ok:
+        return err[PageId](prevRes.err.code, prevRes.err.message, prevRes.err.context)
+      var prevBuf = prevRes.value
+      writeU32LE(prevBuf, 0, uint32(pageId))
+      let prevWrite = writePage(pager, prevPage, prevBuf)
+      if not prevWrite.ok:
+        return err[PageId](prevWrite.err.code, prevWrite.err.message, prevWrite.err.context)
+    else:
+      firstPage = pageId
+    prevPage = pageId
+    offset += chunkSize
+  ok(firstPage)
+
+proc readOverflowChain*(pager: Pager, start: PageId, totalLen: uint32): Result[seq[byte]] =
+  if start == 0:
+    return ok(newSeq[byte]())
+  var output = newSeq[byte](int(totalLen))
+  var written = 0
+  var current = start
+  while current != 0 and written < output.len:
+    let pageRes = readPage(pager, current)
+    if not pageRes.ok:
+      return err[seq[byte]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    let page = pageRes.value
+    let next = readU32LE(page, 0)
+    let chunkLen = int(readU32LE(page, 4))
+    if 8 + chunkLen > page.len:
+      return err[seq[byte]](ERR_CORRUPTION, "Overflow page length invalid", "page_id=" & $current)
+    let copyLen = min(chunkLen, output.len - written)
+    for i in 0 ..< copyLen:
+      output[written + i] = page[8 + i]
+    written += copyLen
+    current = PageId(next)
+  ok(output)
+
+proc decodeRecordWithOverflow*(pager: Pager, data: openArray[byte]): Result[seq[Value]] =
+  let decoded = decodeRecord(data)
+  if not decoded.ok:
+    return decoded
+  var values = decoded.value
+  for i in 0 ..< values.len:
+    if values[i].kind in {vkTextOverflow, vkBlobOverflow}:
+      let readRes = readOverflowChain(pager, values[i].overflowPage, values[i].overflowLen)
+      if not readRes.ok:
+        return err[seq[Value]](readRes.err.code, readRes.err.message, readRes.err.context)
+      values[i].bytes = readRes.value
+      values[i].kind = if values[i].kind == vkTextOverflow: vkText else: vkBlob
+  ok(values)

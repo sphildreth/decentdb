@@ -9,12 +9,16 @@ task test, "Run Nim + Python unit tests":
   exec "nim c -r tests/nim/test_faulty_vfs.nim"
   exec "nim c -r tests/nim/test_db_header.nim"
   exec "nim c -r tests/nim/test_pager.nim"
+  exec "nim c -r tests/nim/test_record.nim"
+  exec "nim c -r tests/nim/test_btree.nim"
   exec "python -m unittest tests/harness/test_runner.py"
 
 task test_nim, "Run Nim unit tests":
   exec "nim c -r tests/nim/test_faulty_vfs.nim"
   exec "nim c -r tests/nim/test_db_header.nim"
   exec "nim c -r tests/nim/test_pager.nim"
+  exec "nim c -r tests/nim/test_record.nim"
+  exec "nim c -r tests/nim/test_btree.nim"
 
 task test_py, "Run Python harness tests":
   exec "python -m unittest tests/harness/test_runner.py"
@@ -27,7 +31,11 @@ task lint, "Static checks for Nim + Python":
   exec "nim check src/vfs/faulty_vfs.nim"
   exec "nim check src/pager/db_header.nim"
   exec "nim check src/pager/pager.nim"
+  exec "nim check src/record/record.nim"
+  exec "nim check src/btree/btree.nim"
   exec "nim check tests/nim/test_faulty_vfs.nim"
   exec "nim check tests/nim/test_db_header.nim"
   exec "nim check tests/nim/test_pager.nim"
+  exec "nim check tests/nim/test_record.nim"
+  exec "nim check tests/nim/test_btree.nim"
   exec "python -m compileall tests/harness"
