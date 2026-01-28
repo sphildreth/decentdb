@@ -85,12 +85,32 @@ MVP scope: single process, multi-threaded readers, single writer.
 
 ### 3.2 Main DB header (page 1)
 Store:
-- magic bytes + format version
-- page size
+- magic bytes (16 bytes: "DECENTDB" + padding)
+- format version (u32)
+- page size (u32)
+- header checksum (CRC-32C of header fields)
 - schema cookie (increment on schema change)
 - root page ids for system catalog B+Trees
 - freelist head pointer + count
-- last checkpoint LSN / WAL checkpoint info (optional MVP)
+- last checkpoint LSN / WAL checkpoint info
+
+**Header Layout (128 bytes total):**
+```
+Offset  Size  Field
+0       16    Magic bytes
+16      4     Format version
+20      4     Page size
+24      4     Header checksum (CRC-32C)
+28      4     Schema cookie
+32      4     Root page ID for catalog
+36      4     Root page ID for freelist
+40      4     Freelist head pointer
+44      4     Freelist count
+48      8     Last checkpoint LSN
+56      72    Reserved
+```
+
+See ADR-0016 for checksum calculation details.
 
 ### 3.3 Page types
 - B+Tree internal page
@@ -103,15 +123,31 @@ Store:
 ## 4. Transactions, durability, and recovery (WAL-only)
 ### 4.1 WAL frame format (MVP)
 Each frame appends:
-- `page_id` (u32)
-- `page_size` bytes page image
-- `frame_checksum` (u64)
+- `frame_type` (u8): 0=page, 1=commit, 2=checkpoint
+- `page_id` (u32, valid for page frames)
+- `payload_size` (u32)
+- payload (page image or commit metadata)
+- `frame_checksum` (u64, CRC-32C of header + payload)
 - `lsn` (u64 monotonically increasing)
-- `commit_record` (dedicated record type with transaction_id and commit timestamp)
+
+**Frame Types:**
+- **PAGE (0)**: Contains modified page data
+  - `page_id`: ID of the page
+  - `payload`: Full page image
+- **COMMIT (1)**: Transaction commit marker
+  - `page_id`: 0 (unused)
+  - `payload`: transaction_id (u64), timestamp (u64)
+- **CHECKPOINT (2)**: Checkpoint completion marker
+  - `page_id`: 0 (unused)
+  - `payload`: checkpoint_lsn (u64)
 
 Commit rule:
-- A transaction is committed when a commit marker is durably written.
+- A transaction is committed when a COMMIT frame is durably written.
 - Default durability: `fsync(wal)` on commit.
+
+**Torn Write Detection:**
+- Frame header includes `payload_size` for validation
+- Recovery ignores incomplete frames (checksum mismatch or size truncation)
 
 ### 4.2 Snapshot reads
 On read transaction start:
@@ -126,17 +162,31 @@ Maintain in-memory `walIndex: page_id -> list/latest frame offsets` (store lates
 **Atomicity guarantee**: The `wal_end_lsn` is an `AtomicU64` that is incremented only after the WAL frame is fully written and the in-memory index is updated. Readers use `load_acquire()` to ensure they see all prior writes.
 
 ### 4.3 Checkpointing (MVP)
-- Manual or opportunistic checkpoint:
-  - Only checkpoint when no active readers (simplest MVP)
-  - Copy latest committed page images from WAL back to main db file
-  - Truncate WAL afterward
+Checkpointing copies committed WAL frames back to the main database file and truncates the WAL.
+
+**Atomic Reader Counter:**
+- `active_readers`: AtomicU32 tracking concurrent read transactions
+- `checkpoint_epoch`: AtomicU64 incremented on each checkpoint
+- Readers increment counter on start, decrement on end
+- Checkpoint waits for counter to reach 0 (up to timeout)
+
+See ADR-0018 for detailed protocol.
+
+**Checkpoint Protocol:**
+1. Set `checkpoint_pending` flag to block new write transactions
+2. Wait for `active_readers` to reach 0 (or timeout expires)
+3. If timeout expires: use forced checkpoint with copy-on-write semantics
+4. Copy pages with LSN <= last_commit_lsn to main DB file
+5. Write CHECKPOINT frame to WAL
+6. Truncate WAL and reset `wal_end_lsn`
+7. Clear `checkpoint_pending` flag
 
 **WAL size management**:
 - Configurable WAL size threshold (default: 100MB)
 - If WAL exceeds threshold:
   - Block new writes until checkpoint completes
   - Wait up to `checkpoint_timeout` (default: 30 seconds) for readers to drain
-  - If timeout expires, force checkpoint with readers active (copy pages atomically)
+  - If timeout expires, force checkpoint with readers active
 - After checkpoint, truncate WAL to zero and reset `wal_end_lsn`
 
 **Checkpoint triggers**:
@@ -144,9 +194,30 @@ Maintain in-memory `walIndex: page_id -> list/latest frame offsets` (store lates
 - Automatic checkpoint when WAL size exceeds threshold
 - Automatic checkpoint on database close
 
-Future: incremental checkpoint while readers exist.
+**Forced Checkpoint (timeout case):**
+- Increment checkpoint epoch
+- Copy pages atomically using copy-on-write
+- Active readers continue with old page versions via WAL overlay
+- No blocking of readers
 
-### 4.4 Crash recovery
+### 4.4 Bulk Load API
+Dedicated API for high-throughput data loading with deferred durability.
+
+**Key characteristics:**
+- Holds single-writer lock for entire duration
+- Batches rows and fsyncs only at configured intervals
+- Readers see consistent pre-load state (snapshot isolation)
+- Crash during bulk load loses all progress (no partial commits)
+
+See ADR-0017 for detailed design.
+
+**Configuration:**
+- `batch_size`: Rows per batch (default: 10000)
+- `sync_interval`: Batches between fsync (default: 10)
+- `disable_indexes`: Skip index updates during load (default: true, rebuild after)
+- `checkpoint_on_complete`: Checkpoint after load finishes (default: true)
+
+### 4.5 Crash recovery
 On open:
 - scan WAL from last checkpoint
 - validate frame checksums
@@ -168,7 +239,9 @@ On open:
 ### 5.3 Locks and latches (MVP)
 - `schemaLock`: RW lock around catalog changes
 - Page cache: per-page latch + global eviction lock
-- WAL append: mutex around append operations (or single writer thread)
+- WAL append: mutex for serializing frame writes (enforces single-writer)
+
+**Note:** The WAL append mutex enforces the single-writer constraint at the storage layer. While the architecture supports only one writer transaction at a time by design, the mutex provides defense-in-depth against programming errors.
 
 Multi-process locking is out of scope for MVP.
 
@@ -211,16 +284,23 @@ Alternative:
 - Unique index enforces PK uniqueness
 
 ### 7.2 Foreign keys
-- Enforced at statement time (MVP choice for simplicity)
+- Enforced at statement time (**Note:** differs from SQL standard which enforces at transaction commit)
 - Requires index on referenced parent key (enforced by CREATE TABLE)
 - Auto-create index on child FK columns if not present
   - Index name: `fk_<table>_<column>_idx`
   - This ensures FK checks are efficient and avoids full table scans
 
+**Statement-time enforcement means:**
+- Each INSERT/UPDATE/DELETE statement validates FK constraints immediately
+- Violations cause immediate error and statement rollback
+- This differs from PostgreSQL/MySQL which defer validation to COMMIT
+
 MVP actions:
 - `RESTRICT` / `NO ACTION` on delete/update
+
 Optional later:
 - `CASCADE`, `SET NULL`
+- Deferred constraint checking (transaction-commit time)
 
 ---
 
@@ -248,6 +328,13 @@ Given pattern:
 - order trigrams by increasing postings frequency
 - intersect progressively until candidate set <= threshold
 - verify each candidate by substring match
+
+**Case Sensitivity Rules:**
+- Trigram index stores uppercase-normalized trigrams
+- Patterns are uppercased before query processing
+- `LIKE '%abc%'` and `LIKE '%ABC%'` use the same trigram index entries
+- Case-insensitive matching is the default for trigram-indexed columns
+- For case-sensitive search, use B+Tree index with exact match predicates
 
 **Pattern length guardrails**:
 - Patterns < 3 characters: never use trigram index (too many matches)
@@ -351,13 +438,20 @@ Define microbenchmarks:
 - PK point lookup latency
 - FK join expansion latency (artist->albums->tracks)
 - Contains search (trigram) latency with typical patterns
-- Bulk load throughput (MVP+)
+- Bulk load throughput
 
 Track:
 - P50/P95 latency
 - WAL size growth
 - checkpoint time
 - recovery time after crash
+
+**Memory Usage Budgets:**
+- Peak memory during queries: must not exceed 2x configured cache size
+- Query execution memory: abort if exceeds `max_query_memory` (default: 64MB)
+- Sort operations: spill to disk if exceeds `sort_buffer_size` (default: 1MB)
+- Join operations: use nested-loop with index, materialize only when necessary
+- Memory tracking: report in benchmark results, fail if >20% over budget
 
 ---
 
@@ -445,10 +539,12 @@ Define error categories:
 Database-level configuration (set at open time):
 - `page_size`: 4096, 8192, or 16384 (default: 4096)
 - `cache_size_mb`: Maximum page cache size in MB (default: 4MB)
-- `wal_sync_mode`: `FULL` (fsync), `NORMAL` (fdatasync), `OFF` (unsafe, testing only)
+- `wal_sync_mode`: `FULL` (fsync), `NORMAL` (fdatasync), `TESTING_ONLY_UNSAFE_NOSYNC` (requires compile flag)
 - `checkpoint_threshold_mb`: WAL size before auto-checkpoint (default: 100MB)
 - `checkpoint_timeout_sec`: Max wait for readers before forced checkpoint (default: 30)
 - `trigram_postings_threshold`: Max postings before requiring additional filters (default: 100000)
+
+**Safety Note:** `TESTING_ONLY_UNSAFE_NOSYNC` requires the engine to be compiled with `-d:allowUnsafeSyncMode` flag. This mode provides no durability guarantees and must never be used in production.
 
 ### 16.2 Runtime configuration
 Some options can be changed at runtime:

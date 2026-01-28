@@ -60,8 +60,20 @@ Core suite for ACID durability.
   3) reopen
   4) assert database invariants and expected visibility
 
+**Torn Write Tests:**
+- Partial WAL frame writes (write only N bytes of M-byte frame)
+- Verify: recovery ignores incomplete frames
+- Test scenarios:
+  - Crash mid-frame during multi-page transaction
+  - Crash between frame header and payload
+  - Crash during commit frame write
+- Assert: committed transactions visible, uncommitted not visible, no corruption
+
 ### 2.4 Differential tests vs PostgreSQL (Python)
 For supported subset only.
+
+**PostgreSQL Version:** Target PostgreSQL 15.x for compatibility testing. CI should test against PG14, PG15, and PG16 to ensure broad compatibility.
+
 - Load identical data into PostgreSQL and DecentDb
 - Execute deterministic SQL
 - Compare:
@@ -71,6 +83,36 @@ For supported subset only.
   - string matching for LIKE patterns (define exact semantics)
 
 ### 2.5 Resource leak tests
+
+### 2.6 Test Data Generation Specifications
+
+**Dataset Requirements:**
+
+1. **Sequential ID Dataset:**
+   - Row IDs starting from 1, incrementing by 1
+   - Used for: B+Tree structure validation, basic query testing
+   - Size: 1k, 10k, 100k, 1M rows
+
+2. **Sparse/Deleted Data Dataset:**
+   - Sequential insert followed by 30% random deletes
+   - Used for: B+Tree structure integrity, freelist testing
+   - Size: 100k rows with 30k deletes
+
+3. **Unicode Text Dataset:**
+   - Text fields with mixed ASCII and multi-byte UTF-8 characters
+   - Include: Latin (é, ñ, ü), Cyrillic, CJK characters
+   - Used for: Trigram index testing, string comparison, LIKE patterns
+   - Size: 10k rows
+
+4. **Edge Case Dataset:**
+   - Empty strings, NULL values, max-length text, boundary numeric values
+   - Used for: Type validation, boundary testing, NULL handling
+   - Size: 1k rows
+
+5. **Music Library Dataset (Reference):**
+   - Structure matching MusicBrainz schema (artist, album, track)
+   - 25k artists, 80k albums, 9.5M tracks
+   - Used for: Performance benchmarks, FK constraint testing
 - File handle leaks:
   - Track all file opens/closes
   - Assert all handles closed after each test
@@ -126,7 +168,7 @@ Run microbenchmarks on every PR:
 ### 6.2 Regression detection
 - Compare P50/P95 latencies against baseline (last successful main branch run)
 - Thresholds:
-  - Point lookup: fail if P95 increases > 20%
+  - Point lookup: fail if P95 increases > 10% (tight threshold for critical path)
   - FK join: fail if P95 increases > 20%
   - Substring search: fail if P95 increases > 20%
   - Bulk load: fail if time increases > 15%

@@ -40,23 +40,29 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
    - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `IN` (optional MVP), `LIKE`
    - `LEFT JOIN`, `INNER JOIN`
    - `ORDER BY`, `LIMIT`, `OFFSET`
-   - Parameters (positional and/or named; pick one for MVP and document it)
+   - Parameters: positional `$1, $2, ...` (Postgres-style)
 
 5. **Substring search acceleration**
-   - **Trigram inverted index** for chosen TEXT columns to accelerate `LIKE '%pattern%'`
-   - Guardrails for “too broad” patterns (e.g., articles like “THE”, “LA”):
-     - posting-list frequency thresholds
-     - minimum effective pattern length rules
-     - optional requirement of additional filters for short patterns
+    - **Trigram inverted index** for chosen TEXT columns to accelerate `LIKE '%pattern%'`
+    - Guardrails for "too broad" patterns (e.g., articles like "THE", "LA"):
+      - posting-list frequency thresholds
+      - minimum effective pattern length rules
+      - optional requirement of additional filters for short patterns
+
+6. **Data portability (MVP)**
+    - Database file is portable across platforms (little-endian format)
+    - Export to SQL dump format for backup/migration
+    - Import from SQL dump or CSV
 
 ### 2.2 Non-functional goals (MVP)
 - Cross-platform: Linux/Windows/macOS
 - Deterministic tests: reproducible failure cases with seeded randomness
-- Measurable performance:
+- Measurable performance (tested on reference hardware: Intel i5-8400 or equivalent, 16GB RAM, NVMe SSD):
   - point lookups: P95 < 10ms on target dataset (9.5M tracks)
   - FK-join queries (artist→albums→tracks): P95 < 100ms
   - substring search with trigram index: P95 < 200ms
   - writes should be durable by default (fsync on commit)
+  - bulk load: 100k records in < 20 seconds using dedicated bulk_load() API
 
 ## 3. Non-goals (MVP)
 - Multi-process concurrency (future)
@@ -116,10 +122,14 @@ ORDER BY a.name, al.name, t.trackNumber;
 - Point lookup by primary key: P95 < 10ms
 - FK join expansion (artist→albums→tracks): P95 < 100ms
 - Substring search with trigram index: P95 < 200ms
-- Bulk load (100k records): < 30 seconds
+- Bulk load (100k records): < 20 seconds using `bulk_load()` API with deferred durability
+- Normal transaction insert: < 1ms per row (with fsync-on-commit)
 - Crash recovery time: < 5 seconds for 100MB database
 
 ## 6. MVP milestones (phased delivery)
+
+**Checkpointing Timeline Note:** Basic checkpointing is introduced in M3 (WAL + transactions) for WAL size management, but automatic checkpointing with reader coordination is fully hardened in M6.
+
 ### M0 — Project skeleton + testing foundation
 - Repo layout, build, CI on all OSes
 - Python harness scaffold
