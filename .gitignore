@@ -19,3 +19,5 @@ __pycache__/
 tests/harness/seed.log
 --
 tests/nim/
+decentdb_cli
+test.db
