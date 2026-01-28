@@ -25,9 +25,10 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
    - Foreign keys with enforcement (MVP: `RESTRICT` / `NO ACTION`; optional `CASCADE` later)
    - Secondary indexes (B+Tree)
 
-   - **Transactions & durability**
+2. **Transactions & durability**
    - ACID semantics with **WAL-based** persistence
    - `BEGIN`, `COMMIT`, `ROLLBACK`
+   - **Isolation level**: Snapshot Isolation (see ADR-0023)
    - Crash-safe: committed transactions survive crash; uncommitted do not.
 
 3. **Concurrency**
@@ -56,7 +57,13 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
     - Export to SQL dump format for backup/migration
     - Import from SQL dump or CSV
 
-### 2.2 Non-functional goals (MVP)
+7. **Bulk load API (MVP)**
+    - Dedicated high-throughput API for loading large datasets
+    - Configurable durability options (see ADR-0027)
+    - Maintains snapshot isolation for concurrent readers
+    - Performance target: 100k records in < 20 seconds
+
+### 2.3 Non-functional goals (MVP)
 - Cross-platform: Linux/Windows/macOS
 - Deterministic tests: reproducible failure cases with seeded randomness
 - Measurable performance (tested on reference hardware: Intel i5-8400 or equivalent, 16GB RAM, NVMe SSD):
@@ -66,7 +73,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
   - writes should be durable by default (fsync on commit)
   - bulk load: 100k records in < 20 seconds using dedicated bulk_load() API
 
-## 3. Non-goals (MVP)
+## 4. Non-goals (MVP)
 - Multi-process concurrency (future)
 - Full PostgreSQL semantics, system catalogs, extensions, or wire protocol
 - Advanced query optimizer (cost-based, statistics-driven)
@@ -75,24 +82,27 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
 - Replication / clustering
 - Encrypted storage (future optional)
 
-## Critical Gap Addressed: Aggregate Functions
+## 5. Known Limitations
+- **Foreign Key Enforcement Timing**: FK constraints are enforced at statement time rather than transaction commit time, which differs from the SQL standard (see ADR-0009 and SPEC section 7.2)
+
+## 6. Critical Gap Addressed: Aggregate Functions
 **Status:** Added to MVP requirements (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
 
 Rationale: Essential for any practical embedded database use case including basic analytics and reporting queries.
 
-## 4. Target users & use cases
-### 4.1 Primary user
+## 7. Target users & use cases
+### 7.1 Primary user
 A developer building an embedded application needing relational integrity and fast local queries.
 
-### 4.2 Core use cases
+### 7.2 Core use cases
 1. CRUD-heavy app with normalized schema and FK joins
 2. Interactive search using `LIKE '%…%'` on a few text columns (artist/album/track fields)
 3. Read-heavy workloads with occasional writes (single writer thread)
 
-## 5. Representative queries (acceptance targets)
+## 8. Representative queries (acceptance targets)
 The engine should efficiently handle these patterns:
 
-### 5.1 Join + contains predicates
+### 8.1 Join + contains predicates
 ```sql
 SELECT a.id, a.name, al.name, t.trackNumber, t.name
 FROM artist a
@@ -103,7 +113,7 @@ AND a.name like '%JOEL%'
 ORDER BY a.name, al.name, t.trackNumber;
 ```
 
-### 5.2 Point lookup + ordered expansion
+### 8.2 Point lookup + ordered expansion
 ```sql
 SELECT a.id, a.name, al.name, t.trackNumber, t.name
 FROM artist a
@@ -113,7 +123,7 @@ WHERE a.Id = 143
 ORDER BY a.name, al.name, t.trackNumber;
 ```
 
-### 5.3 Track title search + joins
+### 8.3 Track title search + joins
 ```sql
 SELECT a.id, a.name, al.name, t.trackNumber, t.name
 FROM artist a
@@ -125,7 +135,7 @@ AND a.name like '%JOEL%'
 ORDER BY a.name, al.name, t.trackNumber;
 ```
 
-### 5.4 Performance targets (acceptance criteria)
+### 8.4 Performance targets (acceptance criteria)
 - Point lookup by primary key: P95 < 10ms
 - FK join expansion (artist→albums→tracks): P95 < 100ms
 - Substring search with trigram index: P95 < 200ms
@@ -133,7 +143,7 @@ ORDER BY a.name, al.name, t.trackNumber;
 - Normal transaction insert: < 1ms per row (with fsync-on-commit)
 - Crash recovery time: < 5 seconds for 100MB database
 
-## 6. MVP milestones (phased delivery)
+## 9. MVP milestones (phased delivery)
 
 **Checkpointing Timeline Note:** Basic checkpointing is introduced in M3 (WAL + transactions) for WAL size management, but automatic checkpointing with reader coordination is fully hardened in M6.
 
@@ -178,19 +188,19 @@ ORDER BY a.name, al.name, t.trackNumber;
 - Checkpointing + WAL size management
 - Expanded SQL subset as needed
 
-## 7. Quality bar (must-have)
-### 7.1 Correctness requirements
+## 10. Quality bar (must-have)
+### 10.1 Correctness requirements
 - ACID: committed data survives crash in all tested scenarios
 - Readers always see consistent snapshots
 - FKs and constraints enforced correctly
 
-### 7.2 Testing requirements (critical)
+### 10.2 Testing requirements (critical)
 - Unit tests for every core module (pager, WAL, B+Tree, execution)
 - Property-based tests for invariants
 - Crash-injection tests for WAL correctness
 - Differential testing of SQL subset vs PostgreSQL for deterministic queries (Python harness)
 
-## 8. Success metrics
+## 11. Success metrics
 - Import/load and query performance on target dataset sizes
 - P95 latency on representative queries
 - Crash-recovery time bounds
@@ -198,13 +208,13 @@ ORDER BY a.name, al.name, t.trackNumber;
   - Unit tests: fast (< 1–2 minutes) and run on every PR
   - Extended fuzz/crash suites in nightly CI
 
-## 9. Risks and mitigations
+## 12. Risks and mitigations
 - **Index bloat (trigrams):** mitigate with posting list compression and frequency guards
 - **WAL growth:** checkpoints + size thresholds
 - **Planner limitations:** rule-based heuristics + targeted indexes
 - **Testing complexity:** invest early in faulty I/O and deterministic replay
 
-## 10. Out of scope future roadmap (post-MVP)
+## 13. Out of scope future roadmap (post-MVP)
 - Multi-process locking/shmem
 - PostgreSQL wire protocol compatibility (Npgsql)
 - Additional DDL (`ALTER TABLE`)

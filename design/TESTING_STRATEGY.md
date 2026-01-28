@@ -43,10 +43,16 @@ Runs on every PR.
   - “FK constraints never violated”
 - Seeds:
   - record seed on failure
-  - rerun with same seed in CI- Long-running transactions:
+  - rerun with same seed in CI
+- Long-running transactions:
   - Test snapshot isolation under concurrent writes
   - Verify readers see consistent snapshots
   - Test transaction rollback on errors
+- Race condition testing:
+  - Concurrent reader/writer scenarios (see ADR-0026)
+  - Randomized scheduling to expose timing-dependent bugs
+  - Stress testing with many simultaneous operations
+  - Deadlock detection and prevention verification
 ### 2.3 Crash-injection tests (Python)
 Core suite for ACID durability.
 - Define failpoints in engine (or FaultyVFS) at:
@@ -84,6 +90,22 @@ For supported subset only.
   - string matching for LIKE patterns (define exact semantics)
 
 ### 2.5 Resource leak tests
+- File handle leaks:
+  - Track all file opens/closes
+  - **Verify sort temp files deleted**: after spill tests, ensure `temp_dir` is empty
+  - Assert all handles closed after each test
+  - Use OS-level tools (lsof, handle.exe) in CI
+- Memory leaks:
+  - Use Nim's memory tracking (--gc:arc --gc:stats)
+  - Run tests with leak detection enabled
+  - Assert no memory growth across repeated operations
+  - Test long-running operations for gradual memory accumulation
+  - Verify connection-scoped resource cleanup
+- Lock deadlocks:
+  - Inject random delays in lock acquisition
+  - Detect deadlocks via timeout
+  - Verify deadlock recovery (transaction abort)
+  - Test lock ordering consistency to prevent circular waits
 
 ### 2.6 Test Data Generation Specifications
 
@@ -114,19 +136,6 @@ For supported subset only.
    - Structure matching MusicBrainz schema (artist, album, track)
    - 25k artists, 80k albums, 9.5M tracks
    - Used for: Performance benchmarks, FK constraint testing
-- File handle leaks:
-  - Track all file opens/closes
-  - **Verify sort temp files deleted**: after spill tests, ensure `temp_dir` is empty
-  - Assert all handles closed after each test
-  - Use OS-level tools (lsof, handle.exe) in CI
-- Memory leaks:
-  - Use Nim's memory tracking (--gc:arc --gc:stats)
-  - Run tests with leak detection enabled
-  - Assert no memory growth across repeated operations
-- Lock deadlocks:
-  - Inject random delays in lock acquisition
-  - Detect deadlocks via timeout
-  - Verify deadlock recovery (transaction abort)
 
 ## 3. Faulty VFS design (must-have)
 Implement a test-only VFS layer in Nim that can be toggled on.

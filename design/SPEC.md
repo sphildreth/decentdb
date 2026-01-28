@@ -183,6 +183,12 @@ Checkpointed pages are copied to the main database file.
 **Forced Checkpoint (Timeout):**
 - If we must checkpoint while readers are active, we proceed with the copy based on the `writer`'s LSN, but we **skip the WAL truncation** step for any portion needed by readers.
 
+**WAL Growth Prevention (see ADR-0024):**
+- Implement reader tracking to monitor active readers and their snapshot LSNs
+- Introduce configurable timeout for long-running readers to prevent indefinite WAL growth
+- Log warnings when readers hold snapshots for extended periods
+- Optionally force WAL truncation with appropriate safeguards when readers become too stale
+
 ### 4.4 Bulk Load API
 Dedicated API for high-throughput data loading with deferred durability.
 
@@ -477,11 +483,13 @@ Define error categories:
 - Page cache: fixed-size pool of page buffers (configurable, default: 1000 pages)
 - Row materialization: reusable buffers per operator to avoid per-row alloc
 - Trigram buffers: small per-trigram buffers (max 4KB each)
+- Sort buffers: managed pool for external merge sort operations (see ADR-0025)
 
 ### 14.2 Memory limits
 - Configurable maximum memory usage (default: 256MB)
 - Page cache eviction when limit reached (LRU policy)
 - Query execution aborts if memory limit exceeded during execution
+- Per-query memory limits to prevent single queries from consuming all memory
 
 ### 14.3 Out-of-memory handling
 - Pre-allocate memory at startup where possible
@@ -490,6 +498,12 @@ Define error categories:
   - Rollback current transaction
   - Log error with memory usage statistics
 - Do not crash the process; allow graceful degradation
+
+### 14.4 Memory leak prevention and monitoring
+- Track memory allocations with tags for different subsystems
+- Periodic scanning for unreleased resources
+- Integration with leak detection tools during testing
+- Connection-scoped cleanup for per-connection resources (see ADR-0025)
 
 ---
 
