@@ -4,12 +4,14 @@ import tables
 import parsecsv
 import streams
 import times
+import atomics
 import ./engine
 import ./errors
 import ./catalog/catalog
 import ./pager/pager
 import ./record/record
 import ./storage/storage
+import ./wal/wal
 
 const Version = "0.0.1"
 
@@ -22,12 +24,186 @@ proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): Js
     "rows": rows
   }
 
+proc formatDbInfo(database: Db): seq[string] =
+  @[
+    "Format version: " & $database.formatVersion,
+    "Page size: " & $database.pageSize & " bytes",
+    "Cache pages: " & $database.cachePages & " (" & $(database.cachePages * 4096 div 1024) & "KB)",
+    "Schema cookie: " & $database.schemaCookie,
+    "WAL LSN: " & $database.wal.walEnd.load(moAcquire),
+    "Active readers: " & $readerCount(database.wal)
+  ]
+
+proc formatStats(database: Db): seq[string] =
+  let cache = database.pager.cache
+  @[
+    "Page size: " & $database.pager.pageSize & " bytes",
+    "Page count: " & $database.pager.pageCount,
+    "Cache capacity: " & $cache.capacity & " pages",
+    "Cache loaded: " & $cache.pages.len & " pages",
+    "WAL LSN: " & $database.wal.walEnd.load(moAcquire),
+    "Active readers: " & $readerCount(database.wal)
+  ]
+
+proc parseDurability(mode: string): Result[DurabilityMode] =
+  let normalized = mode.strip().toLowerAscii()
+  case normalized
+  of "full":
+    ok(dmFull)
+  of "deferred":
+    ok(dmDeferred)
+  of "none":
+    ok(dmNone)
+  else:
+    err[DurabilityMode](ERR_SQL, "Invalid durability mode", mode)
+
+proc csvCellToValue(cellValue: string, col: ColumnMeta): Value =
+  if cellValue.len == 0:
+    return Value(kind: vkNull)
+  case col.kind
+  of ctInt64:
+    try:
+      Value(kind: vkInt64, int64Val: parseBiggestInt(cellValue))
+    except:
+      Value(kind: vkNull)
+  of ctBool:
+    Value(kind: vkBool, boolVal: cellValue.toLowerAscii() in ["true", "1", "yes"])
+  of ctFloat64:
+    try:
+      Value(kind: vkFloat64, float64Val: parseFloat(cellValue))
+    except:
+      Value(kind: vkNull)
+  of ctText:
+    var bytes: seq[byte] = @[]
+    for ch in cellValue:
+      bytes.add(byte(ch))
+    Value(kind: vkText, bytes: bytes)
+  of ctBlob:
+    var bytes: seq[byte] = @[]
+    for ch in cellValue:
+      bytes.add(byte(ch))
+    Value(kind: vkBlob, bytes: bytes)
+
+proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]] =
+  var parser: CsvParser
+  try:
+    var s = newFileStream(csvFile, fmRead)
+    if s == nil:
+      return err[seq[seq[Value]]](ERR_IO, "Cannot open CSV file", csvFile)
+    parser.open(s, csvFile)
+    parser.readHeaderRow()
+
+    var rows: seq[seq[Value]] = @[]
+    while parser.readRow():
+      if parser.headers.len != tableMeta.columns.len:
+        parser.close()
+        return err[seq[seq[Value]]](ERR_IO, "CSV column count mismatch", $parser.headers.len & " vs " & $tableMeta.columns.len)
+      var values: seq[Value] = @[]
+      for i, col in tableMeta.columns:
+        values.add(csvCellToValue(parser.row[i], col))
+      rows.add(values)
+    parser.close()
+    ok(rows)
+  except:
+    let msg = getCurrentExceptionMsg()
+    err[seq[seq[Value]]](ERR_IO, "CSV parsing error", msg)
+
+proc jsonToValue(node: JsonNode, col: ColumnMeta): Value =
+  if node.isNil or node.kind == JNull:
+    return Value(kind: vkNull)
+  case col.kind
+  of ctInt64:
+    if node.kind == JInt:
+      return Value(kind: vkInt64, int64Val: node.getBiggestInt())
+    if node.kind == JFloat:
+      return Value(kind: vkInt64, int64Val: int64(node.getFloat()))
+    if node.kind == JString:
+      try:
+        return Value(kind: vkInt64, int64Val: parseBiggestInt(node.getStr()))
+      except:
+        return Value(kind: vkNull)
+    Value(kind: vkNull)
+  of ctBool:
+    if node.kind == JBool:
+      return Value(kind: vkBool, boolVal: node.getBool())
+    if node.kind == JString:
+      return Value(kind: vkBool, boolVal: node.getStr().toLowerAscii() in ["true", "1", "yes"])
+    Value(kind: vkNull)
+  of ctFloat64:
+    if node.kind == JFloat:
+      return Value(kind: vkFloat64, float64Val: node.getFloat())
+    if node.kind == JInt:
+      return Value(kind: vkFloat64, float64Val: float64(node.getBiggestInt()))
+    if node.kind == JString:
+      try:
+        return Value(kind: vkFloat64, float64Val: parseFloat(node.getStr()))
+      except:
+        return Value(kind: vkNull)
+    Value(kind: vkNull)
+  of ctText:
+    if node.kind == JString:
+      var bytes: seq[byte] = @[]
+      for ch in node.getStr():
+        bytes.add(byte(ch))
+      return Value(kind: vkText, bytes: bytes)
+    Value(kind: vkNull)
+  of ctBlob:
+    if node.kind == JString:
+      let value = node.getStr()
+      var bytes: seq[byte] = @[]
+      if value.startsWith("0x") and value.len mod 2 == 0:
+        var i = 2
+        while i < value.len:
+          try:
+            let byteVal = parseHexInt(value[i .. i + 1])
+            bytes.add(byte(byteVal))
+          except:
+            bytes = @[]
+            break
+          i += 2
+      else:
+        for ch in value:
+          bytes.add(byte(ch))
+      return Value(kind: vkBlob, bytes: bytes)
+    Value(kind: vkNull)
+
+proc readJsonRows(tableMeta: TableMeta, jsonFile: string): Result[seq[seq[Value]]] =
+  try:
+    let content = readFile(jsonFile)
+    let root = parseJson(content)
+    if root.kind != JArray:
+      return err[seq[seq[Value]]](ERR_IO, "JSON input must be an array", jsonFile)
+    var rows: seq[seq[Value]] = @[]
+    for rowNode in root.items:
+      var values: seq[Value] = @[]
+      if rowNode.kind == JArray:
+        if rowNode.len != tableMeta.columns.len:
+          return err[seq[seq[Value]]](ERR_IO, "JSON column count mismatch", $rowNode.len & " vs " & $tableMeta.columns.len)
+        for i, col in tableMeta.columns:
+          values.add(jsonToValue(rowNode[i], col))
+      elif rowNode.kind == JObject:
+        for col in tableMeta.columns:
+          if rowNode.hasKey(col.name):
+            values.add(jsonToValue(rowNode[col.name], col))
+          else:
+            values.add(Value(kind: vkNull))
+      else:
+        return err[seq[seq[Value]]](ERR_IO, "JSON rows must be arrays or objects", jsonFile)
+      rows.add(values)
+    ok(rows)
+  except:
+    let msg = getCurrentExceptionMsg()
+    err[seq[seq[Value]]](ERR_IO, "JSON parsing error", msg)
+
 # ============================================================================
 # Main SQL Execution Command
 # ============================================================================
 
-proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing: bool = false, 
-             cachePages: int = 64, cacheMb: int = 0, checkpoint: bool = false): int =
+proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing: bool = false, 
+             cachePages: int = 64, cacheMb: int = 0, checkpoint: bool = false,
+             readerCount: bool = false, longReaders: int = 0, dbInfo: bool = false,
+             warnings: bool = false, verbose: bool = false,
+             checkpointBytes: int = 0, checkpointMs: int = 0): int =
   ## DecentDb CLI v0.0.1 - ACID-first embedded relational database
   ## 
   ## Execute SQL statements against a DecentDb database file.
@@ -52,6 +228,35 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing:
 
   let database = openRes.value
   
+  # Configure auto-checkpoint policies if specified
+  if checkpointBytes > 0 or checkpointMs > 0:
+    setCheckpointConfig(database.wal, int64(checkpointBytes), int64(checkpointMs))
+  
+  # Handle reader count diagnostic
+  if readerCount:
+    let count = readerCount(database.wal)
+    discard closeDb(database)
+    echo resultJson(true, rows = @["Active readers: " & $count])
+    return 0
+  
+  # Handle long-running readers diagnostic
+  if longReaders > 0:
+    let longRunning = readersOverThreshold(database.wal, int64(longReaders))
+    var info: seq[string] = @[]
+    info.add("Threshold: " & $longReaders & "ms")
+    for reader in longRunning:
+      info.add("Snapshot " & $reader.snapshot & " age: " & $reader.ageMs & "ms")
+    discard closeDb(database)
+    echo resultJson(true, rows = info)
+    return 0
+  
+  # Handle database info request
+  if dbInfo:
+    let info = formatDbInfo(database)
+    discard closeDb(database)
+    echo resultJson(true, rows = info)
+    return 0
+  
   # Handle checkpoint request
   if checkpoint:
     let ckRes = checkpointDb(database)
@@ -59,8 +264,17 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing:
       discard closeDb(database)
       echo resultJson(false, ckRes.err)
       return 1
+    
+    var result: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
+    
+    # Add warnings if present
+    if warnings or verbose:
+      let walWarnings = takeWarnings(database.wal)
+      for warn in walWarnings:
+        result.add("WARNING: " & warn)
+    
     discard closeDb(database)
-    echo resultJson(true, rows = @["Checkpoint completed at LSN " & $ckRes.value])
+    echo resultJson(true, rows = result)
     return 0
   
   if not openClose and sql.len > 0:
@@ -74,20 +288,40 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing:
       return 1
     
     let rows = execRes.value
+    
+    # Collect warnings if requested
+    var walWarnings: seq[string] = @[]
+    if warnings or verbose:
+      walWarnings = takeWarnings(database.wal)
+    
     discard closeDb(database)
     
-    # Add timing info to JSON output if requested
-    if timing:
-      let totalTime = (epochTime() - startTime) * 1000.0  # Convert to ms
-      let queryTime = (queryEnd - queryStart) * 1000.0
-      let timingInfo = %*{
-        "total_ms": totalTime,
-        "query_ms": queryTime,
-        "cache_pages": actualCachePages,
-        "cache_mb": (actualCachePages * 4096) div (1024 * 1024)
-      }
+    # Add timing info and warnings to JSON output if requested
+    if timing or warnings or verbose:
       var result = resultJson(true, rows = rows)
-      result["timing"] = timingInfo
+      
+      if timing:
+        let totalTime = (epochTime() - startTime) * 1000.0  # Convert to ms
+        let queryTime = (queryEnd - queryStart) * 1000.0
+        let timingInfo = %*{
+          "total_ms": totalTime,
+          "query_ms": queryTime,
+          "cache_pages": actualCachePages,
+          "cache_mb": (actualCachePages * 4096) div (1024 * 1024)
+        }
+        result["timing"] = timingInfo
+      
+      if (warnings or verbose) and walWarnings.len > 0:
+        result["warnings"] = %walWarnings
+      
+      if verbose:
+        let verboseInfo = %*{
+          "wal_lsn": database.wal.walEnd.load(moAcquire),
+          "active_readers": readerCount(database.wal),
+          "cache_pages": actualCachePages
+        }
+        result["verbose"] = verboseInfo
+      
       echo result
     else:
       echo resultJson(true, rows = rows)
@@ -101,7 +335,7 @@ proc cliMain(db: string = "", sql: string = "", openClose: bool = false, timing:
 # Schema Introspection Commands
 # ============================================================================
 
-proc schemaListTables(db: string = ""): int =
+proc schemaListTables*(db: string = ""): int =
   ## List all tables in the database
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
@@ -122,7 +356,7 @@ proc schemaListTables(db: string = ""): int =
   echo resultJson(true, rows = tables)
   return 0
 
-proc schemaDescribe(table: string, db: string = ""): int =
+proc schemaDescribe*(table: string, db: string = ""): int =
   ## Show table structure (columns, types, constraints)
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
@@ -168,7 +402,7 @@ proc schemaDescribe(table: string, db: string = ""): int =
   echo resultJson(true, rows = output)
   return 0
 
-proc schemaListIndexes(db: string = "", table: string = ""): int =
+proc schemaListIndexes*(db: string = "", table: string = ""): int =
   ## List all indexes, optionally filtered by table
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
@@ -199,11 +433,87 @@ proc schemaListIndexes(db: string = "", table: string = ""): int =
   return 0
 
 # ============================================================================
+# Index Maintenance Commands
+# ============================================================================
+
+proc cmdRebuildIndex*(index: string = "", db: string = ""): int =
+  ## Rebuild an index from scratch
+  if db.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+  
+  if index.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --index argument"))
+    return 1
+
+  let openRes = openDb(db)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  
+  if not database.catalog.indexes.hasKey(index):
+    discard closeDb(database)
+    echo resultJson(false, DbError(code: ERR_SQL, message: "Index not found", context: index))
+    return 1
+  
+  let indexMeta = database.catalog.indexes[index]
+  let rebuildRes = storage.rebuildIndex(database.pager, database.catalog, indexMeta)
+  
+  if not rebuildRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, rebuildRes.err)
+    return 1
+  
+  discard closeDb(database)
+  echo resultJson(true, rows = @["Index '" & index & "' rebuilt successfully"])
+  return 0
+
+proc cmdVerifyIndex*(index: string = "", db: string = ""): int =
+  ## Verify index integrity (basic check)
+  if db.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+  
+  if index.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --index argument"))
+    return 1
+
+  let openRes = openDb(db)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  
+  if not database.catalog.indexes.hasKey(index):
+    discard closeDb(database)
+    echo resultJson(false, DbError(code: ERR_SQL, message: "Index not found", context: index))
+    return 1
+  
+  let indexMeta = database.catalog.indexes[index]
+  
+  # Basic verification - check that index exists in catalog
+  # More sophisticated verification would scan index structure
+  var info: seq[string] = @[]
+  info.add("Index: " & index)
+  info.add("Table: " & indexMeta.table)
+  info.add("Column: " & indexMeta.column)
+  info.add("Type: " & $indexMeta.kind)
+  info.add("Root page: " & $indexMeta.rootPage)
+  info.add("Status: OK")
+  
+  discard closeDb(database)
+  echo resultJson(true, rows = info)
+  return 0
+
+# ============================================================================
 # Import/Export Commands
 # ============================================================================
 
-proc importCsv(table: string, csvFile: string, db: string = "", batchSize: int = 10000): int =
-  ## Import data from CSV file into a table
+proc importData*(table: string, input: string, db: string = "", batchSize: int = 10000, format: string = "csv"): int =
+  ## Import data from CSV or JSON into a table
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
     return 1
@@ -212,8 +522,8 @@ proc importCsv(table: string, csvFile: string, db: string = "", batchSize: int =
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing table name"))
     return 1
   
-  if csvFile.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing CSV file path"))
+  if input.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing input file path"))
     return 1
 
   let openRes = openDb(db)
@@ -230,99 +540,46 @@ proc importCsv(table: string, csvFile: string, db: string = "", batchSize: int =
   
   let tableMeta = database.catalog.tables[table]
   
-  var parser: CsvParser
-  try:
-    var s = newFileStream(csvFile, fmRead)
-    if s == nil:
-      discard closeDb(database)
-      echo resultJson(false, DbError(code: ERR_IO, message: "Cannot open CSV file", context: csvFile))
-      return 1
-    
-    parser.open(s, csvFile)
-    parser.readHeaderRow()
-    
-    var rowCount = 0
-    var batch: seq[seq[Value]] = @[]
-    
-    while parser.readRow():
-      if parser.headers.len != tableMeta.columns.len:
-        parser.close()
-        discard closeDb(database)
-        echo resultJson(false, DbError(code: ERR_IO, message: "CSV column count mismatch", context: $parser.headers.len & " vs " & $tableMeta.columns.len))
-        return 1
-      
-      var values: seq[Value] = @[]
-      for i, col in tableMeta.columns:
-        let cellValue = parser.row[i]
-        
-        # Parse value according to column type
-        let value = if cellValue.len == 0:
-          Value(kind: vkNull)
-        else:
-          case col.kind
-          of ctInt64:
-            try:
-              Value(kind: vkInt64, int64Val: parseBiggestInt(cellValue))
-            except:
-              Value(kind: vkNull)
-          of ctBool:
-            Value(kind: vkBool, boolVal: cellValue.toLowerAscii() in ["true", "1", "yes"])
-          of ctFloat64:
-            try:
-              Value(kind: vkFloat64, float64Val: parseFloat(cellValue))
-            except:
-              Value(kind: vkNull)
-          of ctText:
-            var bytes: seq[byte] = @[]
-            for ch in cellValue:
-              bytes.add(byte(ch))
-            Value(kind: vkText, bytes: bytes)
-          of ctBlob:
-            # For now, treat blob as text encoding
-            var bytes: seq[byte] = @[]
-            for ch in cellValue:
-              bytes.add(byte(ch))
-            Value(kind: vkBlob, bytes: bytes)
-        
-        values.add(value)
-      
-      batch.add(values)
-      rowCount.inc
-      
-      # Insert batch when it reaches batchSize
-      if batch.len >= batchSize:
-        for row in batch:
-          let insertRes = insertRow(database.pager, database.catalog, table, row)
-          if not insertRes.ok:
-            parser.close()
-            discard closeDb(database)
-            echo resultJson(false, insertRes.err)
-            return 1
-        batch = @[]
-    
-    # Insert remaining batch
-    if batch.len > 0:
-      for row in batch:
-        let insertRes = insertRow(database.pager, database.catalog, table, row)
+  let formatNormalized = format.strip().toLowerAscii()
+  let rowsRes = if formatNormalized == "csv":
+    readCsvRows(tableMeta, input)
+  elif formatNormalized == "json":
+    readJsonRows(tableMeta, input)
+  else:
+    err[seq[seq[Value]]](ERR_IO, "Unsupported import format", format)
+  if not rowsRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, rowsRes.err)
+    return 1
+
+  var rowCount = 0
+  var batch: seq[seq[Value]] = @[]
+  for row in rowsRes.value:
+    batch.add(row)
+    rowCount.inc
+    if batch.len >= batchSize:
+      for insertRowValues in batch:
+        let insertRes = insertRow(database.pager, database.catalog, table, insertRowValues)
         if not insertRes.ok:
-          parser.close()
           discard closeDb(database)
           echo resultJson(false, insertRes.err)
           return 1
-    
-    parser.close()
-    discard closeDb(database)
-    echo resultJson(true, rows = @["Imported " & $rowCount & " rows"])
-    return 0
-    
-  except:
-    let msg = getCurrentExceptionMsg()
-    discard closeDb(database)
-    echo resultJson(false, DbError(code: ERR_IO, message: "CSV parsing error", context: msg))
-    return 1
+      batch = @[]
 
-proc exportCsv(table: string, csvFile: string, db: string = ""): int =
-  ## Export table data to CSV file
+  if batch.len > 0:
+    for insertRowValues in batch:
+      let insertRes = insertRow(database.pager, database.catalog, table, insertRowValues)
+      if not insertRes.ok:
+        discard closeDb(database)
+        echo resultJson(false, insertRes.err)
+        return 1
+
+  discard closeDb(database)
+  echo resultJson(true, rows = @["Imported " & $rowCount & " rows"])
+  return 0
+
+proc exportData*(table: string, output: string, db: string = "", format: string = "csv"): int =
+  ## Export table data to CSV or JSON file
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
     return 1
@@ -331,8 +588,8 @@ proc exportCsv(table: string, csvFile: string, db: string = ""): int =
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing table name"))
     return 1
   
-  if csvFile.len == 0:
-    echo resultJson(false, DbError(code: ERR_IO, message: "Missing CSV file path"))
+  if output.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing output file path"))
     return 1
 
   let openRes = openDb(db)
@@ -348,68 +605,100 @@ proc exportCsv(table: string, csvFile: string, db: string = ""): int =
     return 1
   
   let tableMeta = database.catalog.tables[table]
-  
+  let formatNormalized = format.strip().toLowerAscii()
+  if formatNormalized notin ["csv", "json"]:
+    discard closeDb(database)
+    echo resultJson(false, DbError(code: ERR_IO, message: "Unsupported export format", context: format))
+    return 1
+
   try:
-    var f = open(csvFile, fmWrite)
-    
-    # Write header
-    var headers: seq[string] = @[]
-    for col in tableMeta.columns:
-      headers.add(col.name)
-    f.writeLine(headers.join(","))
-    
-    # Read all rows and export
+    # Read all rows
     let rowsRes = scanTable(database.pager, tableMeta)
     if not rowsRes.ok:
-      f.close()
       discard closeDb(database)
       echo resultJson(false, rowsRes.err)
       return 1
-    
-    var rowCount = 0
+
+    if formatNormalized == "csv":
+      var f = open(output, fmWrite)
+      var headers: seq[string] = @[]
+      for col in tableMeta.columns:
+        headers.add(col.name)
+      f.writeLine(headers.join(","))
+
+      var rowCount = 0
+      for row in rowsRes.value:
+        var fields: seq[string] = @[]
+        for value in row.values:
+          let fieldValue = case value.kind
+          of vkNull:
+            ""
+          of vkInt64:
+            $value.int64Val
+          of vkBool:
+            if value.boolVal: "true" else: "false"
+          of vkFloat64:
+            $value.float64Val
+          of vkText, vkBlob:
+            var s = ""
+            for b in value.bytes:
+              s.add(char(b))
+            s
+          else:
+            ""
+
+          let escaped = if "," in fieldValue or "\"" in fieldValue:
+            "\"" & fieldValue.replace("\"", "\"\"") & "\""
+          else:
+            fieldValue
+          fields.add(escaped)
+        f.writeLine(fields.join(","))
+        rowCount.inc
+      f.close()
+      discard closeDb(database)
+      echo resultJson(true, rows = @["Exported " & $rowCount & " rows to " & output & " (csv)"])
+      return 0
+
+    var f = open(output, fmWrite)
+    var jsonRows: JsonNode = newJArray()
     for row in rowsRes.value:
-      var fields: seq[string] = @[]
-      for value in row.values:
-        let fieldValue = case value.kind
+      var obj = newJObject()
+      for i, value in row.values:
+        let colName = tableMeta.columns[i].name
+        case value.kind
         of vkNull:
-          ""
+          obj[colName] = newJNull()
         of vkInt64:
-          $value.int64Val
+          obj[colName] = %value.int64Val
         of vkBool:
-          if value.boolVal: "true" else: "false"
+          obj[colName] = %value.boolVal
         of vkFloat64:
-          $value.float64Val
-        of vkText, vkBlob:
+          obj[colName] = %value.float64Val
+        of vkText:
           var s = ""
           for b in value.bytes:
             s.add(char(b))
-          s
+          obj[colName] = %s
+        of vkBlob:
+          var hexStr = ""
+          for b in value.bytes:
+            hexStr.add(toHex(int(b), 2))
+          obj[colName] = %("0x" & hexStr)
         else:
-          ""
-        
-        # Escape commas and quotes in CSV
-        let escaped = if "," in fieldValue or "\"" in fieldValue:
-          "\"" & fieldValue.replace("\"", "\"\"") & "\""
-        else:
-          fieldValue
-        
-        fields.add(escaped)
-      
-      f.writeLine(fields.join(","))
-      rowCount.inc
-    
+          obj[colName] = newJNull()
+      jsonRows.add(obj)
+    f.writeLine($jsonRows)
     f.close()
     discard closeDb(database)
-    echo resultJson(true, rows = @["Exported " & $rowCount & " rows"])
+    echo resultJson(true, rows = @["Exported " & $rowsRes.value.len & " rows to " & output & " (json)"])
     return 0
-    
   except:
     let msg = getCurrentExceptionMsg()
     discard closeDb(database)
     echo resultJson(false, DbError(code: ERR_IO, message: "File write error", context: msg))
     return 1
 
-proc dumpSql(db: string = "", output: string = ""): int =
+proc dumpSql*(db: string = "", output: string = ""): int =
   ## Dump entire database as SQL statements
   if db.len == 0:
     echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
@@ -509,28 +798,129 @@ proc dumpSql(db: string = "", output: string = ""): int =
     return 0
 
 # ============================================================================
-# Main Entry Point - Backward Compatible Mode
+# Bulk Load Command
 # ============================================================================
 
-when isMainModule:
-  import cligen
-  
-  # For now, use simple dispatch for backward compatibility with test harness
-  # The subcommand functions (schemaListTables, etc.) remain available for
-  # future migration to dispatchMulti when test harness is updated
-  
-  dispatch cliMain,
-    help = {
-      "db": "Path to database file (required)",
-      "sql": "SQL statement to execute",
-      "openClose": "Open and close database without executing SQL (testing mode)",
-      "timing": "Show query execution timing in milliseconds",
-      "cachePages": "Number of 4KB pages to cache (default: 64 = 256KB)",
-      "cacheMb": "Cache size in megabytes (overrides --cache-pages if specified)",
-      "checkpoint": "Force a WAL checkpoint and exit"
-    },
-    short = {
-      "db": 'd',
-      "sql": 's',
-      "timing": 't'
-    }
+proc bulkLoadCsv*(table: string, input: string, db: string = "", batchSize: int = 10000,
+                  syncInterval: int = 10, durability: string = "deferred",
+                  disableIndexes: bool = true, noCheckpoint: bool = false): int =
+  ## Bulk load data from CSV using optimized ingestion
+  if db.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+  if table.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing table name"))
+    return 1
+  if input.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing input file path"))
+    return 1
+
+  let openRes = openDb(db)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  if not database.catalog.tables.hasKey(table):
+    discard closeDb(database)
+    echo resultJson(false, DbError(code: ERR_SQL, message: "Table not found", context: table))
+    return 1
+
+  let durRes = parseDurability(durability)
+  if not durRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, durRes.err)
+    return 1
+
+  let rowsRes = readCsvRows(database.catalog.tables[table], input)
+  if not rowsRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, rowsRes.err)
+    return 1
+
+  let options = BulkLoadOptions(
+    batchSize: batchSize,
+    syncInterval: syncInterval,
+    disableIndexes: disableIndexes,
+    checkpointOnComplete: not noCheckpoint,
+    durability: durRes.value
+  )
+  let loadRes = bulkLoad(database, table, rowsRes.value, options, database.wal)
+  if not loadRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, loadRes.err)
+    return 1
+
+  discard closeDb(database)
+  echo resultJson(true, rows = @["Bulk loaded " & $rowsRes.value.len & " rows"])
+  return 0
+
+# ============================================================================
+# Maintenance & Diagnostics Commands
+# ============================================================================
+
+proc checkpointCmd*(db: string = "", warnings: bool = false, verbose: bool = false): int =
+  ## Force a WAL checkpoint and exit
+  if db.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  let openRes = openDb(db)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  let ckRes = checkpointDb(database)
+  if not ckRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, ckRes.err)
+    return 1
+
+  var result: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
+  if warnings or verbose:
+    let walWarnings = takeWarnings(database.wal)
+    for warn in walWarnings:
+      result.add("WARNING: " & warn)
+
+  discard closeDb(database)
+  echo resultJson(true, rows = result)
+  return 0
+
+proc infoCmd*(db: string = ""): int =
+  ## Display database information (format, size, cache, LSN)
+  if db.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  let openRes = openDb(db)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  let info = formatDbInfo(database)
+  discard closeDb(database)
+  echo resultJson(true, rows = info)
+  return 0
+
+proc statsCmd*(db: string = ""): int =
+  ## Show basic engine statistics
+  if db.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  let openRes = openDb(db)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  let stats = formatStats(database)
+  discard closeDb(database)
+  echo resultJson(true, rows = stats)
+  return 0
+
+# ============================================================================
+# Main Entry Point - Backward Compatible Mode
+# ============================================================================

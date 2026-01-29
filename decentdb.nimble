@@ -3,7 +3,7 @@ author        = "DecentDb contributors"
 description   = "DecentDb engine (pre-alpha)"
 license       = "Apache-2.0"
 srcDir        = "src"
-bin           = @["decentdb_cli", "decentdb_schema", "decentdb_data"]
+bin           = @["decentdb"]
 
 requires "nim >= 1.6.0"
 requires "cligen >= 1.7.0"
@@ -56,6 +56,7 @@ task coverage_nim, "Run Nim unit tests with gcov coverage report":
   exec "scripts/coverage_nim.sh"
 
 task lint, "Static checks for Nim + Python":
+  exec "nim check src/decentdb.nim"
   exec "nim check src/decentdb_cli.nim"
   exec "nim check src/engine.nim"
   exec "nim check src/vfs/vfs.nim"

@@ -21,6 +21,10 @@ def build_engine_command(engine_path: str, db_path: str, sql: str | None, open_c
     cmd = [engine_path]
     if engine_path.endswith(".py"):
         cmd = [sys.executable, engine_path]
+    else:
+        engine_name = Path(engine_path).name
+        if engine_name in {"decentdb", "decentdb.exe"}:
+            cmd.append("exec")
     cmd += ["--db", db_path]
     if open_close:
         cmd += ["--open-close"]

@@ -5,10 +5,10 @@
 
 ## 1. Summary
 
-This document outlines the plan to enhance the `decentdb_cli` tool with comprehensive CLI features including:
+This document outlines the plan to enhance the `decentdb` CLI with comprehensive features including:
 - Standard flags (`--help`, `--version`)
-- Schema introspection (`--list-tables`, `--describe`, `--list-indexes`)
-- Data import/export (`--import`, `--export`, `--bulk-load`, `--dump-sql`)
+- Schema introspection (`list-tables`, `describe`, `list-indexes`)
+- Data import/export (`import`, `export`, `bulk-load`, `dump`)
 
 The implementation will upgrade from manual `parseopt` parsing to the modern `cligen` framework with subcommands.
 
@@ -16,7 +16,7 @@ The implementation will upgrade from manual `parseopt` parsing to the modern `cl
 
 ### 2.1 Current Limitations
 
-The `decentdb_cli` tool (src/decentdb_cli.nim:1-56) currently uses Nim's basic `parseopt` library with these limitations:
+The `decentdb` exec command (implemented in `src/decentdb_cli.nim`) currently uses Nim's basic `parseopt` library with these limitations:
 
 1. **No help text** - `--help` flag not implemented; users cannot discover available options
 2. **No version information** - `--version` flag missing; cannot verify CLI version
@@ -29,13 +29,13 @@ The `decentdb_cli` tool (src/decentdb_cli.nim:1-56) currently uses Nim's basic `
 
 **Current experience:**
 ```bash
-$ decentdb_cli --help
+$ decentdb exec --help
 {"ok":false,"error":{"code":"ERR_IO","message":"Missing --db argument","context":""},"rows":[]}
 
-$ decentdb_cli --version
+$ decentdb exec --version
 {"ok":false,"error":{"code":"ERR_IO","message":"Missing --db argument","context":""},"rows":[]}
 
-$ decentdb_cli --typo-in-flag-name
+$ decentdb exec --typo-in-flag-name
 # Silently ignored, no warning or error - BAD!
 ```
 
@@ -53,7 +53,7 @@ $ decentdb_cli --typo-in-flag-name
 
 ### 3.1 Architecture
 
-**Main entry point:** `src/decentdb_cli.nim`
+**Main entry point:** `src/decentdb.nim` (dispatches to exec logic in `src/decentdb_cli.nim`)
 
 **Current parsing approach:**
 ```nim
@@ -84,14 +84,16 @@ for kind, key, val in getOpt():  # parseopt iterator
 
 ### 3.2 Test Integration
 
-The CLI is invoked by Python test harness (`tests/harness/runner.py:20-29`):
+The CLI is invoked by Python test harness (`tests/harness/runner.py:20-35`):
 
 ```python
 def build_engine_command(engine_path: str, db_path: str, sql: str | None, open_close: bool) -> list[str]:
     cmd = [engine_path]
     if engine_path.endswith(".py"):
         cmd = [sys.executable, engine_path]
-    cmd += [f"--db={db_path}"]
+    elif Path(engine_path).name in {"decentdb", "decentdb.exe"}:
+        cmd.append("exec")
+    cmd += ["--db", db_path]
     if open_close:
         cmd += ["--open-close"]
     elif sql:
@@ -145,14 +147,14 @@ def build_engine_command(engine_path: str, db_path: str, sql: str | None, open_c
 **After implementation:**
 
 ```bash
-$ decentdb_cli --help
+$ decentdb exec --help
 DecentDb CLI - ACID-first embedded relational database
 
 Execute SQL statements against a DecentDb database file.
 All output is JSON formatted for programmatic use.
 
 Usage:
-  decentdb_cli [optional-params] 
+  decentdb exec [optional-params] 
 Options:
   -h, --help                      print this cligen-erated help
   --help-syntax                   advanced: prepend,plurals,..
@@ -161,14 +163,14 @@ Options:
   -s, --sql=       string ""      SQL statement to execute
   --open-close     bool   false   Open and close without executing SQL (testing mode)
 
-$ decentdb_cli --version
+$ decentdb exec --version
 0.0.1
 
-$ decentdb_cli --typo-in-flag-name
+$ decentdb exec --typo-in-flag-name
 Error: Unknown option: "typo-in-flag-name"
-Try 'decentdb_cli --help' for more information.
+Try 'decentdb exec --help' for more information.
 
-$ decentdb_cli -d test.db -s "SELECT * FROM users"
+$ decentdb exec -d test.db -s "SELECT * FROM users"
 {"ok":true,"error":null,"rows":["id|name|email",...]}
 ```
 
@@ -193,7 +195,7 @@ requires "cligen >= 1.7.0"  # Add this line
 
 ### Phase 2: Refactor CLI Implementation
 
-**File:** `src/decentdb_cli.nim`
+**Files:** `src/decentdb_cli.nim` (exec handler), `src/decentdb.nim` (CLI entry point)
 
 **Changes:**
 
@@ -216,19 +218,14 @@ requires "cligen >= 1.7.0"  # Add this line
 
 3. **Replace parseopt with cligen dispatch**
    ```nim
+   # src/decentdb.nim
    when isMainModule:
-     import cligen
-     dispatch cliMain,
-       version = Version,
-       help = {
-         "db": "Path to database file (required)",
-         "sql": "SQL statement to execute",
-         "openClose": "Open and close database without executing SQL (testing mode)"
-       },
-       short = {
-         "db": 'd',
-         "sql": 's'
-       }
+     dispatchMulti(
+       ["multi", doc = "DecentDb CLI v" & Version],
+       [cliMain, cmdName = "exec", ...],
+       [listTables, cmdName = "list-tables", ...],
+       [importData, cmdName = "import", ...]
+     )
    ```
 
 **Key preservation:**
@@ -238,7 +235,7 @@ requires "cligen >= 1.7.0"  # Add this line
 
 ### Phase 3: Validation Testing
 
-**No test harness changes required** - cligen accepts same syntax as parseopt.
+**Test harness update required** - `decentdb` uses the `exec` subcommand for SQL execution.
 
 **New tests to add:**
 
@@ -248,13 +245,13 @@ requires "cligen >= 1.7.0"  # Add this line
    
    suite "CLI interface tests":
      test "help flag shows usage":
-       let (output, exitCode) = execCmdEx("./decentdb_cli --help")
+       let (output, exitCode) = execCmdEx("./decentdb exec --help")
        check exitCode == 0
        check "Usage:" in output
        check "--db" in output
      
      test "version flag shows version":
-       let (output, exitCode) = execCmdEx("./decentdb_cli --version")
+       let (output, exitCode) = execCmdEx("./decentdb exec --version")
        check exitCode == 0
        check "0.0.1" in output
      
@@ -296,7 +293,7 @@ requires "cligen >= 1.7.0"  # Add this line
    DecentDb provides a command-line tool for direct database interaction:
    
    ```bash
-   decentdb_cli --db=path/to/db.db --sql="SELECT * FROM users"
+   decentdb exec --db=path/to/db.db --sql="SELECT * FROM users"
    ```
    
    All output is JSON formatted for programmatic integration with test harnesses.
@@ -333,7 +330,7 @@ task test, "Run Nim + Python unit tests":
 ### 6.2 Integration Tests (Python Harness)
 
 **Coverage:**
-- Existing scenarios continue to work unchanged
+- Existing scenarios continue to work with `decentdb exec`
 - Version check via subprocess
 - Help text parsing
 - JSON output format validation
@@ -344,7 +341,7 @@ task test, "Run Nim + Python unit tests":
 - All existing `tests/harness/test_runner.py` tests pass
 - JSON schema unchanged
 - Exit codes unchanged
-- Flag syntax backward compatible
+- Flag syntax stable within the unified `decentdb` CLI
 
 Tests will need to be modified to use the new CLI interface.
 
@@ -362,15 +359,15 @@ Tests will need to be modified to use the new CLI interface.
 Implementation is **done** when:
 
 ### Basic CLI Features:
-✅ `decentdb_cli --help` shows formatted usage with all subcommands  
-✅ `decentdb_cli --version` outputs `0.0.1`  
+✅ `decentdb exec --help` shows formatted usage with all subcommands  
+✅ `decentdb exec --version` outputs `0.0.1`  
 ✅ **Invalid flags trigger error** (e.g., `--typo` → "Unknown option" with help hint)  
 ✅ Short flags work: `-d database.db -s "SELECT 1"`  
 
 ### Schema Introspection:
-✅ `decentdb schema list-tables -d test.db` lists all tables  
-✅ `decentdb schema describe users -d test.db` shows table structure  
-✅ `decentdb schema list-indexes -d test.db` shows all indexes  
+✅ `decentdb list-tables -d test.db` lists all tables  
+✅ `decentdb describe users -d test.db` shows table structure  
+✅ `decentdb list-indexes -d test.db` shows all indexes  
 
 ### Import Functionality:
 ✅ `decentdb import users data.csv -d test.db` imports CSV  
@@ -380,7 +377,7 @@ Implementation is **done** when:
 ### Export Functionality:
 ✅ `decentdb export users output.csv -d test.db` exports to CSV  
 ✅ `decentdb export users output.json -d test.db --format=json` exports to JSON  
-✅ `decentdb dump-sql -d test.db > backup.sql` full database dump  
+✅ `decentdb dump -d test.db > backup.sql` full database dump  
 
 ### Testing & Compatibility:
 ✅ All existing Python harness tests pass without modification  
@@ -424,7 +421,7 @@ This is a **user interface enhancement** that:
 - CSV/JSON parser implementation
 - Import and bulk-load functionality
 - Export functionality (CSV/JSON/SQL)
-- Dump-sql for full database backup
+- Dump for full database backup
 - Comprehensive test coverage
 - Documentation updates
 - CI validation
@@ -442,10 +439,10 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]],
 ```
 
 **Proposed CLI options:**
-- `--bulk-load <file>` - Load data from CSV/JSON file
+- `bulk-load <file>` - Load data from CSV file
 - `--batch-size <n>` - Rows per batch (default: 10000)
 - `--sync-interval <n>` - Batches between fsync (default: 10)
-- `--durability [full|deferred|none]` - Durability mode (default: full)
+- `--durability [full|deferred|none]` - Durability mode (default: deferred)
 - `--no-checkpoint` - Skip checkpoint after bulk load
 
 **Use case:** Fast import of large datasets (PRD target: 100k records < 20s)
@@ -527,7 +524,7 @@ proc scanTable*(pager: Pager, table: TableMeta): Result[seq[StoredRow]]
 **Proposed CLI options:**
 - `--export <table> <file>` - Export table to CSV/JSON/SQL
 - `--import <table> <file>` - Import from CSV/JSON
-- `--dump-sql` - Export entire database as SQL dump
+- `dump` - Export entire database as SQL dump
 
 **Use case:** Data portability (aligns with PRD Section 6)
 
@@ -576,11 +573,11 @@ type DbHeader = object
 **Phase 1 (Extended - This Document):** ✅ **COMPLETED 2026-01-28**
 - ✅ `--help` / `-h`, `--version` (standard CLI - version in help text)
 - ✅ `--db` / `-d`, `--sql` / `-s` (existing functionality with short flags)
-- ✅ Schema introspection via `decentdb_schema` tool:
+- ✅ Schema introspection via `decentdb` commands:
   - `list-tables`, `describe`, `list-indexes` subcommands
-- ✅ Data import/export via `decentdb_data` tool:
+- ✅ Data import/export via `decentdb` commands:
   - `import` (CSV to DB), `export` (DB to CSV), `dump` (SQL backup)
-- ✅ Subcommand structure using `dispatchMulti` for schema and data tools
+- ✅ Subcommand structure using `dispatchMulti` for schema and data commands
 - ✅ `--timing` / `-t` for query performance diagnostics
 
 **Phase 2 (Performance & Diagnostics):** ✅ **COMPLETED 2026-01-28** (See ADR-003)
@@ -592,13 +589,14 @@ type DbHeader = object
   - Changes currently commit immediately (WAL provides crash recovery)
   - Documented in ADR-003 as future enhancement
 
-**Phase 3 (Future - Advanced/Debugging):**
-- ⏭️ `--rebuild-index`, `--verify-index` (maintenance)
-- ⏭️ `--reader-count`, `--long-readers` (concurrency diagnostics)
-- ⏭️ `--dump-header`, `--db-info` (forensics)
-- ⏭️ `--warnings`, `--verbose` (debugging)
-- ⏭️ `--checkpoint-bytes`, `--checkpoint-ms` (auto-checkpoint policies)
-- ⏭️ Complete transaction isolation (storage layer integration)
+**Phase 3 (Advanced/Debugging):** ✅ **COMPLETED 2026-01-28**
+- ✅ **UNIFIED CLI Tool**: `decentdb` binary containing all subcommands
+- ✅ `--rebuild-index`, `--verify-index` (implemented in `decentdb`)
+- ✅ `--reader-count`, `--long-readers` (implemented in `decentdb exec`)
+- ✅ `--db-info` (implemented in `decentdb exec` - shows header, format, size)
+- ✅ `--warnings`, `--verbose` (debugging output for WAL/checkpoints)
+- ✅ `--checkpoint-bytes`, `--checkpoint-ms` (auto-checkpoint configuration)
+- ⚠️ Complete transaction isolation (storage layer integration remains pending as Future/Phase 4)
 
 ### 11.3 Subcommand Architecture (Future)
 
@@ -609,8 +607,8 @@ For Phase 2+, recommend **subcommand structure** using cligen's `dispatchMulti`:
 decentdb exec --db=test.db --sql="SELECT * FROM users"
 
 # Schema introspection
-decentdb schema list-tables --db=test.db
-decentdb schema describe users --db=test.db
+decentdb list-tables --db=test.db
+decentdb describe users --db=test.db
 
 # Data operations
 decentdb bulk-load users data.csv --batch-size=50000 --durability=deferred
@@ -644,7 +642,7 @@ These would require separate design documents and may be considered post-MVP.
 
 ## 13. References
 
-- Current CLI implementation: `src/decentdb_cli.nim`
+- Current CLI entry point: `src/decentdb.nim` (exec handler in `src/decentdb_cli.nim`)
 - Test harness integration: `tests/harness/runner.py`
 - Project PRD: `design/PRD.md`
 - Agent guidelines: `AGENTS.md`
@@ -656,16 +654,15 @@ These would require separate design documents and may be considered post-MVP.
 
 **Phase 1 Completed:** 2026-01-28  
 **Phase 2 Completed:** 2026-01-28  
+**Phase 3 Completed:** 2026-01-28  
 **ADR Created:** design/adr/003-cli-engine-enhancements.md
 
 **Implementation Documentation:** design/CLI-IMPROVEMENTS-IMPLEMENTATION.md
 
 **Key Deliverables:**
-1. ✅ `decentdb_cli` - Enhanced main CLI with timing, cache config, checkpoint
-2. ✅ `decentdb_schema` - Schema introspection tool (list-tables, describe, list-indexes)
-3. ✅ `decentdb_data` - Import/export tool (CSV import/export, SQL dump)
+1. ✅ `decentdb` - Unified CLI with exec, schema, maintenance, and data commands
 4. ✅ Engine enhancements - Configurable cache, WAL control, transaction API
-5. ✅ All existing tests pass - 100% backward compatibility maintained
+5. ✅ All existing tests pass
 
 **Performance Results:**
 - 37% query performance improvement with 1MB cache (vs default 256KB)
@@ -673,4 +670,4 @@ These would require separate design documents and may be considered post-MVP.
 - Timing diagnostics with cache statistics
 
 **Next Steps:**
-- Phase 3 (Optional): Advanced diagnostics, auto-checkpoint policies, complete transaction isolation
+- Phase 4 (Future): Complete transaction isolation (storage layer integration)

@@ -35,14 +35,14 @@ class RunnerTests(unittest.TestCase):
 class DifferentialLikeTests(unittest.TestCase):
     def test_like_matches_postgres(self) -> None:
         psql = shutil.which("psql")
-        cli = os.environ.get("DECENTDB_CLI")
+        cli = os.environ.get("DECENTDB")
         if cli is None:
             repo_root = Path(__file__).resolve().parents[2]
-            candidate = repo_root / "decentdb_cli"
+            candidate = repo_root / "decentdb"
             if candidate.exists():
                 cli = str(candidate)
         if not psql or not cli:
-            self.skipTest("psql or decentdb_cli not available")
+            self.skipTest("psql or decentdb not available")
         if "PGDATABASE" not in os.environ:
             self.skipTest("PGDATABASE not set for PostgreSQL differential test")
 
@@ -74,7 +74,7 @@ class DifferentialLikeTests(unittest.TestCase):
                 db_path = Path(temp_dir) / "diff_like.db"
                 def run_cli(sql: str) -> dict:
                     proc = subprocess.run(
-                        [cli, "--db", str(db_path), "--sql", sql],
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
                         capture_output=True,
                         text=True,
                         check=False,

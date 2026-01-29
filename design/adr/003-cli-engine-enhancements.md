@@ -54,8 +54,8 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db]
 
 **CLI Interface:**
 ```bash
-./decentdb_cli --db=test.db --sql="SELECT ..." --cache-pages=256
-./decentdb_cli --db=test.db --sql="SELECT ..." --cache-mb=1  # Alternative
+./decentdb exec --db=test.db --sql="SELECT ..." --cache-pages=256
+./decentdb exec --db=test.db --sql="SELECT ..." --cache-mb=1  # Alternative
 ```
 
 **Rationale:**
@@ -77,7 +77,7 @@ proc getWal*(db: Db): Wal  # Accessor for checkpoint operations
 
 **CLI Interface:**
 ```bash
-./decentdb_cli --db=test.db --checkpoint  # Force checkpoint
+./decentdb exec --db=test.db --checkpoint  # Force checkpoint
 ```
 
 **Rationale:**
@@ -100,12 +100,12 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value] = @[]): Result[seq[str
 **CLI Interface:**
 ```bash
 # Multi-statement transaction (requires engine support for statement batching)
-./decentdb_cli --db=test.db --sql="BEGIN; INSERT ...; COMMIT;"
+./decentdb exec --db=test.db --sql="BEGIN; INSERT ...; COMMIT;"
 
 # Or explicit transaction mode (future enhancement)
-./decentdb_cli --db=test.db --begin
-./decentdb_cli --db=test.db --sql="INSERT ..." --no-auto-commit
-./decentdb_cli --db=test.db --commit
+./decentdb exec --db=test.db --begin
+./decentdb exec --db=test.db --sql="INSERT ..." --no-auto-commit
+./decentdb exec --db=test.db --commit
 ```
 
 **Rationale:**
@@ -224,7 +224,7 @@ test "explicit transaction rollback":
 
 ### Alternative 2: Environment Variables for Config
 ```bash
-DECENTDB_CACHE_PAGES=256 ./decentdb_cli --db=test.db
+DECENTDB_CACHE_PAGES=256 ./decentdb exec --db=test.db
 ```
 **Rejected:** Less discoverable, harder to script
 
@@ -237,9 +237,9 @@ cache_pages = 256
 
 ### Alternative 4: Separate Transaction CLI Tool
 ```bash
-./decentdb_tx --db=test.db begin
-./decentdb_cli --db=test.db --sql="..."
-./decentdb_tx --db=test.db commit
+./decentdb exec --db=test.db --begin
+./decentdb exec --db=test.db --sql="..."
+./decentdb exec --db=test.db --commit
 ```
 **Rejected:** Awkward UX, requires shared lock management
 

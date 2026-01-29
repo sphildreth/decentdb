@@ -4,6 +4,14 @@
 [![Language](https://img.shields.io/badge/language-Nim-2d9cdb)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
+```text                                       
+  ___                 _   ___  ___ 
+ |   \ ___ __ ___ _ _| |_|   \| _ )
+ | |) / -_) _/ -_) ' \  _| |) | _ \
+ |___/\___\__\___|_||_\__|___/|___/
+                                                             
+```
+                                                  
 ACID first. Everything else… eventually.
 
 DecentDb is a pre‑alpha embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation.

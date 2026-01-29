@@ -1,6 +1,7 @@
 nimcache/
 nimblecache/
 htmldocs/
+build/
 *.exe
 *.out
 *.o
@@ -23,5 +24,16 @@ tests/nim/
 !tests/nim/
 tests/nim/*
 !tests/nim/*.nim
+decentdb
+debug_parser
 decentdb_cli
-test.db
+decentdb_schema
+decentdb_data
+src/decentdb
+src/decentdb_cli
+src/decentdb_schema
+src/decentdb_data
+*.db
+*.db-wal
+*.wal
+*.tmp
