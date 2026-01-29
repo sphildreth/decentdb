@@ -276,6 +276,7 @@ proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] 
   catalog.tables[table.name] = table
   let key = uint64(crc32c(stringToBytes("table:" & table.name)))
   let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns)
+  discard delete(catalog.catalogTree, key)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
