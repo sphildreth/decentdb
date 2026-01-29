@@ -41,6 +41,7 @@ type Wal* = ref object
   walEnd*: Atomic[uint64]
   endOffset*: int64
   index*: Table[PageId, seq[WalIndexEntry]]
+  dirtySinceCheckpoint: Table[PageId, WalIndexEntry]
   lock*: Lock
   indexLock*: Lock
   readerLock*: Lock
@@ -112,6 +113,7 @@ proc newWal*(vfs: Vfs, path: string): Result[Wal] =
     path: path,
     endOffset: getFileInfo(path).size,
     index: initTable[PageId, seq[WalIndexEntry]](),
+    dirtySinceCheckpoint: initTable[PageId, WalIndexEntry](),
     readers: initTable[int, tuple[snapshot: uint64, started: float]](),
     abortedReaders: initHashSet[int](),
     failpoints: initTable[string, WalFailpoint](),
@@ -212,7 +214,6 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
   if lastCommit == 0:
     wal.lastCheckpointAt = epochTime()
     return ok(lastCommit)
-  var forceTruncate = false
   if wal.readerWarnMs > 0:
     let warningReaders = wal.readersOverThreshold(wal.readerWarnMs)
     for info in warningReaders:
@@ -228,20 +229,37 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
         if wal.readers.hasKey(info.id):
           wal.readers.del(info.id)
       release(wal.readerLock)
-      if wal.forceTruncateOnTimeout:
-        forceTruncate = true
+  let minSnap = wal.minReaderSnapshot()
+  let safeLsn =
+    if minSnap.isNone:
+      lastCommit
+    else:
+      min(minSnap.get, lastCommit)
   var toCheckpoint: seq[(PageId, int64)] = @[]
-  acquire(wal.indexLock)
-  for pageId, entries in wal.index.pairs:
-    var bestLsn: uint64 = 0
-    var bestOffset: int64 = -1
-    for entry in entries:
-      if entry.lsn <= lastCommit and entry.lsn >= bestLsn:
-        bestLsn = entry.lsn
-        bestOffset = entry.offset
-    if bestLsn != 0 and bestOffset >= 0:
-      toCheckpoint.add((pageId, bestOffset))
-  release(wal.indexLock)
+  if safeLsn == lastCommit:
+    acquire(wal.indexLock)
+    for pageId, entry in wal.dirtySinceCheckpoint.pairs:
+      if entry.lsn <= safeLsn:
+        toCheckpoint.add((pageId, entry.offset))
+    release(wal.indexLock)
+  else:
+    acquire(wal.indexLock)
+    # Slow path: active readers pin an earlier safe LSN. Avoid scanning the full
+    # WAL index by only considering pages that have changed since the last
+    # checkpoint, then selecting the best version <= safeLsn for each.
+    for pageId, _ in wal.dirtySinceCheckpoint.pairs:
+      if not wal.index.hasKey(pageId):
+        continue
+      let entries = wal.index[pageId]
+      var bestLsn: uint64 = 0
+      var bestOffset: int64 = -1
+      for entry in entries:
+        if entry.lsn <= safeLsn and entry.lsn >= bestLsn:
+          bestLsn = entry.lsn
+          bestOffset = entry.offset
+      if bestLsn != 0 and bestOffset >= 0:
+        toCheckpoint.add((pageId, bestOffset))
+    release(wal.indexLock)
 
   for entry in toCheckpoint:
     let frameRes = readFrame(wal.vfs, wal.file, entry[1])
@@ -253,20 +271,23 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
     let failRes = applyFailpoint(wal, "checkpoint_write_page", bestPayload)
     if not failRes.ok:
       return err[uint64](failRes.err.code, failRes.err.message, failRes.err.context)
-    let writeRes = writePage(pager, entry[0], bestPayload)
+    var payloadStr = newString(bestPayload.len)
+    if bestPayload.len > 0:
+      copyMem(addr payloadStr[0], unsafeAddr bestPayload[0], bestPayload.len)
+    let writeRes = writePageDirectFile(pager, entry[0], payloadStr)
     if not writeRes.ok:
       return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-  let flushRes = flushAll(pager)
-  if not flushRes.ok:
-    return err[uint64](flushRes.err.code, flushRes.err.message, flushRes.err.context)
   let fsyncFail = applyFailpoint(wal, "checkpoint_fsync", @[])
   if not fsyncFail.ok:
     return err[uint64](fsyncFail.err.code, fsyncFail.err.message, fsyncFail.err.context)
-  pager.header.lastCheckpointLsn = lastCommit
+  pager.header.lastCheckpointLsn = safeLsn
   let headerRes = writeHeader(pager.vfs, pager.file, pager.header)
   if not headerRes.ok:
     return err[uint64](headerRes.err.code, headerRes.err.message, headerRes.err.context)
-  let chkRes = appendFrame(wal, wfCheckpoint, 0, encodeCheckpointPayload(lastCommit))
+  let syncRes = pager.vfs.fsync(pager.file)
+  if not syncRes.ok:
+    return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+  let chkRes = appendFrame(wal, wfCheckpoint, 0, encodeCheckpointPayload(safeLsn))
   if not chkRes.ok:
     return err[uint64](chkRes.err.code, chkRes.err.message, chkRes.err.context)
   let walSyncFail = applyFailpoint(wal, "checkpoint_wal_fsync", @[])
@@ -276,16 +297,16 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
   if not walSync.ok:
     return err[uint64](walSync.err.code, walSync.err.message, walSync.err.context)
   wal.lastCheckpointAt = epochTime()
-  let minSnap = wal.minReaderSnapshot()
-  if forceTruncate or minSnap.isNone or minSnap.get >= lastCommit:
+  if minSnap.isNone or minSnap.get >= lastCommit:
     let truncRes = wal.vfs.truncate(wal.file, 0)
     if not truncRes.ok:
       return err[uint64](truncRes.err.code, truncRes.err.message, truncRes.err.context)
     acquire(wal.indexLock)
     wal.index.clear()
+    wal.dirtySinceCheckpoint.clear()
     release(wal.indexLock)
     wal.endOffset = 0
-  ok(lastCommit)
+  ok(safeLsn)
 
 proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
   var trigger = false
@@ -305,6 +326,7 @@ proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
 
 proc recover*(wal: Wal): Result[Void] =
   wal.index.clear()
+  wal.dirtySinceCheckpoint.clear()
   var pending: seq[(PageId, uint64, int64)] = @[]
   var lastCommit: uint64 = 0
   var offset: int64 = 0
@@ -318,12 +340,16 @@ proc recover*(wal: Wal): Result[Void] =
     of wfPage:
       pending.add((PageId(pageId), lsn, frameOffset))
     of wfCommit:
+      var commitMeta: seq[(PageId, WalIndexEntry)] = @[]
       for entry in pending:
         if not wal.index.hasKey(entry[0]):
           wal.index[entry[0]] = @[]
         wal.index[entry[0]].add(WalIndexEntry(lsn: entry[1], offset: entry[2]))
+        commitMeta.add((entry[0], WalIndexEntry(lsn: entry[1], offset: entry[2])))
         if entry[1] > lastCommit:
           lastCommit = entry[1]
+      for m in commitMeta:
+        wal.dirtySinceCheckpoint[m[0]] = m[1]
       pending = @[]
       if lsn > lastCommit:
         lastCommit = lsn
@@ -393,10 +419,14 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
     return none(seq[byte])
   some(payload)
 
-proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: PageId): Result[seq[byte]] =
+proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: PageId): Result[string] =
   let overlay = wal.getPageAtOrBefore(pageId, snapshot)
   if overlay.isSome:
-    return ok(overlay.get)
+    let payload = overlay.get
+    var s = newString(payload.len)
+    if payload.len > 0:
+      copyMem(addr s[0], unsafeAddr payload[0], payload.len)
+    return ok(s)
   readPageDirect(pager, pageId)
 
 type WalWriter* = ref object
@@ -446,7 +476,9 @@ proc commit*(writer: WalWriter): Result[uint64] =
   for i, entry in writer.pending:
     if not writer.wal.index.hasKey(entry[0]):
       writer.wal.index[entry[0]] = @[]
-    writer.wal.index[entry[0]].add(WalIndexEntry(lsn: pageMeta[i][0], offset: pageMeta[i][1]))
+    let idxEntry = WalIndexEntry(lsn: pageMeta[i][0], offset: pageMeta[i][1])
+    writer.wal.index[entry[0]].add(idxEntry)
+    writer.wal.dirtySinceCheckpoint[entry[0]] = idxEntry
   release(writer.wal.indexLock)
   writer.wal.walEnd.store(commitRes.value[0], moRelease)
   writer.active = false

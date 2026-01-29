@@ -209,7 +209,7 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     of "LIKE", "ILIKE":
       let leftStr = valueToString(leftRes.value)
       let rightStr = valueToString(rightRes.value)
-      return ok(Value(kind: vkBool, boolVal: likeMatch(leftStr, rightStr, true)))
+      return ok(Value(kind: vkBool, boolVal: likeMatch(leftStr, rightStr, expr.op == "ILIKE")))
     of "IS":
        if rightRes.value.kind == vkNull:
          return ok(Value(kind: vkBool, boolVal: leftRes.value.kind == vkNull))
@@ -305,7 +305,7 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
   var postingsLists: seq[seq[uint64]] = @[]
   var rarestCount = -1
   for g in grams:
-    let postRes = getTrigramPostings(pager, idx, g)
+    let postRes = getTrigramPostingsWithDeltas(pager, catalog, idx, g)
     if not postRes.ok:
       return err[seq[Row]](postRes.err.code, postRes.err.message, postRes.err.context)
     let list = postRes.value
@@ -776,12 +776,40 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
     var resultRows: seq[Row] = @[]
     var rightColumns: seq[string] = @[]
+    let canCacheRight = plan.right.kind != pkIndexSeek
+    var cachedRight: seq[Row] = @[]
+    if canCacheRight:
+      let rightRes = execPlan(pager, catalog, plan.right, params)
+      if not rightRes.ok:
+        return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+      cachedRight = rightRes.value
     if plan.right.table.len > 0:
       let tableRes = catalog.getTable(plan.right.table)
       if tableRes.ok:
         let prefix = if plan.right.alias.len > 0: plan.right.alias else: plan.right.table
         for col in tableRes.value.columns:
           rightColumns.add(prefix & "." & col.name)
+    proc joinPredicateIsCoveredByIndexSeek(): bool =
+      if plan.right.kind != pkIndexSeek:
+        return false
+      if plan.joinOn == nil or plan.joinOn.kind != ekBinary or plan.joinOn.op != "=":
+        return false
+      let left = plan.joinOn.left
+      let right = plan.joinOn.right
+      if left == nil or right == nil:
+        return false
+      proc isRightCol(expr: Expr): bool =
+        if expr.kind != ekColumn:
+          return false
+        if expr.name != plan.right.column:
+          return false
+        if plan.right.alias.len > 0 and expr.table == plan.right.alias:
+          return true
+        if expr.table.len == 0 or expr.table == plan.right.table:
+          return true
+        false
+      (isRightCol(left) and right.kind == ekColumn) or (isRightCol(right) and left.kind == ekColumn)
+    let skipJoinPredicate = joinPredicateIsCoveredByIndexSeek()
     for lrow in leftRes.value:
       var matched = false
       var rightRows: seq[Row] = @[]
@@ -794,20 +822,21 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           return err[seq[Row]](idxRes.err.code, idxRes.err.message, idxRes.err.context)
         rightRows = idxRes.value
       else:
-        let rightRes = execPlan(pager, catalog, plan.right, params)
-        if not rightRes.ok:
-          return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
-        rightRows = rightRes.value
+        rightRows = cachedRight
       if rightColumns.len == 0 and rightRows.len > 0:
         rightColumns = rightRows[0].columns
       for rrow in rightRows:
         var merged = Row(columns: lrow.columns & rrow.columns, values: lrow.values & rrow.values)
-        let predRes = evalExpr(merged, plan.joinOn, params)
-        if not predRes.ok:
-          return err[seq[Row]](predRes.err.code, predRes.err.message, predRes.err.context)
-        if valueToBool(predRes.value):
+        if skipJoinPredicate:
           matched = true
           resultRows.add(merged)
+        else:
+          let predRes = evalExpr(merged, plan.joinOn, params)
+          if not predRes.ok:
+            return err[seq[Row]](predRes.err.code, predRes.err.message, predRes.err.context)
+          if valueToBool(predRes.value):
+            matched = true
+            resultRows.add(merged)
       if plan.joinType == jtLeft and not matched:
         var nullVals: seq[Value] = @[]
         for _ in rightColumns:

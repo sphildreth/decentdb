@@ -17,6 +17,12 @@ method read*(vfs: Vfs, file: VfsFile, offset: int64, buf: var openArray[byte]): 
 method write*(vfs: Vfs, file: VfsFile, offset: int64, buf: openArray[byte]): Result[int] {.base.} =
   err[int](ERR_INTERNAL, "VFS.write not implemented", file.path)
 
+method readStr*(vfs: Vfs, file: VfsFile, offset: int64, buf: var string): Result[int] {.base.} =
+  err[int](ERR_INTERNAL, "VFS.readStr not implemented", file.path)
+
+method writeStr*(vfs: Vfs, file: VfsFile, offset: int64, buf: string): Result[int] {.base.} =
+  err[int](ERR_INTERNAL, "VFS.writeStr not implemented", file.path)
+
 method fsync*(vfs: Vfs, file: VfsFile): Result[Void] {.base.} =
   err[Void](ERR_INTERNAL, "VFS.fsync not implemented", file.path)
 

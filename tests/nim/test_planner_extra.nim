@@ -9,7 +9,8 @@ proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),
     indexes: initTable[string, IndexMeta](),
-    catalogTree: nil
+    catalogTree: nil,
+    trigramDeltas: initTable[(string, uint32), TrigramDelta]()
   )
 
 proc addTable(catalog: Catalog, name: string) =

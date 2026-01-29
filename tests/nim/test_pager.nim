@@ -25,14 +25,46 @@ suite "Pager":
     let pageIdRes = allocatePage(pager)
     check pageIdRes.ok
     let pageId = pageIdRes.value
-    var data = newSeq[byte](pager.pageSize)
+    var data = newString(pager.pageSize)
     for i in 0 ..< data.len:
-      data[i] = byte(i mod 251)
+      data[i] = char(byte(i mod 251))
     let writeRes = writePage(pager, pageId, data)
     check writeRes.ok
     let readRes = readPage(pager, pageId)
     check readRes.ok
     check readRes.value == data
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "readPageRo avoids per-read page copy when cached":
+    let path = makeTempDb("decentdb_pager_read_ro.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 4)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let pageId = allocatePage(pager).value
+    var data = newString(pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = char(byte((i * 7) mod 251))
+    check writePage(pager, pageId, data).ok
+    let r1 = readPageRo(pager, pageId)
+    let r2 = readPageRo(pager, pageId)
+    check r1.ok
+    check r2.ok
+    let s1 = r1.value
+    let s2 = r2.value
+    check s1 == data
+    check s2 == data
+    let c1 = readPage(pager, pageId)
+    let c2 = readPage(pager, pageId)
+    check c1.ok
+    check c2.ok
+    let t1 = c1.value
+    let t2 = c2.value
+    check t1 == data
+    check t2 == data
     discard closePager(pager)
     discard closeDb(db)
 
@@ -54,13 +86,13 @@ suite "Pager":
     let p2 = p2Res.value
     let p3 = p3Res.value
     discard p2
-    var d1 = newSeq[byte](pager.pageSize)
-    var d2 = newSeq[byte](pager.pageSize)
-    var d3 = newSeq[byte](pager.pageSize)
+    var d1 = newString(pager.pageSize)
+    var d2 = newString(pager.pageSize)
+    var d3 = newString(pager.pageSize)
     for i in 0 ..< pager.pageSize:
-      d1[i] = 1
-      d2[i] = 2
-      d3[i] = 3
+      d1[i] = char(1)
+      d2[i] = char(2)
+      d3[i] = char(3)
     check writePage(pager, p1, d1).ok
     check writePage(pager, p2, d2).ok
     check writePage(pager, p3, d3).ok

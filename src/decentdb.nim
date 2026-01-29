@@ -20,7 +20,7 @@ when isMainModule:
        "sql": "SQL statement to execute",
        "openClose": "Open and close database without executing SQL (testing mode)",
        "timing": "Show query execution timing in milliseconds",
-       "cachePages": "Number of 4KB pages to cache (default: 64 = 256KB)",
+       "cachePages": "Number of 4KB pages to cache (default: 1024 = 4MB)",
        "cacheMb": "Cache size in megabytes (overrides --cachePages if specified)",
        "checkpoint": "Force a WAL checkpoint and exit",
        "readerCount": "Show number of active readers and exit",

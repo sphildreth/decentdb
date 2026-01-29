@@ -12,14 +12,14 @@ proc makeTempDb(name: string): string =
     removeFile(path)
   path
 
-proc buildLeaf(pageSize: int, keys: seq[uint64], values: seq[seq[byte]], nextLeaf: uint32): seq[byte] =
-  var buf = newSeq[byte](pageSize)
-  buf[0] = PageTypeLeaf
-  buf[1] = 0
+proc buildLeaf(pageSize: int, keys: seq[uint64], values: seq[seq[byte]], nextLeaf: uint32): string =
+  var buf = newString(pageSize)
+  buf[0] = char(PageTypeLeaf)
+  buf[1] = '\0'
   writeU32LE(buf, 4, nextLeaf)
   let count = uint16(keys.len)
-  buf[2] = byte(count and 0xFF)
-  buf[3] = byte((count shr 8) and 0xFF)
+  buf[2] = char(byte(count and 0xFF))
+  buf[3] = char(byte((count shr 8) and 0xFF))
   var offset = 8
   for i in 0 ..< keys.len:
     writeU64LE(buf, offset, keys[i])
@@ -27,18 +27,18 @@ proc buildLeaf(pageSize: int, keys: seq[uint64], values: seq[seq[byte]], nextLea
     writeU32LE(buf, offset + 12, 0)
     offset += 16
     for b in values[i]:
-      buf[offset] = b
+      buf[offset] = char(b)
       offset.inc
   buf
 
-proc buildInternal(pageSize: int, keys: seq[uint64], children: seq[uint32], rightChild: uint32): seq[byte] =
-  var buf = newSeq[byte](pageSize)
-  buf[0] = PageTypeInternal
-  buf[1] = 0
+proc buildInternal(pageSize: int, keys: seq[uint64], children: seq[uint32], rightChild: uint32): string =
+  var buf = newString(pageSize)
+  buf[0] = char(PageTypeInternal)
+  buf[1] = '\0'
   writeU32LE(buf, 4, rightChild)
   let count = uint16(keys.len)
-  buf[2] = byte(count and 0xFF)
-  buf[3] = byte((count shr 8) and 0xFF)
+  buf[2] = char(byte(count and 0xFF))
+  buf[3] = char(byte((count shr 8) and 0xFF))
   var offset = 8
   for i in 0 ..< keys.len:
     writeU64LE(buf, offset, keys[i])
@@ -98,8 +98,8 @@ suite "BTree":
     let rootRes = allocatePage(pager)
     check rootRes.ok
     let root = rootRes.value
-    var rootBuf = newSeq[byte](pager.pageSize)
-    rootBuf[0] = PageTypeLeaf
+    var rootBuf = newString(pager.pageSize)
+    rootBuf[0] = char(PageTypeLeaf)
     writeU32LE(rootBuf, 4, 0)
     check writePage(pager, root, rootBuf).ok
     let tree = newBTree(pager, root)
@@ -143,8 +143,8 @@ suite "BTree":
     let rootRes = allocatePage(pager)
     check rootRes.ok
     let root = rootRes.value
-    var rootBuf = newSeq[byte](pager.pageSize)
-    rootBuf[0] = PageTypeLeaf
+    var rootBuf = newString(pager.pageSize)
+    rootBuf[0] = char(PageTypeLeaf)
     writeU32LE(rootBuf, 4, 0)
     check writePage(pager, root, rootBuf).ok
     let tree = newBTree(pager, root)
@@ -184,8 +184,8 @@ suite "BTree":
     let rootRes = allocatePage(pager)
     check rootRes.ok
     let root = rootRes.value
-    var rootBuf = newSeq[byte](pager.pageSize)
-    rootBuf[0] = PageTypeLeaf
+    var rootBuf = newString(pager.pageSize)
+    rootBuf[0] = char(PageTypeLeaf)
     writeU32LE(rootBuf, 4, 0)
     check writePage(pager, root, rootBuf).ok
     let tree = newBTree(pager, root)

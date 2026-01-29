@@ -1,5 +1,6 @@
 import options
 import tables
+import algorithm
 import ../errors
 import ../record/record
 import ../pager/pager
@@ -18,8 +19,8 @@ proc initTableRoot*(pager: Pager): Result[PageId] =
   if not rootRes.ok:
     return err[PageId](rootRes.err.code, rootRes.err.message, rootRes.err.context)
   let root = rootRes.value
-  var buf = newSeq[byte](pager.pageSize)
-  buf[0] = PageTypeLeaf
+  var buf = newString(pager.pageSize)
+  buf[0] = char(PageTypeLeaf)
   writeU32LE(buf, 4, 0)
   let writeRes = writePage(pager, root, buf)
   if not writeRes.ok:
@@ -106,8 +107,62 @@ proc getTrigramPostings*(pager: Pager, index: IndexMeta, trigram: uint32): Resul
 
 proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Void]
 
+proc setToSortedSeq(setVal: HashSet[uint64]): seq[uint64] =
+  for v in setVal.items:
+    result.add(v)
+  result.sort()
+
+proc applyPostingDeltas(base: seq[uint64], adds: HashSet[uint64], removes: HashSet[uint64]): seq[uint64] =
+  let addList = setToSortedSeq(adds)
+  let removeList = setToSortedSeq(removes)
+  var filtered: seq[uint64] = @[]
+  var i = 0
+  var j = 0
+  while i < base.len:
+    let v = base[i]
+    while j < removeList.len and removeList[j] < v:
+      j.inc
+    if j < removeList.len and removeList[j] == v:
+      i.inc
+      continue
+    filtered.add(v)
+    i.inc
+  var merged: seq[uint64] = @[]
+  i = 0
+  j = 0
+  while i < filtered.len or j < addList.len:
+    if j >= addList.len:
+      merged.add(filtered[i])
+      i.inc
+    elif i >= filtered.len:
+      merged.add(addList[j])
+      j.inc
+    else:
+      let a = filtered[i]
+      let b = addList[j]
+      if a == b:
+        merged.add(a)
+        i.inc
+        j.inc
+      elif a < b:
+        merged.add(a)
+        i.inc
+      else:
+        merged.add(b)
+        j.inc
+  merged
+
+proc getTrigramPostingsWithDeltas*(pager: Pager, catalog: Catalog, index: IndexMeta, trigram: uint32): Result[seq[uint64]] =
+  let baseRes = getTrigramPostings(pager, index, trigram)
+  if not baseRes.ok:
+    return err[seq[uint64]](baseRes.err.code, baseRes.err.message, baseRes.err.context)
+  let deltaOpt = catalog.trigramDelta(index.name, trigram)
+  if deltaOpt.isNone:
+    return ok(baseRes.value)
+  let delta = deltaOpt.get
+  ok(applyPostingDeltas(baseRes.value, delta.adds, delta.removes))
+
 proc updateTrigramIndex(pager: Pager, catalog: Catalog, index: IndexMeta, rowid: uint64, oldValue: Value, newValue: Value): Result[Void] =
-  let idxTree = newBTree(pager, index.rootPage)
   let oldText = if oldValue.kind == vkText: valueText(oldValue) else: ""
   let newText = if newValue.kind == vkText: valueText(newValue) else: ""
   let oldTrigrams = uniqueTrigrams(oldText)
@@ -118,29 +173,54 @@ proc updateTrigramIndex(pager: Pager, catalog: Catalog, index: IndexMeta, rowid:
   for g in newTrigrams: newSet.incl(g)
   for g in oldSet:
     if g notin newSet:
-      let postingsRes = loadPostings(idxTree, g)
-      if not postingsRes.ok:
-        return err[Void](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
-      let updatedRes = removeRowid(postingsRes.value, rowid)
-      if not updatedRes.ok:
-        return err[Void](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
-      let storeRes = storePostings(idxTree, g, updatedRes.value)
-      if not storeRes.ok:
-        return storeRes
+      catalog.trigramBufferRemove(index.name, g, rowid)
   for g in newSet:
     if g notin oldSet:
-      let postingsRes = loadPostings(idxTree, g)
+      catalog.trigramBufferAdd(index.name, g, rowid)
+  okVoid()
+
+proc flushTrigramDeltas*(pager: Pager, catalog: Catalog): Result[Void] =
+  let all = catalog.allTrigramDeltas()
+  if all.len == 0:
+    return okVoid()
+  var byIndex: Table[string, seq[(uint32, TrigramDelta)]] = initTable[string, seq[(uint32, TrigramDelta)]]()
+  for entry in all:
+    let indexName = entry[0][0]
+    let trigram = entry[0][1]
+    if not byIndex.hasKey(indexName):
+      byIndex[indexName] = @[]
+    byIndex[indexName].add((trigram, entry[1]))
+
+  for indexName, ops in byIndex.mpairs:
+    let idxOpt = catalog.getIndexByName(indexName)
+    if isNone(idxOpt):
+      continue
+    let idx = idxOpt.get
+    if idx.kind != ikTrigram:
+      continue
+    let idxTree = newBTree(pager, idx.rootPage)
+    for op in ops:
+      let trigram = op[0]
+      let delta = op[1]
+      let postingsRes = loadPostings(idxTree, trigram)
       if not postingsRes.ok:
         return err[Void](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
-      let updatedRes = addRowid(postingsRes.value, rowid)
-      if not updatedRes.ok:
-        return err[Void](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
-      let storeRes = storePostings(idxTree, g, updatedRes.value)
+      var baseIds: seq[uint64] = @[]
+      if postingsRes.value.len > 0:
+        let decoded = decodePostings(postingsRes.value)
+        if not decoded.ok:
+          return err[Void](decoded.err.code, decoded.err.message, decoded.err.context)
+        baseIds = decoded.value
+      let merged = applyPostingDeltas(baseIds, delta.adds, delta.removes)
+      let updated = encodePostingsSorted(merged)
+      let storeRes = storePostings(idxTree, trigram, updated)
       if not storeRes.ok:
         return storeRes
-  let syncRes = syncIndexRoot(catalog, index.name, idxTree)
-  if not syncRes.ok:
-    return syncRes
+    let syncRes = syncIndexRoot(catalog, indexName, idxTree)
+    if not syncRes.ok:
+      return syncRes
+
+  catalog.clearTrigramDeltas()
   okVoid()
 
 proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Void] =
@@ -243,21 +323,9 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     for entry in trigramValues:
       if entry[1].kind != vkText:
         continue
-      let idxTree = newBTree(pager, entry[0].rootPage)
       let grams = uniqueTrigrams(valueText(entry[1]))
       for g in grams:
-        let postingsRes = loadPostings(idxTree, g)
-        if not postingsRes.ok:
-          return err[uint64](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
-        let updatedRes = addRowid(postingsRes.value, rowid)
-        if not updatedRes.ok:
-          return err[uint64](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
-        let storeRes = storePostings(idxTree, g, updatedRes.value)
-        if not storeRes.ok:
-          return err[uint64](storeRes.err.code, storeRes.err.message, storeRes.err.context)
-      let syncRes = syncIndexRoot(catalog, entry[0].name, idxTree)
-      if not syncRes.ok:
-        return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+        catalog.trigramBufferAdd(entry[0].name, g, rowid)
   table.nextRowId = rowid + 1
   discard catalog.saveTable(pager, table)
   ok(rowid)
@@ -340,22 +408,10 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
         if not syncRes.ok:
           return syncRes
       else:
-        let idxTree = newBTree(pager, idx.rootPage)
         if oldRes.value.values[valueIndex].kind == vkText:
           let grams = uniqueTrigrams(valueText(oldRes.value.values[valueIndex]))
           for g in grams:
-            let postingsRes = loadPostings(idxTree, g)
-            if not postingsRes.ok:
-              return err[Void](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
-            let updatedRes = removeRowid(postingsRes.value, rowid)
-            if not updatedRes.ok:
-              return err[Void](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
-            let storeRes = storePostings(idxTree, g, updatedRes.value)
-            if not storeRes.ok:
-              return storeRes
-          let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
-          if not syncRes.ok:
-            return syncRes
+            catalog.trigramBufferRemove(idx.name, g, rowid)
   let tree = newBTree(pager, table.rootPage)
   let delRes = delete(tree, rowid)
   if not delRes.ok:
@@ -377,13 +433,23 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
   let rowsRes = scanTable(pager, table)
   if not rowsRes.ok:
     return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  var pairs: seq[(uint64, uint64)] = @[]
+  pairs.setLen(rowsRes.value.len)
+  for i, row in rowsRes.value:
+    pairs[i] = (indexKeyFromValue(row.values[columnIndex]), row.rowid)
+  pairs.sort(proc(a, b: (uint64, uint64)): int =
+    let c = cmp(a[0], b[0])
+    if c != 0: c else: cmp(a[1], b[1])
+  )
+  var entries: seq[(uint64, seq[byte])] = @[]
+  entries.setLen(pairs.len)
+  for i, pair in pairs:
+    entries[i] = (pair[0], encodeRowId(pair[1]))
   let idxTree = newBTree(pager, indexRoot)
-  for row in rowsRes.value:
-    let key = indexKeyFromValue(row.values[columnIndex])
-    let insertRes = insert(idxTree, key, encodeRowId(row.rowid))
-    if not insertRes.ok:
-      return err[PageId](insertRes.err.code, insertRes.err.message, insertRes.err.context)
-  ok(idxTree.root)
+  let buildRes = bulkBuildFromSorted(idxTree, entries)
+  if not buildRes.ok:
+    return err[PageId](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+  ok(buildRes.value)
 
 proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[PageId] =
   let tableRes = catalog.getTable(tableName)
@@ -418,10 +484,10 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
   ok(idxTree.root)
 
 proc resetIndexRoot(pager: Pager, root: PageId): Result[Void] =
-  var buf = newSeq[byte](pager.pageSize)
-  buf[0] = PageTypeLeaf
-  buf[2] = 0
-  buf[3] = 0
+  var buf = newString(pager.pageSize)
+  buf[0] = char(PageTypeLeaf)
+  buf[2] = '\0'
+  buf[3] = '\0'
   writeU32LE(buf, 4, 0'u32)
   writePage(pager, root, buf)
 

@@ -2,6 +2,8 @@ import options
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
+import sets
+import strutils
 
 type PlanKind* = enum
   pkStatement
@@ -67,41 +69,127 @@ proc isTrigramLike(expr: Expr, table: string, columnOut: var string, patternOut:
     return true
   false
 
+proc isSimpleEqualityFor(expr: Expr, table: string, alias: string, columnOut: var string, valueOut: var Expr): bool =
+  if isSimpleEquality(expr, table, columnOut, valueOut):
+    return true
+  if alias.len > 0 and isSimpleEquality(expr, alias, columnOut, valueOut):
+    return true
+  false
+
+proc isTrigramLikeFor(expr: Expr, table: string, alias: string, columnOut: var string, patternOut: var Expr, insensitive: var bool): bool =
+  if isTrigramLike(expr, table, columnOut, patternOut, insensitive):
+    return true
+  if alias.len > 0 and isTrigramLike(expr, alias, columnOut, patternOut, insensitive):
+    return true
+  false
+
+proc splitAnd(expr: Expr): seq[Expr] =
+  if expr == nil:
+    return @[]
+  if expr.kind == ekBinary and expr.op.toUpperAscii() == "AND":
+    result.add(splitAnd(expr.left))
+    result.add(splitAnd(expr.right))
+  else:
+    result.add(expr)
+
+proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
+  if expr == nil:
+    return
+  case expr.kind
+  of ekColumn:
+    if expr.table.len > 0:
+      tablesOut.incl(expr.table)
+  of ekBinary:
+    referencedTables(expr.left, tablesOut)
+    referencedTables(expr.right, tablesOut)
+  of ekUnary:
+    referencedTables(expr.expr, tablesOut)
+  of ekFunc:
+    for a in expr.args:
+      referencedTables(a, tablesOut)
+  else:
+    discard
+
+proc refs(expr: Expr): HashSet[string] =
+  result = initHashSet[string]()
+  referencedTables(expr, result)
+
 proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   proc hasAggregate(items: seq[SelectItem]): bool =
     for item in items:
       if item.expr != nil and item.expr.kind == ekFunc:
         return true
     false
+  var conjuncts = splitAnd(stmt.whereExpr)
   var base: Plan = nil
-  var idxColumn = ""
-  var idxValue: Expr = nil
-  var likeColumn = ""
-  var likePattern: Expr = nil
-  var ignoreInsensitive = false
-  if isTrigramLike(stmt.whereExpr, stmt.fromTable, likeColumn, likePattern, ignoreInsensitive):
-    let idxOpt = catalog.getTrigramIndexForColumn(stmt.fromTable, likeColumn)
-    if isSome(idxOpt):
-      base = Plan(kind: pkTrigramSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: likeColumn, likeExpr: likePattern, likeInsensitive: true)
-  if isSimpleEquality(stmt.whereExpr, stmt.fromTable, idxColumn, idxValue):
-    let idxOpt = catalog.getBtreeIndexForColumn(stmt.fromTable, idxColumn)
-    if isSome(idxOpt):
-      base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+
+  # Choose the best access path for the FROM table from any conjunct.
+  var accessConjunctIdx = -1
+  for i, c in conjuncts:
+    var idxColumn = ""
+    var idxValue: Expr = nil
+    if isSimpleEqualityFor(c, stmt.fromTable, stmt.fromAlias, idxColumn, idxValue):
+      let idxOpt = catalog.getBtreeIndexForColumn(stmt.fromTable, idxColumn)
+      if isSome(idxOpt):
+        base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+        accessConjunctIdx = i
+        break
+  if base == nil:
+    for i, c in conjuncts:
+      var likeColumn = ""
+      var likePattern: Expr = nil
+      var ignoreInsensitive = false
+      if isTrigramLikeFor(c, stmt.fromTable, stmt.fromAlias, likeColumn, likePattern, ignoreInsensitive):
+        let idxOpt = catalog.getTrigramIndexForColumn(stmt.fromTable, likeColumn)
+        if isSome(idxOpt):
+          base = Plan(kind: pkTrigramSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: likeColumn, likeExpr: likePattern, likeInsensitive: ignoreInsensitive)
+          accessConjunctIdx = i
+          break
+  if accessConjunctIdx >= 0:
+    conjuncts.delete(accessConjunctIdx)
   if base == nil:
     base = Plan(kind: pkTableScan, table: stmt.fromTable, alias: stmt.fromAlias)
-  if stmt.whereExpr != nil and base.kind notin {pkIndexSeek, pkTrigramSeek}:
-    base = Plan(kind: pkFilter, predicate: stmt.whereExpr, left: base)
+
+  # Predicate pushdown: apply conjuncts as early as possible (once referenced
+  # tables are available), rather than applying the full WHERE before joins.
+  var available = initHashSet[string]()
+  if stmt.fromAlias.len > 0:
+    available.incl(stmt.fromAlias)
+  available.incl(stmt.fromTable)
+
+  proc applyEligible() =
+    var remaining: seq[Expr] = @[]
+    for c in conjuncts:
+      let r = refs(c)
+      if r.len == 0:
+        # Unqualified columns are treated conservatively; only apply at the end
+        # once all joins have been introduced.
+        remaining.add(c)
+      elif r <= available:
+        base = Plan(kind: pkFilter, predicate: c, left: base)
+      else:
+        remaining.add(c)
+    conjuncts = remaining
+  applyEligible()
   for join in stmt.joins:
     var rightPlan: Plan = nil
     var joinIdxCol = ""
     var joinIdxVal: Expr = nil
-    if isSimpleEquality(join.onExpr, join.table, joinIdxCol, joinIdxVal):
+    if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
       let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
       if isSome(idxOpt):
         rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
     if rightPlan == nil:
       rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
     base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+    if join.alias.len > 0:
+      available.incl(join.alias)
+    available.incl(join.table)
+    applyEligible()
+
+  # Apply any remaining conjuncts after all joins are present.
+  for c in conjuncts:
+    base = Plan(kind: pkFilter, predicate: c, left: base)
   if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
     base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
   else:

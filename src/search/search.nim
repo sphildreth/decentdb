@@ -20,14 +20,18 @@ proc trigrams*(text: string): seq[uint32] =
   for i in 0 ..< norm.len - 2:
     result.add(packTrigram(norm[i], norm[i + 1], norm[i + 2]))
 
-proc encodePostings*(rowids: seq[uint64]): seq[byte] =
-  var sorted = rowids
-  sorted.sort()
+proc encodePostingsSorted*(rowids: seq[uint64]): seq[byte] =
+  ## Encode postings assuming `rowids` are sorted ascending.
   var prev: uint64 = 0
-  for id in sorted:
+  for id in rowids:
     let delta = id - prev
     result.add(encodeVarint(delta))
     prev = id
+
+proc encodePostings*(rowids: seq[uint64]): seq[byte] =
+  var sorted = rowids
+  sorted.sort()
+  encodePostingsSorted(sorted)
 
 proc decodePostings*(data: openArray[byte]): Result[seq[uint64]] =
   var offset = 0

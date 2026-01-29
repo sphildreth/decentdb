@@ -25,6 +25,12 @@ proc writeU32LE*(buf: var openArray[byte], offset: int, value: uint32) =
   buf[offset + 2] = byte((value shr 16) and 0xFF)
   buf[offset + 3] = byte((value shr 24) and 0xFF)
 
+proc writeU32LE*(buf: var string, offset: int, value: uint32) =
+  buf[offset] = char(byte(value and 0xFF))
+  buf[offset + 1] = char(byte((value shr 8) and 0xFF))
+  buf[offset + 2] = char(byte((value shr 16) and 0xFF))
+  buf[offset + 3] = char(byte((value shr 24) and 0xFF))
+
 proc writeU64LE*(buf: var openArray[byte], offset: int, value: uint64) =
   buf[offset] = byte(value and 0xFF)
   buf[offset + 1] = byte((value shr 8) and 0xFF)
@@ -35,11 +41,27 @@ proc writeU64LE*(buf: var openArray[byte], offset: int, value: uint64) =
   buf[offset + 6] = byte((value shr 48) and 0xFF)
   buf[offset + 7] = byte((value shr 56) and 0xFF)
 
+proc writeU64LE*(buf: var string, offset: int, value: uint64) =
+  buf[offset] = char(byte(value and 0xFF))
+  buf[offset + 1] = char(byte((value shr 8) and 0xFF))
+  buf[offset + 2] = char(byte((value shr 16) and 0xFF))
+  buf[offset + 3] = char(byte((value shr 24) and 0xFF))
+  buf[offset + 4] = char(byte((value shr 32) and 0xFF))
+  buf[offset + 5] = char(byte((value shr 40) and 0xFF))
+  buf[offset + 6] = char(byte((value shr 48) and 0xFF))
+  buf[offset + 7] = char(byte((value shr 56) and 0xFF))
+
 proc readU32LE*(buf: openArray[byte], offset: int): uint32 =
   uint32(buf[offset]) or
     (uint32(buf[offset + 1]) shl 8) or
     (uint32(buf[offset + 2]) shl 16) or
     (uint32(buf[offset + 3]) shl 24)
+
+proc readU32LE*(buf: string, offset: int): uint32 =
+  uint32(byte(buf[offset])) or
+    (uint32(byte(buf[offset + 1])) shl 8) or
+    (uint32(byte(buf[offset + 2])) shl 16) or
+    (uint32(byte(buf[offset + 3])) shl 24)
 
 proc readU64LE*(buf: openArray[byte], offset: int): uint64 =
   uint64(buf[offset]) or
@@ -50,6 +72,16 @@ proc readU64LE*(buf: openArray[byte], offset: int): uint64 =
     (uint64(buf[offset + 5]) shl 40) or
     (uint64(buf[offset + 6]) shl 48) or
     (uint64(buf[offset + 7]) shl 56)
+
+proc readU64LE*(buf: string, offset: int): uint64 =
+  uint64(byte(buf[offset])) or
+    (uint64(byte(buf[offset + 1])) shl 8) or
+    (uint64(byte(buf[offset + 2])) shl 16) or
+    (uint64(byte(buf[offset + 3])) shl 24) or
+    (uint64(byte(buf[offset + 4])) shl 32) or
+    (uint64(byte(buf[offset + 5])) shl 40) or
+    (uint64(byte(buf[offset + 6])) shl 48) or
+    (uint64(byte(buf[offset + 7])) shl 56)
 
 proc crc32cTable(): array[256, uint32] =
   const Poly = 0x82F63B78'u32
@@ -70,6 +102,14 @@ proc crc32c*(data: openArray[byte]): uint32 =
   var current = 0xFFFFFFFF'u32
   for b in data:
     let idx = (current xor uint32(b)) and 0xFF'u32
+    current = (current shr 8) xor Crc32cTable[int(idx)]
+  current xor 0xFFFFFFFF'u32
+
+proc crc32c*(data: string): uint32 =
+  var current = 0xFFFFFFFF'u32
+  for ch in data:
+    let b = uint32(byte(ch))
+    let idx = (current xor b) and 0xFF'u32
     current = (current shr 8) xor Crc32cTable[int(idx)]
   current xor 0xFFFFFFFF'u32
 

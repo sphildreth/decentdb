@@ -1,5 +1,6 @@
 import options
 import tables
+import sets
 import strutils
 import ../errors
 import ../record/record
@@ -41,10 +42,15 @@ type IndexMeta* = object
   kind*: IndexKind
   unique*: bool
 
+type TrigramDelta* = ref object
+  adds*: HashSet[uint64]
+  removes*: HashSet[uint64]
+
 type Catalog* = ref object
   tables*: Table[string, TableMeta]
   indexes*: Table[string, IndexMeta]
   catalogTree*: BTree
+  trigramDeltas*: Table[(string, uint32), TrigramDelta]
 
 type CatalogRecordKind = enum
   crTable
@@ -204,8 +210,8 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
     if not rootRes.ok:
       return err[Catalog](rootRes.err.code, rootRes.err.message, rootRes.err.context)
     let rootPage = rootRes.value
-    var buf = newSeq[byte](pager.pageSize)
-    buf[0] = PageTypeLeaf
+    var buf = newString(pager.pageSize)
+    buf[0] = char(PageTypeLeaf)
     writeU32LE(buf, 4, 0)
     let writeRes = writePage(pager, rootPage, buf)
     if not writeRes.ok:
@@ -213,7 +219,12 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
     pager.header.rootCatalog = uint32(rootPage)
     discard writeHeader(pager.vfs, pager.file, pager.header)
   let tree = newBTree(pager, PageId(pager.header.rootCatalog))
-  let catalog = Catalog(tables: initTable[string, TableMeta](), indexes: initTable[string, IndexMeta](), catalogTree: tree)
+  let catalog = Catalog(
+    tables: initTable[string, TableMeta](),
+    indexes: initTable[string, IndexMeta](),
+    catalogTree: tree,
+    trigramDeltas: initTable[(string, uint32), TrigramDelta]()
+  )
   let cursorRes = openCursor(tree)
   if cursorRes.ok:
     let cursor = cursorRes.value
@@ -231,6 +242,35 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
         of crIndex:
           catalog.indexes[record.index.name] = record.index
   ok(catalog)
+
+proc trigramBufferAdd*(catalog: Catalog, indexName: string, trigram: uint32, rowid: uint64) =
+  let key = (indexName, trigram)
+  if not catalog.trigramDeltas.hasKey(key):
+    catalog.trigramDeltas[key] = TrigramDelta(adds: initHashSet[uint64](), removes: initHashSet[uint64]())
+  let delta = catalog.trigramDeltas[key]
+  delta.removes.excl(rowid)
+  delta.adds.incl(rowid)
+
+proc trigramBufferRemove*(catalog: Catalog, indexName: string, trigram: uint32, rowid: uint64) =
+  let key = (indexName, trigram)
+  if not catalog.trigramDeltas.hasKey(key):
+    catalog.trigramDeltas[key] = TrigramDelta(adds: initHashSet[uint64](), removes: initHashSet[uint64]())
+  let delta = catalog.trigramDeltas[key]
+  delta.adds.excl(rowid)
+  delta.removes.incl(rowid)
+
+proc trigramDelta*(catalog: Catalog, indexName: string, trigram: uint32): Option[TrigramDelta] =
+  let key = (indexName, trigram)
+  if catalog.trigramDeltas.hasKey(key):
+    return some(catalog.trigramDeltas[key])
+  none(TrigramDelta)
+
+proc clearTrigramDeltas*(catalog: Catalog) =
+  catalog.trigramDeltas.clear()
+
+proc allTrigramDeltas*(catalog: Catalog): seq[((string, uint32), TrigramDelta)] =
+  for k, v in catalog.trigramDeltas.pairs:
+    result.add((k, v))
 
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
   catalog.tables[table.name] = table

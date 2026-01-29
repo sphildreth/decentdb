@@ -144,11 +144,11 @@ proc writeOverflowChain*(pager: Pager, data: openArray[byte]): Result[PageId] =
     if not pageRes.ok:
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
     let pageId = pageRes.value
-    var buf = newSeq[byte](pager.pageSize)
+    var buf = newString(pager.pageSize)
     writeU32LE(buf, 0, 0)
     writeU32LE(buf, 4, uint32(chunkSize))
     for i in 0 ..< chunkSize:
-      buf[8 + i] = data[offset + i]
+      buf[8 + i] = char(data[offset + i])
     let writeRes = writePage(pager, pageId, buf)
     if not writeRes.ok:
       return err[PageId](writeRes.err.code, writeRes.err.message, writeRes.err.context)
@@ -174,7 +174,7 @@ proc readOverflowChain*(pager: Pager, start: PageId, totalLen: uint32): Result[s
   var written = 0
   var current = start
   while current != 0 and written < output.len:
-    let pageRes = readPage(pager, current)
+    let pageRes = readPageRo(pager, current)
     if not pageRes.ok:
       return err[seq[byte]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
     let page = pageRes.value
@@ -184,7 +184,7 @@ proc readOverflowChain*(pager: Pager, start: PageId, totalLen: uint32): Result[s
       return err[seq[byte]](ERR_CORRUPTION, "Overflow page length invalid", "page_id=" & $current)
     let copyLen = min(chunkLen, output.len - written)
     for i in 0 ..< copyLen:
-      output[written + i] = page[8 + i]
+      output[written + i] = byte(page[8 + i])
     written += copyLen
     current = PageId(next)
   ok(output)

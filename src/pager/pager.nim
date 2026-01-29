@@ -2,29 +2,33 @@ import os
 import locks
 import tables
 import options
-import sequtils
 import ../errors
 import ../vfs/types
 import ./db_header
 
 type PageId* = uint32
-type PageOverlay* = proc(pageId: PageId): Option[seq[byte]]
+type PageOverlay* = proc(pageId: PageId): Option[string]
 type ReadGuard* = proc(): Result[Void]
 
 type CacheEntry* = ref object
   id*: PageId
-  data*: seq[byte]
+  data*: string
+  lsn*: uint64
   dirty*: bool
   pinCount*: int
   refBit*: bool
   lock*: Lock
 
+type PageCacheShard = ref object
+  capacity: int
+  pages: Table[PageId, CacheEntry]
+  clock: seq[PageId]
+  clockHand: int
+  lock*: Lock
+
 type PageCache* = ref object
   capacity*: int
-  pages*: Table[PageId, CacheEntry]
-  clock*: seq[PageId]
-  clockHand*: int
-  lock*: Lock
+  shards: seq[PageCacheShard]
 
 type Pager* = ref object
   vfs*: Vfs
@@ -35,15 +39,28 @@ type Pager* = ref object
   cache*: PageCache
   lock*: Lock
   overlay*: PageOverlay
+  overlaySnapshot*: uint64
   readGuard*: ReadGuard
+
+const DefaultCacheShards = 16
 
 proc newPageCache*(capacity: int): PageCache =
   let cap = if capacity <= 0: 1 else: capacity
-  let cache = PageCache(capacity: cap, pages: initTable[PageId, CacheEntry](), clock: @[], clockHand: 0)
-  initLock(cache.lock)
+  var shardCount = min(DefaultCacheShards, cap)
+  if shardCount <= 0:
+    shardCount = 1
+  let baseCap = cap div shardCount
+  let remainder = cap mod shardCount
+  var shards: seq[PageCacheShard] = @[]
+  for i in 0 ..< shardCount:
+    let shardCap = baseCap + (if i < remainder: 1 else: 0)
+    let shard = PageCacheShard(capacity: max(1, shardCap), pages: initTable[PageId, CacheEntry](), clock: @[], clockHand: 0)
+    initLock(shard.lock)
+    shards.add(shard)
+  let cache = PageCache(capacity: cap, shards: shards)
   cache
 
-proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 64): Result[Pager] =
+proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
   let headerRes = readHeader(vfs, file)
   if not headerRes.ok:
     return err[Pager](headerRes.err.code, headerRes.err.message, headerRes.err.context)
@@ -58,7 +75,7 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 64): Result[Pager] =
     return err[Pager](ERR_CORRUPTION, "File size not aligned to page size", file.path)
   let count = if fileInfo.size == 0: 0'u32 else: uint32(fileInfo.size div pageSize)
   let cache = newPageCache(cachePages)
-  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache)
+  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0)
   initLock(pager.lock)
   ok(pager)
 
@@ -76,7 +93,7 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
   acquire(entry.lock)
   defer: release(entry.lock)
   let offset = pageOffset(pager, entry.id)
-  let res = pager.vfs.write(pager.file, offset, entry.data)
+  let res = pager.vfs.writeStr(pager.file, offset, entry.data)
   if not res.ok:
     return err[Void](res.err.code, res.err.message, res.err.context)
   if res.value < pager.pageSize:
@@ -84,21 +101,24 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
   entry.dirty = false
   okVoid()
 
-proc evictIfNeeded(pager: Pager): Result[Void] =
-  let cache = pager.cache
-  while cache.pages.len >= cache.capacity:
-    if cache.clock.len == 0:
+proc shardFor(cache: PageCache, pageId: PageId): PageCacheShard =
+  let idx = int(pageId mod PageId(cache.shards.len))
+  cache.shards[idx]
+
+proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
+  while shard.pages.len >= shard.capacity:
+    if shard.clock.len == 0:
       break
     var scanned = 0
     var evicted = false
     var anyUnpinned = false
-    while scanned < cache.clock.len * 2 and not evicted:
-      if cache.clockHand >= cache.clock.len:
-        cache.clockHand = 0
-      let pageId = cache.clock[cache.clockHand]
-      let entry = cache.pages.getOrDefault(pageId, nil)
-      let currentIndex = cache.clockHand
-      cache.clockHand.inc
+    while scanned < shard.clock.len * 2 and not evicted:
+      if shard.clockHand >= shard.clock.len:
+        shard.clockHand = 0
+      let pageId = shard.clock[shard.clockHand]
+      let entry = shard.pages.getOrDefault(pageId, nil)
+      let currentIndex = shard.clockHand
+      shard.clockHand.inc
       scanned.inc
       if entry == nil:
         continue
@@ -111,10 +131,10 @@ proc evictIfNeeded(pager: Pager): Result[Void] =
       let flushRes = flushEntry(pager, entry)
       if not flushRes.ok:
         return flushRes
-      cache.pages.del(pageId)
-      cache.clock.delete(currentIndex)
-      if cache.clockHand > currentIndex:
-        cache.clockHand.dec
+      shard.pages.del(pageId)
+      shard.clock.delete(currentIndex)
+      if shard.clockHand > currentIndex:
+        shard.clockHand.dec
       evicted = true
     if not evicted:
       if not anyUnpinned:
@@ -127,88 +147,181 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
   if not bound.ok:
     return err[CacheEntry](bound.err.code, bound.err.message, bound.err.context)
   let cache = pager.cache
-  acquire(cache.lock)
-  defer: release(cache.lock)
-  if cache.pages.hasKey(pageId):
-    let entry = cache.pages[pageId]
+  let shard = shardFor(cache, pageId)
+  acquire(shard.lock)
+  defer: release(shard.lock)
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
     entry.pinCount.inc
     entry.refBit = true
     return ok(entry)
-  let evictRes = evictIfNeeded(pager)
+  let evictRes = evictIfNeededLocked(pager, shard)
   if not evictRes.ok:
     return err[CacheEntry](evictRes.err.code, evictRes.err.message, evictRes.err.context)
-  var data = newSeq[byte](pager.pageSize)
+  var data = newString(pager.pageSize)
   let offset = pageOffset(pager, pageId)
-  let readRes = pager.vfs.read(pager.file, offset, data)
+  let readRes = pager.vfs.readStr(pager.file, offset, data)
   if not readRes.ok:
     return err[CacheEntry](readRes.err.code, readRes.err.message, readRes.err.context)
   if readRes.value < pager.pageSize:
     return err[CacheEntry](ERR_CORRUPTION, "Short read on page", "page_id=" & $pageId)
-  let entry = CacheEntry(id: pageId, data: data, dirty: false, pinCount: 1, refBit: true)
+  let entry = CacheEntry(id: pageId, data: data, lsn: pager.header.lastCheckpointLsn, dirty: false, pinCount: 1, refBit: true)
   initLock(entry.lock)
-  cache.pages[pageId] = entry
-  cache.clock.add(pageId)
+  shard.pages[pageId] = entry
+  shard.clock.add(pageId)
   ok(entry)
 
 proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Void] =
   let cache = pager.cache
-  acquire(cache.lock)
-  defer: release(cache.lock)
+  let shard = shardFor(cache, entry.id)
+  acquire(shard.lock)
+  defer: release(shard.lock)
   if entry.pinCount > 0:
     entry.pinCount.dec
   if dirty:
     entry.dirty = true
   okVoid()
 
-proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]]
+proc readPageDirect*(pager: Pager, pageId: PageId): Result[string]
 
-proc readPageCached(pager: Pager, pageId: PageId): Result[seq[byte]] =
-  let pinRes = pinPage(pager, pageId)
-  if not pinRes.ok:
-    return err[seq[byte]](pinRes.err.code, pinRes.err.message, pinRes.err.context)
-  let entry = pinRes.value
-  acquire(entry.lock)
-  var snapshot = newSeq[byte](entry.data.len)
-  if entry.data.len > 0:
-    copyMem(addr snapshot[0], unsafeAddr entry.data[0], entry.data.len)
-  release(entry.lock)
-  discard unpinPage(pager, entry)
-  ok(snapshot)
+proc cloneString(buf: string): string =
+  if buf.len == 0:
+    return ""
+  result = newString(buf.len)
+  copyMem(addr result[0], unsafeAddr buf[0], buf.len)
 
-proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64], body: proc(page: string): Result[T]): Result[T] =
+  ## Invoke `body` with a borrowed view of a cached page when safe.
+  ##
+  ## This avoids allocating/copying a full page image on the hot read path by
+  ## pinning the cache entry and holding the entry lock while the callback runs.
+  ##
+  ## If a snapshot is provided and the cached page is not valid for that snapshot
+  ## (dirty or newer LSN), this falls back to a direct file read.
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
     if not guardRes.ok:
-      return err[seq[byte]](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+      return err[T](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+  let pinRes = pinPage(pager, pageId)
+  if not pinRes.ok:
+    return err[T](pinRes.err.code, pinRes.err.message, pinRes.err.context)
+  let entry = pinRes.value
+  acquire(entry.lock)
+  var pinned = true
+  defer:
+    if pinned:
+      release(entry.lock)
+      discard unpinPage(pager, entry)
+  if snapshot.isSome:
+    let snap = snapshot.get
+    if entry.dirty or entry.lsn > snap:
+      release(entry.lock)
+      discard unpinPage(pager, entry)
+      pinned = false
+      let directRes = readPageDirect(pager, pageId)
+      if not directRes.ok:
+        return err[T](directRes.err.code, directRes.err.message, directRes.err.context)
+      return body(directRes.value)
+  body(entry.data)
+
+proc readPageCachedCopy(pager: Pager, pageId: PageId, snapshot: Option[uint64]): Result[string] =
+  let pinRes = pinPage(pager, pageId)
+  if not pinRes.ok:
+    return err[string](pinRes.err.code, pinRes.err.message, pinRes.err.context)
+  let entry = pinRes.value
+  acquire(entry.lock)
+  let entryDirty = entry.dirty
+  let entryLsn = entry.lsn
+  let entryData = entry.data
+  release(entry.lock)
+  discard unpinPage(pager, entry)
+  if snapshot.isSome:
+    let snap = snapshot.get
+    if entryDirty or entryLsn > snap:
+      return readPageDirect(pager, pageId)
+  ok(cloneString(entryData))
+
+proc readPageCachedShared(pager: Pager, pageId: PageId, snapshot: Option[uint64]): Result[string] =
+  let pinRes = pinPage(pager, pageId)
+  if not pinRes.ok:
+    return err[string](pinRes.err.code, pinRes.err.message, pinRes.err.context)
+  let entry = pinRes.value
+  acquire(entry.lock)
+  let entryDirty = entry.dirty
+  let entryLsn = entry.lsn
+  let entryData = entry.data
+  release(entry.lock)
+  discard unpinPage(pager, entry)
+  if snapshot.isSome:
+    let snap = snapshot.get
+    if entryDirty or entryLsn > snap:
+      return readPageDirect(pager, pageId)
+  ok(entryData)
+
+proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Result[T]): Result[T] =
+  ## Call `body` with a read-only view of `pageId` without forcing a page-sized copy.
+  ##
+  ## If a WAL/page overlay is installed, it is consulted first.
+  if pager.readGuard != nil:
+    let guardRes = pager.readGuard()
+    if not guardRes.ok:
+      return err[T](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      return body(overlayRes.get)
+    return withPageRoCached(pager, pageId, some(pager.overlaySnapshot), body)
+  withPageRoCached(pager, pageId, none(uint64), body)
+
+proc readPage*(pager: Pager, pageId: PageId): Result[string] =
+  if pager.readGuard != nil:
+    let guardRes = pager.readGuard()
+    if not guardRes.ok:
+      return err[string](guardRes.err.code, guardRes.err.message, guardRes.err.context)
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
       return ok(overlayRes.get)
-    return readPageCached(pager, pageId)
-  readPageCached(pager, pageId)
+    return readPageCachedCopy(pager, pageId, some(pager.overlaySnapshot))
+  readPageCachedCopy(pager, pageId, none(uint64))
 
-proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+proc readPageRo*(pager: Pager, pageId: PageId): Result[string] =
+  ## Read page without copying when safe (treat returned string as immutable).
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
     if not guardRes.ok:
-      return err[seq[byte]](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+      return err[string](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      return ok(overlayRes.get)
+    return readPageCachedShared(pager, pageId, some(pager.overlaySnapshot))
+  readPageCachedShared(pager, pageId, none(uint64))
+
+proc readPageDirect*(pager: Pager, pageId: PageId): Result[string] =
+  if pager.readGuard != nil:
+    let guardRes = pager.readGuard()
+    if not guardRes.ok:
+      return err[string](guardRes.err.code, guardRes.err.message, guardRes.err.context)
   let bound = ensurePageId(pager, pageId)
   if not bound.ok:
-    return err[seq[byte]](bound.err.code, bound.err.message, bound.err.context)
-  var buf = newSeq[byte](pager.pageSize)
+    return err[string](bound.err.code, bound.err.message, bound.err.context)
+  var buf = newString(pager.pageSize)
   let offset = pageOffset(pager, pageId)
-  let res = pager.vfs.read(pager.file, offset, buf)
+  let res = pager.vfs.readStr(pager.file, offset, buf)
   if not res.ok:
-    return err[seq[byte]](res.err.code, res.err.message, res.err.context)
+    return err[string](res.err.code, res.err.message, res.err.context)
   if res.value < pager.pageSize:
-    return err[seq[byte]](ERR_IO, "Short read on page", "page_id=" & $pageId)
+    return err[string](ERR_IO, "Short read on page", "page_id=" & $pageId)
   ok(buf)
 
-proc setPageOverlay*(pager: Pager, overlay: PageOverlay) =
+proc setPageOverlay*(pager: Pager, snapshot: uint64, overlay: PageOverlay) =
   pager.overlay = overlay
+  pager.overlaySnapshot = snapshot
 
 proc clearPageOverlay*(pager: Pager) =
   pager.overlay = nil
+  pager.overlaySnapshot = 0
 
 proc setReadGuard*(pager: Pager, guard: ReadGuard) =
   pager.readGuard = guard
@@ -216,7 +329,7 @@ proc setReadGuard*(pager: Pager, guard: ReadGuard) =
 proc clearReadGuard*(pager: Pager) =
   pager.readGuard = nil
 
-proc writePage*(pager: Pager, pageId: PageId, data: openArray[byte]): Result[Void] =
+proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   if data.len != pager.pageSize:
     return err[Void](ERR_IO, "Page write size mismatch", "page_id=" & $pageId)
   let pinRes = pinPage(pager, pageId)
@@ -224,16 +337,37 @@ proc writePage*(pager: Pager, pageId: PageId, data: openArray[byte]): Result[Voi
     return err[Void](pinRes.err.code, pinRes.err.message, pinRes.err.context)
   let entry = pinRes.value
   acquire(entry.lock)
-  entry.data = @data
+  entry.data = data
+  entry.lsn = 0
   release(entry.lock)
   discard unpinPage(pager, entry, dirty = true)
   okVoid()
 
+proc writePageDirectFile*(pager: Pager, pageId: PageId, data: string): Result[Void] =
+  ## Write a page image directly to the database file (bypasses cache).
+  if data.len != pager.pageSize:
+    return err[Void](ERR_IO, "Page write size mismatch", "page_id=" & $pageId)
+  let bound = ensurePageId(pager, pageId)
+  if not bound.ok:
+    return err[Void](bound.err.code, bound.err.message, bound.err.context)
+  let offset = pageOffset(pager, pageId)
+  let res = pager.vfs.writeStr(pager.file, offset, data)
+  if not res.ok:
+    return err[Void](res.err.code, res.err.message, res.err.context)
+  if res.value < pager.pageSize:
+    return err[Void](ERR_IO, "Short write on page", "page_id=" & $pageId)
+  okVoid()
+
 proc flushAll*(pager: Pager): Result[Void] =
   let cache = pager.cache
-  acquire(cache.lock)
-  defer: release(cache.lock)
-  for _, entry in cache.pages:
+  var dirtyEntries: seq[CacheEntry] = @[]
+  for shard in cache.shards:
+    acquire(shard.lock)
+    for _, entry in shard.pages:
+      if entry.dirty:
+        dirtyEntries.add(entry)
+    release(shard.lock)
+  for entry in dirtyEntries:
     let res = flushEntry(pager, entry)
     if not res.ok:
       return res
@@ -242,37 +376,43 @@ proc flushAll*(pager: Pager): Result[Void] =
     return err[Void](syncRes.err.code, syncRes.err.message, syncRes.err.context)
   okVoid()
 
-proc snapshotDirtyPages*(pager: Pager): seq[(PageId, seq[byte])] =
+proc snapshotDirtyPages*(pager: Pager): seq[(PageId, string)] =
   let cache = pager.cache
-  acquire(cache.lock)
-  let entries = cache.pages.values.toSeq()
-  release(cache.lock)
+  var entries: seq[CacheEntry] = @[]
+  for shard in cache.shards:
+    acquire(shard.lock)
+    for _, entry in shard.pages:
+      entries.add(entry)
+    release(shard.lock)
   for entry in entries:
     if not entry.dirty:
       continue
     acquire(entry.lock)
-    var copy = newSeq[byte](entry.data.len)
-    if entry.data.len > 0:
-      copyMem(addr copy[0], unsafeAddr entry.data[0], entry.data.len)
+    let copy = entry.data
     release(entry.lock)
     result.add((entry.id, copy))
 
-proc markPagesClean*(pager: Pager, pageIds: seq[PageId]) =
+proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
   let cache = pager.cache
-  acquire(cache.lock)
   for pageId in pageIds:
-    if cache.pages.hasKey(pageId):
-      let entry = cache.pages[pageId]
+    let shard = shardFor(cache, pageId)
+    acquire(shard.lock)
+    if shard.pages.hasKey(pageId):
+      let entry = shard.pages[pageId]
+      acquire(entry.lock)
       entry.dirty = false
-  release(cache.lock)
+      entry.lsn = lsn
+      release(entry.lock)
+    release(shard.lock)
 
 proc clearCache*(pager: Pager) =
   let cache = pager.cache
-  acquire(cache.lock)
-  cache.pages.clear()
-  cache.clock = @[]
-  cache.clockHand = 0
-  release(cache.lock)
+  for shard in cache.shards:
+    acquire(shard.lock)
+    shard.pages.clear()
+    shard.clock = @[]
+    shard.clockHand = 0
+    release(shard.lock)
 
 proc closePager*(pager: Pager): Result[Void] =
   let flushRes = flushAll(pager)
@@ -282,9 +422,9 @@ proc closePager*(pager: Pager): Result[Void] =
 
 proc appendBlankPage(pager: Pager): Result[PageId] =
   let newId = pager.pageCount + 1
-  var data = newSeq[byte](pager.pageSize)
+  var data = newString(pager.pageSize)
   let offset = pageOffset(pager, newId)
-  let res = pager.vfs.write(pager.file, offset, data)
+  let res = pager.vfs.writeStr(pager.file, offset, data)
   if not res.ok:
     return err[PageId](res.err.code, res.err.message, res.err.context)
   if res.value < pager.pageSize:
@@ -296,7 +436,7 @@ proc freelistCapacity(pager: Pager): int =
   (pager.pageSize - 8) div 4
 
 proc readFreelistPage(pager: Pager, pageId: PageId, nextOut: var uint32, countOut: var uint32, idsOut: var seq[uint32]): Result[Void] =
-  let pageRes = readPage(pager, pageId)
+  let pageRes = readPageRo(pager, pageId)
   if not pageRes.ok:
     return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
   let page = pageRes.value
@@ -311,7 +451,7 @@ proc readFreelistPage(pager: Pager, pageId: PageId, nextOut: var uint32, countOu
   okVoid()
 
 proc writeFreelistPage(pager: Pager, pageId: PageId, next: uint32, ids: seq[uint32]): Result[Void] =
-  var buf = newSeq[byte](pager.pageSize)
+  var buf = newString(pager.pageSize)
   writeU32LE(buf, 0, next)
   writeU32LE(buf, 4, uint32(ids.len))
   for i, id in ids:

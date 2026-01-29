@@ -53,7 +53,33 @@ method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte])
       return err[int](ERR_IO, "Read failed", file.path)
   ok(bytesRead)
 
+method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Result[int] =
+  var bytesRead = 0
+  withFileLock(file):
+    try:
+      if buf.len == 0:
+        bytesRead = 0
+      else:
+        setFilePos(file.file, offset)
+        bytesRead = file.file.readBuffer(addr buf[0], buf.len)
+    except OSError:
+      return err[int](ERR_IO, "Read failed", file.path)
+  ok(bytesRead)
+
 method write*(vfs: OsVfs, file: VfsFile, offset: int64, buf: openArray[byte]): Result[int] =
+  var bytesWritten = 0
+  withFileLock(file):
+    try:
+      if buf.len == 0:
+        bytesWritten = 0
+      else:
+        setFilePos(file.file, offset)
+        bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
+    except OSError:
+      return err[int](ERR_IO, "Write failed", file.path)
+  ok(bytesWritten)
+
+method writeStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: string): Result[int] =
   var bytesWritten = 0
   withFileLock(file):
     try:

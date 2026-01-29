@@ -20,13 +20,13 @@ type BTreeCursor* = ref object
   overflows*: seq[uint32]
   nextLeaf*: PageId
 
-proc readU16LE(buf: openArray[byte], offset: int): uint16 =
-  uint16(buf[offset]) or (uint16(buf[offset + 1]) shl 8)
+proc readU16LE(buf: string, offset: int): uint16 =
+  uint16(byte(buf[offset])) or (uint16(byte(buf[offset + 1])) shl 8)
 
-proc readLeafCells(page: openArray[byte]): Result[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)] =
+proc readLeafCells(page: string): Result[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)] =
   if page.len < 8:
     return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Page too small")
-  if page[0] != PageTypeLeaf:
+  if byte(page[0]) != PageTypeLeaf:
     return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Not a leaf page")
   let count = int(readU16LE(page, 2))
   let nextLeaf = PageId(readU32LE(page, 4))
@@ -52,10 +52,10 @@ proc readLeafCells(page: openArray[byte]): Result[(seq[uint64], seq[seq[byte]], 
     overflows.add(overflow)
   ok((keys, values, overflows, nextLeaf))
 
-proc readInternalCells(page: openArray[byte]): Result[(seq[uint64], seq[uint32], uint32)] =
+proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)] =
   if page.len < 8:
     return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Page too small")
-  if page[0] != PageTypeInternal:
+  if byte(page[0]) != PageTypeInternal:
     return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Not an internal page")
   let count = int(readU16LE(page, 2))
   let rightChild = readU32LE(page, 4)
@@ -78,17 +78,24 @@ proc newBTree*(pager: Pager, root: PageId): BTree =
 proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
   var current = tree.root
   while true:
-    let pageRes = readPage(tree.pager, current)
+    var pageType: byte = 0
+    var keys: seq[uint64] = @[]
+    var children: seq[uint32] = @[]
+    var rightChild: uint32 = 0
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        return okVoid()
+      let internalRes = readInternalCells(page)
+      if not internalRes.ok:
+        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+      (keys, children, rightChild) = internalRes.value
+      okVoid()
+    )
     if not pageRes.ok:
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-    let page = pageRes.value
-    let pageType = page[0]
     if pageType == PageTypeLeaf:
       return ok(current)
-    let internalRes = readInternalCells(page)
-    if not internalRes.ok:
-      return err[PageId](internalRes.err.code, internalRes.err.message, internalRes.err.context)
-    let (keys, children, rightChild) = internalRes.value
     var chosen = rightChild
     for i in 0 ..< keys.len:
       if key < keys[i]:
@@ -99,17 +106,24 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
 proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
   var current = tree.root
   while true:
-    let pageRes = readPage(tree.pager, current)
+    var pageType: byte = 0
+    var keys: seq[uint64] = @[]
+    var children: seq[uint32] = @[]
+    var rightChild: uint32 = 0
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        return okVoid()
+      let internalRes = readInternalCells(page)
+      if not internalRes.ok:
+        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+      (keys, children, rightChild) = internalRes.value
+      okVoid()
+    )
     if not pageRes.ok:
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-    let page = pageRes.value
-    let pageType = page[0]
     if pageType == PageTypeLeaf:
       return ok(current)
-    let internalRes = readInternalCells(page)
-    if not internalRes.ok:
-      return err[PageId](internalRes.err.code, internalRes.err.message, internalRes.err.context)
-    let (keys, children, rightChild) = internalRes.value
     var chosen = rightChild
     for i in 0 ..< keys.len:
       if key <= keys[i]:
@@ -133,13 +147,18 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
   if not leafRes.ok:
     return err[(uint64, seq[byte], uint32)](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   let leafId = leafRes.value
-  let pageRes = readPage(tree.pager, leafId)
+  var keys: seq[uint64] = @[]
+  var values: seq[seq[byte]] = @[]
+  var overflows: seq[uint32] = @[]
+  let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
+    let parsed = readLeafCells(page)
+    if not parsed.ok:
+      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+    (keys, values, overflows, _) = parsed.value
+    okVoid()
+  )
   if not pageRes.ok:
     return err[(uint64, seq[byte], uint32)](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-  let parsed = readLeafCells(pageRes.value)
-  if not parsed.ok:
-    return err[(uint64, seq[byte], uint32)](parsed.err.code, parsed.err.message, parsed.err.context)
-  let (keys, values, overflows, _) = parsed.value
   for i in 0 ..< keys.len:
     if keys[i] == key:
       if values[i].len == 0 and overflows[i] == 0'u32:
@@ -150,22 +169,31 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
 proc openCursor*(tree: BTree): Result[BTreeCursor] =
   var current = tree.root
   while true:
-    let pageRes = readPage(tree.pager, current)
+    var pageType: byte = 0
+    var keys: seq[uint64] = @[]
+    var values: seq[seq[byte]] = @[]
+    var overflows: seq[uint32] = @[]
+    var nextLeaf: PageId = 0
+    var children: seq[uint32] = @[]
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        let parsed = readLeafCells(page)
+        if not parsed.ok:
+          return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+        (keys, values, overflows, nextLeaf) = parsed.value
+        return okVoid()
+      let internalRes = readInternalCells(page)
+      if not internalRes.ok:
+        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+      (_, children, _) = internalRes.value
+      okVoid()
+    )
     if not pageRes.ok:
       return err[BTreeCursor](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-    let page = pageRes.value
-    let pageType = page[0]
     if pageType == PageTypeLeaf:
-      let parsed = readLeafCells(page)
-      if not parsed.ok:
-        return err[BTreeCursor](parsed.err.code, parsed.err.message, parsed.err.context)
-      let (keys, values, overflows, nextLeaf) = parsed.value
       let cursor = BTreeCursor(tree: tree, leaf: current, index: 0, keys: keys, values: values, overflows: overflows, nextLeaf: nextLeaf)
       return ok(cursor)
-    let internalRes = readInternalCells(page)
-    if not internalRes.ok:
-      return err[BTreeCursor](internalRes.err.code, internalRes.err.message, internalRes.err.context)
-    let (_, children, _) = internalRes.value
     if children.len == 0:
       return err[BTreeCursor](ERR_CORRUPTION, "Empty internal page")
     current = PageId(children[0])
@@ -175,13 +203,19 @@ proc openCursorAt*(tree: BTree, startKey: uint64): Result[BTreeCursor] =
   if not leafRes.ok:
     return err[BTreeCursor](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   let leafId = leafRes.value
-  let pageRes = readPage(tree.pager, leafId)
+  var keys: seq[uint64] = @[]
+  var values: seq[seq[byte]] = @[]
+  var overflows: seq[uint32] = @[]
+  var nextLeaf: PageId = 0
+  let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
+    let parsed = readLeafCells(page)
+    if not parsed.ok:
+      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+    (keys, values, overflows, nextLeaf) = parsed.value
+    okVoid()
+  )
   if not pageRes.ok:
     return err[BTreeCursor](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-  let parsed = readLeafCells(pageRes.value)
-  if not parsed.ok:
-    return err[BTreeCursor](parsed.err.code, parsed.err.message, parsed.err.context)
-  let (keys, values, overflows, nextLeaf) = parsed.value
   let idx = lowerBound(keys, startKey)
   let cursor = BTreeCursor(tree: tree, leaf: leafId, index: idx, keys: keys, values: values, overflows: overflows, nextLeaf: nextLeaf)
   ok(cursor)
@@ -196,13 +230,19 @@ proc cursorNext*(cursor: BTreeCursor): Result[(uint64, seq[byte], uint32)] =
   if cursor.nextLeaf == 0:
     cursor.leaf = 0
     return err[(uint64, seq[byte], uint32)](ERR_IO, "Cursor exhausted")
-  let pageRes = readPage(cursor.tree.pager, cursor.nextLeaf)
+  var keys: seq[uint64] = @[]
+  var values: seq[seq[byte]] = @[]
+  var overflows: seq[uint32] = @[]
+  var nextLeaf: PageId = 0
+  let pageRes = cursor.tree.pager.withPageRo(cursor.nextLeaf, proc(page: string): Result[Void] =
+    let parsed = readLeafCells(page)
+    if not parsed.ok:
+      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+    (keys, values, overflows, nextLeaf) = parsed.value
+    okVoid()
+  )
   if not pageRes.ok:
     return err[(uint64, seq[byte], uint32)](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-  let parsed = readLeafCells(pageRes.value)
-  if not parsed.ok:
-    return err[(uint64, seq[byte], uint32)](parsed.err.code, parsed.err.message, parsed.err.context)
-  let (keys, values, overflows, nextLeaf) = parsed.value
   cursor.leaf = cursor.nextLeaf
   cursor.keys = keys
   cursor.values = values
@@ -211,21 +251,21 @@ proc cursorNext*(cursor: BTreeCursor): Result[(uint64, seq[byte], uint32)] =
   cursor.index = 0
   cursorNext(cursor)
 
-proc encodeLeaf(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32], nextLeaf: PageId, pageSize: int): Result[seq[byte]] =
+proc encodeLeaf(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32], nextLeaf: PageId, pageSize: int): Result[string] =
   if keys.len != values.len or keys.len != overflows.len:
-    return err[seq[byte]](ERR_INTERNAL, "Leaf encode length mismatch")
-  var buf = newSeq[byte](pageSize)
-  buf[0] = PageTypeLeaf
-  buf[1] = 0
+    return err[string](ERR_INTERNAL, "Leaf encode length mismatch")
+  var buf = newString(pageSize)
+  buf[0] = char(PageTypeLeaf)
+  buf[1] = '\0'
   let count = uint16(keys.len)
-  buf[2] = byte(count and 0xFF)
-  buf[3] = byte((count shr 8) and 0xFF)
+  buf[2] = char(byte(count and 0xFF))
+  buf[3] = char(byte((count shr 8) and 0xFF))
   writeU32LE(buf, 4, uint32(nextLeaf))
   var offset = 8
   for i in 0 ..< keys.len:
     let valueLen = values[i].len
     if offset + 16 + valueLen > pageSize:
-      return err[seq[byte]](ERR_IO, "Leaf overflow")
+      return err[string](ERR_IO, "Leaf overflow")
     writeU64LE(buf, offset, keys[i])
     writeU32LE(buf, offset + 8, uint32(valueLen))
     writeU32LE(buf, offset + 12, overflows[i])
@@ -235,35 +275,144 @@ proc encodeLeaf(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32
       offset += valueLen
   ok(buf)
 
-proc encodeInternal(keys: seq[uint64], children: seq[uint32], rightChild: uint32, pageSize: int): Result[seq[byte]] =
+proc encodeInternal(keys: seq[uint64], children: seq[uint32], rightChild: uint32, pageSize: int): Result[string] =
   if children.len != keys.len:
-    return err[seq[byte]](ERR_INTERNAL, "Internal encode length mismatch")
-  var buf = newSeq[byte](pageSize)
-  buf[0] = PageTypeInternal
-  buf[1] = 0
+    return err[string](ERR_INTERNAL, "Internal encode length mismatch")
+  var buf = newString(pageSize)
+  buf[0] = char(PageTypeInternal)
+  buf[1] = '\0'
   let count = uint16(keys.len)
-  buf[2] = byte(count and 0xFF)
-  buf[3] = byte((count shr 8) and 0xFF)
+  buf[2] = char(byte(count and 0xFF))
+  buf[3] = char(byte((count shr 8) and 0xFF))
   writeU32LE(buf, 4, rightChild)
   var offset = 8
   for i in 0 ..< keys.len:
     if offset + 12 > pageSize:
-      return err[seq[byte]](ERR_IO, "Internal overflow")
+      return err[string](ERR_IO, "Internal overflow")
     writeU64LE(buf, offset, keys[i])
     writeU32LE(buf, offset + 8, children[i])
     offset += 12
   ok(buf)
+
+proc bulkBuildFromSorted*(tree: BTree, entries: seq[(uint64, seq[byte])]): Result[PageId] =
+  ## Build a B+Tree from entries sorted by (key, value).
+  ##
+  ## This is intended for bulk index builds where keys are already sorted, to
+  ## avoid O(N log N) insertion work and reduce split churn.
+  ##
+  ## Note: This builds new pages and may change the tree root page id.
+  let pageSize = tree.pager.pageSize
+  if entries.len == 0:
+    let bufRes = encodeLeaf(@[], @[], @[], 0, pageSize)
+    if not bufRes.ok:
+      return err[PageId](bufRes.err.code, bufRes.err.message, bufRes.err.context)
+    let writeRes = writePage(tree.pager, tree.root, bufRes.value)
+    if not writeRes.ok:
+      return err[PageId](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    return ok(tree.root)
+
+  type ChildInfo = tuple[id: PageId, firstKey: uint64]
+
+  var leaves: seq[ChildInfo] = @[]
+  var currentLeaf = tree.root
+  var currentKeys: seq[uint64] = @[]
+  var currentVals: seq[seq[byte]] = @[]
+  var currentOv: seq[uint32] = @[]
+
+  proc flushLeaf(nextLeaf: PageId): Result[Void] =
+    let bufRes = encodeLeaf(currentKeys, currentVals, currentOv, nextLeaf, pageSize)
+    if not bufRes.ok:
+      return err[Void](bufRes.err.code, bufRes.err.message, bufRes.err.context)
+    let writeRes = writePage(tree.pager, currentLeaf, bufRes.value)
+    if not writeRes.ok:
+      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    okVoid()
+
+  for i, entry in entries:
+    if currentKeys.len == 0:
+      leaves.add((id: currentLeaf, firstKey: entry[0]))
+    currentKeys.add(entry[0])
+    currentVals.add(entry[1])
+    currentOv.add(0'u32)
+    let tryRes = encodeLeaf(currentKeys, currentVals, currentOv, 0, pageSize)
+    if tryRes.ok:
+      continue
+    # Current leaf overflowed; move the last entry into a new leaf.
+    currentKeys.setLen(currentKeys.len - 1)
+    currentVals.setLen(currentVals.len - 1)
+    currentOv.setLen(currentOv.len - 1)
+    let newLeafRes = allocatePage(tree.pager)
+    if not newLeafRes.ok:
+      return err[PageId](newLeafRes.err.code, newLeafRes.err.message, newLeafRes.err.context)
+    let newLeaf = newLeafRes.value
+    let flushRes = flushLeaf(newLeaf)
+    if not flushRes.ok:
+      return err[PageId](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+    currentLeaf = newLeaf
+    currentKeys = @[entry[0]]
+    currentVals = @[entry[1]]
+    currentOv = @[0'u32]
+    leaves.add((id: currentLeaf, firstKey: entry[0]))
+
+  let flushRes = flushLeaf(0)
+  if not flushRes.ok:
+    return err[PageId](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+
+  if leaves.len == 1:
+    tree.root = leaves[0].id
+    return ok(tree.root)
+
+  proc maxInternalKeys(): int =
+    (pageSize - 8) div 12
+
+  var level = leaves
+  while level.len > 1:
+    var nextLevel: seq[ChildInfo] = @[]
+    let maxKeys = maxInternalKeys()
+    let maxChildren = maxKeys + 1
+    var idx = 0
+    while idx < level.len:
+      let endIdx = min(idx + maxChildren, level.len)
+      let group = level[idx ..< endIdx]
+      if group.len == 1:
+        # Degenerate parent: just bubble up the child (should only happen when
+        # the final root is a single page).
+        nextLevel.add(group[0])
+        idx = endIdx
+        continue
+      let pageRes = allocatePage(tree.pager)
+      if not pageRes.ok:
+        return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+      let parentId = pageRes.value
+      var keys: seq[uint64] = @[]
+      var children: seq[uint32] = @[]
+      for i in 0 ..< group.len - 1:
+        children.add(uint32(group[i].id))
+        keys.add(group[i + 1].firstKey)
+      let rightChild = uint32(group[^1].id)
+      let bufRes = encodeInternal(keys, children, rightChild, pageSize)
+      if not bufRes.ok:
+        return err[PageId](bufRes.err.code, bufRes.err.message, bufRes.err.context)
+      let writeRes = writePage(tree.pager, parentId, bufRes.value)
+      if not writeRes.ok:
+        return err[PageId](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+      nextLevel.add((id: parentId, firstKey: group[0].firstKey))
+      idx = endIdx
+    level = nextLevel
+
+  tree.root = level[0].id
+  ok(tree.root)
 
 type SplitResult = object
   promoted: uint64
   newPage: PageId
 
 proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte]): Result[Option[SplitResult]] =
-  let pageRes = readPage(tree.pager, pageId)
+  let pageRes = readPageRo(tree.pager, pageId)
   if not pageRes.ok:
     return err[Option[SplitResult]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
   let page = pageRes.value
-  if page[0] == PageTypeLeaf:
+  if byte(page[0]) == PageTypeLeaf:
     let parsed = readLeafCells(page)
     if not parsed.ok:
       return err[Option[SplitResult]](parsed.err.code, parsed.err.message, parsed.err.context)
@@ -379,7 +528,7 @@ proc update*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
   if not leafRes.ok:
     return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   let pageId = leafRes.value
-  let pageRes = readPage(tree.pager, pageId)
+  let pageRes = readPageRo(tree.pager, pageId)
   if not pageRes.ok:
     return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
   let parsed = readLeafCells(pageRes.value)
@@ -402,7 +551,7 @@ proc delete*(tree: BTree, key: uint64): Result[Void] =
   if not leafRes.ok:
     return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   let pageId = leafRes.value
-  let pageRes = readPage(tree.pager, pageId)
+  let pageRes = readPageRo(tree.pager, pageId)
   if not pageRes.ok:
     return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
   let parsed = readLeafCells(pageRes.value)
@@ -427,7 +576,7 @@ proc deleteKeyValue*(tree: BTree, key: uint64, value: seq[byte]): Result[bool] =
     return err[bool](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   var current = leafRes.value
   while current != 0:
-    let pageRes = readPage(tree.pager, current)
+    let pageRes = readPageRo(tree.pager, current)
     if not pageRes.ok:
       return err[bool](pageRes.err.code, pageRes.err.message, pageRes.err.context)
     let parsed = readLeafCells(pageRes.value)

@@ -14,6 +14,12 @@ proc makeTempDb(name: string): string =
     removeFile(path & ".wal")
   path
 
+proc bytesToPageString(data: seq[byte]): string =
+  if data.len == 0:
+    return ""
+  result = newString(data.len)
+  copyMem(addr result[0], unsafeAddr data[0], data.len)
+
 suite "WAL":
   test "committed visible, uncommitted not visible":
     let path = makeTempDb("decentdb_wal_visibility.db")
@@ -34,6 +40,7 @@ suite "WAL":
     var data = newSeq[byte](pager.pageSize)
     for i in 0 ..< data.len:
       data[i] = 7
+    let dataStr = bytesToPageString(data)
     let writerRes = beginWrite(wal)
     check writerRes.ok
     let writer = writerRes.value
@@ -41,13 +48,13 @@ suite "WAL":
     let snapBefore = wal.beginRead()
     let readBefore = readPageWithSnapshot(pager, wal, snapBefore.snapshot, pageId)
     check readBefore.ok
-    check readBefore.value != data
+    check readBefore.value != dataStr
     wal.endRead(snapBefore)
     check commit(writer).ok
     let snapAfter = wal.beginRead()
     let readAfter = readPageWithSnapshot(pager, wal, snapAfter.snapshot, pageId)
     check readAfter.ok
-    check readAfter.value == data
+    check readAfter.value == dataStr
     wal.endRead(snapAfter)
     discard closePager(pager)
     discard closeDb(db)
@@ -70,6 +77,7 @@ suite "WAL":
     var data = newSeq[byte](pager.pageSize)
     for i in 0 ..< data.len:
       data[i] = 9
+    let dataStr = bytesToPageString(data)
     let writerRes = beginWrite(wal)
     check writerRes.ok
     let writer = writerRes.value
@@ -80,7 +88,7 @@ suite "WAL":
     let snap = wal.beginRead()
     let readRes = readPageWithSnapshot(pager, wal, snap.snapshot, pageId)
     check readRes.ok
-    check readRes.value != data
+    check readRes.value != dataStr
     wal.endRead(snap)
     discard closePager(pager)
     discard closeDb(db)
@@ -100,19 +108,21 @@ suite "WAL":
     let pageRes = allocatePage(pager)
     check pageRes.ok
     let pageId = pageRes.value
-    var initial = newSeq[byte](pager.pageSize)
-    for i in 0 ..< initial.len:
-      initial[i] = 1
+    var initialBytes = newSeq[byte](pager.pageSize)
+    for i in 0 ..< initialBytes.len:
+      initialBytes[i] = 1
+    let initial = bytesToPageString(initialBytes)
     check writePage(pager, pageId, initial).ok
     discard flushAll(pager)
     let snapOld = wal.beginRead()
-    var updated = newSeq[byte](pager.pageSize)
-    for i in 0 ..< updated.len:
-      updated[i] = 2
+    var updatedBytes = newSeq[byte](pager.pageSize)
+    for i in 0 ..< updatedBytes.len:
+      updatedBytes[i] = 2
+    let updated = bytesToPageString(updatedBytes)
     let writerRes = beginWrite(wal)
     check writerRes.ok
     let writer = writerRes.value
-    check writer.writePage(pageId, updated).ok
+    check writer.writePage(pageId, updatedBytes).ok
     check commit(writer).ok
     let readOld = readPageWithSnapshot(pager, wal, snapOld.snapshot, pageId)
     check readOld.ok
@@ -143,6 +153,7 @@ suite "WAL":
     var data = newSeq[byte](pager.pageSize)
     for i in 0 ..< data.len:
       data[i] = 3
+    let dataStr = bytesToPageString(data)
     let writerRes = beginWrite(wal)
     check writerRes.ok
     let writer = writerRes.value
@@ -154,7 +165,7 @@ suite "WAL":
     check info.size == 0
     let readRes = readPage(pager, pageId)
     check readRes.ok
-    check readRes.value == data
+    check readRes.value == dataStr
     discard closePager(pager)
     discard closeDb(db)
 
@@ -185,7 +196,74 @@ suite "WAL":
     check ckRes.ok
     let info = getFileInfo(path & ".wal")
     check info.size > 0
+    # Reader snapshot should still see the pre-update page image even after checkpoint.
+    var zerosBytes = newSeq[byte](pager.pageSize)
+    let zeros = bytesToPageString(zerosBytes)
+    let readOld = readPageWithSnapshot(pager, wal, snap.snapshot, pageId)
+    check readOld.ok
+    check readOld.value == zeros
     wal.endRead(snap)
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "checkpoint uses the best page version <= reader snapshot":
+    let path = makeTempDb("decentdb_wal_checkpoint_best_version.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+
+    var v1Bytes = newSeq[byte](pager.pageSize)
+    for i in 0 ..< v1Bytes.len:
+      v1Bytes[i] = 11
+    let v1 = bytesToPageString(v1Bytes)
+
+    var v2Bytes = newSeq[byte](pager.pageSize)
+    for i in 0 ..< v2Bytes.len:
+      v2Bytes[i] = 22
+    let v2 = bytesToPageString(v2Bytes)
+
+    # Commit v1.
+    let w1Res = beginWrite(wal)
+    check w1Res.ok
+    let w1 = w1Res.value
+    check w1.writePage(pageId, v1Bytes).ok
+    check commit(w1).ok
+
+    # Reader starts after v1 is committed.
+    let snap = wal.beginRead()
+
+    # Commit v2 (newer than reader snapshot).
+    let w2Res = beginWrite(wal)
+    check w2Res.ok
+    let w2 = w2Res.value
+    check w2.writePage(pageId, v2Bytes).ok
+    check commit(w2).ok
+
+    let ckRes = checkpoint(wal, pager)
+    check ckRes.ok
+
+    # The database file should be advanced to v1, not v2, while the reader is active.
+    let base = readPageDirect(pager, pageId)
+    check base.ok
+    check base.value == v1
+    check base.value != v2
+
+    # The reader should still see v1 at its snapshot.
+    let readSnap = readPageWithSnapshot(pager, wal, snap.snapshot, pageId)
+    check readSnap.ok
+    check readSnap.value == v1
+    wal.endRead(snap)
+
     discard closePager(pager)
     discard closeDb(db)
 

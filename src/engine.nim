@@ -2,7 +2,7 @@ import os
 import strutils
 import tables
 import options
-import sets
+import algorithm
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
@@ -423,8 +423,15 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         output.add(parts.join("|"))
       return ok(output)
     let txn = beginRead(db.wal)
-    db.pager.setPageOverlay(proc(pageId: PageId): Option[seq[byte]] =
-      db.wal.getPageAtOrBefore(pageId, txn.snapshot)
+    db.pager.setPageOverlay(txn.snapshot, proc(pageId: PageId): Option[string] =
+      let pageOpt = db.wal.getPageAtOrBefore(pageId, txn.snapshot)
+      if pageOpt.isNone:
+        return none(string)
+      let payload = pageOpt.get
+      var s = newString(payload.len)
+      if payload.len > 0:
+        copyMem(addr s[0], unsafeAddr payload[0], payload.len)
+      some(s)
     )
     db.pager.setReadGuard(proc(): Result[Void] =
       if db.wal.isAborted(txn):
@@ -765,60 +772,181 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
   for i, col in table.columns:
     if col.unique or col.primaryKey:
       uniqueCols.add(i)
-  var seen: seq[HashSet[uint64]] = newSeq[HashSet[uint64]](uniqueCols.len)
-  for i in 0 ..< seen.len:
-    seen[i] = initHashSet[uint64]()
-  if uniqueCols.len > 0:
-    let existingRes = scanTable(db.pager, table)
-    if not existingRes.ok:
-      return err[Void](existingRes.err.code, existingRes.err.message, existingRes.err.context)
-    for row in existingRes.value:
-      for idx, colIndex in uniqueCols:
-        if row.values[colIndex].kind == vkNull:
-          continue
-        seen[idx].incl(indexKeyFromValue(row.values[colIndex]))
+  var seenFiles: seq[string] = newSeq[string](uniqueCols.len)
+  var tempFiles: seq[string] = @[]
+  defer:
+    for path in tempFiles:
+      if path.len > 0 and fileExists(path):
+        removeFile(path)
+
+  proc writeSortedKeys(path: string, keys: seq[uint64]): Result[Void] =
+    var f: File
+    if not open(f, path, fmWrite):
+      return err[Void](ERR_IO, "Failed to open temp key file", path)
+    defer: close(f)
+    var buf = newSeq[byte](8)
+    for k in keys:
+      writeU64LE(buf, 0, k)
+      discard f.writeBuffer(addr buf[0], 8)
+    okVoid()
+
+  proc mergeSeenFile(existingPath: string, batchKeys: seq[uint64], outPath: string, context: string): Result[Void] =
+    var outFile: File
+    if not open(outFile, outPath, fmWrite):
+      return err[Void](ERR_IO, "Failed to open temp key file", outPath)
+    defer: close(outFile)
+    var inFile: File
+    var hasIn = false
+    if existingPath.len > 0 and fileExists(existingPath):
+      if not open(inFile, existingPath, fmRead):
+        return err[Void](ERR_IO, "Failed to open temp key file", existingPath)
+      hasIn = true
+    defer:
+      if hasIn:
+        close(inFile)
+    var inBuf = newSeq[byte](8)
+    var outBuf = newSeq[byte](8)
+    var inKey: uint64 = 0
+    var inOk = false
+    proc readNextIn(): bool =
+      if not hasIn:
+        return false
+      let n = inFile.readBuffer(addr inBuf[0], 8)
+      if n != 8:
+        return false
+      inKey = readU64LE(inBuf, 0)
+      true
+    inOk = readNextIn()
+    var batchIdx = 0
+    var prev: uint64 = 0
+    var hasPrev = false
+    while inOk or batchIdx < batchKeys.len:
+      var nextKey: uint64 = 0
+      if inOk and batchIdx < batchKeys.len:
+        if inKey <= batchKeys[batchIdx]:
+          nextKey = inKey
+          inOk = readNextIn()
+        else:
+          nextKey = batchKeys[batchIdx]
+          batchIdx.inc
+      elif inOk:
+        nextKey = inKey
+        inOk = readNextIn()
+      else:
+        nextKey = batchKeys[batchIdx]
+        batchIdx.inc
+      if hasPrev and nextKey == prev:
+        return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", context)
+      hasPrev = true
+      prev = nextKey
+      writeU64LE(outBuf, 0, nextKey)
+      discard outFile.writeBuffer(addr outBuf[0], 8)
+    okVoid()
 
   var batchCount = 0
   var pendingInBatch = 0
-  for values in rows:
-    if values.len != table.columns.len:
-      return err[Void](ERR_SQL, "Column count mismatch", tableName)
-    for i, col in table.columns:
-      let typeRes = typeCheckValue(col.kind, values[i])
-      if not typeRes.ok:
-        return err[Void](typeRes.err.code, typeRes.err.message, col.name)
-    let notNullRes = enforceNotNull(table, values)
-    if not notNullRes.ok:
-      return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-    let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
-    if not fkRes.ok:
-      return err[Void](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+  var batchRows: seq[seq[Value]] = @[]
+  proc processBatch(): Result[Void] =
+    if batchRows.len == 0:
+      return okVoid()
+    # Validate + uniqueness precheck for the batch (before inserting anything).
+    var perColKeys: seq[seq[uint64]] = newSeq[seq[uint64]](uniqueCols.len)
+    for values in batchRows:
+      if values.len != table.columns.len:
+        return err[Void](ERR_SQL, "Column count mismatch", tableName)
+      for i, col in table.columns:
+        let typeRes = typeCheckValue(col.kind, values[i])
+        if not typeRes.ok:
+          return err[Void](typeRes.err.code, typeRes.err.message, col.name)
+      let notNullRes = enforceNotNull(table, values)
+      if not notNullRes.ok:
+        return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+      let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+      if not fkRes.ok:
+        return err[Void](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+      for idx, colIndex in uniqueCols:
+        if values[colIndex].kind == vkNull:
+          continue
+        let key = indexKeyFromValue(values[colIndex])
+        perColKeys[idx].add(key)
+    var nextSeen: seq[string] = newSeq[string](uniqueCols.len)
+    var nextTemp: seq[string] = @[]
+    defer:
+      for path in nextTemp:
+        if path.len > 0 and fileExists(path):
+          removeFile(path)
     for idx, colIndex in uniqueCols:
-      if values[colIndex].kind == vkNull:
+      if perColKeys[idx].len == 0:
         continue
-      let key = indexKeyFromValue(values[colIndex])
-      if key in seen[idx]:
-        return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & table.columns[colIndex].name)
-      seen[idx].incl(key)
-    let insertRes = if options.disableIndexes:
-      insertRowNoIndexes(db.pager, db.catalog, tableName, values)
-    else:
-      insertRow(db.pager, db.catalog, tableName, values)
-    if not insertRes.ok:
-      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
-    pendingInBatch.inc
-    if pendingInBatch >= batchSize:
-      pendingInBatch = 0
-      batchCount.inc
-      if options.durability == dmFull:
+      perColKeys[idx].sort()
+      for i in 1 ..< perColKeys[idx].len:
+        if perColKeys[idx][i] == perColKeys[idx][i - 1]:
+          return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & table.columns[colIndex].name)
+      # Check against existing table via its unique index if present.
+      let idxOpt = db.catalog.getBtreeIndexForColumn(table.name, table.columns[colIndex].name)
+      if isSome(idxOpt):
+        var prev: Option[uint64] = none(uint64)
+        for k in perColKeys[idx]:
+          if prev.isSome and prev.get == k:
+            continue
+          prev = some(k)
+          let existsRes = indexHasAnyKey(db.pager, idxOpt.get, k)
+          if not existsRes.ok:
+            return err[Void](existsRes.err.code, existsRes.err.message, existsRes.err.context)
+          if existsRes.value:
+            return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & table.columns[colIndex].name)
+      let outPath = getTempDir() / ("decentdb_bulk_seen_" & table.name & "_" & table.columns[colIndex].name & "_" & $batchCount & ".bin")
+      nextTemp.add(outPath)
+      if seenFiles[idx].len == 0:
+        let wRes = writeSortedKeys(outPath, perColKeys[idx])
+        if not wRes.ok:
+          return wRes
+      else:
+        let mRes = mergeSeenFile(seenFiles[idx], perColKeys[idx], outPath, table.name & "." & table.columns[colIndex].name)
+        if not mRes.ok:
+          return mRes
+      nextSeen[idx] = outPath
+    # Insert rows
+    for values in batchRows:
+      let insertRes = if options.disableIndexes:
+        insertRowNoIndexes(db.pager, db.catalog, tableName, values)
+      else:
+        insertRow(db.pager, db.catalog, tableName, values)
+      if not insertRes.ok:
+        return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+    # Commit seenFiles swap
+    for i in 0 ..< uniqueCols.len:
+      if nextSeen[i].len == 0:
+        continue
+      if seenFiles[i].len > 0 and fileExists(seenFiles[i]):
+        removeFile(seenFiles[i])
+      seenFiles[i] = nextSeen[i]
+      tempFiles.add(seenFiles[i])
+    nextTemp = @[]
+    batchRows = @[]
+    pendingInBatch = 0
+    batchCount.inc
+    if options.durability == dmFull:
+      let flushRes = flushAll(db.pager)
+      if not flushRes.ok:
+        return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+    elif options.durability == dmDeferred:
+      if batchCount mod syncInterval == 0:
         let flushRes = flushAll(db.pager)
         if not flushRes.ok:
           return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
-      elif options.durability == dmDeferred:
-        if batchCount mod syncInterval == 0:
-          let flushRes = flushAll(db.pager)
-          if not flushRes.ok:
-            return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+    okVoid()
+
+  for values in rows:
+    batchRows.add(values)
+    pendingInBatch.inc
+    if pendingInBatch >= batchSize:
+      let pRes = processBatch()
+      if not pRes.ok:
+        return pRes
+  let pRes = processBatch()
+  if not pRes.ok:
+    return pRes
 
   if wal != nil and options.durability != dmNone:
     let dirtyPages = snapshotDirtyPages(db.pager)
@@ -828,7 +956,10 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
         return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
       let writer = writerRes.value
       for entry in dirtyPages:
-        let writeRes = writePage(writer, entry[0], entry[1])
+        var bytes = newSeq[byte](entry[1].len)
+        if entry[1].len > 0:
+          copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
+        let writeRes = writePage(writer, entry[0], bytes)
         if not writeRes.ok:
           discard rollback(writer)
           return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
@@ -888,6 +1019,7 @@ proc beginTransaction*(db: Db): Result[Void] =
     return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
   
   db.activeWriter = writerRes.value
+  db.catalog.clearTrigramDeltas()
   okVoid()
 
 proc commitTransaction*(db: Db): Result[Void] =
@@ -897,22 +1029,35 @@ proc commitTransaction*(db: Db): Result[Void] =
   if db.activeWriter == nil:
     return err[Void](ERR_TRANSACTION, "No active transaction")
 
+  let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
+  if not trigramFlushRes.ok:
+    discard rollback(db.activeWriter)
+    db.activeWriter = nil
+    clearCache(db.pager)
+    return err[Void](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
+
   let dirtyPages = snapshotDirtyPages(db.pager)
   var pageIds: seq[PageId] = @[]
   for entry in dirtyPages:
-    let writeRes = writePage(db.activeWriter, entry[0], entry[1])
+    var bytes = newSeq[byte](entry[1].len)
+    if entry[1].len > 0:
+      copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
+    let writeRes = writePage(db.activeWriter, entry[0], bytes)
     if not writeRes.ok:
+      discard rollback(db.activeWriter)
       db.activeWriter = nil
+      clearCache(db.pager)
       return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
     pageIds.add(entry[0])
 
   let commitRes = commit(db.activeWriter)
   if not commitRes.ok:
     db.activeWriter = nil
+    clearCache(db.pager)
     return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
 
   if pageIds.len > 0:
-    markPagesClean(db.pager, pageIds)
+    markPagesCommitted(db.pager, pageIds, commitRes.value)
 
   let chkRes = maybeCheckpoint(db.wal, db.pager)
   if not chkRes.ok:
@@ -933,6 +1078,7 @@ proc rollbackTransaction*(db: Db): Result[Void] =
   db.activeWriter = nil
   if not rollbackRes.ok:
     return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
+  db.catalog.clearTrigramDeltas()
   if dirtyPages.len > 0:
     clearCache(db.pager)
   okVoid()
