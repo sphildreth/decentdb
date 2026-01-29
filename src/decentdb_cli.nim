@@ -57,7 +57,7 @@ proc parseDurability(mode: string): Result[DurabilityMode] =
   else:
     err[DurabilityMode](ERR_SQL, "Invalid durability mode", mode)
 
-proc csvCellToValue(cellValue: string, col: ColumnMeta): Value =
+proc csvCellToValue(cellValue: string, col: Column): Value =
   if cellValue.len == 0:
     return Value(kind: vkNull)
   case col.kind
@@ -108,7 +108,7 @@ proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]]
     let msg = getCurrentExceptionMsg()
     err[seq[seq[Value]]](ERR_IO, "CSV parsing error", msg)
 
-proc jsonToValue(node: JsonNode, col: ColumnMeta): Value =
+proc jsonToValue(node: JsonNode, col: Column): Value =
   if node.isNil or node.kind == JNull:
     return Value(kind: vkNull)
   case col.kind
