@@ -738,12 +738,13 @@ proc rollbackTransaction*(db: Db): Result[Void] =
     return err[Void](ERR_INTERNAL, "Database not open")
   if db.activeWriter == nil:
     return err[Void](ERR_TRANSACTION, "No active transaction")
-  
+  let dirtyPages = snapshotDirtyPages(db.pager)
   let rollbackRes = rollback(db.activeWriter)
   db.activeWriter = nil
   if not rollbackRes.ok:
     return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
-  clearCache(db.pager)
+  if dirtyPages.len > 0:
+    clearCache(db.pager)
   okVoid()
 
 proc checkpointDb*(db: Db): Result[uint64] =

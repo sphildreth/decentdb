@@ -3,7 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-01-28  
 **Deciders:** Engineering Team  
-**Related:** [CLI-IMPROVEMENTS.md](../CLI-IMPROVEMENTS.md), [ADR-001](001-mvp-cli-tool.md)
+**Related:** [ADR-001](001-mvp-cli-tool.md)
 
 ---
 
@@ -263,7 +263,6 @@ cache_pages = 256
 
 ## References
 
-- [CLI Improvements Design](../CLI-IMPROVEMENTS.md)
 - [SQLite WAL Mode](https://www.sqlite.org/wal.html) - Inspiration for checkpoint semantics
 - [PostgreSQL Configuration](https://www.postgresql.org/docs/current/runtime-config.html) - Cache sizing examples
 
