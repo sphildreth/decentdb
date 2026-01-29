@@ -21,7 +21,7 @@ when isMainModule:
        "openClose": "Open and close database without executing SQL (testing mode)",
        "timing": "Show query execution timing in milliseconds",
        "cachePages": "Number of 4KB pages to cache (default: 64 = 256KB)",
-       "cacheMb": "Cache size in megabytes (overrides --cache-pages if specified)",
+       "cacheMb": "Cache size in megabytes (overrides --cachePages if specified)",
        "checkpoint": "Force a WAL checkpoint and exit",
        "readerCount": "Show number of active readers and exit",
        "longReaders": "Show readers active longer than N milliseconds",
@@ -29,7 +29,11 @@ when isMainModule:
        "warnings": "Include WAL warnings in output",
        "verbose": "Include verbose diagnostics (LSN, readers, cache) in output",
        "checkpointBytes": "Auto-checkpoint when WAL reaches N bytes",
-       "checkpointMs": "Auto-checkpoint when N milliseconds elapse since last checkpoint"
+       "checkpointMs": "Auto-checkpoint when N milliseconds elapse since last checkpoint",
+       "format": "Output format: json, csv, table (default: json)",
+       "params": "Bind parameters in order (repeatable). Use type:value, e.g. int:1, text:hi, null",
+       "walFailpoints": "Set WAL failpoints (repeatable). Format: label:kind[:bytes][:count]",
+       "clearWalFailpoints": "Clear all WAL failpoints before executing"
      },
      short = {
        "db": 'd',
@@ -177,5 +181,39 @@ when isMainModule:
      },
      short = {
        "db": 'd'
+     }],
+    [decentdb_cli.dumpHeader,
+     cmdName = "dump-header",
+     doc = "Dump raw database header fields",
+     help = {
+       "db": "Path to database file (required)"
+     },
+     short = {
+       "db": 'd'
+     }],
+    [decentdb_cli.verifyHeader,
+     cmdName = "verify-header",
+     doc = "Verify database header checksum",
+     help = {
+       "db": "Path to database file (required)"
+     },
+     short = {
+       "db": 'd'
+     }],
+    [decentdb_cli.repl,
+     cmdName = "repl",
+     doc = "Interactive REPL mode",
+     help = {
+       "db": "Path to database file (required)",
+       "format": "Output format: json, csv, table (default: table)"
+     },
+     short = {
+       "db": 'd'
+     }],
+    [decentdb_cli.completion,
+     cmdName = "completion",
+     doc = "Emit shell completion script",
+     help = {
+       "shell": "Shell type: bash or zsh (default: bash)"
      }]
   )

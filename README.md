@@ -1,4 +1,4 @@
-# DecentDb
+# DecentDB
 
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 [![Language](https://img.shields.io/badge/language-Nim-2d9cdb)](#)
@@ -14,7 +14,7 @@
                                                   
 ACID first. Everything else… eventually.
 
-DecentDb is a pre‑alpha embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation.
+DecentDB is a embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation. It is not intended to be the best embedded database engine, but not terrible, a decent better than some engine.
 
 ---
 
@@ -26,16 +26,6 @@ DecentDb is a pre‑alpha embedded relational database engine focused on **durab
 - **Postgres‑like SQL subset** (DDL/DML, joins, ORDER BY, LIMIT/OFFSET)
 - **Trigram index** acceleration for `LIKE '%pattern%'`
 - **Deterministic tests** (unit + property + crash injection + differential)
-
----
-
-## Status
-
-Pre‑alpha. Formats may change until a compatibility policy is established.
-
-- ✅ Foundations, pager, records, B+Tree read/write, catalog, SQL MVP
-- ✅ WAL + recovery + checkpoints + bulk load + performance guardrails
-- ✅ Benchmarks + regression thresholds
 
 ---
 
@@ -74,7 +64,7 @@ nimble bench_compare
 
 ## CLI Reference
 
-DecentDb ships a single CLI tool named `decentdb`. All commands and options are under this tool.
+DecentDB ships a single CLI tool named `decentdb`. All commands and options are under this tool.
 
 ### Global Usage
 ```bash
@@ -111,6 +101,10 @@ Options:
 - `--verbose`, `-v`: include verbose diagnostics in output
 - `--checkpointBytes`: auto-checkpoint when WAL reaches N bytes
 - `--checkpointMs`: auto-checkpoint when N ms elapse since last checkpoint
+- `--format`: output format for results: json, csv, table (default json)
+- `--params`: bind parameters in order (repeatable). Use `type:value`, e.g. `int:1`, `text:hi`, `null`
+- `--walFailpoints`: set WAL failpoints (repeatable). Format `label:kind[:bytes][:count]`
+- `--clearWalFailpoints`: clear all WAL failpoints before executing
 
 ### Schema introspection
 ```bash
@@ -169,12 +163,33 @@ Options:
 decentdb checkpoint --db path/to.db
 decentdb stats --db path/to.db
 decentdb info --db path/to.db
+decentdb dump-header --db path/to.db
+decentdb verify-header --db path/to.db
 ```
 
 Options:
 - `checkpoint`: `--db`, `-d`; `--warnings`; `--verbose`
 - `stats`: `--db`, `-d`
 - `info`: `--db`, `-d`
+- `dump-header`: `--db`, `-d`
+- `verify-header`: `--db`, `-d`
+
+### REPL & completion
+```bash
+decentdb repl --db path/to.db
+decentdb completion --shell=bash
+```
+
+Options:
+- `repl`: `--db`, `-d`; `--format` (json|csv|table, default table)
+- `completion`: `--shell` (bash|zsh, default bash)
+
+### Config file
+
+If present, `~/.decentdb/config` provides defaults. Supported keys:
+- `db` (default database path)
+- `cachePages`
+- `cacheMb`
 
 ---
 
@@ -216,20 +231,6 @@ Core modules (see `design/SPEC.md`):
 - WAL frames include checksums + LSN
 - Recovery scans WAL to last committed boundary
 - Checkpointing copies committed pages and **never truncates frames needed by active readers**
-
----
-
-## Roadmap (Phases)
-
-The canonical checklist lives in `design/IMPLEMENTATION_PHASES.md`.
-
-- [x] Phase 0: Foundations
-- [x] Phase 1: DB file + pager + cache
-- [x] Phase 2: Records + B+Tree read path
-- [x] Phase 3: WAL + transactions + recovery
-- [x] Phase 4: B+Tree write path + catalog + SQL MVP
-- [x] Phase 5: Constraints + FKs + trigram search
-- [x] Phase 6: Checkpointing + bulk load + perf hardening
 
 ---
 

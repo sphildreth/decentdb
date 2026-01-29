@@ -292,11 +292,55 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
   if not parseRes.ok:
     return err[seq[string]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
   var output: seq[string] = @[]
+  proc runSelect(bound: Statement): Result[seq[string]] =
+    if db.wal == nil or db.activeWriter != nil:
+      let planRes = plan(db.catalog, bound)
+      if not planRes.ok:
+        return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+      let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
+      if not rowsRes.ok:
+        return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+      for row in rowsRes.value:
+        var parts: seq[string] = @[]
+        for value in row.values:
+          parts.add(valueToString(value))
+        output.add(parts.join("|"))
+      return ok(output)
+    let snapshot = beginRead(db.wal)
+    db.pager.setPageOverlay(proc(pageId: PageId): Option[seq[byte]] =
+      db.wal.getPageAtOrBefore(pageId, snapshot)
+    )
+    defer:
+      db.pager.clearPageOverlay()
+      endRead(db.wal, snapshot)
+    let planRes = plan(db.catalog, bound)
+    if not planRes.ok:
+      return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+    let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
+    if not rowsRes.ok:
+      return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    for row in rowsRes.value:
+      var parts: seq[string] = @[]
+      for value in row.values:
+        parts.add(valueToString(value))
+      output.add(parts.join("|"))
+    ok(output)
   for stmt in parseRes.value.statements:
     let bindRes = bindStatement(db.catalog, stmt)
     if not bindRes.ok:
       return err[seq[string]](bindRes.err.code, bindRes.err.message, bindRes.err.context)
     let bound = bindRes.value
+    let isWrite = bound.kind in {skCreateTable, skDropTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
+    var autoCommit = false
+    if isWrite and db.activeWriter == nil and db.wal != nil:
+      let beginRes = beginTransaction(db)
+      if not beginRes.ok:
+        return err[seq[string]](beginRes.err.code, beginRes.err.message, beginRes.err.context)
+      autoCommit = true
+    var committed = false
+    defer:
+      if autoCommit and not committed:
+        discard rollbackTransaction(db)
     case bound.kind
     of skCreateTable:
       let rootRes = initTableRoot(db.pager)
@@ -513,17 +557,11 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not delRes.ok:
           return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
     of skSelect:
-      let planRes = plan(db.catalog, bound)
-      if not planRes.ok:
-        return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
-      let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
-      if not rowsRes.ok:
-        return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      for row in rowsRes.value:
-        var parts: seq[string] = @[]
-        for value in row.values:
-          parts.add(valueToString(value))
-        output.add(parts.join("|"))
+      let selectRes = runSelect(bound)
+      if not selectRes.ok:
+        if autoCommit:
+          discard rollbackTransaction(db)
+        return selectRes
     of skBegin:
       let beginRes = beginTransaction(db)
       if not beginRes.ok:
@@ -536,6 +574,11 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let rollbackRes = rollbackTransaction(db)
       if not rollbackRes.ok:
         return err[seq[string]](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
+    if autoCommit:
+      let commitRes = commitTransaction(db)
+      if not commitRes.ok:
+        return err[seq[string]](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+      committed = true
   ok(output)
 
 proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
@@ -668,12 +711,24 @@ proc commitTransaction*(db: Db): Result[Void] =
     return err[Void](ERR_INTERNAL, "Database not open")
   if db.activeWriter == nil:
     return err[Void](ERR_TRANSACTION, "No active transaction")
-  
+
+  let dirtyPages = snapshotDirtyPages(db.pager)
+  var pageIds: seq[PageId] = @[]
+  for entry in dirtyPages:
+    let writeRes = writePage(db.activeWriter, entry[0], entry[1])
+    if not writeRes.ok:
+      db.activeWriter = nil
+      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    pageIds.add(entry[0])
+
   let commitRes = commit(db.activeWriter)
   if not commitRes.ok:
     db.activeWriter = nil
     return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
-  
+
+  if pageIds.len > 0:
+    markPagesClean(db.pager, pageIds)
+
   db.activeWriter = nil
   okVoid()
 
@@ -688,7 +743,7 @@ proc rollbackTransaction*(db: Db): Result[Void] =
   db.activeWriter = nil
   if not rollbackRes.ok:
     return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
-  
+  clearCache(db.pager)
   okVoid()
 
 proc checkpointDb*(db: Db): Result[uint64] =

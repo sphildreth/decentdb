@@ -54,8 +54,8 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db]
 
 **CLI Interface:**
 ```bash
-./decentdb exec --db=test.db --sql="SELECT ..." --cache-pages=256
-./decentdb exec --db=test.db --sql="SELECT ..." --cache-mb=1  # Alternative
+./decentdb exec --db=test.db --sql="SELECT ..." --cachePages=256
+./decentdb exec --db=test.db --sql="SELECT ..." --cacheMb=1  # Alternative
 ```
 
 **Rationale:**
@@ -121,7 +121,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value] = @[]): Result[seq[str
 
 1. Add `cachePages` parameter to `openDb()`
 2. Thread parameter through to `newPager()`
-3. Add `--cache-pages` and `--cache-mb` CLI flags
+3. Add `--cachePages` and `--cacheMb` CLI flags
 4. Update tests to verify cache sizing
 
 **Risk Level:** Low (pure parameter passing)  
@@ -274,7 +274,7 @@ cache_pages = 256
 This ADR focuses on **exposing existing engine capabilities** rather than creating new ones. The WAL and transaction infrastructure already exists; we're making it accessible via CLI.
 
 Future enhancements could include:
-- Auto-checkpoint policies (`--checkpoint-bytes`, `--checkpoint-ms`)
+- Auto-checkpoint policies (`--checkpointBytes`, `--checkpointMs`)
 - Read-only transaction mode
 - Savepoints (nested transactions)
 - Connection pooling for concurrent CLI invocations

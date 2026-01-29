@@ -1,11 +1,14 @@
 import os
 import locks
 import tables
+import options
+import sequtils
 import ../errors
 import ../vfs/types
 import ./db_header
 
 type PageId* = uint32
+type PageOverlay* = proc(pageId: PageId): Option[seq[byte]]
 
 type CacheEntry* = ref object
   id*: PageId
@@ -30,6 +33,7 @@ type Pager* = ref object
   pageCount*: uint32
   cache*: PageCache
   lock*: Lock
+  overlay*: PageOverlay
 
 proc newPageCache*(capacity: int): PageCache =
   let cap = if capacity <= 0: 1 else: capacity
@@ -154,7 +158,14 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
     entry.dirty = true
   okVoid()
 
+proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]]
+
 proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      return ok(overlayRes.get)
+    return readPageDirect(pager, pageId)
   let pinRes = pinPage(pager, pageId)
   if not pinRes.ok:
     return err[seq[byte]](pinRes.err.code, pinRes.err.message, pinRes.err.context)
@@ -166,6 +177,25 @@ proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
   release(entry.lock)
   discard unpinPage(pager, entry)
   ok(snapshot)
+
+proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+  let bound = ensurePageId(pager, pageId)
+  if not bound.ok:
+    return err[seq[byte]](bound.err.code, bound.err.message, bound.err.context)
+  var buf = newSeq[byte](pager.pageSize)
+  let offset = pageOffset(pager, pageId)
+  let res = pager.vfs.read(pager.file, offset, buf)
+  if not res.ok:
+    return err[seq[byte]](res.err.code, res.err.message, res.err.context)
+  if res.value < pager.pageSize:
+    return err[seq[byte]](ERR_IO, "Short read on page", "page_id=" & $pageId)
+  ok(buf)
+
+proc setPageOverlay*(pager: Pager, overlay: PageOverlay) =
+  pager.overlay = overlay
+
+proc clearPageOverlay*(pager: Pager) =
+  pager.overlay = nil
 
 proc writePage*(pager: Pager, pageId: PageId, data: openArray[byte]): Result[Void] =
   if data.len != pager.pageSize:
@@ -192,6 +222,38 @@ proc flushAll*(pager: Pager): Result[Void] =
   if not syncRes.ok:
     return err[Void](syncRes.err.code, syncRes.err.message, syncRes.err.context)
   okVoid()
+
+proc snapshotDirtyPages*(pager: Pager): seq[(PageId, seq[byte])] =
+  let cache = pager.cache
+  acquire(cache.lock)
+  let entries = cache.pages.values.toSeq()
+  release(cache.lock)
+  for entry in entries:
+    if not entry.dirty:
+      continue
+    acquire(entry.lock)
+    var copy = newSeq[byte](entry.data.len)
+    if entry.data.len > 0:
+      copyMem(addr copy[0], unsafeAddr entry.data[0], entry.data.len)
+    release(entry.lock)
+    result.add((entry.id, copy))
+
+proc markPagesClean*(pager: Pager, pageIds: seq[PageId]) =
+  let cache = pager.cache
+  acquire(cache.lock)
+  for pageId in pageIds:
+    if cache.pages.hasKey(pageId):
+      let entry = cache.pages[pageId]
+      entry.dirty = false
+  release(cache.lock)
+
+proc clearCache*(pager: Pager) =
+  let cache = pager.cache
+  acquire(cache.lock)
+  cache.pages.clear()
+  cache.clock = @[]
+  cache.clockHand = 0
+  release(cache.lock)
 
 proc closePager*(pager: Pager): Result[Void] =
   let flushRes = flushAll(pager)

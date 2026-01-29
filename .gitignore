@@ -17,6 +17,7 @@ __pycache__/
 .venv/
 .env
 .DS_Store
+config.nims
 tests/harness/seed.log
 build/coverage/
 --
@@ -37,3 +38,5 @@ src/decentdb_data
 *.db-wal
 *.wal
 *.tmp
+nimble.develop
+nimble.paths

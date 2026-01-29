@@ -26,6 +26,7 @@ type WalFailpointKind* = enum
 type WalFailpoint* = object
   kind*: WalFailpointKind
   partialBytes*: int
+  remaining*: int
 
 type Wal* = ref object
   vfs*: Vfs
@@ -131,7 +132,13 @@ proc takeWarnings*(wal: Wal): seq[string] =
 proc applyFailpoint(wal: Wal, label: string, buffer: seq[byte]): Result[int] =
   if not wal.failpoints.hasKey(label):
     return ok(buffer.len)
-  let fp = wal.failpoints[label]
+  var fp = wal.failpoints[label]
+  if fp.remaining > 0:
+    fp.remaining.dec
+    if fp.remaining == 0:
+      wal.failpoints.del(label)
+    else:
+      wal.failpoints[label] = fp
   case fp.kind
   of wfNone:
     ok(buffer.len)
@@ -351,7 +358,7 @@ proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: Pag
   let overlay = wal.getPageAtOrBefore(pageId, snapshot)
   if overlay.isSome:
     return ok(overlay.get)
-  readPage(pager, pageId)
+  readPageDirect(pager, pageId)
 
 type WalWriter* = ref object
   wal*: Wal

@@ -83,6 +83,36 @@ proc computeHeaderChecksum(buf: openArray[byte]): uint32 =
     dest.inc
   crc32c(combined)
 
+proc headerMagicOk*(buf: openArray[byte]): bool =
+  if buf.len < 16:
+    return false
+  for i in 0 .. 15:
+    if buf[i] != byte(MagicPadded[i]):
+      return false
+  true
+
+proc headerChecksumActual*(buf: openArray[byte]): uint32 =
+  computeHeaderChecksum(buf)
+
+proc headerChecksumExpected*(buf: openArray[byte]): uint32 =
+  if buf.len < 28:
+    return 0'u32
+  readU32LE(buf, 24)
+
+proc decodeHeaderUnsafe*(buf: openArray[byte]): Result[DbHeader] =
+  if buf.len < HeaderSize:
+    return err[DbHeader](ERR_CORRUPTION, "Header too short", "page_id=1")
+  ok(DbHeader(
+    formatVersion: readU32LE(buf, 16),
+    pageSize: readU32LE(buf, 20),
+    schemaCookie: readU32LE(buf, 28),
+    rootCatalog: readU32LE(buf, 32),
+    rootFreelist: readU32LE(buf, 36),
+    freelistHead: readU32LE(buf, 40),
+    freelistCount: readU32LE(buf, 44),
+    lastCheckpointLsn: readU64LE(buf, 48)
+  ))
+
 proc encodeHeader*(header: DbHeader): array[HeaderSize, byte] =
   var buf: array[HeaderSize, byte]
   for i, ch in MagicPadded:
