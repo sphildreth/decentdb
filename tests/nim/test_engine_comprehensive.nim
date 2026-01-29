@@ -16,6 +16,10 @@ proc makeTempDb(name: string): string =
     removeFile(path & ".wal")
   path
 
+proc bytes(text: string): seq[byte] =
+  for ch in text:
+    result.add(byte(ch))
+
 suite "Engine Comprehensive":
   test "execSql handles UPDATE statements":
     let path = makeTempDb("decentdb_engine_update.db")
@@ -28,8 +32,8 @@ suite "Engine Comprehensive":
     check createRes.ok
     
     # Insert some data
-    let insertRes = execSql(db, "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')")
-    check insertRes.ok
+    check execSql(db, "INSERT INTO users (id, name) VALUES (1, 'Alice')").ok
+    check execSql(db, "INSERT INTO users (id, name) VALUES (2, 'Bob')").ok
     
     # Update a record
     let updateRes = execSql(db, "UPDATE users SET name = 'Charlie' WHERE id = 1")
@@ -54,8 +58,8 @@ suite "Engine Comprehensive":
     check createRes.ok
     
     # Insert some data
-    let insertRes = execSql(db, "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')")
-    check insertRes.ok
+    check execSql(db, "INSERT INTO users (id, name) VALUES (1, 'Alice')").ok
+    check execSql(db, "INSERT INTO users (id, name) VALUES (2, 'Bob')").ok
     
     # Delete a record
     let deleteRes = execSql(db, "DELETE FROM users WHERE id = 1")
@@ -153,14 +157,14 @@ suite "Engine Comprehensive":
     
     # Prepare some data for bulk loading
     let rows = @[
-      @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: @['A', 'l', 'i', 'c', 'e'])],
-      @[Value(kind: vkInt64, int64Val: 2), Value(kind: vkText, bytes: @['B', 'o', 'b'])],
-      @[Value(kind: vkInt64, int64Val: 3), Value(kind: vkText, bytes: @['C', 'h', 'a', 'r', 'l', 'i', 'e'])]
+      @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: bytes("Alice"))],
+      @[Value(kind: vkInt64, int64Val: 2), Value(kind: vkText, bytes: bytes("Bob"))],
+      @[Value(kind: vkInt64, int64Val: 3), Value(kind: vkText, bytes: bytes("Charlie"))]
     ]
     
     # Perform bulk load
     let options = defaultBulkLoadOptions()
-    let bulkRes = bulkLoad(db, "users", rows, options)
+    let bulkRes = bulkLoad(db, "users", rows, options, db.wal)
     check bulkRes.ok
     
     # Verify the data was loaded
@@ -183,20 +187,20 @@ suite "Engine Comprehensive":
     
     # Prepare data with valid entries
     let rows = @[
-      @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: @['a', '@', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'])],
-      @[Value(kind: vkInt64, int64Val: 2), Value(kind: vkText, bytes: @['b', '@', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'])]
+      @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: bytes("a@example.com"))],
+      @[Value(kind: vkInt64, int64Val: 2), Value(kind: vkText, bytes: bytes("b@example.com"))]
     ]
     
     # Perform bulk load - should succeed
     let options = defaultBulkLoadOptions()
-    let bulkRes = bulkLoad(db, "users", rows, options)
+    let bulkRes = bulkLoad(db, "users", rows, options, db.wal)
     check bulkRes.ok
     
     # Try to load duplicate data - should fail
     let dupRows = @[
-      @[Value(kind: vkInt64, int64Val: 3), Value(kind: vkText, bytes: @['a', '@', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'])]
+      @[Value(kind: vkInt64, int64Val: 3), Value(kind: vkText, bytes: bytes("a@example.com"))]
     ]
-    let dupBulkRes = bulkLoad(db, "users", dupRows, options)
+    let dupBulkRes = bulkLoad(db, "users", dupRows, options, db.wal)
     check not dupBulkRes.ok
     
     discard closeDb(db)
@@ -229,7 +233,7 @@ suite "Engine Comprehensive":
     check createRes.ok
     
     # Insert with parameters
-    let insertRes = execSql(db, "INSERT INTO users (id, name) VALUES (?, ?)", @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: @['T', 'e', 's', 't'])])
+    let insertRes = execSql(db, "INSERT INTO users (id, name) VALUES ($1, $2)", @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: bytes("Test"))])
     check insertRes.ok
     
     # Verify insertion

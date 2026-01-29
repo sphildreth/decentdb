@@ -650,6 +650,22 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
           let flushRes = flushAll(db.pager)
           if not flushRes.ok:
             return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+
+  if wal != nil and options.durability != dmNone:
+    let dirtyPages = snapshotDirtyPages(db.pager)
+    if dirtyPages.len > 0:
+      let writerRes = beginWrite(wal)
+      if not writerRes.ok:
+        return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
+      let writer = writerRes.value
+      for entry in dirtyPages:
+        let writeRes = writePage(writer, entry[0], entry[1])
+        if not writeRes.ok:
+          discard rollback(writer)
+          return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+      let commitRes = commit(writer)
+      if not commitRes.ok:
+        return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
   if options.durability in {dmFull, dmDeferred}:
     let flushRes = flushAll(db.pager)
     if not flushRes.ok:

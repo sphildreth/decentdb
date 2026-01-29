@@ -438,16 +438,16 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
       echo resultJson(false, ckRes.err)
       return 1
     
-    var result: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
+    var ckRows: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
     
     # Add warnings if present
     if warnings or verbose:
       let walWarnings = takeWarnings(database.wal)
       for warn in walWarnings:
-        result.add("WARNING: " & warn)
+        ckRows.add("WARNING: " & warn)
     
     discard closeDb(database)
-    echo resultJson(true, rows = result)
+    echo resultJson(true, rows = ckRows)
     return 0
   
   if not openClose and sql.len > 0:
@@ -479,7 +479,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     
     # Add timing info and warnings to JSON output if requested
     if timing or warnings or verbose:
-      var result = resultJson(true, rows = rows)
+      var resultPayload = resultJson(true, rows = rows)
       
       if timing:
         let totalTime = (epochTime() - startTime) * 1000.0  # Convert to ms
@@ -490,10 +490,10 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
           "cache_pages": actualCachePages,
           "cache_mb": (actualCachePages * 4096) div (1024 * 1024)
         }
-        result["timing"] = timingInfo
+        resultPayload["timing"] = timingInfo
       
       if (warnings or verbose) and walWarnings.len > 0:
-        result["warnings"] = %walWarnings
+        resultPayload["warnings"] = %walWarnings
       
       if verbose:
         let verboseInfo = %*{
@@ -501,10 +501,10 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
           "active_readers": readerCount(database.wal),
           "cache_pages": actualCachePages
         }
-        result["verbose"] = verboseInfo
+        resultPayload["verbose"] = verboseInfo
       
       if format.strip().toLowerAscii() == "json":
-        echo result
+        echo resultPayload
       else:
         echo resultJson(false, DbError(code: ERR_IO, message: "Non-JSON format not supported with timing/warnings/verbose"))
     else:
@@ -1161,14 +1161,14 @@ proc checkpointCmd*(db: string = "", warnings: bool = false, verbose: bool = fal
     echo resultJson(false, ckRes.err)
     return 1
 
-  var result: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
+  var ckRows: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
   if warnings or verbose:
     let walWarnings = takeWarnings(database.wal)
     for warn in walWarnings:
-      result.add("WARNING: " & warn)
+      ckRows.add("WARNING: " & warn)
 
   discard closeDb(database)
-  echo resultJson(true, rows = result)
+  echo resultJson(true, rows = ckRows)
   return 0
 
 proc infoCmd*(db: string = ""): int =

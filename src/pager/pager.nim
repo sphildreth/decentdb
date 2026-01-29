@@ -160,12 +160,7 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]]
 
-proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
-  if pager.overlay != nil:
-    let overlayRes = pager.overlay(pageId)
-    if overlayRes.isSome:
-      return ok(overlayRes.get)
-    return readPageDirect(pager, pageId)
+proc readPageCached(pager: Pager, pageId: PageId): Result[seq[byte]] =
   let pinRes = pinPage(pager, pageId)
   if not pinRes.ok:
     return err[seq[byte]](pinRes.err.code, pinRes.err.message, pinRes.err.context)
@@ -177,6 +172,14 @@ proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
   release(entry.lock)
   discard unpinPage(pager, entry)
   ok(snapshot)
+
+proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      return ok(overlayRes.get)
+    return readPageCached(pager, pageId)
+  readPageCached(pager, pageId)
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]] =
   let bound = ensurePageId(pager, pageId)

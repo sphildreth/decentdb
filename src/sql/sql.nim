@@ -604,8 +604,14 @@ proc parseDropStmt(node: JsonNode): Result[Statement] =
   var name = ""
   if objects.kind == JArray and objects.len > 0:
     let obj = objects[0]
-    if obj.kind == JArray and obj.len > 0:
+    if nodeHas(obj, "List"):
+      let items = nodeGet(obj["List"], "items")
+      if items.kind == JArray and items.len > 0:
+        name = nodeString(items[^1])
+    elif obj.kind == JArray and obj.len > 0:
       name = nodeString(obj[^1])
+    else:
+      name = nodeString(obj)
   if removeType == "OBJECT_INDEX":
     return ok(Statement(kind: skDropIndex, dropIndexName: name))
   ok(Statement(kind: skDropTable, dropTableName: name))
