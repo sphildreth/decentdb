@@ -9,14 +9,14 @@ requires "nim >= 1.6.0"
 requires "cligen >= 1.7.0"
 
 task test, "Run Nim + Python unit tests":
-  exec "sh -c 'set -e; for f in $(ls tests/nim/test_*.nim | sort); do nim c -r \"$f\"; done'"
-  exec "python -m unittest tests/harness/test_runner.py"
+  exec "sh -c 'set -e; for f in $(ls tests/nim/test_*.nim | sort); do nim c --hints:off -r \"$f\"; done'"
+  exec "python -m unittest -q tests/harness/test_runner.py"
 
 task test_nim, "Run Nim unit tests":
-  exec "sh -c 'set -e; for f in $(ls tests/nim/test_*.nim | sort); do nim c -r \"$f\"; done'"
+  exec "sh -c 'set -e; for f in $(ls tests/nim/test_*.nim | sort); do nim c --hints:off -r \"$f\"; done'"
 
 task test_py, "Run Python harness tests":
-  exec "python -m unittest tests/harness/test_runner.py"
+  exec "python -m unittest -q tests/harness/test_runner.py"
 
 task coverage_nim, "Run Nim unit tests with gcov coverage report":
   exec "scripts/coverage_nim.sh"
