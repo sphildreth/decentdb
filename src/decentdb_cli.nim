@@ -107,7 +107,7 @@ proc formatStats(database: Db): seq[string] =
     "Page size: " & $database.pager.pageSize & " bytes",
     "Page count: " & $database.pager.pageCount,
     "Cache capacity: " & $cache.capacity & " pages",
-    "Cache loaded: " & $cache.pages.len & " pages",
+    "Cache loaded: " & $cacheLoadedCount(cache) & " pages",
     "WAL LSN: " & $database.wal.walEnd.load(moAcquire),
     "Active readers: " & $readerCount(database.wal)
   ]

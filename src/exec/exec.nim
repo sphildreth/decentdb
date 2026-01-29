@@ -400,7 +400,7 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
           name = "expr"
         cols.add(name)
         vals.add(evalRes.value)
-    resultRows.add(makeRow(cols, vals))
+    resultRows.add(makeRow(cols, vals, row.rowid))
   ok(resultRows)
 
 type AggState = object

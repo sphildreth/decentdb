@@ -205,13 +205,13 @@ proc minReaderSnapshot*(wal: Wal): Option[uint64] =
   if has: some(minSnap) else: none(uint64)
 
 proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
+  # Phase 1: Acquire lock, determine what to checkpoint, then release lock
   acquire(wal.lock)
   wal.checkpointPending = true
-  defer:
-    wal.checkpointPending = false
-    release(wal.lock)
   let lastCommit = wal.walEnd.load(moAcquire)
   if lastCommit == 0:
+    wal.checkpointPending = false
+    release(wal.lock)
     wal.lastCheckpointAt = epochTime()
     return ok(lastCommit)
   if wal.readerWarnMs > 0:
@@ -260,52 +260,98 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
       if bestLsn != 0 and bestOffset >= 0:
         toCheckpoint.add((pageId, bestOffset))
     release(wal.indexLock)
+  
+  # Release the main WAL lock to allow writers to proceed during I/O
+  release(wal.lock)
 
+  # Phase 2: Perform I/O operations without holding the main lock
   for entry in toCheckpoint:
     let frameRes = readFrame(wal.vfs, wal.file, entry[1])
     if not frameRes.ok:
+      acquire(wal.lock)
+      wal.checkpointPending = false
+      release(wal.lock)
       return err[uint64](frameRes.err.code, frameRes.err.message, frameRes.err.context)
     let (frameType, framePageId, bestPayload, _, _) = frameRes.value
     if frameType != wfPage or framePageId != uint32(entry[0]):
+      acquire(wal.lock)
+      wal.checkpointPending = false
+      release(wal.lock)
       return err[uint64](ERR_CORRUPTION, "Checkpoint frame mismatch", "page_id=" & $entry[0])
     let failRes = applyFailpoint(wal, "checkpoint_write_page", bestPayload)
     if not failRes.ok:
+      acquire(wal.lock)
+      wal.checkpointPending = false
+      release(wal.lock)
       return err[uint64](failRes.err.code, failRes.err.message, failRes.err.context)
     var payloadStr = newString(bestPayload.len)
     if bestPayload.len > 0:
       copyMem(addr payloadStr[0], unsafeAddr bestPayload[0], bestPayload.len)
     let writeRes = writePageDirectFile(pager, entry[0], payloadStr)
     if not writeRes.ok:
+      acquire(wal.lock)
+      wal.checkpointPending = false
+      release(wal.lock)
       return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
   let fsyncFail = applyFailpoint(wal, "checkpoint_fsync", @[])
   if not fsyncFail.ok:
+    acquire(wal.lock)
+    wal.checkpointPending = false
+    release(wal.lock)
     return err[uint64](fsyncFail.err.code, fsyncFail.err.message, fsyncFail.err.context)
   pager.header.lastCheckpointLsn = safeLsn
   let headerRes = writeHeader(pager.vfs, pager.file, pager.header)
   if not headerRes.ok:
+    acquire(wal.lock)
+    wal.checkpointPending = false
+    release(wal.lock)
     return err[uint64](headerRes.err.code, headerRes.err.message, headerRes.err.context)
   let syncRes = pager.vfs.fsync(pager.file)
   if not syncRes.ok:
+    acquire(wal.lock)
+    wal.checkpointPending = false
+    release(wal.lock)
     return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+  
+  # Phase 3: Re-acquire lock to finalize checkpoint state
+  acquire(wal.lock)
   let chkRes = appendFrame(wal, wfCheckpoint, 0, encodeCheckpointPayload(safeLsn))
   if not chkRes.ok:
+    wal.checkpointPending = false
+    release(wal.lock)
     return err[uint64](chkRes.err.code, chkRes.err.message, chkRes.err.context)
   let walSyncFail = applyFailpoint(wal, "checkpoint_wal_fsync", @[])
   if not walSyncFail.ok:
+    wal.checkpointPending = false
+    release(wal.lock)
     return err[uint64](walSyncFail.err.code, walSyncFail.err.message, walSyncFail.err.context)
+  release(wal.lock)
+  
   let walSync = wal.vfs.fsync(wal.file)
   if not walSync.ok:
+    acquire(wal.lock)
+    wal.checkpointPending = false
+    release(wal.lock)
     return err[uint64](walSync.err.code, walSync.err.message, walSync.err.context)
+  
+  acquire(wal.lock)
   wal.lastCheckpointAt = epochTime()
   if minSnap.isNone or minSnap.get >= lastCommit:
+    release(wal.lock)
     let truncRes = wal.vfs.truncate(wal.file, 0)
     if not truncRes.ok:
+      acquire(wal.lock)
+      wal.checkpointPending = false
+      release(wal.lock)
       return err[uint64](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    acquire(wal.lock)
     acquire(wal.indexLock)
     wal.index.clear()
     wal.dirtySinceCheckpoint.clear()
     release(wal.indexLock)
     wal.endOffset = 0
+  wal.checkpointPending = false
+  release(wal.lock)
   ok(safeLsn)
 
 proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =

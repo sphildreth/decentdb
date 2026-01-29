@@ -390,3 +390,63 @@ suite "WAL":
     wal.endRead(snap)
     discard closePager(pager)
     discard closeDb(db)
+
+  test "long-running reader does not prevent WAL growth bounds":
+    # This test validates that WAL truncation happens despite long-running readers
+    # when timeouts are enforced, preventing unbounded WAL growth.
+    let path = makeTempDb("decentdb_wal_bounded_growth.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 16)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    # Set aggressive timeout: 10ms
+    wal.setCheckpointConfig(0, 0, readerWarnMs = 0, readerTimeoutMs = 10, forceTruncateOnTimeout = true)
+    
+    # Start a long-running reader
+    let writerRes1 = beginWrite(wal)
+    check writerRes1.ok
+    let writer1 = writerRes1.value
+    let page1 = allocatePage(pager)
+    check page1.ok
+    var data1 = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data1.len:
+      data1[i] = 1
+    check writer1.writePage(page1.value, data1).ok
+    check commit(writer1).ok
+    
+    let longReader = wal.beginRead()
+    # Backdoor: manually set the reader's start time to be old
+    wal.readers[longReader.id] = (snapshot: longReader.snapshot, started: epochTime() - 1.0)
+    
+    # Perform multiple write + checkpoint cycles
+    for cycle in 0 ..< 5:
+      let writerRes = beginWrite(wal)
+      check writerRes.ok
+      let writer = writerRes.value
+      let pageRes = allocatePage(pager)
+      check pageRes.ok
+      var data = newSeq[byte](pager.pageSize)
+      for i in 0 ..< data.len:
+        data[i] = byte((cycle + 2) mod 256)
+      check writer.writePage(pageRes.value, data).ok
+      check commit(writer).ok
+      
+      # Checkpoint should abort the long reader and truncate
+      let ckRes = checkpoint(wal, pager)
+      check ckRes.ok
+    
+    # Verify the long reader was aborted
+    check wal.isAborted(longReader)
+    
+    # Verify WAL was truncated (size should be 0 after the last checkpoint)
+    let finalInfo = getFileInfo(path & ".wal")
+    check finalInfo.size == 0
+    
+    wal.endRead(longReader)
+    discard closePager(pager)
+    discard closeDb(db)

@@ -377,31 +377,61 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       else:
         cachedPlans.add(nil)
     rememberSqlCache(sqlText, boundStatements, cachedPlans)
-  proc rowidsForSimpleEquality(tableName: string, whereExpr: Expr): Result[Option[seq[uint64]]] =
+  proc findMatchingRowids(tableName: string, whereExpr: Expr): Result[seq[uint64]] =
+    # Use the planner to execute a general WHERE clause, leveraging indexes when possible.
+    # This converts the WHERE clause into a SELECT-like plan and executes it to find rowids.
     if whereExpr == nil:
-      return ok(none(seq[uint64]))
-    if whereExpr.kind != ekBinary or whereExpr.op != "=":
-      return ok(none(seq[uint64]))
-    var colName = ""
-    var valExpr: Expr = nil
-    if whereExpr.left.kind == ekColumn and (whereExpr.left.table.len == 0 or whereExpr.left.table == tableName):
-      colName = whereExpr.left.name
-      valExpr = whereExpr.right
-    elif whereExpr.right.kind == ekColumn and (whereExpr.right.table.len == 0 or whereExpr.right.table == tableName):
-      colName = whereExpr.right.name
-      valExpr = whereExpr.left
-    else:
-      return ok(none(seq[uint64]))
-    let idxOpt = db.catalog.getBtreeIndexForColumn(tableName, colName)
-    if isNone(idxOpt):
-      return ok(none(seq[uint64]))
-    let valueRes = evalExpr(Row(), valExpr, params)
-    if not valueRes.ok:
-      return err[Option[seq[uint64]]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
-    let seekRes = indexSeek(db.pager, db.catalog, tableName, colName, valueRes.value)
-    if not seekRes.ok:
-      return err[Option[seq[uint64]]](seekRes.err.code, seekRes.err.message, seekRes.err.context)
-    ok(some(seekRes.value))
+      # No WHERE clause means all rows; scan the full table
+      let tableRes = db.catalog.getTable(tableName)
+      if not tableRes.ok:
+        return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let rowsRes = scanTable(db.pager, tableRes.value)
+      if not rowsRes.ok:
+        return err[seq[uint64]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+      var rowids: seq[uint64] = @[]
+      for row in rowsRes.value:
+        rowids.add(row.rowid)
+      return ok(rowids)
+    
+    # Get table metadata to build proper select items
+    let tableRes = db.catalog.getTable(tableName)
+    if not tableRes.ok:
+      return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    
+    # Create SELECT items for all columns (needed for proper row construction)
+    var selectItems: seq[SelectItem] = @[]
+    for col in table.columns:
+      selectItems.add(SelectItem(expr: Expr(kind: ekColumn, name: col.name, table: tableName)))
+    
+    # Create a synthetic SELECT statement that the planner can optimize
+    let selectStmt = Statement(
+      kind: skSelect,
+      fromTable: tableName,
+      fromAlias: "",
+      selectItems: selectItems,
+      whereExpr: whereExpr,
+      joins: @[],
+      groupBy: @[],
+      havingExpr: nil,
+      orderBy: @[],
+      limit: -1,
+      offset: -1
+    )
+    
+    # Plan and execute to get matching rows
+    let planRes = plan(db.catalog, selectStmt)
+    if not planRes.ok:
+      return err[seq[uint64]](planRes.err.code, planRes.err.message, planRes.err.context)
+    
+    let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
+    if not rowsRes.ok:
+      return err[seq[uint64]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    
+    var rowids: seq[uint64] = @[]
+    for row in rowsRes.value:
+      rowids.add(row.rowid)
+    ok(rowids)
 
   proc runSelect(bound: Statement, cachedPlan: Plan): Result[seq[string]] =
     let usePlan =
@@ -608,65 +638,33 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       for col in table.columns:
         cols.add(bound.updateTable & "." & col.name)
 
-      let rowidsRes = rowidsForSimpleEquality(bound.updateTable, bound.updateWhere)
+      # Use planner to find matching rowids (leveraging indexes when possible)
+      let rowidsRes = findMatchingRowids(bound.updateTable, bound.updateWhere)
       if not rowidsRes.ok:
         return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
 
-      if rowidsRes.value.isSome:
-        for rowid in rowidsRes.value.get:
-          let storedRes = readRowAt(db.pager, table, rowid)
-          if not storedRes.ok:
-            continue
-          let stored = storedRes.value
-          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-          let whereRes = evalExpr(row, bound.updateWhere, params)
-          if not whereRes.ok:
-            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-          if bound.updateWhere != nil and not valueToBool(whereRes.value):
-            continue
-          var newValues = stored.values
-          for colName, expr in bound.assignments:
-            var idx = -1
-            for i, col in table.columns:
-              if col.name == colName:
-                idx = i
-                break
-            if idx >= 0:
-              let evalRes = evalExpr(row, expr, params)
-              if not evalRes.ok:
-                return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
-              if not typeRes.ok:
-                return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
-              newValues[idx] = evalRes.value
-          updates.add((stored.rowid, stored.values, newValues))
-      else:
-        let rowsRes = scanTable(db.pager, table)
-        if not rowsRes.ok:
-          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-        for stored in rowsRes.value:
-          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-          let whereRes = evalExpr(row, bound.updateWhere, params)
-          if not whereRes.ok:
-            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-          if bound.updateWhere != nil and not valueToBool(whereRes.value):
-            continue
-          var newValues = stored.values
-          for colName, expr in bound.assignments:
-            var idx = -1
-            for i, col in table.columns:
-              if col.name == colName:
-                idx = i
-                break
-            if idx >= 0:
-              let evalRes = evalExpr(row, expr, params)
-              if not evalRes.ok:
-                return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
-              if not typeRes.ok:
-                return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
-              newValues[idx] = evalRes.value
-          updates.add((stored.rowid, stored.values, newValues))
+      for rowid in rowidsRes.value:
+        let storedRes = readRowAt(db.pager, table, rowid)
+        if not storedRes.ok:
+          continue
+        let stored = storedRes.value
+        let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+        var newValues = stored.values
+        for colName, expr in bound.assignments:
+          var idx = -1
+          for i, col in table.columns:
+            if col.name == colName:
+              idx = i
+              break
+          if idx >= 0:
+            let evalRes = evalExpr(row, expr, params)
+            if not evalRes.ok:
+              return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+            let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+            if not typeRes.ok:
+              return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
+            newValues[idx] = evalRes.value
+        updates.add((stored.rowid, stored.values, newValues))
       for entry in updates:
         let notNullRes = enforceNotNull(table, entry[2])
         if not notNullRes.ok:
@@ -690,38 +688,18 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
       var deletions: seq[StoredRow] = @[]
-      var cols: seq[string] = @[]
-      for col in table.columns:
-        cols.add(bound.deleteTable & "." & col.name)
 
-      let rowidsRes = rowidsForSimpleEquality(bound.deleteTable, bound.deleteWhere)
+      # Use planner to find matching rowids (leveraging indexes when possible)
+      let rowidsRes = findMatchingRowids(bound.deleteTable, bound.deleteWhere)
       if not rowidsRes.ok:
         return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
-      if rowidsRes.value.isSome:
-        for rowid in rowidsRes.value.get:
-          let storedRes = readRowAt(db.pager, table, rowid)
-          if not storedRes.ok:
-            continue
-          let stored = storedRes.value
-          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-          let whereRes = evalExpr(row, bound.deleteWhere, params)
-          if not whereRes.ok:
-            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-          if bound.deleteWhere != nil and not valueToBool(whereRes.value):
-            continue
-          deletions.add(stored)
-      else:
-        let rowsRes = scanTable(db.pager, table)
-        if not rowsRes.ok:
-          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-        for stored in rowsRes.value:
-          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-          let whereRes = evalExpr(row, bound.deleteWhere, params)
-          if not whereRes.ok:
-            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-          if bound.deleteWhere != nil and not valueToBool(whereRes.value):
-            continue
-          deletions.add(stored)
+
+      for rowid in rowidsRes.value:
+        let storedRes = readRowAt(db.pager, table, rowid)
+        if not storedRes.ok:
+          continue
+        let stored = storedRes.value
+        deletions.add(stored)
       for row in deletions:
         let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
         if not restrictRes.ok:

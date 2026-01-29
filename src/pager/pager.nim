@@ -405,6 +405,14 @@ proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
       release(entry.lock)
     release(shard.lock)
 
+proc cacheLoadedCount*(cache: PageCache): int =
+  var count = 0
+  for shard in cache.shards:
+    acquire(shard.lock)
+    count += shard.pages.len
+    release(shard.lock)
+  count
+
 proc clearCache*(pager: Pager) =
   let cache = pager.cache
   for shard in cache.shards:
