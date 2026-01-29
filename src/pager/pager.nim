@@ -9,6 +9,7 @@ import ./db_header
 
 type PageId* = uint32
 type PageOverlay* = proc(pageId: PageId): Option[seq[byte]]
+type ReadGuard* = proc(): Result[Void]
 
 type CacheEntry* = ref object
   id*: PageId
@@ -34,6 +35,7 @@ type Pager* = ref object
   cache*: PageCache
   lock*: Lock
   overlay*: PageOverlay
+  readGuard*: ReadGuard
 
 proc newPageCache*(capacity: int): PageCache =
   let cap = if capacity <= 0: 1 else: capacity
@@ -174,6 +176,10 @@ proc readPageCached(pager: Pager, pageId: PageId): Result[seq[byte]] =
   ok(snapshot)
 
 proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+  if pager.readGuard != nil:
+    let guardRes = pager.readGuard()
+    if not guardRes.ok:
+      return err[seq[byte]](guardRes.err.code, guardRes.err.message, guardRes.err.context)
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
@@ -182,6 +188,10 @@ proc readPage*(pager: Pager, pageId: PageId): Result[seq[byte]] =
   readPageCached(pager, pageId)
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[seq[byte]] =
+  if pager.readGuard != nil:
+    let guardRes = pager.readGuard()
+    if not guardRes.ok:
+      return err[seq[byte]](guardRes.err.code, guardRes.err.message, guardRes.err.context)
   let bound = ensurePageId(pager, pageId)
   if not bound.ok:
     return err[seq[byte]](bound.err.code, bound.err.message, bound.err.context)
@@ -199,6 +209,12 @@ proc setPageOverlay*(pager: Pager, overlay: PageOverlay) =
 
 proc clearPageOverlay*(pager: Pager) =
   pager.overlay = nil
+
+proc setReadGuard*(pager: Pager, guard: ReadGuard) =
+  pager.readGuard = guard
+
+proc clearReadGuard*(pager: Pager) =
+  pager.readGuard = nil
 
 proc writePage*(pager: Pager, pageId: PageId, data: openArray[byte]): Result[Void] =
   if data.len != pager.pageSize:

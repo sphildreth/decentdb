@@ -355,10 +355,11 @@ proc readJsonRows(tableMeta: TableMeta, jsonFile: string): Result[seq[seq[Value]
 # ============================================================================
 
 proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing: bool = false,
-              cachePages: int = 64, cacheMb: int = 0, checkpoint: bool = false,
+              cachePages: int = 1024, cacheMb: int = 0, checkpoint: bool = false,
               readerCount: bool = false, longReaders: int = 0, dbInfo: bool = false,
               warnings: bool = false, verbose: bool = false,
               checkpointBytes: int = 0, checkpointMs: int = 0,
+              readerWarnMs: int = 0, readerTimeoutMs: int = 0, forceTruncateOnTimeout: bool = false,
               format: string = "json", params: seq[string] = @[],
               walFailpoints: seq[string] = @[], clearWalFailpoints: bool = false): int =
   ## DecentDb CLI v0.0.1 - ACID-first embedded relational database
@@ -378,7 +379,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
   let configCacheMb = parseConfigInt(cfg, "cacheMb")
   let configCachePages = parseConfigInt(cfg, "cachePages")
   let resolvedCacheMb = if cacheMb > 0: cacheMb else: configCacheMb
-  let resolvedCachePages = if cachePages != 64 or resolvedCacheMb > 0: cachePages else: configCachePages
+  let resolvedCachePages = if cachePages != 1024 or resolvedCacheMb > 0: cachePages else: configCachePages
   let actualCachePages = if resolvedCacheMb > 0:
     (resolvedCacheMb * 1024 * 1024) div 4096  # Convert MB to 4KB pages
   else:
@@ -402,8 +403,11 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     database.wal.setFailpoint(fpRes.value[0], fpRes.value[1])
   
   # Configure auto-checkpoint policies if specified
-  if checkpointBytes > 0 or checkpointMs > 0:
-    setCheckpointConfig(database.wal, int64(checkpointBytes), int64(checkpointMs))
+  if checkpointBytes > 0 or checkpointMs > 0 or readerWarnMs > 0 or readerTimeoutMs > 0 or forceTruncateOnTimeout:
+    setCheckpointConfig(database.wal, int64(checkpointBytes), int64(checkpointMs),
+      readerWarnMs = int64(readerWarnMs),
+      readerTimeoutMs = int64(readerTimeoutMs),
+      forceTruncateOnTimeout = forceTruncateOnTimeout)
   
   # Handle reader count diagnostic
   if readerCount:
@@ -418,7 +422,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     var info: seq[string] = @[]
     info.add("Threshold: " & $longReaders & "ms")
     for reader in longRunning:
-      info.add("Snapshot " & $reader.snapshot & " age: " & $reader.ageMs & "ms")
+      info.add("Reader " & $reader.id & " snapshot " & $reader.snapshot & " age: " & $reader.ageMs & "ms")
     discard closeDb(database)
     echo resultJson(true, rows = info)
     return 0

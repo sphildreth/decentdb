@@ -1,6 +1,7 @@
 import unittest
 import os
 import options
+import strutils
 import sql/sql
 import record/record
 import exec/exec
@@ -141,3 +142,37 @@ suite "Exec Helpers Extended":
     check sorted.value[0].values[0].int64Val == 3
     let limited = applyLimit(sorted.value, 2, 1)
     check limited.len == 2
+
+  test "sortRowsWithConfig supports multi-pass merge and limit pushdown":
+    proc listTempWithPrefix(prefix: string): seq[string] =
+      let dir = getTempDir()
+      for kind, path in walkDir(dir):
+        if kind == pcFile and path.extractFilename.startsWith(prefix):
+          result.add(path)
+
+    let tempPrefix = "decentdb_sort_test_"
+    let before = listTempWithPrefix(tempPrefix)
+
+    let columns = @["score", "payload"]
+    var rows: seq[Row] = @[]
+    for i in 1 .. 25:
+      var payload = ""
+      for _ in 0 ..< 120:
+        payload.add('x')
+      rows.add(makeRow(columns, @[
+        Value(kind: vkInt64, int64Val: int64(i)),
+        Value(kind: vkText, bytes: toBytes(payload))
+      ]))
+
+    let order = @[OrderItem(expr: Expr(kind: ekColumn, name: "score"), asc: false)]
+    let sortedLimited = sortRowsWithConfig(rows, order, @[], limit = 5, offset = 3, bufferBytes = 256, maxOpenRuns = 4, tempPrefix = tempPrefix)
+    check sortedLimited.ok
+    check sortedLimited.value.len == 5
+    # Desc sort: [25,24,23,22,21,20,...], then offset=3 => starts at 22
+    check sortedLimited.value[0].values[0].int64Val == 22
+    check sortedLimited.value[1].values[0].int64Val == 21
+    check sortedLimited.value[4].values[0].int64Val == 18
+
+    let after = listTempWithPrefix(tempPrefix)
+    for path in after:
+      check path in before

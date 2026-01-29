@@ -3,6 +3,7 @@ import options
 import strutils
 import tables
 import algorithm
+import atomics
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
@@ -68,7 +69,10 @@ proc makeRow*(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row 
   Row(rowid: rowid, columns: columns, values: values)
 
 const SortBufferBytes = 16 * 1024 * 1024
-const SortMaxRuns = 64
+const SortMaxOpenRuns = 64
+var sortTempId: Atomic[uint64]
+
+proc applyLimit*(rows: seq[Row], limit: int, offset: int): seq[Row]
 
 proc varintLen*(value: uint64): int =
   var v = value
@@ -553,7 +557,98 @@ proc close*(reader: ChunkReader) =
     close(reader.file)
     reader.finished = true
 
-proc sortRows*(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Result[seq[Row]] =
+proc removeTempFiles(paths: seq[string]) =
+  for path in paths:
+    if fileExists(path):
+      try:
+        removeFile(path)
+      except:
+        discard
+
+proc writeRowToFile(f: File, row: Row, lenBuf: var seq[byte]) =
+  let data = encodeRecord(row.values)
+  writeU32LE(lenBuf, 0, uint32(data.len))
+  discard f.writeBuffer(lenBuf[0].addr, lenBuf.len)
+  if data.len > 0:
+    discard f.writeBuffer(data[0].addr, data.len)
+
+proc mergeRunsToRows(runPaths: seq[string], columns: seq[string], cmpRows: proc(a, b: Row): int, maxOutputRows: int, skipRows: int): Result[seq[Row]] =
+  var readers: seq[ChunkReader] = @[]
+  for path in runPaths:
+    readers.add(openChunkReader(path, columns))
+
+  defer:
+    for reader in readers:
+      reader.close()
+
+  var skipped = 0
+  var produced = 0
+  var resultRows: seq[Row] = @[]
+
+  while true:
+    var bestIdx = -1
+    var bestRow: Row
+
+    for i, reader in readers:
+      if reader.peeked.isNone:
+        continue
+      let candidate = reader.peeked.get
+      if bestIdx < 0 or cmpRows(candidate, bestRow) < 0:
+        bestIdx = i
+        bestRow = candidate
+
+    if bestIdx < 0:
+      break
+
+    discard next(readers[bestIdx])
+
+    if skipped < skipRows:
+      skipped.inc
+      continue
+
+    resultRows.add(bestRow)
+    produced.inc
+    if maxOutputRows >= 0 and produced >= maxOutputRows:
+      break
+
+  ok(resultRows)
+
+proc mergeRunsToFile(runPaths: seq[string], outPath: string, columns: seq[string], cmpRows: proc(a, b: Row): int): Result[Void] =
+  var outFile: File
+  if not open(outFile, outPath, fmWrite):
+    return err[Void](ERR_IO, "Failed to open sort merge output", outPath)
+  defer:
+    close(outFile)
+
+  var readers: seq[ChunkReader] = @[]
+  for path in runPaths:
+    readers.add(openChunkReader(path, columns))
+  defer:
+    for reader in readers:
+      reader.close()
+
+  var lenBuf = newSeq[byte](4)
+  while true:
+    var bestIdx = -1
+    var bestRow: Row
+
+    for i, reader in readers:
+      if reader.peeked.isNone:
+        continue
+      let candidate = reader.peeked.get
+      if bestIdx < 0 or cmpRows(candidate, bestRow) < 0:
+        bestIdx = i
+        bestRow = candidate
+
+    if bestIdx < 0:
+      break
+
+    discard next(readers[bestIdx])
+    writeRowToFile(outFile, bestRow, lenBuf)
+
+  okVoid()
+
+proc sortRowsWithConfig*(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value], limit: int = -1, offset: int = 0, bufferBytes: int = SortBufferBytes, maxOpenRuns: int = SortMaxOpenRuns, tempPrefix: string = "decentdb_sort_"): Result[seq[Row]] =
   proc cmpRows(a, b: Row): int =
     for item in orderBy:
       let av = evalExpr(a, item.expr, params)
@@ -564,70 +659,77 @@ proc sortRows*(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Res
       if c != 0:
         return if item.asc: c else: -c
     0
+
+  let skipRows = max(0, offset)
+  let maxOutputRows =
+    if limit < 0:
+      -1
+    else:
+      limit
+
   if rows.len <= 1:
     var sorted = rows
     sorted.sort(proc(x, y: Row): int = cmpRows(x, y))
-    return ok(sorted)
+    return ok(applyLimit(sorted, limit, offset))
+
+  let invocationId = sortTempId.fetchAdd(1'u64)
+  let invPrefix = tempPrefix & $getCurrentProcessId() & "_" & $invocationId & "_"
+
   var tempFiles: seq[string] = @[]
   var chunk: seq[Row] = @[]
   var chunkBytes = 0
   for row in rows:
     let rowBytes = estimateRowBytes(row)
-    if chunk.len > 0 and chunkBytes + rowBytes > SortBufferBytes:
+    if chunk.len > 0 and chunkBytes + rowBytes > bufferBytes:
       chunk.sort(proc(x, y: Row): int = cmpRows(x, y))
-      let path = getTempDir() / ("decentdb_sort_" & $tempFiles.len & ".tmp")
+      let path = getTempDir() / (invPrefix & $tempFiles.len & ".tmp")
       writeRowChunk(path, chunk)
       tempFiles.add(path)
       chunk = @[]
       chunkBytes = 0
-      if tempFiles.len > SortMaxRuns:
-        return err[seq[Row]](ERR_SQL, "Sort exceeded spill run limit", "max_runs=" & $SortMaxRuns)
     chunk.add(row)
     chunkBytes += rowBytes
+
   if tempFiles.len == 0:
     var sorted = rows
     sorted.sort(proc(x, y: Row): int = cmpRows(x, y))
-    return ok(sorted)
+    return ok(applyLimit(sorted, limit, offset))
+
   if chunk.len > 0:
     chunk.sort(proc(x, y: Row): int = cmpRows(x, y))
-    let path = getTempDir() / ("decentdb_sort_" & $tempFiles.len & ".tmp")
+    let path = getTempDir() / (invPrefix & $tempFiles.len & ".tmp")
     writeRowChunk(path, chunk)
     tempFiles.add(path)
-  var readers: seq[ChunkReader] = @[]
-  let columns = if rows.len > 0: rows[0].columns else: @[]
-  for path in tempFiles:
-    readers.add(openChunkReader(path, columns))
-  
-  var resultRows: seq[Row] = @[]
-  while true:
-    var bestIdx = -1
-    var bestRow: Row
-    
-    for i, reader in readers:
-      if reader.peeked.isNone:
-        continue
-        
-      let candidate = reader.peeked.get
-      if bestIdx < 0:
-        bestIdx = i
-        bestRow = candidate
-      else:
-        if cmpRows(candidate, bestRow) < 0:
-          bestIdx = i
-          bestRow = candidate
-          
-    if bestIdx < 0:
-      break
-      
-    resultRows.add(bestRow)
-    discard next(readers[bestIdx])
 
-  for reader in readers:
-    reader.close()
-  for path in tempFiles:
-    if fileExists(path):
-      removeFile(path)
-  ok(resultRows)
+  let columns = if rows.len > 0: rows[0].columns else: @[]
+
+  var allTempFiles = tempFiles
+  var runs = tempFiles
+  var pass = 0
+
+  defer:
+    removeTempFiles(allTempFiles)
+
+  while runs.len > maxOpenRuns:
+    var nextRuns: seq[string] = @[]
+    var idx = 0
+    while idx < runs.len:
+      let endIdx = min(idx + maxOpenRuns, runs.len)
+      let group = runs[idx ..< endIdx]
+      let outPath = getTempDir() / (invPrefix & "merge_" & $pass & "_" & $nextRuns.len & ".tmp")
+      let mergeRes = mergeRunsToFile(group, outPath, columns, cmpRows)
+      if not mergeRes.ok:
+        return err[seq[Row]](mergeRes.err.code, mergeRes.err.message, mergeRes.err.context)
+      nextRuns.add(outPath)
+      allTempFiles.add(outPath)
+      idx = endIdx
+    runs = nextRuns
+    pass.inc
+
+  mergeRunsToRows(runs, columns, cmpRows, maxOutputRows, skipRows)
+
+proc sortRows*(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Result[seq[Row]] =
+  sortRowsWithConfig(rows, orderBy, params)
 
 proc applyLimit*(rows: seq[Row], limit: int, offset: int): seq[Row] =
   var start = if offset >= 0: offset else: 0
@@ -719,6 +821,12 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
     return sortRows(inputRes.value, plan.orderBy, params)
   of pkLimit:
+    if plan.left.kind == pkSort:
+      let inputRes = execPlan(pager, catalog, plan.left.left, params)
+      if not inputRes.ok:
+        return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
+      return sortRowsWithConfig(inputRes.value, plan.left.orderBy, params, plan.limit, plan.offset)
+
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)

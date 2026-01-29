@@ -1,5 +1,7 @@
 import unittest
 import os
+import times
+import tables
 import engine
 import pager/pager
 import wal/wal
@@ -37,13 +39,13 @@ suite "WAL":
     let writer = writerRes.value
     check writer.writePage(pageId, data).ok
     let snapBefore = wal.beginRead()
-    let readBefore = readPageWithSnapshot(pager, wal, snapBefore, pageId)
+    let readBefore = readPageWithSnapshot(pager, wal, snapBefore.snapshot, pageId)
     check readBefore.ok
     check readBefore.value != data
     wal.endRead(snapBefore)
     check commit(writer).ok
     let snapAfter = wal.beginRead()
-    let readAfter = readPageWithSnapshot(pager, wal, snapAfter, pageId)
+    let readAfter = readPageWithSnapshot(pager, wal, snapAfter.snapshot, pageId)
     check readAfter.ok
     check readAfter.value == data
     wal.endRead(snapAfter)
@@ -76,7 +78,7 @@ suite "WAL":
     check not commitRes.ok
     discard recover(wal)
     let snap = wal.beginRead()
-    let readRes = readPageWithSnapshot(pager, wal, snap, pageId)
+    let readRes = readPageWithSnapshot(pager, wal, snap.snapshot, pageId)
     check readRes.ok
     check readRes.value != data
     wal.endRead(snap)
@@ -112,12 +114,12 @@ suite "WAL":
     let writer = writerRes.value
     check writer.writePage(pageId, updated).ok
     check commit(writer).ok
-    let readOld = readPageWithSnapshot(pager, wal, snapOld, pageId)
+    let readOld = readPageWithSnapshot(pager, wal, snapOld.snapshot, pageId)
     check readOld.ok
     check readOld.value == initial
     wal.endRead(snapOld)
     let snapNew = wal.beginRead()
-    let readNew = readPageWithSnapshot(pager, wal, snapNew, pageId)
+    let readNew = readPageWithSnapshot(pager, wal, snapNew.snapshot, pageId)
     check readNew.ok
     check readNew.value == updated
     wal.endRead(snapNew)
@@ -267,7 +269,7 @@ suite "WAL":
     let writer = writerRes.value
     check writer.writePage(pageId, data).ok
     let snap = wal.beginRead()
-    sleep(20)
+    wal.readers[snap.id] = (snapshot: snap.snapshot, started: epochTime() - 1.0)
     check commit(writer).ok
     let ckRes = checkpoint(wal, pager)
     check ckRes.ok
@@ -300,12 +302,13 @@ suite "WAL":
     let writer = writerRes.value
     check writer.writePage(pageId, data).ok
     let snap = wal.beginRead()
-    sleep(20)
+    wal.readers[snap.id] = (snapshot: snap.snapshot, started: epochTime() - 1.0)
     check commit(writer).ok
     let ckRes = checkpoint(wal, pager)
     check ckRes.ok
     let info = getFileInfo(path & ".wal")
     check info.size == 0
+    check wal.isAborted(snap)
     wal.endRead(snap)
     discard closePager(pager)
     discard closeDb(db)

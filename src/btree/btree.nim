@@ -96,6 +96,38 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
         break
     current = PageId(chosen)
 
+proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
+  var current = tree.root
+  while true:
+    let pageRes = readPage(tree.pager, current)
+    if not pageRes.ok:
+      return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    let page = pageRes.value
+    let pageType = page[0]
+    if pageType == PageTypeLeaf:
+      return ok(current)
+    let internalRes = readInternalCells(page)
+    if not internalRes.ok:
+      return err[PageId](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+    let (keys, children, rightChild) = internalRes.value
+    var chosen = rightChild
+    for i in 0 ..< keys.len:
+      if key <= keys[i]:
+        chosen = children[i]
+        break
+    current = PageId(chosen)
+
+proc lowerBound(keys: seq[uint64], key: uint64): int =
+  var lo = 0
+  var hi = keys.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if keys[mid] < key:
+      lo = mid + 1
+    else:
+      hi = mid
+  lo
+
 proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
   let leafRes = findLeaf(tree, key)
   if not leafRes.ok:
@@ -137,6 +169,22 @@ proc openCursor*(tree: BTree): Result[BTreeCursor] =
     if children.len == 0:
       return err[BTreeCursor](ERR_CORRUPTION, "Empty internal page")
     current = PageId(children[0])
+
+proc openCursorAt*(tree: BTree, startKey: uint64): Result[BTreeCursor] =
+  let leafRes = findLeafLeftmost(tree, startKey)
+  if not leafRes.ok:
+    return err[BTreeCursor](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  let leafId = leafRes.value
+  let pageRes = readPage(tree.pager, leafId)
+  if not pageRes.ok:
+    return err[BTreeCursor](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  let parsed = readLeafCells(pageRes.value)
+  if not parsed.ok:
+    return err[BTreeCursor](parsed.err.code, parsed.err.message, parsed.err.context)
+  let (keys, values, overflows, nextLeaf) = parsed.value
+  let idx = lowerBound(keys, startKey)
+  let cursor = BTreeCursor(tree: tree, leaf: leafId, index: idx, keys: keys, values: values, overflows: overflows, nextLeaf: nextLeaf)
+  ok(cursor)
 
 proc cursorNext*(cursor: BTreeCursor): Result[(uint64, seq[byte], uint32)] =
   if cursor.leaf == 0:
@@ -220,18 +268,9 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
     if not parsed.ok:
       return err[Option[SplitResult]](parsed.err.code, parsed.err.message, parsed.err.context)
     var (keys, values, overflows, nextLeaf) = parsed.value
-    for i in 0 ..< keys.len:
-      if keys[i] == key:
-        values[i] = value
-        overflows[i] = 0
-        let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
-        if not encodeRes.ok:
-          return err[Option[SplitResult]](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)
-        discard writePage(tree.pager, pageId, encodeRes.value)
-        return ok(none(SplitResult))
     var inserted = false
     for i in 0 ..< keys.len:
-      if key <= keys[i]:
+      if key < keys[i]:
         keys.insert(key, i)
         values.insert(value, i)
         overflows.insert(0'u32, i)
@@ -381,3 +420,33 @@ proc delete*(tree: BTree, key: uint64): Result[Void] =
       discard writePage(tree.pager, pageId, encodeRes.value)
       return okVoid()
   err[Void](ERR_IO, "Key not found")
+
+proc deleteKeyValue*(tree: BTree, key: uint64, value: seq[byte]): Result[bool] =
+  let leafRes = findLeafLeftmost(tree, key)
+  if not leafRes.ok:
+    return err[bool](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  var current = leafRes.value
+  while current != 0:
+    let pageRes = readPage(tree.pager, current)
+    if not pageRes.ok:
+      return err[bool](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    let parsed = readLeafCells(pageRes.value)
+    if not parsed.ok:
+      return err[bool](parsed.err.code, parsed.err.message, parsed.err.context)
+    var (keys, values, overflows, nextLeaf) = parsed.value
+    for i in 0 ..< keys.len:
+      if keys[i] < key:
+        continue
+      if keys[i] > key:
+        return ok(false)
+      if values[i] == value and overflows[i] == 0'u32:
+        keys.delete(i)
+        values.delete(i)
+        overflows.delete(i)
+        let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+        if not encodeRes.ok:
+          return err[bool](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)
+        discard writePage(tree.pager, current, encodeRes.value)
+        return ok(true)
+    current = nextLeaf
+  ok(false)

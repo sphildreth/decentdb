@@ -52,12 +52,16 @@ suite "Constraints":
     check badChild.err.code == ERR_CONSTRAINT
     check execSql(db, "INSERT INTO parents (id, name) VALUES (1, 'A')").ok
     check execSql(db, "INSERT INTO children (id, parent_id) VALUES (1, 1)").ok
+    check execSql(db, "INSERT INTO children (id, parent_id) VALUES (2, 1)").ok
+    check execSql(db, "DELETE FROM children WHERE id = 2").ok
     let delParent = execSql(db, "DELETE FROM parents WHERE id = 1")
     check not delParent.ok
     check delParent.err.code == ERR_CONSTRAINT
     let updParent = execSql(db, "UPDATE parents SET id = 2 WHERE id = 1")
     check not updParent.ok
     check updParent.err.code == ERR_CONSTRAINT
+    check execSql(db, "DELETE FROM children WHERE id = 1").ok
+    check execSql(db, "DELETE FROM parents WHERE id = 1").ok
     let nullParent = execSql(db, "INSERT INTO parents (id, name) VALUES (NULL, 'B')")
     check not nullParent.ok
     check nullParent.err.code == ERR_CONSTRAINT

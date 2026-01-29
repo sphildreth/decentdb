@@ -31,6 +31,8 @@ type Db* = ref object
   activeWriter*: WalWriter           # Current transaction writer (nil if no active tx)
   walOverlayEnabled*: bool           # Disable WAL overlay after non-WAL writes
   cachePages*: int                   # Cache size for diagnostics
+  sqlCache*: Table[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]]
+  sqlCacheOrder*: seq[string]
 
 type DurabilityMode* = enum
   dmFull
@@ -47,9 +49,9 @@ type BulkLoadOptions* = object
 proc defaultBulkLoadOptions*(): BulkLoadOptions =
   BulkLoadOptions(batchSize: 10000, syncInterval: 10, disableIndexes: true, checkpointOnComplete: true, durability: dmDeferred)
 
-proc openDb*(path: string, cachePages: int = 64): Result[Db] =
+proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
   ## Open a database file with configurable cache size
-  ## cachePages: Number of 4KB pages to cache (default 64 = 256KB)
+  ## cachePages: Number of 4KB pages to cache (default 1024 = 4MB)
   let vfs = newOsVfs()
   let res = vfs.open(path, fmReadWrite, true)
   if not res.ok:
@@ -141,6 +143,16 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db] =
     discard closePager(pager)
     discard vfs.close(file)
     return err[Db](recoverRes.err.code, recoverRes.err.message, recoverRes.err.context)
+
+  # Default checkpoint + long-reader protection (can be overridden via CLI/config).
+  # - Checkpoint when WAL grows large (bytes-based trigger)
+  # - Warn/abort long-running readers to prevent indefinite WAL pinning
+  setCheckpointConfig(wal,
+    everyBytes = 64 * 1024 * 1024,
+    everyMs = 0,
+    readerWarnMs = 60 * 1000,
+    readerTimeoutMs = 300 * 1000,
+    forceTruncateOnTimeout = true)
   
   ok(Db(
     path: path,
@@ -155,12 +167,16 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db] =
     wal: wal,
     activeWriter: nil,
     walOverlayEnabled: true,
-    cachePages: cachePages
+    cachePages: cachePages,
+    sqlCache: initTable[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]](),
+    sqlCacheOrder: @[]
   ))
 
 proc schemaBump(db: Db): Result[Void] =
   db.schemaCookie.inc
   db.pager.header.schemaCookie = db.schemaCookie
+  db.sqlCache.clear()
+  db.sqlCacheOrder = @[]
   let writeRes = writeHeader(db.vfs, db.file, db.pager.header)
   if not writeRes.ok:
     return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
@@ -211,11 +227,21 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
     if col.unique or col.primaryKey:
       if values[i].kind == vkNull:
         continue
-      let matchesRes = indexSeek(pager, catalog, table.name, col.name, values[i])
-      if not matchesRes.ok:
-        return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
-      for existing in matchesRes.value:
-        if rowid == 0 or existing != rowid:
+      let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
+      if isNone(idxOpt):
+        return err[Void](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
+      let key = indexKeyFromValue(values[i])
+      if rowid == 0:
+        let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+        if not anyRes.ok:
+          return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
+        if anyRes.value:
+          return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+      else:
+        let otherRes = indexHasOtherRowid(pager, idxOpt.get, key, rowid)
+        if not otherRes.ok:
+          return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
+        if otherRes.value:
           return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
   okVoid()
 
@@ -225,10 +251,14 @@ proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values
       continue
     if values[i].kind == vkNull:
       continue
-    let matchesRes = indexSeek(pager, catalog, col.refTable, col.refColumn, values[i])
-    if not matchesRes.ok:
-      return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
-    if matchesRes.value.len == 0:
+    let idxOpt = catalog.getBtreeIndexForColumn(col.refTable, col.refColumn)
+    if isNone(idxOpt):
+      return err[Void](ERR_INTERNAL, "Missing FK parent index", col.refTable & "." & col.refColumn)
+    let key = indexKeyFromValue(values[i])
+    let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+    if not anyRes.ok:
+      return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
+    if not anyRes.value:
       return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
   okVoid()
 
@@ -250,10 +280,14 @@ proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, o
     if oldVal.kind == vkNull:
       continue
     for child in children:
-      let matchesRes = indexSeek(pager, catalog, child[0], child[1], oldVal)
-      if not matchesRes.ok:
-        return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
-      if matchesRes.value.len > 0:
+      let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
+      if isNone(idxOpt):
+        return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
+      let key = indexKeyFromValue(oldVal)
+      let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+      if not anyRes.ok:
+        return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
+      if anyRes.value:
         return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
   okVoid()
 
@@ -266,10 +300,14 @@ proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, o
     if oldVal.kind == vkNull:
       continue
     for child in children:
-      let matchesRes = indexSeek(pager, catalog, child[0], child[1], oldVal)
-      if not matchesRes.ok:
-        return err[Void](matchesRes.err.code, matchesRes.err.message, matchesRes.err.context)
-      if matchesRes.value.len > 0:
+      let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
+      if isNone(idxOpt):
+        return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
+      let key = indexKeyFromValue(oldVal)
+      let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+      if not anyRes.ok:
+        return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
+      if anyRes.value:
         return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
   okVoid()
 
@@ -290,16 +328,92 @@ proc rollbackTransaction*(db: Db): Result[Void]
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] =
   if not db.isOpen:
     return err[seq[string]](ERR_INTERNAL, "Database not open")
-  let parseRes = parseSql(sqlText)
-  if not parseRes.ok:
-    return err[seq[string]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
   var output: seq[string] = @[]
-  proc runSelect(bound: Statement): Result[seq[string]] =
+  const SqlCacheMaxEntries = 128
+
+  proc touchSqlCache(key: string) =
+    var idx = -1
+    for i, existing in db.sqlCacheOrder:
+      if existing == key:
+        idx = i
+        break
+    if idx >= 0:
+      db.sqlCacheOrder.delete(idx)
+    db.sqlCacheOrder.add(key)
+
+  proc rememberSqlCache(key: string, statements: seq[Statement], plans: seq[Plan]) =
+    db.sqlCache[key] = (schemaCookie: db.schemaCookie, statements: statements, plans: plans)
+    touchSqlCache(key)
+    while db.sqlCacheOrder.len > SqlCacheMaxEntries:
+      let evictKey = db.sqlCacheOrder[0]
+      db.sqlCacheOrder.delete(0)
+      if db.sqlCache.hasKey(evictKey):
+        db.sqlCache.del(evictKey)
+
+  var boundStatements: seq[Statement] = @[]
+  var cachedPlans: seq[Plan] = @[]
+  if db.sqlCache.hasKey(sqlText):
+    let cached = db.sqlCache[sqlText]
+    if cached.schemaCookie == db.schemaCookie:
+      boundStatements = cached.statements
+      cachedPlans = cached.plans
+      touchSqlCache(sqlText)
+
+  if boundStatements.len == 0:
+    let parseRes = parseSql(sqlText)
+    if not parseRes.ok:
+      return err[seq[string]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+    for stmt in parseRes.value.statements:
+      let bindRes = bindStatement(db.catalog, stmt)
+      if not bindRes.ok:
+        return err[seq[string]](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+      boundStatements.add(bindRes.value)
+    for bound in boundStatements:
+      if bound.kind == skSelect:
+        let planRes = plan(db.catalog, bound)
+        if not planRes.ok:
+          return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+        cachedPlans.add(planRes.value)
+      else:
+        cachedPlans.add(nil)
+    rememberSqlCache(sqlText, boundStatements, cachedPlans)
+  proc rowidsForSimpleEquality(tableName: string, whereExpr: Expr): Result[Option[seq[uint64]]] =
+    if whereExpr == nil:
+      return ok(none(seq[uint64]))
+    if whereExpr.kind != ekBinary or whereExpr.op != "=":
+      return ok(none(seq[uint64]))
+    var colName = ""
+    var valExpr: Expr = nil
+    if whereExpr.left.kind == ekColumn and (whereExpr.left.table.len == 0 or whereExpr.left.table == tableName):
+      colName = whereExpr.left.name
+      valExpr = whereExpr.right
+    elif whereExpr.right.kind == ekColumn and (whereExpr.right.table.len == 0 or whereExpr.right.table == tableName):
+      colName = whereExpr.right.name
+      valExpr = whereExpr.left
+    else:
+      return ok(none(seq[uint64]))
+    let idxOpt = db.catalog.getBtreeIndexForColumn(tableName, colName)
+    if isNone(idxOpt):
+      return ok(none(seq[uint64]))
+    let valueRes = evalExpr(Row(), valExpr, params)
+    if not valueRes.ok:
+      return err[Option[seq[uint64]]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    let seekRes = indexSeek(db.pager, db.catalog, tableName, colName, valueRes.value)
+    if not seekRes.ok:
+      return err[Option[seq[uint64]]](seekRes.err.code, seekRes.err.message, seekRes.err.context)
+    ok(some(seekRes.value))
+
+  proc runSelect(bound: Statement, cachedPlan: Plan): Result[seq[string]] =
+    let usePlan =
+      if cachedPlan != nil:
+        cachedPlan
+      else:
+        let planRes = plan(db.catalog, bound)
+        if not planRes.ok:
+          return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+        planRes.value
     if db.wal == nil or db.activeWriter != nil or not db.walOverlayEnabled:
-      let planRes = plan(db.catalog, bound)
-      if not planRes.ok:
-        return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
-      let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
+      let rowsRes = execPlan(db.pager, db.catalog, usePlan, params)
       if not rowsRes.ok:
         return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
       for row in rowsRes.value:
@@ -308,17 +422,20 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           parts.add(valueToString(value))
         output.add(parts.join("|"))
       return ok(output)
-    let snapshot = beginRead(db.wal)
+    let txn = beginRead(db.wal)
     db.pager.setPageOverlay(proc(pageId: PageId): Option[seq[byte]] =
-      db.wal.getPageAtOrBefore(pageId, snapshot)
+      db.wal.getPageAtOrBefore(pageId, txn.snapshot)
+    )
+    db.pager.setReadGuard(proc(): Result[Void] =
+      if db.wal.isAborted(txn):
+        return err[Void](ERR_TRANSACTION, "Read transaction aborted (timeout)")
+      okVoid()
     )
     defer:
       db.pager.clearPageOverlay()
-      endRead(db.wal, snapshot)
-    let planRes = plan(db.catalog, bound)
-    if not planRes.ok:
-      return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
-    let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
+      db.pager.clearReadGuard()
+      endRead(db.wal, txn)
+    let rowsRes = execPlan(db.pager, db.catalog, usePlan, params)
     if not rowsRes.ok:
       return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
     for row in rowsRes.value:
@@ -327,11 +444,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         parts.add(valueToString(value))
       output.add(parts.join("|"))
     ok(output)
-  for stmt in parseRes.value.statements:
-    let bindRes = bindStatement(db.catalog, stmt)
-    if not bindRes.ok:
-      return err[seq[string]](bindRes.err.code, bindRes.err.message, bindRes.err.context)
-    let bound = bindRes.value
+  for i, bound in boundStatements:
     let isWrite = bound.kind in {skCreateTable, skDropTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
     var autoCommit = false
     if isWrite and db.activeWriter == nil and db.wal != nil:
@@ -483,36 +596,70 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not tableRes.ok:
         return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
-      let rowsRes = scanTable(db.pager, table)
-      if not rowsRes.ok:
-        return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
       var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
-      for stored in rowsRes.value:
-        var cols: seq[string] = @[]
-        for col in table.columns:
-          cols.add(bound.updateTable & "." & col.name)
-        let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-        let whereRes = evalExpr(row, bound.updateWhere, params)
-        if not whereRes.ok:
-          return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-        if bound.updateWhere != nil and not valueToBool(whereRes.value):
-          continue
-        var newValues = stored.values
-        for colName, expr in bound.assignments:
-          var idx = -1
-          for i, col in table.columns:
-            if col.name == colName:
-              idx = i
-              break
-          if idx >= 0:
-            let evalRes = evalExpr(row, expr, params)
-            if not evalRes.ok:
-              return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-            let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
-            if not typeRes.ok:
-              return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
-            newValues[idx] = evalRes.value
-        updates.add((stored.rowid, stored.values, newValues))
+      var cols: seq[string] = @[]
+      for col in table.columns:
+        cols.add(bound.updateTable & "." & col.name)
+
+      let rowidsRes = rowidsForSimpleEquality(bound.updateTable, bound.updateWhere)
+      if not rowidsRes.ok:
+        return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+
+      if rowidsRes.value.isSome:
+        for rowid in rowidsRes.value.get:
+          let storedRes = readRowAt(db.pager, table, rowid)
+          if not storedRes.ok:
+            continue
+          let stored = storedRes.value
+          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+          let whereRes = evalExpr(row, bound.updateWhere, params)
+          if not whereRes.ok:
+            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+          if bound.updateWhere != nil and not valueToBool(whereRes.value):
+            continue
+          var newValues = stored.values
+          for colName, expr in bound.assignments:
+            var idx = -1
+            for i, col in table.columns:
+              if col.name == colName:
+                idx = i
+                break
+            if idx >= 0:
+              let evalRes = evalExpr(row, expr, params)
+              if not evalRes.ok:
+                return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+              if not typeRes.ok:
+                return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
+              newValues[idx] = evalRes.value
+          updates.add((stored.rowid, stored.values, newValues))
+      else:
+        let rowsRes = scanTable(db.pager, table)
+        if not rowsRes.ok:
+          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        for stored in rowsRes.value:
+          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+          let whereRes = evalExpr(row, bound.updateWhere, params)
+          if not whereRes.ok:
+            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+          if bound.updateWhere != nil and not valueToBool(whereRes.value):
+            continue
+          var newValues = stored.values
+          for colName, expr in bound.assignments:
+            var idx = -1
+            for i, col in table.columns:
+              if col.name == colName:
+                idx = i
+                break
+            if idx >= 0:
+              let evalRes = evalExpr(row, expr, params)
+              if not evalRes.ok:
+                return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+              if not typeRes.ok:
+                return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
+              newValues[idx] = evalRes.value
+          updates.add((stored.rowid, stored.values, newValues))
       for entry in updates:
         let notNullRes = enforceNotNull(table, entry[2])
         if not notNullRes.ok:
@@ -535,21 +682,39 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not tableRes.ok:
         return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
-      let rowsRes = scanTable(db.pager, table)
-      if not rowsRes.ok:
-        return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
       var deletions: seq[StoredRow] = @[]
-      for stored in rowsRes.value:
-        var cols: seq[string] = @[]
-        for col in table.columns:
-          cols.add(bound.deleteTable & "." & col.name)
-        let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-        let whereRes = evalExpr(row, bound.deleteWhere, params)
-        if not whereRes.ok:
-          return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-        if bound.deleteWhere != nil and not valueToBool(whereRes.value):
-          continue
-        deletions.add(stored)
+      var cols: seq[string] = @[]
+      for col in table.columns:
+        cols.add(bound.deleteTable & "." & col.name)
+
+      let rowidsRes = rowidsForSimpleEquality(bound.deleteTable, bound.deleteWhere)
+      if not rowidsRes.ok:
+        return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+      if rowidsRes.value.isSome:
+        for rowid in rowidsRes.value.get:
+          let storedRes = readRowAt(db.pager, table, rowid)
+          if not storedRes.ok:
+            continue
+          let stored = storedRes.value
+          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+          let whereRes = evalExpr(row, bound.deleteWhere, params)
+          if not whereRes.ok:
+            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+          if bound.deleteWhere != nil and not valueToBool(whereRes.value):
+            continue
+          deletions.add(stored)
+      else:
+        let rowsRes = scanTable(db.pager, table)
+        if not rowsRes.ok:
+          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        for stored in rowsRes.value:
+          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+          let whereRes = evalExpr(row, bound.deleteWhere, params)
+          if not whereRes.ok:
+            return err[seq[string]](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+          if bound.deleteWhere != nil and not valueToBool(whereRes.value):
+            continue
+          deletions.add(stored)
       for row in deletions:
         let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
         if not restrictRes.ok:
@@ -559,7 +724,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not delRes.ok:
           return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
     of skSelect:
-      let selectRes = runSelect(bound)
+      let selectRes = runSelect(bound, if i < cachedPlans.len: cachedPlans[i] else: nil)
       if not selectRes.ok:
         if autoCommit:
           discard rollbackTransaction(db)
@@ -748,6 +913,11 @@ proc commitTransaction*(db: Db): Result[Void] =
 
   if pageIds.len > 0:
     markPagesClean(db.pager, pageIds)
+
+  let chkRes = maybeCheckpoint(db.wal, db.pager)
+  if not chkRes.ok:
+    db.activeWriter = nil
+    return err[Void](chkRes.err.code, chkRes.err.message, chkRes.err.context)
 
   db.activeWriter = nil
   okVoid()

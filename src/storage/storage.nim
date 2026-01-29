@@ -290,7 +290,9 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       if idx.kind == ikBtree:
         let idxTree = newBTree(pager, idx.rootPage)
         let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
-        discard delete(idxTree, oldKey)
+        let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
+        if not delRes.ok:
+          return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
         let newKey = indexKeyFromValue(values[valueIndex])
         let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
         if not idxInsert.ok:
@@ -331,7 +333,9 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       if idx.kind == ikBtree:
         let idxTree = newBTree(pager, idx.rootPage)
         let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
-        discard delete(idxTree, oldKey)
+        let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
+        if not delRes.ok:
+          return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
         let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
         if not syncRes.ok:
           return syncRes
@@ -453,15 +457,19 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
     return err[seq[uint64]](ERR_SQL, "Index not found", tableName & "." & column)
   let idx = indexOpt.get
   let idxTree = newBTree(pager, idx.rootPage)
-  let cursorRes = openCursor(idxTree)
+  let needle = indexKeyFromValue(value)
+  let cursorRes = openCursorAt(idxTree, needle)
   if not cursorRes.ok:
     return err[seq[uint64]](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   var matches: seq[uint64] = @[]
-  let needle = indexKeyFromValue(value)
   while true:
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
+      break
+    if nextRes.value[0] < needle:
+      continue
+    if nextRes.value[0] > needle:
       break
     if nextRes.value[0] == needle:
       let rowidRes = decodeRowId(nextRes.value[1])
@@ -471,7 +479,7 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
 
 proc indexHasAnyKey*(pager: Pager, index: IndexMeta, key: uint64): Result[bool] =
   let idxTree = newBTree(pager, index.rootPage)
-  let cursorRes = openCursor(idxTree)
+  let cursorRes = openCursorAt(idxTree, key)
   if not cursorRes.ok:
     return err[bool](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
@@ -479,19 +487,27 @@ proc indexHasAnyKey*(pager: Pager, index: IndexMeta, key: uint64): Result[bool] 
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
       break
+    if nextRes.value[0] < key:
+      continue
+    if nextRes.value[0] > key:
+      break
     if nextRes.value[0] == key:
       return ok(true)
   ok(false)
 
 proc indexHasOtherRowid*(pager: Pager, index: IndexMeta, key: uint64, rowid: uint64): Result[bool] =
   let idxTree = newBTree(pager, index.rootPage)
-  let cursorRes = openCursor(idxTree)
+  let cursorRes = openCursorAt(idxTree, key)
   if not cursorRes.ok:
     return err[bool](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   while true:
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
+      break
+    if nextRes.value[0] < key:
+      continue
+    if nextRes.value[0] > key:
       break
     if nextRes.value[0] == key:
       let rowidRes = decodeRowId(nextRes.value[1])

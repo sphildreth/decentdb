@@ -73,7 +73,7 @@ suite "WAL Extra":
 
     check recover(wal).ok
     let snap = wal.beginRead()
-    check isNone(wal.getPageAtOrBefore(PageId(1), snap))
+    check isNone(wal.getPageAtOrBefore(PageId(1), snap.snapshot))
     wal.endRead(snap)
 
     discard closeDb(db)

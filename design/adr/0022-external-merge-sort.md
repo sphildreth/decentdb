@@ -37,9 +37,9 @@ We will implement **External Merge Sort** in the `Exec` layer.
 
 ### Constraints & Simplifications for MVP
 
-*   **Max Open Files**: To avoid `EMFILE` errors, we will limit the merge fan-in to **64**.
-    *   If `(Total Data Size / Sort Buffer Size) > 64`, we would technically need a multi-pass merge.
-    *   *MVP Decision*: With 16MB buffer, 64 runs = 1GB of sorted data. This covers the 9.5M tracks use case ample enough (9.5M * 100 bytes ≈ 950MB). If exceeded, return `ERR_SORT_TOO_LARGE` (defer multi-pass merge to post-MVP).
+*   **Max Open Files**: To avoid `EMFILE` errors, we limit the merge fan-in to **64** *at a time*.
+    *   If `(Total Data Size / Sort Buffer Size) > 64`, we perform a **multi-pass merge**: merge runs in groups of up to 64 into new runs, repeat until the final merge can be completed within the open-file limit.
+    *   This removes the “hard run-count limit” failure mode and makes large sorts degrade by I/O cost rather than fail outright.
 *   **Serialization**: Use a simple `Length (u32) + EncodedRow` binary format for temp files. No page overhead needed.
 
 ## Consequences
