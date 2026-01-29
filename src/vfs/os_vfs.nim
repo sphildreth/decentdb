@@ -41,30 +41,50 @@ method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[Vfs
   ok(vf)
 
 method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte]): Result[int] =
-  var bytesRead = 0
-  withFileLock(file):
-    try:
-      if buf.len == 0:
-        bytesRead = 0
-      else:
-        setFilePos(file.file, offset)
-        bytesRead = file.file.readBuffer(addr buf[0], buf.len)
-    except OSError:
-      return err[int](ERR_IO, "Read failed", file.path)
-  ok(bytesRead)
+  if buf.len == 0:
+    return ok(0)
+  try:
+    when defined(windows):
+      var bytesRead: DWORD = 0
+      var overlapped: OVERLAPPED
+      zeroMem(addr overlapped, sizeof(overlapped))
+      overlapped.Offset = DWORD(uint64(offset) and 0xFFFFFFFF'u64)
+      overlapped.OffsetHigh = DWORD((uint64(offset) shr 32) and 0xFFFFFFFF'u64)
+      let handle = get_osfhandle(file.file.getFileHandle())
+      if ReadFile(handle, addr buf[0], DWORD(buf.len), addr bytesRead, addr overlapped) == 0:
+        return err[int](ERR_IO, "Read failed", file.path)
+      ok(int(bytesRead))
+    else:
+      let fd = cast[cint](file.file.getFileHandle())
+      let res = pread(fd, addr buf[0], buf.len, offset.Off)
+      if res < 0:
+        return err[int](ERR_IO, "Read failed", file.path)
+      ok(int(res))
+  except OSError:
+    err[int](ERR_IO, "Read failed", file.path)
 
 method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Result[int] =
-  var bytesRead = 0
-  withFileLock(file):
-    try:
-      if buf.len == 0:
-        bytesRead = 0
-      else:
-        setFilePos(file.file, offset)
-        bytesRead = file.file.readBuffer(addr buf[0], buf.len)
-    except OSError:
-      return err[int](ERR_IO, "Read failed", file.path)
-  ok(bytesRead)
+  if buf.len == 0:
+    return ok(0)
+  try:
+    when defined(windows):
+      var bytesRead: DWORD = 0
+      var overlapped: OVERLAPPED
+      zeroMem(addr overlapped, sizeof(overlapped))
+      overlapped.Offset = DWORD(uint64(offset) and 0xFFFFFFFF'u64)
+      overlapped.OffsetHigh = DWORD((uint64(offset) shr 32) and 0xFFFFFFFF'u64)
+      let handle = get_osfhandle(file.file.getFileHandle())
+      if ReadFile(handle, addr buf[0], DWORD(buf.len), addr bytesRead, addr overlapped) == 0:
+        return err[int](ERR_IO, "Read failed", file.path)
+      ok(int(bytesRead))
+    else:
+      let fd = cast[cint](file.file.getFileHandle())
+      let res = pread(fd, addr buf[0], buf.len, offset.Off)
+      if res < 0:
+        return err[int](ERR_IO, "Read failed", file.path)
+      ok(int(res))
+  except OSError:
+    err[int](ERR_IO, "Read failed", file.path)
 
 method write*(vfs: OsVfs, file: VfsFile, offset: int64, buf: openArray[byte]): Result[int] =
   var bytesWritten = 0

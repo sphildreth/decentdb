@@ -764,6 +764,7 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
     return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   if options.durability == dmNone and db.wal != nil:
     db.walOverlayEnabled = false
+  let useWal = wal != nil and options.durability != dmNone
   let table = tableRes.value
   let batchSize = if options.batchSize <= 0: 1 else: options.batchSize
   let syncInterval = if options.syncInterval <= 0: 1 else: options.syncInterval
@@ -846,6 +847,34 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
   var batchCount = 0
   var pendingInBatch = 0
   var batchRows: seq[seq[Value]] = @[]
+
+  proc commitDirtyToWal(): Result[Void] =
+    if not useWal:
+      return okVoid()
+    let dirtyPages = snapshotDirtyPages(db.pager)
+    if dirtyPages.len == 0:
+      return okVoid()
+    let writerRes = beginWrite(wal)
+    if not writerRes.ok:
+      return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
+    let writer = writerRes.value
+    var pageIds: seq[PageId] = @[]
+    for entry in dirtyPages:
+      var bytes = newSeq[byte](entry[1].len)
+      if entry[1].len > 0:
+        copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
+      let writeRes = writePage(writer, entry[0], bytes)
+      if not writeRes.ok:
+        discard rollback(writer)
+        return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+      pageIds.add(entry[0])
+    let commitRes = commit(writer)
+    if not commitRes.ok:
+      return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+    if pageIds.len > 0:
+      markPagesCommitted(db.pager, pageIds, commitRes.value)
+    okVoid()
+
   proc processBatch(): Result[Void] =
     if batchRows.len == 0:
       return okVoid()
@@ -926,15 +955,26 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
     batchRows = @[]
     pendingInBatch = 0
     batchCount.inc
-    if options.durability == dmFull:
-      let flushRes = flushAll(db.pager)
-      if not flushRes.ok:
-        return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
-    elif options.durability == dmDeferred:
-      if batchCount mod syncInterval == 0:
+    if useWal:
+      if options.durability == dmFull:
+        let commitRes = commitDirtyToWal()
+        if not commitRes.ok:
+          return commitRes
+      elif options.durability == dmDeferred:
+        if batchCount mod syncInterval == 0:
+          let commitRes = commitDirtyToWal()
+          if not commitRes.ok:
+            return commitRes
+    else:
+      if options.durability == dmFull:
         let flushRes = flushAll(db.pager)
         if not flushRes.ok:
           return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+      elif options.durability == dmDeferred:
+        if batchCount mod syncInterval == 0:
+          let flushRes = flushAll(db.pager)
+          if not flushRes.ok:
+            return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
     okVoid()
 
   for values in rows:
@@ -948,29 +988,6 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
   if not pRes.ok:
     return pRes
 
-  if wal != nil and options.durability != dmNone:
-    let dirtyPages = snapshotDirtyPages(db.pager)
-    if dirtyPages.len > 0:
-      let writerRes = beginWrite(wal)
-      if not writerRes.ok:
-        return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
-      let writer = writerRes.value
-      for entry in dirtyPages:
-        var bytes = newSeq[byte](entry[1].len)
-        if entry[1].len > 0:
-          copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
-        let writeRes = writePage(writer, entry[0], bytes)
-        if not writeRes.ok:
-          discard rollback(writer)
-          return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-      let commitRes = commit(writer)
-      if not commitRes.ok:
-        return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
-  if options.durability in {dmFull, dmDeferred}:
-    let flushRes = flushAll(db.pager)
-    if not flushRes.ok:
-      return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
-
   if options.disableIndexes:
     for _, idx in db.catalog.indexes:
       if idx.table == tableName:
@@ -978,7 +995,17 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
         if not rebuildRes.ok:
           return rebuildRes
 
-  if options.checkpointOnComplete and wal != nil:
+  if useWal:
+    let commitRes = commitDirtyToWal()
+    if not commitRes.ok:
+      return commitRes
+  else:
+    if options.durability in {dmFull, dmDeferred}:
+      let flushRes = flushAll(db.pager)
+      if not flushRes.ok:
+        return err[Void](flushRes.err.code, flushRes.err.message, flushRes.err.context)
+
+  if options.checkpointOnComplete and useWal:
     let ckRes = checkpoint(wal, db.pager)
     if not ckRes.ok:
       return err[Void](ckRes.err.code, ckRes.err.message, ckRes.err.context)

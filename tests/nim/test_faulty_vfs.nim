@@ -34,6 +34,35 @@ suite "Faulty VFS":
     let replayLog = replayVfs.getLog()
     check replayLog == originalLog
 
+  test "partial write applies to writeStr and is replayable":
+    let tempPath = getTempDir() / "decentdb_faulty_vfs_partial_str.bin"
+    if fileExists(tempPath):
+      removeFile(tempPath)
+    let base = newOsVfs()
+    let faulty = newFaultyVfs(base)
+    faulty.addRule(FaultRule(label: "partial-write-str", op: foWrite, remaining: 1,
+      action: FaultAction(kind: faPartialWrite, partialBytes: 4, errorCode: ERR_IO, label: "partial-write-str")))
+    let openRes = faulty.open(tempPath, fmReadWrite, true)
+    check openRes.ok
+    let handle = openRes.value
+    let payload = "abcdefghij"
+    let writeRes = faulty.writeStr(handle, 0, payload)
+    check writeRes.ok
+    check writeRes.value == 4
+    discard faulty.close(handle)
+    let originalLog = faulty.getLog()
+
+    let replayVfs = newFaultyVfsWithReplay(base, originalLog)
+    let openReplay = replayVfs.open(tempPath & ".replay", fmReadWrite, true)
+    check openReplay.ok
+    let replayHandle = openReplay.value
+    let replayWrite = replayVfs.writeStr(replayHandle, 0, payload)
+    check replayWrite.ok
+    check replayWrite.value == 4
+    discard replayVfs.close(replayHandle)
+    let replayLog = replayVfs.getLog()
+    check replayLog == originalLog
+
   test "dropped fsync is recorded and non-fatal":
     let tempPath = getTempDir() / "decentdb_faulty_vfs_fsync.bin"
     if fileExists(tempPath):
@@ -64,6 +93,23 @@ suite "Faulty VFS":
     let handle = openRes.value
     var buffer = newSeq[byte](8)
     let readRes = faulty.read(handle, 0, buffer)
+    check not readRes.ok
+    check readRes.err.code == ERR_IO
+    discard faulty.close(handle)
+
+  test "failpoint error is injected for readStr":
+    let tempPath = getTempDir() / "decentdb_faulty_vfs_error_str.bin"
+    if fileExists(tempPath):
+      removeFile(tempPath)
+    let base = newOsVfs()
+    let faulty = newFaultyVfs(base)
+    faulty.addRule(FaultRule(label: "fail-read-str", op: foRead, remaining: 1,
+      action: FaultAction(kind: faError, partialBytes: 0, errorCode: ERR_IO, label: "fail-read-str")))
+    let openRes = faulty.open(tempPath, fmReadWrite, true)
+    check openRes.ok
+    let handle = openRes.value
+    var buffer = newString(8)
+    let readRes = faulty.readStr(handle, 0, buffer)
     check not readRes.ok
     check readRes.err.code == ERR_IO
     discard faulty.close(handle)

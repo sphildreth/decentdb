@@ -189,6 +189,48 @@ proc readOverflowChain*(pager: Pager, start: PageId, totalLen: uint32): Result[s
     current = PageId(next)
   ok(output)
 
+proc readOverflowChainAll*(pager: Pager, start: PageId): Result[seq[byte]] =
+  ## Read an overflow chain of unknown total length by following next pointers.
+  ##
+  ## This is used by B+Tree value overflow, which stores large values out-of-line
+  ## without tracking a total length in the leaf cell.
+  if start == 0:
+    return ok(newSeq[byte]())
+  var output: seq[byte] = @[]
+  var current = start
+  while current != 0:
+    let pageRes = readPageRo(pager, current)
+    if not pageRes.ok:
+      return err[seq[byte]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    let page = pageRes.value
+    let next = readU32LE(page, 0)
+    let chunkLen = int(readU32LE(page, 4))
+    if 8 + chunkLen > page.len:
+      return err[seq[byte]](ERR_CORRUPTION, "Overflow page length invalid", "page_id=" & $current)
+    let oldLen = output.len
+    output.setLen(oldLen + chunkLen)
+    for i in 0 ..< chunkLen:
+      output[oldLen + i] = byte(page[8 + i])
+    current = PageId(next)
+  ok(output)
+
+proc freeOverflowChain*(pager: Pager, start: PageId): Result[Void] =
+  ## Free an overflow chain by returning pages to the freelist.
+  ##
+  ## Note: This is used by B+Tree value overflow to avoid leaking overflow pages
+  ## when values are updated or deleted.
+  var current = start
+  while current != 0:
+    let pageRes = readPageRo(pager, current)
+    if not pageRes.ok:
+      return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    let next = PageId(readU32LE(pageRes.value, 0))
+    let freeRes = freePage(pager, current)
+    if not freeRes.ok:
+      return err[Void](freeRes.err.code, freeRes.err.message, freeRes.err.context)
+    current = next
+  okVoid()
+
 proc decodeRecordWithOverflow*(pager: Pager, data: openArray[byte]): Result[seq[Value]] =
   let decoded = decodeRecord(data)
   if not decoded.ok:

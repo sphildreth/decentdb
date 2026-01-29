@@ -4,6 +4,7 @@ import json
 import algorithm
 import engine
 import record/record
+import errors
 
 type BenchResult = object
   name: string
@@ -11,6 +12,13 @@ type BenchResult = object
   samples: seq[float]
   p50Ms: float
   p95Ms: float
+
+proc requireOk[T](res: Result[T], what: string): T =
+  if not res.ok:
+    let ctx = if res.err.context.len > 0: " (" & res.err.context & ")" else: ""
+    echo "bench error: " & what & ": " & $res.err.code & ": " & res.err.message & ctx
+    quit(1)
+  res.value
 
 proc toBytes(text: string): seq[byte] =
   for ch in text:
@@ -37,13 +45,8 @@ proc percentile(samples: seq[float], pct: float): float =
 
 proc runPointLookup(): BenchResult =
   let path = makeTempDb("decentdb_bench_point.db")
-  let dbRes = openDb(path)
-  if not dbRes.ok:
-    quit(1)
-  let db = dbRes.value
-  let createRes = execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)")
-  if not createRes.ok:
-    quit(1)
+  let db = requireOk(openDb(path), "openDb(point)")
+  discard requireOk(execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)"), "create table artists")
   var rows: seq[seq[Value]] = @[]
   for i in 1 .. 1000:
     let name = "artist_" & $i
@@ -54,9 +57,7 @@ proc runPointLookup(): BenchResult =
   var opts = defaultBulkLoadOptions()
   opts.disableIndexes = true
   opts.durability = dmNone
-  let bulkRes = bulkLoad(db, "artists", rows, opts)
-  if not bulkRes.ok:
-    quit(1)
+  discard requireOk(bulkLoad(db, "artists", rows, opts), "bulkLoad artists")
   var samples: seq[float] = @[]
   for i in 1 .. 1000:
     let id = i
@@ -64,21 +65,15 @@ proc runPointLookup(): BenchResult =
       discard execSql(db, "SELECT name FROM artists WHERE id = $1", @[Value(kind: vkInt64, int64Val: id)])
     )
     samples.add(elapsed)
-  discard closeDb(db)
+  discard requireOk(closeDb(db), "closeDb(point)")
   BenchResult(name: "point_lookup", iterations: 1000, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
 
 proc runFkJoin(): BenchResult =
   let path = makeTempDb("decentdb_bench_fk.db")
-  let dbRes = openDb(path)
-  if not dbRes.ok:
-    quit(1)
-  let db = dbRes.value
-  if not execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)").ok:
-    quit(1)
-  if not execSql(db, "CREATE TABLE albums (id INT PRIMARY KEY, artistId INT REFERENCES artists(id))").ok:
-    quit(1)
-  if not execSql(db, "CREATE TABLE tracks (id INT PRIMARY KEY, albumId INT REFERENCES albums(id))").ok:
-    quit(1)
+  let db = requireOk(openDb(path), "openDb(fk)")
+  discard requireOk(execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)"), "create table artists(fk)")
+  discard requireOk(execSql(db, "CREATE TABLE albums (id INT PRIMARY KEY, artistId INT REFERENCES artists(id))"), "create table albums")
+  discard requireOk(execSql(db, "CREATE TABLE tracks (id INT PRIMARY KEY, albumId INT REFERENCES albums(id))"), "create table tracks")
   var artistRows: seq[seq[Value]] = @[]
   var albumRows: seq[seq[Value]] = @[]
   var trackRows: seq[seq[Value]] = @[]
@@ -104,12 +99,9 @@ proc runFkJoin(): BenchResult =
   var opts = defaultBulkLoadOptions()
   opts.disableIndexes = true
   opts.durability = dmNone
-  if not bulkLoad(db, "artists", artistRows, opts).ok:
-    quit(1)
-  if not bulkLoad(db, "albums", albumRows, opts).ok:
-    quit(1)
-  if not bulkLoad(db, "tracks", trackRows, opts).ok:
-    quit(1)
+  discard requireOk(bulkLoad(db, "artists", artistRows, opts), "bulkLoad artists(fk)")
+  discard requireOk(bulkLoad(db, "albums", albumRows, opts), "bulkLoad albums")
+  discard requireOk(bulkLoad(db, "tracks", trackRows, opts), "bulkLoad tracks")
   var samples: seq[float] = @[]
   for i in 1 .. 100:
     let artistId = (i mod 100) + 1
@@ -117,19 +109,14 @@ proc runFkJoin(): BenchResult =
       discard execSql(db, "SELECT tracks.id FROM artists JOIN albums ON albums.artistId = artists.id JOIN tracks ON tracks.albumId = albums.id WHERE artists.id = $1", @[Value(kind: vkInt64, int64Val: artistId)])
     )
     samples.add(elapsed)
-  discard closeDb(db)
+  discard requireOk(closeDb(db), "closeDb(fk)")
   BenchResult(name: "fk_join", iterations: 100, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
 
 proc runSubstringSearch(): BenchResult =
   let path = makeTempDb("decentdb_bench_like.db")
-  let dbRes = openDb(path)
-  if not dbRes.ok:
-    quit(1)
-  let db = dbRes.value
-  if not execSql(db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)").ok:
-    quit(1)
-  if not execSql(db, "CREATE INDEX docs_body_idx ON docs (body)").ok:
-    quit(1)
+  let db = requireOk(openDb(path), "openDb(like)")
+  discard requireOk(execSql(db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)"), "create table docs(like)")
+  discard requireOk(execSql(db, "CREATE INDEX docs_body_trgm ON docs USING trigram (body)"), "create trigram index docs_body_trgm")
   var rows: seq[seq[Value]] = @[]
   for i in 1 .. 2000:
     let body = if i mod 5 == 0: "hello world " & $i else: "random text " & $i
@@ -140,25 +127,44 @@ proc runSubstringSearch(): BenchResult =
   var opts = defaultBulkLoadOptions()
   opts.disableIndexes = true
   opts.durability = dmNone
-  if not bulkLoad(db, "docs", rows, opts).ok:
-    quit(1)
+  discard requireOk(bulkLoad(db, "docs", rows, opts), "bulkLoad docs(like)")
   var samples: seq[float] = @[]
   for _ in 0 ..< 100:
     let elapsed = measureMs(proc() =
       discard execSql(db, "SELECT id FROM docs WHERE body LIKE '%world%'")
     )
     samples.add(elapsed)
-  discard closeDb(db)
+  discard requireOk(closeDb(db), "closeDb(like)")
   BenchResult(name: "substring_search", iterations: 100, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
+
+proc runOrderBySort(): BenchResult =
+  let path = makeTempDb("decentdb_bench_sort.db")
+  let db = requireOk(openDb(path), "openDb(sort)")
+  discard requireOk(execSql(db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)"), "create table docs(sort)")
+  var rows: seq[seq[Value]] = @[]
+  for i in 1 .. 50000:
+    let body = (if i mod 17 == 0: "hello world " else: "random text ") & $i
+    rows.add(@[
+      Value(kind: vkInt64, int64Val: i),
+      Value(kind: vkText, bytes: toBytes(body))
+    ])
+  var opts = defaultBulkLoadOptions()
+  opts.disableIndexes = true
+  opts.durability = dmNone
+  discard requireOk(bulkLoad(db, "docs", rows, opts), "bulkLoad docs(sort)")
+  var samples: seq[float] = @[]
+  for _ in 0 ..< 50:
+    let elapsed = measureMs(proc() =
+      discard execSql(db, "SELECT id FROM docs ORDER BY body LIMIT 1000")
+    )
+    samples.add(elapsed)
+  discard requireOk(closeDb(db), "closeDb(sort)")
+  BenchResult(name: "order_by_sort", iterations: 50, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
 
 proc runBulkLoad(): BenchResult =
   let path = makeTempDb("decentdb_bench_bulk.db")
-  let dbRes = openDb(path)
-  if not dbRes.ok:
-    quit(1)
-  let db = dbRes.value
-  if not execSql(db, "CREATE TABLE bulk (id INT PRIMARY KEY, body TEXT)").ok:
-    quit(1)
+  let db = requireOk(openDb(path), "openDb(bulk)")
+  discard requireOk(execSql(db, "CREATE TABLE bulk (id INT PRIMARY KEY, body TEXT)"), "create table bulk")
   var rows: seq[seq[Value]] = @[]
   for i in 1 .. 10000:
     rows.add(@[
@@ -169,10 +175,9 @@ proc runBulkLoad(): BenchResult =
   opts.disableIndexes = true
   opts.durability = dmNone
   let elapsed = measureMs(proc() =
-    if not bulkLoad(db, "bulk", rows, opts).ok:
-      quit(1)
+    discard requireOk(bulkLoad(db, "bulk", rows, opts), "bulkLoad bulk")
   )
-  discard closeDb(db)
+  discard requireOk(closeDb(db), "closeDb(bulk)")
   BenchResult(name: "bulk_load", iterations: 1, samples: @[elapsed], p50Ms: elapsed, p95Ms: elapsed)
 
 proc toJson(bench: BenchResult): JsonNode =
@@ -189,6 +194,7 @@ when isMainModule:
     runPointLookup(),
     runFkJoin(),
     runSubstringSearch(),
+    runOrderBySort(),
     runBulkLoad()
   ]
   var jsonResults: seq[JsonNode] = @[]

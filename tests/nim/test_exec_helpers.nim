@@ -44,12 +44,26 @@ suite "Exec Helpers Extended":
     let likeExpr = Expr(kind: ekBinary, op: "LIKE", left: Expr(kind: ekColumn, table: "", name: "tag"), right: likePattern)
     let likeRes = evalExpr(row, likeExpr, @[])
     check likeRes.ok
-    check likeRes.value.boolVal
+    check not likeRes.value.boolVal
+
+    let ilikeExpr = Expr(kind: ekBinary, op: "ILIKE", left: Expr(kind: ekColumn, table: "", name: "tag"), right: likePattern)
+    let ilikeRes = evalExpr(row, ilikeExpr, @[])
+    check ilikeRes.ok
+    check ilikeRes.value.boolVal
 
     let unsupported = Expr(kind: ekBinary, op: "XOR", left: col, right: lit)
     let unsupportedRes = evalExpr(row, unsupported, @[])
     check not unsupportedRes.ok
     check unsupportedRes.err.message == "Unsupported operator"
+
+  test "LIKE guardrails reject very long patterns":
+    let row = makeRow(@["tag"], @[Value(kind: vkText, bytes: toBytes("abc"))])
+    let longPattern = repeat("%", MaxLikePatternLen + 1)
+    let likePattern = Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: longPattern))
+    let likeExpr = Expr(kind: ekBinary, op: "LIKE", left: Expr(kind: ekColumn, table: "", name: "tag"), right: likePattern)
+    let likeRes = evalExpr(row, likeExpr, @[])
+    check not likeRes.ok
+    check likeRes.err.message.contains("LIKE pattern too long")
 
   test "applyFilter removes rows and surfaces evalExpr errors":
     let columns = @["id"]

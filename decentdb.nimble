@@ -60,6 +60,7 @@ task lint, "Static checks for Nim + Python":
   exec "nim check tests/nim/test_sort_spill.nim"
   exec "nim check tests/nim/test_bulk_load.nim"
   exec "nim check tests/bench/bench.nim"
+  exec "nim check tests/bench/bench_large.nim"
   exec "python -m compileall tests/bench"
   exec "python -m compileall tests/harness"
 
@@ -69,3 +70,10 @@ task bench, "Run microbenchmarks":
 task bench_compare, "Run microbenchmarks and compare to baseline":
   exec "nim c -r tests/bench/bench.nim -- tests/bench/results.json"
   exec "python tests/bench/compare_bench.py tests/bench/results.json tests/bench/baseline.json tests/bench/thresholds.json"
+
+task bench_large, "Run large/concurrency benchmarks (may be slow)":
+  exec "nim c --threads:on -r tests/bench/bench_large.nim -- tests/bench/results_large.json"
+
+task bench_large_compare, "Run large/concurrency benchmarks and compare to baseline (may be slow)":
+  exec "nim c --threads:on -r tests/bench/bench_large.nim -- tests/bench/results_large.json"
+  exec "python tests/bench/compare_bench.py tests/bench/results_large.json tests/bench/baseline_large.json tests/bench/thresholds_large.json"

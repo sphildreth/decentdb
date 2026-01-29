@@ -1,0 +1,8 @@
+{
+  "point_lookup_large": { "p95_increase": 0.20 },
+  "order_by_sort_large": { "p95_increase": 0.25 },
+  "vfs_concurrent_read_t1": { "p95_increase": 0.30 },
+  "vfs_concurrent_read_t2": { "p95_increase": 0.30 },
+  "vfs_concurrent_read_t4": { "p95_increase": 0.30 },
+  "vfs_concurrent_read_t8": { "p95_increase": 0.30 }
+}

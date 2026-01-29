@@ -97,6 +97,18 @@ method read*(fv: FaultyVfs, file: VfsFile, offset: int64, buf: var openArray[byt
     fv.record(foRead, action.label, action, buf.len, 0, res.err.code)
   res
 
+method readStr*(fv: FaultyVfs, file: VfsFile, offset: int64, buf: var string): Result[int] =
+  let action = fv.nextAction(foRead, buf.len)
+  if action.kind == faError:
+    fv.record(foRead, action.label, action, buf.len, 0, action.errorCode)
+    return err[int](action.errorCode, "Injected error on read", file.path)
+  let res = fv.inner.readStr(file, offset, buf)
+  if res.ok:
+    fv.record(foRead, action.label, action, buf.len, res.value, ERR_INTERNAL)
+  else:
+    fv.record(foRead, action.label, action, buf.len, 0, res.err.code)
+  res
+
 method write*(fv: FaultyVfs, file: VfsFile, offset: int64, buf: openArray[byte]): Result[int] =
   let action = fv.nextAction(foWrite, buf.len)
   if action.kind == faError:
@@ -111,6 +123,27 @@ method write*(fv: FaultyVfs, file: VfsFile, offset: int64, buf: openArray[byte])
       fv.record(foWrite, action.label, action, buf.len, 0, res.err.code)
     return res
   let res = fv.inner.write(file, offset, buf)
+  if res.ok:
+    fv.record(foWrite, action.label, action, buf.len, res.value, ERR_INTERNAL)
+  else:
+    fv.record(foWrite, action.label, action, buf.len, 0, res.err.code)
+  res
+
+method writeStr*(fv: FaultyVfs, file: VfsFile, offset: int64, buf: string): Result[int] =
+  let action = fv.nextAction(foWrite, buf.len)
+  if action.kind == faError:
+    fv.record(foWrite, action.label, action, buf.len, 0, action.errorCode)
+    return err[int](action.errorCode, "Injected error on write", file.path)
+  if action.kind == faPartialWrite:
+    let partial = min(action.partialBytes, buf.len)
+    let slice = if partial <= 0: "" else: buf[0 ..< partial]
+    let res = fv.inner.writeStr(file, offset, slice)
+    if res.ok:
+      fv.record(foWrite, action.label, action, buf.len, res.value, ERR_INTERNAL)
+    else:
+      fv.record(foWrite, action.label, action, buf.len, 0, res.err.code)
+    return res
+  let res = fv.inner.writeStr(file, offset, buf)
   if res.ok:
     fv.record(foWrite, action.label, action, buf.len, res.value, ERR_INTERNAL)
   else:

@@ -65,6 +65,14 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
     j.inc
   j == p.len
 
+const MaxLikePatternLen* = 4096
+
+proc likeMatchChecked*(text: string, pattern: string, caseInsensitive: bool): Result[bool] =
+  ## Guardrails to prevent pathological LIKE inputs from monopolizing CPU/memory.
+  if pattern.len > MaxLikePatternLen:
+    return err[bool](ERR_SQL, "LIKE pattern too long", "len=" & $pattern.len)
+  ok(likeMatch(text, pattern, caseInsensitive))
+
 proc makeRow*(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
   Row(rowid: rowid, columns: columns, values: values)
 
@@ -209,7 +217,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     of "LIKE", "ILIKE":
       let leftStr = valueToString(leftRes.value)
       let rightStr = valueToString(rightRes.value)
-      return ok(Value(kind: vkBool, boolVal: likeMatch(leftStr, rightStr, expr.op == "ILIKE")))
+      let likeRes = likeMatchChecked(leftStr, rightStr, expr.op == "ILIKE")
+      if not likeRes.ok:
+        return err[Value](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+      return ok(Value(kind: vkBool, boolVal: likeRes.value))
     of "IS":
        if rightRes.value.kind == vkNull:
          return ok(Value(kind: vkBool, boolVal: leftRes.value.kind == vkNull))
@@ -296,7 +307,10 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
     var filtered: seq[Row] = @[]
     for row in rowsRes.value:
       let text = valueToString(row.values[columnIndex])
-      if likeMatch(text, pattern, caseInsensitive):
+      let likeRes = likeMatchChecked(text, pattern, caseInsensitive)
+      if not likeRes.ok:
+        return err[seq[Row]](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+      if likeRes.value:
         filtered.add(row)
     return ok(filtered)
   let grams = trigrams(normalized)
@@ -322,7 +336,10 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
     var filtered: seq[Row] = @[]
     for row in rowsRes.value:
       let text = valueToString(row.values[columnIndex])
-      if likeMatch(text, pattern, caseInsensitive):
+      let likeRes = likeMatchChecked(text, pattern, caseInsensitive)
+      if not likeRes.ok:
+        return err[seq[Row]](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+      if likeRes.value:
         filtered.add(row)
     return ok(filtered)
   var candidates = intersectPostings(postingsLists)
@@ -338,7 +355,10 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
     if not readRes.ok:
       continue
     let text = valueToString(readRes.value.values[columnIndex])
-    if not likeMatch(text, pattern, caseInsensitive):
+    let likeRes = likeMatchChecked(text, pattern, caseInsensitive)
+    if not likeRes.ok:
+      return err[seq[Row]](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+    if not likeRes.value:
       continue
     rows.add(makeRow(cols, readRes.value.values, rowid))
   ok(rows)

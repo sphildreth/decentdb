@@ -196,3 +196,41 @@ suite "BTree":
     
     discard closePager(pager)
     discard closeDb(db)
+
+  test "overflow values roundtrip and deleteKeyValue works":
+    let path = makeTempDb("decentdb_btree_overflow.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 8)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let rootRes = allocatePage(pager)
+    check rootRes.ok
+    let root = rootRes.value
+    var rootBuf = newString(pager.pageSize)
+    rootBuf[0] = char(PageTypeLeaf)
+    writeU32LE(rootBuf, 4, 0)
+    check writePage(pager, root, rootBuf).ok
+    let tree = newBTree(pager, root)
+
+    var big = newSeq[byte](pager.pageSize * 3)
+    for i in 0 ..< big.len:
+      big[i] = byte(i mod 251)
+
+    check insert(tree, 1, @[byte(1)]).ok
+    check update(tree, 1, big).ok
+    let found = find(tree, 1)
+    check found.ok
+    check found.value[1].len == big.len
+    check found.value[1][0] == big[0]
+    check found.value[1][^1] == big[^1]
+
+    check insert(tree, 2, big).ok
+    let delKv = deleteKeyValue(tree, 2, big)
+    check delKv.ok
+    check delKv.value
+    check not find(tree, 2).ok
+
+    discard closePager(pager)
+    discard closeDb(db)

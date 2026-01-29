@@ -2,10 +2,12 @@ import options
 import ../errors
 import ../pager/pager
 import ../pager/db_header
+import ../record/record
 
 const
   PageTypeInternal* = 1'u8
   PageTypeLeaf* = 2'u8
+  MaxLeafInlineValueBytes = 512
 
 type BTree* = ref object
   pager*: Pager
@@ -19,6 +21,10 @@ type BTreeCursor* = ref object
   values*: seq[seq[byte]]
   overflows*: seq[uint32]
   nextLeaf*: PageId
+
+type LeafValue = object
+  inline: seq[byte]
+  overflow: uint32
 
 proc readU16LE(buf: string, offset: int): uint16 =
   uint16(byte(buf[offset])) or (uint16(byte(buf[offset + 1])) shl 8)
@@ -142,6 +148,33 @@ proc lowerBound(keys: seq[uint64], key: uint64): int =
       hi = mid
   lo
 
+proc maxInlineValue(tree: BTree): int =
+  max(0, min(MaxLeafInlineValueBytes, tree.pager.pageSize - 24))
+
+proc materializeValue(tree: BTree, inline: seq[byte], overflow: uint32): Result[seq[byte]] =
+  if overflow == 0'u32:
+    return ok(inline)
+  let overflowRes = readOverflowChainAll(tree.pager, PageId(overflow))
+  if not overflowRes.ok:
+    return err[seq[byte]](overflowRes.err.code, overflowRes.err.message, overflowRes.err.context)
+  if inline.len == 0:
+    return ok(overflowRes.value)
+  var merged = newSeq[byte](inline.len + overflowRes.value.len)
+  if inline.len > 0:
+    copyMem(addr merged[0], unsafeAddr inline[0], inline.len)
+  if overflowRes.value.len > 0:
+    copyMem(addr merged[inline.len], unsafeAddr overflowRes.value[0], overflowRes.value.len)
+  ok(merged)
+
+proc prepareLeafValue(tree: BTree, value: seq[byte]): Result[LeafValue] =
+  let maxInline = maxInlineValue(tree)
+  if value.len <= maxInline:
+    return ok(LeafValue(inline: value, overflow: 0'u32))
+  let ovRes = writeOverflowChain(tree.pager, value)
+  if not ovRes.ok:
+    return err[LeafValue](ovRes.err.code, ovRes.err.message, ovRes.err.context)
+  ok(LeafValue(inline: @[], overflow: uint32(ovRes.value)))
+
 proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
   let leafRes = findLeaf(tree, key)
   if not leafRes.ok:
@@ -163,7 +196,10 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
     if keys[i] == key:
       if values[i].len == 0 and overflows[i] == 0'u32:
         return err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
-      return ok((keys[i], values[i], overflows[i]))
+      let valueRes = materializeValue(tree, values[i], overflows[i])
+      if not valueRes.ok:
+        return err[(uint64, seq[byte], uint32)](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+      return ok((keys[i], valueRes.value, overflows[i]))
   err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
 
 proc openCursor*(tree: BTree): Result[BTreeCursor] =
@@ -226,7 +262,10 @@ proc cursorNext*(cursor: BTreeCursor): Result[(uint64, seq[byte], uint32)] =
   if cursor.index < cursor.keys.len:
     let i = cursor.index
     cursor.index.inc
-    return ok((cursor.keys[i], cursor.values[i], cursor.overflows[i]))
+    let valueRes = materializeValue(cursor.tree, cursor.values[i], cursor.overflows[i])
+    if not valueRes.ok:
+      return err[(uint64, seq[byte], uint32)](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    return ok((cursor.keys[i], valueRes.value, cursor.overflows[i]))
   if cursor.nextLeaf == 0:
     cursor.leaf = 0
     return err[(uint64, seq[byte], uint32)](ERR_IO, "Cursor exhausted")
@@ -413,6 +452,11 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
     return err[Option[SplitResult]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
   let page = pageRes.value
   if byte(page[0]) == PageTypeLeaf:
+    let prepRes = prepareLeafValue(tree, value)
+    if not prepRes.ok:
+      return err[Option[SplitResult]](prepRes.err.code, prepRes.err.message, prepRes.err.context)
+    let leafVal = prepRes.value.inline
+    let leafOv = prepRes.value.overflow
     let parsed = readLeafCells(page)
     if not parsed.ok:
       return err[Option[SplitResult]](parsed.err.code, parsed.err.message, parsed.err.context)
@@ -421,14 +465,14 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
     for i in 0 ..< keys.len:
       if key < keys[i]:
         keys.insert(key, i)
-        values.insert(value, i)
-        overflows.insert(0'u32, i)
+        values.insert(leafVal, i)
+        overflows.insert(leafOv, i)
         inserted = true
         break
     if not inserted:
       keys.add(key)
-      values.add(value)
-      overflows.add(0)
+      values.add(leafVal)
+      overflows.add(leafOv)
     let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
     if encodeRes.ok:
       discard writePage(tree.pager, pageId, encodeRes.value)
@@ -537,12 +581,29 @@ proc update*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
   var (keys, values, overflows, nextLeaf) = parsed.value
   for i in 0 ..< keys.len:
     if keys[i] == key:
-      values[i] = value
-      overflows[i] = 0
-      let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+      let oldOv = overflows[i]
+      let prepRes = prepareLeafValue(tree, value)
+      if not prepRes.ok:
+        return err[Void](prepRes.err.code, prepRes.err.message, prepRes.err.context)
+      var leafVal = prepRes.value.inline
+      var leafOv = prepRes.value.overflow
+      values[i] = leafVal
+      overflows[i] = leafOv
+      var encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
+      if not encodeRes.ok and leafOv == 0'u32 and leafVal.len > 0:
+        let ovRes = writeOverflowChain(tree.pager, leafVal)
+        if not ovRes.ok:
+          return err[Void](ovRes.err.code, ovRes.err.message, ovRes.err.context)
+        values[i] = @[]
+        overflows[i] = uint32(ovRes.value)
+        encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
       if not encodeRes.ok:
         return err[Void](encodeRes.err.code, encodeRes.err.message, encodeRes.err.context)
       discard writePage(tree.pager, pageId, encodeRes.value)
+      if oldOv != 0'u32:
+        let freeRes = freeOverflowChain(tree.pager, PageId(oldOv))
+        if not freeRes.ok:
+          return err[Void](freeRes.err.code, freeRes.err.message, freeRes.err.context)
       return okVoid()
   err[Void](ERR_IO, "Key not found")
 
@@ -560,6 +621,10 @@ proc delete*(tree: BTree, key: uint64): Result[Void] =
   var (keys, values, overflows, nextLeaf) = parsed.value
   for i in 0 ..< keys.len:
     if keys[i] == key:
+      if overflows[i] != 0'u32:
+        let freeRes = freeOverflowChain(tree.pager, PageId(overflows[i]))
+        if not freeRes.ok:
+          return err[Void](freeRes.err.code, freeRes.err.message, freeRes.err.context)
       keys.delete(i)
       values.delete(i)
       overflows.delete(i)
@@ -588,7 +653,14 @@ proc deleteKeyValue*(tree: BTree, key: uint64, value: seq[byte]): Result[bool] =
         continue
       if keys[i] > key:
         return ok(false)
-      if values[i] == value and overflows[i] == 0'u32:
+      let valueRes = materializeValue(tree, values[i], overflows[i])
+      if not valueRes.ok:
+        return err[bool](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+      if valueRes.value == value:
+        if overflows[i] != 0'u32:
+          let freeRes = freeOverflowChain(tree.pager, PageId(overflows[i]))
+          if not freeRes.ok:
+            return err[bool](freeRes.err.code, freeRes.err.message, freeRes.err.context)
         keys.delete(i)
         values.delete(i)
         overflows.delete(i)

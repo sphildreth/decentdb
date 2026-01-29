@@ -96,6 +96,7 @@ suite "Storage":
       Value(kind: vkText, bytes: toBytes("HELLO"))
     ])
     check rowRes.ok
+    check flushTrigramDeltas(db.pager, db.catalog).ok
 
     let gramsOld = trigrams("HELLO")
     check gramsOld.len > 0
@@ -107,6 +108,7 @@ suite "Storage":
       Value(kind: vkInt64, int64Val: 1),
       Value(kind: vkText, bytes: toBytes("WORLD"))
     ]).ok
+    check flushTrigramDeltas(db.pager, db.catalog).ok
 
     let postingsOldAfter = getTrigramPostings(db.pager, idx, gramsOld[0])
     check postingsOldAfter.ok
@@ -119,6 +121,7 @@ suite "Storage":
     check rowRes.value in postingsNew.value
 
     check deleteRow(db.pager, db.catalog, "docs", rowRes.value).ok
+    check flushTrigramDeltas(db.pager, db.catalog).ok
     let postingsAfterDelete = getTrigramPostings(db.pager, idx, gramsNew[0])
     check postingsAfterDelete.ok
     check rowRes.value notin postingsAfterDelete.value
