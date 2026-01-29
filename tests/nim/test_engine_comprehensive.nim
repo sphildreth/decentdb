@@ -3,9 +3,6 @@ import os
 import strutils
 
 import engine
-import pager/db_header
-import vfs/os_vfs
-import sql/sql
 import record/record
 
 proc makeTempDb(name: string): string =
@@ -254,16 +251,114 @@ suite "Engine Comprehensive":
     let dbRes = openDb(path)
     check dbRes.ok
     let db = dbRes.value
-    
+
     # Close the database
     let closeRes = closeDb(db)
     check closeRes.ok
-    
+
     # Try to execute SQL on closed database - should fail
     let execRes = execSql(db, "SELECT 1")
     check not execRes.ok
-    
+
     # Reopen for cleanup
     let reopenRes = openDb(path)
     check reopenRes.ok
     discard closeDb(reopenRes.value)
+
+  test "explicit transactions handle nested begin/commit and rollback":
+    let path = makeTempDb("decentdb_engine_txn_lifecycle.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE counters (id INT)").ok
+
+    check beginTransaction(db).ok
+    check not beginTransaction(db).ok
+    check execSql(db, "INSERT INTO counters (id) VALUES (1)").ok
+    check commitTransaction(db).ok
+
+    check beginTransaction(db).ok
+    check execSql(db, "INSERT INTO counters (id) VALUES (2)").ok
+    check rollbackTransaction(db).ok
+    check not rollbackTransaction(db).ok
+
+    let countRes = execSql(db, "SELECT COUNT(*) FROM counters")
+    check countRes.ok
+    check split(countRes.value[0], "|")[0] == "1"
+
+    discard closeDb(db)
+
+  test "foreign key restrict blocks parent update/delete":
+    let path = makeTempDb("decentdb_engine_fk_restrict.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY)").ok
+    check execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id))").ok
+    check execSql(db, "INSERT INTO parent (id) VALUES (1)").ok
+    check execSql(db, "INSERT INTO child (id, parent_id) VALUES (1, 1)").ok
+
+    let updateRes = execSql(db, "UPDATE parent SET id = 2 WHERE id = 1")
+    check not updateRes.ok
+    check updateRes.err.message.contains("FOREIGN KEY")
+
+    let deleteRes = execSql(db, "DELETE FROM parent WHERE id = 1")
+    check not deleteRes.ok
+    check deleteRes.err.message.contains("FOREIGN KEY")
+
+    discard closeDb(db)
+
+  test "bulkLoad rebuilds indexes when durability is full":
+    let path = makeTempDb("decentdb_engine_bulk_load_indexes.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE NOT NULL)").ok
+    let rows = @[
+      @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: bytes("a@example.com"))],
+      @[Value(kind: vkInt64, int64Val: 2), Value(kind: vkText, bytes: bytes("b@example.com"))],
+      @[Value(kind: vkInt64, int64Val: 3), Value(kind: vkText, bytes: bytes("c@example.com"))]
+    ]
+
+    var opts = defaultBulkLoadOptions()
+    opts.disableIndexes = false
+    opts.durability = dmFull
+    opts.batchSize = 2
+    opts.syncInterval = 1
+    opts.checkpointOnComplete = false
+
+    let bulkRes = bulkLoad(db, "users", rows, opts, db.wal)
+    check bulkRes.ok
+
+    let selectRes = execSql(db, "SELECT COUNT(*) FROM users")
+    check selectRes.ok
+    check split(selectRes.value[0], "|")[0] == "3"
+
+    discard closeDb(db)
+
+  test "bulkLoad skips WAL when durability is none":
+    let path = makeTempDb("decentdb_engine_bulk_load_nosync.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE items (id INT, label TEXT)").ok
+    let rows = @[
+      @[Value(kind: vkInt64, int64Val: 10), Value(kind: vkText, bytes: bytes("x"))],
+      @[Value(kind: vkInt64, int64Val: 20), Value(kind: vkText, bytes: bytes("y"))]
+    ]
+
+    var opts = defaultBulkLoadOptions()
+    opts.durability = dmNone
+
+    let bulkRes = bulkLoad(db, "items", rows, opts, nil)
+    check bulkRes.ok
+
+    let selectRes = execSql(db, "SELECT COUNT(*) FROM items")
+    check selectRes.ok
+    check split(selectRes.value[0], "|")[0] == "2"
+
+    discard closeDb(db)

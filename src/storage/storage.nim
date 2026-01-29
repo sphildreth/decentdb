@@ -154,7 +154,7 @@ proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Voi
       return err[Void](saveRes.err.code, saveRes.err.message, saveRes.err.context)
   okVoid()
 
-proc normalizeValues(pager: Pager, values: seq[Value]): Result[seq[Value]] =
+proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
   var resultValues: seq[Value] = @[]
   for value in values:
     if value.kind in {vkText, vkBlob} and value.bytes.len > (pager.pageSize - 128):

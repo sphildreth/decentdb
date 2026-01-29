@@ -40,8 +40,13 @@ TESTS=(
   tests/nim/test_trigram.nim
   tests/nim/test_exec.nim
   tests/nim/test_storage.nim
+  tests/nim/test_storage_extra.nim
+  tests/nim/test_storage_more.nim
   tests/nim/test_sort_spill.nim
   tests/nim/test_bulk_load.nim
+  tests/nim/test_exec_plan_coverage.nim
+  tests/nim/test_planner_extra.nim
+  tests/nim/test_sql_helpers.nim
 )
 
 for test in "${TESTS[@]}"; do

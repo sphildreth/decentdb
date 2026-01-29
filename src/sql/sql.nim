@@ -141,13 +141,13 @@ type Statement* = ref object
 type SqlAst* = ref object
   statements*: seq[Statement]
 
-proc nodeHas(node: JsonNode, key: string): bool =
+proc nodeHas*(node: JsonNode, key: string): bool =
   node.kind == JObject and node.hasKey(key)
 
-proc nodeGet(node: JsonNode, key: string): JsonNode =
+proc nodeGet*(node: JsonNode, key: string): JsonNode =
   if nodeHas(node, key): node[key] else: newJNull()
 
-proc nodeString(node: JsonNode): string =
+proc nodeString*(node: JsonNode): string =
   if node.kind == JString:
     return node.str
   if nodeHas(node, "String"):
@@ -163,14 +163,14 @@ proc nodeString(node: JsonNode): string =
     return node["sval"].str
   ""
 
-proc nodeStringOr(node: JsonNode, key: string, fallback: string): string =
+proc nodeStringOr*(node: JsonNode, key: string, fallback: string): string =
   if nodeHas(node, key):
     return node[key].getStr
   fallback
 
 proc parseExprNode(node: JsonNode): Result[Expr]
 
-proc parseAConst(node: JsonNode): Result[Expr] =
+proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "isnull") and node["isnull"].getBool:
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
   if nodeHas(node, "ival"):

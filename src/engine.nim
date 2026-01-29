@@ -29,6 +29,7 @@ type Db* = ref object
   catalog*: Catalog
   wal*: Wal                          # WAL instance for checkpoint control
   activeWriter*: WalWriter           # Current transaction writer (nil if no active tx)
+  walOverlayEnabled*: bool           # Disable WAL overlay after non-WAL writes
   cachePages*: int                   # Cache size for diagnostics
 
 type DurabilityMode* = enum
@@ -153,6 +154,7 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db] =
     catalog: catalogRes.value,
     wal: wal,
     activeWriter: nil,
+    walOverlayEnabled: true,
     cachePages: cachePages
   ))
 
@@ -293,7 +295,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
     return err[seq[string]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
   var output: seq[string] = @[]
   proc runSelect(bound: Statement): Result[seq[string]] =
-    if db.wal == nil or db.activeWriter != nil:
+    if db.wal == nil or db.activeWriter != nil or not db.walOverlayEnabled:
       let planRes = plan(db.catalog, bound)
       if not planRes.ok:
         return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
@@ -588,6 +590,8 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
   let tableRes = db.catalog.getTable(tableName)
   if not tableRes.ok:
     return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  if options.durability == dmNone and db.wal != nil:
+    db.walOverlayEnabled = false
   let table = tableRes.value
   let batchSize = if options.batchSize <= 0: 1 else: options.batchSize
   let syncInterval = if options.syncInterval <= 0: 1 else: options.syncInterval

@@ -64,20 +64,20 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
     j.inc
   j == p.len
 
-proc makeRow(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
+proc makeRow*(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
   Row(rowid: rowid, columns: columns, values: values)
 
 const SortBufferBytes = 16 * 1024 * 1024
 const SortMaxRuns = 64
 
-proc varintLen(value: uint64): int =
+proc varintLen*(value: uint64): int =
   var v = value
   result = 1
   while v >= 0x80'u64:
     v = v shr 7
     result.inc
 
-proc estimateRowBytes(row: Row): int =
+proc estimateRowBytes*(row: Row): int =
   result = varintLen(uint64(row.values.len))
   for value in row.values:
     result.inc
@@ -95,7 +95,7 @@ proc estimateRowBytes(row: Row): int =
       payloadLen = 8
     result += varintLen(uint64(payloadLen)) + payloadLen
 
-proc columnIndex(row: Row, table: string, name: string): Result[int] =
+proc columnIndex*(row: Row, table: string, name: string): Result[int] =
   if table.len > 0:
     let key = table & "." & name
     for i, col in row.columns:
@@ -339,7 +339,7 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
     rows.add(makeRow(cols, readRes.value.values, rowid))
   ok(rows)
 
-proc applyFilter(rows: seq[Row], expr: Expr, params: seq[Value]): Result[seq[Row]] =
+proc applyFilter*(rows: seq[Row], expr: Expr, params: seq[Value]): Result[seq[Row]] =
   if expr == nil:
     return ok(rows)
   var resultRows: seq[Row] = @[]
@@ -351,7 +351,7 @@ proc applyFilter(rows: seq[Row], expr: Expr, params: seq[Value]): Result[seq[Row
       resultRows.add(row)
   ok(resultRows)
 
-proc projectRows(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): Result[seq[Row]] =
+proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): Result[seq[Row]] =
   if items.len == 0:
     return ok(rows)
   if items.len == 1 and items[0].isStar:
@@ -386,7 +386,7 @@ type AggState = object
   max: Value
   initialized: bool
 
-proc aggregateRows(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], having: Expr, params: seq[Value]): Result[seq[Row]] =
+proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], having: Expr, params: seq[Value]): Result[seq[Row]] =
   var groups = initTable[string, AggState]()
   var groupRows = initTable[string, Row]()
   for row in rows:
@@ -466,7 +466,7 @@ proc aggregateRows(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], h
     resultRows.add(row)
   ok(resultRows)
 
-proc writeRowChunk(path: string, rows: seq[Row]) =
+proc writeRowChunk*(path: string, rows: seq[Row]) =
   var f: File
   if not open(f, path, fmWrite):
     return
@@ -479,13 +479,13 @@ proc writeRowChunk(path: string, rows: seq[Row]) =
       discard f.writeBuffer(data[0].addr, data.len)
   close(f)
 
-type ChunkReader = ref object
+type ChunkReader* = ref object
   file: File
   columns: seq[string]
   peeked: Option[Row]
   finished: bool
 
-proc openChunkReader(path: string, columns: seq[string]): ChunkReader =
+proc openChunkReader*(path: string, columns: seq[string]): ChunkReader =
   var f: File
   if not open(f, path, fmRead):
     return ChunkReader(finished: true)
@@ -515,7 +515,7 @@ proc openChunkReader(path: string, columns: seq[string]): ChunkReader =
     result.finished = true
     close(result.file)
 
-proc next(reader: ChunkReader): Option[Row] =
+proc next*(reader: ChunkReader): Option[Row] =
   if reader.finished:
     return none(Row)
   
@@ -548,12 +548,12 @@ proc next(reader: ChunkReader): Option[Row] =
     close(reader.file)
     reader.peeked = none(Row)
 
-proc close(reader: ChunkReader) =
+proc close*(reader: ChunkReader) =
   if not reader.finished:
     close(reader.file)
     reader.finished = true
 
-proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Result[seq[Row]] =
+proc sortRows*(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Result[seq[Row]] =
   proc cmpRows(a, b: Row): int =
     for item in orderBy:
       let av = evalExpr(a, item.expr, params)
@@ -629,7 +629,7 @@ proc sortRows(rows: seq[Row], orderBy: seq[OrderItem], params: seq[Value]): Resu
       removeFile(path)
   ok(resultRows)
 
-proc applyLimit(rows: seq[Row], limit: int, offset: int): seq[Row] =
+proc applyLimit*(rows: seq[Row], limit: int, offset: int): seq[Row] =
   var start = if offset >= 0: offset else: 0
   var endIndex = rows.len
   if limit >= 0:
