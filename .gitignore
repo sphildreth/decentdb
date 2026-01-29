@@ -20,6 +20,14 @@ __pycache__/
 config.nims
 tests/harness/seed.log
 build/coverage/
+
+# Benchmarks (generated artifacts)
+tests/bench/results.json
+tests/bench/*.results.json
+tests/bench/bench
+tests/bench/bench.exe
+tests/bench/nimcache/
+tests/bench/tmp/
 --
 tests/nim/
 !tests/nim/
