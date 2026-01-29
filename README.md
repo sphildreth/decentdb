@@ -86,6 +86,16 @@ decentdb --help
 decentdb exec --db path/to.db --sql "SELECT 1"
 ```
 
+Database creation:
+- The database file is created automatically on first open if it does not exist.
+- Any command that takes `--db` will create the file when missing.
+
+Examples:
+```bash
+decentdb exec --db ./my.db --openClose
+decentdb exec --db ./my.db --sql "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)"
+```
+
 Options:
 - `--db`, `-d` (required): database file path
 - `--sql`, `-s`: SQL statement to execute
