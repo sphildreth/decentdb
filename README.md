@@ -72,6 +72,102 @@ nimble bench_compare
 
 ---
 
+## CLI Reference
+
+DecentDb ships a single CLI tool named `decentdb`. All commands and options are under this tool.
+
+### Global Usage
+```bash
+decentdb --help
+```
+
+### exec (run SQL / engine controls)
+```bash
+decentdb exec --db path/to.db --sql "SELECT 1"
+```
+
+Options:
+- `--db`, `-d` (required): database file path
+- `--sql`, `-s`: SQL statement to execute
+- `--openClose`: open and close without executing SQL (testing)
+- `--timing`, `-t`: include timing info in JSON output
+- `--cachePages`: number of 4KB pages to cache (default 64)
+- `--cacheMb`: cache size in MB (overrides `--cachePages`)
+- `--checkpoint`: force WAL checkpoint and exit
+- `--readerCount`: show active reader count and exit
+- `--longReaders`: show readers active longer than N ms
+- `--dbInfo`: show DB header/config info and exit
+- `--warnings`: include WAL warnings in output
+- `--verbose`, `-v`: include verbose diagnostics in output
+- `--checkpointBytes`: auto-checkpoint when WAL reaches N bytes
+- `--checkpointMs`: auto-checkpoint when N ms elapse since last checkpoint
+
+### Schema introspection
+```bash
+decentdb list-tables --db path/to.db
+decentdb describe --table users --db path/to.db
+decentdb list-indexes --db path/to.db
+decentdb list-indexes --table users --db path/to.db
+```
+
+Options:
+- `list-tables`: `--db`, `-d`
+- `describe`: `--table`, `-t` and `--db`, `-d`
+- `list-indexes`: `--db`, `-d`, optional `--table`, `-t`
+
+### Index maintenance
+```bash
+decentdb rebuild-index --index users_name_idx --db path/to.db
+decentdb verify-index --index users_name_idx --db path/to.db
+```
+
+Options:
+- `rebuild-index`: `--index`, `-i` and `--db`, `-d`
+- `verify-index`: `--index`, `-i` and `--db`, `-d`
+
+### Import / Export / Dump
+```bash
+decentdb import --table users --input data.csv --db path/to.db
+decentdb import --table users --input data.json --db path/to.db --format=json
+
+decentdb export --table users --output users.csv --db path/to.db
+decentdb export --table users --output users.json --db path/to.db --format=json
+
+decentdb dump --db path/to.db --output backup.sql
+```
+
+Options:
+- `import`: `--table`, `-t`; `--input`; `--db`, `-d`; `--batchSize` (default 10000); `--format` (csv|json, default csv)
+- `export`: `--table`, `-t`; `--output`; `--db`, `-d`; `--format` (csv|json, default csv)
+- `dump`: `--db`, `-d`; optional `--output` (defaults to stdout)
+
+### Bulk load (CSV)
+```bash
+decentdb bulk-load --table users --input data.csv --db path/to.db --batchSize=50000 --durability=deferred
+```
+
+Options:
+- `--table`, `-t`; `--input`; `--db`, `-d`
+- `--batchSize` (default 10000)
+- `--syncInterval` (batches between fsync when durability is deferred, default 10)
+- `--durability` (full|deferred|none, default deferred)
+- `--disable-indexes` (default true)
+- `--no-checkpoint` (skip checkpoint after load)
+
+### Maintenance & diagnostics
+```bash
+decentdb checkpoint --db path/to.db
+decentdb stats --db path/to.db
+decentdb info --db path/to.db
+```
+
+Options:
+- `checkpoint`: `--db`, `-d`; `--warnings`; `--verbose`
+- `stats`: `--db`, `-d`
+- `info`: `--db`, `-d`
+
+---
+
 ## Repository Guide
 
 - `design/PRD.md` — product requirements
