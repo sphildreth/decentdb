@@ -547,6 +547,177 @@ public class Message
 
 ---
 
+## Error Handling Strategy
+
+### Requirements
+
+Consistent error reporting across all layers with clear mapping between native DecentDB errors and C# exceptions.
+
+### Error Code Mapping
+
+| DecentDB Error Code | C# Exception Type | Description |
+|---------------------|-------------------|-------------|
+| `ERR_CONSTRAINT` | `ConstraintViolationException` | Constraint violation (e.g., VARCHAR length, foreign key) |
+| `ERR_LOCK_TIMEOUT` | `DatabaseLockedException` | Timeout waiting for database lock |
+| `ERR_IO_ERROR` | `IOException` | File system error |
+| `ERR_PARSE_ERROR` | `SqlSyntaxErrorException` | Invalid SQL syntax |
+| `ERR_BIND_ERROR` | `ArgumentException` | Parameter binding error |
+| `ERR_FULL` | `DatabaseFullException` | Disk space exhausted |
+| `ERR_CORRUPT` | `DatabaseCorruptedException` | Database file corruption detected |
+
+### Error Propagation Chain
+
+```
+Native Layer (Nim):
+  - Return error codes via `decentdb_last_error()`
+  - Detailed error messages in UTF-8
+
+P/Invoke Layer (C#):
+  - Check return codes from native calls
+  - Marshal error messages from `decentdb_last_error()`
+  - Map native error codes to C# exceptions
+
+ADO.NET Layer:
+  - Translate exceptions to standard ADO.NET exception types
+  - Preserve original error details in exception data
+  - Follow ADO.NET exception hierarchy
+
+Micro-ORM Layer:
+  - Wrap lower-level exceptions with context
+  - Include SQL statement and parameters in exception details
+  - Maintain exception chaining for debugging
+```
+
+### Constraint Violation Handling
+
+**VARCHAR(n) Length Validation:**
+```csharp
+// C# layer pre-validation
+public void SetValue(DbParameter param, string value)
+{
+    if (param.MaxLength > 0 && value.Length > param.MaxLength)
+    {
+        throw new ArgumentException(
+            $"Value exceeds maximum length of {param.MaxLength} characters. Actual length: {value.Length}");
+    }
+
+    // Pass to native layer for secondary validation
+    SetNativeValue(param, value);
+}
+```
+
+**Native layer validation:**
+```nim
+# Secondary validation in Nim
+proc validate_string_length(col_meta: ColumnMeta, value: string): bool =
+  if col_meta.max_length.isSome():
+    if value.len > col_meta.max_length.get():
+      setError(ERR_CONSTRAINT, fmt"String value exceeds column '{col_meta.name}' maximum length ({col_meta.max_length.get()})")
+      return false
+  return true
+```
+
+### Exception Context Preservation
+
+All exceptions should preserve context for debugging:
+
+```csharp
+public class DecentDbException : DataException
+{
+    public string SqlStatement { get; }
+    public Dictionary<string, object> Parameters { get; }
+    public DateTimeOffset Timestamp { get; }
+    public string NativeErrorMessage { get; }
+
+    public DecentDbException(string message, string sql, Dictionary<string, object> parameters)
+        : base(message)
+    {
+        SqlStatement = sql;
+        Parameters = parameters ?? new Dictionary<string, object>();
+        Timestamp = DateTimeOffset.UtcNow;
+    }
+}
+```
+
+### Connection-Level Error Handling
+
+Handle database-level errors that affect connection state:
+
+```csharp
+public class DecentDbConnection : DbConnection
+{
+    protected override void Open()
+    {
+        try
+        {
+            _handle = decentdb_open(_connectionString, _options);
+            if (_handle == null)
+            {
+                var errorMsg = decentdb_last_error(null);
+                throw new InvalidOperationException($"Failed to open database: {errorMsg}");
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new CannotOpenDatabaseException($"Unable to connect to database at {_dataSource}", ex);
+        }
+    }
+}
+```
+
+### Transaction Error Recovery
+
+Handle transaction rollback and recovery scenarios:
+
+```csharp
+public async Task<T> InTransactionAsync<T>(Func<Task<T>> operation)
+{
+    using var tx = BeginTransaction();
+    try
+    {
+        var result = await operation();
+        await tx.CommitAsync();
+        return result;
+    }
+    catch (Exception ex)
+    {
+        try
+        {
+            await tx.RollbackAsync();
+        }
+        catch (Exception rollbackEx)
+        {
+            // Log rollback failure but throw original exception
+            _logger?.LogWarning(rollbackEx, "Transaction rollback failed after operation error");
+        }
+
+        throw new TransactionOperationException("Transaction failed and was rolled back", ex);
+    }
+}
+```
+
+### Async Error Handling
+
+Ensure proper exception propagation in async operations:
+
+```csharp
+public async Task<List<T>> QueryAsync<T>(string sql, params DbParameter[] parameters)
+{
+    using var cmd = CreateCommand(sql, parameters);
+    try
+    {
+        return await cmd.ToListAsync<T>();
+    }
+    catch (Exception ex)
+    {
+        // Wrap with context about the operation
+        throw new QueryExecutionException($"Error executing query: {sql}", sql, parameters, ex);
+    }
+}
+```
+
+---
+
 ## Phase 5: Performance Optimization
 
 ### Requirements
@@ -619,9 +790,9 @@ var factory = Expression.Lambda<Func<IDataReader, T>>(
 // Instead of row-by-row P/Invoke
 [DllImport("decentdb")]
 static unsafe extern int decentdb_fetch_batch(
-    void* result, 
-    RowData* buffer, 
-    int bufferSize, 
+    void* result,
+    RowData* buffer,
+    int bufferSize,
     out int fetched);
 
 struct RowData
@@ -631,6 +802,70 @@ struct RowData
     public long CreatedAt;
 }
 ```
+
+#### 3.5. **Memory Management for P/Invoke Layer** (Critical)
+- Explicit resource ownership: C# layer owns all allocated memory from native calls
+- Deterministic cleanup with `IDisposable` pattern for result sets
+- Safe handle pattern for native resources (database handles, prepared statements)
+- Pinning strategy for large data transfers (avoid excessive GC pressure)
+- Buffer reuse patterns to minimize allocations during result processing
+
+**Safe Handle Implementation:**
+```csharp
+public class DecentDbHandle : SafeHandle
+{
+    public DecentDbHandle() : base(IntPtr.Zero, true) { }
+
+    public override bool IsInvalid => handle == IntPtr.Zero;
+
+    protected override bool ReleaseHandle()
+    {
+        if (!IsInvalid)
+        {
+            decentdb_close(handle);
+            handle = IntPtr.Zero;
+            return true;
+        }
+        return false;
+    }
+}
+```
+
+**Result Set Memory Management:**
+```csharp
+public class DecentDbResultSet : IDisposable
+{
+    private IntPtr _resultPtr;
+    private bool _disposed = false;
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!_disposed && _resultPtr != IntPtr.Zero)
+        {
+            decentdb_result_free(_resultPtr);
+            _resultPtr = IntPtr.Zero;
+            _disposed = true;
+        }
+    }
+
+    ~DecentDbResultSet()
+    {
+        Dispose(false);
+    }
+}
+```
+
+**String and Blob Handling:**
+- Copy strings from native to managed memory immediately after P/Invoke call
+- Free native string memory before returning to caller
+- Use `Marshal.PtrToStringUTF8` for efficient UTF-8 string conversion
+- For blobs, copy to managed byte arrays to avoid pinning issues
 
 #### 4. **Connection Pooling with Reader Semantics**
 - Pool connections separately for readers vs writers
@@ -751,6 +986,68 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
    - Linux (.NET 10)
    - macOS (.NET 10)
 
+### Cross-Platform Considerations
+
+**Native Library Distribution:**
+- Platform-specific native libraries packaged in NuGet `runtimes/` folder
+- RID (Runtime Identifier) specific builds for x64 and ARM64 architectures
+- Automatic selection of appropriate native library at runtime
+- Fallback mechanism if specific platform variant is unavailable
+
+**File System Differences:**
+- Case sensitivity: Linux/macOS file systems are case-sensitive, Windows is not
+- Path separators: Use `System.IO.Path.DirectorySeparatorChar` consistently
+- File locking: Different behaviors across platforms (advisory vs mandatory locks)
+- Permissions: Linux/macOS require appropriate file permissions for database files
+
+**Character Encoding:**
+- UTF-8 encoding used consistently across all platforms
+- Native libraries must handle UTF-8 paths correctly on all platforms
+- String marshaling uses UTF-8 for all text data exchange
+
+**Performance Variations:**
+- Different default page sizes may be optimal per platform
+- Memory management differs between platforms (GC behavior)
+- I/O patterns vary (WAL file handling, checkpoint behavior)
+- Threading models differ (Windows fibers vs Linux pthreads)
+
+**Build Configuration:**
+- Separate build pipelines for each target platform
+- Static linking preferred to avoid runtime dependencies
+- Compiler flags optimized per platform (SIMD instructions, etc.)
+- Size optimization for embedded scenarios
+
+**Platform-Specific Optimizations:**
+- Windows: Use of Windows APIs for file I/O and synchronization
+- Linux: epoll for async I/O, futex for synchronization
+- macOS: kqueue for async I/O, native synchronization primitives
+
+### Testing Strategy Enhancements
+
+**Performance Regression Testing:**
+- Automated performance benchmarks integrated into CI pipeline
+- Baseline performance measurements for all critical operations
+- Alerting when performance degrades beyond acceptable thresholds
+- Separate benchmarks for cold vs warm cache scenarios
+
+**Compatibility Testing:**
+- Test against multiple .NET versions (.NET 10, future versions)
+- Verify compatibility with different Dapper versions
+- Test with various third-party ADO.NET diagnostic tools
+- Validate behavior with popular logging frameworks (Serilog, NLog, etc.)
+
+**Real-World Scenario Testing:**
+- Simulated application workloads with mixed read/write patterns
+- Stress testing with concurrent operations
+- Memory leak detection over extended periods
+- File corruption and recovery scenario testing
+
+**Integration Test Coverage:**
+- End-to-end tests using real-world domain models
+- Validation of complex LINQ queries with joins and aggregations
+- Test backup/restore operations with active connections
+- Verify behavior during system resource constraints (memory, disk space)
+
 ---
 
 ## Implementation Order
@@ -763,6 +1060,15 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
    - Error handling for constraint violations
    - CLI describe command updates
    - Comprehensive unit tests
+
+**Critical Dependency Note**: VARCHAR(n) implementation in the core DecentDB engine is a prerequisite for the entire Dapper integration effort. This feature must be completed before any C# layer development begins, as it requires changes to the SQL parser, binder, and catalog schema. The Nim engine must support this feature before the C API can expose it, and before the ADO.NET provider can utilize it. Teams should coordinate to ensure the core engine implementation is completed and tested before proceeding to Sprint 1.
+
+**Dependency Chain**:
+```
+Core Engine (VARCHAR support) → C API → ADO.NET Provider → Micro-ORM → Dapper Compatibility
+```
+
+Any delays in the core engine implementation will cascade to all subsequent phases. Consider parallelizing work where possible by having C# team begin ADO.NET implementation against mock interfaces while core engine team completes VARCHAR implementation.
 
 ### Sprint 1: Foundation
 1. C API wrapper in Nim
@@ -1021,6 +1327,48 @@ using var db = new DecentDbContext(connStr);
 - Readers: Multiple concurrent connections allowed
 - Writers: Single writer with queue (DecentDB constraint)
 - Idle timeout: 5 minutes (non-configurable in v1.0.0)
+
+### Transaction Isolation Semantics
+
+**Isolation Level Support:**
+The specific isolation levels supported by DecentDB depend on the underlying engine's concurrency control mechanisms. Based on the document's mention of single-writer constraint and WAL (Write-Ahead Logging) behavior, DecentDB likely implements a form of snapshot isolation for readers.
+
+| Isolation Level | DecentDB Behavior | Notes |
+|-----------------|-------------------|-------|
+| `ReadUncommitted` | Not supported | DecentDB prevents dirty reads by design |
+| `ReadCommitted` | Default behavior | Readers see committed data only |
+| `RepeatableRead` | Limited support | Consistency depends on engine implementation |
+| `Serializable` | Serialized writes | Single writer constraint ensures serializability |
+| `Snapshot` | Recommended | Best for read-heavy workloads |
+
+**Implementation Details:**
+- Single writer constraint ensures serialized write operations
+- Multiple concurrent readers are supported (subject to engine limitations)
+- Writers may block if another writer holds the write lock
+- Reader transactions should not block write operations
+
+**Connection String Configuration:**
+```
+Data Source=/path/to.db;IsolationLevel=Serializable
+```
+
+**Usage:**
+```csharp
+using var conn = new DecentDbConnection(connectionString);
+conn.Open();
+
+using var tx = conn.BeginTransaction(IsolationLevel.Serializable);
+// Transaction behavior depends on DecentDB engine implementation
+var data1 = await cmd1.ExecuteScalarAsync();
+var data2 = await cmd2.ExecuteScalarAsync();
+await tx.CommitAsync();
+```
+
+**Important Considerations:**
+- Due to single-writer constraint, high-concurrency write scenarios may experience contention
+- Read operations are generally non-blocking but behavior depends on engine implementation
+- For embedded scenarios, the isolation characteristics are determined by DecentDB's core architecture
+- Specific ADR required: ADR-00XX: Transaction Isolation Strategy (to document actual DecentDB behavior)
 
 ### Error Handling
 
