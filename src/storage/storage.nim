@@ -489,7 +489,10 @@ proc resetIndexRoot(pager: Pager, root: PageId): Result[Void] =
   buf[2] = '\0'
   buf[3] = '\0'
   writeU32LE(buf, 4, 0'u32)
-  writePage(pager, root, buf)
+  let writeRes = writePage(pager, root, buf)
+  if not writeRes.ok:
+    return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+  okVoid()
 
 proc rebuildIndex*(pager: Pager, catalog: Catalog, index: IndexMeta): Result[Void] =
   let resetRes = resetIndexRoot(pager, index.rootPage)

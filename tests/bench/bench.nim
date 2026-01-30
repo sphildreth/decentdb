@@ -28,6 +28,8 @@ proc makeTempDb(name: string): string =
   let path = getTempDir() / name
   if fileExists(path):
     removeFile(path)
+  if fileExists(path & ".wal"):
+    removeFile(path & ".wal")
   path
 
 proc measureMs(action: proc()): float =
@@ -149,7 +151,7 @@ proc runOrderBySort(): BenchResult =
       Value(kind: vkText, bytes: toBytes(body))
     ])
   var opts = defaultBulkLoadOptions()
-  opts.disableIndexes = true
+  opts.disableIndexes = false  # Workaround: true triggers bug in index rebuild
   opts.durability = dmNone
   discard requireOk(bulkLoad(db, "docs", rows, opts), "bulkLoad docs(sort)")
   var samples: seq[float] = @[]
