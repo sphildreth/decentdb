@@ -47,6 +47,12 @@ TESTS=(
   tests/nim/test_exec_plan_coverage.nim
   tests/nim/test_planner_extra.nim
   tests/nim/test_sql_helpers.nim
+  tests/nim/test_engine_comprehensive.nim
+  tests/nim/test_exec_helpers.nim
+  tests/nim/test_engine_edge_cases.nim
+  tests/nim/test_exec_comprehensive.nim
+  tests/nim/test_storage_deep.nim
+  tests/nim/test_vfs_comprehensive.nim
 )
 
 for test in "${TESTS[@]}"; do
