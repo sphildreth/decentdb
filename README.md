@@ -31,12 +31,19 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
-- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, ORDER BY, LIMIT/OFFSET
-- 🧩 **Dapper Support** - Embedded ADO.NET provider for C# / Dapper
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
+- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, ORDER BY, LIMIT/OFFSET
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
+
+## Languages/Toolkits/SDKs
+
+| Language | Toolkit | Status | Description | Capabilities | Design |
+|---|---|---|---|---|---|
+| C# | ADO.NET + Dapper | IN PROGRESS | Embedded provider for querying DecentDB files | CRUD, streaming reads, parameter rewriting to `$1..$N` | [design/DAPPER_SUPPORT.md](design/DAPPER_SUPPORT.md) |
+| Python 3 | SQLAlchemy | IN PROGRESS | Embedded DB-API driver + SQLAlchemy dialect | ORM/Core queries, CRUD, transactions, fast reads focus | [design/SQLALCHEMY_SUPPORT.md](design/SQLALCHEMY_SUPPORT.md) |
+| Go | `database/sql` + sqlc | IN PROGRESS | Embedded `database/sql` driver optimized for sqlc-generated queries | Type-safe compiled queries, CRUD, transactions, fast scan paths | [design/SQLC_SUPPORT.md](design/SQLC_SUPPORT.md) |
 
 ## Quick Start
 

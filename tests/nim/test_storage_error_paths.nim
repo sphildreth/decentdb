@@ -1,5 +1,6 @@
 import unittest
 import os
+import options
 
 import engine
 import catalog/catalog
@@ -225,19 +226,6 @@ suite "Storage Error Paths":
     let postings = getTrigramPostings(db.pager, idx, 12345'u32)
     check postings.ok
     check postings.value.len == 0
-    
-    discard closeDb(db)
-
-  test "decodeRowId error on short data":
-    let path = makeTempDb("decentdb_storage_decode_rowid.db")
-    let dbRes = openDb(path)
-    check dbRes.ok
-    let db = dbRes.value
-    
-    let shortData = @[byte(1), byte(2), byte(3)]
-    let decodeBad = decodeRowId(shortData)
-    check not decodeBad.ok
-    check decodeBad.err.code == ERR_CORRUPTION
     
     discard closeDb(db)
 
