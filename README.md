@@ -1,8 +1,20 @@
 # DecentDB
 
-[![Language](https://img.shields.io/badge/language-Nim-2d9cdb)](https://nim-lang.org)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
+<p align="center">
+    <img src="graphics/logo.png" alt="DecentDB logo" width="220" />
+</p>
+
+<p align="center">
+    <a href="https://nim-lang.org">
+        <img src="https://img.shields.io/badge/language-Nim-2d9cdb" alt="Language: Nim" />
+    </a>
+    <a href="LICENSE">
+        <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0" />
+    </a>
+    <a href="#">
+        <img src="https://img.shields.io/badge/tests-passing-brightgreen" alt="Tests: passing" />
+    </a>
+</p>
 
 ```text                                       
   ___                 _   ___  ___ 

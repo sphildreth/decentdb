@@ -60,7 +60,10 @@ TESTS=(
   tests/nim/test_vfs_types.nim
   tests/nim/test_search_extended.nim
   tests/nim/test_pg_query_ffi.nim
-  tests/nim/test_uplift.nim
+  tests/nim/test_engine_errors.nim
+  tests/nim/test_storage_error_paths.nim
+  tests/nim/test_vfs_error_paths.nim
+  tests/nim/test_btree_error_paths.nim
 )
 
 for test in "${TESTS[@]}"; do

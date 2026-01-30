@@ -76,7 +76,7 @@ proc parseColumnType*(text: string): Result[ColumnType] =
   else:
     err[ColumnType](ERR_SQL, "Unsupported column type", text)
 
-proc columnTypeToText(kind: ColumnType): string =
+proc columnTypeToText*(kind: ColumnType): string =
   case kind
   of ctInt64: "INT64"
   of ctBool: "BOOL"
