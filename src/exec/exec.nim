@@ -804,7 +804,10 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
     var resultRows: seq[Row] = @[]
     var rightColumns: seq[string] = @[]
-    let canCacheRight = plan.right.kind != pkIndexSeek
+    # Only cache right side if it's not an index seek AND we have a reasonable number of left rows
+    # This prevents memory blowup when joining large tables
+    const MaxLeftRowsForCache = 100
+    let canCacheRight = plan.right.kind != pkIndexSeek and leftRes.value.len <= MaxLeftRowsForCache
     var cachedRight: seq[Row] = @[]
     if canCacheRight:
       let rightRes = execPlan(pager, catalog, plan.right, params)
