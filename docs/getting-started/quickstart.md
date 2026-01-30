@@ -114,7 +114,7 @@ decentdb exec --db=myapp.db --sql="PRAGMA integrity_check"
 
 ## Next Steps
 
-- Learn about [SQL features](sql-reference.md)
-- Understand [data types](data-types.md)
-- Optimize performance with [indexes](indexes.md)
+- Learn about [SQL features](../user-guide/sql-reference.md)
+- Understand [data types](../user-guide/data-types.md)
+- Optimize performance with [indexes](../user-guide/indexes.md)
 - Read the full [API reference](../api/cli-reference.md)
