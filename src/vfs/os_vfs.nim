@@ -27,13 +27,17 @@ method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[Vfs
     if not exists:
       if not create:
         return err[VfsFile](ERR_IO, "File does not exist", path)
-      if not open(f, path, fmWrite):
+      if mode == fmRead:
+        return err[VfsFile](ERR_IO, "Cannot create file in read mode", path)
+      if mode == fmReadWrite:
+        openMode = fmReadWrite
+      if not open(f, path, openMode):
         return err[VfsFile](ERR_IO, "Failed to create file", path)
-      close(f)
-    if mode == fmReadWrite:
-      openMode = fmReadWriteExisting
-    if not open(f, path, openMode):
-      return err[VfsFile](ERR_IO, "Failed to open file", path)
+    else:
+      if mode == fmReadWrite:
+        openMode = fmReadWriteExisting
+      if not open(f, path, openMode):
+        return err[VfsFile](ERR_IO, "Failed to open file", path)
   except OSError:
     return err[VfsFile](ERR_IO, "Failed to open file", path)
   let vf = VfsFile(path: path, file: f)
@@ -97,8 +101,11 @@ method write*(vfs: OsVfs, file: VfsFile, offset: int64, buf: openArray[byte]): R
       else:
         setFilePos(file.file, offset)
         bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
-    except OSError:
+        flushFile(file.file)
+    except IOError, OSError:
       return err[int](ERR_IO, "Write failed", file.path)
+    if bytesWritten != buf.len:
+      return err[int](ERR_IO, "Write incomplete", file.path)
   ok(bytesWritten)
 
 method writeStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: string): Result[int] =
@@ -110,8 +117,11 @@ method writeStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: string): Result[
       else:
         setFilePos(file.file, offset)
         bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
-    except OSError:
+        flushFile(file.file)
+    except IOError, OSError:
       return err[int](ERR_IO, "Write failed", file.path)
+    if bytesWritten != buf.len:
+      return err[int](ERR_IO, "Write incomplete", file.path)
   ok(bytesWritten)
 
 method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =

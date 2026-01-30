@@ -1,5 +1,6 @@
 import unittest
 import os
+import strutils
 
 import engine
 import vfs/types
@@ -368,7 +369,7 @@ suite "VFS Complex Error Scenarios":
     let writeRes = vfs.write(file, 0, @[byte(1)])
     check not writeRes.ok
     check writeRes.err.code == ERR_CORRUPTION
-    check writeRes.err.message.find("Injected") >= 0
+    check "Injected" in writeRes.err.message
     
     discard vfs.close(file)
 
