@@ -13,14 +13,10 @@ Based on comprehensive analysis of PRD.md, SPEC.md, TESTING_STRATEGY.md, and the
 - **SQL Subset**: ✅ 98% complete (only minor edge cases might remain)
 - **Testing Infrastructure**: ✅ 95% complete (Phase 1-3 complete, documentation pending)
 - **Performance & Hardening**: ✅ Complete (benchmarks, memory budgets, WAL management)
-- **Documentation**: ✅ 95% complete (MkDocs site, CLI reference, SQL reference, architecture docs, GitHub Pages deployment all complete)
+- **Documentation**: ⚠️ 30% complete
 
 ### Critical Path to RTM
-All major phases are now complete:
-- ✅ Phase 1-3 (Testing Infrastructure, Features, Performance): Complete
-- ✅ Phase 4 (Documentation): Complete - MkDocs site, CLI reference, SQL reference, architecture docs, GitHub Pages deployment
-
-**Remaining work:** Release Engineering (Phase 5) including version bump, changelog, cross-platform builds, and CI/CD hardening.
+The primary blocker is the **testing infrastructure** as defined in TESTING_STRATEGY.md. While unit tests are comprehensive, the mandatory crash-injection, differential, and property-based testing layers are significantly under-implemented.
 
 ---
 
@@ -470,51 +466,79 @@ Verified existing per SPEC section 17:
 
 ### 4.1 API Reference Documentation
 
-- [x] **API Reference Documentation - COMPLETED:**
-  - docs/api/cli-reference.md - Complete CLI reference with all commands and options
-  - Nim API documentation structure in place (docs/api/nim-api.md placeholder)
-  - Error codes and configuration documentation structure ready
+- [ ] **Public API Documentation**
+  - File: `docs/api.md`
+  - Document all public procs in `src/decentdb.nim`
+  - Include examples for each operation
+
+- [ ] **Error Codes Reference**
+  - File: `docs/error_codes.md`
+  - Document ERR_IO, ERR_CORRUPTION, ERR_CONSTRAINT, etc.
+  - Include troubleshooting guidance
+
+- [ ] **Configuration Options**
+  - File: `docs/configuration.md`
+  - Document all config options (page_size, cache_size_mb, etc.)
+  - Performance tuning guidance
 
 ### 4.2 User Guides
 
-- [x] **User Guides - COMPLETED:**
-  - docs/getting-started/installation.md - Installation instructions
-  - docs/getting-started/quickstart.md - 5-minute quick start guide
-  - docs/user-guide/sql-reference.md - Complete SQL reference
-  - docs/user-guide/data-types.md (structure ready)
-  - docs/user-guide/performance.md (structure ready)
+- [ ] **Getting Started Guide**
+  - File: `docs/getting_started.md`
+  - Installation instructions
+  - First database creation
+  - Basic CRUD examples
+
+- [ ] **SQL Reference**
+  - File: `docs/sql_reference.md`
+  - Supported SQL subset
+  - Examples for each statement type
+  - Known limitations (vs PostgreSQL)
+
+- [ ] **Performance Tuning Guide**
+  - File: `docs/performance_tuning.md`
+  - Cache size recommendations
+  - Index design guidelines
+  - Checkpoint tuning
+  - Bulk load best practices
+
+- [ ] **Migration Guide**
+  - File: `docs/migration.md`
+  - v1 → v2 format upgrade process
+  - Export/import procedures
+  - Backup recommendations
 
 ### 4.3 Architecture Documentation
 
-- [x] **Architecture Documentation - COMPLETED:**
-  - docs/architecture/overview.md (structure ready)
-  - docs/architecture/storage.md (structure ready)
-  - docs/architecture/wal.md (structure ready)
-  - docs/architecture/btree.md (structure ready)
-  - docs/architecture/query-execution.md (structure ready)
+- [ ] **High-Level Architecture**
+  - File: `docs/architecture.md`
+  - Module overview
+  - Data flow diagrams
+  - Concurrency model explanation
 
-### 4.4 MkDocs Site Setup - COMPLETED:
-- [x] **Full MkDocs Configuration:**
-  - mkdocs.yml - Full configuration with Material theme
-  - docs/ directory structure created with all subdirectories
-  - Main index.md with overview and quick links
-  - Material theme with dark/light mode toggle
-  - Search enabled
-  - GitHub integration configured
+- [ ] **File Format Specification**
+  - File: `docs/file_format.md`
+  - Detailed page layouts
+  - WAL frame format
+  - Header structure
 
-### 4.5 GitHub Pages Deployment - COMPLETED:
-- [x] **GitHub Actions Workflow:**
-  - .github/workflows/docs.yml - GitHub Actions workflow
-  - Automatic deployment on push to main
-  - Proper permissions and concurrency settings
-  - Ready for decentdb.org custom domain
+- [ ] **Testing Documentation**
+  - File: `docs/testing.md`
+  - How to run tests
+  - How to add new tests
+  - Crash-injection testing guide
 
-### 4.6 Design Documents Integration - COMPLETED:
-- [x] **Design Documentation:**
-  - docs/design/prd.md - Product Requirements Document
-  - docs/design/spec.md - Engineering Specification
-  - docs/design/road-to-rtm.md - Road to RTM document
-  - docs/design/adr.md (structure ready)
+### 4.4 CLI Documentation
+
+- [ ] **CLI Reference**
+  - File: `docs/cli.md`
+  - Document all commands (exec, list-tables, describe, etc.)
+  - Examples for common operations
+
+- [ ] **Troubleshooting Guide**
+  - Common errors and solutions
+  - Recovery procedures
+  - Performance debugging
 
 ---
 
@@ -652,7 +676,7 @@ DecentDb 1.0.0 is ready for release when:
 4. ✅ **Property-based tests for invariants**
 5. ✅ **IN operator implemented**
 6. ✅ **Performance benchmarks passing**
-7. ✅ **Complete API and user documentation**
+7. ⬜ **Complete API and user documentation**
 
 ### Should Have (Highly Recommended)
 1. ✅ ILIKE fully verified with differential tests
@@ -674,7 +698,7 @@ DecentDb 1.0.0 is ready for release when:
 - Core Engine: **95% complete** ✅
 - Testing Infrastructure: **95% complete** ✅ (Phase 1-3 complete, crash/differential/property tests all passing)
 - Performance & Hardening: **100% complete** ✅ (All benchmarks, memory budgets, WAL management done)
-- Documentation: **95% complete** ✅ (MkDocs site, CLI reference, SQL reference, architecture docs, GitHub Pages deployment all complete)
+- Documentation: **30% complete** ⬜
 - Release Engineering: **20% complete** ⬜
 
 ---
