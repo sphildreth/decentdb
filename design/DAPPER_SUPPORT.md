@@ -12,6 +12,13 @@ Enable C# applications to perform high-performance CRUD operations and LINQ-styl
 - Convention-based mapping (zero configuration)
 - **Performance-first SELECT operations** - Query execution overhead < 1ms for typical operations
 
+## Compatibility Constraints (Non-Negotiable)
+
+- **SQL parameters (engine)**: DecentDB uses Postgres-style positional parameters (`$1, $2, ...`) per ADR-0005.
+    - The .NET provider MAY accept named parameters (`@name`, `@p0`) for Dapper ergonomics, but MUST rewrite to `$N` before calling native.
+- **Isolation (engine)**: Default isolation is **Snapshot Isolation** per ADR-0023.
+    - The provider MUST not claim stronger guarantees than Snapshot Isolation.
+
 ## Performance Targets
 
 All SELECT operations must meet these performance criteria:
@@ -58,7 +65,7 @@ public class Artist
 {
     public int Id { get; set; }           // → column "id", PK
     public string Name { get; set; }      // → column "name"
-    public DateTime CreatedAt { get; set; } // → column "createdat"
+    public DateTime CreatedAt { get; set; } // → column "created_at"
 }
 
 // When you need attributes
@@ -101,39 +108,71 @@ C# Application
 
 ### Requirements
 
-Expose a C-compatible API from the Nim DecentDB engine for P/Invoke:
+Expose a C-compatible API from the Nim DecentDB engine for P/Invoke.
+
+**Performance-first SELECT requirement:** Provide a forward-only, streaming cursor API so the .NET provider can implement `DbDataReader` without materializing whole result sets or doing per-cell P/Invoke round-trips.
 
 ```c
+// Opaque handles
+typedef struct decentdb_db decentdb_db;
+typedef struct decentdb_stmt decentdb_stmt;
+
 // Database lifecycle
-db_handle* decentdb_open(const char* path, const char* options);
-int decentdb_close(db_handle* db);
-const char* decentdb_last_error(db_handle* db);
+decentdb_db* decentdb_open(const char* path_utf8, const char* options_utf8);
+int decentdb_close(decentdb_db* db);
 
-// Query execution
-decentdb_result* decentdb_query(db_handle* db, const char* sql, decentdb_param* params, int param_count);
-int decentdb_execute(db_handle* db, const char* sql, decentdb_param* params, int param_count, int64_t* rows_affected);
+// Error reporting (code + message)
+int decentdb_last_error_code(decentdb_db* db);
+const char* decentdb_last_error_message(decentdb_db* db);
 
-// Result handling
-int decentdb_result_row_count(decentdb_result* result);
-int decentdb_result_column_count(decentdb_result* result);
-const char* decentdb_result_column_name(decentdb_result* result, int col);
-decentdb_value* decentdb_result_get(decentdb_result* result, int row, int col);
-void decentdb_result_free(decentdb_result* result);
+// Note: passing NULL returns the calling thread's last error.
 
-// Type accessors
-int decentdb_value_type(decentdb_value* val);
-int64_t decentdb_value_int64(decentdb_value* val);
-double decentdb_value_float64(decentdb_value* val);
-const char* decentdb_value_text(decentdb_value* val);
-const uint8_t* decentdb_value_blob(decentdb_value* val, int* size);
+// Prepared/streaming statements
+int decentdb_prepare(decentdb_db* db, const char* sql_utf8, decentdb_stmt** out_stmt);
+
+// Bind parameters: 1-based indexes match $1..$N
+int decentdb_bind_null(decentdb_stmt* stmt, int index_1_based);
+int decentdb_bind_int64(decentdb_stmt* stmt, int index_1_based, int64_t v);
+int decentdb_bind_float64(decentdb_stmt* stmt, int index_1_based, double v);
+int decentdb_bind_text(decentdb_stmt* stmt, int index_1_based, const char* utf8, int byte_len);
+int decentdb_bind_blob(decentdb_stmt* stmt, int index_1_based, const uint8_t* data, int byte_len);
+
+// Step rows: returns 1=row available, 0=done, <0=error
+int decentdb_step(decentdb_stmt* stmt);
+
+// Column metadata
+int decentdb_column_count(decentdb_stmt* stmt);
+const char* decentdb_column_name(decentdb_stmt* stmt, int col_0_based);
+int decentdb_column_type(decentdb_stmt* stmt, int col_0_based);
+
+// Column accessors (valid after step() returns 1)
+int decentdb_column_is_null(decentdb_stmt* stmt, int col_0_based);
+int64_t decentdb_column_int64(decentdb_stmt* stmt, int col_0_based);
+double decentdb_column_float64(decentdb_stmt* stmt, int col_0_based);
+const char* decentdb_column_text(decentdb_stmt* stmt, int col_0_based, int* out_byte_len);
+const uint8_t* decentdb_column_blob(decentdb_stmt* stmt, int col_0_based, int* out_byte_len);
+
+// DML (INSERT/UPDATE/DELETE): use the same prepare/bind/step API.
+// After completion, rows affected is available from the statement.
+int64_t decentdb_rows_affected(decentdb_stmt* stmt);
+
+// Cleanup
+void decentdb_finalize(decentdb_stmt* stmt);
 ```
+
+### FFI Ownership + Lifetime Rules
+
+- All pointers returned by `decentdb_last_error_message`, `decentdb_column_name`, and `decentdb_column_text/blob` are borrowed views.
+- Borrowed pointers remain valid until the next call that mutates the same handle OR until `decentdb_finalize`/`decentdb_close` (whichever comes first).
+- .NET MUST copy strings/blobs immediately into managed memory.
+- Avoid cross-thread use of a single `decentdb_stmt*`.
 
 ### Tasks
 
 1. **Create C API wrapper module** (`src/c_api.nim`)
    - Wrap existing Nim API in C-compatible functions
-   - Handle memory management (caller frees results)
-   - Error handling via last_error string
+    - Handle resource ownership (`decentdb_finalize`, `decentdb_close`)
+    - Error handling via last_error code + message
    - Thread-safety (single writer, multiple readers)
 
 2. **Export Nim functions with C calling convention**
@@ -142,9 +181,8 @@ const uint8_t* decentdb_value_blob(decentdb_value* val, int* size);
    - Handle platform differences
 
 3. **Memory management design**
-   - Query results: C# owns memory, must call `decentdb_result_free`
-   - Strings: return const char* (Nim manages, copied in C#)
-   - Blobs: return pointer + size (copied in C#)
+    - Statements: C# owns statement lifetime, must call `decentdb_finalize`
+    - Strings/blobs: borrowed views that must be copied immediately in C#
 
 ---
 
@@ -167,12 +205,14 @@ public class DecentDbTransaction : DbTransaction
 1. **DecentDbConnection**
    - Connection string parsing: `Data Source=/path/to.db;Cache Size=1024`
    - Open/Close with P/Invoke to `decentdb_open`/`decentdb_close`
-   - Connection pooling (Dapper manages this)
+    - Optional connection pooling (Dapper relies on provider behavior)
    - Async support (Begin/End pattern or async/await)
 
 2. **DecentDbCommand**
-   - SQL execution via `decentdb_query`/`decentdb_execute`
-   - Parameter collection (`@name` or `$1` syntax)
+    - SQL execution via `decentdb_prepare`/`decentdb_step` (SELECT + DML)
+    - Parameter collection:
+      - Accept `@name`/`@p0` for Dapper ergonomics
+      - Rewrite to `$1..$N` before calling native (engine contract)
    - Command timeout support
    - Async execution
 
@@ -231,7 +271,7 @@ await db.Artists.DeleteAsync(artist);
 | Convention | Rule |
 |------------|------|
 | Table name | Pluralized, lowercase class name (`Artist` → `artists`) |
-| Column name | C# PascalCase → lowercase column (`Name` → `name`) |
+| Column name | C# PascalCase → snake_case lowercase (`Name` → `name`, `CreatedAt` → `created_at`, `ArtistId` → `artist_id`) |
 | Primary key | Property named `Id` (maps to column `id`) |
 | Foreign key | Property named `{NavigationProperty}Id` (maps to `{navigationproperty}_id`) |
 | Nullable | Reference types nullable, value types not null |
@@ -287,7 +327,7 @@ public class Album
 5. **DecentDbContext**
    - Database file path configuration
    - DbSet<T> property discovery
-   - Connection management (open/close per operation)
+    - Connection management (keep warm per context / pooled by default; open/close per operation only when Pooling=false)
    - Transaction support (BeginTransaction)
 
 ---
@@ -301,8 +341,8 @@ public class Album
 | `short` / `Int16` | INT64 | 8 bytes | 16-bit value promoted to INT64 |
 | `int` / `Int32` | INT64 | 8 bytes | 32-bit value promoted to INT64 |
 | `long` / `Int64` | INT64 | 8 bytes | Native 64-bit signed |
-| `string` | VARCHAR(255) | Variable (UTF-8) | Full Unicode support, default 255 chars |
-| `string` + `[Text]` | TEXT | Variable (UTF-8) | Unbounded text (explicit opt-in) |
+| `string` | TEXT | Variable (UTF-8) | Full Unicode support |
+| `string` + `[MaxLength(n)]` | TEXT | Variable (UTF-8) | Optional client-side validation only |
 | `double` | FLOAT64 | 8 bytes | IEEE 754 double precision |
 | `float` | FLOAT64 | 8 bytes | Promoted to double precision |
 | `bool` | BOOL | 1 byte | 0 = false, 1 = true |
@@ -356,110 +396,29 @@ public class Event
 }
 ```
 
-#### 3. **String Length Constraints (VARCHAR Support)**
-**HARD REQUIREMENT**: DecentDB must support `VARCHAR(n)` in DDL with length validation at both language binding and engine layers.
+#### 3. **String Length Constraints (Performance-First)**
 
-**Architecture: Hybrid Storage with Dual Validation**
-```
-SQL Layer:     VARCHAR(n) → Parser/Binder
-                  ↓
-Catalog:       TEXT storage + max_length metadata
-                  ↓
-Validation:    C# AND Nim (defense in depth)
-```
+DecentDB MVP includes `TEXT` (UTF-8) and does not require engine-enforced `VARCHAR(n)` for Dapper support.
 
-**SQL Syntax Support:**
-```sql
--- Standard SQL VARCHAR (RECOMMENDED for most cases)
-CREATE TABLE users (
-    id INT PRIMARY KEY,
-    username VARCHAR(100) NOT NULL,  -- Max 100 characters
-    email VARCHAR(255),
-    bio TEXT                          -- Unbounded (explicit choice)
-);
+**MVP requirement:** Support `[MaxLength(n)]` as a .NET-side guardrail (write-time/parameter binding only). This keeps SELECT hot paths unaffected.
 
--- TEXT remains valid for unbounded strings
-CREATE TABLE articles (
-    id INT PRIMARY KEY,
-    title VARCHAR(200),
-    content TEXT  -- No length limit
-);
-```
+**Validation rule:** measure `n` in **UTF-8 bytes**, not “characters”.
+- Unambiguous across languages and matches storage.
+- Avoids expensive/ambiguous Unicode grapheme counting.
 
-**C# Mapping:**
+**C# example:**
 ```csharp
 public class User
 {
-    public int Id { get; set; }
-    
-    // Convention: string without attribute → VARCHAR(255) default
-    public string Username { get; set; }
-    
-    // Explicit length override
+    public long Id { get; set; }
+
+    // Stored as TEXT; optional guardrail is enforced client-side
     [MaxLength(100)]
-    public string Code { get; set; }
-    
-    // Unbounded text (must opt-in)
-    [Text]
-    public string Description { get; set; }
+    public string Username { get; set; }
 }
-
-// Generates: 
-// CREATE TABLE users (
-//     id INT PRIMARY KEY,
-//     username VARCHAR(255),
-//     code VARCHAR(100),
-//     description TEXT
-// )
 ```
 
-**Dual Validation Strategy (Defense in Depth):**
-
-| Layer | Responsibility | Behavior on Violation |
-|-------|---------------|---------------------|
-| **C#** | Pre-flight validation | `ArgumentException` before SQL sent |
-| **Nim Binder** | SQL parameter validation | `ERR_CONSTRAINT` with message |
-| **Nim Storage** | Last-resort check | Reject with constraint violation |
-
-**Why Both Layers:**
-- **C# validation**: Fast feedback during development, saves round-trip
-- **Nim validation**: Enforced for all clients (Node.js, Kotlin, Go, raw SQL)
-- **Security**: Prevents bypass via direct SQL injection attempts
-
-**Storage Implementation:**
-```nim
-# Catalog stores max_length alongside column metadata
-type ColumnMeta = object
-  name: string
-  type_name: string        # "TEXT" or "VARCHAR"
-  max_length: Option[int]  # Some(n) for VARCHAR, None for TEXT
-  nullable: bool
-```
-
-**Validation Points:**
-1. **Parse Time**: `VARCHAR(n)` syntax validated (n > 0, n <= max_allowed)
-2. **Bind Time**: String literals checked against column constraints
-3. **Insert/Update Time**: All string values validated before storage
-4. **C# Client**: Pre-validates before sending to minimize errors
-
-**Migration Path:**
-```sql
--- Can convert between VARCHAR and TEXT
-ALTER TABLE users ALTER COLUMN username TYPE TEXT;
-ALTER TABLE users ALTER COLUMN bio TYPE VARCHAR(500);
-```
-
-**Error Messages:**
-```
-C#: ArgumentException: "Value exceeds maximum length of 100 characters"
-Nim: ERR_CONSTRAINT: "String value exceeds column 'username' maximum length (100)"
-```
-
-**Performance Notes:**
-- Validation cost: ~1-2 microseconds per string
-- Tables with 20+ VARCHAR columns may exceed 0.5ms target for single-record lookups
-- Storage: Same as TEXT (variable length), no padding
-- Index: Prefix index recommended for VARCHAR columns > 100 chars
+**Post-MVP option:** Engine-enforced `VARCHAR(n)` may be added later behind an ADR (impacts SQL grammar, binder, and likely catalog persistence).
 
 #### 4. **Time Types (TimeSpan, TimeOnly)**
 Stored as INT64 ticks for precision:
@@ -476,7 +435,7 @@ public class Schedule
 
 // Query with time comparisons
 var meetings = db.Schedules
-    .Where(s => s.start_time > new TimeOnly(9, 0))  // After 9 AM
+    .Where(s => s.StartTime > new TimeOnly(9, 0))  // After 9 AM
     .ToList();
 ```
 
@@ -492,14 +451,14 @@ public class Person
 
 // Range queries work naturally
 var adults = db.People
-    .Where(p => p.birth_date < DateOnly.FromDateTime(DateTime.Now.AddYears(-18)))
+    .Where(p => p.BirthDate < DateOnly.FromDateTime(DateTime.Now.AddYears(-18)))
     .ToList();
 ```
 
 #### 6. **UTF-8 and Unicode Support**
 - **TEXT column**: Full UTF-8 encoding (1-4 bytes per character)
 - **Supports**: ASCII, Latin-1, CJK, Emoji, all Unicode planes
-- **Length behavior**: Length measured in **characters**, not bytes
+- **Length behavior**: Optional length guardrails (`MaxLength`) measure **UTF-8 bytes**
 - **Comparison**: UTF-8 binary collation (fast, culture-insensitive)
 
 ```csharp
@@ -513,7 +472,7 @@ public class Message
 }
 ```
 
-**Important**: String length validation counts characters, not bytes. A 100-character string with emoji uses ~400 bytes storage but passes `[MaxLength(100)]` validation.
+**Important**: Emoji and CJK consume more bytes; `MaxLength(n)` is a byte cap.
 
 ### Tasks
 
@@ -527,23 +486,12 @@ public class Message
    - Timezone handling (store UTC only)
    - Conversion helpers for DateOnly, TimeOnly, TimeSpan
 
-3. **VARCHAR(n) Support (HARD REQUIREMENT)**
-   - **Parser**: Add `VARCHAR(n)` syntax support in SQL parser
-   - **Binder**: Validate length parameter (n > 0, reasonable max)
-   - **Catalog**: Add `max_length` column to catalog schema
-   - **Storage**: Store as TEXT internally with length metadata
-   - **Validation Layer**: 
-     - Nim: Validate string lengths in INSERT/UPDATE binder
-     - C#: Pre-validate before SQL execution
-   - **Error Handling**: Standard constraint violation error codes
-   - **Migration**: Support ALTER TABLE to change VARCHAR ↔ TEXT
-   - **CLI**: Update `describe` command to show VARCHAR(n) instead of TEXT
-   - **Tests**: Unit tests for all length violations, edge cases (empty, max, max+1)
+3. **Optional Post-MVP: Engine-Enforced VARCHAR(n)**
+    - Requires an ADR + SPEC/PRD updates (SQL grammar + binder + likely catalog persistence).
 
 4. **Unicode and Encoding**
-   - UTF-8 validation on all TEXT/VARCHAR inputs
-   - Character count vs byte count distinction for MaxLength
-   - Proper handling of surrogate pairs and combining characters
+    - UTF-8 validation on all TEXT inputs
+    - MaxLength uses UTF-8 byte length
 
 ---
 
@@ -557,24 +505,24 @@ Consistent error reporting across all layers with clear mapping between native D
 
 | DecentDB Error Code | C# Exception Type | Description |
 |---------------------|-------------------|-------------|
-| `ERR_CONSTRAINT` | `ConstraintViolationException` | Constraint violation (e.g., VARCHAR length, foreign key) |
+| `ERR_CONSTRAINT` | `ConstraintViolationException` | Constraint violation (e.g., MaxLength guardrails, foreign key) |
 | `ERR_LOCK_TIMEOUT` | `DatabaseLockedException` | Timeout waiting for database lock |
 | `ERR_IO_ERROR` | `IOException` | File system error |
 | `ERR_PARSE_ERROR` | `SqlSyntaxErrorException` | Invalid SQL syntax |
 | `ERR_BIND_ERROR` | `ArgumentException` | Parameter binding error |
 | `ERR_FULL` | `DatabaseFullException` | Disk space exhausted |
-| `ERR_CORRUPT` | `DatabaseCorruptedException` | Database file corruption detected |
+| `ERR_CORRUPTION` | `DatabaseCorruptedException` | Database file corruption detected |
 
 ### Error Propagation Chain
 
 ```
 Native Layer (Nim):
-  - Return error codes via `decentdb_last_error()`
+    - Return error codes via `decentdb_last_error_code()`
   - Detailed error messages in UTF-8
 
 P/Invoke Layer (C#):
   - Check return codes from native calls
-  - Marshal error messages from `decentdb_last_error()`
+    - Marshal error messages from `decentdb_last_error_message()`
   - Map native error codes to C# exceptions
 
 ADO.NET Layer:
@@ -590,32 +538,25 @@ Micro-ORM Layer:
 
 ### Constraint Violation Handling
 
-**VARCHAR(n) Length Validation:**
+**MaxLength Guardrails (MVP, .NET-side):**
 ```csharp
 // C# layer pre-validation
 public void SetValue(DbParameter param, string value)
 {
-    if (param.MaxLength > 0 && value.Length > param.MaxLength)
+    if (param.MaxLength > 0)
     {
-        throw new ArgumentException(
-            $"Value exceeds maximum length of {param.MaxLength} characters. Actual length: {value.Length}");
+        var byteCount = System.Text.Encoding.UTF8.GetByteCount(value);
+        if (byteCount > param.MaxLength)
+            throw new ArgumentException(
+                $"Value exceeds MaxLength({param.MaxLength}) bytes (UTF-8). Actual: {byteCount} bytes.");
     }
 
-    // Pass to native layer for secondary validation
+    // Pass to native layer
     SetNativeValue(param, value);
 }
 ```
 
-**Native layer validation:**
-```nim
-# Secondary validation in Nim
-proc validate_string_length(col_meta: ColumnMeta, value: string): bool =
-  if col_meta.max_length.isSome():
-    if value.len > col_meta.max_length.get():
-      setError(ERR_CONSTRAINT, fmt"String value exceeds column '{col_meta.name}' maximum length ({col_meta.max_length.get()})")
-      return false
-  return true
-```
+Note: Engine-side string length constraints are optional post-MVP (requires ADR).
 
 ### Exception Context Preservation
 
@@ -653,8 +594,9 @@ public class DecentDbConnection : DbConnection
             _handle = decentdb_open(_connectionString, _options);
             if (_handle == null)
             {
-                var errorMsg = decentdb_last_error(null);
-                throw new InvalidOperationException($"Failed to open database: {errorMsg}");
+                var errorCode = decentdb_last_error_code(null);
+                var errorMsg = decentdb_last_error_message(null);
+                throw new InvalidOperationException($"Failed to open database (code={errorCode}): {errorMsg}");
             }
         }
         catch (Exception ex)
@@ -737,7 +679,7 @@ Target performance for common operations:
 | Text search (trigram) | 5ms + 0.2ms/row | 50ms + 1ms/row |
 | Insert single row | < 2ms | 5ms |
 | Bulk insert (1000 rows) | < 100ms | 200ms |
-| Connection open | < 1ms | 3ms |
+| Connection open (warm/pooled) | < 1ms | 3ms |
 
 **Overhead Budget**: C# layer must add < 1ms to native DecentDB execution time.
 
@@ -781,31 +723,27 @@ var factory = Expression.Lambda<Func<IDataReader, T>>(
 ```
 
 #### 3. **Efficient P/Invoke for Results** (Critical)
-- Use struct-based result marshaling instead of pointer chasing
-- Batch row retrieval (fetch N rows at once from native)
-- Minimize managed/native boundary crossings
-- Use blittable types exclusively
+- Prefer a streaming statement API (`prepare/step/column_*`) over materializing result sets
+- Minimize managed/native boundary crossings by:
+  - Avoiding per-cell allocations
+  - Copying UTF-8 slices directly into managed memory when needed
+  - Reusing buffers during materialization
 
 ```csharp
-// Instead of row-by-row P/Invoke
-[DllImport("decentdb")]
-static unsafe extern int decentdb_fetch_batch(
-    void* result,
-    RowData* buffer,
-    int bufferSize,
-    out int fetched);
-
-struct RowData
+// Streaming read pattern (conceptual)
+using var stmt = Prepare("SELECT id, name FROM artists WHERE id = $1", id);
+while (stmt.Step() == RowAvailable)
 {
-    public long Id;
-    public fixed byte Name[256];  // Inline string buffer
-    public long CreatedAt;
+    var artistId = stmt.GetInt64(0);
+    var nameUtf8 = stmt.GetTextUtf8(1); // returns (ptr,len) borrowed view
+    var name = System.Text.Encoding.UTF8.GetString(nameUtf8);
+    // materialize...
 }
 ```
 
 #### 3.5. **Memory Management for P/Invoke Layer** (Critical)
-- Explicit resource ownership: C# layer owns all allocated memory from native calls
-- Deterministic cleanup with `IDisposable` pattern for result sets
+- Explicit resource ownership: C# owns native handles (db handles, prepared statements)
+- Deterministic cleanup with `IDisposable` pattern for statements/readers
 - Safe handle pattern for native resources (database handles, prepared statements)
 - Pinning strategy for large data transfers (avoid excessive GC pressure)
 - Buffer reuse patterns to minimize allocations during result processing
@@ -831,12 +769,12 @@ public class DecentDbHandle : SafeHandle
 }
 ```
 
-**Result Set Memory Management:**
+**Statement/Reader Memory Management:**
 ```csharp
-public class DecentDbResultSet : IDisposable
+public sealed class DecentDbStatement : IDisposable
 {
-    private IntPtr _resultPtr;
-    private bool _disposed = false;
+    private IntPtr _stmtPtr;
+    private bool _disposed;
 
     public void Dispose()
     {
@@ -846,15 +784,15 @@ public class DecentDbResultSet : IDisposable
 
     protected virtual void Dispose(bool disposing)
     {
-        if (!_disposed && _resultPtr != IntPtr.Zero)
+        if (!_disposed && _stmtPtr != IntPtr.Zero)
         {
-            decentdb_result_free(_resultPtr);
-            _resultPtr = IntPtr.Zero;
+            decentdb_finalize(_stmtPtr);
+            _stmtPtr = IntPtr.Zero;
             _disposed = true;
         }
     }
 
-    ~DecentDbResultSet()
+    ~DecentDbStatement()
     {
         Dispose(false);
     }
@@ -863,7 +801,6 @@ public class DecentDbResultSet : IDisposable
 
 **String and Blob Handling:**
 - Copy strings from native to managed memory immediately after P/Invoke call
-- Free native string memory before returning to caller
 - Use `Marshal.PtrToStringUTF8` for efficient UTF-8 string conversion
 - For blobs, copy to managed byte arrays to avoid pinning issues
 
@@ -895,7 +832,7 @@ public async IAsyncEnumerable<T> StreamAsync(
 ```
 
 #### 6. **Smart Pagination**
-- Use keyset pagination (WHERE id > @lastId) when possible
+- Use keyset pagination (WHERE id > $1) when possible
 - Avoid OFFSET for large datasets (O(n) scan)
 - Cache total count for frequent paginated queries
 - Support cursor-based pagination for infinite scroll
@@ -905,7 +842,7 @@ public async IAsyncEnumerable<T> StreamAsync(
 SELECT * FROM artists ORDER BY id LIMIT 20 OFFSET 100000
 
 // Good: Keyset pagination (O(log n))
-SELECT * FROM artists WHERE id > @lastId ORDER BY id LIMIT 20
+SELECT * FROM artists WHERE id > $1 ORDER BY id LIMIT 20
 ```
 
 #### 7. **Projection Optimization**
@@ -1009,7 +946,7 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
 - Different default page sizes may be optimal per platform
 - Memory management differs between platforms (GC behavior)
 - I/O patterns vary (WAL file handling, checkpoint behavior)
-- Threading models differ (Windows fibers vs Linux pthreads)
+- Threading models differ across platforms
 
 **Build Configuration:**
 - Separate build pipelines for each target platform
@@ -1053,22 +990,15 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
 ## Implementation Order
 
 ### Sprint 0: Core Engine (Prerequisite)
-1. **VARCHAR(n) Implementation (HARD REQUIREMENT)**
-   - Parser support for `VARCHAR(n)` syntax
-   - Catalog schema extension (add `max_length` column)
-   - Nim binder validation for string lengths
-   - Error handling for constraint violations
-   - CLI describe command updates
-   - Comprehensive unit tests
+1. **High-performance streaming SELECT ABI**
+    - Add `prepare/bind/step/column/finalize` C API suitable for a fast `DbDataReader`
+    - Define pointer lifetime rules (borrowed views) and keep them stable
 
-**Critical Dependency Note**: VARCHAR(n) implementation in the core DecentDB engine is a prerequisite for the entire Dapper integration effort. This feature must be completed before any C# layer development begins, as it requires changes to the SQL parser, binder, and catalog schema. The Nim engine must support this feature before the C API can expose it, and before the ADO.NET provider can utilize it. Teams should coordinate to ensure the core engine implementation is completed and tested before proceeding to Sprint 1.
+2. **Error codes for exception mapping**
+    - Add `decentdb_last_error_code()` alongside message
 
-**Dependency Chain**:
-```
-Core Engine (VARCHAR support) → C API → ADO.NET Provider → Micro-ORM → Dapper Compatibility
-```
-
-Any delays in the core engine implementation will cascade to all subsequent phases. Consider parallelizing work where possible by having C# team begin ADO.NET implementation against mock interfaces while core engine team completes VARCHAR implementation.
+3. **Parameter binding contract**
+    - Ensure native binding is `$1..$N` (ADR-0005) and add unit tests around binding edge cases
 
 ### Sprint 1: Foundation
 1. C API wrapper in Nim
@@ -1144,7 +1074,7 @@ The following decisions must have ADRs before implementation:
 2. **ADR-00XX: Type System** - C# to DecentDB type mappings
 3. **ADR-00XX: Connection Pooling** - Single writer enforcement strategy
 4. **ADR-00XX: Query Compilation** - Expression tree caching approach
-5. **ADR-00XX: VARCHAR Implementation** - Length validation architecture
+5. **ADR-00XX (Optional Post-MVP): Engine String Length Constraints** - If adding `VARCHAR(n)`/engine-enforced max lengths
 6. **ADR-00XX: String Encoding** - UTF-8 handling and validation
 7. **ADR-00XX: NuGet Packaging** - Native library distribution strategy
 8. **ADR-00XX: SQL Observability** - Event-based logging with zero-cost when disabled
@@ -1169,7 +1099,7 @@ Data Source=/path/to.db;Logging=1;LogLevel=Debug
 | `Logging` | `0` or `1` | `0` | Enable/disable SQL logging globally |
 | `LogLevel` | `Verbose`, `Debug`, `Info`, `Warning`, `Error` | `Debug` | Minimum log level for SQL statements |
 
-**Performance guarantee:** When `Logging=0`, overhead must be < 5ns per query (null check only).
+**Performance guarantee:** When `Logging=0`, overhead is a single predictable branch (no allocations, no string formatting).
 
 ### Events (Zero-Cost Pattern)
 
@@ -1206,7 +1136,7 @@ public class DecentDbContext
 var connectionString = "Data Source=my.db;Logging=1;LogLevel=Debug";
 using var db = new DecentDbContext(connectionString);
 db.Logger = loggerFactory.CreateLogger<DecentDbContext>();
-// Logs: "Executing SQL: SELECT * FROM artists WHERE id = @p0"
+// Logs (native-facing): "Executing SQL: SELECT * FROM artists WHERE id = $1"
 ```
 
 **Production - Metrics Only:**
@@ -1307,7 +1237,7 @@ using var db = new DecentDbContext(connStr);
 ### Checkpointing Behavior
 
 **When checkpoints occur:**
-1. Manual: `PRAGMA checkpoint;` or CLI `decentdb checkpoint`
+1. Manual: provider API (e.g., `DecentDbConnection.Checkpoint()`) or CLI `decentdb checkpoint`
 2. Auto-size: When WAL reaches `Checkpoint Threshold`
 3. Auto-close: When connection closes (if `Checkpoint On Close=true`)
 
@@ -1331,25 +1261,25 @@ using var db = new DecentDbContext(connStr);
 ### Transaction Isolation Semantics
 
 **Isolation Level Support:**
-The specific isolation levels supported by DecentDB depend on the underlying engine's concurrency control mechanisms. Based on the document's mention of single-writer constraint and WAL (Write-Ahead Logging) behavior, DecentDB likely implements a form of snapshot isolation for readers.
+DecentDB implements **Snapshot Isolation** as its default isolation level (ADR-0023).
 
-| Isolation Level | DecentDB Behavior | Notes |
+| Isolation Level | Provider Behavior | Notes |
 |-----------------|-------------------|-------|
-| `ReadUncommitted` | Not supported | DecentDB prevents dirty reads by design |
-| `ReadCommitted` | Default behavior | Readers see committed data only |
-| `RepeatableRead` | Limited support | Consistency depends on engine implementation |
-| `Serializable` | Serialized writes | Single writer constraint ensures serializability |
-| `Snapshot` | Recommended | Best for read-heavy workloads |
+| `ReadUncommitted` | Not supported | Dirty reads are not exposed |
+| `ReadCommitted` | Treated as Snapshot | Compatibility alias |
+| `RepeatableRead` | Treated as Snapshot | Compatibility alias |
+| `Serializable` | Not supported (or treated as Snapshot) | Do not claim serializable semantics |
+| `Snapshot` | Default / recommended | Matches engine behavior |
 
 **Implementation Details:**
-- Single writer constraint ensures serialized write operations
-- Multiple concurrent readers are supported (subject to engine limitations)
+- Snapshot reads are implemented by the engine via WAL snapshot LSN
+- Multiple concurrent readers are supported within a single process
 - Writers may block if another writer holds the write lock
-- Reader transactions should not block write operations
+- Writers do not imply SERIALIZABLE isolation
 
 **Connection String Configuration:**
 ```
-Data Source=/path/to.db;IsolationLevel=Serializable
+Data Source=/path/to.db;IsolationLevel=Snapshot
 ```
 
 **Usage:**
@@ -1357,8 +1287,7 @@ Data Source=/path/to.db;IsolationLevel=Serializable
 using var conn = new DecentDbConnection(connectionString);
 conn.Open();
 
-using var tx = conn.BeginTransaction(IsolationLevel.Serializable);
-// Transaction behavior depends on DecentDB engine implementation
+using var tx = conn.BeginTransaction(IsolationLevel.Snapshot);
 var data1 = await cmd1.ExecuteScalarAsync();
 var data2 = await cmd2.ExecuteScalarAsync();
 await tx.CommitAsync();
@@ -1366,9 +1295,7 @@ await tx.CommitAsync();
 
 **Important Considerations:**
 - Due to single-writer constraint, high-concurrency write scenarios may experience contention
-- Read operations are generally non-blocking but behavior depends on engine implementation
-- For embedded scenarios, the isolation characteristics are determined by DecentDB's core architecture
-- Specific ADR required: ADR-00XX: Transaction Isolation Strategy (to document actual DecentDB behavior)
+- Reads are generally non-blocking and see a stable snapshot
 
 ### Error Handling
 
@@ -1391,6 +1318,20 @@ db.SetCommandTimeout(60);        // Change default timeout
 ## API Surface (Public)
 
 ```csharp
+// Native interop (thin wrapper over C ABI)
+namespace DecentDb.Native
+{
+    // Controls native library loading when not using NuGet runtimes/.
+    public static class DecentDbNative
+    {
+        public static void SetLibraryPath(string absolutePath);
+    }
+
+    // SafeHandles ensure deterministic cleanup.
+    public sealed class DecentDbHandle : SafeHandle { }
+    public sealed class DecentDbStatementHandle : SafeHandle { }
+}
+
 // Core ADO.NET
 namespace DecentDb.AdoNet
 {
@@ -1399,6 +1340,13 @@ namespace DecentDb.AdoNet
     public class DecentDbParameter : DbParameter { }
     public class DecentDbDataReader : DbDataReader { }
     public class DecentDbTransaction : DbTransaction { }
+
+    // Optional provider-specific operations (non-standard ADO.NET)
+    public static class DecentDbConnectionExtensions
+    {
+        // Triggers a checkpoint using the engine's supported mechanism.
+        public static void Checkpoint(this DecentDbConnection connection);
+    }
 }
 
 // Micro-ORM
@@ -1406,9 +1354,9 @@ namespace DecentDb.Orm
 {
     public class DecentDbContext : IDisposable
     {
-        public DecentDbContext(string dataSource);
+        // Accepts a full connection string (recommended) or a bare path.
+        public DecentDbContext(string connectionString);
         public DbSet<T> Set<T>() where T : class;
-        public Task<int> SaveChangesAsync();
         public IDbTransaction BeginTransaction();
     }
 
@@ -1443,9 +1391,22 @@ namespace DecentDb.Orm
 }
 ```
 
+### Behavioral Notes (API Contract)
+
+- **Parameters**: Public APIs MAY accept named parameters (`@name`, `@p0`) for Dapper ergonomics, but the provider MUST rewrite to `$1..$N` before native execution (ADR-0005).
+- **Result streaming**: `DecentDbDataReader` is backed by the native `prepare/bind/step/column/finalize` API and MUST be forward-only.
+- **Rows affected**: `ExecuteNonQuery` uses the statement's `rows_affected` after completion.
+
 ---
 
 ## NuGet Package Distribution
+
+### What users reference
+
+- **Dapper users**: reference the ADO.NET provider (`DecentDb.AdoNet.dll`) via the meta-package below.
+- `DecentDb.Native.dll` is **internal plumbing** (P/Invoke + library resolution). Applications should not call it directly unless they are doing advanced hosting/diagnostics.
+
+Goal: keep the common path (Dapper + `DbConnection`) simple while still enabling the high-performance native streaming reader under the hood.
 
 ### Package Structure
 
@@ -1532,8 +1493,7 @@ DecentDbNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
 4. ✅ All CRUD operations work with async/await
 5. ✅ No attribute decoration required on POCOs
 6. ✅ Cross-platform support (Windows, Linux, macOS)
-7. ✅ VARCHAR(n) DDL support with length validation at engine layer
-8. ✅ MaxLength attribute enforces constraints in C# layer
+7. ✅ MaxLength attribute enforces write-time constraints in C# layer (UTF-8 bytes)
 
 ### Performance (Critical)
 9. ✅ Single record query: < 2ms (P95)
