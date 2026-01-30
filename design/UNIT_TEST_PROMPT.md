@@ -8,6 +8,13 @@ Goal: raise **unit test line coverage to > 90%** (as reported by the repo’s co
 - Don’t add new dependencies unless absolutely necessary; if needed, propose an ADR first (don’t implement the dependency yet).
 - Do not “game” coverage with meaningless tests—assert real invariants and edge cases.
 
+**Autonomy (work independently)**
+- Do not pause to ask whether to continue. Work independently and iteratively until the coverage goal (**>90%**) is reached.
+- Use a tight loop: add/adjust tests → run the relevant test target(s) → run coverage → inspect the worst gaps → repeat.
+- Only stop and ask for guidance if you are genuinely blocked (e.g., unclear intended behavior, an ADR-required change, non-deterministic tests you can’t stabilize, or the repo’s tooling can’t be executed in this environment).
+- If coverage stalls, change tactics rather than stopping: pick a different low-covered module, target missed branches, or improve test inputs to hit error paths.
+- Provide progress as you go: after each iteration (or every ~20–30 minutes of work), report the current coverage %, what changed, and what you’ll tackle next.
+
 **Read first**
 - AGENTS.md
 - TESTING_STRATEGY.md
