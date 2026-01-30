@@ -3,6 +3,9 @@ import strutils
 import tables
 import options
 import algorithm
+import atomics
+import sets
+import locks
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
@@ -121,13 +124,7 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     discard vfs.close(file)
     return err[Db](pagerRes.err.code, pagerRes.err.message, pagerRes.err.context)
   let pager = pagerRes.value
-  
-  let catalogRes = initCatalog(pager)
-  if not catalogRes.ok:
-    discard closePager(pager)
-    discard vfs.close(file)
-    return err[Db](catalogRes.err.code, catalogRes.err.message, catalogRes.err.context)
-  
+
   # Initialize WAL
   let walPath = path & "-wal"
   let walRes = newWal(vfs, walPath)
@@ -144,6 +141,68 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     discard vfs.close(file)
     return err[Db](recoverRes.err.code, recoverRes.err.message, recoverRes.err.context)
 
+  # Set up permanent WAL overlay to ensure late-commits are visible to all reads,
+  # even after cache evictions.
+  pager.setPageOverlay(0, proc(pageId: PageId): Option[string] =
+    # Dirty pages in cache should ALWAYS take precedence over WAL.
+    # This handles both uncommitted changes (overlaySnapshot == 0) and
+    # uncommitted writes from dmNone bulk loads (overlaySnapshot > 0).
+    if pager.isDirty(pageId):
+      return none(string)
+    
+    # If page was written to disk directly (bypassing WAL), we must read from disk.
+    acquire(pager.overlayLock)
+    let isOverridden = pageId in pager.overriddenPages
+    release(pager.overlayLock)
+    if isOverridden:
+      return none(string)
+    
+    let snap = if pager.overlaySnapshot == 0: wal.walEnd.load(moAcquire) else: pager.overlaySnapshot
+    let pageOpt = wal.getPageAtOrBefore(pageId, snap)
+    if pageOpt.isNone:
+      return none(string)
+    let payload = pageOpt.get
+    var s = newString(payload.len)
+    if payload.len > 0: copyMem(addr s[0], unsafeAddr payload[0], payload.len)
+    some(s)
+  )
+
+  # Reload header and catalog after recovery to see latest committed state
+  let page1Res = readPage(pager, PageId(1))
+  if page1Res.ok:
+    let hRes = decodeHeader(page1Res.value)
+    if hRes.ok:
+      pager.header = hRes.value
+    else:
+      stderr.writeLine("Warning: Failed to decode recovered header: " & hRes.err.message)
+  let txn = beginRead(wal)
+  pager.overlaySnapshot = txn.snapshot
+  let catalogRes = initCatalog(pager)
+  pager.overlaySnapshot = 0
+  endRead(wal, txn)
+
+  if not catalogRes.ok:
+    discard closePager(pager)
+    discard vfs.close(file)
+    return err[Db](catalogRes.err.code, catalogRes.err.message, catalogRes.err.context)
+
+  # Commit any bootstrap changes (e.g. newly created catalog root)
+  let dirtyBootstrap = snapshotDirtyPages(pager)
+  if dirtyBootstrap.len > 0:
+    let writerRes = beginWrite(wal)
+    if writerRes.ok:
+      let writer = writerRes.value
+      var pageIds: seq[PageId] = @[]
+      for entry in dirtyBootstrap:
+        var bytes = newSeq[byte](entry[1].len)
+        if entry[1].len > 0: copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
+        discard writePage(writer, entry[0], bytes)
+        pageIds.add(entry[0])
+      let commitRes = commit(writer)
+      if commitRes.ok:
+        markPagesCommitted(pager, pageIds, commitRes.value)
+      else:
+        discard rollback(writer)
   # Default checkpoint + long-reader protection (can be overridden via CLI/config).
   # - Checkpoint when WAL grows large (bytes-based trigger)
   # - Warn/abort long-running readers to prevent indefinite WAL pinning
@@ -177,7 +236,12 @@ proc schemaBump(db: Db): Result[Void] =
   db.pager.header.schemaCookie = db.schemaCookie
   db.sqlCache.clear()
   db.sqlCacheOrder = @[]
-  let writeRes = writeHeader(db.vfs, db.file, db.pager.header)
+  
+  var pageData = newString(db.pager.pageSize)
+  let headerBytes = encodeHeader(db.pager.header)
+  copyMem(addr pageData[0], unsafeAddr headerBytes[0], HeaderSize)
+  
+  let writeRes = writePage(db.pager, PageId(1), pageData)
   if not writeRes.ok:
     return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
   okVoid()
@@ -453,23 +517,14 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         output.add(parts.join("|"))
       return ok(output)
     let txn = beginRead(db.wal)
-    db.pager.setPageOverlay(txn.snapshot, proc(pageId: PageId): Option[string] =
-      let pageOpt = db.wal.getPageAtOrBefore(pageId, txn.snapshot)
-      if pageOpt.isNone:
-        return none(string)
-      let payload = pageOpt.get
-      var s = newString(payload.len)
-      if payload.len > 0:
-        copyMem(addr s[0], unsafeAddr payload[0], payload.len)
-      some(s)
-    )
+    db.pager.overlaySnapshot = txn.snapshot
     db.pager.setReadGuard(proc(): Result[Void] =
       if db.wal.isAborted(txn):
         return err[Void](ERR_TRANSACTION, "Read transaction aborted (timeout)")
       okVoid()
     )
     defer:
-      db.pager.clearPageOverlay()
+      db.pager.overlaySnapshot = 0
       db.pager.clearReadGuard()
       endRead(db.wal, txn)
     let rowsRes = execPlan(db.pager, db.catalog, usePlan, params)
@@ -483,12 +538,14 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
     ok(output)
   for i, bound in boundStatements:
     let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
+    # stderr.writeLine("execSql: i=" & $i & " kind=" & $bound.kind & " isWrite=" & $isWrite)
     var autoCommit = false
     if isWrite and db.activeWriter == nil and db.wal != nil:
       let beginRes = beginTransaction(db)
       if not beginRes.ok:
         return err[seq[string]](beginRes.err.code, beginRes.err.message, beginRes.err.context)
       autoCommit = true
+    # stderr.writeLine("execSql: autoCommit=" & $autoCommit)
     var committed = false
     defer:
       if autoCommit and not committed:
@@ -997,6 +1054,25 @@ proc closeDb*(db: Db): Result[Void] =
   if not db.isOpen:
     return okVoid()
   
+  # Commit any uncommitted dirty pages to WAL before closing
+  if db.wal != nil and db.activeWriter == nil:
+    let dirtyPages = snapshotDirtyPages(db.pager)
+    if dirtyPages.len > 0:
+      let writerRes = beginWrite(db.wal)
+      if writerRes.ok:
+        let writer = writerRes.value
+        var pageIds: seq[PageId] = @[]
+        for entry in dirtyPages:
+          var bytes = newSeq[byte](entry[1].len)
+          if entry[1].len > 0: copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
+          discard writePage(writer, entry[0], bytes)
+          pageIds.add(entry[0])
+        let commitRes = commit(writer)
+        if commitRes.ok:
+          markPagesCommitted(db.pager, pageIds, commitRes.value)
+        else:
+          discard rollback(writer)
+  
   # Close WAL file if present
   if db.wal != nil:
     let walCloseRes = db.vfs.close(db.wal.file)
@@ -1047,12 +1123,14 @@ proc commitTransaction*(db: Db): Result[Void] =
 
   let dirtyPages = snapshotDirtyPages(db.pager)
   var pageIds: seq[PageId] = @[]
+
   for entry in dirtyPages:
     var bytes = newSeq[byte](entry[1].len)
     if entry[1].len > 0:
       copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
     let writeRes = writePage(db.activeWriter, entry[0], bytes)
     if not writeRes.ok:
+
       discard rollback(db.activeWriter)
       db.activeWriter = nil
       clearCache(db.pager)
@@ -1089,7 +1167,24 @@ proc rollbackTransaction*(db: Db): Result[Void] =
     return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
   db.catalog.clearTrigramDeltas()
   if dirtyPages.len > 0:
-    clearCache(db.pager)
+    rollbackCache(db.pager)
+  
+  # Reload header and catalog to revert any in-memory changes
+  let page1Res = readPage(db.pager, PageId(1))
+  if page1Res.ok:
+    let hRes = decodeHeader(page1Res.value)
+    if hRes.ok:
+      db.pager.header = hRes.value
+    
+  let txn = beginRead(db.wal)
+  db.pager.overlaySnapshot = txn.snapshot
+  let reloadRes = initCatalog(db.pager)
+  db.pager.overlaySnapshot = 0
+  endRead(db.wal, txn)
+
+  if reloadRes.ok:
+    db.catalog = reloadRes.value
+  
   okVoid()
 
 proc checkpointDb*(db: Db): Result[uint64] =

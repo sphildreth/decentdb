@@ -4,6 +4,7 @@ import tables
 import options
 import ../errors
 import ../vfs/types
+import sets
 import ./db_header
 
 type PageId* = uint32
@@ -41,6 +42,8 @@ type Pager* = ref object
   overlay*: PageOverlay
   overlaySnapshot*: uint64
   readGuard*: ReadGuard
+  overriddenPages*: HashSet[PageId]
+  overlayLock*: Lock
 
 const DefaultCacheShards = 16
 
@@ -76,7 +79,9 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
   let count = if fileInfo.size == 0: 0'u32 else: uint32(fileInfo.size div pageSize)
   let cache = newPageCache(cachePages)
   var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0)
+  pager.overriddenPages = initHashSet[PageId]()
   initLock(pager.lock)
+  initLock(pager.overlayLock)
   ok(pager)
 
 proc pageOffset(pager: Pager, pageId: PageId): int64 =
@@ -98,6 +103,9 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
     return err[Void](res.err.code, res.err.message, res.err.context)
   if res.value < pager.pageSize:
     return err[Void](ERR_IO, "Short write on page", "page_id=" & $entry.id)
+  acquire(pager.overlayLock)
+  pager.overriddenPages.incl(entry.id)
+  release(pager.overlayLock)
   entry.dirty = false
   okVoid()
 
@@ -214,7 +222,7 @@ proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64]
       discard unpinPage(pager, entry)
   if snapshot.isSome:
     let snap = snapshot.get
-    if entry.dirty or entry.lsn > snap:
+    if snap > 0 and (entry.dirty or entry.lsn > snap):
       release(entry.lock)
       discard unpinPage(pager, entry)
       pinned = false
@@ -237,7 +245,7 @@ proc readPageCachedCopy(pager: Pager, pageId: PageId, snapshot: Option[uint64]):
   discard unpinPage(pager, entry)
   if snapshot.isSome:
     let snap = snapshot.get
-    if entryDirty or entryLsn > snap:
+    if snap > 0 and (entryDirty or entryLsn > snap):
       return readPageDirect(pager, pageId)
   ok(cloneString(entryData))
 
@@ -254,7 +262,7 @@ proc readPageCachedShared(pager: Pager, pageId: PageId, snapshot: Option[uint64]
   discard unpinPage(pager, entry)
   if snapshot.isSome:
     let snap = snapshot.get
-    if entryDirty or entryLsn > snap:
+    if snap > 0 and (entryDirty or entryLsn > snap):
       return readPageDirect(pager, pageId)
   ok(entryData)
 
@@ -282,7 +290,8 @@ proc readPage*(pager: Pager, pageId: PageId): Result[string] =
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
       return ok(overlayRes.get)
-    return readPageCachedCopy(pager, pageId, some(pager.overlaySnapshot))
+    if pager.overlaySnapshot > 0:
+      return readPageCachedCopy(pager, pageId, some(pager.overlaySnapshot))
   readPageCachedCopy(pager, pageId, none(uint64))
 
 proc readPageRo*(pager: Pager, pageId: PageId): Result[string] =
@@ -338,7 +347,7 @@ proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   let entry = pinRes.value
   acquire(entry.lock)
   entry.data = data
-  entry.lsn = 0
+  entry.dirty = true
   release(entry.lock)
   discard unpinPage(pager, entry, dirty = true)
   okVoid()
@@ -394,6 +403,11 @@ proc snapshotDirtyPages*(pager: Pager): seq[(PageId, string)] =
 
 proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
   let cache = pager.cache
+  if pageIds.len > 0:
+    acquire(pager.overlayLock)
+    for pageId in pageIds:
+      pager.overriddenPages.excl(pageId)
+    release(pager.overlayLock)
   for pageId in pageIds:
     let shard = shardFor(cache, pageId)
     acquire(shard.lock)
@@ -404,6 +418,14 @@ proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
       entry.lsn = lsn
       release(entry.lock)
     release(shard.lock)
+
+proc isDirty*(pager: Pager, pageId: PageId): bool =
+  let shard = pager.cache.shards[pageId.int mod pager.cache.shards.len]
+  acquire(shard.lock)
+  defer: release(shard.lock)
+  if shard.pages.hasKey(pageId):
+    return shard.pages[pageId].dirty
+  false
 
 proc cacheLoadedCount*(cache: PageCache): int =
   var count = 0
@@ -420,6 +442,27 @@ proc clearCache*(pager: Pager) =
     shard.pages.clear()
     shard.clock = @[]
     shard.clockHand = 0
+    release(shard.lock)
+
+proc rollbackCache*(pager: Pager) =
+  ## Evict all dirty pages from the cache.
+  ## 
+  ## This is used during rollback to ensure the cache does not contain
+  ## uncommitted changes.
+  let cache = pager.cache
+  for shard in cache.shards:
+    acquire(shard.lock)
+    var toRemove: seq[PageId] = @[]
+    for id, entry in shard.pages:
+      if entry.dirty:
+        toRemove.add(id)
+    for id in toRemove:
+      shard.pages.del(id)
+      # Removing from clock is harder without a full scan or better structure,
+      # but clockHand will skip deleted IDs eventually if we handle nil entries.
+      # Wait, clock is seq[PageId]. If we remove from pages but not clock, 
+      # clockHand will find an ID that isn't in pages Table. 
+      # shard.clockHand logic handles missing entries.
     release(shard.lock)
 
 proc closePager*(pager: Pager): Result[Void] =
