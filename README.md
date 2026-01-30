@@ -30,12 +30,13 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 ## Features
 
-- **ACID Transactions** - Write-ahead logging with crash-safe recovery
-- **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, ORDER BY, LIMIT/OFFSET
-- **B+Tree Storage** - Efficient tables and secondary indexes with page caching
-- **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
-- **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
-- **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
+- 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
+- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, ORDER BY, LIMIT/OFFSET
+- 🧩 **Dapper Support** - Embedded ADO.NET provider for C# / Dapper
+- 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
+- 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
+- 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
+- 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 
 ## Quick Start
 

@@ -39,7 +39,7 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64, value TEXT)")
+    discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let insertBad = insertRow(db.pager, db.catalog, "items", @[Value(kind: vkInt64, int64Val: 1)])
     check not insertBad.ok
@@ -65,7 +65,7 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64, value TEXT)")
+    discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     let rowRes = insertRow(db.pager, db.catalog, "items", @[
       Value(kind: vkInt64, int64Val: 1),
       Value(kind: vkText, bytes: toBytes("test"))
@@ -96,7 +96,7 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64, value TEXT)")
+    discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let tableRes = db.catalog.getTable("items")
     check tableRes.ok
@@ -123,7 +123,7 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64, value TEXT)")
+    discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let seekBad = indexSeek(db.pager, db.catalog, "items", "id", Value(kind: vkInt64, int64Val: 1))
     check not seekBad.ok
@@ -152,7 +152,7 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64, value TEXT)")
+    discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let rootRes = initTableRoot(db.pager)
     check rootRes.ok
@@ -184,7 +184,7 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64, value TEXT)")
+    discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let rootRes = initTableRoot(db.pager)
     check rootRes.ok
@@ -212,15 +212,15 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE docs (id INT64, body TEXT)")
-    let idxRes = db.exec("CREATE INDEX idx_body ON docs USING trigram (body)")
+    discard execSql(db, "CREATE TABLE docs (id INT64, body TEXT)")
+    let idxRes = execSql(db, "CREATE INDEX idx_body ON docs USING trigram (body)")
     check idxRes.ok
     
     let tableRes = db.catalog.getTable("docs")
     check tableRes.ok
     let idxOpt = db.catalog.getTrigramIndexForColumn("docs", "body")
-    check idxOpt.isSome
-    let idx = idxOpt.get
+    check idxOpt != none(IndexMeta)
+    let idx = idxOpt.unsafeGet()
     
     let postings = getTrigramPostings(db.pager, idx, 12345'u32)
     check postings.ok
@@ -247,13 +247,13 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64 PRIMARY KEY, value INT64)")
-    discard db.exec("CREATE INDEX idx_value ON items (value)")
-    discard db.exec("INSERT INTO items VALUES (1, 100)")
+    discard execSql(db, "CREATE TABLE items (id INT64 PRIMARY KEY, value INT64)")
+    discard execSql(db, "CREATE INDEX idx_value ON items (value)")
+    discard execSql(db, "INSERT INTO items VALUES (1, 100)")
     
     let idxOpt = db.catalog.getBtreeIndexForColumn("items", "value")
-    check idxOpt.isSome
-    let idx = idxOpt.get
+    check idxOpt != none(IndexMeta)
+    let idx = idxOpt.unsafeGet()
     
     let hasKey = indexHasAnyKey(db.pager, idx, 100'u64)
     check hasKey.ok
@@ -271,8 +271,8 @@ suite "Storage Error Paths":
     check dbRes.ok
     let db = dbRes.value
     
-    discard db.exec("CREATE TABLE items (id INT64 PRIMARY KEY, value INT64)")
-    discard db.exec("CREATE INDEX idx_value ON items (value)")
+    discard execSql(db, "CREATE TABLE items (id INT64 PRIMARY KEY, value INT64)")
+    discard execSql(db, "CREATE INDEX idx_value ON items (value)")
     let row1 = insertRow(db.pager, db.catalog, "items", @[
       Value(kind: vkInt64, int64Val: 1),
       Value(kind: vkInt64, int64Val: 100)
@@ -280,8 +280,8 @@ suite "Storage Error Paths":
     check row1.ok
     
     let idxOpt = db.catalog.getBtreeIndexForColumn("items", "value")
-    check idxOpt.isSome
-    let idx = idxOpt.get
+    check idxOpt != none(IndexMeta)
+    let idx = idxOpt.unsafeGet()
     
     let hasOther = indexHasOtherRowid(db.pager, idx, 100'u64, row1.value)
     check hasOther.ok
