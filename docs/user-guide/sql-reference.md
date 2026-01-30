@@ -44,6 +44,50 @@ DROP TABLE table_name;
 DROP INDEX index_name;
 ```
 
+### ALTER TABLE
+
+Modify the structure of an existing table.
+
+#### Add Column
+
+```sql
+ALTER TABLE table_name ADD COLUMN column_name datatype [constraints];
+```
+
+Adds a new column to the table. Existing rows will have `NULL` values for the new column.
+
+Example:
+```sql
+-- Add a new column with no default
+ALTER TABLE users ADD COLUMN age INT;
+
+-- Add a column with NOT NULL constraint
+-- (will fail if table has existing rows)
+ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+```
+
+#### Drop Column
+
+```sql
+ALTER TABLE table_name DROP COLUMN column_name;
+```
+
+Removes a column from the table. This operation:
+- Deletes all data in that column
+- Automatically drops any indexes on that column
+- Rebuilds remaining indexes
+- Migrates all data to a new table structure
+
+Example:
+```sql
+ALTER TABLE users DROP COLUMN age;
+```
+
+**Notes:**
+- `ADD COLUMN` and `DROP COLUMN` are the only supported operations in v1.0.0
+- Advanced operations like `RENAME COLUMN`, `MODIFY COLUMN` (type changes), and `ADD CONSTRAINT` are planned for future releases
+- Schema changes require an exclusive lock on the database
+
 ## Data Manipulation Language (DML)
 
 ### INSERT
@@ -186,7 +230,6 @@ Not currently supported:
 - Subqueries in SELECT
 - Window functions
 - Common Table Expressions (CTE)
-- ALTER TABLE
 - Views
 - Stored procedures
 

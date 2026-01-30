@@ -1,6 +1,7 @@
 import options
 import tables
 import sequtils
+import strutils
 import ../errors
 import ../catalog/catalog
 import ./sql
@@ -244,6 +245,48 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](ERR_SQL, "Trigram index cannot be UNIQUE", stmt.columnName)
   ok(stmt)
 
+proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
+  let tableRes = catalog.getTable(stmt.alterTableName)
+  if not tableRes.ok:
+    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  for action in stmt.alterActions:
+    case action.kind
+    of ataAddColumn:
+      for col in table.columns:
+        if col.name == action.columnDef.name:
+          return err[Statement](ERR_SQL, "Column already exists", action.columnDef.name)
+      let validTypes = ["INT", "INT64", "INTEGER", "TEXT", "BLOB", "BOOL", "BOOLEAN", "FLOAT", "FLOAT64", "REAL"]
+      var typeValid = false
+      let typeUpper = action.columnDef.typeName.toUpperAscii()
+      for validType in validTypes:
+        if typeUpper == validType:
+          typeValid = true
+          break
+      if not typeValid:
+        return err[Statement](ERR_SQL, "Unsupported column type for ALTER TABLE", action.columnDef.typeName)
+    of ataDropColumn:
+      var found = false
+      for col in table.columns:
+        if col.name == action.columnName:
+          found = true
+          if col.primaryKey:
+            return err[Statement](ERR_SQL, "Cannot drop PRIMARY KEY column", action.columnName)
+          break
+      if not found:
+        return err[Statement](ERR_SQL, "Column does not exist", action.columnName)
+    of ataAlterColumn:
+      var found = false
+      for col in table.columns:
+        if col.name == action.columnName:
+          found = true
+          break
+      if not found:
+        return err[Statement](ERR_SQL, "Column does not exist", action.columnName)
+    else:
+      return err[Statement](ERR_SQL, "Unsupported ALTER TABLE action")
+  ok(stmt)
+
 proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
   case stmt.kind
   of skSelect:
@@ -258,5 +301,7 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     bindCreateTable(catalog, stmt)
   of skCreateIndex:
     bindCreateIndex(catalog, stmt)
+  of skAlterTable:
+    bindAlterTable(catalog, stmt)
   of skDropTable, skDropIndex, skBegin, skCommit, skRollback:
     ok(stmt)

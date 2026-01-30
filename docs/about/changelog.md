@@ -89,7 +89,6 @@ As of version 1.0.0:
 - **No subqueries** - In SELECT list
 - **No window functions** - ROW_NUMBER, RANK, etc.
 - **No CTEs** - Common Table Expressions (WITH)
-- **No ALTER TABLE** - Schema changes limited to CREATE/DROP
 - **No views** - Virtual tables not supported
 - **No stored procedures** - Server-side logic
 - **Statement-time FK checks** - Not deferred to COMMIT
@@ -106,7 +105,6 @@ As of version 1.0.0:
 - Improved error messages
 
 ### Version 1.2 (Planned)
-- ALTER TABLE support
 - SAVEPOINT for nested transactions
 - More indexing options
 

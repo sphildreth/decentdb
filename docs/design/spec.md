@@ -543,8 +543,9 @@ Define error categories:
 - Writing to older formats may trigger automatic upgrade (with user confirmation)
 
 ### 15.3 Schema changes (MVP)
-- Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX
-- Not supported: ALTER TABLE (post-MVP)
+- Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
+- ALTER TABLE operations: ADD COLUMN, DROP COLUMN
+- Not supported (post-MVP): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 
 ### 15.4 Migration strategy

@@ -85,11 +85,36 @@ type SelectItem* = object
   alias*: string
   isStar*: bool
 
+type AlterTableActionKind* = enum
+  ataAddColumn
+  ataDropColumn
+  ataRenameColumn
+  ataRenameTable
+  ataAlterColumn
+
+type AlterColumnAction* = enum
+  acaSetType
+  acaSetDefault
+  acaDropDefault
+  acaSetNotNull
+  acaDropNotNull
+
+type AlterTableAction* = object
+  kind*: AlterTableActionKind
+  columnDef*: ColumnDef        # For ADD COLUMN
+  columnName*: string          # For DROP/RENAME COLUMN
+  newColumnName*: string       # For RENAME COLUMN
+  newTableName*: string        # For RENAME TABLE
+  alterColumnAction*: AlterColumnAction  # For ALTER COLUMN
+  alterColumnNewType*: string  # For ALTER COLUMN SET TYPE
+  alterColumnDefault*: Expr    # For ALTER COLUMN SET DEFAULT
+
 type StatementKind* = enum
   skCreateTable
   skCreateIndex
   skDropTable
   skDropIndex
+  skAlterTable
   skInsert
   skSelect
   skUpdate
@@ -113,6 +138,9 @@ type Statement* = ref object
     dropTableName*: string
   of skDropIndex:
     dropIndexName*: string
+  of skAlterTable:
+    alterTableName*: string
+    alterActions*: seq[AlterTableAction]
   of skInsert:
     insertTable*: string
     insertColumns*: seq[string]
@@ -655,6 +683,75 @@ proc parseTransactionStmt(node: JsonNode): Result[Statement] =
     return err[Statement](ERR_SQL, "Unsupported transaction statement", kindStr)
   ok(Statement(kind: kind))
 
+proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
+  let colName = nodeGet(node, "colname").getStr
+  let typeNode = nodeGet(node, "typeName")
+  var typeName = ""
+  if typeNode.kind == JObject:
+    let names = nodeGet(typeNode, "names")
+    if names.kind == JArray and names.len > 0:
+      typeName = nodeString(names[^1])
+  let notNull = nodeHas(node, "is_not_null") and node["is_not_null"].getBool
+  let isNull = nodeHas(node, "is_null") and node["is_null"].getBool
+  let constraints = nodeGet(node, "constraints")
+  var isPrimaryKey = false
+  var isUnique = false
+  if constraints.kind == JArray:
+    for c in constraints:
+      if nodeHas(c, "Constraint"):
+        let contype = nodeGet(c["Constraint"], "contype").getStr
+        if contype == "CONSTR_PRIMARY":
+          isPrimaryKey = true
+        elif contype == "CONSTR_UNIQUE":
+          isUnique = true
+  ok(ColumnDef(name: colName, typeName: typeName.toUpperAscii(), notNull: notNull, unique: isUnique, primaryKey: isPrimaryKey))
+
+proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
+  let rel = unwrapRangeVar(node["relation"])
+  let tableRes = parseRangeVar(rel)
+  if not tableRes.ok:
+    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let tableName = tableRes.value[0]
+  let cmdNode = nodeGet(node, "cmds")
+  if cmdNode.kind != JArray or cmdNode.len == 0:
+    return err[Statement](ERR_SQL, "ALTER TABLE requires at least one command")
+  var actions: seq[AlterTableAction] = @[]
+  for cmd in cmdNode:
+    if not nodeHas(cmd, "AlterTableCmd"):
+      continue
+    let alterCmd = cmd["AlterTableCmd"]
+    let subtype = nodeGet(alterCmd, "subtype").getStr
+    var action: AlterTableAction
+    case subtype
+    of "AT_AddColumn":
+      if nodeHas(alterCmd, "def"):
+        let defNode = alterCmd["def"]
+        if nodeHas(defNode, "ColumnDef"):
+          let colRes = parseColumnDef(defNode["ColumnDef"])
+          if not colRes.ok:
+            return err[Statement](colRes.err.code, colRes.err.message, colRes.err.context)
+          action = AlterTableAction(kind: ataAddColumn, columnDef: colRes.value)
+        else:
+          return err[Statement](ERR_SQL, "ADD COLUMN requires column definition")
+      else:
+        return err[Statement](ERR_SQL, "ADD COLUMN requires column definition")
+    of "AT_DropColumn":
+      let colName = nodeGet(alterCmd, "name").getStr
+      action = AlterTableAction(kind: ataDropColumn, columnName: colName)
+    of "AT_ColumnDefault":
+      let colName = nodeGet(alterCmd, "name").getStr
+      if nodeHas(alterCmd, "def"):
+        let defExpr = parseExprNode(alterCmd["def"])
+        if not defExpr.ok:
+          return err[Statement](defExpr.err.code, defExpr.err.message, defExpr.err.context)
+        action = AlterTableAction(kind: ataAlterColumn, columnName: colName, alterColumnAction: acaSetDefault, alterColumnDefault: defExpr.value)
+      else:
+        action = AlterTableAction(kind: ataAlterColumn, columnName: colName, alterColumnAction: acaDropDefault)
+    else:
+      return err[Statement](ERR_SQL, "Unsupported ALTER TABLE operation", subtype)
+    actions.add(action)
+  ok(Statement(kind: skAlterTable, alterTableName: tableName, alterActions: actions))
+
 proc parseStatementNode(node: JsonNode): Result[Statement] =
   if nodeHas(node, "SelectStmt"):
     return parseSelectStmt(node["SelectStmt"])
@@ -670,6 +767,8 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
     return parseIndexStmt(node["IndexStmt"])
   if nodeHas(node, "DropStmt"):
     return parseDropStmt(node["DropStmt"])
+  if nodeHas(node, "AlterTableStmt"):
+    return parseAlterTableStmt(node["AlterTableStmt"])
   if nodeHas(node, "TransactionStmt"):
     return parseTransactionStmt(node["TransactionStmt"])
   err[Statement](ERR_SQL, "Unsupported statement node")

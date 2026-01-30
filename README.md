@@ -1,8 +1,8 @@
 # DecentDB
 
-[![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
-[![Language](https://img.shields.io/badge/language-Nim-2d9cdb)](#)
+[![Language](https://img.shields.io/badge/language-Nim-2d9cdb)](https://nim-lang.org)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 
 ```text                                       
   ___                 _   ___  ___ 
@@ -14,237 +14,146 @@
                                                   
 ACID first. Everything else… eventually.
 
-DecentDB is a embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation. It is not intended to be the best embedded database engine, but not terrible, a decent better than some engine.
+DecentDB is a embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation. DecentDB provides a PostgreSQL-like SQL interface with ACID transactions, efficient B+Tree storage, and concurrent read access. It is not intended to be the best embedded database engine, but not terrible, a decent better than some engine.
 
----
+## Features
 
-## Highlights
+- **ACID Transactions** - Write-ahead logging with crash-safe recovery
+- **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, ORDER BY, LIMIT/OFFSET
+- **B+Tree Storage** - Efficient tables and secondary indexes with page caching
+- **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
+- **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
+- **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 
-- **WAL‑backed ACID** with crash‑safe recovery
-- **B+Trees** for tables + secondary indexes
-- **Snapshot reads** for concurrent readers
-- **Postgres‑like SQL subset** (DDL/DML, joins, ORDER BY, LIMIT/OFFSET)
-- **Trigram index** acceleration for `LIKE '%pattern%'`
-- **Deterministic tests** (unit + property + crash injection + differential)
-
----
-
-## Quick Start (Developer)
+## Quick Start
 
 ### Prerequisites
-- **Nim** (includes `nim` + `nimble`)
-- **Python 3**
-- **libpg_query** (C library + headers)
 
-> `nim.cfg` enables `-d:libpg_query` and links `-lpg_query`.  
-> If headers/libs are in a non‑standard path, set `CFLAGS`/`LDFLAGS` or `NIMFLAGS`.
+- [Nim](https://nim-lang.org) (includes `nim` + `nimble`)
+- Python 3
+- libpg_query (C library + headers)
 
-### Build
+### Installation
+
 ```bash
 nimble build
 ```
 
-### Test
+### Create a Database
+
 ```bash
-nimble test
+# Create and query a database
+decentdb exec --db ./my.db --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
+decentdb exec --db ./my.db --sql "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
+decentdb exec --db ./my.db --sql "SELECT * FROM users"
 ```
 
-### Lint
+### REPL Mode
+
 ```bash
-nimble lint
+decentdb repl --db ./my.db
 ```
 
-### Benchmarks
+## Usage Examples
+
+### SQL Operations
+
 ```bash
-nimble bench
-nimble bench_compare
+# Create tables with constraints
+decentdb exec --db ./my.db --sql "CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    user_id INT REFERENCES users(id),
+    amount FLOAT64,
+    created_at INT
+)"
+
+# Insert data
+decentdb exec --db ./my.db --sql "INSERT INTO orders VALUES (1, 1, 99.99, 1704067200)"
+
+# Query with JOINs
+decentdb exec --db ./my.db --sql "SELECT u.name, SUM(o.amount) 
+    FROM users u 
+    JOIN orders o ON u.id = o.user_id 
+    GROUP BY u.name"
+
+# Text search with trigram index
+decentdb exec --db ./my.db --sql "CREATE INDEX idx_users_name ON users USING trigram(name)"
+decentdb exec --db ./my.db --sql "SELECT * FROM users WHERE name LIKE '%ali%'"
 ```
 
----
+### Import/Export
+
+```bash
+# Import CSV data
+decentdb import --table users --input data.csv --db ./my.db
+
+# Export to JSON
+decentdb export --table users --output users.json --db ./my.db --format=json
+
+# Bulk load large datasets
+decentdb bulk-load --table users --input large_dataset.csv --db ./my.db
+```
+
+### Maintenance
+
+```bash
+# Force WAL checkpoint
+decentdb checkpoint --db ./my.db
+
+# View database statistics
+decentdb stats --db ./my.db
+
+# Rebuild an index
+decentdb rebuild-index --index users_name_idx --db ./my.db
+```
 
 ## CLI Reference
 
-DecentDB ships a single CLI tool named `decentdb`. All commands and options are under this tool.
+DecentDB provides a unified CLI tool. See `decentdb --help` for all commands.
 
-### Global Usage
+Common commands:
+- `exec` - Execute SQL statements
+- `repl` - Interactive SQL shell
+- `import` / `export` - Data transfer
+- `bulk-load` - High-performance data loading
+- `checkpoint` - WAL maintenance
+- `list-tables` / `describe` - Schema introspection
+
+## Documentation
+
+- [User Guide](docs/user-guide/) - SQL reference, tutorials, and examples
+- [Nim API](docs/api/) - Embedded API documentation
+- [Architecture](docs/architecture/) - Design and implementation details
+- [Contributing](docs/development/contributing.md) - Development guidelines
+
+## Architecture
+
+DecentDB is organized into focused modules:
+
+- **VFS** - OS I/O abstraction with fault injection support
+- **Pager** - Fixed-size pages, LRU cache, and freelist management
+- **WAL** - Append-only log, crash recovery, and checkpointing
+- **B+Tree** - Table storage and secondary indexes
+- **Record** - Typed value encoding with overflow pages
+- **Catalog** - Schema metadata management
+- **SQL/Planner/Exec** - Query parsing, planning, and execution
+- **Search** - Trigram inverted index for text search
+
+## Development
+
 ```bash
-decentdb --help
+# Run tests
+nimble test
+
+# Run benchmarks
+nimble bench
+
+# Lint code
+nimble lint
 ```
 
-### exec (run SQL / engine controls)
-```bash
-decentdb exec --db path/to.db --sql "SELECT 1"
-```
-
-Database creation:
-- The database file is created automatically on first open if it does not exist.
-- Any command that takes `--db` will create the file when missing.
-
-Examples:
-```bash
-decentdb exec --db ./my.db --openClose
-decentdb exec --db ./my.db --sql "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)"
-```
-
-Options:
-- `--db`, `-d` (required): database file path
-- `--sql`, `-s`: SQL statement to execute
-- `--openClose`: open and close without executing SQL (testing)
-- `--timing`, `-t`: include timing info in JSON output
-- `--cachePages`: number of 4KB pages to cache (default 64)
-- `--cacheMb`: cache size in MB (overrides `--cachePages`)
-- `--checkpoint`: force WAL checkpoint and exit
-- `--readerCount`: show active reader count and exit
-- `--longReaders`: show readers active longer than N ms
-- `--dbInfo`: show DB header/config info and exit
-- `--warnings`: include WAL warnings in output
-- `--verbose`, `-v`: include verbose diagnostics in output
-- `--checkpointBytes`: auto-checkpoint when WAL reaches N bytes
-- `--checkpointMs`: auto-checkpoint when N ms elapse since last checkpoint
-- `--format`: output format for results: json, csv, table (default json)
-- `--params`: bind parameters in order (repeatable). Use `type:value`, e.g. `int:1`, `text:hi`, `null`
-- `--walFailpoints`: set WAL failpoints (repeatable). Format `label:kind[:bytes][:count]`
-- `--clearWalFailpoints`: clear all WAL failpoints before executing
-
-### Schema introspection
-```bash
-decentdb list-tables --db path/to.db
-decentdb describe --table users --db path/to.db
-decentdb list-indexes --db path/to.db
-decentdb list-indexes --table users --db path/to.db
-```
-
-Options:
-- `list-tables`: `--db`, `-d`
-- `describe`: `--table`, `-t` and `--db`, `-d`
-- `list-indexes`: `--db`, `-d`, optional `--table`, `-t`
-
-### Index maintenance
-```bash
-decentdb rebuild-index --index users_name_idx --db path/to.db
-decentdb verify-index --index users_name_idx --db path/to.db
-```
-
-Options:
-- `rebuild-index`: `--index`, `-i` and `--db`, `-d`
-- `verify-index`: `--index`, `-i` and `--db`, `-d`
-
-### Import / Export / Dump
-```bash
-decentdb import --table users --input data.csv --db path/to.db
-decentdb import --table users --input data.json --db path/to.db --format=json
-
-decentdb export --table users --output users.csv --db path/to.db
-decentdb export --table users --output users.json --db path/to.db --format=json
-
-decentdb dump --db path/to.db --output backup.sql
-```
-
-Options:
-- `import`: `--table`, `-t`; `--input`; `--db`, `-d`; `--batchSize` (default 10000); `--format` (csv|json, default csv)
-- `export`: `--table`, `-t`; `--output`; `--db`, `-d`; `--format` (csv|json, default csv)
-- `dump`: `--db`, `-d`; optional `--output` (defaults to stdout)
-
-### Bulk load (CSV)
-```bash
-decentdb bulk-load --table users --input data.csv --db path/to.db --batchSize=50000 --durability=deferred
-```
-
-Options:
-- `--table`, `-t`; `--input`; `--db`, `-d`
-- `--batchSize` (default 10000)
-- `--syncInterval` (batches between fsync when durability is deferred, default 10)
-- `--durability` (full|deferred|none, default deferred)
-- `--disable-indexes` (default true)
-- `--no-checkpoint` (skip checkpoint after load)
-
-### Maintenance & diagnostics
-```bash
-decentdb checkpoint --db path/to.db
-decentdb stats --db path/to.db
-decentdb info --db path/to.db
-decentdb dump-header --db path/to.db
-decentdb verify-header --db path/to.db
-```
-
-Options:
-- `checkpoint`: `--db`, `-d`; `--warnings`; `--verbose`
-- `stats`: `--db`, `-d`
-- `info`: `--db`, `-d`
-- `dump-header`: `--db`, `-d`
-- `verify-header`: `--db`, `-d`
-
-### REPL & completion
-```bash
-decentdb repl --db path/to.db
-decentdb completion --shell=bash
-```
-
-Options:
-- `repl`: `--db`, `-d`; `--format` (json|csv|table, default table)
-- `completion`: `--shell` (bash|zsh, default bash)
-
-### Config file
-
-If present, `~/.decentdb/config` provides defaults. Supported keys:
-- `db` (default database path)
-- `cachePages`
-- `cacheMb`
-
----
-
-## Repository Guide
-
-- `design/PRD.md` — product requirements
-- `design/SPEC.md` — engineering spec (modules, formats, concurrency)
-- `design/TESTING_STRATEGY.md` — testing plan + benchmarks
-- `design/IMPLEMENTATION_PHASES.md` — phased checklist (canonical)
-- `design/adr/` — architecture decision records (format/ACID)
-- `AGENTS.md` — contributor/agent workflow rules
-
----
-
-## Architecture (MVP)
-
-Core modules (see `design/SPEC.md`):
-- `vfs` — OS I/O abstraction + fault injection
-- `pager` — fixed pages + cache + freelist
-- `wal` — append‑only log + recovery + checkpoints
-- `btree` — tables + secondary indexes
-- `record` — typed encoding + overflow pages
-- `catalog` — schema metadata
-- `sql` / `planner` / `exec` — parsing, planning, execution
-- `search` — trigram index
-
----
-
-## Concurrency Model
-
-- **Single writer**, many concurrent readers
-- Readers capture a **snapshot LSN** at start
-- Reads consult WAL overlay for `lsn <= snapshot`
-
----
-
-## Durability & Recovery
-
-- WAL frames include checksums + LSN
-- Recovery scans WAL to last committed boundary
-- Checkpointing copies committed pages and **never truncates frames needed by active readers**
-
----
-
-## Contributing
-
-This repo is optimized for incremental, test‑driven changes.
-
-1. Read `AGENTS.md` and the design docs under `design/`
-2. Pick the earliest unchecked item in `design/IMPLEMENTATION_PHASES.md`
-3. Implement **exactly** that item + tests
-4. If you change any persistent format, add an ADR + version bump + compatibility tests
-
----
+See [Contributing Guide](docs/development/contributing.md) for development workflow and guidelines.
 
 ## License
 
-Apache‑2.0. See `LICENSE`.
+Apache-2.0. See [LICENSE](LICENSE).

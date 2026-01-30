@@ -482,7 +482,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       output.add(parts.join("|"))
     ok(output)
   for i, bound in boundStatements:
-    let isWrite = bound.kind in {skCreateTable, skDropTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
+    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
     var autoCommit = false
     if isWrite and db.activeWriter == nil and db.wal != nil:
       let beginRes = beginTransaction(db)
@@ -551,6 +551,10 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let bumpRes = schemaBump(db)
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    of skAlterTable:
+      let alterRes = alterTable(db.pager, db.catalog, bound.alterTableName, bound.alterActions)
+      if not alterRes.ok:
+        return err[seq[string]](alterRes.err.code, alterRes.err.message, alterRes.err.context)
     of skCreateIndex:
       let indexRootRes = initTableRoot(db.pager)
       if not indexRootRes.ok:

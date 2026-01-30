@@ -5,7 +5,7 @@
 import cligen
 import ./decentdb_cli
 
-const Version = "0.0.1"
+const Version = "1.0.0"
 
 when isMainModule:
   dispatchMulti(

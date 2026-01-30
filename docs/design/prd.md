@@ -78,7 +78,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
 - Full PostgreSQL semantics, system catalogs, extensions, or wire protocol
 - Advanced query optimizer (cost-based, statistics-driven)
 - Full-text ranking, stemming, language analyzers (beyond trigram index)
-- Online schema migrations / ALTER TABLE beyond minimal needs
+- Advanced ALTER TABLE operations (RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT)
 - Replication / clustering
 - Encrypted storage (future optional)
 
@@ -217,6 +217,6 @@ ORDER BY a.name, al.name, t.trackNumber;
 ## 13. Out of scope future roadmap (post-MVP)
 - Multi-process locking/shmem
 - PostgreSQL wire protocol compatibility (Npgsql)
-- Additional DDL (`ALTER TABLE`)
+- Advanced DDL operations (RENAME TABLE, RENAME COLUMN, MODIFY COLUMN type changes, ADD CONSTRAINT)
 - Advanced search (tokenization + language-aware features)
 - Background checkpointing and compaction

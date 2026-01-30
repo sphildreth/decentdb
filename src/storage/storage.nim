@@ -8,6 +8,7 @@ import ../pager/db_header
 import ../btree/btree
 import ../catalog/catalog
 import ../search/search
+import ../sql/sql
 import sets
 
 type StoredRow* = object
@@ -583,3 +584,197 @@ proc indexHasOtherRowid*(pager: Pager, index: IndexMeta, key: uint64, rowid: uin
       if rowidRes.ok and rowidRes.value != rowid:
         return ok(true)
   ok(false)
+
+# ALTER TABLE implementation
+proc columnFromColumnDef(colDef: ColumnDef): Result[Column] =
+  let typeRes = parseColumnType(colDef.typeName)
+  if not typeRes.ok:
+    return err[Column](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+  ok(Column(
+    name: colDef.name,
+    kind: typeRes.value,
+    notNull: colDef.notNull,
+    unique: colDef.unique,
+    primaryKey: colDef.primaryKey,
+    refTable: colDef.refTable,
+    refColumn: colDef.refColumn
+  ))
+
+proc createNullValue(kind: ColumnType): Value =
+  Value(kind: vkNull)
+
+proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, columnName: string): Result[Void] =
+  var columnIndex = -1
+  for i, col in table.columns:
+    if col.name == columnName:
+      columnIndex = i
+      break
+  
+  if columnIndex < 0:
+    return err[Void](ERR_SQL, "Column not found", columnName)
+  
+  var newColumns: seq[Column] = @[]
+  for i, col in table.columns:
+    if i != columnIndex:
+      newColumns.add(col)
+  
+  var indexesToDrop: seq[string] = @[]
+  for idxName, idx in catalog.indexes:
+    if idx.table == table.name and idx.column == columnName:
+      indexesToDrop.add(idxName)
+  
+  for idxName in indexesToDrop:
+    let dropIdxRes = catalog.dropIndex(idxName)
+    if not dropIdxRes.ok:
+      return dropIdxRes
+  
+  let oldTree = newBTree(pager, table.rootPage)
+  let cursorRes = openCursor(oldTree)
+  if not cursorRes.ok:
+    return err[Void](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+  
+  let newRootRes = initTableRoot(pager)
+  if not newRootRes.ok:
+    return err[Void](newRootRes.err.code, newRootRes.err.message, newRootRes.err.context)
+  
+  let newRoot = newRootRes.value
+  var newTree = newBTree(pager, newRoot)
+  let cursor = cursorRes.value
+  
+  while true:
+    let nextRes = cursorNext(cursor)
+    if not nextRes.ok:
+      break
+    
+    let rowid = nextRes.value[0]
+    let valueBytes = nextRes.value[1]
+    let overflow = nextRes.value[2]
+    
+    if valueBytes.len == 0 and overflow == 0'u32:
+      continue
+    
+    let decoded = decodeRecordWithOverflow(pager, valueBytes)
+    if not decoded.ok:
+      return err[Void](decoded.err.code, decoded.err.message, decoded.err.context)
+    
+    var newValues: seq[Value] = @[]
+    for i, val in decoded.value:
+      if i != columnIndex:
+        newValues.add(val)
+    
+    let normalizedRes = normalizeValues(pager, newValues)
+    if not normalizedRes.ok:
+      return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+    
+    let record = encodeRecord(normalizedRes.value)
+    let insertRes = insert(newTree, rowid, record)
+    if not insertRes.ok:
+      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  
+  table.columns = newColumns
+  table.rootPage = newRoot
+  
+  for idxName, idx in catalog.indexes:
+    if idx.table == table.name:
+      let rebuildRes = rebuildIndex(pager, catalog, idx)
+      if not rebuildRes.ok:
+        return rebuildRes
+  
+  okVoid()
+
+proc addColumnToTable(pager: Pager, catalog: Catalog, table: var TableMeta, colDef: ColumnDef): Result[Void] =
+  for col in table.columns:
+    if col.name == colDef.name:
+      return err[Void](ERR_SQL, "Column already exists", colDef.name)
+  
+  let colRes = columnFromColumnDef(colDef)
+  if not colRes.ok:
+    return err[Void](colRes.err.code, colRes.err.message, colRes.err.context)
+  
+  let newColumn = colRes.value
+  let nullValue = createNullValue(newColumn.kind)
+  
+  let oldTree = newBTree(pager, table.rootPage)
+  let cursorRes = openCursor(oldTree)
+  if not cursorRes.ok:
+    return err[Void](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+  
+  let newRootRes = initTableRoot(pager)
+  if not newRootRes.ok:
+    return err[Void](newRootRes.err.code, newRootRes.err.message, newRootRes.err.context)
+  
+  let newRoot = newRootRes.value
+  var newTree = newBTree(pager, newRoot)
+  let cursor = cursorRes.value
+  
+  while true:
+    let nextRes = cursorNext(cursor)
+    if not nextRes.ok:
+      break
+    
+    let rowid = nextRes.value[0]
+    let valueBytes = nextRes.value[1]
+    let overflow = nextRes.value[2]
+    
+    if valueBytes.len == 0 and overflow == 0'u32:
+      continue
+    
+    let decoded = decodeRecordWithOverflow(pager, valueBytes)
+    if not decoded.ok:
+      return err[Void](decoded.err.code, decoded.err.message, decoded.err.context)
+    
+    var newValues = decoded.value
+    newValues.add(nullValue)
+    
+    let normalizedRes = normalizeValues(pager, newValues)
+    if not normalizedRes.ok:
+      return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+    
+    let record = encodeRecord(normalizedRes.value)
+    let insertRes = insert(newTree, rowid, record)
+    if not insertRes.ok:
+      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  
+  table.columns.add(newColumn)
+  table.rootPage = newRoot
+  
+  for idxName, idx in catalog.indexes:
+    if idx.table == table.name:
+      let rebuildRes = rebuildIndex(pager, catalog, idx)
+      if not rebuildRes.ok:
+        return rebuildRes
+  
+  okVoid()
+
+proc alterTable*(pager: Pager, catalog: Catalog, tableName: string, actions: seq[AlterTableAction]): Result[Void] =
+  let tableRes = catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  
+  var table = tableRes.value
+  
+  for action in actions:
+    case action.kind
+    of ataAddColumn:
+      let addRes = addColumnToTable(pager, catalog, table, action.columnDef)
+      if not addRes.ok:
+        return addRes
+    
+    of ataDropColumn:
+      let dropRes = dropColumnFromTable(pager, catalog, table, action.columnName)
+      if not dropRes.ok:
+        return dropRes
+    
+    else:
+      return err[Void](ERR_INTERNAL, "ALTER TABLE action not yet supported", $action.kind)
+  
+  let saveRes = catalog.saveTable(pager, table)
+  if not saveRes.ok:
+    return saveRes
+  
+  pager.header.schemaCookie.inc
+  let writeRes = writeHeader(pager.vfs, pager.file, pager.header)
+  if not writeRes.ok:
+    return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+  
+  okVoid()

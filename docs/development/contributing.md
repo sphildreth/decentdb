@@ -178,7 +178,7 @@ proc calculatePageUtilization*(tree: BTree, pageId: PageId): Result[float]
 ### High Priority
 
 - [ ] Cost-based query optimizer
-- [ ] Online schema migrations (ALTER TABLE)
+- [x] Online schema migrations (ALTER TABLE) - **IMPLEMENTED in v1.0.0**
 - [ ] Additional SQL functions
 - [ ] Performance benchmarks
 - [ ] More crash test scenarios
