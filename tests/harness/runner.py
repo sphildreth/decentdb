@@ -17,7 +17,33 @@ def load_scenario(path: str) -> dict:
         return json.load(handle)
 
 
-def build_engine_command(engine_path: str, db_path: str, sql: str | None, open_close: bool) -> list[str]:
+def build_failpoint_args(failpoint: dict) -> list[str]:
+    """Build --walFailpoint CLI arguments from failpoint config."""
+    if not failpoint:
+        return []
+
+    label = failpoint.get("label", "")
+    kind = failpoint.get("kind", "error")
+    bytes_count = failpoint.get("bytes", "")
+    count = failpoint.get("count", "")
+
+    # Format: label:kind[:bytes][:count]
+    spec = f"{label}:{kind}"
+    if bytes_count != "":
+        spec += f":{bytes_count}"
+    if count != "":
+        spec += f":{count}"
+
+    return ["--walFailpoint", spec]
+
+
+def build_engine_command(
+    engine_path: str,
+    db_path: str,
+    sql: str | None,
+    open_close: bool,
+    failpoint: dict | None = None,
+) -> list[str]:
     cmd = [engine_path]
     if engine_path.endswith(".py"):
         cmd = [sys.executable, engine_path]
@@ -26,6 +52,11 @@ def build_engine_command(engine_path: str, db_path: str, sql: str | None, open_c
         if engine_name in {"decentdb", "decentdb.exe"}:
             cmd.append("exec")
     cmd += ["--db", db_path]
+
+    # Add failpoint arguments if present
+    if failpoint:
+        cmd.extend(build_failpoint_args(failpoint))
+
     if open_close:
         cmd += ["--open-close"]
     elif sql:
@@ -33,8 +64,14 @@ def build_engine_command(engine_path: str, db_path: str, sql: str | None, open_c
     return cmd
 
 
-def run_engine(engine_path: str, db_path: str, sql: str | None, open_close: bool) -> dict:
-    cmd = build_engine_command(engine_path, db_path, sql, open_close)
+def run_engine(
+    engine_path: str,
+    db_path: str,
+    sql: str | None,
+    open_close: bool,
+    failpoint: dict | None = None,
+) -> dict:
+    cmd = build_engine_command(engine_path, db_path, sql, open_close, failpoint)
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     try:
         payload = json.loads(proc.stdout.strip() or "{}")
@@ -73,7 +110,11 @@ def main() -> int:
     if not db_path:
         return_json = {
             "ok": False,
-            "error": {"code": "ERR_IO", "message": "Scenario missing db_path", "context": ""},
+            "error": {
+                "code": "ERR_IO",
+                "message": "Scenario missing db_path",
+                "context": "",
+            },
             "seed": seed,
         }
         print(json.dumps(return_json))
@@ -81,8 +122,9 @@ def main() -> int:
 
     open_close = bool(scenario.get("open_close", False))
     sql = scenario.get("sql")
+    failpoint = scenario.get("failpoint")
 
-    engine_result = run_engine(args.engine, db_path, sql, open_close)
+    engine_result = run_engine(args.engine, db_path, sql, open_close, failpoint)
     result = {
         "scenario": scenario.get("name", "unknown"),
         "seed": seed,

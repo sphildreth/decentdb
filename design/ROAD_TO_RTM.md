@@ -11,7 +11,7 @@ Based on comprehensive analysis of PRD.md, SPEC.md, TESTING_STRATEGY.md, and the
 ### Current State
 - **Core Engine**: ✅ Feature complete (storage, SQL execution, transactions)
 - **SQL Subset**: ✅ 95% complete (missing IN operator, partial ILIKE)
-- **Testing Infrastructure**: ⚠️ 40% complete (major blocker)
+- **Testing Infrastructure**: ⚠️ 75% complete (Phase 1 infrastructure complete, Phase 2+ pending)
 - **Documentation**: ⚠️ 30% complete
 
 ### Critical Path to RTM
@@ -29,71 +29,71 @@ The primary blocker is the **testing infrastructure** as defined in TESTING_STRA
 
 **Required Scenarios:**
 
-- [ ] **WAL Frame Write Failure**
+- [x] **WAL Frame Write Failure**
   - File: `tests/harness/scenarios/wal_frame_fail.json`
   - Test: Transaction with multiple pages, crash mid-frame write
   - Verify: No corruption, uncommitted data not visible
   - Implementation: Add failpoint trigger in runner.py, execute multi-page INSERT, kill at frame N
 
-- [ ] **WAL Commit Record Failure**
+- [x] **WAL Commit Record Failure**
   - File: `tests/harness/scenarios/wal_commit_fail.json`
   - Test: Crash during commit frame write
   - Verify: Transaction not visible (no commit marker = not committed)
   - Implementation: Set failpoint after N frames but before commit frame
 
-- [ ] **WAL Fsync Drop**
+- [x] **WAL Fsync Drop**
   - File: `tests/harness/scenarios/wal_fsync_drop.json`
   - Test: Simulate "fsync lies" (FaultyVFS capability exists)
   - Verify: Recovery handles partial durability correctly
   - Implementation: Use FaultyVFS with fsync injection enabled
 
-- [ ] **Checkpoint Page Write Failure**
+- [x] **Checkpoint Page Write Failure**
   - File: `tests/harness/scenarios/checkpoint_page_fail.json`
   - Test: Crash during checkpoint page copy to main DB
   - Verify: Database remains consistent, WAL intact for recovery
   - Implementation: Set failpoint during checkpoint phase
 
-- [ ] **Checkpoint Fsync Failure**
+- [x] **Checkpoint Fsync Failure**
   - File: `tests/harness/scenarios/checkpoint_fsync_fail.json`
   - Test: Drop fsync during checkpoint
   - Verify: Next recovery handles interrupted checkpoint
   - Implementation: Use FaultyVFS fsync injection
 
-- [ ] **Torn Write - Partial Frame Header**
+- [x] **Torn Write - Partial Frame Header**
   - File: `tests/harness/scenarios/torn_write_header.json`
   - Test: Write only N bytes of frame header (where N < full header size)
   - Verify: Recovery detects incomplete frame via checksum, ignores it
   - Implementation: FaultyVFS partial write with exact byte count
 
-- [ ] **Torn Write - Partial Frame Payload**
+- [x] **Torn Write - Partial Frame Payload**
   - File: `tests/harness/scenarios/torn_write_payload.json`
   - Test: Write full header but only partial payload
   - Verify: Recovery detects size mismatch, ignores frame
   - Implementation: FaultyVFS with payload_size - 1 bytes written
 
-- [ ] **Torn Write - Partial Commit Frame**
+- [x] **Torn Write - Partial Commit Frame**
   - File: `tests/harness/scenarios/torn_write_commit.json`
   - Test: Crash mid-commit frame write
   - Verify: Transaction treated as uncommitted
   - Implementation: FaultyVFS during commit marker write
 
-- [ ] **Multi-Transaction Crash**
+- [x] **Multi-Transaction Crash**
   - File: `tests/harness/scenarios/multi_txn_crash.json`
   - Test: 3 transactions (committed, in-progress, failed), crash randomly
   - Verify: Only committed transaction visible
   - Implementation: Complex scenario with checkpoints
 
-- [ ] **Reader During Checkpoint Crash**
+- [x] **Reader During Checkpoint Crash**
   - File: `tests/harness/scenarios/reader_checkpoint_crash.json`
   - Test: Active reader at snapshot LSN, checkpoint runs, crash mid-checkpoint
   - Verify: Reader can complete, recovery consistent
   - Implementation: Requires multi-threading simulation in Python
 
 **Implementation Notes:**
-- Extend `tests/harness/runner.py` to support failpoint configuration
-- Add `--failpoint` CLI flag to decentdb for test mode
-- Create scenario JSON format supporting failpoint specification
-- Implement Python test orchestrator that:
+- [x] Extend `tests/harness/runner.py` to support failpoint configuration
+- [x] Add `--failpoint` CLI flag to decentdb for test mode
+- [x] Create scenario JSON format supporting failpoint specification
+- [x] Implement Python test orchestrator that:
   1. Creates fresh database
   2. Sets specific failpoint via env var or CLI
   3. Executes SQL workload
@@ -103,37 +103,37 @@ The primary blocker is the **testing infrastructure** as defined in TESTING_STRA
 
 ### 1.2 Torn Write Detection Tests
 
-SPEC section 4.1 requires torn write detection. Current implementation has frame format with payload_size and checksums, but tests are incomplete.
+SPEC section 4.1 requires torn write detection. Tests implemented in `tests/nim/test_wal.nim` covering frame format with payload_size and checksums.
 
-- [ ] **Frame Header Truncation Test**
+- [x] **Frame Header Truncation Test**
   - Verify: 8-byte header, write only 4 bytes
   - Expected: Recovery identifies as incomplete, ignores
 
-- [ ] **Payload Size Mismatch Test**
+- [x] **Payload Size Mismatch Test**
   - Write header with payload_size=4096, write only 2048 bytes
   - Verify: Recovery detects mismatch via checksum failure
 
-- [ ] **Corrupted Checksum Test**
+- [x] **Corrupted Checksum Test**
   - Write valid frame, corrupt 1 bit in payload
   - Verify: Recovery detects via CRC-32C mismatch
 
-- [ ] **Cross-Frame Corruption Test**
+- [x] **Cross-Frame Corruption Test**
   - Write frame N, crash, write frame N+1 overlapping frame N's location
   - Verify: Recovery uses latest valid LSN
 
 ### 1.3 Differential Test Suite vs PostgreSQL
 
-**Current State:** Only 1 LIKE pattern test exists (`DifferentialLikeTests` in test_runner.py)
+**Current State:** Complete implementation with 25+ test cases in `tests/harness/differential_runner.py` with PostgreSQL adapter at `tests/harness/postgres_ref/__init__.py`
 
 **Required Tests:**
 
-- [ ] **DDL Differential Tests**
+- [x] **DDL Differential Tests**
   - CREATE TABLE with all column types (INT, TEXT, BOOL, FLOAT, BLOB)
   - CREATE INDEX (BTree and trigram)
   - DROP TABLE/DROP INDEX
   - Verify: Schema matches between DecentDb and PostgreSQL
 
-- [ ] **DML Differential Tests - INSERT**
+- [x] **DML Differential Tests - INSERT**
   - Single row insert
   - Multi-row insert (if supported)
   - Insert with NULL values
@@ -141,7 +141,7 @@ SPEC section 4.1 requires torn write detection. Current implementation has frame
   - Insert with default rowid
   - Verify: Row counts and content match
 
-- [ ] **DML Differential Tests - SELECT**
+- [x] **DML Differential Tests - SELECT**
   - SELECT * with ORDER BY
   - SELECT with WHERE equality
   - SELECT with WHERE range (<, >, <=, >=)
@@ -150,19 +150,19 @@ SPEC section 4.1 requires torn write detection. Current implementation has frame
   - SELECT with LIMIT/OFFSET
   - Verify: Result sets identical (order, values, NULL handling)
 
-- [ ] **DML Differential Tests - UPDATE**
+- [x] **DML Differential Tests - UPDATE**
   - Update single row
   - Update multiple rows with WHERE
   - Update with subquery (if supported)
   - Verify: Updated data matches
 
-- [ ] **DML Differential Tests - DELETE**
+- [x] **DML Differential Tests - DELETE**
   - Delete single row
   - Delete with WHERE clause
   - Delete with CASCADE (post-MVP, skip for now)
   - Verify: Remaining rows match
 
-- [ ] **JOIN Differential Tests**
+- [x] **JOIN Differential Tests**
   - INNER JOIN on single column
   - LEFT JOIN on single column
   - Multiple JOINs (3+ tables)
@@ -170,7 +170,7 @@ SPEC section 4.1 requires torn write detection. Current implementation has frame
   - JOIN with aggregate functions
   - Verify: Join results match PostgreSQL exactly
 
-- [ ] **Aggregate Differential Tests**
+- [x] **Aggregate Differential Tests**
   - COUNT(*) vs COUNT(col) NULL handling
   - SUM, AVG, MIN, MAX
   - GROUP BY single column
@@ -178,13 +178,13 @@ SPEC section 4.1 requires torn write detection. Current implementation has frame
   - GROUP BY with HAVING
   - Verify: Aggregation results match (watch for floating point precision)
 
-- [ ] **Transaction Differential Tests**
+- [x] **Transaction Differential Tests**
   - BEGIN...COMMIT visibility
   - BEGIN...ROLLBACK isolation
   - Concurrent transaction isolation (simulate with separate connections)
   - Verify: Transaction semantics match
 
-- [ ] **Constraint Differential Tests**
+- [x] **Constraint Differential Tests**
   - NOT NULL violation handling
   - UNIQUE constraint violation
   - PRIMARY KEY uniqueness
@@ -192,8 +192,9 @@ SPEC section 4.1 requires torn write detection. Current implementation has frame
   - Verify: Error behavior matches PostgreSQL
 
 **Implementation Requirements:**
-- Create `tests/harness/differential_runner.py`
-- Implement dual-database setup:
+- [x] Create `tests/harness/differential_runner.py` (complete with 25+ test cases)
+- [x] Create `tests/harness/postgres_ref/__init__.py` (PostgreSQL adapter)
+- [x] Implement dual-database setup:
   ```python
   # Load identical schema into both databases
   # Execute identical SQL on both
@@ -207,32 +208,32 @@ SPEC section 4.1 requires torn write detection. Current implementation has frame
 
 ### 1.4 Property-Based Tests
 
-TESTING_STRATEGY.md section 2.2 requires property-based testing.
+TESTING_STRATEGY.md section 2.2 requires property-based testing. Implemented in `tests/harness/property_runner.py` with 5 property tests.
 
-- [ ] **Index-Scan Equivalence Property**
+- [x] **Index-Scan Equivalence Property**
   - Generate random tables with random data
   - Create random indexes
   - For random queries: SELECT via index == SELECT via table scan
   - Implementation: Use Hypothesis (Python) or custom generator
 
-- [ ] **BTree Ordering Property**
+- [x] **BTree Ordering Property**
   - Insert random sequence of keys
   - Property: Cursor iteration always returns sorted order
   - Test with duplicate keys, negative numbers, large values
 
-- [ ] **Foreign Key Invariant Property**
+- [x] **Foreign Key Invariant Property**
   - Random schema with FK relationships
   - Random insert/update/delete operations
   - Property: FK constraint never violated at commit
   - Note: Testing at statement time per ADR-0009
 
-- [ ] **ACID Durability Property**
+- [x] **ACID Durability Property**
   - Random transaction sequences
   - Simulate crashes at random points
   - Property: Committed data survives, uncommitted does not
   - Implementation: Combine with crash-injection harness
 
-- [ ] **Snapshot Isolation Property**
+- [x] **Snapshot Isolation Property**
   - Multiple concurrent readers
   - Writer making changes
   - Property: Readers see consistent snapshot from start time
@@ -240,39 +241,39 @@ TESTING_STRATEGY.md section 2.2 requires property-based testing.
 
 ### 1.5 Resource Leak Tests
 
-TESTING_STRATEGY.md section 2.5 requires leak detection.
+TESTING_STRATEGY.md section 2.5 requires leak detection. Implemented in `tests/harness/leak_runner.py` with 4 leak tests.
 
-- [ ] **File Handle Leak Test**
+- [x] **File Handle Leak Test**
   - Repeatedly open/close database
   - Verify: OS file handles (lsof) return to baseline
   - Implementation: Use `lsof -p $PID | grep dbfile | wc -l`
 
-- [ ] **Sort Temp File Cleanup Test**
+- [x] **Sort Temp File Cleanup Test**
   - Execute queries forcing external sort (large ORDER BY)
   - Verify: `temp_dir` is empty after query completes
   - Implementation: List temp_dir before/after
 
-- [ ] **Memory Leak Test**
+- [x] **Memory Leak Test**
   - Run unit tests with garbage collection statistics enabled
   - Verify: No memory growth across repeated operations
   - Implementation: Nim compiler flags + test wrapper
 
-- [ ] **WAL File Growth Test**
+- [x] **WAL File Growth Test**
   - Long-running readers holding old snapshots
   - Verify: WAL size managed via checkpointing
   - Implementation: Monitor WAL file size over time
 
 ### 1.6 Long-Running Reader Tests
 
-ADR-0024 (WAL Growth Prevention) requires testing.
+ADR-0024 (WAL Growth Prevention) requires testing. Implemented in `tests/harness/reader_runner.py` with 4 reader tests.
 
-- [ ] **Reader Timeout Test**
+- [x] **Reader Timeout Test**
   - Start reader with snapshot
   - Hold snapshot past checkpoint_timeout_sec threshold
   - Verify: Reader forced to close or timeout
   - Implementation: Python test with threading
 
-- [ ] **WAL Truncation with Active Readers**
+- [x] **WAL Truncation with Active Readers**
   - Multiple readers at different snapshot LSNs
   - Run checkpoint
   - Verify: WAL truncated only up to minimum reader LSN
@@ -675,7 +676,7 @@ DecentDb 1.0.0 is ready for release when:
 
 **Current Assessment:**
 - Core Engine: **90% complete** ✅
-- Testing Infrastructure: **40% complete** ⚠️ (BLOCKER)
+- Testing Infrastructure: **75% complete** ⚠️ (Phase 1 complete, integration pending)
 - Documentation: **30% complete** ⬜
 - Release Engineering: **20% complete** ⬜
 

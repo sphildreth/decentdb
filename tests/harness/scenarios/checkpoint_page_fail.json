@@ -1,0 +1,16 @@
+{
+  "name": "checkpoint_page_fail",
+  "description": "Crash during checkpoint page copy to main DB",
+  "db_path": "$TMPDIR/decentdb_checkpoint_page_fail.db",
+  "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'test data')",
+  "sql": "PRAGMA checkpoint",
+  "failpoint": {
+    "label": "checkpoint_page",
+    "kind": "error"
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT * FROM test WHERE id = 1",
+    "expect_rows": ["1|test data"]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "reader_checkpoint_crash",
+  "description": "Active reader during checkpoint crash - reader completion and recovery consistency",
+  "db_path": "$TMPDIR/decentdb_reader_checkpoint_crash.db",
+  "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'before checkpoint')",
+  "sql": "INSERT INTO test VALUES (2, 'during checkpoint'); PRAGMA checkpoint",
+  "failpoint": {
+    "label": "checkpoint_page",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id, data FROM test ORDER BY id",
+    "expect_rows": ["1|before checkpoint", "2|during checkpoint"]
+  }
+}

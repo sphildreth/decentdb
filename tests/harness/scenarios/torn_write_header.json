@@ -1,0 +1,16 @@
+{
+  "name": "torn_write_header",
+  "description": "Write only N bytes of frame header - recovery should detect and ignore",
+  "db_path": "$TMPDIR/decentdb_torn_write_header.db",
+  "sql": "CREATE TABLE test (id INT PRIMARY KEY); INSERT INTO test VALUES (1)",
+  "failpoint": {
+    "label": "wal_frame",
+    "kind": "partial",
+    "bytes": 8
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT * FROM test",
+    "expect_rows": []
+  }
+}
