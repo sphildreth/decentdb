@@ -1,0 +1,54 @@
+#ifndef DECENTDB_H
+#define DECENTDB_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Opaque handles
+typedef struct decentdb_db decentdb_db;
+typedef struct decentdb_stmt decentdb_stmt;
+
+// Database lifecycle
+decentdb_db* decentdb_open(const char* path_utf8, const char* options_utf8);
+int decentdb_close(decentdb_db* db);
+
+// Error reporting
+int decentdb_last_error_code(decentdb_db* db);
+const char* decentdb_last_error_message(decentdb_db* db);
+
+// Prepared/streaming statements
+int decentdb_prepare(decentdb_db* db, const char* sql_utf8, decentdb_stmt** out_stmt);
+
+// Bind parameters: 1-based indexes match $1..$N
+int decentdb_bind_null(decentdb_stmt* stmt, int index_1_based);
+int decentdb_bind_int64(decentdb_stmt* stmt, int index_1_based, int64_t v);
+int decentdb_bind_float64(decentdb_stmt* stmt, int index_1_based, double v);
+int decentdb_bind_text(decentdb_stmt* stmt, int index_1_based, const char* utf8, int byte_len);
+int decentdb_bind_blob(decentdb_stmt* stmt, int index_1_based, const uint8_t* data, int byte_len);
+
+// Step rows: returns 1=row available, 0=done, <0=error
+int decentdb_step(decentdb_stmt* stmt);
+
+// Column metadata
+int decentdb_column_count(decentdb_stmt* stmt);
+const char* decentdb_column_name(decentdb_stmt* stmt, int col_0_based);
+int decentdb_column_type(decentdb_stmt* stmt, int col_0_based);
+
+// Column accessors (valid after step() returns 1)
+int decentdb_column_is_null(decentdb_stmt* stmt, int col_0_based);
+int64_t decentdb_column_int64(decentdb_stmt* stmt, int col_0_based);
+double decentdb_column_float64(decentdb_stmt* stmt, int col_0_based);
+const char* decentdb_column_text(decentdb_stmt* stmt, int col_0_based, int* out_byte_len);
+const uint8_t* decentdb_column_blob(decentdb_stmt* stmt, int col_0_based, int* out_byte_len);
+
+int64_t decentdb_rows_affected(decentdb_stmt* stmt);
+void decentdb_finalize(decentdb_stmt* stmt);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // DECENTDB_H

@@ -451,14 +451,16 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
     release(wal.indexLock)
   if not wal.index.hasKey(pageId):
     return none(seq[byte])
+
   let entries = wal.index[pageId]
   var bestLsn: uint64 = 0
   var bestOffset: int64 = -1
   for entry in entries:
     if entry.lsn <= snapshot and entry.lsn >= bestLsn:
+
       bestLsn = entry.lsn
       bestOffset = entry.offset
-  if bestLsn == 0 or bestOffset < 0:
+  if bestOffset < 0:
     return none(seq[byte])
   let frameRes = readFrame(wal.vfs, wal.file, bestOffset)
   if not frameRes.ok:
@@ -528,6 +530,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
     let idxEntry = WalIndexEntry(lsn: pageMeta[i][0], offset: pageMeta[i][1])
     writer.wal.index[entry[0]].add(idxEntry)
     writer.wal.dirtySinceCheckpoint[entry[0]] = idxEntry
+
   release(writer.wal.indexLock)
   writer.wal.walEnd.store(commitRes.value[0], moRelease)
   writer.active = false

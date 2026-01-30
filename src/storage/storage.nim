@@ -328,6 +328,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
       for g in grams:
         catalog.trigramBufferAdd(entry[0].name, g, rowid)
   table.nextRowId = rowid + 1
+  table.rootPage = tree.root
   discard catalog.saveTable(pager, table)
   ok(rowid)
 

@@ -190,6 +190,14 @@ proc decodeHeader*(buf: openArray[byte]): Result[DbHeader] =
     lastCheckpointLsn: readU64LE(buf, 48)
   ))
 
+proc decodeHeader*(buf: string): Result[DbHeader] =
+  if buf.len < HeaderSize:
+    return err[DbHeader](ERR_CORRUPTION, "Header too short", "page_id=1")
+  # Convert string to openArray[byte]
+  var bytes = newSeq[byte](buf.len)
+  if buf.len > 0: copyMem(addr bytes[0], unsafeAddr buf[0], buf.len)
+  decodeHeader(bytes)
+
 proc readHeader*(vfs: Vfs, file: VfsFile): Result[DbHeader] =
   var buf = newSeq[byte](HeaderSize)
   let res = vfs.read(file, 0, buf)

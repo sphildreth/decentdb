@@ -62,7 +62,8 @@ proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)]
   if page.len < 8:
     return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Page too small")
   if byte(page[0]) != PageTypeInternal:
-    return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Not an internal page")
+    # stderr.writeLine("FAIL: Not an internal page (type=" & $int(byte(page[0])) & ") ...")
+    return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Not an internal page (type=" & $int(byte(page[0])) & ")")
   let count = int(readU16LE(page, 2))
   let rightChild = readU32LE(page, 4)
   var keys: seq[uint64] = @[]

@@ -5,7 +5,7 @@
 import cligen
 import ./decentdb_cli
 
-const Version = "1.0.0"
+const Version = "0.0.1"
 
 when isMainModule:
   dispatchMulti(
@@ -30,7 +30,10 @@ when isMainModule:
        "verbose": "Include verbose diagnostics (LSN, readers, cache) in output",
        "checkpointBytes": "Auto-checkpoint when WAL reaches N bytes",
        "checkpointMs": "Auto-checkpoint when N milliseconds elapse since last checkpoint",
-       "format": "Output format: json, csv, table (default: json)",
+       "readerWarnMs": "Warn when readers are older than N milliseconds (0 = disabled)",
+       "readerTimeoutMs": "Abort/truncate for readers older than N milliseconds (0 = disabled)",
+       "forceTruncateOnTimeout": "Force WAL truncation when readerTimeoutMs triggers (dangerous; use for testing)",
+       "format": "Output format: json, csv, table (default: json). Note: timing/warnings/verbose currently require json",
        "params": "Bind parameters in order (repeatable). Use type:value, e.g. int:1, text:hi, null",
        "walFailpoints": "Set WAL failpoints (repeatable). Format: label:kind[:bytes][:count]",
        "clearWalFailpoints": "Clear all WAL failpoints before executing"

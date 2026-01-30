@@ -481,6 +481,12 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
                 state.max = val
             state.initialized = true
     groups[key] = state
+  
+  if rows.len == 0 and groupBy.len == 0:
+    # Scalar aggregate on empty set
+    groups[""] = AggState()
+    groupRows[""] = Row(columns: @[], values: @[])
+
   var resultRows: seq[Row] = @[]
   for key, state in groups:
     var cols: seq[string] = @[]

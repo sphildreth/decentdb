@@ -16,8 +16,6 @@ import ./storage/storage
 import ./wal/wal
 import ./vfs/os_vfs
 
-const Version = "0.0.1"
-
 # Helper to convert JSON to Result for consistent output format
 proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): JsonNode =
   let errorNode = if ok: newJNull() else: errorToJson(err)
@@ -362,10 +360,9 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
               readerWarnMs: int = 0, readerTimeoutMs: int = 0, forceTruncateOnTimeout: bool = false,
               format: string = "json", params: seq[string] = @[],
               walFailpoints: seq[string] = @[], clearWalFailpoints: bool = false): int =
-  ## DecentDb CLI v0.0.1 - ACID-first embedded relational database
-  ## 
   ## Execute SQL statements against a DecentDb database file.
-  ## All output is JSON formatted for programmatic use.
+  ## Output can be rendered as json/csv/table depending on --format.
+  ## (Some diagnostic modes like timing/warnings/verbose currently require json.)
   
   let startTime = if timing: epochTime() else: 0.0
   
