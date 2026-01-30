@@ -26,8 +26,10 @@ COVERAGE_FLAGS=(
 TESTS=(
   tests/nim/test_faulty_vfs.nim
   tests/nim/test_db_header.nim
+  tests/nim/test_db_header_extended.nim
   tests/nim/test_pager.nim
   tests/nim/test_record.nim
+  tests/nim/test_record_extended.nim
   tests/nim/test_btree.nim
   tests/nim/test_wal.nim
   tests/nim/test_wal_extra.nim
@@ -53,6 +55,11 @@ TESTS=(
   tests/nim/test_exec_comprehensive.nim
   tests/nim/test_storage_deep.nim
   tests/nim/test_vfs_comprehensive.nim
+  tests/nim/test_errors.nim
+  tests/nim/test_errors_extended.nim
+  tests/nim/test_vfs_types.nim
+  tests/nim/test_search_extended.nim
+  tests/nim/test_pg_query_ffi.nim
 )
 
 for test in "${TESTS[@]}"; do
