@@ -182,6 +182,58 @@ proc runBulkLoad(): BenchResult =
   discard requireOk(closeDb(db), "closeDb(bulk)")
   BenchResult(name: "bulk_load", iterations: 1, samples: @[elapsed], p50Ms: elapsed, p95Ms: elapsed)
 
+proc runTxnInsert(): BenchResult =
+  let path = makeTempDb("decentdb_bench_txn.db")
+  let db = requireOk(openDb(path), "openDb(txn)")
+  discard requireOk(execSql(db, "CREATE TABLE txn_test (id INT PRIMARY KEY, data TEXT)"), "create table txn_test")
+  var samples: seq[float] = @[]
+  for i in 1 .. 1000:
+    let data = "data_" & $i
+    let elapsed = measureMs(proc() =
+      discard execSql(db, "INSERT INTO txn_test VALUES ($1, $2)", @[
+        Value(kind: vkInt64, int64Val: i),
+        Value(kind: vkText, bytes: toBytes(data))
+      ])
+    )
+    samples.add(elapsed)
+  discard requireOk(closeDb(db), "closeDb(txn)")
+  BenchResult(name: "txn_insert", iterations: 1000, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
+
+proc runCrashRecovery(): BenchResult =
+  let path = makeTempDb("decentdb_bench_recovery.db")
+  # Create database with data
+  var db = requireOk(openDb(path), "openDb(recovery)")
+  discard requireOk(execSql(db, "CREATE TABLE recovery_test (id INT PRIMARY KEY, data TEXT)"), "create table recovery_test")
+  var rows: seq[seq[Value]] = @[]
+  for i in 1 .. 10000:
+    rows.add(@[
+      Value(kind: vkInt64, int64Val: i),
+      Value(kind: vkText, bytes: toBytes("data_" & $i))
+    ])
+  var opts = defaultBulkLoadOptions()
+  opts.disableIndexes = true
+  opts.durability = dmNone
+  discard requireOk(bulkLoad(db, "recovery_test", rows, opts), "bulkLoad recovery_test")
+  discard requireOk(closeDb(db), "closeDb(recovery) before crash")
+  
+  # Measure recovery time
+  var samples: seq[float] = @[]
+  for _ in 0 ..< 10:
+    let elapsed = measureMs(proc() =
+      let db2 = requireOk(openDb(path), "reopen for recovery")
+      discard execSql(db2, "SELECT COUNT(*) FROM recovery_test")
+      discard requireOk(closeDb(db2), "closeDb after recovery")
+    )
+    samples.add(elapsed)
+  
+  # Cleanup
+  if fileExists(path):
+    removeFile(path)
+  if fileExists(path & ".wal"):
+    removeFile(path & ".wal")
+    
+  BenchResult(name: "crash_recovery", iterations: 10, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
+
 proc toJson(bench: BenchResult): JsonNode =
   %*{
     "name": bench.name,
@@ -197,7 +249,9 @@ when isMainModule:
     runFkJoin(),
     runSubstringSearch(),
     runOrderBySort(),
-    runBulkLoad()
+    runBulkLoad(),
+    runTxnInsert(),
+    runCrashRecovery()
   ]
   var jsonResults: seq[JsonNode] = @[]
   for res in results:

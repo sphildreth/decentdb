@@ -671,3 +671,82 @@ proc deleteKeyValue*(tree: BTree, key: uint64, value: seq[byte]): Result[bool] =
         return ok(true)
     current = nextLeaf
   ok(false)
+
+# Page utilization monitoring for B+Tree space management (SPEC section 17.2)
+proc calculatePageUtilization*(tree: BTree, pageId: PageId): Result[float] =
+  ## Calculate utilization percentage for a single page
+  ## Returns 0.0-100.0 representing percentage of page used
+  let pageRes = readPageRo(tree.pager, pageId)
+  if not pageRes.ok:
+    return err[float](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  
+  let page = pageRes.value
+  if page.len == 0:
+    return ok(0.0)
+  
+  let pageType = byte(page[0])
+  var usedBytes = 8  # Header: type(1) + padding(1) + count(2) + next/right(4)
+  
+  if pageType == PageTypeLeaf:
+    let parsed = readLeafCells(page)
+    if not parsed.ok:
+      return err[float](parsed.err.code, parsed.err.message, parsed.err.context)
+    let (keys, values, overflows, _) = parsed.value
+    # Each leaf cell: key(8) + value_len(4) + overflow(4) = 16 bytes header + value data
+    for i in 0 ..< keys.len:
+      usedBytes += 16 + values[i].len
+  elif pageType == PageTypeInternal:
+    let parsed = readInternalCells(page)
+    if not parsed.ok:
+      return err[float](parsed.err.code, parsed.err.message, parsed.err.context)
+    let (keys, children, _) = parsed.value
+    # Each internal cell: key(8) + child(4) = 12 bytes
+    usedBytes += keys.len * 12
+  
+  let utilization = (float(usedBytes) / float(page.len)) * 100.0
+  ok(utilization)
+
+proc calculateTreeUtilization*(tree: BTree): Result[float] =
+  ## Calculate average utilization for entire B+Tree
+  ## Traverses all pages and returns average utilization percentage
+  var totalUtilization = 0.0
+  var pageCount = 0
+  var visitedPages: seq[PageId] = @[]
+  var pagesToVisit: seq[PageId] = @[tree.root]
+  
+  while pagesToVisit.len > 0:
+    let pageId = pagesToVisit.pop()
+    if pageId in visitedPages:
+      continue
+    visitedPages.add(pageId)
+    
+    let utilRes = calculatePageUtilization(tree, pageId)
+    if utilRes.ok:
+      totalUtilization += utilRes.value
+      pageCount += 1
+    
+    # Read page to find child pages
+    let pageRes = readPageRo(tree.pager, pageId)
+    if pageRes.ok:
+      let page = pageRes.value
+      if page.len > 0 and byte(page[0]) == PageTypeInternal:
+        let internalRes = readInternalCells(page)
+        if internalRes.ok:
+          let (_, children, rightChild) = internalRes.value
+          for child in children:
+            if child != 0 and PageId(child) notin visitedPages:
+              pagesToVisit.add(PageId(child))
+          if rightChild != 0 and PageId(rightChild) notin visitedPages:
+            pagesToVisit.add(PageId(rightChild))
+  
+  if pageCount == 0:
+    return ok(0.0)
+  ok(totalUtilization / float(pageCount))
+
+proc needsCompaction*(tree: BTree, threshold: float = 50.0): Result[bool] =
+  ## Check if B+Tree needs compaction based on utilization threshold
+  ## Default threshold is 50% per SPEC section 17.2
+  let utilRes = calculateTreeUtilization(tree)
+  if not utilRes.ok:
+    return err[bool](utilRes.err.code, utilRes.err.message, utilRes.err.context)
+  ok(utilRes.value < threshold)
