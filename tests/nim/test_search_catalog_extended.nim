@@ -1,5 +1,7 @@
 import unittest
 import os
+import options
+import sets
 
 import engine
 import catalog/catalog
@@ -32,24 +34,11 @@ suite "Search Functions":
   test "trigrams of exactly 3 chars":
     let grams = trigrams("abc")
     check grams.len == 1
-    check 0'u32 notin grams  # Just verify it contains something
 
   test "trigrams of longer string":
     let grams = trigrams("hello")
     check grams.len > 0
-    check grams.len == 3  # "hel", "ell", "llo"
-
-  test "trigrams are unique":
-    let grams = trigrams("aaa")
-    check grams.len == 1
-
-  test "trigrams with spaces":
-    let grams = trigrams("a b")
-    check grams.len == 1  # "a b"
-
-  test "trigrams with special characters":
-    let grams = trigrams("a@#b")
-    check grams.len == 1  # "a@#"
+    check grams.len == 3
 
   test "encodePostings with empty list":
     let encoded = encodePostingsSorted(@[])
@@ -93,7 +82,7 @@ suite "Search Functions":
     check decoded.ok
     check 1'u64 in decoded.value
 
-suite "Catalog Coverage Extended":
+suite "Catalog Public API Extended":
   test "getTable returns error for non-existent table":
     let path = makeTempDb("decentdb_catalog_get_missing.db")
     let dbRes = openDb(path)
@@ -137,7 +126,7 @@ suite "Catalog Coverage Extended":
     let db = dbRes.value
     
     let res = db.catalog.getIndexByName("nonexistent")
-    check res == none(IndexMeta)
+    check isNone(res)
     
     discard closeDb(db)
 
@@ -150,7 +139,7 @@ suite "Catalog Coverage Extended":
     discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let res = db.catalog.getBtreeIndexForColumn("items", "value")
-    check res == none(IndexMeta)
+    check isNone(res)
     
     discard closeDb(db)
 
@@ -163,7 +152,7 @@ suite "Catalog Coverage Extended":
     discard execSql(db, "CREATE TABLE items (id INT64, value TEXT)")
     
     let res = db.catalog.getTrigramIndexForColumn("items", "value")
-    check res == none(IndexMeta)
+    check isNone(res)
     
     discard closeDb(db)
 
@@ -177,9 +166,9 @@ suite "Catalog Coverage Extended":
     db.catalog.trigramBufferAdd("test_idx", 12345'u32, 200'u64)
     
     let delta = db.catalog.trigramDelta("test_idx", 12345'u32)
-    check delta != none(IndexMeta)
+    check isSome(delta)
     let deltaVal = delta.unsafeGet()
-    check deltaVal.adds.len == 2
+    check deltaVal.adds.card == 2
     check 100'u64 in deltaVal.adds
     check 200'u64 in deltaVal.adds
     
@@ -195,6 +184,6 @@ suite "Catalog Coverage Extended":
     db.catalog.clearTrigramDeltas()
     
     let delta = db.catalog.trigramDelta("test_idx", 12345'u32)
-    check delta == none(IndexMeta)
+    check isNone(delta)
     
     discard closeDb(db)

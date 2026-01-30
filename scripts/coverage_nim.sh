@@ -66,6 +66,10 @@ TESTS=(
   tests/nim/test_btree_error_paths.nim
   tests/nim/test_parser_binder_errors.nim
   tests/nim/test_planner_error_paths.nim
+  tests/nim/test_planner_coverage.nim
+  tests/nim/test_search_catalog_extended.nim
+  tests/nim/test_uplift.nim
+  tests/nim/test_engine_helpers.nim
 )
 
 for test in "${TESTS[@]}"; do
