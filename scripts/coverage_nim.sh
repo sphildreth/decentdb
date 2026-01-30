@@ -35,12 +35,16 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# Use a shared nimcache so modules are compiled once and reused across test binaries.
-# This makes coverage runs dramatically faster while keeping per-test execution.
+echo "Discovered ${#TESTS[@]} Nim tests"
+
+# In single-binary mode we can safely use a shared nimcache.
+# In multi-binary mode, sharing a nimcache can produce gcov checksum mismatches
+# because the generated C/obj artifacts can differ per main module.
 SHARED_CACHE_DIR="$NIMCACHE_ROOT/shared"
 mkdir -p "$SHARED_CACHE_DIR"
 
 MODE="${COVERAGE_MODE:-single}"
+echo "Coverage mode: $MODE"
 
 if [[ "$MODE" == "single" ]]; then
   RUNNER="$BUILD_DIR/all_tests_runner.nim"
@@ -53,19 +57,27 @@ if [[ "$MODE" == "single" ]]; then
 
   # Ensure the runner can import modules from tests/nim.
   nim c -r "${COVERAGE_FLAGS[@]}" --path:"$ROOT/tests/nim" --nimcache:"$SHARED_CACHE_DIR" "$RUNNER"
+
+  while IFS= read -r -d '' obj; do
+    obj_dir="$(dirname "$obj")"
+    (cd "$GCOV_DIR" && gcov -o "$obj_dir" "$obj" >/dev/null)
+  done < <(find "$SHARED_CACHE_DIR" -name '*.c.o' -print0)
 elif [[ "$MODE" == "multi" ]]; then
   for test in "${TESTS[@]}"; do
-    nim c -r "${COVERAGE_FLAGS[@]}" --nimcache:"$SHARED_CACHE_DIR" "$ROOT/$test"
+    name="$(basename "$test" .nim)"
+    cache_dir="$NIMCACHE_ROOT/$name"
+    out_dir="$GCOV_DIR/$name"
+    mkdir -p "$cache_dir" "$out_dir"
+    nim c -r "${COVERAGE_FLAGS[@]}" --nimcache:"$cache_dir" "$ROOT/$test"
+    while IFS= read -r -d '' obj; do
+      obj_dir="$(dirname "$obj")"
+      (cd "$out_dir" && gcov -o "$obj_dir" "$obj" >/dev/null)
+    done < <(find "$cache_dir" -name '*.c.o' -print0)
   done
 else
   echo "Unknown COVERAGE_MODE='$MODE' (expected 'single' or 'multi')" >&2
   exit 2
 fi
-
-while IFS= read -r -d '' obj; do
-  obj_dir="$(dirname "$obj")"
-  (cd "$GCOV_DIR" && gcov -o "$obj_dir" "$obj" >/dev/null)
-done < <(find "$SHARED_CACHE_DIR" -name '*.c.o' -print0)
 
 python "$ROOT/scripts/coverage_summary.py" "$GCOV_DIR" "$ROOT" "$SUMMARY" "$SUMMARY_JSON"
 
