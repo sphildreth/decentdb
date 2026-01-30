@@ -66,11 +66,19 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
   j == p.len
 
 const MaxLikePatternLen* = 4096
+const MaxLikeWildcards* = 128
 
 proc likeMatchChecked*(text: string, pattern: string, caseInsensitive: bool): Result[bool] =
   ## Guardrails to prevent pathological LIKE inputs from monopolizing CPU/memory.
   if pattern.len > MaxLikePatternLen:
     return err[bool](ERR_SQL, "LIKE pattern too long", "len=" & $pattern.len)
+  # Count wildcards to prevent excessive backtracking
+  var wildcardCount = 0
+  for ch in pattern:
+    if ch == '%':
+      wildcardCount.inc
+  if wildcardCount > MaxLikeWildcards:
+    return err[bool](ERR_SQL, "LIKE pattern has too many wildcards", "count=" & $wildcardCount)
   ok(likeMatch(text, pattern, caseInsensitive))
 
 proc makeRow*(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =

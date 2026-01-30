@@ -41,6 +41,7 @@ method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[Vfs
   ok(vf)
 
 method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte]): Result[int] =
+  ## Read without lock - pread is thread-safe and position-independent.
   if buf.len == 0:
     return ok(0)
   try:
@@ -64,6 +65,7 @@ method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte])
     err[int](ERR_IO, "Read failed", file.path)
 
 method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Result[int] =
+  ## Read without lock - pread is thread-safe and position-independent.
   if buf.len == 0:
     return ok(0)
   try:
