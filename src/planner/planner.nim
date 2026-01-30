@@ -107,6 +107,10 @@ proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
   of ekFunc:
     for a in expr.args:
       referencedTables(a, tablesOut)
+  of ekInList:
+    referencedTables(expr.inExpr, tablesOut)
+    for item in expr.inList:
+      referencedTables(item, tablesOut)
   else:
     discard
 

@@ -27,6 +27,7 @@ type ExprKind* = enum
   ekUnary
   ekFunc
   ekParam
+  ekInList
 
 type Expr* = ref object
   case kind*: ExprKind
@@ -48,6 +49,9 @@ type Expr* = ref object
     isStar*: bool
   of ekParam:
     index*: int
+  of ekInList:
+    inExpr*: Expr
+    inList*: seq[Expr]
 
 type ColumnDef* = object
   name*: string
@@ -266,6 +270,28 @@ proc parseAExpr(node: JsonNode): Result[Expr] =
     op = "LIKE"
   elif op == "~~*":
     op = "ILIKE"
+  
+  # Check for IN expression (kind = 10 for AEXPR_IN in PostgreSQL)
+  let kindNode = nodeGet(node, "kind")
+  if kindNode.kind == JInt and kindNode.getInt == 10:
+    # This is an IN expression
+    let leftRes = parseExprNode(nodeGet(node, "lexpr"))
+    if not leftRes.ok:
+      return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    
+    # Parse the list of values from rexpr
+    var inList: seq[Expr] = @[]
+    let rexpr = nodeGet(node, "rexpr")
+    if rexpr.kind == JArray:
+      for item in rexpr:
+        let itemRes = parseExprNode(item)
+        if not itemRes.ok:
+          return err[Expr](itemRes.err.code, itemRes.err.message, itemRes.err.context)
+        inList.add(itemRes.value)
+    
+    return ok(Expr(kind: ekInList, inExpr: leftRes.value, inList: inList))
+  
+  # Regular binary expression
   let leftRes = parseExprNode(nodeGet(node, "lexpr"))
   if not leftRes.ok:
     return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)

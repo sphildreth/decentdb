@@ -94,6 +94,17 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
       if not res.ok:
         return res
     okVoid()
+  of ekInList:
+    # Bind the expression being tested
+    let exprRes = bindExpr(map, expr.inExpr)
+    if not exprRes.ok:
+      return exprRes
+    # Bind all values in the IN list
+    for item in expr.inList:
+      let itemRes = bindExpr(map, item)
+      if not itemRes.ok:
+        return itemRes
+    okVoid()
   else:
     okVoid()
 

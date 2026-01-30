@@ -241,6 +241,28 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:
     return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
+  of ekInList:
+    # Evaluate the expression being tested
+    let exprRes = evalExpr(row, expr.inExpr, params)
+    if not exprRes.ok:
+      return err[Value](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+    
+    # If the expression is NULL, result is NULL (3-valued logic)
+    if exprRes.value.kind == vkNull:
+      return ok(Value(kind: vkNull))
+    
+    # Check if value matches any item in the IN list
+    for item in expr.inList:
+      let itemRes = evalExpr(row, item, params)
+      if not itemRes.ok:
+        return err[Value](itemRes.err.code, itemRes.err.message, itemRes.err.context)
+      
+      # Compare values
+      if compareValues(exprRes.value, itemRes.value) == 0:
+        return ok(Value(kind: vkBool, boolVal: true))
+    
+    # No match found
+    return ok(Value(kind: vkBool, boolVal: false))
 
 proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: string): Result[seq[Row]] =
   let tableRes = catalog.getTable(tableName)
