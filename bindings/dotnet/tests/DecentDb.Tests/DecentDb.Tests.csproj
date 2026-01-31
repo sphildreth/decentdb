@@ -19,5 +19,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\DecentDb.AdoNet\DecentDb.AdoNet.csproj" />
+    <ProjectReference Include="..\..\src\DecentDb.MicroOrm\DecentDb.MicroOrm.csproj" />
   </ItemGroup>
 </Project>
