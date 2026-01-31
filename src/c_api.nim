@@ -20,6 +20,7 @@ type
     db: Db
     lastErrorCode: int
     lastErrorMessage: string
+    lastErrorMessageC: cstring
 
   DecentdbValueView = object
     kind: cint
@@ -47,6 +48,7 @@ type
 
 var globalLastErrorCode {.threadvar.}: int
 var globalLastErrorMessage {.threadvar.}: string
+var globalLastErrorMessageC {.threadvar.}: cstring
 
 # Forward declarations (this module is compiled single-pass).
 proc setGlobalError(code: ErrorCode, msg: string)
@@ -54,6 +56,10 @@ proc clearGlobalError()
 
 proc setError(h: DbHandle, code: ErrorCode, msg: string)
 proc clearError(h: DbHandle)
+
+proc toApiCode(code: ErrorCode): int {.inline.} =
+  ## C API error codes reserve 0 for OK; internal ErrorCode starts at 0.
+  int(code) + 1
 
 proc allocSharedCString(s: string, outLen: ptr cint): cstring =
   ## Allocate a NUL-terminated string via shared allocator so FFI callers
@@ -130,21 +136,35 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
   return allocSharedCString(payload, out_len)
 
 proc setGlobalError(code: ErrorCode, msg: string) =
-  globalLastErrorCode = int(code)
+  globalLastErrorCode = toApiCode(code)
   globalLastErrorMessage = msg
+  if globalLastErrorMessageC != nil:
+    deallocShared(globalLastErrorMessageC)
+    globalLastErrorMessageC = nil
+  globalLastErrorMessageC = allocSharedCString(msg, nil)
 
 proc clearGlobalError() =
   globalLastErrorCode = 0
   globalLastErrorMessage = ""
+  if globalLastErrorMessageC != nil:
+    deallocShared(globalLastErrorMessageC)
+    globalLastErrorMessageC = nil
 
 proc setError(h: DbHandle, code: ErrorCode, msg: string) =
-  h.lastErrorCode = int(code)
+  h.lastErrorCode = toApiCode(code)
   h.lastErrorMessage = msg
+  if h.lastErrorMessageC != nil:
+    deallocShared(h.lastErrorMessageC)
+    h.lastErrorMessageC = nil
+  h.lastErrorMessageC = allocSharedCString(msg, nil)
   setGlobalError(code, msg)
 
 proc clearError(h: DbHandle) =
   h.lastErrorCode = 0
   h.lastErrorMessage = ""
+  if h.lastErrorMessageC != nil:
+    deallocShared(h.lastErrorMessageC)
+    h.lastErrorMessageC = nil
   clearGlobalError()
 
 proc parseCachePages(options: string): int =
@@ -215,13 +235,14 @@ proc decentdb_open*(path: cstring, options: cstring): pointer {.exportc, cdecl, 
     return nil
 
   clearGlobalError()
-  let handle = DbHandle(db: res.value, lastErrorCode: 0, lastErrorMessage: "")
+  let handle = DbHandle(db: res.value, lastErrorCode: 0, lastErrorMessage: "", lastErrorMessageC: nil)
   GC_ref(handle)
   return cast[pointer](handle)
 
 proc decentdb_close*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil: return 0
   let handle = cast[DbHandle](p)
+  handle.clearError()
   if handle.db != nil:
     discard closeDb(handle.db)
 
@@ -236,9 +257,9 @@ proc decentdb_last_error_code*(p: pointer): cint {.exportc, cdecl, dynlib.} =
 
 proc decentdb_last_error_message*(p: pointer): cstring {.exportc, cdecl, dynlib.} =
   if p == nil:
-    return cstring(globalLastErrorMessage)
+    return globalLastErrorMessageC
   let handle = cast[DbHandle](p)
-  return cstring(handle.lastErrorMessage)
+  return handle.lastErrorMessageC
 
 proc findMaxParam(stmt: Statement): int =
   var maxIdx = 0
@@ -283,17 +304,17 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
   let parseRes = parseSql($sql_text)
   if not parseRes.ok:
     db_handle.setError(parseRes.err.code, parseRes.err.message)
-    return cint(parseRes.err.code)
+    return cint(toApiCode(parseRes.err.code))
   
   if parseRes.value.statements.len == 0:
     db_handle.setError(ERR_SQL, "No SQL statement found")
-    return cint(ERR_SQL)
+    return cint(toApiCode(ERR_SQL))
   
   let stmt = parseRes.value.statements[0]
   let bindRes = bindStatement(db_handle.db.catalog, stmt)
   if not bindRes.ok:
     db_handle.setError(bindRes.err.code, "Bind failure: " & bindRes.err.message)
-    return cint(bindRes.err.code)
+    return cint(toApiCode(bindRes.err.code))
   
   let bound = bindRes.value
   var plan: Plan = nil
@@ -303,7 +324,7 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
     let planRes = planner.plan(db_handle.db.catalog, bound)
     if not planRes.ok:
       db_handle.setError(planRes.err.code, planRes.err.message)
-      return cint(planRes.err.code)
+      return cint(toApiCode(planRes.err.code))
     plan = planRes.value
     
     if bound.selectItems.len == 1 and bound.selectItems[0].isStar:
