@@ -36,6 +36,32 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
+- 📊 **Aggregate Functions** - Built-in COUNT, SUM, AVG, MIN, MAX for data analysis
+- 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
+- 🛠️ **Rich CLI Tool** - Unified command-line interface for all database operations
+- 📈 **Performance Benchmarks** - Built-in benchmarking tools for performance monitoring
+- 📁 **Import/Export Tools** - CSV and JSON data import/export capabilities
+- ⚡ **Bulk Load Operations** - Optimized high-performance data loading
+- 🧰 **Maintenance Utilities** - Checkpoint, stats, verification, and rebuild tools
+- 🔍 **Schema Introspection** - List tables, describe structures, and index inspection
+- 📋 **Multiple Output Formats** - JSON, CSV, and table format support for query results
+- 🧩 **Parameterized Queries** - Safe parameter binding to prevent SQL injection
+- 🧮 **Mathematical Operations** - Support for arithmetic expressions and calculations
+- 📅 **Date/Time Functions** - Built-in temporal data handling capabilities
+- 🏷️ **Type Safety** - Strong typing with automatic type coercion
+- 🧱 **Modular Architecture** - Clean separation of concerns for maintainability
+- 🌐 **Cross-Platform** - Runs on Linux, macOS, and Windows
+- 🧬 **WAL Checkpointing** - Automatic and manual WAL management for optimal performance
+- 🛡️ **Memory Safety** - Robust error handling with specific error codes
+- 🧹 **Automatic Cleanup** - Page cache management and resource deallocation
+- 📦 **Single File Database** - Portable database stored in a single file
+- 🧭 **External Merge Sort** - Efficient sorting for large datasets exceeding memory limits
+- 🧷 **Constraint Enforcement** - Primary key, unique, and not-null constraint validation
+- 🧩 **C API Bindings** - Native C interface for integration with other languages
+- 🧮 **Expression Evaluation** - Runtime evaluation of complex SQL expressions
+- 🧾 **Transaction Support** - BEGIN, COMMIT, ROLLBACK for atomic operations
+- 🧬 **Overflow Page Handling** - Support for large values exceeding page size
+- 🧭 **LRU Page Eviction** - Efficient cache management policy
 
 ## Languages/Toolkits/SDKs
 

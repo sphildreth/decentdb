@@ -1,5 +1,6 @@
 import pytest
 from sqlalchemy import create_engine, text, select, inspect, MetaData, Table, Column, Integer, String
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.orm import Session, declarative_base, Mapped, mapped_column
 
 Base = declarative_base()
@@ -98,3 +99,26 @@ def test_limit_offset(db_path):
         assert len(rows) == 3
         assert rows[0][0] == 2
         assert rows[2][0] == 4
+
+def test_reflection_table_names_and_columns(db_path):
+    engine = create_engine(f"decentdb+pysql:///{db_path}")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE users (id INT64, name TEXT)"))
+        conn.commit()
+
+    insp = inspect(engine)
+    names = insp.get_table_names()
+    assert "users" in names
+    assert insp.has_table("users") is True
+
+    cols = insp.get_columns("users")
+    assert [c["name"] for c in cols] == ["id", "name"]
+
+def test_returning_not_supported(db_path):
+    engine = create_engine(f"decentdb+pysql:///{db_path}")
+    metadata = MetaData()
+    t = Table("items", metadata, Column("id", Integer), Column("val", String))
+
+    stmt = t.insert().values(id=1, val="x").returning(t.c.id)
+    with pytest.raises(sa_exc.CompileError):
+        str(stmt.compile(dialect=engine.dialect))

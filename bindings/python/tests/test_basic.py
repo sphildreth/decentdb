@@ -58,6 +58,37 @@ def test_parameters(db_path):
     
     conn.close()
 
+def test_parameters_reject_mixed_styles(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE foo (id INT64, val TEXT)")
+    conn.commit()
+
+    # Named params + qmark placeholders
+    with pytest.raises(decentdb.ProgrammingError):
+        cur.execute("SELECT * FROM foo WHERE id = ? AND val = :val", {"val": "x"})
+
+    # Positional params + named placeholders
+    with pytest.raises(decentdb.ProgrammingError):
+        cur.execute("SELECT * FROM foo WHERE id = :id", (1,))
+
+    conn.close()
+
+def test_parameters_named_reuse(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE foo (id INT64, val TEXT)")
+    cur.execute("INSERT INTO foo VALUES (1, 'a')")
+    cur.execute("INSERT INTO foo VALUES (2, 'b')")
+    conn.commit()
+
+    # The same named parameter appears multiple times; it should map to one $N.
+    cur.execute("SELECT id FROM foo WHERE id = :target OR id = :target ORDER BY id", {"target": 2})
+    rows = cur.fetchall()
+    assert rows == [(2,)]
+
+    conn.close()
+
 def test_fetchmany(db_path):
     conn = decentdb.connect(db_path)
     cur = conn.cursor()
@@ -104,4 +135,18 @@ def test_types(db_path):
     assert row[4] is True
     assert row[5] is None
     
+    conn.close()
+
+def test_error_includes_sql_and_code(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+
+    with pytest.raises(decentdb.ProgrammingError) as excinfo:
+        cur.execute("SELEC 1")
+
+    msg = str(excinfo.value)
+    assert "Context:" in msg
+    assert "native_code" in msg
+    assert "\"sql\":" in msg
+
     conn.close()

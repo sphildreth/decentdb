@@ -25,6 +25,10 @@ class DecentDbCompiler(compiler.SQLCompiler):
                 text += " OFFSET " + self.process(select._offset_clause, **kw)
         return text
 
+    def returning_clause(self, stmt, returning_cols, **kw):
+        # DecentDB MVP does not support RETURNING.
+        raise exc.CompileError("DecentDB does not support RETURNING")
+
 class DecentDbTypeCompiler(compiler.GenericTypeCompiler):
     def visit_integer(self, type_, **kw):
         return "INT64"
@@ -84,6 +88,9 @@ class DecentDbDialect(default.DefaultDialect):
     supports_unicode_binds = True
     supports_statement_cache = True
     supports_native_boolean = True
+
+    # Prevent SQLAlchemy from emitting implicit RETURNING.
+    implicit_returning = False
     
     default_paramstyle = "qmark"
 
@@ -126,9 +133,63 @@ class DecentDbDialect(default.DefaultDialect):
         if level != "SNAPSHOT":
             raise exc.ArgumentError(f"Invalid isolation level: {level}. DecentDB only supports SNAPSHOT.")
 
+    def _unwrap_dbapi_connection(self, connection):
+        # SQLAlchemy passes a Connection proxy; unwrap to the underlying DB-API connection.
+        c = connection
+        for _ in range(0, 3):
+            if hasattr(c, "dbapi_connection"):
+                c = c.dbapi_connection
+                continue
+            if hasattr(c, "connection"):
+                c = c.connection
+                continue
+            break
+        return c
+
     # Introspection methods (stubbed for now)
     def get_table_names(self, connection, schema=None, **kw):
-        return []
+        dbapi_conn = self._unwrap_dbapi_connection(connection)
+        if not hasattr(dbapi_conn, "list_tables"):
+            return []
+        return list(dbapi_conn.list_tables())
 
     def has_table(self, connection, table_name, schema=None, **kw):
-        return False
+        dbapi_conn = self._unwrap_dbapi_connection(connection)
+        if not hasattr(dbapi_conn, "list_tables"):
+            return False
+        return table_name in dbapi_conn.list_tables()
+
+    def get_columns(self, connection, table_name, schema=None, **kw):
+        dbapi_conn = self._unwrap_dbapi_connection(connection)
+        if not hasattr(dbapi_conn, "get_table_columns"):
+            return []
+
+        cols = dbapi_conn.get_table_columns(table_name)
+
+        def map_type(t):
+            # Keep mapping conservative; aligns with DecentDB storage types.
+            t = (t or "").upper()
+            if t == "INT64":
+                return sqltypes.BigInteger()
+            if t == "BOOL":
+                return sqltypes.Boolean()
+            if t == "FLOAT64":
+                return sqltypes.Float()
+            if t == "TEXT":
+                return sqltypes.Text()
+            if t == "BLOB":
+                return sqltypes.LargeBinary()
+            return sqltypes.NULLTYPE
+
+        out = []
+        for c in cols:
+            out.append(
+                {
+                    "name": c.get("name"),
+                    "type": map_type(c.get("type")),
+                    "nullable": not bool(c.get("not_null", False)),
+                    "default": None,
+                    "primary_key": bool(c.get("primary_key", False)),
+                }
+            )
+        return out

@@ -1,6 +1,8 @@
 import strutils
 import tables
 import options
+import json
+import algorithm
 import catalog/catalog
 import errors
 import record/record
@@ -45,6 +47,87 @@ type
 
 var globalLastErrorCode {.threadvar.}: int
 var globalLastErrorMessage {.threadvar.}: string
+
+# Forward declarations (this module is compiled single-pass).
+proc setGlobalError(code: ErrorCode, msg: string)
+proc clearGlobalError()
+
+proc setError(h: DbHandle, code: ErrorCode, msg: string)
+proc clearError(h: DbHandle)
+
+proc allocSharedCString(s: string, outLen: ptr cint): cstring =
+  ## Allocate a NUL-terminated string via shared allocator so FFI callers
+  ## can free it with `decentdb_free`.
+  if outLen != nil:
+    outLen[] = cint(s.len)
+  let buf = cast[ptr UncheckedArray[char]](allocShared0(s.len + 1))
+  if s.len > 0:
+    copyMem(addr buf[0], unsafeAddr s[0], s.len)
+  buf[s.len] = '\0'
+  return cast[cstring](buf)
+
+proc decentdb_free*(p: pointer) {.exportc, cdecl, dynlib.} =
+  ## Free memory returned by DecentDB C API functions that allocate.
+  if p != nil:
+    deallocShared(p)
+
+proc decentdb_list_tables_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of table names, e.g. ["users","items"].
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var names: seq[string] = @[]
+  for name in dbh.db.catalog.tables.keys:
+    names.add(name)
+  names.sort(system.cmp)
+
+  var arr = newJArray()
+  for name in names:
+    arr.add(%name)
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
+proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of column metadata objects for a given table.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  if table_utf8 == nil:
+    let dbh = cast[DbHandle](p)
+    dbh.setError(ERR_INTERNAL, "NULL table name")
+    return nil
+
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+  let tableName = $table_utf8
+  if not dbh.db.catalog.tables.hasKey(tableName):
+    dbh.setError(ERR_SQL, "Table not found: " & tableName)
+    return nil
+
+  let t = dbh.db.catalog.tables[tableName]
+  var arr = newJArray()
+  for col in t.columns:
+    var obj = newJObject()
+    obj["name"] = %col.name
+    obj["type"] = %columnTypeToText(col.kind)
+    obj["not_null"] = %col.notNull
+    obj["unique"] = %col.unique
+    obj["primary_key"] = %col.primaryKey
+    if col.refTable.len > 0:
+      obj["ref_table"] = %col.refTable
+    if col.refColumn.len > 0:
+      obj["ref_column"] = %col.refColumn
+    arr.add(obj)
+
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
 
 proc setGlobalError(code: ErrorCode, msg: string) =
   globalLastErrorCode = int(code)
