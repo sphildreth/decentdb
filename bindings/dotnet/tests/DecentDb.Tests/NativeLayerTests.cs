@@ -48,6 +48,14 @@ public class NativeLayerTests : IDisposable
     }
 
     [Fact]
+    public void OpenInvalidPathThrows()
+    {
+        var badPath = Path.Combine(Path.GetTempPath(), $"does_not_exist_{Guid.NewGuid():N}", "x.db");
+        var ex = Assert.Throws<DecentDbException>(() => new NativeDb(badPath));
+        Assert.False(string.IsNullOrWhiteSpace(ex.Message));
+    }
+
+    [Fact]
     public void PrepareStatement()
     {
         using var db = new NativeDb(_dbPath);

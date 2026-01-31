@@ -155,7 +155,9 @@ type Statement* = ref object
     havingExpr*: Expr
     orderBy*: seq[OrderItem]
     limit*: int
+    limitParam*: int
     offset*: int
+    offsetParam*: int
   of skUpdate:
     updateTable*: string
     assignments*: Table[string, Expr]
@@ -480,16 +482,30 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       let asc = dir != "SORTBY_DESC" and dir != "2"
       orderBy.add(OrderItem(expr: exprRes.value, asc: asc))
   var limit = -1
+  var limitParam = 0
   var offset = -1
+  var offsetParam = 0
   if nodeHas(node, "limitCount"):
     let limitRes = parseExprNode(node["limitCount"])
-    if limitRes.ok and limitRes.value.kind == ekLiteral and limitRes.value.value.kind == svInt:
+    if not limitRes.ok:
+      return err[Statement](limitRes.err.code, limitRes.err.message, limitRes.err.context)
+    if limitRes.value.kind == ekLiteral and limitRes.value.value.kind == svInt:
       limit = int(limitRes.value.value.intVal)
+    elif limitRes.value.kind == ekParam and limitRes.value.index > 0:
+      limitParam = limitRes.value.index
+    else:
+      return err[Statement](ERR_SQL, "LIMIT must be an integer literal or $N parameter")
   if nodeHas(node, "limitOffset"):
     let offsetRes = parseExprNode(node["limitOffset"])
-    if offsetRes.ok and offsetRes.value.kind == ekLiteral and offsetRes.value.value.kind == svInt:
+    if not offsetRes.ok:
+      return err[Statement](offsetRes.err.code, offsetRes.err.message, offsetRes.err.context)
+    if offsetRes.value.kind == ekLiteral and offsetRes.value.value.kind == svInt:
       offset = int(offsetRes.value.value.intVal)
-  ok(Statement(kind: skSelect, selectItems: items, fromTable: fromTable, fromAlias: fromAlias, joins: joins, whereExpr: whereExpr, groupBy: groupBy, havingExpr: havingExpr, orderBy: orderBy, limit: limit, offset: offset))
+    elif offsetRes.value.kind == ekParam and offsetRes.value.index > 0:
+      offsetParam = offsetRes.value.index
+    else:
+      return err[Statement](ERR_SQL, "OFFSET must be an integer literal or $N parameter")
+  ok(Statement(kind: skSelect, selectItems: items, fromTable: fromTable, fromAlias: fromAlias, joins: joins, whereExpr: whereExpr, groupBy: groupBy, havingExpr: havingExpr, orderBy: orderBy, limit: limit, limitParam: limitParam, offset: offset, offsetParam: offsetParam))
 
 proc parseInsertStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])

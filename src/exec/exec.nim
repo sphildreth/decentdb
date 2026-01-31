@@ -119,6 +119,38 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
   ## - Limit/Offset (without requiring full materialization)
   ##
   ## For other plan kinds, we fall back to materializing via execPlan.
+  proc resolveLimitOffset(): Result[(int, int)] =
+    var limit = plan.limit
+    var offset = plan.offset
+
+    if plan.limitParam > 0:
+      let i = plan.limitParam - 1
+      if i < 0 or i >= params.len:
+        return err[(int, int)](ERR_SQL, "LIMIT parameter index out of bounds")
+      let v = params[i]
+      if v.kind != vkInt64:
+        return err[(int, int)](ERR_SQL, "LIMIT parameter must be INT64")
+      if v.int64Val < 0:
+        return err[(int, int)](ERR_SQL, "LIMIT parameter must be non-negative")
+      if v.int64Val > int64(high(int)):
+        return err[(int, int)](ERR_SQL, "LIMIT parameter too large")
+      limit = int(v.int64Val)
+
+    if plan.offsetParam > 0:
+      let i = plan.offsetParam - 1
+      if i < 0 or i >= params.len:
+        return err[(int, int)](ERR_SQL, "OFFSET parameter index out of bounds")
+      let v = params[i]
+      if v.kind != vkInt64:
+        return err[(int, int)](ERR_SQL, "OFFSET parameter must be INT64")
+      if v.int64Val < 0:
+        return err[(int, int)](ERR_SQL, "OFFSET parameter must be non-negative")
+      if v.int64Val > int64(high(int)):
+        return err[(int, int)](ERR_SQL, "OFFSET parameter too large")
+      offset = int(v.int64Val)
+
+    ok((limit, offset))
+
   proc materialize(): Result[RowCursor] =
     let rowsRes = execPlan(pager, catalog, plan, params)
     if not rowsRes.ok:
@@ -298,8 +330,11 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     if not childRes.ok:
       return err[RowCursor](childRes.err.code, childRes.err.message, childRes.err.context)
     let child = childRes.value
-    let offset = if plan.offset >= 0: plan.offset else: 0
-    let limit = plan.limit
+    let loRes = resolveLimitOffset()
+    if not loRes.ok:
+      return err[RowCursor](loRes.err.code, loRes.err.message, loRes.err.context)
+    let offset = if loRes.value[1] >= 0: loRes.value[1] else: 0
+    let limit = loRes.value[0]
     var skipped = 0
     var produced = 0
     let c = RowCursor(
@@ -1189,15 +1224,53 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
     return sortRows(inputRes.value, plan.orderBy, params)
   of pkLimit:
+    proc resolveLimitOffset(): Result[(int, int)] =
+      var limit = plan.limit
+      var offset = plan.offset
+
+      if plan.limitParam > 0:
+        let i = plan.limitParam - 1
+        if i < 0 or i >= params.len:
+          return err[(int, int)](ERR_SQL, "LIMIT parameter index out of bounds")
+        let v = params[i]
+        if v.kind != vkInt64:
+          return err[(int, int)](ERR_SQL, "LIMIT parameter must be INT64")
+        if v.int64Val < 0:
+          return err[(int, int)](ERR_SQL, "LIMIT parameter must be non-negative")
+        if v.int64Val > int64(high(int)):
+          return err[(int, int)](ERR_SQL, "LIMIT parameter too large")
+        limit = int(v.int64Val)
+
+      if plan.offsetParam > 0:
+        let i = plan.offsetParam - 1
+        if i < 0 or i >= params.len:
+          return err[(int, int)](ERR_SQL, "OFFSET parameter index out of bounds")
+        let v = params[i]
+        if v.kind != vkInt64:
+          return err[(int, int)](ERR_SQL, "OFFSET parameter must be INT64")
+        if v.int64Val < 0:
+          return err[(int, int)](ERR_SQL, "OFFSET parameter must be non-negative")
+        if v.int64Val > int64(high(int)):
+          return err[(int, int)](ERR_SQL, "OFFSET parameter too large")
+        offset = int(v.int64Val)
+
+      ok((limit, offset))
+
+    let loRes = resolveLimitOffset()
+    if not loRes.ok:
+      return err[seq[Row]](loRes.err.code, loRes.err.message, loRes.err.context)
+    let limit = loRes.value[0]
+    let offset = loRes.value[1]
+
     if plan.left.kind == pkSort:
       let inputRes = execPlan(pager, catalog, plan.left.left, params)
       if not inputRes.ok:
         return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
-      return sortRowsWithConfig(inputRes.value, plan.left.orderBy, params, plan.limit, plan.offset)
+      return sortRowsWithConfig(inputRes.value, plan.left.orderBy, params, limit, offset)
 
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
-    return ok(applyLimit(inputRes.value, plan.limit, plan.offset))
+    return ok(applyLimit(inputRes.value, limit, offset))
   of pkStatement:
     return ok(newSeq[Row]())

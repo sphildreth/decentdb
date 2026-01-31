@@ -44,13 +44,26 @@ type
     readTxn: ReadTxn
     rowView: seq[DecentdbValueView]
 
+var globalLastErrorCode {.threadvar.}: int
+var globalLastErrorMessage {.threadvar.}: string
+
+proc setGlobalError(code: ErrorCode, msg: string) =
+  globalLastErrorCode = int(code)
+  globalLastErrorMessage = msg
+
+proc clearGlobalError() =
+  globalLastErrorCode = 0
+  globalLastErrorMessage = ""
+
 proc setError(h: DbHandle, code: ErrorCode, msg: string) =
   h.lastErrorCode = int(code)
   h.lastErrorMessage = msg
+  setGlobalError(code, msg)
 
 proc clearError(h: DbHandle) =
   h.lastErrorCode = 0
   h.lastErrorMessage = ""
+  clearGlobalError()
 
 proc parseCachePages(options: string): int =
   ## Parse an URL query string and extract cache size as pages.
@@ -114,14 +127,13 @@ proc parseCachePages(options: string): int =
 proc decentdb_open*(path: cstring, options: cstring): pointer {.exportc, cdecl, dynlib.} =
   let cachePages = parseCachePages(if options == nil: "" else: $options)
   let res = openDb($path, cachePages = cachePages)
-  let handle = DbHandle()
 
-  if res.ok:
-    handle.db = res.value
-  else:
-    handle.lastErrorCode = int(res.err.code)
-    handle.lastErrorMessage = res.err.message
-  
+  if not res.ok:
+    setGlobalError(res.err.code, res.err.message)
+    return nil
+
+  clearGlobalError()
+  let handle = DbHandle(db: res.value, lastErrorCode: 0, lastErrorMessage: "")
   GC_ref(handle)
   return cast[pointer](handle)
 
@@ -135,12 +147,14 @@ proc decentdb_close*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   return 0
 
 proc decentdb_last_error_code*(p: pointer): cint {.exportc, cdecl, dynlib.} =
-  if p == nil: return 0
+  if p == nil:
+    return cint(globalLastErrorCode)
   let handle = cast[DbHandle](p)
   return cint(handle.lastErrorCode)
 
 proc decentdb_last_error_message*(p: pointer): cstring {.exportc, cdecl, dynlib.} =
-  if p == nil: return ""
+  if p == nil:
+    return cstring(globalLastErrorMessage)
   let handle = cast[DbHandle](p)
   return cstring(handle.lastErrorMessage)
 
@@ -164,6 +178,10 @@ proc findMaxParam(stmt: Statement): int =
     for g in stmt.groupBy: walk(g)
     walk(stmt.havingExpr)
     for o in stmt.orderBy: walk(o.expr)
+    if stmt.limitParam > 0:
+      maxIdx = max(maxIdx, stmt.limitParam)
+    if stmt.offsetParam > 0:
+      maxIdx = max(maxIdx, stmt.offsetParam)
   of skInsert:
     for v in stmt.insertValues: walk(v)
   of skUpdate:

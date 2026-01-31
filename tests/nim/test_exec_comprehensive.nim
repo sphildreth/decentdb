@@ -701,6 +701,27 @@ suite "Exec Limit and Offset":
     
     discard closeDb(db)
 
+  test "LIMIT/OFFSET with parameters":
+    let path = makeTempDb("decentdb_exec_limit_offset_params.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT)").ok
+    for i in 1..10:
+      check execSql(db, "INSERT INTO t (id) VALUES (" & $i & ")").ok
+
+    let res = execSql(db, "SELECT id FROM t ORDER BY id LIMIT $1 OFFSET $2", @[
+      Value(kind: vkInt64, int64Val: 3),
+      Value(kind: vkInt64, int64Val: 5)
+    ])
+    check res.ok
+    check res.value.len == 3
+    check res.value[0] == "6"
+    check res.value[2] == "8"
+
+    discard closeDb(db)
+
   test "LIMIT 0":
     let path = makeTempDb("decentdb_exec_limit0.db")
     let dbRes = openDb(path)

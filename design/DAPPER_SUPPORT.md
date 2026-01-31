@@ -86,6 +86,8 @@ public class Artist
     public string TempData { get; set; }
 }
 
+```
+
 ---
 
 ## Architecture
@@ -503,32 +505,36 @@ Consistent error reporting across all layers with clear mapping between native D
 
 ### Error Code Mapping
 
-| DecentDB Error Code | C# Exception Type | Description |
-|---------------------|-------------------|-------------|
-| `ERR_CONSTRAINT` | `ConstraintViolationException` | Constraint violation (e.g., MaxLength guardrails, foreign key) |
-| `ERR_LOCK_TIMEOUT` | `DatabaseLockedException` | Timeout waiting for database lock |
-| `ERR_IO_ERROR` | `IOException` | File system error |
-| `ERR_PARSE_ERROR` | `SqlSyntaxErrorException` | Invalid SQL syntax |
-| `ERR_BIND_ERROR` | `ArgumentException` | Parameter binding error |
-| `ERR_FULL` | `DatabaseFullException` | Disk space exhausted |
-| `ERR_CORRUPTION` | `DatabaseCorruptedException` | Database file corruption detected |
+DecentDB currently exposes this error code set (see `ErrorCode` in the engine):
+
+| DecentDB Error Code | Meaning | Current .NET Surface |
+|---------------------|---------|----------------------|
+| `ERR_IO` | I/O / OS / VFS error | `DecentDb.Native.DecentDbException` |
+| `ERR_CORRUPTION` | On-disk corruption / invalid format | `DecentDb.Native.DecentDbException` |
+| `ERR_CONSTRAINT` | Constraint violation (PK/UNIQUE/FK/etc) | `DecentDb.Native.DecentDbException` |
+| `ERR_TRANSACTION` | Transaction / snapshot / WAL related error | `DecentDb.Native.DecentDbException` |
+| `ERR_SQL` | SQL parse/bind/exec error | `DecentDb.Native.DecentDbException` |
+| `ERR_INTERNAL` | Internal invariant failure / bug | `DecentDb.Native.DecentDbException` |
+
+Notes:
+- The .NET bindings currently throw `DecentDbException` (single type) with `ErrorCode` set to the native numeric code and `Sql` set to the SQL string.
+- More granular managed exception types (e.g., lock timeout vs disk full) are not implemented yet; introducing additional native error codes would require a design decision (ADR) because it affects all bindings.
 
 ### Error Propagation Chain
 
 ```
 Native Layer (Nim):
-    - Return error codes via `decentdb_last_error_code()`
-  - Detailed error messages in UTF-8
+    - Return error codes via `decentdb_last_error_code(db)`
+    - Detailed error messages in UTF-8 via `decentdb_last_error_message(db)`
 
 P/Invoke Layer (C#):
   - Check return codes from native calls
-    - Marshal error messages from `decentdb_last_error_message()`
-  - Map native error codes to C# exceptions
+        - Marshal error messages from `decentdb_last_error_message(db)`
+    - Throw `DecentDbException` with code/message/sql
 
 ADO.NET Layer:
-  - Translate exceptions to standard ADO.NET exception types
-  - Preserve original error details in exception data
-  - Follow ADO.NET exception hierarchy
+    - Currently propagates `DecentDbException`
+    - Preserves SQL and error code on the exception
 
 Micro-ORM Layer:
   - Wrap lower-level exceptions with context
@@ -1350,32 +1356,54 @@ namespace DecentDb.AdoNet
 }
 
 // Micro-ORM
-namespace DecentDb.Orm
+namespace DecentDb.MicroOrm
 {
     public class DecentDbContext : IDisposable
     {
         // Accepts a full connection string (recommended) or a bare path.
-        public DecentDbContext(string connectionString);
-        public DbSet<T> Set<T>() where T : class;
-        public IDbTransaction BeginTransaction();
+        public DecentDbContext(string connectionStringOrPath, bool pooling = true);
+
+        public event EventHandler<SqlExecutingEventArgs>? SqlExecuting;
+        public event EventHandler<SqlExecutedEventArgs>? SqlExecuted;
+
+        public DbSet<T> Set<T>() where T : class, new();
+        public DbTransaction BeginTransaction();
+        public DbTransaction BeginTransaction(IsolationLevel isolationLevel);
     }
 
-    public class DbSet<T> : IQueryable<T> where T : class
+    public sealed class DbSet<T> : IQueryable<T> where T : class, new()
     {
         // Query
         // id parameter: int, long, or Guid (matches entity's key type)
-        public Task<T> GetAsync(object id);
-        public Task<T> FirstAsync(Expression<Func<T, bool>> predicate);
-        public Task<T> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate);
-        public Task<int> CountAsync(Expression<Func<T, bool>> predicate);
-        public Task<List<T>> ToListAsync();
+        public DbSet<T> Where(Expression<Func<T, bool>> predicate);
+        public DbSet<T> OrderBy<TValue>(Expression<Func<T, TValue>> keySelector);
+        public DbSet<T> OrderByDescending<TValue>(Expression<Func<T, TValue>> keySelector);
+        public DbSet<T> ThenBy<TValue>(Expression<Func<T, TValue>> keySelector);
+        public DbSet<T> ThenByDescending<TValue>(Expression<Func<T, TValue>> keySelector);
+        public DbSet<T> Skip(int count);
+        public DbSet<T> Take(int count);
+
+        public Task<List<T>> ToListAsync(CancellationToken cancellationToken = default);
+        public IAsyncEnumerable<T> StreamAsync(CancellationToken cancellationToken = default);
+        public Task<T?> FirstOrDefaultAsync(CancellationToken cancellationToken = default);
+        public Task<T?> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default);
+        public Task<T> FirstAsync(CancellationToken cancellationToken = default);
+        public Task<T> FirstAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default);
+        public Task<long> CountAsync(CancellationToken cancellationToken = default);
+        public Task<long> CountAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default);
+        public Task<bool> AnyAsync(CancellationToken cancellationToken = default);
+        public Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default);
+        public Task<T?> GetAsync(object id, CancellationToken cancellationToken = default);
+        public Task<T?> SingleOrDefaultAsync(CancellationToken cancellationToken = default);
+        public Task<T> SingleAsync(CancellationToken cancellationToken = default);
         
         // CRUD
-        public Task InsertAsync(T entity);
-        public Task UpdateAsync(T entity);
-        public Task DeleteAsync(T entity);
-        public Task InsertManyAsync(IEnumerable<T> entities);
-        public Task DeleteManyAsync(Expression<Func<T, bool>> predicate);
+        public Task InsertAsync(T entity, CancellationToken cancellationToken = default);
+        public Task InsertManyAsync(IEnumerable<T> entities, CancellationToken cancellationToken = default);
+        public Task UpdateAsync(T entity, CancellationToken cancellationToken = default);
+        public Task DeleteAsync(T entity, CancellationToken cancellationToken = default);
+        public Task DeleteByIdAsync(object id, CancellationToken cancellationToken = default);
+        public Task<long> DeleteManyAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default);
     }
 
     // Extension methods for IQueryable<T>
@@ -1394,6 +1422,7 @@ namespace DecentDb.Orm
 ### Behavioral Notes (API Contract)
 
 - **Parameters**: Public APIs MAY accept named parameters (`@name`, `@p0`) for Dapper ergonomics, but the provider MUST rewrite to `$1..$N` before native execution (ADR-0005).
+- **LIMIT/OFFSET parameters**: `LIMIT $N` / `OFFSET $N` are supported; values must be non-negative INT64 and fit into `int` (ADR-0048).
 - **Result streaming**: `DecentDbDataReader` is backed by the native `prepare/bind/step/column/finalize` API and MUST be forward-only.
 - **Rows affected**: `ExecuteNonQuery` uses the statement's `rows_affected` after completion.
 
@@ -1403,19 +1432,23 @@ namespace DecentDb.Orm
 
 ### What users reference
 
-- **Dapper users**: reference the ADO.NET provider (`DecentDb.AdoNet.dll`) via the meta-package below.
-- `DecentDb.Native.dll` is **internal plumbing** (P/Invoke + library resolution). Applications should not call it directly unless they are doing advanced hosting/diagnostics.
+**Current (in this repo):**
+- **Dapper users** reference `DecentDb.AdoNet`.
+- **Micro-ORM users** reference `DecentDb.MicroOrm` (which depends on `DecentDb.AdoNet`).
+- `DecentDb.Native` is internal plumbing (P/Invoke + library resolution) and is not intended for direct app usage.
+
+**Planned (ADR-0044):** provide a single `DecentDb.NET` meta-package that pulls in the above projects plus native binaries.
 
 Goal: keep the common path (Dapper + `DbConnection`) simple while still enabling the high-performance native streaming reader under the hood.
 
-### Package Structure
+### Target Package Structure (Planned)
 
 ```
 DecentDb.NET
 ├── lib/
 │   └── net10.0/
 │       ├── DecentDb.AdoNet.dll
-│       ├── DecentDb.Orm.dll
+│       ├── DecentDb.MicroOrm.dll
 │       └── DecentDb.Native.dll
 ├── runtimes/
 │   ├── win-x64/
@@ -1436,7 +1469,7 @@ DecentDb.NET
 ### Installation
 
 ```bash
-# Install from NuGet
+# Install from NuGet (planned)
 dotnet add package DecentDb.NET
 
 # Or via PackageReference
@@ -1487,21 +1520,27 @@ DecentDbNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
 ## Success Criteria
 
 ### Functionality
-1. ✅ Can open DecentDB file from C# and execute SQL via Dapper
-2. ✅ Can use LINQ syntax with OrderBy/ThenBy and Skip/Take for pagination
-3. ✅ Zero configuration required (convention-based)
-4. ✅ All CRUD operations work with async/await
-5. ✅ No attribute decoration required on POCOs
-6. ✅ Cross-platform support (Windows, Linux, macOS)
-7. ✅ MaxLength attribute enforces write-time constraints in C# layer (UTF-8 bytes)
+- [x] Open a DecentDB file from C# and execute SQL via Dapper
+- [x] Use LINQ-style syntax with `OrderBy`/`ThenBy` and `Skip`/`Take` (Micro-ORM)
+- [x] Convention-based mapping works with zero configuration
+- [x] CRUD operations work with async/await (Micro-ORM)
+- [x] No attribute decoration required on POCOs for common cases
+- [ ] Cross-platform native packaging validated (Windows/macOS CI + NuGet runtimes)
+- [x] MaxLength guardrails enforced at write-time in C# layer (UTF-8 bytes)
 
 ### Performance (Critical)
-9. ✅ Single record query: < 2ms (P95)
-10. ✅ Filtered list query: < 10ms + 0.5ms/row (P95)
-11. ✅ Paginated + Sorted query: < 20ms + 0.5ms/row (P95)
-12. ✅ C# layer overhead: < 1ms over native DecentDB execution
-13. ✅ Query compilation cached (no re-parsing on identical queries)
-14. ✅ Materialization uses compiled expressions (no reflection per row)
+- [ ] Single record query: < 2ms (P95)
+- [ ] Filtered list query: < 10ms + 0.5ms/row (P95)
+- [ ] Paginated + Sorted query: < 20ms + 0.5ms/row (P95)
+- [ ] C# layer overhead: < 1ms over native DecentDB execution
+- [ ] Query compilation cached (no re-parsing on identical queries)
+- [ ] Materialization uses compiled expressions (no reflection per row)
+
+### Verification (as of 2026-01-30)
+
+- Nim: `nimble test`
+- .NET: `dotnet test bindings/dotnet/tests/DecentDb.Tests/DecentDb.Tests.csproj -c Release`
+- Dapper example: `dotnet run --project examples/dotnet/dapper-basic -c Release`
 
 ---
 

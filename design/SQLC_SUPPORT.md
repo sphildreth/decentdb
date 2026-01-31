@@ -308,12 +308,11 @@ Map native DecentDB errors to idiomatic Go errors and `database/sql` behaviors.
 | DecentDB Error Code | Go / database/sql mapping |
 |---------------------|---------------------------|
 | `ERR_CONSTRAINT` | return `*DecentDBError` wrapping constraint code; callers may treat as application error |
-| `ERR_LOCK_TIMEOUT` | return `context.DeadlineExceeded` if ctx expired; else `*DecentDBError` (operational) |
-| `ERR_IO_ERROR` | return `*DecentDBError` (operational) |
-| `ERR_PARSE_ERROR` | return `*DecentDBError` (programmer error) |
-| `ERR_BIND_ERROR` | return `*DecentDBError` (programmer error) |
-| `ERR_FULL` | return `*DecentDBError` |
+| `ERR_TRANSACTION` | return `context.DeadlineExceeded` if ctx expired; else `*DecentDBError` (operational). Busy/timeout is not currently a distinct native code |
+| `ERR_IO` | return `*DecentDBError` (operational). Disk full is not currently a distinct native code |
+| `ERR_SQL` | return `*DecentDBError` (programmer error) |
 | `ERR_CORRUPTION` | return `*DecentDBError` |
+| `ERR_INTERNAL` | return `*DecentDBError` |
 
 The driver SHOULD expose a structured error type:
 

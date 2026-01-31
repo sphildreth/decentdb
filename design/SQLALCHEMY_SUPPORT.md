@@ -335,12 +335,11 @@ Map native DecentDB errors into:
 | DecentDB Error Code | DB-API Exception | Notes |
 |---------------------|------------------|------|
 | `ERR_CONSTRAINT` | `IntegrityError` | FK/unique/check constraints |
-| `ERR_LOCK_TIMEOUT` | `OperationalError` | lock timeout / busy |
-| `ERR_IO_ERROR` | `OperationalError` | filesystem issues |
-| `ERR_PARSE_ERROR` | `ProgrammingError` | SQL syntax |
-| `ERR_BIND_ERROR` | `ProgrammingError` | parameter mismatch |
-| `ERR_FULL` | `OperationalError` | disk full |
+| `ERR_TRANSACTION` | `OperationalError` | transaction/snapshot/WAL issues (busy/timeout not currently a distinct code) |
+| `ERR_IO` | `OperationalError` | filesystem issues (disk full is not currently a distinct code) |
+| `ERR_SQL` | `ProgrammingError` | SQL parse/bind/exec errors |
 | `ERR_CORRUPTION` | `DatabaseError` | corruption detected |
+| `ERR_INTERNAL` | `InternalError` | engine bug / invariant failure |
 
 ### Context Preservation
 

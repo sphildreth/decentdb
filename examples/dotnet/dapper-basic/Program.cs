@@ -6,8 +6,8 @@ var dbPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..",
 using var conn = new DecentDbConnection($"Data Source={dbPath}");
 conn.Open();
 
-conn.Execute("CREATE TABLE IF NOT EXISTS artists (id INT PRIMARY KEY, name TEXT)");
-conn.Execute("DELETE FROM artists");
+conn.Execute("DROP TABLE artists");
+conn.Execute("CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)");
 
 conn.Execute(
     "INSERT INTO artists (id, name) VALUES (@id, @name)",

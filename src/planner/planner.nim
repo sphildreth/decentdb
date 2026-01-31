@@ -34,7 +34,9 @@ type Plan* = ref object
   right*: Plan
   orderBy*: seq[OrderItem]
   limit*: int
+  limitParam*: int
   offset*: int
+  offsetParam*: int
   groupBy*: seq[Expr]
   having*: Expr
 
@@ -200,8 +202,8 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
   if stmt.orderBy.len > 0:
     base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
-  if stmt.limit >= 0 or stmt.offset >= 0:
-    base = Plan(kind: pkLimit, limit: stmt.limit, offset: stmt.offset, left: base)
+  if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+    base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
   base
 
 proc plan*(catalog: Catalog, stmt: Statement): Result[Plan] =
