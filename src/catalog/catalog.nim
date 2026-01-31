@@ -62,14 +62,20 @@ type CatalogRecord = object
   index: IndexMeta
 
 proc parseColumnType*(text: string): Result[ColumnType] =
-  case text.toUpperAscii()
+  # Extract base type name by taking everything before the first '('
+  var baseType = text
+  let parenPos = text.find('(')
+  if parenPos >= 0:
+    baseType = text[0..<parenPos]
+
+  case baseType.strip().toUpperAscii()
   of "INT", "INT64", "BIGINT", "INT4", "INT8":
     ok(ctInt64)
   of "BOOL", "BOOLEAN":
     ok(ctBool)
   of "FLOAT", "FLOAT64", "DOUBLE", "FLOAT8", "FLOAT4", "REAL":
     ok(ctFloat64)
-  of "TEXT":
+  of "TEXT", "VARCHAR", "CHARACTER VARYING":
     ok(ctText)
   of "BLOB":
     ok(ctBlob)

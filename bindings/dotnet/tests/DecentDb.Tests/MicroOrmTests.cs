@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -40,6 +41,29 @@ public sealed class MicroOrmTests : IDisposable
         public long Id { get; set; }
         public string Name { get; set; } = "";
         public int Age { get; set; }
+    }
+
+    [Table("custom_people")]
+    private sealed class CustomPerson
+    {
+        [PrimaryKey]
+        [Column("person_id")]
+        public long Key { get; set; }
+
+        [Column("full_name")]
+        [MaxLength(3)]
+        public string Name { get; set; } = "";
+
+        [NotNull]
+        [Column("not_nullable")]
+        public string NotNullable { get; set; } = "";
+
+        [Nullable]
+        [Column("optional_note")]
+        public string? OptionalNote { get; set; }
+
+        [Ignore]
+        public string? Ignored { get; set; }
     }
 
     [Fact]
@@ -164,5 +188,54 @@ public sealed class MicroOrmTests : IDisposable
         }
 
         Assert.Equal(new long[] { 1, 2, 3 }, ids);
+    }
+
+    [Fact]
+    public async Task AttributesControlMappingAndNullability()
+    {
+        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE custom_people (person_id INTEGER PRIMARY KEY, full_name TEXT, not_nullable TEXT NOT NULL, optional_note TEXT)";
+        cmd.ExecuteNonQuery();
+
+        using var ctx = new DecentDbContext(_dbPath);
+        var set = ctx.Set<CustomPerson>();
+
+        var ok = new CustomPerson
+        {
+            Key = 1,
+            Name = "Ann",
+            NotNullable = "ok",
+            OptionalNote = null,
+            Ignored = "ignored"
+        };
+
+        await set.InsertAsync(ok);
+
+        var fetched = await set.GetAsync(1);
+        Assert.NotNull(fetched);
+        Assert.Equal("Ann", fetched!.Name);
+        Assert.Equal("ok", fetched.NotNullable);
+        Assert.Null(fetched.OptionalNote);
+
+        var badNull = new CustomPerson
+        {
+            Key = 2,
+            Name = "Bob",
+            NotNullable = null!
+        };
+
+        await Assert.ThrowsAsync<ArgumentException>(() => set.InsertAsync(badNull));
+
+        var tooLong = new CustomPerson
+        {
+            Key = 3,
+            Name = "🎉",
+            NotNullable = "ok"
+        };
+
+        await Assert.ThrowsAsync<ArgumentException>(() => set.InsertAsync(tooLong));
     }
 }

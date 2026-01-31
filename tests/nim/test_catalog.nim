@@ -119,3 +119,33 @@ suite "Catalog":
     check idxOpt.get.rootPage == root2.value
 
     discard closeDb(db)
+
+  test "parseColumnType supports VARCHAR as TEXT alias":
+    # Test that VARCHAR is parsed as TEXT
+    let varcharRes = parseColumnType("VARCHAR")
+    check varcharRes.ok
+    check varcharRes.value == ctText
+
+    # Test that CHARACTER VARYING is parsed as TEXT
+    let charVaryingRes = parseColumnType("CHARACTER VARYING")
+    check charVaryingRes.ok
+    check charVaryingRes.value == ctText
+
+    # Test that VARCHAR(255) is parsed as TEXT (ignoring length specification)
+    let varcharWithLengthRes = parseColumnType("VARCHAR(255)")
+    check varcharWithLengthRes.ok
+    check varcharWithLengthRes.value == ctText
+
+    # Test that CHARACTER VARYING(100) is parsed as TEXT (ignoring length specification)
+    let charVaryingWithLengthRes = parseColumnType("CHARACTER VARYING(100)")
+    check charVaryingWithLengthRes.ok
+    check charVaryingWithLengthRes.value == ctText
+
+    # Test case insensitivity
+    let lowerCaseRes = parseColumnType("varchar")
+    check lowerCaseRes.ok
+    check lowerCaseRes.value == ctText
+
+    let mixedCaseRes = parseColumnType("VarChar(100)")
+    check mixedCaseRes.ok
+    check mixedCaseRes.value == ctText

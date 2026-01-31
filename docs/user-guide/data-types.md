@@ -31,6 +31,20 @@ CREATE TABLE example (
 );
 ```
 
+### VARCHAR / CHARACTER VARYING
+
+Variable-length UTF-8 string (alias for TEXT).
+
+DecentDB treats VARCHAR and CHARACTER VARYING as equivalent to TEXT, ignoring any specified length constraints.
+
+```sql
+CREATE TABLE example (
+    name VARCHAR(255),        -- Same as TEXT
+    description VARCHAR,      -- Same as TEXT
+    title CHARACTER VARYING(100)  -- Same as TEXT
+);
+```
+
 ### BLOB
 
 Binary large object.
@@ -81,6 +95,7 @@ All columns can contain NULL unless marked NOT NULL.
 | INT | INT64 |
 | TEXT | TEXT |
 | VARCHAR | TEXT |
+| CHARACTER VARYING | TEXT |
 | BLOB | BLOB |
 | BOOLEAN | BOOL |
 | BOOL | BOOL |

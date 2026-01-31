@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Page utilization monitoring for B+Tree
 - Full documentation site with MkDocs
 - Additional performance benchmarks
+- VARCHAR and CHARACTER VARYING as TEXT aliases (without length enforcement)
 
 ### Changed
 - Updated ROAD_TO_RTM.md with completion status
