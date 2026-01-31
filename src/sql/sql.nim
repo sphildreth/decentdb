@@ -312,12 +312,27 @@ proc parseAExpr(node: JsonNode): Result[Expr] =
     # Parse the list of values from rexpr
     var inList: seq[Expr] = @[]
     let rexpr = nodeGet(node, "rexpr")
+    
+    proc addFromList(listNode: JsonNode): Result[Void] =
+      if listNode.kind == JArray:
+        for item in listNode:
+          if nodeHas(item, "List"):
+            if nodeHas(item["List"], "items"):
+              let subRes = addFromList(item["List"]["items"])
+              if not subRes.ok: return subRes
+          else:
+            let itemRes = parseExprNode(item)
+            if not itemRes.ok:
+              return err[Void](itemRes.err.code, itemRes.err.message, itemRes.err.context)
+            inList.add(itemRes.value)
+      okVoid()
+
     if rexpr.kind == JArray:
-      for item in rexpr:
-        let itemRes = parseExprNode(item)
-        if not itemRes.ok:
-          return err[Expr](itemRes.err.code, itemRes.err.message, itemRes.err.context)
-        inList.add(itemRes.value)
+      let res = addFromList(rexpr)
+      if not res.ok: return err[Expr](res.err.code, res.err.message, res.err.context)
+    elif nodeHas(rexpr, "List") and nodeHas(rexpr["List"], "items"):
+      let res = addFromList(rexpr["List"]["items"])
+      if not res.ok: return err[Expr](res.err.code, res.err.message, res.err.context)
     
     return ok(Expr(kind: ekInList, inExpr: leftRes.value, inList: inList))
   
@@ -368,7 +383,7 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseTypeCast(node["TypeCast"])
     if nodeHas(node, "NullTest"):
       return parseNullTest(node["NullTest"])
-  err[Expr](ERR_SQL, "Unsupported expression node")
+  err[Expr](ERR_SQL, "Unsupported expression node: " & $node)
 
 proc unwrapRangeVar(node: JsonNode): JsonNode =
   if nodeHas(node, "RangeVar"):

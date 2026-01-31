@@ -22,3 +22,19 @@ with engine.connect() as conn:
     for row in result:
         print(row)
 ```
+
+## Concurrency Model
+
+DecentDB operates as an embedded database with the following concurrency model:
+- **Single Writer**: Only one connection can write to the database at a time.
+- **Multiple Readers**: Multiple connections can read simultaneously (Snapshot Isolation).
+- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe in MVP.
+
+**Recommendation**: Ensure your application architecture enforces a single-writer pattern (e.g. via a dedicated writer thread or queue).
+
+## Benchmarks
+
+To run the fetch benchmark:
+```bash
+python benchmarks/bench_fetch.py
+```

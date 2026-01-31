@@ -1,3 +1,6 @@
+import datetime
+import decimal
+import uuid
 from sqlalchemy import types as sqltypes
 from sqlalchemy.engine import default, reflection
 from sqlalchemy import util
@@ -6,6 +9,111 @@ from sqlalchemy import exc
 import decentdb
 
 from sqlalchemy.sql import compiler
+
+# Type implementations
+
+class _DecentDate(sqltypes.Date):
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            # Days since epoch
+            return (value - datetime.date(1970, 1, 1)).days
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            return datetime.date(1970, 1, 1) + datetime.timedelta(days=value)
+        return process
+
+class _DecentDateTime(sqltypes.DateTime):
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            # Epoch ms (INT64)
+            # Ensure UTC if aware? Requirement says "UTC epoch ms".
+            # If naive, assume UTC or local? Usually generic types assume naive is local or matches db.
+            # Best practice: if naive, treat as UTC.
+            if value.tzinfo:
+                value = value.astimezone(datetime.timezone.utc)
+            else:
+                value = value.replace(tzinfo=datetime.timezone.utc)
+            return int(value.timestamp() * 1000)
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            # Return naive UTC datetime or aware?
+            # SQLAlchemy DateTime(timezone=True) expects aware.
+            # Default is naive.
+            dt = datetime.datetime.fromtimestamp(value / 1000.0, tz=datetime.timezone.utc)
+            if self.timezone:
+                return dt
+            return dt.replace(tzinfo=None)
+        return process
+
+class _DecentTime(sqltypes.Time):
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            # Ms since midnight
+            return (value.hour * 3600 + value.minute * 60 + value.second) * 1000 + value.microsecond // 1000
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            total_seconds = value // 1000
+            microsecond = (value % 1000) * 1000
+            second = total_seconds % 60
+            minute = (total_seconds // 60) % 60
+            hour = (total_seconds // 3600)
+            return datetime.time(hour, minute, second, microsecond)
+        return process
+
+class _DecentNumeric(sqltypes.Numeric):
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            return str(value)
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            return decimal.Decimal(value)
+        return process
+
+class _DecentUUID(sqltypes.Uuid):
+    def bind_processor(self, dialect):
+        def process(value):
+            if value is None:
+                return None
+            if isinstance(value, uuid.UUID):
+                return value.bytes
+            # Handle string input?
+            if isinstance(value, str):
+                return uuid.UUID(value).bytes
+            if isinstance(value, bytes):
+                return value
+            return None
+        return process
+
+    def result_processor(self, dialect, coltype):
+        def process(value):
+            if value is None:
+                return None
+            return uuid.UUID(bytes=value)
+        return process
 
 class DecentDbCompiler(compiler.SQLCompiler):
     def visit_mod_binary(self, binary, operator, **kw):
@@ -28,6 +136,36 @@ class DecentDbCompiler(compiler.SQLCompiler):
     def returning_clause(self, stmt, returning_cols, **kw):
         # DecentDB MVP does not support RETURNING.
         raise exc.CompileError("DecentDB does not support RETURNING")
+
+class DecentDbDDLCompiler(compiler.DDLCompiler):
+    def visit_foreign_key_constraint(self, constraint, **kw):
+        # DecentDB does not support table-level FOREIGN KEY constraints.
+        # We must emit them inline in get_column_specification.
+        return None
+
+    def get_column_specification(self, column, **kw):
+        colspec = self.preparer.format_column(column) + " " + \
+            self.dialect.type_compiler.process(column.type, type_expression=column)
+            
+        if column.nullable is not None:
+            if not column.nullable:
+                colspec += " NOT NULL"
+        
+        # Add foreign keys inline
+        if column.foreign_keys:
+            # Pick the first one
+            fk = list(column.foreign_keys)[0]
+            if fk.column is not None:
+                remote_table = self.preparer.format_table(fk.column.table)
+                remote_col = self.preparer.format_column(fk.column)
+                colspec += f" REFERENCES {remote_table} ({remote_col})"
+        
+        return colspec
+        
+    def visit_create_table(self, create, **kw):
+        # We assume PRIMARY KEY is handled by default visit_create_table (table-level)
+        # unless DecentDB forbids that too. The error only mentioned FKs.
+        return super().visit_create_table(create, **kw)
 
 class DecentDbTypeCompiler(compiler.GenericTypeCompiler):
     def visit_integer(self, type_, **kw):
@@ -93,8 +231,20 @@ class DecentDbDialect(default.DefaultDialect):
     implicit_returning = False
     
     default_paramstyle = "qmark"
+    
+    colspecs = {
+        sqltypes.Date: _DecentDate,
+        sqltypes.DateTime: _DecentDateTime,
+        sqltypes.Time: _DecentTime,
+        sqltypes.Numeric: _DecentNumeric,
+        sqltypes.Uuid: _DecentUUID,
+        # UUID generic type in older SA versions?
+        # If sqltypes.Uuid doesn't exist (added in 1.4/2.0), this might fail.
+        # But we are in 2026, SA 2.0+ is standard.
+    }
 
     statement_compiler = DecentDbCompiler
+    ddl_compiler = DecentDbDDLCompiler
     type_compiler = DecentDbTypeCompiler
     
     def __init__(self, **kwargs):
