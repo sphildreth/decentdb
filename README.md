@@ -39,11 +39,12 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 ## Languages/Toolkits/SDKs
 
-| Language | Toolkit | Status | Description | Capabilities | Design |
-|---|---|---|---|---|---|
-| C# | ADO.NET + Dapper | IN PROGRESS | Embedded provider for querying DecentDB files | CRUD, streaming reads, parameter rewriting to `$1..$N` | [design/DAPPER_SUPPORT.md](design/DAPPER_SUPPORT.md) |
-| Python 3 | SQLAlchemy | IN PROGRESS | Embedded DB-API driver + SQLAlchemy dialect | ORM/Core queries, CRUD, transactions, fast reads focus | [design/SQLALCHEMY_SUPPORT.md](design/SQLALCHEMY_SUPPORT.md) |
-| Go | `database/sql` + sqlc | COMPLETE | Embedded `database/sql` driver optimized for sqlc-generated queries | Type-safe compiled queries, CRUD, transactions, streaming reads, `$1..$N` parameters | [design/SQLC_SUPPORT.md](design/SQLC_SUPPORT.md) |
+| Language | Toolkit | Description | Documentation |
+|---|---|---|---|
+| C# | ADO.NET + Dapper + MicroOrm (LINQ) | Embedded provider + LINQ-style `IQueryable` Micro-ORM for querying DecentDB files | LINK TO DOCS HERE |
+| Go | `database/sql` + sqlc | Embedded `database/sql` driver optimized for sqlc-generated queries | LINK TO DOCS HERE |
+| Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | LINK TO DOCS HERE |
+| Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | LINK TO DOCS HERE |
 
 ## Quick Start
 

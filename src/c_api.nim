@@ -6,7 +6,6 @@ import errors
 import record/record
 import pager/db_header
 import pager/pager
-import vfs/os_vfs
 import sql/sql
 import sql/binder
 import planner/planner
@@ -310,6 +309,13 @@ proc decentdb_bind_int64*(p: pointer, col: cint, val: int64): cint {.exportc, cd
   let idx = bindIndex0(h, col)
   if idx < 0: return -1
   h.params[idx] = Value(kind: vkInt64, int64Val: val)
+  return 0
+
+proc decentdb_bind_bool*(p: pointer, col: cint, val: cint): cint {.exportc, cdecl, dynlib.} =
+  let h = cast[StmtHandle](p)
+  let idx = bindIndex0(h, col)
+  if idx < 0: return -1
+  h.params[idx] = Value(kind: vkBool, boolVal: val != 0)
   return 0
 
 proc decentdb_bind_float64*(p: pointer, col: cint, val: float64): cint {.exportc, cdecl, dynlib.} =
