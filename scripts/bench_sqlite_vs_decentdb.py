@@ -105,7 +105,7 @@ def sqlite_cli_time_ms(sqlite_db: str, query: str, sqlite_path: str, timeout: in
     return real_s * 1000.0
 
 def decentdb_time_ms(decentdb_path: str, ddb_path: str, query: str, timeout: int, debug: bool) -> float:
-    rc, out, err = run_cmd([decentdb_path, "exec", "-d", ddb_path, "-s", query], timeout=timeout)
+    rc, out, err = run_cmd([decentdb_path, "exec", "-d", ddb_path, "-s", query, "--noRows"], timeout=timeout)
     if rc != 0:
         raise RuntimeError(f"decentdb exited {rc}\nstdout:\n{out}\nstderr:\n{err}")
 
@@ -292,12 +292,36 @@ def write_json_report(
         json.dump(doc, f, indent=2)
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Benchmark SQLite CLI (.timer) vs DecentDB exec elapsed_ms.")
+    epilog = """Notes:
+- SQLite .timer prints seconds (we convert to ms).
+- In --mode=cli, DecentDB runs with --noRows so timings reflect query execution
+  (not JSON row materialization). SQLite CLI still has REPL/CLI overhead.
+- For substring LIKE (e.g. LIKE '%needle%'), use a trigram index in DecentDB:
+    CREATE INDEX artists_name_trgm ON artists USING trigram (name);
+"""
+    ap = argparse.ArgumentParser(
+        description="Benchmark SQLite vs DecentDB for a single query.",
+        epilog=epilog,
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     ap.add_argument("--sqlite-db", required=True)
     ap.add_argument("--ddb", required=True)
     ap.add_argument("--query", required=True)
-    ap.add_argument("--mode", choices=["cli", "python"], default="cli")
-    ap.add_argument("--fetch", choices=["none", "one", "all"], default="none")
+    ap.add_argument(
+        "--mode",
+        choices=["cli", "python"],
+        default="cli",
+        help=(
+            "cli: sqlite3 .timer + decentdb exec (with --noRows)\n"
+            "python: sqlite3 module + DecentDB python driver (see --fetch)"
+        ),
+    )
+    ap.add_argument(
+        "--fetch",
+        choices=["none", "one", "all"],
+        default="none",
+        help="In python mode: control how much result data is fetched (execution-only vs include fetch costs)",
+    )
     ap.add_argument(
         "--python-open-per-iter",
         action="store_true",

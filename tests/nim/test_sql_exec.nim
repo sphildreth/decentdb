@@ -71,6 +71,22 @@ suite "SQL Exec":
     check splitRow(countRes.value[0])[0] == "1"
     discard closeDb(db)
 
+  test "execSqlNoRows executes SELECT without materializing rows":
+    let path = makeTempDb("decentdb_sql_exec_norows.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'A')").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'B')").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 'A')").ok
+
+    let res = execSqlNoRows(db, "SELECT * FROM t WHERE name = 'A'", @[])
+    check res.ok
+    check res.value == 2
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),

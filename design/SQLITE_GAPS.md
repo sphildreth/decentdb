@@ -187,6 +187,19 @@ To compare engine performance rather than CLI overhead:
 - Avoid “one query per process” timing. Prefer a long-running process (REPL) or a harness that keeps the DB open.
 - Run N iterations and report percentiles (p50/p95/p99), not single shots.
 - Ensure both engines use the same effective plan (PK lookup vs full scan; correct casing/quoting; same predicate).
+- For DecentDB CLI microbenchmarks where you don’t care about returned rows, use `decentdb exec --format json --noRows ...` so the timing reflects execution rather than JSON row materialization.
+
+### Substring LIKE (`LIKE '%needle%'`) needs a trigram index
+
+For substring predicates, a normal btree index generally cannot be used (SQLite also does a full scan for `LIKE '%needle%'`).
+
+DecentDB’s intended fast path for substring LIKE is a trigram index. Without it, DecentDB will also scan and evaluate LIKE row-by-row, which can look much slower than SQLite in CLI benchmarks.
+
+Practical guidance:
+
+- If you run substring LIKE queries on a column, create a trigram index:
+  - `CREATE INDEX artists_namenormalized_trgm ON artists USING trigram (namenormalized);`
+- Re-run the benchmark with that index in place; this is the apples-to-apples comparison for “search-like workloads”.
 
 ### What we can do about performance
 
@@ -205,39 +218,6 @@ Longer-term (often tied to the same work that reduces size):
 
 - Vacuum rewrites into a new file, so it can reclaim free pages and reduce fragmentation.
 - Vacuum does **not** change the fundamental encoding efficiency (ints and text keys are still stored the same way), so it cannot fully close the gap to SQLite by itself.
-
-## Performance notes (so far)
-
-It’s easy to misread SQLite’s `.timer` output because it reports **seconds**.
-
-Observed point lookup:
-
-- SQLite:
-  - `Run Time: real 0.000341` seconds $= 0.341\,\text{ms}$
-- DecentDB:
-  - `"elapsed_ms": 0.3618` $= 0.3618\,\text{ms}$
-
-So for that single run the engines are in the same ballpark (DecentDB slightly slower, but not “orders of magnitude”).
-
-### How to benchmark fairly
-
-Single-run timings are noisy. For an apples-to-apples comparison:
-
-- Warm cache: run the query 100–1000 times and look at medians/p95.
-- Avoid open/close overhead: DecentDB CLI opens the DB per invocation; SQLite `sqlite3` in a here-doc also has startup cost. A loop inside a long-lived process (REPL / harness) is more representative.
-- Separate query execution from formatting:
-  - DecentDB’s CLI constructs JSON and converts internal values to strings; that can dominate sub-millisecond queries.
-  - Prefer measuring inside the engine (or add a `--format=raw`/`--quiet` mode) when microbenchmarking.
-- Compare “same work”:
-  - Ensure indexes are equivalent (PK / secondary index exists in both).
-  - Ensure collation/casefold behavior is not forcing full scans.
-
-### Practical improvements we can make (non-format)
-
-These do not require changing persistent formats:
-
-- Add prepared statement support / statement caching in the CLI or a harness.
-- Add an output mode that minimizes allocations (avoid building row strings for timing-only runs).
 - Add a `bench`/`perf` harness that runs repeated point lookups and reports p50/p95.
 
 The larger “space efficiency” work items (varints, prefix compression, etc.) will also typically help performance via fewer cache misses and less IO.

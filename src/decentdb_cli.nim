@@ -364,7 +364,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
               warnings: bool = false, verbose: bool = false,
               checkpointBytes: int = 0, checkpointMs: int = 0,
               readerWarnMs: int = 0, readerTimeoutMs: int = 0, forceTruncateOnTimeout: bool = false,
-              format: string = "json", params: seq[string] = @[],
+              format: string = "json", noRows: bool = false, params: seq[string] = @[],
               walFailpoints: seq[string] = @[], clearWalFailpoints: bool = false): int =
   ## Execute SQL statements against a DecentDb database file.
   ## Output can be rendered as json/csv/table depending on --format.
@@ -475,7 +475,31 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
       parsedParams.add(valueRes.value)
 
     let queryStart = getMonoTime()
-    let execRes = execSql(database, sql, parsedParams)
+    let normalizedFormat = format.strip().toLowerAscii()
+    if noRows and normalizedFormat != "json":
+      discard closeDb(database)
+      echo resultJson(false, DbError(code: ERR_IO, message: "--noRows requires --format=json"))
+      return 1
+
+    var rows: seq[string] = @[]
+    var rowsReturned: int64 = 0
+
+    var execOk = true
+    var execErr = DbError()
+    if noRows:
+      let res = execSqlNoRows(database, sql, parsedParams)
+      if not res.ok:
+        execOk = false
+        execErr = res.err
+      else:
+        rowsReturned = res.value
+    else:
+      let res = execSql(database, sql, parsedParams)
+      if not res.ok:
+        execOk = false
+        execErr = res.err
+      else:
+        rows = res.value
 
     let queryEnd = getMonoTime()
     let execEnd = getMonoTime()
@@ -485,15 +509,13 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     let elapsedMs = roundMs(float64(elapsedNs) / 1_000_000.0)
     let queryMs = roundMs(float64(queryNs) / 1_000_000.0)
     
-    if not execRes.ok:
+    if not execOk:
       discard closeDb(database)
-      var payload = resultJson(false, execRes.err)
-      if format.strip().toLowerAscii() == "json":
+      var payload = resultJson(false, execErr)
+      if normalizedFormat == "json":
         payload["elapsed_ms"] = %elapsedMs
       echo payload
       return 1
-    
-    let rows = execRes.value
     
     # Collect warnings if requested
     var walWarnings: seq[string] = @[]
@@ -501,13 +523,13 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
       walWarnings = takeWarnings(database.wal)
     
     discard closeDb(database)
-    
-    let normalizedFormat = format.strip().toLowerAscii()
 
     # Always include timing for exec in JSON output.
     if normalizedFormat == "json":
       var resultPayload = resultJson(true, rows = rows)
       resultPayload["elapsed_ms"] = %elapsedMs
+      if noRows:
+        resultPayload["rows_returned"] = %rowsReturned
 
       # Preserve existing detailed timing output behind --timing.
       if timing:

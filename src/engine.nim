@@ -1127,6 +1127,83 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Resul
 proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
   execSql(db, sqlText, @[])
 
+proc execSqlNoRows*(db: Db, sqlText: string, params: seq[Value]): Result[int64] =
+  ## Execute a single SELECT statement and discard all result rows.
+  ## Returns the number of rows produced by the query.
+  ##
+  ## This is intended for benchmarks/diagnostics where formatting/serializing rows
+  ## would dominate, but you still want to exercise query execution.
+  if not db.isOpen:
+    return err[int64](ERR_INTERNAL, "Database not open")
+  const SqlCacheMaxEntries = 128
+
+  proc touchSqlCache(key: string) =
+    var idx = -1
+    for i, existing in db.sqlCacheOrder:
+      if existing == key:
+        idx = i
+        break
+    if idx >= 0:
+      db.sqlCacheOrder.delete(idx)
+    db.sqlCacheOrder.add(key)
+
+  proc rememberSqlCache(key: string, statements: seq[Statement], plans: seq[Plan]) =
+    db.sqlCache[key] = (schemaCookie: db.schemaCookie, statements: statements, plans: plans)
+    touchSqlCache(key)
+    while db.sqlCacheOrder.len > SqlCacheMaxEntries:
+      let evictKey = db.sqlCacheOrder[0]
+      db.sqlCacheOrder.delete(0)
+      if db.sqlCache.hasKey(evictKey):
+        db.sqlCache.del(evictKey)
+
+  var boundStatements: seq[Statement] = @[]
+  var cachedPlans: seq[Plan] = @[]
+  if db.sqlCache.hasKey(sqlText):
+    let cached = db.sqlCache[sqlText]
+    if cached.schemaCookie == db.schemaCookie:
+      boundStatements = cached.statements
+      cachedPlans = cached.plans
+      touchSqlCache(sqlText)
+
+  if boundStatements.len == 0:
+    let parseRes = parseSql(sqlText)
+    if not parseRes.ok:
+      return err[int64](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+    if parseRes.value.statements.len != 1:
+      return err[int64](ERR_SQL, "execSqlNoRows expects a single SELECT statement")
+    let stmt = parseRes.value.statements[0]
+    let bindRes = bindStatement(db.catalog, stmt)
+    if not bindRes.ok:
+      return err[int64](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+    boundStatements = @[bindRes.value]
+    if boundStatements[0].kind != skSelect:
+      return err[int64](ERR_SQL, "execSqlNoRows expects a SELECT statement")
+    let planRes = plan(db.catalog, boundStatements[0])
+    if not planRes.ok:
+      return err[int64](planRes.err.code, planRes.err.message, planRes.err.context)
+    cachedPlans = @[planRes.value]
+    rememberSqlCache(sqlText, boundStatements, cachedPlans)
+
+  if boundStatements.len != 1 or boundStatements[0].kind != skSelect:
+    return err[int64](ERR_SQL, "execSqlNoRows expects a single SELECT statement")
+  if cachedPlans.len != 1 or cachedPlans[0] == nil:
+    return err[int64](ERR_INTERNAL, "Missing cached plan for SELECT")
+
+  let cursorRes = openRowCursor(db.pager, db.catalog, cachedPlans[0], params)
+  if not cursorRes.ok:
+    return err[int64](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+  let cursor = cursorRes.value
+
+  var rowCount: int64 = 0
+  while true:
+    let nextRes = rowCursorNext(cursor)
+    if not nextRes.ok:
+      return err[int64](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+    if nextRes.value.isNone:
+      break
+    rowCount.inc
+  ok(rowCount)
+
 proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLoadOptions = defaultBulkLoadOptions(), wal: Wal = nil): Result[Void] =
   let tableRes = db.catalog.getTable(tableName)
   if not tableRes.ok:

@@ -38,28 +38,56 @@ proc valueToString*(value: Value): string =
   of vkInt64: $value.int64Val
   of vkFloat64: $value.float64Val
   of vkText, vkBlob:
-    var s = ""
-    for b in value.bytes:
-      s.add(char(b))
+    let n = value.bytes.len
+    var s = newString(n)
+    if n > 0:
+      copyMem(addr s[0], unsafeAddr value.bytes[0], n)
     s
   else:
     ""
 
 proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
-  var t = text
-  var p = pattern
-  if caseInsensitive:
-    t = t.toUpperAscii()
-    p = p.toUpperAscii()
+  template norm(ch: char): char =
+    (if caseInsensitive: toUpperAscii(ch) else: ch)
+
+  # Fast paths for common patterns.
+  # These avoid the general wildcard matcher for the important cases:
+  # - '%needle%'
+  # - 'prefix%'
+  # - '%suffix'
+  # Only enabled when there are no '_' wildcards.
+  if pattern.find('_') < 0:
+    if not caseInsensitive:
+      # '%needle%'
+      if pattern.len >= 2 and pattern[0] == '%' and pattern[^1] == '%':
+        let inner = pattern[1 .. ^2]
+        if inner.len == 0:
+          return true
+        if inner.find('%') < 0:
+          return text.find(inner) >= 0
+
+      # 'prefix%'
+      if pattern.len >= 1 and pattern[^1] == '%' and pattern.find('%') == pattern.len - 1:
+        let prefix = pattern[0 .. ^2]
+        if prefix.len == 0:
+          return true
+        return text.startsWith(prefix)
+
+      # '%suffix'
+      if pattern.len >= 1 and pattern[0] == '%' and pattern.rfind('%') == 0:
+        let suffix = pattern[1 .. ^1]
+        if suffix.len == 0:
+          return true
+        return text.endsWith(suffix)
   var i = 0
   var j = 0
   var star = -1
   var match = 0
-  while i < t.len:
-    if j < p.len and (p[j] == '_' or p[j] == t[i]):
+  while i < text.len:
+    if j < pattern.len and (pattern[j] == '_' or norm(pattern[j]) == norm(text[i])):
       i.inc
       j.inc
-    elif j < p.len and p[j] == '%':
+    elif j < pattern.len and pattern[j] == '%':
       star = j
       j.inc
       match = i
@@ -69,9 +97,9 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
       i = match
     else:
       return false
-  while j < p.len and p[j] == '%':
+  while j < pattern.len and pattern[j] == '%':
     j.inc
-  j == p.len
+  j == pattern.len
 
 const MaxLikePatternLen* = 4096
 const MaxLikeWildcards* = 128
