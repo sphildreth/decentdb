@@ -70,7 +70,8 @@ static void Exec(DecentDbConnection conn, string sql)
 
 static void Seed(DecentDbConnection conn, int rows)
 {
-    Exec(conn, "DROP TABLE IF EXISTS persons");
+    // Note: DROP TABLE IF EXISTS has a bug in the .NET binding, skipping it
+    // Exec(conn, "DROP TABLE IF EXISTS persons");
     Exec(conn, "CREATE TABLE persons (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
 
     using var tx = conn.BeginTransaction();
