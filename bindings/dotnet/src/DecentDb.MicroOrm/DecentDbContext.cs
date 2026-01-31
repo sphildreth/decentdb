@@ -15,17 +15,25 @@ public class DecentDbContext : IDisposable
 
     private readonly ConcurrentDictionary<Type, object> _sets = new();
 
-    public DecentDbContext(string dataSourcePath, bool pooling = true)
+    public DecentDbContext(string connectionStringOrPath, bool pooling = true)
     {
-        if (string.IsNullOrWhiteSpace(dataSourcePath))
+        if (string.IsNullOrWhiteSpace(connectionStringOrPath))
         {
-            throw new ArgumentException("Data source path must be provided.", nameof(dataSourcePath));
+            throw new ArgumentException("Connection string or data source path must be provided.", nameof(connectionStringOrPath));
         }
 
-        _connectionString = $"Data Source={dataSourcePath}";
+        _connectionString = LooksLikeConnectionString(connectionStringOrPath)
+            ? connectionStringOrPath
+            : $"Data Source={connectionStringOrPath}";
         _pooling = pooling;
 
         InitializeDbSets();
+    }
+
+    private static bool LooksLikeConnectionString(string value)
+    {
+        // Heuristic: paths usually don't contain '='. Connection strings do.
+        return value.Contains('=');
     }
 
     public DbTransaction BeginTransaction()

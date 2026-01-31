@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -141,5 +142,27 @@ public sealed class MicroOrmTests : IDisposable
 
         var any = q.Any(p => p.Name == "C");
         Assert.True(any);
+    }
+
+    [Fact]
+    public async Task StreamAsync_YieldsRowsInOrder()
+    {
+        using var ctx = new DecentDbContext(_dbPath);
+        var persons = ctx.Set<Person>();
+
+        await persons.InsertManyAsync(new[]
+        {
+            new Person { Id = 1, Name = "A", Age = 10 },
+            new Person { Id = 2, Name = "B", Age = 20 },
+            new Person { Id = 3, Name = "C", Age = 30 },
+        });
+
+        var ids = new List<long>();
+        await foreach (var p in persons.OrderBy(p => p.Id).StreamAsync())
+        {
+            ids.Add(p.Id);
+        }
+
+        Assert.Equal(new long[] { 1, 2, 3 }, ids);
     }
 }

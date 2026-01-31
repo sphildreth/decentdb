@@ -7,7 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Dapper" Version="2.1.35" />
-    <ProjectReference Include="../../../bindings/dotnet/src/DecentDb.AdoNet/DecentDb.AdoNet.csproj" />
+    <ProjectReference Include="../../src/DecentDb.AdoNet/DecentDb.AdoNet.csproj" />
+    <ProjectReference Include="../../src/DecentDb.MicroOrm/DecentDb.MicroOrm.csproj" />
   </ItemGroup>
 </Project>

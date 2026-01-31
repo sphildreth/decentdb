@@ -6,6 +6,7 @@ using System.Data.Common;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -89,10 +90,32 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         return result;
     }
 
+    public async IAsyncEnumerable<T> StreamAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var (sql, parameters) = BuildSelectSql(selectCount: false);
+
+        using var scope = _context.AcquireConnectionScope();
+        using var cmd = CreateCommand(scope.Connection, sql, parameters);
+        using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        var mapper = FastMaterializer<T>.Bind(_map, reader);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            yield return mapper(reader);
+        }
+    }
+
     public async Task<T?> FirstOrDefaultAsync(CancellationToken cancellationToken = default)
     {
         var list = await Take(1).ToListAsync(cancellationToken);
         return list.Count == 0 ? null : list[0];
+    }
+
+    public Task<T?> FirstOrDefaultAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default)
+    {
+        if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+        return Where(predicate).FirstOrDefaultAsync(cancellationToken);
     }
 
     public async Task<T> FirstAsync(CancellationToken cancellationToken = default)
@@ -100,6 +123,12 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         var item = await FirstOrDefaultAsync(cancellationToken);
         if (item == null) throw new InvalidOperationException("Sequence contains no elements");
         return item;
+    }
+
+    public Task<T> FirstAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default)
+    {
+        if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+        return Where(predicate).FirstAsync(cancellationToken);
     }
 
     public async Task<long> CountAsync(CancellationToken cancellationToken = default)
@@ -111,6 +140,12 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         return scalar == null ? 0 : Convert.ToInt64(scalar);
     }
 
+    public Task<long> CountAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default)
+    {
+        if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+        return Where(predicate).CountAsync(cancellationToken);
+    }
+
     public async Task<bool> AnyAsync(CancellationToken cancellationToken = default)
     {
         var (sql, parameters) = BuildSelectSql(selectCount: false, selectExists: true, overrideTake: 1);
@@ -118,6 +153,12 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         using var cmd = CreateCommand(scope.Connection, sql, parameters);
         using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken);
+    }
+
+    public Task<bool> AnyAsync(Expression<Func<T, bool>> predicate, CancellationToken cancellationToken = default)
+    {
+        if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+        return Where(predicate).AnyAsync(cancellationToken);
     }
 
     public async Task<T?> GetAsync(object id, CancellationToken cancellationToken = default)
