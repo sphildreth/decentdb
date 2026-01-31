@@ -57,9 +57,9 @@ Legend:
 | P3-02 | URL forms support `decentdb+pysql:///path` | ✅ | Used in tests via `create_engine("decentdb+pysql:///...")` |
 | P3-03 | connect args mapping for path + query options | ⚠️ | `create_connect_args()` passes `url.database` + query dict; no tests proving options affect engine |
 | P3-04 | SQL compilation: LIMIT/OFFSET matches DecentDB | ✅ | `DecentDbCompiler.limit_clause()` + integration test |
-| P3-05 | SQL compilation: RETURNING only enabled if supported / otherwise emulated | ❌ | No explicit RETURNING gating/emulation |
+| P3-05 | SQL compilation: RETURNING only enabled if supported / otherwise emulated | ⚠️ | Explicitly disabled: `implicit_returning=False` + compiler raises `CompileError` in `bindings/python/decentdb_sqlalchemy/dialect.py`; tested in `bindings/python/tests/test_sqlalchemy.py` |
 | P3-06 | Type compiler maps SQLAlchemy types to DecentDB storage types | ⚠️ | Basic mappings implemented; no round-trip tests for Date/Time/UUID/Decimal semantics |
-| P3-07 | Introspection best-effort: `get_table_names`, `get_columns`, indexes, FKs | ❌ | `get_table_names()` returns `[]`, `has_table()` returns `False` (stubbed) |
+| P3-07 | Introspection best-effort: `get_table_names`, `get_columns`, indexes, FKs | ⚠️ | `get_table_names/has_table/get_columns` implemented via C API JSON catalog helpers; tested in `bindings/python/tests/test_sqlalchemy.py` (indexes/FKs still missing) |
 | P3-08 | Dialect capabilities consistent with MVP + isolation constraints (Snapshot Isolation) | ⚠️ | `get_isolation_level()` returns `SNAPSHOT`; no full capability matrix or tests |
 | P3-09 | Optional perf hooks: compiled cache integration | ❌ | Not implemented |
 | P3-10 | Optional perf hooks: fast row/tuple mode | ❌ | Not implemented |
@@ -97,8 +97,8 @@ Legend:
 
 | ID | Requirement | Status | Evidence |
 |---|---|---|---|
-| E-01 | Map native errors into DB-API exception hierarchy | ⚠️ | `_raise_error()` maps known error codes; not comprehensively tested |
-| E-02 | SQLAlchemy exceptions include SQL + params + native error code | ❌ | Exceptions do not attach SQL/params/context |
+| E-01 | Map native errors into DB-API exception hierarchy | ⚠️ | `_raise_error()` maps known error codes; SQL parse errors covered by `bindings/python/tests/test_basic.py::test_error_includes_sql_and_code` |
+| E-02 | SQLAlchemy exceptions include SQL + params + native error code | ✅ | `_raise_error(..., sql=..., params=...)` appends JSON Context; tested in `bindings/python/tests/test_basic.py::test_error_includes_sql_and_code` |
 | O-01 | Support SQLAlchemy echo logging without excessive overhead | ⚠️ | Likely works via SQLAlchemy; not tested |
 | O-02 | Optional driver-level tracing hooks (timings/rows/cache metrics) | ❌ | Not implemented |
 | PERF-01 | Prepared statement cache (LRU) | ❌ | Not implemented |
@@ -117,8 +117,9 @@ Legend:
 
 ## Notes / Next smallest fixes
 
-1. **Implement minimal reflection** (`get_table_names`, `has_table`, `get_columns`) using DecentDB catalogs once catalog SQL is exposed; add tests using `sqlalchemy.inspect(engine)`.
-2. **Implement RETURNING gating**: explicitly disable `implicit_returning` (or equivalent) and add a test that ORM insert works without RETURNING.
-3. **Improve error context**: wrap DB-API exceptions to include SQL + params (redacted/capped) + native error code; add tests for message contents.
-4. **Performance basics**: per-connection prepared statement cache + `reset()`/`clear_bindings()` reuse in `executemany()`; add microbench + correctness tests.
-5. **Type conversions**: add bind/result processors for `Date/DateTime/Time/Numeric/UUID` via SQLAlchemy type decorators; add round-trip tests.
+1. **Performance basics**: per-connection prepared statement cache + `reset()`/`clear_bindings()` reuse in `executemany()`; add microbench + correctness tests.
+2. **Batch fetching**: use the row view API to reduce per-cell FFI overhead; add a benchmark and ensure `fetchmany()` uses it.
+3. **Type conversions**: add bind/result processors for `Date/DateTime/Time/Numeric/UUID/Enum`; add round-trip tests.
+4. **Introspection expansion**: implement indexes + foreign key reflection (best-effort) and add tests.
+5. **ORM coverage**: add relationship + eager-loading integration tests.
+6. **Packaging & perf gates**: cross-platform wheel automation and benchmarks to prove the <1ms overhead target.
