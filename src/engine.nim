@@ -794,6 +794,336 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       committed = true
   ok(output)
 
+proc findMatchingRowidsPrepared(db: Db, tableName: string, whereExpr: Expr, params: seq[Value]): Result[seq[uint64]] =
+  ## Match the execSql() helper, but usable from prepared APIs.
+  ## Uses the planner so indexes can be leveraged.
+  if whereExpr == nil:
+    let tableRes = db.catalog.getTable(tableName)
+    if not tableRes.ok:
+      return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let rowsRes = scanTable(db.pager, tableRes.value)
+    if not rowsRes.ok:
+      return err[seq[uint64]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    var rowids: seq[uint64] = @[]
+    for row in rowsRes.value:
+      rowids.add(row.rowid)
+    return ok(rowids)
+
+  let tableRes = db.catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  var selectItems: seq[SelectItem] = @[]
+  for col in table.columns:
+    selectItems.add(SelectItem(expr: Expr(kind: ekColumn, name: col.name, table: tableName)))
+  let selectStmt = Statement(
+    kind: skSelect,
+    fromTable: tableName,
+    fromAlias: "",
+    selectItems: selectItems,
+    whereExpr: whereExpr,
+    joins: @[],
+    groupBy: @[],
+    havingExpr: nil,
+    orderBy: @[],
+    limit: -1,
+    offset: -1
+  )
+  let planRes = plan(db.catalog, selectStmt)
+  if not planRes.ok:
+    return err[seq[uint64]](planRes.err.code, planRes.err.message, planRes.err.context)
+  let rowsRes = execPlan(db.pager, db.catalog, planRes.value, params)
+  if not rowsRes.ok:
+    return err[seq[uint64]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  var rowids: seq[uint64] = @[]
+  for row in rowsRes.value:
+    rowids.add(row.rowid)
+  ok(rowids)
+
+proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Result[int64] =
+  ## Execute a single already-bound non-SELECT statement and return rows affected.
+  ## Intended for the native C ABI / Go driver.
+  if not db.isOpen:
+    return err[int64](ERR_INTERNAL, "Database not open")
+  if bound.kind == skSelect:
+    return err[int64](ERR_INTERNAL, "execPreparedNonSelect called with SELECT")
+
+  let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
+  var autoCommit = false
+  if isWrite and db.activeWriter == nil and db.wal != nil:
+    let beginRes = beginTransaction(db)
+    if not beginRes.ok:
+      return err[int64](beginRes.err.code, beginRes.err.message, beginRes.err.context)
+    autoCommit = true
+  var committed = false
+  defer:
+    if autoCommit and not committed:
+      discard rollbackTransaction(db)
+
+  var affected: int64 = 0
+  case bound.kind
+  of skCreateTable:
+    let rootRes = initTableRoot(db.pager)
+    if not rootRes.ok:
+      return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
+    var columns: seq[Column] = @[]
+    for col in bound.columns:
+      let typeRes = parseColumnType(col.typeName)
+      if not typeRes.ok:
+        return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+      columns.add(Column(name: col.name, kind: typeRes.value, notNull: col.notNull, unique: col.unique, primaryKey: col.primaryKey, refTable: col.refTable, refColumn: col.refColumn))
+    let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
+    let saveRes = db.catalog.saveTable(db.pager, meta)
+    if not saveRes.ok:
+      return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    for col in columns:
+      if col.primaryKey or col.unique:
+        let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
+        if isNone(db.catalog.getIndexByName(idxName)):
+          let idxRootRes = initTableRoot(db.pager)
+          if not idxRootRes.ok:
+            return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+          let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+          if not buildRes.ok:
+            return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+          let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+          let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+          if not idxSaveRes.ok:
+            return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+      if col.refTable.len > 0 and col.refColumn.len > 0:
+        if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
+          let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
+          let idxRootRes = initTableRoot(db.pager)
+          if not idxRootRes.ok:
+            return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+          let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+          if not buildRes.ok:
+            return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+          let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
+          let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+          if not idxSaveRes.ok:
+            return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skDropTable:
+    var toDrop: seq[string] = @[]
+    for name, idx in db.catalog.indexes:
+      if idx.table == bound.dropTableName:
+        toDrop.add(name)
+    for idxName in toDrop:
+      discard db.catalog.dropIndex(idxName)
+    let dropRes = db.catalog.dropTable(bound.dropTableName)
+    if not dropRes.ok:
+      return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skAlterTable:
+    let alterRes = alterTable(db.pager, db.catalog, bound.alterTableName, bound.alterActions)
+    if not alterRes.ok:
+      return err[int64](alterRes.err.code, alterRes.err.message, alterRes.err.context)
+    affected = 0
+
+  of skCreateIndex:
+    let indexRootRes = initTableRoot(db.pager)
+    if not indexRootRes.ok:
+      return err[int64](indexRootRes.err.code, indexRootRes.err.message, indexRootRes.err.context)
+    if bound.unique:
+      let tableRes = db.catalog.getTable(bound.indexTableName)
+      if not tableRes.ok:
+        return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let table = tableRes.value
+      var colIndex = -1
+      for i, col in table.columns:
+        if col.name == bound.columnName:
+          colIndex = i
+          break
+      if colIndex < 0:
+        return err[int64](ERR_SQL, "Column not found", bound.columnName)
+      let rowsRes = scanTable(db.pager, table)
+      if not rowsRes.ok:
+        return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+      var seen = initTable[uint64, bool]()
+      for row in rowsRes.value:
+        if row.values[colIndex].kind == vkNull:
+          continue
+        let key = indexKeyFromValue(row.values[colIndex])
+        if seen.hasKey(key):
+          return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
+        seen[key] = true
+    var finalRoot = indexRootRes.value
+    if bound.indexKind == sql.ikTrigram:
+      let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
+      if not buildRes.ok:
+        return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      finalRoot = buildRes.value
+    else:
+      let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
+      if not buildRes.ok:
+        return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      finalRoot = buildRes.value
+    let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
+    let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
+    let saveRes = db.catalog.createIndexMeta(idxMeta)
+    if not saveRes.ok:
+      return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skDropIndex:
+    let dropRes = db.catalog.dropIndex(bound.dropIndexName)
+    if not dropRes.ok:
+      return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skInsert:
+    let tableRes = db.catalog.getTable(bound.insertTable)
+    if not tableRes.ok:
+      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let valuesRes = evalInsertValues(bound, params)
+    if not valuesRes.ok:
+      return err[int64](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
+    let values = valuesRes.value
+    for i, col in tableRes.value.columns:
+      let typeRes = typeCheckValue(col.kind, values[i])
+      if not typeRes.ok:
+        return err[int64](typeRes.err.code, typeRes.err.message, col.name)
+    let notNullRes = enforceNotNull(tableRes.value, values)
+    if not notNullRes.ok:
+      return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    let uniqueRes = enforceUnique(db.catalog, db.pager, tableRes.value, values)
+    if not uniqueRes.ok:
+      return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+    let fkRes = enforceForeignKeys(db.catalog, db.pager, tableRes.value, values)
+    if not fkRes.ok:
+      return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+    if not insertRes.ok:
+      return err[int64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+    affected = 1
+
+  of skUpdate:
+    let tableRes = db.catalog.getTable(bound.updateTable)
+    if not tableRes.ok:
+      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
+    var cols: seq[string] = @[]
+    for col in table.columns:
+      cols.add(bound.updateTable & "." & col.name)
+
+    let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
+    if not rowidsRes.ok:
+      return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+
+    for rowid in rowidsRes.value:
+      let storedRes = readRowAt(db.pager, table, rowid)
+      if not storedRes.ok:
+        continue
+      let stored = storedRes.value
+      let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+      var newValues = stored.values
+      for colName, expr in bound.assignments:
+        var idx = -1
+        for i, col in table.columns:
+          if col.name == colName:
+            idx = i
+            break
+        if idx >= 0:
+          let evalRes = evalExpr(row, expr, params)
+          if not evalRes.ok:
+            return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+          let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+          if not typeRes.ok:
+            return err[int64](typeRes.err.code, typeRes.err.message, colName)
+          newValues[idx] = evalRes.value
+      updates.add((stored.rowid, stored.values, newValues))
+
+    for entry in updates:
+      let notNullRes = enforceNotNull(table, entry[2])
+      if not notNullRes.ok:
+        return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+      let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
+      if not uniqueRes.ok:
+        return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+      let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
+      if not fkRes.ok:
+        return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+      let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+      if not restrictRes.ok:
+        return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+    for entry in updates:
+      let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
+      if not upRes.ok:
+        return err[int64](upRes.err.code, upRes.err.message, upRes.err.context)
+
+    affected = int64(updates.len)
+
+  of skDelete:
+    let tableRes = db.catalog.getTable(bound.deleteTable)
+    if not tableRes.ok:
+      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    var deletions: seq[StoredRow] = @[]
+
+    let rowidsRes = findMatchingRowidsPrepared(db, bound.deleteTable, bound.deleteWhere, params)
+    if not rowidsRes.ok:
+      return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+
+    for rowid in rowidsRes.value:
+      let storedRes = readRowAt(db.pager, table, rowid)
+      if not storedRes.ok:
+        continue
+      deletions.add(storedRes.value)
+    for row in deletions:
+      let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
+      if not restrictRes.ok:
+        return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+    for row in deletions:
+      let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
+      if not delRes.ok:
+        return err[int64](delRes.err.code, delRes.err.message, delRes.err.context)
+
+    affected = int64(deletions.len)
+
+  of skBegin:
+    let beginRes = beginTransaction(db)
+    if not beginRes.ok:
+      return err[int64](beginRes.err.code, beginRes.err.message, beginRes.err.context)
+    affected = 0
+
+  of skCommit:
+    let commitRes = commitTransaction(db)
+    if not commitRes.ok:
+      return err[int64](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+    affected = 0
+
+  of skRollback:
+    let rollbackRes = rollbackTransaction(db)
+    if not rollbackRes.ok:
+      return err[int64](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
+    affected = 0
+
+  else:
+    affected = 0
+
+  if autoCommit:
+    let commitRes = commitTransaction(db)
+    if not commitRes.ok:
+      return err[int64](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+    committed = true
+  ok(affected)
+
 proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
   execSql(db, sqlText, @[])
 

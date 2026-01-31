@@ -1,7 +1,7 @@
 package decentdb
 
 /*
-#cgo LDFLAGS: -L../../../build -lc_api -Wl,-rpath,$ORIGIN/../../../build
+#cgo LDFLAGS: -L${SRCDIR}/../../../build -lc_api -Wl,-rpath,${SRCDIR}/../../../build
 #include "decentdb.h"
 #include <stdlib.h>
 */
@@ -93,11 +93,52 @@ type conn struct {
 	db *C.decentdb_db
 }
 
+func hasUnsupportedParamStyle(sqlText string) bool {
+	// sqlc-generated SQL should use $N. Reject common alternative styles to avoid
+	// silent misbinding. Best-effort parsing: ignores tokens inside single quotes.
+	inSingle := false
+	for i := 0; i < len(sqlText); i++ {
+		ch := sqlText[i]
+		if ch == '\'' {
+			if inSingle {
+				// Handle doubled single-quote escape in SQL strings.
+				if i+1 < len(sqlText) && sqlText[i+1] == '\'' {
+					i++
+					continue
+				}
+				inSingle = false
+				continue
+			}
+			inSingle = true
+			continue
+		}
+		if inSingle {
+			continue
+		}
+		if ch == '?' {
+			return true
+		}
+		if ch == '@' && i+1 < len(sqlText) {
+			n := sqlText[i+1]
+			if (n >= 'a' && n <= 'z') || (n >= 'A' && n <= 'Z') || n == '_' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	return c.PrepareContext(context.Background(), query)
 }
 
 func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if hasUnsupportedParamStyle(query) {
+		return nil, fmt.Errorf("unsupported parameter style: use $1..$N only")
+	}
 	cQuery := C.CString(query)
 	defer C.free(unsafe.Pointer(cQuery))
 
@@ -197,12 +238,24 @@ func (s *stmtStruct) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *stmtStruct) bind(args []driver.NamedValue) error {
+	if s.stmt == nil {
+		return errors.New("statement is closed")
+	}
+	// Ensure statement reuse is safe: clear previous execution state and bindings.
+	C.decentdb_reset(s.stmt)
+	C.decentdb_clear_bindings(s.stmt)
+
 	for _, arg := range args {
-		idx := C.int(arg.Ordinal - 1)
+		if arg.Ordinal <= 0 {
+			return fmt.Errorf("invalid bind ordinal: %d", arg.Ordinal)
+		}
+		idx := C.int(arg.Ordinal) // 1-based
 		var res C.int
 		switch v := arg.Value.(type) {
 		case nil:
 			res = C.decentdb_bind_null(s.stmt, idx)
+		case int:
+			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(int64(v)))
 		case int64:
 			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(v))
 		case float64:
@@ -239,6 +292,9 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 }
 
 func (s *stmtStruct) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := s.bind(args); err != nil {
 		return nil, err
 	}
@@ -254,15 +310,19 @@ func (s *stmtStruct) ExecContext(ctx context.Context, args []driver.NamedValue) 
 }
 
 func (s *stmtStruct) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := s.bind(args); err != nil {
 		return nil, err
 	}
 
-	return &rows{s: s}, nil
+	return &rows{s: s, ctx: ctx}, nil
 }
 
 type rows struct {
-	s *stmtStruct
+	s   *stmtStruct
+	ctx context.Context
 }
 
 func (r *rows) Columns() []string {
@@ -275,13 +335,21 @@ func (r *rows) Columns() []string {
 }
 
 func (r *rows) Close() error {
-	// We don't finalize the stmt here because it might be reused.
-	// But we should probably reset it or something if we had a reset.
-	// Database/sql will call stmt.Close eventually.
+	// Make statement reusable (and release any held read snapshot).
+	if r.s != nil && r.s.stmt != nil {
+		C.decentdb_reset(r.s.stmt)
+	}
 	return nil
 }
 
 func (r *rows) Next(dest []driver.Value) error {
+	if r.ctx != nil {
+		select {
+		case <-r.ctx.Done():
+			return r.ctx.Err()
+		default:
+		}
+	}
 	res := C.decentdb_step(r.s.stmt)
 	if res == 0 {
 		return io.EOF
@@ -291,30 +359,42 @@ func (r *rows) Next(dest []driver.Value) error {
 		return &DecentDBError{Code: int(res), Message: msg, SQL: r.s.query}
 	}
 
-	count := int(C.decentdb_column_count(r.s.stmt))
-	for i := 0; i < count; i++ {
-		if C.decentdb_column_is_null(r.s.stmt, C.int(i)) != 0 {
+	var views *C.decentdb_value_view
+	var count C.int
+	viewRes := C.decentdb_row_view(r.s.stmt, &views, &count)
+	if viewRes != 0 {
+		msg := C.GoString(C.decentdb_last_error_message(r.s.c.db))
+		return &DecentDBError{Code: int(viewRes), Message: msg, SQL: r.s.query}
+	}
+	if count == 0 {
+		return nil
+	}
+	goViews := unsafe.Slice((*C.decentdb_value_view)(unsafe.Pointer(views)), int(count))
+	for i := 0; i < int(count) && i < len(dest); i++ {
+		v := goViews[i]
+		if v.is_null != 0 {
 			dest[i] = nil
 			continue
 		}
-		typ := int(C.decentdb_column_type(r.s.stmt, C.int(i)))
-		// Define mapping (vkNull=0, vkInt64=1, vkBool=2, vkFloat64=3, vkText=4, vkBlob=5)
-		// Wait, I should check the enum values in record.nim
-		switch typ {
+		switch int(v.kind) {
 		case 1: // vkInt64
-			dest[i] = int64(C.decentdb_column_int64(r.s.stmt, C.int(i)))
+			dest[i] = int64(v.int64_val)
 		case 2: // vkBool
-			dest[i] = C.decentdb_column_int64(r.s.stmt, C.int(i)) != 0
+			dest[i] = v.int64_val != 0
 		case 3: // vkFloat64
-			dest[i] = float64(C.decentdb_column_float64(r.s.stmt, C.int(i)))
+			dest[i] = float64(v.float64_val)
 		case 4: // vkText
-			var length C.int
-			ptr := C.decentdb_column_text(r.s.stmt, C.int(i), &length)
-			dest[i] = C.GoStringN(ptr, length)
+			if v.bytes_len == 0 || v.bytes == nil {
+				dest[i] = ""
+				continue
+			}
+			dest[i] = C.GoStringN((*C.char)(unsafe.Pointer(v.bytes)), v.bytes_len)
 		case 5: // vkBlob
-			var length C.int
-			ptr := C.decentdb_column_blob(r.s.stmt, C.int(i), &length)
-			dest[i] = C.GoBytes(unsafe.Pointer(ptr), length)
+			if v.bytes_len == 0 || v.bytes == nil {
+				dest[i] = []byte{}
+				continue
+			}
+			dest[i] = C.GoBytes(unsafe.Pointer(v.bytes), v.bytes_len)
 		default:
 			dest[i] = nil
 		}

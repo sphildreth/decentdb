@@ -11,6 +11,8 @@ import errors
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
+  if fileExists(path & "-wal"):
+    removeFile(path & "-wal")
   if fileExists(path):
     removeFile(path)
   if fileExists(path & ".wal"):

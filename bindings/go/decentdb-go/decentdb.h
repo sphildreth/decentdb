@@ -29,6 +29,10 @@ int decentdb_bind_float64(decentdb_stmt* stmt, int index_1_based, double v);
 int decentdb_bind_text(decentdb_stmt* stmt, int index_1_based, const char* utf8, int byte_len);
 int decentdb_bind_blob(decentdb_stmt* stmt, int index_1_based, const uint8_t* data, int byte_len);
 
+// Statement reuse
+int decentdb_reset(decentdb_stmt* stmt);
+int decentdb_clear_bindings(decentdb_stmt* stmt);
+
 // Step rows: returns 1=row available, 0=done, <0=error
 int decentdb_step(decentdb_stmt* stmt);
 
@@ -43,6 +47,18 @@ int64_t decentdb_column_int64(decentdb_stmt* stmt, int col_0_based);
 double decentdb_column_float64(decentdb_stmt* stmt, int col_0_based);
 const char* decentdb_column_text(decentdb_stmt* stmt, int col_0_based, int* out_byte_len);
 const uint8_t* decentdb_column_blob(decentdb_stmt* stmt, int col_0_based, int* out_byte_len);
+
+// Row view (performance extension): borrowed until next step/reset/finalize.
+typedef struct decentdb_value_view {
+	int kind;
+	int is_null;
+	int64_t int64_val;
+	double float64_val;
+	const uint8_t* bytes;
+	int bytes_len;
+} decentdb_value_view;
+
+int decentdb_row_view(decentdb_stmt* stmt, const decentdb_value_view** out_values, int* out_count);
 
 int64_t decentdb_rows_affected(decentdb_stmt* stmt);
 void decentdb_finalize(decentdb_stmt* stmt);

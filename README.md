@@ -43,7 +43,7 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 |---|---|---|---|---|---|
 | C# | ADO.NET + Dapper | IN PROGRESS | Embedded provider for querying DecentDB files | CRUD, streaming reads, parameter rewriting to `$1..$N` | [design/DAPPER_SUPPORT.md](design/DAPPER_SUPPORT.md) |
 | Python 3 | SQLAlchemy | IN PROGRESS | Embedded DB-API driver + SQLAlchemy dialect | ORM/Core queries, CRUD, transactions, fast reads focus | [design/SQLALCHEMY_SUPPORT.md](design/SQLALCHEMY_SUPPORT.md) |
-| Go | `database/sql` + sqlc | IN PROGRESS | Embedded `database/sql` driver optimized for sqlc-generated queries | Type-safe compiled queries, CRUD, transactions, fast scan paths | [design/SQLC_SUPPORT.md](design/SQLC_SUPPORT.md) |
+| Go | `database/sql` + sqlc | COMPLETE | Embedded `database/sql` driver optimized for sqlc-generated queries | Type-safe compiled queries, CRUD, transactions, streaming reads, `$1..$N` parameters | [design/SQLC_SUPPORT.md](design/SQLC_SUPPORT.md) |
 
 ## Quick Start
 

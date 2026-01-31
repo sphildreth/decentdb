@@ -364,11 +364,21 @@ suite "Exec Expression Evaluation":
     check res.ok
     check res.value.kind == vkNull
 
-  test "evalExpr with unsupported operator":
+  test "evalExpr with addition operator":
     let row = Row(columns: @[], values: @[])
     let left = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1))
     let right = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 2))
     let expr = Expr(kind: ekBinary, op: "+", left: left, right: right)
+    let res = evalExpr(row, expr, @[])
+    check res.ok
+    check res.value.kind == vkInt64
+    check res.value.int64Val == 3
+
+  test "evalExpr with unsupported operator":
+    let row = Row(columns: @[], values: @[])
+    let left = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1))
+    let right = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 2))
+    let expr = Expr(kind: ekBinary, op: "||", left: left, right: right)
     let res = evalExpr(row, expr, @[])
     check not res.ok
 

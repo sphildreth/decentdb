@@ -12,6 +12,10 @@ import pager/pager
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
+  if fileExists(path & "-wal"):
+    removeFile(path & "-wal")
+  if fileExists(path & ".wal"):
+    removeFile(path & ".wal")
   if fileExists(path):
     removeFile(path)
   path

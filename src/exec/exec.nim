@@ -13,11 +13,19 @@ import ../pager/db_header
 import ../storage/storage
 import ../planner/planner
 import ../search/search
+import ../btree/btree
 
 type Row* = object
   rowid*: uint64
   columns*: seq[string]
   values*: seq[Value]
+
+type RowCursor* = ref object
+  ## Forward-only row iterator for common SELECT paths.
+  ##
+  ## - For complex plans (join/sort/aggregate), this may materialize internally.
+  columns*: seq[string]
+  nextFn: proc(): Result[Option[Row]] {.closure.}
 
 proc valueToString*(value: Value): string =
   case value.kind
@@ -83,6 +91,241 @@ proc likeMatchChecked*(text: string, pattern: string, caseInsensitive: bool): Re
 
 proc makeRow*(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
   Row(rowid: rowid, columns: columns, values: values)
+
+proc rowCursorColumns*(cursor: RowCursor): seq[string] =
+  if cursor == nil: return @[]
+  cursor.columns
+
+proc rowCursorNext*(cursor: RowCursor): Result[Option[Row]] =
+  if cursor == nil:
+    return ok(none(Row))
+  cursor.nextFn()
+
+# Forward declaration (used by openRowCursor materialization fallback)
+proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[seq[Row]]
+
+# Forward declarations used by streaming cursor wrappers
+proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value]
+proc valueToBool*(value: Value): bool
+
+proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[RowCursor] =
+  ## Build a forward-only cursor for a query plan.
+  ##
+  ## Streaming is implemented for these plan shapes:
+  ## - Table scan
+  ## - Index seek (equality)
+  ## - Filter
+  ## - Project
+  ## - Limit/Offset (without requiring full materialization)
+  ##
+  ## For other plan kinds, we fall back to materializing via execPlan.
+  proc materialize(): Result[RowCursor] =
+    let rowsRes = execPlan(pager, catalog, plan, params)
+    if not rowsRes.ok:
+      return err[RowCursor](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    let rows = rowsRes.value
+    let cols = if rows.len > 0: rows[0].columns else: @[]
+    var i = 0
+    let c = RowCursor(
+      columns: cols,
+      nextFn: proc(): Result[Option[Row]] =
+        if i >= rows.len:
+          return ok(none(Row))
+        let r = rows[i]
+        i.inc
+        ok(some(r))
+    )
+    ok(c)
+
+  case plan.kind
+  of pkTableScan:
+    let tableRes = catalog.getTable(plan.table)
+    if not tableRes.ok:
+      return err[RowCursor](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    let tree = newBTree(pager, table.rootPage)
+    let cursorRes = openCursor(tree)
+    if not cursorRes.ok:
+      return err[RowCursor](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+    let btCursor = cursorRes.value
+    let prefix = if plan.alias.len > 0: plan.alias else: plan.table
+    var cols: seq[string] = @[]
+    for col in table.columns:
+      cols.add(prefix & "." & col.name)
+    let c = RowCursor(
+      columns: cols,
+      nextFn: proc(): Result[Option[Row]] =
+        while true:
+          let nextRes = cursorNext(btCursor)
+          if not nextRes.ok:
+            return ok(none(Row))
+          let (rowid, valueBytes, overflow) = nextRes.value
+          if valueBytes.len == 0 and overflow == 0'u32:
+            continue
+          let decoded = decodeRecordWithOverflow(pager, valueBytes)
+          if not decoded.ok:
+            return err[Option[Row]](decoded.err.code, decoded.err.message, decoded.err.context)
+          return ok(some(makeRow(cols, decoded.value, rowid)))
+    )
+    ok(c)
+
+  of pkIndexSeek:
+    let valueRes = evalExpr(Row(), plan.valueExpr, params)
+    if not valueRes.ok:
+      return err[RowCursor](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    let tableRes = catalog.getTable(plan.table)
+    if not tableRes.ok:
+      return err[RowCursor](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    let indexOpt = catalog.getBtreeIndexForColumn(plan.table, plan.column)
+    if isNone(indexOpt):
+      return err[RowCursor](ERR_SQL, "Index not found", plan.table & "." & plan.column)
+    let idx = indexOpt.get
+    let needle = indexKeyFromValue(valueRes.value)
+    let idxTree = newBTree(pager, idx.rootPage)
+    let idxCursorRes = openCursorAt(idxTree, needle)
+    if not idxCursorRes.ok:
+      return err[RowCursor](idxCursorRes.err.code, idxCursorRes.err.message, idxCursorRes.err.context)
+    let idxCursor = idxCursorRes.value
+    let prefix = if plan.alias.len > 0: plan.alias else: plan.table
+    var cols: seq[string] = @[]
+    for col in table.columns:
+      cols.add(prefix & "." & col.name)
+    proc decodeRowIdBytes(data: seq[byte]): Result[uint64] =
+      if data.len < 8:
+        return err[uint64](ERR_CORRUPTION, "Index rowid payload too short")
+      ok(readU64LE(data, 0))
+    let c = RowCursor(
+      columns: cols,
+      nextFn: proc(): Result[Option[Row]] =
+        while true:
+          let nextRes = cursorNext(idxCursor)
+          if not nextRes.ok:
+            return ok(none(Row))
+          if nextRes.value[0] < needle:
+            continue
+          if nextRes.value[0] > needle:
+            return ok(none(Row))
+          let rowidRes = decodeRowIdBytes(nextRes.value[1])
+          if not rowidRes.ok:
+            # Skip corrupt rowid payloads.
+            continue
+          let readRes = readRowAt(pager, table, rowidRes.value)
+          if not readRes.ok:
+            continue
+          return ok(some(makeRow(cols, readRes.value.values, rowidRes.value)))
+    )
+    ok(c)
+
+  of pkFilter:
+    let childRes = openRowCursor(pager, catalog, plan.left, params)
+    if not childRes.ok:
+      return err[RowCursor](childRes.err.code, childRes.err.message, childRes.err.context)
+    let child = childRes.value
+    let c = RowCursor(
+      columns: child.columns,
+      nextFn: proc(): Result[Option[Row]] =
+        while true:
+          let rRes = rowCursorNext(child)
+          if not rRes.ok:
+            return err[Option[Row]](rRes.err.code, rRes.err.message, rRes.err.context)
+          if rRes.value.isNone:
+            return ok(none(Row))
+          let r = rRes.value.get
+          if plan.predicate == nil:
+            return ok(some(r))
+          let evalRes = evalExpr(r, plan.predicate, params)
+          if not evalRes.ok:
+            return err[Option[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+          if valueToBool(evalRes.value):
+            return ok(some(r))
+    )
+    ok(c)
+
+  of pkProject:
+    let childRes = openRowCursor(pager, catalog, plan.left, params)
+    if not childRes.ok:
+      return err[RowCursor](childRes.err.code, childRes.err.message, childRes.err.context)
+    let child = childRes.value
+    let items = plan.projections
+    if items.len == 0 or (items.len == 1 and items[0].isStar):
+      return ok(child)
+    var outCols: seq[string] = @[]
+    for item in items:
+      if item.isStar:
+        for c in child.columns:
+          outCols.add(c)
+      else:
+        var name = if item.alias.len > 0: item.alias else: ""
+        if name.len == 0 and item.expr != nil and item.expr.kind == ekColumn:
+          name = item.expr.name
+        if name.len == 0:
+          name = "expr"
+        outCols.add(name)
+    let c = RowCursor(
+      columns: outCols,
+      nextFn: proc(): Result[Option[Row]] =
+        let rRes = rowCursorNext(child)
+        if not rRes.ok:
+          return err[Option[Row]](rRes.err.code, rRes.err.message, rRes.err.context)
+        if rRes.value.isNone:
+          return ok(none(Row))
+        let r = rRes.value.get
+        var vals: seq[Value] = @[]
+        for item in items:
+          if item.isStar:
+            for v in r.values:
+              vals.add(v)
+          else:
+            let evalRes = evalExpr(r, item.expr, params)
+            if not evalRes.ok:
+              return err[Option[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+            vals.add(evalRes.value)
+        ok(some(makeRow(outCols, vals, r.rowid)))
+    )
+    ok(c)
+
+  of pkLimit:
+    let childPlan =
+      if plan.left != nil and plan.left.kind == pkSort:
+        # Sorting requires materialization; preserve existing optimized path.
+        nil
+      else:
+        plan.left
+    if childPlan == nil:
+      return materialize()
+    let childRes = openRowCursor(pager, catalog, childPlan, params)
+    if not childRes.ok:
+      return err[RowCursor](childRes.err.code, childRes.err.message, childRes.err.context)
+    let child = childRes.value
+    let offset = if plan.offset >= 0: plan.offset else: 0
+    let limit = plan.limit
+    var skipped = 0
+    var produced = 0
+    let c = RowCursor(
+      columns: child.columns,
+      nextFn: proc(): Result[Option[Row]] =
+        if limit >= 0 and produced >= limit:
+          return ok(none(Row))
+        while skipped < offset:
+          let rRes = rowCursorNext(child)
+          if not rRes.ok:
+            return err[Option[Row]](rRes.err.code, rRes.err.message, rRes.err.context)
+          if rRes.value.isNone:
+            return ok(none(Row))
+          skipped.inc
+        let rRes = rowCursorNext(child)
+        if not rRes.ok:
+          return err[Option[Row]](rRes.err.code, rRes.err.message, rRes.err.context)
+        if rRes.value.isNone:
+          return ok(none(Row))
+        produced.inc
+        ok(rRes.value)
+    )
+    ok(c)
+
+  of pkTrigramSeek, pkJoin, pkSort, pkAggregate, pkStatement:
+    materialize()
 
 const SortBufferBytes = 16 * 1024 * 1024
 const SortMaxOpenRuns = 64
@@ -222,6 +465,43 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) > 0))
     of ">=":
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) >= 0))
+    of "+", "-", "*", "/":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      if leftRes.value.kind notin {vkInt64, vkFloat64} or rightRes.value.kind notin {vkInt64, vkFloat64}:
+        return err[Value](ERR_SQL, "Numeric operator on non-numeric", expr.op)
+      if leftRes.value.kind == vkFloat64 or rightRes.value.kind == vkFloat64:
+        let l = if leftRes.value.kind == vkFloat64: leftRes.value.float64Val else: float64(leftRes.value.int64Val)
+        let r = if rightRes.value.kind == vkFloat64: rightRes.value.float64Val else: float64(rightRes.value.int64Val)
+        case expr.op
+        of "+":
+          return ok(Value(kind: vkFloat64, float64Val: l + r))
+        of "-":
+          return ok(Value(kind: vkFloat64, float64Val: l - r))
+        of "*":
+          return ok(Value(kind: vkFloat64, float64Val: l * r))
+        of "/":
+          if r == 0.0:
+            return err[Value](ERR_SQL, "Division by zero")
+          return ok(Value(kind: vkFloat64, float64Val: l / r))
+        else:
+          return err[Value](ERR_SQL, "Unsupported operator", expr.op)
+      else:
+        let l = leftRes.value.int64Val
+        let r = rightRes.value.int64Val
+        case expr.op
+        of "+":
+          return ok(Value(kind: vkInt64, int64Val: l + r))
+        of "-":
+          return ok(Value(kind: vkInt64, int64Val: l - r))
+        of "*":
+          return ok(Value(kind: vkInt64, int64Val: l * r))
+        of "/":
+          if r == 0:
+            return err[Value](ERR_SQL, "Division by zero")
+          return ok(Value(kind: vkInt64, int64Val: l div r))
+        else:
+          return err[Value](ERR_SQL, "Unsupported operator", expr.op)
     of "LIKE", "ILIKE":
       let leftStr = valueToString(leftRes.value)
       let rightStr = valueToString(rightRes.value)

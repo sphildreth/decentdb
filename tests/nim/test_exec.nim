@@ -12,8 +12,10 @@ proc makeTempDb(name: string): string =
   let path = getTempDir() / name
   if fileExists(path):
     removeFile(path)
+  if fileExists(path & "-wal"):
+    removeFile(path & "-wal")
   if fileExists(path & ".wal"):
-    removeFile(path)
+    removeFile(path & ".wal")
   path
 
 proc splitRow(row: string): seq[string] =

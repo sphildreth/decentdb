@@ -12,6 +12,10 @@ proc makeTempDb(name: string): string =
   let path = getTempDir() / name
   if fileExists(path):
     removeFile(path)
+  # Current DecentDB WAL naming convention is "<db>-wal".
+  # Keep legacy cleanup for ".wal" to avoid leaving stale files.
+  if fileExists(path & "-wal"):
+    removeFile(path & "-wal")
   if fileExists(path & ".wal"):
     removeFile(path & ".wal")
   path
@@ -57,6 +61,8 @@ suite "B+Tree Page Utilization":
     
     if fileExists(path):
       removeFile(path)
+    if fileExists(path & "-wal"):
+      removeFile(path & "-wal")
     if fileExists(path & ".wal"):
       removeFile(path & ".wal")
   
@@ -105,6 +111,8 @@ suite "B+Tree Page Utilization":
     
     if fileExists(path):
       removeFile(path)
+    if fileExists(path & "-wal"):
+      removeFile(path & "-wal")
     if fileExists(path & ".wal"):
       removeFile(path & ".wal")
   
@@ -141,5 +149,7 @@ suite "B+Tree Page Utilization":
     
     if fileExists(path):
       removeFile(path)
+    if fileExists(path & "-wal"):
+      removeFile(path & "-wal")
     if fileExists(path & ".wal"):
       removeFile(path & ".wal")
