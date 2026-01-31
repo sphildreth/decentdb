@@ -13,6 +13,37 @@ public class DecentDbContext : IDisposable
     private DecentDbConnection? _connection;
     private DbTransaction? _transaction;
 
+    private EventHandler<SqlExecutingEventArgs>? _sqlExecuting;
+    private EventHandler<SqlExecutedEventArgs>? _sqlExecuted;
+
+    public event EventHandler<SqlExecutingEventArgs>? SqlExecuting
+    {
+        add
+        {
+            _sqlExecuting += value;
+            if (_connection != null) _connection.SqlExecuting += value;
+        }
+        remove
+        {
+            _sqlExecuting -= value;
+            if (_connection != null) _connection.SqlExecuting -= value;
+        }
+    }
+
+    public event EventHandler<SqlExecutedEventArgs>? SqlExecuted
+    {
+        add
+        {
+            _sqlExecuted += value;
+            if (_connection != null) _connection.SqlExecuted += value;
+        }
+        remove
+        {
+            _sqlExecuted -= value;
+            if (_connection != null) _connection.SqlExecuted -= value;
+        }
+    }
+
     private readonly ConcurrentDictionary<Type, object> _sets = new();
 
     public DecentDbContext(string connectionStringOrPath, bool pooling = true)
@@ -25,7 +56,9 @@ public class DecentDbContext : IDisposable
         _connectionString = LooksLikeConnectionString(connectionStringOrPath)
             ? connectionStringOrPath
             : $"Data Source={connectionStringOrPath}";
-        _pooling = pooling;
+        _pooling = LooksLikeConnectionString(connectionStringOrPath) && TryGetBoolOption(connectionStringOrPath, "Pooling", out var poolingFromCs)
+            ? poolingFromCs
+            : pooling;
 
         InitializeDbSets();
     }
@@ -34,6 +67,25 @@ public class DecentDbContext : IDisposable
     {
         // Heuristic: paths usually don't contain '='. Connection strings do.
         return value.Contains('=');
+    }
+
+    private static bool TryGetBoolOption(string connectionString, string key, out bool value)
+    {
+        foreach (var part in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var kv = part.Split('=', 2);
+            if (kv.Length != 2) continue;
+            if (!kv[0].Trim().Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+
+            var raw = kv[1].Trim();
+            if (bool.TryParse(raw, out value)) return true;
+            if (raw == "0") { value = false; return true; }
+            if (raw == "1") { value = true; return true; }
+            break;
+        }
+
+        value = default;
+        return false;
     }
 
     public DbTransaction BeginTransaction()
@@ -87,6 +139,9 @@ public class DecentDbContext : IDisposable
 
         _connection = new DecentDbConnection(_connectionString);
         _connection.Open();
+
+        if (_sqlExecuting != null) _connection.SqlExecuting += _sqlExecuting;
+        if (_sqlExecuted != null) _connection.SqlExecuted += _sqlExecuted;
     }
 
     internal readonly struct ConnectionScope : IDisposable

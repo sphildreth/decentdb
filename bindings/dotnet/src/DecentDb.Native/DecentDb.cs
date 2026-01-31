@@ -46,7 +46,7 @@ public sealed class DecentDb : IDisposable
         {
             var ptr = DecentDbNativeUnsafe.decentdb_last_error_message(db);
             if (ptr == null) return string.Empty;
-            return Marshal.PtrToStringAnsi((IntPtr)ptr) ?? string.Empty;
+            return Marshal.PtrToStringUTF8((IntPtr)ptr) ?? string.Empty;
         }
     }
 
@@ -234,7 +234,7 @@ public sealed class PreparedStatement : IDisposable
         {
             var ptr = DecentDbNativeUnsafe.decentdb_column_name(Handle, col0Based);
             if (ptr == null) return string.Empty;
-            return Marshal.PtrToStringAnsi((IntPtr)ptr) ?? string.Empty;
+            return Marshal.PtrToStringUTF8((IntPtr)ptr) ?? string.Empty;
         }
     }
 
@@ -264,7 +264,7 @@ public sealed class PreparedStatement : IDisposable
         {
             var ptr = DecentDbNativeUnsafe.decentdb_column_text(Handle, col0Based, out var len);
             if (ptr == null || len == 0) return string.Empty;
-            return Marshal.PtrToStringAnsi((IntPtr)ptr, len) ?? string.Empty;
+            return Marshal.PtrToStringUTF8((IntPtr)ptr, len) ?? string.Empty;
         }
     }
 

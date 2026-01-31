@@ -4,6 +4,7 @@ import options
 import catalog/catalog
 import errors
 import record/record
+import pager/db_header
 import pager/pager
 import vfs/os_vfs
 import sql/sql
@@ -57,6 +58,37 @@ proc parseCachePages(options: string): int =
   result = 1024
   if options.len == 0:
     return
+
+  proc tryParseCachePagesValue(raw: string): Option[int] =
+    let s = raw.strip()
+    if s.len == 0:
+      return none(int)
+
+    let lower = s.toLowerAscii()
+    let pageSize = int(DefaultPageSize)
+
+    if lower.endsWith("mb"):
+      let numPart = lower[0 ..< lower.len - 2].strip()
+      try:
+        let mb = parseFloat(numPart)
+        if mb <= 0:
+          return none(int)
+        let bytes = int64(mb * 1024.0 * 1024.0)
+        let pages = int((bytes + int64(pageSize) - 1) div int64(pageSize))
+        if pages > 0:
+          return some(pages)
+      except ValueError:
+        discard
+      return none(int)
+
+    try:
+      let v = parseInt(lower)
+      if v > 0:
+        return some(v)
+    except ValueError:
+      discard
+    return none(int)
+
   for part in options.split('&'):
     if part.len == 0:
       continue
@@ -64,14 +96,20 @@ proc parseCachePages(options: string): int =
     if kv.len != 2:
       continue
     let key = kv[0].toLowerAscii()
+
+    if key == "cache_mb":
+      # Convenience: cache_mb=<int> means MB of cache using DefaultPageSize.
+      let vOpt = tryParseCachePagesValue(kv[1] & "MB")
+      if vOpt.isSome:
+        result = vOpt.get
+      continue
+
     if key != "cache_pages" and key != "cache_size":
       continue
-    try:
-      let v = parseInt(kv[1])
-      if v > 0:
-        result = v
-    except ValueError:
-      discard
+
+    let vOpt = tryParseCachePagesValue(kv[1])
+    if vOpt.isSome:
+      result = vOpt.get
 
 proc decentdb_open*(path: cstring, options: cstring): pointer {.exportc, cdecl, dynlib.} =
   let cachePages = parseCachePages(if options == nil: "" else: $options)

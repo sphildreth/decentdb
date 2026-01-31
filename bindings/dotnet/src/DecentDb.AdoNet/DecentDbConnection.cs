@@ -1,7 +1,9 @@
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics;
 using System.IO;
+using System.Collections.Generic;
 using System.Text;
 using DecentDb.Native;
 
@@ -13,6 +15,26 @@ namespace DecentDb.AdoNet
         private string _connectionString = string.Empty;
         private ConnectionState _state;
         private string _dataSource = string.Empty;
+
+        private string _nativeOptions = string.Empty;
+        private bool _loggingEnabled;
+        private SqlLogLevel _logLevel = SqlLogLevel.Debug;
+        private int _defaultCommandTimeoutSeconds = 30;
+
+        private EventHandler<SqlExecutingEventArgs>? _sqlExecuting;
+        private EventHandler<SqlExecutedEventArgs>? _sqlExecuted;
+
+        public event EventHandler<SqlExecutingEventArgs>? SqlExecuting
+        {
+            add => _sqlExecuting += value;
+            remove => _sqlExecuting -= value;
+        }
+
+        public event EventHandler<SqlExecutedEventArgs>? SqlExecuted
+        {
+            add => _sqlExecuted += value;
+            remove => _sqlExecuted -= value;
+        }
 
         public DecentDbConnection()
         {
@@ -33,7 +55,13 @@ namespace DecentDb.AdoNet
                     throw new InvalidOperationException("Cannot change connection string while connection is open");
                 }
                 _connectionString = value ?? string.Empty;
-                _dataSource = ParseDataSource(value);
+
+                var parsed = ParseConnectionString(_connectionString);
+                _dataSource = parsed.DataSource;
+                _nativeOptions = parsed.NativeOptions;
+                _loggingEnabled = parsed.LoggingEnabled;
+                _logLevel = parsed.LogLevel;
+                _defaultCommandTimeoutSeconds = parsed.DefaultCommandTimeoutSeconds;
             }
         }
 
@@ -102,11 +130,9 @@ namespace DecentDb.AdoNet
                 Directory.CreateDirectory(directory);
             }
 
-            var options = ParseOptions(_connectionString);
-
             try
             {
-                _db = new Native.DecentDb(path, options);
+                _db = new Native.DecentDb(path, _nativeOptions);
                 _state = ConnectionState.Open;
             }
             catch (Exception ex)
@@ -140,52 +166,174 @@ namespace DecentDb.AdoNet
             return _db ?? throw new InvalidOperationException("Connection is not open");
         }
 
-        private static string ParseDataSource(string connectionString)
-        {
-            if (string.IsNullOrEmpty(connectionString)) return string.Empty;
+        internal int DefaultCommandTimeoutSeconds => _defaultCommandTimeoutSeconds;
 
-            var parts = connectionString.Split(';');
-            foreach (var part in parts)
+        internal SqlObservation? TryStartSqlObservation(string sql, IReadOnlyList<SqlParameterValue> parameters)
+        {
+            // Zero-cost when disabled: one predictable branch, no allocations.
+            if (!_loggingEnabled && _sqlExecuting == null && _sqlExecuted == null)
             {
-                var kv = part.Split('=', 2);
-                if (kv.Length == 2)
-                {
-                    var key = kv[0].Trim();
-                    if (key.Equals("Data Source", StringComparison.OrdinalIgnoreCase) ||
-                        key.Equals("Filename", StringComparison.OrdinalIgnoreCase) ||
-                        key.Equals("Database", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return kv[1].Trim();
-                    }
-                }
+                return null;
             }
-            return string.Empty;
+
+            var obs = new SqlObservation(Stopwatch.GetTimestamp(), sql, parameters);
+
+            if (_loggingEnabled && _logLevel <= SqlLogLevel.Debug)
+            {
+                Trace.WriteLine($"DecentDB SQL executing: {sql}");
+            }
+
+            _sqlExecuting?.Invoke(this, new SqlExecutingEventArgs(sql, parameters, obs.Timestamp));
+            return obs;
         }
 
-        private static string ParseOptions(string connectionString)
+        internal void CompleteSqlObservation(SqlObservation obs, long rowsAffected, Exception? exception)
         {
-            if (string.IsNullOrEmpty(connectionString)) return string.Empty;
+            var duration = Stopwatch.GetElapsedTime(obs.StartTimestamp, Stopwatch.GetTimestamp());
 
-            var options = new StringBuilder();
-            var parts = connectionString.Split(';');
+            if (_loggingEnabled && _logLevel <= SqlLogLevel.Debug)
+            {
+                var status = exception == null ? "ok" : "error";
+                Trace.WriteLine($"DecentDB SQL executed ({status}) in {duration.TotalMilliseconds:F3}ms: {obs.Sql}");
+            }
 
-            foreach (var part in parts)
+            _sqlExecuted?.Invoke(this, new SqlExecutedEventArgs(obs.Sql, obs.Parameters, obs.Timestamp, duration, rowsAffected, exception));
+        }
+
+        private readonly struct ParsedConnectionString
+        {
+            public ParsedConnectionString(
+                string dataSource,
+                string nativeOptions,
+                bool loggingEnabled,
+                SqlLogLevel logLevel,
+                int defaultCommandTimeoutSeconds)
+            {
+                DataSource = dataSource;
+                NativeOptions = nativeOptions;
+                LoggingEnabled = loggingEnabled;
+                LogLevel = logLevel;
+                DefaultCommandTimeoutSeconds = defaultCommandTimeoutSeconds;
+            }
+
+            public string DataSource { get; }
+            public string NativeOptions { get; }
+            public bool LoggingEnabled { get; }
+            public SqlLogLevel LogLevel { get; }
+            public int DefaultCommandTimeoutSeconds { get; }
+        }
+
+        private static ParsedConnectionString ParseConnectionString(string connectionString)
+        {
+            if (string.IsNullOrEmpty(connectionString))
+            {
+                return new ParsedConnectionString(string.Empty, string.Empty, loggingEnabled: false, SqlLogLevel.Debug, 30);
+            }
+
+            var kvps = ParseKeyValuePairs(connectionString);
+
+            var dataSource = GetFirstValue(kvps, "Data Source", "Filename", "Database") ?? string.Empty;
+
+            var nativeOptions = BuildNativeOptions(kvps);
+
+            var loggingEnabled = TryParseBool(GetFirstValue(kvps, "Logging"), out var logEnabled) && logEnabled;
+            var logLevel = TryParseLogLevel(GetFirstValue(kvps, "LogLevel"), out var ll) ? ll : SqlLogLevel.Debug;
+
+            var defaultCommandTimeoutSeconds = 30;
+            if (TryParseNonNegativeInt(GetFirstValue(kvps, "Command Timeout"), out var cmdTimeout))
+            {
+                defaultCommandTimeoutSeconds = cmdTimeout;
+            }
+
+            return new ParsedConnectionString(dataSource, nativeOptions, loggingEnabled, logLevel, defaultCommandTimeoutSeconds);
+        }
+
+        private static Dictionary<string, string> ParseKeyValuePairs(string connectionString)
+        {
+            var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var part in connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
             {
                 var kv = part.Split('=', 2);
-                if (kv.Length == 2)
-                {
-                    var key = kv[0].Trim();
-                    var value = kv[1].Trim();
+                if (kv.Length != 2) continue;
+                var key = kv[0].Trim();
+                var value = kv[1].Trim();
+                if (key.Length == 0) continue;
+                dict[key] = value;
+            }
+            return dict;
+        }
 
-                    if (key.Equals("Cache Size", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (options.Length > 0) options.Append('&');
-                        options.Append("cache_pages=").Append(value);
-                    }
+        private static string? GetFirstValue(Dictionary<string, string> dict, params string[] keys)
+        {
+            foreach (var key in keys)
+            {
+                if (dict.TryGetValue(key, out var value))
+                {
+                    return value;
                 }
+            }
+            return null;
+        }
+
+        private static string BuildNativeOptions(Dictionary<string, string> kvps)
+        {
+            var options = new StringBuilder();
+
+            if (kvps.TryGetValue("Cache Size", out var cacheSize) && !string.IsNullOrWhiteSpace(cacheSize))
+            {
+                // Delegate parsing to the native layer. Supports pages (int) or e.g. "64MB".
+                options.Append("cache_size=").Append(cacheSize.Trim());
             }
 
             return options.ToString();
+        }
+
+        private static bool TryParseBool(string? value, out bool result)
+        {
+            if (value == null)
+            {
+                result = false;
+                return false;
+            }
+
+            if (bool.TryParse(value, out result))
+            {
+                return true;
+            }
+
+            if (value == "0") { result = false; return true; }
+            if (value == "1") { result = true; return true; }
+
+            result = false;
+            return false;
+        }
+
+        private static bool TryParseLogLevel(string? value, out SqlLogLevel logLevel)
+        {
+            if (value == null)
+            {
+                logLevel = SqlLogLevel.Debug;
+                return false;
+            }
+
+            if (Enum.TryParse<SqlLogLevel>(value, ignoreCase: true, out logLevel))
+            {
+                return true;
+            }
+
+            logLevel = SqlLogLevel.Debug;
+            return false;
+        }
+
+        private static bool TryParseNonNegativeInt(string? value, out int parsed)
+        {
+            if (value != null && int.TryParse(value, out parsed) && parsed >= 0)
+            {
+                return true;
+            }
+
+            parsed = 0;
+            return false;
         }
 
         protected override void Dispose(bool disposing)

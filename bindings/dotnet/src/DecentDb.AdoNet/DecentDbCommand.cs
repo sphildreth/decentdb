@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -30,6 +31,7 @@ namespace DecentDb.AdoNet
         {
             _connection = connection;
             _parameterCollection = new DecentDbParameterCollection(_parameters);
+            _commandTimeout = connection.DefaultCommandTimeoutSeconds;
         }
 
         public DecentDbCommand(DecentDbConnection connection, string commandText)
@@ -37,7 +39,10 @@ namespace DecentDb.AdoNet
             _connection = connection;
             _commandText = commandText;
             _parameterCollection = new DecentDbParameterCollection(_parameters);
+            _commandTimeout = connection.DefaultCommandTimeoutSeconds;
         }
+
+        internal DecentDbConnection OwnerConnection => _connection;
 
         public override string CommandText
         {
@@ -151,23 +156,71 @@ namespace DecentDb.AdoNet
             var db = _connection.GetNativeDb();
             var (sql, paramMap) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
 
-            var stmt = db.Prepare(sql);
+            var observation = _connection.TryStartSqlObservation(sql, SnapshotParameters(paramMap));
 
-            foreach (var kvp in paramMap)
+            PreparedStatement? stmt = null;
+            try
             {
-                BindParameter(stmt, kvp.Key, kvp.Value);
+                stmt = db.Prepare(sql);
+
+                foreach (var kvp in paramMap)
+                {
+                    BindParameter(stmt, kvp.Key, kvp.Value);
+                }
+
+                _statement = stmt;
+
+                var stepResult = stmt.Step();
+                if (stepResult < 0)
+                {
+                    var ex = new DecentDbException(stmt.RowsAffected > 0 ? (int)stmt.RowsAffected : stepResult,
+                        db.LastErrorMessage, sql);
+                    if (observation != null)
+                    {
+                        _connection.CompleteSqlObservation(observation, stmt.RowsAffected, ex);
+                    }
+                    throw ex;
+                }
+
+                return new DecentDbDataReader(this, stmt, stepResult, observation);
+            }
+            catch (Exception ex)
+            {
+                if (_statement == null && stmt != null)
+                {
+                    stmt.Dispose();
+                }
+
+                if (observation != null)
+                {
+                    _connection.CompleteSqlObservation(observation, rowsAffected: 0, ex);
+                }
+
+                throw;
+            }
+        }
+
+        private static IReadOnlyList<SqlParameterValue> SnapshotParameters(Dictionary<int, DbParameter> paramMap)
+        {
+            if (paramMap.Count == 0)
+            {
+                return Array.Empty<SqlParameterValue>();
             }
 
-            _statement = stmt;
+            var keys = paramMap.Keys.ToArray();
+            Array.Sort(keys);
 
-            var stepResult = stmt.Step();
-            if (stepResult < 0)
+            var values = new SqlParameterValue[keys.Length];
+            for (var i = 0; i < keys.Length; i++)
             {
-                throw new DecentDbException(stmt.RowsAffected > 0 ? (int)stmt.RowsAffected : stepResult,
-                    db.LastErrorMessage, sql);
+                var ordinal = keys[i];
+                var p = paramMap[ordinal];
+                var name = string.IsNullOrEmpty(p.ParameterName) ? $"${ordinal}" : p.ParameterName;
+                var v = p.Value == DBNull.Value ? null : p.Value;
+                values[i] = new SqlParameterValue(ordinal, name, v);
             }
 
-            return new DecentDbDataReader(this, stmt, stepResult);
+            return values;
         }
 
         protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)

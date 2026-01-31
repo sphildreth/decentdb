@@ -1070,15 +1070,15 @@ What are the trade-offs? What else was considered?
 
 The following decisions must have ADRs before implementation:
 
-1. **ADR-00XX: C API Design** - Native library interface (P/Invoke vs C++/CLI)
-2. **ADR-00XX: Type System** - C# to DecentDB type mappings
-3. **ADR-00XX: Connection Pooling** - Single writer enforcement strategy
-4. **ADR-00XX: Query Compilation** - Expression tree caching approach
-5. **ADR-00XX (Optional Post-MVP): Engine String Length Constraints** - If adding `VARCHAR(n)`/engine-enforced max lengths
-6. **ADR-00XX: String Encoding** - UTF-8 handling and validation
-7. **ADR-00XX: NuGet Packaging** - Native library distribution strategy
-8. **ADR-00XX: SQL Observability** - Event-based logging with zero-cost when disabled
-9. **ADR-00XX: Connection String Design** - Parameter parsing, validation, and default behavior
+1. **ADR-0039: .NET C API Design** - Native library interface (P/Invoke vs C++/CLI)
+2. **ADR-0040: .NET Type System** - C# to DecentDB type mappings
+3. **ADR-0041: .NET Connection Pooling** - Single writer enforcement strategy
+4. **ADR-0042: .NET Query Compilation** - Expression tree caching approach
+5. **ADR-0047 (Optional Post-MVP): Engine String Length Constraints** - If adding `VARCHAR(n)`/engine-enforced max lengths
+6. **ADR-0043: .NET String Encoding** - UTF-8 handling and validation
+7. **ADR-0044: .NET NuGet Packaging** - Native library distribution strategy
+8. **ADR-0045: .NET SQL Observability** - Event-based logging with zero-cost when disabled
+9. **ADR-0046: .NET Connection String Design** - Parameter parsing, validation, and default behavior
 
 **No implementation without documentation.** Each major feature sprint must have corresponding ADRs created before coding begins.
 
@@ -1135,7 +1135,7 @@ public class DecentDbContext
 ```csharp
 var connectionString = "Data Source=my.db;Logging=1;LogLevel=Debug";
 using var db = new DecentDbContext(connectionString);
-db.Logger = loggerFactory.CreateLogger<DecentDbContext>();
+db.SqlExecuting += (s, e) => Console.WriteLine($"Executing SQL: {e.Sql}");
 // Logs (native-facing): "Executing SQL: SELECT * FROM artists WHERE id = $1"
 ```
 
@@ -1153,7 +1153,7 @@ using var db = new DecentDbContext(connectionString);
 // Zero observability overhead
 ```
 
-**ADR Required:** ADR-00XX: SQL Observability Strategy (events vs logging, performance guarantees)
+**ADR Required:** ADR-0045: .NET SQL Observability (events vs logging, performance guarantees)
 
 ---
 
@@ -1311,7 +1311,7 @@ db.SetCommandTimeout(60);        // Change default timeout
 // Checkpoint settings require reconnect
 ```
 
-**ADR Required:** ADR-00XX: Connection String Design (parameter parsing, validation, defaults)
+**ADR Required:** ADR-0046: .NET Connection String Design (parameter parsing, validation, defaults)
 
 ---
 

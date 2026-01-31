@@ -12,6 +12,8 @@ namespace DecentDb.AdoNet
     {
         private readonly DecentDbCommand _command;
         private PreparedStatement _statement;
+        private SqlObservation? _sqlObservation;
+        private bool _sqlObservationCompleted;
         private bool _hasRows;
         private bool _isClosed;
         private int _depth;
@@ -20,11 +22,12 @@ namespace DecentDb.AdoNet
         private readonly int _initialStepResult;
         private bool _initialStepConsumed;
 
-        public DecentDbDataReader(DecentDbCommand command, PreparedStatement statement, int initialStepResult)
+        internal DecentDbDataReader(DecentDbCommand command, PreparedStatement statement, int initialStepResult, SqlObservation? observation)
         {
             _command = command;
             _statement = statement;
             _initialStepResult = initialStepResult;
+            _sqlObservation = observation;
             _hasRows = initialStepResult == 1;
             _recordsAffected = -1;
         }
@@ -342,7 +345,9 @@ namespace DecentDb.AdoNet
             var result = _statement.Step();
             if (result < 0)
             {
-                throw new DecentDbException(result, "Step failed", _command.CommandText);
+                var ex = new DecentDbException(result, "Step failed", _command.CommandText);
+                CompleteSqlObservationOnce(exception: ex);
+                throw ex;
             }
 
             return result == 1;
@@ -372,7 +377,19 @@ namespace DecentDb.AdoNet
         {
             if (_isClosed) return;
             _isClosed = true;
+
+            CompleteSqlObservationOnce(exception: null);
             _command.FinalizeStatement();
+        }
+
+        private void CompleteSqlObservationOnce(Exception? exception)
+        {
+            if (_sqlObservationCompleted) return;
+            if (_sqlObservation == null) return;
+
+            _sqlObservationCompleted = true;
+            _command.OwnerConnection.CompleteSqlObservation(_sqlObservation, _statement.RowsAffected, exception);
+            _sqlObservation = null;
         }
 
         protected override void Dispose(bool disposing)
