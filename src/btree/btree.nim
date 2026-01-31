@@ -3,6 +3,7 @@ import ../errors
 import ../pager/pager
 import ../pager/db_header
 import ../record/record
+import sets
 
 const
   PageTypeInternal* = 1'u8
@@ -78,6 +79,74 @@ proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)]
     keys.add(key)
     children.add(child)
   ok((keys, children, rightChild))
+
+proc freeBTreePagesExceptRoot*(pager: Pager, root: PageId): Result[Void] =
+  ## Free all pages in the B+Tree rooted at `root`, except the root page.
+  ##
+  ## This is used by index rebuild to avoid leaking unreachable pages.
+  ## It also frees any overflow chains referenced by leaf cells.
+  if root == 0:
+    return okVoid()
+
+  var stack: seq[PageId] = @[root]
+  var visited = initHashSet[PageId]()
+  visited.incl(root)
+
+  var pagesToFree: seq[PageId] = @[]
+
+  while stack.len > 0:
+    let current = stack[^1]
+    stack.setLen(stack.len - 1)
+
+    var pageType: byte = 0
+    var children: seq[uint32] = @[]
+    var rightChild: uint32 = 0
+    var overflows: seq[uint32] = @[]
+
+    let pageRes = pager.withPageRo(current, proc(page: string): Result[Void] =
+      pageType = byte(page[0])
+      if pageType == PageTypeInternal:
+        let internalRes = readInternalCells(page)
+        if not internalRes.ok:
+          return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+        (_, children, rightChild) = internalRes.value
+        return okVoid()
+      if pageType == PageTypeLeaf:
+        let leafRes = readLeafCells(page)
+        if not leafRes.ok:
+          return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+        (_, _, overflows, _) = leafRes.value
+        return okVoid()
+      err[Void](ERR_CORRUPTION, "Unknown BTree page type", "page_id=" & $current)
+    )
+    if not pageRes.ok:
+      return err[Void](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+
+    if pageType == PageTypeInternal:
+      for child in children:
+        let childId = PageId(child)
+        if childId != 0 and not visited.contains(childId):
+          visited.incl(childId)
+          stack.add(childId)
+          pagesToFree.add(childId)
+      let rightId = PageId(rightChild)
+      if rightId != 0 and not visited.contains(rightId):
+        visited.incl(rightId)
+        stack.add(rightId)
+        pagesToFree.add(rightId)
+    else:
+      for ov in overflows:
+        if ov != 0'u32:
+          let freeOvRes = freeOverflowChain(pager, PageId(ov))
+          if not freeOvRes.ok:
+            return err[Void](freeOvRes.err.code, freeOvRes.err.message, freeOvRes.err.context)
+
+  for pageId in pagesToFree:
+    let freeRes = freePage(pager, pageId)
+    if not freeRes.ok:
+      return err[Void](freeRes.err.code, freeRes.err.message, freeRes.err.context)
+
+  okVoid()
 
 proc newBTree*(pager: Pager, root: PageId): BTree =
   BTree(pager: pager, root: root)

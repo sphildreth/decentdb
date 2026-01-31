@@ -176,6 +176,19 @@ when isMainModule:
      short = {
        "db": 'd'
      }],
+    [decentdb_cli.vacuumCmd,
+     cmdName = "vacuum",
+     doc = "Rewrite database into a new file to reclaim space",
+     help = {
+       "db": "Path to database file (required)",
+       "output": "Output database path (required)",
+       "overwrite": "Overwrite output if it exists",
+       "cachePages": "Number of 4KB pages to cache (default: 1024 = 4MB)",
+       "cacheMb": "Cache size in megabytes (overrides --cachePages if specified)"
+     },
+     short = {
+       "db": 'd'
+     }],
     [decentdb_cli.infoCmd,
      cmdName = "info",
      doc = "Display database information",

@@ -280,6 +280,29 @@ proc scanTable*(pager: Pager, table: TableMeta): Result[seq[StoredRow]] =
     rows.add(StoredRow(rowid: nextRes.value[0], values: decoded.value))
   ok(rows)
 
+proc scanTableEach*(pager: Pager, table: TableMeta, body: proc(row: StoredRow): Result[Void]): Result[Void] =
+  ## Iterate all rows in a table without materializing them into memory.
+  let tree = newBTree(pager, table.rootPage)
+  let cursorRes = openCursor(tree)
+  if not cursorRes.ok:
+    return err[Void](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+  let cursor = cursorRes.value
+  while true:
+    let nextRes = cursorNext(cursor)
+    if not nextRes.ok:
+      break
+    let valueBytes = nextRes.value[1]
+    let overflow = nextRes.value[2]
+    if valueBytes.len == 0 and overflow == 0'u32:
+      continue
+    let decoded = decodeRecordWithOverflow(pager, valueBytes)
+    if not decoded.ok:
+      return err[Void](decoded.err.code, decoded.err.message, decoded.err.context)
+    let cbRes = body(StoredRow(rowid: nextRes.value[0], values: decoded.value))
+    if not cbRes.ok:
+      return cbRes
+  okVoid()
+
 proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool): Result[uint64] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
@@ -497,6 +520,9 @@ proc resetIndexRoot(pager: Pager, root: PageId): Result[Void] =
   okVoid()
 
 proc rebuildIndex*(pager: Pager, catalog: Catalog, index: IndexMeta): Result[Void] =
+  let freeRes = freeBTreePagesExceptRoot(pager, index.rootPage)
+  if not freeRes.ok:
+    return err[Void](freeRes.err.code, freeRes.err.message, freeRes.err.context)
   let resetRes = resetIndexRoot(pager, index.rootPage)
   if not resetRes.ok:
     return err[Void](resetRes.err.code, resetRes.err.message, resetRes.err.context)

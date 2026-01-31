@@ -5,6 +5,8 @@ import tables
 import parsecsv
 import streams
 import times
+import std/monotimes
+import math
 import atomics
 import ./engine
 import ./errors
@@ -24,6 +26,10 @@ proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): Js
     "error": errorNode,
     "rows": rows
   }
+
+proc roundMs*(ms: float64): float64 {.inline.} =
+  ## Round milliseconds to 4 decimal places for stable, readable CLI output.
+  round(ms * 10_000.0) / 10_000.0
 
 proc loadConfig(): Table[string, string] =
   var cfg = initTable[string, string]()
@@ -363,8 +369,8 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
   ## Execute SQL statements against a DecentDb database file.
   ## Output can be rendered as json/csv/table depending on --format.
   ## (Some diagnostic modes like timing/warnings/verbose currently require json.)
-  
-  let startTime = if timing: epochTime() else: 0.0
+
+  let cmdStart = getMonoTime()
   
   let cfg = loadConfig()
   let dbPath = applyDbConfig(db, cfg)
@@ -452,21 +458,39 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     return 0
   
   if not openClose and sql.len > 0:
+    let execStart = getMonoTime()
     var parsedParams: seq[Value] = @[]
     for param in params:
       let valueRes = parseParamValue(param)
       if not valueRes.ok:
         discard closeDb(database)
-        echo resultJson(false, valueRes.err)
+        let execEnd = getMonoTime()
+        let elapsedNs = inNanoseconds(execEnd - execStart)
+        let elapsedMs = roundMs(float64(elapsedNs) / 1_000_000.0)
+        var payload = resultJson(false, valueRes.err)
+        if format.strip().toLowerAscii() == "json":
+          payload["elapsed_ms"] = %elapsedMs
+        echo payload
         return 1
       parsedParams.add(valueRes.value)
-    let queryStart = if timing: epochTime() else: 0.0
+
+    let queryStart = getMonoTime()
     let execRes = execSql(database, sql, parsedParams)
-    let queryEnd = if timing: epochTime() else: 0.0
+
+    let queryEnd = getMonoTime()
+    let execEnd = getMonoTime()
+    let elapsedNs = inNanoseconds(execEnd - execStart)
+
+    let queryNs = inNanoseconds(queryEnd - queryStart)
+    let elapsedMs = roundMs(float64(elapsedNs) / 1_000_000.0)
+    let queryMs = roundMs(float64(queryNs) / 1_000_000.0)
     
     if not execRes.ok:
       discard closeDb(database)
-      echo resultJson(false, execRes.err)
+      var payload = resultJson(false, execRes.err)
+      if format.strip().toLowerAscii() == "json":
+        payload["elapsed_ms"] = %elapsedMs
+      echo payload
       return 1
     
     let rows = execRes.value
@@ -478,24 +502,29 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     
     discard closeDb(database)
     
-    # Add timing info and warnings to JSON output if requested
-    if timing or warnings or verbose:
+    let normalizedFormat = format.strip().toLowerAscii()
+
+    # Always include timing for exec in JSON output.
+    if normalizedFormat == "json":
       var resultPayload = resultJson(true, rows = rows)
-      
+      resultPayload["elapsed_ms"] = %elapsedMs
+
+      # Preserve existing detailed timing output behind --timing.
       if timing:
-        let totalTime = (epochTime() - startTime) * 1000.0  # Convert to ms
-        let queryTime = (queryEnd - queryStart) * 1000.0
+        let cmdEnd = getMonoTime()
+        let totalNs = inNanoseconds(cmdEnd - cmdStart)
+        let totalMs = roundMs(float64(totalNs) / 1_000_000.0)
         let timingInfo = %*{
-          "total_ms": totalTime,
-          "query_ms": queryTime,
+          "total_ms": float64(totalMs),
+          "query_ms": float64(queryMs),
           "cache_pages": actualCachePages,
           "cache_mb": (actualCachePages * 4096) div (1024 * 1024)
         }
         resultPayload["timing"] = timingInfo
-      
+
       if (warnings or verbose) and walWarnings.len > 0:
         resultPayload["warnings"] = %walWarnings
-      
+
       if verbose:
         let verboseInfo = %*{
           "wal_lsn": database.wal.walEnd.load(moAcquire),
@@ -503,13 +532,15 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
           "cache_pages": actualCachePages
         }
         resultPayload["verbose"] = verboseInfo
-      
-      if format.strip().toLowerAscii() == "json":
-        echo resultPayload
-      else:
-        echo resultJson(false, DbError(code: ERR_IO, message: "Non-JSON format not supported with timing/warnings/verbose"))
+
+      echo resultPayload
     else:
-      emitRows(rows, format)
+      # Keep existing behavior for non-JSON formats.
+      # (Timing is still available via JSON output.)
+      if timing or warnings or verbose:
+        echo resultJson(false, DbError(code: ERR_IO, message: "Non-JSON format not supported with timing/warnings/verbose"))
+      else:
+        emitRows(rows, format)
     return 0
 
   discard closeDb(database)
@@ -1208,6 +1239,181 @@ proc statsCmd*(db: string = ""): int =
   echo resultJson(true, rows = stats)
   return 0
 
+proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, cachePages: int = 1024, cacheMb: int = 0): int =
+  ## Rewrite the database into a new file to reclaim space (VACUUM).
+  let srcPath = resolveDbPath(db)
+  if srcPath.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+  if output.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --output argument"))
+    return 1
+  if expandTilde(output) == expandTilde(srcPath):
+    echo resultJson(false, DbError(code: ERR_IO, message: "--output must be different from --db"))
+    return 1
+
+  let resolvedCacheMb = cacheMb
+  let actualCachePages = if resolvedCacheMb > 0:
+    (resolvedCacheMb * 1024 * 1024) div 4096
+  else:
+    cachePages
+
+  let outPath = expandTilde(output)
+  if fileExists(outPath) or fileExists(outPath & "-wal"):
+    if not overwrite:
+      echo resultJson(false, DbError(code: ERR_IO, message: "Output file exists (use --overwrite)", context: outPath))
+      return 1
+    if fileExists(outPath & "-wal"):
+      try: removeFile(outPath & "-wal")
+      except: discard
+    if fileExists(outPath):
+      try: removeFile(outPath)
+      except: discard
+
+  let srcRes = openDb(srcPath, cachePages = actualCachePages)
+  if not srcRes.ok:
+    echo resultJson(false, srcRes.err)
+    return 1
+  let srcDb = srcRes.value
+
+  let dstRes = openDb(outPath, cachePages = actualCachePages)
+  if not dstRes.ok:
+    discard closeDb(srcDb)
+    echo resultJson(false, dstRes.err)
+    return 1
+  let dstDb = dstRes.value
+
+  if dstDb.catalog.tables.len != 0 or dstDb.catalog.indexes.len != 0:
+    discard closeDb(srcDb)
+    discard closeDb(dstDb)
+    echo resultJson(false, DbError(code: ERR_IO, message: "Output database is not empty", context: outPath))
+    return 1
+
+  # Toposort tables by inline FK dependencies.
+  var deps = initTable[string, seq[string]]()
+  for tableName, tableMeta in srcDb.catalog.tables:
+    var refs: seq[string] = @[]
+    for col in tableMeta.columns:
+      if col.refTable.len > 0:
+        refs.add(col.refTable)
+    deps[tableName] = refs
+
+  var ordered: seq[string] = @[]
+  var perm = initTable[string, bool]()
+  var temp = initTable[string, bool]()
+
+  proc visit(name: string): Result[Void] =
+    if perm.getOrDefault(name, false):
+      return okVoid()
+    if temp.getOrDefault(name, false):
+      return err[Void](ERR_SQL, "Cycle in foreign key dependencies", name)
+    temp[name] = true
+    for dep in deps.getOrDefault(name, @[]):
+      if deps.hasKey(dep):
+        let vRes = visit(dep)
+        if not vRes.ok:
+          return vRes
+    temp[name] = false
+    perm[name] = true
+    ordered.add(name)
+    okVoid()
+
+  for tableName, _ in srcDb.catalog.tables:
+    let vRes = visit(tableName)
+    if not vRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, vRes.err)
+      return 1
+
+  # Create tables (with constraints) in dependency order.
+  for tableName in ordered:
+    let tableMeta = srcDb.catalog.tables[tableName]
+    var createStmt = "CREATE TABLE " & tableName & " (\n"
+    var columnDefs: seq[string] = @[]
+    for col in tableMeta.columns:
+      var colDef = "  " & col.name & " " & columnTypeToText(col.kind)
+      if col.primaryKey:
+        colDef &= " PRIMARY KEY"
+      if col.unique and not col.primaryKey:
+        colDef &= " UNIQUE"
+      if col.notNull and not col.primaryKey:
+        colDef &= " NOT NULL"
+      if col.refTable.len > 0 and col.refColumn.len > 0:
+        colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+      columnDefs.add(colDef)
+    createStmt &= columnDefs.join(",\n") & "\n);"
+
+    let createRes = execSql(dstDb, createStmt)
+    if not createRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, createRes.err)
+      return 1
+
+  # Copy data with index updates disabled, then rebuild constraint-created indexes.
+  var totalRows = 0'i64
+  for tableName in ordered:
+    let dstTableName = tableName
+    let tableMeta = srcDb.catalog.tables[tableName]
+    let scanRes = scanTableEach(srcDb.pager, tableMeta, proc(row: StoredRow): Result[Void] =
+      let insRes = insertRowNoIndexes(dstDb.pager, dstDb.catalog, dstTableName, row.values)
+      if not insRes.ok:
+        return err[Void](insRes.err.code, insRes.err.message, insRes.err.context)
+      totalRows.inc
+      okVoid()
+    )
+    if not scanRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, scanRes.err)
+      return 1
+
+  for _, idx in dstDb.catalog.indexes:
+    let rebuildRes = storage.rebuildIndex(dstDb.pager, dstDb.catalog, idx)
+    if not rebuildRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, rebuildRes.err)
+      return 1
+
+  # Recreate any additional indexes present in the source but not auto-created by constraints.
+  var createdIndexes = 0
+  for idxName, idx in srcDb.catalog.indexes:
+    if dstDb.catalog.indexes.hasKey(idxName):
+      continue
+    var stmt = "CREATE "
+    if idx.unique:
+      stmt &= "UNIQUE "
+    stmt &= "INDEX " & idx.name & " ON " & idx.table
+    if idx.kind == ikTrigram:
+      stmt &= " USING trigram "
+    stmt &= "(" & idx.column & ")"
+    let idxRes = execSql(dstDb, stmt)
+    if not idxRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, idxRes.err)
+      return 1
+    createdIndexes.inc
+
+  # Checkpoint destination to truncate WAL and persist pages.
+  discard checkpointDb(dstDb)
+
+  let srcPages = srcDb.pager.pageCount
+  let dstPages = dstDb.pager.pageCount
+  discard closeDb(srcDb)
+  discard closeDb(dstDb)
+
+  echo resultJson(true, rows = @[
+    "Vacuum complete",
+    "Rows copied: " & $totalRows,
+    "Extra indexes created: " & $createdIndexes,
+    "Source pages: " & $srcPages,
+    "Destination pages: " & $dstPages
+  ])
+  return 0
+
 # ============================================================================
 # REPL & Completion Commands
 # ============================================================================
@@ -1252,7 +1458,7 @@ proc repl*(db: string = "", format: string = "table"): int =
 proc completion*(shell: string = "bash"): int =
   ## Emit basic shell completion script
   let normalized = shell.strip().toLowerAscii()
-  let commands = "exec list-tables describe list-indexes rebuild-index verify-index import export dump bulk-load checkpoint stats info dump-header verify-header repl completion"
+  let commands = "exec list-tables describe list-indexes rebuild-index verify-index import export dump bulk-load checkpoint stats info vacuum dump-header verify-header repl completion"
   if normalized == "zsh":
     echo "#compdef decentdb"
     echo "_decentdb() {"

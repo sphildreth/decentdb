@@ -19,6 +19,35 @@ proc makeTempDb(name: string): string =
   path
 
 suite "Storage Extras":
+  test "rebuild index does not leak pages":
+    let path = makeTempDb("decentdb_storage_rebuild_size.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL)").ok
+    check execSql(db, "CREATE INDEX items_name_idx ON items (name)").ok
+
+    for i in 0 ..< 5000:
+      discard execSql(db, "INSERT INTO items (id, name) VALUES (" & $i & ", 'name" & $i & "')")
+
+    # Update names to create churn in the index.
+    for i in 0 ..< 5000:
+      discard execSql(db, "UPDATE items SET name = 'name" & $i & "_x' WHERE id = " & $i)
+
+    let beforePages = db.pager.pageCount
+
+    let idxOpt = db.catalog.getIndexByName("items_name_idx")
+    check isSome(idxOpt)
+    let idx = idxOpt.get
+    check rebuildIndex(db.pager, db.catalog, idx).ok
+
+    let afterPages = db.pager.pageCount
+    # Rebuilding should reuse freed pages; allow small header/freelist growth.
+    check afterPages <= beforePages + 8'u32
+
+    discard closeDb(db)
+
   test "rebuild btree index keeps entries searchable":
     let path = makeTempDb("decentdb_storage_rebuild_btree.db")
     let dbRes = openDb(path)

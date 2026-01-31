@@ -47,6 +47,14 @@ Convert an existing SQLite database file into a DecentDB database file:
 decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb
 ```
 
+By default, identifiers are normalized to lowercase so you can query without quoting (Postgres-style).
+
+To preserve original SQLite casing (requires quoting identifiers in SQL):
+
+```bash
+decentdb-sqlite-import --preserve-case /path/to/input.sqlite /path/to/output.decentdb
+```
+
 To overwrite an existing destination:
 
 ```bash
