@@ -1,0 +1,13 @@
+<Project>
+  <ItemGroup>
+    <NativeLib Include="$(MSBuildThisFileDirectory)../build/libc_api.so" Condition="'$(OS)' == 'Unix' and '$(RuntimeIdentifier)' == ''">
+      <Link>runtimes/linux-x64/native/libdecentdb.so</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+    </NativeLib>
+  </ItemGroup>
+
+  <Target Name="CopyNativeLibs" BeforeTargets="Build">
+    <Copy SourceFiles="@(NativeLib)" DestinationFolder="$(OutputPath)runtimes/linux-x64/native/" Condition="'$(OS)' == 'Unix' and '$(RuntimeIdentifier)' == ''" />
+  </Target>
+</Project>

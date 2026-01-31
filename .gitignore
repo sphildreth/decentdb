@@ -21,6 +21,16 @@ config.nims
 tests/harness/seed.log
 build/coverage/
 
+# .NET / C# (bindings/dotnet)
+**/bin/
+**/obj/
+**/TestResults/
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+.vs/
+
 # Benchmarks (generated artifacts)
 tests/bench/results.json
 tests/bench/*.results.json
