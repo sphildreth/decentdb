@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using DecentDb.AdoNet;
 using DecentDb.MicroOrm;
@@ -79,5 +80,66 @@ public sealed class MicroOrmTests : IDisposable
         await persons.DeleteByIdAsync(2);
         var bob = await persons.GetAsync(2);
         Assert.Null(bob);
+    }
+
+    [Fact]
+    public async Task AnySingleAndBulkOperations()
+    {
+        using var ctx = new DecentDbContext(_dbPath);
+        var persons = ctx.Set<Person>();
+
+        Assert.False(await persons.AnyAsync());
+
+        await persons.InsertManyAsync(new[]
+        {
+            new Person { Id = 10, Name = "A", Age = 1 },
+            new Person { Id = 11, Name = "B", Age = 2 },
+            new Person { Id = 12, Name = "C", Age = 3 },
+        });
+
+        Assert.True(await persons.AnyAsync());
+
+        var b = await persons.Where(p => p.Name == "B").SingleAsync();
+        Assert.Equal(11, b.Id);
+
+        var deleted = await persons.DeleteManyAsync(p => p.Age >= 2);
+        Assert.Equal(2, deleted);
+
+        var remaining = await persons.OrderBy(p => p.Id).ToListAsync();
+        Assert.Single(remaining);
+        Assert.Equal(10, remaining[0].Id);
+    }
+
+    [Fact]
+    public async Task SupportsQueryableLinqSyntax()
+    {
+        using var ctx = new DecentDbContext(_dbPath);
+        var persons = ctx.Set<Person>();
+
+        await persons.InsertManyAsync(new[]
+        {
+            new Person { Id = 1, Name = "A", Age = 10 },
+            new Person { Id = 2, Name = "B", Age = 20 },
+            new Person { Id = 3, Name = "C", Age = 30 },
+        });
+
+        IQueryable<Person> q = persons;
+
+        var list = q
+            .Where(p => p.Age >= 20)
+            .OrderBy(p => p.Id)
+            .Skip(0)
+            .Take(10)
+            .ToList();
+
+        Assert.Equal(2, list.Count);
+        Assert.Equal(2, list[0].Id);
+        Assert.Equal(3, list[1].Id);
+
+        var count = q.Count(p => p.Age >= 20);
+        Assert.Equal(2, count);
+
+        var any = q.Any(p => p.Name == "C");
+        Assert.True(any);
     }
 }

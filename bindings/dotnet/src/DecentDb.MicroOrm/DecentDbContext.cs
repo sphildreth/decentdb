@@ -47,10 +47,25 @@ public class DecentDbContext : IDisposable
         return (DbSet<T>)_sets.GetOrAdd(typeof(T), _ => new DbSet<T>(this));
     }
 
-    internal DecentDbConnection GetConnection()
+    internal ConnectionScope AcquireConnectionScope()
     {
-        EnsureOpenConnection();
-        return _connection!;
+        // If a transaction is active, always stick to the transaction's connection.
+        if (_transaction != null)
+        {
+            EnsureOpenConnection();
+            return new ConnectionScope(_connection!, disposeConnection: false);
+        }
+
+        if (_pooling)
+        {
+            EnsureOpenConnection();
+            return new ConnectionScope(_connection!, disposeConnection: false);
+        }
+
+        // Non-pooled mode: open/close per operation.
+        var conn = new DecentDbConnection(_connectionString);
+        conn.Open();
+        return new ConnectionScope(conn, disposeConnection: true);
     }
 
     internal DbTransaction? CurrentTransaction => _transaction;
@@ -64,6 +79,27 @@ public class DecentDbContext : IDisposable
 
         _connection = new DecentDbConnection(_connectionString);
         _connection.Open();
+    }
+
+    internal readonly struct ConnectionScope : IDisposable
+    {
+        private readonly bool _disposeConnection;
+
+        public ConnectionScope(DecentDbConnection connection, bool disposeConnection)
+        {
+            Connection = connection;
+            _disposeConnection = disposeConnection;
+        }
+
+        public DecentDbConnection Connection { get; }
+
+        public void Dispose()
+        {
+            if (_disposeConnection)
+            {
+                Connection.Dispose();
+            }
+        }
     }
 
     private void InitializeDbSets()

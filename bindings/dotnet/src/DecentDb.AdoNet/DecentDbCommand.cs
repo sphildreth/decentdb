@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DecentDb.Native;
@@ -193,8 +194,9 @@ namespace DecentDb.AdoNet
             }
         }
 
-        private void BindParameter(PreparedStatement stmt, int index1Based, object? value)
+        private void BindParameter(PreparedStatement stmt, int index1Based, DbParameter parameter)
         {
+            var value = parameter.Value;
             if (value == null || value == DBNull.Value)
             {
                 stmt.BindNull(index1Based);
@@ -224,23 +226,44 @@ namespace DecentDb.AdoNet
             }
             else if (type == typeof(string))
             {
-                stmt.BindText(index1Based, (string)value);
+                var s = (string)value;
+                if (parameter.Size > 0)
+                {
+                    var byteCount = Encoding.UTF8.GetByteCount(s);
+                    if (byteCount > parameter.Size)
+                    {
+                        throw new ArgumentException($"Value exceeds Size({parameter.Size}) bytes (UTF-8). Actual: {byteCount} bytes.");
+                    }
+                }
+
+                stmt.BindText(index1Based, s);
             }
             else if (type == typeof(DateTime))
             {
                 var dt = (DateTime)value;
-                var ms = dt.ToUniversalTime().Ticks / TimeSpan.TicksPerMillisecond;
+                var utc = dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime();
+                var ms = new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeMilliseconds();
                 stmt.BindInt64(index1Based, ms);
             }
             else if (type == typeof(DateTimeOffset))
             {
-                var dt = ((DateTimeOffset)value).ToUniversalTime().DateTime;
-                var ms = dt.Ticks / TimeSpan.TicksPerMillisecond;
+                var dto = ((DateTimeOffset)value).ToUniversalTime();
+                var ms = dto.ToUnixTimeMilliseconds();
                 stmt.BindInt64(index1Based, ms);
             }
             else if (type == typeof(TimeSpan))
             {
-                stmt.BindInt64(index1Based, ((TimeSpan)value).Ticks / TimeSpan.TicksPerMillisecond);
+                stmt.BindInt64(index1Based, ((TimeSpan)value).Ticks);
+            }
+            else if (type == typeof(DateOnly))
+            {
+                var date = (DateOnly)value;
+                var epoch = DateOnly.FromDateTime(DateTime.UnixEpoch);
+                stmt.BindInt64(index1Based, date.DayNumber - epoch.DayNumber);
+            }
+            else if (type == typeof(TimeOnly))
+            {
+                stmt.BindInt64(index1Based, ((TimeOnly)value).Ticks);
             }
             else if (type == typeof(byte[]))
             {

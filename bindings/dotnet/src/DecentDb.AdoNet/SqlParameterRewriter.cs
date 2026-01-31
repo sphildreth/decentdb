@@ -7,7 +7,7 @@ namespace DecentDb.AdoNet
 {
     public static class SqlParameterRewriter
     {
-        public static (string Sql, Dictionary<int, object?> Parameters) Rewrite(
+        public static (string Sql, Dictionary<int, DbParameter> Parameters) Rewrite(
             string sql,
             IReadOnlyList<DbParameter> parameters)
         {
@@ -15,11 +15,11 @@ namespace DecentDb.AdoNet
 
             if (parameters.Count == 0)
             {
-                return (sql, new Dictionary<int, object?>());
+                return (sql, new Dictionary<int, DbParameter>());
             }
 
-            var parameterValueByName = new Dictionary<string, object?>(StringComparer.Ordinal);
-            var unnamedValues = new List<object?>();
+            var parameterByName = new Dictionary<string, DbParameter>(StringComparer.Ordinal);
+            var unnamedParameters = new List<DbParameter>();
 
             for (var i = 0; i < parameters.Count; i++)
             {
@@ -27,16 +27,16 @@ namespace DecentDb.AdoNet
                 var name = NormalizeParameterName(p.ParameterName);
                 if (name == null)
                 {
-                    unnamedValues.Add(p.Value);
+                    unnamedParameters.Add(p);
                     continue;
                 }
 
-                parameterValueByName[name] = p.Value;
+                parameterByName[name] = p;
 
                 var stripped = StripParameterPrefix(name);
                 if (stripped != null)
                 {
-                    parameterValueByName[stripped] = p.Value;
+                    parameterByName[stripped] = p;
                 }
             }
 
@@ -222,7 +222,7 @@ namespace DecentDb.AdoNet
                 iPos++;
             }
 
-            var paramMap = new Dictionary<int, object?>();
+            var paramMap = new Dictionary<int, DbParameter>();
             var unnamedCursor = 0;
 
             var indices = new List<int>(usedIndices);
@@ -232,23 +232,23 @@ namespace DecentDb.AdoNet
             {
                 if (indexToName.TryGetValue(index, out var name))
                 {
-                    if (!TryResolveNamed(parameterValueByName, name, out var value))
+                    if (!TryResolveNamed(parameterByName, name, out var parameter))
                     {
                         throw new InvalidOperationException($"Missing value for parameter '@{name}'.");
                     }
-                    paramMap[index] = value;
+                    paramMap[index] = parameter;
                     continue;
                 }
 
-                if (TryResolveIndexed(parameterValueByName, index, out var indexedValue))
+                if (TryResolveIndexed(parameterByName, index, out var indexedParameter))
                 {
-                    paramMap[index] = indexedValue;
+                    paramMap[index] = indexedParameter;
                     continue;
                 }
 
-                if (unnamedCursor < unnamedValues.Count)
+                if (unnamedCursor < unnamedParameters.Count)
                 {
-                    paramMap[index] = unnamedValues[unnamedCursor++];
+                    paramMap[index] = unnamedParameters[unnamedCursor++];
                     continue;
                 }
 
@@ -258,26 +258,26 @@ namespace DecentDb.AdoNet
             return (rewritten.ToString(), paramMap);
         }
 
-        private static bool TryResolveNamed(Dictionary<string, object?> valuesByName, string name, out object? value)
+        private static bool TryResolveNamed(Dictionary<string, DbParameter> parametersByName, string name, out DbParameter parameter)
         {
-            if (valuesByName.TryGetValue(name, out value)) return true;
-            if (valuesByName.TryGetValue("@" + name, out value)) return true;
+            if (parametersByName.TryGetValue(name, out parameter)) return true;
+            if (parametersByName.TryGetValue("@" + name, out parameter)) return true;
             return false;
         }
 
-        private static bool TryResolveIndexed(Dictionary<string, object?> valuesByName, int index1Based, out object? value)
+        private static bool TryResolveIndexed(Dictionary<string, DbParameter> parametersByName, int index1Based, out DbParameter parameter)
         {
-            if (valuesByName.TryGetValue("$" + index1Based, out value)) return true;
-            if (valuesByName.TryGetValue(index1Based.ToString(), out value)) return true;
+            if (parametersByName.TryGetValue("$" + index1Based, out parameter)) return true;
+            if (parametersByName.TryGetValue(index1Based.ToString(), out parameter)) return true;
 
             var pNum = index1Based - 1;
             if (pNum >= 0)
             {
-                if (valuesByName.TryGetValue("@p" + pNum, out value)) return true;
-                if (valuesByName.TryGetValue("p" + pNum, out value)) return true;
+                if (parametersByName.TryGetValue("@p" + pNum, out parameter)) return true;
+                if (parametersByName.TryGetValue("p" + pNum, out parameter)) return true;
             }
 
-            value = null;
+            parameter = null!;
             return false;
         }
 

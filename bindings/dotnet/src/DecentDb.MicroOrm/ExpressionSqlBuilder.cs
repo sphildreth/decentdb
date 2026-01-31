@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
@@ -8,7 +9,9 @@ namespace DecentDb.MicroOrm;
 internal sealed class ExpressionSqlBuilder<T>
 {
     private readonly EntityMap _map;
-    private readonly List<(string Name, object? Value, int? MaxLength)> _parameters = new();
+    private readonly List<(string Name, Func<object?> Getter, int? MaxLength)> _parameters = new();
+
+    private static readonly ConditionalWeakTable<LambdaExpression, CompiledWhere> Cache = new();
 
     public ExpressionSqlBuilder(EntityMap map)
     {
@@ -17,8 +20,15 @@ internal sealed class ExpressionSqlBuilder<T>
 
     public (string Sql, IReadOnlyList<(string Name, object? Value, int? MaxLength)> Parameters) BuildWhere(Expression<Func<T, bool>> predicate)
     {
+        if (Cache.TryGetValue(predicate, out var compiled))
+        {
+            return (compiled.Sql, compiled.Evaluate());
+        }
+
         var where = Visit(predicate.Body);
-        return (where, _parameters);
+        var compiledNew = new CompiledWhere(where, _parameters);
+        Cache.Add(predicate, compiledNew);
+        return (compiledNew.Sql, compiledNew.Evaluate());
     }
 
     private string Visit(Expression expr)
@@ -36,7 +46,7 @@ internal sealed class ExpressionSqlBuilder<T>
             ExpressionType.Call => VisitCall((MethodCallExpression)expr),
             ExpressionType.MemberAccess => VisitMember((MemberExpression)expr),
             ExpressionType.Convert => Visit(((UnaryExpression)expr).Operand),
-            ExpressionType.Constant => AddParameter(((ConstantExpression)expr).Value, null),
+            ExpressionType.Constant => AddParameter(() => ((ConstantExpression)expr).Value, null),
             _ => throw new NotSupportedException($"Unsupported expression node: {expr.NodeType}")
         };
     }
@@ -78,18 +88,21 @@ internal sealed class ExpressionSqlBuilder<T>
             if (mce.Method.Name is "Contains" or "StartsWith" or "EndsWith")
             {
                 if (mce.Arguments.Count != 1) throw new NotSupportedException("Unexpected string method arity");
-                var value = Evaluate(mce.Arguments[0]);
-                var s = value as string ?? throw new NotSupportedException("LIKE patterns must be strings");
-
-                var pattern = mce.Method.Name switch
+                var argExpr = mce.Arguments[0];
+                Func<object?> getter = () =>
                 {
-                    "Contains" => $"%{s}%",
-                    "StartsWith" => $"{s}%",
-                    "EndsWith" => $"%{s}",
-                    _ => throw new NotSupportedException()
+                    var raw = Evaluate(argExpr);
+                    var s = raw as string ?? throw new NotSupportedException("LIKE patterns must be strings");
+                    return mce.Method.Name switch
+                    {
+                        "Contains" => $"%{s}%",
+                        "StartsWith" => $"{s}%",
+                        "EndsWith" => $"%{s}",
+                        _ => throw new NotSupportedException()
+                    };
                 };
 
-                var param = AddParameter(pattern, maxLen);
+                var param = AddParameter(getter, maxLen);
                 return $"({column} LIKE {param})";
             }
         }
@@ -105,8 +118,7 @@ internal sealed class ExpressionSqlBuilder<T>
         }
 
         // Captured variables / static members.
-        var val = Evaluate(me);
-        return AddParameter(val, null);
+        return AddParameter(() => Evaluate(me), null);
     }
 
     private bool TryGetColumn(Expression expr, out string columnSql, out int? maxLength)
@@ -133,20 +145,66 @@ internal sealed class ExpressionSqlBuilder<T>
         return expr is ConstantExpression ce && ce.Value == null;
     }
 
-    private string AddParameter(object? value, int? maxLength)
+    private string AddParameter(Func<object?> getter, int? maxLength)
     {
         var name = $"@p{_parameters.Count}";
-        _parameters.Add((name, value, maxLength));
+        _parameters.Add((name, getter, maxLength));
         return name;
     }
 
     private static object? Evaluate(Expression expr)
     {
+        expr = StripConvert(expr);
+
         if (expr is ConstantExpression ce) return ce.Value;
 
-        // Evaluate via compilation (safe here; used for captured values only).
+        if (expr is MemberExpression me)
+        {
+            var target = Evaluate(me.Expression!);
+            return me.Member switch
+            {
+                FieldInfo fi => fi.GetValue(target),
+                PropertyInfo pi => pi.GetValue(target),
+                _ => throw new NotSupportedException($"Unsupported member: {me.Member.MemberType}")
+            };
+        }
+
+        // Fallback: evaluate via compilation.
         var lambda = Expression.Lambda(expr);
         var del = lambda.Compile();
         return del.DynamicInvoke();
+    }
+
+    private static Expression StripConvert(Expression expr)
+    {
+        while (expr is UnaryExpression ue && (ue.NodeType == ExpressionType.Convert || ue.NodeType == ExpressionType.ConvertChecked))
+        {
+            expr = ue.Operand;
+        }
+        return expr;
+    }
+
+    private sealed class CompiledWhere
+    {
+        private readonly (string Name, Func<object?> Getter, int? MaxLength)[] _parameters;
+
+        public CompiledWhere(string sql, List<(string Name, Func<object?> Getter, int? MaxLength)> parameters)
+        {
+            Sql = sql;
+            _parameters = parameters.ToArray();
+        }
+
+        public string Sql { get; }
+
+        public IReadOnlyList<(string Name, object? Value, int? MaxLength)> Evaluate()
+        {
+            var result = new (string Name, object? Value, int? MaxLength)[_parameters.Length];
+            for (var i = 0; i < _parameters.Length; i++)
+            {
+                var p = _parameters[i];
+                result[i] = (p.Name, p.Getter(), p.MaxLength);
+            }
+            return result;
+        }
     }
 }

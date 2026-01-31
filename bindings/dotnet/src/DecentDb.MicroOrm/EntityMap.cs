@@ -10,7 +10,8 @@ internal sealed record PropertyMap(
     string ColumnName,
     bool IsPrimaryKey,
     bool IsIgnored,
-    int? MaxLength);
+    int? MaxLength,
+    bool IsNullable);
 
 internal sealed class EntityMap
 {
@@ -43,13 +44,15 @@ internal sealed class EntityMap
             var isIgnored = prop.GetCustomAttribute<IgnoreAttribute>() != null;
             var isPk = prop.GetCustomAttribute<PrimaryKeyAttribute>() != null || string.Equals(prop.Name, "Id", StringComparison.Ordinal);
 
+            var isNullable = ComputeNullability(prop);
+
             var colName = prop.GetCustomAttribute<ColumnAttribute>()?.Name
                 ?? Conventions.DefaultColumnName(prop.Name);
 
             var maxLengthAttr = prop.GetCustomAttribute<MaxLengthAttribute>();
             int? maxLength = maxLengthAttr?.Length;
 
-            mapped.Add(new PropertyMap(prop, colName, isPk, isIgnored, maxLength));
+            mapped.Add(new PropertyMap(prop, colName, isPk, isIgnored, maxLength, isNullable));
 
             if (isPk && !isIgnored)
             {
@@ -74,6 +77,16 @@ internal sealed class EntityMap
     public PropertyMap[] Properties { get; }
 
     public PropertyMap[] NonPrimaryKeyProperties => Properties.Where(p => !p.IsPrimaryKey).ToArray();
+
+    private static bool ComputeNullability(PropertyInfo prop)
+    {
+        if (prop.GetCustomAttribute<NullableAttribute>() != null) return true;
+        if (prop.GetCustomAttribute<NotNullAttribute>() != null) return false;
+
+        var t = prop.PropertyType;
+        if (!t.IsValueType) return true; // convention: reference types are nullable
+        return Nullable.GetUnderlyingType(t) != null;
+    }
 
     public string PrimaryKeyColumnName
     {

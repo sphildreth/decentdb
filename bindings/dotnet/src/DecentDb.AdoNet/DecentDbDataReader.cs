@@ -109,75 +109,95 @@ namespace DecentDb.AdoNet
 
         public override T GetFieldValue<T>(int ordinal)
         {
-            var type = typeof(T);
-            var value = GetValue(ordinal);
+            var requestedType = typeof(T);
 
-            if (value == null || value == DBNull.Value)
+            if (_statement.IsNull(ordinal))
             {
                 return default!;
             }
 
-            if (type == typeof(string))
-            {
-                return (T)(object)_statement.GetText(ordinal);
-            }
+            var nonNullableType = Nullable.GetUnderlyingType(requestedType) ?? requestedType;
 
-            if (type == typeof(int))
+            object boxed;
+            if (nonNullableType == typeof(string))
             {
-                return (T)(object)(int)_statement.GetInt64(ordinal);
+                boxed = _statement.GetText(ordinal);
             }
-
-            if (type == typeof(long))
+            else if (nonNullableType == typeof(short))
             {
-                return (T)(object)_statement.GetInt64(ordinal);
+                boxed = (short)_statement.GetInt64(ordinal);
             }
-
-            if (type == typeof(bool))
+            else if (nonNullableType == typeof(int))
             {
-                return (T)(object)(_statement.GetInt64(ordinal) != 0);
+                boxed = (int)_statement.GetInt64(ordinal);
             }
-
-            if (type == typeof(double))
+            else if (nonNullableType == typeof(long))
             {
-                return (T)(object)_statement.GetFloat64(ordinal);
+                boxed = _statement.GetInt64(ordinal);
             }
-
-            if (type == typeof(byte[]))
+            else if (nonNullableType == typeof(bool))
             {
-                return (T)(object)_statement.GetBlob(ordinal);
+                boxed = _statement.GetInt64(ordinal) != 0;
             }
-
-            if (type == typeof(DateTime))
+            else if (nonNullableType == typeof(float))
             {
-                var ms = _statement.GetInt64(ordinal);
-                return (T)(object)DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+                boxed = (float)_statement.GetFloat64(ordinal);
             }
-
-            if (type == typeof(DateTimeOffset))
+            else if (nonNullableType == typeof(double))
             {
-                var ms = _statement.GetInt64(ordinal);
-                return (T)(object)DateTimeOffset.FromUnixTimeMilliseconds(ms);
+                boxed = _statement.GetFloat64(ordinal);
             }
-
-            if (type == typeof(TimeSpan))
+            else if (nonNullableType == typeof(byte[]))
+            {
+                boxed = _statement.GetBlob(ordinal);
+            }
+            else if (nonNullableType == typeof(DateTime))
             {
                 var ms = _statement.GetInt64(ordinal);
-                return (T)(object)TimeSpan.FromMilliseconds(ms);
+                boxed = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
             }
-
-            if (type == typeof(decimal))
+            else if (nonNullableType == typeof(DateTimeOffset))
+            {
+                var ms = _statement.GetInt64(ordinal);
+                boxed = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+            }
+            else if (nonNullableType == typeof(DateOnly))
+            {
+                var days = _statement.GetInt64(ordinal);
+                var epoch = DateOnly.FromDateTime(DateTime.UnixEpoch);
+                boxed = epoch.AddDays(checked((int)days));
+            }
+            else if (nonNullableType == typeof(TimeOnly))
+            {
+                var ticks = _statement.GetInt64(ordinal);
+                boxed = new TimeOnly(ticks);
+            }
+            else if (nonNullableType == typeof(TimeSpan))
+            {
+                var ticks = _statement.GetInt64(ordinal);
+                boxed = TimeSpan.FromTicks(ticks);
+            }
+            else if (nonNullableType == typeof(decimal))
             {
                 var str = _statement.GetText(ordinal);
-                return (T)(object)decimal.Parse(str);
+                boxed = decimal.Parse(str);
             }
-
-            if (type == typeof(Guid))
+            else if (nonNullableType == typeof(Guid))
             {
                 var bytes = _statement.GetBlob(ordinal);
-                return (T)(object)new Guid(bytes);
+                boxed = new Guid(bytes);
+            }
+            else if (nonNullableType.IsEnum)
+            {
+                var raw = _statement.GetInt64(ordinal);
+                boxed = Enum.ToObject(nonNullableType, raw);
+            }
+            else
+            {
+                boxed = GetValue(ordinal)!;
             }
 
-            return (T)value;
+            return (T)boxed;
         }
 
         public override int GetInt32(int ordinal)
