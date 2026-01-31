@@ -9,10 +9,11 @@ const { positionBindings } = require('./positionBindings');
 // third-party clients import from internal paths.
 let Client;
 try {
-  // Knex v2 internal path (common pattern in ecosystem)
+  // Inherit from Postgres client to get $1 binding generation and valid SQL for DDL.
+  Client = require('knex/lib/dialects/postgres');
+} catch (e) {
+  // Fallback to base client if postgres dialect is moved/hidden
   Client = require('knex/lib/client');
-} catch {
-  Client = null;
 }
 
 const { Database } = require('decentdb-native');
@@ -22,6 +23,9 @@ class Client_DecentDB extends (Client ?? class {}) {
     super(config);
     this.dialect = 'decentdb';
     this.driverName = 'decentdb-native';
+    if (!this.pool) {
+        this.initializePool(config);
+    }
   }
 
   _driver() {
@@ -51,25 +55,72 @@ class Client_DecentDB extends (Client ?? class {}) {
     return positionBindings(sql);
   }
 
+  // Used to explicitly validate a connection
+  async validateConnection(connection) {
+    return true;
+  }
+
   // Run a single query.
   async _query(connection, obj) {
     const sql = this.positionBindings(obj.sql);
     const bindings = obj.bindings || [];
 
-    const res = connection.exec(sql, bindings);
-
-    // Knex expects obj.response to be set.
-    // For SELECT: response is typically rows.
-    // For DML: response may be rowCount / rowsAffected.
-    obj.response = res.rows;
-    obj.rowsAffected = res.rowsAffected;
-
-    return obj;
+    const stmt = connection.prepare(sql);
+    try {
+      stmt.bindAll(bindings);
+      
+      const colNames = stmt.columnNames();
+      const rows = [];
+      
+      for await (const row of stmt.rows()) {
+        const rowObj = {};
+        for (let i = 0; i < row.length; i++) {
+          rowObj[colNames[i]] = row[i];
+        }
+        rows.push(rowObj);
+      }
+      
+      // Mimic pg response format
+      obj.response = { 
+        rows, 
+        rowCount: stmt.rowsAffected() 
+      };
+      return obj;
+    } finally {
+      stmt.finalize();
+    }
   }
 
-  // Minimal processing: return raw rows.
-  processResponse(obj /*, runner */) {
-    return obj.response;
+  async _stream(connection, obj, stream, options) {
+    const sql = this.positionBindings(obj.sql);
+    const bindings = obj.bindings || [];
+
+    const stmt = connection.prepare(sql);
+    try {
+      stmt.bindAll(bindings);
+      const colNames = stmt.columnNames();
+      for await (const row of stmt.rows()) {
+        const rowObj = {};
+        for (let i = 0; i < row.length; i++) {
+          rowObj[colNames[i]] = row[i];
+        }
+        stream.write(rowObj);
+      }
+      stream.end();
+    } catch (err) {
+      stream.emit('error', err);
+    } finally {
+      stmt.finalize();
+    }
+  }
+
+  processResponse(obj, runner) {
+    if (obj.method === 'raw') return obj.response;
+    if (obj.method === 'insert' || obj.method === 'update' || obj.method === 'del') {
+       if (obj.response.rows.length > 0) return obj.response.rows;
+       return obj.response.rowCount;
+    }
+    return obj.response.rows;
   }
 }
 

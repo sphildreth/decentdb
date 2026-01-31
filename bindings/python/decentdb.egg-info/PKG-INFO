@@ -1,3 +1,17 @@
+Metadata-Version: 2.4
+Name: decentdb
+Version: 0.0.1
+Summary: Python DB-API 2.0 driver and SQLAlchemy dialect for DecentDB
+Author: DecentDB Contributors
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: SQLAlchemy>=2.0.0
+Requires-Dist: rich>=13.0.0
+
 # DecentDB Python Bindings
 
 This package provides:
@@ -51,16 +65,4 @@ To overwrite an existing destination:
 
 ```bash
 decentdb-sqlite-import --overwrite /path/to/input.sqlite /path/to/output.decentdb
-```
-
-Write a machine-readable conversion report:
-
-```bash
-decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb --report-json report.json
-```
-
-Or to stdout:
-
-```bash
-decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb --report-json -
 ```

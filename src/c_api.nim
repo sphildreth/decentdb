@@ -592,7 +592,7 @@ proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_c
     elif v.kind in {vkText, vkBlob}:
       view.bytesLen = cint(v.bytes.len)
       if v.bytes.len > 0:
-        view.bytes = cast[ptr uint8](unsafeAddr v.bytes[0])
+        view.bytes = cast[ptr uint8](unsafeAddr h.currentValues[i].bytes[0])
     h.rowView[i] = view
   if out_values != nil:
     if n > 0:

@@ -1,0 +1,6 @@
+[console_scripts]
+decentdb-sqlite-import = decentdb.tools.sqlite_import:main
+
+[sqlalchemy.dialects]
+decentdb = decentdb_sqlalchemy.dialect:DecentDbDialect
+decentdb.pysql = decentdb_sqlalchemy.dialect:DecentDbDialect
