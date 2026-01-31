@@ -80,12 +80,13 @@ def compute_summary(ms: List[float]) -> Summary:
     )
 
 def sqlite_cli_time_ms(sqlite_db: str, query: str, sqlite_path: str, timeout: int, debug: bool) -> float:
-    # Suppress result output; timer still prints.
+    # Important: many sqlite3 builds only emit .timer output in interactive mode.
+    # Also: .output /dev/null suppresses .timer output on some builds, so we avoid it.
     script = f""".timer on
-.output /dev/null
+.prompt '' ''
 {query}
 """
-    rc, out, err = run_cmd([sqlite_path, sqlite_db], input_text=script, timeout=timeout)
+    rc, out, err = run_cmd([sqlite_path, "-interactive", sqlite_db], input_text=script, timeout=timeout)
     if rc != 0:
         raise RuntimeError(f"sqlite3 exited {rc}\nstdout:\n{out}\nstderr:\n{err}")
 
