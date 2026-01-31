@@ -26,11 +26,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Recommended: create requirements.txt (see below), otherwise it installs plain mkdocs.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install mkdocs; fi
+          pip install mkdocs-minify-plugin mkdocs-material mkdocs-awesome-pages-plugin mkdocs-mermaid2-plugin 
 
       # Build using the root mkdocs.yml (docs_dir defaults to "docs")
       - name: Build site
