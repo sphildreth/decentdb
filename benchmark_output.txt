@@ -1,0 +1,6 @@
+Unhandled exception. DecentDb.Native.DecentDbException: DecentDB error -1: Table not found
+   at DecentDb.AdoNet.DecentDbCommand.ExecuteDbDataReader(CommandBehavior behavior) in /home/steven/source/decentdb/bindings/dotnet/src/DecentDb.AdoNet/DecentDbCommand.cs:line 182
+   at DecentDb.AdoNet.DecentDbCommand.ExecuteNonQuery() in /home/steven/source/decentdb/bindings/dotnet/src/DecentDb.AdoNet/DecentDbCommand.cs:line 129
+   at Program.<<Main>$>g__Exec|0_5(DecentDbConnection conn, String sql) in /home/steven/source/decentdb/bindings/dotnet/benchmarks/DecentDb.Benchmarks/Program.cs:line 68
+   at Program.<<Main>$>g__Seed|0_6(DecentDbConnection conn, Int32 rows) in /home/steven/source/decentdb/bindings/dotnet/benchmarks/DecentDb.Benchmarks/Program.cs:line 73
+   at Program.<Main>$(String[] args) in /home/steven/source/decentdb/bindings/dotnet/benchmarks/DecentDb.Benchmarks/Program.cs:line 110

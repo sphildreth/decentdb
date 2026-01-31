@@ -9,4 +9,9 @@
     <AssemblyName>DecentDb.Native</AssemblyName>
   </PropertyGroup>
   
+  <ItemGroup>
+    <None Include="..\..\..\..\libdecentdb.so" Pack="true" PackagePath="runtimes/linux-x64/native/libdecentdb.so" Condition="Exists('..\..\..\..\libdecentdb.so')" />
+    <None Include="..\..\..\..\libdecentdb.dylib" Pack="true" PackagePath="runtimes/osx-x64/native/libdecentdb.dylib" Condition="Exists('..\..\..\..\libdecentdb.dylib')" />
+    <None Include="..\..\..\..\decentdb.dll" Pack="true" PackagePath="runtimes/win-x64/native/decentdb.dll" Condition="Exists('..\..\..\..\decentdb.dll')" />
+  </ItemGroup>
 </Project>

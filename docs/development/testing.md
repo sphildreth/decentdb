@@ -171,21 +171,35 @@ nimble bench_compare
 
 Located in `tests/data/`:
 
-- **Sequential IDs**: 1K, 10K, 100K, 1M rows
-- **Sparse data**: With deletions
-- **Unicode text**: Multi-byte characters
-- **Edge cases**: NULLs, empty strings, max values
+- **Sequential data**: Scripts to generate sequential ID datasets of various sizes (1K, 10K, 100K, 1M rows)
+- **Unicode text**: Multi-byte characters in various scripts (Latin, Cyrillic, Chinese, Japanese, Korean, Greek)
+- **Edge cases**: NULLs, empty strings, max values, long text fields
 
 ### Generating Test Data
 
 ```bash
-# Generate music library dataset
-python tests/data/generate_music_library.py
+# Generate edge cases dataset
+python tests/data/generate_edge_cases.py
 
 # Creates:
-# - 25K artists
-# - 80K albums
-# - 9.5M tracks
+# - Empty strings
+# - NULL values
+# - Maximum integer values
+# - Long text fields
+
+# Generate sequential dataset
+python tests/data/generate_sequential.py
+
+# Creates:
+# - Sequential ID sequences
+# - Various sized datasets (1K, 10K, 100K, 1M rows)
+
+# Generate unicode dataset
+python tests/data/generate_unicode.py
+
+# Creates:
+# - Multi-script text (Latin, Cyrillic, Chinese, Japanese, Korean, Greek)
+# - UTF-8 encoded text fields
 ```
 
 ## Writing Tests
