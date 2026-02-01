@@ -288,6 +288,33 @@ def decentdb_python_time_ms(ddb_path: str, query: str, *, fetch: str) -> float:
         conn.close()
 
 
+def decentdb_explain_plan(ddb_path: str, query: str) -> List[str]:
+    # Returns a list of human-friendly plan lines from DecentDB.
+    # Uses the Python driver so this works regardless of --mode.
+    decentdb = maybe_import_decentdb()
+    q = query.strip()
+    if q.endswith(";"):
+        q = q[:-1]
+    if not re.match(r"^\s*EXPLAIN\b", q, re.IGNORECASE):
+        q = "EXPLAIN " + q
+
+    conn = decentdb.connect(ddb_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(q)
+        rows = cur.fetchall()
+
+        lines: List[str] = []
+        for r in rows:
+            if isinstance(r, (tuple, list)):
+                lines.append(str(r[0]) if len(r) > 0 else "")
+            else:
+                lines.append(str(r))
+        return lines
+    finally:
+        conn.close()
+
+
 def bench_python(
     *,
     sqlite_db: str,
@@ -457,6 +484,11 @@ def main() -> int:
         help="Disable printing SQLite EXPLAIN QUERY PLAN + scan warnings",
     )
     ap.add_argument(
+        "--no-decentdb-explain",
+        action="store_true",
+        help="Disable printing DecentDB EXPLAIN",
+    )
+    ap.add_argument(
         "--sqlite-fts5-trigram",
         action="store_true",
         help=(
@@ -502,6 +534,15 @@ def main() -> int:
             sqlite_plan_warn_if_full_scan(plan, label="--query")
         except Exception as e:
             print(f"warning: could not get SQLite EXPLAIN QUERY PLAN: {e}", file=sys.stderr)
+
+    if not args.no_decentdb_explain:
+        try:
+            plan = decentdb_explain_plan(args.ddb, query)
+            print("\nDecentDB EXPLAIN:")
+            for line in plan:
+                print("  " + line)
+        except Exception as e:
+            print(f"warning: could not get DecentDB EXPLAIN: {e}", file=sys.stderr)
 
     sqlite_fts_db: Optional[str] = None
     sqlite_fts_query: Optional[str] = None

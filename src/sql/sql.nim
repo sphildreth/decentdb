@@ -122,9 +122,13 @@ type StatementKind* = enum
   skBegin
   skCommit
   skRollback
+  skExplain
 
 type Statement* = ref object
   case kind*: StatementKind
+  of skExplain:
+    explainInner*: Statement
+    explainHasOptions*: bool
   of skCreateTable:
     createTableName*: string
     columns*: seq[ColumnDef]
@@ -723,7 +727,6 @@ proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
     if names.kind == JArray and names.len > 0:
       typeName = nodeString(names[^1])
   let notNull = nodeHas(node, "is_not_null") and node["is_not_null"].getBool
-  let isNull = nodeHas(node, "is_null") and node["is_null"].getBool
   let constraints = nodeGet(node, "constraints")
   var isPrimaryKey = false
   var isUnique = false
@@ -783,7 +786,28 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
     actions.add(action)
   ok(Statement(kind: skAlterTable, alterTableName: tableName, alterActions: actions))
 
+proc parseStatementNode(node: JsonNode): Result[Statement]
+
+proc parseExplainStmt(node: JsonNode): Result[Statement] =
+  if nodeHas(node, "options"):
+    let opts = node["options"]
+    if opts.kind == JArray and opts.len > 0:
+      return err[Statement](ERR_SQL, "EXPLAIN options not supported")
+
+  let queryNode = nodeGet(node, "query")
+  # nodeGet returns JNull if missing, or the node.
+  # But we want to ensure it's a valid statement node.
+  # PG query structure for ExplainStmt has "query" field.
+  
+  let innerRes = parseStatementNode(queryNode)
+  if not innerRes.ok:
+    return err[Statement](innerRes.err.code, innerRes.err.message, innerRes.err.context)
+  
+  ok(Statement(kind: skExplain, explainInner: innerRes.value, explainHasOptions: false))
+
 proc parseStatementNode(node: JsonNode): Result[Statement] =
+  if nodeHas(node, "ExplainStmt"):
+    return parseExplainStmt(node["ExplainStmt"])
   if nodeHas(node, "SelectStmt"):
     return parseSelectStmt(node["SelectStmt"])
   if nodeHas(node, "InsertStmt"):
@@ -967,9 +991,32 @@ proc parseSql*(sql: string): Result[SqlAst] =
     )
     SqlAst(statements: @[stmt])
 
-  let fastAst = tryParseFastSelect(sql)
-  if fastAst != nil:
-    return ok(fastAst)
+  var isExplain = false
+  if sql.len >= 7:
+    # Check for case-insensitive "EXPLAIN" prefix (ignoring leading whitespace is handled by tryParseFastSelect but here we want to avoid it)
+    # Actually, tryParseFastSelect handles whitespace. 
+    # But checking strictly for "EXPLAIN" prefix might miss "  EXPLAIN".
+    # However, tryParseFastSelect is very strict. It expects SELECT.
+    # So if it starts with EXPLAIN, tryParseFastSelect will likely fail anyway or return nil.
+    # The requirement is: "Ensure EXPLAIN never goes through the fast-path."
+    # "Before calling tryParseFastSelect(sql), check if the input starts with EXPLAIN (case-insensitive, leading whitespace allowed). If so, skip fast-path and go directly to pg_query."
+    
+    var i = 0
+    while i < sql.len and sql[i].isSpaceAscii: i.inc
+    if i + 7 <= sql.len:
+      var match = true
+      let target = "EXPLAIN"
+      for k in 0 ..< 7:
+        if sql[i+k].toUpperAscii != target[k]:
+          match = false
+          break
+      if match:
+        isExplain = true
+
+  if not isExplain:
+    let fastAst = tryParseFastSelect(sql)
+    if fastAst != nil:
+      return ok(fastAst)
 
   when not defined(libpg_query):
     return err[SqlAst](ERR_INTERNAL, "libpg_query required", "build with -d:libpg_query and link libpg_query")

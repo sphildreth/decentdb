@@ -15,6 +15,7 @@ import ./catalog/catalog
 import ./sql/sql
 import ./sql/binder
 import ./planner/planner
+import ./planner/explain
 import ./exec/exec
 import ./record/record
 import ./storage/storage
@@ -504,6 +505,16 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not planRes.ok:
           return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
         cachedPlans.add(planRes.value)
+      elif bound.kind == skExplain:
+        # For EXPLAIN, we plan the inner statement if it is a SELECT.
+        # If it's not a SELECT, we'll error at execution time, so we store nil here.
+        if bound.explainInner.kind == skSelect:
+          let planRes = plan(db.catalog, bound.explainInner)
+          if not planRes.ok:
+            return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+          cachedPlans.add(planRes.value)
+        else:
+          cachedPlans.add(nil)
       else:
         cachedPlans.add(nil)
     rememberSqlCache(sqlText, boundStatements, cachedPlans)
@@ -837,6 +848,18 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
         if not delRes.ok:
           return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
+    of skExplain:
+      if bound.explainInner.kind != skSelect:
+        return err[seq[string]](ERR_SQL, "EXPLAIN currently supports SELECT only")
+      var p = if i < cachedPlans.len: cachedPlans[i] else: nil
+      if p == nil:
+        let planRes = plan(db.catalog, bound.explainInner)
+        if not planRes.ok:
+          return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+        p = planRes.value
+      let lines = explainPlanLines(db.catalog, p)
+      for line in lines:
+        output.add(line)
     of skSelect:
       let selectRes = runSelect(bound, if i < cachedPlans.len: cachedPlans[i] else: nil)
       if not selectRes.ok:

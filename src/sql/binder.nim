@@ -312,3 +312,8 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     bindAlterTable(catalog, stmt)
   of skDropTable, skDropIndex, skBegin, skCommit, skRollback:
     ok(stmt)
+  of skExplain:
+    let innerRes = bindStatement(catalog, stmt.explainInner)
+    if not innerRes.ok:
+      return err[Statement](innerRes.err.code, innerRes.err.message, innerRes.err.context)
+    ok(Statement(kind: skExplain, explainInner: innerRes.value, explainHasOptions: stmt.explainHasOptions))

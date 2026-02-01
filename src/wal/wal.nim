@@ -384,7 +384,7 @@ proc recover*(wal: Wal): Result[Void] =
     let frameRes = readFrame(wal.vfs, wal.file, frameOffset)
     if not frameRes.ok:
       break
-    let (frameType, pageId, payload, lsn, nextOffset) = frameRes.value
+    let (frameType, pageId, _, lsn, nextOffset) = frameRes.value
     case frameType
     of wfPage:
       pending.add((PageId(pageId), lsn, frameOffset))
