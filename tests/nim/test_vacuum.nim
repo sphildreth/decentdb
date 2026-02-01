@@ -1,6 +1,7 @@
 import unittest
 import os
 import tables
+import strutils
 
 import engine
 import decentdb_cli
@@ -57,6 +58,45 @@ suite "Vacuum":
     let cntRes = execSql(dbDst2, "SELECT COUNT(*) FROM items")
     check cntRes.ok
     check cntRes.value.len == 1
+    check parseInt(cntRes.value[0]) == 2500
+
+    discard closeDb(dbDst2)
+
+  test "vacuum preserves data under cache pressure":
+    let srcPath = makeTempDb("decentdb_vacuum_pressure_src.db")
+    let dstPath = makeTempDb("decentdb_vacuum_pressure_dst.db")
+
+    let dbRes = openDb(srcPath)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, SortName TEXT NOT NULL)").ok
+    check execSql(db, "CREATE INDEX artists_sortname_idx ON artists (SortName)").ok
+
+    const nRows = 20000
+    for i in 0 ..< nRows:
+      let sortName = "name" & $i
+      discard execSql(db, "INSERT INTO artists (id, SortName) VALUES (" & $i & ", '" & sortName & "')")
+
+    discard checkpointDb(db)
+    discard closeDb(db)
+
+    # Force cache eviction while vacuuming to exercise WAL/flush behavior.
+    let vacRes = vacuumCmd(db = srcPath, output = dstPath, overwrite = true, cachePages = 32)
+    check vacRes == 0
+
+    let dst2 = openDb(dstPath)
+    check dst2.ok
+    let dbDst2 = dst2.value
+
+    let cntRes = execSql(dbDst2, "SELECT COUNT(*) FROM artists")
+    check cntRes.ok
+    check cntRes.value.len == 1
+    check parseInt(cntRes.value[0]) == nRows
+
+    let sampleRes = execSql(dbDst2, "SELECT * FROM artists ORDER BY SortName LIMIT 5")
+    check sampleRes.ok
+    check sampleRes.value.len == 5
 
     discard closeDb(dbDst2)
 
