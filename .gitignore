@@ -67,3 +67,7 @@ coverage/
 .nyc_output/
 .lock-wscript
 config.gypi
+test_pk_fk.ddb-wal
+
+# Local review/action-plan notes (do not commit)
+design/reviews/ACTION-PLAN.md

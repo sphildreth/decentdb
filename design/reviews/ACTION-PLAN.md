@@ -10,11 +10,51 @@
 
 This document consolidates findings from four comprehensive code reviews (G3PRO, KIMI-K2.5, OPUS45, Qwen) into a single prioritized action plan. Issues have been deduplicated and organized by severity, with detailed implementation guidance for each item.
 
+### Change Control (ADR Gating)
+
+This repository has strict constraints (see `AGENTS.md`). Some actions below are **not** “implementation ready” until an ADR is written and accepted.
+
+**ADR REQUIRED before implementation** for any change that affects:
+- Persistent formats (db header, page layouts, freelist layouts, postings formats, WAL frame formats)
+- Checkpoint/truncation strategy or recovery invariants
+- Locking/concurrency semantics that affect correctness
+- SQL dialect / query-visible semantics
+- Durability policy levels (fsync policy options)
+
+**Rule:** If an item is marked **ADR REQUIRED**, do the ADR first, update `design/SPEC.md` as needed, then implement.
+
+#### ADR Checklist (Template)
+
+Use this checklist when writing an ADR in `design/adr/` for any item marked **ADR REQUIRED**.
+
+- **Decision**: What is changing, and what is explicitly *not* changing?
+- **Motivation**: What failure mode or workload drives this?
+- **Scope (0.x vs post-1.0)**: Does this remain within single-process, one-writer/many-readers?
+- **Compatibility**:
+  - Does this break existing `.ddb` files or WAL files?
+  - If yes: version bump strategy and how old/new are detected.
+- **Persistent formats impacted**: db header / page layouts / freelist / postings / WAL frames.
+- **Recovery + invariants**:
+  - What must be true after crash/restart?
+  - What partial states can exist, and how are they detected/repaired?
+- **Checkpoint/truncation semantics**: Any changes to safe-LSN rules or reader retention?
+- **Isolation + SQL-visible semantics**: Any query-visible behavior changes?
+- **Configuration / knobs**: Defaults, safety trade-offs, and how users opt into riskier modes.
+- **Performance expectations**: Big-O changes, hot-path allocations, benchmarks to run.
+- **Test plan (must be concrete)**:
+  - Unit tests (what functions/behaviors)
+  - Property tests (what invariants)
+  - Crash-injection tests (what crash points)
+  - Differential tests (what SQL behaviors, if applicable)
+- **Rollout / migration story**: How to upgrade safely; any offline rebuild tools needed.
+- **Observability**: What metrics/logs are added (must be zero-cost when disabled on hot paths).
+
 ### Testing Policy (NON-NEGOTIABLE)
 
 **Unit testing is IMPERATIVE for all changes. The following rules apply:**
 
-1. **NO TEST PATCHING**: Existing tests MUST NOT be modified to accommodate changes. If a change breaks an existing test, the implementation is wrong, not the test.
+1. **NO TEST PATCHING**: Existing tests MUST NOT be modified to hide regressions. If a change breaks an existing test, the implementation is wrong, not the test.
+  - Exception: If behavior is intentionally changed (and approved via `design/SPEC.md` and/or an ADR), update/add tests to reflect the new documented behavior.
 
 2. **MANDATORY NEW TESTS**: Every fix must include:
    - Unit tests covering the main behavior
@@ -104,6 +144,7 @@ The current `fsync` implementation uses Nim's `flushFile()` which only flushes u
    ```
 
 2. **Add durability levels configuration**:
+  **ADR REQUIRED:** This introduces “durability policy levels” and must be documented/approved before implementation.
    ```nim
    type DurabilityLevel* = enum
      dlFull        # fsync on every commit (safest)
@@ -330,6 +371,8 @@ The trigram inverted index uses read-modify-write on entire postings lists. For 
 
 #### Implementation Steps
 
+**ADR REQUIRED:** This is a postings storage format change.
+
 **Option A: Segmented Postings Lists (Recommended)**
 
 1. **Change schema from single blob to segments**:
@@ -415,6 +458,8 @@ The WAL uses a single global lock (`wal.lock`) for all operations, serializing:
 This creates severe write throughput limitations.
 
 #### Implementation Steps
+
+**NOTE (0.x scope):** DecentDB is currently single-process, one-writer/many-readers. Do **not** implement multi-writer support in 0.x without an ADR and explicit scope change.
 
 **Phase 1: Document Lock Hierarchy**
 
@@ -555,6 +600,8 @@ The WAL maintains two unbounded hash tables (`index` and `dirtySinceCheckpoint`)
 Freelist management modifies multiple structures (freelist pages, header) without atomicity. A crash between operations can leave the freelist inconsistent, causing space leaks or double allocation.
 
 #### Implementation Steps
+
+**ADR REQUIRED:** This proposes a freelist page format change and startup repair semantics.
 
 **Option A: Self-Describing Freelist (Recommended)**
 
@@ -997,6 +1044,8 @@ Every `commitTransaction` unconditionally flushes trigram deltas, causing severe
 
 #### Implementation Steps
 
+**ADR REQUIRED:** Moving trigram persistence out of commit changes user-visible query correctness after crash (missing results until rebuild) and must be explicitly documented/approved.
+
 **Option A: Move Trigram Flush to Checkpoint (Recommended)**
 
 1. **Remove trigram flush from commit path**:
@@ -1031,7 +1080,7 @@ Every `commitTransaction` unconditionally flushes trigram deltas, causing severe
    - On startup, check if trigram deltas were lost (crash between commit and checkpoint)
    - Provide index rebuild utility for offline reconstruction
 
-**Trade-off:** If crash occurs between commits, trigram deltas may be lost. Queries might miss results until index is rebuilt. **Acceptable for 0.x**.
+**Trade-off:** If crash occurs between commit and next checkpoint, trigram deltas may be lost. Queries may miss results until index is rebuilt. If accepted, this must be documented as part of index durability semantics.
 
 #### Testing Requirements
 
@@ -1213,11 +1262,11 @@ The database implements snapshot isolation which allows phantom read anomalies. 
    **Guarantees:**
    - No dirty reads
    - No non-repeatable reads
-   - No phantom reads within a snapshot
+  - Reads within a transaction see a stable snapshot
    
    **Limitations:**
-   - Phantom reads can occur between different queries in the same transaction
-   - Not serializable (write skew possible)
+  - Not serializable (write skew possible)
+  - Predicate-based “phantom” style anomalies can exist compared to SERIALIZABLE, but repeated reads in the same transaction observe the same snapshot
    
    **Future:** Serializable Snapshot Isolation (SSI) may be added post-1.0.
    ```
@@ -1361,7 +1410,7 @@ Database lacks comprehensive metrics for production monitoring.
 
 ### Phase 5: Future (Post-1.0)
 
-1. **CRIT-006**: Fine-grained WAL locking
+1. **CRIT-006**: Fine-grained WAL locking (post-1.0 only)
 2. **MED-005**: Lock contention improvements
 3. **LOW-002** through **LOW-005**: Enhanced features
 
