@@ -95,3 +95,84 @@ suite "Vacuum":
     check nameUniqueCount == 1
 
     discard closeDb(dbDst2)
+
+  test "vacuum skips redundant FK child indexes":
+    let srcPath = makeTempDb("decentdb_vacuum_fk_redundant_src.db")
+    let dstPath = makeTempDb("decentdb_vacuum_fk_redundant_dst.db")
+
+    let dbRes = openDb(srcPath)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE parents (id INT PRIMARY KEY)").ok
+    check execSql(db, "CREATE TABLE children (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES parents(id))").ok
+
+    # Source has the auto-created FK index plus an extra user-created index on the same column.
+    check execSql(db, "CREATE INDEX children_parent_id_user_idx ON children (parent_id)").ok
+
+    for i in 0 ..< 1000:
+      discard execSql(db, "INSERT INTO parents (id) VALUES (" & $i & ")")
+      discard execSql(db, "INSERT INTO children (id, parent_id) VALUES (" & $i & ", " & $i & ")")
+
+    discard checkpointDb(db)
+    discard closeDb(db)
+
+    let vacRes = vacuumCmd(db = srcPath, output = dstPath, overwrite = true)
+    check vacRes == 0
+
+    let dst2 = openDb(dstPath)
+    check dst2.ok
+    let dbDst2 = dst2.value
+
+    # The explicit user index should not be recreated since the destination already has
+    # an FK auto-index on children.parent_id.
+    check not dbDst2.catalog.indexes.hasKey("children_parent_id_user_idx")
+    var fkChildIndexCount = 0
+    for _, idx in dbDst2.catalog.indexes:
+      if idx.table == "children" and idx.column == "parent_id" and idx.kind == ikBtree:
+        fkChildIndexCount.inc
+    check fkChildIndexCount == 1
+
+    discard closeDb(dbDst2)
+
+  test "vacuum recreates UNIQUE index not satisfied by FK auto-index":
+    let srcPath = makeTempDb("decentdb_vacuum_fk_unique_src.db")
+    let dstPath = makeTempDb("decentdb_vacuum_fk_unique_dst.db")
+
+    let dbRes = openDb(srcPath)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE parents (id INT PRIMARY KEY)").ok
+    check execSql(db, "CREATE TABLE children (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES parents(id))").ok
+
+    # This UNIQUE index is stronger than the FK auto-index (which is non-unique).
+    check execSql(db, "CREATE UNIQUE INDEX children_parent_id_unique_user_idx ON children (parent_id)").ok
+
+    # Ensure parent_id values are unique so the UNIQUE index is valid.
+    for i in 0 ..< 1000:
+      discard execSql(db, "INSERT INTO parents (id) VALUES (" & $i & ")")
+      discard execSql(db, "INSERT INTO children (id, parent_id) VALUES (" & $i & ", " & $i & ")")
+
+    discard checkpointDb(db)
+    discard closeDb(db)
+
+    let vacRes = vacuumCmd(db = srcPath, output = dstPath, overwrite = true)
+    check vacRes == 0
+
+    let dst2 = openDb(dstPath)
+    check dst2.ok
+    let dbDst2 = dst2.value
+
+    # The UNIQUE index should be recreated (non-unique FK index does not satisfy it).
+    check dbDst2.catalog.indexes.hasKey("children_parent_id_unique_user_idx")
+
+    var nonUniqueCount = 0
+    var uniqueCount = 0
+    for _, idx in dbDst2.catalog.indexes:
+      if idx.table == "children" and idx.column == "parent_id" and idx.kind == ikBtree:
+        if idx.unique: uniqueCount.inc else: nonUniqueCount.inc
+    check nonUniqueCount == 1
+    check uniqueCount == 1
+
+    discard closeDb(dbDst2)
