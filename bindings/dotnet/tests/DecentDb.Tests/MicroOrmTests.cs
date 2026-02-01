@@ -16,7 +16,7 @@ public sealed class MicroOrmTests : IDisposable
 
     public MicroOrmTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.db");
+        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
 
         using var conn = new DecentDbConnection($"Data Source={_dbPath}");
         conn.Open();

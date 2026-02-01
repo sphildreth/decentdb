@@ -8,4 +8,4 @@ From repo root:
 
 - `dotnet run -c Release --project examples/dotnet/microorm-linq/DecentDb.MicroOrmLinq.csproj`
 
-It will create/update `sample.db` next to the project.
+It will create/update `sample.ddb` next to the project.

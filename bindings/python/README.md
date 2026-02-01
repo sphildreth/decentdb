@@ -11,7 +11,7 @@ import sqlalchemy
 from sqlalchemy import create_engine
 
 # Use the decentdb dialect
-engine = create_engine("decentdb+pysql:////path/to/database.db")
+engine = create_engine("decentdb+pysql:////path/to/database.ddb")
 
 with engine.connect() as conn:
     conn.execute(sqlalchemy.text("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT)"))
@@ -28,7 +28,7 @@ with engine.connect() as conn:
 DecentDB operates as an embedded database with the following concurrency model:
 - **Single Writer**: Only one connection can write to the database at a time.
 - **Multiple Readers**: Multiple connections can read simultaneously (Snapshot Isolation).
-- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe in MVP.
+- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe yet.
 
 **Recommendation**: Ensure your application architecture enforces a single-writer pattern (e.g. via a dedicated writer thread or queue).
 

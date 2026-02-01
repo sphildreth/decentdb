@@ -221,7 +221,7 @@ SELECT * FROM users WHERE id = $1 AND name = $2;
 
 CLI usage:
 ```bash
-decentdb exec --db=my.db --sql="SELECT * FROM users WHERE id = \$1" --params=int:42
+decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=int:42
 ```
 
 ## Unsupported Features

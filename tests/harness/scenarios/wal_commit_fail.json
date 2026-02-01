@@ -1,7 +1,7 @@
 {
   "name": "wal_commit_fail",
   "description": "Crash during commit frame write - transaction should not be visible",
-  "db_path": "$TMPDIR/decentdb_wal_commit_fail.db",
+  "db_path": "$TMPDIR/decentdb_wal_commit_fail.ddb",
   "sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'committed data')",
   "failpoint": {
     "label": "wal_commit",

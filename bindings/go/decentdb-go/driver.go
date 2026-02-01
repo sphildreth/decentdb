@@ -41,7 +41,7 @@ type connector struct {
 }
 
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
-	// Parse DSN: file:/path/to.db?opt=val
+	// Parse DSN: file:/path/to.ddb?opt=val
 	u, err := url.Parse(c.dsn)
 	if err != nil {
 		return nil, err

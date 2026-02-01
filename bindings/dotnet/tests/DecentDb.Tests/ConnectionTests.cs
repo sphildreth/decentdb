@@ -12,7 +12,7 @@ public class ConnectionTests
     [Fact]
     public void OpenAndCloseDatabase()
     {
-        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.db");
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
         try
         {
             using var conn = new DecentDbConnection($"Data Source={dbPath}");
@@ -34,7 +34,7 @@ public class ConnectionTests
     [Fact]
     public void OpenNonExistentDatabase()
     {
-        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}", "subdir", "db.db");
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}", "subdir", "db.ddb");
         try
         {
             using var conn = new DecentDbConnection($"Data Source={dbPath}");
@@ -53,7 +53,7 @@ public class ConnectionTests
     [Fact]
     public void OpenWithCacheSizeMb_Succeeds()
     {
-        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.db");
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
         try
         {
             using var conn = new DecentDbConnection($"Data Source={dbPath};Cache Size=64MB");
@@ -82,7 +82,7 @@ public class ConnectionTests
     [Fact]
     public void SqlObservability_EventsFire_WhenHandlersAttached()
     {
-        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.db");
+        var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
         try
         {
             using var conn = new DecentDbConnection($"Data Source={dbPath};Logging=0");

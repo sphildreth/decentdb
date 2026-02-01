@@ -11,7 +11,7 @@ namespace DecentDb.Tests
 
         public DapperIntegrationTests()
         {
-            _dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_dapper_{Guid.NewGuid()}.db");
+            _dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_dapper_{Guid.NewGuid()}.ddb");
             var connStr = $"Data Source={_dbPath}";
             _connection = new DecentDbConnection(connStr);
             _connection.Open();

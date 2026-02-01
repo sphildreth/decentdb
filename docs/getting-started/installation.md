@@ -38,7 +38,7 @@ A Docker image is available for containerized usage:
 
 ```bash
 docker build -t decentdb .
-docker run -v $(pwd):/data decentdb exec --db=/data/mydb.db --sql="SELECT 1"
+docker run -v $(pwd):/data decentdb exec --db=/data/mydb.ddb --sql="SELECT 1"
 ```
 
 ## System Installation

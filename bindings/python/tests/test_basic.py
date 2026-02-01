@@ -5,7 +5,7 @@ import time
 
 @pytest.fixture
 def db_path(tmp_path):
-    return str(tmp_path / "test.db")
+    return str(tmp_path / "test.ddb")
 
 def test_connect(db_path):
     conn = decentdb.connect(db_path)

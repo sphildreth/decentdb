@@ -1,7 +1,7 @@
 {
   "name": "wal_fsync_drop",
   "description": "Simulate fsync lies - durability failure simulation",
-  "db_path": "$TMPDIR/decentdb_wal_fsync_drop.db",
+  "db_path": "$TMPDIR/decentdb_wal_fsync_drop.ddb",
   "sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'fsync test')",
   "failpoint": {
     "label": "wal_fsync",

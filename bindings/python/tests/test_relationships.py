@@ -18,7 +18,7 @@ class Address(Base):
     user = relationship("User", back_populates="addresses")
 
 def test_relationships_and_eager_loading(tmp_path):
-    db_path = str(tmp_path / "rels.db")
+    db_path = str(tmp_path / "rels.ddb")
     url = f"decentdb:///{db_path}"
     engine = create_engine(url)
     Base.metadata.create_all(engine)

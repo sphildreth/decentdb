@@ -18,10 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated ROAD_TO_RTM.md with completion status
 - Improved documentation organization
 
-## [1.0.0] - 2026-01-30
+## [0.0.1] - 2026-01-30
 
 ### Added
-- Initial stable release
+- Initial beta release (pre-1.0)
 - ACID transactions with WAL-based durability
 - PostgreSQL-like SQL subset
 - B+Tree storage with page cache
@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Known Limitations
 
-As of version 1.0.0:
+As of version 0.0.1:
 
 - **Single writer only** - No concurrent write transactions
 - **Single process** - No multi-process access
@@ -98,6 +98,12 @@ As of version 1.0.0:
 - **No encryption** - Data at rest not encrypted
 
 ## Future Roadmap
+
+### Version 1.0.0 (Planned)
+- Feature-complete engine and CLI
+- More robust unit tests (plus crash/differential coverage where appropriate)
+- Benchmarks meet release targets
+- API stability guarantees begin (Semantic Versioning)
 
 ### Version 1.1 (Planned)
 - Subquery support

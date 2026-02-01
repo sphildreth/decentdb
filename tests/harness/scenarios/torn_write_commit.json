@@ -1,7 +1,7 @@
 {
   "name": "torn_write_commit",
   "description": "Crash mid-commit frame write - transaction treated as uncommitted",
-  "db_path": "$TMPDIR/decentdb_torn_write_commit.db",
+  "db_path": "$TMPDIR/decentdb_torn_write_commit.ddb",
   "sql": "CREATE TABLE test (id INT PRIMARY KEY); INSERT INTO test VALUES (1); INSERT INTO test VALUES (2)",
   "failpoint": {
     "label": "wal_commit",

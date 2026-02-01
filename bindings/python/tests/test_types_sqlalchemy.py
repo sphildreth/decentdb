@@ -24,7 +24,7 @@ class AllTypes(Base):
     e = Column(Enum(MyEnum))
 
 def test_sqlalchemy_types(tmp_path):
-    db_path = str(tmp_path / "sa_types.db")
+    db_path = str(tmp_path / "sa_types.ddb")
     url = f"decentdb:///{db_path}"
     engine = create_engine(url)
     
@@ -63,7 +63,7 @@ def test_sqlalchemy_types(tmp_path):
         assert o.e == MyEnum.A
 
 def test_sqlalchemy_core_types(tmp_path):
-    db_path = str(tmp_path / "sa_core.db")
+    db_path = str(tmp_path / "sa_core.ddb")
     url = f"decentdb:///{db_path}"
     engine = create_engine(url)
     

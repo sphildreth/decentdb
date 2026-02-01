@@ -8,10 +8,10 @@ The page cache is critical for read performance.
 
 ```bash
 # Default: 1024 pages = 4MB
-decentdb exec --db=my.db --sql="SELECT 1" --cachePages=4096  # 16MB
+decentdb exec --db=my.ddb --sql="SELECT 1" --cachePages=4096  # 16MB
 
 # Or use megabytes
-decentdb exec --db=my.db --sql="SELECT 1" --cacheMb=64  # 64MB
+decentdb exec --db=my.ddb --sql="SELECT 1" --cacheMb=64  # 64MB
 ```
 
 Recommendations:
@@ -74,7 +74,7 @@ For large imports, use bulk load:
 
 ```bash
 # Much faster than individual inserts
-decentdb bulk-load --db=my.db --table=users --file=users.csv
+decentdb bulk-load --db=my.ddb --table=users --file=users.csv
 ```
 
 Bulk load options:
@@ -121,10 +121,10 @@ Checkpoints write WAL data to the main database file:
 
 ```bash
 # Manual checkpoint
-decentdb exec --db=my.db --checkpoint
+decentdb exec --db=my.ddb --checkpoint
 
 # Configure auto-checkpoint thresholds
-decentdb exec --db=my.db --sql="PRAGMA checkpoint_threshold=10000000"  # 10MB
+decentdb exec --db=my.ddb --sql="PRAGMA checkpoint_threshold=10000000"  # 10MB
 ```
 
 ### Durability vs Performance
@@ -148,7 +148,7 @@ Check database statistics:
 
 ```bash
 # Database info
-decentdb exec --db=my.db --dbInfo --verbose
+decentdb exec --db=my.ddb --dbInfo --verbose
 
 # Shows:
 # - Page size
@@ -163,10 +163,10 @@ Over time, indexes may become fragmented. Rebuild them:
 
 ```bash
 # Rebuild a specific index
-decentdb rebuild-index --db=my.db --index=idx_users_name
+decentdb rebuild-index --db=my.ddb --index=idx_users_name
 
 # Or rebuild all indexes
-decentdb exec --db=my.db --sql="PRAGMA rebuild_all_indexes"
+decentdb exec --db=my.ddb --sql="PRAGMA rebuild_all_indexes"
 ```
 
 ## Common Bottlenecks

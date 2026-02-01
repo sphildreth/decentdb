@@ -2,7 +2,7 @@ import pytest
 import decentdb
 
 def test_statement_cache_reuse(tmp_path):
-    db_path = str(tmp_path / "cache_test.db")
+    db_path = str(tmp_path / "cache_test.ddb")
     conn = decentdb.connect(db_path, stmt_cache_size=10)
     cur = conn.cursor()
     
@@ -53,7 +53,7 @@ def test_statement_cache_reuse(tmp_path):
     conn.close()
 
 def test_cache_eviction(tmp_path):
-    db_path = str(tmp_path / "eviction_test.db")
+    db_path = str(tmp_path / "eviction_test.ddb")
     conn = decentdb.connect(db_path, stmt_cache_size=2) # Small cache
     cur = conn.cursor()
     

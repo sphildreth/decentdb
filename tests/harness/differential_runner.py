@@ -282,7 +282,7 @@ def run_differential_test(
     Returns:
         Tuple of (passed, message)
     """
-    db_path = os.path.join(temp_dir, f"diff_{test.name}.db")
+    db_path = os.path.join(temp_dir, f"diff_{test.name}.ddb")
     pg_schema = f"decentdb_diff_{test.name}"
 
     # Clean up any existing files

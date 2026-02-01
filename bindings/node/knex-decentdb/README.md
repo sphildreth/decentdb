@@ -12,7 +12,7 @@ const { Client_DecentDB } = require('knex-decentdb');
 
 const db = knex({
   client: Client_DecentDB,
-  connection: { filename: '/path/to.db' },
+  connection: { filename: '/path/to.ddb' },
   useNullAsDefault: true
 });
 

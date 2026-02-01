@@ -222,7 +222,7 @@ docker build -t decentdb:latest .
 
 ```bash
 docker run -v $(pwd):/data decentdb:latest \
-  exec --db=/data/my.db --sql="SELECT 1"
+  exec --db=/data/my.ddb --sql="SELECT 1"
 ```
 
 ## Troubleshooting
@@ -346,8 +346,9 @@ Before creating a release:
 3. [ ] CHANGELOG.md updated
 4. [ ] Documentation built
 5. [ ] Binaries built for all platforms
-6. [ ] Git tag created: `git tag -a v1.0.0 -m "Release 1.0.0"`
-7. [ ] Tag pushed: `git push origin v1.0.0`
+6. [ ] Version bumped (e.g. `0.0.1` -> `0.0.2`) and changelog updated
+7. [ ] Git tag created: `git tag -a v0.0.1 -m "Release 0.0.1"`
+8. [ ] Tag pushed: `git push origin v0.0.1`
 
 ## Next Steps
 

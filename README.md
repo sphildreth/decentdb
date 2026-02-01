@@ -28,6 +28,11 @@ ACID first. Everything else… eventually.
 
 DecentDB is a embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation. DecentDB provides a PostgreSQL-like SQL interface with ACID transactions, efficient B+Tree storage, and concurrent read access. It is not intended to be the best embedded database engine, but not terrible, a decent better than some engine.
 
+## Status
+
+- Current version: **0.0.1** (beta)
+- Planned initial stable release: **1.0.0** once the engine is feature-complete, unit tests are more robust, and benchmarks are acceptable.
+
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
@@ -73,15 +78,15 @@ nimble build
 
 ```bash
 # Create and query a database
-decentdb exec --db ./my.db --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
-decentdb exec --db ./my.db --sql "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
-decentdb exec --db ./my.db --sql "SELECT * FROM users"
+decentdb exec --db ./my.ddb --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
+decentdb exec --db ./my.ddb --sql "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
+decentdb exec --db ./my.ddb --sql "SELECT * FROM users"
 ```
 
 ### REPL Mode
 
 ```bash
-decentdb repl --db ./my.db
+decentdb repl --db ./my.ddb
 ```
 
 ## Usage Examples
@@ -90,7 +95,7 @@ decentdb repl --db ./my.db
 
 ```bash
 # Create tables with constraints
-decentdb exec --db ./my.db --sql "CREATE TABLE orders (
+decentdb exec --db ./my.ddb --sql "CREATE TABLE orders (
     id INT PRIMARY KEY,
     user_id INT REFERENCES users(id),
     amount FLOAT64,
@@ -98,43 +103,43 @@ decentdb exec --db ./my.db --sql "CREATE TABLE orders (
 )"
 
 # Insert data
-decentdb exec --db ./my.db --sql "INSERT INTO orders VALUES (1, 1, 99.99, 1704067200)"
+decentdb exec --db ./my.ddb --sql "INSERT INTO orders VALUES (1, 1, 99.99, 1704067200)"
 
 # Query with JOINs
-decentdb exec --db ./my.db --sql "SELECT u.name, SUM(o.amount) 
+decentdb exec --db ./my.ddb --sql "SELECT u.name, SUM(o.amount) 
     FROM users u 
     JOIN orders o ON u.id = o.user_id 
     GROUP BY u.name"
 
 # Text search with trigram index
-decentdb exec --db ./my.db --sql "CREATE INDEX idx_users_name ON users USING trigram(name)"
-decentdb exec --db ./my.db --sql "SELECT * FROM users WHERE name LIKE '%ali%'"
+decentdb exec --db ./my.ddb --sql "CREATE INDEX idx_users_name ON users USING trigram(name)"
+decentdb exec --db ./my.ddb --sql "SELECT * FROM users WHERE name LIKE '%ali%'"
 ```
 
 ### Import/Export
 
 ```bash
 # Import CSV data
-decentdb import --table users --input data.csv --db ./my.db
+decentdb import --table users --input data.csv --db ./my.ddb
 
 # Export to JSON
-decentdb export --table users --output users.json --db ./my.db --format=json
+decentdb export --table users --output users.json --db ./my.ddb --format=json
 
 # Bulk load large datasets
-decentdb bulk-load --table users --input large_dataset.csv --db ./my.db
+decentdb bulk-load --table users --input large_dataset.csv --db ./my.ddb
 ```
 
 ### Maintenance
 
 ```bash
 # Force WAL checkpoint
-decentdb checkpoint --db ./my.db
+decentdb checkpoint --db ./my.ddb
 
 # View database statistics
-decentdb stats --db ./my.db
+decentdb stats --db ./my.ddb
 
 # Rebuild an index
-decentdb rebuild-index --index users_name_idx --db ./my.db
+decentdb rebuild-index --index users_name_idx --db ./my.ddb
 ```
 
 ## CLI Reference

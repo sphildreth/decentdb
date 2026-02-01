@@ -1,7 +1,7 @@
 {
   "name": "checkpoint_page_fail",
   "description": "Crash during checkpoint page copy to main DB",
-  "db_path": "$TMPDIR/decentdb_checkpoint_page_fail.db",
+  "db_path": "$TMPDIR/decentdb_checkpoint_page_fail.ddb",
   "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'test data')",
   "sql": "PRAGMA checkpoint",
   "failpoint": {

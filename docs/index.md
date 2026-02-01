@@ -19,13 +19,13 @@ DecentDb is an embedded, single-machine relational database engine focused on **
 nimble install decentdb
 
 # Create a database
-decentdb exec --db=mydb.db --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"
+decentdb exec --db=mydb.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"
 
 # Insert data
-decentdb exec --db=mydb.db --sql="INSERT INTO users VALUES (1, 'Alice')"
+decentdb exec --db=mydb.ddb --sql="INSERT INTO users VALUES (1, 'Alice')"
 
 # Query
-decentdb exec --db=mydb.db --sql="SELECT * FROM users"
+decentdb exec --db=mydb.ddb --sql="SELECT * FROM users"
 ```
 
 ## Use Cases

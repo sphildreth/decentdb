@@ -6,7 +6,7 @@ import btree/btree
 import errors
 
 proc makeTempDb(name: string): string =
-  let path = getTempDir() / name
+  let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
   if fileExists(path):
     removeFile(path)
   path

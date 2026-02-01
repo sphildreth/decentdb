@@ -35,7 +35,12 @@ proc makeTempFile(name: string): string =
   path
 
 proc makeTempDb(name: string): string =
-  makeTempFile(name)
+  let normalizedName =
+    if name.len >= 3 and name[name.len - 3 .. ^1] == ".db":
+      name[0 .. ^4] & ".ddb"
+    else:
+      name
+  makeTempFile(normalizedName)
 
 proc measureMs(action: proc()): float =
   let start = epochTime()

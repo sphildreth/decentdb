@@ -6,11 +6,11 @@ This file defines how coding agents should operate in this repository.
 ## 1. North Star
 - **Priority #1:** Durable ACID writes
 - **Priority #2:** Fast reads
-- MVP supports **single process** with **one writer** and **multiple concurrent reader threads**.
+- Current concurrency model: **single process** with **one writer** and **multiple concurrent reader threads**.
 - Correctness is enforced via **tests from day one** (unit + property + crash-injection + differential testing).
 
 ## 2. Scope boundaries
-### MVP In Scope
+### Current Scope (0.x, pre-1.0)
 - WAL-only durability (fsync on commit by default)
 - Paged storage + page cache
 - B+Tree tables and secondary indexes
@@ -19,13 +19,13 @@ This file defines how coding agents should operate in this repository.
   - DML: SELECT/INSERT/UPDATE/DELETE
   - JOINs: INNER/LEFT
   - WHERE, ORDER BY, LIMIT/OFFSET, parameters
-- Foreign keys enforced (MVP: RESTRICT/NO ACTION)
+- Foreign keys enforced (RESTRICT/NO ACTION)
 - Trigram substring index for LIKE '%pattern%' on configured columns
 - Python harness to run:
   - crash-injection durability tests
   - differential checks vs PostgreSQL for supported subset
 
-### MVP Out of Scope (do not implement without an ADR)
+### Out of Scope (do not implement without an ADR)
 - Multi-process concurrency / shared-memory locking
 - PostgreSQL wire protocol (Npgsql compatibility)
 - Full PostgreSQL system catalogs / extensions

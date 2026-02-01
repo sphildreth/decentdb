@@ -8,13 +8,13 @@ DecentDb's native Nim API for embedded applications.
 import decentdb/engine
 
 # Open with default cache (1024 pages = 4MB)
-let db = openDb("myapp.db")
+let db = openDb("myapp.ddb")
 if not db.ok:
   echo "Failed to open: ", db.err.message
   quit(1)
 
 # Open with custom cache size
-let db2 = openDb("myapp.db", cachePages = 4096)  # 16MB cache
+let db2 = openDb("myapp.ddb", cachePages = 4096)  # 16MB cache
 ```
 
 ## Executing SQL
@@ -25,7 +25,7 @@ let db2 = openDb("myapp.db", cachePages = 4096)  # 16MB cache
 import decentdb/engine
 import decentdb/record/record
 
-let db = openDb("myapp.db").value
+let db = openDb("myapp.ddb").value
 
 # Execute DDL
 let createRes = execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
@@ -90,7 +90,7 @@ For high-performance data import:
 ```nim
 import decentdb/engine
 
-let db = openDb("myapp.db").value
+let db = openDb("myapp.ddb").value
 
 # Create table
 discard execSql(db, "CREATE TABLE bulk_data (id INT PRIMARY KEY, data TEXT)")
@@ -201,7 +201,7 @@ if not res.ok:
 ### Database Properties
 
 ```nim
-let db = openDb("myapp.db").value
+let db = openDb("myapp.ddb").value
 
 echo "Path: ", db.path
 echo "Page size: ", db.pageSize, " bytes"
@@ -240,7 +240,7 @@ import decentdb/record/record
 import os
 
 proc main() =
-  let dbPath = getTempDir() / "example.db"
+  let dbPath = getTempDir() / "example.ddb"
   
   # Open database
   let dbRes = openDb(dbPath)
@@ -330,4 +330,5 @@ See the [VFS module](../architecture/storage.md) for details.
 
 ## API Stability
 
-The Nim API is stable for version 1.0.0. Future versions will maintain backward compatibility where possible.
+DecentDb is currently pre-1.0 (starting at 0.0.1). Until 1.0.0, APIs may change, including breaking changes.
+Once 1.0.0 is released, we will follow Semantic Versioning for API compatibility.

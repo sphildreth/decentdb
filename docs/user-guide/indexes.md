@@ -101,10 +101,10 @@ CREATE INDEX idx_users_email ON users(email);
 
 ```bash
 # All indexes
-decentdb list-indexes --db=my.db
+decentdb list-indexes --db=my.ddb
 
 # Indexes for specific table
-decentdb list-indexes --db=my.db --table=users
+decentdb list-indexes --db=my.ddb --table=users
 ```
 
 ### Rebuilding Indexes
@@ -113,7 +113,7 @@ Over time, indexes can become fragmented. Rebuild them for better performance:
 
 ```bash
 # Rebuild a specific index
-decentdb rebuild-index --db=my.db --index=idx_users_email
+decentdb rebuild-index --db=my.ddb --index=idx_users_email
 ```
 
 ### Dropping Indexes
@@ -200,7 +200,7 @@ View index information:
 
 ```bash
 # Table description shows indexes
-decentdb describe --db=my.db --table=users
+decentdb describe --db=my.ddb --table=users
 ```
 
 ## Troubleshooting
@@ -224,5 +224,5 @@ SELECT * FROM users WHERE LOWER(email) = 'alice@example.com';
 For large tables:
 ```bash
 # Use bulk load options for faster rebuild
-decentdb exec --db=my.db --sql="PRAGMA checkpoint"  --durability=deferred
+decentdb exec --db=my.ddb --sql="PRAGMA checkpoint"  --durability=deferred
 ```

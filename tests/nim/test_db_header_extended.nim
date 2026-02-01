@@ -150,7 +150,7 @@ suite "DB Header Extended":
     check DefaultPageSize == 4096'u32
 
   test "readHeader from empty file fails":
-    let tempPath = getTempDir() / "decentdb_empty_header.db"
+    let tempPath = getTempDir() / "decentdb_empty_header.ddb"
     if fileExists(tempPath):
       removeFile(tempPath)
     let vfs = newOsVfs()
@@ -168,7 +168,7 @@ suite "DB Header Extended":
     discard vfs.close(reopenRes.value)
 
   test "writeHeader writes correct size":
-    let tempPath = getTempDir() / "decentdb_write_header.db"
+    let tempPath = getTempDir() / "decentdb_write_header.ddb"
     if fileExists(tempPath):
       removeFile(tempPath)
     let vfs = newOsVfs()

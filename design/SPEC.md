@@ -2,22 +2,24 @@
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
+> Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
+
 ## 1. Overview
-This document defines the MVP engineering design for DecentDb:
+This document defines the baseline engineering design for DecentDb:
 - Embedded DB engine in **Nim**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
 - ACID via **WAL-based** design
 - Storage: **paged file + B+Trees**, with **trigram inverted index** for search
 - **Mandatory Overflow Pages** for BLOB/Large TEXT support
 
-MVP scope: single process, multi-threaded readers, single writer.
+Current scope (0.x, pre-1.0): single process, multi-threaded readers, single writer.
 
 ---
 
 ## 2. Module architecture
 ### 2.1 Engine modules (Nim)
 1. **vfs/**
-   - OS file I/O abstraction: open/read/write/fsync/lock (intra-process lock only MVP)
+  - OS file I/O abstraction: open/read/write/fsync/lock (intra-process lock only)
    - “Faulty VFS” hooks for tests (partial writes, dropped fsync, crash points)
 
 2. **pager/**
@@ -36,11 +38,11 @@ MVP scope: single process, multi-threaded readers, single writer.
 4. **btree/**
    - B+Tree implementation for tables and secondary indexes
    - Cursors and iterators
-   - Node split handling (merge/rebalance optional post-MVP)
+  - Node split handling (merge/rebalance optional post-1.0)
 
 5. **record/**
    - Record encoding/decoding: varint lengths + typed fields
-   - Overflow pages for large TEXT/BLOB (Mandatory MVP - see ADR-0020)
+  - Overflow pages for large TEXT/BLOB (baseline requirement - see ADR-0020)
 
 6. **catalog/**
    - System tables and schema management
@@ -61,7 +63,7 @@ MVP scope: single process, multi-threaded readers, single writer.
 9. **exec/**
    - Volcano (iterator) engine operators:
      - TableScan, IndexSeek, Filter, Project
-     - NestedLoopJoin (MVP)
+    - NestedLoopJoin (0.x baseline)
      - Sort (External Merge Sort capable, see ADR-0022), Limit/Offset
    - Row materialization in reusable buffers (avoid per-row heap alloc)
 
@@ -140,13 +142,13 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 ### 3.3 Page types
 - B+Tree internal page
 - B+Tree leaf page
-- Overflow page (Mandatory MVP)
-- Freelist trunk/leaf (or single freelist chain for MVP)
+- Overflow page (baseline requirement)
+- Freelist trunk/leaf (or single freelist chain for 0.x)
 
 ---
 
 ## 4. Transactions, durability, and recovery (WAL-only)
-### 4.1 WAL frame format (MVP)
+### 4.1 WAL frame format (0.x baseline)
 Each frame appends:
 - `frame_type` (u8): 0=page, 1=commit, 2=checkpoint
 - `page_id` (u32, valid for page frames)
@@ -249,14 +251,14 @@ On open:
 - Multiple concurrent readers
 - Each reader uses snapshot_lsn and does not block on writer except for brief schema locks
 
-### 5.3 Locks and latches (MVP)
+### 5.3 Locks and latches (0.x baseline)
 - `schemaLock`: RW lock around catalog changes
 - Page cache: per-page latch + global eviction lock
 - WAL append: mutex for serializing frame writes (enforces single-writer)
 
 **Note:** The WAL append mutex enforces the single-writer constraint at the storage layer. While the architecture supports only one writer transaction at a time by design, the mutex provides defense-in-depth against programming errors.
 
-Multi-process locking is out of scope for MVP.
+Multi-process locking is out of scope for 0.x.
 
 ### 5.4 Deadlock detection and prevention
 - Writer acquires locks in a consistent order to avoid deadlocks
@@ -268,14 +270,14 @@ Multi-process locking is out of scope for MVP.
 
 ## 6. SQL parsing & compatibility (Postgres-like)
 ### 6.1 Parser choice
-MVP recommendation:
+0.x recommendation:
 - Use a Postgres-compatible parser via FFI (e.g., `libpg_query`) to accept familiar syntax.
 - Normalize parse trees into DecentDb’s internal AST immediately.
 
 Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
-### 6.2 Supported SQL subset (MVP)
+### 6.2 Supported SQL subset (0.x baseline)
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
 - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
@@ -284,7 +286,7 @@ Alternative:
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
 
 ### 6.3 Parameterization
-- `$1, $2, ...` positional (Postgres style) — chosen for MVP
+- `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline
   - Consistent with libpg_query parser choice
   - Simple to implement and test
   - Well-understood by developers familiar with PostgreSQL
@@ -309,7 +311,7 @@ Alternative:
 - Violations cause immediate error and statement rollback
 - This differs from PostgreSQL/MySQL which defer validation to COMMIT
 
-MVP actions:
+0.x actions:
 - `RESTRICT` / `NO ACTION` on delete/update
 
 Optional later:
@@ -327,7 +329,7 @@ Optional later:
 
 ### 8.2 Index data model
 For each indexed TEXT column:
-- Normalize to uppercase (configurable; MVP assumes uppercase inputs are already normalized)
+- Normalize to uppercase (configurable; 0.x assumes uppercase inputs are already normalized)
 - Generate trigrams across a canonical form (define whitespace/punctuation handling)
 
 Store:
@@ -360,11 +362,11 @@ Maintain postings count per trigram.
 - If rarest trigram count exceeds a threshold (e.g., >100k), require additional predicate or cap results.
 - Provide an engine setting for thresholds.
 
-### 8.5 Storage format for postings (MVP)
+### 8.5 Storage format for postings (0.x baseline)
 - Store postings lists in a dedicated B+Tree keyed by trigram:
   - key: trigram
   - value: compressed postings blob (delta-encoded varints)
-- Updates (MVP choice: in-memory buffers):
+- Updates (0.x choice: in-memory buffers):
   - Maintain small in-memory buffers per trigram (max buffer size: 4KB)
   - Flush buffers to B+Tree during transaction commit
   - If buffer exceeds size, flush immediately and create new buffer
@@ -395,7 +397,7 @@ For contains predicates:
 - Prefer driving from the most selective candidate set (smallest).
 
 ### 9.1 Index statistics (heuristic-based)
-MVP uses simple heuristics without full statistics collection:
+0.x uses simple heuristics without full statistics collection:
 - Assume uniform distribution for equality predicates
 - For trigram indexes: use actual posting list counts (stored in index metadata)
 - For B+Tree indexes: estimate selectivity based on index type:
@@ -470,7 +472,7 @@ Track:
 ---
 
 ## 12. Future compatibility: Npgsql / PostgreSQL wire protocol
-Not MVP. If pursued:
+Not planned for 0.x. If pursued:
 - Implement pgwire subset as a server endpoint
 - Add minimal catalog responses for clients
 - Maintain dialect compatibility with libpg_query parser
@@ -542,10 +544,10 @@ Define error categories:
 - Engine can read older format versions (read-only compatibility)
 - Writing to older formats may trigger automatic upgrade (with user confirmation)
 
-### 15.3 Schema changes (MVP)
+### 15.3 Schema changes (0.x baseline)
 - Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
 - ALTER TABLE operations: ADD COLUMN, DROP COLUMN
-- Not supported (post-MVP): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
+- Not supported (post-1.0): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 
 ### 15.4 Migration strategy
@@ -600,7 +602,7 @@ db.set_config("trigram_postings_threshold", 50000)
 - If utilization drops below 50% (configurable), trigger compaction
 - Compaction: rebuild B+Tree from scratch, freeing empty pages
 
-### 17.3 Merge/rebalance (post-MVP)
-- Not implemented in MVP to simplify code
+### 17.3 Merge/rebalance (post-1.0)
+- Not implemented in 0.x to simplify code
 - Compaction provides equivalent space recovery
 - Future: implement merge for delete-heavy workloads

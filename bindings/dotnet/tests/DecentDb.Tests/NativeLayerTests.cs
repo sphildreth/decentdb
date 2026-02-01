@@ -12,7 +12,7 @@ public class NativeLayerTests : IDisposable
 
     public NativeLayerTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.db");
+        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
     }
 
     public void Dispose()
@@ -50,7 +50,7 @@ public class NativeLayerTests : IDisposable
     [Fact]
     public void OpenInvalidPathThrows()
     {
-        var badPath = Path.Combine(Path.GetTempPath(), $"does_not_exist_{Guid.NewGuid():N}", "x.db");
+        var badPath = Path.Combine(Path.GetTempPath(), $"does_not_exist_{Guid.NewGuid():N}", "x.ddb");
         var ex = Assert.Throws<DecentDbException>(() => new NativeDb(badPath));
         Assert.False(string.IsNullOrWhiteSpace(ex.Message));
     }

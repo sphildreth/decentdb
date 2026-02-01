@@ -439,7 +439,7 @@ def main() -> int:
     failed = 0
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = os.path.join(temp_dir, "property_test.db")
+        db_path = os.path.join(temp_dir, "property_test.ddb")
 
         for test_name, test_func in tests:
             print(f"\n{test_name}:")

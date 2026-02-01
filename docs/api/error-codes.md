@@ -16,7 +16,7 @@ File system operations failed.
 
 **Example:**
 ```bash
-decentdb exec --db=/readonly/my.db --sql="SELECT 1"
+decentdb exec --db=/readonly/my.ddb --sql="SELECT 1"
 # Error: ERR_IO: Permission denied
 ```
 
@@ -37,7 +37,7 @@ Database file structure is invalid.
 
 **Example:**
 ```bash
-decentdb exec --db=corrupted.db --sql="SELECT 1"
+decentdb exec --db=corrupted.ddb --sql="SELECT 1"
 # Error: ERR_CORRUPTION: Invalid page checksum
 ```
 
@@ -104,10 +104,10 @@ Invalid SQL syntax or semantic error.
 
 **Example:**
 ```bash
-decentdb exec --db=my.db --sql="SELECT * FROM nonexistent"
+decentdb exec --db=my.ddb --sql="SELECT * FROM nonexistent"
 # Error: ERR_SQL: Table not found
 
-decentdb exec --db=my.db --sql="SELEC * FROM users"
+decentdb exec --db=my.ddb --sql="SELEC * FROM users"
 # Error: ERR_SQL: Syntax error
 ```
 
@@ -260,10 +260,10 @@ If database is corrupted:
 
 ```bash
 # Check integrity
-decentdb exec --db=my.db --sql="PRAGMA integrity_check"
+decentdb exec --db=my.ddb --sql="PRAGMA integrity_check"
 
 # Export and reimport if needed
-decentdb export --db=my.db --table=users --file=users.csv
+decentdb export --db=my.ddb --table=users --file=users.csv
 # Create new database and import
 ```
 

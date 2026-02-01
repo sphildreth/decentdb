@@ -71,7 +71,7 @@ class DifferentialLikeTests(unittest.TestCase):
             run_psql(create_sql + " " + insert_sql)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                db_path = Path(temp_dir) / "diff_like.db"
+                db_path = Path(temp_dir) / "diff_like.ddb"
                 def run_cli(sql: str) -> dict:
                     proc = subprocess.run(
                         [cli, "exec", "--db", str(db_path), "--sql", sql],

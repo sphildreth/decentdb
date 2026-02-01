@@ -25,7 +25,7 @@ This is **not** an ORM design. sqlc generates strongly typed query methods from 
   - The sqlc integration MUST configure `engine: postgresql` so generated SQL uses `$N`.
 - **Isolation (engine):** Default isolation is **Snapshot Isolation** per ADR-0023.
   - The driver MUST not claim stronger guarantees.
-- **Concurrency model (MVP):** single process, one writer, multiple concurrent readers.
+- **Concurrency model:** single process, one writer, multiple concurrent readers.
   - The driver SHOULD support many concurrent read connections and MUST handle writer contention predictably.
 
 ## Performance Targets
@@ -194,7 +194,7 @@ Performance requirement:
 
 Implementation approach:
 - On `Rows.Next`, use the row-view/batch native API (Phase 1 extension) when available.
-- Otherwise, fall back to per-column accessors with careful buffering (acceptable for MVP, but may miss the <1ms overhead budget).
+- Otherwise, fall back to per-column accessors with careful buffering (acceptable for the 0.x baseline, but may miss the <1ms overhead budget).
 
 ---
 
@@ -447,7 +447,7 @@ SELECT * FROM artists WHERE id > $1 ORDER BY id LIMIT 20
 2. `database/sql` driver skeleton (Driver/Conn/Stmt/Rows/Tx)
 3. Basic DSN parsing and option plumbing
 
-### Sprint 2: sqlc MVP
+### Sprint 2: sqlc baseline
 1. sqlc config + examples
 2. Integration tests running generated code
 3. Type mapping (including time)
@@ -513,7 +513,7 @@ Create an ADR before implementing:
 
 1. **cgo overhead**: without row batching, driver overhead may exceed the <1ms budget.
 2. **Distribution complexity**: cross-platform native library shipping for Go needs early automation.
-3. **Feature expectation mismatch**: users may expect PostgreSQL behaviors beyond DecentDB MVP.
+3. **Feature expectation mismatch**: users may expect PostgreSQL behaviors beyond DecentDB 0.x scope.
 4. **Time type ergonomics**: mapping INT64 ↔ `time.Time` must be crystal clear and tested.
 
 ---

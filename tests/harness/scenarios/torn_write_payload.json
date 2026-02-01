@@ -1,7 +1,7 @@
 {
   "name": "torn_write_payload",
   "description": "Write full header but partial payload - recovery should detect",
-  "db_path": "$TMPDIR/decentdb_torn_write_payload.db",
+  "db_path": "$TMPDIR/decentdb_torn_write_payload.ddb",
   "sql": "CREATE TABLE test (id INT PRIMARY KEY, data BLOB); INSERT INTO test VALUES (1, 'large blob data that exceeds partial write')",
   "failpoint": {
     "label": "wal_frame",

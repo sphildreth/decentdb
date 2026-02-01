@@ -11,7 +11,12 @@ import pager/pager
 import btree/btree
 
 proc makeTempDb(name: string): string =
-  let path = getTempDir() / name
+  let normalizedName =
+    if name.len >= 3 and name[name.len - 3 .. ^1] == ".db":
+      name[0 .. ^4] & ".ddb"
+    else:
+      name
+  let path = getTempDir() / normalizedName
   if fileExists(path):
     removeFile(path)
   if fileExists(path & "-wal"):

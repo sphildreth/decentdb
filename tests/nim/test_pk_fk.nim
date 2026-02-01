@@ -18,7 +18,7 @@ proc createTestDb(path: string): Db =
 
 suite "Primary Key Optimization - Foreign Keys":
   test "FK works with INT64 PRIMARY KEY (Optimized)":
-    let dbPath = "test_pk_fk.db"
+    let dbPath = "test_pk_fk.ddb"
     var db = createTestDb(dbPath)
     defer:
       discard closeDb(db)

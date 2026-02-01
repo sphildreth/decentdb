@@ -1,5 +1,5 @@
 {
   "name": "open_close",
-  "db_path": "$TMPDIR/decentdb_open_close.db",
+  "db_path": "$TMPDIR/decentdb_open_close.ddb",
   "open_close": true
 }

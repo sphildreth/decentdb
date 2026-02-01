@@ -27,7 +27,7 @@ Target audience:
   - The Python DB-API layer MAY accept SQLAlchemy-generated parameter formats (named/pyformat) but MUST rewrite to `$N` before calling native.
 - **Isolation (engine):** Default isolation is **Snapshot Isolation** per ADR-0023.
   - The SQLAlchemy dialect MUST not claim stronger guarantees.
-- **Concurrency model (MVP):** single process, one writer, multiple concurrent readers.
+- **Concurrency model:** single process, one writer, multiple concurrent readers.
   - The DB-API driver and dialect MUST avoid suggesting cross-process file sharing semantics beyond what DecentDB provides.
 
 ## Performance Targets
@@ -241,7 +241,7 @@ Rules:
 ### Requirements
 
 Implement a SQLAlchemy dialect that:
-- declares capabilities consistent with DecentDB MVP
+- declares capabilities consistent with DecentDB 0.x baseline
 - compiles SQL using supported syntax
 - integrates the DB-API driver
 - provides correct reflection/inspection behavior where possible
@@ -461,7 +461,7 @@ SELECT * FROM artists WHERE id > $1 ORDER BY id LIMIT 20
 1. Native C API stability + streaming semantics
 2. DB-API driver skeleton (connect/execute/iterate)
 3. Parameter rewriting + type conversions
-4. SQLAlchemy dialect MVP (types + execution)
+4. SQLAlchemy dialect baseline (types + execution)
 5. ORM integration tests and examples
 6. Performance extensions (batch fetch) and benchmarks
 7. Packaging: `pip` wheels + manylinux/macos/windows builds
@@ -507,7 +507,7 @@ Any changes that impact:
 - Python 3.11+ (recommended baseline)
 - SQLAlchemy 2.x
 - Native binding layer:
-  - MVP: `cffi` or `ctypes`
+   - Initial implementation: `cffi` or `ctypes`
   - Performance tier: CPython extension / Cython (future)
 
 ---
@@ -515,7 +515,7 @@ Any changes that impact:
 ## Risks
 
 - Python-level overhead may exceed the <1ms budget without a batch fetch API.
-- SQLAlchemy feature expectations (reflection, schema features) may exceed DecentDB MVP scope.
+- SQLAlchemy feature expectations (reflection, schema features) may exceed DecentDB 0.x (pre-1.0) scope.
 - Packaging native libraries for manylinux/macos/windows must be automated early.
 
 ---

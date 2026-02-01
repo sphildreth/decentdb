@@ -16,7 +16,7 @@ func TestDriver(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	dbPath := filepath.Join(tmpDir, "test.db")
+	dbPath := filepath.Join(tmpDir, "test.ddb")
 	dsn := fmt.Sprintf("file:%s", dbPath)
 
 	db, err := sql.Open("decentdb", dsn)

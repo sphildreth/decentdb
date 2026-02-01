@@ -12,7 +12,7 @@ BEGIN;
 
 Or using the CLI:
 ```bash
-decentdb exec --db=my.db --sql="BEGIN"
+decentdb exec --db=my.ddb --sql="BEGIN"
 ```
 
 ### Committing a Transaction
@@ -72,7 +72,7 @@ Committed transactions survive crashes:
 
 ```bash
 # Transaction is committed with fsync
-decentdb exec --db=my.db --sql="BEGIN; INSERT INTO logs VALUES (1, 'important'); COMMIT"
+decentdb exec --db=my.ddb --sql="BEGIN; INSERT INTO logs VALUES (1, 'important'); COMMIT"
 
 # Even if system crashes here, the data is safe
 ```
@@ -113,7 +113,7 @@ PRAGMA wal_sync_mode = NORMAL;
 Use bulk load API for large imports:
 
 ```bash
-decentdb bulk-load --db=my.db --table=users --file=users.csv --durability=deferred
+decentdb bulk-load --db=my.ddb --table=users --file=users.csv --durability=deferred
 ```
 
 ## Best Practices
@@ -155,15 +155,15 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 #!/bin/bash
 set -e
 
-decentdb exec --db=my.db --sql="BEGIN"
+decentdb exec --db=my.ddb --sql="BEGIN"
 
-if ! decentdb exec --db=my.db --sql="INSERT INTO users VALUES (1, 'Alice')"; then
-    decentdb exec --db=my.db --sql="ROLLBACK"
+if ! decentdb exec --db=my.ddb --sql="INSERT INTO users VALUES (1, 'Alice')"; then
+    decentdb exec --db=my.ddb --sql="ROLLBACK"
     echo "Transaction failed, rolled back"
     exit 1
 fi
 
-decentdb exec --db=my.db --sql="COMMIT"
+decentdb exec --db=my.ddb --sql="COMMIT"
 ```
 
 ## Transaction State
@@ -172,7 +172,7 @@ Check transaction status:
 
 ```bash
 # Show database info including active readers/writers
-decentdb exec --db=my.db --dbInfo --verbose
+decentdb exec --db=my.ddb --dbInfo --verbose
 ```
 
 ## Limitations

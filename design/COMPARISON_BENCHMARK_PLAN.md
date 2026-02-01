@@ -89,7 +89,7 @@ SQLite-specific requirement:
 - GROUP BY and ORDER BY operations
 - Subqueries
 
-Note: CTEs (WITH) and RIGHT JOIN are intentionally excluded from the common subset for MVP comparability. They can be added later as an “extensions” suite once DecentDB supports them.
+Note: CTEs (WITH) and RIGHT JOIN are intentionally excluded from the common subset for baseline comparability. They can be added later as an “extensions” suite once DecentDB supports them.
 
 ### 4. Concurrency Testing
 - Multiple simultaneous read operations
@@ -559,7 +559,7 @@ If any SQLite PRAGMAs are unsupported in the chosen build, record that explicitl
 Python threads can hide or distort concurrency due to the GIL and driver behavior. For concurrency scenarios:
 
 - Prefer a **multi-process** client model for concurrency tests (each worker process has its own connection).
-- Match DecentDB’s MVP concurrency model: **one writer** process, **many readers**.
+- Match DecentDB’s current concurrency model: **one writer** process, **many readers**.
 - Always validate correctness under concurrency (row counts, aggregate totals, checksum of key columns).
 
 ## Python Dependencies (`requirements.txt`)

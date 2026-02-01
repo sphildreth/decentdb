@@ -10,10 +10,10 @@ Configuration is set when opening the database:
 import decentdb/engine
 
 # With default settings
-let db = openDb("myapp.db")
+let db = openDb("myapp.ddb")
 
 # With custom cache size
-let db2 = openDb("myapp.db", cachePages = 4096)
+let db2 = openDb("myapp.ddb", cachePages = 4096)
 ```
 
 ### Cache Size
@@ -37,10 +37,10 @@ The page cache keeps frequently accessed pages in memory.
 **Example:**
 ```bash
 # Small database
-decentdb exec --db=small.db --sql="SELECT 1" --cachePages=1024
+decentdb exec --db=small.ddb --sql="SELECT 1" --cachePages=1024
 
 # Large database
-decentdb exec --db=large.db --sql="SELECT 1" --cacheMb=256
+decentdb exec --db=large.ddb --sql="SELECT 1" --cacheMb=256
 ```
 
 ## WAL Configuration
@@ -125,7 +125,7 @@ Default: 4096 bytes
 
 ```bash
 # Database info
-decentdb exec --db=my.db --dbInfo --verbose
+decentdb exec --db=my.ddb --dbInfo --verbose
 
 # Shows:
 # - Page size
@@ -157,7 +157,7 @@ Create `~/.decentdb/config` for default settings:
 
 ```
 # Default database path
-db = ~/myapp.db
+db = ~/myapp.ddb
 
 # Default cache size
 cacheMb = 64
@@ -174,7 +174,7 @@ Settings are overridden by command-line options.
 
 ```bash
 # Large cache
-decentdb exec --db=my.db --sql="SELECT * FROM large_table" --cacheMb=256
+decentdb exec --db=my.ddb --sql="SELECT * FROM large_table" --cacheMb=256
 
 # Create indexes for frequent queries
 ```
@@ -192,7 +192,7 @@ opts.checkpointOnComplete = true
 
 ```bash
 # Balanced settings
-decentdb exec --db=my.db --sql="..." --cacheMb=64
+decentdb exec --db=my.ddb --sql="..." --cacheMb=64
 
 # Normal durability
 PRAGMA wal_sync_mode = NORMAL;
@@ -231,14 +231,14 @@ PRAGMA wal_sync_mode = NORMAL;
 
 ```bash
 # Minimal memory usage
-decentdb exec --db=embedded.db --sql="..." --cachePages=256  # 1MB
+decentdb exec --db=embedded.ddb --sql="..." --cachePages=256  # 1MB
 ```
 
 ### Development/Testing
 
 ```bash
 # Fast but less safe
-decentdb exec --db=dev.db --sql="..." --cacheMb=32
+decentdb exec --db=dev.ddb --sql="..." --cacheMb=32
 PRAGMA wal_sync_mode = NORMAL;
 ```
 
@@ -246,7 +246,7 @@ PRAGMA wal_sync_mode = NORMAL;
 
 ```bash
 # Safe and fast
-decentdb exec --db=prod.db --sql="..." --cacheMb=256
+decentdb exec --db=prod.ddb --sql="..." --cacheMb=256
 PRAGMA wal_sync_mode = FULL;
 PRAGMA checkpoint_threshold = 10000000;  # 10MB
 ```

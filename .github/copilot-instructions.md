@@ -6,7 +6,7 @@ These instructions guide GitHub Copilot Chat when editing this repository.
 
 - **Priority #1: Durable ACID writes**
 - **Priority #2: Fast reads**
-- MVP concurrency model: **single process**, **one writer**, **multiple concurrent reader threads**.
+- Current concurrency model: **single process**, **one writer**, **multiple concurrent reader threads**.
 - Correctness is enforced via **tests from day one** (unit + property + crash-injection + differential testing).
 
 ## Non-negotiable constraints

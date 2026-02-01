@@ -11,7 +11,7 @@ public sealed class TypeMappingTests : IDisposable
 
     public TypeMappingTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.db");
+        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
     }
 
     public void Dispose()

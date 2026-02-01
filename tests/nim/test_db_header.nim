@@ -25,7 +25,7 @@ suite "DB Header":
     check decoded.value.freelistCount == 40
 
   test "corrupt checksum fails open":
-    let tempPath = getTempDir() / "decentdb_header_corrupt.db"
+    let tempPath = getTempDir() / "decentdb_header_corrupt.ddb"
     if fileExists(tempPath):
       removeFile(tempPath)
     let vfs = newOsVfs()
@@ -80,7 +80,7 @@ suite "DB Header":
     check reopen.err.code == ERR_CORRUPTION
 
   test "unsupported format version fails open":
-    let tempPath = getTempDir() / "decentdb_header_old_version.db"
+    let tempPath = getTempDir() / "decentdb_header_old_version.ddb"
     if fileExists(tempPath):
       removeFile(tempPath)
     let vfs = newOsVfs()

@@ -1,7 +1,7 @@
 {
   "name": "checkpoint_fsync_fail",
   "description": "Fsync failure during checkpoint - interrupted checkpoint handling",
-  "db_path": "$TMPDIR/decentdb_checkpoint_fsync_fail.db",
+  "db_path": "$TMPDIR/decentdb_checkpoint_fsync_fail.ddb",
   "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'checkpoint test')",
   "sql": "PRAGMA checkpoint",
   "failpoint": {

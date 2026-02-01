@@ -119,7 +119,7 @@ def test_wal_truncation_with_readers(
     When readers are active, WAL truncation should only happen up to
     the minimum reader snapshot LSN.
     """
-    db_path = os.path.join(temp_dir, "wal_reader_test.db")
+    db_path = os.path.join(temp_dir, "wal_reader_test.ddb")
     wal_path = db_path + ".wal"
 
     # Create table with data
@@ -274,7 +274,7 @@ def main() -> int:
     failed = 0
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = os.path.join(temp_dir, "reader_test.db")
+        db_path = os.path.join(temp_dir, "reader_test.ddb")
 
         for test_name, test_func in tests:
             try:

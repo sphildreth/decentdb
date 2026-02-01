@@ -172,7 +172,7 @@ Each cell (FormatVersion 4):
 1. Find target leaf page
 2. Remove cell
 3. Re-encode remaining cells
-4. Note: Merge not implemented (Post-MVP)
+4. Note: Merge not implemented yet
 
 **Split:**
 - Split point: Middle of sorted keys
@@ -213,7 +213,7 @@ The pager maintains an in-memory cache of recently used pages.
 
 ```nim
 # Default: 1024 pages = 4MB
-let db = openDb("my.db", cachePages = 4096)  # 16MB
+let db = openDb("my.ddb", cachePages = 4096)  # 16MB
 ```
 
 **Sizing Guidelines:**
@@ -251,7 +251,7 @@ Pages with low utilization can be rebuilt:
 
 ```bash
 # Rebuild index to reclaim space
-decentdb rebuild-index --db=my.db --index=idx_name
+decentdb rebuild-index --db=my.ddb --index=idx_name
 ```
 
 This:
@@ -291,7 +291,7 @@ Monitor storage health:
 
 ```bash
 # Database stats
-decentdb exec --db=my.db --dbInfo --verbose
+decentdb exec --db=my.ddb --dbInfo --verbose
 
 # Shows:
 # - Page size

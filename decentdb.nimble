@@ -1,6 +1,6 @@
 version       = "0.0.1"
 author        = "DecentDb contributors"
-description   = "DecentDb engine (pre-alpha)"
+description   = "DecentDb engine (beta)"
 license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["decentdb"]

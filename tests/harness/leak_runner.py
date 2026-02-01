@@ -83,7 +83,7 @@ def test_sort_temp_cleanup(engine: DecentDbAdapter, temp_dir: str) -> tuple[bool
     """
     Test: Sort spill files should be cleaned up after query completes.
     """
-    db_path = os.path.join(temp_dir, "sort_test.db")
+    db_path = os.path.join(temp_dir, "sort_test.ddb")
 
     # Create table with data
     ok, err = engine.execute(
@@ -115,7 +115,7 @@ def test_sort_temp_cleanup(engine: DecentDbAdapter, temp_dir: str) -> tuple[bool
     new_files = temp_files_after - temp_files_before
 
     # Filter out the database files
-    spill_files = [f for f in new_files if not f.endswith((".db", ".wal"))]
+    spill_files = [f for f in new_files if not f.endswith((".ddb", ".db", ".wal"))]
 
     if spill_files:
         return False, f"Temp files not cleaned up: {spill_files}"
@@ -170,7 +170,7 @@ def test_wal_growth_managed(engine: DecentDbAdapter, temp_dir: str) -> tuple[boo
     """
     Test: WAL size should not grow unbounded with normal operations.
     """
-    db_path = os.path.join(temp_dir, "wal_growth_test.db")
+    db_path = os.path.join(temp_dir, "wal_growth_test.ddb")
     wal_path = db_path + ".wal"
 
     # Create table
@@ -231,7 +231,7 @@ def main() -> int:
     failed = 0
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        db_path = os.path.join(temp_dir, "leak_test.db")
+        db_path = os.path.join(temp_dir, "leak_test.ddb")
 
         for test_name, test_func in tests:
             try:

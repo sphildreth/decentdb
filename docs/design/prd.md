@@ -2,11 +2,13 @@
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
+> Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
+
 ## 1. Product summary
 DecentDb is an embedded, single-machine relational database engine focused on:
 - **Durable ACID writes** (priority #1)
 - **Fast reads** (priority #2)
-- **Single writer + many concurrent readers** (MVP: single process, multi-threaded)
+- **Single writer + many concurrent readers** (single process, multi-threaded)
 - **PostgreSQL-like SQL syntax** (subset, “good enough” for common CRUD + joins)
 - **Efficient substring search** for user-facing “contains” queries (e.g., `LIKE '%FOO%'`) on selected text columns
 - **WAL-based durability** (Write-Ahead Log) for ACID compliance
@@ -18,11 +20,11 @@ The initial target workload is music-library style data:
 The project emphasizes **testing and correctness from day 1**, using a **Python-driven test harness** plus engine-level unit and property tests.
 
 ## 2. Goals
-### 2.1 Functional goals (MVP)
+### 2.1 Functional goals (0.x baseline)
 1. **Relational core**
-   - Tables with typed columns (MVP types: NULL, INT64, BOOL, FLOAT64, TEXT (UTF-8), BLOB)
+   - Tables with typed columns (baseline types: NULL, INT64, BOOL, FLOAT64, TEXT (UTF-8), BLOB)
    - Primary keys (rowid or explicit PK)
-   - Foreign keys with enforcement (MVP: `RESTRICT` / `NO ACTION`; optional `CASCADE` later)
+   - Foreign keys with enforcement (`RESTRICT` / `NO ACTION`; optional `CASCADE` later)
    - Secondary indexes (B+Tree)
 
 2. **Transactions & durability**
@@ -40,7 +42,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
    - DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
    - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
    - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY`
-   - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `IN` (optional MVP), `LIKE`
+   - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `IN` (optional), `LIKE`
    - `LEFT JOIN`, `INNER JOIN`
    - `ORDER BY`, `LIMIT`, `OFFSET`
    - Parameters: positional `$1, $2, ...` (Postgres-style)
@@ -52,18 +54,18 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
       - minimum effective pattern length rules
       - optional requirement of additional filters for short patterns
 
-6. **Data portability (MVP)**
+6. **Data portability (0.x baseline)**
     - Database file is portable across platforms (little-endian format)
     - Export to SQL dump format for backup/migration
     - Import from SQL dump or CSV
 
-7. **Bulk load API (MVP)**
+7. **Bulk load API (0.x baseline)**
     - Dedicated high-throughput API for loading large datasets
     - Configurable durability options (see ADR-0027)
     - Maintains snapshot isolation for concurrent readers
     - Performance target: 100k records in < 20 seconds
 
-### 2.3 Non-functional goals (MVP)
+### 2.3 Non-functional goals (0.x baseline)
 - Cross-platform: Linux/Windows/macOS
 - Deterministic tests: reproducible failure cases with seeded randomness
 - Measurable performance (tested on reference hardware: Intel i5-8400 or equivalent, 16GB RAM, NVMe SSD):
@@ -73,7 +75,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
   - writes should be durable by default (fsync on commit)
   - bulk load: 100k records in < 20 seconds using dedicated bulk_load() API
 
-## 4. Non-goals (MVP)
+## 4. Non-goals (0.x baseline)
 - Multi-process concurrency (future)
 - Full PostgreSQL semantics, system catalogs, extensions, or wire protocol
 - Advanced query optimizer (cost-based, statistics-driven)
@@ -86,7 +88,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
 - **Foreign Key Enforcement Timing**: FK constraints are enforced at statement time rather than transaction commit time, which differs from the SQL standard (see ADR-0009 and SPEC section 7.2)
 
 ## 6. Critical Gap Addressed: Aggregate Functions
-**Status:** Added to MVP requirements (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
+**Status:** Added to baseline requirements (COUNT, SUM, AVG, MIN, MAX with GROUP BY)
 
 Rationale: Essential for any practical embedded database use case including basic analytics and reporting queries.
 
@@ -143,7 +145,7 @@ ORDER BY a.name, al.name, t.trackNumber;
 - Normal transaction insert: < 1ms per row (with fsync-on-commit)
 - Crash recovery time: < 5 seconds for 100MB database
 
-## 9. MVP milestones (phased delivery)
+## 9. Milestones (phased delivery)
 
 **Checkpointing Timeline Note:** Basic checkpointing is introduced in M3 (WAL + transactions) for WAL size management, but automatic checkpointing with reader coordination is fully hardened in M6.
 
@@ -183,7 +185,7 @@ ORDER BY a.name, al.name, t.trackNumber;
 - Benchmark suite and regression thresholds
 
 ### M6 — Harden + performance passes
-- Bulk loader mode (optional MVP+)
+- Bulk loader mode (optional post-1.0)
 - Improved join ordering heuristics
 - Checkpointing + WAL size management
 - Expanded SQL subset as needed
@@ -214,7 +216,7 @@ ORDER BY a.name, al.name, t.trackNumber;
 - **Planner limitations:** rule-based heuristics + targeted indexes
 - **Testing complexity:** invest early in faulty I/O and deterministic replay
 
-## 13. Out of scope future roadmap (post-MVP)
+## 13. Out of scope future roadmap (post-1.0)
 - Multi-process locking/shmem
 - PostgreSQL wire protocol compatibility (Npgsql)
 - Advanced DDL operations (RENAME TABLE, RENAME COLUMN, MODIFY COLUMN type changes, ADD CONSTRAINT)

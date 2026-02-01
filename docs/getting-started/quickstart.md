@@ -6,17 +6,17 @@ This guide will get you up and running with DecentDb in 5 minutes.
 
 ```bash
 # Create a database file (automatically created on first access)
-decentdb exec --db=myapp.db --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
+decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
 ```
 
 ## Insert Data
 
 ```bash
 # Insert a single row
-decentdb exec --db=myapp.db --sql="INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
 
 # Insert with parameters
-decentdb exec --db=myapp.db --sql="INSERT INTO users VALUES (\$1, \$2, \$3)" \
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (\$1, \$2, \$3)" \
   --params=int:2 --params=text:Bob --params=text:bob@example.com
 ```
 
@@ -24,62 +24,62 @@ decentdb exec --db=myapp.db --sql="INSERT INTO users VALUES (\$1, \$2, \$3)" \
 
 ```bash
 # Select all users
-decentdb exec --db=myapp.db --sql="SELECT * FROM users"
+decentdb exec --db=myapp.ddb --sql="SELECT * FROM users"
 
 # Select with WHERE clause
-decentdb exec --db=myapp.db --sql="SELECT * FROM users WHERE id = 1"
+decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE id = 1"
 
 # Update a user
-decentdb exec --db=myapp.db --sql="UPDATE users SET name = 'Alice Smith' WHERE id = 1"
+decentdb exec --db=myapp.ddb --sql="UPDATE users SET name = 'Alice Smith' WHERE id = 1"
 
 # Delete a user
-decentdb exec --db=myapp.db --sql="DELETE FROM users WHERE id = 2"
+decentdb exec --db=myapp.ddb --sql="DELETE FROM users WHERE id = 2"
 ```
 
 ## Create Indexes
 
 ```bash
 # Create a regular index
-decentdb exec --db=myapp.db --sql="CREATE INDEX idx_users_email ON users(email)"
+decentdb exec --db=myapp.ddb --sql="CREATE INDEX idx_users_email ON users(email)"
 
 # Create a trigram index for text search
-decentdb exec --db=myapp.db --sql="CREATE INDEX idx_users_name_trgm ON users USING trigram(name)"
+decentdb exec --db=myapp.ddb --sql="CREATE INDEX idx_users_name_trgm ON users USING trigram(name)"
 
 # Search with trigram index
-decentdb exec --db=myapp.db --sql="SELECT * FROM users WHERE name LIKE '%ali%'"
+decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE name LIKE '%ali%'"
 ```
 
 ## Schema Management
 
 ```bash
 # List all tables
-decentdb list-tables --db=myapp.db
+decentdb list-tables --db=myapp.ddb
 
 # Describe a table
-decentdb describe --db=myapp.db --table=users
+decentdb describe --db=myapp.ddb --table=users
 
 # List indexes
-decentdb list-indexes --db=myapp.db
+decentdb list-indexes --db=myapp.ddb
 
 # Drop a table
-decentdb exec --db=myapp.db --sql="DROP TABLE users"
+decentdb exec --db=myapp.ddb --sql="DROP TABLE users"
 ```
 
 ## Transactions
 
 ```bash
 # Begin a transaction
-decentdb exec --db=myapp.db --sql="BEGIN"
+decentdb exec --db=myapp.ddb --sql="BEGIN"
 
 # Multiple operations in a transaction
-decentdb exec --db=myapp.db --sql="INSERT INTO users VALUES (3, 'Carol', 'carol@example.com')"
-decentdb exec --db=myapp.db --sql="INSERT INTO users VALUES (4, 'Dave', 'dave@example.com')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (3, 'Carol', 'carol@example.com')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (4, 'Dave', 'dave@example.com')"
 
 # Commit the transaction
-decentdb exec --db=myapp.db --sql="COMMIT"
+decentdb exec --db=myapp.ddb --sql="COMMIT"
 
 # Or rollback
-decentdb exec --db=myapp.db --sql="ROLLBACK"
+decentdb exec --db=myapp.ddb --sql="ROLLBACK"
 ```
 
 ## Bulk Loading
@@ -96,20 +96,20 @@ id,name,email
 EOF
 
 # Import the CSV
-decentdb import --db=myapp.db --table=users --file=users.csv
+decentdb import --db=myapp.ddb --table=users --file=users.csv
 ```
 
 ## Checkpoint and Maintenance
 
 ```bash
 # Force a WAL checkpoint
-decentdb exec --db=myapp.db --checkpoint
+decentdb exec --db=myapp.ddb --checkpoint
 
 # Get database statistics
-decentdb exec --db=myapp.db --sql="PRAGMA stats"
+decentdb exec --db=myapp.ddb --sql="PRAGMA stats"
 
 # Verify database integrity
-decentdb exec --db=myapp.db --sql="PRAGMA integrity_check"
+decentdb exec --db=myapp.ddb --sql="PRAGMA integrity_check"
 ```
 
 ## Next Steps

@@ -28,9 +28,9 @@ Options:
 
 Examples:
 ```bash
-decentdb exec --db=my.db --sql="SELECT * FROM users"
-decentdb exec --db=my.db --sql="INSERT INTO users VALUES (\$1, \$2)" --params=int:1 --params=text:Alice
-decentdb exec --db=my.db --sql="SELECT * FROM users" --format=table
+decentdb exec --db=my.ddb --sql="SELECT * FROM users"
+decentdb exec --db=my.ddb --sql="INSERT INTO users VALUES (\$1, \$2)" --params=int:1 --params=text:Alice
+decentdb exec --db=my.ddb --sql="SELECT * FROM users" --format=table
 ```
 
 ### list-tables

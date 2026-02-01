@@ -10,7 +10,7 @@ namespace DecentDb.Tests
 
         public ObservabilityTests()
         {
-            _dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_obs_{Guid.NewGuid()}.db");
+            _dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_obs_{Guid.NewGuid()}.ddb");
             var connStr = $"Data Source={_dbPath}";
             _connection = new DecentDbConnection(connStr);
             _connection.Open();

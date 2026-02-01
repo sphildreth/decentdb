@@ -1,7 +1,7 @@
 {
   "name": "multi_txn_crash",
   "description": "Multiple transactions - committed should survive, uncommitted should not",
-  "db_path": "$TMPDIR/decentdb_multi_txn_crash.db",
+  "db_path": "$TMPDIR/decentdb_multi_txn_crash.ddb",
   "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, status TEXT); BEGIN; INSERT INTO test VALUES (1, 'committed'); COMMIT",
   "sql": "BEGIN; INSERT INTO test VALUES (2, 'uncommitted');",
   "failpoint": {
