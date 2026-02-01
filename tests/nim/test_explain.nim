@@ -114,6 +114,45 @@ suite "EXPLAIN Statement":
     
     discard closeDb(db)
 
+  test "OR predicate plans as UnionDistinct when indexable":
+    let path = makeTempDb("decentdb_explain_or_union.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "CREATE INDEX ix_id ON t (id)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'A')").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'B')").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 'C')").ok
+
+    let res = execSql(db, "EXPLAIN SELECT * FROM t WHERE id = 1 OR id = 3")
+    check res.ok
+    let planText = res.value.join("\n")
+    check "UnionDistinct" in planText
+    check "IndexSeek" in planText
+    check "TableScan" notin planText
+
+    discard closeDb(db)
+
+  test "AND (OR ...) distributes into UnionDistinct when indexable":
+    let path = makeTempDb("decentdb_explain_and_or_union.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (name TEXT)").ok
+    check execSql(db, "CREATE INDEX ix_name_trgm ON t USING trigram (name)").ok
+    check execSql(db, "INSERT INTO t VALUES ('abc')").ok
+    check execSql(db, "INSERT INTO t VALUES ('def')").ok
+
+    let res = execSql(db, "EXPLAIN SELECT * FROM t WHERE name IS NOT NULL AND (name LIKE '%abc%' OR name LIKE '%def%')")
+    check res.ok
+    let planText = res.value.join("\n")
+    check "UnionDistinct" in planText
+    check "TrigramSeek" in planText
+    check "TableScan" notin planText
+
+    discard closeDb(db)
+
   test "C API: EXPLAIN yields query_plan rows":
     let path = makeTempDb("decentdb_explain_capi.db")
     let h = decentdb_open(path.cstring, nil)

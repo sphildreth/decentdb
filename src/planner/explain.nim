@@ -86,6 +86,11 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       let idxName = if idxOpt.isSome: idxOpt.get.name else: "?"
       line.add("TrigramSeek(table=" & p.table & " column=" & p.column & " pattern=" & renderExpr(p.likeExpr) & " insensitive=" & $p.likeInsensitive & " index=" & idxName & ")")
       lines.add(line)
+    of pkUnionDistinct:
+      line.add("UnionDistinct")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
     of pkFilter:
       line.add("Filter(predicate=" & renderExpr(p.predicate) & ")")
       lines.add(line)
