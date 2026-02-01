@@ -48,6 +48,7 @@ type Pager* = ref object
   rollbackLock*: Lock    # Guards against seeing dirty state during rollback
   txnAllocatedPages*: seq[PageId]  # Pages allocated during current transaction (HIGH-003)
   inTransaction*: bool             # Whether a transaction is active (HIGH-003)
+  flushHandler*: proc(pageId: PageId, data: string): Result[Void]
 
 const DefaultCacheShards = 16
 
@@ -108,15 +109,27 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
     return okVoid()
   acquire(entry.lock)
   defer: release(entry.lock)
-  let offset = pageOffset(pager, entry.id)
-  let res = pager.vfs.writeStr(pager.file, offset, entry.data)
-  if not res.ok:
-    return err[Void](res.err.code, res.err.message, res.err.context)
-  if res.value < pager.pageSize:
-    return err[Void](ERR_IO, "Short write on page", "page_id=" & $entry.id)
-  acquire(pager.overlayLock)
-  pager.overriddenPages.incl(entry.id)
-  release(pager.overlayLock)
+
+  if pager.flushHandler != nil:
+    let res = pager.flushHandler(entry.id, entry.data)
+    if not res.ok:
+      return res
+    
+    acquire(pager.overlayLock)
+    pager.overriddenPages.excl(entry.id)
+    release(pager.overlayLock)
+  else:
+    let offset = pageOffset(pager, entry.id)
+    let res = pager.vfs.writeStr(pager.file, offset, entry.data)
+    if not res.ok:
+      return err[Void](res.err.code, res.err.message, res.err.context)
+    if res.value < pager.pageSize:
+      return err[Void](ERR_IO, "Short write on page", "page_id=" & $entry.id)
+
+    acquire(pager.overlayLock)
+    pager.overriddenPages.incl(entry.id)
+    release(pager.overlayLock)
+
   entry.dirty = false
   okVoid()
 
@@ -226,27 +239,55 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
     return err[CacheEntry](bound.err.code, bound.err.message, bound.err.context)
   let cache = pager.cache
   let shard = shardFor(cache, pageId)
+  
+  # Fast path: check cache
   acquire(shard.lock)
-  defer: release(shard.lock)
   if shard.pages.hasKey(pageId):
     let entry = shard.pages[pageId]
     entry.pinCount.inc
     entry.refBit = true
+    release(shard.lock)
     return ok(entry)
+  release(shard.lock)
+
+  # Slow path: load data (without holding lock)
+  var data = newString(pager.pageSize)
+  var loaded = false
+  
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      data = overlayRes.get
+      loaded = true
+  
+  if not loaded:
+    let offset = pageOffset(pager, pageId)
+    let readRes = pager.vfs.readStr(pager.file, offset, data)
+    if not readRes.ok:
+      return err[CacheEntry](readRes.err.code, readRes.err.message, readRes.err.context)
+    if readRes.value < pager.pageSize:
+      return err[CacheEntry](ERR_CORRUPTION, "Short read on page", "page_id=" & $pageId)
+
+  # Re-acquire lock to insert
+  acquire(shard.lock)
+  # Check if someone else loaded it while we were reading
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
+    entry.pinCount.inc
+    entry.refBit = true
+    release(shard.lock)
+    return ok(entry)
+    
   let evictRes = evictIfNeededLocked(pager, shard)
   if not evictRes.ok:
+    release(shard.lock)
     return err[CacheEntry](evictRes.err.code, evictRes.err.message, evictRes.err.context)
-  var data = newString(pager.pageSize)
-  let offset = pageOffset(pager, pageId)
-  let readRes = pager.vfs.readStr(pager.file, offset, data)
-  if not readRes.ok:
-    return err[CacheEntry](readRes.err.code, readRes.err.message, readRes.err.context)
-  if readRes.value < pager.pageSize:
-    return err[CacheEntry](ERR_CORRUPTION, "Short read on page", "page_id=" & $pageId)
+
   let entry = CacheEntry(id: pageId, data: data, lsn: pager.header.lastCheckpointLsn, dirty: false, pinCount: 1, refBit: true)
   initLock(entry.lock)
   shard.pages[pageId] = entry
   shard.clock.add(pageId)
+  release(shard.lock)
   ok(entry)
 
 proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Void] =

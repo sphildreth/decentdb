@@ -286,6 +286,11 @@ proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] 
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  
+  # Ensure catalog root page update is propagated to the pager header
+  if catalog.catalogTree.root != pager.header.rootCatalog:
+    pager.header.rootCatalog = catalog.catalogTree.root
+  
   okVoid()
 
 proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
@@ -300,6 +305,10 @@ proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+
   okVoid()
 
 proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
@@ -310,6 +319,10 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+
   okVoid()
 
 proc dropTable*(catalog: Catalog, name: string): Result[Void] =
@@ -320,6 +333,10 @@ proc dropTable*(catalog: Catalog, name: string): Result[Void] =
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+
   okVoid()
 
 proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
@@ -330,6 +347,10 @@ proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+
   okVoid()
 
 proc getBtreeIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =

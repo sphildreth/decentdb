@@ -79,6 +79,10 @@ suite "Storage Extras":
     check execSql(db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)").ok
     check execSql(db, "CREATE INDEX docs_body_trgm ON docs USING trigram (body)").ok
     discard execSql(db, "INSERT INTO docs (id, body) VALUES (1, 'trigram')")
+    
+    # Trigram deltas are now deferred until checkpoint (MED-003), so we must checkpoint
+    # to ensure they are flushed to the B-Tree for getTrigramPostings to find them.
+    check checkpointDb(db).ok
 
     let idxOpt = db.catalog.getIndexByName("docs_body_trgm")
     check isSome(idxOpt)

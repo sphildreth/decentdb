@@ -2122,8 +2122,29 @@ proc checkpointDb*(db: Db): Result[uint64] =
   # MED-003: Flush trigram deltas during checkpoint rather than on every commit
   # This amortizes the cost across multiple transactions while ensuring
   # trigram indexes are eventually consistent with the B+Tree data.
-  let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
-  if not trigramFlushRes.ok:
-    return err[uint64](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
+  
+  # Ensure no active transaction (checkpoint must be standalone)
+  if db.activeWriter != nil:
+    return err[uint64](ERR_TRANSACTION, "Cannot checkpoint during active transaction")
+
+  # MED-003: Only start a transaction to flush trigram deltas if there are any.
+  # This avoids unnecessary WAL writes and potential interference with bulk operations (like VACUUM).
+  if db.catalog.trigramDeltas.len > 0:
+    let beginRes = beginTransaction(db)
+    if not beginRes.ok:
+      return err[uint64](beginRes.err.code, beginRes.err.message, beginRes.err.context)
+
+    # Don't clear deltas yet - wait for successful commit
+    let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog, clear = false)
+    if not trigramFlushRes.ok:
+      discard rollbackTransaction(db)
+      return err[uint64](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
+    
+    let commitRes = commitTransaction(db)
+    if not commitRes.ok:
+      return err[uint64](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+    
+    # Now safe to clear memory deltas
+    db.catalog.clearTrigramDeltas()
   
   checkpoint(db.wal, db.pager)
