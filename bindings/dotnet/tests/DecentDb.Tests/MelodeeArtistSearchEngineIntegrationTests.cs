@@ -21,11 +21,24 @@ public sealed class MelodeeArtistSearchEngineIntegrationTests
         _output = output;
     }
 
-    private static readonly string DefaultSqlitePath = "/mnt/incoming/melodee_test/search-engine-storage/artistSearchEngine.db";
-    private static readonly string DefaultDecentDbPath = "/mnt/incoming/melodee_test/search-engine-storage/artistSearchEngine.ddb";
+    private static bool TryGetExternalPath(string envVar, string description, out string path, out string reason)
+    {
+        path = (Environment.GetEnvironmentVariable(envVar) ?? "").Trim();
+        if (path.Length == 0)
+        {
+            reason = $"set {envVar} to a {description} path to enable this test";
+            return false;
+        }
 
-    private static string GetExternalPath(string envVar, string fallback) =>
-        Environment.GetEnvironmentVariable(envVar)?.Trim() is { Length: > 0 } v ? v : fallback;
+        if (!File.Exists(path))
+        {
+            reason = $"missing file at {envVar}='{path}'";
+            return false;
+        }
+
+        reason = "";
+        return true;
+    }
 
     private static bool TryStageDbForReadOnly(string sourcePath, out string stagedPath)
     {
@@ -714,10 +727,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_Dapper_ArtistIdsOnly_CanExecuteSampleQueries()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -742,10 +759,14 @@ WHERE
     [Fact]
     public void MelodeeArtistSearch_AdoNet_JoinQuery_CanStreamRows_NoCrash()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -795,10 +816,14 @@ WHERE
     [Fact]
     public void MelodeeArtistSearch_AdoNet_FullSelect_CanReadValues_NoCrash()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -879,10 +904,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_Dapper_CanExecuteSampleQueries()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -907,10 +936,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_MicroOrm_CanExecuteSampleQueries()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -945,10 +978,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_Dapper_PerfSamples_PrintsPercentiles_OptionalAssertion()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -1002,10 +1039,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_MicroOrm_PerfSamples_PrintsPercentiles_OptionalAssertion()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -1061,10 +1102,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_Dapper_PerfSamples_IndexFriendly_PrintsPercentiles_OptionalAssertion()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -1128,17 +1173,20 @@ WHERE
             return;
         }
 
-        var sqlitePath = GetExternalPath("MELODEE_ARTIST_SQLITE", DefaultSqlitePath);
-        if (!File.Exists(sqlitePath))
+        if (!TryGetExternalPath("MELODEE_ARTIST_SQLITE", "Melodee SQLite .db", out var sqlitePath, out var sqliteReason))
         {
-            _output.WriteLine($"SKIP: missing SQLite file: {sqlitePath}");
+            _output.WriteLine($"SKIP: {sqliteReason}");
             return;
         }
 
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var ddbReason))
+        {
+            _output.WriteLine($"SKIP: {ddbReason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
@@ -1166,10 +1214,14 @@ WHERE
     [Fact]
     public async Task MelodeeArtistSearch_MicroOrm_PerfSamples_IndexFriendly_PrintsPercentiles_OptionalAssertion()
     {
-        var decentDbPath = GetExternalPath("MELODEE_ARTIST_DDB", DefaultDecentDbPath);
+        if (!TryGetExternalPath("MELODEE_ARTIST_DDB", "Melodee-converted .ddb", out var decentDbPath, out var reason))
+        {
+            _output.WriteLine($"SKIP: {reason}");
+            return;
+        }
         if (!TryStageDbForReadOnly(decentDbPath, out var staged))
         {
-            _output.WriteLine($"SKIP: missing DecentDB file: {decentDbPath}");
+            _output.WriteLine($"SKIP: failed to stage DecentDB file: {decentDbPath}");
             return;
         }
 
