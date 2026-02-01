@@ -192,12 +192,12 @@ bash scripts/coverage_nim.sh
 
 # Alternative: run coverage in smaller batches
 bash scripts/coverage_batch.sh
-```
+``
 
 Outputs:
-- [build/coverage/summary.txt](build/coverage/summary.txt) (human-readable summary)
-- [build/coverage/summary.json](build/coverage/summary.json) (machine-readable summary)
-- [build/coverage/gcov/](build/coverage/gcov/) (raw per-test `.gcov` files)
+- build/coverage/summary.txt (human-readable summary)
+- build/coverage/summary.json (machine-readable summary)
+- build/coverage/gcov/ (raw per-test `.gcov` files)
 
 See [Contributing Guide](docs/development/contributing.md) for development workflow and guidelines.
 

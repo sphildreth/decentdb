@@ -1,8 +1,7 @@
 # ADR 0049: Constraint Index Deduplication
 
 **Date:** 2026-01-31  
-**Status:** Proposed  
-**Context:** Phase 3 of [SQLITE_GAPS_PLAN_V2.md](../SQLITE_GAPS_PLAN_V2.md)
+**Status:** Accepted
 
 ## Context
 
@@ -17,7 +16,7 @@ These auto-created indexes have predictable names (e.g. `pk_<table>_<col>_idx`, 
 However, *index equivalence* is currently treated primarily as “same name”, not “same semantics”. This creates two problems:
 
 1. **Redundant indexes can exist with different names**, especially when indexes are recreated by tools (e.g. `vacuum`) or when schemas are imported/transformed.
-2. **Size gap impact**: redundant indexes increase page count and write amplification and directly contribute to the SQLite→DecentDB size gap discussed in [SQLITE_GAPS.md](../SQLITE_GAPS.md).
+2. **Size & write amplification impact**: redundant indexes increase page count and write amplification.
 
 Given the MVP scope (single-column indexes; no collations; no per-index options beyond kind+unique), two indexes with the same `(table, column, kind)` and compatible `unique` flag are operationally redundant for our planner and enforcement.
 
@@ -100,9 +99,6 @@ This avoids creating redundant indexes that differ only by name.
 - In rare cases where “duplicate indexes” are intentionally created for experimentation, the vacuum tool may no longer reproduce the duplication.
 
 ## References
-
-- [SQLITE_GAPS.md](../SQLITE_GAPS.md)
-- [SQLITE_GAPS_PLAN_V2.md](../SQLITE_GAPS_PLAN_V2.md)
 - [0006-foreign-key-index-creation.md](0006-foreign-key-index-creation.md)
 - [0036-catalog-constraints-index-metadata.md](0036-catalog-constraints-index-metadata.md)
 - [0036-integer-primary-key.md](0036-integer-primary-key.md)

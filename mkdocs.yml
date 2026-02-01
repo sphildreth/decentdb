@@ -31,6 +31,7 @@ nav:
   - Development:
     - Building from Source: development/building.md
     - Testing: development/testing.md
+    - SQLite Import Notes: development/sqlite-import-notes.md
     - Contributing: development/contributing.md
   - Design Documents:
     - PRD: design/prd.md

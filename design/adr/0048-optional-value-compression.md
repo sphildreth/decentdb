@@ -2,7 +2,7 @@
 
 **Date:** 2026-01-31  
 **Status:** Accepted  
-**Context:** Phase 4 of [SQLITE_GAPS_PLAN_V2.md](../../design/SQLITE_GAPS_PLAN_V2.md)
+**Context:** Storage size reduction
 
 ## Context
 
