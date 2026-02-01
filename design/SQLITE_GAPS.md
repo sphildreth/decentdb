@@ -59,7 +59,9 @@ Even after vacuuming, DecentDB remains significantly larger because:
 
 SQLite stores integers using a variable-length encoding (varint). Small integers (IDs, enums, years) commonly use 1–3 bytes rather than 8 bytes.
 
-DecentDB currently stores `INT64` as fixed-width 8 bytes in the record encoding. For “mostly small ints” datasets, that alone can be a big multiplier.
+DecentDB previously stored `INT64` as fixed-width 8 bytes in the record encoding. For “mostly small ints” datasets, that alone is a big multiplier.
+
+Update (2026-01-31): DecentDB now uses ZigZag + varint encoding for `vkInt64` record payloads (see `design/adr/0034-compact-int64-record-payload.md`). This materially reduces size for integer-heavy schemas.
 
 ### 2) SQLite’s rowid / INTEGER PRIMARY KEY special-casing
 
@@ -73,7 +75,9 @@ Many real workloads (including this one) have multiple secondary indexes over te
 
 SQLite’s btree format is highly space-optimized and benefits from decades of tuning.
 
-DecentDB’s current btree leaf layout stores per-cell metadata + key/value material that is not yet compressed (no prefix compression for text keys), which increases index size.
+DecentDB’s btree format historically used fixed-width per-cell headers, which increased index size.
+
+Update (2026-01-31): DecentDB now uses a compact varint-based btree page layout (see `design/adr/0035-btree-page-layout-v2.md`). This reduces per-cell overhead and increases fan-out.
 
 ### 4) Page utilization / splits
 
@@ -111,19 +115,19 @@ These items are ordered by expected impact and risk.
 
 **Goal:** make small integers cheap.
 
-- Add varint encoding for `INT64` in record payloads.
-- Update index key encoding for integer keys to be more compact.
+- Implemented: ZigZag + varint encoding for `vkInt64` record payloads (see `design/adr/0034-compact-int64-record-payload.md`).
 
 **Notes:**
 - This affects the persistent record format and possibly index formats.
 - Requires a format versioning strategy and migration story.
 
-### Phase 2: Prefix compression for TEXT keys in btree pages (high impact; ADR required)
+### Phase 2: Reduce btree per-cell overhead (high impact; ADR required)
 
-**Goal:** reduce secondary index size for TEXT-heavy schemas.
+**Goal:** reduce btree page overhead and improve fan-out.
 
-- Implement prefix compression (front-coding) on leaf keys.
-- Consider block-level restart points for efficient binary search.
+- Implemented: compact varint-based btree page layout (see `design/adr/0035-btree-page-layout-v2.md`).
+
+Further work (still ADR-required) may include slot directories and/or prefix compression for ordered TEXT keys if/when TEXT keys become first-class ordered btree keys.
 
 ### Phase 3: Re-evaluate PK / rowid redundancy (medium-to-high impact; ADR required)
 

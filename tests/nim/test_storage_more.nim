@@ -22,12 +22,21 @@ suite "Storage More":
 
     let bigLen = int(db.pageSize) * 2
     var payload: seq[byte] = newSeq[byte](bigLen)
+    var s: uint32 = 0x12345678'u32
     for i in 0 ..< payload.len:
-      payload[i] = byte(i and 0xFF)
+      s = s * 1103515245'u32 + 12345'u32
+      payload[i] = byte((s shr 24) and 0xFF'u32)
     let val = Value(kind: vkText, bytes: payload)
     let res = normalizeValues(db.pager, @[val])
     check res.ok
-    check res.value[0].kind == vkTextOverflow
+    check res.value[0].kind in {vkTextOverflow, vkTextCompressed, vkTextCompressedOverflow}
+
+    let rec = encodeRecord(res.value)
+    let decoded = decodeRecordWithOverflow(db.pager, rec)
+    check decoded.ok
+    check decoded.value.len == 1
+    check decoded.value[0].kind == vkText
+    check decoded.value[0].bytes == payload
 
     let smallRes = normalizeValues(db.pager, @[Value(kind: vkText, bytes: @['a'.byte])])
     check smallRes.ok

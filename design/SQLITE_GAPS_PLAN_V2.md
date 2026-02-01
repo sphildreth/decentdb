@@ -1,7 +1,7 @@
 # SQLite Size Gap Resolution Plan (V2)
 
 **Date:** 2026-01-31  
-**Status:** Draft (ADR-first; Nim implementation plan)  
+**Status:** In progress (Phases 1–2 implemented; remaining work tracked below)  
 **Supersedes:** [design/SQLITE_GAPS_PLAN.md](design/SQLITE_GAPS_PLAN.md) (older draft contains C-centric pseudocode that does not match this repo)  
 **Primary reference:** [design/SQLITE_GAPS.md](design/SQLITE_GAPS.md)
 
@@ -23,14 +23,20 @@
 
 These are the actual on-disk formats that matter for the size gap today:
 
-- Global file format version gate: [src/pager/db_header.nim](src/pager/db_header.nim) defines `FormatVersion` and the engine currently rejects any DB whose header `formatVersion != FormatVersion`.
+- Global file format version gate: [src/pager/db_header.nim](src/pager/db_header.nim) defines `FormatVersion` and the engine rejects any DB whose header `formatVersion != FormatVersion`.
 - Record encoding: [src/record/record.nim](src/record/record.nim)
   - Record = `[count varint][value…]`.
   - Value = `[kind u8][len varint][payload bytes]` (per [design/adr/0030-record-format.md](design/adr/0030-record-format.md)).
-  - **INT64 payload is currently fixed 8 bytes little-endian**, which is the primary “small ints waste space” issue called out in [design/SQLITE_GAPS.md](design/SQLITE_GAPS.md).
+  - INT64 payload uses **ZigZag + varint** encoding (per [design/adr/0034-compact-int64-record-payload.md](design/adr/0034-compact-int64-record-payload.md)).
 - B+Tree page layout: [src/btree/btree.nim](src/btree/btree.nim)
-  - Leaf cell header is fixed-width: `key u64 + value_len u32 + overflow_page u32` (16 bytes) plus inline value bytes (per [design/adr/0032-btree-page-layout.md](design/adr/0032-btree-page-layout.md)).
-  - This fixed 16-byte-per-cell overhead contributes to “not as tightly packed as SQLite”, especially for small rows and/or many secondary index entries.
+  - Leaf/internal cells use a **compact varint-based layout** (per [design/adr/0035-btree-page-layout-v2.md](design/adr/0035-btree-page-layout-v2.md)).
+  - This reduces per-cell overhead and increases fan-out vs the prior fixed-width header.
+
+Related implemented behaviors that affect the size gap:
+
+- Integer PRIMARY KEY optimization: [design/adr/0036-integer-primary-key.md](design/adr/0036-integer-primary-key.md)
+  - `INT64 PRIMARY KEY` can be used as the table btree key (rowid) directly, avoiding a redundant PK index.
+- Optional value compression exists (storage-internal; no SQL surface area) via [design/adr/0048-optional-value-compression.md](design/adr/0048-optional-value-compression.md).
 
 ## Phase 0: Operational & documentation (done)
 
@@ -43,20 +49,20 @@ No code work required here.
 
 ## Phase 1: Compact INT64 in record payloads (ADR required)
 
+### Status
+
+Implemented (see [design/adr/0034-compact-int64-record-payload.md](design/adr/0034-compact-int64-record-payload.md)).
+
 ### Why
 
 This is the highest-impact structural fix for ID-heavy schemas:
 
-- Today: each INT64 consumes 8 bytes (+ 1 kind byte + 1+ length varint).
-- Target: small integers consume ~1–3 bytes in payload.
+- Previously: each INT64 consumed 8 bytes (+ 1 kind byte + 1+ length varint).
+- Current: small integers commonly consume ~1–3 bytes in payload (plus outer record framing).
 
-### ADR requirements
+### ADR notes
 
-Create a new ADR before any implementation:
-
-- Define **the exact encoding for `vkInt64` payload**.
-- Define **format versioning**: how `FormatVersion` changes, and what versions are readable/writable.
-- Define the **migration story** (vacuum-upgrades, open-old-files behavior, test fixtures).
+This required a persistent-format change and is tracked/justified by ADR 0034.
 
 ### Encoding options (must pick one in ADR)
 
@@ -71,13 +77,13 @@ Create a new ADR before any implementation:
 
 Important: DecentDB’s current varint implementation is LEB128-style over `uint64` and has a **max encoded length of 10 bytes** for full `uint64`.
 
-### Likely implementation surface
+### Implementation surface
 
 - Update `vkInt64` in `encodeValue`/`decodeValue` in [src/record/record.nim](src/record/record.nim).
 - Update any other code paths that assume `vkInt64` payload len must be 8.
 - Update documentation describing record formats if needed (e.g., [docs/architecture/storage.md](docs/architecture/storage.md) if it is intended to be authoritative).
 
-### Tests (stable & durable)
+### Tests
 
 - Unit tests (extend existing suites rather than adding perf gates):
   - Round-trip for boundary values (0, 1, 127, 128, 16383, …, int64.high, int64.low).
@@ -92,13 +98,17 @@ Avoid: perf thresholds like “>1M ops/sec” (too flaky across CI/machines).
 
 ## Phase 2: Reduce B+Tree leaf overhead (ADR required)
 
+### Status
+
+Implemented (see [design/adr/0035-btree-page-layout-v2.md](design/adr/0035-btree-page-layout-v2.md)).
+
 ### Why
 
 SQLite’s btree layout is extremely space efficient. DecentDB’s fixed per-cell headers contribute to page count and file size.
 
-### ADR requirements
+### ADR notes
 
-Create a new ADR to change btree leaf cell layout (and migration/versioning).
+This required a persistent-format change and is tracked/justified by ADR 0035.
 
 ### Candidate improvements (choose a coherent subset)
 
@@ -119,6 +129,18 @@ Create a new ADR to change btree leaf cell layout (and migration/versioning).
 
 ## Phase 3: Eliminate PK/rowid redundancy (ADR required)
 
+### Status
+
+Partially implemented:
+
+- `INT64 PRIMARY KEY` uses the table btree key directly (see [design/adr/0036-integer-primary-key.md](design/adr/0036-integer-primary-key.md)).
+
+Remaining work in this phase is about reducing additional redundancy and write amplification beyond the integer-PK case.
+
+Next ADR to unlock Phase 3 work:
+
+- [design/adr/0049-constraint-index-deduplication.md](design/adr/0049-constraint-index-deduplication.md) (proposed)
+
 ### Why
 
 If we can avoid duplicating “row identity” across a table btree and a separate PK/UNIQUE btree in the common cases, size drops and write amplification improves.
@@ -135,18 +157,26 @@ If we can avoid duplicating “row identity” across a table btree and a separa
 - Differential tests vs Postgres for supported SQL subset where applicable.
 - Crash tests around constraint enforcement and index maintenance.
 
-## Phase 4: Optional compression (defer; ADR + dependency approval)
+## Phase 4: Optional compression
 
-Compression can reduce size for large TEXT/BLOB, but it is intentionally **deferred**:
+### Status
 
-- Requires a new dependency (or an internal implementation) and clear performance trade-offs.
-- If pursued, split into:
-  1) Storage-internal “compressed value container” (no SQL syntax changes)
-  2) Optional SQL surface area (DDL) as a separate ADR and project
+Implemented (storage-internal; no SQL surface) and covered by unit tests.
+
+### Remaining work
+
+- Ensure ADR 0048 is consistent with the implemented behavior and current `FormatVersion` gating.
+- Decide whether compression remains “always opportunistic” or becomes explicitly opt-in (this is an API/behavior decision and should be ADR’d if exposed).
 
 ## Size regression harness (required)
 
-Add a deterministic, in-repo size regression test that:
+### Status
+
+Implemented (see [tests/nim/test_size_regression.nim](tests/nim/test_size_regression.nim)).
+
+### Requirements
+
+Maintain a deterministic, in-repo size regression test that:
 
 - Generates a synthetic dataset with:
   - many small ints

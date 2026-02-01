@@ -127,22 +127,25 @@ suite "Storage Comprehensive":
     
     discard closeDb(db)
 
-  test "normalizeValues with large text (overflow)":
+  test "normalizeValues with large blob (overflow)":
     let path = makeTempDb("decentdb_normalize_values_large.db")
     let dbRes = openDb(path)
     check dbRes.ok
     let db = dbRes.value
     
-    # Create a large text value that should trigger overflow
-    var largeText = ""
-    for i in 0..<db.pager.pageSize:
-      largeText.add('x')
-    let values = @[Value(kind: vkText, bytes: toBytes(largeText))]
+    # Create a large pseudo-random blob that should trigger overflow.
+    # (This data should also be hard to compress, keeping the overflow path stable.)
+    var blob = newSeq[byte](db.pager.pageSize)
+    var s: uint32 = 0x12345678'u32
+    for i in 0..<blob.len:
+      s = s * 1103515245'u32 + 12345'u32
+      blob[i] = byte((s shr 24) and 0xFF'u32)
+    let values = @[Value(kind: vkBlob, bytes: blob)]
     let result = normalizeValues(db.pager, values)
     check result.ok
     check result.value.len == 1
     # Should be converted to overflow type
-    check result.value[0].kind in {vkTextOverflow}
+    check result.value[0].kind in {vkBlobOverflow, vkBlobCompressedOverflow}
     
     discard closeDb(db)
 

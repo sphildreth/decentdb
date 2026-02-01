@@ -1,4 +1,5 @@
 import json
+import options
 import os
 import strutils
 import tables
@@ -1404,6 +1405,12 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
   for idxName, idx in srcDb.catalog.indexes:
     if dstDb.catalog.indexes.hasKey(idxName):
       continue
+
+    # Semantic dedupe: if destination already has an equivalent index under a different
+    # name, do not recreate it.
+    if isSome(dstDb.catalog.getIndexForColumn(idx.table, idx.column, idx.kind, requireUnique = idx.unique)):
+      continue
+
     var stmt = "CREATE "
     if idx.unique:
       stmt &= "UNIQUE "

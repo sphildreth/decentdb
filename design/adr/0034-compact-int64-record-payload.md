@@ -36,9 +36,10 @@ The `vkInt64` payload will no longer be a fixed 8 bytes. Instead, it will be a v
 
 This is a breaking change to the on-disk format.
 
-- The global `FormatVersion` in `db_header` will be incremented from `2` to **`3`**.
+- The global `FormatVersion` in `db_header` is incremented as part of the format-change series that includes this ADR.
+- **Current repo state**: `FormatVersion` is **`4`** (see ADR 0035).
 - The engine will strictly enforce `header.formatVersion == FormatVersion`.
-    - Opening a version `2` database with version `3` code will fail with an "Unsupported format version" error.
+    - Opening a database with an older format version will fail with an "Unsupported format version" error.
     - **Migration**: For this pre-1.0 stage, no automatic migration (read-old-write-new) is provided in the engine itself. Users must rebuild databases (e.g., via export/import if tools existed, or simply recreating test DBs). Future upgrades to the vacuum tool could handle format migration.
 
 ### 3. Record Decoding

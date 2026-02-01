@@ -1,6 +1,6 @@
 ## B+Tree Page Layout (Read Path)
 **Date:** 2026-01-28
-**Status:** Accepted
+**Status:** Superseded by ADR 0035 (FormatVersion 4)
 
 ### Decision
 Use a compact header and sequential cell layout for B+Tree pages.

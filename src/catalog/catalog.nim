@@ -338,6 +338,17 @@ proc getBtreeIndexForColumn*(catalog: Catalog, table: string, column: string): O
       return some(idx)
   none(IndexMeta)
 
+proc getIndexForColumn*(catalog: Catalog, table: string, column: string, kind: IndexKind, requireUnique: bool = false): Option[IndexMeta] =
+  ## Returns any index that semantically satisfies the requested signature.
+  ## If requireUnique is true, only unique indexes satisfy.
+  for _, idx in catalog.indexes:
+    if idx.table != table or idx.column != column or idx.kind != kind:
+      continue
+    if requireUnique and not idx.unique:
+      continue
+    return some(idx)
+  none(IndexMeta)
+
 proc getTrigramIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
   for _, idx in catalog.indexes:
     if idx.table == table and idx.column == column and idx.kind == ikTrigram:

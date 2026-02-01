@@ -5,7 +5,7 @@
 
 ## Context
 
-The current B+Tree page layout uses fixed-width headers for both leaf and internal cells.
+The prior B+Tree page layout used fixed-width headers for both leaf and internal cells.
 
 -   **Leaf Cells**: 16 bytes overhead (`key` u64 + `value_len` u32 + `overflow` u32).
 -   **Internal Cells**: 12 bytes overhead (`key` u64 + `child` u32).

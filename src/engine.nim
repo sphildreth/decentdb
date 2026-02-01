@@ -376,23 +376,23 @@ proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, o
     for child in children:
       let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
       if isNone(idxOpt):
-        # Check if the referencing column is an optimized INT64 PRIMARY KEY
+        # Check if the referencing column is an optimized INT64 PRIMARY KEY.
         let childTableRes = catalog.getTable(child[0])
         if childTableRes.ok:
-           var isInt64Pk = false
-           for cCol in childTableRes.value.columns:
-             if cCol.name == child[1] and cCol.primaryKey and cCol.kind == ctInt64:
-               isInt64Pk = true
-               break
-           if isInt64Pk:
-              if oldVal.kind == vkInt64:
-                let targetId = cast[uint64](oldVal.int64Val)
-                let rowRes = readRowAt(pager, childTableRes.value, targetId)
-                if rowRes.ok:
-                   return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
-                elif rowRes.err.code != ERR_IO:
-                   return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
-                continue
+          var isInt64Pk = false
+          for cCol in childTableRes.value.columns:
+            if cCol.name == child[1] and cCol.primaryKey and cCol.kind == ctInt64:
+              isInt64Pk = true
+              break
+          if isInt64Pk:
+            if oldVal.kind == vkInt64:
+              let targetId = cast[uint64](oldVal.int64Val)
+              let rowRes = readRowAt(pager, childTableRes.value, targetId)
+              if rowRes.ok:
+                return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+              elif rowRes.err.code != ERR_IO:
+                return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+              continue
 
         return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
       let key = indexKeyFromValue(oldVal)
@@ -636,7 +636,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           if col.primaryKey and col.kind == ctInt64:
             continue
           let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
-          if isNone(db.catalog.getIndexByName(idxName)):
+          if isNone(db.catalog.getIndexForColumn(meta.name, col.name, catalog.ikBtree, requireUnique = true)):
             let idxRootRes = initTableRoot(db.pager)
             if not idxRootRes.ok:
               return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)

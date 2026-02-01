@@ -32,7 +32,7 @@ Set at database creation and cannot be changed.
 2. **B+Tree Internal Pages**
    - Store routing keys
    - Point to child pages
-   - Fixed-size cell format
+   - Compact varint-based cell format
 
 3. **B+Tree Leaf Pages**
    - Store actual data
@@ -40,7 +40,7 @@ Set at database creation and cannot be changed.
    - Overflow pointers for large data
 
 4. **Overflow Pages**
-   - Store data > 512 bytes inline
+   - Store values too large to fit inline in a B+Tree leaf
    - Chained for very large values
    - Separate allocation from B+Tree
 
@@ -56,37 +56,63 @@ Set at database creation and cannot be changed.
 Rows are stored as key-value pairs in B+Tree leaves:
 
 ```
-Key: RowId (8 bytes)
+Key: RowId (uint64; stored as varint in leaf cells)
 Value: Encoded row data
 ```
 
 ### Encoding
 
-Row values are encoded as:
+Row values are encoded as a small self-describing record:
 
 ```
-[null_bitmap: varint]
-[type_tags: varint per column]
-[data: variable per type]
+[field_count: varint]
+   repeated field_count times:
+      [kind: u8]
+      [payload_len: varint]
+      [payload_bytes]
 ```
 
-**Type Encoding:**
-- NULL: 0 bytes (marked in bitmap)
-- INT64: 8 bytes, little-endian
-- FLOAT64: 8 bytes, IEEE 754
-- BOOL: 1 byte
-- TEXT/BLOB: 4-byte length + data
+This is defined in `src/record/record.nim` and ADR 0030.
+
+**Value kinds (payload encoding):**
+- NULL: empty payload
+- BOOL: 1 byte (0/1)
+- INT64: ZigZag + varint-encoded `uint64` (compact for small signed ints)
+- FLOAT64: 8 bytes (IEEE 754, little-endian)
+- TEXT/BLOB: raw bytes
+- TEXT/BLOB overflow pointers: 8-byte payload containing `[overflow_page_id u32][overflow_len u32]`
+
+Some builds may also store opportunistically-compressed TEXT/BLOB payloads and transparently decompress on decode.
 
 ### Overflow Handling
 
-Values > 512 bytes are stored in overflow pages:
+DecentDB uses overflow pages in two places:
+
+1) **Record value overflow** (large TEXT/BLOB values stored out-of-line)
+2) **B+Tree value overflow** (very large encoded records stored out-of-line)
+
+#### Record value overflow
+
+Large `TEXT`/`BLOB` payloads may be stored as an overflow chain. In that case, the record stores a small overflow pointer payload:
 
 ```
-Inline storage: [overflow_page_id: 4 bytes]
-Overflow page: [next_page: 4 bytes][data: rest of page]
+[overflow_page_id: 4 bytes]
+[overflow_len: 4 bytes]
 ```
 
-This keeps B+Tree pages compact while supporting large values.
+#### Overflow page layout
+
+Overflow pages store chunks of bytes and link to the next page:
+
+```
+Overflow page: [next_page: 4 bytes][chunk_len: 4 bytes][chunk_bytes...]
+```
+
+For record value overflow, `overflow_len` is the total length of the logical value bytes.
+
+#### B+Tree value overflow
+
+If the *entire encoded record* does not fit inline in a leaf cell, the leaf cell can store an overflow page id and the record bytes are stored out-of-line as an overflow chain.
 
 ## B+Tree Structure
 
@@ -100,13 +126,18 @@ This keeps B+Tree pages compact while supporting large values.
 [cells...]
 ```
 
-Each cell:
+Each cell (FormatVersion 4):
 ```
-[key: 8 bytes]
-[value_length: 4 bytes]
-[overflow_page: 4 bytes (0 if none)]
-[value_data: variable]
+[key: varint]
+[control: varint]
+[inline_payload: bytes]   (only when control indicates inline)
 ```
+
+`control` packs both “inline length” and “overflow pointer”:
+- `is_overflow = control & 1`
+- `value = control >> 1`
+- If `is_overflow == 0`: `value` is the inline payload length in bytes
+- If `is_overflow == 1`: `value` is the overflow page id (no inline payload)
 
 **Internal Page:**
 ```
@@ -116,10 +147,10 @@ Each cell:
 [cells...]
 ```
 
-Each cell:
+Each cell (FormatVersion 4):
 ```
-[key: 8 bytes]
-[child_page: 4 bytes]
+[key: varint]
+[child_page: varint]
 ```
 
 ### Tree Operations

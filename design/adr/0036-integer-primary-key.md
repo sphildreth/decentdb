@@ -4,7 +4,7 @@ Date: 2026-01-31
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -64,3 +64,7 @@ For such tables:
 ### Negative
 - **Complexity:** `storage.nim` must now be aware of the schema's PK definition to determine the `rowid`.
 - **Updates:** Updating a Primary Key is expensive (requires moving the row in the B+Tree), whereas updating a non-PK column is in-place (or overflow).
+
+## Implementation status
+
+Implemented in the engine and covered by unit tests ("Primary Key Optimization"). This ADR does not require a `FormatVersion` bump because it does not change the on-disk page/record encoding; it changes how rowids are assigned and which indexes are created for integer-PK tables.

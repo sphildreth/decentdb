@@ -3,8 +3,6 @@ import os
 import engine
 import pager/pager
 import btree/btree
-import record/record
-import pager/db_header
 import errors
 
 proc makeTempDb(name: string): string =
@@ -44,9 +42,7 @@ suite "BTree Layout V2":
     #   Total: 3 bytes per row.
     # Max rows: (4096 - 8) / 3 = ~1362.
     
-    # We insert 500 rows. 
-    # In V3, this would split (500 > 240).
-    # In V4, this should fit in one page (500 < 1362).
+    # We insert 500 rows; this should fit in one page (500 < 1362).
     
     for i in 0 ..< 500:
        check insert(tree, uint64(i), @[byte(1)]).ok

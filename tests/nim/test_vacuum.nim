@@ -1,8 +1,10 @@
 import unittest
 import os
+import tables
 
 import engine
 import decentdb_cli
+import catalog/catalog
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / name
@@ -55,5 +57,41 @@ suite "Vacuum":
     let cntRes = execSql(dbDst2, "SELECT COUNT(*) FROM items")
     check cntRes.ok
     check cntRes.value.len == 1
+
+    discard closeDb(dbDst2)
+
+  test "vacuum skips semantically redundant indexes":
+    let srcPath = makeTempDb("decentdb_vacuum_redundant_src.db")
+    let dstPath = makeTempDb("decentdb_vacuum_redundant_dst.db")
+
+    let dbRes = openDb(srcPath)
+    check dbRes.ok
+    let db = dbRes.value
+
+    # UNIQUE on name auto-creates a unique btree index.
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT UNIQUE NOT NULL)").ok
+    # Add a redundant unique index on the same column with a different name.
+    check execSql(db, "CREATE UNIQUE INDEX items_name_unique2 ON items (name)").ok
+
+    for i in 0 ..< 1000:
+      discard execSql(db, "INSERT INTO items (id, name) VALUES (" & $i & ", 'name" & $i & "')")
+
+    discard checkpointDb(db)
+    discard closeDb(db)
+
+    let vacRes = vacuumCmd(db = srcPath, output = dstPath, overwrite = true)
+    check vacRes == 0
+
+    let dst2 = openDb(dstPath)
+    check dst2.ok
+    let dbDst2 = dst2.value
+
+    # The redundant extra index should not be recreated.
+    check not dbDst2.catalog.indexes.hasKey("items_name_unique2")
+    var nameUniqueCount = 0
+    for _, idx in dbDst2.catalog.indexes:
+      if idx.table == "items" and idx.column == "name" and idx.kind == ikBtree and idx.unique:
+        nameUniqueCount.inc
+    check nameUniqueCount == 1
 
     discard closeDb(dbDst2)
