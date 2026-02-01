@@ -35,7 +35,7 @@ Target audience:
   - The N-API layer SHOULD reject unsupported parameter styles rather than silently misbinding.
 - **Isolation (engine):** Default isolation is **Snapshot Isolation** per ADR-0023.
   - Node bindings MUST not claim stronger guarantees.
-- **Concurrency model (MVP):** single process, one writer, multiple concurrent readers.
+- **Concurrency model:** single process, one writer, multiple concurrent readers.
   - Node bindings MUST avoid implying cross-process coordination.
   - Statement handles MUST NOT be used concurrently from multiple threads.
 - **Event loop discipline:** Long-running native work MUST NOT block the Node event loop.

@@ -3,7 +3,7 @@
 **Status:** Accepted  
 **Date:** 2026-01-28  
 **Deciders:** Engineering Team  
-**Related:** [ADR-001](001-mvp-cli-tool.md)
+**Related:** None
 
 ---
 
@@ -54,8 +54,8 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db]
 
 **CLI Interface:**
 ```bash
-./decentdb exec --db=test.db --sql="SELECT ..." --cachePages=256
-./decentdb exec --db=test.db --sql="SELECT ..." --cacheMb=1  # Alternative
+./decentdb exec --db=test.ddb --sql="SELECT ..." --cachePages=256
+./decentdb exec --db=test.ddb --sql="SELECT ..." --cacheMb=1  # Alternative
 ```
 
 **Rationale:**
@@ -77,7 +77,7 @@ proc getWal*(db: Db): Wal  # Accessor for checkpoint operations
 
 **CLI Interface:**
 ```bash
-./decentdb exec --db=test.db --checkpoint  # Force checkpoint
+./decentdb exec --db=test.ddb --checkpoint  # Force checkpoint
 ```
 
 **Rationale:**
@@ -224,7 +224,7 @@ test "explicit transaction rollback":
 
 ### Alternative 2: Environment Variables for Config
 ```bash
-DECENTDB_CACHE_PAGES=256 ./decentdb exec --db=test.db
+DECENTDB_CACHE_PAGES=256 ./decentdb exec --db=test.ddb
 ```
 **Rejected:** Less discoverable, harder to script
 
@@ -233,13 +233,13 @@ DECENTDB_CACHE_PAGES=256 ./decentdb exec --db=test.db
 [performance]
 cache_pages = 256
 ```
-**Rejected:** Overkill for MVP, can add later
+**Rejected:** Overkill for the 0.x baseline, can add later
 
 ### Alternative 4: Separate Transaction CLI Tool
 ```bash
-./decentdb exec --db=test.db --begin
-./decentdb exec --db=test.db --sql="..."
-./decentdb exec --db=test.db --commit
+./decentdb exec --db=test.ddb --begin
+./decentdb exec --db=test.ddb --sql="..."
+./decentdb exec --db=test.ddb --commit
 ```
 **Rejected:** Awkward UX, requires shared lock management
 

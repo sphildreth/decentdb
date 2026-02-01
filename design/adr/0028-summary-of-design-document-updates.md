@@ -24,7 +24,7 @@ During review of the PRD, SPEC, and TESTING_STRATEGY documents, several areas fo
 
 6. **PRD Updates**:
    - Added isolation level specification
-   - Included bulk load API as explicit MVP requirement
+   - Included bulk load API as explicit 0.x baseline requirement
    - Added known limitations section for FK enforcement timing
    - Updated section numbering to reflect new sections
 

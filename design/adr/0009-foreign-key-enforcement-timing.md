@@ -3,7 +3,7 @@
 **Status:** Accepted
 
 ### Decision
-Enforce foreign key constraints at statement time (MVP).
+Enforce foreign key constraints at statement time (0.x baseline).
 
 ### Rationale
 - Simpler implementation (no need to track deferred constraints)

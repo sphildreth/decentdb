@@ -15,7 +15,7 @@ Use 4096 bytes as the default page size, but make it configurable at database cr
 ### Alternatives Considered
 - Fixed 8KB pages: Better for wide rows, worse for cache-constrained environments
 - Fixed 2KB pages: Better for memory-constrained systems, worse for I/O efficiency
-- Dynamic page sizing: Too complex for MVP
+- Dynamic page sizing: Too complex for the 0.x baseline
 
 ### Trade-offs
 - **Pros**: Good default for most workloads, configurable for special cases

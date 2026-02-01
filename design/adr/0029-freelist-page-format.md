@@ -6,7 +6,7 @@
 Use a single-chain freelist stored in dedicated freelist pages. The database header points to the head page, and each freelist page contains a next pointer plus a compact list of free page IDs.
 
 ## Rationale
-- Simple persistent format suitable for MVP
+- Simple persistent format suitable for the 0.x baseline
 - Cheap to append new free pages and pop for allocations
 - Fits within Phase 1 goals without requiring complex structures
 

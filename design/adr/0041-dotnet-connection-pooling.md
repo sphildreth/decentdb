@@ -4,10 +4,10 @@
 **Date**: 2026-01-30
 
 ## Context
-DecentDB MVP concurrency is single process, one writer, many readers. ADO.NET consumers (including Dapper) often open/close connections frequently, and micro-ORM query composition benefits from reusing an open connection.
+DecentDB concurrency is single process, one writer, many readers. ADO.NET consumers (including Dapper) often open/close connections frequently, and micro-ORM query composition benefits from reusing an open connection.
 
 ## Decision
-- The ADO.NET provider does **not** implement a global cross-connection pool in MVP.
+- The ADO.NET provider does **not** implement a global cross-connection pool in the 0.x baseline.
 - Single-writer enforcement is provided by the engine’s locking semantics; the provider must not claim stronger guarantees.
 - The Micro-ORM (`DecentDbContext`) implements **context-scoped pooling**:
   - pooled mode: a single open `DecentDbConnection` is reused within the context

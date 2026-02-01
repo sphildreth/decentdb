@@ -10,15 +10,15 @@ Dapper support requires predictable string handling and optional length guardrai
 - introduce backward-compatibility considerations
 
 ## Decision
-- MVP does **not** implement engine-enforced `VARCHAR(n)` / max length constraints with actual length validation.
+- The 0.x baseline does **not** implement engine-enforced `VARCHAR(n)` / max length constraints with actual length validation.
 - However, `VARCHAR` and `CHARACTER VARYING` are now supported as aliases for `TEXT` type (case-insensitive, with optional length specifications like `VARCHAR(255)`).
 - Length guardrails are enforced in the .NET layer on write/bind paths using UTF-8 byte length.
-- Revisit engine-enforced lengths post-MVP behind a dedicated SQL-dialect ADR.
+- Revisit engine-enforced lengths post-1.0 behind a dedicated SQL-dialect ADR.
 
 ## Consequences
 - **Pros**:
   - Maintains SQL dialect compatibility with existing applications expecting VARCHAR support
-  - Avoids persistence changes for MVP
+  - Avoids persistence changes for the 0.x baseline
   - Keeps SELECT hot paths untouched
   - Provides syntactic compatibility with SQL standards
 - **Cons**:

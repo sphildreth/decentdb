@@ -3,7 +3,7 @@
 **Status:** Accepted
 
 ### Decision
-Use Postgres-style positional parameters (`$1, $2, ...`) for MVP.
+Use Postgres-style positional parameters (`$1, $2, ...`) for the 0.x baseline.
 
 ### Rationale
 - Consistent with libpg_query parser choice

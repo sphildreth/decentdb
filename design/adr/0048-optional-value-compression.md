@@ -19,7 +19,7 @@ However, compression adds CPU overhead and a dependency.
 We will implement **storage-internal transparent compression** for `TEXT` and `BLOB` values.
 
 1.  **Algorithm:** **Zlib (Deflate)** via Nim's standard `zip/zlib`.
-    *   *Reasoning:* Available without adding new dependencies; good size/CPU tradeoff for MVP.
+    *   *Reasoning:* Available without adding new dependencies; good size/CPU tradeoff for the 0.x baseline.
 
 2.  **Storage Format:**
     *   We introduce new `ValueKind` variants:

@@ -8,8 +8,8 @@ Dapper expects a normal `DbConnection` accepting a connection string. DecentDB a
 
 ## Decision
 - Use a semicolon-separated key/value connection string:
-  - Required: `Data Source=/path/to.db` (aliases: `Filename`, `Database`)
-  - Supported options (MVP):
+  - Required: `Data Source=/path/to.ddb` (aliases: `Filename`, `Database`)
+  - Supported options (0.x baseline):
     - `Cache Size=<pages|NNMB>` (default `1024` pages)
     - `Logging=0|1` (default `0`)
     - `LogLevel=...` (default `Debug`)

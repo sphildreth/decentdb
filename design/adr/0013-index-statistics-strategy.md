@@ -3,7 +3,7 @@
 **Status:** Accepted
 
 ### Decision
-Use heuristic-based selectivity estimates for MVP, defer full statistics collection.
+Use heuristic-based selectivity estimates for the 0.x baseline, defer full statistics collection.
 
 ### Rationale
 - Heuristics are sufficient for rule-based planner
@@ -12,11 +12,11 @@ Use heuristic-based selectivity estimates for MVP, defer full statistics collect
 - Can add statistics later if needed
 
 ### Alternatives Considered
-- Full statistics collection in MVP: More accurate but more complex
+- Full statistics collection in 0.x: More accurate but more complex
 - No selectivity estimates: Too naive for good planning
 
 ### Trade-offs
-- **Pros**: Simple, sufficient for MVP
+- **Pros**: Simple, sufficient for the 0.x baseline
 - **Cons**: Less accurate than full statistics, may make suboptimal plan choices
 
 ### References

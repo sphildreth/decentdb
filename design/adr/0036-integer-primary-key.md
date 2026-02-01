@@ -45,7 +45,7 @@ For such tables:
 - **Catalog:** When saving a table definition, if an Integer PK is detected, the engine will skip creating a default `IndexMeta` for it.
 - **Storage:** 
     - `insertRow`: Check if the table has an Integer PK. If so, extract the value from the provided values and use it as the `rowid`. Ensure uniqueness (the B+Tree will enforce this naturally).
-    - `updateRow`: Allow updating the row. If the PK changes, it effectively becomes a delete of the old key and insert of the new key (though `updateRow` might need adjustment to handle this, or we restrict PK updates for MVP. The prompt instructions imply `updateRow` needs handling).
+    - `updateRow`: Allow updating the row. If the PK changes, it effectively becomes a delete of the old key and insert of the new key (though `updateRow` might need adjustment to handle this, or we restrict PK updates for the 0.x baseline. The prompt instructions imply `updateRow` needs handling).
     - `deleteRow`: Ensure deletion uses the correct key.
 
 ### Constraints

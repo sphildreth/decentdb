@@ -6,7 +6,7 @@
 Adopt `libpg_query` via FFI as the SQL parser from the start of Phase 4 and beyond.
 
 ### Rationale
-- Aligns with the MVP recommendation in `design/SPEC.md` §6.1.
+- Aligns with the baseline recommendation in `design/SPEC.md` §6.1.
 - Ensures Postgres-compatible syntax and parse tree structure early.
 - Avoids a later parser migration that would impact tests and planner/exec logic.
 

@@ -400,9 +400,9 @@ public class Event
 
 #### 3. **String Length Constraints (Performance-First)**
 
-DecentDB MVP includes `TEXT` (UTF-8) and does not require engine-enforced `VARCHAR(n)` for Dapper support.
+DecentDB 0.x baseline includes `TEXT` (UTF-8) and does not require engine-enforced `VARCHAR(n)` for Dapper support.
 
-**MVP requirement:** Support `[MaxLength(n)]` as a .NET-side guardrail (write-time/parameter binding only). This keeps SELECT hot paths unaffected.
+**0.x baseline requirement:** Support `[MaxLength(n)]` as a .NET-side guardrail (write-time/parameter binding only). This keeps SELECT hot paths unaffected.
 
 **Validation rule:** measure `n` in **UTF-8 bytes**, not “characters”.
 - Unambiguous across languages and matches storage.
@@ -420,7 +420,7 @@ public class User
 }
 ```
 
-**Post-MVP option:** Engine-enforced `VARCHAR(n)` may be added later behind an ADR (impacts SQL grammar, binder, and likely catalog persistence).
+**Post-1.0 option:** Engine-enforced `VARCHAR(n)` may be added later behind an ADR (impacts SQL grammar, binder, and likely catalog persistence).
 
 #### 4. **Time Types (TimeSpan, TimeOnly)**
 Stored as INT64 ticks for precision:
@@ -488,7 +488,7 @@ public class Message
    - Timezone handling (store UTC only)
    - Conversion helpers for DateOnly, TimeOnly, TimeSpan
 
-3. **Optional Post-MVP: Engine-Enforced VARCHAR(n)**
+3. **Optional Post-1.0: Engine-Enforced VARCHAR(n)**
     - Requires an ADR + SPEC/PRD updates (SQL grammar + binder + likely catalog persistence).
 
 4. **Unicode and Encoding**
@@ -544,7 +544,7 @@ Micro-ORM Layer:
 
 ### Constraint Violation Handling
 
-**MaxLength Guardrails (MVP, .NET-side):**
+**MaxLength Guardrails (0.x baseline, .NET-side):**
 ```csharp
 // C# layer pre-validation
 public void SetValue(DbParameter param, string value)
@@ -562,7 +562,7 @@ public void SetValue(DbParameter param, string value)
 }
 ```
 
-Note: Engine-side string length constraints are optional post-MVP (requires ADR).
+Note: Engine-side string length constraints are optional post-1.0 (requires ADR).
 
 ### Exception Context Preservation
 
@@ -1080,7 +1080,7 @@ The following decisions must have ADRs before implementation:
 2. **ADR-0040: .NET Type System** - C# to DecentDB type mappings
 3. **ADR-0041: .NET Connection Pooling** - Single writer enforcement strategy
 4. **ADR-0042: .NET Query Compilation** - Expression tree caching approach
-5. **ADR-0047 (Optional Post-MVP): Engine String Length Constraints** - If adding `VARCHAR(n)`/engine-enforced max lengths
+5. **ADR-0047 (Optional Post-1.0): Engine String Length Constraints** - If adding `VARCHAR(n)`/engine-enforced max lengths
 6. **ADR-0043: .NET String Encoding** - UTF-8 handling and validation
 7. **ADR-0044: .NET NuGet Packaging** - Native library distribution strategy
 8. **ADR-0045: .NET SQL Observability** - Event-based logging with zero-cost when disabled
@@ -1097,7 +1097,7 @@ The following decisions must have ADRs before implementation:
 ### Connection String Configuration
 
 ```
-Data Source=/path/to.db;Logging=1;LogLevel=Debug
+Data Source=/path/to.ddb;Logging=1;LogLevel=Debug
 ```
 
 | Parameter | Values | Default | Description |

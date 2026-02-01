@@ -6,7 +6,7 @@
 Use an atomic reader reference counter with epoch-based cleanup to coordinate checkpoints with concurrent readers.
 
 ### Rationale
-- MVP requires "only checkpoint when no active readers" for simplicity
+- The 0.x baseline requires "only checkpoint when no active readers" for simplicity
 - Need atomic mechanism to track reader count without locks
 - Must handle race conditions: reader starts after checkpoint begins
 - Need fallback for forced checkpoint (timeout expires with active readers)
@@ -79,7 +79,7 @@ If timeout expires with active readers:
 
 ### Alternatives Considered
 - **RWLock**: Would block readers during checkpoint, violating "readers never block"
-- **Epoch-based reclamation**: More complex, better for post-MVP incremental checkpoint
+- **Epoch-based reclamation**: More complex, better for post-1.0 incremental checkpoint
 - **Stop-the-world**: Simplest but violates concurrent reader requirement
 
 ### Trade-offs

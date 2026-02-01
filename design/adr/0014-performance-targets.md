@@ -19,7 +19,7 @@ Define concrete performance targets with P95 latency thresholds:
 ### Alternatives Considered
 - No targets: Hard to measure success
 - P50 targets: Doesn't capture user experience
-- Stricter targets: May be unrealistic for MVP
+- Stricter targets: May be unrealistic for the 0.x baseline
 
 ### Trade-offs
 - **Pros**: Measurable, enables regression testing, clear acceptance criteria

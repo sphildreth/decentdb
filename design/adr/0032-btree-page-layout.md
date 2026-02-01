@@ -21,7 +21,7 @@ Leaf cells:
 `[key u64][value_len u32][overflow_page u32][value bytes]` repeated.
 
 ### Rationale
-- Simple to build and parse for MVP read path
+- Simple to build and parse for the 0.x baseline read path
 - Supports in-order leaf traversal via next-leaf pointer
 
 ### Alternatives Considered

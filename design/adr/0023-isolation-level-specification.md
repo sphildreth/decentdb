@@ -29,7 +29,7 @@ DecentDb will implement **Snapshot Isolation** as its default isolation level, w
 - Prevents all three ANSI isolation anomalies
 - Compatible with MVCC/Snapshot read architecture already planned
 - Good performance characteristics for read-heavy workloads
-- Reasonable complexity for MVP implementation
+- Reasonable complexity for 0.x implementation
 
 **Cons:**
 - Still allows write skews (not prevented by snapshot isolation)

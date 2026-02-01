@@ -29,10 +29,10 @@ We will change the Checkpoint and Log Management logic to **never truncate WAL f
 3.  **WAL Grwoth**:
     *   This implies that if a reader is open for a very long time (hours) while heavy writes occur, the WAL file will continue to grow indefinitely (or until disk exhaustion), even if checkpoints are happening.
     *   This is a standard trade-off in MVCC systems (Postgres "VACUUM" issues, Oracle ORA-01555).
-    *   For MVP, we accept the risk of disk growth to ensure Correctness.
+    *   For the 0.x baseline, we accept the risk of disk growth to ensure Correctness.
 
 ## Consequences
 
 *   **Correctness**: Readers strictly guaranteed Snapshot Isolation.
 *   **Performance/Risk**: A "toxic" long-running reader can prevent WAL cleanup, filling the disk. We should add monitoring or "max transaction age" timeouts in the future.
-*   **Complexity**: Checkpoint logic needs to calculate the safe truncation point. WAL management needs to handle "partial" truncation or simply defer the entire file truncation until all blocking readers are gone. For MVP simplicity: **Defer entire WAL truncation** if any reader needs any part of it.
+*   **Complexity**: Checkpoint logic needs to calculate the safe truncation point. WAL management needs to handle "partial" truncation or simply defer the entire file truncation until all blocking readers are gone. For 0.x simplicity: **Defer entire WAL truncation** if any reader needs any part of it.

@@ -10,7 +10,7 @@ Accepted
 
 The user has identified that "very large sort operations" are likely in the near future for the Music Library workload (e.g., `SELECT * FROM tracks ORDER BY title` on 9.5M rows).
 
-Prior ADR-0021 recommended "In-Memory Only" sorting for MVP simplicity. However, given the explicit requirement for scale, we must implement **External Merge Sort** to handle datasets larger than available RAM.
+Prior ADR-0021 recommended "In-Memory Only" sorting for initial 0.x simplicity. However, given the explicit requirement for scale, we must implement **External Merge Sort** to handle datasets larger than available RAM.
 
 ## Decision
 
@@ -35,7 +35,7 @@ We will implement **External Merge Sort** in the `Exec` layer.
         4.  **Next()**: Pop min row from Heap, return to caller. Read next row from that Run's stream and push to Heap.
         5.  Clean up: Delete all temp files when the Sort iterator is closed or the transaction ends.
 
-### Constraints & Simplifications for MVP
+### Constraints & Simplifications for the 0.x Baseline
 
 *   **Max Open Files**: To avoid `EMFILE` errors, we limit the merge fan-in to **64** *at a time*.
     *   If `(Total Data Size / Sort Buffer Size) > 64`, we perform a **multi-pass merge**: merge runs in groups of up to 64 into new runs, repeat until the final merge can be completed within the open-file limit.

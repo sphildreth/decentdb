@@ -1,14 +1,14 @@
-## Group Commit and WAL Batching Policies (Post-MVP)
+## Group Commit and WAL Batching Policies (Post-1.0)
 **Date:** 2026-01-30
-**Status:** Accepted (Post-MVP Deferral)
+**Status:** Accepted (Post-1.0 Deferral)
 
 ### Decision
 
-Group commit and WAL batching policies are **deferred as post-MVP features**. The default durability mode remains synchronous fsync-on-every-commit with no weakening of guarantees. An opt-in group commit mode may be added in a future release after MVP, following the completion of this ADR and implementation of required infrastructure.
+Group commit and WAL batching policies are **deferred until post-1.0**. The default durability mode remains synchronous fsync-on-every-commit with no weakening of guarantees. An opt-in group commit mode may be added in a future release after 1.0, following the completion of this ADR and implementation of required infrastructure.
 
 ### Rationale
 
-1. **MVP Priority:** The current MVP focuses on correctness and durability guarantees. Synchronous fsync-on-commit provides the strongest durability guarantee and is simplest to implement correctly.
+1. **0.x Priority:** The current 0.x baseline focuses on correctness and durability guarantees. Synchronous fsync-on-commit provides the strongest durability guarantee and is simplest to implement correctly.
 
 2. **Complexity vs. Benefit:** Group commit requires:
    - Transaction queueing and batching logic
@@ -23,22 +23,22 @@ Group commit and WAL batching policies are **deferred as post-MVP features**. Th
 
 ### Alternatives Considered
 
-**Option A: Implement group commit for MVP**
-- Rejected: Adds significant complexity and testing burden to MVP timeline
+**Option A: Implement group commit for the 0.x baseline**
+- Rejected: Adds significant complexity and testing burden to the 0.x timeline
 - Risk of introducing durability bugs in critical path
 
 **Option B: Weaken default durability (async commit)**
 - Rejected: Violates project Priority #1 (Durable ACID writes)
 - "Works in tests, dies in production" risk
 
-**Option C: Defer to post-MVP (Selected)**
-- Accepted: Keeps MVP focused and correct
+**Option C: Defer to post-1.0 (Selected)**
+- Accepted: Keeps the 0.x baseline focused and correct
 - Allows time for proper design and testing
 - Maintains strong default guarantees
 
 ### Future Implementation Requirements
 
-If group commit is implemented post-MVP, the following must be addressed:
+If group commit is implemented post-1.0, the following must be addressed:
 
 1. **ADR Update:** This ADR must be updated with specific design details
 2. **Durability Modes:** Define explicit modes:

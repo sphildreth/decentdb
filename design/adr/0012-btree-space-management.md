@@ -3,7 +3,7 @@
 **Status:** Accepted
 
 ### Decision
-Implement node split for MVP, defer merge/rebalance, use compaction for space recovery.
+Implement node split for the 0.x baseline, defer merge/rebalance, use compaction for space recovery.
 
 ### Rationale
 - Split is necessary for correctness (cannot overflow pages)
@@ -12,11 +12,11 @@ Implement node split for MVP, defer merge/rebalance, use compaction for space re
 - Delete-heavy workloads are less common in target use case
 
 ### Alternatives Considered
-- Implement merge/rebalance in MVP: More complex but better space efficiency
+- Implement merge/rebalance in 0.x: More complex but better space efficiency
 - No compaction: Simpler but space bloat over time
 
 ### Trade-offs
-- **Pros**: Simpler MVP, compaction provides space recovery
+- **Pros**: Simpler 0.x baseline, compaction provides space recovery
 - **Cons**: May have temporary space bloat, requires periodic compaction
 
 ### References

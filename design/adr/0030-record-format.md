@@ -7,7 +7,7 @@ Define a compact record encoding using a varint field count followed by per-fiel
 `[type u8][length varint][payload bytes]`. Overflow pointers for large TEXT/BLOB use dedicated type codes.
 
 ### Rationale
-- Simple to parse and suitable for MVP
+- Simple to parse and suitable for the 0.x baseline
 - Explicit lengths allow variable-sized fields
 - Dedicated overflow types avoid ambiguity with inline data
 

@@ -18,7 +18,7 @@ However, *index equivalence* is currently treated primarily as “same name”, 
 1. **Redundant indexes can exist with different names**, especially when indexes are recreated by tools (e.g. `vacuum`) or when schemas are imported/transformed.
 2. **Size & write amplification impact**: redundant indexes increase page count and write amplification.
 
-Given the MVP scope (single-column indexes; no collations; no per-index options beyond kind+unique), two indexes with the same `(table, column, kind)` and compatible `unique` flag are operationally redundant for our planner and enforcement.
+Given the 0.x baseline scope (single-column indexes; no collations; no per-index options beyond kind+unique), two indexes with the same `(table, column, kind)` and compatible `unique` flag are operationally redundant for our planner and enforcement.
 
 ## Decision
 

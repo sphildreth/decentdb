@@ -1,4 +1,4 @@
-# Bulk Load API (MVP)
+# Bulk Load API (0.x Baseline)
 **Date:** 2026-01-28
 **Status:** Accepted
 
