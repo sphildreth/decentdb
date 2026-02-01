@@ -221,8 +221,15 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
       if not parentHasColumn:
         return err[Statement](ERR_SQL, "Referenced column not found", col.refTable & "." & col.refColumn)
       let parentIdx = catalog.getBtreeIndexForColumn(col.refTable, col.refColumn)
-      if isNone(parentIdx) or not parentIdx.get.unique:
-        return err[Statement](ERR_SQL, "Referenced column must be indexed uniquely", col.refTable & "." & col.refColumn)
+      var isInt64Pk = false
+      for parentCol in parentRes.value.columns:
+        if parentCol.name == col.refColumn and parentCol.primaryKey and parentCol.kind == ctInt64:
+          isInt64Pk = true
+          break
+      
+      if not isInt64Pk:
+        if isNone(parentIdx) or not parentIdx.get.unique:
+          return err[Statement](ERR_SQL, "Referenced column must be indexed uniquely", col.refTable & "." & col.refColumn)
   if primaryCount > 1:
     return err[Statement](ERR_SQL, "Multiple primary keys not supported")
   ok(stmt)

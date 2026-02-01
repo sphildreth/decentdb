@@ -7,6 +7,8 @@ bin           = @["decentdb"]
 
 requires "nim >= 1.6.0"
 requires "cligen >= 1.7.0"
+requires "zip >= 0.3.1"
+
 
 task build_lib, "Build DecentDb shared library (C API)":
   exec "nim c --app:lib -d:libpg_query -d:release --gc:arc --threads:on --outdir:build src/c_api.nim"

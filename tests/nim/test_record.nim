@@ -35,6 +35,45 @@ suite "Record":
     check decodedValues[6].bytes == @[byte('h'), byte('e'), byte('l'), byte('l'), byte('o')]
     check decodedValues[7].bytes == @[byte 1, 2, 3, 4]
 
+  test "compact int64 encoding":
+    # Small positive
+    var v = Value(kind: vkInt64, int64Val: 1)
+    var enc = encodeValue(v)
+    # 1 byte kind + 1 byte len + 1 byte payload (zigzag(1) = 2)
+    check enc.len == 3
+    
+    # Small negative
+    v = Value(kind: vkInt64, int64Val: -1)
+    enc = encodeValue(v)
+    # 1 byte kind + 1 byte len + 1 byte payload (zigzag(-1) = 1)
+    check enc.len == 3
+
+    # Zero
+    v = Value(kind: vkInt64, int64Val: 0)
+    enc = encodeValue(v)
+    check enc.len == 3
+
+    # Large value (int64.high)
+    v = Value(kind: vkInt64, int64Val: int64.high)
+    enc = encodeValue(v)
+    # 1 kind + 1 len + 10 payload (max varint) = 12 bytes? 
+    # Zigzag(high) is huge, so 10 bytes varint.
+    # Len of payload is 10, which fits in 1 byte varint (values < 128).
+    check enc.len == 12
+
+    # Roundtrip check for boundary values
+    let boundaries = @[
+      0'i64, 1, -1, 63, -64, 64, -65, # 1 byte boundaries (zigzag)
+      127, -128, 128, -129,           # varint boundaries
+      int64.high, int64.low
+    ]
+    for val in boundaries:
+      let rec = @[Value(kind: vkInt64, int64Val: val)]
+      let e = encodeRecord(rec)
+      let d = decodeRecord(e)
+      check d.ok
+      check d.value[0].int64Val == val
+
   test "overflow chain roundtrip":
     let path = makeTempDb("decentdb_record_overflow.db")
     let dbRes = openDb(path)

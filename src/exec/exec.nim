@@ -415,9 +415,9 @@ proc estimateRowBytes*(row: Row): int =
       payloadLen = 1
     of vkInt64, vkFloat64:
       payloadLen = 8
-    of vkText, vkBlob:
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
       payloadLen = value.bytes.len
-    of vkTextOverflow, vkBlobOverflow:
+    of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
       payloadLen = 8
     result += varintLen(uint64(payloadLen)) + payloadLen
 
@@ -456,7 +456,7 @@ proc valueToBool*(value: Value): bool =
   of vkBool: value.boolVal
   of vkInt64: value.int64Val != 0
   of vkFloat64: value.float64Val != 0.0
-  of vkText, vkBlob: value.bytes.len > 0
+  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed: value.bytes.len > 0
   else: false
 
 proc compareValues*(a: Value, b: Value): int =
@@ -467,7 +467,7 @@ proc compareValues*(a: Value, b: Value): int =
   of vkBool: cmp(a.boolVal, b.boolVal)
   of vkInt64: cmp(a.int64Val, b.int64Val)
   of vkFloat64: cmp(a.float64Val, b.float64Val)
-  of vkText, vkBlob:
+  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
     var lenA = a.bytes.len
     var lenB = b.bytes.len
     var minLen = min(lenA, lenB)

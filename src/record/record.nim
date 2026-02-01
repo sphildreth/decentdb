@@ -1,3 +1,4 @@
+import zip/zlib
 import ../errors
 import ../pager/pager
 import ../pager/db_header
@@ -11,6 +12,10 @@ type ValueKind* = enum
   vkBlob
   vkTextOverflow
   vkBlobOverflow
+  vkTextCompressed
+  vkBlobCompressed
+  vkTextCompressedOverflow
+  vkBlobCompressedOverflow
 
 type Value* = object
   kind*: ValueKind
@@ -20,6 +25,16 @@ type Value* = object
   bytes*: seq[byte]
   overflowPage*: PageId
   overflowLen*: uint32
+
+func zigzagEncode(n: int64): uint64 =
+  (cast[uint64](n) shl 1) xor cast[uint64](n shr 63)
+
+func zigzagDecode(n: uint64): int64 =
+  let shifted = n shr 1
+  if (n and 1) == 0:
+    result = cast[int64](shifted)
+  else:
+    result = cast[int64](shifted xor (not 0'u64))
 
 proc encodeVarint*(value: uint64): seq[byte] =
   var v = value
@@ -47,6 +62,50 @@ proc decodeVarint*(data: openArray[byte], offset: var int): Result[uint64] =
       return err[uint64](ERR_CORRUPTION, "Varint overflow")
   err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
 
+proc compressData(data: seq[byte]): seq[byte] =
+  if data.len == 0: return @[]
+  var s = newString(data.len)
+  if data.len > 0:
+    copyMem(addr s[0], unsafeAddr data[0], data.len)
+  
+  let compressed = zlib.compress(s, stream=ZlibStream)
+  
+  result = newSeq[byte](compressed.len)
+  if compressed.len > 0:
+    copyMem(addr result[0], unsafeAddr compressed[0], compressed.len)
+
+proc decompressData(data: seq[byte]): Result[seq[byte]] =
+  if data.len == 0: return ok(newSeq[byte]())
+  var s = newString(data.len)
+  if data.len > 0:
+    copyMem(addr s[0], unsafeAddr data[0], data.len)
+  
+  try:
+    let decompressed = zlib.uncompress(s, stream=ZlibStream)
+    var res = newSeq[byte](decompressed.len)
+    if decompressed.len > 0:
+      copyMem(addr res[0], unsafeAddr decompressed[0], decompressed.len)
+    ok(res)
+  except:
+    let e = getCurrentException()
+    return err[seq[byte]](ERR_CORRUPTION, "Decompression failed: " & e.msg)
+
+proc compressValue*(value: Value): Value =
+  if value.kind notin {vkText, vkBlob}:
+    return value
+  
+  if value.bytes.len <= 128:
+    return value
+    
+  let compressed = compressData(value.bytes)
+  if float(compressed.len) < float(value.bytes.len) * 0.9:
+    var newVal = value
+    newVal.kind = if value.kind == vkText: vkTextCompressed else: vkBlobCompressed
+    newVal.bytes = compressed
+    return newVal
+  
+  return value
+
 proc encodeValue*(value: Value): seq[byte] =
   var payload: seq[byte] = @[]
   case value.kind
@@ -55,14 +114,13 @@ proc encodeValue*(value: Value): seq[byte] =
   of vkBool:
     payload = @[byte(if value.boolVal: 1 else: 0)]
   of vkInt64:
-    payload = newSeq[byte](8)
-    writeU64LE(payload, 0, cast[uint64](value.int64Val))
+    payload = encodeVarint(zigzagEncode(value.int64Val))
   of vkFloat64:
     payload = newSeq[byte](8)
     writeU64LE(payload, 0, cast[uint64](value.float64Val))
-  of vkText, vkBlob:
+  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
     payload = if value.bytes.len == 0: @[] else: value.bytes
-  of vkTextOverflow, vkBlobOverflow:
+  of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
     payload = newSeq[byte](8)
     writeU32LE(payload, 0, uint32(value.overflowPage))
     writeU32LE(payload, 4, value.overflowLen)
@@ -95,16 +153,24 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
       return err[Value](ERR_CORRUPTION, "Invalid BOOL length")
     value.boolVal = payload[0] != 0
   of vkInt64:
-    if payload.len != 8:
-      return err[Value](ERR_CORRUPTION, "Invalid INT64 length")
-    value.int64Val = cast[int64](readU64LE(payload, 0))
+    var pOffset = 0
+    let vRes = decodeVarint(payload, pOffset)
+    if not vRes.ok:
+      return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
+    value.int64Val = zigzagDecode(vRes.value)
   of vkFloat64:
     if payload.len != 8:
       return err[Value](ERR_CORRUPTION, "Invalid FLOAT64 length")
     value.float64Val = cast[float64](readU64LE(payload, 0))
   of vkText, vkBlob:
     value.bytes = @payload
-  of vkTextOverflow, vkBlobOverflow:
+  of vkTextCompressed, vkBlobCompressed:
+    let decompRes = decompressData(@payload)
+    if not decompRes.ok:
+      return err[Value](decompRes.err.code, decompRes.err.message, decompRes.err.context)
+    value.bytes = decompRes.value
+    value.kind = if kind == vkTextCompressed: vkText else: vkBlob
+  of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
     if payload.len != 8:
       return err[Value](ERR_CORRUPTION, "Invalid overflow pointer length")
     value.overflowPage = PageId(readU32LE(payload, 0))
@@ -237,10 +303,18 @@ proc decodeRecordWithOverflow*(pager: Pager, data: openArray[byte]): Result[seq[
     return decoded
   var values = decoded.value
   for i in 0 ..< values.len:
-    if values[i].kind in {vkTextOverflow, vkBlobOverflow}:
+    if values[i].kind in {vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow}:
       let readRes = readOverflowChain(pager, values[i].overflowPage, values[i].overflowLen)
       if not readRes.ok:
         return err[seq[Value]](readRes.err.code, readRes.err.message, readRes.err.context)
       values[i].bytes = readRes.value
-      values[i].kind = if values[i].kind == vkTextOverflow: vkText else: vkBlob
+      
+      if values[i].kind in {vkTextCompressedOverflow, vkBlobCompressedOverflow}:
+        let decompRes = decompressData(values[i].bytes)
+        if not decompRes.ok:
+          return err[seq[Value]](decompRes.err.code, decompRes.err.message, decompRes.err.context)
+        values[i].bytes = decompRes.value
+        values[i].kind = if values[i].kind == vkTextCompressedOverflow: vkText else: vkBlob
+      else:
+        values[i].kind = if values[i].kind == vkTextOverflow: vkText else: vkBlob
   ok(values)

@@ -41,19 +41,46 @@ proc readLeafCells(page: string): Result[(seq[uint64], seq[seq[byte]], seq[uint3
   var values: seq[seq[byte]] = @[]
   var overflows: seq[uint32] = @[]
   var offset = 8
+
+  var data = newSeq[byte](page.len)
+  if page.len > 0:
+    copyMem(addr data[0], unsafeAddr page[0], page.len)
+
   for _ in 0 ..< count:
-    if offset + 16 > page.len:
+    if offset >= page.len:
       return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Leaf cell out of bounds")
-    let key = readU64LE(page, offset)
-    let valueLen = int(readU32LE(page, offset + 8))
-    let overflow = readU32LE(page, offset + 12)
-    offset += 16
+
+    let keyRes = decodeVarint(data, offset)
+    if not keyRes.ok:
+      return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+    let key = keyRes.value
+
+    let ctrlRes = decodeVarint(data, offset)
+    if not ctrlRes.ok:
+      return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ctrlRes.err.code, ctrlRes.err.message, ctrlRes.err.context)
+    let control = ctrlRes.value
+
+    let isOverflow = (control and 1) != 0
+    let val = uint32(control shr 1)
+
+    var valueLen = 0
+    var overflow = 0'u32
+
+    if isOverflow:
+      overflow = val
+      valueLen = 0
+    else:
+      valueLen = int(val)
+      overflow = 0
+
     if offset + valueLen > page.len:
       return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Leaf value out of bounds")
+
     var payload = newSeq[byte](valueLen)
     if valueLen > 0:
       copyMem(addr payload[0], unsafeAddr page[offset], valueLen)
     offset += valueLen
+
     keys.add(key)
     values.add(payload)
     overflows.add(overflow)
@@ -70,12 +97,25 @@ proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)]
   var keys: seq[uint64] = @[]
   var children: seq[uint32] = @[]
   var offset = 8
+
+  var data = newSeq[byte](page.len)
+  if page.len > 0:
+    copyMem(addr data[0], unsafeAddr page[0], page.len)
+
   for _ in 0 ..< count:
-    if offset + 12 > page.len:
+    if offset >= page.len:
       return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Internal cell out of bounds")
-    let key = readU64LE(page, offset)
-    let child = readU32LE(page, offset + 8)
-    offset += 12
+    
+    let keyRes = decodeVarint(data, offset)
+    if not keyRes.ok:
+      return err[(seq[uint64], seq[uint32], uint32)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+    let key = keyRes.value
+
+    let childRes = decodeVarint(data, offset)
+    if not childRes.ok:
+      return err[(seq[uint64], seq[uint32], uint32)](childRes.err.code, childRes.err.message, childRes.err.context)
+    let child = uint32(childRes.value)
+
     keys.add(key)
     children.add(child)
   ok((keys, children, rightChild))
@@ -372,13 +412,25 @@ proc encodeLeaf(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32
   writeU32LE(buf, 4, uint32(nextLeaf))
   var offset = 8
   for i in 0 ..< keys.len:
+    let keyBytes = encodeVarint(keys[i])
+    var control: uint64 = 0
     let valueLen = values[i].len
-    if offset + 16 + valueLen > pageSize:
+    if overflows[i] != 0:
+      control = (uint64(overflows[i]) shl 1) or 1
+    else:
+      control = (uint64(valueLen) shl 1)
+    let ctrlBytes = encodeVarint(control)
+
+    if offset + keyBytes.len + ctrlBytes.len + valueLen > pageSize:
       return err[string](ERR_IO, "Leaf overflow")
-    writeU64LE(buf, offset, keys[i])
-    writeU32LE(buf, offset + 8, uint32(valueLen))
-    writeU32LE(buf, offset + 12, overflows[i])
-    offset += 16
+    
+    for b in keyBytes:
+      buf[offset] = char(b)
+      offset.inc
+    for b in ctrlBytes:
+      buf[offset] = char(b)
+      offset.inc
+      
     if valueLen > 0:
       copyMem(addr buf[offset], unsafeAddr values[i][0], valueLen)
       offset += valueLen
@@ -396,11 +448,18 @@ proc encodeInternal(keys: seq[uint64], children: seq[uint32], rightChild: uint32
   writeU32LE(buf, 4, rightChild)
   var offset = 8
   for i in 0 ..< keys.len:
-    if offset + 12 > pageSize:
+    let keyBytes = encodeVarint(keys[i])
+    let childBytes = encodeVarint(uint64(children[i]))
+
+    if offset + keyBytes.len + childBytes.len > pageSize:
       return err[string](ERR_IO, "Internal overflow")
-    writeU64LE(buf, offset, keys[i])
-    writeU32LE(buf, offset + 8, children[i])
-    offset += 12
+    
+    for b in keyBytes:
+      buf[offset] = char(b)
+      offset.inc
+    for b in childBytes:
+      buf[offset] = char(b)
+      offset.inc
   ok(buf)
 
 proc bulkBuildFromSorted*(tree: BTree, entries: seq[(uint64, seq[byte])]): Result[PageId] =
@@ -472,7 +531,7 @@ proc bulkBuildFromSorted*(tree: BTree, entries: seq[(uint64, seq[byte])]): Resul
     return ok(tree.root)
 
   proc maxInternalKeys(): int =
-    (pageSize - 8) div 12
+    (pageSize - 8) div 15
 
   var level = leaves
   while level.len > 1:
@@ -762,16 +821,26 @@ proc calculatePageUtilization*(tree: BTree, pageId: PageId): Result[float] =
     if not parsed.ok:
       return err[float](parsed.err.code, parsed.err.message, parsed.err.context)
     let (keys, values, overflows, _) = parsed.value
-    # Each leaf cell: key(8) + value_len(4) + overflow(4) = 16 bytes header + value data
+    # Variable length headers
     for i in 0 ..< keys.len:
-      usedBytes += 16 + values[i].len
+      let keyLen = encodeVarint(keys[i]).len
+      var control: uint64 = 0
+      if overflows[i] != 0:
+        control = (uint64(overflows[i]) shl 1) or 1
+      else:
+        control = (uint64(values[i].len) shl 1)
+      let ctrlLen = encodeVarint(control).len
+      usedBytes += keyLen + ctrlLen + values[i].len
   elif pageType == PageTypeInternal:
     let parsed = readInternalCells(page)
     if not parsed.ok:
       return err[float](parsed.err.code, parsed.err.message, parsed.err.context)
     let (keys, children, _) = parsed.value
-    # Each internal cell: key(8) + child(4) = 12 bytes
-    usedBytes += keys.len * 12
+    # Variable length headers
+    for i in 0 ..< keys.len:
+      let keyLen = encodeVarint(keys[i]).len
+      let childLen = encodeVarint(uint64(children[i])).len
+      usedBytes += keyLen + childLen
   
   let utilization = (float(usedBytes) / float(page.len)) * 100.0
   ok(utilization)

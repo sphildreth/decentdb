@@ -291,6 +291,17 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
     if col.unique or col.primaryKey:
       if values[i].kind == vkNull:
         continue
+      if col.primaryKey and col.kind == ctInt64:
+        if values[i].kind == vkInt64:
+          let targetId = cast[uint64](values[i].int64Val)
+          let rowRes = readRowAt(pager, table, targetId)
+          if rowRes.ok:
+            if rowid == 0 or rowid != targetId:
+              return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+          else:
+            if rowRes.err.code != ERR_IO:
+              return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+          continue
       let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
       if isNone(idxOpt):
         return err[Void](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
@@ -317,6 +328,25 @@ proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values
       continue
     let idxOpt = catalog.getBtreeIndexForColumn(col.refTable, col.refColumn)
     if isNone(idxOpt):
+      # Check if it is an optimized INT64 PRIMARY KEY
+      let parentRes = catalog.getTable(col.refTable)
+      if parentRes.ok:
+        var isInt64Pk = false
+        for pCol in parentRes.value.columns:
+          if pCol.name == col.refColumn and pCol.primaryKey and pCol.kind == ctInt64:
+            isInt64Pk = true
+            break
+        
+        if isInt64Pk and values[i].kind == vkInt64:
+           let targetId = cast[uint64](values[i].int64Val)
+           let rowRes = readRowAt(pager, parentRes.value, targetId)
+           if rowRes.ok:
+             continue # Found
+           elif rowRes.err.code == ERR_IO: # ERR_IO usually means not found in readRowAt from find()
+             return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
+           else:
+             return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+
       return err[Void](ERR_INTERNAL, "Missing FK parent index", col.refTable & "." & col.refColumn)
     let key = indexKeyFromValue(values[i])
     let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
@@ -346,6 +376,24 @@ proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, o
     for child in children:
       let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
       if isNone(idxOpt):
+        # Check if the referencing column is an optimized INT64 PRIMARY KEY
+        let childTableRes = catalog.getTable(child[0])
+        if childTableRes.ok:
+           var isInt64Pk = false
+           for cCol in childTableRes.value.columns:
+             if cCol.name == child[1] and cCol.primaryKey and cCol.kind == ctInt64:
+               isInt64Pk = true
+               break
+           if isInt64Pk:
+              if oldVal.kind == vkInt64:
+                let targetId = cast[uint64](oldVal.int64Val)
+                let rowRes = readRowAt(pager, childTableRes.value, targetId)
+                if rowRes.ok:
+                   return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+                elif rowRes.err.code != ERR_IO:
+                   return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+                continue
+
         return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
       let key = indexKeyFromValue(oldVal)
       let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
@@ -366,6 +414,24 @@ proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, o
     for child in children:
       let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
       if isNone(idxOpt):
+        # Check if the referencing column is an optimized INT64 PRIMARY KEY
+        let childTableRes = catalog.getTable(child[0])
+        if childTableRes.ok:
+           var isInt64Pk = false
+           for cCol in childTableRes.value.columns:
+             if cCol.name == child[1] and cCol.primaryKey and cCol.kind == ctInt64:
+               isInt64Pk = true
+               break
+           if isInt64Pk:
+              if oldVal.kind == vkInt64:
+                let targetId = cast[uint64](oldVal.int64Val)
+                let rowRes = readRowAt(pager, childTableRes.value, targetId)
+                if rowRes.ok:
+                   return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+                elif rowRes.err.code != ERR_IO:
+                   return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+                continue
+
         return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
       let key = indexKeyFromValue(oldVal)
       let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
@@ -567,6 +633,8 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
       for col in columns:
         if col.primaryKey or col.unique:
+          if col.primaryKey and col.kind == ctInt64:
+            continue
           let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
           if isNone(db.catalog.getIndexByName(idxName)):
             let idxRootRes = initTableRoot(db.pager)
@@ -877,6 +945,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Resul
     if not saveRes.ok:
       return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
     for col in columns:
+      if col.primaryKey and col.kind == ctInt64: continue
       if col.primaryKey or col.unique:
         let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
         if isNone(db.catalog.getIndexByName(idxName)):

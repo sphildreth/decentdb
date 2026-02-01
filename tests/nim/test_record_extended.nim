@@ -97,7 +97,8 @@ suite "Record Extended":
     let val = Value(kind: vkInt64, int64Val: 0)
     let encoded = encodeValue(val)
     check encoded[0] == byte(vkInt64)
-    check encoded.len == 10  # 1 + 1 + 8
+    # With varint encoding: kind (1) + length (1) + payload (1) = 3 bytes
+    check encoded.len == 3
 
   test "encodeValue int64 negative":
     let val = Value(kind: vkInt64, int64Val: -1)
@@ -157,7 +158,8 @@ suite "Record Extended":
     check res.err.code == ERR_CORRUPTION
 
   test "decodeValue int64 invalid length":
-    let data = @[byte(vkInt64), byte(4), byte(0), byte(0), byte(0), byte(0)]  # Claims 4 bytes
+    # Payload is 1 byte [0x80], which indicates continuation but ends immediately
+    let data = @[byte(vkInt64), byte(1), byte(0x80)]
     var offset = 0
     let res = decodeValue(data, offset)
     check not res.ok

@@ -238,14 +238,25 @@ proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Voi
 proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
   var resultValues: seq[Value] = @[]
   for value in values:
-    if value.kind in {vkText, vkBlob} and value.bytes.len > (pager.pageSize - 128):
-      let pageRes = writeOverflowChain(pager, value.bytes)
+    var processedValue = value
+    if value.kind in {vkText, vkBlob}:
+      processedValue = compressValue(value)
+
+    if processedValue.kind in {vkText, vkBlob, vkTextCompressed, vkBlobCompressed} and processedValue.bytes.len > (pager.pageSize - 128):
+      let pageRes = writeOverflowChain(pager, processedValue.bytes)
       if not pageRes.ok:
         return err[seq[Value]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-      let overflowKind = if value.kind == vkText: vkTextOverflow else: vkBlobOverflow
-      resultValues.add(Value(kind: overflowKind, overflowPage: pageRes.value, overflowLen: uint32(value.bytes.len)))
+      
+      let overflowKind = case processedValue.kind
+        of vkText: vkTextOverflow
+        of vkBlob: vkBlobOverflow
+        of vkTextCompressed: vkTextCompressedOverflow
+        of vkBlobCompressed: vkBlobCompressedOverflow
+        else: vkTextOverflow
+
+      resultValues.add(Value(kind: overflowKind, overflowPage: pageRes.value, overflowLen: uint32(processedValue.bytes.len)))
     else:
-      resultValues.add(value)
+      resultValues.add(processedValue)
   ok(resultValues)
 
 proc readRowAt*(pager: Pager, table: TableMeta, rowid: uint64): Result[StoredRow] =
@@ -310,7 +321,20 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   var table = tableRes.value
   if values.len != table.columns.len:
     return err[uint64](ERR_SQL, "Column count mismatch", tableName)
-  let rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
+  
+  var rowid: uint64 = 0
+  var isExplicitRowId = false
+  
+  for i, col in table.columns:
+    if col.primaryKey and col.kind == ctInt64:
+      if values[i].kind == vkInt64:
+        rowid = cast[uint64](values[i].int64Val)
+        isExplicitRowId = true
+      break
+  
+  if not isExplicitRowId:
+    rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
+
   var indexKeys: seq[(IndexMeta, uint64)] = @[]
   var trigramValues: seq[(IndexMeta, Value)] = @[]
   if updateIndexes:
@@ -350,7 +374,13 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
       let grams = uniqueTrigrams(valueText(entry[1]))
       for g in grams:
         catalog.trigramBufferAdd(entry[0].name, g, rowid)
-  table.nextRowId = rowid + 1
+  
+  if isExplicitRowId:
+    if rowid >= table.nextRowId:
+      table.nextRowId = rowid + 1
+  else:
+    table.nextRowId = rowid + 1
+
   table.rootPage = tree.root
   discard catalog.saveTable(pager, table)
   ok(rowid)
@@ -361,6 +391,8 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
 proc insertRowNoIndexes*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
   insertRowInternal(pager, catalog, tableName, values, false)
 
+proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64): Result[Void]
+
 proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64, values: seq[Value]): Result[Void] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
@@ -368,6 +400,28 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
   let table = tableRes.value
   if values.len != table.columns.len:
     return err[Void](ERR_SQL, "Column count mismatch", tableName)
+
+  var newRowId = rowid
+  var pkChanged = false
+  for i, col in table.columns:
+    if col.primaryKey and col.kind == ctInt64:
+      if values[i].kind == vkInt64:
+        let val = cast[uint64](values[i].int64Val)
+        if val != rowid:
+          newRowId = val
+          pkChanged = true
+      break
+
+  if pkChanged:
+    let checkRes = readRowAt(pager, table, newRowId)
+    if checkRes.ok:
+      return err[Void](ERR_SQL, "Unique constraint failed: Primary Key conflict", $newRowId)
+    let delRes = deleteRow(pager, catalog, tableName, rowid)
+    if not delRes.ok: return delRes
+    let insRes = insertRow(pager, catalog, tableName, values)
+    if not insRes.ok: return err[Void](insRes.err.code, insRes.err.message, insRes.err.context)
+    return okVoid()
+
   let oldRes = readRowAt(pager, table, rowid)
   if not oldRes.ok:
     return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)

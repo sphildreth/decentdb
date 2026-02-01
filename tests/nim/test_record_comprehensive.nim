@@ -74,11 +74,10 @@ suite "Record Comprehensive":
     check boolResult.value.boolVal == true
     
     # Test int64
-    let intData = @[byte(vkInt64), byte(8)] & newSeq[byte](8)
-    var mutableIntData = intData
-    writeU64LE(mutableIntData, 2, uint64(42))
+    let intVal = Value(kind: vkInt64, int64Val: 42)
+    let intData = encodeValue(intVal)
     offset = 0
-    let intResult = decodeValue(mutableIntData, offset)
+    let intResult = decodeValue(intData, offset)
     check intResult.ok
     check intResult.value.kind == vkInt64
     check intResult.value.int64Val == 42

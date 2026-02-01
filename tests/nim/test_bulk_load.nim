@@ -36,7 +36,8 @@ suite "Bulk Load":
     opts.durability = dmNone
     let bulkRes = bulkLoad(db, "docs", rows, opts)
     check bulkRes.ok
-    let idxRes = indexSeek(db.pager, db.catalog, "docs", "id", Value(kind: vkInt64, int64Val: 3))
+    # Seek on 'body' index since 'id' (PK) no longer has a secondary index.
+    let idxRes = indexSeek(db.pager, db.catalog, "docs", "body", Value(kind: vkText, bytes: @['A'.byte, byte(64 + 3)]))
     check idxRes.ok
     check idxRes.value.len == 1
     discard closeDb(db)

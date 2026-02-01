@@ -3,6 +3,7 @@ import os
 import engine
 import pager/pager
 import btree/btree
+import record/record
 import pager/db_header
 import errors
 
@@ -16,16 +17,23 @@ proc buildLeaf(pageSize: int, keys: seq[uint64], values: seq[seq[byte]], nextLea
   var buf = newString(pageSize)
   buf[0] = char(PageTypeLeaf)
   buf[1] = '\0'
-  writeU32LE(buf, 4, nextLeaf)
   let count = uint16(keys.len)
   buf[2] = char(byte(count and 0xFF))
   buf[3] = char(byte((count shr 8) and 0xFF))
+  writeU32LE(buf, 4, nextLeaf)
   var offset = 8
   for i in 0 ..< keys.len:
-    writeU64LE(buf, offset, keys[i])
-    writeU32LE(buf, offset + 8, uint32(values[i].len))
-    writeU32LE(buf, offset + 12, 0)
-    offset += 16
+    let keyBytes = encodeVarint(keys[i])
+    for b in keyBytes:
+      buf[offset] = char(b)
+      offset.inc
+    
+    let control = (uint64(values[i].len) shl 1)
+    let ctrlBytes = encodeVarint(control)
+    for b in ctrlBytes:
+      buf[offset] = char(b)
+      offset.inc
+      
     for b in values[i]:
       buf[offset] = char(b)
       offset.inc
@@ -35,15 +43,20 @@ proc buildInternal(pageSize: int, keys: seq[uint64], children: seq[uint32], righ
   var buf = newString(pageSize)
   buf[0] = char(PageTypeInternal)
   buf[1] = '\0'
-  writeU32LE(buf, 4, rightChild)
   let count = uint16(keys.len)
   buf[2] = char(byte(count and 0xFF))
   buf[3] = char(byte((count shr 8) and 0xFF))
+  writeU32LE(buf, 4, rightChild)
   var offset = 8
   for i in 0 ..< keys.len:
-    writeU64LE(buf, offset, keys[i])
-    writeU32LE(buf, offset + 8, children[i])
-    offset += 12
+    let keyBytes = encodeVarint(keys[i])
+    for b in keyBytes:
+      buf[offset] = char(b)
+      offset.inc
+    let childBytes = encodeVarint(uint64(children[i]))
+    for b in childBytes:
+      buf[offset] = char(b)
+      offset.inc
   buf
 
 suite "BTree":
