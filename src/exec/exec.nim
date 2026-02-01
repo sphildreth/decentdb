@@ -432,6 +432,190 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
   ## - err(...) on real execution errors
   if plan == nil:
     return ok(none(int64))
+
+  type LikeMode = enum
+    lmGeneric
+    lmContains
+    lmPrefix
+    lmSuffix
+
+  proc parseLikePattern(pattern: string, caseInsensitive: bool): (LikeMode, string) =
+    ## Extract a simple LIKE pattern into a fast match mode when possible.
+    ## Returns (mode, needleText). For lmGeneric, needleText is unused.
+    if pattern.find('_') >= 0:
+      return (lmGeneric, "")
+
+    # For now, only optimize the case-sensitive common forms.
+    if not caseInsensitive:
+      # '%needle%'
+      if pattern.len >= 2 and pattern[0] == '%' and pattern[^1] == '%':
+        let inner = pattern[1 .. ^2]
+        if inner.len == 0:
+          return (lmContains, "")
+        if inner.find('%') < 0:
+          return (lmContains, inner)
+
+      # 'prefix%'
+      if pattern.len >= 1 and pattern[^1] == '%' and pattern.find('%') == pattern.len - 1:
+        let prefix = pattern[0 .. ^2]
+        return (lmPrefix, prefix)
+
+      # '%suffix'
+      if pattern.len >= 1 and pattern[0] == '%' and pattern.rfind('%') == 0:
+        let suffix = pattern[1 .. ^1]
+        return (lmSuffix, suffix)
+
+    (lmGeneric, "")
+
+  proc extractSimpleLike(expr: Expr, table: string, columnOut: var string, patternOut: var Expr, insensitiveOut: var bool): bool =
+    ## Return true for a single-column LIKE/ILIKE predicate.
+    if expr == nil or expr.kind != ekBinary or not (expr.op in ["LIKE", "ILIKE"]):
+      return false
+    insensitiveOut = expr.op == "ILIKE"
+    let left = expr.left
+    let right = expr.right
+    if left != nil and left.kind == ekColumn and (left.table.len == 0 or left.table == table):
+      columnOut = left.name
+      patternOut = right
+      return true
+    if right != nil and right.kind == ekColumn and (right.table.len == 0 or right.table == table):
+      columnOut = right.name
+      patternOut = left
+      return true
+    false
+
+  proc bytesEqAt(hay: openArray[byte], hayStart: int, needle: openArray[byte]): bool {.inline.} =
+    if needle.len == 0:
+      return true
+    if hayStart < 0 or hayStart + needle.len > hay.len:
+      return false
+    for i in 0 ..< needle.len:
+      if hay[hayStart + i] != needle[i]:
+        return false
+    true
+
+  proc bytesFindIn(hay: openArray[byte], hayStart: int, hayLen: int, needle: openArray[byte]): int =
+    if needle.len == 0:
+      return 0
+    if hayLen < 0 or needle.len > hayLen:
+      return -1
+    let last = hayStart + hayLen - needle.len
+    for i in hayStart .. last:
+      if hay[i] == needle[0] and bytesEqAt(hay, i, needle):
+        return i - hayStart
+    -1
+
+  proc bytesStartsWithIn(hay: openArray[byte], hayStart: int, hayLen: int, needle: openArray[byte]): bool {.inline.} =
+    if needle.len == 0:
+      return true
+    if needle.len > hayLen:
+      return false
+    bytesEqAt(hay, hayStart, needle)
+
+  proc bytesEndsWithIn(hay: openArray[byte], hayStart: int, hayLen: int, needle: openArray[byte]): bool {.inline.} =
+    if needle.len == 0:
+      return true
+    if needle.len > hayLen:
+      return false
+    bytesEqAt(hay, hayStart + hayLen - needle.len, needle)
+
+  proc matchLikeInRecord(recordData: openArray[byte], colIndex: int, mode: LikeMode, needleBytes: seq[byte], pattern: string, caseInsensitive: bool): Result[bool] =
+    ## Fast LIKE matcher for a single TEXT column inside a record.
+    ## Falls back to full decode for uncommon encodings.
+    var offset = 0
+    let countRes = decodeVarint(recordData, offset)
+    if not countRes.ok:
+      return err[bool](countRes.err.code, countRes.err.message, countRes.err.context)
+    let fieldCount = int(countRes.value)
+    if colIndex < 0 or colIndex >= fieldCount:
+      return ok(false)
+
+    for idx in 0 ..< fieldCount:
+      if offset >= recordData.len:
+        return err[bool](ERR_CORRUPTION, "Unexpected end of record")
+      let kindValue = int(recordData[offset])
+      if kindValue < 0 or kindValue > ord(high(ValueKind)):
+        return err[bool](ERR_CORRUPTION, "Unknown value kind")
+      let kind = ValueKind(kindValue)
+      offset.inc
+
+      let lenRes = decodeVarint(recordData, offset)
+      if not lenRes.ok:
+        return err[bool](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+      let length = int(lenRes.value)
+      if offset + length > recordData.len:
+        return err[bool](ERR_CORRUPTION, "Record field length out of bounds")
+
+      if idx == colIndex:
+        case kind
+        of vkNull:
+          return ok(false)
+        of vkText:
+          if mode == lmGeneric or caseInsensitive:
+            var s = newString(length)
+            if length > 0:
+              copyMem(addr s[0], unsafeAddr recordData[offset], length)
+            let likeRes = likeMatchChecked(s, pattern, caseInsensitive)
+            if not likeRes.ok:
+              return err[bool](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+            return ok(likeRes.value)
+
+          if mode == lmContains:
+            if needleBytes.len == 0:
+              return ok(true)
+            return ok(bytesFindIn(recordData, offset, length, needleBytes) >= 0)
+          if mode == lmPrefix:
+            return ok(bytesStartsWithIn(recordData, offset, length, needleBytes))
+          if mode == lmSuffix:
+            return ok(bytesEndsWithIn(recordData, offset, length, needleBytes))
+          return ok(false)
+        else:
+          # Overflow/compressed/non-text: decode fully and reuse generic matcher.
+          let decoded = decodeRecordWithOverflow(pager, recordData)
+          if not decoded.ok:
+            return err[bool](decoded.err.code, decoded.err.message, decoded.err.context)
+          if colIndex >= decoded.value.len:
+            return ok(false)
+          let v = decoded.value[colIndex]
+          if v.kind != vkText:
+            return ok(false)
+          let s = valueToString(v)
+          let likeRes = likeMatchChecked(s, pattern, caseInsensitive)
+          if not likeRes.ok:
+            return err[bool](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+          return ok(likeRes.value)
+
+      offset += length
+    ok(false)
+
+  proc countLikeTableScan(table: TableMeta, colIndex: int, patternStr: string, caseInsensitive: bool): Result[int64] =
+    ## Count matches for a single-column LIKE by scanning the base table.
+    let (mode, needleText) = parseLikePattern(patternStr, caseInsensitive)
+    var needleBytes: seq[byte] = @[]
+    if mode != lmGeneric:
+      needleBytes = newSeq[byte](needleText.len)
+      for i, ch in needleText:
+        needleBytes[i] = byte(ch)
+    let tree = newBTree(pager, table.rootPage)
+    let cursorRes = openCursor(tree)
+    if not cursorRes.ok:
+      return err[int64](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+    let btCursor = cursorRes.value
+    var count: int64 = 0
+    while true:
+      let nextRes = cursorNext(btCursor)
+      if not nextRes.ok:
+        break
+      let (_, valueBytes, overflow) = nextRes.value
+      if valueBytes.len == 0 and overflow == 0'u32:
+        continue
+      let mRes = matchLikeInRecord(valueBytes, colIndex, mode, needleBytes, patternStr, caseInsensitive)
+      if not mRes.ok:
+        return err[int64](mRes.err.code, mRes.err.message, mRes.err.context)
+      if mRes.value:
+        count.inc
+    ok(count)
+
   case plan.kind
   of pkProject:
     # Projection does not affect row count.
@@ -524,6 +708,121 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     if not existsRes.ok:
       return err[Option[int64]](existsRes.err.code, existsRes.err.message, existsRes.err.context)
     return ok(some(if existsRes.value: 1'i64 else: 0'i64))
+
+  of pkTrigramSeek:
+    let patternRes = evalExpr(Row(), plan.likeExpr, params)
+    if not patternRes.ok:
+      return err[Option[int64]](patternRes.err.code, patternRes.err.message, patternRes.err.context)
+    let patternStr = valueToString(patternRes.value)
+
+    let tableRes = catalog.getTable(plan.table)
+    if not tableRes.ok:
+      return err[Option[int64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+
+    let indexOpt = catalog.getTrigramIndexForColumn(plan.table, plan.column)
+    if isNone(indexOpt):
+      return err[Option[int64]](ERR_SQL, "Trigram index not found", plan.table & "." & plan.column)
+    let idx = indexOpt.get
+
+    var colIndex = -1
+    for i, col in table.columns:
+      if col.name == plan.column:
+        colIndex = i
+        break
+    if colIndex < 0:
+      return err[Option[int64]](ERR_SQL, "Column not found", plan.column)
+
+    # Mirror trigramSeekRows heuristics.
+    var stripped = ""
+    for ch in patternStr:
+      if ch != '%' and ch != '_':
+        stripped.add(ch)
+    let normalized = canonicalize(stripped)
+    if normalized.len < 3:
+      let countRes = countLikeTableScan(table, colIndex, patternStr, plan.likeInsensitive)
+      if not countRes.ok:
+        return err[Option[int64]](countRes.err.code, countRes.err.message, countRes.err.context)
+      return ok(some(countRes.value))
+
+    let grams = trigrams(normalized)
+    if grams.len == 0:
+      return ok(some(0'i64))
+
+    var postingsLists: seq[seq[uint64]] = @[]
+    var rarestCount = -1
+    for g in grams:
+      let postRes = getTrigramPostingsWithDeltas(pager, catalog, idx, g)
+      if not postRes.ok:
+        return err[Option[int64]](postRes.err.code, postRes.err.message, postRes.err.context)
+      let list = postRes.value
+      if list.len == 0:
+        return ok(some(0'i64))
+      postingsLists.add(list)
+      if rarestCount < 0 or list.len < rarestCount:
+        rarestCount = list.len
+
+    let threshold = DefaultPostingsThreshold
+    if normalized.len <= 5 and rarestCount >= threshold:
+      let countRes = countLikeTableScan(table, colIndex, patternStr, plan.likeInsensitive)
+      if not countRes.ok:
+        return err[Option[int64]](countRes.err.code, countRes.err.message, countRes.err.context)
+      return ok(some(countRes.value))
+
+    var candidates = intersectPostings(postingsLists)
+    if normalized.len > 5 and rarestCount >= threshold and candidates.len > threshold:
+      candidates.setLen(threshold)
+
+    var count: int64 = 0
+    for rowid in candidates:
+      let readRes = readRowAt(pager, table, rowid)
+      if not readRes.ok:
+        continue
+      if colIndex >= readRes.value.values.len:
+        continue
+      let text = valueToString(readRes.value.values[colIndex])
+      let likeRes = likeMatchChecked(text, patternStr, plan.likeInsensitive)
+      if not likeRes.ok:
+        return err[Option[int64]](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+      if likeRes.value:
+        count.inc
+    return ok(some(count))
+
+  of pkFilter:
+    if plan.predicate == nil:
+      return tryCountNoRowsFast(pager, catalog, plan.left, params)
+    if plan.left == nil or plan.left.kind != pkTableScan:
+      return ok(none(int64))
+
+    let tableRes = catalog.getTable(plan.left.table)
+    if not tableRes.ok:
+      return err[Option[int64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+
+    var colName = ""
+    var patExpr: Expr = nil
+    var insensitive = false
+    if not extractSimpleLike(plan.predicate, plan.left.table, colName, patExpr, insensitive):
+      return ok(none(int64))
+
+    var colIndex = -1
+    for i, col in table.columns:
+      if col.name == colName:
+        colIndex = i
+        break
+    if colIndex < 0:
+      return ok(none(int64))
+
+    let patValRes = evalExpr(Row(), patExpr, params)
+    if not patValRes.ok:
+      return err[Option[int64]](patValRes.err.code, patValRes.err.message, patValRes.err.context)
+    if patValRes.value.kind != vkText:
+      return err[Option[int64]](ERR_SQL, "LIKE pattern must be TEXT")
+    let patternStr = valueToString(patValRes.value)
+    let countRes = countLikeTableScan(table, colIndex, patternStr, insensitive)
+    if not countRes.ok:
+      return err[Option[int64]](countRes.err.code, countRes.err.message, countRes.err.context)
+    return ok(some(countRes.value))
 
   else:
     return ok(none(int64))

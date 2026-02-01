@@ -90,6 +90,10 @@ suite "SQL Exec":
     check res.ok
     check res.value == 2
 
+    let resLike = execSqlNoRows(db, "SELECT * FROM t WHERE name LIKE '%A%'", @[])
+    check resLike.ok
+    check resLike.value == 2
+
     discard closeDb(db)
 
 proc makeCatalog(): Catalog =
