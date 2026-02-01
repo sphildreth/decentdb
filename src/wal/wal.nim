@@ -33,6 +33,13 @@ type WalFailpoint* = object
   partialBytes*: int
   remaining*: int
 
+type ReaderInfo* = object
+  ## Extended information about a reader for resource management
+  snapshot*: uint64
+  started*: float
+  lastWarningAt*: float  # When the last warning was issued
+  bytesAtStart*: int64   # WAL size when reader started
+
 type Wal* = ref object
   vfs*: Vfs
   file*: VfsFile
@@ -45,7 +52,7 @@ type Wal* = ref object
   lock*: Lock
   indexLock*: Lock
   readerLock*: Lock
-  readers*: Table[int, tuple[snapshot: uint64, started: float]]
+  readers*: Table[int, ReaderInfo]
   abortedReaders*: HashSet[int]
   nextReaderId*: int
   failpoints*: Table[string, WalFailpoint]
@@ -57,6 +64,15 @@ type Wal* = ref object
   readerTimeoutMs*: int64
   forceTruncateOnTimeout*: bool
   warnings*: seq[string]
+  # Memory tracking for WAL index
+  indexMemoryBytes*: int64
+  checkpointMemoryThreshold*: int64  # Trigger checkpoint when index exceeds this
+  # HIGH-006: Long-running reader resource management
+  maxWalBytesPerReader*: int64  # Max WAL bytes a reader can pin (0 = disabled)
+  readerCheckIntervalMs*: int64  # How often to check readers (0 = check every operation)
+  lastReaderCheckAt*: float  # Last time reader check was performed
+  totalReadersAborted*: int64  # Stats: total readers aborted due to timeout
+  totalWarningsIssued*: int64  # Stats: total warnings issued
 
 const HeaderSize = 1 + 4 + 4
 const TrailerSize = 8 + 8
@@ -117,11 +133,17 @@ proc newWal*(vfs: Vfs, path: string): Result[Wal] =
     endOffset: getFileInfo(path).size,
     index: initTable[PageId, seq[WalIndexEntry]](),
     dirtySinceCheckpoint: initTable[PageId, WalIndexEntry](),
-    readers: initTable[int, tuple[snapshot: uint64, started: float]](),
+    readers: initTable[int, ReaderInfo](),
     abortedReaders: initHashSet[int](),
     failpoints: initTable[string, WalFailpoint](),
     warnings: @[],
-    lastCheckpointAt: epochTime()
+    lastCheckpointAt: epochTime(),
+    lastReaderCheckAt: 0.0,
+    # HIGH-006: Disabled by default (zero-cost when not configured)
+    maxWalBytesPerReader: 0,
+    readerCheckIntervalMs: 0,
+    totalReadersAborted: 0,
+    totalWarningsIssued: 0
   )
   initLock(wal.lock)
   initLock(wal.indexLock)
@@ -186,6 +208,8 @@ proc encodeCheckpointPayload(lsn: uint64): seq[byte] =
   writeU64LE(result, 0, lsn)
 
 proc readersOverThreshold*(wal: Wal, thresholdMs: int64): seq[tuple[id: int, snapshot: uint64, ageMs: int64]] =
+  ## Find all readers that have been running longer than thresholdMs.
+  ## This is used for warning and timeout detection.
   if thresholdMs <= 0:
     return @[]
   let now = epochTime()
@@ -195,6 +219,68 @@ proc readersOverThreshold*(wal: Wal, thresholdMs: int64): seq[tuple[id: int, sna
     if elapsedMs >= thresholdMs:
       result.add((id: id, snapshot: info.snapshot, ageMs: elapsedMs))
   release(wal.readerLock)
+
+proc readersExceedingWalLimit*(wal: Wal): seq[tuple[id: int, snapshot: uint64, bytesPinned: int64, ageMs: int64]] =
+  ## HIGH-006: Find readers that are pinning too much WAL data.
+  ## Returns readers where (current WAL size - bytes at start) > maxWalBytesPerReader.
+  ## Zero-cost when maxWalBytesPerReader is 0 (disabled).
+  if wal.maxWalBytesPerReader <= 0:
+    return @[]
+  
+  let now = epochTime()
+  let currentWalSize = wal.endOffset
+  
+  acquire(wal.readerLock)
+  defer: release(wal.readerLock)
+  
+  for id, info in wal.readers:
+    let bytesPinned = currentWalSize - info.bytesAtStart
+    if bytesPinned > wal.maxWalBytesPerReader:
+      let ageMs = int64((now - info.started) * 1000)
+      result.add((id: id, snapshot: info.snapshot, bytesPinned: bytesPinned, ageMs: ageMs))
+
+proc readerWalSize*(wal: Wal, readerId: int): int64 =
+  ## Calculate the amount of WAL data pinned by a specific reader.
+  ## Returns 0 if reader doesn't exist or reader has been cleaned up.
+  acquire(wal.readerLock)
+  defer: release(wal.readerLock)
+  
+  if not wal.readers.hasKey(readerId):
+    return 0
+  
+  let info = wal.readers[readerId]
+  let currentWalSize = wal.endOffset
+  result = currentWalSize - info.bytesAtStart
+  if result < 0:
+    result = 0  # Shouldn't happen, but be safe
+
+proc getReaderStats*(wal: Wal): tuple[activeReaders: int, oldestReaderAgeMs: int64, totalWalPinned: int64, totalAborted: int64, totalWarnings: int64] =
+  ## Get statistics about current readers and WAL retention.
+  ## This helps monitor WAL growth and reader behavior.
+  acquire(wal.readerLock)
+  defer: release(wal.readerLock)
+  
+  let now = epochTime()
+  var oldestStart = now
+  var totalPinned: int64 = 0
+  let currentWalSize = wal.endOffset
+  
+  for id, info in wal.readers:
+    if info.started < oldestStart:
+      oldestStart = info.started
+    let pinned = currentWalSize - info.bytesAtStart
+    if pinned > 0:
+      totalPinned += pinned
+  
+  let oldestAgeMs = if wal.readers.len > 0: int64((now - oldestStart) * 1000) else: 0
+  
+  result = (
+    activeReaders: wal.readers.len,
+    oldestReaderAgeMs: oldestAgeMs,
+    totalWalPinned: totalPinned,
+    totalAborted: wal.totalReadersAborted,
+    totalWarnings: wal.totalWarningsIssued
+  )
 
 proc minReaderSnapshot*(wal: Wal): Option[uint64] =
   acquire(wal.readerLock)
@@ -207,6 +293,17 @@ proc minReaderSnapshot*(wal: Wal): Option[uint64] =
   release(wal.readerLock)
   if has: some(minSnap) else: none(uint64)
 
+proc shouldCheckReaders*(wal: Wal): bool =
+  ## HIGH-006: Determine if we should perform reader checks now.
+  ## Zero-cost check when readerCheckIntervalMs is 0 (always check) or features disabled.
+  if wal.readerWarnMs <= 0 and wal.readerTimeoutMs <= 0 and wal.maxWalBytesPerReader <= 0:
+    return false
+  if wal.readerCheckIntervalMs <= 0:
+    return true
+  let now = epochTime()
+  let elapsedMs = int64((now - wal.lastReaderCheckAt) * 1000)
+  return elapsedMs >= wal.readerCheckIntervalMs
+
 proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
   # Phase 1: Acquire lock, determine what to checkpoint, then release lock
   acquire(wal.lock)
@@ -217,21 +314,62 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
     release(wal.lock)
     wal.lastCheckpointAt = epochTime()
     return ok(lastCommit)
-  if wal.readerWarnMs > 0:
+  
+  # HIGH-006: Check if it's time to check readers
+  let shouldCheck = wal.shouldCheckReaders()
+  if shouldCheck:
+    wal.lastReaderCheckAt = epochTime()
+  
+  # Check for long-running readers (warnings)
+  if shouldCheck and wal.readerWarnMs > 0:
     let warningReaders = wal.readersOverThreshold(wal.readerWarnMs)
+    acquire(wal.readerLock)
     for info in warningReaders:
-      wal.recordWarningLocked("Long-running reader id=" & $info.id & " snapshot=" & $info.snapshot & " age_ms=" & $info.ageMs)
-  if wal.readerTimeoutMs > 0:
+      if wal.readers.hasKey(info.id):
+        let readerInfo = wal.readers[info.id]
+        # Only warn once per reader (or at intervals)
+        let timeSinceLastWarning = epochTime() - readerInfo.lastWarningAt
+        if readerInfo.lastWarningAt == 0.0 or timeSinceLastWarning >= 60.0:  # Warn at most once per minute
+          wal.readers[info.id].lastWarningAt = epochTime()
+          wal.totalWarningsIssued.inc
+          let bytesPinned = wal.endOffset - readerInfo.bytesAtStart
+          wal.recordWarningLocked("Long-running reader id=" & $info.id & 
+            " snapshot=" & $info.snapshot & " age_ms=" & $info.ageMs & 
+            " wal_pinned_bytes=" & $bytesPinned)
+    release(wal.readerLock)
+  
+  # Check for timed-out readers (abort)
+  if shouldCheck and wal.readerTimeoutMs > 0:
     let timedOut = wal.readersOverThreshold(wal.readerTimeoutMs)
     if timedOut.len > 0:
-      for info in timedOut:
-        wal.recordWarningLocked("Reader timeout id=" & $info.id & " snapshot=" & $info.snapshot & " age_ms=" & $info.ageMs)
       acquire(wal.readerLock)
       for info in timedOut:
         wal.abortedReaders.incl(info.id)
         if wal.readers.hasKey(info.id):
+          let readerInfo = wal.readers[info.id]
+          let bytesPinned = wal.endOffset - readerInfo.bytesAtStart
           wal.readers.del(info.id)
+          wal.totalReadersAborted.inc
+          wal.recordWarningLocked("Reader timeout id=" & $info.id & 
+            " snapshot=" & $info.snapshot & " age_ms=" & $info.ageMs &
+            " wal_pinned_bytes=" & $bytesPinned)
       release(wal.readerLock)
+  
+  # HIGH-006: Check for readers exceeding WAL size limit
+  if shouldCheck and wal.maxWalBytesPerReader > 0:
+    let oversizedReaders = wal.readersExceedingWalLimit()
+    if oversizedReaders.len > 0:
+      acquire(wal.readerLock)
+      for info in oversizedReaders:
+        wal.abortedReaders.incl(info.id)
+        if wal.readers.hasKey(info.id):
+          wal.readers.del(info.id)
+          wal.totalReadersAborted.inc
+          wal.recordWarningLocked("Reader WAL limit exceeded id=" & $info.id &
+            " snapshot=" & $info.snapshot & " wal_pinned_bytes=" & $info.bytesPinned &
+            " limit=" & $wal.maxWalBytesPerReader)
+      release(wal.readerLock)
+  
   let minSnap = wal.minReaderSnapshot()
   let safeLsn =
     if minSnap.isNone:
@@ -339,7 +477,18 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
   
   acquire(wal.lock)
   wal.lastCheckpointAt = epochTime()
-  if minSnap.isNone or minSnap.get >= lastCommit:
+  
+  # Check if new commits occurred during checkpoint I/O phase
+  # If so, we cannot truncate the WAL or clear the index completely
+  let currentEnd = wal.walEnd.load(moAcquire)
+  let hadNewCommits = currentEnd > lastCommit
+  
+  # Only truncate if:
+  # 1. No active readers (minSnap.isNone) OR all readers are at or past lastCommit
+  # 2. AND no new commits occurred during checkpoint
+  let canTruncate = (minSnap.isNone or minSnap.get >= lastCommit) and not hadNewCommits
+  
+  if canTruncate:
     release(wal.lock)
     let truncRes = wal.vfs.truncate(wal.file, 0)
     if not truncRes.ok:
@@ -353,9 +502,26 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
     wal.dirtySinceCheckpoint.clear()
     release(wal.indexLock)
     wal.endOffset = 0
+  elif hadNewCommits:
+    # New commits occurred during checkpoint - cannot truncate
+    # Keep the index entries for pages with LSN > safeLsn
+    acquire(wal.indexLock)
+    # Remove only entries with LSN <= safeLsn from dirtySinceCheckpoint
+    # but keep entries with LSN > safeLsn (newer commits during checkpoint)
+    var toRemove: seq[PageId] = @[]
+    for pageId, entry in wal.dirtySinceCheckpoint.pairs:
+      if entry.lsn <= safeLsn:
+        toRemove.add(pageId)
+    for pageId in toRemove:
+      wal.dirtySinceCheckpoint.del(pageId)
+    # Note: wal.index is not cleared - it still contains entries for newer commits
+    release(wal.indexLock)
   wal.checkpointPending = false
   release(wal.lock)
   ok(safeLsn)
+
+# Forward declaration
+proc estimateIndexMemoryUsage*(wal: Wal): int64
 
 proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
   var trigger = false
@@ -366,6 +532,11 @@ proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
     let elapsedMs = int64((epochTime() - wal.lastCheckpointAt) * 1000)
     if elapsedMs >= wal.checkpointEveryMs:
       trigger = true
+  # Check memory threshold for WAL index
+  if wal.checkpointMemoryThreshold > 0:
+    let memUsage = estimateIndexMemoryUsage(wal)
+    if memUsage >= wal.checkpointMemoryThreshold:
+      trigger = true
   if not trigger:
     return ok(false)
   let chkRes = checkpoint(wal, pager)
@@ -374,21 +545,39 @@ proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
   ok(true)
 
 proc recover*(wal: Wal): Result[Void] =
+  ## Recover WAL state after restart/crash.
+  ## 
+  ## Processes all frames to rebuild the index and validate invariants.
+  ## Checkpoint frames are tracked to establish the safe recovery point.
   wal.index.clear()
   wal.dirtySinceCheckpoint.clear()
   var pending: seq[(PageId, uint64, int64)] = @[]
   var lastCommit: uint64 = 0
+  var lastCheckpointLsn: uint64 = 0
   var offset: int64 = 0
+  var frameCount: int = 0
+  var commitCount: int = 0
+  var checkpointCount: int = 0
+  
   while true:
     let frameOffset = offset
     let frameRes = readFrame(wal.vfs, wal.file, frameOffset)
     if not frameRes.ok:
       break
-    let (frameType, pageId, _, lsn, nextOffset) = frameRes.value
+    let (frameType, pageId, payload, lsn, nextOffset) = frameRes.value
+    frameCount.inc
+    
     case frameType
     of wfPage:
+      # Validate page frame invariants
+      if pageId == 0:
+        return err[Void](ERR_CORRUPTION, "Invalid page ID in WAL frame", "offset=" & $frameOffset)
+      if lsn == 0:
+        return err[Void](ERR_CORRUPTION, "Invalid LSN in WAL frame", "offset=" & $frameOffset)
       pending.add((PageId(pageId), lsn, frameOffset))
+      
     of wfCommit:
+      commitCount.inc
       var commitMeta: seq[(PageId, WalIndexEntry)] = @[]
       for entry in pending:
         if not wal.index.hasKey(entry[0]):
@@ -402,20 +591,58 @@ proc recover*(wal: Wal): Result[Void] =
       pending = @[]
       if lsn > lastCommit:
         lastCommit = lsn
+        
     of wfCheckpoint:
-      discard
+      checkpointCount.inc
+      # Decode checkpoint payload to get the safe LSN
+      if payload.len >= 8:
+        let chkLsn = readU64LE(payload, 0)
+        if chkLsn > lastCheckpointLsn:
+          lastCheckpointLsn = chkLsn
+      # Discard any pending frames before this checkpoint
+      # They have been safely written to the main database file
+      pending = @[]
+      
     offset = nextOffset
+  
+  # Validation: Ensure LSN ordering
+  if lastCheckpointLsn > lastCommit:
+    return err[Void](ERR_CORRUPTION, "Checkpoint LSN exceeds commit LSN", 
+                    "checkpoint=" & $lastCheckpointLsn & " commit=" & $lastCommit)
+  
+  # Warn about incomplete transactions (pages without commits)
+  if pending.len > 0:
+    # These are uncommitted changes - they will be discarded
+    stderr.writeLine("Warning: " & $pending.len & " uncommitted WAL frames discarded during recovery")
+  
   wal.endOffset = offset
   wal.walEnd.store(lastCommit, moRelease)
   wal.nextLsn = max(wal.nextLsn, lastCommit + 1)
+  
+  # Validation: Ensure we have a consistent state
+  if wal.index.len > 0 and lastCommit == 0:
+    return err[Void](ERR_CORRUPTION, "WAL index non-empty but no commits found")
+  
+  # Log recovery summary
+  stderr.writeLine("WAL recovery complete: " & $frameCount & " frames, " & 
+                   $commitCount & " commits, " & $checkpointCount & " checkpoints")
+  
   okVoid()
 
 proc beginRead*(wal: Wal): ReadTxn =
+  ## Begin a read transaction.
+  ## Tracks reader start time and WAL size for resource management (HIGH-006).
   let snapshot = wal.walEnd.load(moAcquire)
   acquire(wal.readerLock)
   let readerId = wal.nextReaderId
   wal.nextReaderId.inc
-  wal.readers[readerId] = (snapshot: snapshot, started: epochTime())
+  let now = epochTime()
+  wal.readers[readerId] = ReaderInfo(
+    snapshot: snapshot, 
+    started: now,
+    lastWarningAt: 0.0,
+    bytesAtStart: wal.endOffset
+  )
   wal.abortedReaders.excl(readerId)
   release(wal.readerLock)
   ReadTxn(id: readerId, snapshot: snapshot)
@@ -438,12 +665,40 @@ proc isAborted*(wal: Wal, txn: ReadTxn): bool =
   result = txn.id in wal.abortedReaders
   release(wal.readerLock)
 
-proc setCheckpointConfig*(wal: Wal, everyBytes: int64, everyMs: int64, readerWarnMs: int64 = 0, readerTimeoutMs: int64 = 0, forceTruncateOnTimeout: bool = false) =
+proc setCheckpointConfig*(wal: Wal, everyBytes: int64, everyMs: int64, readerWarnMs: int64 = 0, readerTimeoutMs: int64 = 0, forceTruncateOnTimeout: bool = false, memoryThreshold: int64 = 0, maxWalBytesPerReader: int64 = 0, readerCheckIntervalMs: int64 = 0) =
+  ## Configure checkpoint and reader management settings.
+  ## 
+  ## HIGH-006 parameters:
+  ## - maxWalBytesPerReader: Maximum WAL bytes a single reader can pin (0 = disabled)
+  ## - readerCheckIntervalMs: Minimum time between reader checks (0 = check every operation)
   wal.checkpointEveryBytes = everyBytes
   wal.checkpointEveryMs = everyMs
   wal.readerWarnMs = readerWarnMs
   wal.readerTimeoutMs = readerTimeoutMs
   wal.forceTruncateOnTimeout = forceTruncateOnTimeout
+  wal.checkpointMemoryThreshold = memoryThreshold
+  # HIGH-006: Long-running reader resource management
+  wal.maxWalBytesPerReader = maxWalBytesPerReader
+  wal.readerCheckIntervalMs = readerCheckIntervalMs
+
+proc estimateIndexMemoryUsage*(wal: Wal): int64 =
+  ## Estimate memory usage of the WAL index in bytes.
+  ## This includes the index table and dirtySinceCheckpoint table.
+  acquire(wal.indexLock)
+  defer: release(wal.indexLock)
+  
+  var totalBytes: int64 = 0
+  # Account for table overhead (approximately)
+  totalBytes += int64(wal.index.len) * (sizeof(PageId) + sizeof(pointer) * 2)
+  totalBytes += int64(wal.dirtySinceCheckpoint.len) * (sizeof(PageId) + sizeof(WalIndexEntry) + sizeof(pointer) * 2)
+  
+  # Account for entry sequences
+  for pageId, entries in wal.index:
+    totalBytes += int64(entries.len) * sizeof(WalIndexEntry)
+    totalBytes += sizeof(seq[int])  # seq overhead
+  
+  wal.indexMemoryBytes = totalBytes
+  totalBytes
 
 proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[byte]] =
   acquire(wal.indexLock)
@@ -470,7 +725,15 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
     return none(seq[byte])
   some(payload)
 
-proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: PageId): Result[string] =
+proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: PageId, readerId: int = -1): Result[string] =
+  # Check if this reader has been aborted (timeout)
+  if readerId >= 0:
+    acquire(wal.readerLock)
+    let isAborted = readerId in wal.abortedReaders
+    release(wal.readerLock)
+    if isAborted:
+      return err[string](ERR_TRANSACTION, "Read transaction aborted (timeout)")
+  
   let overlay = wal.getPageAtOrBefore(pageId, snapshot)
   if overlay.isSome:
     let payload = overlay.get
