@@ -617,7 +617,9 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   while true:
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
-      break
+      if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
+        break
+      return err[seq[uint64]](nextRes.err.code, nextRes.err.message, nextRes.err.context)
     if nextRes.value[0] < needle:
       continue
     if nextRes.value[0] > needle:

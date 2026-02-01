@@ -7,6 +7,7 @@ import atomics
 import sets
 import locks
 import sequtils
+import times
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
@@ -1981,7 +1982,6 @@ proc beginTransaction*(db: Db): Result[Void] =
     return err[Void](writerRes.err.code, writerRes.err.message, writerRes.err.context)
   
   db.activeWriter = writerRes.value
-  db.catalog.clearTrigramDeltas()
   
   # Begin tracking page allocations for this transaction (HIGH-003)
   beginTxnPageTracking(db.pager)
@@ -1990,17 +1990,16 @@ proc beginTransaction*(db: Db): Result[Void] =
 
 proc commitTransaction*(db: Db): Result[Void] =
   ## Commit the active transaction
+  ## Note: Trigram deltas are NOT flushed on commit - they are flushed 
+  ## during checkpoint for better performance (MED-003)
   if not db.isOpen:
     return err[Void](ERR_INTERNAL, "Database not open")
   if db.activeWriter == nil:
     return err[Void](ERR_TRANSACTION, "No active transaction")
 
-  let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
-  if not trigramFlushRes.ok:
-    discard rollback(db.activeWriter)
-    db.activeWriter = nil
-    clearCache(db.pager)
-    return err[Void](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
+  # MED-003: Trigram deltas are deferred to checkpoint for better performance
+  # This means trigram indexes may be temporarily out of sync after crash
+  # until a checkpoint completes. The B+Tree data is always durable.
 
   let dirtyPages = snapshotDirtyPages(db.pager)
   var pageIds: seq[PageId] = @[]
@@ -2027,6 +2026,26 @@ proc commitTransaction*(db: Db): Result[Void] =
   if pageIds.len > 0:
     markPagesCommitted(db.pager, pageIds, commitRes.value)
 
+  # MED-003: Check if checkpoint will be triggered and flush trigram deltas first
+  # This ensures trigram indexes are consistent with the checkpointed data
+  var willCheckpoint = false
+  if db.wal.checkpointEveryBytes > 0 and db.wal.endOffset >= db.wal.checkpointEveryBytes:
+    willCheckpoint = true
+  if db.wal.checkpointEveryMs > 0:
+    let elapsedMs = int64((epochTime() - db.wal.lastCheckpointAt) * 1000)
+    if elapsedMs >= db.wal.checkpointEveryMs:
+      willCheckpoint = true
+  if db.wal.checkpointMemoryThreshold > 0:
+    let memUsage = estimateIndexMemoryUsage(db.wal)
+    if memUsage >= db.wal.checkpointMemoryThreshold:
+      willCheckpoint = true
+  
+  if willCheckpoint:
+    let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
+    if not trigramFlushRes.ok:
+      db.activeWriter = nil
+      return err[Void](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
+  
   let chkRes = maybeCheckpoint(db.wal, db.pager)
   if not chkRes.ok:
     db.activeWriter = nil
@@ -2050,36 +2069,39 @@ proc rollbackTransaction*(db: Db): Result[Void] =
   if db.activeWriter == nil:
     return err[Void](ERR_TRANSACTION, "No active transaction")
   
-  # Hold rollback lock during both WAL rollback and cache eviction
-  # to prevent readers from seeing dirty state during the transition
+  # Hold rollback lock only across the atomic rollback window:
+  # WAL rollback + cache eviction + page allocation rollback.
+  # Do not hold it while reading pages (readPage/withPageRo acquire it internally).
   acquire(db.pager.rollbackLock)
-  defer: release(db.pager.rollbackLock)
-  
+
   let dirtyPages = snapshotDirtyPages(db.pager)
   let rollbackRes = rollback(db.activeWriter)
   db.activeWriter = nil
   if not rollbackRes.ok:
+    release(db.pager.rollbackLock)
     return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
-  
+
   # Evict dirty pages immediately while holding rollback lock
   if dirtyPages.len > 0:
-    rollbackCache(db.pager)
-  
+    rollbackCacheLocked(db.pager)
+
   # Return allocated pages to freelist (HIGH-003)
   let freeRes = rollbackTxnPageAllocations(db.pager)
   if not freeRes.ok:
     # Log error but continue - partial cleanup is better than none
     stderr.writeLine("Warning: failed to return some allocated pages to freelist during rollback")
-  
+
   db.catalog.clearTrigramDeltas()
-  
+
+  release(db.pager.rollbackLock)
+
   # Reload header and catalog to revert any in-memory changes
   let page1Res = readPage(db.pager, PageId(1))
   if page1Res.ok:
     let hRes = decodeHeader(page1Res.value)
     if hRes.ok:
       db.pager.header = hRes.value
-     
+
   let txn = beginRead(db.wal)
   db.pager.overlaySnapshot = txn.snapshot
   let reloadRes = initCatalog(db.pager)
@@ -2088,12 +2110,20 @@ proc rollbackTransaction*(db: Db): Result[Void] =
 
   if reloadRes.ok:
     db.catalog = reloadRes.value
-  
+
   okVoid()
 
 proc checkpointDb*(db: Db): Result[uint64] =
-  ##  Force a checkpoint of the WAL
+  ## Force a checkpoint of the WAL.
+  ## Also flushes any pending trigram index deltas (MED-003).
   if not db.isOpen:
     return err[uint64](ERR_INTERNAL, "Database not open")
+  
+  # MED-003: Flush trigram deltas during checkpoint rather than on every commit
+  # This amortizes the cost across multiple transactions while ensuring
+  # trigram indexes are eventually consistent with the B+Tree data.
+  let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
+  if not trigramFlushRes.ok:
+    return err[uint64](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
   
   checkpoint(db.wal, db.pager)

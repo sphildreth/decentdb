@@ -191,6 +191,22 @@ proc freeBTreePagesExceptRoot*(pager: Pager, root: PageId): Result[Void] =
 proc newBTree*(pager: Pager, root: PageId): BTree =
   BTree(pager: pager, root: root)
 
+proc findChildPage(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
+  ## Binary search to find the appropriate child page for a key.
+  ## Finds the first key > search key and returns corresponding children[index].
+  ## Returns rightChild if key >= all keys.
+  var lo = 0
+  var hi = keys.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if keys[mid] <= key:
+      lo = mid + 1
+    else:
+      hi = mid
+  if lo < keys.len:
+    return children[lo]
+  return rightChild
+
 proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
   var current = tree.root
   while true:
@@ -212,12 +228,24 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
     if pageType == PageTypeLeaf:
       return ok(current)
-    var chosen = rightChild
-    for i in 0 ..< keys.len:
-      if key < keys[i]:
-        chosen = children[i]
-        break
+    let chosen = findChildPage(keys, children, rightChild, key)
     current = PageId(chosen)
+
+proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
+  ## Binary search to find the appropriate child page for a key (leftmost variant).
+  ## Finds the first key >= search key and returns corresponding children[index].
+  ## Returns rightChild if key > all keys.
+  var lo = 0
+  var hi = keys.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if keys[mid] < key:
+      lo = mid + 1
+    else:
+      hi = mid
+  if lo < keys.len:
+    return children[lo]
+  return rightChild
 
 proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
   var current = tree.root
@@ -240,11 +268,7 @@ proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
     if pageType == PageTypeLeaf:
       return ok(current)
-    var chosen = rightChild
-    for i in 0 ..< keys.len:
-      if key <= keys[i]:
-        chosen = children[i]
-        break
+    let chosen = findChildPageLeftmost(keys, children, rightChild, key)
     current = PageId(chosen)
 
 proc lowerBound(keys: seq[uint64], key: uint64): int =
@@ -658,12 +682,18 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
   if not internalRes.ok:
     return err[Option[SplitResult]](internalRes.err.code, internalRes.err.message, internalRes.err.context)
   var (keys, children, rightChild) = internalRes.value
-  var childIndex = keys.len
-  for i in 0 ..< keys.len:
-    if key < keys[i]:
-      childIndex = i
-      break
-  let childPage = if childIndex == keys.len: PageId(rightChild) else: PageId(children[childIndex])
+  # Use binary search to find child page - O(log n) instead of O(n)
+  # Finds first key > search key (same logic as findChildPage)
+  var lo = 0
+  var hi = keys.len
+  while lo < hi:
+    let mid = (lo + hi) shr 1
+    if keys[mid] <= key:
+      lo = mid + 1
+    else:
+      hi = mid
+  let childIndex = lo
+  let childPage = if childIndex < keys.len: PageId(children[childIndex]) else: PageId(rightChild)
   let splitRes = insertRecursive(tree, childPage, key, value)
   if not splitRes.ok:
     return err[Option[SplitResult]](splitRes.err.code, splitRes.err.message, splitRes.err.context)

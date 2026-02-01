@@ -26,6 +26,7 @@ type PageCacheShard = ref object
   clock: seq[PageId]
   clockHand: int
   lock*: Lock
+  clockTombstones: int  # Count of deleted entries in clock (for triggering compaction)
 
 type PageCache* = ref object
   capacity*: int
@@ -60,7 +61,13 @@ proc newPageCache*(capacity: int): PageCache =
   var shards: seq[PageCacheShard] = @[]
   for i in 0 ..< shardCount:
     let shardCap = baseCap + (if i < remainder: 1 else: 0)
-    let shard = PageCacheShard(capacity: max(1, shardCap), pages: initTable[PageId, CacheEntry](), clock: @[], clockHand: 0)
+    let shard = PageCacheShard(
+      capacity: max(1, shardCap), 
+      pages: initTable[PageId, CacheEntry](), 
+      clock: @[], 
+      clockHand: 0,
+      clockTombstones: 0
+    )
     initLock(shard.lock)
     shards.add(shard)
   let cache = PageCache(capacity: cap, shards: shards)
@@ -113,45 +120,104 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
   entry.dirty = false
   okVoid()
 
+proc splitmix64(x: uint64): uint64 =
+  ## Splitmix64 hash function for better hash distribution.
+  ## This is a high-quality hash function that provides good
+  ## distribution properties for hash table indexing.
+  var z = x
+  z = (z + 0x9e3779b97f4a7c15'u64)
+  z = (z xor (z shr 30)) * 0xbf58476d1ce4e5b9'u64
+  z = (z xor (z shr 27)) * 0x94d049bb133111eb'u64
+  z = z xor (z shr 31)
+  return z
+
 proc shardFor(cache: PageCache, pageId: PageId): PageCacheShard =
-  let idx = int(pageId mod PageId(cache.shards.len))
+  ## Select shard using splitmix64 hash for better distribution.
+  ## This reduces lock contention compared to simple modulo hashing.
+  let hash = splitmix64(uint64(pageId))
+  let idx = int(hash mod uint64(cache.shards.len))
   cache.shards[idx]
 
+const
+  # Trigger compaction when tombstones exceed this percentage of clock size
+  ClockTombstoneThresholdPct = 25
+
+proc compactClock(shard: PageCacheShard) =
+  ## Remove tombstones from clock array to reclaim space.
+  ## Called periodically when tombstone count exceeds threshold.
+  var newClock: seq[PageId] = @[]
+  # Pre-allocate capacity to minimize reallocations
+  newClock.setLen(0)
+  for pageId in shard.clock:
+    if pageId != PageId(0):  # 0 is tombstone sentinel
+      newClock.add(pageId)
+  shard.clock = newClock
+  shard.clockTombstones = 0
+  if shard.clockHand >= shard.clock.len:
+    shard.clockHand = 0
+
 proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
+  ## Clock eviction with mark-and-compact instead of O(N) deletion.
+  ## Uses PageId(0) as tombstone sentinel and compacts periodically.
   while shard.pages.len >= shard.capacity:
     if shard.clock.len == 0:
       break
+    
+    # Trigger compaction if too many tombstones
+    if shard.clockTombstones > 0 and shard.clock.len > 0:
+      let tombstonePct = (shard.clockTombstones * 100) div shard.clock.len
+      if tombstonePct >= ClockTombstoneThresholdPct:
+        compactClock(shard)
+    
     var scanned = 0
     var evicted = false
     var anyUnpinned = false
-    while scanned < shard.clock.len * 2 and not evicted:
+    let scanLimit = (shard.clock.len - shard.clockTombstones) * 2  # Scan only non-tombstones
+    
+    while scanned < scanLimit and not evicted:
       if shard.clockHand >= shard.clock.len:
         shard.clockHand = 0
+      
       let pageId = shard.clock[shard.clockHand]
-      let entry = shard.pages.getOrDefault(pageId, nil)
       let currentIndex = shard.clockHand
       shard.clockHand.inc
-      scanned.inc
-      if entry == nil:
+      
+      # Skip tombstones
+      if pageId == PageId(0):
         continue
+      
+      scanned.inc
+      let entry = shard.pages.getOrDefault(pageId, nil)
+      
+      if entry == nil:
+        # Entry was removed but not marked as tombstone - mark it now
+        shard.clock[currentIndex] = PageId(0)
+        shard.clockTombstones.inc
+        continue
+      
       if entry.pinCount > 0:
         continue
+      
       anyUnpinned = true
       if entry.refBit:
         entry.refBit = false
         continue
+      
       let flushRes = flushEntry(pager, entry)
       if not flushRes.ok:
         return flushRes
+      
+      # Mark as tombstone instead of O(N) delete
       shard.pages.del(pageId)
-      shard.clock.delete(currentIndex)
-      if shard.clockHand > currentIndex:
-        shard.clockHand.dec
+      shard.clock[currentIndex] = PageId(0)
+      shard.clockTombstones.inc
       evicted = true
+    
     if not evicted:
       if not anyUnpinned:
         return err[Void](ERR_INTERNAL, "No evictable page in cache")
       continue
+  
   okVoid()
 
 proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
@@ -447,12 +513,12 @@ proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
     release(shard.lock)
 
 proc isDirty*(pager: Pager, pageId: PageId): bool =
-  let shard = pager.cache.shards[pageId.int mod pager.cache.shards.len]
+  let shard = shardFor(pager.cache, pageId)
   acquire(shard.lock)
   defer: release(shard.lock)
   if shard.pages.hasKey(pageId):
     return shard.pages[pageId].dirty
-  false
+  return false
 
 proc cacheLoadedCount*(cache: PageCache): int =
   var count = 0
@@ -469,15 +535,14 @@ proc clearCache*(pager: Pager) =
     shard.pages.clear()
     shard.clock = @[]
     shard.clockHand = 0
+    shard.clockTombstones = 0
     release(shard.lock)
 
-proc rollbackCache*(pager: Pager) =
-  ## Evict all dirty pages from the cache atomically.
-  ## 
-  ## This is used during rollback to ensure the cache does not contain
-  ## uncommitted changes. The rollbackLock is held during eviction to
-  ## prevent readers from seeing partial dirty state.
-  acquire(pager.rollbackLock)
+proc rollbackCacheLocked*(pager: Pager) =
+  ## Evict all dirty pages from the cache.
+  ##
+  ## Caller must hold `pager.rollbackLock`.
+  ## Uses tombstones (PageId 0) for O(1) clock cleanup instead of O(N).
   let cache = pager.cache
   for shard in cache.shards:
     acquire(shard.lock)
@@ -485,14 +550,32 @@ proc rollbackCache*(pager: Pager) =
     for id, entry in shard.pages:
       if entry.dirty:
         toRemove.add(id)
+
+    # Build a set for O(1) lookup when scanning clock
+    var removeSet = initHashSet[PageId]()
+    for id in toRemove:
+      removeSet.incl(id)
+
+    # Mark removed pages as tombstones in the clock array
+    for i in 0 ..< shard.clock.len:
+      if shard.clock[i] in removeSet:
+        shard.clock[i] = PageId(0)
+        shard.clockTombstones.inc
+
+    # Remove from pages table
     for id in toRemove:
       shard.pages.del(id)
-      # Removing from clock is harder without a full scan or better structure,
-      # but clockHand will skip deleted IDs eventually if we handle nil entries.
-      # Wait, clock is seq[PageId]. If we remove from pages but not clock, 
-      # clockHand will find an ID that isn't in pages Table. 
-      # shard.clockHand logic handles missing entries.
+
     release(shard.lock)
+
+proc rollbackCache*(pager: Pager) =
+  ## Evict all dirty pages from the cache atomically.
+  ##
+  ## This is used during rollback to ensure the cache does not contain
+  ## uncommitted changes. The rollbackLock is held during eviction to
+  ## prevent readers from seeing partial dirty state.
+  acquire(pager.rollbackLock)
+  rollbackCacheLocked(pager)
   release(pager.rollbackLock)
 
 proc isRollbackInProgress*(pager: Pager): bool =

@@ -348,12 +348,15 @@ suite "HIGH-006: Long-running Reader Resource Management":
       ])
       require insertRes.ok
     
+    # Check if reader was detected as exceeding limit (before checkpoint aborts it)
+    let oversized = readersExceedingWalLimit(db.wal)
+    check oversized.len >= 1
+    
     # Trigger a checkpoint to check readers
     discard checkpoint(db.wal, db.pager)
     
-    # Check if reader was detected as exceeding limit
-    let oversized = readersExceedingWalLimit(db.wal)
-    check oversized.len >= 1  # Should detect at least one oversized reader
+    # Reader should be aborted
+    check isAborted(db.wal, txn)
     
     endRead(db.wal, txn)
     discard closeDb(db)

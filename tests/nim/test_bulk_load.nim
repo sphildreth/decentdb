@@ -3,6 +3,7 @@ import os
 import engine
 import record/record
 import storage/storage
+import catalog/catalog
 import errors
 
 proc makeTempDb(name: string): string =
@@ -38,6 +39,18 @@ suite "Bulk Load":
     check bulkRes.ok
     # Seek on 'body' index since 'id' (PK) no longer has a secondary index.
     let idxRes = indexSeek(db.pager, db.catalog, "docs", "body", Value(kind: vkText, bytes: @['A'.byte, byte(64 + 3)]))
+    if not idxRes.ok:
+      echo "indexSeek failed: ", $idxRes.err.code, " ", idxRes.err.message, " ", idxRes.err.context
+    elif idxRes.value.len == 0:
+      let tRes = db.catalog.getTable("docs")
+      if tRes.ok:
+        let sRes = scanTable(db.pager, tRes.value)
+        if sRes.ok:
+          echo "scanTable(docs) rows=", $sRes.value.len
+        else:
+          echo "scanTable(docs) failed: ", $sRes.err.code, " ", sRes.err.message
+      else:
+        echo "getTable(docs) failed: ", $tRes.err.code, " ", tRes.err.message
     check idxRes.ok
     check idxRes.value.len == 1
     discard closeDb(db)

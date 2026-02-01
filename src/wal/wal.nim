@@ -138,7 +138,7 @@ proc newWal*(vfs: Vfs, path: string): Result[Wal] =
     failpoints: initTable[string, WalFailpoint](),
     warnings: @[],
     lastCheckpointAt: epochTime(),
-    lastReaderCheckAt: 0.0,
+    lastReaderCheckAt: epochTime(),
     # HIGH-006: Disabled by default (zero-cost when not configured)
     maxWalBytesPerReader: 0,
     readerCheckIntervalMs: 0,
@@ -700,6 +700,36 @@ proc estimateIndexMemoryUsage*(wal: Wal): int64 =
   wal.indexMemoryBytes = totalBytes
   totalBytes
 
+proc findBestEntryBinarySearch(entries: seq[WalIndexEntry], snapshot: uint64): Option[tuple[lsn: uint64, offset: int64]] =
+  ## Binary search to find the entry with the largest LSN <= snapshot.
+  ## Entries are sorted by LSN in ascending order.
+  ## Returns none if no entry satisfies the condition.
+  if entries.len == 0:
+    return none(tuple[lsn: uint64, offset: int64])
+  
+  # Check if all entries are too new
+  if entries[0].lsn > snapshot:
+    return none(tuple[lsn: uint64, offset: int64])
+  
+  # Binary search for the rightmost entry <= snapshot
+  var lo = 0
+  var hi = entries.len - 1
+  var bestIdx = -1
+  
+  while lo <= hi:
+    let mid = (lo + hi) shr 1
+    if entries[mid].lsn <= snapshot:
+      bestIdx = mid
+      lo = mid + 1
+    else:
+      hi = mid - 1
+  
+  if bestIdx < 0:
+    return none(tuple[lsn: uint64, offset: int64])
+  
+  let best = entries[bestIdx]
+  some((lsn: best.lsn, offset: best.offset))
+
 proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[byte]] =
   acquire(wal.indexLock)
   defer:
@@ -708,15 +738,12 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
     return none(seq[byte])
 
   let entries = wal.index[pageId]
-  var bestLsn: uint64 = 0
-  var bestOffset: int64 = -1
-  for entry in entries:
-    if entry.lsn <= snapshot and entry.lsn >= bestLsn:
-
-      bestLsn = entry.lsn
-      bestOffset = entry.offset
-  if bestOffset < 0:
+  let bestEntryOpt = findBestEntryBinarySearch(entries, snapshot)
+  
+  if bestEntryOpt.isNone:
     return none(seq[byte])
+  
+  let bestOffset = bestEntryOpt.get.offset
   let frameRes = readFrame(wal.vfs, wal.file, bestOffset)
   if not frameRes.ok:
     return none(seq[byte])
