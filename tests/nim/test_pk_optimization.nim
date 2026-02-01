@@ -8,6 +8,8 @@ import catalog/catalog
 import record/record
 import errors
 import sql/sql
+import sql/binder
+import planner/planner
 
 proc createTestDb(path: string): Db =
   if fileExists(path):
@@ -32,6 +34,20 @@ suite "Primary Key Optimization":
     # Verify no secondary index created for 'id'
     let indexOpt = db.catalog.getIndexByName("pk_users_id_idx")
     check indexOpt.isNone
+
+    # Planner should seek directly by rowid for equality on INT64 PK.
+    let parseRes = parseSql("SELECT * FROM users WHERE id = 100")
+    check parseRes.ok
+    let stmt = parseRes.value.statements[0]
+    let bindRes = bindStatement(db.catalog, stmt)
+    check bindRes.ok
+    let planRes = plan(db.catalog, bindRes.value)
+    check planRes.ok
+    var p = planRes.value
+    while p != nil and p.kind in {pkProject, pkLimit, pkFilter}:
+      p = p.left
+    check p != nil
+    check p.kind == pkRowidSeek
     
     # 2. Insert row with specific ID
     let insertSql = "INSERT INTO users (id, name) VALUES (100, 'alice')"

@@ -805,6 +805,172 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
   err[Statement](ERR_SQL, "Unsupported statement node")
 
 proc parseSql*(sql: string): Result[SqlAst] =
+  # Fast-path parser for a tiny subset of SELECT statements.
+  #
+  # This avoids the cost of pg_query + JSON parsing on common CLI benchmark queries,
+  # while still falling back to the full parser for everything else.
+  proc tryParseFastSelect(sqlText: string): SqlAst =
+    var i = 0
+    proc skipWs() =
+      while i < sqlText.len and sqlText[i].isSpaceAscii:
+        i.inc
+
+    proc consumeChar(ch: char): bool =
+      skipWs()
+      if i < sqlText.len and sqlText[i] == ch:
+        i.inc
+        return true
+      false
+
+    proc consumeKeyword(word: string): bool =
+      skipWs()
+      let start = i
+      if start + word.len > sqlText.len:
+        return false
+      # Case-insensitive match.
+      for k in 0 ..< word.len:
+        if toUpperAscii(sqlText[start + k]) != toUpperAscii(word[k]):
+          return false
+      let endPos = start + word.len
+      # Require a boundary (whitespace/punct/end) after keyword.
+      if endPos < sqlText.len:
+        let c = sqlText[endPos]
+        if c.isAlphaNumeric or c == '_':
+          return false
+      i = endPos
+      true
+
+    proc parseIdent(): string =
+      skipWs()
+      if i >= sqlText.len:
+        return ""
+      # Unquoted identifier: [A-Za-z_][A-Za-z0-9_]*
+      let c0 = sqlText[i]
+      if not (c0.isAlphaAscii or c0 == '_'):
+        return ""
+      let start = i
+      i.inc
+      while i < sqlText.len:
+        let c = sqlText[i]
+        if c.isAlphaNumeric or c == '_':
+          i.inc
+        else:
+          break
+      sqlText[start ..< i]
+
+    proc parseInt64Literal(outVal: var int64): bool =
+      skipWs()
+      if i >= sqlText.len:
+        return false
+      var sign = 1'i64
+      if sqlText[i] == '-':
+        sign = -1
+        i.inc
+      elif sqlText[i] == '+':
+        i.inc
+      if i >= sqlText.len or not sqlText[i].isDigit:
+        return false
+      var v: int64 = 0
+      while i < sqlText.len and sqlText[i].isDigit:
+        let d = int64(ord(sqlText[i]) - ord('0'))
+        # Avoid overflow; fall back to full parser if suspicious.
+        if v > (high(int64) - d) div 10:
+          return false
+        v = v * 10 + d
+        i.inc
+      outVal = v * sign
+      true
+
+    proc parseSqlStringLiteral(outVal: var string): bool =
+      skipWs()
+      if i >= sqlText.len or sqlText[i] != '\'':
+        return false
+      i.inc
+      outVal = ""
+      while i < sqlText.len:
+        let c = sqlText[i]
+        if c == '\'':
+          # '' inside string -> single quote
+          if i + 1 < sqlText.len and sqlText[i + 1] == '\'':
+            outVal.add('\'')
+            i += 2
+            continue
+          i.inc
+          return true
+        outVal.add(c)
+        i.inc
+      false
+
+    # SELECT * FROM <table> WHERE <col> (=|LIKE|ILIKE) (<int>|'pattern') [;]
+    if not consumeKeyword("SELECT"):
+      return nil
+    if not consumeChar('*'):
+      return nil
+    if not consumeKeyword("FROM"):
+      return nil
+    let tableName = parseIdent()
+    if tableName.len == 0:
+      return nil
+    if not consumeKeyword("WHERE"):
+      return nil
+    let colName = parseIdent()
+    if colName.len == 0:
+      return nil
+
+    var op = ""
+    skipWs()
+    if consumeChar('='):
+      op = "="
+    else:
+      if consumeKeyword("ILIKE"):
+        op = "ILIKE"
+      elif consumeKeyword("LIKE"):
+        op = "LIKE"
+      else:
+        return nil
+
+    var rhs: Expr = nil
+    if op == "=":
+      var v: int64 = 0
+      if not parseInt64Literal(v):
+        return nil
+      rhs = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: v))
+    else:
+      var s = ""
+      if not parseSqlStringLiteral(s):
+        return nil
+      rhs = Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: s))
+
+    let lhs = Expr(kind: ekColumn, table: "", name: colName)
+    let whereExpr = Expr(kind: ekBinary, op: op, left: lhs, right: rhs)
+
+    # Optional trailing semicolon + whitespace
+    discard consumeChar(';')
+    skipWs()
+    if i != sqlText.len:
+      return nil
+
+    let stmt = Statement(
+      kind: skSelect,
+      selectItems: @[SelectItem(expr: nil, alias: "", isStar: true)],
+      fromTable: tableName,
+      fromAlias: "",
+      joins: @[],
+      whereExpr: whereExpr,
+      groupBy: @[],
+      havingExpr: nil,
+      orderBy: @[],
+      limit: -1,
+      limitParam: 0,
+      offset: -1,
+      offsetParam: 0
+    )
+    SqlAst(statements: @[stmt])
+
+  let fastAst = tryParseFastSelect(sql)
+  if fastAst != nil:
+    return ok(fastAst)
+
   when not defined(libpg_query):
     return err[SqlAst](ERR_INTERNAL, "libpg_query required", "build with -d:libpg_query and link libpg_query")
   let parseResult = pg_query_parse(sql.cstring)

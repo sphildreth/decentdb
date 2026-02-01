@@ -1258,6 +1258,13 @@ proc execSqlNoRows*(db: Db, sqlText: string, params: seq[Value]): Result[int64] 
   if cachedPlans.len != 1 or cachedPlans[0] == nil:
     return err[int64](ERR_INTERNAL, "Missing cached plan for SELECT")
 
+  # Fast path: for simple index-seek plans, count rows without decoding full rows.
+  let fastCountRes = tryCountNoRowsFast(db.pager, db.catalog, cachedPlans[0], params)
+  if not fastCountRes.ok:
+    return err[int64](fastCountRes.err.code, fastCountRes.err.message, fastCountRes.err.context)
+  if fastCountRes.value.isSome:
+    return ok(fastCountRes.value.get)
+
   let cursorRes = openRowCursor(db.pager, db.catalog, cachedPlans[0], params)
   if not cursorRes.ok:
     return err[int64](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)

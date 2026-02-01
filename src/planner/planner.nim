@@ -8,6 +8,7 @@ import strutils
 type PlanKind* = enum
   pkStatement
   pkTableScan
+  pkRowidSeek
   pkIndexSeek
   pkTrigramSeek
   pkFilter
@@ -129,12 +130,28 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   var conjuncts = splitAnd(stmt.whereExpr)
   var base: Plan = nil
 
+  let tableRes = catalog.getTable(stmt.fromTable)
+  # Planning should only run on bound statements, but keep a safe fallback.
+  let tableMeta = if tableRes.ok: tableRes.value else: TableMeta()
+  proc isRowidPkColumn(colName: string): bool =
+    if not tableRes.ok:
+      return false
+    for col in tableMeta.columns:
+      if col.name == colName and col.primaryKey and col.kind == ctInt64:
+        return true
+    false
+
   # Choose the best access path for the FROM table from any conjunct.
   var accessConjunctIdx = -1
   for i, c in conjuncts:
     var idxColumn = ""
     var idxValue: Expr = nil
     if isSimpleEqualityFor(c, stmt.fromTable, stmt.fromAlias, idxColumn, idxValue):
+      # INT64 PRIMARY KEY is stored as the table rowid (no secondary index).
+      if isRowidPkColumn(idxColumn):
+        base = Plan(kind: pkRowidSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+        accessConjunctIdx = i
+        break
       let idxOpt = catalog.getBtreeIndexForColumn(stmt.fromTable, idxColumn)
       if isSome(idxOpt):
         base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)

@@ -229,6 +229,38 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
+  of pkRowidSeek:
+    let valueRes = evalExpr(Row(), plan.valueExpr, params)
+    if not valueRes.ok:
+      return err[RowCursor](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    if valueRes.value.kind != vkInt64:
+      return err[RowCursor](ERR_SQL, "Rowid seek expects INT64")
+    let tableRes = catalog.getTable(plan.table)
+    if not tableRes.ok:
+      return err[RowCursor](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    let prefix = if plan.alias.len > 0: plan.alias else: plan.table
+    var cols: seq[string] = @[]
+    for col in table.columns:
+      cols.add(prefix & "." & col.name)
+    let targetRowId = cast[uint64](valueRes.value.int64Val)
+    var done = false
+    let c = RowCursor(
+      columns: cols,
+      nextFn: proc(): Result[Option[Row]] =
+        if done:
+          return ok(none(Row))
+        done = true
+        let readRes = readRowAt(pager, table, targetRowId)
+        if not readRes.ok:
+          # Not found -> empty result set.
+          if readRes.err.code == ERR_IO and readRes.err.message == "Key not found":
+            return ok(none(Row))
+          return err[Option[Row]](readRes.err.code, readRes.err.message, readRes.err.context)
+        ok(some(makeRow(cols, readRes.value.values, targetRowId)))
+    )
+    ok(c)
+
   of pkIndexSeek:
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:
@@ -389,6 +421,112 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
 
   of pkTrigramSeek, pkJoin, pkSort, pkAggregate, pkStatement:
     materialize()
+
+proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
+  ## Attempt to compute the number of rows produced by `plan` without
+  ## materializing full `Row` objects.
+  ##
+  ## Returns:
+  ## - ok(some(count)) when handled
+  ## - ok(none(int64)) when the plan is not supported by the fast path
+  ## - err(...) on real execution errors
+  if plan == nil:
+    return ok(none(int64))
+  case plan.kind
+  of pkProject:
+    # Projection does not affect row count.
+    return tryCountNoRowsFast(pager, catalog, plan.left, params)
+
+  of pkLimit:
+    let innerRes = tryCountNoRowsFast(pager, catalog, plan.left, params)
+    if not innerRes.ok:
+      return err[Option[int64]](innerRes.err.code, innerRes.err.message, innerRes.err.context)
+    if innerRes.value.isNone:
+      return ok(none(int64))
+    var count = innerRes.value.get
+    var limit = plan.limit
+    var offset = plan.offset
+    if plan.limitParam > 0:
+      let idx = plan.limitParam - 1
+      if idx < 0 or idx >= params.len:
+        return err[Option[int64]](ERR_SQL, "LIMIT parameter index out of bounds")
+      let v = params[idx]
+      if v.kind != vkInt64:
+        return err[Option[int64]](ERR_SQL, "LIMIT parameter must be INT64")
+      if v.int64Val < 0:
+        return err[Option[int64]](ERR_SQL, "LIMIT parameter must be non-negative")
+      if v.int64Val > int64(high(int)):
+        return err[Option[int64]](ERR_SQL, "LIMIT parameter too large")
+      limit = int(v.int64Val)
+    if plan.offsetParam > 0:
+      let idx = plan.offsetParam - 1
+      if idx < 0 or idx >= params.len:
+        return err[Option[int64]](ERR_SQL, "OFFSET parameter index out of bounds")
+      let v = params[idx]
+      if v.kind != vkInt64:
+        return err[Option[int64]](ERR_SQL, "OFFSET parameter must be INT64")
+      if v.int64Val < 0:
+        return err[Option[int64]](ERR_SQL, "OFFSET parameter must be non-negative")
+      if v.int64Val > int64(high(int)):
+        return err[Option[int64]](ERR_SQL, "OFFSET parameter too large")
+      offset = int(v.int64Val)
+    if offset > 0:
+      if count <= int64(offset):
+        count = 0
+      else:
+        count -= int64(offset)
+    if limit >= 0 and count > int64(limit):
+      count = int64(limit)
+    return ok(some(count))
+
+  of pkIndexSeek:
+    let valueRes = evalExpr(Row(), plan.valueExpr, params)
+    if not valueRes.ok:
+      return err[Option[int64]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    # Only safe for non-hashed key types.
+    if valueRes.value.kind notin {vkInt64, vkBool, vkFloat64}:
+      return ok(none(int64))
+    let indexOpt = catalog.getBtreeIndexForColumn(plan.table, plan.column)
+    if isNone(indexOpt):
+      return err[Option[int64]](ERR_SQL, "Index not found", plan.table & "." & plan.column)
+    let idx = indexOpt.get
+    let needle = indexKeyFromValue(valueRes.value)
+    let idxTree = newBTree(pager, idx.rootPage)
+    let idxCursorRes = openCursorAt(idxTree, needle)
+    if not idxCursorRes.ok:
+      return err[Option[int64]](idxCursorRes.err.code, idxCursorRes.err.message, idxCursorRes.err.context)
+    let idxCursor = idxCursorRes.value
+    var count: int64 = 0
+    while true:
+      let nextRes = cursorNext(idxCursor)
+      if not nextRes.ok:
+        break
+      let key = nextRes.value[0]
+      if key < needle:
+        continue
+      if key > needle:
+        break
+      count.inc
+    return ok(some(count))
+
+  of pkRowidSeek:
+    let valueRes = evalExpr(Row(), plan.valueExpr, params)
+    if not valueRes.ok:
+      return err[Option[int64]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    if valueRes.value.kind != vkInt64:
+      return err[Option[int64]](ERR_SQL, "Rowid seek expects INT64")
+    let tableRes = catalog.getTable(plan.table)
+    if not tableRes.ok:
+      return err[Option[int64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    let tree = newBTree(pager, table.rootPage)
+    let existsRes = containsKey(tree, cast[uint64](valueRes.value.int64Val))
+    if not existsRes.ok:
+      return err[Option[int64]](existsRes.err.code, existsRes.err.message, existsRes.err.context)
+    return ok(some(if existsRes.value: 1'i64 else: 0'i64))
+
+  else:
+    return ok(none(int64))
 
 const SortBufferBytes = 16 * 1024 * 1024
 const SortMaxOpenRuns = 64
@@ -1143,6 +1281,27 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
   case plan.kind
   of pkTableScan:
     return tableScanRows(pager, catalog, plan.table, plan.alias)
+  of pkRowidSeek:
+    let valueRes = evalExpr(Row(), plan.valueExpr, params)
+    if not valueRes.ok:
+      return err[seq[Row]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    if valueRes.value.kind != vkInt64:
+      return err[seq[Row]](ERR_SQL, "Rowid seek expects INT64")
+    let tableRes = catalog.getTable(plan.table)
+    if not tableRes.ok:
+      return err[seq[Row]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let table = tableRes.value
+    let prefix = if plan.alias.len > 0: plan.alias else: plan.table
+    var cols: seq[string] = @[]
+    for col in table.columns:
+      cols.add(prefix & "." & col.name)
+    let targetRowId = cast[uint64](valueRes.value.int64Val)
+    let readRes = readRowAt(pager, table, targetRowId)
+    if not readRes.ok:
+      if readRes.err.code == ERR_IO and readRes.err.message == "Key not found":
+        return ok(newSeq[Row]())
+      return err[seq[Row]](readRes.err.code, readRes.err.message, readRes.err.context)
+    return ok(@[makeRow(cols, readRes.value.values, targetRowId)])
   of pkIndexSeek:
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:

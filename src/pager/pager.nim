@@ -376,6 +376,11 @@ proc flushAll*(pager: Pager): Result[Void] =
       if entry.dirty:
         dirtyEntries.add(entry)
     release(shard.lock)
+  # Fast path: if nothing was dirtied, do not issue an fsync.
+  # This matters a lot for read-only workloads (e.g. CLI benchmarks) where
+  # an unconditional fsync dominates latency.
+  if dirtyEntries.len == 0:
+    return okVoid()
   for entry in dirtyEntries:
     let res = flushEntry(pager, entry)
     if not res.ok:

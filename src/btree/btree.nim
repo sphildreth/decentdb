@@ -312,6 +312,34 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
       return ok((keys[i], valueRes.value, overflows[i]))
   err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
 
+proc containsKey*(tree: BTree, key: uint64): Result[bool] =
+  ## Return true if `key` exists in the tree.
+  ##
+  ## Unlike `find`, this does not materialize (read) overflow value chains.
+  let leafRes = findLeaf(tree, key)
+  if not leafRes.ok:
+    return err[bool](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  let leafId = leafRes.value
+  var keys: seq[uint64] = @[]
+  var values: seq[seq[byte]] = @[]
+  var overflows: seq[uint32] = @[]
+  let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
+    let parsed = readLeafCells(page)
+    if not parsed.ok:
+      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+    (keys, values, overflows, _) = parsed.value
+    okVoid()
+  )
+  if not pageRes.ok:
+    return err[bool](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  for i in 0 ..< keys.len:
+    if keys[i] == key:
+      # Treat tombstone-like empty payload as missing.
+      if values[i].len == 0 and overflows[i] == 0'u32:
+        return ok(false)
+      return ok(true)
+  ok(false)
+
 proc openCursor*(tree: BTree): Result[BTreeCursor] =
   var current = tree.root
   while true:
