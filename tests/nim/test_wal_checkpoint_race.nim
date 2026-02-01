@@ -77,7 +77,9 @@ suite "WAL checkpoint race condition tests":
     var writer1 = beginWrite(wal)
     check writer1.ok
     
-    let data1 = newSeq[byte](DefaultPageSize)
+    var data1 = newSeq[byte](DefaultPageSize)
+    data1[0] = 0xA1
+    data1[1] = 0xB2
     let write1 = writePage(writer1.value, page2Id, data1)
     check write1.ok
     
@@ -88,7 +90,9 @@ suite "WAL checkpoint race condition tests":
     var writer2 = beginWrite(wal)
     check writer2.ok
     
-    let data2 = newSeq[byte](DefaultPageSize)
+    var data2 = newSeq[byte](DefaultPageSize)
+    data2[0] = 0xC3
+    data2[1] = 0xD4
     let write2 = writePage(writer2.value, page3Id, data2)
     check write2.ok
     
@@ -106,12 +110,17 @@ suite "WAL checkpoint race condition tests":
     let chkRes = checkpoint(wal, pager)
     check chkRes.ok
     
-    # After checkpoint, both pages should still be readable via WAL
-    let page2After = wal.getPageAtOrBefore(page2Id, commit2.value)
-    let page3After = wal.getPageAtOrBefore(page3Id, commit2.value)
-    
-    # At least page 3 must be available
-    check page3After.isSome
+    # After checkpoint, the committed pages must be present in the main DB file.
+    # (The WAL may have been truncated, so do not require WAL overlays to exist.)
+    let page2FileRes = readPageDirect(pager, page2Id)
+    check page2FileRes.ok
+    check uint8(page2FileRes.value[0]) == 0xA1'u8
+    check uint8(page2FileRes.value[1]) == 0xB2'u8
+
+    let page3FileRes = readPageDirect(pager, page3Id)
+    check page3FileRes.ok
+    check uint8(page3FileRes.value[0]) == 0xC3'u8
+    check uint8(page3FileRes.value[1]) == 0xD4'u8
 
   test "checkpoint preserves newer commits when truncation is unsafe":
     let vfs = newOsVfs()
@@ -165,6 +174,10 @@ suite "WAL checkpoint race condition tests":
     
     # Record state before checkpoint
     let lsnBefore = commit1.value
+
+    # Pin a reader snapshot at lsnBefore so truncation is unsafe.
+    let reader = beginRead(wal)
+    check reader.snapshot == lsnBefore
     
     # Simulate: new commit happens (simulating concurrent activity)
     var writer2 = beginWrite(wal)
@@ -182,12 +195,14 @@ suite "WAL checkpoint race condition tests":
     let chkRes = checkpoint(wal, pager)
     check chkRes.ok
     
-    # Verify checkpoint result
+    # Verify checkpoint result: should only checkpoint up to the pinned reader snapshot.
     check chkRes.value <= lsnBefore
-    
-    # But page 6 should still be accessible
+
+    # The newer commit must still be accessible via WAL overlay (cannot truncate).
     let page6Overlay = wal.getPageAtOrBefore(pageIds[4], commit2.value)
     check page6Overlay.isSome
+
+    endRead(wal, reader)
 
   test "checkpoint with no new commits can safely truncate":
     let vfs = newOsVfs()
