@@ -856,7 +856,7 @@ proc parseSql*(sql: string): Result[SqlAst] =
           i.inc
         else:
           break
-      sqlText[start ..< i]
+      toLowerAscii(sqlText[start ..< i])
 
     proc parseInt64Literal(outVal: var int64): bool =
       skipWs()
