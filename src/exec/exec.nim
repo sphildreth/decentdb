@@ -750,20 +750,29 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     if grams.len == 0:
       return ok(some(0'i64))
 
+    let threshold = DefaultPostingsThreshold
     var postingsLists: seq[seq[uint64]] = @[]
     var rarestCount = -1
+    var anyTruncated = false
     for g in grams:
-      let postRes = getTrigramPostingsWithDeltas(pager, catalog, idx, g)
+      let postRes = getTrigramPostingsWithDeltasUpTo(pager, catalog, idx, g, threshold)
       if not postRes.ok:
         return err[Option[int64]](postRes.err.code, postRes.err.message, postRes.err.context)
-      let list = postRes.value
+      if postRes.value.truncated:
+        anyTruncated = true
+        break
+      let list = postRes.value.ids
       if list.len == 0:
         return ok(some(0'i64))
       postingsLists.add(list)
       if rarestCount < 0 or list.len < rarestCount:
         rarestCount = list.len
 
-    let threshold = DefaultPostingsThreshold
+    if anyTruncated:
+      let countRes = countLikeTableScan(table, colIndex, patternStr, plan.likeInsensitive)
+      if not countRes.ok:
+        return err[Option[int64]](countRes.err.code, countRes.err.message, countRes.err.context)
+      return ok(some(countRes.value))
     if normalized.len <= 5 and rarestCount >= threshold:
       let countRes = countLikeTableScan(table, colIndex, patternStr, plan.likeInsensitive)
       if not countRes.ok:
@@ -1127,19 +1136,37 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
   let grams = trigrams(normalized)
   if grams.len == 0:
     return ok(newSeq[Row]())
+  let threshold = DefaultPostingsThreshold
   var postingsLists: seq[seq[uint64]] = @[]
   var rarestCount = -1
+  var anyTruncated = false
   for g in grams:
-    let postRes = getTrigramPostingsWithDeltas(pager, catalog, idx, g)
+    let postRes = getTrigramPostingsWithDeltasUpTo(pager, catalog, idx, g, threshold)
     if not postRes.ok:
       return err[seq[Row]](postRes.err.code, postRes.err.message, postRes.err.context)
-    let list = postRes.value
+    if postRes.value.truncated:
+      anyTruncated = true
+      break
+    let list = postRes.value.ids
     if list.len == 0:
       return ok(newSeq[Row]())
     postingsLists.add(list)
     if rarestCount < 0 or list.len < rarestCount:
       rarestCount = list.len
-  let threshold = DefaultPostingsThreshold
+
+  if anyTruncated:
+    let rowsRes = tableScanRows(pager, catalog, tableName, alias)
+    if not rowsRes.ok:
+      return err[seq[Row]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+    var filtered: seq[Row] = @[]
+    for row in rowsRes.value:
+      let text = valueToString(row.values[columnIndex])
+      let likeRes = likeMatchChecked(text, pattern, caseInsensitive)
+      if not likeRes.ok:
+        return err[seq[Row]](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+      if likeRes.value:
+        filtered.add(row)
+    return ok(filtered)
   if normalized.len <= 5 and rarestCount >= threshold:
     let rowsRes = tableScanRows(pager, catalog, tableName, alias)
     if not rowsRes.ok:

@@ -45,6 +45,23 @@ proc decodePostings*(data: openArray[byte]): Result[seq[uint64]] =
     output.add(current)
   ok(output)
 
+proc decodePostingsUpTo*(data: openArray[byte], limit: int): Result[tuple[ids: seq[uint64], truncated: bool]] =
+  ## Decode postings, but stop after `limit` rowids.
+  ##
+  ## Returns (ids, truncated=true) if there are additional rowids beyond `limit`.
+  var offset = 0
+  var current: uint64 = 0
+  var output: seq[uint64] = @[]
+  if limit <= 0:
+    return ok((ids: output, truncated: data.len > 0))
+  while offset < data.len and output.len < limit:
+    let deltaRes = decodeVarint(data, offset)
+    if not deltaRes.ok:
+      return err[tuple[ids: seq[uint64], truncated: bool]](deltaRes.err.code, deltaRes.err.message, deltaRes.err.context)
+    current += deltaRes.value
+    output.add(current)
+  ok((ids: output, truncated: offset < data.len))
+
 proc postingsCount*(data: openArray[byte]): int =
   let decoded = decodePostings(data)
   if not decoded.ok:

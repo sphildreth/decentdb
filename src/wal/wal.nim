@@ -514,6 +514,25 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
         toRemove.add(pageId)
     for pageId in toRemove:
       wal.dirtySinceCheckpoint.del(pageId)
+
+    # Prune WAL index entries that are now checkpointed (<= safeLsn) for pages
+    # written to the main DB file during this checkpoint. This bounds index
+    # growth when checkpoints overlap with new commits.
+    for entry in toCheckpoint:
+      let pageId = entry[0]
+      if not wal.index.hasKey(pageId):
+        continue
+      let entries = wal.index[pageId]
+      var cut = 0
+      while cut < entries.len and entries[cut].lsn <= safeLsn:
+        cut.inc
+      if cut <= 0:
+        continue
+      if cut >= entries.len:
+        wal.index.del(pageId)
+      else:
+        wal.index[pageId] = entries[cut .. ^1]
+
     # Note: wal.index is not cleared - it still contains entries for newer commits
     release(wal.indexLock)
   wal.checkpointPending = false

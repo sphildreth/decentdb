@@ -163,6 +163,34 @@ proc getTrigramPostingsWithDeltas*(pager: Pager, catalog: Catalog, index: IndexM
   let delta = deltaOpt.get
   ok(applyPostingDeltas(baseRes.value, delta.adds, delta.removes))
 
+proc getTrigramPostingsWithDeltasUpTo*(pager: Pager, catalog: Catalog, index: IndexMeta, trigram: uint32, limit: int): Result[tuple[ids: seq[uint64], truncated: bool]] =
+  ## Like getTrigramPostingsWithDeltas, but avoids unbounded allocations.
+  ##
+  ## If the postings list (after applying deltas) would exceed `limit`, returns
+  ## truncated=true and does not guarantee ids contains all matches.
+  let idxTree = newBTree(pager, index.rootPage)
+  let bytesRes = loadPostings(idxTree, trigram)
+  if not bytesRes.ok:
+    return err[tuple[ids: seq[uint64], truncated: bool]](bytesRes.err.code, bytesRes.err.message, bytesRes.err.context)
+  var baseIds: seq[uint64] = @[]
+  if bytesRes.value.len > 0:
+    let baseRes = decodePostingsUpTo(bytesRes.value, limit)
+    if not baseRes.ok:
+      return err[tuple[ids: seq[uint64], truncated: bool]](baseRes.err.code, baseRes.err.message, baseRes.err.context)
+    if baseRes.value.truncated:
+      return ok((ids: baseRes.value.ids, truncated: true))
+    baseIds = baseRes.value.ids
+
+  let deltaOpt = catalog.trigramDelta(index.name, trigram)
+  if deltaOpt.isNone:
+    return ok((ids: baseIds, truncated: false))
+
+  let delta = deltaOpt.get
+  let merged = applyPostingDeltas(baseIds, delta.adds, delta.removes)
+  if limit > 0 and merged.len > limit:
+    return ok((ids: merged[0 ..< limit], truncated: true))
+  ok((ids: merged, truncated: false))
+
 proc updateTrigramIndex(pager: Pager, catalog: Catalog, index: IndexMeta, rowid: uint64, oldValue: Value, newValue: Value): Result[Void] =
   let oldText = if oldValue.kind == vkText: valueText(oldValue) else: ""
   let newText = if newValue.kind == vkText: valueText(newValue) else: ""
