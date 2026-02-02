@@ -125,9 +125,35 @@ method writeStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: string): Result[
   ok(bytesWritten)
 
 method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
+  ## Synchronize file data to persistent storage using OS-level primitives.
+  ## On POSIX: uses fdatasync() (or fsync() on macOS/iOS where fdatasync is unavailable)
+  ## On Windows: uses FlushFileBuffers()
   withFileLock(file):
     try:
+      # First flush stdio buffers to ensure all data is in kernel buffers
       flushFile(file.file)
+      
+      when defined(windows):
+        # Windows: Use FlushFileBuffers for OS-level sync
+        let handle = get_osfhandle(file.file.getFileHandle())
+        if handle == INVALID_HANDLE_VALUE:
+          return err[Void](ERR_IO, "Invalid file handle for fsync", file.path)
+        if FlushFileBuffers(handle) == 0:
+          return err[Void](ERR_IO, "FlushFileBuffers failed", file.path)
+      else:
+        # POSIX: Use fdatasync for data-only sync (faster than fsync)
+        # Falls back to fsync on platforms where fdatasync is unavailable
+        let fd = cint(file.file.getFileHandle())
+        when defined(macosx) or defined(ios):
+          # macOS/iOS don't have fdatasync, use fsync instead
+          if fsync(fd) != 0:
+            return err[Void](ERR_IO, "fsync failed: " & $strerror(errno), file.path)
+        else:
+          # Linux and other POSIX systems: prefer fdatasync
+          if fdatasync(fd) != 0:
+            # If fdatasync fails (e.g., not implemented), fall back to fsync
+            if fsync(fd) != 0:
+              return err[Void](ERR_IO, "fdatasync/fsync failed: " & $strerror(errno), file.path)
     except OSError:
       return err[Void](ERR_IO, "Fsync failed", file.path)
   okVoid()

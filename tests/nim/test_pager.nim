@@ -173,6 +173,9 @@ suite "Pager":
     
     # Unpin one
     check unpinPage(pager, pin1.value).ok
+    # Also unpin the second one to ensure p3 can find a slot regardless of sharding
+    # (p3 might share a shard with p2 instead of p1)
+    check unpinPage(pager, pin2.value).ok
     
     # Now it should work
     let pin3Retry = pinPage(pager, p3)

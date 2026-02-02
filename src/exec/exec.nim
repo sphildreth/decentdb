@@ -4,6 +4,7 @@ import strutils
 import tables
 import algorithm
 import atomics
+import sets
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
@@ -419,7 +420,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
-  of pkTrigramSeek, pkJoin, pkSort, pkAggregate, pkStatement:
+  of pkTrigramSeek, pkUnionDistinct, pkJoin, pkSort, pkAggregate, pkStatement:
     materialize()
 
 proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
@@ -1612,6 +1613,30 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](patternRes.err.code, patternRes.err.message, patternRes.err.context)
     let pattern = valueToString(patternRes.value)
     return trigramSeekRows(pager, catalog, plan.table, plan.alias, plan.column, pattern, plan.likeInsensitive)
+  of pkUnionDistinct:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+
+    let leftRows = leftRes.value
+    let rightRows = rightRes.value
+    if leftRows.len > 0 and rightRows.len > 0 and leftRows[0].columns != rightRows[0].columns:
+      return err[seq[Row]](ERR_SQL, "UNION requires matching column sets")
+
+    var seen = initHashSet[uint64]()
+    var outRows: seq[Row] = @[]
+    for r in leftRows:
+      if not seen.contains(r.rowid):
+        seen.incl(r.rowid)
+        outRows.add(r)
+    for r in rightRows:
+      if not seen.contains(r.rowid):
+        seen.incl(r.rowid)
+        outRows.add(r)
+    return ok(outRows)
   of pkFilter:
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:

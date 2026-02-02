@@ -26,6 +26,7 @@ type PageCacheShard = ref object
   clock: seq[PageId]
   clockHand: int
   lock*: Lock
+  clockTombstones: int  # Count of deleted entries in clock (for triggering compaction)
 
 type PageCache* = ref object
   capacity*: int
@@ -44,6 +45,10 @@ type Pager* = ref object
   readGuard*: ReadGuard
   overriddenPages*: HashSet[PageId]
   overlayLock*: Lock
+  rollbackLock*: Lock    # Guards against seeing dirty state during rollback
+  txnAllocatedPages*: seq[PageId]  # Pages allocated during current transaction (HIGH-003)
+  inTransaction*: bool             # Whether a transaction is active (HIGH-003)
+  flushHandler*: proc(pageId: PageId, data: string): Result[Void]
 
 const DefaultCacheShards = 16
 
@@ -57,7 +62,13 @@ proc newPageCache*(capacity: int): PageCache =
   var shards: seq[PageCacheShard] = @[]
   for i in 0 ..< shardCount:
     let shardCap = baseCap + (if i < remainder: 1 else: 0)
-    let shard = PageCacheShard(capacity: max(1, shardCap), pages: initTable[PageId, CacheEntry](), clock: @[], clockHand: 0)
+    let shard = PageCacheShard(
+      capacity: max(1, shardCap), 
+      pages: initTable[PageId, CacheEntry](), 
+      clock: @[], 
+      clockHand: 0,
+      clockTombstones: 0
+    )
     initLock(shard.lock)
     shards.add(shard)
   let cache = PageCache(capacity: cap, shards: shards)
@@ -82,6 +93,7 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
   pager.overriddenPages = initHashSet[PageId]()
   initLock(pager.lock)
   initLock(pager.overlayLock)
+  initLock(pager.rollbackLock)
   ok(pager)
 
 proc pageOffset(pager: Pager, pageId: PageId): int64 =
@@ -97,57 +109,128 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
     return okVoid()
   acquire(entry.lock)
   defer: release(entry.lock)
-  let offset = pageOffset(pager, entry.id)
-  let res = pager.vfs.writeStr(pager.file, offset, entry.data)
-  if not res.ok:
-    return err[Void](res.err.code, res.err.message, res.err.context)
-  if res.value < pager.pageSize:
-    return err[Void](ERR_IO, "Short write on page", "page_id=" & $entry.id)
-  acquire(pager.overlayLock)
-  pager.overriddenPages.incl(entry.id)
-  release(pager.overlayLock)
+
+  if pager.flushHandler != nil:
+    let res = pager.flushHandler(entry.id, entry.data)
+    if not res.ok:
+      return res
+    
+    acquire(pager.overlayLock)
+    pager.overriddenPages.excl(entry.id)
+    release(pager.overlayLock)
+  else:
+    let offset = pageOffset(pager, entry.id)
+    let res = pager.vfs.writeStr(pager.file, offset, entry.data)
+    if not res.ok:
+      return err[Void](res.err.code, res.err.message, res.err.context)
+    if res.value < pager.pageSize:
+      return err[Void](ERR_IO, "Short write on page", "page_id=" & $entry.id)
+
+    acquire(pager.overlayLock)
+    pager.overriddenPages.incl(entry.id)
+    release(pager.overlayLock)
+
   entry.dirty = false
   okVoid()
 
+proc splitmix64*(x: uint64): uint64 =
+  ## Splitmix64 hash function for better hash distribution.
+  ## This is a high-quality hash function that provides good
+  ## distribution properties for hash table indexing.
+  var z = x
+  z = (z + 0x9e3779b97f4a7c15'u64)
+  z = (z xor (z shr 30)) * 0xbf58476d1ce4e5b9'u64
+  z = (z xor (z shr 27)) * 0x94d049bb133111eb'u64
+  z = z xor (z shr 31)
+  return z
+
 proc shardFor(cache: PageCache, pageId: PageId): PageCacheShard =
-  let idx = int(pageId mod PageId(cache.shards.len))
+  ## Select shard using splitmix64 hash for better distribution.
+  ## This reduces lock contention compared to simple modulo hashing.
+  let hash = splitmix64(uint64(pageId))
+  let idx = int(hash mod uint64(cache.shards.len))
   cache.shards[idx]
 
+const
+  # Trigger compaction when tombstones exceed this percentage of clock size
+  ClockTombstoneThresholdPct = 25
+
+proc compactClock(shard: PageCacheShard) =
+  ## Remove tombstones from clock array to reclaim space.
+  ## Called periodically when tombstone count exceeds threshold.
+  var newClock: seq[PageId] = @[]
+  # Pre-allocate capacity to minimize reallocations
+  newClock.setLen(0)
+  for pageId in shard.clock:
+    if pageId != PageId(0):  # 0 is tombstone sentinel
+      newClock.add(pageId)
+  shard.clock = newClock
+  shard.clockTombstones = 0
+  if shard.clockHand >= shard.clock.len:
+    shard.clockHand = 0
+
 proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
+  ## Clock eviction with mark-and-compact instead of O(N) deletion.
+  ## Uses PageId(0) as tombstone sentinel and compacts periodically.
   while shard.pages.len >= shard.capacity:
     if shard.clock.len == 0:
       break
+    
+    # Trigger compaction if too many tombstones
+    if shard.clockTombstones > 0 and shard.clock.len > 0:
+      let tombstonePct = (shard.clockTombstones * 100) div shard.clock.len
+      if tombstonePct >= ClockTombstoneThresholdPct:
+        compactClock(shard)
+    
     var scanned = 0
     var evicted = false
     var anyUnpinned = false
-    while scanned < shard.clock.len * 2 and not evicted:
+    let scanLimit = (shard.clock.len - shard.clockTombstones) * 2  # Scan only non-tombstones
+    
+    while scanned < scanLimit and not evicted:
       if shard.clockHand >= shard.clock.len:
         shard.clockHand = 0
+      
       let pageId = shard.clock[shard.clockHand]
-      let entry = shard.pages.getOrDefault(pageId, nil)
       let currentIndex = shard.clockHand
       shard.clockHand.inc
-      scanned.inc
-      if entry == nil:
+      
+      # Skip tombstones
+      if pageId == PageId(0):
         continue
+      
+      scanned.inc
+      let entry = shard.pages.getOrDefault(pageId, nil)
+      
+      if entry == nil:
+        # Entry was removed but not marked as tombstone - mark it now
+        shard.clock[currentIndex] = PageId(0)
+        shard.clockTombstones.inc
+        continue
+      
       if entry.pinCount > 0:
         continue
+      
       anyUnpinned = true
       if entry.refBit:
         entry.refBit = false
         continue
+      
       let flushRes = flushEntry(pager, entry)
       if not flushRes.ok:
         return flushRes
+      
+      # Mark as tombstone instead of O(N) delete
       shard.pages.del(pageId)
-      shard.clock.delete(currentIndex)
-      if shard.clockHand > currentIndex:
-        shard.clockHand.dec
+      shard.clock[currentIndex] = PageId(0)
+      shard.clockTombstones.inc
       evicted = true
+    
     if not evicted:
       if not anyUnpinned:
         return err[Void](ERR_INTERNAL, "No evictable page in cache")
       continue
+  
   okVoid()
 
 proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
@@ -156,27 +239,55 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
     return err[CacheEntry](bound.err.code, bound.err.message, bound.err.context)
   let cache = pager.cache
   let shard = shardFor(cache, pageId)
+  
+  # Fast path: check cache
   acquire(shard.lock)
-  defer: release(shard.lock)
   if shard.pages.hasKey(pageId):
     let entry = shard.pages[pageId]
     entry.pinCount.inc
     entry.refBit = true
+    release(shard.lock)
     return ok(entry)
+  release(shard.lock)
+
+  # Slow path: load data (without holding lock)
+  var data = newString(pager.pageSize)
+  var loaded = false
+  
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      data = overlayRes.get
+      loaded = true
+  
+  if not loaded:
+    let offset = pageOffset(pager, pageId)
+    let readRes = pager.vfs.readStr(pager.file, offset, data)
+    if not readRes.ok:
+      return err[CacheEntry](readRes.err.code, readRes.err.message, readRes.err.context)
+    if readRes.value < pager.pageSize:
+      return err[CacheEntry](ERR_CORRUPTION, "Short read on page", "page_id=" & $pageId)
+
+  # Re-acquire lock to insert
+  acquire(shard.lock)
+  # Check if someone else loaded it while we were reading
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
+    entry.pinCount.inc
+    entry.refBit = true
+    release(shard.lock)
+    return ok(entry)
+    
   let evictRes = evictIfNeededLocked(pager, shard)
   if not evictRes.ok:
+    release(shard.lock)
     return err[CacheEntry](evictRes.err.code, evictRes.err.message, evictRes.err.context)
-  var data = newString(pager.pageSize)
-  let offset = pageOffset(pager, pageId)
-  let readRes = pager.vfs.readStr(pager.file, offset, data)
-  if not readRes.ok:
-    return err[CacheEntry](readRes.err.code, readRes.err.message, readRes.err.context)
-  if readRes.value < pager.pageSize:
-    return err[CacheEntry](ERR_CORRUPTION, "Short read on page", "page_id=" & $pageId)
+
   let entry = CacheEntry(id: pageId, data: data, lsn: pager.header.lastCheckpointLsn, dirty: false, pinCount: 1, refBit: true)
   initLock(entry.lock)
   shard.pages[pageId] = entry
   shard.clock.add(pageId)
+  release(shard.lock)
   ok(entry)
 
 proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Void] =
@@ -206,6 +317,11 @@ proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64]
   ##
   ## If a snapshot is provided and the cached page is not valid for that snapshot
   ## (dirty or newer LSN), this falls back to a direct file read.
+  
+  # Wait if rollback is in progress to avoid seeing dirty state
+  acquire(pager.rollbackLock)
+  release(pager.rollbackLock)
+  
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
     if not guardRes.ok:
@@ -270,6 +386,11 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
   ## Call `body` with a read-only view of `pageId` without forcing a page-sized copy.
   ##
   ## If a WAL/page overlay is installed, it is consulted first.
+  
+  # Wait if rollback is in progress to avoid seeing dirty state
+  acquire(pager.rollbackLock)
+  release(pager.rollbackLock)
+  
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
     if not guardRes.ok:
@@ -282,6 +403,10 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
   withPageRoCached(pager, pageId, none(uint64), body)
 
 proc readPage*(pager: Pager, pageId: PageId): Result[string] =
+  # Wait if rollback is in progress to avoid seeing dirty state
+  acquire(pager.rollbackLock)
+  release(pager.rollbackLock)
+  
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
     if not guardRes.ok:
@@ -308,6 +433,10 @@ proc readPageRo*(pager: Pager, pageId: PageId): Result[string] =
   readPageCachedShared(pager, pageId, none(uint64))
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[string] =
+  # Wait if rollback is in progress to avoid seeing dirty state
+  acquire(pager.rollbackLock)
+  release(pager.rollbackLock)
+  
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
     if not guardRes.ok:
@@ -425,12 +554,12 @@ proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
     release(shard.lock)
 
 proc isDirty*(pager: Pager, pageId: PageId): bool =
-  let shard = pager.cache.shards[pageId.int mod pager.cache.shards.len]
+  let shard = shardFor(pager.cache, pageId)
   acquire(shard.lock)
   defer: release(shard.lock)
   if shard.pages.hasKey(pageId):
     return shard.pages[pageId].dirty
-  false
+  return false
 
 proc cacheLoadedCount*(cache: PageCache): int =
   var count = 0
@@ -447,13 +576,14 @@ proc clearCache*(pager: Pager) =
     shard.pages.clear()
     shard.clock = @[]
     shard.clockHand = 0
+    shard.clockTombstones = 0
     release(shard.lock)
 
-proc rollbackCache*(pager: Pager) =
+proc rollbackCacheLocked*(pager: Pager) =
   ## Evict all dirty pages from the cache.
-  ## 
-  ## This is used during rollback to ensure the cache does not contain
-  ## uncommitted changes.
+  ##
+  ## Caller must hold `pager.rollbackLock`.
+  ## Uses tombstones (PageId 0) for O(1) clock cleanup instead of O(N).
   let cache = pager.cache
   for shard in cache.shards:
     acquire(shard.lock)
@@ -461,14 +591,41 @@ proc rollbackCache*(pager: Pager) =
     for id, entry in shard.pages:
       if entry.dirty:
         toRemove.add(id)
+
+    # Build a set for O(1) lookup when scanning clock
+    var removeSet = initHashSet[PageId]()
+    for id in toRemove:
+      removeSet.incl(id)
+
+    # Mark removed pages as tombstones in the clock array
+    for i in 0 ..< shard.clock.len:
+      if shard.clock[i] in removeSet:
+        shard.clock[i] = PageId(0)
+        shard.clockTombstones.inc
+
+    # Remove from pages table
     for id in toRemove:
       shard.pages.del(id)
-      # Removing from clock is harder without a full scan or better structure,
-      # but clockHand will skip deleted IDs eventually if we handle nil entries.
-      # Wait, clock is seq[PageId]. If we remove from pages but not clock, 
-      # clockHand will find an ID that isn't in pages Table. 
-      # shard.clockHand logic handles missing entries.
+
     release(shard.lock)
+
+proc rollbackCache*(pager: Pager) =
+  ## Evict all dirty pages from the cache atomically.
+  ##
+  ## This is used during rollback to ensure the cache does not contain
+  ## uncommitted changes. The rollbackLock is held during eviction to
+  ## prevent readers from seeing partial dirty state.
+  acquire(pager.rollbackLock)
+  rollbackCacheLocked(pager)
+  release(pager.rollbackLock)
+
+proc isRollbackInProgress*(pager: Pager): bool =
+  ## Check if a rollback is currently in progress.
+  ## This is a non-blocking check that returns immediately.
+  ## Readers should check this before accessing potentially dirty pages.
+  acquire(pager.rollbackLock)
+  release(pager.rollbackLock)
+  false  # If we acquired the lock, rollback is not in progress
 
 proc closePager*(pager: Pager): Result[Void] =
   let flushRes = flushAll(pager)
@@ -520,7 +677,10 @@ proc updateHeader(pager: Pager): Result[Void] =
 
 proc allocatePage*(pager: Pager): Result[PageId] =
   if pager.header.freelistCount == 0 or pager.header.freelistHead == 0:
-    return appendBlankPage(pager)
+    let res = appendBlankPage(pager)
+    if res.ok and pager.inTransaction:
+      pager.txnAllocatedPages.add(res.value)
+    return res
   let headId = PageId(pager.header.freelistHead)
   var next: uint32
   var count: uint32
@@ -533,7 +693,10 @@ proc allocatePage*(pager: Pager): Result[PageId] =
     let headerRes = updateHeader(pager)
     if not headerRes.ok:
       return err[PageId](headerRes.err.code, headerRes.err.message, headerRes.err.context)
-    return appendBlankPage(pager)
+    let res = appendBlankPage(pager)
+    if res.ok and pager.inTransaction:
+      pager.txnAllocatedPages.add(res.value)
+    return res
   let id = ids[^1]
   ids.setLen(ids.len - 1)
   pager.header.freelistCount = pager.header.freelistCount - 1
@@ -545,7 +708,10 @@ proc allocatePage*(pager: Pager): Result[PageId] =
   let headerRes = updateHeader(pager)
   if not headerRes.ok:
     return err[PageId](headerRes.err.code, headerRes.err.message, headerRes.err.context)
-  ok(PageId(id))
+  let pageId = PageId(id)
+  if pager.inTransaction:
+    pager.txnAllocatedPages.add(pageId)
+  ok(pageId)
 
 proc freePage*(pager: Pager, pageId: PageId): Result[Void] =
   if pageId < 2 or pageId > pager.pageCount:
@@ -577,3 +743,32 @@ proc freePage*(pager: Pager, pageId: PageId): Result[Void] =
   if not writeRes.ok:
     return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
   updateHeader(pager)
+
+proc beginTxnPageTracking*(pager: Pager) =
+  ## Begin tracking page allocations for the current transaction.
+  ## Call this when a transaction begins.
+  pager.inTransaction = true
+  pager.txnAllocatedPages = @[]
+
+proc endTxnPageTracking*(pager: Pager) =
+  ## End tracking page allocations for the current transaction.
+  ## Call this when a transaction commits (pages become permanent).
+  pager.inTransaction = false
+  pager.txnAllocatedPages = @[]
+
+proc rollbackTxnPageAllocations*(pager: Pager): Result[Void] =
+  ## Return all pages allocated during the current transaction to the freelist.
+  ## Call this when a transaction rolls back to prevent orphaned pages.
+  if not pager.inTransaction or pager.txnAllocatedPages.len == 0:
+    endTxnPageTracking(pager)
+    return okVoid()
+  
+  # Return each allocated page to the freelist
+  for pageId in pager.txnAllocatedPages:
+    let freeRes = freePage(pager, pageId)
+    if not freeRes.ok:
+      # Log error but continue trying to free other pages
+      stderr.writeLine("Warning: failed to free page " & $pageId & " during rollback: " & freeRes.err.message)
+  
+  endTxnPageTracking(pager)
+  okVoid()

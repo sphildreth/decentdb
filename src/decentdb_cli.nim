@@ -1306,11 +1306,78 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
     return 1
   let dstDb = dstRes.value
 
+  # Install a flush handler to ensure evicted dirty pages go to WAL, not DB file.
+  # IMPORTANT: Do not fsync/commit per evicted page (too slow under small caches).
+  # Instead, append evicted pages into dstDb.activeWriter and commit in batches.
+  if dstDb.wal != nil:
+    let writerRes = beginWrite(dstDb.wal)
+    if not writerRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, writerRes.err)
+      return 1
+    dstDb.activeWriter = writerRes.value
+
+  dstDb.pager.flushHandler = proc(pageId: PageId, data: string): Result[Void] =
+    if dstDb.wal == nil:
+      return okVoid()
+    if dstDb.activeWriter == nil:
+      return err[Void](ERR_TRANSACTION, "VACUUM flush requires active WAL writer")
+
+    var bytes = newSeq[byte](data.len)
+    if data.len > 0:
+      copyMem(addr bytes[0], unsafeAddr data[0], data.len)
+
+    let writeRes = writePage(dstDb.activeWriter, pageId, bytes)
+    if not writeRes.ok:
+      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    okVoid()
+
   if dstDb.catalog.tables.len != 0 or dstDb.catalog.indexes.len != 0:
     discard closeDb(srcDb)
     discard closeDb(dstDb)
     echo resultJson(false, DbError(code: ERR_IO, message: "Output database is not empty", context: outPath))
     return 1
+
+  proc commitDirtyToWal(db: Db): Result[Void] =
+    ## Commit dirty pages to WAL in a single batch.
+    ## Also rotates dstDb.activeWriter so the flush handler can keep appending
+    ## pages without forcing per-page fsync.
+    if db.wal == nil:
+      return okVoid()
+    if db.activeWriter == nil:
+      return err[Void](ERR_TRANSACTION, "VACUUM requires active WAL writer")
+
+    let dirtyPages = snapshotDirtyPages(db.pager)
+    var pageIds: seq[PageId] = @[]
+    for entry in dirtyPages:
+      var bytes = newSeq[byte](entry[1].len)
+      if entry[1].len > 0:
+        copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
+      let writeRes = writePage(db.activeWriter, entry[0], bytes)
+      if not writeRes.ok:
+        discard rollback(db.activeWriter)
+        db.activeWriter = nil
+        clearCache(db.pager)
+        return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+      pageIds.add(entry[0])
+
+    let commitRes = commit(db.activeWriter)
+    if not commitRes.ok:
+      db.activeWriter = nil
+      clearCache(db.pager)
+      return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+
+    if pageIds.len > 0:
+      markPagesCommitted(db.pager, pageIds, commitRes.value)
+
+    # Start a new writer so the flush handler can continue enqueueing pages.
+    let nextWriterRes = beginWrite(db.wal)
+    if not nextWriterRes.ok:
+      db.activeWriter = nil
+      return err[Void](nextWriterRes.err.code, nextWriterRes.err.message, nextWriterRes.err.context)
+    db.activeWriter = nextWriterRes.value
+    okVoid()
 
   # Toposort tables by inline FK dependencies.
   var deps = initTable[string, seq[string]]()
@@ -1376,6 +1443,8 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
 
   # Copy data with index updates disabled, then rebuild constraint-created indexes.
   var totalRows = 0'i64
+  let commitEvery = max(64, actualCachePages div 4)
+  var sinceCommit = 0
   for tableName in ordered:
     let dstTableName = tableName
     let tableMeta = srcDb.catalog.tables[tableName]
@@ -1384,6 +1453,12 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
       if not insRes.ok:
         return err[Void](insRes.err.code, insRes.err.message, insRes.err.context)
       totalRows.inc
+      sinceCommit.inc
+      if sinceCommit >= commitEvery:
+        let cRes = commitDirtyToWal(dstDb)
+        if not cRes.ok:
+          return cRes
+        sinceCommit = 0
       okVoid()
     )
     if not scanRes.ok:
@@ -1391,6 +1466,15 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
       discard closeDb(dstDb)
       echo resultJson(false, scanRes.err)
       return 1
+
+    # Commit at table boundaries to keep the cache from spilling dirty pages.
+    let cRes = commitDirtyToWal(dstDb)
+    if not cRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, cRes.err)
+      return 1
+    sinceCommit = 0
 
   for _, idx in dstDb.catalog.indexes:
     let rebuildRes = storage.rebuildIndex(dstDb.pager, dstDb.catalog, idx)
@@ -1426,8 +1510,29 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
       return 1
     createdIndexes.inc
 
+  # Ensure any remaining dirty pages (table/index/catalog) are committed before checkpoint.
+  let cRes = commitDirtyToWal(dstDb)
+  if not cRes.ok:
+    discard closeDb(srcDb)
+    discard closeDb(dstDb)
+    echo resultJson(false, cRes.err)
+    return 1
+
+  # Finish the final writer batch before checkpoint/close.
+  if dstDb.wal != nil and dstDb.activeWriter != nil:
+    let finalCommitRes = commit(dstDb.activeWriter)
+    dstDb.activeWriter = nil
+    if not finalCommitRes.ok:
+      discard closeDb(srcDb)
+      discard closeDb(dstDb)
+      echo resultJson(false, finalCommitRes.err)
+      return 1
+  dstDb.pager.flushHandler = nil
+
   # Checkpoint destination to truncate WAL and persist pages.
-  discard checkpointDb(dstDb)
+  let ckptRes = checkpointDb(dstDb)
+  if not ckptRes.ok:
+    echo "Checkpoint failed: ", ckptRes.err.message, " ", ckptRes.err.context
 
   let srcPages = srcDb.pager.pageCount
   let dstPages = dstDb.pager.pageCount

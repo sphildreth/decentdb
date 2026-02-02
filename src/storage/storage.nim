@@ -180,7 +180,7 @@ proc updateTrigramIndex(pager: Pager, catalog: Catalog, index: IndexMeta, rowid:
       catalog.trigramBufferAdd(index.name, g, rowid)
   okVoid()
 
-proc flushTrigramDeltas*(pager: Pager, catalog: Catalog): Result[Void] =
+proc flushTrigramDeltas*(pager: Pager, catalog: Catalog, clear: bool = true): Result[Void] =
   let all = catalog.allTrigramDeltas()
   if all.len == 0:
     return okVoid()
@@ -221,7 +221,8 @@ proc flushTrigramDeltas*(pager: Pager, catalog: Catalog): Result[Void] =
     if not syncRes.ok:
       return syncRes
 
-  catalog.clearTrigramDeltas()
+  if clear:
+    catalog.clearTrigramDeltas()
   okVoid()
 
 proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Void] =
@@ -382,7 +383,9 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     table.nextRowId = rowid + 1
 
   table.rootPage = tree.root
-  discard catalog.saveTable(pager, table)
+  let saveRes = catalog.saveTable(pager, table)
+  if not saveRes.ok:
+    return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
   ok(rowid)
 
 proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
@@ -617,7 +620,9 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   while true:
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
-      break
+      if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
+        break
+      return err[seq[uint64]](nextRes.err.code, nextRes.err.message, nextRes.err.context)
     if nextRes.value[0] < needle:
       continue
     if nextRes.value[0] > needle:

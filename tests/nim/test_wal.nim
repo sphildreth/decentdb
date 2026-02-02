@@ -1,6 +1,7 @@
 import unittest
 import os
 import times
+import locks
 import tables
 import engine
 import pager/pager
@@ -352,7 +353,12 @@ suite "WAL":
     let writer = writerRes.value
     check writer.writePage(pageId, data).ok
     let snap = wal.beginRead()
-    wal.readers[snap.id] = (snapshot: snap.snapshot, started: epochTime() - 1.0)
+    acquire(wal.readerLock)
+    if wal.readers.hasKey(snap.id):
+      var info = wal.readers[snap.id]
+      info.started = epochTime() - 1.0
+      wal.readers[snap.id] = info
+    release(wal.readerLock)
     check commit(writer).ok
     let ckRes = checkpoint(wal, pager)
     check ckRes.ok
@@ -385,7 +391,12 @@ suite "WAL":
     let writer = writerRes.value
     check writer.writePage(pageId, data).ok
     let snap = wal.beginRead()
-    wal.readers[snap.id] = (snapshot: snap.snapshot, started: epochTime() - 1.0)
+    acquire(wal.readerLock)
+    if wal.readers.hasKey(snap.id):
+      var info = wal.readers[snap.id]
+      info.started = epochTime() - 1.0
+      wal.readers[snap.id] = info
+    release(wal.readerLock)
     check commit(writer).ok
     let ckRes = checkpoint(wal, pager)
     check ckRes.ok
@@ -426,7 +437,12 @@ suite "WAL":
     
     let longReader = wal.beginRead()
     # Backdoor: manually set the reader's start time to be old
-    wal.readers[longReader.id] = (snapshot: longReader.snapshot, started: epochTime() - 1.0)
+    acquire(wal.readerLock)
+    if wal.readers.hasKey(longReader.id):
+      var info = wal.readers[longReader.id]
+      info.started = epochTime() - 1.0
+      wal.readers[longReader.id] = info
+    release(wal.readerLock)
     
     # Perform multiple write + checkpoint cycles
     for cycle in 0 ..< 5:

@@ -37,6 +37,8 @@ type
     plan: Plan
     params: seq[Value]
     columnNames: seq[string]
+    explainLines: seq[string]
+    explainPos: int
     affectedRows: int64
     cursor: RowCursor
     hasRow: bool
@@ -285,6 +287,8 @@ proc findMaxParam(stmt: Statement): int =
       maxIdx = max(maxIdx, stmt.limitParam)
     if stmt.offsetParam > 0:
       maxIdx = max(maxIdx, stmt.offsetParam)
+  of skExplain:
+    return findMaxParam(stmt.explainInner)
   of skInsert:
     for v in stmt.insertValues: walk(v)
   of skUpdate:
@@ -294,6 +298,12 @@ proc findMaxParam(stmt: Statement): int =
     walk(stmt.deleteWhere)
   else: discard
   return maxIdx
+
+proc valueTextFromString(s: string): Value =
+  var bytes = newSeq[byte](s.len)
+  if s.len > 0:
+    copyMem(addr bytes[0], unsafeAddr s[0], s.len)
+  Value(kind: vkText, bytes: bytes)
 
 proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil or out_stmt == nil: return -1
@@ -319,6 +329,8 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
   let bound = bindRes.value
   var plan: Plan = nil
   var colNames: seq[string] = @[]
+  var explainLines: seq[string] = @[]
+  var explainPos: int = 0
 
   if bound.kind == skSelect:
     let planRes = planner.plan(db_handle.db.catalog, bound)
@@ -341,9 +353,25 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
           name = "column" & $colNames.len
         colNames.add(name)
 
+  if bound.kind == skExplain:
+    if bound.explainInner.kind != skSelect:
+      db_handle.setError(ERR_SQL, "EXPLAIN currently supports SELECT only")
+      return cint(toApiCode(ERR_SQL))
+    colNames = @["query_plan"]
+    explainPos = 0
+
   let maxParam = findMaxParam(bound)
   var params = newSeq[Value](maxParam)
   for i in 0 ..< maxParam: params[i] = Value(kind: vkNull)
+
+  if bound.kind == skExplain:
+    # Reuse the canonical EXPLAIN execution path in the engine to produce
+    # deterministic plan lines (still does not execute the inner SELECT).
+    let explainRes = engine.execSql(db_handle.db, $sql_text, params)
+    if not explainRes.ok:
+      db_handle.setError(explainRes.err.code, explainRes.err.message)
+      return cint(toApiCode(explainRes.err.code))
+    explainLines = explainRes.value
 
   let stmt_handle = StmtHandle(
     db: db_handle,
@@ -352,6 +380,8 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
     plan: plan,
     params: params,
     columnNames: colNames,
+    explainLines: explainLines,
+    explainPos: explainPos,
     affectedRows: 0,
     cursor: nil,
     hasRow: false,
@@ -385,6 +415,7 @@ proc decentdb_reset*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   h.currentValues = @[]
   h.affectedRows = 0
   h.isDone = false
+  h.explainPos = 0
   return 0
 
 proc decentdb_clear_bindings*(p: pointer): cint {.exportc, cdecl, dynlib.} =
@@ -453,6 +484,20 @@ proc decentdb_step*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   
   if h.isDone:
     return 0
+
+  if h.statement.kind == skExplain:
+    if h.explainLines.len == 0:
+      h.db.setError(ERR_INTERNAL, "EXPLAIN returned 0 plan lines")
+      return -1
+    if h.explainPos >= h.explainLines.len:
+      h.isDone = true
+      h.hasRow = false
+      h.currentValues = @[]
+      return 0
+    h.currentValues = @[valueTextFromString(h.explainLines[h.explainPos])]
+    h.explainPos.inc
+    h.hasRow = true
+    return 1
 
   if h.statement.kind != skSelect:
     let res = execPreparedNonSelect(h.db.db, h.statement, h.params)
@@ -551,21 +596,22 @@ proc decentdb_column_float64*(p: pointer, col: cint): float64 {.exportc, cdecl, 
 proc decentdb_column_text*(p: pointer, col: cint, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
   let h = cast[StmtHandle](p)
   if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return nil
-  let val = h.currentValues[col]
-  if val.kind in {vkText, vkBlob}:
-    if out_len != nil: out_len[] = cint(val.bytes.len)
-    if val.bytes.len == 0: return ""
-    return cast[cstring](unsafeAddr val.bytes[0])
+  let v = h.currentValues[col]
+  if v.kind in {vkText, vkBlob}:
+    if out_len != nil: out_len[] = cint(v.bytes.len)
+    if v.bytes.len == 0: return ""
+    # IMPORTANT: return a pointer into statement-owned storage.
+    return cast[cstring](unsafeAddr h.currentValues[col].bytes[0])
   return nil
 
 proc decentdb_column_blob*(p: pointer, col: cint, out_len: ptr cint): ptr uint8 {.exportc, cdecl, dynlib.} =
   let h = cast[StmtHandle](p)
   if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return nil
-  let val = h.currentValues[col]
-  if val.kind in {vkText, vkBlob}:
-    if out_len != nil: out_len[] = cint(val.bytes.len)
-    if val.bytes.len == 0: return nil
-    return cast[ptr uint8](unsafeAddr val.bytes[0])
+  let v = h.currentValues[col]
+  if v.kind in {vkText, vkBlob}:
+    if out_len != nil: out_len[] = cint(v.bytes.len)
+    if v.bytes.len == 0: return nil
+    return cast[ptr uint8](unsafeAddr h.currentValues[col].bytes[0])
   return nil
 
 proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_count: ptr cint): cint {.exportc, cdecl, dynlib.} =

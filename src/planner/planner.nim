@@ -11,6 +11,7 @@ type PlanKind* = enum
   pkRowidSeek
   pkIndexSeek
   pkTrigramSeek
+  pkUnionDistinct
   pkFilter
   pkProject
   pkJoin
@@ -95,6 +96,15 @@ proc splitAnd(expr: Expr): seq[Expr] =
   else:
     result.add(expr)
 
+proc splitOr(expr: Expr): seq[Expr] =
+  if expr == nil:
+    return @[]
+  if expr.kind == ekBinary and expr.op.toUpperAscii() == "OR":
+    result.add(splitOr(expr.left))
+    result.add(splitOr(expr.right))
+  else:
+    result.add(expr)
+
 proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
   if expr == nil:
     return
@@ -141,6 +151,130 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         return true
     false
 
+  proc planSeekFromConjuncts(ds: seq[Expr]): Option[Plan] =
+    var partBase: Plan = nil
+    var accessIdx = -1
+
+    for i, c in ds:
+      var idxColumn = ""
+      var idxValue: Expr = nil
+      if isSimpleEqualityFor(c, stmt.fromTable, stmt.fromAlias, idxColumn, idxValue):
+        if isRowidPkColumn(idxColumn):
+          partBase = Plan(kind: pkRowidSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+          accessIdx = i
+          break
+        let idxOpt = catalog.getBtreeIndexForColumn(stmt.fromTable, idxColumn)
+        if isSome(idxOpt):
+          partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+          accessIdx = i
+          break
+
+    if partBase == nil:
+      for i, c in ds:
+        var likeColumn = ""
+        var likePattern: Expr = nil
+        var ignoreInsensitive = false
+        if isTrigramLikeFor(c, stmt.fromTable, stmt.fromAlias, likeColumn, likePattern, ignoreInsensitive):
+          let idxOpt = catalog.getTrigramIndexForColumn(stmt.fromTable, likeColumn)
+          if isSome(idxOpt):
+            partBase = Plan(kind: pkTrigramSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: likeColumn, likeExpr: likePattern, likeInsensitive: ignoreInsensitive)
+            accessIdx = i
+            break
+
+    if partBase == nil:
+      return none(Plan)
+
+    var rem = ds
+    if accessIdx >= 0:
+      rem.delete(accessIdx)
+    for c in rem:
+      partBase = Plan(kind: pkFilter, predicate: c, left: partBase)
+    some(partBase)
+
+  proc planDisjunct(d: Expr): Option[Plan] =
+    let ds = splitAnd(d)
+
+    var orIdx = -1
+    for i, c in ds:
+      if c != nil and c.kind == ekBinary and c.op.toUpperAscii() == "OR":
+        orIdx = i
+        break
+
+    if orIdx < 0:
+      return planSeekFromConjuncts(ds)
+
+    let orExpr = ds[orIdx]
+    let arms = splitOr(orExpr)
+    if arms.len < 2:
+      return none(Plan)
+
+    var otherConj: seq[Expr] = @[]
+    for i, c in ds:
+      if i != orIdx:
+        otherConj.add(c)
+
+    var armPlans: seq[Plan] = @[]
+    for arm in arms:
+      var armConj = otherConj
+      armConj.add(splitAnd(arm))
+      let p = planSeekFromConjuncts(armConj)
+      if p.isNone:
+        return none(Plan)
+      armPlans.add(p.get)
+
+    var unionBase = Plan(kind: pkUnionDistinct, left: armPlans[0], right: armPlans[1])
+    for i in 2 ..< armPlans.len:
+      unionBase = Plan(kind: pkUnionDistinct, left: unionBase, right: armPlans[i])
+    some(unionBase)
+
+  proc planOrExpr(orExpr: Expr): Option[Plan] =
+    if orExpr == nil or orExpr.kind != ekBinary or orExpr.op.toUpperAscii() != "OR":
+      return none(Plan)
+    let disjuncts = splitOr(orExpr)
+    if disjuncts.len < 2:
+      return none(Plan)
+    var parts: seq[Plan] = @[]
+    for d in disjuncts:
+      let p = planDisjunct(d)
+      if p.isNone:
+        return none(Plan)
+      parts.add(p.get)
+    var unionBase = Plan(kind: pkUnionDistinct, left: parts[0], right: parts[1])
+    for i in 2 ..< parts.len:
+      unionBase = Plan(kind: pkUnionDistinct, left: unionBase, right: parts[i])
+    some(unionBase)
+
+  # OR-planning: if the WHERE is a top-level OR of disjuncts, and every disjunct
+  # can use an indexable access path, plan it as a UNION DISTINCT of seeks.
+  # This preserves semantics but avoids a full table scan for OR-heavy predicates.
+  if stmt.joins.len == 0 and stmt.whereExpr != nil:
+    let disjuncts = splitOr(stmt.whereExpr)
+    if disjuncts.len > 1:
+      var parts: seq[Plan] = @[]
+      var allSeek = true
+      for d in disjuncts:
+        let p = planDisjunct(d)
+        if p.isNone:
+          allSeek = false
+          break
+        parts.add(p.get)
+
+      if allSeek and parts.len >= 2:
+        var unionBase = Plan(kind: pkUnionDistinct, left: parts[0], right: parts[1])
+        for i in 2 ..< parts.len:
+          unionBase = Plan(kind: pkUnionDistinct, left: unionBase, right: parts[i])
+
+        var base = unionBase
+        if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
+          base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+        else:
+          base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
+        if stmt.orderBy.len > 0:
+          base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+        if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+          base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
+        return base
+
   # Choose the best access path for the FROM table from any conjunct.
   var accessConjunctIdx = -1
   for i, c in conjuncts:
@@ -168,6 +302,13 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
           base = Plan(kind: pkTrigramSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: likeColumn, likeExpr: likePattern, likeInsensitive: ignoreInsensitive)
           accessConjunctIdx = i
           break
+  if base == nil:
+    for i, c in conjuncts:
+      let p = planOrExpr(c)
+      if p.isSome:
+        base = p.get
+        accessConjunctIdx = i
+        break
   if accessConjunctIdx >= 0:
     conjuncts.delete(accessConjunctIdx)
   if base == nil:
