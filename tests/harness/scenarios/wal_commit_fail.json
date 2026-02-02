@@ -1,10 +1,11 @@
 {
   "name": "wal_commit_fail",
-  "description": "Crash during commit frame write - transaction should not be visible",
+  "description": "Fail a WAL frame write - transaction should not be visible",
   "db_path": "$TMPDIR/decentdb_wal_commit_fail.ddb",
-  "sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'committed data')",
+  "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT)",
+  "sql": "INSERT INTO test VALUES (1, 'committed data')",
   "failpoint": {
-    "label": "wal_commit",
+    "label": "wal_write_frame",
     "kind": "error"
   },
   "verify": {

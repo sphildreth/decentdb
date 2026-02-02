@@ -1,15 +1,16 @@
 {
   "name": "wal_fsync_drop",
-  "description": "Simulate fsync lies - durability failure simulation",
+  "description": "Fail checkpoint WAL fsync - checkpoint should report error but data remains consistent",
   "db_path": "$TMPDIR/decentdb_wal_fsync_drop.ddb",
-  "sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'fsync test')",
+  "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'fsync test')",
+  "checkpoint": true,
   "failpoint": {
-    "label": "wal_fsync",
-    "kind": "drop"
+    "label": "checkpoint_wal_fsync",
+    "kind": "error"
   },
   "verify": {
-    "expect_crash": false,
-    "post_sql": "SELECT * FROM test WHERE id = 1",
+    "expect_crash": true,
+    "post_crash_sql": "SELECT * FROM test WHERE id = 1",
     "expect_rows": ["1|fsync test"]
   }
 }

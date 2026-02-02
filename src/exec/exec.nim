@@ -1734,7 +1734,16 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           return err[seq[Row]](idxRes.err.code, idxRes.err.message, idxRes.err.context)
         rightRows = idxRes.value
       else:
-        rightRows = cachedRight
+        if not canCacheRight:
+          # Fallback: execute right plan for each left row (Nested Loop Join)
+          # This is necessary because we couldn't cache the right side (e.g. too many left rows)
+          # and it's not an index seek.
+          let rightRes = execPlan(pager, catalog, plan.right, params)
+          if not rightRes.ok:
+            return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+          rightRows = rightRes.value
+        else:
+          rightRows = cachedRight
       if rightColumns.len == 0 and rightRows.len > 0:
         rightColumns = rightRows[0].columns
       for rrow in rightRows:

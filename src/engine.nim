@@ -288,6 +288,45 @@ proc valuesEqual(a: Value, b: Value): bool =
   else:
     false
 
+proc bytesToString(bytes: seq[byte]): string =
+  result = newString(bytes.len)
+  for i, b in bytes:
+    result[i] = char(b)
+
+proc valueBytesKey(value: Value): string =
+  ## Stable key for exact equality of TEXT/BLOB values.
+  case value.kind
+  of vkText, vkBlob:
+    bytesToString(value.bytes)
+  else:
+    ""
+
+proc indexHasAnyMatchingValue(
+  catalog: Catalog,
+  pager: Pager,
+  table: TableMeta,
+  columnName: string,
+  columnIndex: int,
+  value: Value,
+  excludeRowid: uint64 = 0
+): Result[bool] =
+  ## Safety net for hashed index keys (TEXT/BLOB):
+  ## look up candidate rowids by hash key, then verify exact value bytes.
+  let rowIdsRes = indexSeek(pager, catalog, table.name, columnName, value)
+  if not rowIdsRes.ok:
+    return err[bool](rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context)
+  for rid in rowIdsRes.value:
+    if excludeRowid != 0 and rid == excludeRowid:
+      continue
+    let rowRes = readRowAt(pager, table, rid)
+    if rowRes.ok:
+      if valuesEqual(rowRes.value.values[columnIndex], value):
+        return ok(true)
+    else:
+      if rowRes.err.code != ERR_IO:
+        return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+  ok(false)
+
 proc enforceNotNull(table: TableMeta, values: seq[Value]): Result[Void] =
   for i, col in table.columns:
     if col.notNull and values[i].kind == vkNull:
@@ -313,19 +352,28 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
       let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
       if isNone(idxOpt):
         return err[Void](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
-      let key = indexKeyFromValue(values[i])
-      if rowid == 0:
-        let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+      if col.kind in {ctText, ctBlob} and values[i].kind in {vkText, vkBlob}:
+        let anyRes = indexHasAnyMatchingValue(
+          catalog, pager, table, col.name, i, values[i], excludeRowid = rowid
+        )
         if not anyRes.ok:
           return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
         if anyRes.value:
           return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
       else:
-        let otherRes = indexHasOtherRowid(pager, idxOpt.get, key, rowid)
-        if not otherRes.ok:
-          return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
-        if otherRes.value:
-          return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+        let key = indexKeyFromValue(values[i])
+        if rowid == 0:
+          let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+          if not anyRes.ok:
+            return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
+          if anyRes.value:
+            return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+        else:
+          let otherRes = indexHasOtherRowid(pager, idxOpt.get, key, rowid)
+          if not otherRes.ok:
+            return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
+          if otherRes.value:
+            return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
   okVoid()
 
 proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value]): Result[Void] =
@@ -356,12 +404,36 @@ proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values
              return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
 
       return err[Void](ERR_INTERNAL, "Missing FK parent index", col.refTable & "." & col.refColumn)
-    let key = indexKeyFromValue(values[i])
-    let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
-    if not anyRes.ok:
-      return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
-    if not anyRes.value:
-      return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
+    let parentRes = catalog.getTable(col.refTable)
+    if not parentRes.ok:
+      return err[Void](parentRes.err.code, parentRes.err.message, parentRes.err.context)
+    var parentColIdx = -1
+    for pIdx, pCol in parentRes.value.columns:
+      if pCol.name == col.refColumn:
+        parentColIdx = pIdx
+        break
+    if parentColIdx < 0:
+      return err[Void](ERR_INTERNAL, "Missing FK parent column", col.refTable & "." & col.refColumn)
+    if parentRes.value.columns[parentColIdx].kind in {ctText, ctBlob} and values[i].kind in {vkText, vkBlob}:
+      let existsRes = indexHasAnyMatchingValue(
+        catalog,
+        pager,
+        parentRes.value,
+        col.refColumn,
+        parentColIdx,
+        values[i]
+      )
+      if not existsRes.ok:
+        return err[Void](existsRes.err.code, existsRes.err.message, existsRes.err.context)
+      if not existsRes.value:
+        return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
+    else:
+      let key = indexKeyFromValue(values[i])
+      let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
+      if not anyRes.ok:
+        return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
+      if not anyRes.value:
+        return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
   okVoid()
 
 # ============================================================================
@@ -402,6 +474,12 @@ proc enforceNotNullBatch*(table: TableMeta, rows: seq[seq[Value]]): Result[seq[i
   
   ok(failedIndices)
 
+proc hasFailure(failures: seq[tuple[rowIdx: int, colName: string]], rowIdx: int, colName: string): bool =
+  for f in failures:
+    if f.rowIdx == rowIdx and f.colName == colName:
+      return true
+  false
+
 proc enforceUniqueBatch*(
   catalog: Catalog, 
   pager: Pager, 
@@ -436,6 +514,53 @@ proc enforceUniqueBatch*(
   
   # For each unique column, collect all keys to check
   for colInfo in uniqueCols:
+    if table.columns[colInfo.colIdx].kind in {ctText, ctBlob}:
+      # TEXT/BLOB btree indexes are currently hash-keyed (CRC32C). To avoid
+      # hash-collision false positives, verify exact values by reading rows.
+      if isNone(colInfo.idxOpt):
+        return err[seq[tuple[rowIdx: int, colName: string]]](
+          ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & colInfo.colName
+        )
+
+      var byValue: Table[string, tuple[value: Value, rowid: uint64, rowIdxs: seq[int]]] =
+        initTable[string, tuple[value: Value, rowid: uint64, rowIdxs: seq[int]]]()
+
+      for rowIdx, rowData in rows:
+        let values = rowData.values
+        if values[colInfo.colIdx].kind == vkNull:
+          continue
+        if values[colInfo.colIdx].kind notin {vkText, vkBlob}:
+          continue
+
+        let k = valueBytesKey(values[colInfo.colIdx])
+        if byValue.hasKey(k):
+          failures.add((rowIdx: rowIdx, colName: colInfo.colName))
+          byValue[k].rowIdxs.add(rowIdx)
+        else:
+          byValue[k] = (value: values[colInfo.colIdx], rowid: rowData.rowid, rowIdxs: @[rowIdx])
+
+      for k, info in byValue.pairs:
+        let existsRes = indexHasAnyMatchingValue(
+          catalog,
+          pager,
+          table,
+          colInfo.colName,
+          colInfo.colIdx,
+          info.value,
+          excludeRowid = info.rowid
+        )
+        if not existsRes.ok:
+          return err[seq[tuple[rowIdx: int, colName: string]]](
+            existsRes.err.code, existsRes.err.message, existsRes.err.context
+          )
+        if existsRes.value:
+          for ridx in info.rowIdxs:
+            let colName = colInfo.colName
+            if not hasFailure(failures, ridx, colName):
+              failures.add((rowIdx: ridx, colName: colName))
+
+      continue
+
     var keysToCheck: seq[tuple[rowIdx: int, key: uint64, rowid: uint64]] = @[]
     
     # Collect all non-null keys for this column from all rows
@@ -564,17 +689,27 @@ proc enforceForeignKeysBatch*(
   # Process each FK group
   for refKey, refs in fkGroups.pairs:
     let idxOpt = catalog.getBtreeIndexForColumn(refKey.refTable, refKey.refColumn)
+
+    let parentRes = catalog.getTable(refKey.refTable)
+    if not parentRes.ok:
+      return err[seq[tuple[rowIdx: int, colName: string]]](
+        parentRes.err.code, parentRes.err.message, parentRes.err.context
+      )
+    let parentTable = parentRes.value
+    var parentColIdx = -1
+    for i, col in parentTable.columns:
+      if col.name == refKey.refColumn:
+        parentColIdx = i
+        break
+    if parentColIdx < 0:
+      return err[seq[tuple[rowIdx: int, colName: string]]](
+        ERR_INTERNAL, "Missing FK parent column", refKey.refTable & "." & refKey.refColumn
+      )
     
     if isNone(idxOpt):
       # Check if it's an optimized INT64 PRIMARY KEY
-      let parentRes = catalog.getTable(refKey.refTable)
-      if not parentRes.ok:
-        return err[seq[tuple[rowIdx: int, colName: string]]](
-          ERR_INTERNAL, "Missing FK parent table", refKey.refTable
-        )
-      
       var isInt64Pk = false
-      for pCol in parentRes.value.columns:
+      for pCol in parentTable.columns:
         if pCol.name == refKey.refColumn and pCol.primaryKey and pCol.kind == ctInt64:
           isInt64Pk = true
           break
@@ -590,13 +725,48 @@ proc enforceForeignKeysBatch*(
               colIdx: fkRef.colIdx, 
               colName: fkRef.colName,
               targetId: targetId,
-              parentTable: parentRes.value
+              parentTable: parentTable
             ))
         continue
       
       return err[seq[tuple[rowIdx: int, colName: string]]](
         ERR_INTERNAL, "Missing FK parent index", refKey.refTable & "." & refKey.refColumn
       )
+
+    if parentTable.columns[parentColIdx].kind in {ctText, ctBlob}:
+      # Hash-keyed TEXT/BLOB parent index: verify exact values.
+      var byVal: Table[string, tuple[value: Value, refs: seq[tuple[rowIdx: int, colName: string]]]] =
+        initTable[string, tuple[value: Value, refs: seq[tuple[rowIdx: int, colName: string]]]]()
+
+      for fkRef in refs:
+        let values = rows[fkRef.rowIdx]
+        if values[fkRef.colIdx].kind notin {vkText, vkBlob}:
+          continue
+        let k = valueBytesKey(values[fkRef.colIdx])
+        if not byVal.hasKey(k):
+          byVal[k] = (value: values[fkRef.colIdx], refs: @[])
+        byVal[k].refs.add((rowIdx: fkRef.rowIdx, colName: fkRef.colName))
+
+      for k, info in byVal.pairs:
+        let existsRes = indexHasAnyMatchingValue(
+          catalog,
+          pager,
+          parentTable,
+          refKey.refColumn,
+          parentColIdx,
+          info.value
+        )
+        if not existsRes.ok:
+          return err[seq[tuple[rowIdx: int, colName: string]]](
+            existsRes.err.code, existsRes.err.message, existsRes.err.context
+          )
+        if not existsRes.value:
+          for keyRef in info.refs:
+            let keyRefRowIdx = keyRef.rowIdx
+            let keyRefColName = keyRef.colName
+            if not hasFailure(failures, keyRefRowIdx, keyRefColName):
+              failures.add((rowIdx: keyRefRowIdx, colName: keyRefColName))
+      continue
     
     # Collect all unique keys to check for this index
     var uniqueKeys: seq[uint64] = @[]
@@ -1082,14 +1252,25 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let rowsRes = scanTable(db.pager, table)
         if not rowsRes.ok:
           return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-        var seen = initTable[uint64, bool]()
+        let colKind = table.columns[colIndex].kind
+        var seen: Table[uint64, bool] = initTable[uint64, bool]()
+        var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
         for row in rowsRes.value:
           if row.values[colIndex].kind == vkNull:
             continue
           let key = indexKeyFromValue(row.values[colIndex])
-          if seen.hasKey(key):
-            return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
-          seen[key] = true
+          if colKind in {ctText, ctBlob} and row.values[colIndex].kind in {vkText, vkBlob}:
+            let vKey = valueBytesKey(row.values[colIndex])
+            if not seenVals.hasKey(key):
+              seenVals[key] = @[vKey]
+            else:
+              if vKey in seenVals[key]:
+                return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
+              seenVals[key].add(vKey)
+          else:
+            if seen.hasKey(key):
+              return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
+            seen[key] = true
       var finalRoot = indexRootRes.value
       if bound.indexKind == sql.ikTrigram:
         let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
@@ -1412,14 +1593,25 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Resul
       let rowsRes = scanTable(db.pager, table)
       if not rowsRes.ok:
         return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      var seen = initTable[uint64, bool]()
+      let colKind = table.columns[colIndex].kind
+      var seen: Table[uint64, bool] = initTable[uint64, bool]()
+      var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
       for row in rowsRes.value:
         if row.values[colIndex].kind == vkNull:
           continue
         let key = indexKeyFromValue(row.values[colIndex])
-        if seen.hasKey(key):
-          return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
-        seen[key] = true
+        if colKind in {ctText, ctBlob} and row.values[colIndex].kind in {vkText, vkBlob}:
+          let vKey = valueBytesKey(row.values[colIndex])
+          if not seenVals.hasKey(key):
+            seenVals[key] = @[vKey]
+          else:
+            if vKey in seenVals[key]:
+              return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
+            seenVals[key].add(vKey)
+        else:
+          if seen.hasKey(key):
+            return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
+          seen[key] = true
     var finalRoot = indexRootRes.value
     if bound.indexKind == sql.ikTrigram:
       let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)

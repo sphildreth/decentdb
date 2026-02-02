@@ -6,6 +6,7 @@ import ../errors
 import ../vfs/types
 import sets
 import ./db_header
+import ../utils/perf
 
 type PageId* = uint32
 type PageOverlay* = proc(pageId: PageId): Option[string]
@@ -51,10 +52,16 @@ type Pager* = ref object
   flushHandler*: proc(pageId: PageId, data: string): Result[Void]
 
 const DefaultCacheShards = 16
+const MinShardCapacity = 4
 
 proc newPageCache*(capacity: int): PageCache =
   let cap = if capacity <= 0: 1 else: capacity
   var shardCount = min(DefaultCacheShards, cap)
+  # Avoid pathological sharding for tiny caches (e.g. cap=4 => 4 shards of 1 page).
+  # With very small caches, per-shard capacity=1 can cause frequent eviction failures
+  # when multiple hot pages map to the same shard.
+  let maxShardsByMinCap = max(1, cap div MinShardCapacity)
+  shardCount = min(shardCount, maxShardsByMinCap)
   if shardCount <= 0:
     shardCount = 1
   let baseCap = cap div shardCount
@@ -151,6 +158,21 @@ proc shardFor(cache: PageCache, pageId: PageId): PageCacheShard =
   let idx = int(hash mod uint64(cache.shards.len))
   cache.shards[idx]
 
+proc invalidatePage*(pager: Pager, pageId: PageId) =
+  ## Invalidate a page in the cache if it is not dirty.
+  ## Used by checkpointing to ensure readers don't see stale cached pages
+  ## after the DB file has been updated from WAL.
+  let shard = shardFor(pager.cache, pageId)
+  acquire(shard.lock)
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
+    if not entry.dirty:
+      # Only evict if not dirty. If dirty, it contains newer data than DB.
+      shard.pages.del(pageId)
+      # Note: We don't remove from clock immediately (lazy removal via tombstones)
+      # or we can iterate clock? Lazy is fine, evictIfNeeded handles missing entries.
+  release(shard.lock)
+
 const
   # Trigger compaction when tombstones exceed this percentage of clock size
   ClockTombstoneThresholdPct = 25
@@ -172,6 +194,7 @@ proc compactClock(shard: PageCacheShard) =
 proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
   ## Clock eviction with mark-and-compact instead of O(N) deletion.
   ## Uses PageId(0) as tombstone sentinel and compacts periodically.
+  perf.EvictionAttempts.inc()
   while shard.pages.len >= shard.capacity:
     if shard.clock.len == 0:
       break
@@ -185,6 +208,7 @@ proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
     var scanned = 0
     var evicted = false
     var anyUnpinned = false
+    var anyEvictable = false
     let scanLimit = (shard.clock.len - shard.clockTombstones) * 2  # Scan only non-tombstones
     
     while scanned < scanLimit and not evicted:
@@ -212,6 +236,13 @@ proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
         continue
       
       anyUnpinned = true
+
+      # Atomicity guard: do not evict/flush dirty pages during a transaction.
+      # Otherwise flushEntry() may write uncommitted bytes into the main DB.
+      if pager.inTransaction and entry.dirty:
+        continue
+
+      anyEvictable = true
       if entry.refBit:
         entry.refBit = false
         continue
@@ -225,9 +256,13 @@ proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
       shard.clock[currentIndex] = PageId(0)
       shard.clockTombstones.inc
       evicted = true
+      perf.Evictions.inc()
     
     if not evicted:
-      if not anyUnpinned:
+      if not anyUnpinned or not anyEvictable:
+        perf.EvictionBlocked.inc()
+        if pager.inTransaction and anyUnpinned and not anyEvictable:
+          return err[Void](ERR_INTERNAL, "No evictable page in cache (dirty pages blocked during transaction)")
         return err[Void](ERR_INTERNAL, "No evictable page in cache")
       continue
   
@@ -257,8 +292,11 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
+      perf.OverlayHits.inc()
       data = overlayRes.get
       loaded = true
+    else:
+      perf.OverlayMisses.inc()
   
   if not loaded:
     let offset = pageOffset(pager, pageId)
@@ -398,7 +436,9 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
+      perf.OverlayHits.inc()
       return body(overlayRes.get)
+    perf.OverlayMisses.inc()
     return withPageRoCached(pager, pageId, some(pager.overlaySnapshot), body)
   withPageRoCached(pager, pageId, none(uint64), body)
 
@@ -414,7 +454,9 @@ proc readPage*(pager: Pager, pageId: PageId): Result[string] =
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
+      perf.OverlayHits.inc()
       return ok(overlayRes.get)
+    perf.OverlayMisses.inc()
     if pager.overlaySnapshot > 0:
       return readPageCachedCopy(pager, pageId, some(pager.overlaySnapshot))
   readPageCachedCopy(pager, pageId, none(uint64))
@@ -428,7 +470,9 @@ proc readPageRo*(pager: Pager, pageId: PageId): Result[string] =
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
+      perf.OverlayHits.inc()
       return ok(overlayRes.get)
+    perf.OverlayMisses.inc()
     return readPageCachedShared(pager, pageId, some(pager.overlaySnapshot))
   readPageCachedShared(pager, pageId, none(uint64))
 

@@ -44,7 +44,8 @@ def build_failpoint_args(failpoint: dict) -> list[str]:
     if count:
         spec += ":" + str(count)
 
-    args.extend(["--walFailpoint", spec])
+    # cligen expects --walFailpoints=<spec> (repeatable) rather than space-separated args.
+    args.append(f"--walFailpoints={spec}")
     return args
 
 
@@ -52,13 +53,14 @@ def run_with_failpoint(
     engine_path: str, db_path: str, sql: str, failpoint: dict, timeout: float = 5.0
 ) -> tuple[subprocess.Popen, list[str]]:
     """Run the engine with a failpoint configured."""
-    cmd = [engine_path, "exec", "--db", db_path]
+    # NOTE: cligen requires --opt=value (not --opt value).
+    cmd = [engine_path, "exec", f"--db={db_path}"]
 
     # Add failpoint arguments
     cmd.extend(build_failpoint_args(failpoint))
 
     if sql:
-        cmd.extend(["--sql", sql])
+        cmd.append(f"--sql={sql}")
 
     # Start the process
     proc = subprocess.Popen(
@@ -70,24 +72,47 @@ def run_with_failpoint(
 
 def run_engine_normal(engine_path: str, db_path: str, sql: str) -> dict:
     """Run a normal SQL command and return the result."""
-    cmd = [engine_path, "exec", "--db", db_path, "--sql", sql]
+    cmd = [engine_path, "exec", f"--db={db_path}", f"--sql={sql}"]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+
     try:
-        result = json.loads(proc.stdout.strip() or "{}")
+        result = json.loads(stdout or "{}")
     except json.JSONDecodeError:
         result = {
             "ok": False,
             "error": {
                 "code": "ERR_INTERNAL",
                 "message": "Engine returned non-JSON output",
-                "context": proc.stdout.strip(),
+                "context": (stdout or stderr)[:2000],
+            },
+        }
+
+    # If we got an empty object (common for CLI parse errors), surface stderr.
+    if result == {}:
+        result = {
+            "ok": False,
+            "error": {
+                "code": "ERR_INTERNAL",
+                "message": "Engine returned no JSON output",
+                "context": (stderr or stdout)[:2000],
             },
         }
 
     result["exit_code"] = proc.returncode
-    result["stderr"] = proc.stderr.strip()
+    result["stderr"] = stderr
     return result
+
+
+def run_engine_checkpoint(engine_path: str, db_path: str, failpoint: Optional[dict] = None) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run a checkpoint operation (optionally with a WAL failpoint)."""
+    cmd = [engine_path, "exec", f"--db={db_path}", "--checkpoint"]
+    if failpoint:
+        cmd.extend(build_failpoint_args(failpoint))
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return proc, cmd
 
 
 def verify_results(actual_rows: list, expected_rows: list, scenario_name: str) -> bool:
@@ -127,42 +152,58 @@ def run_crash_scenario(engine_path: str, scenario: dict, keep_db: bool = False) 
     # Clean up any existing database
     if Path(db_path).exists():
         Path(db_path).unlink()
-    wal_path = db_path + ".wal"
-    if Path(wal_path).exists():
-        Path(wal_path).unlink()
+    # Correct WAL suffix is "-wal", but check both for safety
+    for suffix in ["-wal", ".wal"]:
+        wal_path = db_path + suffix
+        if Path(wal_path).exists():
+            Path(wal_path).unlink()
 
     # Run setup SQL if present
     setup_sql = scenario.get("setup_sql", "")
     if setup_sql:
         print(f"  Running setup SQL...")
-        result = run_engine_normal(engine_path, db_path, setup_sql)
-        if not result.get("ok", False):
-            print(f"  [FAIL] {name}: Setup failed - {result.get('error', {})}")
-            return False
+        # The CLI/engine expects a single statement per --sql invocation.
+        # Many scenarios use semicolons to separate statements; run them sequentially.
+        for stmt in [s.strip() for s in setup_sql.split(";")]:
+            if not stmt:
+                continue
+            result = run_engine_normal(engine_path, db_path, stmt)
+            if not result.get("ok", False):
+                print(f"  [FAIL] {name}: Setup failed - {result.get('error', {})}")
+                if result.get("stderr"):
+                    print(f"    stderr: {result.get('stderr')}")
+                return False
 
     # Get scenario components
     sql = scenario.get("sql", "")
     failpoint = scenario.get("failpoint", {})
     verify = scenario.get("verify", {})
     expect_crash = verify.get("expect_crash", True)
+    run_checkpoint = bool(scenario.get("checkpoint", False))
 
     if not failpoint:
         print(f"  [SKIP] {name}: No failpoint configured")
         return True
 
-    # Run with failpoint
-    print(f"  Executing with failpoint: {failpoint.get('label', 'unknown')}")
-    proc, cmd = run_with_failpoint(engine_path, db_path, sql, failpoint)
+    if run_checkpoint:
+        print(f"  Executing checkpoint with failpoint: {failpoint.get('label', 'unknown')}")
+        completed, cmd = run_engine_checkpoint(engine_path, db_path, failpoint)
+        stdout, stderr = completed.stdout, completed.stderr
+        exit_code = completed.returncode
+    else:
+        # Run with failpoint
+        print(f"  Executing with failpoint: {failpoint.get('label', 'unknown')}")
+        proc, cmd = run_with_failpoint(engine_path, db_path, sql, failpoint)
 
-    # Wait for the process
-    try:
-        stdout, stderr = proc.communicate(timeout=10.0)
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired:
-        # Process might be hanging due to failpoint - kill it
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        exit_code = -1
+        # Wait for the process
+        try:
+            stdout, stderr = proc.communicate(timeout=10.0)
+            exit_code = proc.returncode
+        except subprocess.TimeoutExpired:
+            # Process might be hanging due to failpoint - kill it
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            exit_code = -1
 
     # Check if we expected a crash
     if expect_crash:
@@ -182,7 +223,7 @@ def run_crash_scenario(engine_path: str, scenario: dict, keep_db: bool = False) 
             print(f"  [OK] {name}: Process completed successfully")
 
     # Post-crash verification
-    post_crash_sql = verify.get("post_crash_sql", "")
+    post_crash_sql = verify.get("post_crash_sql", "") or verify.get("post_sql", "")
     if post_crash_sql:
         print(f"  Verifying post-crash state...")
         result = run_engine_normal(engine_path, db_path, post_crash_sql)
@@ -209,8 +250,10 @@ def run_crash_scenario(engine_path: str, scenario: dict, keep_db: bool = False) 
     if not keep_db:
         if Path(db_path).exists():
             Path(db_path).unlink()
-        if Path(wal_path).exists():
-            Path(wal_path).unlink()
+        for suffix in ["-wal", ".wal"]:
+            wal_path = db_path + suffix
+            if Path(wal_path).exists():
+                Path(wal_path).unlink()
 
     return True
 

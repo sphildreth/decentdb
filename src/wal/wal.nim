@@ -9,6 +9,7 @@ import ../errors
 import ../pager/pager
 import ../pager/db_header
 import ../vfs/types
+import ../utils/perf
 
 type WalFrameType* = enum
   wfPage = 0
@@ -187,6 +188,7 @@ proc applyFailpoint(wal: Wal, label: string, buffer: seq[byte]): Result[int] =
     ok(part)
 
 proc appendFrame(wal: Wal, frameType: WalFrameType, pageId: uint32, payload: seq[byte]): Result[(uint64, int64)] =
+  perf.WalGrowthWriter.inc()
   let lsn = wal.nextLsn
   wal.nextLsn.inc
   let frame = encodeFrame(frameType, pageId, payload, lsn)
@@ -305,6 +307,11 @@ proc shouldCheckReaders*(wal: Wal): bool =
   return elapsedMs >= wal.readerCheckIntervalMs
 
 proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
+  let start = epochTime()
+  defer:
+    let duration = int64((epochTime() - start) * 1_000_000)
+    perf.CheckpointDurationUs.add(duration)
+
   # Phase 1: Acquire lock, determine what to checkpoint, then release lock
   acquire(wal.lock)
   wal.checkpointPending = true
@@ -434,6 +441,8 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
       wal.checkpointPending = false
       release(wal.lock)
       return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    # Ensure readers don't see stale pages in cache now that DB file is updated
+    pager.invalidatePage(entry[0])
   let fsyncFail = applyFailpoint(wal, "checkpoint_fsync", @[])
   if not fsyncFail.ok:
     acquire(wal.lock)
@@ -483,10 +492,13 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
   let currentEnd = wal.walEnd.load(moAcquire)
   let hadNewCommits = currentEnd > lastCommit
   
+  # Re-check active readers (in case new ones started during I/O)
+  let currentMinSnap = wal.minReaderSnapshot()
+  
   # Only truncate if:
-  # 1. No active readers (minSnap.isNone) OR all readers are at or past lastCommit
+  # 1. No active readers (currentMinSnap.isNone) OR all readers are at or past lastCommit
   # 2. AND no new commits occurred during checkpoint
-  let canTruncate = (minSnap.isNone or minSnap.get >= lastCommit) and not hadNewCommits
+  let canTruncate = (currentMinSnap.isNone or currentMinSnap.get >= lastCommit) and not hadNewCommits
   
   if canTruncate:
     release(wal.lock)

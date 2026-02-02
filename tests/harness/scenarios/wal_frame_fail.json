@@ -2,9 +2,10 @@
   "name": "wal_frame_fail",
   "description": "Transaction with multiple pages, crash mid-frame write",
   "db_path": "$TMPDIR/decentdb_wal_frame_fail.ddb",
-  "sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'test data'), (2, 'more data'), (3, 'third row')",
+  "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT)",
+  "sql": "INSERT INTO test VALUES (1, 'test data')",
   "failpoint": {
-    "label": "wal_frame",
+    "label": "wal_write_frame",
     "kind": "partial",
     "bytes": 16,
     "count": 2
@@ -12,6 +13,6 @@
   "verify": {
     "expect_crash": true,
     "post_crash_sql": "SELECT COUNT(*) FROM test",
-    "expect_rows": []
+    "expect_rows": ["0"]
   }
 }

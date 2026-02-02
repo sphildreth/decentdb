@@ -93,3 +93,32 @@ def test_sqlite_to_decentdb_convert(tmp_path):
 
     finally:
         conn.close()
+
+
+def test_sqlite_to_decentdb_convert_chunked_commits(tmp_path):
+    sqlite_path = str(tmp_path / "src.sqlite")
+    decent_path = str(tmp_path / "dst.decentdb")
+
+    _make_sqlite_source(sqlite_path)
+
+    # Exercise the chunked-commit mode (many small transactions) to ensure
+    # bulk imports don't require an unbounded page cache.
+    report = convert_sqlite_to_decentdb(
+        sqlite_path=sqlite_path,
+        decentdb_path=decent_path,
+        overwrite=False,
+        show_progress=False,
+        commit_every=1,
+    )
+
+    assert report.rows_copied.get("parent") == 2
+    assert report.rows_copied.get("child") == 2
+    assert report.rows_copied.get("flags") == 2
+
+    conn = decentdb.connect(decent_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM parent").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM child").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM flags").fetchone()[0] == 2
+    finally:
+        conn.close()
