@@ -434,8 +434,9 @@ def write_json_report(
 def main() -> int:
     epilog = """Notes:
 - SQLite .timer prints seconds (we convert to ms).
-- In --mode=cli, DecentDB runs with --noRows so timings reflect query execution
-  (not JSON row materialization). SQLite CLI still has REPL/CLI overhead.
+- Default --mode=python reuses connections, so the numbers focus on query execution.
+- In --mode=cli, timings include per-iteration process startup + open/close overhead.
+    DecentDB runs with --noRows so timings reflect query execution (not JSON row materialization).
 - For substring LIKE (e.g. LIKE '%needle%'), use a trigram index in DecentDB:
     CREATE INDEX artists_name_trgm ON artists USING trigram (name);
 - For a more apples-to-apples substring-search comparison with SQLite, consider
@@ -452,7 +453,7 @@ def main() -> int:
     ap.add_argument(
         "--mode",
         choices=["cli", "python"],
-        default="cli",
+        default="python",
         help=(
             "cli: sqlite3 .timer + decentdb exec (with --noRows)\n"
             "python: sqlite3 module + DecentDB python driver (see --fetch)"

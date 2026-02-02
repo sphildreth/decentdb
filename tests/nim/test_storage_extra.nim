@@ -103,3 +103,21 @@ suite "Storage Extras":
     check buildRes.ok
 
     discard closeDb(db)
+
+  test "trigram index build supports large postings (leaf value overflow)":
+    let path = makeTempDb("decentdb_trigram_large_postings.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)").ok
+
+    # Insert enough rows sharing a common trigram so the postings blob exceeds
+    # the leaf inline size and must spill to overflow pages.
+    for i in 1 .. 800:
+      discard execSql(db, "INSERT INTO docs (id, body) VALUES (" & $i & ", 'AAAAA')")
+
+    let idxRes = execSql(db, "CREATE INDEX docs_body_trgm_big ON docs USING trigram (body)")
+    check idxRes.ok
+
+    discard closeDb(db)

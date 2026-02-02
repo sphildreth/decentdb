@@ -23,6 +23,29 @@ type BTreeCursor* = ref object
   overflows*: seq[uint32]
   nextLeaf*: PageId
 
+type BTreeCursorView* = ref object
+  ## Cursor that avoids allocating/copying leaf payloads.
+  ## Values are accessed as (page string, offset, len) views when inline.
+  tree*: BTree
+  leaf*: PageId
+  index*: int
+  keys*: seq[uint64]
+  valueOffsets*: seq[int]
+  valueLens*: seq[int]
+  overflows*: seq[uint32]
+  nextLeaf*: PageId
+  leafPage*: string
+
+type BTreeCursorStream* = ref object
+  ## Streaming cursor for full scans.
+  ## Decodes leaf cells on-the-fly without allocating per-leaf arrays.
+  tree*: BTree
+  leaf*: PageId
+  nextLeaf*: PageId
+  leafPage*: string
+  offset*: int
+  remaining*: int
+
 type LeafValue = object
   inline: seq[byte]
   overflow: uint32
@@ -85,6 +108,51 @@ proc readLeafCells(page: string): Result[(seq[uint64], seq[seq[byte]], seq[uint3
     values.add(payload)
     overflows.add(overflow)
   ok((keys, values, overflows, nextLeaf))
+
+proc readLeafCellsView(page: string): Result[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)] =
+  if page.len < 8:
+    return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Page too small")
+  if byte(page[0]) != PageTypeLeaf:
+    return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Not a leaf page")
+  let count = int(readU16LE(page, 2))
+  let nextLeaf = PageId(readU32LE(page, 4))
+  var keys = newSeq[uint64](count)
+  var valueOffsets = newSeq[int](count)
+  var valueLens = newSeq[int](count)
+  var overflows = newSeq[uint32](count)
+  var offset = 8
+
+  for i in 0 ..< count:
+    if offset >= page.len:
+      return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Leaf cell out of bounds")
+
+    let keyRes = decodeVarint(page, offset)
+    if not keyRes.ok:
+      return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+    keys[i] = keyRes.value
+
+    let ctrlRes = decodeVarint(page, offset)
+    if not ctrlRes.ok:
+      return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ctrlRes.err.code, ctrlRes.err.message, ctrlRes.err.context)
+    let control = ctrlRes.value
+
+    let isOverflow = (control and 1) != 0
+    let val = uint32(control shr 1)
+
+    if isOverflow:
+      overflows[i] = val
+      valueOffsets[i] = 0
+      valueLens[i] = 0
+    else:
+      let valueLen = int(val)
+      if offset + valueLen > page.len:
+        return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Leaf value out of bounds")
+      overflows[i] = 0'u32
+      valueOffsets[i] = offset
+      valueLens[i] = valueLen
+      offset += valueLen
+
+  ok((keys, valueOffsets, valueLens, overflows, nextLeaf))
 
 proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)] =
   if page.len < 8:
@@ -418,6 +486,194 @@ proc openCursorAt*(tree: BTree, startKey: uint64): Result[BTreeCursor] =
   let cursor = BTreeCursor(tree: tree, leaf: leafId, index: idx, keys: keys, values: values, overflows: overflows, nextLeaf: nextLeaf)
   ok(cursor)
 
+proc openCursorView*(tree: BTree): Result[BTreeCursorView] =
+  var current = tree.root
+  while true:
+    var pageType: byte = 0
+    var keys: seq[uint64] = @[]
+    var valueOffsets: seq[int] = @[]
+    var valueLens: seq[int] = @[]
+    var overflows: seq[uint32] = @[]
+    var nextLeaf: PageId = 0
+    var leafPage: string = ""
+    var children: seq[uint32] = @[]
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        leafPage = page
+        let parsed = readLeafCellsView(page)
+        if not parsed.ok:
+          return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+        (keys, valueOffsets, valueLens, overflows, nextLeaf) = parsed.value
+        return okVoid()
+      let internalRes = readInternalCells(page)
+      if not internalRes.ok:
+        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+      (_, children, _) = internalRes.value
+      okVoid()
+    )
+    if not pageRes.ok:
+      return err[BTreeCursorView](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    if pageType == PageTypeLeaf:
+      let cursor = BTreeCursorView(
+        tree: tree,
+        leaf: current,
+        index: 0,
+        keys: keys,
+        valueOffsets: valueOffsets,
+        valueLens: valueLens,
+        overflows: overflows,
+        nextLeaf: nextLeaf,
+        leafPage: leafPage
+      )
+      return ok(cursor)
+    if children.len == 0:
+      return err[BTreeCursorView](ERR_CORRUPTION, "Empty internal page")
+    current = PageId(children[0])
+
+proc cursorNextView*(cursor: BTreeCursorView): Result[(uint64, string, int, int, uint32)] =
+  ## Returns (key, leafPage, valueOffset, valueLen, leafOverflowRoot)
+  if cursor.leaf == 0:
+    return err[(uint64, string, int, int, uint32)](ERR_IO, "Cursor exhausted")
+  if cursor.index < cursor.keys.len:
+    let i = cursor.index
+    cursor.index.inc
+    return ok((cursor.keys[i], cursor.leafPage, cursor.valueOffsets[i], cursor.valueLens[i], cursor.overflows[i]))
+  if cursor.nextLeaf == 0:
+    cursor.leaf = 0
+    return err[(uint64, string, int, int, uint32)](ERR_IO, "Cursor exhausted")
+
+  var keys: seq[uint64] = @[]
+  var valueOffsets: seq[int] = @[]
+  var valueLens: seq[int] = @[]
+  var overflows: seq[uint32] = @[]
+  var nextLeaf: PageId = 0
+  var leafPage: string = ""
+  let pageRes = cursor.tree.pager.withPageRo(cursor.nextLeaf, proc(page: string): Result[Void] =
+    leafPage = page
+    let parsed = readLeafCellsView(page)
+    if not parsed.ok:
+      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+    (keys, valueOffsets, valueLens, overflows, nextLeaf) = parsed.value
+    okVoid()
+  )
+  if not pageRes.ok:
+    return err[(uint64, string, int, int, uint32)](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  cursor.leaf = cursor.nextLeaf
+  cursor.keys = keys
+  cursor.valueOffsets = valueOffsets
+  cursor.valueLens = valueLens
+  cursor.overflows = overflows
+  cursor.nextLeaf = nextLeaf
+  cursor.leafPage = leafPage
+  cursor.index = 0
+  cursorNextView(cursor)
+
+proc openCursorStream*(tree: BTree): Result[BTreeCursorStream] =
+  var current = tree.root
+  while true:
+    var pageType: byte = 0
+    var children: seq[uint32] = @[]
+    var leafPage: string = ""
+    var count = 0
+    var nextLeaf: PageId = 0
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      if page.len < 8:
+        return err[Void](ERR_CORRUPTION, "Page too small")
+      pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        leafPage = page
+        count = int(readU16LE(page, 2))
+        nextLeaf = PageId(readU32LE(page, 4))
+        return okVoid()
+      let internalRes = readInternalCells(page)
+      if not internalRes.ok:
+        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
+      (_, children, _) = internalRes.value
+      okVoid()
+    )
+    if not pageRes.ok:
+      return err[BTreeCursorStream](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+    if pageType == PageTypeLeaf:
+      return ok(BTreeCursorStream(
+        tree: tree,
+        leaf: current,
+        nextLeaf: nextLeaf,
+        leafPage: leafPage,
+        offset: 8,
+        remaining: count
+      ))
+    if children.len == 0:
+      return err[BTreeCursorStream](ERR_CORRUPTION, "Empty internal page")
+    current = PageId(children[0])
+
+proc cursorNextStream*(cursor: BTreeCursorStream): Result[(uint64, string, int, int, uint32)] =
+  ## Returns (key, leafPage, valueOffset, valueLen, leafOverflowRoot)
+  if cursor.leaf == 0:
+    return err[(uint64, string, int, int, uint32)](ERR_IO, "Cursor exhausted")
+
+  if cursor.remaining <= 0:
+    if cursor.nextLeaf == 0:
+      cursor.leaf = 0
+      return err[(uint64, string, int, int, uint32)](ERR_IO, "Cursor exhausted")
+
+    var leafPage: string = ""
+    var count = 0
+    var nextLeaf: PageId = 0
+    let pageRes = cursor.tree.pager.withPageRo(cursor.nextLeaf, proc(page: string): Result[Void] =
+      if page.len < 8:
+        return err[Void](ERR_CORRUPTION, "Page too small")
+      if byte(page[0]) != PageTypeLeaf:
+        return err[Void](ERR_CORRUPTION, "Not a leaf page")
+      leafPage = page
+      count = int(readU16LE(page, 2))
+      nextLeaf = PageId(readU32LE(page, 4))
+      okVoid()
+    )
+    if not pageRes.ok:
+      return err[(uint64, string, int, int, uint32)](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+
+    cursor.leaf = cursor.nextLeaf
+    cursor.nextLeaf = nextLeaf
+    cursor.leafPage = leafPage
+    cursor.offset = 8
+    cursor.remaining = count
+    return cursorNextStream(cursor)
+
+  if cursor.offset >= cursor.leafPage.len:
+    return err[(uint64, string, int, int, uint32)](ERR_CORRUPTION, "Leaf cell out of bounds")
+
+  let keyRes = decodeVarint(cursor.leafPage, cursor.offset)
+  if not keyRes.ok:
+    return err[(uint64, string, int, int, uint32)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+  let key = keyRes.value
+
+  let ctrlRes = decodeVarint(cursor.leafPage, cursor.offset)
+  if not ctrlRes.ok:
+    return err[(uint64, string, int, int, uint32)](ctrlRes.err.code, ctrlRes.err.message, ctrlRes.err.context)
+  let control = ctrlRes.value
+
+  let isOverflow = (control and 1) != 0
+  let val = uint32(control shr 1)
+
+  var valueOffset = 0
+  var valueLen = 0
+  var overflow = 0'u32
+  if isOverflow:
+    overflow = val
+    valueOffset = 0
+    valueLen = 0
+  else:
+    valueLen = int(val)
+    overflow = 0'u32
+    if cursor.offset + valueLen > cursor.leafPage.len:
+      return err[(uint64, string, int, int, uint32)](ERR_CORRUPTION, "Leaf value out of bounds")
+    valueOffset = cursor.offset
+    cursor.offset += valueLen
+
+  cursor.remaining.dec
+  ok((key, cursor.leafPage, valueOffset, valueLen, overflow))
+
 proc cursorNext*(cursor: BTreeCursor): Result[(uint64, seq[byte], uint32)] =
   if cursor.leaf == 0:
     return err[(uint64, seq[byte], uint32)](ERR_IO, "Cursor exhausted")
@@ -551,9 +807,13 @@ proc bulkBuildFromSorted*(tree: BTree, entries: seq[(uint64, seq[byte])]): Resul
   for i, entry in entries:
     if currentKeys.len == 0:
       leaves.add((id: currentLeaf, firstKey: entry[0]))
+    let leafValRes = prepareLeafValue(tree, entry[1])
+    if not leafValRes.ok:
+      return err[PageId](leafValRes.err.code, leafValRes.err.message, leafValRes.err.context)
+    let leafVal = leafValRes.value
     currentKeys.add(entry[0])
-    currentVals.add(entry[1])
-    currentOv.add(0'u32)
+    currentVals.add(leafVal.inline)
+    currentOv.add(leafVal.overflow)
     let tryRes = encodeLeaf(currentKeys, currentVals, currentOv, 0, pageSize)
     if tryRes.ok:
       continue
@@ -570,8 +830,8 @@ proc bulkBuildFromSorted*(tree: BTree, entries: seq[(uint64, seq[byte])]): Resul
       return err[PageId](flushRes.err.code, flushRes.err.message, flushRes.err.context)
     currentLeaf = newLeaf
     currentKeys = @[entry[0]]
-    currentVals = @[entry[1]]
-    currentOv = @[0'u32]
+    currentVals = @[leafVal.inline]
+    currentOv = @[leafVal.overflow]
     leaves.add((id: currentLeaf, firstKey: entry[0]))
 
   let flushRes = flushLeaf(0)

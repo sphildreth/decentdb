@@ -62,6 +62,22 @@ proc decodeVarint*(data: openArray[byte], offset: var int): Result[uint64] =
       return err[uint64](ERR_CORRUPTION, "Varint overflow")
   err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
 
+proc decodeVarint*(data: string, offset: var int): Result[uint64] =
+  ## Decode a varint from a raw byte string.
+  ## This avoids copying pager page buffers into seq[byte] just to decode varints.
+  var shift = 0
+  var value: uint64 = 0
+  while offset < data.len:
+    let b = byte(data[offset])
+    offset.inc
+    value = value or (uint64(b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      return ok(value)
+    shift += 7
+    if shift > 63:
+      return err[uint64](ERR_CORRUPTION, "Varint overflow")
+  err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
+
 proc compressData(data: seq[byte]): seq[byte] =
   if data.len == 0: return @[]
   var s = newString(data.len)

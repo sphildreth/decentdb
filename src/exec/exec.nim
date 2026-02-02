@@ -495,6 +495,40 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
         return false
     true
 
+  type BmhSkipTable = array[256, int]
+
+  proc initBmhSkipTable(needle: openArray[byte], skip: var BmhSkipTable) {.inline.} =
+    ## Boyer–Moore–Horspool skip table for byte strings.
+    let m = needle.len
+    for i in 0 .. 255:
+      skip[i] = m
+    if m <= 1:
+      return
+    for i in 0 ..< (m - 1):
+      skip[int(needle[i])] = (m - 1) - i
+
+  proc bytesFindInBmh(hay: openArray[byte], hayStart: int, hayLen: int, needle: openArray[byte], skip: ptr BmhSkipTable): int =
+    if needle.len == 0:
+      return 0
+    if hayLen < 0 or needle.len > hayLen:
+      return -1
+    if needle.len == 1:
+      let b0 = needle[0]
+      for i in hayStart ..< (hayStart + hayLen):
+        if hay[i] == b0:
+          return i - hayStart
+      return -1
+    let m = needle.len
+    let lastNeedle = needle[m - 1]
+    let endPos = hayStart + hayLen - m
+    var i = hayStart
+    while i <= endPos:
+      let c = hay[i + m - 1]
+      if c == lastNeedle and bytesEqAt(hay, i, needle):
+        return i - hayStart
+      i += skip[][int(c)]
+    -1
+
   proc bytesFindIn(hay: openArray[byte], hayStart: int, hayLen: int, needle: openArray[byte]): int =
     if needle.len == 0:
       return 0
@@ -520,7 +554,7 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       return false
     bytesEqAt(hay, hayStart + hayLen - needle.len, needle)
 
-  proc matchLikeInRecord(recordData: openArray[byte], colIndex: int, mode: LikeMode, needleBytes: seq[byte], pattern: string, caseInsensitive: bool): Result[bool] =
+  proc matchLikeInRecord(recordData: openArray[byte], colIndex: int, mode: LikeMode, needleBytes: seq[byte], pattern: string, caseInsensitive: bool, containsBmh: ptr BmhSkipTable): Result[bool] =
     ## Fast LIKE matcher for a single TEXT column inside a record.
     ## Falls back to full decode for uncommon encodings.
     var offset = 0
@@ -564,6 +598,8 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
           if mode == lmContains:
             if needleBytes.len == 0:
               return ok(true)
+            if containsBmh != nil:
+              return ok(bytesFindInBmh(recordData, offset, length, needleBytes, containsBmh) >= 0)
             return ok(bytesFindIn(recordData, offset, length, needleBytes) >= 0)
           if mode == lmPrefix:
             return ok(bytesStartsWithIn(recordData, offset, length, needleBytes))
@@ -589,6 +625,152 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       offset += length
     ok(false)
 
+  proc bytesEqAtStr(hay: string, hayStart: int, needle: openArray[byte]): bool {.inline.} =
+    if needle.len == 0:
+      return true
+    if hayStart < 0 or hayStart + needle.len > hay.len:
+      return false
+    for i in 0 ..< needle.len:
+      if byte(hay[hayStart + i]) != needle[i]:
+        return false
+    true
+
+  proc bytesFindInBmhStr(hay: string, hayStart: int, hayLen: int, needle: openArray[byte], skip: ptr BmhSkipTable): int =
+    if needle.len == 0:
+      return 0
+    if hayLen < 0 or needle.len > hayLen:
+      return -1
+    if needle.len == 1:
+      let b0 = needle[0]
+      for i in hayStart ..< (hayStart + hayLen):
+        if byte(hay[i]) == b0:
+          return i - hayStart
+      return -1
+    let m = needle.len
+    let lastNeedle = needle[m - 1]
+    let endPos = hayStart + hayLen - m
+    var i = hayStart
+    while i <= endPos:
+      let c = byte(hay[i + m - 1])
+      if c == lastNeedle and bytesEqAtStr(hay, i, needle):
+        return i - hayStart
+      i += skip[][int(c)]
+    -1
+
+  proc bytesStartsWithInStr(hay: string, hayStart: int, hayLen: int, needle: openArray[byte]): bool {.inline.} =
+    if needle.len == 0:
+      return true
+    if needle.len > hayLen:
+      return false
+    bytesEqAtStr(hay, hayStart, needle)
+
+  proc bytesEndsWithInStr(hay: string, hayStart: int, hayLen: int, needle: openArray[byte]): bool {.inline.} =
+    if needle.len == 0:
+      return true
+    if needle.len > hayLen:
+      return false
+    bytesEqAtStr(hay, hayStart + hayLen - needle.len, needle)
+
+  proc decodeVarintBoundedStr(data: string, offset: var int, endPos: int): Result[uint64] =
+    ## Like decodeVarint, but refuses to read beyond endPos.
+    var shift = 0
+    var value: uint64 = 0
+    while offset < endPos:
+      let b = byte(data[offset])
+      offset.inc
+      value = value or (uint64(b and 0x7F) shl shift)
+      if (b and 0x80) == 0:
+        return ok(value)
+      shift += 7
+      if shift > 63:
+        return err[uint64](ERR_CORRUPTION, "Varint overflow")
+    err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
+
+  proc matchLikeInRecordStr(recordPage: string, recordStart: int, recordLen: int, colIndex: int, mode: LikeMode, needleBytes: seq[byte], pattern: string, caseInsensitive: bool, containsBmh: ptr BmhSkipTable): Result[bool] =
+    ## Like matchLikeInRecord, but treats the record as a view into a page string.
+    ## Avoids allocating/copying the record payload for the common vkText + simple LIKE cases.
+    var offset = recordStart
+    let endPos = recordStart + recordLen
+    if offset < 0 or endPos < 0 or endPos > recordPage.len:
+      return err[bool](ERR_CORRUPTION, "Record view out of bounds")
+
+    let countRes = decodeVarintBoundedStr(recordPage, offset, endPos)
+    if not countRes.ok:
+      return err[bool](countRes.err.code, countRes.err.message, countRes.err.context)
+    let fieldCount = int(countRes.value)
+    if colIndex < 0 or colIndex >= fieldCount:
+      return ok(false)
+
+    for idx in 0 ..< fieldCount:
+      if offset >= endPos:
+        return err[bool](ERR_CORRUPTION, "Unexpected end of record")
+      let kindValue = int(byte(recordPage[offset]))
+      if kindValue < 0 or kindValue > ord(high(ValueKind)):
+        return err[bool](ERR_CORRUPTION, "Unknown value kind")
+      let kind = ValueKind(kindValue)
+      offset.inc
+
+      let lenRes = decodeVarintBoundedStr(recordPage, offset, endPos)
+      if not lenRes.ok:
+        return err[bool](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+      let length = int(lenRes.value)
+      if offset + length > endPos:
+        return err[bool](ERR_CORRUPTION, "Record field length out of bounds")
+
+      if idx == colIndex:
+        case kind
+        of vkNull:
+          return ok(false)
+        of vkText:
+          if mode == lmGeneric or caseInsensitive:
+            var s = newString(length)
+            if length > 0:
+              copyMem(addr s[0], unsafeAddr recordPage[offset], length)
+            let likeRes = likeMatchChecked(s, pattern, caseInsensitive)
+            if not likeRes.ok:
+              return err[bool](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+            return ok(likeRes.value)
+
+          if mode == lmContains:
+            if needleBytes.len == 0:
+              return ok(true)
+            if containsBmh != nil:
+              return ok(bytesFindInBmhStr(recordPage, offset, length, needleBytes, containsBmh) >= 0)
+            # Fallback for 1-byte needles.
+            if needleBytes.len == 1:
+              let b0 = needleBytes[0]
+              for i in offset ..< (offset + length):
+                if byte(recordPage[i]) == b0:
+                  return ok(true)
+              return ok(false)
+            return ok(false)
+          if mode == lmPrefix:
+            return ok(bytesStartsWithInStr(recordPage, offset, length, needleBytes))
+          if mode == lmSuffix:
+            return ok(bytesEndsWithInStr(recordPage, offset, length, needleBytes))
+          return ok(false)
+        else:
+          # Decode fully for non-text or special encodings.
+          var recordBytes = newSeq[byte](recordLen)
+          if recordLen > 0:
+            copyMem(addr recordBytes[0], unsafeAddr recordPage[recordStart], recordLen)
+          let decoded = decodeRecordWithOverflow(pager, recordBytes)
+          if not decoded.ok:
+            return err[bool](decoded.err.code, decoded.err.message, decoded.err.context)
+          if colIndex >= decoded.value.len:
+            return ok(false)
+          let v = decoded.value[colIndex]
+          if v.kind != vkText:
+            return ok(false)
+          let s = valueToString(v)
+          let likeRes = likeMatchChecked(s, pattern, caseInsensitive)
+          if not likeRes.ok:
+            return err[bool](likeRes.err.code, likeRes.err.message, likeRes.err.context)
+          return ok(likeRes.value)
+
+      offset += length
+    ok(false)
+
   proc countLikeTableScan(table: TableMeta, colIndex: int, patternStr: string, caseInsensitive: bool): Result[int64] =
     ## Count matches for a single-column LIKE by scanning the base table.
     let (mode, needleText) = parseLikePattern(patternStr, caseInsensitive)
@@ -597,24 +779,42 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       needleBytes = newSeq[byte](needleText.len)
       for i, ch in needleText:
         needleBytes[i] = byte(ch)
+
+    var containsBmh: BmhSkipTable
+    var containsBmhPtr: ptr BmhSkipTable = nil
+    if mode == lmContains and needleBytes.len >= 2:
+      initBmhSkipTable(needleBytes, containsBmh)
+      containsBmhPtr = addr containsBmh
     let tree = newBTree(pager, table.rootPage)
-    let cursorRes = openCursor(tree)
+    let cursorRes = openCursorStream(tree)
     if not cursorRes.ok:
       return err[int64](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
     let btCursor = cursorRes.value
     var count: int64 = 0
     while true:
-      let nextRes = cursorNext(btCursor)
+      let nextRes = cursorNextStream(btCursor)
       if not nextRes.ok:
         break
-      let (_, valueBytes, overflow) = nextRes.value
-      if valueBytes.len == 0 and overflow == 0'u32:
+      let (_, leafPage, valueOffset, valueLen, leafOverflow) = nextRes.value
+      if valueLen == 0 and leafOverflow == 0'u32:
         continue
-      let mRes = matchLikeInRecord(valueBytes, colIndex, mode, needleBytes, patternStr, caseInsensitive)
-      if not mRes.ok:
-        return err[int64](mRes.err.code, mRes.err.message, mRes.err.context)
-      if mRes.value:
-        count.inc
+
+      if leafOverflow != 0'u32:
+        # Rare: row payload itself is in an overflow chain.
+        let rowBytesRes = readOverflowChainAll(pager, PageId(leafOverflow))
+        if not rowBytesRes.ok:
+          return err[int64](rowBytesRes.err.code, rowBytesRes.err.message, rowBytesRes.err.context)
+        let mRes = matchLikeInRecord(rowBytesRes.value, colIndex, mode, needleBytes, patternStr, caseInsensitive, containsBmhPtr)
+        if not mRes.ok:
+          return err[int64](mRes.err.code, mRes.err.message, mRes.err.context)
+        if mRes.value:
+          count.inc
+      else:
+        let mRes = matchLikeInRecordStr(leafPage, valueOffset, valueLen, colIndex, mode, needleBytes, patternStr, caseInsensitive, containsBmhPtr)
+        if not mRes.ok:
+          return err[int64](mRes.err.code, mRes.err.message, mRes.err.context)
+        if mRes.value:
+          count.inc
     ok(count)
 
   case plan.kind

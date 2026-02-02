@@ -573,25 +573,39 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
       break
   if columnIndex < 0:
     return err[PageId](ERR_SQL, "Column not found", columnName)
-  let rowsRes = scanTable(pager, table)
-  if not rowsRes.ok:
-    return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-  let idxTree = newBTree(pager, indexRoot)
-  for row in rowsRes.value:
+
+  # Bulk-build trigram postings in-memory and write once.
+  # This is dramatically faster than repeatedly reading/decoding/writing postings
+  # for each trigram across all rows.
+  var postingsByTrigram: Table[uint32, seq[uint64]] = initTable[uint32, seq[uint64]]()
+  let scanRes = scanTableEach(pager, table, proc(row: StoredRow): Result[Void] =
     if row.values[columnIndex].kind != vkText:
-      continue
+      return okVoid()
     let grams = uniqueTrigrams(valueText(row.values[columnIndex]))
     for g in grams:
-      let postingsRes = loadPostings(idxTree, g)
-      if not postingsRes.ok:
-        return err[PageId](postingsRes.err.code, postingsRes.err.message, postingsRes.err.context)
-      let updatedRes = addRowid(postingsRes.value, row.rowid)
-      if not updatedRes.ok:
-        return err[PageId](updatedRes.err.code, updatedRes.err.message, updatedRes.err.context)
-      let storeRes = storePostings(idxTree, g, updatedRes.value)
-      if not storeRes.ok:
-        return err[PageId](storeRes.err.code, storeRes.err.message, storeRes.err.context)
-  ok(idxTree.root)
+      if not postingsByTrigram.hasKey(g):
+        postingsByTrigram[g] = @[]
+      postingsByTrigram[g].add(row.rowid)
+    okVoid()
+  )
+  if not scanRes.ok:
+    return err[PageId](scanRes.err.code, scanRes.err.message, scanRes.err.context)
+
+  var entries: seq[(uint64, seq[byte])] = @[]
+  entries.setLen(postingsByTrigram.len)
+  var i = 0
+  for trigram, ids in postingsByTrigram:
+    # scanTableEach yields rowids in ascending order (table btree key order),
+    # so ids are already sorted and unique per trigram.
+    entries[i] = (uint64(trigram), encodePostingsSorted(ids))
+    i.inc
+  entries.sort(proc(a, b: (uint64, seq[byte])): int = cmp(a[0], b[0]))
+
+  let idxTree = newBTree(pager, indexRoot)
+  let buildRes = bulkBuildFromSorted(idxTree, entries)
+  if not buildRes.ok:
+    return err[PageId](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+  ok(buildRes.value)
 
 proc resetIndexRoot(pager: Pager, root: PageId): Result[Void] =
   var buf = newString(pager.pageSize)

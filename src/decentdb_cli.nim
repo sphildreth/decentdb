@@ -33,6 +33,30 @@ proc roundMs*(ms: float64): float64 {.inline.} =
   ## Round milliseconds to 4 decimal places for stable, readable CLI output.
   round(ms * 10_000.0) / 10_000.0
 
+type HeartbeatCtx = object
+  stop: ptr Atomic[bool]
+  startedAt: MonoTime
+  everyMs: int
+  label: string
+
+proc heartbeatThread(ctx: ptr HeartbeatCtx) {.thread.} =
+  ## Periodically prints a heartbeat to stderr while a long-running operation
+  ## is in progress. Intended for CLI usability; output always goes to stderr
+  ## so stdout remains machine-parseable (e.g. JSON).
+  if ctx.isNil:
+    return
+  if ctx.everyMs <= 0:
+    return
+  while not ctx.stop[].load(moAcquire):
+    sleep(ctx.everyMs)
+    if ctx.stop[].load(moAcquire):
+      break
+    let now = getMonoTime()
+    let elapsedNs = inNanoseconds(now - ctx.startedAt)
+    let elapsedMs = roundMs(float64(elapsedNs) / 1_000_000.0)
+    stderr.writeLine("Still running (" & ctx.label & ") elapsed_ms=" & $elapsedMs)
+    flushFile(stderr)
+
 proc loadConfig(): Table[string, string] =
   var cfg = initTable[string, string]()
   let path = expandTilde("~/.decentdb/config")
@@ -413,6 +437,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
               warnings: bool = false, verbose: bool = false,
               checkpointBytes: int = 0, checkpointMs: int = 0,
               readerWarnMs: int = 0, readerTimeoutMs: int = 0, forceTruncateOnTimeout: bool = false,
+              heartbeatMs: int = 0,
               format: string = "json", noRows: bool = false, params: seq[string] = @[],
               walFailpoints: seq[string] = @[], clearWalFailpoints: bool = false): int =
   ## Execute SQL statements against a DecentDb database file.
@@ -535,20 +560,39 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
 
     var execOk = true
     var execErr = DbError()
-    if noRows:
-      let res = execSqlNoRows(database, sql, parsedParams)
-      if not res.ok:
-        execOk = false
-        execErr = res.err
+
+    var hbStop: Atomic[bool]
+    var hbCtx = HeartbeatCtx()
+    var hbThread: Thread[ptr HeartbeatCtx]
+    var hbStarted = false
+    if heartbeatMs > 0:
+      hbStop.store(false, moRelaxed)
+      hbCtx.stop = addr hbStop
+      hbCtx.startedAt = queryStart
+      hbCtx.everyMs = heartbeatMs
+      hbCtx.label = "sql"
+      createThread(hbThread, heartbeatThread, addr hbCtx)
+      hbStarted = true
+
+    try:
+      if noRows:
+        let res = execSqlNoRows(database, sql, parsedParams)
+        if not res.ok:
+          execOk = false
+          execErr = res.err
+        else:
+          rowsReturned = res.value
       else:
-        rowsReturned = res.value
-    else:
-      let res = execSql(database, sql, parsedParams)
-      if not res.ok:
-        execOk = false
-        execErr = res.err
-      else:
-        rows = res.value
+        let res = execSql(database, sql, parsedParams)
+        if not res.ok:
+          execOk = false
+          execErr = res.err
+        else:
+          rows = res.value
+    finally:
+      if hbStarted:
+        hbStop.store(true, moRelease)
+        joinThread(hbThread)
 
     let queryEnd = getMonoTime()
     let execEnd = getMonoTime()
