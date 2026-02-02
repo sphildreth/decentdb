@@ -266,6 +266,20 @@ Multi-process locking is out of scope for 0.x.
 - If a deadlock is detected (via timeout), abort the newer transaction
 - Document lock acquisition order for all operations
 
+### 5.5 Isolation Levels (LOW-001)
+DecentDb implements **Snapshot Isolation (SI)** as the default and only isolation level.
+
+**Semantics:**
+- **Snapshot Acquisition**: A transaction acquires its snapshot (`snapshot_lsn`) at the beginning of the first statement (or `BEGIN` if explicit).
+- **Visibility**: Queries see all transactions committed before `snapshot_lsn`. They do *not* see uncommitted changes from other transactions or changes committed after `snapshot_lsn`.
+- **Own Writes**: A transaction always sees its own uncommitted modifications.
+
+**Anomalies:**
+- **Dirty Reads**: Prevented. Readers never see uncommitted data.
+- **Non-Repeatable Reads**: Prevented. Repeated reads within a transaction return the same data (unless modified by the transaction itself).
+- **Phantoms**: Prevented. Range scans are consistent with the snapshot.
+- **Write Skew**: Possible. Two concurrent transactions can modify disjoint rows based on a consistent snapshot state that they both invalidate. (e.g., "maintain at least one doctor on call"). This distinguishes SI from full Serializability.
+
 ---
 
 ## 6. SQL parsing & compatibility (Postgres-like)

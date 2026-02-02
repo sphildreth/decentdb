@@ -133,7 +133,7 @@ proc flushEntry(pager: Pager, entry: CacheEntry): Result[Void] =
   entry.dirty = false
   okVoid()
 
-proc splitmix64(x: uint64): uint64 =
+proc splitmix64*(x: uint64): uint64 =
   ## Splitmix64 hash function for better hash distribution.
   ## This is a high-quality hash function that provides good
   ## distribution properties for hash table indexing.

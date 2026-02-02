@@ -1932,6 +1932,11 @@ proc closeDb*(db: Db): Result[Void] =
   if not db.isOpen:
     return okVoid()
   
+  # Flush any pending trigram deltas before closing (ensure clean shutdown durability)
+  # We ignore errors here to prioritize closing, but log them in a real system
+  if db.catalog.trigramDeltas.len > 0:
+    discard flushTrigramDeltas(db.pager, db.catalog)
+
   # Commit any uncommitted dirty pages to WAL before closing
   if db.wal != nil and db.activeWriter == nil:
     let dirtyPages = snapshotDirtyPages(db.pager)
