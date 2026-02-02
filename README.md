@@ -55,10 +55,10 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 | Language | Toolkit | Description | Documentation |
 |---|---|---|---|
-| C# | ADO.NET + Dapper + MicroOrm (LINQ) | Embedded provider + LINQ-style `IQueryable` Micro-ORM for querying DecentDB files | LINK TO DOCS HERE |
-| Go | `database/sql` + sqlc | Embedded `database/sql` driver optimized for sqlc-generated queries | LINK TO DOCS HERE |
-| Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | LINK TO DOCS HERE |
-| Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | LINK TO DOCS HERE |
+| C# | ADO.NET + Dapper + MicroOrm (LINQ) | Embedded provider + LINQ-style `IQueryable` Micro-ORM for querying DecentDB files | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
+| Go | `database/sql` + sqlc | Embedded `database/sql` driver optimized for sqlc-generated queries | [decentdb.org/api/go](https://decentdb.org/api/go/) |
+| Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
+| Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 
 ## Quick Start
 
@@ -156,10 +156,10 @@ Common commands:
 
 ## Documentation
 
-- [User Guide](docs/user-guide/) - SQL reference, tutorials, and examples
-- [Nim API](docs/api/) - Embedded API documentation
-- [Architecture](docs/architecture/) - Design and implementation details
-- [Contributing](docs/development/contributing.md) - Development guidelines
+- [User Guide](https://decentdb.org/user-guide/sql-reference/) - SQL reference, tutorials, and examples
+- [Nim API](https://decentdb.org/api/nim-api/) - Embedded API documentation
+- [Architecture](https://decentdb.org/architecture/overview/) - Design and implementation details
+- [Contributing](https://decentdb.org/development/contributing/) - Development guidelines
 
 ## Architecture
 
@@ -197,14 +197,14 @@ bash scripts/coverage_nim.sh
 
 # Alternative: run coverage in smaller batches
 bash scripts/coverage_batch.sh
-``
+```
 
 Outputs:
 - build/coverage/summary.txt (human-readable summary)
 - build/coverage/summary.json (machine-readable summary)
 - build/coverage/gcov/ (raw per-test `.gcov` files)
 
-See [Contributing Guide](docs/development/contributing.md) for development workflow and guidelines.
+See [Contributing Guide](https://decentdb.org/development/contributing/) for development workflow and guidelines.
 
 ## License
 

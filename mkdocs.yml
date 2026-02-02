@@ -22,6 +22,11 @@ nav:
     - CLI Reference: api/cli-reference.md
     - Error Codes: api/error-codes.md
     - Configuration: api/configuration.md
+    - Language Bindings:
+      - .NET (C#): api/dotnet.md
+      - Go: api/go.md
+      - Node.js: api/node.md
+      - Python: api/python.md
   - Architecture:
     - Overview: architecture/overview.md
     - Storage Engine: architecture/storage.md
