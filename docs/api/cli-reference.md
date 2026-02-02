@@ -94,6 +94,17 @@ decentdb rebuild-index --db=<path> --index=<name>
 Options:
 - `--index=<name>` - Index name to rebuild
 
+### rebuild-indexes
+
+Rebuild all indexes in the database.
+
+```bash
+decentdb rebuild-indexes --db=<path> [--table=<name>]
+```
+
+Options:
+- `--table=<name>` - Filter indexes by table (optional)
+
 ### verify-index
 
 Verify index integrity.
@@ -173,8 +184,11 @@ decentdb stats --db=<path>
 Show detailed database information.
 
 ```bash
-decentdb info --db=<path>
+decentdb info --db=<path> [--schema-summary]
 ```
+
+Options:
+- `--schema-summary` - Include schema summary (tables, columns, indexes)
 
 ### vacuum
 

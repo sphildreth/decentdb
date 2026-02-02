@@ -127,11 +127,15 @@ Default: 4096 bytes
 # Database info
 decentdb info --db=my.ddb
 
+# Include schema details (tables, columns, indexes)
+decentdb info --db=my.ddb --schema-summary
+
 # Shows:
 # - Page size
 # - Cache capacity
 # - WAL LSN
 # - Active readers
+# - (optional) Schema summary (tables, columns, indexes)
 ```
 
 ### PRAGMA Commands

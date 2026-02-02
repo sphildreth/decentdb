@@ -88,6 +88,18 @@ when isMainModule:
        "db": 'd',
        "index": 'i'
      }],
+
+    [decentdb_cli.cmdRebuildIndexes,
+     cmdName = "rebuild-indexes",
+     doc = "Rebuild all indexes",
+     help = {
+       "db": "Path to database file (required)",
+       "table": "Optional table name to filter indexes"
+     },
+     short = {
+       "db": 'd',
+       "table": 't'
+     }],
     [decentdb_cli.cmdVerifyIndex,
      cmdName = "verify-index",
      doc = "Verify index integrity",
@@ -193,7 +205,8 @@ when isMainModule:
      cmdName = "info",
      doc = "Display database information",
      help = {
-       "db": "Path to database file (required)"
+       "db": "Path to database file (required)",
+       "schema-summary": "Include schema summary (tables, columns, indexes)"
      },
      short = {
        "db": 'd'

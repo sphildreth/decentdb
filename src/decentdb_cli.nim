@@ -9,6 +9,7 @@ import times
 import std/monotimes
 import math
 import atomics
+import algorithm
 import ./engine
 import ./errors
 import ./catalog/catalog
@@ -105,6 +106,53 @@ proc formatDbInfo(database: Db): seq[string] =
     "WAL LSN: " & $database.wal.walEnd.load(moAcquire),
     "Active readers: " & $readerCount(database.wal)
   ]
+
+proc formatSchemaSummary(database: Db): seq[string] =
+  var tableNames: seq[string] = @[]
+  for name, _ in database.catalog.tables:
+    tableNames.add(name)
+  tableNames.sort()
+
+  var indexNames: seq[string] = @[]
+  for name, _ in database.catalog.indexes:
+    indexNames.add(name)
+  indexNames.sort()
+
+  var lines: seq[string] = @[]
+  lines.add("Schema summary")
+  lines.add("Tables: " & $tableNames.len)
+  for tableName in tableNames:
+    let t = database.catalog.tables[tableName]
+    lines.add("Table: " & tableName)
+    for col in t.columns:
+      var colLine = "  " & col.name & " " & columnTypeToText(col.kind)
+      if col.notNull:
+        colLine &= " NOT NULL"
+      if col.unique:
+        colLine &= " UNIQUE"
+      if col.primaryKey:
+        colLine &= " PRIMARY KEY"
+      if col.refTable.len > 0:
+        colLine &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+      lines.add(colLine)
+
+  lines.add("Indexes: " & $indexNames.len)
+  for indexName in indexNames:
+    let idx = database.catalog.indexes[indexName]
+    var idxLine = "Index: " & indexName & " ON " & idx.table & "(" & idx.column & ")"
+    if idx.unique:
+      idxLine &= " UNIQUE"
+    idxLine &= " " & (if idx.kind == ikBtree: "BTREE" else: "TRIGRAM")
+    lines.add(idxLine)
+  lines
+
+proc collectInfoRows*(database: Db, schema_summary: bool): seq[string] =
+  ## Used by `decentdb info` (and unit tests).
+  var rows = formatDbInfo(database)
+  if schema_summary:
+    rows.add("")
+    rows.add(formatSchemaSummary(database))
+  rows
 
 proc formatStats(database: Db): seq[string] =
   let cache = database.pager.cache
@@ -674,6 +722,23 @@ proc schemaListIndexes*(db: string = "", table: string = ""): int =
   echo resultJson(true, rows = output)
   return 0
 
+proc rebuildAllIndexes*(database: Db, table: string = ""): Result[seq[string]] =
+  var indexNames: seq[string] = @[]
+  for indexName, indexMeta in database.catalog.indexes:
+    if table.len > 0 and indexMeta.table != table:
+      continue
+    indexNames.add(indexName)
+  indexNames.sort()
+
+  var rows: seq[string] = @[]
+  for indexName in indexNames:
+    let indexMeta = database.catalog.indexes[indexName]
+    let rebuildRes = storage.rebuildIndex(database.pager, database.catalog, indexMeta)
+    if not rebuildRes.ok:
+      return err[seq[string]](rebuildRes.err.code, rebuildRes.err.message, rebuildRes.err.context)
+    rows.add("Index '" & indexName & "' rebuilt successfully")
+  ok(rows)
+
 # ============================================================================
 # Index Maintenance Commands
 # ============================================================================
@@ -711,6 +776,29 @@ proc cmdRebuildIndex*(index: string = "", db: string = ""): int =
   
   discard closeDb(database)
   echo resultJson(true, rows = @["Index '" & index & "' rebuilt successfully"])
+  return 0
+
+proc cmdRebuildIndexes*(db: string = "", table: string = ""): int =
+  ## Rebuild all indexes in the database
+  let dbPath = resolveDbPath(db)
+  if dbPath.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  let openRes = openDb(dbPath)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  let rebuildRes = rebuildAllIndexes(database, table)
+  if not rebuildRes.ok:
+    discard closeDb(database)
+    echo resultJson(false, rebuildRes.err)
+    return 1
+
+  discard closeDb(database)
+  echo resultJson(true, rows = rebuildRes.value)
   return 0
 
 proc cmdVerifyIndex*(index: string = "", db: string = ""): int =
@@ -1226,7 +1314,7 @@ proc checkpointCmd*(db: string = "", warnings: bool = false, verbose: bool = fal
   echo resultJson(true, rows = ckRows)
   return 0
 
-proc infoCmd*(db: string = ""): int =
+proc infoCmd*(db: string = "", schema_summary: bool = false): int =
   ## Display database information (format, size, cache, LSN)
   let dbPath = resolveDbPath(db)
   if dbPath.len == 0:
@@ -1239,7 +1327,7 @@ proc infoCmd*(db: string = ""): int =
     return 1
 
   let database = openRes.value
-  let info = formatDbInfo(database)
+  let info = collectInfoRows(database, schema_summary)
   discard closeDb(database)
   echo resultJson(true, rows = info)
   return 0
@@ -1592,7 +1680,7 @@ proc repl*(db: string = "", format: string = "table"): int =
 proc completion*(shell: string = "bash"): int =
   ## Emit basic shell completion script
   let normalized = shell.strip().toLowerAscii()
-  let commands = "exec list-tables describe list-indexes rebuild-index verify-index import export dump bulk-load checkpoint stats info vacuum dump-header verify-header repl completion"
+  let commands = "exec list-tables describe list-indexes rebuild-index rebuild-indexes verify-index import export dump bulk-load checkpoint stats info vacuum dump-header verify-header repl completion"
   if normalized == "zsh":
     echo "#compdef decentdb"
     echo "_decentdb() {"
