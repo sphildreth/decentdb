@@ -95,11 +95,12 @@ Format:
 
 ## How to Create an ADR
 
-1. Copy `design/adr/template.md` to `design/adr/adr-XXXX-title.md`
-2. Fill in all sections
-3. Set status to "Proposed"
-4. Open PR for review
-5. Update to "Accepted" when merged
+1. Copy the template:
+   - `design/adr/0000-template.md` → `design/adr/NNNN-short-title.md`
+2. Choose the next sequential number `NNNN` (4 digits, zero-padded).
+3. Use a short, kebab-case title.
+4. Fill out every section and keep it concise.
+5. Open a PR for review and link the ADR in the PR description.
 
 ## ADR Template
 
@@ -156,6 +157,8 @@ Why it was rejected.
 ## Reading ADRs
 
 ADRs are located in `design/adr/` directory.
+
+Note: The index on this page is a curated subset and may lag behind the full list.
 
 To read about a specific decision:
 1. Find it in the index above

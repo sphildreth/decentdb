@@ -96,17 +96,17 @@ id,name,email
 EOF
 
 # Import the CSV
-decentdb import --db=myapp.ddb --table=users --file=users.csv
+decentdb import --db=myapp.ddb --table=users --input=users.csv
 ```
 
 ## Checkpoint and Maintenance
 
 ```bash
 # Force a WAL checkpoint
-decentdb exec --db=myapp.ddb --checkpoint
+decentdb checkpoint --db=myapp.ddb
 
 # Get database statistics
-decentdb exec --db=myapp.ddb --sql="PRAGMA stats"
+decentdb stats --db=myapp.ddb
 
 # Verify database integrity
 decentdb exec --db=myapp.ddb --sql="PRAGMA integrity_check"

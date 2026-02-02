@@ -34,12 +34,9 @@ nimble test
 
 ## Docker (Optional)
 
-A Docker image is available for containerized usage:
+At the moment, this repository does not ship a maintained `Dockerfile`.
 
-```bash
-docker build -t decentdb .
-docker run -v $(pwd):/data decentdb exec --db=/data/mydb.ddb --sql="SELECT 1"
-```
+If Docker support is needed, either add a `Dockerfile` (and wire it into CI) or use a dev container tailored to your environment.
 
 ## System Installation
 

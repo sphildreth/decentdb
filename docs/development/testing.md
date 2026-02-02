@@ -102,9 +102,11 @@ test "insert split update delete":
 
 ### 2. Property-Based Tests
 
-Test that invariants hold for random operations.
+DecentDb uses invariant-style tests, and some tests include randomized loops to exercise edge cases.
 
-**Example** (from `test_property.nim`):
+There is not currently a dedicated `tests/nim/test_property.nim` suite; if/when property testing is split out, it should follow the same `tests/nim/test_*.nim` naming convention so `nimble test` picks it up.
+
+**Example** (illustrative):
 ```nim
 test "index results == scan results":
   for i in 0..<100:

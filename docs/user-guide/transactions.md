@@ -113,7 +113,7 @@ PRAGMA wal_sync_mode = NORMAL;
 Use bulk load API for large imports:
 
 ```bash
-decentdb bulk-load --db=my.ddb --table=users --file=users.csv --durability=deferred
+decentdb bulk-load --db=my.ddb --table=users --input=users.csv --durability=deferred
 ```
 
 ## Best Practices
@@ -172,7 +172,7 @@ Check transaction status:
 
 ```bash
 # Show database info including active readers/writers
-decentdb exec --db=my.ddb --dbInfo --verbose
+decentdb info --db=my.ddb
 ```
 
 ## Limitations

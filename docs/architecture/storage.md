@@ -291,7 +291,7 @@ Monitor storage health:
 
 ```bash
 # Database stats
-decentdb exec --db=my.ddb --dbInfo --verbose
+decentdb info --db=my.ddb
 
 # Shows:
 # - Page size

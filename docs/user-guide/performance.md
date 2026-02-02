@@ -74,13 +74,13 @@ For large imports, use bulk load:
 
 ```bash
 # Much faster than individual inserts
-decentdb bulk-load --db=my.ddb --table=users --file=users.csv
+decentdb bulk-load --db=my.ddb --table=users --input=users.csv
 ```
 
 Bulk load options:
-- `--disable-indexes` - Skip index updates during load (rebuild after)
+- `--disableIndexes` - Skip index updates during load (rebuild after)
 - `--durability=deferred` - Batch fsync operations
-- `--batch-size=10000` - Rows per batch
+- `--batchSize=10000` - Rows per batch
 
 ## Query Optimization
 
@@ -121,7 +121,7 @@ Checkpoints write WAL data to the main database file:
 
 ```bash
 # Manual checkpoint
-decentdb exec --db=my.ddb --checkpoint
+decentdb checkpoint --db=my.ddb
 
 # Configure auto-checkpoint thresholds
 decentdb exec --db=my.ddb --sql="PRAGMA checkpoint_threshold=10000000"  # 10MB
@@ -148,7 +148,7 @@ Check database statistics:
 
 ```bash
 # Database info
-decentdb exec --db=my.ddb --dbInfo --verbose
+decentdb info --db=my.ddb
 
 # Shows:
 # - Page size

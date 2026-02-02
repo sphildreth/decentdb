@@ -125,7 +125,7 @@ Default: 4096 bytes
 
 ```bash
 # Database info
-decentdb exec --db=my.ddb --dbInfo --verbose
+decentdb info --db=my.ddb
 
 # Shows:
 # - Page size

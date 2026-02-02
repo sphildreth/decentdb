@@ -263,7 +263,7 @@ If database is corrupted:
 decentdb exec --db=my.ddb --sql="PRAGMA integrity_check"
 
 # Export and reimport if needed
-decentdb export --db=my.ddb --table=users --file=users.csv
+decentdb export --db=my.ddb --table=users --output=users.csv
 # Create new database and import
 ```
 

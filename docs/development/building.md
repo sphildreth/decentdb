@@ -210,21 +210,6 @@ Requires macOS SDK (complex setup).
 nim c -d:release --cpu:arm64 src/decentdb.nim
 ```
 
-## Docker Build
-
-### Build Image
-
-```bash
-docker build -t decentdb:latest .
-```
-
-### Run Container
-
-```bash
-docker run -v $(pwd):/data decentdb:latest \
-  exec --db=/data/my.ddb --sql="SELECT 1"
-```
-
 ## Troubleshooting
 
 ### "libpg_query not found"
@@ -274,7 +259,7 @@ Some tests fail after build.
 nim c -r tests/nim/test_wal.nim
 
 # Check Python tests separately
-python -m pytest tests/harness/test_runner.py -v
+python -m unittest -v tests/harness/test_runner.py
 ```
 
 ### Slow Build

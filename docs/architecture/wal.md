@@ -181,7 +181,7 @@ Copy committed pages from WAL to main database file.
 
 **Manual:**
 ```bash
-decentdb exec --db=my.ddb --checkpoint
+decentdb checkpoint --db=my.ddb
 ```
 
 ### Checkpoint Process
@@ -248,7 +248,7 @@ If readers hold snapshots too long:
 ls -lh my.ddb.wal
 
 # Database stats
-decentdb exec --db=my.ddb --dbInfo
+decentdb info --db=my.ddb
 # Shows: WAL LSN, active readers
 ```
 
@@ -318,7 +318,7 @@ PRAGMA wal_sync_mode = NORMAL;
 **Check:**
 ```bash
 # Active readers
-decentdb exec --db=my.ddb --dbInfo
+decentdb info --db=my.ddb
 # Shows "Active readers: N"
 
 # Long-running queries?

@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Data types: NULL, INT64, TEXT, BLOB, BOOL, FLOAT64
 - Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL
 - Transactions: BEGIN, COMMIT, ROLLBACK
-- LIKE, ILKE pattern matching with trigram index support
+- LIKE, ILIKE pattern matching with trigram index support
 - IN operator for list membership
 
 ### Performance

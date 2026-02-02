@@ -2,10 +2,16 @@
 
 The `decentdb` CLI provides all database operations through subcommands.
 
-## Global Options
+## General Usage
 
-- `--db=<path>` - Database file path (required for most commands)
-- `--help` - Show help for any command
+Most commands require `--db=<path>`.
+
+Use `--help` on any command for the authoritative, generated help:
+
+```bash
+decentdb --help
+decentdb <command> --help
+```
 
 ## Commands
 
@@ -19,12 +25,26 @@ decentdb exec --db=<path> --sql=<statement> [options]
 
 Options:
 - `--sql=<statement>` - SQL statement to execute
-- `--params=<type:value>` - Bind parameters (repeatable)
-- `--timing` - Show execution timing
-- `--format=<json|csv|table>` - Output format (default: json)
-- `--checkpoint` - Force checkpoint after execution
-- `--cachePages=<n>` - Number of pages to cache
-- `--cacheMb=<n>` - Cache size in megabytes
+- `--params=<type:value>` - Bind parameters (repeatable, positional). Examples: `int:1`, `text:Alice`, `null`
+- `--timing` - Include `elapsed_ms` in JSON output
+- `--format=<json|csv|table>` - Output format (default: json). Note: `--timing/--warnings/--verbose` currently require `--format=json`
+- `--cachePages=<n>` - Cache size in 4KB pages (default: 1024)
+- `--cacheMb=<n>` - Cache size in megabytes (overrides `--cachePages` if non-zero)
+
+Diagnostics and management flags (these run and exit, ignoring `--sql` when applicable):
+- `--checkpoint` - Force a WAL checkpoint and exit
+- `--dbInfo` - Print database info and exit
+- `--readerCount` - Print active reader count and exit
+- `--longReaders=<ms>` - Print readers older than this threshold and exit
+
+WAL tuning/testing flags:
+- `--checkpointBytes=<n>` - Auto-checkpoint when WAL reaches N bytes
+- `--checkpointMs=<n>` - Auto-checkpoint when N ms elapse since last checkpoint
+- `--readerWarnMs=<n>` - Warn when readers are older than N ms
+- `--readerTimeoutMs=<n>` - Trigger timeout behavior for readers older than N ms
+- `--forceTruncateOnTimeout` - Force WAL truncation when `--readerTimeoutMs` triggers (dangerous; testing only)
+- `--walFailpoints=<spec>` - Set WAL failpoints (repeatable). Format: `label:kind[:bytes][:count]`
+- `--clearWalFailpoints` - Clear all WAL failpoints before executing
 
 Examples:
 ```bash
@@ -84,30 +104,60 @@ decentdb verify-index --db=<path> --index=<name>
 
 ### import
 
-Import data from CSV.
+Import data from CSV or JSON.
 
 ```bash
-decentdb import --db=<path> --table=<name> --file=<path>
+decentdb import --db=<path> --table=<name> --input=<path> [options]
 ```
 
 Options:
 - `--table=<name>` - Target table
-- `--file=<path>` - CSV file path
+- `--input=<path>` - Input file path
+- `--format=<csv|json>` - Input format (default: csv)
+- `--batchSize=<n>` - Rows per batch (default: 10000)
 
 ### export
 
 Export table to CSV.
 
 ```bash
-decentdb export --db=<path> --table=<name> --file=<path>
+decentdb export --db=<path> --table=<name> --output=<path> [options]
 ```
+
+Options:
+- `--table=<name>` - Table name to export
+- `--output=<path>` - Output file path
+- `--format=<csv|json>` - Output format (default: csv)
+
+### dump
+
+Dump the database as SQL statements.
+
+```bash
+decentdb dump --db=<path> [--output=<path>]
+```
+
+### bulk-load
+
+Bulk load data from CSV (high-throughput ingest).
+
+```bash
+decentdb bulk-load --db=<path> --table=<name> --input=<path> [options]
+```
+
+Options:
+- `--batchSize=<n>` - Rows per batch (default: 10000)
+- `--syncInterval=<n>` - Batches between fsync when durability is deferred (default: 10)
+- `--durability=<full|deferred|none>` - Durability mode (default: deferred)
+- `--disableIndexes` - Disable indexes during load (default: true)
+- `--noCheckpoint` - Skip checkpoint after load completes
 
 ### checkpoint
 
 Force WAL checkpoint.
 
 ```bash
-decentdb exec --db=<path> --checkpoint
+decentdb checkpoint --db=<path> [--warnings] [--verbose]
 ```
 
 ### stats
@@ -115,7 +165,7 @@ decentdb exec --db=<path> --checkpoint
 Show database statistics.
 
 ```bash
-decentdb exec --db=<path> --dbInfo
+decentdb stats --db=<path>
 ```
 
 ### info
@@ -123,7 +173,47 @@ decentdb exec --db=<path> --dbInfo
 Show detailed database information.
 
 ```bash
-decentdb exec --db=<path> --dbInfo --verbose
+decentdb info --db=<path>
+```
+
+### vacuum
+
+Rewrite the database into a new file to reclaim space.
+
+```bash
+decentdb vacuum --db=<path> --output=<path> [--overwrite] [--cachePages=<n>] [--cacheMb=<n>]
+```
+
+### dump-header
+
+Dump raw database header fields and checksum status.
+
+```bash
+decentdb dump-header --db=<path>
+```
+
+### verify-header
+
+Verify database header magic and checksum.
+
+```bash
+decentdb verify-header --db=<path>
+```
+
+### repl
+
+Interactive REPL mode.
+
+```bash
+decentdb repl --db=<path> [--format=<json|csv|table>]
+```
+
+### completion
+
+Emit a basic shell completion script.
+
+```bash
+decentdb completion [--shell=bash|zsh]
 ```
 
 ## Output Formats
