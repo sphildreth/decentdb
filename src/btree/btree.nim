@@ -350,6 +350,72 @@ proc lowerBound(keys: seq[uint64], key: uint64): int =
       hi = mid
   lo
 
+proc varintLen(value: uint64): int {.inline.} =
+  var v = value
+  result = 1
+  while v >= 0x80'u64:
+    v = v shr 7
+    result.inc
+
+proc leafEntryEncodedLen(key: uint64, valueLen: int, overflow: uint32): int {.inline.} =
+  ## Number of bytes this entry contributes to a leaf page encoding (excluding
+  ## the 8-byte page header).
+  var control: uint64 = 0
+  if overflow != 0'u32:
+    control = (uint64(overflow) shl 1) or 1
+  else:
+    control = (uint64(valueLen) shl 1)
+  varintLen(key) + varintLen(control) + valueLen
+
+proc chooseLeafSplitPoint(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32], pageSize: int): Result[int] =
+  ## Choose a split point for a leaf such that both halves fit in `pageSize`.
+  ##
+  ## This is required for variable-sized values: splitting by count can fail
+  ## when large inline values cluster and end up on the same side.
+  if keys.len != values.len or keys.len != overflows.len:
+    return err[int](ERR_INTERNAL, "Leaf split length mismatch")
+  if keys.len < 2:
+    return err[int](ERR_IO, "Leaf overflow")
+
+  let maxPayload = pageSize - 8
+  var entrySizes: seq[int] = @[]
+  entrySizes.setLen(keys.len)
+  var total = 0
+  for i in 0 ..< keys.len:
+    let s = leafEntryEncodedLen(keys[i], values[i].len, overflows[i])
+    if s > maxPayload:
+      # Single cell can't fit even in an empty leaf.
+      return err[int](ERR_IO, "Leaf overflow")
+    entrySizes[i] = s
+    total += s
+
+  # Prefix sums for O(1) left/right size checks.
+  var prefix: seq[int] = @[]
+  prefix.setLen(keys.len + 1)
+  prefix[0] = 0
+  for i in 0 ..< keys.len:
+    prefix[i + 1] = prefix[i] + entrySizes[i]
+
+  var minSplitAt = -1
+  for splitAt in 1 ..< keys.len:
+    let r = 8 + (prefix[keys.len] - prefix[splitAt])
+    if r <= pageSize:
+      minSplitAt = splitAt
+      break
+  var maxSplitAt = -1
+  for splitAt in 1 ..< keys.len:
+    let l = 8 + prefix[splitAt]
+    if l <= pageSize:
+      maxSplitAt = splitAt
+
+  if minSplitAt < 0 or maxSplitAt < 0 or minSplitAt > maxSplitAt:
+    return err[int](ERR_IO, "Leaf overflow")
+
+  var splitAt = keys.len div 2
+  if splitAt < minSplitAt: splitAt = minSplitAt
+  if splitAt > maxSplitAt: splitAt = maxSplitAt
+  ok(splitAt)
+
 proc maxInlineValue(tree: BTree): int =
   max(0, min(MaxLeafInlineValueBytes, tree.pager.pageSize - 24))
 
@@ -918,7 +984,11 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
     if encodeRes.ok:
       discard writePage(tree.pager, pageId, encodeRes.value)
       return ok(none(SplitResult))
-    let mid = keys.len div 2
+
+    let splitRes = chooseLeafSplitPoint(keys, values, overflows, tree.pager.pageSize)
+    if not splitRes.ok:
+      return err[Option[SplitResult]](splitRes.err.code, splitRes.err.message, splitRes.err.context)
+    let mid = splitRes.value
     let leftKeys = keys[0 ..< mid]
     let leftVals = values[0 ..< mid]
     let leftOv = overflows[0 ..< mid]

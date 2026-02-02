@@ -232,6 +232,40 @@ suite "BTree Error Paths":
     discard closePager(pager)
     discard closeDb(db)
 
+  test "leaf split handles clustered large inline values (no leaf overflow)":
+    let path = makeTempDb("decentdb_btree_leaf_split_by_size.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 4)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let rootRes = allocatePage(pager)
+    check rootRes.ok
+    let root = rootRes.value
+    var rootBuf = newString(pager.pageSize)
+    rootBuf[0] = char(PageTypeLeaf)
+    writeU32LE(rootBuf, 4, 0)
+    check writePage(pager, root, rootBuf).ok
+    let tree = newBTree(pager, root)
+
+    # Many small values, then two large values adjacent, then more small values.
+    # With naive count-based splitting, this can place both large values into the
+    # same leaf half and trigger ERR_IO "Leaf overflow" even though a valid split
+    # exists.
+    for k in 1'u64 .. 60'u64:
+      check insert(tree, k, @[byte(k and 0xFF)]).ok
+
+    let big = newSeq[byte](3000)
+    check insert(tree, 61, big).ok
+    check insert(tree, 62, big).ok
+
+    for k in 63'u64 .. 120'u64:
+      check insert(tree, k, @[byte(k and 0xFF)]).ok
+
+    discard closePager(pager)
+    discard closeDb(db)
+
   test "bulkBuildFromSorted with single entry":
     let path = makeTempDb("decentdb_btree_bulk_single.db")
     let dbRes = openDb(path)
