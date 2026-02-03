@@ -38,6 +38,7 @@ tests/bench/bench
 tests/bench/bench.exe
 tests/bench/nimcache/
 tests/bench/tmp/
+benchmarks/embedded_compare/raw/
 --
 tests/nim/
 !tests/nim/

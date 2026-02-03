@@ -33,6 +33,36 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - Current version: **0.0.1** (beta)
 - Planned initial stable release: **1.0.0** once the engine is feature-complete, unit tests are more robust, and benchmarks are acceptable.
 
+## Performance (at a glance)
+
+![DecentDB benchmark chart](assets/decentdb-benchmarks.svg)
+
+**How this chart is produced**
+- The chart is generated from benchmark runs using `nimble bench_embedded_chart`.
+- Values are **normalized vs SQLite** (baseline = 1.0).
+- For "lower is better" metrics (latency, DB size), the score is inverted so **higher bars mean better**.
+- Full methodology and raw results live in `benchmarks/embedded_compare/`.
+
+**Supported engines**
+- DecentDB (native API)
+- SQLite (via C API)
+- DuckDB (via C API) - when library is available
+
+**Regenerate**
+```bash
+# Run full benchmark pipeline (all engines, aggregate, chart)
+nimble bench_embedded_pipeline
+
+# Or run individual steps:
+nimble bench_embedded_sample    # Run all engines
+nimble bench_embedded_aggregate  # Aggregate results
+nimble bench_embedded_chart     # Generate chart
+
+# Run specific engines only:
+./build/run_benchmarks /tmp/bench_out --engines=decentdb,sqlite
+./build/run_benchmarks /tmp/bench_out --engines=all
+```
+
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery

@@ -82,3 +82,25 @@ task bench_large, "Run large/concurrency benchmarks (may be slow)":
 task bench_large_compare, "Run large/concurrency benchmarks and compare to baseline (may be slow)":
   exec "nim c --threads:on -r tests/bench/bench_large.nim -- tests/bench/results_large.json"
   exec "python tests/bench/compare_bench.py tests/bench/results_large.json tests/bench/baseline_large.json tests/bench/thresholds_large.json"
+
+task bench_embedded, "Run embedded database comparison benchmarks":
+  exec "nim c --warnings:off -d:libpg_query -d:release --mm:arc --threads:on --outdir:build benchmarks/embedded_compare/run_benchmarks.nim"
+
+task bench_embedded_sample, "Run embedded benchmarks and aggregate sample data":
+  exec "nimble bench_embedded"
+  exec "./build/run_benchmarks benchmarks/embedded_compare/raw/sample --engines=all"
+
+task bench_embedded_run, "Run embedded benchmarks (engines: decentdb,sqlite,duckdb or all)":
+  exec "nimble bench_embedded"
+  exec "./build/run_benchmarks benchmarks/raw sample --engines=decentdb,sqlite"
+
+task bench_embedded_aggregate, "Aggregate raw benchmark results":
+  exec "python3 benchmarks/embedded_compare/scripts/aggregate_benchmarks.py"
+
+task bench_embedded_chart, "Generate README benchmark chart":
+  exec "benchmarks/embedded_compare/venv/bin/python3 benchmarks/embedded_compare/scripts/make_readme_chart.py"
+
+task bench_embedded_pipeline, "Run full embedded benchmark pipeline (run + aggregate + chart)":
+  exec "nimble bench_embedded_sample"
+  exec "nimble bench_embedded_aggregate"
+  exec "nimble bench_embedded_chart"
