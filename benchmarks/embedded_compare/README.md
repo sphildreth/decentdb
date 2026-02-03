@@ -67,6 +67,12 @@ Default benches (can be extended):
 
 The chart uses `p50 µs/op`.
 
+Schema note:
+
+- SQLite uses `INTEGER PRIMARY KEY` in the harness.
+- DecentDB uses `INT64 PRIMARY KEY` so it exercises DecentDB's rowid-optimized
+	primary-key path (functionally equivalent 64-bit integer semantics).
+
 ## Engines
 
 Currently implemented in the Python harness:

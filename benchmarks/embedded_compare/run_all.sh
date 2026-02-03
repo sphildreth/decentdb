@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+# Comma-separated list, e.g. "10000,100000,1000000".
+BENCH_OP_COUNTS="${BENCH_OP_COUNTS:-10000,100000,1000000}"
+
 COMPOSE_FILE="benchmarks/embedded_compare/docker-compose.yml"
 
 OUT_DIR="$ROOT_DIR/benchmarks/embedded_compare/out"
@@ -198,7 +201,7 @@ run_with_podman_direct() {
 			--db-dir /db \
 			--out /out/results_py.json \
 			--plot /out/chart.png \
-			--op-counts 10000,100000,1000000 \
+			--op-counts "$BENCH_OP_COUNTS" \
 			--iterations 7 \
 			--warmup 2
 
@@ -212,7 +215,7 @@ run_with_podman_direct() {
 		dotnet run -c Release --project benchmarks/embedded_compare/dotnet/LiteDbBench/LiteDbBench.csproj -- \
 			--db-dir /db \
 			--out /out/results_litedb.json \
-			--op-counts 10000,100000,1000000 \
+			--op-counts "$BENCH_OP_COUNTS" \
 			--iterations 7 \
 			--warmup 2
 

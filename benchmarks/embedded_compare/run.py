@@ -152,6 +152,13 @@ class DecentDbEngine(DbEngine):
         # Keep stmt cache on; SQLite has statement caching too.
         return decentdb.connect(db_path)
 
+    def setup_schema(self, conn) -> None:
+        # DecentDB has a fast path for `INT64 PRIMARY KEY` (rowid-optimized).
+        # Using `INTEGER PRIMARY KEY` here would parse, but can miss that
+        # optimization depending on dialect/type mapping.
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE kv (id INT64 PRIMARY KEY, v INT64 NOT NULL)")
+
 
 class SQLiteEngine(DbEngine):
     def __init__(self, variant: str):

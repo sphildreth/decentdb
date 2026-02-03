@@ -649,6 +649,83 @@ proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_c
     out_count[] = cint(n)
   return 0
 
+proc decentdb_step_with_params_row_view*(
+  p: pointer,
+  in_params: ptr DecentdbValueView,
+  in_count: cint,
+  out_values: ptr ptr DecentdbValueView,
+  out_count: ptr cint,
+  out_has_row: ptr cint
+): cint {.exportc, cdecl, dynlib.} =
+  ## Convenience API for FFI consumers (notably Python/ctypes):
+  ## - reset statement
+  ## - clear bindings
+  ## - bind all params from a `decentdb_value_view[]`
+  ## - step once
+  ## - if a row is available, populate row_view and return it
+  ##
+  ## Returns 0 on success, -1 on error.
+  if p == nil: return -1
+  let h = cast[StmtHandle](p)
+
+  discard decentdb_reset(p)
+  discard decentdb_clear_bindings(p)
+
+  let n = int(in_count)
+  if n != h.params.len:
+    h.db.setError(ERR_SQL, "Incorrect parameter count: expected " & $h.params.len & " got " & $n)
+    return -1
+
+  if n > 0 and in_params == nil:
+    h.db.setError(ERR_INTERNAL, "NULL in_params with non-zero in_count")
+    return -1
+
+  if n > 0:
+    let arr = cast[ptr UncheckedArray[DecentdbValueView]](in_params)
+    for i in 0 ..< n:
+      let v = arr[i]
+      let kindInt = int(v.kind)
+      if v.isNull != 0 or kindInt == int(vkNull):
+        h.params[i] = Value(kind: vkNull)
+      elif kindInt == int(vkInt64):
+        h.params[i] = Value(kind: vkInt64, int64Val: v.int64Val)
+      elif kindInt == int(vkBool):
+        h.params[i] = Value(kind: vkBool, boolVal: v.int64Val != 0)
+      elif kindInt == int(vkFloat64):
+        h.params[i] = Value(kind: vkFloat64, float64Val: v.float64Val)
+      elif kindInt == int(vkText) or kindInt == int(vkBlob):
+        let byteLen = int(v.bytesLen)
+        if byteLen < 0:
+          h.db.setError(ERR_SQL, "Negative bytesLen")
+          return -1
+        if byteLen > 0 and v.bytes == nil:
+          h.db.setError(ERR_SQL, "NULL bytes with non-zero bytesLen")
+          return -1
+        var bytes = newSeq[byte](byteLen)
+        if byteLen > 0:
+          copyMem(addr bytes[0], v.bytes, byteLen)
+        if kindInt == int(vkText):
+          h.params[i] = Value(kind: vkText, bytes: bytes)
+        else:
+          h.params[i] = Value(kind: vkBlob, bytes: bytes)
+      else:
+        h.db.setError(ERR_SQL, "Unsupported parameter kind: " & $kindInt)
+        return -1
+
+  let stepRes = decentdb_step(p)
+  if out_has_row != nil:
+    out_has_row[] = if stepRes == 1: 1 else: 0
+  if stepRes == -1:
+    return -1
+  if stepRes == 0:
+    if out_values != nil: out_values[] = nil
+    if out_count != nil: out_count[] = 0
+    return 0
+
+  # Row available: populate row view (borrowed until next step/reset/finalize).
+  discard decentdb_row_view(p, out_values, out_count)
+  return 0
+
 proc decentdb_rows_affected*(p: pointer): int64 {.exportc, cdecl, dynlib.} =
   if p == nil: return 0
   let h = cast[StmtHandle](p)

@@ -22,7 +22,7 @@ services:
       - --plot
       - /out/chart.png
       - --op-counts
-      - 10000,100000,1000000
+      - "${BENCH_OP_COUNTS:-10000,100000,1000000}"
       - --iterations
       - "7"
       - --warmup
@@ -48,7 +48,7 @@ services:
       - --out
       - /out/results_litedb.json
       - --op-counts
-      - 10000,100000,1000000
+      - "${BENCH_OP_COUNTS:-10000,100000,1000000}"
       - --iterations
       - "7"
       - --warmup

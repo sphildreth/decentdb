@@ -60,6 +60,18 @@ typedef struct decentdb_value_view {
 
 int decentdb_row_view(decentdb_stmt* stmt, const decentdb_value_view** out_values, int* out_count);
 
+// Convenience API for high-overhead FFI layers (e.g. Python/ctypes):
+// reset + clear bindings + bind params (from value_view array) + step once + row_view.
+// Returns 0 on success, -1 on error. `out_has_row` is set to 1 if a row is available.
+int decentdb_step_with_params_row_view(
+	decentdb_stmt* stmt,
+	const decentdb_value_view* in_params,
+	int in_count,
+	const decentdb_value_view** out_values,
+	int* out_count,
+	int* out_has_row
+);
+
 int64_t decentdb_rows_affected(decentdb_stmt* stmt);
 void decentdb_finalize(decentdb_stmt* stmt);
 

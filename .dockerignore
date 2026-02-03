@@ -1,0 +1,3 @@
+# Benchmark artifacts can get very large; exclude from container build context.
+benchmarks/embedded_compare/db/
+benchmarks/embedded_compare/out/

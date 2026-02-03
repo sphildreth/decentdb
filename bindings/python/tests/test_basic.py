@@ -137,6 +137,26 @@ def test_types(db_path):
     
     conn.close()
 
+
+def test_row_view_toggle(db_path, monkeypatch):
+    # Default (row_view enabled)
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE foo (id INT64, name TEXT, b BLOB, ok BOOL)")
+    cur.execute("INSERT INTO foo VALUES (?, ?, ?, ?)", (1, "alice", b"\x00\x01", True))
+    conn.commit()
+    cur.execute("SELECT id, name, b, ok FROM foo")
+    assert cur.fetchone() == (1, "alice", b"\x00\x01", True)
+    conn.close()
+
+    # Slow path (row_view disabled) should still be correct.
+    monkeypatch.setenv("DECENTDB_PY_USE_ROW_VIEW", "0")
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, b, ok FROM foo")
+    assert cur.fetchone() == (1, "alice", b"\x00\x01", True)
+    conn.close()
+
 def test_error_includes_sql_and_code(db_path):
     conn = decentdb.connect(db_path)
     cur = conn.cursor()
