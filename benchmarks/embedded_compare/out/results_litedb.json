@@ -1,0 +1,150 @@
+{
+  "manifest": {
+    "timestamp_utc": "2026-02-03T09:33:11Z",
+    "platform": {
+      "dotnet": "8.0.23",
+      "os": "Debian GNU/Linux 12 (bookworm)",
+      "arch": "X64"
+    },
+    "deps": {
+      "litedb": "5.0.21.0"
+    },
+    "bench": {
+      "op_counts": [
+        10000,
+        100000,
+        1000000
+      ],
+      "benches": [
+        "point_select",
+        "insert_txn"
+      ],
+      "iterations": 7,
+      "warmup": 2,
+      "db_dir": "/db"
+    }
+  },
+  "results": [
+    {
+      "engine": "LiteDB",
+      "bench": "point_select",
+      "n_ops": 10000,
+      "unit": "us/op",
+      "samples_elapsed_ns": [
+        500647815,
+        315497970,
+        194522401,
+        194661773,
+        193563571,
+        194100404,
+        194960405
+      ],
+      "p50_us_per_op": 19.4661773,
+      "p95_us_per_op": 50.064781499999995,
+      "mean_us_per_op": 25.54220484285714,
+      "min_us_per_op": 19.3563571,
+      "max_us_per_op": 50.064781499999995
+    },
+    {
+      "engine": "LiteDB",
+      "bench": "point_select",
+      "n_ops": 100000,
+      "unit": "us/op",
+      "samples_elapsed_ns": [
+        1863694621,
+        1853009763,
+        1825323123,
+        1830282314,
+        1822348657,
+        1847288707,
+        1838491833
+      ],
+      "p50_us_per_op": 18.38491833,
+      "p95_us_per_op": 18.636946209999998,
+      "mean_us_per_op": 18.40062716857143,
+      "min_us_per_op": 18.223486570000002,
+      "max_us_per_op": 18.636946209999998
+    },
+    {
+      "engine": "LiteDB",
+      "bench": "point_select",
+      "n_ops": 1000000,
+      "unit": "us/op",
+      "samples_elapsed_ns": [
+        23756240662,
+        23699264126,
+        23887917055,
+        23755985540,
+        23864272042,
+        23734270989,
+        23698127042
+      ],
+      "p50_us_per_op": 23.75598554,
+      "p95_us_per_op": 23.887917055000003,
+      "mean_us_per_op": 23.770868208,
+      "min_us_per_op": 23.698127042,
+      "max_us_per_op": 23.887917055000003
+    },
+    {
+      "engine": "LiteDB",
+      "bench": "insert_txn",
+      "n_ops": 10000,
+      "unit": "us/op",
+      "samples_elapsed_ns": [
+        47013761,
+        46965401,
+        47030262,
+        46939622,
+        46966571,
+        48030175,
+        45925692
+      ],
+      "p50_us_per_op": 4.6966571,
+      "p95_us_per_op": 4.8030175,
+      "mean_us_per_op": 4.698164057142857,
+      "min_us_per_op": 4.5925692,
+      "max_us_per_op": 4.8030175
+    },
+    {
+      "engine": "LiteDB",
+      "bench": "insert_txn",
+      "n_ops": 100000,
+      "unit": "us/op",
+      "samples_elapsed_ns": [
+        477027583,
+        503939319,
+        503135804,
+        484941041,
+        482938538,
+        479144409,
+        481663043
+      ],
+      "p50_us_per_op": 4.82938538,
+      "p95_us_per_op": 5.03939319,
+      "mean_us_per_op": 4.87541391,
+      "min_us_per_op": 4.770275829999999,
+      "max_us_per_op": 5.03939319
+    },
+    {
+      "engine": "LiteDB",
+      "bench": "insert_txn",
+      "n_ops": 1000000,
+      "unit": "us/op",
+      "samples_elapsed_ns": [
+        5036648945,
+        5472171010,
+        5380325240,
+        5415226207,
+        5115798973,
+        5357291733,
+        5225965864
+      ],
+      "p50_us_per_op": 5.357291733,
+      "p95_us_per_op": 5.47217101,
+      "mean_us_per_op": 5.286203995999999,
+      "min_us_per_op": 5.036648945,
+      "max_us_per_op": 5.47217101
+    }
+  ],
+  "skipped": []
+}

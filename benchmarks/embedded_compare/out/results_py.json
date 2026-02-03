@@ -1,0 +1,584 @@
+{
+  "manifest": {
+    "bench": {
+      "benches": [
+        "point_select",
+        "insert_txn"
+      ],
+      "db_dir": "/db",
+      "iterations": 7,
+      "op_counts": [
+        10000,
+        100000,
+        1000000
+      ],
+      "warmup": 2
+    },
+    "deps": {
+      "duckdb": "0.10.3",
+      "jaydebeapi": "1.2.3",
+      "jpype": "1.5.0",
+      "matplotlib": "3.8.4"
+    },
+    "platform": {
+      "cpu_model": "AMD Ryzen 9 3900X 12-Core Processor",
+      "os": "Linux-6.12.64-1-MANJARO-x86_64-with-glibc2.36",
+      "python": "3.11.2 (main, Apr 28 2025, 14:11:48) [GCC 12.2.0]",
+      "uname": "Linux batman 6.12.64-1-MANJARO #1 SMP PREEMPT_DYNAMIC Thu, 08 Jan 2026 10:03:06 +0000 x86_64 "
+    },
+    "repo": {
+      "git_rev": "ec8beaa1e008052a961eaf85b6b34b9cbca82eec"
+    },
+    "timestamp_utc": "2026-02-03T06:22:01Z"
+  },
+  "results": [
+    {
+      "bench": "point_select",
+      "engine": "DecentDB",
+      "max_us_per_op": 94.32583220000001,
+      "mean_us_per_op": 93.79704644285714,
+      "min_us_per_op": 93.44834780000001,
+      "n_ops": 10000,
+      "p50_us_per_op": 93.7071316,
+      "p95_us_per_op": 94.32583220000001,
+      "samples_elapsed_ns": [
+        934483478,
+        935787807,
+        936165366,
+        937071316,
+        937164501,
+        941862461,
+        943258322
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "DecentDB",
+      "max_us_per_op": 97.43669625999999,
+      "mean_us_per_op": 95.66720324571428,
+      "min_us_per_op": 93.97755753999999,
+      "n_ops": 100000,
+      "p50_us_per_op": 95.11640734999999,
+      "p95_us_per_op": 97.43669625999999,
+      "samples_elapsed_ns": [
+        9511640735,
+        9397755754,
+        9605190480,
+        9503769848,
+        9743669626,
+        9464907208,
+        9740108621
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "DecentDB",
+      "max_us_per_op": 111.79421358500001,
+      "mean_us_per_op": 110.779781994,
+      "min_us_per_op": 109.746043368,
+      "n_ops": 1000000,
+      "p50_us_per_op": 110.827294001,
+      "p95_us_per_op": 111.79421358500001,
+      "samples_elapsed_ns": [
+        110357934553,
+        111606217732,
+        110827294001,
+        110141681184,
+        111794213585,
+        110985089535,
+        109746043368
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "DecentDB",
+      "max_us_per_op": 73.0165928,
+      "mean_us_per_op": 72.52980811428571,
+      "min_us_per_op": 71.9268638,
+      "n_ops": 10000,
+      "p50_us_per_op": 72.4009871,
+      "p95_us_per_op": 73.0165928,
+      "samples_elapsed_ns": [
+        723942984,
+        724009871,
+        719268638,
+        730165928,
+        728413748,
+        729994004,
+        721291395
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "DecentDB",
+      "max_us_per_op": 81.74858577,
+      "mean_us_per_op": 80.92333107428571,
+      "min_us_per_op": 80.46890284,
+      "n_ops": 100000,
+      "p50_us_per_op": 80.66755781,
+      "p95_us_per_op": 81.74858577,
+      "samples_elapsed_ns": [
+        8066755781,
+        8062879352,
+        8047938763,
+        8174858577,
+        8132926101,
+        8114082894,
+        8046890284
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "DecentDB",
+      "max_us_per_op": 91.924560547,
+      "mean_us_per_op": 90.94640913785715,
+      "min_us_per_op": 90.23169154600001,
+      "n_ops": 1000000,
+      "p50_us_per_op": 90.88852958,
+      "p95_us_per_op": 91.924560547,
+      "samples_elapsed_ns": [
+        91924560547,
+        90888529580,
+        90610772070,
+        90592507481,
+        90231691546,
+        91194635731,
+        91182167010
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "SQLite(wal_normal)",
+      "max_us_per_op": 3.8567658000000002,
+      "mean_us_per_op": 3.6495259,
+      "min_us_per_op": 3.5644892,
+      "n_ops": 10000,
+      "p50_us_per_op": 3.603326,
+      "p95_us_per_op": 3.8567658000000002,
+      "samples_elapsed_ns": [
+        36178934,
+        36033260,
+        35644892,
+        35798640,
+        35821802,
+        37421627,
+        38567658
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "SQLite(wal_normal)",
+      "max_us_per_op": 3.64258882,
+      "mean_us_per_op": 3.600825522857143,
+      "min_us_per_op": 3.5670671200000004,
+      "n_ops": 100000,
+      "p50_us_per_op": 3.59016249,
+      "p95_us_per_op": 3.64258882,
+      "samples_elapsed_ns": [
+        364258882,
+        363370414,
+        359554209,
+        356706712,
+        358976785,
+        358694615,
+        359016249
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "SQLite(wal_normal)",
+      "max_us_per_op": 4.668803746,
+      "mean_us_per_op": 4.647384414857143,
+      "min_us_per_op": 4.636660298,
+      "n_ops": 1000000,
+      "p50_us_per_op": 4.646239633,
+      "p95_us_per_op": 4.668803746,
+      "samples_elapsed_ns": [
+        4649518598,
+        4668803746,
+        4646239633,
+        4645846596,
+        4637541552,
+        4636660298,
+        4647080481
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "SQLite(wal_normal)",
+      "max_us_per_op": 1.2614531999999998,
+      "mean_us_per_op": 1.2173631999999999,
+      "min_us_per_op": 1.1987775999999999,
+      "n_ops": 10000,
+      "p50_us_per_op": 1.2106519,
+      "p95_us_per_op": 1.2614531999999998,
+      "samples_elapsed_ns": [
+        11987776,
+        12614532,
+        12036238,
+        12071242,
+        12106519,
+        12249797,
+        12149320
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "SQLite(wal_normal)",
+      "max_us_per_op": 1.25595187,
+      "mean_us_per_op": 1.2407553900000001,
+      "min_us_per_op": 1.21722085,
+      "n_ops": 100000,
+      "p50_us_per_op": 1.24344378,
+      "p95_us_per_op": 1.25595187,
+      "samples_elapsed_ns": [
+        121722085,
+        122438299,
+        124344378,
+        125437791,
+        125595187,
+        123730445,
+        125260588
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "SQLite(wal_normal)",
+      "max_us_per_op": 1.3329682479999998,
+      "mean_us_per_op": 1.323393113,
+      "min_us_per_op": 1.313893227,
+      "n_ops": 1000000,
+      "p50_us_per_op": 1.324917714,
+      "p95_us_per_op": 1.3329682479999998,
+      "samples_elapsed_ns": [
+        1313893227,
+        1329967545,
+        1324997213,
+        1320025138,
+        1316982706,
+        1324917714,
+        1332968248
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "SQLite(wal_full)",
+      "max_us_per_op": 3.7422147,
+      "mean_us_per_op": 3.6622168142857143,
+      "min_us_per_op": 3.5635542,
+      "n_ops": 10000,
+      "p50_us_per_op": 3.6503222,
+      "p95_us_per_op": 3.7422147,
+      "samples_elapsed_ns": [
+        37163081,
+        36397905,
+        35635542,
+        36931907,
+        36301373,
+        36503222,
+        37422147
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "SQLite(wal_full)",
+      "max_us_per_op": 3.64693228,
+      "mean_us_per_op": 3.6055794485714285,
+      "min_us_per_op": 3.58642197,
+      "n_ops": 100000,
+      "p50_us_per_op": 3.59791925,
+      "p95_us_per_op": 3.64693228,
+      "samples_elapsed_ns": [
+        364693228,
+        361437303,
+        358642197,
+        359767189,
+        359356508,
+        359791925,
+        360217264
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "SQLite(wal_full)",
+      "max_us_per_op": 4.679876003,
+      "mean_us_per_op": 4.656515429000001,
+      "min_us_per_op": 4.637969115,
+      "n_ops": 1000000,
+      "p50_us_per_op": 4.64921617,
+      "p95_us_per_op": 4.679876003,
+      "samples_elapsed_ns": [
+        4671737013,
+        4667785503,
+        4679876003,
+        4649216170,
+        4637969115,
+        4641203268,
+        4647820931
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "SQLite(wal_full)",
+      "max_us_per_op": 1.6095979,
+      "mean_us_per_op": 1.5159090000000002,
+      "min_us_per_op": 1.403516,
+      "n_ops": 10000,
+      "p50_us_per_op": 1.5035399,
+      "p95_us_per_op": 1.6095979,
+      "samples_elapsed_ns": [
+        16095979,
+        15969511,
+        15035399,
+        14919410,
+        15036519,
+        14035160,
+        15021652
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "SQLite(wal_full)",
+      "max_us_per_op": 1.32074682,
+      "mean_us_per_op": 1.2961962814285715,
+      "min_us_per_op": 1.2810024100000001,
+      "n_ops": 100000,
+      "p50_us_per_op": 1.29035846,
+      "p95_us_per_op": 1.32074682,
+      "samples_elapsed_ns": [
+        129028092,
+        129028603,
+        128100241,
+        132074682,
+        129970911,
+        130099022,
+        129035846
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "SQLite(wal_full)",
+      "max_us_per_op": 1.345033921,
+      "mean_us_per_op": 1.3275927248571429,
+      "min_us_per_op": 1.3200532310000002,
+      "n_ops": 1000000,
+      "p50_us_per_op": 1.32501109,
+      "p95_us_per_op": 1.345033921,
+      "samples_elapsed_ns": [
+        1320053231,
+        1321928041,
+        1326102929,
+        1324957429,
+        1325011090,
+        1330062433,
+        1345033921
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "H2(JDBC)",
+      "max_us_per_op": 18.7425909,
+      "mean_us_per_op": 17.844148614285714,
+      "min_us_per_op": 16.990740000000002,
+      "n_ops": 10000,
+      "p50_us_per_op": 18.1663599,
+      "p95_us_per_op": 18.7425909,
+      "samples_elapsed_ns": [
+        183122941,
+        185192312,
+        187425909,
+        169907400,
+        171248095,
+        181663599,
+        170530147
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "H2(JDBC)",
+      "max_us_per_op": 17.85111746,
+      "mean_us_per_op": 17.470641717142858,
+      "min_us_per_op": 17.28467614,
+      "n_ops": 100000,
+      "p50_us_per_op": 17.41443194,
+      "p95_us_per_op": 17.85111746,
+      "samples_elapsed_ns": [
+        1750846546,
+        1741148624,
+        1753889272,
+        1785111746,
+        1728467614,
+        1741443194,
+        1728542206
+      ],
+      "unit": "us/op"
+    },
+    {
+      "bench": "point_select",
+      "engine": "H2(JDBC)",
+      "max_us_per_op": 19.504284285999997,
+      "mean_us_per_op": 19.431958545714284,
+      "min_us_per_op": 19.389616247000003,
+      "n_ops": 1000000,
+      "p50_us_per_op": 19.424158637,
+      "p95_us_per_op": 19.504284285999997,
+      "samples_elapsed_ns": [
+        19504284286,
+        19479551954,
+        19398276415,
+        19402652113,
+        19424158637,
+        19425170168,
+        19389616247
+      ],
+      "unit": "us/op"
+    }
+  ],
+  "skipped": [
+    {
+      "bench": "point_select",
+      "engine": "DuckDB",
+      "error": "TransactionContext Error: cannot commit - no transaction is active",
+      "n_ops": 10000
+    },
+    {
+      "bench": "point_select",
+      "engine": "DuckDB",
+      "error": "TransactionContext Error: cannot commit - no transaction is active",
+      "n_ops": 100000
+    },
+    {
+      "bench": "point_select",
+      "engine": "DuckDB",
+      "error": "TransactionContext Error: cannot commit - no transaction is active",
+      "n_ops": 1000000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "DuckDB",
+      "error": "TransactionContext Error: cannot commit - no transaction is active",
+      "n_ops": 10000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "DuckDB",
+      "error": "TransactionContext Error: cannot commit - no transaction is active",
+      "n_ops": 100000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "DuckDB",
+      "error": "TransactionContext Error: cannot commit - no transaction is active",
+      "n_ops": 1000000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "H2(JDBC)",
+      "error": "org.h2.jdbc.JdbcSQLSyntaxErrorException: Table \"kv\" already exists; SQL statement:\nCREATE TABLE kv (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) [42101-224]",
+      "n_ops": 10000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "H2(JDBC)",
+      "error": "org.h2.jdbc.JdbcSQLSyntaxErrorException: Table \"kv\" already exists; SQL statement:\nCREATE TABLE kv (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) [42101-224]",
+      "n_ops": 100000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "H2(JDBC)",
+      "error": "org.h2.jdbc.JdbcSQLSyntaxErrorException: Table \"kv\" already exists; SQL statement:\nCREATE TABLE kv (id INTEGER PRIMARY KEY, v INTEGER NOT NULL) [42101-224]",
+      "n_ops": 1000000
+    },
+    {
+      "bench": "point_select",
+      "engine": "Derby(JDBC)",
+      "error": "Class org.apache.derby.jdbc.EmbeddedDriver is not found",
+      "n_ops": 10000
+    },
+    {
+      "bench": "point_select",
+      "engine": "Derby(JDBC)",
+      "error": "Class org.apache.derby.jdbc.EmbeddedDriver is not found",
+      "n_ops": 100000
+    },
+    {
+      "bench": "point_select",
+      "engine": "Derby(JDBC)",
+      "error": "Class org.apache.derby.jdbc.EmbeddedDriver is not found",
+      "n_ops": 1000000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "Derby(JDBC)",
+      "error": "Class org.apache.derby.jdbc.EmbeddedDriver is not found",
+      "n_ops": 10000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "Derby(JDBC)",
+      "error": "Class org.apache.derby.jdbc.EmbeddedDriver is not found",
+      "n_ops": 100000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "Derby(JDBC)",
+      "error": "Class org.apache.derby.jdbc.EmbeddedDriver is not found",
+      "n_ops": 1000000
+    },
+    {
+      "bench": "point_select",
+      "engine": "HSQLDB(JDBC)",
+      "error": "Class org.hsqldb.jdbc.JDBCDriver is not found",
+      "n_ops": 10000
+    },
+    {
+      "bench": "point_select",
+      "engine": "HSQLDB(JDBC)",
+      "error": "Class org.hsqldb.jdbc.JDBCDriver is not found",
+      "n_ops": 100000
+    },
+    {
+      "bench": "point_select",
+      "engine": "HSQLDB(JDBC)",
+      "error": "Class org.hsqldb.jdbc.JDBCDriver is not found",
+      "n_ops": 1000000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "HSQLDB(JDBC)",
+      "error": "Class org.hsqldb.jdbc.JDBCDriver is not found",
+      "n_ops": 10000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "HSQLDB(JDBC)",
+      "error": "Class org.hsqldb.jdbc.JDBCDriver is not found",
+      "n_ops": 100000
+    },
+    {
+      "bench": "insert_txn",
+      "engine": "HSQLDB(JDBC)",
+      "error": "Class org.hsqldb.jdbc.JDBCDriver is not found",
+      "n_ops": 1000000
+    }
+  ]
+}

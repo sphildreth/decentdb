@@ -240,7 +240,7 @@ foreach (var bench in benches)
         {
             var row = RunBench(dbDir, bench, nOps, iterations, warmup);
             results.Add(row);
-            Console.WriteLine($"OK LiteDB {bench} n={nOps} p50={row[\"p50_us_per_op\"]:0.000} us/op");
+			Console.WriteLine($"OK LiteDB {bench} n={nOps} p50={row["p50_us_per_op"]:0.000} us/op");
         }
         catch (Exception e)
         {
@@ -275,7 +275,7 @@ var payload = new Dictionary<string, object?>
     ["skipped"] = skipped,
 };
 
-var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions
+var json = System.Text.Json.JsonSerializer.Serialize(payload, new JsonSerializerOptions
 {
     WriteIndented = true,
 });
