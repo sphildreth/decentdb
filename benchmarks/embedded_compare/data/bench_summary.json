@@ -1,0 +1,44 @@
+{
+  "metadata": {
+    "run_id": "example",
+    "machine": "example-machine",
+    "notes": "Example numbers ONLY. Replace with real benchmark outputs.",
+    "units": {
+      "read_p95_ms": "ms (lower is better)",
+      "join_p95_ms": "ms (lower is better)",
+      "commit_p95_ms": "ms (lower is better)",
+      "insert_rows_per_sec": "rows/sec (higher is better)",
+      "db_size_mb": "MB (lower is better)"
+    }
+  },
+  "engines": {
+    "DecentDB": {
+      "read_p95_ms": 1.8,
+      "join_p95_ms": 4.9,
+      "commit_p95_ms": 2.7,
+      "insert_rows_per_sec": 120000,
+      "db_size_mb": 620
+    },
+    "SQLite": {
+      "read_p95_ms": 1.5,
+      "join_p95_ms": 4.2,
+      "commit_p95_ms": 2.2,
+      "insert_rows_per_sec": 135000,
+      "db_size_mb": 590
+    },
+    "DuckDB": {
+      "read_p95_ms": 2.4,
+      "join_p95_ms": 6.8,
+      "commit_p95_ms": 3.5,
+      "insert_rows_per_sec": 90000,
+      "db_size_mb": 700
+    },
+    "LMDB": {
+      "read_p95_ms": 0.9,
+      "join_p95_ms": null,
+      "commit_p95_ms": 1.6,
+      "insert_rows_per_sec": 160000,
+      "db_size_mb": 410
+    }
+  }
+}
