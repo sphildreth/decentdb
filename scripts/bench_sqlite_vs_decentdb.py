@@ -261,10 +261,7 @@ def sqlite_python_time_ms(sqlite_db: str, query: str, *, fetch: str) -> float:
         cur = conn.cursor()
         start = time.perf_counter()
         cur.execute(query)
-        if fetch == "one":
-            cur.fetchone()
-        elif fetch == "all":
-            cur.fetchall()
+        _consume_cursor(cur, fetch=fetch)
         end = time.perf_counter()
         return (end - start) * 1000.0
     finally:
@@ -278,14 +275,49 @@ def decentdb_python_time_ms(ddb_path: str, query: str, *, fetch: str) -> float:
         cur = conn.cursor()
         start = time.perf_counter()
         cur.execute(query)
-        if fetch == "one":
-            cur.fetchone()
-        elif fetch == "all":
-            cur.fetchall()
+        _consume_cursor(cur, fetch=fetch)
         end = time.perf_counter()
         return (end - start) * 1000.0
     finally:
         conn.close()
+
+
+def _normalize_fetch(fetch: str) -> str:
+    # Back-compat: the original script used fetch=none to mean "execution-only".
+    # For DecentDB (and often SQLite), SELECT execution is lazy until stepping/fetching.
+    # So "none" must drain results, otherwise we only time prepare/bind.
+    if fetch == "none":
+        return "drain"
+    return fetch
+
+
+def _consume_cursor(cur: Any, *, fetch: str, drain_batch_size: int = 1024) -> None:
+    """Consume a cursor's results according to fetch mode.
+
+    Modes:
+    - prepare: do not step/fetch (times prepare/bind only)
+    - one: fetch a single row
+    - all: fetch all rows (materialize)
+    - drain: execute to completion but discard rows (best effort)
+    """
+    fetch = _normalize_fetch(fetch)
+
+    if fetch == "prepare":
+        return
+    if fetch == "one":
+        cur.fetchone()
+        return
+    if fetch == "all":
+        cur.fetchall()
+        return
+    if fetch != "drain":
+        raise ValueError("fetch must be none|drain|one|all|prepare")
+
+    # Drain via fetchmany to reduce per-row Python overhead.
+    while True:
+        rows = cur.fetchmany(drain_batch_size)
+        if not rows:
+            break
 
 
 def decentdb_explain_plan(ddb_path: str, query: str) -> List[str]:
@@ -325,15 +357,18 @@ def bench_python(
     fetch: str,
     open_per_iter: bool,
 ) -> Tuple[List[float], List[float]]:
-    if fetch not in ("none", "one", "all"):
-        raise ValueError("fetch must be none|one|all")
+    if fetch not in ("none", "drain", "one", "all", "prepare"):
+        raise ValueError("fetch must be none|drain|one|all|prepare")
     if sqlite3 is None:
         raise RuntimeError("sqlite3 stdlib module unavailable")
 
     sqlite_ms: List[float] = []
     decent_ms: List[float] = []
 
-    print(f"python mode: fetch={fetch} open_per_iter={open_per_iter}")
+    normalized_fetch = _normalize_fetch(fetch)
+    if fetch == "none":
+        print("note: --fetch none is treated as --fetch drain (execute to completion without retaining rows)")
+    print(f"python mode: fetch={normalized_fetch} open_per_iter={open_per_iter}")
 
     if open_per_iter:
         if warmup > 0:
@@ -364,34 +399,22 @@ def bench_python(
             print(f"\nWarmup: {warmup} runs each (not measured)…")
             for _ in range(warmup):
                 sqlite_cur.execute(query)
-                if fetch == "one":
-                    sqlite_cur.fetchone()
-                elif fetch == "all":
-                    sqlite_cur.fetchall()
+                _consume_cursor(sqlite_cur, fetch=fetch)
             for _ in range(warmup):
                 decent_cur.execute(query)
-                if fetch == "one":
-                    decent_cur.fetchone()
-                elif fetch == "all":
-                    decent_cur.fetchall()
+                _consume_cursor(decent_cur, fetch=fetch)
 
         print(f"\nMeasured iterations: {iterations}")
         for i in range(1, iterations + 1):
             start = time.perf_counter()
             sqlite_cur.execute(query)
-            if fetch == "one":
-                sqlite_cur.fetchone()
-            elif fetch == "all":
-                sqlite_cur.fetchall()
+            _consume_cursor(sqlite_cur, fetch=fetch)
             end = time.perf_counter()
             sqlite_ms.append((end - start) * 1000.0)
 
             start = time.perf_counter()
             decent_cur.execute(query)
-            if fetch == "one":
-                decent_cur.fetchone()
-            elif fetch == "all":
-                decent_cur.fetchall()
+            _consume_cursor(decent_cur, fetch=fetch)
             end = time.perf_counter()
             decent_ms.append((end - start) * 1000.0)
 
@@ -435,6 +458,8 @@ def main() -> int:
     epilog = """Notes:
 - SQLite .timer prints seconds (we convert to ms).
 - Default --mode=python reuses connections, so the numbers focus on query execution.
+- For SELECT, both SQLite and DecentDB can be lazy; use --fetch drain/all/one to actually step.
+- Use --fetch prepare to time prepare/bind only (not full execution).
 - In --mode=cli, timings include per-iteration process startup + open/close overhead.
     DecentDB runs with --noRows so timings reflect query execution (not JSON row materialization).
 - For substring LIKE (e.g. LIKE '%needle%'), use a trigram index in DecentDB:
@@ -461,9 +486,16 @@ def main() -> int:
     )
     ap.add_argument(
         "--fetch",
-        choices=["none", "one", "all"],
+        choices=["none", "drain", "one", "all", "prepare"],
         default="none",
-        help="In python mode: control how much result data is fetched (execution-only vs include fetch costs)",
+        help=(
+            "In python mode: control how results are consumed.\n"
+            "  none   : alias for drain (execute to completion, discard rows)\n"
+            "  drain  : execute to completion, discard rows\n"
+            "  one    : fetch a single row\n"
+            "  all    : fetch all rows (materialize)\n"
+            "  prepare: do not step/fetch (times prepare/bind only; SELECT may not execute)"
+        ),
     )
     ap.add_argument(
         "--python-open-per-iter",
@@ -689,8 +721,9 @@ def main() -> int:
             fetch=args.fetch,
             open_per_iter=args.python_open_per_iter,
         )
-        summarize(f"SQLite Python (fetch={args.fetch})", sqlite_ms)
-        summarize(f"DecentDB Python (fetch={args.fetch})", decent_ms)
+        fetch_label = _normalize_fetch(args.fetch)
+        summarize(f"SQLite Python (fetch={fetch_label})", sqlite_ms)
+        summarize(f"DecentDB Python (fetch={fetch_label})", decent_ms)
 
         if sqlite_fts_db is not None and sqlite_fts_query is not None:
             # Benchmark FTS5 with the same fetch policy.
@@ -707,7 +740,7 @@ def main() -> int:
                     time.sleep(args.sleep_ms / 1000.0)
                 if i % max(1, (args.iterations // 10)) == 0:
                     print(f"  progress: {i}/{args.iterations}")
-            summarize(f"SQLite FTS5 trigram Python (fetch={args.fetch})", sqlite_fts_ms)
+            summarize(f"SQLite FTS5 trigram Python (fetch={fetch_label})", sqlite_fts_ms)
 
     s_med = statistics.median(sqlite_ms)
     d_med = statistics.median(decent_ms)
@@ -731,7 +764,7 @@ def main() -> int:
             "query": query,
         }
         if args.mode == "python":
-            extra["fetch"] = args.fetch
+            extra["fetch"] = _normalize_fetch(args.fetch)
             extra["python_open_per_iter"] = bool(args.python_open_per_iter)
         benches: List[Tuple[str, List[float]]] = [
             (f"sqlite_{args.mode}", sqlite_ms),
