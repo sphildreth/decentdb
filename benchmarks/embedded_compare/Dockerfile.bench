@@ -1,0 +1,74 @@
+FROM debian:bookworm-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Debian bookworm ships an older Nim (1.6.x) that is too old to compile
+# this repo. Install a pinned toolchain version for reproducibility.
+ARG NIM_VERSION=2.0.8
+
+# Pinned JDBC jar versions (recorded by the runner too)
+ARG H2_VERSION=2.2.224
+ARG HSQLDB_VERSION=2.7.3
+ARG DERBY_VERSION=10.17.1.0
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    openjdk-17-jre-headless \
+    make \
+    gcc \
+    g++ \
+    libpg-query-dev \
+    xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install Nim toolchain directly (avoids choosenim's bootstrap download of the
+# current stable Nim, which would otherwise cause two Nim versions to be fetched).
+RUN curl -fsSL -o /tmp/nim.tar.xz \
+    "https://nim-lang.org/download/nim-${NIM_VERSION}-linux_x64.tar.xz" \
+  && mkdir -p /opt \
+  && tar -C /opt -xJf /tmp/nim.tar.xz \
+  && rm -f /tmp/nim.tar.xz
+
+# Python deps for benchmarking + plotting
+RUN python3 -m venv /opt/venv \
+  && /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip \
+  && /opt/venv/bin/python -m pip install --no-cache-dir \
+    duckdb==0.10.3 \
+    JayDeBeApi==1.2.3 \
+    JPype1==1.5.0 \
+    matplotlib==3.8.4
+
+ENV PATH=/opt/venv/bin:/root/.nimble/bin:/opt/nim-${NIM_VERSION}/bin:$PATH
+
+# JDBC driver jars
+RUN mkdir -p /opt/jdbc \
+  && curl -fsSL -o /opt/jdbc/h2.jar \
+    "https://repo1.maven.org/maven2/com/h2database/h2/${H2_VERSION}/h2-${H2_VERSION}.jar" \
+  && curl -fsSL -o /opt/jdbc/hsqldb.jar \
+    "https://repo1.maven.org/maven2/org/hsqldb/hsqldb/${HSQLDB_VERSION}/hsqldb-${HSQLDB_VERSION}.jar" \
+  && curl -fsSL -o /opt/jdbc/derby.jar \
+    "https://repo1.maven.org/maven2/org/apache/derby/derby/${DERBY_VERSION}/derby-${DERBY_VERSION}.jar"
+
+ENV JDBC_H2_JAR=/opt/jdbc/h2.jar
+ENV JDBC_HSQLDB_JAR=/opt/jdbc/hsqldb.jar
+ENV JDBC_DERBY_JAR=/opt/jdbc/derby.jar
+
+WORKDIR /repo
+COPY . /repo
+
+# Build DecentDB shared library used by Python bindings.
+RUN command -v nimble >/dev/null 2>&1 \
+  && nimble install -y --depsOnly \
+  && nimble -y build_lib
+
+ENV DECENTDB_NATIVE_LIB=/repo/build/libc_api.so
+ENV PYTHONPATH=/repo/bindings/python
+
+# Default (docker-compose overrides)
+CMD ["python3", "-u", "benchmarks/embedded_compare/run.py", "--db-dir", "/db", "--out", "/out/results_py.json"]

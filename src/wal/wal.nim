@@ -16,9 +16,9 @@ type WalFrameType* = enum
   wfCommit = 1
   wfCheckpoint = 2
 
-type WalIndexEntry = object
-  lsn: uint64
-  offset: int64
+type WalIndexEntry* = object
+  lsn*: uint64
+  offset*: int64
 
 type ReadTxn* = object
   id*: int
@@ -783,6 +783,18 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
     return none(seq[byte])
   some(payload)
 
+proc readFramePayload*(wal: Wal, offset: int64): Option[string] =
+  ## Read just the payload of a frame at a known offset.
+  ## Used for reading flushed-but-uncommitted pages.
+  let res = readFrame(wal.vfs, wal.file, offset)
+  if not res.ok:
+    return none(string)
+  let (_, _, payload, _, _) = res.value
+  var s = newString(payload.len)
+  if payload.len > 0:
+    copyMem(addr s[0], unsafeAddr payload[0], payload.len)
+  some(s)
+
 proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: PageId, readerId: int = -1): Result[string] =
   # Check if this reader has been aborted (timeout)
   if readerId >= 0:
@@ -805,16 +817,40 @@ type WalWriter* = ref object
   wal*: Wal
   pending*: seq[(PageId, seq[byte])]
   active*: bool
+  flushed*: Table[PageId, WalIndexEntry]
 
 proc beginWrite*(wal: Wal): Result[WalWriter] =
   acquire(wal.lock)
-  let writer = WalWriter(wal: wal, pending: @[], active: true)
+  let writer = WalWriter(wal: wal, pending: @[], active: true, flushed: initTable[PageId, WalIndexEntry]())
   ok(writer)
 
 proc writePage*(writer: WalWriter, pageId: PageId, data: seq[byte]): Result[Void] =
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
   writer.pending.add((pageId, data))
+  okVoid()
+
+proc noteFlushedPage*(writer: WalWriter, pageId: PageId, lsn: uint64, offset: int64) =
+  ## Record a page that was flushed to WAL during the transaction.
+  ## These pages will be added to the index at commit time.
+  if writer.active:
+    writer.flushed[pageId] = WalIndexEntry(lsn: lsn, offset: offset)
+
+proc getFlushedPage*(writer: WalWriter, pageId: PageId): Option[WalIndexEntry] =
+  ## Get metadata for a page flushed during the current transaction.
+  if writer.active and writer.flushed.hasKey(pageId):
+    some(writer.flushed[pageId])
+  else:
+    none(WalIndexEntry)
+
+proc flushPage*(writer: WalWriter, pageId: PageId, data: seq[byte]): Result[Void] =
+  ## Flush a dirty page to the WAL immediately without committing.
+  ## Used to handle cache pressure during large transactions.
+  let res = writer.wal.appendFrame(wfPage, uint32(pageId), data)
+  if not res.ok:
+    return err[Void](res.err.code, res.err.message, res.err.context)
+  let (lsn, offset) = res.value
+  writer.noteFlushedPage(pageId, lsn, offset)
   okVoid()
 
 proc commit*(writer: WalWriter): Result[uint64] =
@@ -845,6 +881,15 @@ proc commit*(writer: WalWriter): Result[uint64] =
     release(writer.wal.lock)
     return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
   acquire(writer.wal.indexLock)
+  
+  # Add flushed pages to index first
+  for pageId, entry in writer.flushed:
+    if not writer.wal.index.hasKey(pageId):
+      writer.wal.index[pageId] = @[]
+    writer.wal.index[pageId].add(entry)
+    writer.wal.dirtySinceCheckpoint[pageId] = entry
+  
+  # Add pending pages to index
   for i, entry in writer.pending:
     if not writer.wal.index.hasKey(entry[0]):
       writer.wal.index[entry[0]] = @[]
@@ -860,6 +905,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
 
 proc rollback*(writer: WalWriter): Result[Void] =
   writer.pending = @[]
+  writer.flushed.clear()
   writer.active = false
   release(writer.wal.lock)
   okVoid()

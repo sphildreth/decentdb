@@ -144,6 +144,26 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     discard vfs.close(file)
     return err[Db](recoverRes.err.code, recoverRes.err.message, recoverRes.err.context)
 
+  # Create Db instance early so we can refer to it in callbacks
+  # Use a ref to allow safe capture in closure
+  var dbRef = Db(
+    path: path,
+    vfs: vfs,
+    file: file,
+    isOpen: true,
+    formatVersion: header.formatVersion,
+    pageSize: header.pageSize,
+    schemaCookie: header.schemaCookie,
+    pager: pager,
+    catalog: Catalog(), # Placeholder, replaced after initCatalog
+    wal: wal,
+    activeWriter: nil,
+    walOverlayEnabled: true,
+    cachePages: cachePages,
+    sqlCache: initTable[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]](),
+    sqlCacheOrder: @[]
+  )
+
   # Set up permanent WAL overlay to ensure late-commits are visible to all reads,
   # even after cache evictions.
   pager.setPageOverlay(0, proc(pageId: PageId): Option[string] =
@@ -159,6 +179,14 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     release(pager.overlayLock)
     if isOverridden:
       return none(string)
+    
+    # Check if page was flushed to WAL during current active transaction
+    if dbRef.activeWriter != nil:
+      let flushed = getFlushedPage(dbRef.activeWriter, pageId)
+      if flushed.isSome:
+        let payloadOpt = readFramePayload(wal, flushed.get.offset)
+        if payloadOpt.isSome:
+          return payloadOpt
     
     let snap = if pager.overlaySnapshot == 0: wal.walEnd.load(moAcquire) else: pager.overlaySnapshot
     let pageOpt = wal.getPageAtOrBefore(pageId, snap)
@@ -188,6 +216,8 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     discard closePager(pager)
     discard vfs.close(file)
     return err[Db](catalogRes.err.code, catalogRes.err.message, catalogRes.err.context)
+  
+  dbRef.catalog = catalogRes.value
 
   # Commit any bootstrap changes (e.g. newly created catalog root)
   let dirtyBootstrap = snapshotDirtyPages(pager)
@@ -221,23 +251,7 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     maxWalBytesPerReader = 256 * 1024 * 1024,  # HIGH-006: 256MB per reader limit
     readerCheckIntervalMs = 5000)  # HIGH-006: Check readers every 5 seconds
   
-  ok(Db(
-    path: path,
-    vfs: vfs,
-    file: file,
-    isOpen: true,
-    formatVersion: header.formatVersion,
-    pageSize: header.pageSize,
-    schemaCookie: header.schemaCookie,
-    pager: pager,
-    catalog: catalogRes.value,
-    wal: wal,
-    activeWriter: nil,
-    walOverlayEnabled: true,
-    cachePages: cachePages,
-    sqlCache: initTable[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]](),
-    sqlCacheOrder: @[]
-  ))
+  ok(dbRef)
 
 proc schemaBump(db: Db): Result[Void] =
   db.schemaCookie.inc
@@ -2183,6 +2197,15 @@ proc beginTransaction*(db: Db): Result[Void] =
   # Begin tracking page allocations for this transaction (HIGH-003)
   beginTxnPageTracking(db.pager)
   
+  # Install flush handler to allow evicting dirty pages during large transactions
+  db.pager.flushHandler = proc(pageId: PageId, data: string): Result[Void] =
+    # Convert page data (string) to WAL payload (seq[byte])
+    var payload = newSeq[byte](data.len)
+    if data.len > 0:
+      copyMem(addr payload[0], unsafeAddr data[0], data.len)
+      
+    db.activeWriter.flushPage(pageId, payload)
+
   okVoid()
 
 proc commitTransaction*(db: Db): Result[Void] =
@@ -2210,6 +2233,7 @@ proc commitTransaction*(db: Db): Result[Void] =
 
       discard rollback(db.activeWriter)
       db.activeWriter = nil
+      db.pager.flushHandler = nil
       clearCache(db.pager)
       return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
     pageIds.add(entry[0])
@@ -2217,6 +2241,7 @@ proc commitTransaction*(db: Db): Result[Void] =
   let commitRes = commit(db.activeWriter)
   if not commitRes.ok:
     db.activeWriter = nil
+    db.pager.flushHandler = nil
     clearCache(db.pager)
     return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
 
@@ -2241,14 +2266,17 @@ proc commitTransaction*(db: Db): Result[Void] =
     let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
     if not trigramFlushRes.ok:
       db.activeWriter = nil
+      db.pager.flushHandler = nil
       return err[Void](trigramFlushRes.err.code, trigramFlushRes.err.message, trigramFlushRes.err.context)
   
   let chkRes = maybeCheckpoint(db.wal, db.pager)
   if not chkRes.ok:
     db.activeWriter = nil
+    db.pager.flushHandler = nil
     return err[Void](chkRes.err.code, chkRes.err.message, chkRes.err.context)
 
   db.activeWriter = nil
+  db.pager.flushHandler = nil
   
   # End page allocation tracking (pages are now permanent) (HIGH-003)
   endTxnPageTracking(db.pager)
@@ -2274,6 +2302,7 @@ proc rollbackTransaction*(db: Db): Result[Void] =
   let dirtyPages = snapshotDirtyPages(db.pager)
   let rollbackRes = rollback(db.activeWriter)
   db.activeWriter = nil
+  db.pager.flushHandler = nil
   if not rollbackRes.ok:
     release(db.pager.rollbackLock)
     return err[Void](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)

@@ -237,9 +237,10 @@ proc evictIfNeededLocked(pager: Pager, shard: PageCacheShard): Result[Void] =
       
       anyUnpinned = true
 
-      # Atomicity guard: do not evict/flush dirty pages during a transaction.
+      # Atomicity guard: do not evict/flush dirty pages during a transaction
+      # unless we have a custom flush handler (e.g. WAL) that can handle uncommitted data.
       # Otherwise flushEntry() may write uncommitted bytes into the main DB.
-      if pager.inTransaction and entry.dirty:
+      if pager.inTransaction and entry.dirty and pager.flushHandler == nil:
         continue
 
       anyEvictable = true

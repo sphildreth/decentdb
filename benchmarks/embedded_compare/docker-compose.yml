@@ -1,0 +1,74 @@
+services:
+  bench_py:
+    build:
+      context: ../..
+      dockerfile: benchmarks/embedded_compare/Dockerfile.bench
+    volumes:
+      # Results (JSON + chart)
+      - ./out:/out:Z
+      # DB files on a bind mount (avoid overlayfs semantics for durability-ish runs)
+      - ./db:/db:Z
+    environment:
+      - BENCH_DB_DIR=/db
+      - BENCH_OUT_DIR=/out
+    command:
+      - python3
+      - -u
+      - benchmarks/embedded_compare/run.py
+      - --db-dir
+      - /db
+      - --out
+      - /out/results_py.json
+      - --plot
+      - /out/chart.png
+      - --op-counts
+      - 10000,100000,1000000
+      - --iterations
+      - "7"
+      - --warmup
+      - "2"
+
+  bench_litedb:
+    image: mcr.microsoft.com/dotnet/sdk:8.0
+    working_dir: /repo
+    volumes:
+      - ../..:/repo:Z
+      - ./out:/out:Z
+      - ./db:/db:Z
+    command:
+      - dotnet
+      - run
+      - -c
+      - Release
+      - --project
+      - benchmarks/embedded_compare/dotnet/LiteDbBench/LiteDbBench.csproj
+      - --
+      - --db-dir
+      - /db
+      - --out
+      - /out/results_litedb.json
+      - --op-counts
+      - 10000,100000,1000000
+      - --iterations
+      - "7"
+      - --warmup
+      - "2"
+
+  plot_all:
+    build:
+      context: ../..
+      dockerfile: benchmarks/embedded_compare/Dockerfile.bench
+    volumes:
+      - ./out:/out:Z
+    command:
+      - python3
+      - -u
+      - benchmarks/embedded_compare/plot.py
+      - --in
+      - /out/results_py.json
+      - --in
+      - /out/results_litedb.json
+      - --out
+      - /out/chart_all.png
+      - --merged-json
+      - /out/results_merged.json

@@ -33,6 +33,16 @@ This document outlines a comprehensive comparison plan to evaluate DecentDB's pe
 4. Provide data-driven insights for developers choosing an embedded database
 5. Track DecentDB's performance relative to established competitors
 
+## Primary Deliverable (Near-Term)
+
+The initial output we want is a single chart that is easy to re-run over time:
+
+- X-axis: operation count (`10_000`, `100_000`, `1_000_000`)
+- Y-axis: latency in $\mu s/op$ (preferred over $ns/op$ at the Python/driver layer)
+- Series: one line per embedded system
+
+The benchmark runner must emit machine-readable JSON results (with a run manifest) so we can re-plot historically and track regressions.
+
 ## Target Database Systems
 
 ### Primary Systems
@@ -64,6 +74,8 @@ To keep results meaningful and publishable, every benchmark run must record and 
 - **Same durability mode**: Benchmarks must be run under explicitly defined durability settings and reported separately (see “Durability Modes”).
 - **Same concurrency model**: Concurrency tests must use the same client model (process vs thread), and each worker must use its own connection.
 - **Same environment**: Pin CPU model, RAM, storage medium, OS/kernel, filesystem, and power governor; record them in results.
+
+- **Storage semantics**: For durability-related runs, results must be produced on a real filesystem mount (not Docker overlayfs). If Docker is used, the DB directory must be a bind-mounted host directory and the mount/filesystem details must be recorded in the run manifest.
 
 This suite should emit a machine-readable “run manifest” (JSON) capturing all knobs so a run is reproducible.
 
@@ -305,6 +317,23 @@ Any changes to generator logic or distributions must bump a generator version st
 - **Recovery Time**: Time to recover from simulated failures
 
 ## Technical Implementation Plan
+
+## Recommended Execution Model (Re-runnable + Fair)
+
+To make this benchmark suite easy to re-run and hard to "accidentally cheat", the preferred execution model is:
+
+- A Docker image (or set of images) that pins:
+    - OS base image
+    - Engine versions (DuckDB, JDBC jars, etc.)
+    - Python dependencies
+- A benchmark runner that writes:
+    - `results.json` (benchmark samples + aggregates)
+    - `manifest.json` (engine versions + knobs + machine/container details)
+- A plotting step that consumes `results.json` and produces the initial chart.
+
+Important caveat:
+
+- Durable-commit benchmarks are highly sensitive to filesystem + sync semantics. Docker overlayfs can distort results. For durability runs, always bind-mount a host directory for database files.
 
 ### 0. SQL Subset Definition (Required)
 
@@ -593,7 +622,7 @@ rich>=12.0.0  # For nice console output
 - Python 3.8+ installed
 - Java Runtime Environment (for H2, Derby, HSQLDB)
 - Native libraries for Firebird if testing that system
-- DecentDB service running (if accessed via API)
+- DecentDB Python bindings + native library available (embedded, in-process)
 
 ### Setup Steps
 1. Clone the comparison repository
