@@ -96,6 +96,24 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "execSql returns rows for simple LIKE":
+    let path = makeTempDb("decentdb_sql_exec_like_rows.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'Hello Metallica')").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'World')").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 'Bye Metallica')").ok
+
+    let res = execSql(db, "SELECT * FROM t WHERE name LIKE '%Metallica'")
+    check res.ok
+    check res.value.len == 2
+    check res.value.contains("1|Hello Metallica")
+    check res.value.contains("3|Bye Metallica")
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),
