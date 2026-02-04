@@ -8,6 +8,7 @@ import sets
 import locks
 import sequtils
 import times
+import std/monotimes
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
@@ -353,16 +354,8 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
       if values[i].kind == vkNull:
         continue
       if col.primaryKey and col.kind == ctInt64:
-        if values[i].kind == vkInt64:
-          let targetId = cast[uint64](values[i].int64Val)
-          let rowRes = readRowAt(pager, table, targetId)
-          if rowRes.ok:
-            if rowid == 0 or rowid != targetId:
-              return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
-          else:
-            if rowRes.err.code != ERR_IO:
-              return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
-          continue
+        # Optimization: checked by btree.insert
+        continue
       let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
       if isNone(idxOpt):
         return err[Void](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
@@ -1050,6 +1043,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       touchSqlCache(sqlText)
 
   if boundStatements.len == 0:
+    let t0 = getMonoTime()
     let parseRes = parseSql(sqlText)
     if not parseRes.ok:
       return err[seq[string]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
@@ -1077,6 +1071,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       else:
         cachedPlans.add(nil)
     rememberSqlCache(sqlText, boundStatements, cachedPlans)
+    let t1 = getMonoTime()
+    if sqlText.contains("count(*)"):
+      stderr.writeLine("Plan: " & $((t1 - t0).inNanoseconds.float / 1000.0) & "us")
   proc findMatchingRowids(tableName: string, whereExpr: Expr): Result[seq[uint64]] =
     # Use the planner to execute a general WHERE clause, leveraging indexes when possible.
     # This converts the WHERE clause into a SELECT-like plan and executes it to find rowids.
@@ -1143,7 +1140,11 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
         planRes.value
     if db.wal == nil or db.activeWriter != nil or not db.walOverlayEnabled:
+      let t2 = getMonoTime()
       let rowsRes = execPlan(db.pager, db.catalog, usePlan, params)
+      let t3 = getMonoTime()
+      if sqlText.contains("count(*)"):
+        stderr.writeLine("Exec(NoWAL): " & $((t3 - t2).inNanoseconds.float / 1000.0) & "us")
       if not rowsRes.ok:
         return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
       for row in rowsRes.value:
@@ -1163,7 +1164,11 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       db.pager.overlaySnapshot = 0
       db.pager.clearReadGuard()
       endRead(db.wal, txn)
+    let t2 = getMonoTime()
     let rowsRes = execPlan(db.pager, db.catalog, usePlan, params)
+    let t3 = getMonoTime()
+    if sqlText.contains("count(*)"):
+      stderr.writeLine("Exec(WAL): " & $((t3 - t2).inNanoseconds.float / 1000.0) & "us")
     if not rowsRes.ok:
       return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
     for row in rowsRes.value:

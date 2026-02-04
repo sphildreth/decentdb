@@ -6,6 +6,8 @@ import algorithm
 import atomics
 import sets
 import hashes
+import std/monotimes
+import std/times
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
@@ -976,6 +978,7 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     return ok(some(count))
 
   of pkIndexSeek:
+    let tA = getMonoTime()
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:
       return err[Option[int64]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
@@ -987,8 +990,10 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       return err[Option[int64]](ERR_SQL, "Index not found", plan.table & "." & plan.column)
     let idx = indexOpt.get
     let needle = indexKeyFromValue(valueRes.value)
+    let tB = getMonoTime()
     let idxTree = newBTree(pager, idx.rootPage)
     let idxCursorRes = openCursorAt(idxTree, needle)
+    let tC = getMonoTime()
     if not idxCursorRes.ok:
       return err[Option[int64]](idxCursorRes.err.code, idxCursorRes.err.message, idxCursorRes.err.context)
     let idxCursor = idxCursorRes.value
@@ -1003,6 +1008,9 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       if key > needle:
         break
       count.inc
+    let tD = getMonoTime()
+    if (tD - tA).inNanoseconds > 1000:
+       stderr.writeLine("Seek: Eval=" & $((tB - tA).inNanoseconds) & "ns Open=" & $((tC - tB).inNanoseconds) & "ns Scan=" & $((tD - tC).inNanoseconds) & "ns")
     return ok(some(count))
 
   of pkRowidSeek:
@@ -1108,6 +1116,9 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       if likeRes.value:
         count.inc
     return ok(some(count))
+
+  of pkSort:
+    return tryCountNoRowsFast(pager, catalog, plan.left, params)
 
   of pkFilter:
     if plan.predicate == nil:

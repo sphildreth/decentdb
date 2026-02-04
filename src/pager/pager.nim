@@ -8,13 +8,6 @@ import ../vfs/types
 import sets
 import ./db_header
 import ../utils/perf
-import std/times
-
-var debugCacheHits {.global.} = 0
-var debugCacheMisses {.global.} = 0
-var debugOverlayHits {.global.} = 0
-var debugOverlayMisses {.global.} = 0
-var debugPinCounter {.global.} = 0
 
 type PageId* = uint32
 type PageOverlay* = proc(pageId: PageId): Option[string]
@@ -28,6 +21,7 @@ type CacheEntry* = ref object
   pinCount*: int
   refBit*: bool
   lock*: Lock
+  aux*: RootRef
 
 type PageCacheShard = ref object
   capacity: int
@@ -297,19 +291,12 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
   let shard = shardFor(cache, pageId)
   
   # Fast path: check cache
-  let tFastStart = cpuTime()
   acquire(shard.lock)
   if shard.pages.hasKey(pageId):
-    debugCacheHits.inc
     let entry = shard.pages[pageId]
     entry.pinCount.inc
     entry.refBit = true
     release(shard.lock)
-    let tFastEnd = cpuTime()
-    debugPinCounter.inc
-    if debugPinCounter mod 10000 == 0:
-       let duration = (tFastEnd - tFastStart) * 1_000_000
-       stderr.writeLine("Pager Stats: Hits=" & $debugCacheHits & " Misses=" & $debugCacheMisses & " OvHits=" & $debugOverlayHits & " FastPathTime=" & $duration & "us")
     return ok(entry)
   release(shard.lock)
 
@@ -320,12 +307,10 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
-      debugOverlayHits.inc
       perf.OverlayHits.inc()
       data = overlayRes.get
       loaded = true
     else:
-      debugOverlayMisses.inc
       perf.OverlayMisses.inc()
   
   if not loaded:
@@ -351,8 +336,8 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
     release(shard.lock)
     return err[CacheEntry](evictRes.err.code, evictRes.err.message, evictRes.err.context)
 
-  debugCacheMisses.inc
-  let entry = CacheEntry(id: pageId, data: data, lsn: pager.header.lastCheckpointLsn, dirty: false, pinCount: 1, refBit: true)
+  let lsn = if loaded: high(uint64) else: pager.header.lastCheckpointLsn
+  let entry = CacheEntry(id: pageId, data: data, lsn: lsn, dirty: false, pinCount: 1, refBit: true)
   initLock(entry.lock)
   shard.pages[pageId] = entry
   shard.clock.add(pageId)
@@ -379,7 +364,6 @@ proc cloneString(buf: string): string =
   copyMem(addr result[0], unsafeAddr buf[0], buf.len)
 
 proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64], body: proc(page: string): Result[T]): Result[T] =
-  let tStart = cpuTime()
   ## Invoke `body` with a borrowed view of a cached page when safe.
   ## ...
   
@@ -404,10 +388,6 @@ proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64]
     if pinned:
       release(entry.lock)
       discard unpinPage(pager, entry)
-      let tEnd = cpuTime()
-      if debugPinCounter mod 10000 == 0:
-         let duration = (tEnd - tStart) * 1_000_000
-         stderr.writeLine("withPageRo Stats: TotalTime=" & $duration & "us")
 
   if snapshot.isSome:
     let snap = snapshot.get
@@ -422,13 +402,7 @@ proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64]
         return err[T](directRes.err.code, directRes.err.message, directRes.err.context)
       return body(directRes.value)
   
-  let tBodyStart = cpuTime()
-  let res = body(entry.data)
-  let tBodyEnd = cpuTime()
-  if debugPinCounter mod 10000 == 0:
-     let duration = (tBodyEnd - tBodyStart) * 1_000_000
-     stderr.writeLine("withPageRo Body Time=" & $duration & "us")
-  return res
+  return body(entry.data)
 
 proc readPageCachedCopy(pager: Pager, pageId: PageId, snapshot: Option[uint64]): Result[string] =
   let pinRes = pinPage(pager, pageId)
@@ -576,42 +550,99 @@ proc acquirePageRo*(pager: Pager, pageId: PageId): Result[PageHandle] =
     if not guardRes.ok:
       return err[PageHandle](guardRes.err.code, guardRes.err.message, guardRes.err.context)
   
-  if pager.overlay != nil:
-    let overlayRes = pager.overlay(pageId)
-    if overlayRes.isSome:
-      perf.OverlayHits.inc()
-      # Overlay pages are not pinned in cache, just return data handle
-      # We construct a dummy handle that doesn't need unpinning
-      return ok(PageHandle(pager: pager, entry: nil, data: overlayRes.get, pinned: false))
-    perf.OverlayMisses.inc()
-    # Fallthrough to cached read with snapshot check logic handled below
-  
-  # Inline pinPage fast path to avoid Result overhead
+  # 1. Fast Path: Check Cache
   let shard = shardFor(pager.cache, pageId)
   acquire(shard.lock)
   if shard.pages.hasKey(pageId):
-    let entry = shard.pages[pageId]
+    var entry = shard.pages[pageId]
     entry.pinCount.inc
     entry.refBit = true
+    
+    # Optimization: Skip overlay check if page is dirty or explicitly cached from WAL
+    let skipOverlay = entry.dirty or entry.lsn == high(uint64)
     release(shard.lock)
     
-    acquire(entry.lock)
+    if not skipOverlay and pager.overlay != nil:
+       let overlayRes = pager.overlay(pageId)
+       if overlayRes.isSome:
+          perf.OverlayHits.inc()
+          let data = overlayRes.get
+          acquire(entry.lock)
+          entry.data = data
+          entry.lsn = high(uint64)
+          entry.aux = nil
+          release(entry.lock)
+       else:
+          perf.OverlayMisses.inc()
     
+    acquire(entry.lock)
     # Snapshot isolation check
     if pager.overlaySnapshot > 0 and (entry.dirty or entry.lsn > pager.overlaySnapshot):
         release(entry.lock)
         discard unpinPage(pager, entry)
+        
+        # Fallback: check overlay first (for older WAL versions), then disk
+        if pager.overlay != nil:
+           let ovRes = pager.overlay(pageId)
+           if ovRes.isSome:
+              return ok(PageHandle(pager: pager, entry: nil, data: ovRes.get, pinned: false))
+        
         let directRes = readPageDirect(pager, pageId)
         if not directRes.ok:
           return err[PageHandle](directRes.err.code, directRes.err.message, directRes.err.context)
         return ok(PageHandle(pager: pager, entry: nil, data: directRes.value, pinned: false))
     
-    # Fast path success
     return ok(PageHandle(pager: pager, entry: entry, pinned: true))
   
   release(shard.lock)
-  
-  # Slow path (Cache miss)
+
+  # 2. Cache Miss: Check Overlay First (Cache WAL pages)
+  if pager.overlay != nil:
+     let overlayRes = pager.overlay(pageId)
+     if overlayRes.isSome:
+        perf.OverlayHits.inc()
+        let data = overlayRes.get
+        
+        acquire(shard.lock)
+        # Check race: did someone load it?
+        if shard.pages.hasKey(pageId):
+           var entry = shard.pages[pageId]
+           entry.pinCount.inc
+           entry.refBit = true
+           release(shard.lock)
+           
+           acquire(entry.lock)
+           if not entry.dirty:
+              entry.data = data
+              entry.lsn = high(uint64)
+              entry.aux = nil
+           release(entry.lock)
+           
+           acquire(entry.lock)
+           # Snapshot Check
+           if pager.overlaySnapshot > 0 and (entry.dirty or entry.lsn > pager.overlaySnapshot):
+               release(entry.lock)
+               discard unpinPage(pager, entry)
+               return ok(PageHandle(pager: pager, entry: nil, data: data, pinned: false))
+           return ok(PageHandle(pager: pager, entry: entry, pinned: true))
+        
+        # Insert new entry
+        let evictRes = evictIfNeededLocked(pager, shard)
+        if not evictRes.ok:
+           release(shard.lock)
+           return ok(PageHandle(pager: pager, entry: nil, data: data, pinned: false))
+           
+        let entry = CacheEntry(id: pageId, data: data, lsn: high(uint64), dirty: false, pinCount: 1, refBit: true)
+        initLock(entry.lock)
+        shard.pages[pageId] = entry
+        shard.clock.add(pageId)
+        release(shard.lock)
+        
+        return ok(PageHandle(pager: pager, entry: entry, pinned: true))
+     else:
+        perf.OverlayMisses.inc()
+
+  # 3. Slow Path: Load from Disk
   let pinRes = pinPage(pager, pageId)
   if not pinRes.ok:
     return err[PageHandle](pinRes.err.code, pinRes.err.message, pinRes.err.context)
@@ -623,6 +654,12 @@ proc acquirePageRo*(pager: Pager, pageId: PageId): Result[PageHandle] =
   if pager.overlaySnapshot > 0 and (entry.dirty or entry.lsn > pager.overlaySnapshot):
     release(entry.lock)
     discard unpinPage(pager, entry)
+    
+    if pager.overlay != nil:
+       let ovRes = pager.overlay(pageId)
+       if ovRes.isSome:
+          return ok(PageHandle(pager: pager, entry: nil, data: ovRes.get, pinned: false))
+
     let directRes = readPageDirect(pager, pageId)
     if not directRes.ok:
       return err[PageHandle](directRes.err.code, directRes.err.message, directRes.err.context)
@@ -647,6 +684,7 @@ proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   acquire(entry.lock)
   entry.data = data
   entry.dirty = true
+  entry.aux = nil
   release(entry.lock)
   discard unpinPage(pager, entry, dirty = true)
   okVoid()

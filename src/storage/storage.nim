@@ -387,7 +387,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
   let record = encodeRecord(normalizedRes.value)
   let tree = newBTree(pager, table.rootPage)
-  let insertRes = insert(tree, rowid, record)
+  let insertRes = insert(tree, rowid, record, checkUnique = true)
   if not insertRes.ok:
     return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   if updateIndexes:
