@@ -1,8 +1,6 @@
 import unittest
 import os
-import options
 import strutils
-import tables
 
 import engine
 import exec/exec

@@ -1,5 +1,4 @@
 import unittest
-import engine
 import catalog/catalog
 import record/record
 import storage/storage

@@ -1,13 +1,9 @@
 import unittest
 import os
 import strutils
-import sequtils
 
 import engine
-import exec/exec
 import record/record
-import sql/sql
-import catalog/catalog
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)

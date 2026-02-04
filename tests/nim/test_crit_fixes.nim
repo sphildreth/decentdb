@@ -1,6 +1,5 @@
 import os
 import strutils
-import times
 import locks
 import sets
 import unittest
