@@ -52,7 +52,16 @@ proc getBenchDataDir(): string =
     createDir(gDataDir)
     return gDataDir
   else:
-    return getBenchDataDir()
+    let d = getTempDir() / "decentdb_bench_data"
+    createDir(d)
+    return d
+
+proc toBytes(text: string): seq[byte] =
+  ## Convert a Nim string to owned bytes (safe under ARC/ORC).
+  ## Do NOT cast string -> seq[byte]; that can segfault.
+  result = newSeq[byte](text.len)
+  for i, ch in text:
+    result[i] = byte(ch)
 
 type
   BenchmarkMetrics = object
@@ -148,8 +157,10 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
 proc runDecentDbInsert(outputDir: string) =
   echo "Running DecentDB Insert Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_insert.ddb"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
 
   let db = openDb(dbPath).value
   defer: discard closeDb(db)
@@ -165,8 +176,8 @@ proc runDecentDbInsert(outputDir: string) =
     let t0 = epochTime()
     discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", @[
       Value(kind: vkInt64, int64Val: int64(i)),
-      Value(kind: vkText, bytes: cast[seq[byte]]("User" & $i)),
-      Value(kind: vkText, bytes: cast[seq[byte]]("user" & $i & "@example.com"))
+      Value(kind: vkText, bytes: toBytes("User" & $i)),
+      Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
     ])
     let t1 = epochTime()
     latencies.add(int((t1 - t0) * 1_000_000))
@@ -207,8 +218,10 @@ proc runDecentDbInsert(outputDir: string) =
 proc runDecentDbCommitLatency(outputDir: string) =
   echo "Running DecentDB Commit Latency Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_commit.ddb"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
 
   let db = openDb(dbPath).value
   defer: discard closeDb(db)
@@ -227,7 +240,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
     let t0 = epochTime()
     # Each UPDATE is a separate transaction with durable commit
     discard execSql(db, "UPDATE kv SET v = $1 WHERE k = 1", @[
-      Value(kind: vkText, bytes: cast[seq[byte]]("value" & $i))
+      Value(kind: vkText, bytes: toBytes("value" & $i))
     ])
     let t1 = epochTime()
     latencies.add(int((t1 - t0) * 1_000_000))
@@ -268,8 +281,10 @@ proc runDecentDbCommitLatency(outputDir: string) =
 proc runDecentDbPointRead(outputDir: string) =
   echo "Running DecentDB Point Read Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_read.ddb"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
 
   let db = openDb(dbPath).value
   defer: discard closeDb(db)
@@ -281,8 +296,8 @@ proc runDecentDbPointRead(outputDir: string) =
   for i in 1..dataSize:
     discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", @[
       Value(kind: vkInt64, int64Val: int64(i)),
-      Value(kind: vkText, bytes: cast[seq[byte]]("User" & $i)),
-      Value(kind: vkText, bytes: cast[seq[byte]]("user" & $i & "@example.com"))
+      Value(kind: vkText, bytes: toBytes("User" & $i)),
+      Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
     ])
   
   let iterations = 1000
@@ -336,8 +351,10 @@ proc runDecentDbPointRead(outputDir: string) =
 proc runDecentDbJoin(outputDir: string) =
   echo "Running DecentDB Join Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_join.ddb"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
 
   let db = openDb(dbPath).value
   defer: discard closeDb(db)
@@ -351,7 +368,7 @@ proc runDecentDbJoin(outputDir: string) =
   for i in 1..userCount:
     discard execSql(db, "INSERT INTO users VALUES ($1, $2)", @[
       Value(kind: vkInt64, int64Val: int64(i)),
-      Value(kind: vkText, bytes: cast[seq[byte]]("User" & $i))
+      Value(kind: vkText, bytes: toBytes("User" & $i))
     ])
   
   var rng = initRand(42)
