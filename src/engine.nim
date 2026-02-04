@@ -1899,26 +1899,23 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     for col in table.columns:
       cols.add(bound.updateTable & "." & col.name)
 
-    var rowids: seq[uint64] = @[]
+    var rows: seq[Row] = @[]
     if plan != nil:
       let rowsRes = execPlan(db.pager, db.catalog, plan, params)
       if not rowsRes.ok:
         return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      for row in rowsRes.value:
-        rowids.add(row.rowid)
+      rows = rowsRes.value
     else:
       let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
       if not rowidsRes.ok:
         return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
-      rowids = rowidsRes.value
+      for rowid in rowidsRes.value:
+        let storedRes = readRowAt(db.pager, table, rowid)
+        if not storedRes.ok: continue
+        rows.add(Row(rowid: storedRes.value.rowid, columns: cols, values: storedRes.value.values))
 
-    for rowid in rowids:
-      let storedRes = readRowAt(db.pager, table, rowid)
-      if not storedRes.ok:
-        continue
-      let stored = storedRes.value
-      let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-      var newValues = stored.values
+    for row in rows:
+      var newValues = row.values
       for colName, expr in bound.assignments:
         var idx = -1
         for i, col in table.columns:
@@ -1933,7 +1930,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
           if not typeRes.ok:
             return err[int64](typeRes.err.code, typeRes.err.message, colName)
           newValues[idx] = evalRes.value
-      updates.add((stored.rowid, stored.values, newValues))
+      updates.add((row.rowid, row.values, newValues))
 
     for entry in updates:
       let notNullRes = enforceNotNull(table, entry[2])
@@ -1960,26 +1957,21 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     if not tableRes.ok:
       return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
     let table = tableRes.value
-    var deletions: seq[StoredRow] = @[]
-
-    var rowids: seq[uint64] = @[]
+    var deletions: seq[Row] = @[]
     if plan != nil:
       let rowsRes = execPlan(db.pager, db.catalog, plan, params)
       if not rowsRes.ok:
         return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      for row in rowsRes.value:
-        rowids.add(row.rowid)
+      deletions = rowsRes.value
     else:
       let rowidsRes = findMatchingRowidsPrepared(db, bound.deleteTable, bound.deleteWhere, params)
       if not rowidsRes.ok:
         return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
-      rowids = rowidsRes.value
+      for rowid in rowidsRes.value:
+        let storedRes = readRowAt(db.pager, table, rowid)
+        if not storedRes.ok: continue
+        deletions.add(Row(rowid: storedRes.value.rowid, columns: @[], values: storedRes.value.values))
 
-    for rowid in rowids:
-      let storedRes = readRowAt(db.pager, table, rowid)
-      if not storedRes.ok:
-        continue
-      deletions.add(storedRes.value)
     for row in deletions:
       let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
       if not restrictRes.ok:
