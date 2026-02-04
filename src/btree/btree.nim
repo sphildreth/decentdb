@@ -1288,7 +1288,7 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte],
     if scanRes.ok:
       let (lastKey, usedBytes, count) = scanRes.value
       if (count == 0 or key > lastKey):
-         stderr.writeLine("Fast append hit")
+         # stderr.writeLine("Fast append hit")
          let keyBytes = encodeVarint(key)
          var ctrlBytes: seq[byte]
          var valLen = 0

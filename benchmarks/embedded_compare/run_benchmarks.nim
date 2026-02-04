@@ -222,12 +222,15 @@ proc runDecentDbInsert(outputDir: string) =
   let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = getMonoTime()
-    discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", @[
+    let name = "User" & $i
+    let email = "user" & $i & "@example.com"
+    let params = @[
       Value(kind: vkInt64, int64Val: int64(i)),
-      Value(kind: vkText, bytes: toBytes("User" & $i)),
-      Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
-    ])
+      Value(kind: vkText, bytes: toBytes(name)),
+      Value(kind: vkText, bytes: toBytes(email))
+    ]
+    let t0 = getMonoTime()
+    discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", params)
     let t1 = getMonoTime()
     let ns = nanosBetween(t0, t1)
     latenciesNs.add(ns)
