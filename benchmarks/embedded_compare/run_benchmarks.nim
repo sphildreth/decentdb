@@ -215,6 +215,11 @@ proc runDecentDbInsert(outputDir: string) =
 
   discard execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)")
   
+  let prepRes = prepare(db, "INSERT INTO users VALUES ($1, $2, $3)")
+  if not prepRes.ok:
+    raise newException(IOError, "Failed to prepare statement: " & prepRes.err.message)
+  let stmt = prepRes.value
+
   let iterations = 1000
   var latencies: seq[int] = @[]
   var latenciesNs: seq[int64] = @[]
@@ -230,7 +235,7 @@ proc runDecentDbInsert(outputDir: string) =
       Value(kind: vkText, bytes: toBytes(email))
     ]
     let t0 = getMonoTime()
-    discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", params)
+    discard execPrepared(stmt, params)
     let t1 = getMonoTime()
     let ns = nanosBetween(t0, t1)
     latenciesNs.add(ns)
@@ -292,6 +297,11 @@ proc runDecentDbCommitLatency(outputDir: string) =
   # Pre-insert a row to update
   discard execSql(db, "INSERT INTO kv VALUES (1, 'initial')")
   
+  let prepRes = prepare(db, "UPDATE kv SET v = $1 WHERE k = 1")
+  if not prepRes.ok:
+    raise newException(IOError, "Failed to prepare statement: " & prepRes.err.message)
+  let stmt = prepRes.value
+
   let iterations = 1000
   var latencies: seq[int] = @[]
   var latenciesNs: seq[int64] = @[]
@@ -301,7 +311,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
   for i in 1..iterations:
     let t0 = getMonoTime()
     # Each UPDATE is a separate transaction with durable commit
-    discard execSql(db, "UPDATE kv SET v = $1 WHERE k = 1", @[
+    discard execPrepared(stmt, @[
       Value(kind: vkText, bytes: toBytes("value" & $i))
     ])
     let t1 = getMonoTime()

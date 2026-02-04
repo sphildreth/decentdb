@@ -41,6 +41,13 @@ type Db* = ref object
   sqlCache*: Table[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]]
   sqlCacheOrder*: seq[string]
 
+type Prepared* = ref object
+  db*: Db
+  sql*: string
+  schemaCookie*: uint32
+  statements*: seq[Statement]
+  plans*: seq[Plan]
+
 type DurabilityMode* = enum
   dmFull
   dmDeferred
@@ -1005,6 +1012,198 @@ proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
 
+proc prepare*(db: Db, sqlText: string): Result[Prepared] =
+  if not db.isOpen:
+    return err[Prepared](ERR_INTERNAL, "Database not open")
+
+  let parseRes = parseSql(sqlText)
+  if not parseRes.ok:
+    return err[Prepared](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+
+  var boundStatements: seq[Statement] = @[]
+  var plans: seq[Plan] = @[]
+
+  for stmt in parseRes.value.statements:
+    let bindRes = bindStatement(db.catalog, stmt)
+    if not bindRes.ok:
+      return err[Prepared](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+    let bound = bindRes.value
+    boundStatements.add(bound)
+
+    if bound.kind == skSelect:
+      let planRes = plan(db.catalog, bound)
+      if not planRes.ok:
+        return err[Prepared](planRes.err.code, planRes.err.message, planRes.err.context)
+      plans.add(planRes.value)
+    elif bound.kind == skUpdate:
+      let tableRes = db.catalog.getTable(bound.updateTable)
+      if not tableRes.ok:
+        return err[Prepared](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let table = tableRes.value
+      var selectItems: seq[SelectItem] = @[]
+      for col in table.columns:
+        selectItems.add(SelectItem(expr: Expr(kind: ekColumn, name: col.name, table: bound.updateTable)))
+      
+      let sel = Statement(
+        kind: skSelect,
+        fromTable: bound.updateTable,
+        fromAlias: "",
+        selectItems: selectItems,
+        whereExpr: bound.updateWhere,
+        joins: @[],
+        groupBy: @[],
+        havingExpr: nil,
+        orderBy: @[],
+        limit: -1,
+        offset: -1
+      )
+      let planRes = plan(db.catalog, sel)
+      if not planRes.ok:
+        return err[Prepared](planRes.err.code, planRes.err.message, planRes.err.context)
+      plans.add(planRes.value)
+    elif bound.kind == skDelete:
+      let tableRes = db.catalog.getTable(bound.deleteTable)
+      if not tableRes.ok:
+        return err[Prepared](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let table = tableRes.value
+      var selectItems: seq[SelectItem] = @[]
+      for col in table.columns:
+        selectItems.add(SelectItem(expr: Expr(kind: ekColumn, name: col.name, table: bound.deleteTable)))
+      
+      let sel = Statement(
+        kind: skSelect,
+        fromTable: bound.deleteTable,
+        fromAlias: "",
+        selectItems: selectItems,
+        whereExpr: bound.deleteWhere,
+        joins: @[],
+        groupBy: @[],
+        havingExpr: nil,
+        orderBy: @[],
+        limit: -1,
+        offset: -1
+      )
+      let planRes = plan(db.catalog, sel)
+      if not planRes.ok:
+        return err[Prepared](planRes.err.code, planRes.err.message, planRes.err.context)
+      plans.add(planRes.value)
+    elif bound.kind == skExplain and bound.explainInner.kind == skSelect:
+      let planRes = plan(db.catalog, bound.explainInner)
+      if not planRes.ok:
+        return err[Prepared](planRes.err.code, planRes.err.message, planRes.err.context)
+      plans.add(planRes.value)
+    else:
+      plans.add(nil)
+
+  ok(Prepared(
+    db: db,
+    sql: sqlText,
+    schemaCookie: db.schemaCookie,
+    statements: boundStatements,
+    plans: plans
+  ))
+
+proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
+
+# Forward declaration
+proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil): Result[int64]
+
+proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] =
+  if not prepared.db.isOpen:
+    return err[seq[string]](ERR_INTERNAL, "Database not open")
+  
+  if prepared.schemaCookie != prepared.db.schemaCookie:
+    # Schema changed, need to re-prepare
+    # For now, just error out or re-prepare implicitly?
+    # Simpler to error out and let user handle it, but for benchmarks we assume stable schema.
+    # Let's try to re-prepare internally.
+    let reRes = prepare(prepared.db, prepared.sql)
+    if not reRes.ok:
+      return err[seq[string]](reRes.err.code, "Schema changed and re-prepare failed: " & reRes.err.message, reRes.err.context)
+    let newPrep = reRes.value
+    prepared.schemaCookie = newPrep.schemaCookie
+    prepared.statements = newPrep.statements
+    prepared.plans = newPrep.plans
+
+  let db = prepared.db
+  var output: seq[string] = @[]
+
+  for i, bound in prepared.statements:
+    let plan = prepared.plans[i]
+    case bound.kind
+    of skBegin:
+      let res = beginTransaction(db)
+      if not res.ok: return err[seq[string]](res.err.code, res.err.message, res.err.context)
+    of skCommit:
+      let res = commitTransaction(db)
+      if not res.ok: return err[seq[string]](res.err.code, res.err.message, res.err.context)
+    of skRollback:
+      let res = rollbackTransaction(db)
+      if not res.ok: return err[seq[string]](res.err.code, res.err.message, res.err.context)
+    of skExplain:
+      let explainStr = explainPlanLines(db.catalog, plan).join("\n")
+      output.add(explainStr)
+    of skSelect:
+      let cursorRes = openRowCursor(db.pager, db.catalog, plan, params)
+      if not cursorRes.ok:
+        return err[seq[string]](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+      let cursor = cursorRes.value
+      var rows: seq[string] = @[]
+      # Limit output for safety
+      var limit = 1000
+      while true:
+        let nextRes = rowCursorNext(cursor)
+        if not nextRes.ok:
+          return err[seq[string]](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+        if nextRes.value.isNone:
+          break
+        let row = nextRes.value.get
+        var parts: seq[string] = @[]
+        for v in row.values:
+          parts.add($v)
+        rows.add(parts.join("|"))
+        limit.dec
+        if limit == 0:
+          break
+      output.add(rows.join("\n"))
+    of skInsert:
+      let tableRes = db.catalog.getTable(bound.insertTable)
+      if not tableRes.ok:
+        return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let valuesRes = evalInsertValues(bound, params)
+      if not valuesRes.ok:
+        return err[seq[string]](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
+      let values = valuesRes.value
+      for i, col in tableRes.value.columns:
+        let typeRes = typeCheckValue(col.kind, values[i])
+        if not typeRes.ok:
+          return err[seq[string]](typeRes.err.code, typeRes.err.message, col.name)
+      let notNullRes = enforceNotNull(tableRes.value, values)
+      if not notNullRes.ok:
+        return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+      let uniqueRes = enforceUnique(db.catalog, db.pager, tableRes.value, values)
+      if not uniqueRes.ok:
+        return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+      let fkRes = enforceForeignKeys(db.catalog, db.pager, tableRes.value, values)
+      if not fkRes.ok:
+        return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+      let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+      if not insertRes.ok:
+        return err[seq[string]](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+    of skUpdate:
+      let execRes = execPreparedNonSelect(db, bound, params, plan)
+      if not execRes.ok:
+        return err[seq[string]](execRes.err.code, execRes.err.message, execRes.err.context)
+    of skDelete:
+       let execRes = execPreparedNonSelect(db, bound, params, plan)
+       if not execRes.ok:
+         return err[seq[string]](execRes.err.code, execRes.err.message, execRes.err.context)
+    of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skAlterTable:
+       # DDL invalidates prepared statements anyway
+       return execSql(db, prepared.sql, params)
+
+  ok(output)
+
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] =
   if not db.isOpen:
     return err[seq[string]](ERR_INTERNAL, "Database not open")
@@ -1506,7 +1705,7 @@ proc findMatchingRowidsPrepared(db: Db, tableName: string, whereExpr: Expr, para
     rowids.add(row.rowid)
   ok(rowids)
 
-proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Result[int64] =
+proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil): Result[int64] =
   ## Execute a single already-bound non-SELECT statement and return rows affected.
   ## Intended for the native C ABI / Go driver.
   if not db.isOpen:
@@ -1700,11 +1899,20 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Resul
     for col in table.columns:
       cols.add(bound.updateTable & "." & col.name)
 
-    let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
-    if not rowidsRes.ok:
-      return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+    var rowids: seq[uint64] = @[]
+    if plan != nil:
+      let rowsRes = execPlan(db.pager, db.catalog, plan, params)
+      if not rowsRes.ok:
+        return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+      for row in rowsRes.value:
+        rowids.add(row.rowid)
+    else:
+      let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
+      if not rowidsRes.ok:
+        return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+      rowids = rowidsRes.value
 
-    for rowid in rowidsRes.value:
+    for rowid in rowids:
       let storedRes = readRowAt(db.pager, table, rowid)
       if not storedRes.ok:
         continue
@@ -1754,11 +1962,20 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Resul
     let table = tableRes.value
     var deletions: seq[StoredRow] = @[]
 
-    let rowidsRes = findMatchingRowidsPrepared(db, bound.deleteTable, bound.deleteWhere, params)
-    if not rowidsRes.ok:
-      return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+    var rowids: seq[uint64] = @[]
+    if plan != nil:
+      let rowsRes = execPlan(db.pager, db.catalog, plan, params)
+      if not rowsRes.ok:
+        return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+      for row in rowsRes.value:
+        rowids.add(row.rowid)
+    else:
+      let rowidsRes = findMatchingRowidsPrepared(db, bound.deleteTable, bound.deleteWhere, params)
+      if not rowidsRes.ok:
+        return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+      rowids = rowidsRes.value
 
-    for rowid in rowidsRes.value:
+    for rowid in rowids:
       let storedRes = readRowAt(db.pager, table, rowid)
       if not storedRes.ok:
         continue

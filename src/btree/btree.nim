@@ -1,5 +1,4 @@
 import options
-import algorithm
 import ../errors
 import ../pager/pager
 import ../pager/db_header
@@ -450,21 +449,21 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
       return ok(current)
     current = nextPage
 
-proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
-  ## Binary search to find the appropriate child page for a key (leftmost variant).
-  ## Finds the first key >= search key and returns corresponding children[index].
-  ## Returns rightChild if key > all keys.
-  var lo = 0
-  var hi = keys.len
-  while lo < hi:
-    let mid = (lo + hi) shr 1
-    if keys[mid] < key:
-      lo = mid + 1
-    else:
-      hi = mid
-  if lo < keys.len:
-    return children[lo]
-  return rightChild
+# proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
+#   ## Binary search to find the appropriate child page for a key (leftmost variant).
+#   ## Finds the first key >= search key and returns corresponding children[index].
+#   ## Returns rightChild if key > all keys.
+#   var lo = 0
+#   var hi = keys.len
+#   while lo < hi:
+#     let mid = (lo + hi) shr 1
+#     if keys[mid] < key:
+#       lo = mid + 1
+#     else:
+#       hi = mid
+#   if lo < keys.len:
+#     return children[lo]
+#   return rightChild
 
 proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
   ## Navigate from root to leaf for leftmost variant, avoiding seq allocations.

@@ -10,7 +10,6 @@ import ../catalog/catalog
 import ../search/search
 import ../sql/sql
 import sets
-import times
 
 type StoredRow* = object
   rowid*: uint64
