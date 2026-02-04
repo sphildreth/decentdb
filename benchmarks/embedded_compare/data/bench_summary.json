@@ -3,7 +3,7 @@
     "DecentDB": {
       "commit_p95_ms": 0.282,
       "db_size_mb": 0.0,
-      "insert_rows_per_sec": 3991.888857184822,
+      "insert_rows_per_sec": 4011.344716651217,
       "join_p95_ms": 1.0,
       "read_p95_ms": 0.012
     },
@@ -18,7 +18,7 @@
   "metadata": {
     "machine": "batman (AMD Ryzen 9 3900X 12-Core Processor)",
     "notes": "Generated from raw benchmark outputs in benchmarks/raw/",
-    "run_id": "20260204_003256",
+    "run_id": "20260204_003413",
     "units": {
       "commit_p95_ms": "ms (lower is better)",
       "db_size_mb": "MB (lower is better)",
