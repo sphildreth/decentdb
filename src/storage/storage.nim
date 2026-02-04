@@ -414,9 +414,13 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
 
   table.rootPage = tree.root
 
-  let saveRes = saveTable(catalog, pager, table)
-  if not saveRes.ok:
-    return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+  if table.rootPage != tableRes.value.rootPage:
+    let saveRes = saveTable(catalog, pager, table)
+    if not saveRes.ok:
+      return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+  else:
+    updateTableMeta(catalog, table)
+
 
   ok(rowid)
 

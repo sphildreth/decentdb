@@ -244,7 +244,13 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
         let record = recordRes.value
         case record.kind
         of crTable:
-          catalog.tables[record.table.name] = record.table
+          var table = record.table
+          let tableTree = newBTree(pager, table.rootPage)
+          let maxKeyRes = findMaxKey(tableTree)
+          if maxKeyRes.ok:
+            if table.nextRowId <= maxKeyRes.value:
+               table.nextRowId = maxKeyRes.value + 1
+          catalog.tables[record.table.name] = table
         of crIndex:
           catalog.indexes[record.index.name] = record.index
   ok(catalog)
@@ -277,6 +283,11 @@ proc clearTrigramDeltas*(catalog: Catalog) =
 proc allTrigramDeltas*(catalog: Catalog): seq[((string, uint32), TrigramDelta)] =
   for k, v in catalog.trigramDeltas.pairs:
     result.add((k, v))
+
+proc updateTableMeta*(catalog: Catalog, table: TableMeta) =
+  ## Updates the in-memory metadata for a table without persisting to disk.
+  ## Use with caution: changes will be lost on crash if not followed by saveTable eventually.
+  catalog.tables[table.name] = table
 
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
   catalog.tables[table.name] = table

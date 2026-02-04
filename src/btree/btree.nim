@@ -1632,3 +1632,40 @@ proc needsCompaction*(tree: BTree, threshold: float = 50.0): Result[bool] =
   if not utilRes.ok:
     return err[bool](utilRes.err.code, utilRes.err.message, utilRes.err.context)
   ok(utilRes.value < threshold)
+
+proc findMaxKey*(tree: BTree): Result[uint64] =
+  ## Finds the maximum key in the B-Tree. Returns 0 if tree is empty.
+  var current = tree.root
+  while true:
+    var nextPage: PageId = 0
+    var isLeaf = false
+    var maxKey: uint64 = 0
+    
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      if page.len < 1:
+        return err[Void](ERR_CORRUPTION, "Page empty")
+      let pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        isLeaf = true
+        let scanRes = scanLeafLastKey(page)
+        if not scanRes.ok:
+           return err[Void](scanRes.err.code, scanRes.err.message, scanRes.err.context)
+        maxKey = scanRes.value[0]
+        return okVoid()
+      
+      if pageType != PageTypeInternal:
+         return err[Void](ERR_CORRUPTION, "Invalid page type " & $pageType)
+
+      if page.len < 8:
+         return err[Void](ERR_CORRUPTION, "Internal page too small")
+
+      # Internal Page: right child is at offset 4
+      nextPage = PageId(readU32LE(page, 4))
+      okVoid()
+    )
+    if not pageRes.ok:
+      return err[uint64](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+      
+    if isLeaf:
+      return ok(maxKey)
+    current = nextPage
