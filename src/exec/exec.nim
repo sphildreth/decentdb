@@ -5,6 +5,7 @@ import tables
 import algorithm
 import atomics
 import sets
+import hashes
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
@@ -1129,6 +1130,21 @@ proc compareValues*(a: Value, b: Value): int =
   else:
     0
 
+proc hash*(v: Value): Hash =
+  var h: Hash = 0
+  h = h !& hash(v.kind)
+  case v.kind
+  of vkNull: discard
+  of vkBool: h = h !& hash(v.boolVal)
+  of vkInt64: h = h !& hash(v.int64Val)
+  of vkFloat64: h = h !& hash(v.float64Val)
+  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed, 
+     vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+     h = h !& hash(v.bytes)
+  h = h !& hash(v.overflowPage)
+  h = h !& hash(v.overflowLen)
+  !$h
+
 proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
   if expr == nil:
     return ok(Value(kind: vkNull))
@@ -1453,50 +1469,58 @@ type AggState = object
   initialized: bool
 
 proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], having: Expr, params: seq[Value]): Result[seq[Row]] =
-  var groups = initTable[string, AggState]()
-  var groupRows = initTable[string, Row]()
-  var keyParts = newSeqOfCap[string](groupBy.len)  # Reuse across iterations
+  var groups = initTable[seq[Value], AggState]()
+  var groupRows = initTable[seq[Value], Row]()
+  var keyParts = newSeqOfCap[Value](groupBy.len)  # Reuse across iterations
   for row in rows:
     keyParts.setLen(0)
     for expr in groupBy:
       let evalRes = evalExpr(row, expr, params)
       if not evalRes.ok:
         return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-      keyParts.add(valueToString(evalRes.value))
-    let key = keyParts.join("|")
-    if not groups.hasKey(key):
-      groups[key] = AggState()
-      groupRows[key] = row
-    var state = groups[key]
-    state.count.inc
-    for item in items:
-      if item.expr != nil and item.expr.kind == ekFunc:
-        let funcName = item.expr.funcName
-        if funcName == "COUNT":
-          discard
-        else:
-          let arg = if item.expr.args.len > 0: item.expr.args[0] else: nil
-          if arg != nil:
-            let evalRes = evalExpr(row, arg, params)
-            if not evalRes.ok:
-              return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-            let val = evalRes.value
-            if funcName == "SUM" or funcName == "AVG":
-              let addVal = if val.kind == vkFloat64: val.float64Val else: float(val.int64Val)
-              state.sum += addVal
-            if funcName == "MIN":
-              if not state.initialized or compareValues(val, state.min) < 0:
-                state.min = val
-            if funcName == "MAX":
-              if not state.initialized or compareValues(val, state.max) > 0:
-                state.max = val
-            state.initialized = true
-    groups[key] = state
+      keyParts.add(evalRes.value)
+    
+    # We use keyParts directly. Note: Table[seq[T]] copies the key on assignment/lookup if needed?
+    # Actually, standard Table requires immutable keys. 
+    # But for lookup `hasKey` we can use `keyParts`.
+    # For `groups[key] = ...`, it will make a copy of the key if it's new.
+    # To avoid double lookup, usage of `mgetOrPut` is ideal, but `AggState` is value type.
+    # We follow the existing pattern but with seq[Value].
+    
+    if not groups.hasKey(keyParts):
+      groups[keyParts] = AggState()
+      groupRows[keyParts] = row
+    
+    groups.withValue(keyParts, state) do:
+      state.count.inc
+      for item in items:
+        if item.expr != nil and item.expr.kind == ekFunc:
+          let funcName = item.expr.funcName
+          if funcName == "COUNT":
+            discard
+          else:
+            let arg = if item.expr.args.len > 0: item.expr.args[0] else: nil
+            if arg != nil:
+              let evalRes = evalExpr(row, arg, params)
+              if not evalRes.ok:
+                return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+              let val = evalRes.value
+              if funcName == "SUM" or funcName == "AVG":
+                let addVal = if val.kind == vkFloat64: val.float64Val else: float(val.int64Val)
+                state.sum += addVal
+              if funcName == "MIN":
+                if not state.initialized or compareValues(val, state.min) < 0:
+                  state.min = val
+              if funcName == "MAX":
+                if not state.initialized or compareValues(val, state.max) > 0:
+                  state.max = val
+              state.initialized = true
+
   
   if rows.len == 0 and groupBy.len == 0:
     # Scalar aggregate on empty set
-    groups[""] = AggState()
-    groupRows[""] = Row(columns: @[], values: @[])
+    groups[newSeq[Value]()] = AggState()
+    groupRows[newSeq[Value]()] = Row(columns: @[], values: @[])
 
   var resultRows: seq[Row] = @[]
   for key, state in groups:
@@ -2138,7 +2162,14 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       for rrow in rightRows:
         # Reuse pre-computed merged column names
         let cols = if mergedColumns.len > 0: mergedColumns else: lrow.columns & rrow.columns
-        var merged = Row(columns: cols, values: lrow.values & rrow.values)
+        # Optimize: Pre-allocate seq and copy instead of concatenation
+        var mergedValues = newSeq[Value](lrow.values.len + rrow.values.len)
+        for i in 0 ..< lrow.values.len:
+          mergedValues[i] = lrow.values[i]
+        for i in 0 ..< rrow.values.len:
+          mergedValues[lrow.values.len + i] = rrow.values[i]
+        
+        var merged = Row(columns: cols, values: mergedValues)
         if skipJoinPredicate or useHashJoin:
           # Hash join already filtered by equality, no need to re-evaluate predicate
           matched = true
@@ -2155,7 +2186,12 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         for _ in rightColumns:
           nullVals.add(Value(kind: vkNull))
         let cols = if mergedColumns.len > 0: mergedColumns else: lrow.columns & rightColumns
-        let merged = Row(columns: cols, values: lrow.values & nullVals)
+        var mergedValues = newSeq[Value](lrow.values.len + nullVals.len)
+        for i in 0 ..< lrow.values.len:
+          mergedValues[i] = lrow.values[i]
+        for i in 0 ..< nullVals.len:
+          mergedValues[lrow.values.len + i] = nullVals[i]
+        let merged = Row(columns: cols, values: mergedValues)
         resultRows.add(merged)
     ok(resultRows)
   of pkSort:

@@ -286,7 +286,7 @@ proc runDecentDbPointRead(outputDir: string) =
   if fileExists(dbPath & "-wal"):
     removeFile(dbPath & "-wal")
 
-  let db = openDb(dbPath).value
+  let db = openDb(dbPath, 50000).value
   defer: discard closeDb(db)
 
   discard execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)")
@@ -300,7 +300,7 @@ proc runDecentDbPointRead(outputDir: string) =
       Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
     ])
   
-  let iterations = 1000
+  let iterations = 100000
   var latencies: seq[int] = @[]
   var rng = initRand(42)
   
@@ -309,7 +309,7 @@ proc runDecentDbPointRead(outputDir: string) =
   for i in 1..iterations:
     let lookupId = rng.rand(1..dataSize)
     let t0 = epochTime()
-    discard execSql(db, "SELECT * FROM users WHERE id = $1", @[
+    discard execSqlRows(db, "SELECT * FROM users WHERE id = $1", @[
       Value(kind: vkInt64, int64Val: int64(lookupId))
     ])
     let t1 = epochTime()
@@ -386,7 +386,7 @@ proc runDecentDbJoin(outputDir: string) =
   
   for i in 1..iterations:
     let t0 = epochTime()
-    discard execSql(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name")
+    discard execSqlRows(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name", @[])
     let t1 = epochTime()
     latencies.add(int((t1 - t0) * 1_000_000))
   

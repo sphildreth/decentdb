@@ -1800,6 +1800,87 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value]): Resul
 proc execSql*(db: Db, sqlText: string): Result[seq[string]] =
   execSql(db, sqlText, @[])
 
+proc execSqlRows*(db: Db, sqlText: string, params: seq[Value]): Result[seq[Row]] =
+  ## Execute a single SELECT statement and return raw Rows.
+  ## This avoids the overhead of converting all values to strings.
+  if not db.isOpen:
+    return err[seq[Row]](ERR_INTERNAL, "Database not open")
+  
+  const SqlCacheMaxEntries = 128
+
+  proc touchSqlCache(key: string) =
+    if db.sqlCacheOrder.len > 0 and db.sqlCacheOrder[^1] == key:
+      return
+    var idx = -1
+    for i, existing in db.sqlCacheOrder:
+      if existing == key:
+        idx = i
+        break
+    if idx >= 0:
+      db.sqlCacheOrder.delete(idx)
+    db.sqlCacheOrder.add(key)
+
+  proc rememberSqlCache(key: string, statements: seq[Statement], plans: seq[Plan]) =
+    db.sqlCache[key] = (schemaCookie: db.schemaCookie, statements: statements, plans: plans)
+    touchSqlCache(key)
+    while db.sqlCacheOrder.len > SqlCacheMaxEntries:
+      let evictKey = db.sqlCacheOrder[0]
+      db.sqlCacheOrder.delete(0)
+      if db.sqlCache.hasKey(evictKey):
+        db.sqlCache.del(evictKey)
+
+  var boundStatements: seq[Statement] = @[]
+  var cachedPlans: seq[Plan] = @[]
+  if db.sqlCache.hasKey(sqlText):
+    let cached = db.sqlCache[sqlText]
+    if cached.schemaCookie == db.schemaCookie:
+      boundStatements = cached.statements
+      cachedPlans = cached.plans
+      touchSqlCache(sqlText)
+
+  if boundStatements.len == 0:
+    let parseRes = parseSql(sqlText)
+    if not parseRes.ok:
+      return err[seq[Row]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+    if parseRes.value.statements.len != 1:
+      return err[seq[Row]](ERR_SQL, "execSqlRows expects a single SELECT statement")
+    let stmt = parseRes.value.statements[0]
+    let bindRes = bindStatement(db.catalog, stmt)
+    if not bindRes.ok:
+      return err[seq[Row]](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+    boundStatements = @[bindRes.value]
+    if boundStatements[0].kind != skSelect:
+      return err[seq[Row]](ERR_SQL, "execSqlRows expects a SELECT statement")
+    let planRes = plan(db.catalog, boundStatements[0])
+    if not planRes.ok:
+      return err[seq[Row]](planRes.err.code, planRes.err.message, planRes.err.context)
+    cachedPlans = @[planRes.value]
+    rememberSqlCache(sqlText, boundStatements, cachedPlans)
+
+  if boundStatements.len != 1 or boundStatements[0].kind != skSelect:
+    return err[seq[Row]](ERR_SQL, "execSqlRows expects a single SELECT statement")
+  if cachedPlans.len != 1 or cachedPlans[0] == nil:
+    return err[seq[Row]](ERR_INTERNAL, "Missing cached plan for SELECT")
+
+  let usePlan = cachedPlans[0]
+
+  if db.wal == nil or db.activeWriter != nil or not db.walOverlayEnabled:
+    return execPlan(db.pager, db.catalog, usePlan, params)
+  
+  let txn = beginRead(db.wal)
+  db.pager.overlaySnapshot = txn.snapshot
+  db.pager.setReadGuard(proc(): Result[Void] =
+    if db.wal.isAborted(txn):
+      return err[Void](ERR_TRANSACTION, "Read transaction aborted (timeout)")
+    okVoid()
+  )
+  defer:
+    db.pager.overlaySnapshot = 0
+    db.pager.clearReadGuard()
+    endRead(db.wal, txn)
+    
+  return execPlan(db.pager, db.catalog, usePlan, params)
+
 proc execSqlNoRows*(db: Db, sqlText: string, params: seq[Value]): Result[int64] =
   ## Execute a single SELECT statement and discard all result rows.
   ## Returns the number of rows produced by the query.
@@ -2200,6 +2281,8 @@ proc beginTransaction*(db: Db): Result[Void] =
   
   db.activeWriter = writerRes.value
   
+  let writer = db.activeWriter
+  
   # Begin tracking page allocations for this transaction (HIGH-003)
   beginTxnPageTracking(db.pager)
   
@@ -2210,7 +2293,7 @@ proc beginTransaction*(db: Db): Result[Void] =
     if data.len > 0:
       copyMem(addr payload[0], unsafeAddr data[0], data.len)
       
-    db.activeWriter.flushPage(pageId, payload)
+    writer.flushPage(pageId, payload)
 
   okVoid()
 

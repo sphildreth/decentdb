@@ -281,86 +281,57 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
   while true:
     var nextPage: PageId = 0
     var isLeaf = false
-    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+    
+    let handleRes = tree.pager.acquirePageRo(current)
+    if not handleRes.ok:
+      return err[PageId](handleRes.err.code, handleRes.err.message, handleRes.err.context)
+    var handle = handleRes.value
+    
+    
+    try:
+      let page = handle.getPage
       if page.len < 8:
-        return err[Void](ERR_CORRUPTION, "Page too small")
-      let pageType = byte(page[0])
-      if pageType == PageTypeLeaf:
-        isLeaf = true
-        return okVoid()
-      if pageType != PageTypeInternal:
-        return err[Void](ERR_CORRUPTION, "Not an internal page (type=" & $int(pageType) & ")")
+        return err[PageId](ERR_CORRUPTION, "Page too small")
       
-      # Read internal page header without allocating seqs
+      let pType = byte(page[0])
+      if pType == PageTypeLeaf:
+        isLeaf = true
+      elif pType != PageTypeInternal:
+        return err[PageId](ERR_CORRUPTION, "Invalid page type " & $pType)
+      
+      # Read internal page header
       let count = int(readU16LE(page, 2))
       let rightChild = readU32LE(page, 4)
       
-      if count == 0:
+      if isLeaf:
+        # We found the leaf, loop will terminate
+        discard
+      elif count == 0:
         nextPage = PageId(rightChild)
-        return okVoid()
-      
-      # Binary search inline: find first key > search key
-      # Keys and children are interleaved as varints starting at offset 8
-      # We need to decode all keys to find the right child
-      var offset = 8
-      var lo = 0
-      var hi = count
-      
-      # First pass: decode all keys into a small stack array (most B-trees have <256 keys per node)
-      var keyOffsets: array[256, int]  # offset where each key starts
-      var childOffsets: array[256, int]  # offset where each child starts
-      var keyVals: array[256, uint64]
-      var childVals: array[256, uint32]
-      
-      for i in 0 ..< count:
-        if i < 256:
-          keyOffsets[i] = offset
-        
-        # Decode key varint
-        var k: uint64 = 0
-        var shift = 0
-        while offset < page.len:
-          let b = byte(page[offset])
-          offset.inc
-          k = k or ((uint64(b and 0x7F)) shl shift)
-          if (b and 0x80) == 0:
-            break
-          shift += 7
-        
-        if i < 256:
-          keyVals[i] = k
-          childOffsets[i] = offset
-        
-        # Decode child varint
-        var c: uint64 = 0
-        shift = 0
-        while offset < page.len:
-          let b = byte(page[offset])
-          offset.inc
-          c = c or ((uint64(b and 0x7F)) shl shift)
-          if (b and 0x80) == 0:
-            break
-          shift += 7
-        
-        if i < 256:
-          childVals[i] = uint32(c)
-      
-      # Binary search: find first key > search key
-      while lo < hi:
-        let mid = (lo + hi) shr 1
-        if mid < 256 and keyVals[mid] <= key:
-          lo = mid + 1
-        else:
-          hi = mid
-      
-      if lo < count and lo < 256:
-        nextPage = PageId(childVals[lo])
       else:
-        nextPage = PageId(rightChild)
-      okVoid()
-    )
-    if not pageRes.ok:
-      return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+        # Linear scan: find first key > search key
+        # Keys and children are interleaved as varints starting at offset 8
+        var offset = 8
+        nextPage = PageId(rightChild) # Default to right child
+        
+        for i in 0 ..< count:
+          # Decode key varint
+          var k: uint64
+          if not decodeVarintFast(page, offset, k):
+            return err[PageId](ERR_CORRUPTION, "Invalid key varint")
+          
+          # Decode child varint
+          var c: uint64
+          if not decodeVarintFast(page, offset, c):
+            return err[PageId](ERR_CORRUPTION, "Invalid child varint")
+          
+          # Check condition: first key > search key
+          if k > key:
+            nextPage = PageId(uint32(c))
+            break # Found
+    finally:
+      handle.release()
+
     if isLeaf:
       return ok(current)
     current = nextPage
@@ -411,29 +382,17 @@ proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
       
       for i in 0 ..< count:
         # Decode key varint
-        var k: uint64 = 0
-        var shift = 0
-        while offset < page.len:
-          let b = byte(page[offset])
-          offset.inc
-          k = k or ((uint64(b and 0x7F)) shl shift)
-          if (b and 0x80) == 0:
-            break
-          shift += 7
+        var k: uint64
+        if not decodeVarintFast(page, offset, k):
+          return err[Void](ERR_CORRUPTION, "Invalid key varint")
         
         if i < 256:
           keyVals[i] = k
         
         # Decode child varint
-        var c: uint64 = 0
-        shift = 0
-        while offset < page.len:
-          let b = byte(page[offset])
-          offset.inc
-          c = c or ((uint64(b and 0x7F)) shl shift)
-          if (b and 0x80) == 0:
-            break
-          shift += 7
+        var c: uint64
+        if not decodeVarintFast(page, offset, c):
+          return err[Void](ERR_CORRUPTION, "Invalid child varint")
         
         if i < 256:
           childVals[i] = uint32(c)
@@ -589,26 +548,14 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
         return err[Void](ERR_CORRUPTION, "Leaf cell out of bounds")
       
       # Decode key varint inline
-      var k: uint64 = 0
-      var shift = 0
-      while offset < page.len:
-        let b = byte(page[offset])
-        offset.inc
-        k = k or ((uint64(b and 0x7F)) shl shift)
-        if (b and 0x80) == 0:
-          break
-        shift += 7
+      var k: uint64
+      if not decodeVarintFast(page, offset, k):
+        return err[Void](ERR_CORRUPTION, "Invalid key varint")
       
       # Decode control varint inline
-      var ctrl: uint64 = 0
-      shift = 0
-      while offset < page.len:
-        let b = byte(page[offset])
-        offset.inc
-        ctrl = ctrl or ((uint64(b and 0x7F)) shl shift)
-        if (b and 0x80) == 0:
-          break
-        shift += 7
+      var ctrl: uint64
+      if not decodeVarintFast(page, offset, ctrl):
+        return err[Void](ERR_CORRUPTION, "Invalid control varint")
       
       let isOverflow = (ctrl and 1) != 0
       let val = uint32(ctrl shr 1)
@@ -636,6 +583,10 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
       
       # Skip this value's bytes
       offset += valueLen
+
+      if k > key:
+        # Since keys are sorted, if we passed the key, it doesn't exist.
+        return okVoid()
     
     okVoid()
   )

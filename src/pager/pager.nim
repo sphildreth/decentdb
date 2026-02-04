@@ -8,6 +8,13 @@ import ../vfs/types
 import sets
 import ./db_header
 import ../utils/perf
+import std/times
+
+var debugCacheHits {.global.} = 0
+var debugCacheMisses {.global.} = 0
+var debugOverlayHits {.global.} = 0
+var debugOverlayMisses {.global.} = 0
+var debugPinCounter {.global.} = 0
 
 type PageId* = uint32
 type PageOverlay* = proc(pageId: PageId): Option[string]
@@ -52,6 +59,16 @@ type Pager* = ref object
   txnAllocatedPages*: seq[PageId]  # Pages allocated during current transaction (HIGH-003)
   inTransaction*: bool             # Whether a transaction is active (HIGH-003)
   flushHandler*: proc(pageId: PageId, data: string): Result[Void]
+
+type PageHandle* = object
+  pager*: Pager
+  entry*: CacheEntry
+  data*: string
+  pinned*: bool
+
+template getPage*(handle: PageHandle): string =
+  if handle.entry != nil: handle.entry.data
+  else: handle.data
 
 const DefaultCacheShards = 16
 const MinShardCapacity = 4
@@ -280,12 +297,19 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
   let shard = shardFor(cache, pageId)
   
   # Fast path: check cache
+  let tFastStart = cpuTime()
   acquire(shard.lock)
   if shard.pages.hasKey(pageId):
+    debugCacheHits.inc
     let entry = shard.pages[pageId]
     entry.pinCount.inc
     entry.refBit = true
     release(shard.lock)
+    let tFastEnd = cpuTime()
+    debugPinCounter.inc
+    if debugPinCounter mod 10000 == 0:
+       let duration = (tFastEnd - tFastStart) * 1_000_000
+       stderr.writeLine("Pager Stats: Hits=" & $debugCacheHits & " Misses=" & $debugCacheMisses & " OvHits=" & $debugOverlayHits & " FastPathTime=" & $duration & "us")
     return ok(entry)
   release(shard.lock)
 
@@ -296,10 +320,12 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
   if pager.overlay != nil:
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
+      debugOverlayHits.inc
       perf.OverlayHits.inc()
       data = overlayRes.get
       loaded = true
     else:
+      debugOverlayMisses.inc
       perf.OverlayMisses.inc()
   
   if not loaded:
@@ -325,6 +351,7 @@ proc pinPage*(pager: Pager, pageId: PageId): Result[CacheEntry] =
     release(shard.lock)
     return err[CacheEntry](evictRes.err.code, evictRes.err.message, evictRes.err.context)
 
+  debugCacheMisses.inc
   let entry = CacheEntry(id: pageId, data: data, lsn: pager.header.lastCheckpointLsn, dirty: false, pinCount: 1, refBit: true)
   initLock(entry.lock)
   shard.pages[pageId] = entry
@@ -352,37 +379,41 @@ proc cloneString(buf: string): string =
   copyMem(addr result[0], unsafeAddr buf[0], buf.len)
 
 proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64], body: proc(page: string): Result[T]): Result[T] =
+  let tStart = cpuTime()
   ## Invoke `body` with a borrowed view of a cached page when safe.
-  ##
-  ## This avoids allocating/copying a full page image on the hot read path by
-  ## pinning the cache entry and holding the entry lock while the callback runs.
-  ##
-  ## If a snapshot is provided and the cached page is not valid for that snapshot
-  ## (dirty or newer LSN), this falls back to a direct file read.
+  ## ...
   
   # Wait if rollback is in progress to avoid seeing dirty state
-  # Fast path: atomic check to avoid lock contention in the common case
-  if pager.rollbackInProgress.load(moAcquire):
-    acquire(pager.rollbackLock)
-    release(pager.rollbackLock)
+  # if pager.rollbackInProgress.load(moAcquire):
+  #   acquire(pager.rollbackLock)
+  #   release(pager.rollbackLock)
   
-  if pager.readGuard != nil:
-    let guardRes = pager.readGuard()
-    if not guardRes.ok:
-      return err[T](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+  # if pager.readGuard != nil:
+  #   let guardRes = pager.readGuard()
+  #   if not guardRes.ok:
+  #     return err[T](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+  
   let pinRes = pinPage(pager, pageId)
   if not pinRes.ok:
     return err[T](pinRes.err.code, pinRes.err.message, pinRes.err.context)
   let entry = pinRes.value
+  
   acquire(entry.lock)
   var pinned = true
   defer:
     if pinned:
       release(entry.lock)
       discard unpinPage(pager, entry)
+      let tEnd = cpuTime()
+      if debugPinCounter mod 10000 == 0:
+         let duration = (tEnd - tStart) * 1_000_000
+         stderr.writeLine("withPageRo Stats: TotalTime=" & $duration & "us")
+
   if snapshot.isSome:
     let snap = snapshot.get
     if snap > 0 and (entry.dirty or entry.lsn > snap):
+      if (pager.overlaySnapshot > 0 and pager.overlaySnapshot mod 1000 == 0): 
+         stderr.writeLine("Fallback! Dirty=" & $entry.dirty & " Lsn=" & $entry.lsn & " Snap=" & $snap)
       release(entry.lock)
       discard unpinPage(pager, entry)
       pinned = false
@@ -390,7 +421,14 @@ proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64]
       if not directRes.ok:
         return err[T](directRes.err.code, directRes.err.message, directRes.err.context)
       return body(directRes.value)
-  body(entry.data)
+  
+  let tBodyStart = cpuTime()
+  let res = body(entry.data)
+  let tBodyEnd = cpuTime()
+  if debugPinCounter mod 10000 == 0:
+     let duration = (tBodyEnd - tBodyStart) * 1_000_000
+     stderr.writeLine("withPageRo Body Time=" & $duration & "us")
+  return res
 
 proc readPageCachedCopy(pager: Pager, pageId: PageId, snapshot: Option[uint64]): Result[string] =
   let pinRes = pinPage(pager, pageId)
@@ -522,6 +560,82 @@ proc setReadGuard*(pager: Pager, guard: ReadGuard) =
 
 proc clearReadGuard*(pager: Pager) =
   pager.readGuard = nil
+
+proc acquirePageRo*(pager: Pager, pageId: PageId): Result[PageHandle] =
+  ## Acquire a read-only handle to a page without using closures.
+  ## This avoids allocation overhead for high-frequency traversals (like B-Tree).
+  ## Caller MUST call release() on the handle.
+  
+  # Wait if rollback is in progress to avoid seeing dirty state
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
+  
+  if pager.readGuard != nil:
+    let guardRes = pager.readGuard()
+    if not guardRes.ok:
+      return err[PageHandle](guardRes.err.code, guardRes.err.message, guardRes.err.context)
+  
+  if pager.overlay != nil:
+    let overlayRes = pager.overlay(pageId)
+    if overlayRes.isSome:
+      perf.OverlayHits.inc()
+      # Overlay pages are not pinned in cache, just return data handle
+      # We construct a dummy handle that doesn't need unpinning
+      return ok(PageHandle(pager: pager, entry: nil, data: overlayRes.get, pinned: false))
+    perf.OverlayMisses.inc()
+    # Fallthrough to cached read with snapshot check logic handled below
+  
+  # Inline pinPage fast path to avoid Result overhead
+  let shard = shardFor(pager.cache, pageId)
+  acquire(shard.lock)
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
+    entry.pinCount.inc
+    entry.refBit = true
+    release(shard.lock)
+    
+    acquire(entry.lock)
+    
+    # Snapshot isolation check
+    if pager.overlaySnapshot > 0 and (entry.dirty or entry.lsn > pager.overlaySnapshot):
+        release(entry.lock)
+        discard unpinPage(pager, entry)
+        let directRes = readPageDirect(pager, pageId)
+        if not directRes.ok:
+          return err[PageHandle](directRes.err.code, directRes.err.message, directRes.err.context)
+        return ok(PageHandle(pager: pager, entry: nil, data: directRes.value, pinned: false))
+    
+    # Fast path success
+    return ok(PageHandle(pager: pager, entry: entry, pinned: true))
+  
+  release(shard.lock)
+  
+  # Slow path (Cache miss)
+  let pinRes = pinPage(pager, pageId)
+  if not pinRes.ok:
+    return err[PageHandle](pinRes.err.code, pinRes.err.message, pinRes.err.context)
+  let entry = pinRes.value
+  
+  acquire(entry.lock)
+  
+  # Snapshot isolation check
+  if pager.overlaySnapshot > 0 and (entry.dirty or entry.lsn > pager.overlaySnapshot):
+    release(entry.lock)
+    discard unpinPage(pager, entry)
+    let directRes = readPageDirect(pager, pageId)
+    if not directRes.ok:
+      return err[PageHandle](directRes.err.code, directRes.err.message, directRes.err.context)
+    return ok(PageHandle(pager: pager, entry: nil, data: directRes.value, pinned: false))
+  
+  ok(PageHandle(pager: pager, entry: entry, pinned: true))
+
+proc release*(handle: var PageHandle) =
+  if handle.pinned and handle.entry != nil:
+    release(handle.entry.lock)
+    discard unpinPage(handle.pager, handle.entry)
+    handle.pinned = false
+    handle.entry = nil
 
 proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   if data.len != pager.pageSize:

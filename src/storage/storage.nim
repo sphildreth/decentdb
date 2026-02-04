@@ -10,6 +10,7 @@ import ../catalog/catalog
 import ../search/search
 import ../sql/sql
 import sets
+import times
 
 type StoredRow* = object
   rowid*: uint64
@@ -297,6 +298,7 @@ proc readRowAt*(pager: Pager, table: TableMeta, rowid: uint64): Result[StoredRow
   let decodeRes = decodeRecordWithOverflow(pager, payload)
   if not decodeRes.ok:
     return err[StoredRow](decodeRes.err.code, decodeRes.err.message, decodeRes.err.context)
+  
   ok(StoredRow(rowid: rowid, values: decodeRes.value))
 
 proc scanTable*(pager: Pager, table: TableMeta): Result[seq[StoredRow]] =

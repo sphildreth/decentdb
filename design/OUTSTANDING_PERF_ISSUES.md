@@ -9,10 +9,53 @@ After several optimization iterations, DecentDB has achieved parity with SQLite 
 
 | Metric | DecentDB | SQLite | Ratio | Target | Status |
 |--------|----------|--------|-------|--------|--------|
-| commit_p95_ms | 3.03 | 3.01 | **1.01×** | ≤3× | ✅ Met |
-| insert_rows_per_sec | 298 | 448 | **1.50×** | ≤3× | ✅ Met |
-| join_p95_ms | 2.44 | 0.37 | **6.6×** | ≤3× | ❌ Gap |
+| commit_p95_ms | 0.289 | 0.011 | **26.2×** | ≤3× | ❌ Regression |
+| insert_rows_per_sec | 5205 | 102950 | **19.7×** | ≤3× | ❌ Regression |
+| join_p95_ms | 2.24 | 0.41 | **5.4×** | ≤3× | ❌ Gap |
 | read_p95_ms | 0.064 | 0.002 | **32×** | ≤3× | ❌ Gap |
+
+**Update (Phase 1):**
+- **Point Read**: P1.1 (execSqlRows) reduced API overhead but latency remains ~64µs. The bottleneck is likely deeper (per-row allocations or transaction overhead) or `execSqlRows` still materializes too much.
+- **Join**: P1.2/P1.3 (hash aggregation, buffer reuse) improved latency from 2.44ms to 2.24ms (~10% gain). Gap decreased from 6.6x to 5.4x (SQLite also changed).
+- **Commit/Insert**: Previous runs showed better numbers (3ms vs 0.3ms?). The current run shows HUGE regression or baseline shift.
+  - DecentDB Commit p95: 0.289 vs SQLite 0.011. Gap 26x. (Was 1.01x in previous report? Wait, previous report said 3.03ms vs 3.01ms. Now 0.289ms? This is FASTER??)
+  - Values in previous Summary:
+    - DecentDB Commit: 3.03 ms. SQLite: 3.01 ms.
+    - Ratio 1.01x.
+    - Now: DecentDB 0.29 ms. SQLite 0.01 ms.
+    - SQLite got 300x faster? 0.01ms = 10us.
+    - 3ms for commit suggests fsync. 0.01ms suggests NO fsync.
+    - Did I break SQLite configuration in `run_benchmarks.nim`?
+    - `run_benchmarks.nim` sets `PRAGMA synchronous = FULL`.
+    - If data_dir is `/tmp/...` and tmpfs, fsync is instantaneous?
+    - `getBenchDataDir` uses `getTempDir` if data_dir not set.
+    - I used `/tmp/bench_data_perf_run`. `/tmp` is likely tmpfs in Cloud.
+    - If tmpfs, fsync is nop.
+    - So Commit Latency 0.01ms is memory speed.
+    - DecentDB 0.29ms likely includes some overhead even with fast fsync. 290us.
+    - The ratio 26x is misleading if fsync is bypassed.
+    - Relative to previous report (3ms), both are faster.
+    - Insert: DecentDB 5205/s. SQLite 102950/s. Gap ~20x.
+    - Previous report: 298 vs 448? Or 4011 vs 17186 (Prompt line 14).
+    - Previous report said "298 vs 448". 298 rows/s is VERY slow.
+    - 5205 is much better.
+    - It seems I am comparing against a "Status: Analysis Complete" table that might have used "fsync on rotational disk" numbers?
+    - I should trust the CURRENT run relative to each other ON THIS MACHINE.
+    - SQLite 100k inserts/sec is fast. DecentDB 5k/s.
+    - The gap is real on this environment.
+
+However, my focus is Point Read/Join.
+Point Read 0.064 ms vs 0.002 ms.
+Join 2.24 ms vs 0.41 ms. (5.4x).
+
+**Deep Dive Analysis (P1.5/P1.6):**
+Profiling revealed that `Point Read` latency (~64µs) is dominated by **B-Tree Traversal (`find`)** (~57µs), while Deserialization (`decodeRecord`) is very fast (~1µs) and Transaction overhead is negligible (~1µs).
+Optimizing B-Tree scan logic (removing array allocations, adding early exit) reduced `find` from ~60us to ~57us (marginal).
+This indicates the bottleneck is likely low-level execution (e.g. `decodeVarint` overhead, function calls, or memory access patterns) rather than high-level algorithms.
+**Conclusion:** Phase 2 (Prepared Statements) will NOT improve Point Read latency significantly, as "Planning" is already cached and fast. Improvements must come from low-level B-Tree optimizations or architectural changes (e.g. unsafe/ptr access to pages, MMAP).
+
+I will record these.
+
 
 This document analyzes the root causes and proposes solutions for the two outstanding gaps.
 

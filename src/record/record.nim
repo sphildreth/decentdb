@@ -78,6 +78,44 @@ proc decodeVarint*(data: string, offset: var int): Result[uint64] =
       return err[uint64](ERR_CORRUPTION, "Varint overflow")
   err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
 
+proc decodeVarintFast*(data: openArray[byte], offset: var int, valOut: var uint64): bool {.inline.} =
+  ## Optimized varint decoder avoiding Result overhead.
+  var shift = 0
+  var value: uint64 = 0
+  var i = offset
+  let L = data.len
+  while i < L:
+    let b = data[i]
+    i.inc
+    value = value or (uint64(b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      valOut = value
+      offset = i
+      return true
+    shift += 7
+    if shift > 63:
+      return false
+  return false
+
+proc decodeVarintFast*(data: string, offset: var int, valOut: var uint64): bool {.inline.} =
+  ## Optimized varint decoder avoiding Result overhead.
+  var shift = 0
+  var value: uint64 = 0
+  var i = offset
+  let L = data.len
+  while i < L:
+    let b = byte(data[i])
+    i.inc
+    value = value or (uint64(b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      valOut = value
+      offset = i
+      return true
+    shift += 7
+    if shift > 63:
+      return false
+  return false
+
 proc compressData(data: seq[byte]): seq[byte] =
   if data.len == 0: return @[]
   var s = newString(data.len)
