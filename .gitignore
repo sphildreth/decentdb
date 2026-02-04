@@ -74,3 +74,8 @@ test_pk_fk.ddb-wal
 
 # Local review/action-plan notes (do not commit)
 design/reviews/ACTION-PLAN.md
+
+# Testament artifacts
+testresults/
+testresults.html
+testresults.db

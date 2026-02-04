@@ -14,11 +14,12 @@ task build_lib, "Build DecentDb shared library (C API)":
   exec "nim c --app:lib -d:libpg_query -d:release --mm:arc --threads:on --outdir:build src/c_api.nim"
 
 task test, "Run Nim + Python unit tests":
-  exec "sh -c 'set -e; for f in $(ls tests/nim/test_*.nim | sort); do nim c --hints:off -r \"$f\"; done'"
+  exec "nimble test_nim"
   exec "python -m unittest -q tests/harness/test_runner.py"
 
 task test_nim, "Run Nim unit tests":
-  exec "sh -c 'set -e; for f in $(ls tests/nim/test_*.nim | sort); do nim c --hints:off -r \"$f\"; done'"
+  # Use testament for parallel test execution and better reporting
+  exec "testament pattern \"tests/nim/*.nim\""
 
 task test_py, "Run Python harness tests":
   exec "python -m unittest -q tests/harness/test_runner.py"
