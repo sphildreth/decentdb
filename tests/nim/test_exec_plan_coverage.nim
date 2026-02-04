@@ -6,6 +6,9 @@ import exec/exec
 import planner/planner
 import record/record
 import sql/sql
+import wal/wal
+import pager/pager
+import errors
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
@@ -16,6 +19,17 @@ proc makeTempDb(name: string): string =
   if fileExists(path & ".wal"):
     removeFile(path & ".wal")
   path
+
+proc execPlanInTxn(db: Db, plan: Plan, params: seq[Value] = @[]): Result[seq[Row]] =
+  if db.wal != nil:
+    let txn = beginRead(db.wal)
+    db.pager.overlaySnapshot = txn.snapshot
+    defer:
+      db.pager.overlaySnapshot = 0
+      endRead(db.wal, txn)
+    execPlan(db.pager, db.catalog, plan, params)
+  else:
+    execPlan(db.pager, db.catalog, plan, params)
 
 suite "Exec Plan Coverage":
   test "index seek plan returns matching rows":
@@ -31,7 +45,8 @@ suite "Exec Plan Coverage":
 
     let plan = Plan(kind: pkIndexSeek, table: "items", column: "id",
       valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 2)))
-    let rowsRes = execPlan(db.pager, db.catalog, plan, @[])
+
+    let rowsRes = execPlanInTxn(db, plan)
     check rowsRes.ok
     check rowsRes.value.len == 1
     check rowsRes.value[0].values[0].int64Val == 2
@@ -52,7 +67,7 @@ suite "Exec Plan Coverage":
     let plan = Plan(kind: pkTrigramSeek, table: "docs", column: "body",
       likeExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "%bet%")),
       likeInsensitive: true)
-    let rowsRes = execPlan(db.pager, db.catalog, plan, @[])
+    let rowsRes = execPlanInTxn(db, plan)
     check rowsRes.ok
     check rowsRes.value.len == 2
 
@@ -79,7 +94,7 @@ suite "Exec Plan Coverage":
       left: Plan(kind: pkFilter, predicate: predicate,
         left: Plan(kind: pkTableScan, table: "metrics")))
 
-    let rowsRes = execPlan(db.pager, db.catalog, plan, @[])
+    let rowsRes = execPlanInTxn(db, plan)
     check rowsRes.ok
     check rowsRes.value.len == 1
     check rowsRes.value[0].columns[0] == "score"
@@ -110,7 +125,7 @@ suite "Exec Plan Coverage":
     let plan = Plan(kind: pkJoin, joinType: jtInner, joinOn: joinOn,
       left: Plan(kind: pkTableScan, table: "users"), right: rightPlan)
 
-    let rowsRes = execPlan(db.pager, db.catalog, plan, @[])
+    let rowsRes = execPlanInTxn(db, plan)
     check rowsRes.ok
     check rowsRes.value.len == 1
     check rowsRes.value[0].values[0].int64Val == 1
@@ -134,7 +149,7 @@ suite "Exec Plan Coverage":
       left: Plan(kind: pkTableScan, table: "scores"))
     let plan = Plan(kind: pkLimit, limit: 1, offset: 1, left: sortPlan)
 
-    let rowsRes = execPlan(db.pager, db.catalog, plan, @[])
+    let rowsRes = execPlanInTxn(db, plan)
     check rowsRes.ok
     check rowsRes.value.len == 1
     check rowsRes.value[0].values[1].int64Val == 75
@@ -148,7 +163,7 @@ suite "Exec Plan Coverage":
     let db = dbRes.value
 
     let plan = Plan(kind: pkStatement)
-    let rowsRes = execPlan(db.pager, db.catalog, plan, @[])
+    let rowsRes = execPlanInTxn(db, plan)
     check rowsRes.ok
     check rowsRes.value.len == 0
 

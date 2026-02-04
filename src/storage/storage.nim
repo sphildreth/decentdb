@@ -259,7 +259,7 @@ proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Voi
   var meta = catalog.indexes[indexName]
   if meta.rootPage != tree.root:
     meta.rootPage = tree.root
-    let saveRes = catalog.saveIndexMeta(meta)
+    let saveRes = saveIndexMeta(catalog, meta)
     if not saveRes.ok:
       return err[Void](saveRes.err.code, saveRes.err.message, saveRes.err.context)
   okVoid()
@@ -403,17 +403,19 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
       let grams = uniqueTrigrams(valueText(entry[1]))
       for g in grams:
         catalog.trigramBufferAdd(entry[0].name, g, rowid)
-  
+   
   if isExplicitRowId:
     if rowid >= table.nextRowId:
       table.nextRowId = rowid + 1
   else:
-    table.nextRowId = rowid + 1
+      table.nextRowId = rowid + 1
 
   table.rootPage = tree.root
-  let saveRes = catalog.saveTable(pager, table)
+
+  let saveRes = saveTable(catalog, pager, table)
   if not saveRes.ok:
     return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+
   ok(rowid)
 
 proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =

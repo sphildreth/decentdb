@@ -68,6 +68,8 @@ type Wal* = ref object
   # Memory tracking for WAL index
   indexMemoryBytes*: int64
   checkpointMemoryThreshold*: int64  # Trigger checkpoint when index exceeds this
+  # Optimization: Reusable buffer for frame encoding to avoid allocations
+  frameBuffer*: seq[byte]
   # HIGH-006: Long-running reader resource management
   maxWalBytesPerReader*: int64  # Max WAL bytes a reader can pin (0 = disabled)
   readerCheckIntervalMs*: int64  # How often to check readers (0 = check every operation)
@@ -78,17 +80,25 @@ type Wal* = ref object
 const HeaderSize = 1 + 4 + 4
 const TrailerSize = 8 + 8
 
-proc encodeFrame(frameType: WalFrameType, pageId: uint32, payload: openArray[byte], lsn: uint64): seq[byte] =
-  var buf = newSeq[byte](HeaderSize + payload.len + TrailerSize)
-  buf[0] = byte(frameType)
-  writeU32LE(buf, 1, pageId)
-  writeU32LE(buf, 5, uint32(payload.len))
+proc encodeFrameInto(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte], lsn: uint64): int =
+  let needed = HeaderSize + payload.len + TrailerSize
+  if dest.len < offset + needed:
+    dest.setLen(max(dest.len * 2, offset + needed))
+  
+  dest[offset] = byte(frameType)
+  writeU32LE(dest, offset + 1, pageId)
+  writeU32LE(dest, offset + 5, uint32(payload.len))
   if payload.len > 0:
-    copyMem(addr buf[HeaderSize], unsafeAddr payload[0], payload.len)
-  let checksum = uint64(crc32c(buf[0 ..< HeaderSize + payload.len]))
-  writeU64LE(buf, HeaderSize + payload.len, checksum)
-  writeU64LE(buf, HeaderSize + payload.len + 8, lsn)
-  buf
+    copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
+  
+  let checksum = uint64(crc32c(dest.toOpenArray(offset, offset + HeaderSize + payload.len - 1)))
+  writeU64LE(dest, offset + HeaderSize + payload.len, checksum)
+  writeU64LE(dest, offset + HeaderSize + payload.len + 8, lsn)
+  result = needed
+
+proc encodeFrame(frameType: WalFrameType, pageId: uint32, payload: openArray[byte], lsn: uint64): seq[byte] =
+  result = newSeq[byte](HeaderSize + payload.len + TrailerSize)
+  discard encodeFrameInto(result, 0, frameType, pageId, payload, lsn)
 
 proc readFrame(vfs: Vfs, file: VfsFile, offset: int64): Result[(WalFrameType, uint32, seq[byte], uint64, int64)] =
   var header = newSeq[byte](HeaderSize)
@@ -138,6 +148,8 @@ proc newWal*(vfs: Vfs, path: string): Result[Wal] =
     abortedReaders: initHashSet[int](),
     failpoints: initTable[string, WalFailpoint](),
     warnings: @[],
+    # Optimization: Pre-allocate buffer (4KB * 4 + overhead)
+    frameBuffer: newSeq[byte](16384),
     lastCheckpointAt: epochTime(),
     lastReaderCheckAt: epochTime(),
     # HIGH-006: Disabled by default (zero-cost when not configured)
@@ -168,9 +180,9 @@ proc takeWarnings*(wal: Wal): seq[string] =
   wal.warnings = @[]
   release(wal.lock)
 
-proc applyFailpoint(wal: Wal, label: string, buffer: seq[byte]): Result[int] =
+proc applyFailpoint(wal: Wal, label: string, length: int): Result[int] =
   if not wal.failpoints.hasKey(label):
-    return ok(buffer.len)
+    return ok(length)
   var fp = wal.failpoints[label]
   if fp.remaining > 0:
     fp.remaining.dec
@@ -180,11 +192,11 @@ proc applyFailpoint(wal: Wal, label: string, buffer: seq[byte]): Result[int] =
       wal.failpoints[label] = fp
   case fp.kind
   of wfNone:
-    ok(buffer.len)
+    ok(length)
   of wfError:
     err[int](ERR_IO, "Injected WAL failpoint", label)
   of wfPartial:
-    let part = min(fp.partialBytes, buffer.len)
+    let part = min(fp.partialBytes, length)
     ok(part)
 
 proc appendFrame(wal: Wal, frameType: WalFrameType, pageId: uint32, payload: seq[byte]): Result[(uint64, int64)] =
@@ -193,7 +205,7 @@ proc appendFrame(wal: Wal, frameType: WalFrameType, pageId: uint32, payload: seq
   wal.nextLsn.inc
   let frame = encodeFrame(frameType, pageId, payload, lsn)
   let offset = wal.endOffset
-  let fpRes = applyFailpoint(wal, "wal_write_frame", frame)
+  let fpRes = applyFailpoint(wal, "wal_write_frame", frame.len)
   if not fpRes.ok:
     return err[(uint64, int64)](fpRes.err.code, fpRes.err.message, fpRes.err.context)
   let writeLen = fpRes.value
@@ -426,7 +438,7 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
       wal.checkpointPending = false
       release(wal.lock)
       return err[uint64](ERR_CORRUPTION, "Checkpoint frame mismatch", "page_id=" & $entry[0])
-    let failRes = applyFailpoint(wal, "checkpoint_write_page", bestPayload)
+    let failRes = applyFailpoint(wal, "checkpoint_write_page", bestPayload.len)
     if not failRes.ok:
       acquire(wal.lock)
       wal.checkpointPending = false
@@ -443,7 +455,7 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
       return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
     # Ensure readers don't see stale pages in cache now that DB file is updated
     pager.invalidatePage(entry[0])
-  let fsyncFail = applyFailpoint(wal, "checkpoint_fsync", @[])
+  let fsyncFail = applyFailpoint(wal, "checkpoint_fsync", 0)
   if not fsyncFail.ok:
     acquire(wal.lock)
     wal.checkpointPending = false
@@ -470,7 +482,7 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
     wal.checkpointPending = false
     release(wal.lock)
     return err[uint64](chkRes.err.code, chkRes.err.message, chkRes.err.context)
-  let walSyncFail = applyFailpoint(wal, "checkpoint_wal_fsync", @[])
+  let walSyncFail = applyFailpoint(wal, "checkpoint_wal_fsync", 0)
   if not walSyncFail.ok:
     wal.checkpointPending = false
     release(wal.lock)
@@ -857,20 +869,60 @@ proc commit*(writer: WalWriter): Result[uint64] =
   if not writer.active:
     release(writer.wal.lock)
     return err[uint64](ERR_TRANSACTION, "No active transaction")
+  
+  # Optimization: Batch all writes into a single buffer and single fsync
+  # This reduces lock contention and system calls significantly.
+  
   var pageMeta: seq[(uint64, int64)] = @[]
+  var bufferOffset = 0
+  let startOffset = writer.wal.endOffset
+  var currentOffset = startOffset
+  
+  # 1. Encode all pending pages into the shared buffer
   for entry in writer.pending:
-    let lsnRes = appendFrame(writer.wal, wfPage, uint32(entry[0]), entry[1])
-    if not lsnRes.ok:
+    perf.WalGrowthWriter.inc()
+    let lsn = writer.wal.nextLsn
+    writer.wal.nextLsn.inc
+    
+    let len = encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry[0]), entry[1], lsn)
+    pageMeta.add((lsn, currentOffset))
+    
+    bufferOffset += len
+    currentOffset += int64(len)
+  
+  # 2. Encode commit frame
+  perf.WalGrowthWriter.inc()
+  let commitLsn = writer.wal.nextLsn
+  writer.wal.nextLsn.inc
+  
+  let commitLen = encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfCommit, 0, [], commitLsn)
+  bufferOffset += commitLen
+  currentOffset += int64(commitLen)
+  
+  # 3. Write everything in one go
+  let totalLen = bufferOffset
+  if totalLen > 0:
+    let fpRes = applyFailpoint(writer.wal, "wal_write_frame", totalLen)
+    if not fpRes.ok:
       writer.active = false
       release(writer.wal.lock)
-      return err[uint64](lsnRes.err.code, lsnRes.err.message, lsnRes.err.context)
-    pageMeta.add(lsnRes.value)
-  let commitRes = appendFrame(writer.wal, wfCommit, 0, @[])
-  if not commitRes.ok:
-    writer.active = false
-    release(writer.wal.lock)
-    return err[uint64](commitRes.err.code, commitRes.err.message, commitRes.err.context)
-  let syncFail = applyFailpoint(writer.wal, "wal_fsync", @[])
+      return err[uint64](fpRes.err.code, fpRes.err.message, fpRes.err.context)
+    
+    let writeLen = fpRes.value
+    let writeRes = writer.wal.vfs.write(writer.wal.file, startOffset, writer.wal.frameBuffer.toOpenArray(0, writeLen - 1))
+    if not writeRes.ok:
+      writer.active = false
+      release(writer.wal.lock)
+      return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+      
+    if writeLen < totalLen:
+      writer.active = false
+      release(writer.wal.lock)
+      return err[uint64](ERR_IO, "Partial frame write", "wal_write_frame")
+      
+    writer.wal.endOffset += int64(totalLen)
+  
+  let syncFail = applyFailpoint(writer.wal, "wal_fsync", 0)
   if not syncFail.ok:
     writer.active = false
     release(writer.wal.lock)
@@ -898,10 +950,10 @@ proc commit*(writer: WalWriter): Result[uint64] =
     writer.wal.dirtySinceCheckpoint[entry[0]] = idxEntry
 
   release(writer.wal.indexLock)
-  writer.wal.walEnd.store(commitRes.value[0], moRelease)
+  writer.wal.walEnd.store(commitLsn, moRelease)
   writer.active = false
   release(writer.wal.lock)
-  ok(commitRes.value[0])
+  ok(commitLsn)
 
 proc rollback*(writer: WalWriter): Result[Void] =
   writer.pending = @[]

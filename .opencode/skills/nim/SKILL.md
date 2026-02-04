@@ -1,3 +1,10 @@
+---
+name: nim
+description: Guidance for making safe, minimal-diff Nim changes in DecentDB with tests and durability/isolation rules.
+license: MIT
+compatibility: opencode
+---
+
 # Skill: Nim Specialist (DecentDB)
 
 You are an expert Nim coding agent working in the DecentDB repository.

@@ -3,7 +3,7 @@ Name: decentdb
 Version: 0.0.1
 Summary: Python DB-API 2.0 driver and SQLAlchemy dialect for DecentDB
 Author: DecentDB Contributors
-Classifier: Development Status :: 3 - Alpha
+Classifier: Development Status :: 4 - Beta
 Classifier: Intended Audience :: Developers
 Classifier: License :: OSI Approved :: Apache Software License
 Classifier: Programming Language :: Python :: 3
@@ -25,7 +25,7 @@ import sqlalchemy
 from sqlalchemy import create_engine
 
 # Use the decentdb dialect
-engine = create_engine("decentdb+pysql:////path/to/database.db")
+engine = create_engine("decentdb+pysql:////path/to/database.ddb")
 
 with engine.connect() as conn:
     conn.execute(sqlalchemy.text("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT)"))
@@ -42,7 +42,7 @@ with engine.connect() as conn:
 DecentDB operates as an embedded database with the following concurrency model:
 - **Single Writer**: Only one connection can write to the database at a time.
 - **Multiple Readers**: Multiple connections can read simultaneously (Snapshot Isolation).
-- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe in MVP.
+- **Process Model**: Currently optimized for single-process usage. Multi-process sharing is not guaranteed safe yet.
 
 **Recommendation**: Ensure your application architecture enforces a single-writer pattern (e.g. via a dedicated writer thread or queue).
 
@@ -61,8 +61,28 @@ Convert an existing SQLite database file into a DecentDB database file:
 decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb
 ```
 
+By default, identifiers are normalized to lowercase so you can query without quoting (Postgres-style).
+
+To preserve original SQLite casing (requires quoting identifiers in SQL):
+
+```bash
+decentdb-sqlite-import --preserve-case /path/to/input.sqlite /path/to/output.decentdb
+```
+
 To overwrite an existing destination:
 
 ```bash
 decentdb-sqlite-import --overwrite /path/to/input.sqlite /path/to/output.decentdb
+```
+
+Write a machine-readable conversion report:
+
+```bash
+decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb --report-json report.json
+```
+
+Or to stdout:
+
+```bash
+decentdb-sqlite-import /path/to/input.sqlite /path/to/output.decentdb --report-json -
 ```
