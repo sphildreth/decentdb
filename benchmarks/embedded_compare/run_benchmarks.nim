@@ -1,6 +1,7 @@
 import os
 import strutils
 import times
+import std/monotimes
 import json
 import random
 import math
@@ -13,6 +14,8 @@ import ../../src/engine
 import ../../src/record/record
 import ../../src/errors
 import ../../src/vfs/vfs
+when defined(fused_join_sum_stats):
+  import ../../src/exec/exec
 
 # --- SQLite FFI bindings ---
 {.passL: "-lsqlite3".}
@@ -44,6 +47,33 @@ const SQLITE_TRANSIENT = cast[pointer](-1)
 
 # Global variable for benchmark data directory (on real disk, not tmpfs)
 var gDataDir*: string = ""
+
+# Paths to benchmark database files to remove at end.
+var gCleanupPaths: seq[string] = @[]
+
+proc registerCleanupPath(path: string) =
+  if path.len == 0:
+    return
+  for p in gCleanupPaths:
+    if p == path:
+      return
+  gCleanupPaths.add(path)
+
+proc registerDbArtifacts(basePath: string, includeShm: bool) =
+  ## Register database-related files for cleanup.
+  registerCleanupPath(basePath)
+  registerCleanupPath(basePath & "-wal")
+  if includeShm:
+    registerCleanupPath(basePath & "-shm")
+
+proc cleanupRegisteredArtifacts() =
+  ## Best-effort cleanup of benchmark DB files.
+  for p in gCleanupPaths:
+    if fileExists(p):
+      try:
+        removeFile(p)
+      except CatchableError:
+        echo "Warning: failed to remove ", p, ": ", getCurrentExceptionMsg()
 
 proc getBenchDataDir(): string =
   ## Get the directory for benchmark database files.
@@ -103,6 +133,15 @@ type
 proc getIsoTime(): string =
   now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
 
+proc microsBetween(t0, t1: MonoTime): int =
+  ## Return microseconds between two monotonic timestamps.
+  let d = t1 - t0
+  int(inMicroseconds(d))
+
+proc secondsBetween(t0, t1: MonoTime): float =
+  ## Return seconds between two monotonic timestamps.
+  float(inMicroseconds(t1 - t0)) / 1_000_000.0
+
 proc percentile(latencies: seq[int], p: float): int =
   if latencies.len == 0: return 0
   var sorted = latencies
@@ -157,6 +196,7 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
 proc runDecentDbInsert(outputDir: string) =
   echo "Running DecentDB Insert Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_insert.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -170,19 +210,19 @@ proc runDecentDbInsert(outputDir: string) =
   let iterations = 1000
   var latencies: seq[int] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", @[
       Value(kind: vkInt64, int64Val: int64(i)),
       Value(kind: vkText, bytes: toBytes("User" & $i)),
       Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
     ])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -218,6 +258,7 @@ proc runDecentDbInsert(outputDir: string) =
 proc runDecentDbCommitLatency(outputDir: string) =
   echo "Running DecentDB Commit Latency Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_commit.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -234,18 +275,18 @@ proc runDecentDbCommitLatency(outputDir: string) =
   let iterations = 1000
   var latencies: seq[int] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     # Each UPDATE is a separate transaction with durable commit
     discard execSql(db, "UPDATE kv SET v = $1 WHERE k = 1", @[
       Value(kind: vkText, bytes: toBytes("value" & $i))
     ])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -281,6 +322,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
 proc runDecentDbPointRead(outputDir: string) =
   echo "Running DecentDB Point Read Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_read.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -304,18 +346,18 @@ proc runDecentDbPointRead(outputDir: string) =
   var latencies: seq[int] = @[]
   var rng = initRand(42)
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let lookupId = rng.rand(1..dataSize)
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     discard execSqlRows(db, "SELECT * FROM users WHERE id = $1", @[
       Value(kind: vkInt64, int64Val: int64(lookupId))
     ])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -351,6 +393,7 @@ proc runDecentDbPointRead(outputDir: string) =
 proc runDecentDbJoin(outputDir: string) =
   echo "Running DecentDB Join Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_join.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -381,16 +424,23 @@ proc runDecentDbJoin(outputDir: string) =
   
   let iterations = 100
   var latencies: seq[int] = @[]
+
+  when defined(fused_join_sum_stats):
+    resetFusedJoinSumStats()
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     discard execSqlRows(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name", @[])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
+
+  when defined(fused_join_sum_stats):
+    let st = fusedJoinSumStats()
+    echo "Fused join+sum stats: attempts=", st.attempts, " hits=", st.hits, " dense=", st.dense, " sparse=", st.sparse
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -435,8 +485,13 @@ proc sqliteExec(db: Sqlite3, sql: string) =
 proc runSqliteInsert(outputDir: string) =
   echo "Running SQLite Insert Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_insert.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -457,13 +512,13 @@ proc runSqliteInsert(outputDir: string) =
   let iterations = 1000
   var latencies: seq[int] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let name = "User" & $i
     let email = "user" & $i & "@example.com"
     
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     # Explicit transaction for fair durability comparison
     sqliteExec(db, "BEGIN IMMEDIATE")
     discard sqlite3_bind_int64(stmt, 1, int64(i))
@@ -472,10 +527,10 @@ proc runSqliteInsert(outputDir: string) =
     discard sqlite3_step(stmt)
     discard sqlite3_reset(stmt)
     sqliteExec(db, "COMMIT")
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -511,8 +566,13 @@ proc runSqliteInsert(outputDir: string) =
 proc runSqliteCommitLatency(outputDir: string) =
   echo "Running SQLite Commit Latency Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_commit.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -534,22 +594,22 @@ proc runSqliteCommitLatency(outputDir: string) =
   let iterations = 1000
   var latencies: seq[int] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let value = "value" & $i
     
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     # Explicit transaction for fair durability comparison
     sqliteExec(db, "BEGIN IMMEDIATE")
     discard sqlite3_bind_text(stmt, 1, value.cstring, cint(value.len), SQLITE_TRANSIENT)
     discard sqlite3_step(stmt)
     discard sqlite3_reset(stmt)
     sqliteExec(db, "COMMIT")
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -585,8 +645,13 @@ proc runSqliteCommitLatency(outputDir: string) =
 proc runSqlitePointRead(outputDir: string) =
   echo "Running SQLite Point Read Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_read.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -618,22 +683,22 @@ proc runSqlitePointRead(outputDir: string) =
     raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
   defer: discard sqlite3_finalize(readStmt)
   
-  let iterations = 1000
+  let iterations = 100000
   var latencies: seq[int] = @[]
   var rng = initRand(42)
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let lookupId = rng.rand(1..dataSize)
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     discard sqlite3_bind_int64(readStmt, 1, int64(lookupId))
     discard sqlite3_step(readStmt)
     discard sqlite3_reset(readStmt)
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -669,8 +734,13 @@ proc runSqlitePointRead(outputDir: string) =
 proc runSqliteJoin(outputDir: string) =
   echo "Running SQLite Join Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_join.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -717,17 +787,17 @@ proc runSqliteJoin(outputDir: string) =
   let iterations = 100
   var latencies: seq[int] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     while sqlite3_step(joinStmt) == SQLITE_ROW:
       discard  # Consume results
     discard sqlite3_reset(joinStmt)
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    latencies.add(microsBetween(t0, t1))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
   let p50 = percentile(latencies, 50.0)
@@ -773,6 +843,9 @@ proc clearOldData(outputDir: string) =
         echo "Removed stale: ", path
 
 proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "", args: seq[string]) =
+  defer:
+    cleanupRegisteredArtifacts()
+
   if args.len == 0:
     echo "Error: output_dir is required as a positional argument."
     quit(1)

@@ -383,6 +383,112 @@ proc decodeVarintBoundedStr(data: string, offset: var int, endPos: int): Result[
       return err[uint64](ERR_CORRUPTION, "Varint overflow")
   err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
 
+proc decodeVarintFastBoundedStr(data: string, offset: var int, endPos: int, valOut: var uint64): bool {.inline.} =
+  ## Fast varint decoder with an explicit bound.
+  ## Returns false on overflow or out-of-bounds.
+  var shift = 0
+  var value: uint64 = 0
+  var i = offset
+  while i < endPos:
+    let b = uint64(byte(data[i]))
+    i.inc
+    value = value or ((b and 0x7F'u64) shl shift)
+    if (b and 0x80'u64) == 0'u64:
+      valOut = value
+      offset = i
+      return true
+    shift += 7
+    if shift > 63:
+      return false
+  false
+
+func zigzagDecode64(n: uint64): int64 {.inline.} =
+  let shifted = n shr 1
+  if (n and 1'u64) == 0'u64:
+    cast[int64](shifted)
+  else:
+    cast[int64](shifted xor (not 0'u64))
+
+proc recordFieldViewStr(recordPage: string, recordStart: int, recordLen: int, fieldIndex: int, kindOut: var ValueKind, payloadStartOut: var int, payloadLenOut: var int): bool {.inline.} =
+  ## Extract a single field view (kind + payload bounds) from an encoded record.
+  ## Uses the record as a view into a page string to avoid allocations.
+  if recordLen <= 0:
+    return false
+  var offset = recordStart
+  let endPos = recordStart + recordLen
+  if offset < 0 or endPos < 0 or endPos > recordPage.len:
+    return false
+
+  var fieldCountU: uint64 = 0
+  if not decodeVarintFastBoundedStr(recordPage, offset, endPos, fieldCountU):
+    return false
+  let fieldCount = int(fieldCountU)
+  if fieldIndex < 0 or fieldIndex >= fieldCount:
+    return false
+
+  for idx in 0 ..< fieldCount:
+    if offset >= endPos:
+      return false
+    let kindValue = int(byte(recordPage[offset]))
+    if kindValue < 0 or kindValue > ord(high(ValueKind)):
+      return false
+    kindOut = ValueKind(kindValue)
+    offset.inc
+
+    var lenU: uint64 = 0
+    if not decodeVarintFastBoundedStr(recordPage, offset, endPos, lenU):
+      return false
+    let length = int(lenU)
+    if offset + length > endPos:
+      return false
+
+    if idx == fieldIndex:
+      payloadStartOut = offset
+      payloadLenOut = length
+      return true
+
+    offset += length
+  false
+
+proc parseInt64PayloadStr(recordPage: string, payloadStart: int, payloadLen: int, outVal: var int64): bool {.inline.} =
+  var off = payloadStart
+  let endPos = payloadStart + payloadLen
+  if payloadLen < 0 or off < 0 or endPos < 0 or endPos > recordPage.len:
+    return false
+  var u: uint64 = 0
+  if not decodeVarintFastBoundedStr(recordPage, off, endPos, u):
+    return false
+  outVal = zigzagDecode64(u)
+  true
+
+proc parseFloat64PayloadStr(recordPage: string, payloadStart: int, payloadLen: int, outVal: var float64): bool {.inline.} =
+  if payloadLen != 8:
+    return false
+  if payloadStart < 0 or payloadStart + 8 > recordPage.len:
+    return false
+  outVal = cast[float64](readU64LE(recordPage, payloadStart))
+  true
+
+when defined(fused_join_sum_stats):
+  var gFusedJoinSumAttempts: Atomic[int64]
+  var gFusedJoinSumHits: Atomic[int64]
+  var gFusedJoinSumDense: Atomic[int64]
+  var gFusedJoinSumSparse: Atomic[int64]
+
+  proc resetFusedJoinSumStats*() =
+    gFusedJoinSumAttempts.store(0, moRelaxed)
+    gFusedJoinSumHits.store(0, moRelaxed)
+    gFusedJoinSumDense.store(0, moRelaxed)
+    gFusedJoinSumSparse.store(0, moRelaxed)
+
+  proc fusedJoinSumStats*(): tuple[attempts: int64, hits: int64, dense: int64, sparse: int64] =
+    (
+      attempts: gFusedJoinSumAttempts.load(moRelaxed),
+      hits: gFusedJoinSumHits.load(moRelaxed),
+      dense: gFusedJoinSumDense.load(moRelaxed),
+      sparse: gFusedJoinSumSparse.load(moRelaxed)
+    )
+
 proc matchLikeInRecordStr(pager: Pager, recordPage: string, recordStart: int, recordLen: int, colIndex: int, mode: LikeMode, needleBytes: seq[byte], pattern: string, caseInsensitive: bool, containsBmh: ptr BmhSkipTable): Result[bool] =
   ## Like matchLikeInRecord, but treats the record as a view into a page string.
   ## Avoids allocating/copying the record payload for the common vkText + simple LIKE cases.
@@ -1561,6 +1667,353 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
     resultRows.add(row)
   ok(resultRows)
 
+type FusedJoinSumSpec = object
+  leftKeyCol: string
+  leftNameCol: string
+  rightKeyCol: string
+  rightSumCol: string
+  leftPrefix: string
+  rightPrefix: string
+  # Preserve SELECT item ordering
+  nameFirst: bool
+
+proc tryFuseJoinSumAggregate(
+  pager: Pager,
+  catalog: Catalog,
+  aggPlan: Plan,
+  params: seq[Value]
+): Result[Option[seq[Row]]] =
+  ## Fast path for the common benchmark shape:
+  ##   SELECT u.name, SUM(o.amount)
+  ##   FROM users u INNER JOIN orders o ON u.id = o.user_id
+  ##   GROUP BY u.id, u.name
+  ##
+  ## We avoid materializing joined rows and aggregate directly.
+  when defined(fused_join_sum_stats):
+    discard gFusedJoinSumAttempts.fetchAdd(1, moRelaxed)
+  if aggPlan == nil or aggPlan.kind != pkAggregate:
+    return ok(none(seq[Row]))
+  if aggPlan.having != nil:
+    return ok(none(seq[Row]))
+  if aggPlan.left == nil or aggPlan.left.kind != pkJoin:
+    return ok(none(seq[Row]))
+  let joinPlan = aggPlan.left
+  if joinPlan.joinType != jtInner:
+    return ok(none(seq[Row]))
+  if joinPlan.left == nil or joinPlan.right == nil:
+    return ok(none(seq[Row]))
+  if joinPlan.left.kind != pkTableScan or joinPlan.right.kind != pkTableScan:
+    return ok(none(seq[Row]))
+
+  # Projections must be: one left column + one SUM(right column)
+  if aggPlan.projections.len != 2:
+    return ok(none(seq[Row]))
+
+  # Join predicate must be simple equality between two columns.
+  if joinPlan.joinOn == nil or joinPlan.joinOn.kind != ekBinary or joinPlan.joinOn.op != "=":
+    return ok(none(seq[Row]))
+  let onLeft = joinPlan.joinOn.left
+  let onRight = joinPlan.joinOn.right
+  if onLeft == nil or onRight == nil:
+    return ok(none(seq[Row]))
+  if onLeft.kind != ekColumn or onRight.kind != ekColumn:
+    return ok(none(seq[Row]))
+
+  let leftPrefix = if joinPlan.left.alias.len > 0: joinPlan.left.alias else: joinPlan.left.table
+  let rightPrefix = if joinPlan.right.alias.len > 0: joinPlan.right.alias else: joinPlan.right.table
+  proc matchesSide(colTable: string, sidePrefix: string, sideTable: string): bool {.inline.} =
+    colTable.len > 0 and (colTable == sidePrefix or colTable == sideTable)
+
+  var leftKeyCol = ""
+  var rightKeyCol = ""
+  if matchesSide(onLeft.table, leftPrefix, joinPlan.left.table) and matchesSide(onRight.table, rightPrefix, joinPlan.right.table):
+    leftKeyCol = onLeft.name
+    rightKeyCol = onRight.name
+  elif matchesSide(onLeft.table, rightPrefix, joinPlan.right.table) and matchesSide(onRight.table, leftPrefix, joinPlan.left.table):
+    leftKeyCol = onRight.name
+    rightKeyCol = onLeft.name
+  else:
+    return ok(none(seq[Row]))
+
+  var leftNameCol = ""
+  var rightSumCol = ""
+  var nameFirst = false
+  for i, item in aggPlan.projections:
+    if item.expr == nil:
+      return ok(none(seq[Row]))
+    if item.expr.kind == ekColumn:
+      if not matchesSide(item.expr.table, leftPrefix, joinPlan.left.table):
+        return ok(none(seq[Row]))
+      leftNameCol = item.expr.name
+      nameFirst = i == 0
+    elif item.expr.kind == ekFunc:
+      if item.expr.funcName != "SUM":
+        return ok(none(seq[Row]))
+      if item.expr.isStar:
+        return ok(none(seq[Row]))
+      if item.expr.args.len != 1 or item.expr.args[0] == nil or item.expr.args[0].kind != ekColumn:
+        return ok(none(seq[Row]))
+      let arg = item.expr.args[0]
+      if not matchesSide(arg.table, rightPrefix, joinPlan.right.table):
+        return ok(none(seq[Row]))
+      rightSumCol = arg.name
+    else:
+      return ok(none(seq[Row]))
+
+  if leftNameCol.len == 0 or rightSumCol.len == 0:
+    return ok(none(seq[Row]))
+
+  # GROUP BY must include the left join key and selected left column.
+  if aggPlan.groupBy.len == 0:
+    return ok(none(seq[Row]))
+  var hasKey = false
+  var hasName = false
+  for g in aggPlan.groupBy:
+    if g == nil or g.kind != ekColumn:
+      return ok(none(seq[Row]))
+    if not matchesSide(g.table, leftPrefix, joinPlan.left.table):
+      return ok(none(seq[Row]))
+    if g.name == leftKeyCol:
+      hasKey = true
+    if g.name == leftNameCol:
+      hasName = true
+  if not hasKey or not hasName:
+    return ok(none(seq[Row]))
+
+  # Verify schema types to avoid semantic surprises.
+  let leftTableRes = catalog.getTable(joinPlan.left.table)
+  if not leftTableRes.ok:
+    return err[Option[seq[Row]]](leftTableRes.err.code, leftTableRes.err.message, leftTableRes.err.context)
+  let rightTableRes = catalog.getTable(joinPlan.right.table)
+  if not rightTableRes.ok:
+    return err[Option[seq[Row]]](rightTableRes.err.code, rightTableRes.err.message, rightTableRes.err.context)
+  let leftTable = leftTableRes.value
+  let rightTable = rightTableRes.value
+
+  proc findColIdx(t: TableMeta, colName: string): int {.inline.} =
+    for i, c in t.columns:
+      if c.name == colName:
+        return i
+    -1
+
+  let leftKeyIdx = findColIdx(leftTable, leftKeyCol)
+  let leftNameIdx = findColIdx(leftTable, leftNameCol)
+  let rightKeyIdx = findColIdx(rightTable, rightKeyCol)
+  let rightSumIdx = findColIdx(rightTable, rightSumCol)
+  if leftKeyIdx < 0 or leftNameIdx < 0 or rightKeyIdx < 0 or rightSumIdx < 0:
+    return ok(none(seq[Row]))
+  if leftTable.columns[leftKeyIdx].kind != ctInt64 or not leftTable.columns[leftKeyIdx].primaryKey:
+    return ok(none(seq[Row]))
+  if rightTable.columns[rightKeyIdx].kind != ctInt64:
+    return ok(none(seq[Row]))
+  if rightTable.columns[rightSumIdx].kind notin {ctInt64, ctFloat64}:
+    return ok(none(seq[Row]))
+
+  let spec = FusedJoinSumSpec(
+    leftKeyCol: leftKeyCol,
+    leftNameCol: leftNameCol,
+    rightKeyCol: rightKeyCol,
+    rightSumCol: rightSumCol,
+    leftPrefix: leftPrefix,
+    rightPrefix: rightPrefix,
+    nameFirst: nameFirst
+  )
+
+  # Open streaming cursors for both sides.
+  let leftCurRes = openRowCursor(pager, catalog, joinPlan.left, params)
+  if not leftCurRes.ok:
+    return err[Option[seq[Row]]](leftCurRes.err.code, leftCurRes.err.message, leftCurRes.err.context)
+  let leftCur = leftCurRes.value
+  # RowCursor for table scans returns values in table column order.
+  let lKeyPos = leftKeyIdx
+  let lNamePos = leftNameIdx
+  let rKeyPos = rightKeyIdx
+  let rSumPos = rightSumIdx
+
+  # Materialize result groups directly as we scan orders.
+  #
+  # We only need mapping from join key -> left name, and SUM by join key.
+  # Build a sparse map for correctness, but also try a dense array mode for
+  # the common benchmark shape (keys 1..N) to avoid hashing.
+  var leftNameByKey: Table[int64, Value] = initTable[int64, Value]()
+  const DenseMaxKey = 1_000_000'i64
+  var useDense = true
+  var maxDenseKey: int64 = 0
+  var namesDense: seq[Value] = @[]
+  var namesPresent: seq[bool] = @[]
+  while true:
+    let lrRes = rowCursorNext(leftCur)
+    if not lrRes.ok:
+      return err[Option[seq[Row]]](lrRes.err.code, lrRes.err.message, lrRes.err.context)
+    if lrRes.value.isNone:
+      break
+    let r = lrRes.value.get
+    if lKeyPos >= r.values.len or lNamePos >= r.values.len:
+      continue
+    let k = r.values[lKeyPos]
+    if k.kind != vkInt64:
+      continue
+    let key = k.int64Val
+    if leftNameByKey.hasKey(key):
+      # Duplicate join key would change grouping; fall back.
+      return ok(none(seq[Row]))
+    leftNameByKey[key] = r.values[lNamePos]
+
+    if useDense:
+      if key < 0 or key > DenseMaxKey:
+        useDense = false
+        namesDense.setLen(0)
+        namesPresent.setLen(0)
+      else:
+        if key > maxDenseKey:
+          maxDenseKey = key
+        if namesDense.len <= int(key):
+          namesDense.setLen(int(key) + 1)
+          namesPresent.setLen(int(key) + 1)
+        if namesPresent[int(key)]:
+          return ok(none(seq[Row]))
+        namesPresent[int(key)] = true
+        namesDense[int(key)] = r.values[lNamePos]
+
+  # Stream right side via B+Tree cursor view when possible.
+  let outCols = if spec.nameFirst: @["expr", "sum"] else: @["sum", "expr"]
+  var outRows: seq[Row] = @[]
+
+  if useDense:
+    when defined(fused_join_sum_stats):
+      discard gFusedJoinSumDense.fetchAdd(1, moRelaxed)
+    var sumsDense: seq[float64] = @[]
+    var sumsDenseSeen: seq[bool] = @[]
+    sumsDense.setLen(int(maxDenseKey) + 1)
+    sumsDenseSeen.setLen(int(maxDenseKey) + 1)
+
+    # Fast path requires the right side to be a simple table scan.
+    let rightTree2 = newBTree(pager, rightTable.rootPage)
+    let curRes2 = openCursorStream(rightTree2)
+    if not curRes2.ok:
+      return err[Option[seq[Row]]](curRes2.err.code, curRes2.err.message, curRes2.err.context)
+    let btCur = curRes2.value
+
+    while true:
+      let nextRes = cursorNextStream(btCur)
+      if not nextRes.ok:
+        if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
+          break
+        return err[Option[seq[Row]]](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+      let (_, leafPage, valueOffset, valueLen, leafOverflow) = nextRes.value
+      if valueLen == 0 and leafOverflow == 0'u32:
+        continue
+
+      # Overflow rows are rare for benchmark data; fall back to correctness path.
+      if leafOverflow != 0'u32:
+        return ok(none(seq[Row]))
+
+      var kindK: ValueKind
+      var payStartK = 0
+      var payLenK = 0
+      if not recordFieldViewStr(leafPage, valueOffset, valueLen, rKeyPos, kindK, payStartK, payLenK):
+        return ok(none(seq[Row]))
+      if kindK == vkNull:
+        continue
+      if kindK != vkInt64:
+        continue
+      var key: int64 = 0
+      if not parseInt64PayloadStr(leafPage, payStartK, payLenK, key):
+        return ok(none(seq[Row]))
+      if key < 0 or key > maxDenseKey:
+        continue
+      if int(key) >= namesPresent.len or not namesPresent[int(key)]:
+        continue
+
+      var kindAmt: ValueKind
+      var payStartA = 0
+      var payLenA = 0
+      if not recordFieldViewStr(leafPage, valueOffset, valueLen, rSumPos, kindAmt, payStartA, payLenA):
+        return ok(none(seq[Row]))
+
+      var addVal = 0.0
+      case kindAmt
+      of vkNull:
+        addVal = 0.0
+      of vkInt64:
+        var tmp: int64 = 0
+        if not parseInt64PayloadStr(leafPage, payStartA, payLenA, tmp):
+          return ok(none(seq[Row]))
+        addVal = float64(tmp)
+      of vkFloat64:
+        var tmpf: float64 = 0
+        if not parseFloat64PayloadStr(leafPage, payStartA, payLenA, tmpf):
+          return ok(none(seq[Row]))
+        addVal = tmpf
+      else:
+        return ok(none(seq[Row]))
+
+      sumsDenseSeen[int(key)] = true
+      sumsDense[int(key)] += addVal
+
+    outRows = newSeqOfCap[Row](leftNameByKey.len)
+    for i in 0 .. int(maxDenseKey):
+      if i >= sumsDenseSeen.len or not sumsDenseSeen[i]:
+        continue
+      if i >= namesPresent.len or not namesPresent[i]:
+        continue
+      let nameVal = namesDense[i]
+      let sumOut = Value(kind: vkFloat64, float64Val: sumsDense[i])
+      let outVals = if spec.nameFirst: @[nameVal, sumOut] else: @[sumOut, nameVal]
+      outRows.add(makeRow(outCols, outVals))
+
+    when defined(fused_join_sum_stats):
+      discard gFusedJoinSumHits.fetchAdd(1, moRelaxed)
+    return ok(some(outRows))
+
+  else:
+    when defined(fused_join_sum_stats):
+      discard gFusedJoinSumSparse.fetchAdd(1, moRelaxed)
+    var sumsSparse: Table[int64, float64] = initTable[int64, float64]()
+    let rightCurRes = openRowCursor(pager, catalog, joinPlan.right, params)
+    if not rightCurRes.ok:
+      return err[Option[seq[Row]]](rightCurRes.err.code, rightCurRes.err.message, rightCurRes.err.context)
+    let rightCur = rightCurRes.value
+    while true:
+      let rrRes = rowCursorNext(rightCur)
+      if not rrRes.ok:
+        return err[Option[seq[Row]]](rrRes.err.code, rrRes.err.message, rrRes.err.context)
+      if rrRes.value.isNone:
+        break
+      let r = rrRes.value.get
+      if rKeyPos >= r.values.len or rSumPos >= r.values.len:
+        continue
+      let fk = r.values[rKeyPos]
+      if fk.kind != vkInt64:
+        continue
+      let key = fk.int64Val
+      if not leftNameByKey.hasKey(key):
+        continue
+      let amt = r.values[rSumPos]
+      var addVal = 0.0
+      case amt.kind
+      of vkInt64:
+        addVal = float64(amt.int64Val)
+      of vkFloat64:
+        addVal = amt.float64Val
+      of vkNull:
+        addVal = 0.0
+      else:
+        return ok(none(seq[Row]))
+      sumsSparse[key] = sumsSparse.getOrDefault(key, 0.0) + addVal
+
+    for key, sumVal in sumsSparse:
+      if not leftNameByKey.hasKey(key):
+        continue
+      let nameVal = leftNameByKey[key]
+      let sumOut = Value(kind: vkFloat64, float64Val: sumVal)
+      let outVals = if spec.nameFirst: @[nameVal, sumOut] else: @[sumOut, nameVal]
+      outRows.add(makeRow(outCols, outVals))
+
+    when defined(fused_join_sum_stats):
+      discard gFusedJoinSumHits.fetchAdd(1, moRelaxed)
+    return ok(some(outRows))
+
 proc writeRowChunk*(path: string, rows: seq[Row]) =
   var f: File
   if not open(f, path, fmWrite):
@@ -1983,6 +2436,11 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
     return projectRows(inputRes.value, plan.projections, params)
   of pkAggregate:
+    let fusedRes = tryFuseJoinSumAggregate(pager, catalog, plan, params)
+    if not fusedRes.ok:
+      return err[seq[Row]](fusedRes.err.code, fusedRes.err.message, fusedRes.err.context)
+    if fusedRes.value.isSome:
+      return ok(fusedRes.value.get)
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:
       return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
@@ -1993,17 +2451,18 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
     var resultRows: seq[Row] = @[]
     var rightColumns: seq[string] = @[]
-    # Only cache right side if it's not an index seek AND we have a reasonable number of left rows
-    # This prevents memory blowup when joining large tables
-    const MaxLeftRowsForCache = 1000  # Increased to allow hash join on larger sets
-    let canCacheRight = plan.right.kind != pkIndexSeek and leftRes.value.len <= MaxLeftRowsForCache
+    # Cache the right side once when it is not correlated.
+    #
+    # IMPORTANT: A non-index-seek right plan does not depend on the current left row.
+    # Executing it once per left row is redundant and can turn joins into O(N*M)
+    # full rescans.
+    let rightIsCorrelated = plan.right.kind == pkIndexSeek
     var cachedRight: seq[Row] = @[]
-    if canCacheRight:
+    if not rightIsCorrelated:
       let rightRes = execPlan(pager, catalog, plan.right, params)
       if not rightRes.ok:
         return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
       cachedRight = rightRes.value
-      # Get right columns from first cached row if available
       if cachedRight.len > 0:
         rightColumns = cachedRight[0].columns
     if rightColumns.len == 0 and plan.right.table.len > 0:
@@ -2064,13 +2523,24 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         false
       (isRightCol(left) and right.kind == ekColumn) or (isRightCol(right) and left.kind == ekColumn)
     let skipJoinPredicate = joinPredicateIsCoveredByIndexSeek()
-    
+
     # Hash join optimization: build hash table on cached right side for equality joins
-    var rightHashTable: Table[string, seq[int]]  # key -> indices into cachedRight
+    var rightHashTable: Table[Value, seq[int]]  # join key -> indices into cachedRight
     var rightJoinColIdx = -1
-    var leftJoinColTable, leftJoinColName: string
-    let useHashJoin = canCacheRight and isSome(hashJoinInfo) and cachedRight.len > 0
-    
+    var leftJoinColIdx = -1
+    let useHashJoin = (not rightIsCorrelated) and isSome(hashJoinInfo) and cachedRight.len > 0 and leftRes.value.len > 0
+
+    proc hashJoinKeySupported(v: Value): bool {.inline.} =
+      # Must match evalExpr "=" semantics. Float NaN corner cases make VkFloat64 risky.
+      case v.kind
+      of vkNull, vkBool, vkInt64, vkText, vkBlob, vkTextCompressed, vkBlobCompressed,
+         vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+        # Overflow values have additional state (overflowPage/overflowLen) and may not compare
+        # equal to their materialized counterpart; keep them out of hash join for correctness.
+        v.overflowLen == 0'u32 and v.overflowPage == PageId(0)
+      of vkFloat64:
+        false
+
     if useHashJoin:
       let info = hashJoinInfo.get
       # Determine which side of the equality refers to which table
@@ -2094,30 +2564,38 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         rColTable = info.rightColTable
         rColName = info.rightColName
       
-      leftJoinColTable = lColTable
-      leftJoinColName = lColName
-      
-      # Find index of join column in right rows
-      let rightColKey = if rColTable.len > 0: rColTable & "." & rColName else: rColName
+      # Find index of join column on each side using the known scan prefixes.
+      let rightColKey = rightPrefix & "." & rColName
       for i, col in cachedRight[0].columns:
         if col == rightColKey or col.endsWith("." & rColName):
           rightJoinColIdx = i
           break
-      
-      # Build hash table if we found the column
-      if rightJoinColIdx >= 0:
-        for idx, rrow in cachedRight:
-          let keyVal = rrow.values[rightJoinColIdx]
-          var keyStr: string
-          case keyVal.kind
-          of vkInt64: keyStr = $keyVal.int64Val
-          of vkText, vkBlob: keyStr = cast[string](keyVal.bytes)
-          of vkFloat64: keyStr = $keyVal.float64Val
-          of vkBool: keyStr = $keyVal.boolVal
-          else: keyStr = ""
-          if not rightHashTable.hasKey(keyStr):
-            rightHashTable[keyStr] = @[]
-          rightHashTable[keyStr].add(idx)
+
+      let leftColKey = leftPrefix & "." & lColName
+      for i, col in leftRes.value[0].columns:
+        if col == leftColKey or col.endsWith("." & lColName):
+          leftJoinColIdx = i
+          break
+
+      # Build hash table if we found the columns and the key kind is supported.
+      if rightJoinColIdx >= 0 and leftJoinColIdx >= 0:
+        var supported = true
+        for rrow in cachedRight:
+          if rightJoinColIdx >= rrow.values.len:
+            supported = false
+            break
+          if not hashJoinKeySupported(rrow.values[rightJoinColIdx]):
+            supported = false
+            break
+        if supported:
+          for idx, rrow in cachedRight:
+            let keyVal = rrow.values[rightJoinColIdx]
+            if not rightHashTable.hasKey(keyVal):
+              rightHashTable[keyVal] = @[]
+            rightHashTable[keyVal].add(idx)
+        else:
+          rightJoinColIdx = -1
+          leftJoinColIdx = -1
     
     for lrow in leftRes.value:
       var matched = false
@@ -2130,30 +2608,17 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         if not idxRes.ok:
           return err[seq[Row]](idxRes.err.code, idxRes.err.message, idxRes.err.context)
         rightRows = idxRes.value
-      elif useHashJoin and rightJoinColIdx >= 0:
-        # Hash join: lookup matching right rows by join key
-        let leftColIdxRes = columnIndex(lrow, leftJoinColTable, leftJoinColName)
-        if leftColIdxRes.ok:
-          let leftVal = lrow.values[leftColIdxRes.value]
-          var keyStr: string
-          case leftVal.kind
-          of vkInt64: keyStr = $leftVal.int64Val
-          of vkText, vkBlob: keyStr = cast[string](leftVal.bytes)
-          of vkFloat64: keyStr = $leftVal.float64Val
-          of vkBool: keyStr = $leftVal.boolVal
-          else: keyStr = ""
-          if rightHashTable.hasKey(keyStr):
-            for idx in rightHashTable[keyStr]:
+      elif useHashJoin and rightJoinColIdx >= 0 and leftJoinColIdx >= 0:
+        # Hash join: lookup matching right rows by join key (no string conversions).
+        if leftJoinColIdx < lrow.values.len:
+          let leftVal = lrow.values[leftJoinColIdx]
+          if hashJoinKeySupported(leftVal) and rightHashTable.hasKey(leftVal):
+            for idx in rightHashTable[leftVal]:
               rightRows.add(cachedRight[idx])
       else:
-        if not canCacheRight:
-          # Fallback: execute right plan for each left row (Nested Loop Join)
-          let rightRes = execPlan(pager, catalog, plan.right, params)
-          if not rightRes.ok:
-            return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
-          rightRows = rightRes.value
-        else:
-          rightRows = cachedRight
+        # Non-correlated right side: reuse cached rows.
+        # Correlated right side is handled above via pkIndexSeek.
+        rightRows = cachedRight
       if rightColumns.len == 0 and rightRows.len > 0:
         rightColumns = rightRows[0].columns
         # Update merged columns if we didn't have right columns before
@@ -2170,7 +2635,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           mergedValues[lrow.values.len + i] = rrow.values[i]
         
         var merged = Row(columns: cols, values: mergedValues)
-        if skipJoinPredicate or useHashJoin:
+        if skipJoinPredicate or (useHashJoin and rightJoinColIdx >= 0 and leftJoinColIdx >= 0):
           # Hash join already filtered by equality, no need to re-evaluate predicate
           matched = true
           resultRows.add(merged)

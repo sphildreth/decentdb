@@ -221,6 +221,29 @@ suite "Engine Complex Queries":
     check res.value.len == 1
     discard closeDb(db)
 
+  test "JOIN + GROUP BY + SUM uses correct results":
+    let path = makeTempDb("decentdb_engine_join_group_sum.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").ok
+    check execSql(db, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)").ok
+    check execSql(db, "INSERT INTO users VALUES (1, 'Alice')").ok
+    check execSql(db, "INSERT INTO users VALUES (2, 'Bob')").ok
+    check execSql(db, "INSERT INTO orders VALUES (1, 1, 10)").ok
+    check execSql(db, "INSERT INTO orders VALUES (2, 1, 5)").ok
+    check execSql(db, "INSERT INTO orders VALUES (3, 2, 7)").ok
+
+    # Order is not guaranteed without relying on stable/fully-supported ORDER BY
+    # resolution through aggregates; validate contents instead.
+    let res = execSql(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name")
+    check res.ok
+    check res.value.len == 2
+    check res.value.contains("Alice|15.0")
+    check res.value.contains("Bob|7.0")
+
+    discard closeDb(db)
+
   # test "Self-referencing foreign key" - REMOVED: self-referencing FK not working
 
 suite "Engine Bulk Load":
