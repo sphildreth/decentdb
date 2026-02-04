@@ -99,6 +99,11 @@ type
     p50_us: int
     p95_us: int
     p99_us: int
+    # Higher precision percentiles (nanoseconds).
+    # Used by the aggregator to avoid microsecond quantization.
+    p50_ns: int64
+    p95_ns: int64
+    p99_ns: int64
     ops_per_sec: float
     rows_processed: int
     checksum_u64: uint64
@@ -133,17 +138,17 @@ type
 proc getIsoTime(): string =
   now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
 
-proc microsBetween(t0, t1: MonoTime): int =
-  ## Return microseconds between two monotonic timestamps.
+proc nanosBetween(t0, t1: MonoTime): int64 =
+  ## Return nanoseconds between two monotonic timestamps.
   let d = t1 - t0
-  int(inMicroseconds(d))
+  int64(inNanoseconds(d))
 
 proc secondsBetween(t0, t1: MonoTime): float =
   ## Return seconds between two monotonic timestamps.
   float(inMicroseconds(t1 - t0)) / 1_000_000.0
 
-proc percentile(latencies: seq[int], p: float): int =
-  if latencies.len == 0: return 0
+proc percentileNs(latencies: seq[int64], p: float): int64 =
+  if latencies.len == 0: return 0'i64
   var sorted = latencies
   sorted.sort()
   let idx = int(ceil(float(sorted.len) * p / 100.0)) - 1
@@ -169,6 +174,9 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
       "p50_us": res.metrics.p50_us,
       "p95_us": res.metrics.p95_us,
       "p99_us": res.metrics.p99_us,
+      "p50_ns": res.metrics.p50_ns,
+      "p95_ns": res.metrics.p95_ns,
+      "p99_ns": res.metrics.p99_ns,
       "ops_per_sec": res.metrics.ops_per_sec,
       "rows_processed": res.metrics.rows_processed,
       "checksum_u64": res.metrics.checksum_u64
@@ -209,6 +217,7 @@ proc runDecentDbInsert(outputDir: string) =
   
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
   
@@ -220,14 +229,19 @@ proc runDecentDbInsert(outputDir: string) =
       Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
     ])
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -243,6 +257,9 @@ proc runDecentDbInsert(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0 
@@ -274,6 +291,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
   
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
   
@@ -284,14 +302,19 @@ proc runDecentDbCommitLatency(outputDir: string) =
       Value(kind: vkText, bytes: toBytes("value" & $i))
     ])
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -307,6 +330,9 @@ proc runDecentDbCommitLatency(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -344,6 +370,8 @@ proc runDecentDbPointRead(outputDir: string) =
   
   let iterations = 100000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  var rowsProcessedTotal: int64 = 0
   var rng = initRand(42)
   
   let start = getMonoTime()
@@ -351,18 +379,25 @@ proc runDecentDbPointRead(outputDir: string) =
   for i in 1..iterations:
     let lookupId = rng.rand(1..dataSize)
     let t0 = getMonoTime()
-    discard execSqlRows(db, "SELECT * FROM users WHERE id = $1", @[
+    let nRes = execSqlNoRows(db, "SELECT * FROM users WHERE id = $1", @[
       Value(kind: vkInt64, int64Val: int64(lookupId))
     ])
+    if nRes.ok:
+      rowsProcessedTotal += nRes.value
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -378,8 +413,11 @@ proc runDecentDbPointRead(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
-      rows_processed: iterations,
+      rows_processed: int(rowsProcessedTotal),
       checksum_u64: 0
     ),
     artifacts: BenchmarkArtifacts(
@@ -424,6 +462,8 @@ proc runDecentDbJoin(outputDir: string) =
   
   let iterations = 100
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  var rowsProcessedTotal: int64 = 0
 
   when defined(fused_join_sum_stats):
     resetFusedJoinSumStats()
@@ -432,9 +472,13 @@ proc runDecentDbJoin(outputDir: string) =
   
   for i in 1..iterations:
     let t0 = getMonoTime()
-    discard execSqlRows(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name", @[])
+    let nRes = execSqlNoRows(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name", @[])
+    if nRes.ok:
+      rowsProcessedTotal += nRes.value
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
 
   when defined(fused_join_sum_stats):
     let st = fusedJoinSumStats()
@@ -443,9 +487,12 @@ proc runDecentDbJoin(outputDir: string) =
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -461,8 +508,11 @@ proc runDecentDbJoin(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
-      rows_processed: iterations,
+      rows_processed: int(rowsProcessedTotal),
       checksum_u64: 0
     ),
     artifacts: BenchmarkArtifacts(
@@ -511,6 +561,7 @@ proc runSqliteInsert(outputDir: string) =
   
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
   
@@ -519,23 +570,25 @@ proc runSqliteInsert(outputDir: string) =
     let email = "user" & $i & "@example.com"
     
     let t0 = getMonoTime()
-    # Explicit transaction for fair durability comparison
-    sqliteExec(db, "BEGIN IMMEDIATE")
     discard sqlite3_bind_int64(stmt, 1, int64(i))
     discard sqlite3_bind_text(stmt, 2, name.cstring, cint(name.len), SQLITE_TRANSIENT)
     discard sqlite3_bind_text(stmt, 3, email.cstring, cint(email.len), SQLITE_TRANSIENT)
     discard sqlite3_step(stmt)
     discard sqlite3_reset(stmt)
-    sqliteExec(db, "COMMIT")
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -551,6 +604,9 @@ proc runSqliteInsert(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -593,6 +649,7 @@ proc runSqliteCommitLatency(outputDir: string) =
   
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
   
@@ -600,21 +657,23 @@ proc runSqliteCommitLatency(outputDir: string) =
     let value = "value" & $i
     
     let t0 = getMonoTime()
-    # Explicit transaction for fair durability comparison
-    sqliteExec(db, "BEGIN IMMEDIATE")
     discard sqlite3_bind_text(stmt, 1, value.cstring, cint(value.len), SQLITE_TRANSIENT)
     discard sqlite3_step(stmt)
     discard sqlite3_reset(stmt)
-    sqliteExec(db, "COMMIT")
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -630,6 +689,9 @@ proc runSqliteCommitLatency(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -685,6 +747,7 @@ proc runSqlitePointRead(outputDir: string) =
   
   let iterations = 100000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   var rng = initRand(42)
   
   let start = getMonoTime()
@@ -696,14 +759,19 @@ proc runSqlitePointRead(outputDir: string) =
     discard sqlite3_step(readStmt)
     discard sqlite3_reset(readStmt)
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -719,6 +787,9 @@ proc runSqlitePointRead(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -786,6 +857,7 @@ proc runSqliteJoin(outputDir: string) =
   
   let iterations = 100
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
   
@@ -795,14 +867,19 @@ proc runSqliteJoin(outputDir: string) =
       discard  # Consume results
     discard sqlite3_reset(joinStmt)
     let t1 = getMonoTime()
-    latencies.add(microsBetween(t0, t1))
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -818,6 +895,9 @@ proc runSqliteJoin(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
