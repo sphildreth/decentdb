@@ -66,14 +66,23 @@ def sqlite_explain_query_plan(sqlite_db: str, query: str) -> List[str]:
         conn.close()
 
 
-def sqlite_plan_warn_if_full_scan(plan_lines: Sequence[str], *, label: str) -> None:
+def sqlite_is_full_scan(plan_lines: Sequence[str]) -> bool:
     plan_text = "\n".join(plan_lines)
     # Heuristic: warn when it looks like a table scan without an index.
     # (FTS queries may show VIRTUAL TABLE access; we treat that as indexed.)
     looks_like_scan = bool(EXPLAIN_SCAN_RE.search(plan_text))
     looks_indexed = bool(EXPLAIN_USING_INDEX_RE.search(plan_text)) or bool(EXPLAIN_VIRTUAL_TABLE_RE.search(plan_text))
-    if looks_like_scan and not looks_indexed:
+    return looks_like_scan and not looks_indexed
+
+
+def sqlite_plan_warn_if_full_scan(plan_lines: Sequence[str], *, label: str) -> None:
+    if sqlite_is_full_scan(plan_lines):
         print(f"warning: SQLite plan for {label} appears to be a full scan")
+
+
+def decentdb_is_trigram_seek(plan_lines: Sequence[str]) -> bool:
+    plan_text = "\n".join(plan_lines)
+    return "TrigramSeek" in plan_text
 
 
 LIKE_SUBSTR_RE = re.compile(
@@ -560,22 +569,50 @@ def main() -> int:
 
     if not args.no_sqlite_explain:
         try:
-            plan = sqlite_explain_query_plan(args.sqlite_db, query)
+            sqlite_plan = sqlite_explain_query_plan(args.sqlite_db, query)
             print("\nSQLite EXPLAIN QUERY PLAN:")
-            for line in plan:
+            for line in sqlite_plan:
                 print("  " + line)
-            sqlite_plan_warn_if_full_scan(plan, label="--query")
+            sqlite_plan_warn_if_full_scan(sqlite_plan, label="--query")
         except Exception as e:
             print(f"warning: could not get SQLite EXPLAIN QUERY PLAN: {e}", file=sys.stderr)
 
     if not args.no_decentdb_explain:
         try:
-            plan = decentdb_explain_plan(args.ddb, query)
+            decentdb_plan = decentdb_explain_plan(args.ddb, query)
             print("\nDecentDB EXPLAIN:")
-            for line in plan:
+            for line in decentdb_plan:
                 print("  " + line)
         except Exception as e:
             print(f"warning: could not get DecentDB EXPLAIN: {e}", file=sys.stderr)
+
+    # Check for unfair comparison: DecentDB using TrigramSeek vs SQLite Full Scan
+    if not args.sqlite_fts5_trigram:
+        sqlite_scan = False
+        if not args.no_sqlite_explain:
+            # We already computed it above
+            try:
+                sqlite_scan = sqlite_is_full_scan(sqlite_plan)
+            except NameError:
+                pass
+        
+        decentdb_trigram = False
+        if not args.no_decentdb_explain:
+             try:
+                 decentdb_trigram = decentdb_is_trigram_seek(decentdb_plan)
+             except NameError:
+                 pass
+        
+        if decentdb_trigram and sqlite_scan:
+            print("\n" + "=" * 80)
+            print("CAUTION: UNFAIR BENCHMARK DETECTED")
+            print("DecentDB is using a Trigram Index ('TrigramSeek') to execute this query.")
+            print("SQLite is performing a Full Table Scan (no suitable index found).")
+            print("")
+            print("To ensure a fair comparison, verify that SQLite has an equivalent index,")
+            print("or use --sqlite-fts5-trigram to automatically build and test against")
+            print("an SQLite FTS5 trigram index.")
+            print("=" * 80 + "\n")
 
     sqlite_fts_db: Optional[str] = None
     sqlite_fts_query: Optional[str] = None
