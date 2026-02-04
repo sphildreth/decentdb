@@ -2,6 +2,7 @@ import os
 import locks
 import tables
 import options
+import atomics
 import ../errors
 import ../vfs/types
 import sets
@@ -47,6 +48,7 @@ type Pager* = ref object
   overriddenPages*: HashSet[PageId]
   overlayLock*: Lock
   rollbackLock*: Lock    # Guards against seeing dirty state during rollback
+  rollbackInProgress*: Atomic[bool]  # Fast path check to avoid lock contention
   txnAllocatedPages*: seq[PageId]  # Pages allocated during current transaction (HIGH-003)
   inTransaction*: bool             # Whether a transaction is active (HIGH-003)
   flushHandler*: proc(pageId: PageId, data: string): Result[Void]
@@ -101,6 +103,7 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
   initLock(pager.lock)
   initLock(pager.overlayLock)
   initLock(pager.rollbackLock)
+  pager.rollbackInProgress.store(false, moRelaxed)
   ok(pager)
 
 proc pageOffset(pager: Pager, pageId: PageId): int64 =
@@ -358,8 +361,10 @@ proc withPageRoCached*[T](pager: Pager, pageId: PageId, snapshot: Option[uint64]
   ## (dirty or newer LSN), this falls back to a direct file read.
   
   # Wait if rollback is in progress to avoid seeing dirty state
-  acquire(pager.rollbackLock)
-  release(pager.rollbackLock)
+  # Fast path: atomic check to avoid lock contention in the common case
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
   
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
@@ -427,8 +432,10 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
   ## If a WAL/page overlay is installed, it is consulted first.
   
   # Wait if rollback is in progress to avoid seeing dirty state
-  acquire(pager.rollbackLock)
-  release(pager.rollbackLock)
+  # Fast path: atomic check to avoid lock contention in the common case
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
   
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
@@ -445,8 +452,10 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
 
 proc readPage*(pager: Pager, pageId: PageId): Result[string] =
   # Wait if rollback is in progress to avoid seeing dirty state
-  acquire(pager.rollbackLock)
-  release(pager.rollbackLock)
+  # Fast path: atomic check to avoid lock contention in the common case
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
   
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
@@ -479,8 +488,10 @@ proc readPageRo*(pager: Pager, pageId: PageId): Result[string] =
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[string] =
   # Wait if rollback is in progress to avoid seeing dirty state
-  acquire(pager.rollbackLock)
-  release(pager.rollbackLock)
+  # Fast path: atomic check to avoid lock contention in the common case
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
   
   if pager.readGuard != nil:
     let guardRes = pager.readGuard()
@@ -660,17 +671,16 @@ proc rollbackCache*(pager: Pager) =
   ## This is used during rollback to ensure the cache does not contain
   ## uncommitted changes. The rollbackLock is held during eviction to
   ## prevent readers from seeing partial dirty state.
+  pager.rollbackInProgress.store(true, moRelease)
   acquire(pager.rollbackLock)
   rollbackCacheLocked(pager)
   release(pager.rollbackLock)
+  pager.rollbackInProgress.store(false, moRelease)
 
 proc isRollbackInProgress*(pager: Pager): bool =
   ## Check if a rollback is currently in progress.
-  ## This is a non-blocking check that returns immediately.
-  ## Readers should check this before accessing potentially dirty pages.
-  acquire(pager.rollbackLock)
-  release(pager.rollbackLock)
-  false  # If we acquired the lock, rollback is not in progress
+  ## This is a lock-free check using the atomic flag.
+  pager.rollbackInProgress.load(moAcquire)
 
 proc closePager*(pager: Pager): Result[Void] =
   let flushRes = flushAll(pager)

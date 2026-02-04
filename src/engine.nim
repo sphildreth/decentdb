@@ -1019,6 +1019,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
   const SqlCacheMaxEntries = 128
 
   proc touchSqlCache(key: string) =
+    # Fast path: if key is already at the end (most recent), skip
+    if db.sqlCacheOrder.len > 0 and db.sqlCacheOrder[^1] == key:
+      return
     var idx = -1
     for i, existing in db.sqlCacheOrder:
       if existing == key:
@@ -1808,6 +1811,9 @@ proc execSqlNoRows*(db: Db, sqlText: string, params: seq[Value]): Result[int64] 
   const SqlCacheMaxEntries = 128
 
   proc touchSqlCache(key: string) =
+    # Fast path: if key is already at the end (most recent), skip
+    if db.sqlCacheOrder.len > 0 and db.sqlCacheOrder[^1] == key:
+      return
     var idx = -1
     for i, existing in db.sqlCacheOrder:
       if existing == key:

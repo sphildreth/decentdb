@@ -1455,14 +1455,13 @@ type AggState = object
 proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], having: Expr, params: seq[Value]): Result[seq[Row]] =
   var groups = initTable[string, AggState]()
   var groupRows = initTable[string, Row]()
+  var keyParts = newSeqOfCap[string](groupBy.len)  # Reuse across iterations
   for row in rows:
-    var keyParts: seq[string] = @[]
-    var keyValues: seq[Value] = @[]
+    keyParts.setLen(0)
     for expr in groupBy:
       let evalRes = evalExpr(row, expr, params)
       if not evalRes.ok:
         return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-      keyValues.add(evalRes.value)
       keyParts.add(valueToString(evalRes.value))
     let key = keyParts.join("|")
     if not groups.hasKey(key):
@@ -1972,7 +1971,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
     var rightColumns: seq[string] = @[]
     # Only cache right side if it's not an index seek AND we have a reasonable number of left rows
     # This prevents memory blowup when joining large tables
-    const MaxLeftRowsForCache = 100
+    const MaxLeftRowsForCache = 1000  # Increased to allow hash join on larger sets
     let canCacheRight = plan.right.kind != pkIndexSeek and leftRes.value.len <= MaxLeftRowsForCache
     var cachedRight: seq[Row] = @[]
     if canCacheRight:
@@ -1980,12 +1979,46 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       if not rightRes.ok:
         return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
       cachedRight = rightRes.value
-    if plan.right.table.len > 0:
+      # Get right columns from first cached row if available
+      if cachedRight.len > 0:
+        rightColumns = cachedRight[0].columns
+    if rightColumns.len == 0 and plan.right.table.len > 0:
       let tableRes = catalog.getTable(plan.right.table)
       if tableRes.ok:
         let prefix = if plan.right.alias.len > 0: plan.right.alias else: plan.right.table
         for col in tableRes.value.columns:
           rightColumns.add(prefix & "." & col.name)
+    
+    # Pre-compute merged column names once (avoid allocating for each match)
+    var mergedColumns: seq[string] = @[]
+    if leftRes.value.len > 0:
+      mergedColumns = leftRes.value[0].columns & rightColumns
+    
+    # Check if we can use hash join (simple equality predicate)
+    type HashJoinInfo = object
+      leftColTable: string
+      leftColName: string
+      rightColTable: string
+      rightColName: string
+    
+    proc extractHashJoinInfo(): Option[HashJoinInfo] =
+      if plan.joinOn == nil or plan.joinOn.kind != ekBinary or plan.joinOn.op != "=":
+        return none(HashJoinInfo)
+      let left = plan.joinOn.left
+      let right = plan.joinOn.right
+      if left == nil or right == nil:
+        return none(HashJoinInfo)
+      if left.kind != ekColumn or right.kind != ekColumn:
+        return none(HashJoinInfo)
+      some(HashJoinInfo(
+        leftColTable: left.table,
+        leftColName: left.name,
+        rightColTable: right.table,
+        rightColName: right.name
+      ))
+    
+    let hashJoinInfo = extractHashJoinInfo()
+    
     proc joinPredicateIsCoveredByIndexSeek(): bool =
       if plan.right.kind != pkIndexSeek:
         return false
@@ -2007,6 +2040,61 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         false
       (isRightCol(left) and right.kind == ekColumn) or (isRightCol(right) and left.kind == ekColumn)
     let skipJoinPredicate = joinPredicateIsCoveredByIndexSeek()
+    
+    # Hash join optimization: build hash table on cached right side for equality joins
+    var rightHashTable: Table[string, seq[int]]  # key -> indices into cachedRight
+    var rightJoinColIdx = -1
+    var leftJoinColTable, leftJoinColName: string
+    let useHashJoin = canCacheRight and isSome(hashJoinInfo) and cachedRight.len > 0
+    
+    if useHashJoin:
+      let info = hashJoinInfo.get
+      # Determine which side of the equality refers to which table
+      # Left side of predicate could be from left or right table
+      let leftPrefix = if plan.left.alias.len > 0: plan.left.alias else: plan.left.table
+      let rightPrefix = if plan.right.alias.len > 0: plan.right.alias else: plan.right.table
+      
+      var rColName, lColName: string
+      var rColTable, lColTable: string
+      
+      # Check if first column matches right table
+      if info.leftColTable == rightPrefix or info.leftColTable == plan.right.table or 
+         (info.leftColTable.len == 0 and info.rightColTable == leftPrefix):
+        rColTable = info.leftColTable
+        rColName = info.leftColName
+        lColTable = info.rightColTable
+        lColName = info.rightColName
+      else:
+        lColTable = info.leftColTable
+        lColName = info.leftColName
+        rColTable = info.rightColTable
+        rColName = info.rightColName
+      
+      leftJoinColTable = lColTable
+      leftJoinColName = lColName
+      
+      # Find index of join column in right rows
+      let rightColKey = if rColTable.len > 0: rColTable & "." & rColName else: rColName
+      for i, col in cachedRight[0].columns:
+        if col == rightColKey or col.endsWith("." & rColName):
+          rightJoinColIdx = i
+          break
+      
+      # Build hash table if we found the column
+      if rightJoinColIdx >= 0:
+        for idx, rrow in cachedRight:
+          let keyVal = rrow.values[rightJoinColIdx]
+          var keyStr: string
+          case keyVal.kind
+          of vkInt64: keyStr = $keyVal.int64Val
+          of vkText, vkBlob: keyStr = cast[string](keyVal.bytes)
+          of vkFloat64: keyStr = $keyVal.float64Val
+          of vkBool: keyStr = $keyVal.boolVal
+          else: keyStr = ""
+          if not rightHashTable.hasKey(keyStr):
+            rightHashTable[keyStr] = @[]
+          rightHashTable[keyStr].add(idx)
+    
     for lrow in leftRes.value:
       var matched = false
       var rightRows: seq[Row] = @[]
@@ -2018,11 +2106,24 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         if not idxRes.ok:
           return err[seq[Row]](idxRes.err.code, idxRes.err.message, idxRes.err.context)
         rightRows = idxRes.value
+      elif useHashJoin and rightJoinColIdx >= 0:
+        # Hash join: lookup matching right rows by join key
+        let leftColIdxRes = columnIndex(lrow, leftJoinColTable, leftJoinColName)
+        if leftColIdxRes.ok:
+          let leftVal = lrow.values[leftColIdxRes.value]
+          var keyStr: string
+          case leftVal.kind
+          of vkInt64: keyStr = $leftVal.int64Val
+          of vkText, vkBlob: keyStr = cast[string](leftVal.bytes)
+          of vkFloat64: keyStr = $leftVal.float64Val
+          of vkBool: keyStr = $leftVal.boolVal
+          else: keyStr = ""
+          if rightHashTable.hasKey(keyStr):
+            for idx in rightHashTable[keyStr]:
+              rightRows.add(cachedRight[idx])
       else:
         if not canCacheRight:
           # Fallback: execute right plan for each left row (Nested Loop Join)
-          # This is necessary because we couldn't cache the right side (e.g. too many left rows)
-          # and it's not an index seek.
           let rightRes = execPlan(pager, catalog, plan.right, params)
           if not rightRes.ok:
             return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
@@ -2031,9 +2132,15 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           rightRows = cachedRight
       if rightColumns.len == 0 and rightRows.len > 0:
         rightColumns = rightRows[0].columns
+        # Update merged columns if we didn't have right columns before
+        if mergedColumns.len == 0:
+          mergedColumns = lrow.columns & rightColumns
       for rrow in rightRows:
-        var merged = Row(columns: lrow.columns & rrow.columns, values: lrow.values & rrow.values)
-        if skipJoinPredicate:
+        # Reuse pre-computed merged column names
+        let cols = if mergedColumns.len > 0: mergedColumns else: lrow.columns & rrow.columns
+        var merged = Row(columns: cols, values: lrow.values & rrow.values)
+        if skipJoinPredicate or useHashJoin:
+          # Hash join already filtered by equality, no need to re-evaluate predicate
           matched = true
           resultRows.add(merged)
         else:
@@ -2047,7 +2154,8 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         var nullVals: seq[Value] = @[]
         for _ in rightColumns:
           nullVals.add(Value(kind: vkNull))
-        let merged = Row(columns: lrow.columns & rightColumns, values: lrow.values & nullVals)
+        let cols = if mergedColumns.len > 0: mergedColumns else: lrow.columns & rightColumns
+        let merged = Row(columns: cols, values: lrow.values & nullVals)
         resultRows.add(merged)
     ok(resultRows)
   of pkSort:

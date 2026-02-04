@@ -276,28 +276,94 @@ proc findChildPage(keys: seq[uint64], children: seq[uint32], rightChild: uint32,
   return rightChild
 
 proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
+  ## Navigate from root to leaf, avoiding seq allocations on internal pages.
   var current = tree.root
   while true:
-    var pageType: byte = 0
-    var keys: seq[uint64] = @[]
-    var children: seq[uint32] = @[]
-    var rightChild: uint32 = 0
+    var nextPage: PageId = 0
+    var isLeaf = false
     let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
-      pageType = byte(page[0])
+      if page.len < 8:
+        return err[Void](ERR_CORRUPTION, "Page too small")
+      let pageType = byte(page[0])
       if pageType == PageTypeLeaf:
+        isLeaf = true
         return okVoid()
-      let internalRes = readInternalCells(page)
-      if not internalRes.ok:
-        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
-      (keys, children, rightChild) = internalRes.value
+      if pageType != PageTypeInternal:
+        return err[Void](ERR_CORRUPTION, "Not an internal page (type=" & $int(pageType) & ")")
+      
+      # Read internal page header without allocating seqs
+      let count = int(readU16LE(page, 2))
+      let rightChild = readU32LE(page, 4)
+      
+      if count == 0:
+        nextPage = PageId(rightChild)
+        return okVoid()
+      
+      # Binary search inline: find first key > search key
+      # Keys and children are interleaved as varints starting at offset 8
+      # We need to decode all keys to find the right child
+      var offset = 8
+      var lo = 0
+      var hi = count
+      
+      # First pass: decode all keys into a small stack array (most B-trees have <256 keys per node)
+      var keyOffsets: array[256, int]  # offset where each key starts
+      var childOffsets: array[256, int]  # offset where each child starts
+      var keyVals: array[256, uint64]
+      var childVals: array[256, uint32]
+      
+      for i in 0 ..< count:
+        if i < 256:
+          keyOffsets[i] = offset
+        
+        # Decode key varint
+        var k: uint64 = 0
+        var shift = 0
+        while offset < page.len:
+          let b = byte(page[offset])
+          offset.inc
+          k = k or ((uint64(b and 0x7F)) shl shift)
+          if (b and 0x80) == 0:
+            break
+          shift += 7
+        
+        if i < 256:
+          keyVals[i] = k
+          childOffsets[i] = offset
+        
+        # Decode child varint
+        var c: uint64 = 0
+        shift = 0
+        while offset < page.len:
+          let b = byte(page[offset])
+          offset.inc
+          c = c or ((uint64(b and 0x7F)) shl shift)
+          if (b and 0x80) == 0:
+            break
+          shift += 7
+        
+        if i < 256:
+          childVals[i] = uint32(c)
+      
+      # Binary search: find first key > search key
+      while lo < hi:
+        let mid = (lo + hi) shr 1
+        if mid < 256 and keyVals[mid] <= key:
+          lo = mid + 1
+        else:
+          hi = mid
+      
+      if lo < count and lo < 256:
+        nextPage = PageId(childVals[lo])
+      else:
+        nextPage = PageId(rightChild)
       okVoid()
     )
     if not pageRes.ok:
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-    if pageType == PageTypeLeaf:
+    if isLeaf:
       return ok(current)
-    let chosen = findChildPage(keys, children, rightChild, key)
-    current = PageId(chosen)
+    current = nextPage
 
 proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
   ## Binary search to find the appropriate child page for a key (leftmost variant).
@@ -316,28 +382,83 @@ proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild:
   return rightChild
 
 proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
+  ## Navigate from root to leaf for leftmost variant, avoiding seq allocations.
   var current = tree.root
   while true:
-    var pageType: byte = 0
-    var keys: seq[uint64] = @[]
-    var children: seq[uint32] = @[]
-    var rightChild: uint32 = 0
+    var nextPage: PageId = 0
+    var isLeaf = false
     let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
-      pageType = byte(page[0])
+      if page.len < 8:
+        return err[Void](ERR_CORRUPTION, "Page too small")
+      let pageType = byte(page[0])
       if pageType == PageTypeLeaf:
+        isLeaf = true
         return okVoid()
-      let internalRes = readInternalCells(page)
-      if not internalRes.ok:
-        return err[Void](internalRes.err.code, internalRes.err.message, internalRes.err.context)
-      (keys, children, rightChild) = internalRes.value
+      if pageType != PageTypeInternal:
+        return err[Void](ERR_CORRUPTION, "Not an internal page (type=" & $int(pageType) & ")")
+      
+      let count = int(readU16LE(page, 2))
+      let rightChild = readU32LE(page, 4)
+      
+      if count == 0:
+        nextPage = PageId(rightChild)
+        return okVoid()
+      
+      # Decode all keys inline
+      var offset = 8
+      var keyVals: array[256, uint64]
+      var childVals: array[256, uint32]
+      
+      for i in 0 ..< count:
+        # Decode key varint
+        var k: uint64 = 0
+        var shift = 0
+        while offset < page.len:
+          let b = byte(page[offset])
+          offset.inc
+          k = k or ((uint64(b and 0x7F)) shl shift)
+          if (b and 0x80) == 0:
+            break
+          shift += 7
+        
+        if i < 256:
+          keyVals[i] = k
+        
+        # Decode child varint
+        var c: uint64 = 0
+        shift = 0
+        while offset < page.len:
+          let b = byte(page[offset])
+          offset.inc
+          c = c or ((uint64(b and 0x7F)) shl shift)
+          if (b and 0x80) == 0:
+            break
+          shift += 7
+        
+        if i < 256:
+          childVals[i] = uint32(c)
+      
+      # Binary search: find first key >= search key (leftmost variant)
+      var lo = 0
+      var hi = count
+      while lo < hi:
+        let mid = (lo + hi) shr 1
+        if mid < 256 and keyVals[mid] < key:
+          lo = mid + 1
+        else:
+          hi = mid
+      
+      if lo < count and lo < 256:
+        nextPage = PageId(childVals[lo])
+      else:
+        nextPage = PageId(rightChild)
       okVoid()
     )
     if not pageRes.ok:
       return err[PageId](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-    if pageType == PageTypeLeaf:
+    if isLeaf:
       return ok(current)
-    let chosen = findChildPageLeftmost(keys, children, rightChild, key)
-    current = PageId(chosen)
+    current = nextPage
 
 proc lowerBound(keys: seq[uint64], key: uint64): int =
   var lo = 0
@@ -448,27 +569,87 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
   if not leafRes.ok:
     return err[(uint64, seq[byte], uint32)](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   let leafId = leafRes.value
-  var keys: seq[uint64] = @[]
-  var values: seq[seq[byte]] = @[]
-  var overflows: seq[uint32] = @[]
+  
+  # Optimized path: scan leaf directly without materializing all cells
+  var foundKey: uint64 = 0
+  var foundValue: seq[byte] = @[]
+  var foundOverflow: uint32 = 0
+  var found = false
+  
   let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
-    let parsed = readLeafCells(page)
-    if not parsed.ok:
-      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
-    (keys, values, overflows, _) = parsed.value
+    if page.len < 8:
+      return err[Void](ERR_CORRUPTION, "Page too small")
+    if byte(page[0]) != PageTypeLeaf:
+      return err[Void](ERR_CORRUPTION, "Not a leaf page")
+    let count = int(readU16LE(page, 2))
+    var offset = 8
+    
+    for _ in 0 ..< count:
+      if offset >= page.len:
+        return err[Void](ERR_CORRUPTION, "Leaf cell out of bounds")
+      
+      # Decode key varint inline
+      var k: uint64 = 0
+      var shift = 0
+      while offset < page.len:
+        let b = byte(page[offset])
+        offset.inc
+        k = k or ((uint64(b and 0x7F)) shl shift)
+        if (b and 0x80) == 0:
+          break
+        shift += 7
+      
+      # Decode control varint inline
+      var ctrl: uint64 = 0
+      shift = 0
+      while offset < page.len:
+        let b = byte(page[offset])
+        offset.inc
+        ctrl = ctrl or ((uint64(b and 0x7F)) shl shift)
+        if (b and 0x80) == 0:
+          break
+        shift += 7
+      
+      let isOverflow = (ctrl and 1) != 0
+      let val = uint32(ctrl shr 1)
+      var valueLen = 0
+      var overflow = 0'u32
+      
+      if isOverflow:
+        overflow = val
+      else:
+        valueLen = int(val)
+      
+      if k == key:
+        # Found the key - copy only this value
+        if valueLen == 0 and overflow == 0'u32:
+          return err[Void](ERR_IO, "Key not found")
+        foundKey = k
+        foundOverflow = overflow
+        if valueLen > 0:
+          if offset + valueLen > page.len:
+            return err[Void](ERR_CORRUPTION, "Leaf value out of bounds")
+          foundValue = newSeq[byte](valueLen)
+          copyMem(addr foundValue[0], unsafeAddr page[offset], valueLen)
+        found = true
+        return okVoid()
+      
+      # Skip this value's bytes
+      offset += valueLen
+    
     okVoid()
   )
+  
   if not pageRes.ok:
     return err[(uint64, seq[byte], uint32)](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-  for i in 0 ..< keys.len:
-    if keys[i] == key:
-      if values[i].len == 0 and overflows[i] == 0'u32:
-        return err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
-      let valueRes = materializeValue(tree, values[i], overflows[i])
-      if not valueRes.ok:
-        return err[(uint64, seq[byte], uint32)](valueRes.err.code, valueRes.err.message, valueRes.err.context)
-      return ok((keys[i], valueRes.value, overflows[i]))
-  err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
+  
+  if not found:
+    return err[(uint64, seq[byte], uint32)](ERR_IO, "Key not found")
+  
+  let valueRes = materializeValue(tree, foundValue, foundOverflow)
+  if not valueRes.ok:
+    return err[(uint64, seq[byte], uint32)](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+  ok((foundKey, valueRes.value, foundOverflow))
 
 proc containsKey*(tree: BTree, key: uint64): Result[bool] =
   ## Return true if `key` exists in the tree.

@@ -23,6 +23,7 @@ type WalIndexEntry* = object
 type ReadTxn* = object
   id*: int
   snapshot*: uint64
+  aborted*: ptr Atomic[bool]  # Atomic flag for lock-free abort check
 
 type WalFailpointKind* = enum
   wfNone
@@ -40,6 +41,7 @@ type ReaderInfo* = object
   started*: float
   lastWarningAt*: float  # When the last warning was issued
   bytesAtStart*: int64   # WAL size when reader started
+  abortedFlag*: ptr Atomic[bool]  # Shared atomic flag for lock-free abort check
 
 type Wal* = ref object
   vfs*: Vfs
@@ -367,6 +369,9 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
         if wal.readers.hasKey(info.id):
           let readerInfo = wal.readers[info.id]
           let bytesPinned = wal.endOffset - readerInfo.bytesAtStart
+          # Set atomic abort flag for lock-free checking
+          if readerInfo.abortedFlag != nil:
+            readerInfo.abortedFlag[].store(true, moRelease)
           wal.readers.del(info.id)
           wal.totalReadersAborted.inc
           wal.recordWarningLocked("Reader timeout id=" & $info.id & 
@@ -382,6 +387,9 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
       for info in oversizedReaders:
         wal.abortedReaders.incl(info.id)
         if wal.readers.hasKey(info.id):
+          # Set atomic abort flag for lock-free checking
+          if wal.readers[info.id].abortedFlag != nil:
+            wal.readers[info.id].abortedFlag[].store(true, moRelease)
           wal.readers.del(info.id)
           wal.totalReadersAborted.inc
           wal.recordWarningLocked("Reader WAL limit exceeded id=" & $info.id &
@@ -680,19 +688,26 @@ proc beginRead*(wal: Wal): ReadTxn =
   let readerId = wal.nextReaderId
   wal.nextReaderId.inc
   let now = epochTime()
+  # Allocate atomic flag for lock-free abort checking
+  let abortFlag = cast[ptr Atomic[bool]](alloc0(sizeof(Atomic[bool])))
+  abortFlag[].store(false, moRelaxed)
   wal.readers[readerId] = ReaderInfo(
     snapshot: snapshot, 
     started: now,
     lastWarningAt: 0.0,
-    bytesAtStart: wal.endOffset
+    bytesAtStart: wal.endOffset,
+    abortedFlag: abortFlag
   )
   wal.abortedReaders.excl(readerId)
   release(wal.readerLock)
-  ReadTxn(id: readerId, snapshot: snapshot)
+  ReadTxn(id: readerId, snapshot: snapshot, aborted: abortFlag)
 
 proc endRead*(wal: Wal, txn: ReadTxn) =
   acquire(wal.readerLock)
   if wal.readers.hasKey(txn.id):
+    # Free the atomic flag
+    if wal.readers[txn.id].abortedFlag != nil:
+      dealloc(wal.readers[txn.id].abortedFlag)
     wal.readers.del(txn.id)
   wal.abortedReaders.excl(txn.id)
   release(wal.readerLock)
@@ -704,6 +719,11 @@ proc readerCount*(wal: Wal): int =
   count
 
 proc isAborted*(wal: Wal, txn: ReadTxn): bool =
+  ## Check if a read transaction has been aborted.
+  ## Uses atomic flag for lock-free hot-path checking.
+  if txn.aborted != nil:
+    return txn.aborted[].load(moAcquire)
+  # Fallback for legacy txns without atomic flag
   acquire(wal.readerLock)
   result = txn.id in wal.abortedReaders
   release(wal.readerLock)

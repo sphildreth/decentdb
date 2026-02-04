@@ -14,6 +14,46 @@ import ../../src/record/record
 import ../../src/errors
 import ../../src/vfs/vfs
 
+# --- SQLite FFI bindings ---
+{.passL: "-lsqlite3".}
+
+const
+  SQLITE_OK* = 0
+  SQLITE_ROW* = 100
+  SQLITE_DONE* = 101
+
+type
+  Sqlite3* = pointer
+  Sqlite3Stmt* = pointer
+
+proc sqlite3_open*(filename: cstring, ppDb: ptr Sqlite3): cint {.cdecl, importc.}
+proc sqlite3_close*(db: Sqlite3): cint {.cdecl, importc.}
+proc sqlite3_exec*(db: Sqlite3, sql: cstring, callback: pointer, arg: pointer, errmsg: ptr cstring): cint {.cdecl, importc.}
+proc sqlite3_prepare_v2*(db: Sqlite3, sql: cstring, nByte: cint, ppStmt: ptr Sqlite3Stmt, pzTail: ptr cstring): cint {.cdecl, importc.}
+proc sqlite3_step*(stmt: Sqlite3Stmt): cint {.cdecl, importc.}
+proc sqlite3_finalize*(stmt: Sqlite3Stmt): cint {.cdecl, importc.}
+proc sqlite3_bind_int64*(stmt: Sqlite3Stmt, idx: cint, value: int64): cint {.cdecl, importc.}
+proc sqlite3_bind_text*(stmt: Sqlite3Stmt, idx: cint, value: cstring, nBytes: cint, destructor: pointer): cint {.cdecl, importc.}
+proc sqlite3_reset*(stmt: Sqlite3Stmt): cint {.cdecl, importc.}
+proc sqlite3_column_int64*(stmt: Sqlite3Stmt, col: cint): int64 {.cdecl, importc.}
+proc sqlite3_column_text*(stmt: Sqlite3Stmt, col: cint): cstring {.cdecl, importc.}
+proc sqlite3_errmsg*(db: Sqlite3): cstring {.cdecl, importc.}
+proc sqlite3_libversion*(): cstring {.cdecl, importc.}
+
+const SQLITE_TRANSIENT = cast[pointer](-1)
+
+# Global variable for benchmark data directory (on real disk, not tmpfs)
+var gDataDir*: string = ""
+
+proc getBenchDataDir(): string =
+  ## Get the directory for benchmark database files.
+  ## Uses --data-dir if specified, otherwise falls back to temp dir.
+  if gDataDir.len > 0:
+    createDir(gDataDir)
+    return gDataDir
+  else:
+    return getBenchDataDir()
+
 type
   BenchmarkMetrics = object
     latencies_us: seq[int]
@@ -107,9 +147,9 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
 
 proc runDecentDbInsert(outputDir: string) =
   echo "Running DecentDB Insert Benchmark..."
-  let dbPath = getTempDir() / "bench_decentdb_insert.ddb"
+  let dbPath = getBenchDataDir() / "bench_decentdb_insert.ddb"
   removeFile(dbPath)
-  removeFile(dbPath & ".wal")
+  removeFile(dbPath & "-wal")
 
   let db = openDb(dbPath).value
   defer: discard closeDb(db)
@@ -159,7 +199,546 @@ proc runDecentDbInsert(outputDir: string) =
     artifacts: BenchmarkArtifacts(
       db_path: dbPath,
       db_size_bytes: getFileSize(dbPath),
-      wal_size_bytes: if fileExists(dbPath & ".wal"): getFileSize(dbPath & ".wal") else: 0
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runDecentDbCommitLatency(outputDir: string) =
+  echo "Running DecentDB Commit Latency Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_decentdb_commit.ddb"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  let db = openDb(dbPath).value
+  defer: discard closeDb(db)
+
+  discard execSql(db, "CREATE TABLE kv (k INT PRIMARY KEY, v TEXT)")
+  
+  # Pre-insert a row to update
+  discard execSql(db, "INSERT INTO kv VALUES (1, 'initial')")
+  
+  let iterations = 1000
+  var latencies: seq[int] = @[]
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let t0 = epochTime()
+    # Each UPDATE is a separate transaction with durable commit
+    discard execSql(db, "UPDATE kv SET v = $1 WHERE k = 1", @[
+      Value(kind: vkText, bytes: cast[seq[byte]]("value" & $i))
+    ])
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DecentDB",
+    engine_version: "0.0.1",
+    dataset: "sample",
+    benchmark: "commit_latency",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runDecentDbPointRead(outputDir: string) =
+  echo "Running DecentDB Point Read Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_decentdb_read.ddb"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  let db = openDb(dbPath).value
+  defer: discard closeDb(db)
+
+  discard execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)")
+  
+  # Pre-populate with data
+  let dataSize = 1000
+  for i in 1..dataSize:
+    discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", @[
+      Value(kind: vkInt64, int64Val: int64(i)),
+      Value(kind: vkText, bytes: cast[seq[byte]]("User" & $i)),
+      Value(kind: vkText, bytes: cast[seq[byte]]("user" & $i & "@example.com"))
+    ])
+  
+  let iterations = 1000
+  var latencies: seq[int] = @[]
+  var rng = initRand(42)
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let lookupId = rng.rand(1..dataSize)
+    let t0 = epochTime()
+    discard execSql(db, "SELECT * FROM users WHERE id = $1", @[
+      Value(kind: vkInt64, int64Val: int64(lookupId))
+    ])
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DecentDB",
+    engine_version: "0.0.1",
+    dataset: "sample",
+    benchmark: "point_read",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runDecentDbJoin(outputDir: string) =
+  echo "Running DecentDB Join Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_decentdb_join.ddb"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  let db = openDb(dbPath).value
+  defer: discard closeDb(db)
+
+  discard execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+  discard execSql(db, "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT)")
+  
+  # Pre-populate
+  let userCount = 100
+  let orderCount = 1000
+  for i in 1..userCount:
+    discard execSql(db, "INSERT INTO users VALUES ($1, $2)", @[
+      Value(kind: vkInt64, int64Val: int64(i)),
+      Value(kind: vkText, bytes: cast[seq[byte]]("User" & $i))
+    ])
+  
+  var rng = initRand(42)
+  for i in 1..orderCount:
+    discard execSql(db, "INSERT INTO orders VALUES ($1, $2, $3)", @[
+      Value(kind: vkInt64, int64Val: int64(i)),
+      Value(kind: vkInt64, int64Val: int64(rng.rand(1..userCount))),
+      Value(kind: vkInt64, int64Val: int64(rng.rand(10..1000)))
+    ])
+  
+  let iterations = 100
+  var latencies: seq[int] = @[]
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let t0 = epochTime()
+    discard execSql(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name")
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DecentDB",
+    engine_version: "0.0.1",
+    dataset: "sample",
+    benchmark: "join",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+# --- SQLite Benchmarks ---
+
+proc sqliteExec(db: Sqlite3, sql: string) =
+  var errmsg: cstring
+  let rc = sqlite3_exec(db, sql.cstring, nil, nil, addr errmsg)
+  if rc != SQLITE_OK:
+    let msg = if errmsg != nil: $errmsg else: "unknown error"
+    raise newException(IOError, "SQLite exec error: " & msg)
+
+proc runSqliteInsert(outputDir: string) =
+  echo "Running SQLite Insert Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_sqlite_insert.db"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  var db: Sqlite3
+  if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
+    raise newException(IOError, "Failed to open SQLite database")
+  defer: discard sqlite3_close(db)
+
+  # Configure for fair durability comparison
+  sqliteExec(db, "PRAGMA journal_mode = WAL")
+  sqliteExec(db, "PRAGMA synchronous = FULL")  # Durable commits like DecentDB
+  
+  sqliteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+  
+  var stmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db, "INSERT INTO users VALUES (?, ?, ?)".cstring, -1, addr stmt, nil) != SQLITE_OK:
+    raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
+  defer: discard sqlite3_finalize(stmt)
+  
+  let iterations = 1000
+  var latencies: seq[int] = @[]
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let name = "User" & $i
+    let email = "user" & $i & "@example.com"
+    
+    let t0 = epochTime()
+    # Explicit transaction for fair durability comparison
+    sqliteExec(db, "BEGIN IMMEDIATE")
+    discard sqlite3_bind_int64(stmt, 1, int64(i))
+    discard sqlite3_bind_text(stmt, 2, name.cstring, cint(name.len), SQLITE_TRANSIENT)
+    discard sqlite3_bind_text(stmt, 3, email.cstring, cint(email.len), SQLITE_TRANSIENT)
+    discard sqlite3_step(stmt)
+    discard sqlite3_reset(stmt)
+    sqliteExec(db, "COMMIT")
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "SQLite",
+    engine_version: $sqlite3_libversion(),
+    dataset: "sample",
+    benchmark: "insert",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runSqliteCommitLatency(outputDir: string) =
+  echo "Running SQLite Commit Latency Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_sqlite_commit.db"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  var db: Sqlite3
+  if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
+    raise newException(IOError, "Failed to open SQLite database")
+  defer: discard sqlite3_close(db)
+
+  # Configure for fair durability comparison
+  sqliteExec(db, "PRAGMA journal_mode = WAL")
+  sqliteExec(db, "PRAGMA synchronous = FULL")  # Durable commits
+  
+  sqliteExec(db, "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)")
+  sqliteExec(db, "INSERT INTO kv VALUES (1, 'initial')")
+  
+  var stmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db, "UPDATE kv SET v = ? WHERE k = 1".cstring, -1, addr stmt, nil) != SQLITE_OK:
+    raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
+  defer: discard sqlite3_finalize(stmt)
+  
+  let iterations = 1000
+  var latencies: seq[int] = @[]
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let value = "value" & $i
+    
+    let t0 = epochTime()
+    # Explicit transaction for fair durability comparison
+    sqliteExec(db, "BEGIN IMMEDIATE")
+    discard sqlite3_bind_text(stmt, 1, value.cstring, cint(value.len), SQLITE_TRANSIENT)
+    discard sqlite3_step(stmt)
+    discard sqlite3_reset(stmt)
+    sqliteExec(db, "COMMIT")
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "SQLite",
+    engine_version: $sqlite3_libversion(),
+    dataset: "sample",
+    benchmark: "commit_latency",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runSqlitePointRead(outputDir: string) =
+  echo "Running SQLite Point Read Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_sqlite_read.db"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  var db: Sqlite3
+  if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
+    raise newException(IOError, "Failed to open SQLite database")
+  defer: discard sqlite3_close(db)
+
+  sqliteExec(db, "PRAGMA journal_mode = WAL")
+  sqliteExec(db, "PRAGMA synchronous = FULL")
+  
+  sqliteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
+  
+  # Pre-populate
+  var insertStmt: Sqlite3Stmt
+  discard sqlite3_prepare_v2(db, "INSERT INTO users VALUES (?, ?, ?)".cstring, -1, addr insertStmt, nil)
+  
+  let dataSize = 1000
+  for i in 1..dataSize:
+    let name = "User" & $i
+    let email = "user" & $i & "@example.com"
+    discard sqlite3_bind_int64(insertStmt, 1, int64(i))
+    discard sqlite3_bind_text(insertStmt, 2, name.cstring, cint(name.len), SQLITE_TRANSIENT)
+    discard sqlite3_bind_text(insertStmt, 3, email.cstring, cint(email.len), SQLITE_TRANSIENT)
+    discard sqlite3_step(insertStmt)
+    discard sqlite3_reset(insertStmt)
+  discard sqlite3_finalize(insertStmt)
+  
+  var readStmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db, "SELECT * FROM users WHERE id = ?".cstring, -1, addr readStmt, nil) != SQLITE_OK:
+    raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
+  defer: discard sqlite3_finalize(readStmt)
+  
+  let iterations = 1000
+  var latencies: seq[int] = @[]
+  var rng = initRand(42)
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let lookupId = rng.rand(1..dataSize)
+    let t0 = epochTime()
+    discard sqlite3_bind_int64(readStmt, 1, int64(lookupId))
+    discard sqlite3_step(readStmt)
+    discard sqlite3_reset(readStmt)
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "SQLite",
+    engine_version: $sqlite3_libversion(),
+    dataset: "sample",
+    benchmark: "point_read",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runSqliteJoin(outputDir: string) =
+  echo "Running SQLite Join Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_sqlite_join.db"
+  removeFile(dbPath)
+  removeFile(dbPath & "-wal")
+
+  var db: Sqlite3
+  if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
+    raise newException(IOError, "Failed to open SQLite database")
+  defer: discard sqlite3_close(db)
+
+  sqliteExec(db, "PRAGMA journal_mode = WAL")
+  sqliteExec(db, "PRAGMA synchronous = FULL")
+  
+  sqliteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+  sqliteExec(db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)")
+  
+  # Pre-populate
+  var userStmt: Sqlite3Stmt
+  discard sqlite3_prepare_v2(db, "INSERT INTO users VALUES (?, ?)".cstring, -1, addr userStmt, nil)
+  
+  let userCount = 100
+  for i in 1..userCount:
+    let name = "User" & $i
+    discard sqlite3_bind_int64(userStmt, 1, int64(i))
+    discard sqlite3_bind_text(userStmt, 2, name.cstring, cint(name.len), SQLITE_TRANSIENT)
+    discard sqlite3_step(userStmt)
+    discard sqlite3_reset(userStmt)
+  discard sqlite3_finalize(userStmt)
+  
+  var orderStmt: Sqlite3Stmt
+  discard sqlite3_prepare_v2(db, "INSERT INTO orders VALUES (?, ?, ?)".cstring, -1, addr orderStmt, nil)
+  
+  var rng = initRand(42)
+  let orderCount = 1000
+  for i in 1..orderCount:
+    discard sqlite3_bind_int64(orderStmt, 1, int64(i))
+    discard sqlite3_bind_int64(orderStmt, 2, int64(rng.rand(1..userCount)))
+    discard sqlite3_bind_int64(orderStmt, 3, int64(rng.rand(10..1000)))
+    discard sqlite3_step(orderStmt)
+    discard sqlite3_reset(orderStmt)
+  discard sqlite3_finalize(orderStmt)
+  
+  var joinStmt: Sqlite3Stmt
+  if sqlite3_prepare_v2(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name".cstring, -1, addr joinStmt, nil) != SQLITE_OK:
+    raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
+  defer: discard sqlite3_finalize(joinStmt)
+  
+  let iterations = 100
+  var latencies: seq[int] = @[]
+  
+  let start = epochTime()
+  
+  for i in 1..iterations:
+    let t0 = epochTime()
+    while sqlite3_step(joinStmt) == SQLITE_ROW:
+      discard  # Consume results
+    discard sqlite3_reset(joinStmt)
+    let t1 = epochTime()
+    latencies.add(int((t1 - t0) * 1_000_000))
+  
+  let duration = epochTime() - start
+  let opsPerSec = float(iterations) / duration
+
+  let p50 = percentile(latencies, 50.0)
+  let p95 = percentile(latencies, 95.0)
+  let p99 = percentile(latencies, 99.0)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "SQLite",
+    engine_version: $sqlite3_libversion(),
+    dataset: "sample",
+    benchmark: "join",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
     )
   )
   writeResult(outputDir, res)
@@ -168,32 +747,59 @@ proc runDecentDbInsert(outputDir: string) =
 
 import cligen
 
-proc benchmark(engines: string = "all", args: seq[string]) =
+proc clearOldData(outputDir: string) =
+  ## Remove existing benchmark files to ensure fresh run
+  if dirExists(outputDir):
+    for kind, path in walkDir(outputDir):
+      if kind == pcFile and (path.endsWith(".jsonl") or path.endsWith(".json")):
+        removeFile(path)
+        echo "Removed stale: ", path
+
+proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "", args: seq[string]) =
   if args.len == 0:
     echo "Error: output_dir is required as a positional argument."
     quit(1)
   
   let output_dir = args[0]
   
+  # Set the global data directory for benchmark files (on real disk for fair fsync comparison)
+  if data_dir.len > 0:
+    gDataDir = data_dir
+    echo "Using data directory: ", data_dir
+  else:
+    echo "Warning: No --data-dir specified, using system tmpdir which may be tmpfs (no real fsync)"
+  
   echo "Starting benchmarks..."
   echo "Output directory: ", output_dir
   echo "Engines: ", engines
   
+  createDir(output_dir)
+  
+  if clear:
+    echo "Clearing old data from output directory..."
+    clearOldData(output_dir)
+  
   let runAll = engines == "all"
   let runDecent = runAll or "decentdb" in engines
-  # let runSqlite = runAll or "sqlite" in engines
-  # let runDuck = runAll or "duckdb" in engines
+  let runSqlite = runAll or "sqlite" in engines
   
   if runDecent:
     runDecentDbInsert(output_dir)
+    runDecentDbCommitLatency(output_dir)
+    runDecentDbPointRead(output_dir)
+    runDecentDbJoin(output_dir)
   
-  # Stub for other engines
-  if not runDecent and not runAll:
-    echo "Warning: Only DecentDB benchmarks are currently implemented in this runner."
+  if runSqlite:
+    runSqliteInsert(output_dir)
+    runSqliteCommitLatency(output_dir)
+    runSqlitePointRead(output_dir)
+    runSqliteJoin(output_dir)
 
   echo "Benchmarks completed."
 
 when isMainModule:
   dispatch(benchmark, help = {
-    "engines": "Comma-separated list of engines to run (decentdb, sqlite, duckdb) or 'all'"
+    "engines": "Comma-separated list of engines to run (decentdb, sqlite) or 'all'",
+    "clear": "Clear old benchmark data before running (default: true)",
+    "data_dir": "Directory for benchmark database files (use real disk, not tmpfs for fair fsync comparison)"
   })
