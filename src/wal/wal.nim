@@ -35,6 +35,12 @@ type WalFailpoint* = object
   partialBytes*: int
   remaining*: int
 
+type WalPendingPage = object
+  pageId: PageId
+  bytes: seq[byte]
+  str: string
+  isString: bool
+
 type ReaderInfo* = object
   ## Extended information about a reader for resource management
   snapshot*: uint64
@@ -86,6 +92,22 @@ const HeaderSize = 1 + 4 + 4
 const TrailerSize = 8 + 8
 
 proc encodeFrameInto(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte], lsn: uint64): int =
+  let needed = HeaderSize + payload.len + TrailerSize
+  if dest.len < offset + needed:
+    dest.setLen(max(dest.len * 2, offset + needed))
+  
+  dest[offset] = byte(frameType)
+  writeU32LE(dest, offset + 1, pageId)
+  writeU32LE(dest, offset + 5, uint32(payload.len))
+  if payload.len > 0:
+    copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
+  
+  let checksum = uint64(crc32c(dest.toOpenArray(offset, offset + HeaderSize + payload.len - 1)))
+  writeU64LE(dest, offset + HeaderSize + payload.len, checksum)
+  writeU64LE(dest, offset + HeaderSize + payload.len + 8, lsn)
+  result = needed
+
+proc encodeFrameIntoString(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: string, lsn: uint64): int =
   let needed = HeaderSize + payload.len + TrailerSize
   if dest.len < offset + needed:
     dest.setLen(max(dest.len * 2, offset + needed))
@@ -870,7 +892,7 @@ proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: Pag
 
 type WalWriter* = ref object
   wal*: Wal
-  pending*: seq[(PageId, seq[byte])]
+  pending*: seq[WalPendingPage]
   active*: bool
   flushed*: Table[PageId, WalIndexEntry]
 
@@ -882,18 +904,15 @@ proc beginWrite*(wal: Wal): Result[WalWriter] =
 proc writePage*(writer: WalWriter, pageId: PageId, data: seq[byte]): Result[Void] =
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
-  writer.pending.add((pageId, data))
+  writer.pending.add(WalPendingPage(pageId: pageId, bytes: data, str: "", isString: false))
   okVoid()
 
 proc writePageDirect*(writer: WalWriter, pageId: PageId, data: string): Result[Void] =
   ## Write page data directly without intermediate allocation.
-  ## Converts string data to bytes and adds to pending in one step.
+  ## Stores string data directly to avoid extra allocation/copy before encoding.
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
-  var bytes = newSeq[byte](data.len)
-  if data.len > 0:
-    copyMem(addr bytes[0], unsafeAddr data[0], data.len)
-  writer.pending.add((pageId, bytes))
+  writer.pending.add(WalPendingPage(pageId: pageId, bytes: @[], str: data, isString: true))
   okVoid()
 
 proc noteFlushedPage*(writer: WalWriter, pageId: PageId, lsn: uint64, offset: int64) =
@@ -935,7 +954,8 @@ proc commit*(writer: WalWriter): Result[uint64] =
   # Pre-size frame buffer to avoid incremental growth during encoding
   var expectedLen = HeaderSize + TrailerSize # commit frame
   for entry in writer.pending:
-    expectedLen += HeaderSize + TrailerSize + entry[1].len
+    let payloadLen = if entry.isString: entry.str.len else: entry.bytes.len
+    expectedLen += HeaderSize + TrailerSize + payloadLen
   if writer.wal.frameBuffer.len < expectedLen:
     writer.wal.frameBuffer.setLen(expectedLen)
   
@@ -945,7 +965,11 @@ proc commit*(writer: WalWriter): Result[uint64] =
     let lsn = writer.wal.nextLsn
     writer.wal.nextLsn.inc
     
-    let len = encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry[0]), entry[1], lsn)
+    let len =
+      if entry.isString:
+        encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.str, lsn)
+      else:
+        encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes, lsn)
     pageMeta.add((lsn, currentOffset))
     
     bufferOffset += len
@@ -1004,11 +1028,11 @@ proc commit*(writer: WalWriter): Result[uint64] =
   
   # Add pending pages to index
   for i, entry in writer.pending:
-    if not writer.wal.index.hasKey(entry[0]):
-      writer.wal.index[entry[0]] = @[]
+    if not writer.wal.index.hasKey(entry.pageId):
+      writer.wal.index[entry.pageId] = @[]
     let idxEntry = WalIndexEntry(lsn: pageMeta[i][0], offset: pageMeta[i][1])
-    writer.wal.index[entry[0]].add(idxEntry)
-    writer.wal.dirtySinceCheckpoint[entry[0]] = idxEntry
+    writer.wal.index[entry.pageId].add(idxEntry)
+    writer.wal.dirtySinceCheckpoint[entry.pageId] = idxEntry
 
   release(writer.wal.indexLock)
   writer.wal.walEnd.store(commitLsn, moRelease)

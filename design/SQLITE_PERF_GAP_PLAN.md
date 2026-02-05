@@ -877,3 +877,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009798 → gap **11.50×**  
 **Correctness/Durability:** No changes to WAL semantics or recovery.  
 **Follow-ups:** Next low-risk item: direct string-to-frame encoding (avoid string→seq copy).
+
+### 2) Direct string-to-frame encoding (Section 2: Memory Copying and Buffer Allocation)
+**Change:** Store pending pages as strings and encode directly into WAL frames to avoid string→seq allocation.  
+**Bench (run_id: 20260205_190231)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.1127165 | 0.1111285 | **Improved** (~1.4%) |
+| read_p95_ms | 0.001197 | 0.0011825 | Improved |
+| join_p95_ms | 0.497524 | 0.496702 | Improved |
+| insert_rows_per_sec | 195,020.60 | 199,036.46 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009117 → gap **12.19×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next low-risk item: release WAL lock before fsync (careful with commit window).
