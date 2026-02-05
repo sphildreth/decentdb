@@ -460,35 +460,42 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     if not insRes.ok: return err[Void](insRes.err.code, insRes.err.message, insRes.err.context)
     return okVoid()
 
-  let oldRes = readRowAt(pager, table, rowid)
-  if not oldRes.ok:
-    return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
+  var hasIndexes = false
   for _, idx in catalog.indexes:
-    if idx.table != tableName:
-      continue
-    var valueIndex = -1
-    for i, col in table.columns:
-      if col.name == idx.column:
-        valueIndex = i
-        break
-    if valueIndex >= 0:
-      if idx.kind == ikBtree:
-        let idxTree = newBTree(pager, idx.rootPage)
-        let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
-        let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
-        if not delRes.ok:
-          return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-        let newKey = indexKeyFromValue(values[valueIndex])
-        let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
-        if not idxInsert.ok:
-          return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
-        let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
-        if not syncRes.ok:
-          return syncRes
-      else:
-        let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], values[valueIndex])
-        if not updateRes.ok:
-          return updateRes
+    if idx.table == tableName:
+      hasIndexes = true
+      break
+
+  if hasIndexes:
+    let oldRes = readRowAt(pager, table, rowid)
+    if not oldRes.ok:
+      return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
+    for _, idx in catalog.indexes:
+      if idx.table != tableName:
+        continue
+      var valueIndex = -1
+      for i, col in table.columns:
+        if col.name == idx.column:
+          valueIndex = i
+          break
+      if valueIndex >= 0:
+        if idx.kind == ikBtree:
+          let idxTree = newBTree(pager, idx.rootPage)
+          let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
+          let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
+          if not delRes.ok:
+            return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+          let newKey = indexKeyFromValue(values[valueIndex])
+          let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
+          if not idxInsert.ok:
+            return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
+          let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
+          if not syncRes.ok:
+            return syncRes
+        else:
+          let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], values[valueIndex])
+          if not updateRes.ok:
+            return updateRes
   let normalizedRes = normalizeValues(pager, values)
   if not normalizedRes.ok:
     return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)

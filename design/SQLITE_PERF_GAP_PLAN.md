@@ -1080,3 +1080,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009227 → gap **8.53×**  
 **Correctness/Durability:** No changes to WAL semantics or recovery.  
 **Follow-ups:** Next high-ROI remains OS-level sync optimizations or zero-copy page cache.
+
+### 9) Skip old-row read when no secondary indexes (Storage update path)
+**Change:** In `updateRow`, avoid `readRowAt` + index maintenance when the table has no secondary/trigram indexes.  
+**Bench (run_id: 20260205_231025)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.075632 | **Improved** (~3.9%) |
+| read_p95_ms | 0.001182 | 0.0012075 | +2.16% (within noise) |
+| join_p95_ms | 0.447451 | 0.4497395 | +0.51% (within noise) |
+| insert_rows_per_sec | 198,258.17 | 197,962.03 | -0.15% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009588 → gap **7.89×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next high-ROI remains zero-copy page cache / mmap WAL or OS-level sync optimizations (if any).
