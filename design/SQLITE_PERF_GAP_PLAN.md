@@ -909,3 +909,18 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009508 → gap **10.07×**  
 **Correctness/Durability:** CRC32C semantics preserved; added slow-vs-fast test for parity.  
 **Follow-ups:** Next medium effort: release lock before fsync (ADR required) or CRC32C removal (ADR required).
+
+### Rejected: Single-page direct WAL write via `writev`
+**Change:** Added streaming CRC + `writev` path for single-page commits to avoid copying payload into `frameBuffer`.  
+**Bench (run_id: 20260205_192133)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.09579 | 0.0968015 | **Regressed** (~1.1%) |
+| read_p95_ms | 0.001177 | 0.0011825 | Flat |
+| join_p95_ms | 0.4711145 | 0.473148 | Flat |
+| insert_rows_per_sec | 196,183.58 | 200,588.67 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** Possible syscall overhead from `writev` path offset the copy savings in this workload.
