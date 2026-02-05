@@ -32,7 +32,7 @@ Current scope (0.x, pre-1.0): single process, multi-threaded readers, single wri
 
 3. **wal/**
    - WAL file append and recovery
-   - Frame checksums, commit markers
+   - Frame trailer (checksum reserved in v5), commit markers
    - WAL index (in-memory map pageId -> latest frame offset for fast reads)
 
 4. **btree/**
@@ -117,6 +117,7 @@ See ADR-0016 for checksum calculation details.
 
 **Format version notes:**
 - v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
+- v5 removes per-frame WAL CRC32C validation (checksum field reserved, written as zero).
 - v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
 
 ### 3.4 Catalog record encoding (v2)
@@ -154,7 +155,7 @@ Each frame appends:
 - `page_id` (u32, valid for page frames)
 - `payload_size` (u32)
 - payload (page image or commit metadata)
-- `frame_checksum` (u64, CRC-32C of header + payload)
+- `frame_checksum` (u64, **reserved**, written as 0 in format v5)
 - `lsn` (u64 monotonically increasing)
 
 **Frame Types:**
@@ -172,9 +173,10 @@ Commit rule:
 - A transaction is committed when a COMMIT frame is durably written.
 - Default durability: `fsync(wal)` on commit.
 
-**Torn Write Detection:**
+**Torn Write Detection (format v5):**
 - Frame header includes `payload_size` for validation
-- Recovery ignores incomplete frames (checksum mismatch or size truncation)
+- Recovery ignores incomplete frames (short reads / size truncation)
+- Frame type and basic invariants are validated (e.g., page_id != 0 for page frames)
 
 ### 4.2 Snapshot reads
 On read transaction start:
@@ -235,7 +237,7 @@ See ADR-0017 for detailed design.
 ### 4.5 Crash recovery
 On open:
 - scan WAL from last checkpoint
-- validate frame checksums
+- validate frame invariants (type, payload_size, lsn)
 - apply frames up to last commit boundary into walIndex view
 - DB becomes readable immediately using WAL overlay
 - optional: perform checkpoint soon after open
@@ -497,7 +499,7 @@ Not planned for 0.x. If pursued:
 ### 13.1 Error codes
 Define error categories:
 - `ERR_IO`: File I/O errors (disk full, permissions, corruption)
-- `ERR_CORRUPTION`: Database corruption detected (checksum mismatch)
+- `ERR_CORRUPTION`: Database corruption detected (invalid frame/header, checksum mismatch when applicable)
 - `ERR_CONSTRAINT`: Constraint violation (FK, unique, NOT NULL)
 - `ERR_TRANSACTION`: Transaction errors (deadlock, timeout)
 - `ERR_SQL`: SQL syntax or semantic errors
@@ -514,7 +516,7 @@ Define error categories:
 ### 13.3 Error messages
 - Include error code, human-readable message, and context
 - For constraint violations: include table/column and violating value
-- For corruption: include page ID and expected vs actual checksum
+- For corruption: include page ID and invariant details (checksum mismatch when applicable)
 
 ---
 

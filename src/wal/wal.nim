@@ -102,8 +102,7 @@ proc encodeFrameInto(dest: var seq[byte], offset: int, frameType: WalFrameType, 
   if payload.len > 0:
     copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
   
-  let checksum = uint64(crc32c(dest.toOpenArray(offset, offset + HeaderSize + payload.len - 1)))
-  writeU64LE(dest, offset + HeaderSize + payload.len, checksum)
+  writeU64LE(dest, offset + HeaderSize + payload.len, 0)
   writeU64LE(dest, offset + HeaderSize + payload.len + 8, lsn)
   result = needed
 
@@ -118,8 +117,7 @@ proc encodeFrameIntoString(dest: var seq[byte], offset: int, frameType: WalFrame
   if payload.len > 0:
     copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
   
-  let checksum = uint64(crc32c(dest.toOpenArray(offset, offset + HeaderSize + payload.len - 1)))
-  writeU64LE(dest, offset + HeaderSize + payload.len, checksum)
+  writeU64LE(dest, offset + HeaderSize + payload.len, 0)
   writeU64LE(dest, offset + HeaderSize + payload.len + 8, lsn)
   result = needed
 
@@ -152,11 +150,7 @@ proc readFrame(vfs: Vfs, file: VfsFile, offset: int64): Result[(WalFrameType, ui
     return err[(WalFrameType, uint32, seq[byte], uint64, int64)](trailerRes.err.code, trailerRes.err.message, trailerRes.err.context)
   if trailerRes.value < TrailerSize:
     return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_IO, "Short trailer read")
-  let checksum = readU64LE(trailer, 0)
   let lsn = readU64LE(trailer, 8)
-  let computed = uint64(crc32c(header & payload))
-  if checksum != computed:
-    return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_CORRUPTION, "Checksum mismatch")
   let nextOffset = offset + HeaderSize + payloadSize + TrailerSize
   ok((frameType, pageId, payload, lsn, nextOffset))
 

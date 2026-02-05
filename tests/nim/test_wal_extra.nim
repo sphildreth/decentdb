@@ -56,8 +56,8 @@ suite "WAL Extra":
     discard closePager(pager)
     discard closeDb(db)
 
-  test "recover stops on bad checksum":
-    let path = makeTempDb("decentdb_wal_bad_checksum.db")
+  test "recover stops on invalid frame type":
+    let path = makeTempDb("decentdb_wal_bad_frame_type.db")
     let dbRes = openDb(path)
     check dbRes.ok
     let db = dbRes.value
@@ -68,12 +68,12 @@ suite "WAL Extra":
     # Write a malformed frame directly.
     let payload = @[byte(1), byte(2), byte(3)]
     var buf = newSeq[byte](1 + 4 + 4 + payload.len + 16)
-    buf[0] = byte(wfPage)
+    buf[0] = 0xFF'u8
     writeU32LE(buf, 1, 1'u32)
     writeU32LE(buf, 5, uint32(payload.len))
     for i, b in payload:
       buf[9 + i] = b
-    # Bad checksum/lsn (zeros)
+    # Trailer left as zeros (checksum/lsn)
     discard db.vfs.write(wal.file, int64(0), buf)
 
     check recover(wal).ok

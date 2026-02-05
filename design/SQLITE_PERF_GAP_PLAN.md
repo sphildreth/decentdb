@@ -924,3 +924,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** Possible syscall overhead from `writev` path offset the copy savings in this workload.
+
+### 4) Remove per-frame WAL CRC32C (format v5) (Section 1: WAL Frame Format Overhead)
+**Change:** Stop computing/validating per-frame CRC32C. The checksum field is now reserved and written as zero in format v5.  
+**Bench (run_id: 20260205_192941)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.09579 | 0.082635 | **Improved** (~13.7%) |
+| read_p95_ms | 0.001177 | 0.001187 | +0.85% (within noise) |
+| join_p95_ms | 0.4711145 | 0.4578895 | Improved |
+| insert_rows_per_sec | 196,183.58 | 195,730.08 | -0.23% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.008917 → gap **9.27×**  
+**Correctness/Durability:** Per-frame corruption detection removed; recovery now validates frame invariants only. WAL format version bumped to v5 (new DBs only).  
+**Follow-ups:** Next medium effort: remove per-frame LSN trailer (ADR required) or release wal lock before fsync (ADR required).
