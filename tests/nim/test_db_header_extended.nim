@@ -6,6 +6,40 @@ import errors
 import strutils
 
 suite "DB Header Extended":
+  proc crc32cSlow(data: openArray[byte]): uint32 =
+    const Poly = 0x82F63B78'u32
+    var table: array[256, uint32]
+    for i in 0 .. 255:
+      var crc = uint32(i)
+      for _ in 0 .. 7:
+        if (crc and 1) == 1:
+          crc = (crc shr 1) xor Poly
+        else:
+          crc = crc shr 1
+      table[i] = crc
+    var current = 0xFFFFFFFF'u32
+    for b in data:
+      let idx = (current xor uint32(b)) and 0xFF'u32
+      current = (current shr 8) xor table[int(idx)]
+    current xor 0xFFFFFFFF'u32
+
+  proc crc32cSlow(data: string): uint32 =
+    const Poly = 0x82F63B78'u32
+    var table: array[256, uint32]
+    for i in 0 .. 255:
+      var crc = uint32(i)
+      for _ in 0 .. 7:
+        if (crc and 1) == 1:
+          crc = (crc shr 1) xor Poly
+        else:
+          crc = crc shr 1
+      table[i] = crc
+    var current = 0xFFFFFFFF'u32
+    for ch in data:
+      let b = uint32(byte(ch))
+      let idx = (current xor b) and 0xFF'u32
+      current = (current shr 8) xor table[int(idx)]
+    current xor 0xFFFFFFFF'u32
   test "writeU32LE with byte array":
     var buf: array[4, byte]
     writeU32LE(buf, 0, 0x12345678'u32)
@@ -75,6 +109,12 @@ suite "DB Header Extended":
     let result = crc32c("")
     let expected = 0xFFFFFFFF'u32 xor 0xFFFFFFFF'u32
     check result == expected  # ~0 ^ ~0 = 0
+
+  test "crc32c fast matches slow":
+    let data = "The quick brown fox jumps over the lazy dog"
+    check crc32c(data) == crc32cSlow(data)
+    let bytes = @[byte('A'), byte('B'), byte('C'), byte('D'), byte('E'), byte('F'), byte('G'), byte('H'), byte('I')]
+    check crc32c(bytes) == crc32cSlow(bytes)
 
   test "headerMagicOk with valid magic":
     var buf = newSeq[byte](128)

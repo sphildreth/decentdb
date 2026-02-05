@@ -893,3 +893,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009117 → gap **12.19×**  
 **Correctness/Durability:** No changes to WAL semantics or recovery.  
 **Follow-ups:** Next low-risk item: release WAL lock before fsync (careful with commit window).
+
+### 3) Faster CRC32C (slicing-by-8) (Section 1: WAL Frame Format Overhead)
+**Change:** Replace byte-at-a-time CRC32C with slicing-by-8 table implementation (same polynomial/semantics).  
+**Bench (run_id: 20260205_191231)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.1111285 | 0.09579 | **Improved** (~13.8%) |
+| read_p95_ms | 0.0011825 | 0.001177 | Improved |
+| join_p95_ms | 0.496702 | 0.4711145 | Improved |
+| insert_rows_per_sec | 199,036.46 | 196,183.58 | -1.43% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009508 → gap **10.07×**  
+**Correctness/Durability:** CRC32C semantics preserved; added slow-vs-fast test for parity.  
+**Follow-ups:** Next medium effort: release lock before fsync (ADR required) or CRC32C removal (ADR required).
