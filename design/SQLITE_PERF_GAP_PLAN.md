@@ -1112,3 +1112,18 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009919 → gap **7.69×**  
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** The cache lookup/management overhead outweighed the avoided per-update string building in this workload.
+
+### Meta: ADR 0067 WAL mmap write path (no code change)
+**Change:** Added ADR documenting the mmap-backed WAL write path decision.  
+**Bench (run_id: 20260205_235412)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.0748005 | Improved (run-to-run noise; no code change) |
+| read_p95_ms | 0.0012075 | 0.0012225 | +1.2% (noise) |
+| join_p95_ms | 0.4497395 | 0.4669415 | +3.8% (noise) |
+| insert_rows_per_sec | 197,962.03 | 193,957.51 | -2.0% (noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.01024 → gap **7.30×**  
+**Correctness/Durability:** No code change; documentation only.  
