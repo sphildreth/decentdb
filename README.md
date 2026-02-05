@@ -60,6 +60,9 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 | Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
 | Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 
+## Tools
+**[MehSQL](https://github.com/sphildreth/mehsql)** - Native cross platform DecentDB SQL Query tool.
+
 ## Performance (at a glance)
 
 <p align="center">
