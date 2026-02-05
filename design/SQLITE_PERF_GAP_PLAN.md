@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.0790ms (after optimizations)
-- SQLite p95 commit latency: ~0.00980ms
-- **Gap:** ~8.06x slower
+- DecentDB p95 commit latency: ~0.0787ms (after optimizations)
+- SQLite p95 commit latency: ~0.00981ms
+- **Gap:** ~8.02x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
@@ -45,16 +45,15 @@ This plan targets **commit latency** specifically, but changes must not “win�
 ```
 [1 byte]   Frame type (wfPage = 0x01, wfCommit = 0x02, wfCheckpoint = 0x03)
 [4 bytes]  Page ID (uint32)
-[4 bytes]  Payload length (uint32) 
 [N bytes]  Page data (typically 4096 bytes)
 [8 bytes]  Checksum (reserved, zero in v5+)
 ────────────────────────────
-Total overhead per frame: 17 bytes
+Total overhead per frame: 13 bytes
 ```
 
 **For a single-page commit (typical UPDATE):**
-- Bytes written: 17 (frame) + 17 (commit frame) = 34 bytes overhead
-- Plus 4096 bytes of actual page data = 4130 bytes total
+- Bytes written: 13 (frame) + 13 (commit frame) = 26 bytes overhead
+- Plus 4096 bytes of actual page data = 4122 bytes total
 - No per-frame CRC32C in v6 (checksum field reserved)
 
 ### SQLite Approach
@@ -70,8 +69,8 @@ Total overhead per frame: ~4-8 bytes
 
 **Key Differences:**
 1. **No frame type field**: SQLite infers frame type from position/context
-2. **No length field**: Page size is known from database header
-3. **No per-frame LSN**: LSN is implicit from WAL header + frame position
+2. **No length field (DecentDB v7 matches)**: Page size is known from database header
+3. **No per-frame LSN (DecentDB v6 matches)**: LSN is implicit from WAL header + frame position
 4. **No per-frame CRC32C (DecentDB v5+ matches)**: SQLite uses:
    - 32-bit salt in WAL header for each transaction
    - Per-transaction checksum (not per-page)
@@ -971,3 +970,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009799 → gap **8.06×**  
 **Correctness/Durability:** No changes to WAL semantics or recovery.  
 **Follow-ups:** Next medium effort: simplify frame header (remove payload length / frame type) or unify page representation for zero-copy WAL writes (ADR required).
+
+### 7) Remove WAL payload length field (format v7) (Section 1: WAL Frame Format Overhead)
+**Change:** Remove `payload_length` from frame headers; payload sizes are derived from frame type and page size.  
+**Bench (run_id: 20260205_195032)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0790035 | 0.078693 | **Improved** (~0.4%) |
+| read_p95_ms | 0.001172 | 0.001177 | +0.4% (within noise) |
+| join_p95_ms | 0.4491985 | 0.4447445 | Improved |
+| insert_rows_per_sec | 201,193.70 | 200,154.99 | -0.5% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009808 → gap **8.02×**  
+**Correctness/Durability:** WAL format version bumped to v7; payload size derived from frame type and page size.  
+**Follow-ups:** Next medium effort: remove frame type field (infer from position) or unify page representation for zero-copy WAL writes (ADR required).

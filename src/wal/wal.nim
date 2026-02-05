@@ -53,6 +53,7 @@ type Wal* = ref object
   vfs*: Vfs
   file*: VfsFile
   path*: string
+  pageSize*: uint32
   walEnd*: Atomic[uint64]
   endOffset*: int64
   index*: Table[PageId, seq[WalIndexEntry]]
@@ -87,8 +88,17 @@ type Wal* = ref object
   commitsSinceCheckpointCheck*: int64  # Commits since last full checkpoint check
   checkpointCheckInterval*: int64      # Check time/memory every N commits (0 = always)
 
-const HeaderSize = 1 + 4 + 4
+const HeaderSize = 1 + 4
 const TrailerSize = 8
+
+proc payloadSizeFor(frameType: WalFrameType, pageSize: uint32): int =
+  case frameType
+  of wfPage:
+    int(pageSize)
+  of wfCommit:
+    0
+  of wfCheckpoint:
+    8
 
 proc encodeFrameInto(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): int =
   let needed = HeaderSize + payload.len + TrailerSize
@@ -97,7 +107,6 @@ proc encodeFrameInto(dest: var seq[byte], offset: int, frameType: WalFrameType, 
   
   dest[offset] = byte(frameType)
   writeU32LE(dest, offset + 1, pageId)
-  writeU32LE(dest, offset + 5, uint32(payload.len))
   if payload.len > 0:
     copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
   
@@ -111,7 +120,6 @@ proc encodeFrameIntoString(dest: var seq[byte], offset: int, frameType: WalFrame
   
   dest[offset] = byte(frameType)
   writeU32LE(dest, offset + 1, pageId)
-  writeU32LE(dest, offset + 5, uint32(payload.len))
   if payload.len > 0:
     copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
   
@@ -122,7 +130,7 @@ proc encodeFrame(frameType: WalFrameType, pageId: uint32, payload: openArray[byt
   result = newSeq[byte](HeaderSize + payload.len + TrailerSize)
   discard encodeFrameInto(result, 0, frameType, pageId, payload)
 
-proc readFrame(vfs: Vfs, file: VfsFile, offset: int64): Result[(WalFrameType, uint32, seq[byte], uint64, int64)] =
+proc readFrame(vfs: Vfs, file: VfsFile, offset: int64, pageSize: uint32): Result[(WalFrameType, uint32, seq[byte], uint64, int64)] =
   var header = newSeq[byte](HeaderSize)
   let headerRes = vfs.read(file, offset, header)
   if not headerRes.ok:
@@ -134,13 +142,14 @@ proc readFrame(vfs: Vfs, file: VfsFile, offset: int64): Result[(WalFrameType, ui
     return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_CORRUPTION, "Invalid frame type", "type=" & $rawFrameType)
   let frameType = WalFrameType(rawFrameType)
   let pageId = readU32LE(header, 1)
-  let payloadSize = int(readU32LE(header, 5))
+  let payloadSize = payloadSizeFor(frameType, pageSize)
   var payload = newSeq[byte](payloadSize)
-  let payloadRes = vfs.read(file, offset + HeaderSize, payload)
-  if not payloadRes.ok:
-    return err[(WalFrameType, uint32, seq[byte], uint64, int64)](payloadRes.err.code, payloadRes.err.message, payloadRes.err.context)
-  if payloadRes.value < payloadSize:
-    return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_IO, "Short payload read")
+  if payloadSize > 0:
+    let payloadRes = vfs.read(file, offset + HeaderSize, payload)
+    if not payloadRes.ok:
+      return err[(WalFrameType, uint32, seq[byte], uint64, int64)](payloadRes.err.code, payloadRes.err.message, payloadRes.err.context)
+    if payloadRes.value < payloadSize:
+      return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_IO, "Short payload read")
   var trailer = newSeq[byte](TrailerSize)
   let trailerRes = vfs.read(file, offset + HeaderSize + payloadSize, trailer)
   if not trailerRes.ok:
@@ -151,7 +160,7 @@ proc readFrame(vfs: Vfs, file: VfsFile, offset: int64): Result[(WalFrameType, ui
   let lsn = uint64(nextOffset)
   ok((frameType, pageId, payload, lsn, nextOffset))
 
-proc newWal*(vfs: Vfs, path: string): Result[Wal] =
+proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result[Wal] =
   let fileRes = vfs.open(path, fmReadWrite, true)
   if not fileRes.ok:
     return err[Wal](fileRes.err.code, fileRes.err.message, fileRes.err.context)
@@ -159,6 +168,7 @@ proc newWal*(vfs: Vfs, path: string): Result[Wal] =
     vfs: vfs,
     file: fileRes.value,
     path: path,
+    pageSize: pageSize,
     endOffset: getFileInfo(path).size,
     index: initTable[PageId, seq[WalIndexEntry]](),
     dirtySinceCheckpoint: initTable[PageId, WalIndexEntry](),
@@ -447,7 +457,7 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
 
   # Phase 2: Perform I/O operations without holding the main lock
   for entry in toCheckpoint:
-    let frameRes = readFrame(wal.vfs, wal.file, entry[1])
+    let frameRes = readFrame(wal.vfs, wal.file, entry[1], wal.pageSize)
     if not frameRes.ok:
       acquire(wal.lock)
       wal.checkpointPending = false
@@ -645,7 +655,7 @@ proc recover*(wal: Wal): Result[Void] =
   
   while true:
     let frameOffset = offset
-    let frameRes = readFrame(wal.vfs, wal.file, frameOffset)
+    let frameRes = readFrame(wal.vfs, wal.file, frameOffset, wal.pageSize)
     if not frameRes.ok:
       break
     let (frameType, pageId, payload, lsn, nextOffset) = frameRes.value
@@ -837,7 +847,7 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
     return none(seq[byte])
   
   let bestOffset = bestEntryOpt.get.offset
-  let frameRes = readFrame(wal.vfs, wal.file, bestOffset)
+  let frameRes = readFrame(wal.vfs, wal.file, bestOffset, wal.pageSize)
   if not frameRes.ok:
     return none(seq[byte])
   let (frameType, framePageId, payload, _, _) = frameRes.value
@@ -848,7 +858,7 @@ proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[
 proc readFramePayload*(wal: Wal, offset: int64): Option[string] =
   ## Read just the payload of a frame at a known offset.
   ## Used for reading flushed-but-uncommitted pages.
-  let res = readFrame(wal.vfs, wal.file, offset)
+  let res = readFrame(wal.vfs, wal.file, offset, wal.pageSize)
   if not res.ok:
     return none(string)
   let (_, _, payload, _, _) = res.value

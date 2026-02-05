@@ -138,7 +138,7 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
 
   # Initialize WAL
   let walPath = path & "-wal"
-  let walRes = newWal(vfs, walPath)
+  let walRes = newWal(vfs, walPath, header.pageSize)
   if not walRes.ok:
     discard closePager(pager)
     discard vfs.close(file)

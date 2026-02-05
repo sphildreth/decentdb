@@ -119,6 +119,7 @@ See ADR-0016 for checksum calculation details.
 - v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
 - v5 removes per-frame WAL CRC32C validation (checksum field reserved, written as zero).
 - v6 removes per-frame WAL LSN trailer; LSNs are derived from frame end offsets.
+- v7 removes WAL `payload_size` field; payload sizes are derived from frame type and page size.
 - v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
 
 ### 3.4 Catalog record encoding (v2)
@@ -154,13 +155,17 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 Each frame appends:
 - `frame_type` (u8): 0=page, 1=commit, 2=checkpoint
 - `page_id` (u32, valid for page frames)
-- `payload_size` (u32)
 - payload (page image or commit metadata)
 - `frame_checksum` (u64, **reserved**, written as 0 in format v5)
 
 **LSN (format v6):**
 - LSNs are derived from WAL byte offsets (frame end offset).
 - `wal_end_lsn` is the WAL end offset after the last committed frame.
+
+**Payload size (format v7):**
+- PAGE frames: `pageSize`
+- COMMIT frames: 0 bytes
+- CHECKPOINT frames: 8 bytes (`checkpoint_lsn`)
 
 **Frame Types:**
 - **PAGE (0)**: Contains modified page data
