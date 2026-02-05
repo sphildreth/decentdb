@@ -878,18 +878,30 @@ proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: Pag
 type WalWriter* = ref object
   wal*: Wal
   pending*: seq[WalPendingPage]
+  pendingSingle*: WalPendingPage
+  hasPendingSingle*: bool
   active*: bool
   flushed*: Table[PageId, WalIndexEntry]
 
 proc beginWrite*(wal: Wal): Result[WalWriter] =
   acquire(wal.lock)
-  let writer = WalWriter(wal: wal, pending: @[], active: true, flushed: initTable[PageId, WalIndexEntry]())
+  let writer = WalWriter(wal: wal, pending: @[], active: true, hasPendingSingle: false, flushed: initTable[PageId, WalIndexEntry]())
   ok(writer)
+
+proc addPending(writer: WalWriter, entry: WalPendingPage) =
+  if writer.pending.len > 0:
+    writer.pending.add(entry)
+  elif writer.hasPendingSingle:
+    writer.pending = @[writer.pendingSingle, entry]
+    writer.hasPendingSingle = false
+  else:
+    writer.pendingSingle = entry
+    writer.hasPendingSingle = true
 
 proc writePage*(writer: WalWriter, pageId: PageId, data: seq[byte]): Result[Void] =
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
-  writer.pending.add(WalPendingPage(pageId: pageId, bytes: data, str: "", isString: false))
+  writer.addPending(WalPendingPage(pageId: pageId, bytes: data, str: "", isString: false))
   okVoid()
 
 proc writePageDirect*(writer: WalWriter, pageId: PageId, data: string): Result[Void] =
@@ -897,7 +909,7 @@ proc writePageDirect*(writer: WalWriter, pageId: PageId, data: string): Result[V
   ## Stores string data directly to avoid extra allocation/copy before encoding.
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
-  writer.pending.add(WalPendingPage(pageId: pageId, bytes: @[], str: data, isString: true))
+  writer.addPending(WalPendingPage(pageId: pageId, bytes: @[], str: data, isString: true))
   okVoid()
 
 proc noteFlushedPage*(writer: WalWriter, pageId: PageId, lsn: uint64, offset: int64) =
@@ -931,13 +943,16 @@ proc commit*(writer: WalWriter): Result[uint64] =
   # Optimization: Batch all writes into a single buffer and single fsync
   # This reduces lock contention and system calls significantly.
   
-  var pageMeta: seq[(uint64, int64)] = @[]
+  var pageMeta: seq[(PageId, WalIndexEntry)] = @[]
   var bufferOffset = 0
   let startOffset = writer.wal.endOffset
   var currentOffset = startOffset
   
   # Pre-size frame buffer to avoid incremental growth during encoding
   var expectedLen = HeaderSize + TrailerSize # commit frame
+  if writer.hasPendingSingle:
+    let payloadLen = if writer.pendingSingle.isString: writer.pendingSingle.str.len else: writer.pendingSingle.bytes.len
+    expectedLen += HeaderSize + TrailerSize + payloadLen
   for entry in writer.pending:
     let payloadLen = if entry.isString: entry.str.len else: entry.bytes.len
     expectedLen += HeaderSize + TrailerSize + payloadLen
@@ -945,6 +960,19 @@ proc commit*(writer: WalWriter): Result[uint64] =
     writer.wal.frameBuffer.setLen(expectedLen)
   
   # 1. Encode all pending pages into the shared buffer
+  if writer.hasPendingSingle:
+    perf.WalGrowthWriter.inc()
+    let frameStart = currentOffset
+    let len =
+      if writer.pendingSingle.isString:
+        encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
+      else:
+        encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
+    let frameEnd = frameStart + int64(len)
+    pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
+    bufferOffset += len
+    currentOffset = frameEnd
+
   for entry in writer.pending:
     perf.WalGrowthWriter.inc()
     let len =
@@ -953,7 +981,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
       else:
         encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
     let frameEnd = currentOffset + int64(len)
-    pageMeta.add((uint64(frameEnd), currentOffset))
+    pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
     
     bufferOffset += len
     currentOffset += int64(len)
@@ -1007,22 +1035,24 @@ proc commit*(writer: WalWriter): Result[uint64] =
     writer.wal.dirtySinceCheckpoint[pageId] = entry
   
   # Add pending pages to index
-  for i, entry in writer.pending:
-    if not writer.wal.index.hasKey(entry.pageId):
-      writer.wal.index[entry.pageId] = @[]
-    let idxEntry = WalIndexEntry(lsn: pageMeta[i][0], offset: pageMeta[i][1])
-    writer.wal.index[entry.pageId].add(idxEntry)
-    writer.wal.dirtySinceCheckpoint[entry.pageId] = idxEntry
+  for entry in pageMeta:
+    if not writer.wal.index.hasKey(entry[0]):
+      writer.wal.index[entry[0]] = @[]
+    writer.wal.index[entry[0]].add(entry[1])
+    writer.wal.dirtySinceCheckpoint[entry[0]] = entry[1]
 
   release(writer.wal.indexLock)
   let commitLsn = uint64(writer.wal.endOffset)
   writer.wal.walEnd.store(commitLsn, moRelease)
   writer.active = false
   release(writer.wal.lock)
+  writer.pending = @[]
+  writer.hasPendingSingle = false
   ok(commitLsn)
 
 proc rollback*(writer: WalWriter): Result[Void] =
   writer.pending = @[]
+  writer.hasPendingSingle = false
   writer.flushed.clear()
   writer.active = false
   release(writer.wal.lock)

@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.0795ms (after optimizations)
-- SQLite p95 commit latency: ~0.00941ms
-- **Gap:** ~8.45x slower
+- DecentDB p95 commit latency: ~0.0790ms (after optimizations)
+- SQLite p95 commit latency: ~0.00980ms
+- **Gap:** ~8.06x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
@@ -954,4 +954,20 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 
 **SQLite reference (same run):** commit_p95_ms = 0.009408 → gap **8.45×**  
 **Correctness/Durability:** LSNs now derived from WAL byte offsets; WAL format version bumped to v6 (new DBs only).  
+**Follow-ups:** Next medium effort: simplify frame header (remove payload length / frame type) or unify page representation for zero-copy WAL writes (ADR required).
+
+### 6) Single-page pending fast path (Section 2: Memory Copying and Buffer Allocation)
+**Change:** Avoid allocating the pending queue for single-page commits by storing the first pending page inline.  
+**Bench (run_id: 20260205_194416)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0794645 | 0.0790035 | **Improved** (~0.6%) |
+| read_p95_ms | 0.0011725 | 0.001172 | Flat |
+| join_p95_ms | 0.44195 | 0.4491985 | +1.6% (within noise) |
+| insert_rows_per_sec | 201,869.72 | 201,193.70 | -0.3% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009799 → gap **8.06×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
 **Follow-ups:** Next medium effort: simplify frame header (remove payload length / frame type) or unify page representation for zero-copy WAL writes (ADR required).
