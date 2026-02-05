@@ -2527,13 +2527,10 @@ proc commitTransaction*(db: Db): Result[Void] =
   let dirtyPages = snapshotDirtyPages(db.pager)
   var pageIds: seq[PageId] = @[]
 
+  # Optimization: Use writePageDirect to avoid double allocation/copy
   for entry in dirtyPages:
-    var bytes = newSeq[byte](entry[1].len)
-    if entry[1].len > 0:
-      copyMem(addr bytes[0], unsafeAddr entry[1][0], entry[1].len)
-    let writeRes = writePage(db.activeWriter, entry[0], bytes)
+    let writeRes = writePageDirect(db.activeWriter, entry[0], entry[1])
     if not writeRes.ok:
-
       discard rollback(db.activeWriter)
       db.activeWriter = nil
       db.pager.flushHandler = nil
