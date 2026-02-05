@@ -1,8 +1,8 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.115ms (after optimizations)
-- SQLite p95 commit latency: ~0.010ms
+- DecentDB p95 commit latency: ~0.113082ms (after optimizations)
+- SQLite p95 commit latency: ~0.010159ms
 - **Gap:** ~11.5x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
@@ -13,6 +13,27 @@
 - Multi-process concurrency optimizations (out of scope for 0.x)
 
 **Note on Impact Estimates:** Throughout this document, improvement percentages are **multiplicative, not additive**. For example, a 40% improvement followed by a 20% improvement yields `0.6 × 0.8 = 0.48` (52% total improvement), not 60%.
+
+## Cross-metric guardrails (do not regress the rest of the chart)
+
+This plan targets **commit latency** specifically, but changes must not “win” by shifting cost into other benchmarked dimensions.
+
+**Primary metric (this doc):**
+- `commit_p95_ms` (durability = safe)
+
+**Must-not-regress metrics (README chart suite):**
+- `read_p95_ms` (point reads)
+- `join_p95_ms`
+- `insert_rows_per_sec` (durability = safe)
+- `db_size_mb`
+
+**Acceptance rule:**
+- For any optimization proposed here, re-run the full embedded benchmark pipeline and only accept the change if commit latency improves **and** the other benchmarked metrics do not materially regress beyond run-to-run noise.
+- If a tradeoff is genuinely unavoidable, it must be documented explicitly (what regresses, why) and treated as a deliberate product decision rather than an incidental side effect.
+
+**How to enforce:**
+- Use the existing benchmark pipeline (`nimble bench_embedded_pipeline`) and compare aggregated outputs (median-of-runs) rather than single-run results.
+- Always report the “full metric surface” for a change (not just commit latency) when updating the plan or implementing items from it.
 
 ---
 
