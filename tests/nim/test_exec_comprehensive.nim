@@ -1,14 +1,12 @@
 import unittest
 import os
 import strutils
-import sequtils
 import algorithm
 
 import engine
 import exec/exec
 import record/record
 import sql/sql
-import catalog/catalog
 import errors
 
 proc makeTempDb(name: string): string =

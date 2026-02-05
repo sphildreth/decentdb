@@ -10,7 +10,7 @@ Output:
 
 Rules:
   - For each engine and metric, compute median-of-runs for p95 values.
-  - Convert units: microseconds -> milliseconds, bytes -> MB.
+  - Convert units: nanoseconds/microseconds -> milliseconds, bytes -> MB.
   - Baseline engine SQLite must be present.
 """
 
@@ -57,8 +57,16 @@ def get_machine_info():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="benchmarks/embedded_compare/raw", help="Folder containing raw benchmark outputs")
-    ap.add_argument("--output", default="benchmarks/embedded_compare/data/bench_summary.json", help="Output JSON path")
+    ap.add_argument(
+        "--input",
+        default="benchmarks/embedded_compare/raw",
+        help="Folder containing raw benchmark outputs",
+    )
+    ap.add_argument(
+        "--output",
+        default="benchmarks/embedded_compare/data/bench_summary.json",
+        help="Output JSON path",
+    )
     args = ap.parse_args()
 
     inp = Path(args.input)
@@ -84,6 +92,12 @@ def main():
         if not engine or not benchmark:
             continue
 
+        # Prefer nanosecond percentiles when available to avoid microsecond
+        # quantization for very fast operations.
+        p95_ns = metrics.get("p95_ns")
+        if p95_ns is not None:
+            data[(engine, benchmark)]["p95_ns"].append(float(p95_ns))
+
         p95_us = metrics.get("p95_us")
         if p95_us is not None:
             data[(engine, benchmark)]["p95_us"].append(float(p95_us))
@@ -92,9 +106,6 @@ def main():
             ops_per_sec = metrics.get("ops_per_sec")
             if ops_per_sec is not None:
                 data[(engine, "insert")]["ops_per_sec"].append(float(ops_per_sec))
-            db_size_bytes = artifacts.get("db_size_bytes")
-            if db_size_bytes is not None:
-                data[(engine, "insert")]["db_size_bytes"].append(float(db_size_bytes))
 
     engines = {}
 
@@ -103,24 +114,30 @@ def main():
             engines[engine] = {}
 
         if benchmark == "point_read":
+            p95_ns_values = values_dict.get("p95_ns", [])
             p95_us_values = values_dict.get("p95_us", [])
-            if p95_us_values:
+            if p95_ns_values:
+                engines[engine]["read_p95_ms"] = median(p95_ns_values) / 1_000_000.0
+            elif p95_us_values:
                 engines[engine]["read_p95_ms"] = median(p95_us_values) / 1000.0
         elif benchmark == "join":
+            p95_ns_values = values_dict.get("p95_ns", [])
             p95_us_values = values_dict.get("p95_us", [])
-            if p95_us_values:
+            if p95_ns_values:
+                engines[engine]["join_p95_ms"] = median(p95_ns_values) / 1_000_000.0
+            elif p95_us_values:
                 engines[engine]["join_p95_ms"] = median(p95_us_values) / 1000.0
         elif benchmark == "commit_latency":
+            p95_ns_values = values_dict.get("p95_ns", [])
             p95_us_values = values_dict.get("p95_us", [])
-            if p95_us_values:
+            if p95_ns_values:
+                engines[engine]["commit_p95_ms"] = median(p95_ns_values) / 1_000_000.0
+            elif p95_us_values:
                 engines[engine]["commit_p95_ms"] = median(p95_us_values) / 1000.0
         elif benchmark == "insert":
             ops_per_sec_values = values_dict.get("ops_per_sec", [])
             if ops_per_sec_values:
                 engines[engine]["insert_rows_per_sec"] = median(ops_per_sec_values)
-            db_size_bytes_values = values_dict.get("db_size_bytes", [])
-            if db_size_bytes_values:
-                engines[engine]["db_size_mb"] = median(db_size_bytes_values) / (1024.0 * 1024.0)
 
     if "SQLite" not in engines:
         raise SystemExit("Baseline engine 'SQLite' not found in benchmark data")
@@ -138,10 +155,9 @@ def main():
                 "join_p95_ms": "ms (lower is better)",
                 "commit_p95_ms": "ms (lower is better)",
                 "insert_rows_per_sec": "rows/sec (higher is better)",
-                "db_size_mb": "MB (lower is better)"
-            }
+            },
         },
-        "engines": engines
+        "engines": engines,
     }
 
     outp.parent.mkdir(parents=True, exist_ok=True)

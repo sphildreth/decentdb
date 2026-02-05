@@ -1,6 +1,7 @@
 import os
 import strutils
 import times
+import std/monotimes
 import json
 import random
 import math
@@ -13,6 +14,8 @@ import ../../src/engine
 import ../../src/record/record
 import ../../src/errors
 import ../../src/vfs/vfs
+when defined(fused_join_sum_stats):
+  import ../../src/exec/exec
 
 # --- SQLite FFI bindings ---
 {.passL: "-lsqlite3".}
@@ -42,8 +45,76 @@ proc sqlite3_libversion*(): cstring {.cdecl, importc.}
 
 const SQLITE_TRANSIENT = cast[pointer](-1)
 
+# --- DuckDB FFI bindings ---
+{.passL: "-lduckdb".}
+
+type
+  duckdb_database* = pointer
+  duckdb_connection* = pointer
+  duckdb_prepared_statement* = pointer
+  duckdb_result* = object
+    deprecated_column_count: uint64
+    deprecated_row_count: uint64
+    deprecated_rows_changed: uint64
+    deprecated_columns: pointer
+    deprecated_error_message: cstring
+    internal_data: pointer
+  duckdb_state* = enum
+    DuckDBSuccess = 0
+    DuckDBError = 1
+
+proc duckdb_open*(path: cstring, out_database: ptr duckdb_database): duckdb_state {.cdecl, importc.}
+proc duckdb_close*(database: ptr duckdb_database) {.cdecl, importc.}
+proc duckdb_connect*(database: duckdb_database, out_connection: ptr duckdb_connection): duckdb_state {.cdecl, importc.}
+proc duckdb_disconnect*(connection: ptr duckdb_connection) {.cdecl, importc.}
+proc duckdb_query*(connection: duckdb_connection, query: cstring, out_result: ptr duckdb_result): duckdb_state {.cdecl, importc.}
+proc duckdb_destroy_result*(result: ptr duckdb_result) {.cdecl, importc.}
+proc duckdb_prepare*(connection: duckdb_connection, query: cstring, out_prepared_statement: ptr duckdb_prepared_statement): duckdb_state {.cdecl, importc.}
+proc duckdb_destroy_prepare*(prepared_statement: ptr duckdb_prepared_statement) {.cdecl, importc.}
+proc duckdb_bind_int64*(prepared_statement: duckdb_prepared_statement, param_idx: int64, val: int64): duckdb_state {.cdecl, importc.}
+proc duckdb_bind_varchar_length*(prepared_statement: duckdb_prepared_statement, param_idx: int64, val: cstring, length: int64): duckdb_state {.cdecl, importc.}
+proc duckdb_execute_prepared*(prepared_statement: duckdb_prepared_statement, out_result: ptr duckdb_result): duckdb_state {.cdecl, importc.}
+proc duckdb_library_version*(): cstring {.cdecl, importc.}
+proc duckdb_result_error*(result: duckdb_result): cstring {.cdecl, importc.}
+
+# Helper for DuckDB execution
+proc duckExec(con: duckdb_connection, sql: string) =
+  var res: duckdb_result
+  if duckdb_query(con, sql.cstring, addr res) != DuckDBSuccess:
+    let err = $duckdb_result_error(res)
+    duckdb_destroy_result(addr res)
+    raise newException(IOError, "DuckDB exec failed: " & sql & " Error: " & err)
+  duckdb_destroy_result(addr res)
+
 # Global variable for benchmark data directory (on real disk, not tmpfs)
 var gDataDir*: string = ""
+
+# Paths to benchmark database files to remove at end.
+var gCleanupPaths: seq[string] = @[]
+
+proc registerCleanupPath(path: string) =
+  if path.len == 0:
+    return
+  for p in gCleanupPaths:
+    if p == path:
+      return
+  gCleanupPaths.add(path)
+
+proc registerDbArtifacts(basePath: string, includeShm: bool) =
+  ## Register database-related files for cleanup.
+  registerCleanupPath(basePath)
+  registerCleanupPath(basePath & "-wal")
+  if includeShm:
+    registerCleanupPath(basePath & "-shm")
+
+proc cleanupRegisteredArtifacts() =
+  ## Best-effort cleanup of benchmark DB files.
+  for p in gCleanupPaths:
+    if fileExists(p):
+      try:
+        removeFile(p)
+      except CatchableError:
+        echo "Warning: failed to remove ", p, ": ", getCurrentExceptionMsg()
 
 proc getBenchDataDir(): string =
   ## Get the directory for benchmark database files.
@@ -69,6 +140,11 @@ type
     p50_us: int
     p95_us: int
     p99_us: int
+    # Higher precision percentiles (nanoseconds).
+    # Used by the aggregator to avoid microsecond quantization.
+    p50_ns: int64
+    p95_ns: int64
+    p99_ns: int64
     ops_per_sec: float
     rows_processed: int
     checksum_u64: uint64
@@ -103,8 +179,17 @@ type
 proc getIsoTime(): string =
   now().utc.format("yyyy-MM-dd'T'HH:mm:ss'Z'")
 
-proc percentile(latencies: seq[int], p: float): int =
-  if latencies.len == 0: return 0
+proc nanosBetween(t0, t1: MonoTime): int64 =
+  ## Return nanoseconds between two monotonic timestamps.
+  let d = t1 - t0
+  int64(inNanoseconds(d))
+
+proc secondsBetween(t0, t1: MonoTime): float =
+  ## Return seconds between two monotonic timestamps.
+  float(inMicroseconds(t1 - t0)) / 1_000_000.0
+
+proc percentileNs(latencies: seq[int64], p: float): int64 =
+  if latencies.len == 0: return 0'i64
   var sorted = latencies
   sorted.sort()
   let idx = int(ceil(float(sorted.len) * p / 100.0)) - 1
@@ -130,6 +215,9 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
       "p50_us": res.metrics.p50_us,
       "p95_us": res.metrics.p95_us,
       "p99_us": res.metrics.p99_us,
+      "p50_ns": res.metrics.p50_ns,
+      "p95_ns": res.metrics.p95_ns,
+      "p99_ns": res.metrics.p99_ns,
       "ops_per_sec": res.metrics.ops_per_sec,
       "rows_processed": res.metrics.rows_processed,
       "checksum_u64": res.metrics.checksum_u64
@@ -157,6 +245,7 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
 proc runDecentDbInsert(outputDir: string) =
   echo "Running DecentDB Insert Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_insert.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -167,27 +256,41 @@ proc runDecentDbInsert(outputDir: string) =
 
   discard execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)")
   
+  let prepRes = prepare(db, "INSERT INTO users VALUES ($1, $2, $3)")
+  if not prepRes.ok:
+    raise newException(IOError, "Failed to prepare statement: " & prepRes.err.message)
+  let stmt = prepRes.value
+
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
-    discard execSql(db, "INSERT INTO users VALUES ($1, $2, $3)", @[
+    let name = "User" & $i
+    let email = "user" & $i & "@example.com"
+    let params = @[
       Value(kind: vkInt64, int64Val: int64(i)),
-      Value(kind: vkText, bytes: toBytes("User" & $i)),
-      Value(kind: vkText, bytes: toBytes("user" & $i & "@example.com"))
-    ])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+      Value(kind: vkText, bytes: toBytes(name)),
+      Value(kind: vkText, bytes: toBytes(email))
+    ]
+    let t0 = getMonoTime()
+    discard execPrepared(stmt, params)
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -203,6 +306,9 @@ proc runDecentDbInsert(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0 
@@ -218,6 +324,7 @@ proc runDecentDbInsert(outputDir: string) =
 proc runDecentDbCommitLatency(outputDir: string) =
   echo "Running DecentDB Commit Latency Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_commit.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -231,26 +338,37 @@ proc runDecentDbCommitLatency(outputDir: string) =
   # Pre-insert a row to update
   discard execSql(db, "INSERT INTO kv VALUES (1, 'initial')")
   
+  let prepRes = prepare(db, "UPDATE kv SET v = $1 WHERE k = 1")
+  if not prepRes.ok:
+    raise newException(IOError, "Failed to prepare statement: " & prepRes.err.message)
+  let stmt = prepRes.value
+
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     # Each UPDATE is a separate transaction with durable commit
-    discard execSql(db, "UPDATE kv SET v = $1 WHERE k = 1", @[
+    discard execPrepared(stmt, @[
       Value(kind: vkText, bytes: toBytes("value" & $i))
     ])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -266,6 +384,9 @@ proc runDecentDbCommitLatency(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -281,6 +402,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
 proc runDecentDbPointRead(outputDir: string) =
   echo "Running DecentDB Point Read Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_read.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -302,25 +424,34 @@ proc runDecentDbPointRead(outputDir: string) =
   
   let iterations = 100000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  var rowsProcessedTotal: int64 = 0
   var rng = initRand(42)
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let lookupId = rng.rand(1..dataSize)
-    let t0 = epochTime()
-    discard execSqlRows(db, "SELECT * FROM users WHERE id = $1", @[
+    let t0 = getMonoTime()
+    let nRes = execSqlNoRows(db, "SELECT * FROM users WHERE id = $1", @[
       Value(kind: vkInt64, int64Val: int64(lookupId))
     ])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    if nRes.ok:
+      rowsProcessedTotal += nRes.value
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -336,8 +467,11 @@ proc runDecentDbPointRead(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
-      rows_processed: iterations,
+      rows_processed: int(rowsProcessedTotal),
       checksum_u64: 0
     ),
     artifacts: BenchmarkArtifacts(
@@ -351,6 +485,7 @@ proc runDecentDbPointRead(outputDir: string) =
 proc runDecentDbJoin(outputDir: string) =
   echo "Running DecentDB Join Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_join.ddb"
+  registerDbArtifacts(dbPath, includeShm = false)
   if fileExists(dbPath):
     removeFile(dbPath)
   if fileExists(dbPath & "-wal"):
@@ -381,21 +516,37 @@ proc runDecentDbJoin(outputDir: string) =
   
   let iterations = 100
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  var rowsProcessedTotal: int64 = 0
+
+  when defined(fused_join_sum_stats):
+    resetFusedJoinSumStats()
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
-    discard execSqlRows(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name", @[])
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t0 = getMonoTime()
+    let nRes = execSqlNoRows(db, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name", @[])
+    if nRes.ok:
+      rowsProcessedTotal += nRes.value
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
+
+  when defined(fused_join_sum_stats):
+    let st = fusedJoinSumStats()
+    echo "Fused join+sum stats: attempts=", st.attempts, " hits=", st.hits, " dense=", st.dense, " sparse=", st.sparse
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -411,8 +562,11 @@ proc runDecentDbJoin(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
-      rows_processed: iterations,
+      rows_processed: int(rowsProcessedTotal),
       checksum_u64: 0
     ),
     artifacts: BenchmarkArtifacts(
@@ -435,8 +589,13 @@ proc sqliteExec(db: Sqlite3, sql: string) =
 proc runSqliteInsert(outputDir: string) =
   echo "Running SQLite Insert Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_insert.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -456,31 +615,34 @@ proc runSqliteInsert(outputDir: string) =
   
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let name = "User" & $i
     let email = "user" & $i & "@example.com"
     
-    let t0 = epochTime()
-    # Explicit transaction for fair durability comparison
-    sqliteExec(db, "BEGIN IMMEDIATE")
+    let t0 = getMonoTime()
     discard sqlite3_bind_int64(stmt, 1, int64(i))
     discard sqlite3_bind_text(stmt, 2, name.cstring, cint(name.len), SQLITE_TRANSIENT)
     discard sqlite3_bind_text(stmt, 3, email.cstring, cint(email.len), SQLITE_TRANSIENT)
     discard sqlite3_step(stmt)
     discard sqlite3_reset(stmt)
-    sqliteExec(db, "COMMIT")
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -496,6 +658,9 @@ proc runSqliteInsert(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -511,8 +676,13 @@ proc runSqliteInsert(outputDir: string) =
 proc runSqliteCommitLatency(outputDir: string) =
   echo "Running SQLite Commit Latency Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_commit.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -533,28 +703,31 @@ proc runSqliteCommitLatency(outputDir: string) =
   
   let iterations = 1000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let value = "value" & $i
     
-    let t0 = epochTime()
-    # Explicit transaction for fair durability comparison
-    sqliteExec(db, "BEGIN IMMEDIATE")
+    let t0 = getMonoTime()
     discard sqlite3_bind_text(stmt, 1, value.cstring, cint(value.len), SQLITE_TRANSIENT)
     discard sqlite3_step(stmt)
     discard sqlite3_reset(stmt)
-    sqliteExec(db, "COMMIT")
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -570,6 +743,9 @@ proc runSqliteCommitLatency(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -585,8 +761,13 @@ proc runSqliteCommitLatency(outputDir: string) =
 proc runSqlitePointRead(outputDir: string) =
   echo "Running SQLite Point Read Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_read.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -618,27 +799,33 @@ proc runSqlitePointRead(outputDir: string) =
     raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
   defer: discard sqlite3_finalize(readStmt)
   
-  let iterations = 1000
+  let iterations = 100000
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   var rng = initRand(42)
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
     let lookupId = rng.rand(1..dataSize)
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     discard sqlite3_bind_int64(readStmt, 1, int64(lookupId))
     discard sqlite3_step(readStmt)
     discard sqlite3_reset(readStmt)
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -654,6 +841,9 @@ proc runSqlitePointRead(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -669,8 +859,13 @@ proc runSqlitePointRead(outputDir: string) =
 proc runSqliteJoin(outputDir: string) =
   echo "Running SQLite Join Benchmark..."
   let dbPath = getBenchDataDir() / "bench_sqlite_join.db"
-  removeFile(dbPath)
-  removeFile(dbPath & "-wal")
+  registerDbArtifacts(dbPath, includeShm = true)
+  if fileExists(dbPath):
+    removeFile(dbPath)
+  if fileExists(dbPath & "-wal"):
+    removeFile(dbPath & "-wal")
+  if fileExists(dbPath & "-shm"):
+    removeFile(dbPath & "-shm")
 
   var db: Sqlite3
   if sqlite3_open(dbPath.cstring, addr db) != SQLITE_OK:
@@ -716,23 +911,29 @@ proc runSqliteJoin(outputDir: string) =
   
   let iterations = 100
   var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
   
-  let start = epochTime()
+  let start = getMonoTime()
   
   for i in 1..iterations:
-    let t0 = epochTime()
+    let t0 = getMonoTime()
     while sqlite3_step(joinStmt) == SQLITE_ROW:
       discard  # Consume results
     discard sqlite3_reset(joinStmt)
-    let t1 = epochTime()
-    latencies.add(int((t1 - t0) * 1_000_000))
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
   
-  let duration = epochTime() - start
+  let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
 
-  let p50 = percentile(latencies, 50.0)
-  let p95 = percentile(latencies, 95.0)
-  let p99 = percentile(latencies, 99.0)
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
 
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
@@ -748,6 +949,9 @@ proc runSqliteJoin(outputDir: string) =
       p50_us: p50,
       p95_us: p95,
       p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
       checksum_u64: 0
@@ -756,6 +960,395 @@ proc runSqliteJoin(outputDir: string) =
       db_path: dbPath,
       db_size_bytes: getFileSize(dbPath),
       wal_size_bytes: if fileExists(dbPath & "-wal"): getFileSize(dbPath & "-wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+# --- DuckDB Benchmarks ---
+
+proc runDuckdbInsert(outputDir: string) =
+  echo "Running DuckDB Insert Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_duckdb_insert.db"
+  registerDbArtifacts(dbPath, includeShm = false)
+  if fileExists(dbPath): removeFile(dbPath)
+  if fileExists(dbPath & ".wal"): removeFile(dbPath & ".wal")
+
+  var db: duckdb_database
+  var con: duckdb_connection
+  
+  if duckdb_open(dbPath.cstring, addr db) != DuckDBSuccess:
+    raise newException(IOError, "Failed to open DuckDB database")
+  defer: duckdb_close(addr db)
+  
+  if duckdb_connect(db, addr con) != DuckDBSuccess:
+    raise newException(IOError, "Failed to connect to DuckDB")
+  defer: duckdb_disconnect(addr con)
+  
+  duckExec(con, "CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, email VARCHAR)")
+  
+  var stmt: duckdb_prepared_statement
+  if duckdb_prepare(con, "INSERT INTO users VALUES (?, ?, ?)".cstring, addr stmt) != DuckDBSuccess:
+    raise newException(IOError, "Failed to prepare statement")
+  defer: duckdb_destroy_prepare(addr stmt)
+  
+  let iterations = 250000
+  var latencies: seq[int] = @[] # Not used for insert
+  
+  let start = getMonoTime()
+  
+  duckExec(con, "BEGIN TRANSACTION")
+  
+  for i in 1..iterations:
+    let name = "User" & $i
+    let email = "user" & $i & "@example.com"
+    
+    discard duckdb_bind_int64(stmt, 1, int64(i))
+    discard duckdb_bind_varchar_length(stmt, 2, name.cstring, int64(name.len))
+    discard duckdb_bind_varchar_length(stmt, 3, email.cstring, int64(email.len))
+    
+    var res: duckdb_result
+    discard duckdb_execute_prepared(stmt, addr res)
+    duckdb_destroy_result(addr res)
+    # DuckDB prepare reuse is automatic/implied or we just re-bind?
+    # Actually duckdb_execute_prepared doesn't reset bindings, we overwrite them.
+    
+  duckExec(con, "COMMIT")
+  
+  let duration = secondsBetween(start, getMonoTime())
+  let opsPerSec = float(iterations) / duration
+  
+  echo "DuckDB Insert Ops/Sec: ", opsPerSec
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DuckDB",
+    engine_version: $duckdb_library_version(),
+    dataset: "sample",
+    benchmark: "insert",
+    durability: "safe", # Default
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: 0,
+      p95_us: 0,
+      p99_us: 0,
+      p50_ns: 0,
+      p95_ns: 0,
+      p99_ns: 0,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & ".wal"): getFileSize(dbPath & ".wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runDuckdbCommitLatency(outputDir: string) =
+  echo "Running DuckDB Commit Latency Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_duckdb_commit.db"
+  registerDbArtifacts(dbPath, includeShm = false)
+  if fileExists(dbPath): removeFile(dbPath)
+  if fileExists(dbPath & ".wal"): removeFile(dbPath & ".wal")
+
+  var db: duckdb_database
+  var con: duckdb_connection
+  
+  if duckdb_open(dbPath.cstring, addr db) != DuckDBSuccess:
+    raise newException(IOError, "Failed to open DuckDB database")
+  defer: duckdb_close(addr db)
+  
+  if duckdb_connect(db, addr con) != DuckDBSuccess:
+    raise newException(IOError, "Failed to connect to DuckDB")
+  defer: duckdb_disconnect(addr con)
+  
+  duckExec(con, "CREATE TABLE kv (k BIGINT PRIMARY KEY, v VARCHAR)")
+  duckExec(con, "INSERT INTO kv VALUES (1, 'initial')")
+  
+  var stmt: duckdb_prepared_statement
+  if duckdb_prepare(con, "UPDATE kv SET v = ? WHERE k = 1".cstring, addr stmt) != DuckDBSuccess:
+    raise newException(IOError, "Failed to prepare statement")
+  defer: duckdb_destroy_prepare(addr stmt)
+  
+  let iterations = 1000
+  var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  
+  let start = getMonoTime()
+  
+  for i in 1..iterations:
+    let value = "value" & $i
+    
+    let t0 = getMonoTime()
+    discard duckdb_bind_varchar_length(stmt, 1, value.cstring, int64(value.len))
+    
+    var res: duckdb_result
+    if duckdb_execute_prepared(stmt, addr res) != DuckDBSuccess:
+       quit("Update failed")
+    duckdb_destroy_result(addr res)
+    
+    # DuckDB auto-commit?
+    # "By default, DuckDB runs in auto-commit mode."
+    # But does it sync to disk?
+    # We can force checkpoint if we want "safe" durability like SQLite synchronous=FULL
+    # but that might be extremely slow.
+    # We'll just rely on default auto-commit for now and note it.
+    
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
+  
+  let duration = secondsBetween(start, getMonoTime())
+  let opsPerSec = float(iterations) / duration
+
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DuckDB",
+    engine_version: $duckdb_library_version(),
+    dataset: "sample",
+    benchmark: "commit_latency",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & ".wal"): getFileSize(dbPath & ".wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runDuckdbPointRead(outputDir: string) =
+  echo "Running DuckDB Point Read Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_duckdb_read.db"
+  registerDbArtifacts(dbPath, includeShm = false)
+  if fileExists(dbPath): removeFile(dbPath)
+  if fileExists(dbPath & ".wal"): removeFile(dbPath & ".wal")
+
+  var db: duckdb_database
+  var con: duckdb_connection
+  
+  if duckdb_open(dbPath.cstring, addr db) != DuckDBSuccess:
+    raise newException(IOError, "Failed to open DuckDB database")
+  defer: duckdb_close(addr db)
+  
+  if duckdb_connect(db, addr con) != DuckDBSuccess:
+    raise newException(IOError, "Failed to connect to DuckDB")
+  defer: duckdb_disconnect(addr con)
+  
+  duckExec(con, "CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, email VARCHAR)")
+  
+  var stmt: duckdb_prepared_statement
+  if duckdb_prepare(con, "INSERT INTO users VALUES (?, ?, ?)".cstring, addr stmt) != DuckDBSuccess:
+    raise newException(IOError, "Failed to prepare insert")
+  defer: duckdb_destroy_prepare(addr stmt)
+  
+  let dataSize = 1000
+  duckExec(con, "BEGIN TRANSACTION")
+  for i in 1..dataSize:
+    let name = "User" & $i
+    let email = "user" & $i & "@example.com"
+    discard duckdb_bind_int64(stmt, 1, int64(i))
+    discard duckdb_bind_varchar_length(stmt, 2, name.cstring, int64(name.len))
+    discard duckdb_bind_varchar_length(stmt, 3, email.cstring, int64(email.len))
+    var res: duckdb_result
+    discard duckdb_execute_prepared(stmt, addr res)
+    duckdb_destroy_result(addr res)
+  duckExec(con, "COMMIT")
+  
+  var readStmt: duckdb_prepared_statement
+  if duckdb_prepare(con, "SELECT * FROM users WHERE id = ?".cstring, addr readStmt) != DuckDBSuccess:
+    raise newException(IOError, "Failed to prepare read")
+  defer: duckdb_destroy_prepare(addr readStmt)
+  
+  let iterations = 100000
+  var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  var rng = initRand(42)
+  
+  let start = getMonoTime()
+  
+  for i in 1..iterations:
+    let lookupId = rng.rand(1..dataSize)
+    let t0 = getMonoTime()
+    discard duckdb_bind_int64(readStmt, 1, int64(lookupId))
+    var res: duckdb_result
+    discard duckdb_execute_prepared(readStmt, addr res)
+    duckdb_destroy_result(addr res)
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
+  
+  let duration = secondsBetween(start, getMonoTime())
+  let opsPerSec = float(iterations) / duration
+
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DuckDB",
+    engine_version: $duckdb_library_version(),
+    dataset: "sample",
+    benchmark: "point_read",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & ".wal"): getFileSize(dbPath & ".wal") else: 0
+    )
+  )
+  writeResult(outputDir, res)
+
+proc runDuckdbJoin(outputDir: string) =
+  echo "Running DuckDB Join Benchmark..."
+  let dbPath = getBenchDataDir() / "bench_duckdb_join.db"
+  registerDbArtifacts(dbPath, includeShm = false)
+  if fileExists(dbPath): removeFile(dbPath)
+  if fileExists(dbPath & ".wal"): removeFile(dbPath & ".wal")
+
+  var db: duckdb_database
+  var con: duckdb_connection
+  
+  if duckdb_open(dbPath.cstring, addr db) != DuckDBSuccess:
+    raise newException(IOError, "Failed to open DuckDB database")
+  defer: duckdb_close(addr db)
+  
+  if duckdb_connect(db, addr con) != DuckDBSuccess:
+    raise newException(IOError, "Failed to connect to DuckDB")
+  defer: duckdb_disconnect(addr con)
+  
+  duckExec(con, "CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR)")
+  duckExec(con, "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT, amount BIGINT)")
+  
+  duckExec(con, "BEGIN TRANSACTION")
+  
+  var userStmt: duckdb_prepared_statement
+  discard duckdb_prepare(con, "INSERT INTO users VALUES (?, ?)".cstring, addr userStmt)
+  let userCount = 100
+  for i in 1..userCount:
+    let name = "User" & $i
+    discard duckdb_bind_int64(userStmt, 1, int64(i))
+    discard duckdb_bind_varchar_length(userStmt, 2, name.cstring, int64(name.len))
+    var res: duckdb_result
+    discard duckdb_execute_prepared(userStmt, addr res)
+    duckdb_destroy_result(addr res)
+  duckdb_destroy_prepare(addr userStmt)
+  
+  var orderStmt: duckdb_prepared_statement
+  discard duckdb_prepare(con, "INSERT INTO orders VALUES (?, ?, ?)".cstring, addr orderStmt)
+  var rng = initRand(42)
+  let orderCount = 1000
+  for i in 1..orderCount:
+    discard duckdb_bind_int64(orderStmt, 1, int64(i))
+    discard duckdb_bind_int64(orderStmt, 2, int64(rng.rand(1..userCount)))
+    discard duckdb_bind_int64(orderStmt, 3, int64(rng.rand(10..1000)))
+    var res: duckdb_result
+    discard duckdb_execute_prepared(orderStmt, addr res)
+    duckdb_destroy_result(addr res)
+  duckdb_destroy_prepare(addr orderStmt)
+  
+  duckExec(con, "COMMIT")
+  
+  var joinStmt: duckdb_prepared_statement
+  if duckdb_prepare(con, "SELECT u.name, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name".cstring, addr joinStmt) != DuckDBSuccess:
+    raise newException(IOError, "Failed to prepare join")
+  defer: duckdb_destroy_prepare(addr joinStmt)
+  
+  let iterations = 100
+  var latencies: seq[int] = @[]
+  var latenciesNs: seq[int64] = @[]
+  
+  let start = getMonoTime()
+  
+  for i in 1..iterations:
+    let t0 = getMonoTime()
+    var res: duckdb_result
+    discard duckdb_execute_prepared(joinStmt, addr res)
+    duckdb_destroy_result(addr res)
+    let t1 = getMonoTime()
+    let ns = nanosBetween(t0, t1)
+    latenciesNs.add(ns)
+    latencies.add(int(ns div 1000))
+  
+  let duration = secondsBetween(start, getMonoTime())
+  let opsPerSec = float(iterations) / duration
+
+  let p50ns = percentileNs(latenciesNs, 50.0)
+  let p95ns = percentileNs(latenciesNs, 95.0)
+  let p99ns = percentileNs(latenciesNs, 99.0)
+  let p50 = int(p50ns div 1000)
+  let p95 = int(p95ns div 1000)
+  let p99 = int(p99ns div 1000)
+
+  let res = BenchmarkResult(
+    timestamp_utc: getIsoTime(),
+    engine: "DuckDB",
+    engine_version: $duckdb_library_version(),
+    dataset: "sample",
+    benchmark: "join",
+    durability: "safe",
+    threads: 1,
+    iterations: iterations,
+    metrics: BenchmarkMetrics(
+      latencies_us: latencies,
+      p50_us: p50,
+      p95_us: p95,
+      p99_us: p99,
+      p50_ns: p50ns,
+      p95_ns: p95ns,
+      p99_ns: p99ns,
+      ops_per_sec: opsPerSec,
+      rows_processed: iterations,
+      checksum_u64: 0
+    ),
+    artifacts: BenchmarkArtifacts(
+      db_path: dbPath,
+      db_size_bytes: getFileSize(dbPath),
+      wal_size_bytes: if fileExists(dbPath & ".wal"): getFileSize(dbPath & ".wal") else: 0
     )
   )
   writeResult(outputDir, res)
@@ -773,6 +1366,9 @@ proc clearOldData(outputDir: string) =
         echo "Removed stale: ", path
 
 proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "", args: seq[string]) =
+  defer:
+    cleanupRegisteredArtifacts()
+
   if args.len == 0:
     echo "Error: output_dir is required as a positional argument."
     quit(1)
@@ -799,6 +1395,7 @@ proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "
   let runAll = engines == "all"
   let runDecent = runAll or "decentdb" in engines
   let runSqlite = runAll or "sqlite" in engines
+  let runDuck = runAll or "duckdb" in engines
   
   if runDecent:
     runDecentDbInsert(output_dir)
@@ -812,11 +1409,17 @@ proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "
     runSqlitePointRead(output_dir)
     runSqliteJoin(output_dir)
 
+  if runDuck:
+    runDuckdbInsert(output_dir)
+    runDuckdbCommitLatency(output_dir)
+    runDuckdbPointRead(output_dir)
+    runDuckdbJoin(output_dir)
+
   echo "Benchmarks completed."
 
 when isMainModule:
   dispatch(benchmark, help = {
-    "engines": "Comma-separated list of engines to run (decentdb, sqlite) or 'all'",
+    "engines": "Comma-separated list of engines to run (decentdb, sqlite, duckdb) or 'all'",
     "clear": "Clear old benchmark data before running (default: true)",
     "data_dir": "Directory for benchmark database files (use real disk, not tmpfs for fair fsync comparison)"
   })

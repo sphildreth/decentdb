@@ -78,6 +78,9 @@ type Wal* = ref object
   lastReaderCheckAt*: float  # Last time reader check was performed
   totalReadersAborted*: int64  # Stats: total readers aborted due to timeout
   totalWarningsIssued*: int64  # Stats: total warnings issued
+  # Optimization: Lazy checkpoint evaluation counters
+  commitsSinceCheckpointCheck*: int64  # Commits since last full checkpoint check
+  checkpointCheckInterval*: int64      # Check time/memory every N commits (0 = always)
 
 const HeaderSize = 1 + 4 + 4
 const TrailerSize = 8 + 8
@@ -576,20 +579,40 @@ proc estimateIndexMemoryUsage*(wal: Wal): int64
 
 proc maybeCheckpoint*(wal: Wal, pager: Pager): Result[bool] =
   var trigger = false
-  if wal.checkpointEveryBytes > 0:
-    if wal.endOffset >= wal.checkpointEveryBytes:
-      trigger = true
-  if wal.checkpointEveryMs > 0:
-    let elapsedMs = int64((epochTime() - wal.lastCheckpointAt) * 1000)
-    if elapsedMs >= wal.checkpointEveryMs:
-      trigger = true
-  # Check memory threshold for WAL index
-  if wal.checkpointMemoryThreshold > 0:
-    let memUsage = estimateIndexMemoryUsage(wal)
-    if memUsage >= wal.checkpointMemoryThreshold:
-      trigger = true
+  
+  # Fast path: Check bytes threshold first (cheap)
+  if wal.checkpointEveryBytes > 0 and wal.endOffset >= wal.checkpointEveryBytes:
+    trigger = true
+  
+  # Check time/memory thresholds
+  if not trigger and (wal.checkpointEveryMs > 0 or wal.checkpointMemoryThreshold > 0):
+    var shouldCheckTimeMemory = true
+    
+    # Lazy evaluation: Only check time/memory every N commits (if interval configured)
+    if wal.checkpointCheckInterval > 0:
+      wal.commitsSinceCheckpointCheck.inc
+      if wal.commitsSinceCheckpointCheck < wal.checkpointCheckInterval:
+        shouldCheckTimeMemory = false
+      else:
+        wal.commitsSinceCheckpointCheck = 0
+    
+    if shouldCheckTimeMemory:
+      if wal.checkpointEveryMs > 0:
+        let elapsedMs = int64((epochTime() - wal.lastCheckpointAt) * 1000)
+        if elapsedMs >= wal.checkpointEveryMs:
+          trigger = true
+      
+      if not trigger and wal.checkpointMemoryThreshold > 0:
+        let memUsage = estimateIndexMemoryUsage(wal)
+        if memUsage >= wal.checkpointMemoryThreshold:
+          trigger = true
+  
   if not trigger:
     return ok(false)
+  
+  # Reset counter after triggering
+  wal.commitsSinceCheckpointCheck = 0
+  
   let chkRes = checkpoint(wal, pager)
   if not chkRes.ok:
     return err[bool](chkRes.err.code, chkRes.err.message, chkRes.err.context)
@@ -860,6 +883,17 @@ proc writePage*(writer: WalWriter, pageId: PageId, data: seq[byte]): Result[Void
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
   writer.pending.add((pageId, data))
+  okVoid()
+
+proc writePageDirect*(writer: WalWriter, pageId: PageId, data: string): Result[Void] =
+  ## Write page data directly without intermediate allocation.
+  ## Converts string data to bytes and adds to pending in one step.
+  if not writer.active:
+    return err[Void](ERR_TRANSACTION, "No active transaction")
+  var bytes = newSeq[byte](data.len)
+  if data.len > 0:
+    copyMem(addr bytes[0], unsafeAddr data[0], data.len)
+  writer.pending.add((pageId, bytes))
   okVoid()
 
 proc noteFlushedPage*(writer: WalWriter, pageId: PageId, lsn: uint64, offset: int64) =

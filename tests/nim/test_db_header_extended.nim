@@ -3,7 +3,6 @@ import os
 import vfs/os_vfs
 import pager/db_header
 import errors
-import engine
 import strutils
 
 suite "DB Header Extended":

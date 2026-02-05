@@ -10,6 +10,18 @@ const
   PageTypeLeaf* = 2'u8
   MaxLeafInlineValueBytes = 512
 
+type
+  InternalNodeIndex = ref object of RootRef
+    keys: seq[uint64]
+    children: seq[uint32]
+    rightChild: uint32
+
+  LeafNodeIndex = ref object of RootRef
+    keys: seq[uint64]
+    valueOffsets: seq[int]
+    valueLens: seq[int]
+    overflows: seq[uint32]
+
 type BTree* = ref object
   pager*: Pager
   root*: PageId
@@ -259,6 +271,85 @@ proc freeBTreePagesExceptRoot*(pager: Pager, root: PageId): Result[Void] =
 proc newBTree*(pager: Pager, root: PageId): BTree =
   BTree(pager: pager, root: root)
 
+proc getOrBuildInternalIndex(page: string, entry: CacheEntry): Result[InternalNodeIndex] =
+  if entry.aux != nil:
+    if entry.aux of InternalNodeIndex:
+       return ok(InternalNodeIndex(entry.aux))
+    entry.aux = nil
+
+  if page.len < 8:
+    return err[InternalNodeIndex](ERR_CORRUPTION, "Page too small")
+  
+  let count = int(readU16LE(page, 2))
+  let rightChild = readU32LE(page, 4)
+  var keys = newSeq[uint64](count)
+  var children = newSeq[uint32](count)
+  var offset = 8
+  
+  for i in 0 ..< count:
+    if offset >= page.len:
+      return err[InternalNodeIndex](ERR_CORRUPTION, "Internal cell out of bounds")
+    
+    var k: uint64
+    if not decodeVarintFast(page, offset, k):
+      return err[InternalNodeIndex](ERR_CORRUPTION, "Invalid key varint")
+    keys[i] = k
+    
+    var c: uint64
+    if not decodeVarintFast(page, offset, c):
+      return err[InternalNodeIndex](ERR_CORRUPTION, "Invalid child varint")
+    children[i] = uint32(c)
+    
+  let idx = InternalNodeIndex(keys: keys, children: children, rightChild: rightChild)
+  entry.aux = idx
+  ok(idx)
+
+proc getOrBuildLeafIndex(page: string, entry: CacheEntry): Result[LeafNodeIndex] =
+  if entry.aux != nil:
+    if entry.aux of LeafNodeIndex:
+       return ok(LeafNodeIndex(entry.aux))
+    entry.aux = nil
+
+  if page.len < 8:
+    return err[LeafNodeIndex](ERR_CORRUPTION, "Page too small")
+    
+  let count = int(readU16LE(page, 2))
+  var keys = newSeq[uint64](count)
+  var valueOffsets = newSeq[int](count)
+  var valueLens = newSeq[int](count)
+  var overflows = newSeq[uint32](count)
+  var offset = 8
+  
+  for i in 0 ..< count:
+    if offset >= page.len:
+      return err[LeafNodeIndex](ERR_CORRUPTION, "Leaf cell out of bounds")
+    
+    var k: uint64
+    if not decodeVarintFast(page, offset, k):
+      return err[LeafNodeIndex](ERR_CORRUPTION, "Invalid key varint")
+    keys[i] = k
+    
+    var ctrl: uint64
+    if not decodeVarintFast(page, offset, ctrl):
+      return err[LeafNodeIndex](ERR_CORRUPTION, "Invalid control varint")
+      
+    let isOverflow = (ctrl and 1) != 0
+    let val = uint32(ctrl shr 1)
+    
+    if isOverflow:
+      overflows[i] = val
+      valueOffsets[i] = 0
+      valueLens[i] = 0
+    else:
+      overflows[i] = 0
+      valueOffsets[i] = offset
+      valueLens[i] = int(val)
+      offset += int(val)
+      
+  let idx = LeafNodeIndex(keys: keys, valueOffsets: valueOffsets, valueLens: valueLens, overflows: overflows)
+  entry.aux = idx
+  ok(idx)
+
 proc findChildPage(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
   ## Binary search to find the appropriate child page for a key.
   ## Finds the first key > search key and returns corresponding children[index].
@@ -274,6 +365,35 @@ proc findChildPage(keys: seq[uint64], children: seq[uint32], rightChild: uint32,
   if lo < keys.len:
     return children[lo]
   return rightChild
+
+proc findChildInPage(page: string, searchKey: uint64): Result[uint32] =
+  ## Linear scan of internal page cells to find child page.
+  ## Avoids allocating sequences for keys/children.
+  if page.len < 8:
+    return err[uint32](ERR_CORRUPTION, "Page too small")
+  
+  let count = int(readU16LE(page, 2))
+  let rightChild = readU32LE(page, 4)
+  var offset = 8
+  
+  for _ in 0 ..< count:
+    if offset >= page.len:
+      return err[uint32](ERR_CORRUPTION, "Internal cell out of bounds")
+    
+    let keyRes = decodeVarint(page, offset)
+    if not keyRes.ok:
+      return err[uint32](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+    let key = keyRes.value
+    
+    let childRes = decodeVarint(page, offset)
+    if not childRes.ok:
+      return err[uint32](childRes.err.code, childRes.err.message, childRes.err.context)
+    let child = uint32(childRes.value)
+    
+    if key > searchKey:
+      return ok(child)
+      
+  ok(rightChild)
 
 proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
   ## Navigate from root to leaf, avoiding seq allocations on internal pages.
@@ -309,26 +429,19 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
       elif count == 0:
         nextPage = PageId(rightChild)
       else:
-        # Linear scan: find first key > search key
-        # Keys and children are interleaved as varints starting at offset 8
-        var offset = 8
-        nextPage = PageId(rightChild) # Default to right child
-        
-        for i in 0 ..< count:
-          # Decode key varint
-          var k: uint64
-          if not decodeVarintFast(page, offset, k):
-            return err[PageId](ERR_CORRUPTION, "Invalid key varint")
-          
-          # Decode child varint
-          var c: uint64
-          if not decodeVarintFast(page, offset, c):
-            return err[PageId](ERR_CORRUPTION, "Invalid child varint")
-          
-          # Check condition: first key > search key
-          if k > key:
-            nextPage = PageId(uint32(c))
-            break # Found
+        # Optimizaation: Check for cached index
+        if handle.entry != nil:
+           let idxRes = getOrBuildInternalIndex(page, handle.entry)
+           if not idxRes.ok:
+             return err[PageId](idxRes.err.code, idxRes.err.message, idxRes.err.context)
+           let idx = idxRes.value
+           nextPage = PageId(findChildPage(idx.keys, idx.children, idx.rightChild, key))
+        else:
+           # Fallback to linear scan
+           let childRes = findChildInPage(page, key)
+           if not childRes.ok:
+              return err[PageId](childRes.err.code, childRes.err.message, childRes.err.context)
+           nextPage = PageId(childRes.value)
     finally:
       handle.release()
 
@@ -336,21 +449,21 @@ proc findLeaf(tree: BTree, key: uint64): Result[PageId] =
       return ok(current)
     current = nextPage
 
-proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
-  ## Binary search to find the appropriate child page for a key (leftmost variant).
-  ## Finds the first key >= search key and returns corresponding children[index].
-  ## Returns rightChild if key > all keys.
-  var lo = 0
-  var hi = keys.len
-  while lo < hi:
-    let mid = (lo + hi) shr 1
-    if keys[mid] < key:
-      lo = mid + 1
-    else:
-      hi = mid
-  if lo < keys.len:
-    return children[lo]
-  return rightChild
+# proc findChildPageLeftmost(keys: seq[uint64], children: seq[uint32], rightChild: uint32, key: uint64): uint32 =
+#   ## Binary search to find the appropriate child page for a key (leftmost variant).
+#   ## Finds the first key >= search key and returns corresponding children[index].
+#   ## Returns rightChild if key > all keys.
+#   var lo = 0
+#   var hi = keys.len
+#   while lo < hi:
+#     let mid = (lo + hi) shr 1
+#     if keys[mid] < key:
+#       lo = mid + 1
+#     else:
+#       hi = mid
+#   if lo < keys.len:
+#     return children[lo]
+#   return rightChild
 
 proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
   ## Navigate from root to leaf for leftmost variant, avoiding seq allocations.
@@ -605,29 +718,68 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
 proc containsKey*(tree: BTree, key: uint64): Result[bool] =
   ## Return true if `key` exists in the tree.
   ##
-  ## Unlike `find`, this does not materialize (read) overflow value chains.
+  ## Optimized to scan leaf directly without materializing all cells.
   let leafRes = findLeaf(tree, key)
   if not leafRes.ok:
     return err[bool](leafRes.err.code, leafRes.err.message, leafRes.err.context)
   let leafId = leafRes.value
-  var keys: seq[uint64] = @[]
-  var values: seq[seq[byte]] = @[]
-  var overflows: seq[uint32] = @[]
-  let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
-    let parsed = readLeafCells(page)
-    if not parsed.ok:
-      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
-    (keys, values, overflows, _) = parsed.value
-    okVoid()
-  )
-  if not pageRes.ok:
-    return err[bool](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-  for i in 0 ..< keys.len:
-    if keys[i] == key:
-      # Treat tombstone-like empty payload as missing.
-      if values[i].len == 0 and overflows[i] == 0'u32:
+  
+  let handleRes = tree.pager.acquirePageRo(leafId)
+  if not handleRes.ok:
+    return err[bool](handleRes.err.code, handleRes.err.message, handleRes.err.context)
+  var handle = handleRes.value
+  defer: handle.release()
+  
+  if handle.entry != nil:
+     let idxRes = getOrBuildLeafIndex(handle.getPage, handle.entry)
+     if not idxRes.ok:
+       return err[bool](idxRes.err.code, idxRes.err.message, idxRes.err.context)
+     let idx = idxRes.value
+     let i = lowerBound(idx.keys, key)
+     if i < idx.keys.len and idx.keys[i] == key:
+        if idx.valueLens[i] == 0 and idx.overflows[i] == 0:
+           return ok(false)
+        return ok(true)
+     return ok(false)
+
+  let page = handle.getPage
+  if page.len < 8:
+    return err[bool](ERR_CORRUPTION, "Page too small")
+  if byte(page[0]) != PageTypeLeaf:
+    return err[bool](ERR_CORRUPTION, "Not a leaf page")
+  let count = int(readU16LE(page, 2))
+  var offset = 8
+  
+  for _ in 0 ..< count:
+    if offset >= page.len:
+      return err[bool](ERR_CORRUPTION, "Leaf cell out of bounds")
+    
+    var k: uint64
+    if not decodeVarintFast(page, offset, k):
+      return err[bool](ERR_CORRUPTION, "Invalid key varint")
+    
+    var ctrl: uint64
+    if not decodeVarintFast(page, offset, ctrl):
+      return err[bool](ERR_CORRUPTION, "Invalid control varint")
+    
+    let isOverflow = (ctrl and 1) != 0
+    let val = uint32(ctrl shr 1)
+    var valueLen = 0
+    var overflow = 0'u32
+    
+    if isOverflow:
+      overflow = val
+    else:
+      valueLen = int(val)
+    
+    if k == key:
+      if valueLen == 0 and overflow == 0'u32:
         return ok(false)
       return ok(true)
+    
+    offset += valueLen
+    if k > key:
+      return ok(false)
   ok(false)
 
 proc openCursor*(tree: BTree): Result[BTreeCursor] =
@@ -1085,7 +1237,40 @@ type SplitResult = object
   promoted: uint64
   newPage: PageId
 
-proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte]): Result[Option[SplitResult]] =
+proc scanLeafLastKey(page: string): Result[(uint64, int, int)] =
+  ## Returns (lastKey, usedBytes, count)
+  if page.len < 8:
+    return err[(uint64, int, int)](ERR_CORRUPTION, "Page too small")
+  if byte(page[0]) != PageTypeLeaf:
+    return err[(uint64, int, int)](ERR_CORRUPTION, "Not a leaf page")
+  let count = int(readU16LE(page, 2))
+  var offset = 8
+  var lastKey: uint64 = 0
+
+  if count == 0:
+    return ok((0'u64, 8, 0))
+
+  for i in 0 ..< count:
+    if offset >= page.len:
+      return err[(uint64, int, int)](ERR_CORRUPTION, "Leaf cell out of bounds")
+
+    var val: uint64
+    if not decodeVarintFast(page, offset, val):
+       return err[(uint64, int, int)](ERR_CORRUPTION, "Invalid varint")
+    lastKey = val
+
+    var ctrl: uint64
+    if not decodeVarintFast(page, offset, ctrl):
+       return err[(uint64, int, int)](ERR_CORRUPTION, "Invalid varint")
+    
+    let isOverflow = (ctrl and 1) != 0
+    let v = uint32(ctrl shr 1)
+    if not isOverflow:
+       offset += int(v)
+  
+  ok((lastKey, offset, count))
+
+proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte], checkUnique: bool): Result[Option[SplitResult]] =
   let pageRes = readPageRo(tree.pager, pageId)
   if not pageRes.ok:
     return err[Option[SplitResult]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
@@ -1096,12 +1281,49 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
       return err[Option[SplitResult]](prepRes.err.code, prepRes.err.message, prepRes.err.context)
     let leafVal = prepRes.value.inline
     let leafOv = prepRes.value.overflow
+
+    # Optimization: Fast path for append (sequential inserts)
+    let scanRes = scanLeafLastKey(page)
+    if scanRes.ok:
+      let (lastKey, usedBytes, count) = scanRes.value
+      if (count == 0 or key > lastKey):
+         # stderr.writeLine("Fast append hit")
+         let keyBytes = encodeVarint(key)
+         var ctrlBytes: seq[byte]
+         var valLen = 0
+         if leafOv != 0:
+            ctrlBytes = encodeVarint((uint64(leafOv) shl 1) or 1)
+         else:
+            valLen = leafVal.len
+            ctrlBytes = encodeVarint(uint64(valLen) shl 1)
+         
+         if usedBytes + keyBytes.len + ctrlBytes.len + valLen <= tree.pager.pageSize:
+             var newPage = page 
+             let newCount = uint16(count + 1)
+             newPage[2] = char(byte(newCount and 0xFF))
+             newPage[3] = char(byte((newCount shr 8) and 0xFF))
+             
+             var writeOffset = usedBytes
+             for b in keyBytes:
+               newPage[writeOffset] = char(b)
+               writeOffset.inc
+             for b in ctrlBytes:
+               newPage[writeOffset] = char(b)
+               writeOffset.inc
+             if valLen > 0:
+               copyMem(addr newPage[writeOffset], unsafeAddr leafVal[0], valLen)
+             
+             discard writePage(tree.pager, pageId, newPage)
+             return ok(none(SplitResult))
+
     let parsed = readLeafCells(page)
     if not parsed.ok:
       return err[Option[SplitResult]](parsed.err.code, parsed.err.message, parsed.err.context)
     var (keys, values, overflows, nextLeaf) = parsed.value
     var inserted = false
     for i in 0 ..< keys.len:
+      if checkUnique and keys[i] == key:
+        return err[Option[SplitResult]](ERR_CONSTRAINT, "Unique constraint violation", $key)
       if key < keys[i]:
         keys.insert(key, i)
         values.insert(leafVal, i)
@@ -1156,7 +1378,7 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
       hi = mid
   let childIndex = lo
   let childPage = if childIndex < keys.len: PageId(children[childIndex]) else: PageId(rightChild)
-  let splitRes = insertRecursive(tree, childPage, key, value)
+  let splitRes = insertRecursive(tree, childPage, key, value, checkUnique)
   if not splitRes.ok:
     return err[Option[SplitResult]](splitRes.err.code, splitRes.err.message, splitRes.err.context)
   if splitRes.value.isNone:
@@ -1196,8 +1418,8 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte])
   discard writePage(tree.pager, newPage, rightBufRes.value)
   ok(some(SplitResult(promoted: promoted, newPage: newPage)))
 
-proc insert*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
-  let splitRes = insertRecursive(tree, tree.root, key, value)
+proc insert*(tree: BTree, key: uint64, value: seq[byte], checkUnique: bool = false): Result[Void] =
+  let splitRes = insertRecursive(tree, tree.root, key, value, checkUnique)
   if not splitRes.ok:
     return err[Void](splitRes.err.code, splitRes.err.message, splitRes.err.context)
   if splitRes.value.isSome:
@@ -1409,3 +1631,40 @@ proc needsCompaction*(tree: BTree, threshold: float = 50.0): Result[bool] =
   if not utilRes.ok:
     return err[bool](utilRes.err.code, utilRes.err.message, utilRes.err.context)
   ok(utilRes.value < threshold)
+
+proc findMaxKey*(tree: BTree): Result[uint64] =
+  ## Finds the maximum key in the B-Tree. Returns 0 if tree is empty.
+  var current = tree.root
+  while true:
+    var nextPage: PageId = 0
+    var isLeaf = false
+    var maxKey: uint64 = 0
+    
+    let pageRes = tree.pager.withPageRo(current, proc(page: string): Result[Void] =
+      if page.len < 1:
+        return err[Void](ERR_CORRUPTION, "Page empty")
+      let pageType = byte(page[0])
+      if pageType == PageTypeLeaf:
+        isLeaf = true
+        let scanRes = scanLeafLastKey(page)
+        if not scanRes.ok:
+           return err[Void](scanRes.err.code, scanRes.err.message, scanRes.err.context)
+        maxKey = scanRes.value[0]
+        return okVoid()
+      
+      if pageType != PageTypeInternal:
+         return err[Void](ERR_CORRUPTION, "Invalid page type " & $pageType)
+
+      if page.len < 8:
+         return err[Void](ERR_CORRUPTION, "Internal page too small")
+
+      # Internal Page: right child is at offset 4
+      nextPage = PageId(readU32LE(page, 4))
+      okVoid()
+    )
+    if not pageRes.ok:
+      return err[uint64](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+      
+    if isLeaf:
+      return ok(maxKey)
+    current = nextPage

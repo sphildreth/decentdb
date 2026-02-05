@@ -1,17 +1,12 @@
 import unittest
 import os
 import engine
-import pager/pager
-import btree/btree
-import pager/db_header
 import errors
 import record/record
 import sql/sql
 import sql/binder
 import catalog/catalog
 import storage/storage
-import exec/exec
-import planner/planner
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)

@@ -10,7 +10,6 @@ import ../catalog/catalog
 import ../search/search
 import ../sql/sql
 import sets
-import times
 
 type StoredRow* = object
   rowid*: uint64
@@ -387,7 +386,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
   let record = encodeRecord(normalizedRes.value)
   let tree = newBTree(pager, table.rootPage)
-  let insertRes = insert(tree, rowid, record)
+  let insertRes = insert(tree, rowid, record, checkUnique = true)
   if not insertRes.ok:
     return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   if updateIndexes:
@@ -414,9 +413,13 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
 
   table.rootPage = tree.root
 
-  let saveRes = saveTable(catalog, pager, table)
-  if not saveRes.ok:
-    return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+  if table.rootPage != tableRes.value.rootPage:
+    let saveRes = saveTable(catalog, pager, table)
+    if not saveRes.ok:
+      return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+  else:
+    updateTableMeta(catalog, table)
+
 
   ok(rowid)
 

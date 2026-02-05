@@ -3,13 +3,8 @@ import os
 import strutils
 
 import engine
-import catalog/catalog
-import record/record
-import storage/storage
-import search/search
-import vfs/os_vfs
-import vfs/faulty_vfs
 import errors
+import vfs/os_vfs
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
