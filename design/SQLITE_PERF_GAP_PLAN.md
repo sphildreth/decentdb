@@ -986,3 +986,18 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009808 → gap **8.02×**  
 **Correctness/Durability:** WAL format version bumped to v7; payload size derived from frame type and page size.  
 **Follow-ups:** Next medium effort: remove frame type field (infer from position) or unify page representation for zero-copy WAL writes (ADR required).
+
+### Rejected: Remove WAL frame type field (format v8)
+**Change:** Infer frame type from page_id sentinel values to drop the explicit frame_type byte.  
+**Bench (run_id: 20260205_195622)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.078693 | 0.0792585 | **Regressed** (~0.7%) |
+| read_p95_ms | 0.001177 | 0.001172 | Improved |
+| join_p95_ms | 0.4447445 | 0.445491 | Flat |
+| insert_rows_per_sec | 200,154.99 | 194,412.84 | -2.9% (likely noise, but commit regressed) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The header byte reduction did not offset the additional branching in this workload.
