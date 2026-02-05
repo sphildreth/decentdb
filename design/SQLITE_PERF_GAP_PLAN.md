@@ -1001,3 +1001,18 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** The header byte reduction did not offset the additional branching in this workload.
+
+### Rejected: Reuse WAL pageMeta buffer (commit allocation)
+**Change:** Reuse a WAL-level `pageMeta` buffer to avoid per-commit allocations.  
+**Bench (run_id: 20260205_200412)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.078693 | 0.0795445 | **Regressed** (~1.1%) |
+| read_p95_ms | 0.001177 | 0.0011725 | Improved |
+| join_p95_ms | 0.4447445 | 0.437396 | Improved |
+| insert_rows_per_sec | 200,154.99 | 197,863.71 | -1.1% (within noise, but commit regressed) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** Allocation reuse did not translate into lower p95 latency in this workload.
