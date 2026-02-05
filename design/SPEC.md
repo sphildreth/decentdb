@@ -32,7 +32,7 @@ Current scope (0.x, pre-1.0): single process, multi-threaded readers, single wri
 
 3. **wal/**
    - WAL file append and recovery
-   - Frame trailer (checksum reserved in v5), commit markers
+   - Frame trailer (checksum reserved; LSN derived from offsets in v6), commit markers
    - WAL index (in-memory map pageId -> latest frame offset for fast reads)
 
 4. **btree/**
@@ -118,6 +118,7 @@ See ADR-0016 for checksum calculation details.
 **Format version notes:**
 - v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
 - v5 removes per-frame WAL CRC32C validation (checksum field reserved, written as zero).
+- v6 removes per-frame WAL LSN trailer; LSNs are derived from frame end offsets.
 - v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
 
 ### 3.4 Catalog record encoding (v2)
@@ -156,7 +157,10 @@ Each frame appends:
 - `payload_size` (u32)
 - payload (page image or commit metadata)
 - `frame_checksum` (u64, **reserved**, written as 0 in format v5)
-- `lsn` (u64 monotonically increasing)
+
+**LSN (format v6):**
+- LSNs are derived from WAL byte offsets (frame end offset).
+- `wal_end_lsn` is the WAL end offset after the last committed frame.
 
 **Frame Types:**
 - **PAGE (0)**: Contains modified page data

@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.113082ms (after optimizations)
-- SQLite p95 commit latency: ~0.010159ms
-- **Gap:** ~11.5x slower
+- DecentDB p95 commit latency: ~0.0795ms (after optimizations)
+- SQLite p95 commit latency: ~0.00941ms
+- **Gap:** ~8.45x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
@@ -47,16 +47,15 @@ This plan targets **commit latency** specifically, but changes must not “win�
 [4 bytes]  Page ID (uint32)
 [4 bytes]  Payload length (uint32) 
 [N bytes]  Page data (typically 4096 bytes)
-[8 bytes]  Checksum (CRC32C as uint64)
-[8 bytes]  LSN (uint64)
+[8 bytes]  Checksum (reserved, zero in v5+)
 ────────────────────────────
-Total overhead per frame: 25 bytes
+Total overhead per frame: 17 bytes
 ```
 
 **For a single-page commit (typical UPDATE):**
-- Bytes written: 25 (frame) + 25 (commit frame) = 50 bytes overhead
-- Plus 4096 bytes of actual page data = 4146 bytes total
-- CRC32C calculated on ~4097 bytes of frame data
+- Bytes written: 17 (frame) + 17 (commit frame) = 34 bytes overhead
+- Plus 4096 bytes of actual page data = 4130 bytes total
+- No per-frame CRC32C in v6 (checksum field reserved)
 
 ### SQLite Approach
 
@@ -73,7 +72,7 @@ Total overhead per frame: ~4-8 bytes
 1. **No frame type field**: SQLite infers frame type from position/context
 2. **No length field**: Page size is known from database header
 3. **No per-frame LSN**: LSN is implicit from WAL header + frame position
-4. **No per-frame CRC32C**: SQLite uses:
+4. **No per-frame CRC32C (DecentDB v5+ matches)**: SQLite uses:
    - 32-bit salt in WAL header for each transaction
    - Per-transaction checksum (not per-page)
    - OS-level write guarantees (power loss is the main concern)
@@ -940,3 +939,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.008917 → gap **9.27×**  
 **Correctness/Durability:** Per-frame corruption detection removed; recovery now validates frame invariants only. WAL format version bumped to v5 (new DBs only).  
 **Follow-ups:** Next medium effort: remove per-frame LSN trailer (ADR required) or release wal lock before fsync (ADR required).
+
+### 5) Remove per-frame WAL LSN trailer (format v6) (Section 1: WAL Frame Format Overhead)
+**Change:** Remove LSN from frame trailer; LSNs are derived from WAL byte offsets (frame end offset).  
+**Bench (run_id: 20260205_193932)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.082635 | 0.0794645 | **Improved** (~3.8%) |
+| read_p95_ms | 0.001187 | 0.0011725 | Improved |
+| join_p95_ms | 0.4578895 | 0.44195 | Improved |
+| insert_rows_per_sec | 195,730.08 | 201,869.72 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009408 → gap **8.45×**  
+**Correctness/Durability:** LSNs now derived from WAL byte offsets; WAL format version bumped to v6 (new DBs only).  
+**Follow-ups:** Next medium effort: simplify frame header (remove payload length / frame type) or unify page representation for zero-copy WAL writes (ADR required).
