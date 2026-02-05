@@ -7,6 +7,13 @@
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
+**Non-Goals:**
+- Matching SQLite's `synchronous=OFF` mode (no durability)
+- Sacrificing crash-safety guarantees for performance
+- Multi-process concurrency optimizations (out of scope for 0.x)
+
+**Note on Impact Estimates:** Throughout this document, improvement percentages are **multiplicative, not additive**. For example, a 40% improvement followed by a 20% improvement yields `0.6 × 0.8 = 0.48` (52% total improvement), not 60%.
+
 ---
 
 ## 1. WAL Frame Format Overhead
@@ -69,7 +76,7 @@ Total overhead per frame: ~4-8 bytes
 
 ---
 
-## 2. Memory Copying and Buffer Management
+## 2. Memory Copying and Buffer Allocation
 
 ### Current State (Data Flow)
 
@@ -136,7 +143,9 @@ Total overhead per frame: ~4-8 bytes
 
 ---
 
-## 3. Locking and Synchronization Overhead
+## 3. Locking and Synchronization
+
+> **Note:** The concurrency optimizations in this section primarily benefit **multi-threaded workloads**. For the single-threaded p95 latency benchmark, only "Release lock before fsync" provides meaningful improvement.
 
 ### Current State (DecentDB)
 
@@ -219,6 +228,8 @@ Total overhead per frame: ~4-8 bytes
 ---
 
 ## 4. Fsync Patterns and OS Interaction
+
+> **TODO:** Verify current behavior. If DecentDB already avoids DB file fsync on commit (only fsyncing during checkpoint), the "Remove DB fsync" optimization is already implemented and should be removed from this plan.
 
 ### Current State (DecentDB)
 
@@ -323,7 +334,9 @@ else:
 
 ---
 
-## 2. Zero-Copy Architecture
+## 5. Zero-Copy Architecture
+
+> **Relationship to Section 2:** This section expands on the buffer management issues with a focus on achieving zero-copy I/O, which requires deeper architectural changes.
 
 ### Current State
 
@@ -426,7 +439,7 @@ WAL File (disk)
 
 ---
 
-## 3. Fsync Patterns and Durability Strategy
+## 6. Durability Strategy and Checkpoint Design
 
 ### Current State
 
@@ -478,6 +491,8 @@ release locks
                      ← OS flushes within ~1 second
                      ← Or checkpoint forces flush
 ```
+
+> ⚠️ **Durability Warning:** This mode can lose committed transactions on power failure. Per DecentDB's north star ("Priority #1: Durable ACID writes"), this mode should be **opt-in only** and clearly documented as trading durability for speed.
 
 This is still safe because:
 - Power loss loses only uncheckpointed data (usually <<1 second)
@@ -532,7 +547,9 @@ This is still safe because:
 
 ---
 
-## 4. Checksum Calculation Overhead
+## 7. Checksum Calculation Overhead
+
+> ⚠️ **ADR Required:** Removing per-frame CRC32C is a **format-breaking change** that affects corruption detection semantics. Per AGENTS.md, this requires an ADR before implementation. See design/adr/README.md.
 
 ### Current State
 
@@ -583,9 +600,12 @@ writeU64LE(dest, offset + HeaderSize + payload.len, checksum)
 
 **Why this is safe:**
 - Modern filesystems (ext4, xfs, APFS) have their own checksums
+  - ⚠️ **Caveat:** ext4 requires `metadata_csum` mount option; not all deployments have this
 - Disk controllers have ECC
 - SQLite's approach has been battle-tested for 15+ years
 - Most corruption comes from application bugs, not disk failures
+
+> **Note on CRC32C Performance:** The 10-20 cycles/byte estimate assumes software CRC32C. With Intel SSE4.2 hardware acceleration (`crc32` instruction), throughput is ~1 cycle/byte. If DecentDB uses hardware CRC32C, the savings from removal may be smaller (~5us vs ~15us).
 
 ### Required Changes
 
@@ -630,7 +650,7 @@ writeU64LE(dest, offset + HeaderSize + payload.len, checksum)
 
 ---
 
-## 5. OS/File System Interaction Patterns
+## 8. OS/Filesystem Interaction Patterns
 
 ### Current State
 
@@ -708,23 +728,26 @@ open(path, O_DIRECT | O_RDWR);
 
 ---
 
-## Summary: Path to SQLite Performance
+## 9. Summary: Path to SQLite Performance
 
 ### Current Gap
 - **DecentDB**: 0.115ms p95 commit
 - **SQLite**: 0.010ms p95 commit
 - **Gap**: 11.5x
+- **Benchmark Context**: Single-threaded, single-page UPDATE commits
 
 ### Achievable Improvements by Category
 
-| Optimization | Effort | Impact | Target Latency |
-|-------------|--------|--------|----------------|
-| Remove DB fsync on commit | Medium | 40-50% | 0.058-0.069ms |
-| Remove per-frame CRC32C | Medium | 10-15% | 0.098-0.104ms |
-| Lock release before fsync | Medium | 5-10% | 0.104-0.109ms |
-| Zero-copy page writes | High | 15-20% | 0.092-0.098ms |
-| io_uring on Linux | High | 10-20% | 0.092-0.104ms |
-| Lock-free commit publishing | High | 10-15% | 0.098-0.104ms |
+> **Legend:** 🧵 = Single-threaded impact, 🔀 = Multi-threaded only
+
+| Optimization | Effort | Impact | Target Latency | Scope |
+|-------------|--------|--------|----------------|-------|
+| Remove DB fsync on commit | Medium | 40-50% | 0.058-0.069ms | 🧵 |
+| Remove per-frame CRC32C | Medium | 10-15% | 0.098-0.104ms | 🧵 |
+| Lock release before fsync | Medium | 5-10% | 0.104-0.109ms | 🧵🔀 |
+| Zero-copy page writes | High | 15-20% | 0.092-0.098ms | 🧵 |
+| io_uring on Linux | High | 10-20% | 0.092-0.104ms | 🧵 |
+| Lock-free commit publishing | High | 10-15% | 0.098-0.104ms | 🔀 only |
 
 **If ALL optimizations are implemented:**
 - Conservative: 0.115ms × 0.5 × 0.85 × 0.9 × 0.8 × 0.8 × 0.85 ≈ **0.048ms** (2.4× SQLite)
@@ -744,6 +767,7 @@ open(path, O_DIRECT | O_RDWR);
    - Add corruption detection via salt
    - **Effort**: Medium (2-3 days)
    - **Risk**: LOW - well-established approach
+   - **⚠️ Requires ADR** (format change per AGENTS.md)
 
 3. **Release lock before fsync** (5-10% improvement + better concurrency)
    - Allows multiple connections to fsync concurrently
