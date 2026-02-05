@@ -1017,6 +1017,22 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** Allocation reuse did not translate into lower p95 latency in this workload.
 
+### Rejected: Zero-copy WAL writev path (single-page commit)
+**Change:** Attempted to avoid copying page payload into frameBuffer by writing header + payload + trailer via `writev`-style slices.  
+**Bench (run_id: 20260205_215248)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.079329 | **Regressed** (~0.8%) |
+| read_p95_ms | 0.001182 | 0.0013225 | **Regressed** (~11.9%) |
+| join_p95_ms | 0.447451 | 0.448642 | +0.3% (within noise) |
+| insert_rows_per_sec | 198,258.17 | 197,726.38 | -0.3% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009739 → gap **8.15×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The slice-based write path increased overhead in this workload.
+
 ### 8) Prepared UPDATE fast path for INT64 PK (Executor)
 **Change:** Detect `WHERE pk = $param|literal` and bypass planner/rowid scan for a direct single-row lookup/update.  
 **Bench (run_id: 20260205_211350)**  
