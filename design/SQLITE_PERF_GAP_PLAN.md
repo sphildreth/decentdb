@@ -1096,3 +1096,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009588 → gap **7.89×**  
 **Correctness/Durability:** No changes to WAL semantics or recovery.  
 **Follow-ups:** Next high-ROI remains zero-copy page cache / mmap WAL or OS-level sync optimizations (if any).
+
+### Rejected: Cache qualified column names for UPDATE fast path (Executor)
+**Change:** Cache fully-qualified column names per table to avoid per-update allocations in `tryFastPkUpdate`.  
+**Bench (run_id: 20260205_234443)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.0762835 | **Regressed** (~0.86%) |
+| read_p95_ms | 0.0012075 | 0.0011975 | Improved |
+| join_p95_ms | 0.4497395 | 0.457233 | +1.7% (within noise) |
+| insert_rows_per_sec | 197,962.03 | 195,937.41 | -1.0% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009919 → gap **7.69×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The cache lookup/management overhead outweighed the avoided per-update string building in this workload.
