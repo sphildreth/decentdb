@@ -1708,6 +1708,87 @@ proc findMatchingRowidsPrepared(db: Db, tableName: string, whereExpr: Expr, para
     rowids.add(row.rowid)
   ok(rowids)
 
+proc isPkColumnExpr(expr: Expr, pkName: string, tableName: string): bool =
+  expr != nil and expr.kind == ekColumn and expr.name == pkName and (expr.table.len == 0 or expr.table == tableName)
+
+proc tryFastPkUpdate(db: Db, bound: Statement, params: seq[Value]): Result[Option[int64]] =
+  if bound.updateWhere == nil:
+    return ok(none(int64))
+  let tableRes = db.catalog.getTable(bound.updateTable)
+  if not tableRes.ok:
+    return err[Option[int64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  var pkName = ""
+  for col in table.columns:
+    if col.primaryKey and col.kind == ctInt64:
+      pkName = col.name
+      break
+  if pkName.len == 0:
+    return ok(none(int64))
+  let whereExpr = bound.updateWhere
+  if whereExpr.kind != ekBinary or whereExpr.op != "=":
+    return ok(none(int64))
+  var valueExpr: Expr = nil
+  if isPkColumnExpr(whereExpr.left, pkName, bound.updateTable):
+    valueExpr = whereExpr.right
+  elif isPkColumnExpr(whereExpr.right, pkName, bound.updateTable):
+    valueExpr = whereExpr.left
+  else:
+    return ok(none(int64))
+  var rowidVal: uint64 = 0
+  case valueExpr.kind
+  of ekLiteral:
+    if valueExpr.value.kind != svInt:
+      return ok(none(int64))
+    rowidVal = cast[uint64](valueExpr.value.intVal)
+  of ekParam:
+    if valueExpr.index <= 0 or valueExpr.index > params.len:
+      return err[Option[int64]](ERR_SQL, "Missing parameter", $valueExpr.index)
+    let paramVal = params[valueExpr.index - 1]
+    if paramVal.kind != vkInt64:
+      return ok(none(int64))
+    rowidVal = cast[uint64](paramVal.int64Val)
+  else:
+    return ok(none(int64))
+  let storedRes = readRowAt(db.pager, table, rowidVal)
+  if not storedRes.ok:
+    return ok(some(0'i64))
+  var cols: seq[string] = @[]
+  for col in table.columns:
+    cols.add(bound.updateTable & "." & col.name)
+  let row = Row(rowid: storedRes.value.rowid, columns: cols, values: storedRes.value.values)
+  var newValues = row.values
+  for colName, expr in bound.assignments:
+    var idx = -1
+    for i, col in table.columns:
+      if col.name == colName:
+        idx = i
+        break
+    if idx >= 0:
+      let evalRes = evalExpr(row, expr, params)
+      if not evalRes.ok:
+        return err[Option[int64]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+      let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+      if not typeRes.ok:
+        return err[Option[int64]](typeRes.err.code, typeRes.err.message, colName)
+      newValues[idx] = evalRes.value
+  let notNullRes = enforceNotNull(table, newValues)
+  if not notNullRes.ok:
+    return err[Option[int64]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+  let uniqueRes = enforceUnique(db.catalog, db.pager, table, newValues, row.rowid)
+  if not uniqueRes.ok:
+    return err[Option[int64]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+  let fkRes = enforceForeignKeys(db.catalog, db.pager, table, newValues)
+  if not fkRes.ok:
+    return err[Option[int64]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+  let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, row.values, newValues)
+  if not restrictRes.ok:
+    return err[Option[int64]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+  let upRes = updateRow(db.pager, db.catalog, bound.updateTable, row.rowid, newValues)
+  if not upRes.ok:
+    return err[Option[int64]](upRes.err.code, upRes.err.message, upRes.err.context)
+  ok(some(1'i64))
+
 proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil): Result[int64] =
   ## Execute a single already-bound non-SELECT statement and return rows affected.
   ## Intended for the native C ABI / Go driver.
@@ -1893,67 +1974,73 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 1
 
   of skUpdate:
-    let tableRes = db.catalog.getTable(bound.updateTable)
-    if not tableRes.ok:
-      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-    let table = tableRes.value
-    var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
-    var cols: seq[string] = @[]
-    for col in table.columns:
-      cols.add(bound.updateTable & "." & col.name)
-
-    var rows: seq[Row] = @[]
-    if plan != nil:
-      let rowsRes = execPlan(db.pager, db.catalog, plan, params)
-      if not rowsRes.ok:
-        return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      rows = rowsRes.value
+    let fastRes = tryFastPkUpdate(db, bound, params)
+    if not fastRes.ok:
+      return err[int64](fastRes.err.code, fastRes.err.message, fastRes.err.context)
+    if fastRes.value.isSome:
+      affected = fastRes.value.get
     else:
-      let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
-      if not rowidsRes.ok:
-        return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
-      for rowid in rowidsRes.value:
-        let storedRes = readRowAt(db.pager, table, rowid)
-        if not storedRes.ok: continue
-        rows.add(Row(rowid: storedRes.value.rowid, columns: cols, values: storedRes.value.values))
+      let tableRes = db.catalog.getTable(bound.updateTable)
+      if not tableRes.ok:
+        return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let table = tableRes.value
+      var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
+      var cols: seq[string] = @[]
+      for col in table.columns:
+        cols.add(bound.updateTable & "." & col.name)
 
-    for row in rows:
-      var newValues = row.values
-      for colName, expr in bound.assignments:
-        var idx = -1
-        for i, col in table.columns:
-          if col.name == colName:
-            idx = i
-            break
-        if idx >= 0:
-          let evalRes = evalExpr(row, expr, params)
-          if not evalRes.ok:
-            return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-          let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
-          if not typeRes.ok:
-            return err[int64](typeRes.err.code, typeRes.err.message, colName)
-          newValues[idx] = evalRes.value
-      updates.add((row.rowid, row.values, newValues))
+      var rows: seq[Row] = @[]
+      if plan != nil:
+        let rowsRes = execPlan(db.pager, db.catalog, plan, params)
+        if not rowsRes.ok:
+          return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        rows = rowsRes.value
+      else:
+        let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
+        if not rowidsRes.ok:
+          return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+        for rowid in rowidsRes.value:
+          let storedRes = readRowAt(db.pager, table, rowid)
+          if not storedRes.ok: continue
+          rows.add(Row(rowid: storedRes.value.rowid, columns: cols, values: storedRes.value.values))
 
-    for entry in updates:
-      let notNullRes = enforceNotNull(table, entry[2])
-      if not notNullRes.ok:
-        return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-      let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
-      if not uniqueRes.ok:
-        return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-      let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
-      if not fkRes.ok:
-        return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-      let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
-      if not restrictRes.ok:
-        return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
-    for entry in updates:
-      let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
-      if not upRes.ok:
-        return err[int64](upRes.err.code, upRes.err.message, upRes.err.context)
+      for row in rows:
+        var newValues = row.values
+        for colName, expr in bound.assignments:
+          var idx = -1
+          for i, col in table.columns:
+            if col.name == colName:
+              idx = i
+              break
+          if idx >= 0:
+            let evalRes = evalExpr(row, expr, params)
+            if not evalRes.ok:
+              return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+            let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+            if not typeRes.ok:
+              return err[int64](typeRes.err.code, typeRes.err.message, colName)
+            newValues[idx] = evalRes.value
+        updates.add((row.rowid, row.values, newValues))
 
-    affected = int64(updates.len)
+      for entry in updates:
+        let notNullRes = enforceNotNull(table, entry[2])
+        if not notNullRes.ok:
+          return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+        let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
+        if not uniqueRes.ok:
+          return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+        let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
+        if not fkRes.ok:
+          return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+        let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+        if not restrictRes.ok:
+          return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+      for entry in updates:
+        let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
+        if not upRes.ok:
+          return err[int64](upRes.err.code, upRes.err.message, upRes.err.context)
+
+      affected = int64(updates.len)
 
   of skDelete:
     let tableRes = db.catalog.getTable(bound.deleteTable)

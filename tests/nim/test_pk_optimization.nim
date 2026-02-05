@@ -101,6 +101,32 @@ suite "Primary Key Optimization":
     check not conflictRes.ok
     check conflictRes.err.message == "UNIQUE constraint failed" or conflictRes.err.message == "Unique constraint failed: Primary Key conflict"
 
+  test "Prepared update by INT64 PK":
+    let dbPath = "test_pk_prepared_update.db"
+    var db = createTestDb(dbPath)
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+    
+    check execSql(db, "CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT)").ok
+    check execSql(db, "INSERT INTO users (id, name) VALUES (1, 'alice')").ok
+
+    var bobBytes: seq[byte] = @[]
+    for c in "bob": bobBytes.add(byte(c))
+    let prepRes = prepare(db, "UPDATE users SET name = $1 WHERE id = $2")
+    check prepRes.ok
+    let execRes = execPrepared(prepRes.value, @[
+      Value(kind: vkText, bytes: bobBytes),
+      Value(kind: vkInt64, int64Val: 1)
+    ])
+    check execRes.ok
+
+    let tableRes = db.catalog.getTable("users")
+    check tableRes.ok
+    let rowRes = readRowAt(db.pager, tableRes.value, 1)
+    check rowRes.ok
+    check rowRes.value.values[1].bytes == bobBytes
+
   test "Non-INT64 PK still creates index":
     let dbPath = "test_pk_text.db"
     var db = createTestDb(dbPath)

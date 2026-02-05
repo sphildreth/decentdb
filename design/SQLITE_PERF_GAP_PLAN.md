@@ -1016,3 +1016,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** Allocation reuse did not translate into lower p95 latency in this workload.
+
+### 8) Prepared UPDATE fast path for INT64 PK (Executor)
+**Change:** Detect `WHERE pk = $param|literal` and bypass planner/rowid scan for a direct single-row lookup/update.  
+**Bench (run_id: 20260205_211350)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.078693 | 0.0786825 | Improved (within noise) |
+| read_p95_ms | 0.001177 | 0.001182 | +0.4% (within noise) |
+| join_p95_ms | 0.4447445 | 0.447451 | +0.6% (within noise) |
+| insert_rows_per_sec | 200,154.99 | 198,258.17 | -0.95% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009227 → gap **8.53×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next high-ROI remains OS-level sync optimizations or zero-copy page cache.
