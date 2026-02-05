@@ -1033,6 +1033,22 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** The slice-based write path increased overhead in this workload.
 
+### Rejected: Linux `sync_file_range` preflush (WAL write path)
+**Change:** Attempted best-effort `sync_file_range(..., SYNC_FILE_RANGE_WRITE)` after WAL append to overlap flush with fsync.  
+**Bench (run_id: 20260205_220612)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.0823095 | **Regressed** (~4.6%) |
+| read_p95_ms | 0.001182 | 0.0011975 | +1.3% (within noise) |
+| join_p95_ms | 0.447451 | 0.4472595 | Flat |
+| insert_rows_per_sec | 198,258.17 | 195,880.78 | -1.2% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009668 → gap **8.51×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** Preflush did not reduce fsync latency on this system; added overhead outweighed benefits.
+
 ### 8) Prepared UPDATE fast path for INT64 PK (Executor)
 **Change:** Detect `WHERE pk = $param|literal` and bypass planner/rowid scan for a direct single-row lookup/update.  
 **Bench (run_id: 20260205_211350)**  
