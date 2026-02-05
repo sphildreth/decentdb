@@ -32,7 +32,6 @@ METRICS = [
     ("join_p95_ms", "Join p95", "lower"),
     ("commit_p95_ms", "Commit p95", "lower"),
     ("insert_rows_per_sec", "Insert (rows/s)", "higher"),
-    ("db_size_mb", "DB size (MB)", "lower"),
 ]
 
 BASELINE_ENGINE = "SQLite"  # normalize against this engine

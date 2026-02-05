@@ -19,7 +19,10 @@ task test, "Run Nim + Python unit tests":
 
 task test_nim, "Run Nim unit tests":
   # Use testament for parallel test execution and better reporting
-  exec "testament pattern \"tests/nim/*.nim\""
+  try:
+    exec "testament pattern \"tests/nim/*.nim\""
+  finally:
+    exec "testament html"
 
 task test_py, "Run Python harness tests":
   exec "python -m unittest -q tests/harness/test_runner.py"
@@ -93,7 +96,7 @@ task bench_embedded_sample, "Run embedded benchmarks and aggregate sample data":
 
 task bench_embedded_run, "Run embedded benchmarks (engines: decentdb,sqlite,duckdb or all)":
   exec "nimble bench_embedded"
-  exec "./build/run_benchmarks benchmarks/raw sample --engines=decentdb,sqlite"
+  exec "./build/run_benchmarks benchmarks/raw sample --engines=all"
 
 task bench_embedded_aggregate, "Aggregate raw benchmark results":
   exec "python3 benchmarks/embedded_compare/scripts/aggregate_benchmarks.py"

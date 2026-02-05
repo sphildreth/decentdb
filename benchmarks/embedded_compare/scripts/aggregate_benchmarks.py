@@ -106,9 +106,6 @@ def main():
             ops_per_sec = metrics.get("ops_per_sec")
             if ops_per_sec is not None:
                 data[(engine, "insert")]["ops_per_sec"].append(float(ops_per_sec))
-            db_size_bytes = artifacts.get("db_size_bytes")
-            if db_size_bytes is not None:
-                data[(engine, "insert")]["db_size_bytes"].append(float(db_size_bytes))
 
     engines = {}
 
@@ -141,11 +138,6 @@ def main():
             ops_per_sec_values = values_dict.get("ops_per_sec", [])
             if ops_per_sec_values:
                 engines[engine]["insert_rows_per_sec"] = median(ops_per_sec_values)
-            db_size_bytes_values = values_dict.get("db_size_bytes", [])
-            if db_size_bytes_values:
-                engines[engine]["db_size_mb"] = median(db_size_bytes_values) / (
-                    1024.0 * 1024.0
-                )
 
     if "SQLite" not in engines:
         raise SystemExit("Baseline engine 'SQLite' not found in benchmark data")
@@ -163,7 +155,6 @@ def main():
                 "join_p95_ms": "ms (lower is better)",
                 "commit_p95_ms": "ms (lower is better)",
                 "insert_rows_per_sec": "rows/sec (higher is better)",
-                "db_size_mb": "MB (lower is better)",
             },
         },
         "engines": engines,
