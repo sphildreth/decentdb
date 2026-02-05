@@ -932,6 +932,13 @@ proc commit*(writer: WalWriter): Result[uint64] =
   let startOffset = writer.wal.endOffset
   var currentOffset = startOffset
   
+  # Pre-size frame buffer to avoid incremental growth during encoding
+  var expectedLen = HeaderSize + TrailerSize # commit frame
+  for entry in writer.pending:
+    expectedLen += HeaderSize + TrailerSize + entry[1].len
+  if writer.wal.frameBuffer.len < expectedLen:
+    writer.wal.frameBuffer.setLen(expectedLen)
+  
   # 1. Encode all pending pages into the shared buffer
   for entry in writer.pending:
     perf.WalGrowthWriter.inc()

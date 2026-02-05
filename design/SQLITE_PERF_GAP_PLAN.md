@@ -846,3 +846,34 @@ To match SQLite exactly (0.010ms), would also need:
 7. **Per-thread WAL buffers** [HIGH effort]
 
 **Conclusion**: Getting to 2× SQLite performance is achievable with medium effort (weeks). Getting to parity requires significant architectural changes (months) that sacrifice some of DecentDB's safety guarantees.
+
+---
+
+## Progress (2026-02-05)
+
+**Baseline (run_id: 20260205_174417)**  
+DecentDB vs SQLite (commit latency gap: **14.61×**)
+
+| Metric | DecentDB | SQLite |
+|---|---:|---:|
+| commit_p95_ms | 0.127369 | 0.008716 |
+| read_p95_ms | 0.001252 | 0.001854 |
+| join_p95_ms | 0.493286 | 0.371568 |
+| insert_rows_per_sec | 200,964.63 | 121,787.85 |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.045056 |
+
+### 1) Pre-size WAL frameBuffer (Section 2: Memory Copying and Buffer Allocation)
+**Change:** Pre-size `wal.frameBuffer` per commit based on pending frames to avoid incremental growth during encoding.  
+**Bench (run_id: 20260205_185403)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.127369 | 0.1127165 | **Improved** (~11.5%) |
+| read_p95_ms | 0.001252 | 0.001197 | Improved |
+| join_p95_ms | 0.493286 | 0.497524 | +0.86% (within noise) |
+| insert_rows_per_sec | 200,964.63 | 195,020.60 | -2.95% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009798 → gap **11.50×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next low-risk item: direct string-to-frame encoding (avoid string→seq copy).
