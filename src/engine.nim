@@ -67,6 +67,7 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
   ## Open a database file with configurable cache size
   ## cachePages: Number of 4KB pages to cache (default 1024 = 4MB)
   let vfs = newOsVfs()
+  let walPath = path & "-wal"
   let res = vfs.open(path, fmReadWrite, true)
   if not res.ok:
     return err[Db](res.err.code, res.err.message, res.err.context)
@@ -81,6 +82,9 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     if info.size > 0:
       discard vfs.close(file)
       return err[Db](ERR_CORRUPTION, "Header unreadable", "page_id=1")
+    # Fresh DB: remove any stale WAL from prior runs
+    if fileExists(walPath):
+      removeFile(walPath)
     let header = DbHeader(
       formatVersion: FormatVersion,
       pageSize: DefaultPageSize,
@@ -137,7 +141,6 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
   let pager = pagerRes.value
 
   # Initialize WAL
-  let walPath = path & "-wal"
   let walRes = newWal(vfs, walPath, header.pageSize)
   if not walRes.ok:
     discard closePager(pager)
