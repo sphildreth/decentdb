@@ -86,6 +86,7 @@ decentdb-pgbak-import <pg_dump_path> <decentdb_path> [options]
 | `--commit-every <n>` | Commit every N rows per table (default: 5000) |
 | `--cache-mb <n>` | Cache size in MB |
 | `--cache-pages <n>` | Cache size in pages |
+| `--verbose`, `-v` | Enable verbose output for debugging |
 
 ### Example
 
@@ -230,6 +231,16 @@ For very large dumps:
 - Ensure progress is enabled to monitor bottlenecks
 - Index creation is typically the slowest phase - this is normal
 - The "Create indexes" phase builds all indexes after data load
+- Use `--verbose` to see detailed progress (rows processed, percentage complete)
+- The final summary shows elapsed time in `M:SS` format
+
+### Import appears stuck
+
+If the import seems to hang with no progress:
+- Use `--verbose` flag to see row-by-row progress
+- Check if it's stuck on a specific table (shown in progress bar)
+- Large tables may take several minutes to copy - this is normal
+- For debugging, use `--verbose` with `--no-progress` to see log output
 
 ## Differences from Native DecentDB Import
 
