@@ -1127,3 +1127,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 
 **SQLite reference (same run):** commit_p95_ms = 0.01024 → gap **7.30×**  
 **Correctness/Durability:** No code change; documentation only.  
+
+### Rejected: mmap-backed WAL write path (zero-copy frame encoding)
+**Change:** Add optional mmap-backed WAL write path and encode frames directly into the mapped region (fallback to `vfs.write`).  
+**Bench (run_id: 20260206_000651)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.0763885 | **Regressed** (~1.0%) |
+| read_p95_ms | 0.0012075 | 0.0011875 | Improved |
+| join_p95_ms | 0.4497395 | 0.445741 | Improved |
+| insert_rows_per_sec | 197,962.03 | 198,576.00 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009448 → gap **8.09×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** mmap path introduced extra overhead (mapping/truncate) without improving p95 in this workload; revisit only with a WAL header/end-offset strategy that avoids per-commit truncation.
