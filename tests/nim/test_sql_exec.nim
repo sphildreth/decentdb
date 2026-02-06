@@ -5,6 +5,7 @@ import engine
 import record/record
 import errors
 import tables
+import sets
 import sql/sql
 import planner/planner
 import catalog/catalog
@@ -114,10 +115,99 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "view DDL and read-only behavior":
+    let path = makeTempDb("decentdb_sql_exec_view_basic.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'a')").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'b')").ok
+    check execSql(db, "CREATE VIEW v AS SELECT id, name FROM t").ok
+
+    let rows = execSql(db, "SELECT name FROM v WHERE id = 2")
+    check rows.ok
+    check rows.value.len == 1
+    check rows.value[0] == "b"
+
+    let ins = execSql(db, "INSERT INTO v (id, name) VALUES (3, 'c')")
+    check not ins.ok
+    check ins.err.code == ERR_SQL
+
+    let upd = execSql(db, "UPDATE v SET name = 'x' WHERE id = 1")
+    check not upd.ok
+    check upd.err.code == ERR_SQL
+
+    let del = execSql(db, "DELETE FROM v WHERE id = 1")
+    check not del.ok
+    check del.err.code == ERR_SQL
+
+    check execSql(db, "DROP VIEW v").ok
+    discard closeDb(db)
+
+  test "view dependency restrictions and replace revalidation":
+    let path = makeTempDb("decentdb_sql_exec_view_dependencies.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'a')").ok
+    check execSql(db, "CREATE VIEW v1 AS SELECT id FROM t").ok
+    check execSql(db, "CREATE VIEW v2 AS SELECT id FROM v1").ok
+
+    let dropTable = execSql(db, "DROP TABLE t")
+    check not dropTable.ok
+    check dropTable.err.code == ERR_SQL
+
+    let dropView = execSql(db, "DROP VIEW v1")
+    check not dropView.ok
+    check dropView.err.code == ERR_SQL
+
+    let rename = execSql(db, "ALTER VIEW v1 RENAME TO v1_new")
+    check not rename.ok
+    check rename.err.code == ERR_SQL
+
+    let replaceInvalid = execSql(db, "CREATE OR REPLACE VIEW v1 AS SELECT name FROM t")
+    check not replaceInvalid.ok
+    check replaceInvalid.err.code == ERR_SQL
+
+    let rows = execSql(db, "SELECT id FROM v1")
+    check rows.ok
+    check rows.value == @["1"]
+
+    discard closeDb(db)
+
+  test "prepared statements re-prepare after view schema change":
+    let path = makeTempDb("decentdb_sql_exec_view_prepared.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'a')").ok
+    check execSql(db, "CREATE VIEW v AS SELECT id FROM t").ok
+
+    let prepRes = prepare(db, "SELECT id FROM v")
+    check prepRes.ok
+    let prepared = prepRes.value
+
+    let firstExec = execPrepared(prepared, @[])
+    check firstExec.ok
+    check firstExec.value.len == 1
+    check "int64Val: 1" in firstExec.value[0]
+
+    check execSql(db, "CREATE OR REPLACE VIEW v AS SELECT name FROM t").ok
+    let staleExec = execPrepared(prepared, @[])
+    check not staleExec.ok
+    check staleExec.err.code == ERR_SQL
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),
     indexes: initTable[string, IndexMeta](),
+    views: initTable[string, ViewMeta](),
+    dependentViews: initTable[string, HashSet[string]](),
     catalogTree: nil,
     trigramDeltas: initTable[(string, uint32), TrigramDelta]()
   )

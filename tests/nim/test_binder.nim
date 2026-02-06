@@ -31,6 +31,11 @@ proc addIndex(db: Db, name: string, table: string, column: string, unique: bool)
   check db.catalog.createIndexMeta(meta).ok
   meta
 
+proc addView(db: Db, name: string, sqlText: string, columnNames: seq[string], dependencies: seq[string]): ViewMeta =
+  let meta = ViewMeta(name: name, sqlText: sqlText, columnNames: columnNames, dependencies: dependencies)
+  check db.catalog.createViewMeta(meta).ok
+  meta
+
 proc parseSingle(sqlText: string): Statement =
   let astRes = parseSql(sqlText)
   check astRes.ok
@@ -109,5 +114,76 @@ suite "Binder":
     let stmtIdxUniq = parseSingle("CREATE UNIQUE INDEX t_trgm2 ON parent USING trigram (id)")
     let bindIdxUniq = bindStatement(db.catalog, stmtIdxUniq)
     check not bindIdxUniq.ok
+
+    discard closeDb(db)
+
+  test "bind create view and select expansion":
+    let path = makeTempDb("decentdb_binder_view_basic.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64), Column(name: "name", kind: ctText)])
+
+    let createStmt = parseSingle("CREATE VIEW v AS SELECT id AS x, name FROM t")
+    let createBind = bindStatement(db.catalog, createStmt)
+    check createBind.ok
+    check createBind.value.kind == skCreateView
+    check createBind.value.createViewColumns == @["x", "name"]
+
+    discard addView(db, "v", "SELECT id AS x, name FROM t", @["x", "name"], @["t"])
+    let selectStmt = parseSingle("SELECT x FROM v WHERE x = 1")
+    let selectBind = bindStatement(db.catalog, selectStmt)
+    check selectBind.ok
+    check selectBind.value.kind == skSelect
+    check selectBind.value.fromTable == "t"
+
+    discard closeDb(db)
+
+  test "bind view validations and DML rejection":
+    let path = makeTempDb("decentdb_binder_view_validation.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64), Column(name: "name", kind: ctText)])
+    discard addView(db, "v", "SELECT id FROM t", @["id"], @["t"])
+
+    let mismatch = bindStatement(db.catalog, parseSingle("CREATE VIEW vm (a) AS SELECT id, name FROM t"))
+    check not mismatch.ok
+
+    let duplicate = bindStatement(db.catalog, parseSingle("CREATE VIEW vd AS SELECT id, id FROM t"))
+    check not duplicate.ok
+
+    let withParam = bindStatement(db.catalog, parseSingle("CREATE VIEW vp AS SELECT id FROM t WHERE id = $1"))
+    check not withParam.ok
+
+    let insertView = bindStatement(db.catalog, parseSingle("INSERT INTO v (id) VALUES (1)"))
+    check not insertView.ok
+    let updateView = bindStatement(db.catalog, parseSingle("UPDATE v SET id = 2"))
+    check not updateView.ok
+    let deleteView = bindStatement(db.catalog, parseSingle("DELETE FROM v"))
+    check not deleteView.ok
+
+    discard closeDb(db)
+
+  test "bind strict dependency semantics":
+    let path = makeTempDb("decentdb_binder_view_dependencies.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64)])
+    discard addView(db, "v1", "SELECT id FROM t", @["id"], @["t"])
+    discard addView(db, "v2", "SELECT id FROM v1", @["id"], @["v1"])
+
+    let dropTable = bindStatement(db.catalog, parseSingle("DROP TABLE t"))
+    check not dropTable.ok
+
+    let dropView = bindStatement(db.catalog, parseSingle("DROP VIEW v1"))
+    check not dropView.ok
+
+    let renameView = bindStatement(db.catalog, parseSingle("ALTER VIEW v1 RENAME TO v1_new"))
+    check not renameView.ok
+
+    let cycleReplace = bindStatement(db.catalog, parseSingle("CREATE OR REPLACE VIEW v1 AS SELECT id FROM v2"))
+    check not cycleReplace.ok
 
     discard closeDb(db)

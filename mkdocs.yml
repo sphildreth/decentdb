@@ -17,6 +17,7 @@ nav:
     - Transactions: user-guide/transactions.md
     - Indexes: user-guide/indexes.md
     - Performance Tuning: user-guide/performance.md
+    - Comparison (SQLite/DuckDB): user-guide/comparison.md
   - API Reference:
     - Nim API: api/nim-api.md
     - CLI Reference: api/cli-reference.md

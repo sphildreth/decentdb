@@ -230,3 +230,45 @@ suite "Planner Coverage":
     check planRes.ok
     
     discard closeDb(db)
+
+  test "plan view-expanded query keeps index seek":
+    let path = makeTempDb("decentdb_planner_view_idx.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE docs (id INT64, body TEXT)")
+    discard execSql(db, "CREATE INDEX docs_id_idx ON docs (id)")
+    discard execSql(db, "CREATE VIEW docs_v AS SELECT id, body FROM docs")
+
+    let parseRes = parseSql("SELECT id FROM docs_v WHERE id = 1")
+    check parseRes.ok
+    let bindRes = bindStatement(db.catalog, parseRes.value.statements[0])
+    check bindRes.ok
+    let planRes = plan(db.catalog, bindRes.value)
+    check planRes.ok
+    check planRes.value.kind == pkProject
+    check planRes.value.left.kind == pkIndexSeek
+
+    discard closeDb(db)
+
+  test "plan view-expanded query keeps trigram seek":
+    let path = makeTempDb("decentdb_planner_view_trigram.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE docs (id INT64, body TEXT)")
+    discard execSql(db, "CREATE INDEX docs_body_trgm ON docs USING trigram (body)")
+    discard execSql(db, "CREATE VIEW docs_v AS SELECT id, body FROM docs")
+
+    let parseRes = parseSql("SELECT id FROM docs_v WHERE body LIKE '%foo%'")
+    check parseRes.ok
+    let bindRes = bindStatement(db.catalog, parseRes.value.statements[0])
+    check bindRes.ok
+    let planRes = plan(db.catalog, bindRes.value)
+    check planRes.ok
+    check planRes.value.kind == pkProject
+    check planRes.value.left.kind == pkTrigramSeek
+
+    discard closeDb(db)

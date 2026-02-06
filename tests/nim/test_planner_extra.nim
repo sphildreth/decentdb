@@ -1,6 +1,7 @@
 import unittest
 
 import tables
+import sets
 import catalog/catalog
 import planner/planner
 import sql/sql
@@ -9,6 +10,8 @@ proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),
     indexes: initTable[string, IndexMeta](),
+    views: initTable[string, ViewMeta](),
+    dependentViews: initTable[string, HashSet[string]](),
     catalogTree: nil,
     trigramDeltas: initTable[(string, uint32), TrigramDelta]()
   )

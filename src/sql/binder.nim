@@ -1,10 +1,17 @@
 import options
 import tables
+import sets
 import sequtils
 import strutils
 import ../errors
 import ../catalog/catalog
 import ./sql
+
+const MaxViewExpansionDepth* = 16
+const MaxExpandedAstNodes* = 10_000
+
+proc normalizedName(name: string): string =
+  name.toLowerAscii()
 
 proc nullExpr(): Expr =
   Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
@@ -31,6 +38,163 @@ proc checkLiteralType(expr: Expr, expected: ColumnType, columnName: string): Res
   if isSome(lit) and lit.get != expected:
     return err[Void](ERR_SQL, "Type mismatch for column", columnName)
   okVoid()
+
+proc cloneExpr(expr: Expr): Expr
+
+proc cloneExpr(expr: Expr): Expr =
+  if expr == nil:
+    return nil
+  case expr.kind
+  of ekLiteral:
+    Expr(kind: ekLiteral, value: expr.value)
+  of ekColumn:
+    Expr(kind: ekColumn, table: expr.table, name: expr.name)
+  of ekBinary:
+    Expr(kind: ekBinary, op: expr.op, left: cloneExpr(expr.left), right: cloneExpr(expr.right))
+  of ekUnary:
+    Expr(kind: ekUnary, unOp: expr.unOp, expr: cloneExpr(expr.expr))
+  of ekFunc:
+    var args: seq[Expr] = @[]
+    for arg in expr.args:
+      args.add(cloneExpr(arg))
+    Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar)
+  of ekParam:
+    Expr(kind: ekParam, index: expr.index)
+  of ekInList:
+    var listExprs: seq[Expr] = @[]
+    for item in expr.inList:
+      listExprs.add(cloneExpr(item))
+    Expr(kind: ekInList, inExpr: cloneExpr(expr.inExpr), inList: listExprs)
+
+proc cloneSelectItem(item: SelectItem): SelectItem =
+  SelectItem(expr: cloneExpr(item.expr), alias: item.alias, isStar: item.isStar)
+
+proc cloneJoin(join: JoinClause): JoinClause =
+  JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: cloneExpr(join.onExpr))
+
+proc cloneOrderItem(item: OrderItem): OrderItem =
+  OrderItem(expr: cloneExpr(item.expr), asc: item.asc)
+
+proc cloneSelectStatement(stmt: Statement): Statement =
+  var selectItems: seq[SelectItem] = @[]
+  for item in stmt.selectItems:
+    selectItems.add(cloneSelectItem(item))
+  var joins: seq[JoinClause] = @[]
+  for join in stmt.joins:
+    joins.add(cloneJoin(join))
+  var groupBy: seq[Expr] = @[]
+  for expr in stmt.groupBy:
+    groupBy.add(cloneExpr(expr))
+  var orderBy: seq[OrderItem] = @[]
+  for item in stmt.orderBy:
+    orderBy.add(cloneOrderItem(item))
+  Statement(
+    kind: skSelect,
+    selectItems: selectItems,
+    fromTable: stmt.fromTable,
+    fromAlias: stmt.fromAlias,
+    joins: joins,
+    whereExpr: cloneExpr(stmt.whereExpr),
+    groupBy: groupBy,
+    havingExpr: cloneExpr(stmt.havingExpr),
+    orderBy: orderBy,
+    limit: stmt.limit,
+    limitParam: stmt.limitParam,
+    offset: stmt.offset,
+    offsetParam: stmt.offsetParam
+  )
+
+proc countExprNodes(expr: Expr): int
+
+proc countExprNodes(expr: Expr): int =
+  if expr == nil:
+    return 0
+  result = 1
+  case expr.kind
+  of ekBinary:
+    result += countExprNodes(expr.left)
+    result += countExprNodes(expr.right)
+  of ekUnary:
+    result += countExprNodes(expr.expr)
+  of ekFunc:
+    for arg in expr.args:
+      result += countExprNodes(arg)
+  of ekInList:
+    result += countExprNodes(expr.inExpr)
+    for item in expr.inList:
+      result += countExprNodes(item)
+  else:
+    discard
+
+proc countSelectNodes(stmt: Statement): int =
+  var nodes = 1
+  nodes += stmt.selectItems.len
+  for item in stmt.selectItems:
+    if not item.isStar:
+      nodes += countExprNodes(item.expr)
+  nodes += stmt.joins.len
+  for join in stmt.joins:
+    nodes += countExprNodes(join.onExpr)
+  nodes += countExprNodes(stmt.whereExpr)
+  for expr in stmt.groupBy:
+    nodes += countExprNodes(expr)
+  nodes += countExprNodes(stmt.havingExpr)
+  for item in stmt.orderBy:
+    nodes += countExprNodes(item.expr)
+  nodes
+
+proc andExpr(left: Expr, right: Expr): Expr =
+  if left == nil:
+    return right
+  if right == nil:
+    return left
+  Expr(kind: ekBinary, op: "AND", left: left, right: right)
+
+proc hasParamsInExpr(expr: Expr): bool =
+  if expr == nil:
+    return false
+  case expr.kind
+  of ekParam:
+    true
+  of ekBinary:
+    hasParamsInExpr(expr.left) or hasParamsInExpr(expr.right)
+  of ekUnary:
+    hasParamsInExpr(expr.expr)
+  of ekFunc:
+    for arg in expr.args:
+      if hasParamsInExpr(arg):
+        return true
+    false
+  of ekInList:
+    if hasParamsInExpr(expr.inExpr):
+      return true
+    for item in expr.inList:
+      if hasParamsInExpr(item):
+        return true
+    false
+  of ekLiteral:
+    expr.value.kind == svParam
+  else:
+    false
+
+proc hasParamsInSelect(stmt: Statement): bool =
+  for item in stmt.selectItems:
+    if not item.isStar and hasParamsInExpr(item.expr):
+      return true
+  if hasParamsInExpr(stmt.whereExpr):
+    return true
+  for join in stmt.joins:
+    if hasParamsInExpr(join.onExpr):
+      return true
+  for expr in stmt.groupBy:
+    if hasParamsInExpr(expr):
+      return true
+  if hasParamsInExpr(stmt.havingExpr):
+    return true
+  for item in stmt.orderBy:
+    if hasParamsInExpr(item.expr):
+      return true
+  stmt.limitParam > 0 or stmt.offsetParam > 0
 
 proc buildTableMap(catalog: Catalog, fromTable: string, fromAlias: string, joins: seq[JoinClause]): Result[Table[string, TableMeta]] =
   var map = initTable[string, TableMeta]()
@@ -78,7 +242,7 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
     let res = resolveColumn(map, expr.table, expr.name)
     if not res.ok:
       return err[Void](res.err.code, res.err.message, res.err.context)
-    return okVoid()
+    okVoid()
   of ekBinary:
     let leftRes = bindExpr(map, expr.left)
     if not leftRes.ok:
@@ -96,11 +260,9 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
         return res
     okVoid()
   of ekInList:
-    # Bind the expression being tested
     let exprRes = bindExpr(map, expr.inExpr)
     if not exprRes.ok:
       return exprRes
-    # Bind all values in the IN list
     for item in expr.inList:
       let itemRes = bindExpr(map, item)
       if not itemRes.ok:
@@ -109,38 +271,418 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
   else:
     okVoid()
 
+proc sourceName(sourceTable: string, sourceAlias: string): string =
+  if sourceAlias.len > 0: sourceAlias else: sourceTable
+
+proc directSelectDependencies(stmt: Statement): seq[string] =
+  var seen = initHashSet[string]()
+  if stmt.fromTable.len > 0:
+    seen.incl(normalizedName(stmt.fromTable))
+  for join in stmt.joins:
+    seen.incl(normalizedName(join.table))
+  for name in seen:
+    result.add(name)
+
+proc collectTransitiveDependents(catalog: Catalog, objectName: string): seq[string] =
+  let root = normalizedName(objectName)
+  var visited = initHashSet[string]()
+  var queue = catalog.listDependentViews(root)
+  var i = 0
+  while i < queue.len:
+    let name = normalizedName(queue[i])
+    i.inc
+    if name in visited:
+      continue
+    visited.incl(name)
+    result.add(name)
+    for dep in catalog.listDependentViews(name):
+      let normalized = normalizedName(dep)
+      if normalized notin visited:
+        queue.add(normalized)
+
+proc viewDependsOn(catalog: Catalog, viewName: string, targetName: string, visiting: var HashSet[string]): bool =
+  let current = normalizedName(viewName)
+  let target = normalizedName(targetName)
+  if current == target:
+    return true
+  if current in visiting:
+    return false
+  visiting.incl(current)
+  let viewRes = catalog.getView(current)
+  if not viewRes.ok:
+    return false
+  for dep in viewRes.value.dependencies:
+    let depName = normalizedName(dep)
+    if depName == target:
+      return true
+    if catalog.hasViewName(depName) and viewDependsOn(catalog, depName, target, visiting):
+      return true
+  false
+
+proc parseViewSelect(view: ViewMeta): Result[Statement] =
+  let parseRes = parseSql(view.sqlText)
+  if not parseRes.ok:
+    return err[Statement](parseRes.err.code, parseRes.err.message, view.name)
+  if parseRes.value.statements.len != 1:
+    return err[Statement](ERR_SQL, "View definition must contain exactly one SELECT", view.name)
+  let stmt = parseRes.value.statements[0]
+  if stmt.kind != skSelect:
+    return err[Statement](ERR_SQL, "View definition must be SELECT", view.name)
+  ok(stmt)
+
+proc ensureExpandableViewShape(viewName: string, stmt: Statement): Result[Void] =
+  if stmt.groupBy.len > 0 or stmt.havingExpr != nil:
+    return err[Void](ERR_SQL, "Views with GROUP BY/HAVING are not supported in 0.x", viewName)
+  if stmt.orderBy.len > 0:
+    return err[Void](ERR_SQL, "Views with ORDER BY are not supported in 0.x", viewName)
+  if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+    return err[Void](ERR_SQL, "Views with LIMIT/OFFSET are not supported in 0.x", viewName)
+  okVoid()
+
+proc buildViewOutputExprs(catalog: Catalog, stmt: Statement): Result[seq[Expr]] =
+  var outputExprs: seq[Expr] = @[]
+  for item in stmt.selectItems:
+    if item.isStar:
+      if stmt.fromTable.len == 0:
+        return err[seq[Expr]](ERR_SQL, "SELECT * requires FROM clause")
+      let baseRes = catalog.getTable(stmt.fromTable)
+      if not baseRes.ok:
+        return err[seq[Expr]](baseRes.err.code, baseRes.err.message, baseRes.err.context)
+      let basePrefix = sourceName(stmt.fromTable, stmt.fromAlias)
+      for col in baseRes.value.columns:
+        outputExprs.add(Expr(kind: ekColumn, table: basePrefix, name: col.name))
+      for join in stmt.joins:
+        let tableRes = catalog.getTable(join.table)
+        if not tableRes.ok:
+          return err[seq[Expr]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+        let joinPrefix = sourceName(join.table, join.alias)
+        for col in tableRes.value.columns:
+          outputExprs.add(Expr(kind: ekColumn, table: joinPrefix, name: col.name))
+    else:
+      outputExprs.add(cloneExpr(item.expr))
+  ok(outputExprs)
+
+proc resolveViewOutputColumnNames(
+  catalog: Catalog,
+  viewName: string,
+  explicitColumns: seq[string],
+  expandedStmt: Statement
+): Result[seq[string]] =
+  let outputExprsRes = buildViewOutputExprs(catalog, expandedStmt)
+  if not outputExprsRes.ok:
+    return err[seq[string]](outputExprsRes.err.code, outputExprsRes.err.message, outputExprsRes.err.context)
+  let outputExprs = outputExprsRes.value
+  var names: seq[string] = @[]
+
+  if explicitColumns.len > 0:
+    if explicitColumns.len != outputExprs.len:
+      let ctx = "view_name=" & viewName & ",expected_count=" & $explicitColumns.len & ",actual_count=" & $outputExprs.len
+      return err[seq[string]](ERR_SQL, "View column count mismatch", ctx)
+    names = explicitColumns
+  else:
+    names = newSeq[string](outputExprs.len)
+    for i, expr in outputExprs:
+      var name = ""
+      if i < expandedStmt.selectItems.len:
+        let item = expandedStmt.selectItems[i]
+        if not item.isStar and item.alias.len > 0:
+          name = item.alias
+      if name.len == 0 and expr.kind == ekColumn:
+        name = expr.name
+      if name.len == 0:
+        name = "col" & $(i + 1)
+      names[i] = name
+
+  var seen = initHashSet[string]()
+  for name in names:
+    let key = normalizedName(name)
+    if key in seen:
+      let ctx = "view_name=" & viewName & ",column_name=" & name
+      return err[seq[string]](ERR_SQL, "Duplicate view output column", ctx)
+    seen.incl(key)
+  ok(names)
+
+proc viewColumnExprMap(catalog: Catalog, expandedViewStmt: Statement, viewMeta: ViewMeta): Result[Table[string, Expr]] =
+  let outputExprsRes = buildViewOutputExprs(catalog, expandedViewStmt)
+  if not outputExprsRes.ok:
+    return err[Table[string, Expr]](outputExprsRes.err.code, outputExprsRes.err.message, outputExprsRes.err.context)
+  let outputExprs = outputExprsRes.value
+  if outputExprs.len != viewMeta.columnNames.len:
+    let ctx = "view_name=" & viewMeta.name & ",expected_count=" & $viewMeta.columnNames.len & ",actual_count=" & $outputExprs.len
+    return err[Table[string, Expr]](ERR_SQL, "Stored view column shape mismatch", ctx)
+  var map = initTable[string, Expr]()
+  for i, name in viewMeta.columnNames:
+    map[normalizedName(name)] = cloneExpr(outputExprs[i])
+  ok(map)
+
+proc rewriteExprForViewRef(
+  expr: Expr,
+  refTable: string,
+  refAlias: string,
+  columnMap: Table[string, Expr],
+  allowUnqualified: bool
+): Result[Expr] =
+  if expr == nil:
+    return ok(Expr(nil))
+  case expr.kind
+  of ekColumn:
+    let tableMatches =
+      (expr.table.len > 0) and
+      (expr.table == refTable or (refAlias.len > 0 and expr.table == refAlias))
+    let unqualifiedMatch = expr.table.len == 0 and allowUnqualified
+    if tableMatches or unqualifiedMatch:
+      let key = normalizedName(expr.name)
+      if not columnMap.hasKey(key):
+        return err[Expr](ERR_SQL, "Unknown view column", refTable & "." & expr.name)
+      return ok(cloneExpr(columnMap[key]))
+    return ok(cloneExpr(expr))
+  of ekBinary:
+    let leftRes = rewriteExprForViewRef(expr.left, refTable, refAlias, columnMap, allowUnqualified)
+    if not leftRes.ok:
+      return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = rewriteExprForViewRef(expr.right, refTable, refAlias, columnMap, allowUnqualified)
+    if not rightRes.ok:
+      return err[Expr](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    ok(Expr(kind: ekBinary, op: expr.op, left: leftRes.value, right: rightRes.value))
+  of ekUnary:
+    let innerRes = rewriteExprForViewRef(expr.expr, refTable, refAlias, columnMap, allowUnqualified)
+    if not innerRes.ok:
+      return err[Expr](innerRes.err.code, innerRes.err.message, innerRes.err.context)
+    ok(Expr(kind: ekUnary, unOp: expr.unOp, expr: innerRes.value))
+  of ekFunc:
+    var args: seq[Expr] = @[]
+    for arg in expr.args:
+      let argRes = rewriteExprForViewRef(arg, refTable, refAlias, columnMap, allowUnqualified)
+      if not argRes.ok:
+        return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+      args.add(argRes.value)
+    ok(Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar))
+  of ekInList:
+    let inExprRes = rewriteExprForViewRef(expr.inExpr, refTable, refAlias, columnMap, allowUnqualified)
+    if not inExprRes.ok:
+      return err[Expr](inExprRes.err.code, inExprRes.err.message, inExprRes.err.context)
+    var listExprs: seq[Expr] = @[]
+    for item in expr.inList:
+      let itemRes = rewriteExprForViewRef(item, refTable, refAlias, columnMap, allowUnqualified)
+      if not itemRes.ok:
+        return err[Expr](itemRes.err.code, itemRes.err.message, itemRes.err.context)
+      listExprs.add(itemRes.value)
+    ok(Expr(kind: ekInList, inExpr: inExprRes.value, inList: listExprs))
+  else:
+    ok(cloneExpr(expr))
+
+proc selectHasStar(stmt: Statement): bool =
+  for item in stmt.selectItems:
+    if item.isStar:
+      return true
+  false
+
+proc expandSelectViews(
+  catalog: Catalog,
+  stmt: Statement,
+  depth: int,
+  stack: seq[string]
+): Result[Statement]
+
+proc expandSelectViews(
+  catalog: Catalog,
+  stmt: Statement,
+  depth: int,
+  stack: seq[string]
+): Result[Statement] =
+  if depth > MaxViewExpansionDepth:
+    return err[Statement](ERR_SQL, "View expansion depth exceeded", "max_depth=" & $MaxViewExpansionDepth)
+
+  var expanded = cloneSelectStatement(stmt)
+
+  proc expandSingleSource(refTable: string, refAlias: string, allowUnqualified: bool): Result[(ViewMeta, Statement, Statement, Table[string, Expr])] =
+    let viewRes = catalog.getView(refTable)
+    if not viewRes.ok:
+      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+    let normalized = normalizedName(refTable)
+    for existing in stack:
+      if normalizedName(existing) == normalized:
+        return err[(ViewMeta, Statement, Statement, Table[string, Expr])](ERR_SQL, "Circular view reference", refTable)
+    let parsedRes = parseViewSelect(viewRes.value)
+    if not parsedRes.ok:
+      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](parsedRes.err.code, parsedRes.err.message, parsedRes.err.context)
+    let shapeRes = ensureExpandableViewShape(viewRes.value.name, parsedRes.value)
+    if not shapeRes.ok:
+      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](shapeRes.err.code, shapeRes.err.message, shapeRes.err.context)
+    let nextRes = expandSelectViews(catalog, parsedRes.value, depth + 1, stack & @[refTable])
+    if not nextRes.ok:
+      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+    let mapRes = viewColumnExprMap(catalog, nextRes.value, viewRes.value)
+    if not mapRes.ok:
+      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](mapRes.err.code, mapRes.err.message, mapRes.err.context)
+    ok((viewRes.value, nextRes.value, cloneSelectStatement(nextRes.value), mapRes.value))
+
+  proc rewriteAllExpressions(target: var Statement, refTable: string, refAlias: string, columnMap: Table[string, Expr], allowUnqualified: bool): Result[Void] =
+    var rewrittenItems: seq[SelectItem] = @[]
+    for item in target.selectItems:
+      if item.isStar:
+        rewrittenItems.add(item)
+        continue
+      let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, allowUnqualified)
+      if not exprRes.ok:
+        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+      rewrittenItems.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
+    target.selectItems = rewrittenItems
+
+    let whereRes = rewriteExprForViewRef(target.whereExpr, refTable, refAlias, columnMap, allowUnqualified)
+    if not whereRes.ok:
+      return err[Void](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+    target.whereExpr = whereRes.value
+
+    var rewrittenJoins: seq[JoinClause] = @[]
+    for join in target.joins:
+      let onRes = rewriteExprForViewRef(join.onExpr, refTable, refAlias, columnMap, allowUnqualified)
+      if not onRes.ok:
+        return err[Void](onRes.err.code, onRes.err.message, onRes.err.context)
+      rewrittenJoins.add(JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: onRes.value))
+    target.joins = rewrittenJoins
+
+    var rewrittenGroupBy: seq[Expr] = @[]
+    for expr in target.groupBy:
+      let exprRes = rewriteExprForViewRef(expr, refTable, refAlias, columnMap, allowUnqualified)
+      if not exprRes.ok:
+        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+      rewrittenGroupBy.add(exprRes.value)
+    target.groupBy = rewrittenGroupBy
+
+    let havingRes = rewriteExprForViewRef(target.havingExpr, refTable, refAlias, columnMap, allowUnqualified)
+    if not havingRes.ok:
+      return err[Void](havingRes.err.code, havingRes.err.message, havingRes.err.context)
+    target.havingExpr = havingRes.value
+
+    var rewrittenOrder: seq[OrderItem] = @[]
+    for item in target.orderBy:
+      let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, allowUnqualified)
+      if not exprRes.ok:
+        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+      rewrittenOrder.add(OrderItem(expr: exprRes.value, asc: item.asc))
+    target.orderBy = rewrittenOrder
+    okVoid()
+
+  if expanded.fromTable.len > 0 and catalog.hasViewName(expanded.fromTable):
+    let onlySource = expanded.joins.len == 0
+    let singleSourceStar = selectHasStar(expanded)
+    if singleSourceStar and not onlySource:
+      return err[Statement](ERR_SQL, "SELECT * with joined views is not supported in 0.x")
+
+    let sourceRes = expandSingleSource(expanded.fromTable, expanded.fromAlias, onlySource)
+    if not sourceRes.ok:
+      return err[Statement](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+
+    let viewMeta = sourceRes.value[0]
+    let viewExpanded = sourceRes.value[1]
+    let viewCopy = sourceRes.value[2]
+    let columnMap = sourceRes.value[3]
+    let refTable = expanded.fromTable
+    let refAlias = expanded.fromAlias
+
+    if singleSourceStar:
+      var items: seq[SelectItem] = @[]
+      for item in expanded.selectItems:
+        if item.isStar:
+          for colName in viewMeta.columnNames:
+            let key = normalizedName(colName)
+            if columnMap.hasKey(key):
+              items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
+        else:
+          items.add(item)
+      expanded.selectItems = items
+
+    let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, onlySource)
+    if not rewriteRes.ok:
+      return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
+
+    let outerJoins = expanded.joins
+    expanded.fromTable = viewExpanded.fromTable
+    expanded.fromAlias = viewExpanded.fromAlias
+    expanded.joins = viewCopy.joins & outerJoins
+    expanded.whereExpr = andExpr(cloneExpr(viewCopy.whereExpr), expanded.whereExpr)
+
+  var joinIdx = 0
+  while joinIdx < expanded.joins.len:
+    if catalog.hasViewName(expanded.joins[joinIdx].table):
+      if selectHasStar(expanded):
+        return err[Statement](ERR_SQL, "SELECT * with joined views is not supported in 0.x")
+
+      let refTable = expanded.joins[joinIdx].table
+      let refAlias = expanded.joins[joinIdx].alias
+      let sourceRes = expandSingleSource(refTable, refAlias, false)
+      if not sourceRes.ok:
+        return err[Statement](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+      let viewExpanded = sourceRes.value[1]
+      let viewCopy = sourceRes.value[2]
+      let columnMap = sourceRes.value[3]
+
+      let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, false)
+      if not rewriteRes.ok:
+        return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
+
+      var baseJoin = expanded.joins[joinIdx]
+      baseJoin.table = viewExpanded.fromTable
+      baseJoin.alias = viewExpanded.fromAlias
+      baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(viewCopy.whereExpr))
+
+      var newJoins: seq[JoinClause] = @[]
+      for i, join in expanded.joins:
+        if i == joinIdx:
+          newJoins.add(baseJoin)
+          for extra in viewCopy.joins:
+            newJoins.add(extra)
+        else:
+          newJoins.add(join)
+      expanded.joins = newJoins
+    joinIdx.inc
+
+  let nodeCount = countSelectNodes(expanded)
+  if nodeCount > MaxExpandedAstNodes:
+    return err[Statement](ERR_SQL, "Expanded AST node budget exceeded", "max_nodes=" & $MaxExpandedAstNodes)
+
+  ok(expanded)
+
 proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
-  let mapRes = buildTableMap(catalog, stmt.fromTable, stmt.fromAlias, stmt.joins)
+  let expandedRes = expandSelectViews(catalog, stmt, 0, @[])
+  if not expandedRes.ok:
+    return err[Statement](expandedRes.err.code, expandedRes.err.message, expandedRes.err.context)
+  let expanded = expandedRes.value
+
+  let mapRes = buildTableMap(catalog, expanded.fromTable, expanded.fromAlias, expanded.joins)
   if not mapRes.ok:
     return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
   let map = mapRes.value
-  for item in stmt.selectItems:
+  for item in expanded.selectItems:
     if item.isStar:
       continue
     let res = bindExpr(map, item.expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
-  let whereRes = bindExpr(map, stmt.whereExpr)
+  let whereRes = bindExpr(map, expanded.whereExpr)
   if not whereRes.ok:
     return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-  for join in stmt.joins:
+  for join in expanded.joins:
     let onRes = bindExpr(map, join.onExpr)
     if not onRes.ok:
       return err[Statement](onRes.err.code, onRes.err.message, onRes.err.context)
-  for expr in stmt.groupBy:
+  for expr in expanded.groupBy:
     let res = bindExpr(map, expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
-  let havingRes = bindExpr(map, stmt.havingExpr)
+  let havingRes = bindExpr(map, expanded.havingExpr)
   if not havingRes.ok:
     return err[Statement](havingRes.err.code, havingRes.err.message, havingRes.err.context)
-  for item in stmt.orderBy:
+  for item in expanded.orderBy:
     let res = bindExpr(map, item.expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
-  ok(stmt)
+  ok(expanded)
 
 proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if catalog.hasViewName(stmt.insertTable):
+    return err[Statement](ERR_SQL, "View is read-only", stmt.insertTable)
   let tableRes = catalog.getTable(stmt.insertTable)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -169,6 +711,8 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
   ok(Statement(kind: skInsert, insertTable: stmt.insertTable, insertColumns: @[], insertValues: ordered))
 
 proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if catalog.hasViewName(stmt.updateTable):
+    return err[Statement](ERR_SQL, "View is read-only", stmt.updateTable)
   let tableRes = catalog.getTable(stmt.updateTable)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -193,6 +737,8 @@ proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
   ok(stmt)
 
 proc bindDelete(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if catalog.hasViewName(stmt.deleteTable):
+    return err[Statement](ERR_SQL, "View is read-only", stmt.deleteTable)
   let mapRes = buildTableMap(catalog, stmt.deleteTable, "", @[])
   if not mapRes.ok:
     return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
@@ -202,6 +748,9 @@ proc bindDelete(catalog: Catalog, stmt: Statement): Result[Statement] =
   ok(stmt)
 
 proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if catalog.hasTableOrViewName(stmt.createTableName):
+    return err[Statement](ERR_SQL, "Object already exists", stmt.createTableName)
+
   var primaryCount = 0
   for col in stmt.columns:
     let typeRes = parseColumnType(col.typeName)
@@ -226,12 +775,11 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
         if parentCol.name == col.refColumn and parentCol.primaryKey and parentCol.kind == ctInt64:
           isInt64Pk = true
           break
-      
+
       if not isInt64Pk:
         if isNone(parentIdx) or not parentIdx.get.unique:
           return err[Statement](ERR_SQL, "Referenced column must be indexed uniquely", col.refTable & "." & col.refColumn)
   if primaryCount > 1:
-    # Composite primary keys: validate all PK columns are NOT NULL
     for col in stmt.columns:
       if col.primaryKey and not col.notNull:
         return err[Statement](ERR_SQL, "Composite primary key column must be NOT NULL", col.name)
@@ -257,6 +805,133 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](ERR_SQL, "Trigram index on multiple columns not supported")
   if stmt.indexKind == sql.ikTrigram and stmt.unique:
     return err[Statement](ERR_SQL, "Trigram index cannot be UNIQUE", stmt.columnNames[0])
+  ok(stmt)
+
+proc validateDependentViewsForReplacement(catalog: Catalog, candidate: ViewMeta): Result[Void] =
+  let direct = catalog.listDependentViews(candidate.name)
+  if direct.len == 0:
+    return okVoid()
+
+  let backupViews = catalog.views
+  let backupDependents = catalog.dependentViews
+
+  catalog.views[candidate.name] = candidate
+  rebuildDependentViewsIndex(catalog)
+
+  let dependents = collectTransitiveDependents(catalog, candidate.name)
+  for depName in dependents:
+    let depRes = catalog.getView(depName)
+    if not depRes.ok:
+      catalog.views = backupViews
+      catalog.dependentViews = backupDependents
+      return err[Void](depRes.err.code, depRes.err.message, depRes.err.context)
+    let parseRes = parseViewSelect(depRes.value)
+    if not parseRes.ok:
+      catalog.views = backupViews
+      catalog.dependentViews = backupDependents
+      return err[Void](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+    let expandRes = expandSelectViews(catalog, parseRes.value, 0, @[depName])
+    if not expandRes.ok:
+      catalog.views = backupViews
+      catalog.dependentViews = backupDependents
+      return err[Void](expandRes.err.code, "Dependent view revalidation failed: " & expandRes.err.message, depName)
+    let colRes = resolveViewOutputColumnNames(catalog, depName, depRes.value.columnNames, expandRes.value)
+    if not colRes.ok:
+      catalog.views = backupViews
+      catalog.dependentViews = backupDependents
+      return err[Void](colRes.err.code, "Dependent view revalidation failed: " & colRes.err.message, colRes.err.context)
+
+  catalog.views = backupViews
+  catalog.dependentViews = backupDependents
+  okVoid()
+
+proc bindCreateView(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if stmt.createViewIfNotExists and stmt.createViewOrReplace:
+    return err[Statement](ERR_SQL, "CREATE OR REPLACE VIEW cannot include IF NOT EXISTS", stmt.createViewName)
+
+  let viewName = normalizedName(stmt.createViewName)
+
+  if catalog.hasTableName(viewName):
+    return err[Statement](ERR_SQL, "Object name collides with existing table", stmt.createViewName)
+
+  let exists = catalog.hasViewName(viewName)
+  if exists and not stmt.createViewOrReplace:
+    if stmt.createViewIfNotExists:
+      return ok(stmt)
+    return err[Statement](ERR_SQL, "View already exists", stmt.createViewName)
+
+  if stmt.createViewQuery == nil or stmt.createViewQuery.kind != skSelect:
+    return err[Statement](ERR_SQL, "CREATE VIEW requires SELECT definition", stmt.createViewName)
+
+  if hasParamsInSelect(stmt.createViewQuery):
+    return err[Statement](ERR_SQL, "View definition cannot contain parameters", stmt.createViewName)
+
+  let deps = directSelectDependencies(stmt.createViewQuery)
+  for dep in deps:
+    if not catalog.hasTableName(dep) and not catalog.hasViewName(dep):
+      return err[Statement](ERR_SQL, "Referenced object not found", dep)
+    if dep == viewName:
+      return err[Statement](ERR_SQL, "Circular view reference", stmt.createViewName)
+    if catalog.hasViewName(dep):
+      var visiting = initHashSet[string]()
+      if viewDependsOn(catalog, dep, viewName, visiting):
+        return err[Statement](ERR_SQL, "Circular view reference", stmt.createViewName)
+
+  let expandedRes = expandSelectViews(catalog, stmt.createViewQuery, 0, @[viewName])
+  if not expandedRes.ok:
+    return err[Statement](expandedRes.err.code, expandedRes.err.message, expandedRes.err.context)
+
+  let colRes = resolveViewOutputColumnNames(catalog, viewName, stmt.createViewColumns, expandedRes.value)
+  if not colRes.ok:
+    return err[Statement](colRes.err.code, colRes.err.message, colRes.err.context)
+
+  let bound = Statement(
+    kind: skCreateView,
+    createViewName: viewName,
+    createViewIfNotExists: stmt.createViewIfNotExists,
+    createViewOrReplace: stmt.createViewOrReplace,
+    createViewColumns: colRes.value,
+    createViewSqlText: stmt.createViewSqlText,
+    createViewQuery: cloneSelectStatement(stmt.createViewQuery)
+  )
+
+  if stmt.createViewOrReplace and exists:
+    let candidate = ViewMeta(
+      name: viewName,
+      sqlText: bound.createViewSqlText,
+      columnNames: bound.createViewColumns,
+      dependencies: deps
+    )
+    let revalidateRes = validateDependentViewsForReplacement(catalog, candidate)
+    if not revalidateRes.ok:
+      return err[Statement](revalidateRes.err.code, revalidateRes.err.message, revalidateRes.err.context)
+
+  ok(bound)
+
+proc bindDropTable(catalog: Catalog, stmt: Statement): Result[Statement] =
+  let deps = catalog.listDependentViews(stmt.dropTableName)
+  if deps.len > 0:
+    return err[Statement](ERR_SQL, "Cannot drop table with dependent views", stmt.dropTableName)
+  ok(stmt)
+
+proc bindDropView(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if not catalog.hasViewName(stmt.dropViewName):
+    if stmt.dropViewIfExists:
+      return ok(stmt)
+    return err[Statement](ERR_SQL, "View not found", stmt.dropViewName)
+  let deps = catalog.listDependentViews(stmt.dropViewName)
+  if deps.len > 0:
+    return err[Statement](ERR_SQL, "Cannot drop view with dependent views", stmt.dropViewName)
+  ok(stmt)
+
+proc bindAlterView(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if not catalog.hasViewName(stmt.alterViewName):
+    return err[Statement](ERR_SQL, "View not found", stmt.alterViewName)
+  if catalog.hasTableOrViewName(stmt.alterViewNewName):
+    return err[Statement](ERR_SQL, "Target name already exists", stmt.alterViewNewName)
+  let deps = catalog.listDependentViews(stmt.alterViewName)
+  if deps.len > 0:
+    return err[Statement](ERR_SQL, "Cannot rename view with dependent views", stmt.alterViewName)
   ok(stmt)
 
 proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
@@ -315,9 +990,19 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     bindCreateTable(catalog, stmt)
   of skCreateIndex:
     bindCreateIndex(catalog, stmt)
+  of skCreateView:
+    bindCreateView(catalog, stmt)
+  of skDropTable:
+    bindDropTable(catalog, stmt)
+  of skDropIndex:
+    ok(stmt)
+  of skDropView:
+    bindDropView(catalog, stmt)
+  of skAlterView:
+    bindAlterView(catalog, stmt)
   of skAlterTable:
     bindAlterTable(catalog, stmt)
-  of skDropTable, skDropIndex, skBegin, skCommit, skRollback:
+  of skBegin, skCommit, skRollback:
     ok(stmt)
   of skExplain:
     let innerRes = bindStatement(catalog, stmt.explainInner)

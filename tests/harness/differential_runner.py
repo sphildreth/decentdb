@@ -98,6 +98,29 @@ DIFFERENTIAL_TESTS = [
         test_sql="INSERT INTO test VALUES (1, true), (2, false); SELECT * FROM test ORDER BY id",
         expect_rows=["1|true", "2|false"],
     ),
+    DifferentialTest(
+        name="create_view_select",
+        description="CREATE VIEW and SELECT through view",
+        schema_sql="CREATE TABLE test (id INT PRIMARY KEY, val INT); CREATE VIEW v_test AS SELECT id, val FROM test",
+        setup_sql="INSERT INTO test VALUES (1, 10), (2, 20)",
+        test_sql="SELECT id, val FROM v_test ORDER BY id",
+        expect_rows=["1|10", "2|20"],
+    ),
+    DifferentialTest(
+        name="nested_view_select",
+        description="Nested views produce expected rows",
+        schema_sql="CREATE TABLE test (id INT PRIMARY KEY, val INT); CREATE VIEW v1 AS SELECT id, val FROM test; CREATE VIEW v2 AS SELECT id FROM v1 WHERE val > 10",
+        setup_sql="INSERT INTO test VALUES (1, 10), (2, 20), (3, 30)",
+        test_sql="SELECT id FROM v2 ORDER BY id",
+        expect_rows=["2", "3"],
+    ),
+    DifferentialTest(
+        name="view_dml_rejected",
+        description="DML against view should fail",
+        schema_sql="CREATE TABLE test (id INT PRIMARY KEY, val INT); CREATE VIEW v_test AS SELECT id, val FROM test",
+        test_sql="INSERT INTO v_test VALUES (1, 10)",
+        expect_rows=[],
+    ),
     # DML - INSERT tests
     DifferentialTest(
         name="insert_single",

@@ -280,6 +280,17 @@ proc schemaBump(db: Db): Result[Void] =
     return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
   okVoid()
 
+proc viewDependencies(stmt: Statement): seq[string] =
+  var seen = initHashSet[string]()
+  if stmt != nil and stmt.kind == skSelect:
+    if stmt.fromTable.len > 0:
+      seen.incl(stmt.fromTable.toLowerAscii())
+    for join in stmt.joins:
+      if join.table.len > 0:
+        seen.incl(join.table.toLowerAscii())
+  for dep in seen:
+    result.add(dep)
+
 proc valueFromSql(value: Value): Value =
   value
 
@@ -1256,7 +1267,7 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
        let execRes = execPreparedNonSelect(db, bound, params, plan)
        if not execRes.ok:
          return err[seq[string]](execRes.err.code, execRes.err.message, execRes.err.context)
-    of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skAlterTable:
+    of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skCreateView, skDropView, skAlterView, skAlterTable:
        # DDL invalidates prepared statements anyway
        return execSql(db, prepared.sql, params)
 
@@ -1435,7 +1446,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       output.add(parts.join("|"))
     ok(output)
   for i, bound in boundStatements:
-    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
+    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
     # stderr.writeLine("execSql: i=" & $i & " kind=" & $bound.kind & " isWrite=" & $isWrite)
     var autoCommit = false
     if isWrite and db.activeWriter == nil and db.wal != nil:
@@ -1516,6 +1527,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropTable:
+      let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
+      if dependentViews.len > 0:
+        return err[seq[string]](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
       var toDrop: seq[string] = @[]
       for name, idx in db.catalog.indexes:
         if idx.table == bound.dropTableName:
@@ -1629,6 +1643,55 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let dropRes = db.catalog.dropIndex(bound.dropIndexName)
       if not dropRes.ok:
         return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    of skCreateView:
+      let dependencies = viewDependencies(bound.createViewQuery)
+      let viewMeta = ViewMeta(
+        name: bound.createViewName,
+        sqlText: bound.createViewSqlText,
+        columnNames: bound.createViewColumns,
+        dependencies: dependencies
+      )
+      if bound.createViewIfNotExists and db.catalog.hasViewName(bound.createViewName):
+        discard
+      elif bound.createViewOrReplace and db.catalog.hasViewName(bound.createViewName):
+        let saveRes = db.catalog.saveViewMeta(viewMeta)
+        if not saveRes.ok:
+          return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+      else:
+        let createRes = db.catalog.createViewMeta(viewMeta)
+        if not createRes.ok:
+          return err[seq[string]](createRes.err.code, createRes.err.message, createRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    of skDropView:
+      if not db.catalog.hasViewName(bound.dropViewName):
+        if bound.dropViewIfExists:
+          discard
+        else:
+          return err[seq[string]](ERR_SQL, "View not found", bound.dropViewName)
+      else:
+        let dependentViews = db.catalog.listDependentViews(bound.dropViewName)
+        if dependentViews.len > 0:
+          return err[seq[string]](ERR_SQL, "Cannot drop view with dependent views", bound.dropViewName)
+        let dropRes = db.catalog.dropView(bound.dropViewName)
+        if not dropRes.ok:
+          return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    of skAlterView:
+      let dependentViews = db.catalog.listDependentViews(bound.alterViewName)
+      if dependentViews.len > 0:
+        return err[seq[string]](ERR_SQL, "Cannot rename view with dependent views", bound.alterViewName)
+      if db.catalog.hasTableOrViewName(bound.alterViewNewName):
+        return err[seq[string]](ERR_SQL, "Target name already exists", bound.alterViewNewName)
+      let renameRes = db.catalog.renameView(bound.alterViewName, bound.alterViewNewName)
+      if not renameRes.ok:
+        return err[seq[string]](renameRes.err.code, renameRes.err.message, renameRes.err.context)
       let bumpRes = schemaBump(db)
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
@@ -1908,7 +1971,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   if bound.kind == skSelect:
     return err[int64](ERR_INTERNAL, "execPreparedNonSelect called with SELECT")
 
-  let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skInsert, skUpdate, skDelete}
+  let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
   var autoCommit = false
   if isWrite and db.activeWriter == nil and db.wal != nil:
     let beginRes = beginTransaction(db)
@@ -1989,6 +2052,9 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 0
 
   of skDropTable:
+    let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
+    if dependentViews.len > 0:
+      return err[int64](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
     var toDrop: seq[string] = @[]
     for name, idx in db.catalog.indexes:
       if idx.table == bound.dropTableName:
@@ -2107,6 +2173,59 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     let dropRes = db.catalog.dropIndex(bound.dropIndexName)
     if not dropRes.ok:
       return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skCreateView:
+    let dependencies = viewDependencies(bound.createViewQuery)
+    let viewMeta = ViewMeta(
+      name: bound.createViewName,
+      sqlText: bound.createViewSqlText,
+      columnNames: bound.createViewColumns,
+      dependencies: dependencies
+    )
+    if bound.createViewIfNotExists and db.catalog.hasViewName(bound.createViewName):
+      discard
+    elif bound.createViewOrReplace and db.catalog.hasViewName(bound.createViewName):
+      let saveRes = db.catalog.saveViewMeta(viewMeta)
+      if not saveRes.ok:
+        return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    else:
+      let createRes = db.catalog.createViewMeta(viewMeta)
+      if not createRes.ok:
+        return err[int64](createRes.err.code, createRes.err.message, createRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skDropView:
+    if not db.catalog.hasViewName(bound.dropViewName):
+      if not bound.dropViewIfExists:
+        return err[int64](ERR_SQL, "View not found", bound.dropViewName)
+    else:
+      let dependentViews = db.catalog.listDependentViews(bound.dropViewName)
+      if dependentViews.len > 0:
+        return err[int64](ERR_SQL, "Cannot drop view with dependent views", bound.dropViewName)
+      let dropRes = db.catalog.dropView(bound.dropViewName)
+      if not dropRes.ok:
+        return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skAlterView:
+    let dependentViews = db.catalog.listDependentViews(bound.alterViewName)
+    if dependentViews.len > 0:
+      return err[int64](ERR_SQL, "Cannot rename view with dependent views", bound.alterViewName)
+    if db.catalog.hasTableOrViewName(bound.alterViewNewName):
+      return err[int64](ERR_SQL, "Target name already exists", bound.alterViewNewName)
+    let renameRes = db.catalog.renameView(bound.alterViewName, bound.alterViewNewName)
+    if not renameRes.ok:
+      return err[int64](renameRes.err.code, renameRes.err.message, renameRes.err.context)
     let bumpRes = schemaBump(db)
     if not bumpRes.ok:
       return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)

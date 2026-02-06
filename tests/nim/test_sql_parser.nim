@@ -58,3 +58,34 @@ suite "SQL Parser":
 
     let rollbackStmt = parseSingle("ROLLBACK")
     check rollbackStmt.kind == skRollback
+
+  test "parse create/drop/alter view":
+    let cv = parseSingle("CREATE VIEW v AS SELECT id, name FROM t")
+    check cv.kind == skCreateView
+    check cv.createViewName == "v"
+    check cv.createViewIfNotExists == false
+    check cv.createViewOrReplace == false
+    check cv.createViewColumns.len == 0
+    check cv.createViewQuery != nil
+    check cv.createViewQuery.kind == skSelect
+
+    let cvIf = parseSingle("CREATE VIEW IF NOT EXISTS v2 (a,b) AS SELECT id, name FROM t")
+    check cvIf.kind == skCreateView
+    check cvIf.createViewIfNotExists
+    check cvIf.createViewOrReplace == false
+    check cvIf.createViewColumns == @["a", "b"]
+
+    let cvOrReplace = parseSingle("CREATE OR REPLACE VIEW v3 AS SELECT id FROM t")
+    check cvOrReplace.kind == skCreateView
+    check cvOrReplace.createViewOrReplace
+    check cvOrReplace.createViewIfNotExists == false
+
+    let dv = parseSingle("DROP VIEW IF EXISTS v")
+    check dv.kind == skDropView
+    check dv.dropViewName == "v"
+    check dv.dropViewIfExists
+
+    let av = parseSingle("ALTER VIEW v RENAME TO v_new")
+    check av.kind == skAlterView
+    check av.alterViewName == "v"
+    check av.alterViewNewName == "v_new"

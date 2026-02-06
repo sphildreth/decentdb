@@ -1,0 +1,19 @@
+{
+  "name": "view_replace_crash",
+  "description": "Crash during CREATE OR REPLACE VIEW should preserve old definition",
+  "db_path": "$TMPDIR/decentdb_view_replace_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'a'); CREATE VIEW v AS SELECT id FROM t",
+  "sql": "CREATE OR REPLACE VIEW v AS SELECT name FROM t",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id FROM v",
+    "expect_rows": [
+      "1"
+    ]
+  }
+}

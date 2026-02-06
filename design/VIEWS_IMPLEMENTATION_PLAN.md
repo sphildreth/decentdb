@@ -1,6 +1,6 @@
 # DecentDB Views Implementation Plan
 **Date:** 2026-02-06  
-**Status:** Draft (v0.1)
+**Status:** Accepted
 
 ## 1. Purpose
 Define the initial requirements and implementation plan for SQL views in DecentDB, using SQLite and DuckDB as behavioral baselines while preserving DecentDB priorities:

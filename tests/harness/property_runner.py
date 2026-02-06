@@ -25,7 +25,7 @@ class DecentDbAdapter:
 
     def execute(self, db_path: str, sql: str) -> tuple[bool, list[str], str]:
         """Execute SQL and return (success, rows, error)."""
-        cmd = [self.engine_path, "exec", "--db", db_path, "--sql", sql]
+        cmd = [self.engine_path, "exec", f"--db={db_path}", f"--sql={sql}"]
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
         try:
@@ -388,6 +388,71 @@ def test_acid_durability_simple(
     return True, f"Verified {count} rows persisted after reopen"
 
 
+def test_view_equivalence(
+    engine: DecentDbAdapter, db_path: str, seed: int
+) -> tuple[bool, str]:
+    """
+    Property: SELECT from a simple view matches the inlined SELECT.
+    """
+    random.seed(seed)
+
+    table_name = f"view_base_{seed}"
+    view_name = f"view_v_{seed}"
+
+    engine.execute(db_path, f"DROP VIEW IF EXISTS {view_name}")
+    engine.execute(db_path, f"DROP TABLE IF EXISTS {table_name}")
+
+    ok, _, err = engine.execute(
+        db_path, f"CREATE TABLE {table_name} (id INT PRIMARY KEY, val INT)"
+    )
+    if not ok:
+        return False, f"Failed to create table: {err}"
+
+    num_rows = random.randint(10, 40)
+    threshold = random.randint(-100, 100)
+    for i in range(num_rows):
+        val = generate_random_int(-200, 200)
+        ok, _, err = engine.execute(
+            db_path, f"INSERT INTO {table_name} VALUES ({i}, {val})"
+        )
+        if not ok:
+            return False, f"Failed to insert row {i}: {err}"
+
+    ok, _, err = engine.execute(
+        db_path,
+        f"CREATE VIEW {view_name} AS SELECT id, val FROM {table_name} WHERE val > {threshold}",
+    )
+    if not ok:
+        return False, f"Failed to create view: {err}"
+
+    ok, view_rows, err = engine.execute(
+        db_path, f"SELECT id, val FROM {view_name} ORDER BY id"
+    )
+    if not ok:
+        return False, f"Failed to query view: {err}"
+
+    ok, base_rows, err = engine.execute(
+        db_path,
+        f"SELECT id, val FROM {table_name} WHERE val > {threshold} ORDER BY id",
+    )
+    if not ok:
+        return False, f"Failed to query base: {err}"
+
+    if view_rows != base_rows:
+        return False, f"View/base mismatch: view={view_rows[:5]} base={base_rows[:5]}"
+
+    replace_ok, _, replace_err = engine.execute(
+        db_path,
+        f"CREATE OR REPLACE VIEW {view_name} AS SELECT id, val FROM {table_name} WHERE val >= {threshold}",
+    )
+    if not replace_ok:
+        return False, f"Failed to replace view: {replace_err}"
+
+    engine.execute(db_path, f"DROP VIEW {view_name}")
+    engine.execute(db_path, f"DROP TABLE {table_name}")
+    return True, f"Verified equivalence on {num_rows} rows (threshold={threshold})"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Property-based tests for DecentDb")
     parser.add_argument(
@@ -402,7 +467,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
     parser.add_argument(
         "--test",
-        choices=["index", "btree", "fk", "snapshot", "acid", "all"],
+        choices=["index", "btree", "fk", "snapshot", "acid", "view", "all"],
         default="all",
     )
     args = parser.parse_args()
@@ -429,6 +494,8 @@ def main() -> int:
         tests.append(("Snapshot Isolation", test_snapshot_isolation))
     if args.test in ("acid", "all"):
         tests.append(("ACID Durability", test_acid_durability_simple))
+    if args.test in ("view", "all"):
+        tests.append(("View Equivalence", test_view_equivalence))
 
     print(
         f"Running property-based tests: {len(tests)} properties x {args.iterations} iterations"
