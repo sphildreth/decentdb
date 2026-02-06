@@ -511,26 +511,26 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     echo resultJson(true, rows = info)
     return 0
   
-  # Handle checkpoint request
-  if checkpoint:
+  # Handle checkpoint-only request (no SQL to execute)
+  if checkpoint and sql.len == 0:
     let ckRes = checkpointDb(database)
     if not ckRes.ok:
       discard closeDb(database)
       echo resultJson(false, ckRes.err)
       return 1
-    
+
     var ckRows: seq[string] = @["Checkpoint completed at LSN " & $ckRes.value]
-    
+
     # Add warnings if present
     if warnings or verbose:
       let walWarnings = takeWarnings(database.wal)
       for warn in walWarnings:
         ckRows.add("WARNING: " & warn)
-    
+
     discard closeDb(database)
     echo resultJson(true, rows = ckRows)
     return 0
-  
+
   if not openClose and sql.len > 0:
     let execStart = getMonoTime()
     var parsedParams: seq[Value] = @[]
@@ -614,7 +614,24 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
     var walWarnings: seq[string] = @[]
     if warnings or verbose:
       walWarnings = takeWarnings(database.wal)
-    
+
+    # Handle checkpoint after SQL execution if requested
+    var checkpointLsn: uint64 = 0
+    var checkpointErr: DbError
+    var checkpointOk = true
+    if checkpoint:
+      let ckRes = checkpointDb(database)
+      if not ckRes.ok:
+        checkpointOk = false
+        checkpointErr = ckRes.err
+      else:
+        checkpointLsn = ckRes.value
+        # Add checkpoint warnings to existing warnings
+        if warnings or verbose:
+          let ckWarnings = takeWarnings(database.wal)
+          for warn in ckWarnings:
+            walWarnings.add("CHECKPOINT: " & warn)
+
     discard closeDb(database)
 
     # Always include timing for exec in JSON output.
@@ -648,6 +665,13 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
         }
         resultPayload["verbose"] = verboseInfo
 
+      # Include checkpoint info if checkpoint was requested
+      if checkpoint:
+        if checkpointOk:
+          resultPayload["checkpoint_lsn"] = %checkpointLsn
+        else:
+          resultPayload["checkpoint_error"] = %checkpointErr.message
+
       echo resultPayload
     else:
       # Keep existing behavior for non-JSON formats.
@@ -656,6 +680,15 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
         echo resultJson(false, DbError(code: ERR_IO, message: "Non-JSON format not supported with timing/warnings/verbose"))
       else:
         emitRows(rows, format)
+        # Print checkpoint info for non-JSON output if requested
+        if checkpoint:
+          if checkpointOk:
+            echo "Checkpoint completed at LSN " & $checkpointLsn
+          else:
+            echo "Checkpoint failed: " & checkpointErr.message
+    # Return error if checkpoint failed
+    if checkpoint and not checkpointOk:
+      return 1
     return 0
 
   discard closeDb(database)

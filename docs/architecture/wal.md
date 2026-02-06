@@ -176,7 +176,7 @@ Copy committed pages from WAL to main database file.
 ### When to Checkpoint
 
 **Automatic:**
-- WAL reaches threshold size (default: 1MB)
+- WAL reaches threshold size (default: 64MB)
 - Time since last checkpoint (configurable)
 
 **Manual:**
@@ -221,6 +221,22 @@ If readers hold snapshots too long:
 3. Log warning about blocking readers
 4. Skip WAL truncation
 ```
+
+### SQL with Checkpoint
+
+Execute SQL and immediately checkpoint in a single command:
+
+```bash
+# Create index and checkpoint to main database file
+decentdb exec --db=my.ddb --sql="CREATE INDEX ix_name ON users(name)" --checkpoint
+```
+
+This is useful when:
+- Creating indexes that must survive WAL deletion
+- Performing DDL operations that should be immediately persisted
+- Ensuring data is in the main file before archival/backup
+
+The response includes `checkpoint_lsn` showing where the data was persisted.
 
 ## WAL Size Management
 
@@ -300,7 +316,7 @@ PRAGMA wal_sync_mode = NORMAL;
 3. **Size checkpoint threshold appropriately**
    - Smaller: More frequent I/O, smaller WAL
    - Larger: Less I/O, larger WAL
-   - Default 1MB is good for most
+   - Default 64MB is good for most workloads
 
 4. **Monitor WAL growth**
    - Set up alerts if WAL > 100MB
@@ -310,6 +326,11 @@ PRAGMA wal_sync_mode = NORMAL;
    - FULL: Critical data, slowest
    - NORMAL: Good balance
    - DEFERRED: Bulk loads only
+
+6. **Checkpoint after DDL operations**
+   - Use `--checkpoint` with CREATE INDEX to persist immediately
+   - Prevents loss if WAL file is accidentally deleted
+   - Example: `decentdb exec --db=my.ddb --sql="CREATE INDEX ..." --checkpoint`
 
 ## Troubleshooting
 

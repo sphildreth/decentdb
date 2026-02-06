@@ -31,8 +31,8 @@ Options:
 - `--cachePages=<n>` - Cache size in 4KB pages (default: 1024)
 - `--cacheMb=<n>` - Cache size in megabytes (overrides `--cachePages` if non-zero)
 
-Diagnostics and management flags (these run and exit, ignoring `--sql` when applicable):
-- `--checkpoint` - Force a WAL checkpoint and exit
+Diagnostics and management flags:
+- `--checkpoint` - Force a WAL checkpoint (after SQL execution if `--sql` is also provided)
 - `--dbInfo` - Print database info and exit
 - `--readerCount` - Print active reader count and exit
 - `--longReaders=<ms>` - Print readers older than this threshold and exit
@@ -51,6 +51,9 @@ Examples:
 decentdb exec --db=my.ddb --sql="SELECT * FROM users"
 decentdb exec --db=my.ddb --sql="INSERT INTO users VALUES (\$1, \$2)" --params=int:1 --params=text:Alice
 decentdb exec --db=my.ddb --sql="SELECT * FROM users" --format=table
+
+# Execute SQL and immediately checkpoint to main DB (ensures data is persisted)
+decentdb exec --db=my.ddb --sql="CREATE INDEX ix_name ON users(name)" --checkpoint
 ```
 
 ### list-tables
@@ -242,6 +245,17 @@ decentdb completion [--shell=bash|zsh]
     "1|Alice|alice@example.com",
     "2|Bob|bob@example.com"
   ]
+}
+```
+
+When `--checkpoint` is used with `--sql`, the response includes the checkpoint LSN:
+
+```json
+{
+  "ok": true,
+  "error": null,
+  "rows": [],
+  "checkpoint_lsn": 550651
 }
 ```
 
