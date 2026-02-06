@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.0742ms (after optimizations)
-- SQLite p95 commit latency: ~0.00930ms
-- **Gap:** ~7.98x slower
+- DecentDB p95 commit latency: ~0.07395ms (after optimizations)
+- SQLite p95 commit latency: ~0.00955ms
+- **Gap:** ~7.74x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
@@ -1159,3 +1159,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009298 → gap **7.98×**  
 **Correctness/Durability:** WAL header stored/updated before fsync; recovery bounded by `wal_end_offset`; checkpoint truncation leaves header-only WAL. Format v8 (new DBs only).  
 **Follow-ups:** Evaluate further mmap fast-path tuning or OS-level sync optimizations only if commit p95 regresses in future runs.
+
+### Rejected: Dirty-page set snapshot (Pager)
+**Change:** Track dirty page IDs and snapshot only those instead of scanning the full cache each commit.  
+**Bench (run_id: 20260206_010015)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0739485 | 0.074325 | **Regressed** (~0.5%) |
+| read_p95_ms | 0.001177 | 0.0011875 | +0.9% (noise) |
+| join_p95_ms | 0.506416 | 0.4615915 | Improved |
+| insert_rows_per_sec | 197,942.35 | 198,100.01 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009858 → gap **7.54×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The dirty-set bookkeeping overhead outweighed the cache-scan savings for this workload; revisit only if dirty density or cache size changes materially.
