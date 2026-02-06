@@ -353,3 +353,152 @@ def test_pg_dump_file_not_found():
             decentdb_path="/tmp/test.db",
             show_progress=False,
         )
+
+
+def _make_pg_dump_nullable_numerics(path: str) -> None:
+    """Create a PG dump with nullable int4 and float8 columns containing NULLs."""
+    dump = """\
+SET default_table_access_method = heap;
+
+CREATE TABLE public."Tracks" (
+    "Id" integer NOT NULL,
+    "Title" character varying(255) NOT NULL,
+    "ImageCount" int4 NULL,
+    "ReplayGain" float8 NULL,
+    "DeezerId" int4 NULL
+);
+
+COPY public."Tracks" ("Id", "Title", "ImageCount", "ReplayGain", "DeezerId") FROM stdin;
+1	Hello	5	-3.14	1001
+2	World	\\N	\\N	\\N
+3	Test	0	0.0	2002
+\\.
+
+ALTER TABLE ONLY public."Tracks"
+    ADD CONSTRAINT "Tracks_pkey" PRIMARY KEY ("Id");
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(dump)
+
+
+def test_pg_dump_nullable_int4_not_downgraded_to_text(tmp_path):
+    """int4 NULL columns with NULL values must import as INT64, not TEXT."""
+    pg_path = str(tmp_path / "dump.sql")
+    decent_path = str(tmp_path / "dst.decentdb")
+
+    _make_pg_dump_nullable_numerics(pg_path)
+
+    report = convert_pg_dump_to_decentdb(
+        pg_dump_path=pg_path,
+        decentdb_path=decent_path,
+        overwrite=False,
+        show_progress=False,
+    )
+
+    # No warnings about non-numeric data for int4/float8 columns
+    numeric_warnings = [w for w in report.warnings if "non-numeric" in w]
+    assert numeric_warnings == [], f"Unexpected numeric warnings: {numeric_warnings}"
+
+    conn = decentdb.connect(decent_path)
+    try:
+        rows = conn.execute(
+            'SELECT "id", "imagecount", "replaygain", "deezerid" '
+            'FROM "tracks" ORDER BY "id"'
+        ).fetchall()
+        assert rows[0] == (1, 5, -3.14, 1001)
+        assert rows[1] == (2, None, None, None)
+        assert rows[2] == (3, 0, 0.0, 2002)
+    finally:
+        conn.close()
+
+
+def _make_pg_dump_composite_pk(path: str) -> None:
+    """Create a PG dump with composite primary key tables."""
+    dump = """\
+SET default_table_access_method = heap;
+
+CREATE TABLE public."Playlists" (
+    "Id" integer NOT NULL,
+    "Name" character varying(255) NOT NULL
+);
+
+CREATE TABLE public."Songs" (
+    "Id" integer NOT NULL,
+    "Title" character varying(255) NOT NULL
+);
+
+CREATE TABLE public."PlaylistSong" (
+    "PlaylistId" integer NOT NULL,
+    "SongId" integer NOT NULL,
+    "SortOrder" integer NOT NULL
+);
+
+COPY public."Playlists" ("Id", "Name") FROM stdin;
+1	Favorites
+2	Chill
+\\.
+
+COPY public."Songs" ("Id", "Title") FROM stdin;
+1	Song A
+2	Song B
+3	Song C
+\\.
+
+COPY public."PlaylistSong" ("PlaylistId", "SongId", "SortOrder") FROM stdin;
+1	1	1
+1	2	2
+2	2	1
+2	3	2
+\\.
+
+ALTER TABLE ONLY public."Playlists"
+    ADD CONSTRAINT "Playlists_pkey" PRIMARY KEY ("Id");
+
+ALTER TABLE ONLY public."Songs"
+    ADD CONSTRAINT "Songs_pkey" PRIMARY KEY ("Id");
+
+ALTER TABLE ONLY public."PlaylistSong"
+    ADD CONSTRAINT "PlaylistSong_pkey" PRIMARY KEY ("PlaylistId", "SongId");
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(dump)
+
+
+def test_pg_dump_composite_pk_tables_imported(tmp_path):
+    """Tables with composite PKs should be imported (not skipped)."""
+    pg_path = str(tmp_path / "dump.sql")
+    decent_path = str(tmp_path / "dst.decentdb")
+
+    _make_pg_dump_composite_pk(pg_path)
+
+    report = convert_pg_dump_to_decentdb(
+        pg_dump_path=pg_path,
+        decentdb_path=decent_path,
+        overwrite=False,
+        show_progress=False,
+    )
+
+    # PlaylistSong should NOT be in skipped tables
+    assert "PlaylistSong" not in report.skipped_tables
+    assert "playlistsong" in report.tables
+
+    # All data should be imported
+    assert report.rows_copied.get("playlistsong") == 4
+
+    # Should have a warning about composite PK
+    composite_warnings = [w for w in report.warnings if "composite primary key" in w]
+    assert len(composite_warnings) == 1
+
+    conn = decentdb.connect(decent_path)
+    try:
+        rows = conn.execute(
+            'SELECT "playlistid", "songid", "sortorder" '
+            'FROM "playlistsong" ORDER BY "playlistid", "songid"'
+        ).fetchall()
+        assert len(rows) == 4
+        assert rows[0] == (1, 1, 1)
+        assert rows[1] == (1, 2, 2)
+        assert rows[2] == (2, 2, 1)
+        assert rows[3] == (2, 3, 2)
+    finally:
+        conn.close()

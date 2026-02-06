@@ -164,6 +164,8 @@ decentdb export --table users --output users.json --db ./my.ddb --format=json
 decentdb bulk-load --table users --input large_dataset.csv --db ./my.ddb
 ```
 
+There are several tools for DecentDB that provide importing/converting from other databases, [read more here](https://decentdb.org/development/import-tools/)
+
 ### Maintenance
 
 ```bash
