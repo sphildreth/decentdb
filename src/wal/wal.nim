@@ -78,6 +78,10 @@ type Wal* = ref object
   checkpointMemoryThreshold*: int64  # Trigger checkpoint when index exceeds this
   # Optimization: Reusable buffer for frame encoding to avoid allocations
   frameBuffer*: seq[byte]
+  # Optimization: Optional mmap-backed WAL write path
+  mmapEnabled*: bool
+  mmapPtr*: pointer
+  mmapLen*: int
   # HIGH-006: Long-running reader resource management
   maxWalBytesPerReader*: int64  # Max WAL bytes a reader can pin (0 = disabled)
   readerCheckIntervalMs*: int64  # How often to check readers (0 = check every operation)
@@ -90,6 +94,55 @@ type Wal* = ref object
 
 const HeaderSize = 1 + 4
 const TrailerSize = 8
+const WalHeaderMagic = "DDBWAL01"
+const WalHeaderVersion = 1'u32
+const WalHeaderSize* = 32
+const WalMmapInitialSize = 1024 * 1024
+
+proc writeU32LEPtr(buf: ptr UncheckedArray[byte], offset: int, value: uint32) =
+  buf[offset] = byte(value and 0xFF)
+  buf[offset + 1] = byte((value shr 8) and 0xFF)
+  buf[offset + 2] = byte((value shr 16) and 0xFF)
+  buf[offset + 3] = byte((value shr 24) and 0xFF)
+
+proc writeU64LEPtr(buf: ptr UncheckedArray[byte], offset: int, value: uint64) =
+  buf[offset] = byte(value and 0xFF)
+  buf[offset + 1] = byte((value shr 8) and 0xFF)
+  buf[offset + 2] = byte((value shr 16) and 0xFF)
+  buf[offset + 3] = byte((value shr 24) and 0xFF)
+  buf[offset + 4] = byte((value shr 32) and 0xFF)
+  buf[offset + 5] = byte((value shr 40) and 0xFF)
+  buf[offset + 6] = byte((value shr 48) and 0xFF)
+  buf[offset + 7] = byte((value shr 56) and 0xFF)
+
+proc encodeWalHeader(buf: var openArray[byte], pageSize: uint32, walEnd: uint64) =
+  for i in 0 ..< 8:
+    buf[i] = byte(WalHeaderMagic[i])
+  writeU32LE(buf, 8, WalHeaderVersion)
+  writeU32LE(buf, 12, pageSize)
+  writeU64LE(buf, 16, walEnd)
+  writeU64LE(buf, 24, 0)
+
+proc encodeWalHeaderPtr(buf: ptr UncheckedArray[byte], pageSize: uint32, walEnd: uint64) =
+  for i in 0 ..< 8:
+    buf[i] = byte(WalHeaderMagic[i])
+  writeU32LEPtr(buf, 8, WalHeaderVersion)
+  writeU32LEPtr(buf, 12, pageSize)
+  writeU64LEPtr(buf, 16, walEnd)
+  writeU64LEPtr(buf, 24, 0)
+
+proc decodeWalHeader(buf: openArray[byte]): Result[(uint32, uint64)] =
+  if buf.len < WalHeaderSize:
+    return err[(uint32, uint64)](ERR_CORRUPTION, "Short WAL header")
+  for i in 0 ..< 8:
+    if buf[i] != byte(WalHeaderMagic[i]):
+      return err[(uint32, uint64)](ERR_CORRUPTION, "Invalid WAL header magic")
+  let version = readU32LE(buf, 8)
+  if version != WalHeaderVersion:
+    return err[(uint32, uint64)](ERR_CORRUPTION, "Unsupported WAL header version", "version=" & $version)
+  let pageSize = readU32LE(buf, 12)
+  let walEnd = readU64LE(buf, 16)
+  ok((pageSize, walEnd))
 
 proc payloadSizeFor(frameType: WalFrameType, pageSize: uint32): int =
   case frameType
@@ -124,6 +177,24 @@ proc encodeFrameIntoString(dest: var seq[byte], offset: int, frameType: WalFrame
     copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
   
   writeU64LE(dest, offset + HeaderSize + payload.len, 0)
+  result = needed
+
+proc encodeFrameIntoPtr(dest: ptr UncheckedArray[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): int =
+  let needed = HeaderSize + payload.len + TrailerSize
+  dest[offset] = byte(frameType)
+  writeU32LEPtr(dest, offset + 1, pageId)
+  if payload.len > 0:
+    copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
+  writeU64LEPtr(dest, offset + HeaderSize + payload.len, 0)
+  result = needed
+
+proc encodeFrameIntoPtrString(dest: ptr UncheckedArray[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: string): int =
+  let needed = HeaderSize + payload.len + TrailerSize
+  dest[offset] = byte(frameType)
+  writeU32LEPtr(dest, offset + 1, pageId)
+  if payload.len > 0:
+    copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
+  writeU64LEPtr(dest, offset + HeaderSize + payload.len, 0)
   result = needed
 
 proc encodeFrame(frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): seq[byte] =
@@ -164,12 +235,47 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
   let fileRes = vfs.open(path, fmReadWrite, true)
   if not fileRes.ok:
     return err[Wal](fileRes.err.code, fileRes.err.message, fileRes.err.context)
+  let info = getFileInfo(path)
+  var endOffset = int64(0)
+  var headerWalEnd: uint64 = 0
+  if info.size == 0:
+    var header = newSeq[byte](WalHeaderSize)
+    encodeWalHeader(header, pageSize, 0)
+    let writeRes = vfs.write(fileRes.value, 0, header)
+    if not writeRes.ok:
+      return err[Wal](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    let truncRes = vfs.truncate(fileRes.value, WalHeaderSize)
+    if not truncRes.ok:
+      return err[Wal](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    endOffset = WalHeaderSize
+  else:
+    if info.size < WalHeaderSize:
+      return err[Wal](ERR_CORRUPTION, "WAL header missing", path)
+    var header = newSeq[byte](WalHeaderSize)
+    let readRes = vfs.read(fileRes.value, 0, header)
+    if not readRes.ok:
+      return err[Wal](readRes.err.code, readRes.err.message, readRes.err.context)
+    if readRes.value < WalHeaderSize:
+      return err[Wal](ERR_CORRUPTION, "Short WAL header read", path)
+    let headerRes = decodeWalHeader(header)
+    if not headerRes.ok:
+      return err[Wal](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+    let (headerPageSize, walEnd) = headerRes.value
+    if headerPageSize != pageSize:
+      return err[Wal](ERR_CORRUPTION, "WAL page size mismatch", "wal=" & $headerPageSize & " db=" & $pageSize)
+    if walEnd != 0 and walEnd < uint64(WalHeaderSize):
+      return err[Wal](ERR_CORRUPTION, "Invalid WAL end offset", "wal_end=" & $walEnd)
+    if walEnd > uint64(info.size):
+      return err[Wal](ERR_CORRUPTION, "WAL end exceeds file size", "wal_end=" & $walEnd & " size=" & $info.size)
+    headerWalEnd = walEnd
+    endOffset = max(int64(walEnd), int64(WalHeaderSize))
+  
   let wal = Wal(
     vfs: vfs,
     file: fileRes.value,
     path: path,
     pageSize: pageSize,
-    endOffset: getFileInfo(path).size,
+    endOffset: endOffset,
     index: initTable[PageId, seq[WalIndexEntry]](),
     dirtySinceCheckpoint: initTable[PageId, WalIndexEntry](),
     readers: initTable[int, ReaderInfo](),
@@ -178,6 +284,9 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
     warnings: @[],
     # Optimization: Pre-allocate buffer (4KB * 4 + overhead)
     frameBuffer: newSeq[byte](16384),
+    mmapEnabled: vfs.supportsMmap(),
+    mmapPtr: nil,
+    mmapLen: 0,
     lastCheckpointAt: epochTime(),
     lastReaderCheckAt: epochTime(),
     # HIGH-006: Disabled by default (zero-cost when not configured)
@@ -189,7 +298,7 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
   initLock(wal.lock)
   initLock(wal.indexLock)
   initLock(wal.readerLock)
-  wal.walEnd.store(0, moRelaxed)
+  wal.walEnd.store(headerWalEnd, moRelaxed)
   ok(wal)
 
 proc setFailpoint*(wal: Wal, label: string, fp: WalFailpoint) =
@@ -225,6 +334,63 @@ proc applyFailpoint(wal: Wal, label: string, length: int): Result[int] =
   of wfPartial:
     let part = min(fp.partialBytes, length)
     ok(part)
+
+proc unmapWalIfMapped*(wal: Wal) =
+  if wal.mmapPtr == nil or wal.mmapLen <= 0:
+    return
+  discard wal.vfs.unmap(MmapRegion(base: wal.mmapPtr, len: wal.mmapLen))
+  wal.mmapPtr = nil
+  wal.mmapLen = 0
+
+proc ensureWalMmapCapacity(wal: Wal, requiredEnd: int64): Result[bool] =
+  if not wal.mmapEnabled:
+    return ok(false)
+  if not wal.vfs.supportsMmap():
+    wal.mmapEnabled = false
+    return ok(false)
+  if requiredEnd <= 0:
+    return ok(false)
+
+  var fileSize = if wal.mmapLen > 0: int64(wal.mmapLen) else: getFileInfo(wal.path).size
+  if fileSize < WalHeaderSize:
+    fileSize = WalHeaderSize
+
+  if requiredEnd > fileSize:
+    var targetSize = max(requiredEnd, int64(WalMmapInitialSize))
+    if wal.mmapLen > 0:
+      targetSize = max(targetSize, int64(wal.mmapLen) * 2)
+    let truncRes = wal.vfs.truncate(wal.file, targetSize)
+    if not truncRes.ok:
+      return err[bool](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    fileSize = targetSize
+
+  if wal.mmapPtr != nil and wal.mmapLen >= int(fileSize):
+    return ok(true)
+
+  if wal.mmapPtr != nil:
+    unmapWalIfMapped(wal)
+
+  let mapRes = wal.vfs.mapWritable(wal.file, fileSize)
+  if not mapRes.ok:
+    wal.mmapEnabled = false
+    return ok(false)
+  wal.mmapPtr = mapRes.value.base
+  wal.mmapLen = mapRes.value.len
+  ok(true)
+
+proc writeWalHeader(wal: Wal, walEnd: uint64): Result[Void] =
+  if wal.mmapPtr != nil:
+    let dest = cast[ptr UncheckedArray[byte]](wal.mmapPtr)
+    encodeWalHeaderPtr(dest, wal.pageSize, walEnd)
+    return okVoid()
+  var header = newSeq[byte](WalHeaderSize)
+  encodeWalHeader(header, wal.pageSize, walEnd)
+  let writeRes = wal.vfs.write(wal.file, 0, header)
+  if not writeRes.ok:
+    return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+  if writeRes.value < WalHeaderSize:
+    return err[Void](ERR_IO, "Short WAL header write", wal.path)
+  okVoid()
 
 proc appendFrame(wal: Wal, frameType: WalFrameType, pageId: uint32, payload: seq[byte]): Result[(uint64, int64)] =
   perf.WalGrowthWriter.inc()
@@ -545,18 +711,26 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
   
   if canTruncate:
     release(wal.lock)
-    let truncRes = wal.vfs.truncate(wal.file, 0)
+    let truncRes = wal.vfs.truncate(wal.file, WalHeaderSize)
     if not truncRes.ok:
       acquire(wal.lock)
       wal.checkpointPending = false
       release(wal.lock)
       return err[uint64](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    let headerRes = writeWalHeader(wal, 0)
+    if not headerRes.ok:
+      acquire(wal.lock)
+      wal.checkpointPending = false
+      release(wal.lock)
+      return err[uint64](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+    unmapWalIfMapped(wal)
     acquire(wal.lock)
     acquire(wal.indexLock)
     wal.index.clear()
     wal.dirtySinceCheckpoint.clear()
     release(wal.indexLock)
-    wal.endOffset = 0
+    wal.endOffset = WalHeaderSize
+    wal.walEnd.store(0, moRelease)
   elif hadNewCommits:
     # New commits occurred during checkpoint - cannot truncate
     # Keep the index entries for pages with LSN > safeLsn
@@ -648,12 +822,18 @@ proc recover*(wal: Wal): Result[Void] =
   var pending: seq[(PageId, uint64, int64)] = @[]
   var lastCommit: uint64 = 0
   var lastCheckpointLsn: uint64 = 0
-  var offset: int64 = 0
+  let headerEnd = wal.walEnd.load(moAcquire)
+  if headerEnd == 0:
+    wal.endOffset = WalHeaderSize
+    return okVoid()
+  if headerEnd < uint64(WalHeaderSize):
+    return err[Void](ERR_CORRUPTION, "Invalid WAL end offset", "wal_end=" & $headerEnd)
+  var offset: int64 = WalHeaderSize
   var frameCount: int = 0
   var commitCount: int = 0
   var checkpointCount: int = 0
   
-  while true:
+  while offset < int64(headerEnd):
     let frameOffset = offset
     let frameRes = readFrame(wal.vfs, wal.file, frameOffset, wal.pageSize)
     if not frameRes.ok:
@@ -707,7 +887,7 @@ proc recover*(wal: Wal): Result[Void] =
     # These are uncommitted changes - they will be discarded
     stderr.writeLine("Warning: " & $pending.len & " uncommitted WAL frames discarded during recovery")
   
-  wal.endOffset = offset
+  wal.endOffset = max(offset, int64(WalHeaderSize))
   wal.walEnd.store(lastCommit, moRelease)
   
   # Validation: Ensure we have a consistent state
@@ -954,76 +1134,147 @@ proc commit*(writer: WalWriter): Result[uint64] =
   # This reduces lock contention and system calls significantly.
   
   var pageMeta: seq[(PageId, WalIndexEntry)] = @[]
-  var bufferOffset = 0
-  let startOffset = writer.wal.endOffset
+  let startOffset = max(writer.wal.endOffset, int64(WalHeaderSize))
   var currentOffset = startOffset
   
-  # Pre-size frame buffer to avoid incremental growth during encoding
-  var expectedLen = HeaderSize + TrailerSize # commit frame
+  # Compute total length upfront (commit frame included)
+  var totalLen = HeaderSize + TrailerSize # commit frame
   if writer.hasPendingSingle:
     let payloadLen = if writer.pendingSingle.isString: writer.pendingSingle.str.len else: writer.pendingSingle.bytes.len
-    expectedLen += HeaderSize + TrailerSize + payloadLen
+    totalLen += HeaderSize + TrailerSize + payloadLen
   for entry in writer.pending:
     let payloadLen = if entry.isString: entry.str.len else: entry.bytes.len
-    expectedLen += HeaderSize + TrailerSize + payloadLen
-  if writer.wal.frameBuffer.len < expectedLen:
-    writer.wal.frameBuffer.setLen(expectedLen)
-  
-  # 1. Encode all pending pages into the shared buffer
-  if writer.hasPendingSingle:
-    perf.WalGrowthWriter.inc()
-    let frameStart = currentOffset
-    let len =
-      if writer.pendingSingle.isString:
-        encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
-      else:
-        encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
-    let frameEnd = frameStart + int64(len)
-    pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
-    bufferOffset += len
-    currentOffset = frameEnd
+    totalLen += HeaderSize + TrailerSize + payloadLen
 
-  for entry in writer.pending:
+  let fpRes = applyFailpoint(writer.wal, "wal_write_frame", totalLen)
+  if not fpRes.ok:
+    writer.active = false
+    release(writer.wal.lock)
+    return err[uint64](fpRes.err.code, fpRes.err.message, fpRes.err.context)
+
+  let writeLen = fpRes.value
+  if writeLen < totalLen:
+    # Partial write path (simulate torn write)
+    if writer.wal.frameBuffer.len < totalLen:
+      writer.wal.frameBuffer.setLen(totalLen)
+    var bufferOffset = 0
+    if writer.hasPendingSingle:
+      perf.WalGrowthWriter.inc()
+      let len =
+        if writer.pendingSingle.isString:
+          encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
+        else:
+          encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
+      bufferOffset += len
+    for entry in writer.pending:
+      perf.WalGrowthWriter.inc()
+      let len =
+        if entry.isString:
+          encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.str)
+        else:
+          encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
+      bufferOffset += len
     perf.WalGrowthWriter.inc()
-    let len =
-      if entry.isString:
-        encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.str)
-      else:
-        encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
-    let frameEnd = currentOffset + int64(len)
-    pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
-    
-    bufferOffset += len
-    currentOffset += int64(len)
-  
-  # 2. Encode commit frame
-  perf.WalGrowthWriter.inc()
-  let commitLen = encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfCommit, 0, [])
-  bufferOffset += commitLen
-  currentOffset += int64(commitLen)
-  
-  # 3. Write everything in one go
-  let totalLen = bufferOffset
-  if totalLen > 0:
-    let fpRes = applyFailpoint(writer.wal, "wal_write_frame", totalLen)
-    if not fpRes.ok:
-      writer.active = false
-      release(writer.wal.lock)
-      return err[uint64](fpRes.err.code, fpRes.err.message, fpRes.err.context)
-    
-    let writeLen = fpRes.value
+    discard encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfCommit, 0, [])
+
     let writeRes = writer.wal.vfs.write(writer.wal.file, startOffset, writer.wal.frameBuffer.toOpenArray(0, writeLen - 1))
     if not writeRes.ok:
       writer.active = false
       release(writer.wal.lock)
       return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-      
-    if writeLen < totalLen:
+    writer.active = false
+    release(writer.wal.lock)
+    return err[uint64](ERR_IO, "Partial frame write", "wal_write_frame")
+
+  var useMmap = false
+  if totalLen > 0:
+    let mmapRes = ensureWalMmapCapacity(writer.wal, startOffset + int64(totalLen))
+    if not mmapRes.ok:
       writer.active = false
       release(writer.wal.lock)
-      return err[uint64](ERR_IO, "Partial frame write", "wal_write_frame")
-      
-    writer.wal.endOffset += int64(totalLen)
+      return err[uint64](mmapRes.err.code, mmapRes.err.message, mmapRes.err.context)
+    useMmap = mmapRes.value
+
+  if useMmap:
+    let dest = cast[ptr UncheckedArray[byte]](writer.wal.mmapPtr)
+    var mapOffset = int(startOffset)
+    if writer.hasPendingSingle:
+      perf.WalGrowthWriter.inc()
+      let frameStart = currentOffset
+      let len =
+        if writer.pendingSingle.isString:
+          encodeFrameIntoPtrString(dest, mapOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
+        else:
+          encodeFrameIntoPtr(dest, mapOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
+      let frameEnd = frameStart + int64(len)
+      pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
+      mapOffset += len
+      currentOffset = frameEnd
+
+    for entry in writer.pending:
+      perf.WalGrowthWriter.inc()
+      let len =
+        if entry.isString:
+          encodeFrameIntoPtrString(dest, mapOffset, wfPage, uint32(entry.pageId), entry.str)
+        else:
+          encodeFrameIntoPtr(dest, mapOffset, wfPage, uint32(entry.pageId), entry.bytes)
+      let frameEnd = currentOffset + int64(len)
+      pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
+      mapOffset += len
+      currentOffset += int64(len)
+
+    perf.WalGrowthWriter.inc()
+    let commitLen = encodeFrameIntoPtr(dest, mapOffset, wfCommit, 0, [])
+    mapOffset += commitLen
+    currentOffset += int64(commitLen)
+  else:
+    if writer.wal.frameBuffer.len < totalLen:
+      writer.wal.frameBuffer.setLen(totalLen)
+    var bufferOffset = 0
+    if writer.hasPendingSingle:
+      perf.WalGrowthWriter.inc()
+      let frameStart = currentOffset
+      let len =
+        if writer.pendingSingle.isString:
+          encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
+        else:
+          encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
+      let frameEnd = frameStart + int64(len)
+      pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
+      bufferOffset += len
+      currentOffset = frameEnd
+
+    for entry in writer.pending:
+      perf.WalGrowthWriter.inc()
+      let len =
+        if entry.isString:
+          encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.str)
+        else:
+          encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
+      let frameEnd = currentOffset + int64(len)
+      pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
+      bufferOffset += len
+      currentOffset += int64(len)
+
+    perf.WalGrowthWriter.inc()
+    let commitLen = encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfCommit, 0, [])
+    bufferOffset += commitLen
+    currentOffset += int64(commitLen)
+
+    if totalLen > 0:
+      let writeRes = writer.wal.vfs.write(writer.wal.file, startOffset, writer.wal.frameBuffer.toOpenArray(0, totalLen - 1))
+      if not writeRes.ok:
+        writer.active = false
+        release(writer.wal.lock)
+        return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+
+  let newEnd = startOffset + int64(totalLen)
+  let headerRes = writeWalHeader(writer.wal, uint64(newEnd))
+  if not headerRes.ok:
+    writer.active = false
+    release(writer.wal.lock)
+    return err[uint64](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+  writer.wal.endOffset = newEnd
   
   let syncFail = applyFailpoint(writer.wal, "wal_fsync", 0)
   if not syncFail.ok:

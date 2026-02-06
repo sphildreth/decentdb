@@ -120,6 +120,7 @@ See ADR-0016 for checksum calculation details.
 - v5 removes per-frame WAL CRC32C validation (checksum field reserved, written as zero).
 - v6 removes per-frame WAL LSN trailer; LSNs are derived from frame end offsets.
 - v7 removes WAL `payload_size` field; payload sizes are derived from frame type and page size.
+- v8 adds a fixed WAL header with a logical end offset (`wal_end_offset`).
 - v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
 
 ### 3.4 Catalog record encoding (v2)
@@ -161,6 +162,17 @@ Each frame appends:
 **LSN (format v6):**
 - LSNs are derived from WAL byte offsets (frame end offset).
 - `wal_end_lsn` is the WAL end offset after the last committed frame.
+
+**WAL Header (format v8):**
+- Fixed 32-byte header at file offset 0:
+  - `magic` (8 bytes): `"DDBWAL01"`
+  - `header_version` (u32): `1`
+  - `page_size` (u32)
+  - `wal_end_offset` (u64): logical end offset of the last committed frame (0 if none)
+  - `reserved` (u64): 0
+- WAL frames start at offset `WalHeaderSize` (32 bytes).
+- Recovery scans only up to `wal_end_offset` (not physical file size).
+- Checkpoint truncation reduces WAL to header-only and resets `wal_end_offset` to 0.
 
 **Payload size (format v7):**
 - PAGE frames: `pageSize`
@@ -213,7 +225,7 @@ Checkpointed pages are copied to the main database file.
    - If no readers, `safe_truncate_lsn = last_commit_lsn`.
 4. Write CHECKPOINT frame to WAL.
 5. **Conditionally Truncate:**
-   - If `safe_truncate_lsn` allows, truncate the WAL file.
+   - If `safe_truncate_lsn` allows, truncate the WAL file to header-only.
    - If readers are blocking truncation, the WAL remains large until the next checkpoint opportunistically truncates it.
 6. Clear `checkpoint_pending` flag.
 

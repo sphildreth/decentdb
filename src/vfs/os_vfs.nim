@@ -12,6 +12,12 @@ type OsVfs* = ref object of Vfs
 proc newOsVfs*(): OsVfs =
   OsVfs()
 
+method supportsMmap*(vfs: OsVfs): bool =
+  when defined(windows):
+    false
+  else:
+    true
+
 template withFileLock(file: VfsFile, body: untyped) =
   acquire(file.lock)
   try:
@@ -183,3 +189,31 @@ method close*(vfs: OsVfs, file: VfsFile): Result[Void] =
       return err[Void](ERR_IO, "Close failed", file.path)
   deinitLock(file.lock)
   okVoid()
+
+method mapWritable*(vfs: OsVfs, file: VfsFile, length: int64): Result[MmapRegion] =
+  when defined(windows):
+    err[MmapRegion](ERR_INTERNAL, "mmap not supported on Windows", file.path)
+  else:
+    if length <= 0:
+      return err[MmapRegion](ERR_INTERNAL, "Invalid mmap length", file.path)
+    try:
+      let fd = cast[cint](file.file.getFileHandle())
+      let region = mmap(nil, int(length), cint(PROT_READ or PROT_WRITE), cint(MAP_SHARED), fd, 0.Off)
+      if region == MAP_FAILED:
+        return err[MmapRegion](ERR_IO, "mmap failed: " & $strerror(errno), file.path)
+      ok(MmapRegion(base: region, len: int(length)))
+    except OSError:
+      err[MmapRegion](ERR_IO, "mmap failed", file.path)
+
+method unmap*(vfs: OsVfs, region: MmapRegion): Result[Void] =
+  when defined(windows):
+    err[Void](ERR_INTERNAL, "munmap not supported on Windows", "")
+  else:
+    if region.base == nil or region.len <= 0:
+      return okVoid()
+    try:
+      if munmap(region.base, int(region.len)) != 0:
+        return err[Void](ERR_IO, "munmap failed: " & $strerror(errno))
+    except OSError:
+      return err[Void](ERR_IO, "munmap failed")
+    okVoid()

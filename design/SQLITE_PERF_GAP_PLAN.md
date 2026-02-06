@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.0787ms (after optimizations)
-- SQLite p95 commit latency: ~0.00981ms
-- **Gap:** ~8.02x slower
+- DecentDB p95 commit latency: ~0.0742ms (after optimizations)
+- SQLite p95 commit latency: ~0.00930ms
+- **Gap:** ~7.98x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
@@ -1143,3 +1143,19 @@ DecentDB vs SQLite (commit latency gap: **14.61×**)
 **SQLite reference (same run):** commit_p95_ms = 0.009448 → gap **8.09×**  
 **Decision:** Reverted due to commit latency regression (primary metric).  
 **Notes:** mmap path introduced extra overhead (mapping/truncate) without improving p95 in this workload; revisit only with a WAL header/end-offset strategy that avoids per-commit truncation.
+
+### 10) WAL header + logical end offset (format v8) with mmap preallocation
+**Change:** Add a fixed WAL header with `wal_end_offset`, preallocate/mmap WAL to avoid per-commit truncation, and truncate to header-only on checkpoints. Format version bumped to v8 (ADR-0068).  
+**Bench (run_id: 20260206_002601)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.074234 | **Improved** (~1.8%) |
+| read_p95_ms | 0.0012075 | 0.001177 | Improved |
+| join_p95_ms | 0.4497395 | 0.4415085 | Improved |
+| insert_rows_per_sec | 197,962.03 | 201,193.70 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009298 → gap **7.98×**  
+**Correctness/Durability:** WAL header stored/updated before fsync; recovery bounded by `wal_end_offset`; checkpoint truncation leaves header-only WAL. Format v8 (new DBs only).  
+**Follow-ups:** Evaluate further mmap fast-path tuning or OS-level sync optimizations only if commit p95 regresses in future runs.

@@ -2555,6 +2555,7 @@ proc closeDb*(db: Db): Result[Void] =
   
   # Close WAL file if present
   if db.wal != nil:
+    unmapWalIfMapped(db.wal)
     let walCloseRes = db.vfs.close(db.wal.file)
     if not walCloseRes.ok:
       return walCloseRes
