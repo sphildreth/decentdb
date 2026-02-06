@@ -1,6 +1,7 @@
 import os
 import options
 import unittest
+import atomics
 import wal/wal
 import pager/pager
 import vfs/os_vfs
@@ -259,5 +260,6 @@ suite "WAL checkpoint race condition tests":
     let chkRes = checkpoint(wal, pager)
     check chkRes.ok
     
-    # WAL should be truncated (offset reset to 0) because no new commits occurred
-    check wal.endOffset == 0
+    # WAL should be truncated to header-only (logical end reset to 0) because no new commits occurred
+    check wal.walEnd.load(moAcquire) == 0
+    check wal.endOffset == WalHeaderSize
