@@ -163,7 +163,7 @@ proc formatSchemaSummary(database: Db): seq[string] =
   lines.add("Indexes: " & $indexNames.len)
   for indexName in indexNames:
     let idx = database.catalog.indexes[indexName]
-    var idxLine = "Index: " & indexName & " ON " & idx.table & "(" & idx.column & ")"
+    var idxLine = "Index: " & indexName & " ON " & idx.table & "(" & idx.columns.join(", ") & ")"
     if idx.unique:
       idxLine &= " UNIQUE"
     idxLine &= " " & (if idx.kind == ikBtree: "BTREE" else: "TRIGRAM")
@@ -793,7 +793,7 @@ proc schemaListIndexes*(db: string = "", table: string = ""): int =
       of ikTrigram: "trigram"
     
     let unique = if indexMeta.unique: "YES" else: "NO"
-    output.add("$1|$2|$3|$4|$5" % [indexName, indexMeta.table, indexMeta.column, indexType, unique])
+    output.add("$1|$2|$3|$4|$5" % [indexName, indexMeta.table, indexMeta.columns.join(","), indexType, unique])
   
   discard closeDb(database)
   echo resultJson(true, rows = output)
@@ -908,7 +908,7 @@ proc cmdVerifyIndex*(index: string = "", db: string = ""): int =
   var info: seq[string] = @[]
   info.add("Index: " & index)
   info.add("Table: " & indexMeta.table)
-  info.add("Column: " & indexMeta.column)
+  info.add("Columns: " & indexMeta.columns.join(", "))
   info.add("Type: " & $indexMeta.kind)
   info.add("Root page: " & $indexMeta.rootPage)
   info.add("Status: OK")
@@ -1657,7 +1657,7 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
 
     # Semantic dedupe: if destination already has an equivalent index under a different
     # name, do not recreate it.
-    if isSome(dstDb.catalog.getIndexForColumn(idx.table, idx.column, idx.kind, requireUnique = idx.unique)):
+    if idx.columns.len == 1 and isSome(dstDb.catalog.getIndexForColumn(idx.table, idx.columns[0], idx.kind, requireUnique = idx.unique)):
       continue
 
     var stmt = "CREATE "
@@ -1666,7 +1666,7 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
     stmt &= "INDEX " & idx.name & " ON " & idx.table
     if idx.kind == ikTrigram:
       stmt &= " USING trigram "
-    stmt &= "(" & idx.column & ")"
+    stmt &= "(" & idx.columns.join(", ") & ")"
     let idxRes = execSql(dstDb, stmt)
     if not idxRes.ok:
       discard closeDb(srcDb)

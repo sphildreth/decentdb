@@ -25,7 +25,7 @@ proc addTable(db: Db, name: string, columns: seq[Column]): TableMeta =
   meta
 
 proc addIndex(db: Db, name: string, table: string, column: string, kind: IndexKind, root: PageId): IndexMeta =
-  let meta = IndexMeta(name: name, table: table, column: column, rootPage: root, kind: kind, unique: false)
+  let meta = IndexMeta(name: name, table: table, columns: @[column], rootPage: root, kind: kind, unique: false)
   check db.catalog.createIndexMeta(meta).ok
   meta
 

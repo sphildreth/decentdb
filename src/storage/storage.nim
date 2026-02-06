@@ -53,6 +53,32 @@ proc indexKeyFromValue*(value: Value): uint64 =
   else:
     0'u64
 
+proc compositeIndexKey*(values: seq[Value], columnIndices: seq[int]): uint64 =
+  ## Hash multiple column values into a single uint64 key for composite indexes.
+  if columnIndices.len == 1:
+    return indexKeyFromValue(values[columnIndices[0]])
+  var buf: seq[byte] = @[]
+  for ci in columnIndices:
+    let k = indexKeyFromValue(values[ci])
+    buf.add(byte(k and 0xFF))
+    buf.add(byte((k shr 8) and 0xFF))
+    buf.add(byte((k shr 16) and 0xFF))
+    buf.add(byte((k shr 24) and 0xFF))
+    buf.add(byte((k shr 32) and 0xFF))
+    buf.add(byte((k shr 40) and 0xFF))
+    buf.add(byte((k shr 48) and 0xFF))
+    buf.add(byte((k shr 56) and 0xFF))
+  uint64(crc32c(buf))
+
+proc indexColumnIndices*(table: TableMeta, idx: IndexMeta): seq[int] =
+  ## Map index column names to column indices in the table.
+  result = @[]
+  for colName in idx.columns:
+    for i, col in table.columns:
+      if col.name == colName:
+        result.add(i)
+        break
+
 proc valueText(value: Value): string =
   var s = ""
   for b in value.bytes:
@@ -355,12 +381,18 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   var rowid: uint64 = 0
   var isExplicitRowId = false
   
-  for i, col in table.columns:
-    if col.primaryKey and col.kind == ctInt64:
-      if values[i].kind == vkInt64:
-        rowid = cast[uint64](values[i].int64Val)
-        isExplicitRowId = true
-      break
+  # INT64 PK optimization: only applies to single-column PKs
+  var pkCount = 0
+  for col in table.columns:
+    if col.primaryKey:
+      inc pkCount
+  if pkCount <= 1:
+    for i, col in table.columns:
+      if col.primaryKey and col.kind == ctInt64:
+        if values[i].kind == vkInt64:
+          rowid = cast[uint64](values[i].int64Val)
+          isExplicitRowId = true
+        break
   
   if not isExplicitRowId:
     rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
@@ -371,16 +403,20 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     for _, idx in catalog.indexes:
       if idx.table != tableName:
         continue
-      var valueIndex = -1
-      for i, col in table.columns:
-        if col.name == idx.column:
-          valueIndex = i
-          break
-      if valueIndex >= 0:
-        if idx.kind == ikBtree:
-          indexKeys.add((idx, indexKeyFromValue(values[valueIndex])))
-        else:
-          trigramValues.add((idx, values[valueIndex]))
+      if idx.kind == ikBtree:
+        let colIndices = indexColumnIndices(table, idx)
+        if colIndices.len == idx.columns.len and colIndices.len > 0:
+          indexKeys.add((idx, compositeIndexKey(values, colIndices)))
+      else:
+        # Trigram indexes are always single-column
+        if idx.columns.len == 1:
+          var valueIndex = -1
+          for i, col in table.columns:
+            if col.name == idx.columns[0]:
+              valueIndex = i
+              break
+          if valueIndex >= 0:
+            trigramValues.add((idx, values[valueIndex]))
   let normalizedRes = normalizeValues(pager, values)
   if not normalizedRes.ok:
     return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
@@ -473,29 +509,32 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     for _, idx in catalog.indexes:
       if idx.table != tableName:
         continue
-      var valueIndex = -1
-      for i, col in table.columns:
-        if col.name == idx.column:
-          valueIndex = i
-          break
-      if valueIndex >= 0:
-        if idx.kind == ikBtree:
+      if idx.kind == ikBtree:
+        let colIndices = indexColumnIndices(table, idx)
+        if colIndices.len == idx.columns.len and colIndices.len > 0:
           let idxTree = newBTree(pager, idx.rootPage)
-          let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
+          let oldKey = compositeIndexKey(oldRes.value.values, colIndices)
           let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
           if not delRes.ok:
             return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-          let newKey = indexKeyFromValue(values[valueIndex])
+          let newKey = compositeIndexKey(values, colIndices)
           let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
           if not idxInsert.ok:
             return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
           let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
           if not syncRes.ok:
             return syncRes
-        else:
-          let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], values[valueIndex])
-          if not updateRes.ok:
-            return updateRes
+      else:
+        if idx.columns.len == 1:
+          var valueIndex = -1
+          for i, col in table.columns:
+            if col.name == idx.columns[0]:
+              valueIndex = i
+              break
+          if valueIndex >= 0:
+            let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], values[valueIndex])
+            if not updateRes.ok:
+              return updateRes
   let normalizedRes = normalizeValues(pager, values)
   if not normalizedRes.ok:
     return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
@@ -516,26 +555,29 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
   for _, idx in catalog.indexes:
     if idx.table != tableName:
       continue
-    var valueIndex = -1
-    for i, col in table.columns:
-      if col.name == idx.column:
-        valueIndex = i
-        break
-    if valueIndex >= 0:
-      if idx.kind == ikBtree:
+    if idx.kind == ikBtree:
+      let colIndices = indexColumnIndices(table, idx)
+      if colIndices.len == idx.columns.len and colIndices.len > 0:
         let idxTree = newBTree(pager, idx.rootPage)
-        let oldKey = indexKeyFromValue(oldRes.value.values[valueIndex])
+        let oldKey = compositeIndexKey(oldRes.value.values, colIndices)
         let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
         if not delRes.ok:
           return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
         let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
         if not syncRes.ok:
           return syncRes
-      else:
-        if oldRes.value.values[valueIndex].kind == vkText:
-          let grams = uniqueTrigrams(valueText(oldRes.value.values[valueIndex]))
-          for g in grams:
-            catalog.trigramBufferRemove(idx.name, g, rowid)
+    else:
+      if idx.columns.len == 1:
+        var valueIndex = -1
+        for i, col in table.columns:
+          if col.name == idx.columns[0]:
+            valueIndex = i
+            break
+        if valueIndex >= 0:
+          if oldRes.value.values[valueIndex].kind == vkText:
+            let grams = uniqueTrigrams(valueText(oldRes.value.values[valueIndex]))
+            for g in grams:
+              catalog.trigramBufferRemove(idx.name, g, rowid)
   let tree = newBTree(pager, table.rootPage)
   let delRes = delete(tree, rowid)
   if not delRes.ok:
@@ -561,6 +603,42 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
   pairs.setLen(rowsRes.value.len)
   for i, row in rowsRes.value:
     pairs[i] = (indexKeyFromValue(row.values[columnIndex]), row.rowid)
+  pairs.sort(proc(a, b: (uint64, uint64)): int =
+    let c = cmp(a[0], b[0])
+    if c != 0: c else: cmp(a[1], b[1])
+  )
+  var entries: seq[(uint64, seq[byte])] = @[]
+  entries.setLen(pairs.len)
+  for i, pair in pairs:
+    entries[i] = (pair[0], encodeRowId(pair[1]))
+  let idxTree = newBTree(pager, indexRoot)
+  let buildRes = bulkBuildFromSorted(idxTree, entries)
+  if not buildRes.ok:
+    return err[PageId](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+  ok(buildRes.value)
+
+proc buildIndexForColumns*(pager: Pager, catalog: Catalog, tableName: string, columnNames: seq[string], indexRoot: PageId): Result[PageId] =
+  let tableRes = catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[PageId](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  var colIndices: seq[int] = @[]
+  for colName in columnNames:
+    var found = false
+    for i, col in table.columns:
+      if col.name == colName:
+        colIndices.add(i)
+        found = true
+        break
+    if not found:
+      return err[PageId](ERR_SQL, "Column not found", colName)
+  let rowsRes = scanTable(pager, table)
+  if not rowsRes.ok:
+    return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  var pairs: seq[(uint64, uint64)] = @[]
+  pairs.setLen(rowsRes.value.len)
+  for i, row in rowsRes.value:
+    pairs[i] = (compositeIndexKey(row.values, colIndices), row.rowid)
   pairs.sort(proc(a, b: (uint64, uint64)): int =
     let c = cmp(a[0], b[0])
     if c != 0: c else: cmp(a[1], b[1])
@@ -641,15 +719,21 @@ proc rebuildIndex*(pager: Pager, catalog: Catalog, index: IndexMeta): Result[Voi
     return err[Void](resetRes.err.code, resetRes.err.message, resetRes.err.context)
   var newRoot = index.rootPage
   if index.kind == ikTrigram:
-    let buildRes = buildTrigramIndexForColumn(pager, catalog, index.table, index.column, index.rootPage)
+    let buildRes = buildTrigramIndexForColumn(pager, catalog, index.table, index.columns[0], index.rootPage)
     if not buildRes.ok:
       return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
     newRoot = buildRes.value
   else:
-    let buildRes = buildIndexForColumn(pager, catalog, index.table, index.column, index.rootPage)
-    if not buildRes.ok:
-      return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-    newRoot = buildRes.value
+    if index.columns.len == 1:
+      let buildRes = buildIndexForColumn(pager, catalog, index.table, index.columns[0], index.rootPage)
+      if not buildRes.ok:
+        return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      newRoot = buildRes.value
+    else:
+      let buildRes = buildIndexForColumns(pager, catalog, index.table, index.columns, index.rootPage)
+      if not buildRes.ok:
+        return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      newRoot = buildRes.value
   if newRoot != index.rootPage:
     var meta = index
     meta.rootPage = newRoot
@@ -762,7 +846,7 @@ proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, c
   
   var indexesToDrop: seq[string] = @[]
   for idxName, idx in catalog.indexes:
-    if idx.table == table.name and idx.column == columnName:
+    if idx.table == table.name and idx.columns.len == 1 and idx.columns[0] == columnName:
       indexesToDrop.add(idxName)
   
   for idxName in indexesToDrop:

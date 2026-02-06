@@ -99,7 +99,7 @@ suite "Storage Extras":
     check postingsAfter.ok
     check postingsAfter.value.len == 1
 
-    let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, idx.table, idx.column, idx.rootPage)
+    let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, idx.table, idx.columns[0], idx.rootPage)
     check buildRes.ok
 
     discard closeDb(db)

@@ -485,9 +485,9 @@ def test_pg_dump_composite_pk_tables_imported(tmp_path):
     # All data should be imported
     assert report.rows_copied.get("playlistsong") == 4
 
-    # Should have a warning about composite PK
+    # Composite PKs are now fully supported — no warnings expected
     composite_warnings = [w for w in report.warnings if "composite primary key" in w]
-    assert len(composite_warnings) == 1
+    assert len(composite_warnings) == 0
 
     conn = decentdb.connect(decent_path)
     try:

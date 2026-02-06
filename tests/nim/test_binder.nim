@@ -27,7 +27,7 @@ proc addTable(db: Db, name: string, columns: seq[Column]): TableMeta =
 proc addIndex(db: Db, name: string, table: string, column: string, unique: bool): IndexMeta =
   let rootRes = initTableRoot(db.pager)
   check rootRes.ok
-  let meta = IndexMeta(name: name, table: table, column: column, rootPage: rootRes.value, kind: ikBtree, unique: unique)
+  let meta = IndexMeta(name: name, table: table, columns: @[column], rootPage: rootRes.value, kind: ikBtree, unique: unique)
   check db.catalog.createIndexMeta(meta).ok
   meta
 
@@ -86,7 +86,7 @@ suite "Binder":
 
     let stmtPk = parseSingle("CREATE TABLE bad (a INT PRIMARY KEY, b INT PRIMARY KEY)")
     let bindPk = bindStatement(db.catalog, stmtPk)
-    check not bindPk.ok
+    check bindPk.ok  # composite PKs are now supported
 
     let stmtFk = parseSingle("CREATE TABLE child (id INT, parent_id INT REFERENCES parent(id))")
     let bindFk = bindStatement(db.catalog, stmtFk)

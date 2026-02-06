@@ -32,7 +32,7 @@ proc createTable(db: Db, name: string, columns: seq[Column]): TableMeta =
 proc createIndex(db: Db, name: string, table: string, column: string, kind: IndexKind): IndexMeta =
   let rootRes = initTableRoot(db.pager)
   check rootRes.ok
-  let meta = IndexMeta(name: name, table: table, column: column, rootPage: rootRes.value, kind: kind, unique: false)
+  let meta = IndexMeta(name: name, table: table, columns: @[column], rootPage: rootRes.value, kind: kind, unique: false)
   check db.catalog.createIndexMeta(meta).ok
   meta
 
@@ -79,7 +79,7 @@ suite "Storage Comprehensive":
     let table = createTable(db, "test", @[Column(name: "id", kind: ctInt64)])
 
     # Create an index meta that doesn't exist in the database
-    let fakeIndex = IndexMeta(name: "fake", table: "test", column: "id", rootPage: 999, kind: ikTrigram, unique: false)
+    let fakeIndex = IndexMeta(name: "fake", table: "test", columns: @["id"], rootPage: 999, kind: ikTrigram, unique: false)
     let result = getTrigramPostings(db.pager, fakeIndex, 123'u32)
     # This might return empty instead of error, depending on implementation
     # Just check that it doesn't crash

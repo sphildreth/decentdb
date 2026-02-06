@@ -32,7 +32,7 @@ proc createTable(db: Db, name: string, columns: seq[Column]): TableMeta =
 proc createIndex(db: Db, name: string, table: string, column: string, kind: IndexKind): IndexMeta =
   let rootRes = initTableRoot(db.pager)
   check rootRes.ok
-  let meta = IndexMeta(name: name, table: table, column: column, rootPage: rootRes.value, kind: kind, unique: false)
+  let meta = IndexMeta(name: name, table: table, columns: @[column], rootPage: rootRes.value, kind: kind, unique: false)
   check db.catalog.createIndexMeta(meta).ok
   meta
 

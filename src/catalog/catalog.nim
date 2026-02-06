@@ -37,7 +37,7 @@ type TableMeta* = object
 type IndexMeta* = object
   name*: string
   table*: string
-  column*: string
+  columns*: seq[string]
   rootPage*: PageId
   kind*: IndexKind
   unique*: bool
@@ -160,12 +160,12 @@ proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns:
   ]
   encodeRecord(values)
 
-proc makeIndexRecord(name: string, table: string, column: string, rootPage: PageId, kind: IndexKind, unique: bool): seq[byte] =
+proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage: PageId, kind: IndexKind, unique: bool): seq[byte] =
   let values = @[
     Value(kind: vkText, bytes: stringToBytes("index")),
     Value(kind: vkText, bytes: stringToBytes(name)),
     Value(kind: vkText, bytes: stringToBytes(table)),
-    Value(kind: vkText, bytes: stringToBytes(column)),
+    Value(kind: vkText, bytes: stringToBytes(columns.join(";"))),
     Value(kind: vkInt64, int64Val: int64(rootPage)),
     Value(kind: vkText, bytes: stringToBytes(if kind == ikTrigram: "trigram" else: "btree")),
     Value(kind: vkInt64, int64Val: int64(if unique: 1 else: 0))
@@ -197,7 +197,8 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
       return err[CatalogRecord](ERR_CORRUPTION, "Index catalog record too short")
     let name = bytesToString(values[1].bytes)
     let tableName = bytesToString(values[2].bytes)
-    let columnName = bytesToString(values[3].bytes)
+    let columnStr = bytesToString(values[3].bytes)
+    let columns = if columnStr.len > 0: columnStr.split(";") else: @[]
     let rootPage = PageId(values[4].int64Val)
     var kind = ikBtree
     var unique = false
@@ -207,7 +208,7 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
         kind = ikTrigram
     if values.len >= 7:
       unique = values[6].int64Val != 0
-    return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, column: columnName, rootPage: rootPage, kind: kind, unique: unique)))
+    return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, columns: columns, rootPage: rootPage, kind: kind, unique: unique)))
   err[CatalogRecord](ERR_CORRUPTION, "Unknown catalog record type", recordType)
 
 proc initCatalog*(pager: Pager): Result[Catalog] =
@@ -319,7 +320,7 @@ proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
-  let record = makeIndexRecord(index.name, index.table, index.column, index.rootPage, index.kind, index.unique)
+  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -333,7 +334,7 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
   discard delete(catalog.catalogTree, key)
-  let record = makeIndexRecord(index.name, index.table, index.column, index.rootPage, index.kind, index.unique)
+  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -373,15 +374,15 @@ proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
 
 proc getBtreeIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
   for _, idx in catalog.indexes:
-    if idx.table == table and idx.column == column and idx.kind == ikBtree:
+    if idx.table == table and idx.columns.len == 1 and idx.columns[0] == column and idx.kind == ikBtree:
       return some(idx)
   none(IndexMeta)
 
 proc getIndexForColumn*(catalog: Catalog, table: string, column: string, kind: IndexKind, requireUnique: bool = false): Option[IndexMeta] =
-  ## Returns any index that semantically satisfies the requested signature.
+  ## Returns any single-column index that semantically satisfies the requested signature.
   ## If requireUnique is true, only unique indexes satisfy.
   for _, idx in catalog.indexes:
-    if idx.table != table or idx.column != column or idx.kind != kind:
+    if idx.table != table or idx.columns.len != 1 or idx.columns[0] != column or idx.kind != kind:
       continue
     if requireUnique and not idx.unique:
       continue
@@ -390,7 +391,7 @@ proc getIndexForColumn*(catalog: Catalog, table: string, column: string, kind: I
 
 proc getTrigramIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
   for _, idx in catalog.indexes:
-    if idx.table == table and idx.column == column and idx.kind == ikTrigram:
+    if idx.table == table and idx.columns.len == 1 and idx.columns[0] == column and idx.kind == ikTrigram:
       return some(idx)
   none(IndexMeta)
 

@@ -59,10 +59,10 @@ suite "Catalog Public API":
     check not table.columns[1].primaryKey
 
   test "IndexMeta structure":
-    let index = IndexMeta(name: "idx", table: "t", column: "c", rootPage: 5, kind: ikBtree, unique: true)
+    let index = IndexMeta(name: "idx", table: "t", columns: @["c"], rootPage: 5, kind: ikBtree, unique: true)
     check index.name == "idx"
     check index.table == "t"
-    check index.column == "c"
+    check index.columns == @["c"]
     check index.rootPage == 5
     check index.kind == ikBtree
     check index.unique == true

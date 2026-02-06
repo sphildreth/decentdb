@@ -22,6 +22,7 @@ import ./planner/explain
 import ./exec/exec
 import ./record/record
 import ./storage/storage
+import ./btree/btree
 import ./wal/wal
 
 type Db* = ref object
@@ -359,8 +360,13 @@ proc enforceNotNull(table: TableMeta, values: seq[Value]): Result[Void] =
   okVoid()
 
 proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value], rowid: uint64 = 0): Result[Void] =
+  # Count PK columns to detect composite PKs
+  var pkCount = 0
+  for col in table.columns:
+    if col.primaryKey:
+      inc pkCount
   for i, col in table.columns:
-    if col.unique or col.primaryKey:
+    if col.unique or (col.primaryKey and pkCount == 1):
       if values[i].kind == vkNull:
         continue
       if col.primaryKey and col.kind == ctInt64:
@@ -391,6 +397,55 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
             return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
           if otherRes.value:
             return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+  # Check composite unique indexes (including composite PKs)
+  for _, idx in catalog.indexes:
+    if idx.table != table.name or idx.columns.len < 2 or not idx.unique:
+      continue
+    let colIndices = indexColumnIndices(table, idx)
+    if colIndices.len != idx.columns.len:
+      continue
+    # Skip if any composite column value is NULL
+    var hasNull = false
+    for ci in colIndices:
+      if values[ci].kind == vkNull:
+        hasNull = true
+        break
+    if hasNull:
+      continue
+    let key = compositeIndexKey(values, colIndices)
+    # Look up candidate rowids by hash key, then verify exact column values
+    let idxTree = newBTree(pager, idx.rootPage)
+    let cursorRes = openCursorAt(idxTree, key)
+    if not cursorRes.ok:
+      return err[Void](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+    let cursor = cursorRes.value
+    while true:
+      let nextRes = cursorNext(cursor)
+      if not nextRes.ok:
+        if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
+          break
+        return err[Void](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+      if nextRes.value[0] < key:
+        continue
+      if nextRes.value[0] > key:
+        break
+      if nextRes.value[1].len < 8:
+        continue
+      let candidateRowid = readU64LE(nextRes.value[1], 0)
+      if rowid != 0 and candidateRowid == rowid:
+        continue
+      let rowRes = readRowAt(pager, table, candidateRowid)
+      if not rowRes.ok:
+        if rowRes.err.code != ERR_IO:
+          return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+        continue
+      var allMatch = true
+      for ci in colIndices:
+        if not valuesEqual(rowRes.value.values[ci], values[ci]):
+          allMatch = false
+          break
+      if allMatch:
+        return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & idx.columns.join(","))
   okVoid()
 
 proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value]): Result[Void] =
@@ -1408,8 +1463,28 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let saveRes = db.catalog.saveTable(db.pager, meta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+      # Collect PK columns for composite PK detection
+      var pkCols: seq[string] = @[]
+      for col in columns:
+        if col.primaryKey:
+          pkCols.add(col.name)
+      if pkCols.len > 1:
+        # Composite PK: single-INT64 optimization doesn't apply; create composite unique index
+        let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
+        let idxRootRes = initTableRoot(db.pager)
+        if not idxRootRes.ok:
+          return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+        let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
+        if not buildRes.ok:
+          return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+        let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+        if not idxSaveRes.ok:
+          return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
       for col in columns:
         if col.primaryKey or col.unique:
+          if col.primaryKey and pkCols.len > 1:
+            continue  # handled by composite index above
           if col.primaryKey and col.kind == ctInt64:
             continue
           let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
@@ -1420,7 +1495,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
             let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
             if not buildRes.ok:
               return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
             let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
             if not idxSaveRes.ok:
               return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
@@ -1433,7 +1508,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
             let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
             if not buildRes.ok:
               return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
             let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
             if not idxSaveRes.ok:
               return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
@@ -1466,48 +1541,84 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not tableRes.ok:
           return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
         let table = tableRes.value
-        var colIndex = -1
-        for i, col in table.columns:
-          if col.name == bound.columnName:
-            colIndex = i
-            break
-        if colIndex < 0:
-          return err[seq[string]](ERR_SQL, "Column not found", bound.columnName)
+        var colIndices: seq[int] = @[]
+        for colName in bound.columnNames:
+          var found = false
+          for i, col in table.columns:
+            if col.name == colName:
+              colIndices.add(i)
+              found = true
+              break
+          if not found:
+            return err[seq[string]](ERR_SQL, "Column not found", colName)
         let rowsRes = scanTable(db.pager, table)
         if not rowsRes.ok:
           return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-        let colKind = table.columns[colIndex].kind
-        var seen: Table[uint64, bool] = initTable[uint64, bool]()
-        var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
-        for row in rowsRes.value:
-          if row.values[colIndex].kind == vkNull:
-            continue
-          let key = indexKeyFromValue(row.values[colIndex])
-          if colKind in {ctText, ctBlob} and row.values[colIndex].kind in {vkText, vkBlob}:
-            let vKey = valueBytesKey(row.values[colIndex])
-            if not seenVals.hasKey(key):
-              seenVals[key] = @[vKey]
+        if colIndices.len == 1:
+          let colKind = table.columns[colIndices[0]].kind
+          var seen: Table[uint64, bool] = initTable[uint64, bool]()
+          var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
+          for row in rowsRes.value:
+            if row.values[colIndices[0]].kind == vkNull:
+              continue
+            let key = indexKeyFromValue(row.values[colIndices[0]])
+            if colKind in {ctText, ctBlob} and row.values[colIndices[0]].kind in {vkText, vkBlob}:
+              let vKey = valueBytesKey(row.values[colIndices[0]])
+              if not seenVals.hasKey(key):
+                seenVals[key] = @[vKey]
+              else:
+                if vKey in seenVals[key]:
+                  return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnNames[0])
+                seenVals[key].add(vKey)
             else:
-              if vKey in seenVals[key]:
-                return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
-              seenVals[key].add(vKey)
-          else:
+              if seen.hasKey(key):
+                return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnNames[0])
+              seen[key] = true
+        else:
+          # Composite uniqueness check: hash all column values, verify via row comparison
+          var seen: Table[uint64, seq[seq[Value]]] = initTable[uint64, seq[seq[Value]]]()
+          for row in rowsRes.value:
+            var hasNull = false
+            var vals: seq[Value] = @[]
+            for ci in colIndices:
+              if row.values[ci].kind == vkNull:
+                hasNull = true
+                break
+              vals.add(row.values[ci])
+            if hasNull:
+              continue
+            let key = compositeIndexKey(row.values, colIndices)
             if seen.hasKey(key):
-              return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
-            seen[key] = true
+              for existing in seen[key]:
+                var allMatch = true
+                for j in 0..<vals.len:
+                  if not valuesEqual(existing[j], vals[j]):
+                    allMatch = false
+                    break
+                if allMatch:
+                  return err[seq[string]](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnNames.join(","))
+              seen[key].add(vals)
+            else:
+              seen[key] = @[vals]
       var finalRoot = indexRootRes.value
       if bound.indexKind == sql.ikTrigram:
-        let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
+        let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
         if not buildRes.ok:
           return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
         finalRoot = buildRes.value
       else:
-        let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
-        if not buildRes.ok:
-          return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-        finalRoot = buildRes.value
+        if bound.columnNames.len == 1:
+          let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
+          if not buildRes.ok:
+            return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+          finalRoot = buildRes.value
+        else:
+          let buildRes = buildIndexForColumns(db.pager, db.catalog, bound.indexTableName, bound.columnNames, indexRootRes.value)
+          if not buildRes.ok:
+            return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+          finalRoot = buildRes.value
       let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
-      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
+      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, columns: bound.columnNames, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
       let saveRes = db.catalog.createIndexMeta(idxMeta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
@@ -1825,9 +1936,28 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     let saveRes = db.catalog.saveTable(db.pager, meta)
     if not saveRes.ok:
       return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    var pkCols: seq[string] = @[]
     for col in columns:
-      if col.primaryKey and col.kind == ctInt64: continue
+      if col.primaryKey:
+        pkCols.add(col.name)
+    if pkCols.len > 1:
+      let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
+      let idxRootRes = initTableRoot(db.pager)
+      if not idxRootRes.ok:
+        return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+      let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
+      if not buildRes.ok:
+        return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+      let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+      if not idxSaveRes.ok:
+        return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+    for col in columns:
       if col.primaryKey or col.unique:
+        if col.primaryKey and pkCols.len > 1:
+          continue
+        if col.primaryKey and col.kind == ctInt64:
+          continue
         let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
         if isNone(db.catalog.getIndexByName(idxName)):
           let idxRootRes = initTableRoot(db.pager)
@@ -1836,7 +1966,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
           let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
           if not buildRes.ok:
             return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-          let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+          let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
           let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
           if not idxSaveRes.ok:
             return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
@@ -1849,7 +1979,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
           let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
           if not buildRes.ok:
             return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-          let idxMeta = IndexMeta(name: idxName, table: meta.name, column: col.name, rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
+          let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
           let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
           if not idxSaveRes.ok:
             return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
@@ -1888,48 +2018,83 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       if not tableRes.ok:
         return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
-      var colIndex = -1
-      for i, col in table.columns:
-        if col.name == bound.columnName:
-          colIndex = i
-          break
-      if colIndex < 0:
-        return err[int64](ERR_SQL, "Column not found", bound.columnName)
+      var colIndices: seq[int] = @[]
+      for colName in bound.columnNames:
+        var found = false
+        for i, col in table.columns:
+          if col.name == colName:
+            colIndices.add(i)
+            found = true
+            break
+        if not found:
+          return err[int64](ERR_SQL, "Column not found", colName)
       let rowsRes = scanTable(db.pager, table)
       if not rowsRes.ok:
         return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      let colKind = table.columns[colIndex].kind
-      var seen: Table[uint64, bool] = initTable[uint64, bool]()
-      var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
-      for row in rowsRes.value:
-        if row.values[colIndex].kind == vkNull:
-          continue
-        let key = indexKeyFromValue(row.values[colIndex])
-        if colKind in {ctText, ctBlob} and row.values[colIndex].kind in {vkText, vkBlob}:
-          let vKey = valueBytesKey(row.values[colIndex])
-          if not seenVals.hasKey(key):
-            seenVals[key] = @[vKey]
+      if colIndices.len == 1:
+        let colKind = table.columns[colIndices[0]].kind
+        var seen: Table[uint64, bool] = initTable[uint64, bool]()
+        var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
+        for row in rowsRes.value:
+          if row.values[colIndices[0]].kind == vkNull:
+            continue
+          let key = indexKeyFromValue(row.values[colIndices[0]])
+          if colKind in {ctText, ctBlob} and row.values[colIndices[0]].kind in {vkText, vkBlob}:
+            let vKey = valueBytesKey(row.values[colIndices[0]])
+            if not seenVals.hasKey(key):
+              seenVals[key] = @[vKey]
+            else:
+              if vKey in seenVals[key]:
+                return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnNames[0])
+              seenVals[key].add(vKey)
           else:
-            if vKey in seenVals[key]:
-              return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
-            seenVals[key].add(vKey)
-        else:
+            if seen.hasKey(key):
+              return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnNames[0])
+            seen[key] = true
+      else:
+        var seen: Table[uint64, seq[seq[Value]]] = initTable[uint64, seq[seq[Value]]]()
+        for row in rowsRes.value:
+          var hasNull = false
+          var vals: seq[Value] = @[]
+          for ci in colIndices:
+            if row.values[ci].kind == vkNull:
+              hasNull = true
+              break
+            vals.add(row.values[ci])
+          if hasNull:
+            continue
+          let key = compositeIndexKey(row.values, colIndices)
           if seen.hasKey(key):
-            return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnName)
-          seen[key] = true
+            for existing in seen[key]:
+              var allMatch = true
+              for j in 0..<vals.len:
+                if not valuesEqual(existing[j], vals[j]):
+                  allMatch = false
+                  break
+              if allMatch:
+                return err[int64](ERR_CONSTRAINT, "UNIQUE index creation failed", bound.columnNames.join(","))
+            seen[key].add(vals)
+          else:
+            seen[key] = @[vals]
     var finalRoot = indexRootRes.value
     if bound.indexKind == sql.ikTrigram:
-      let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
+      let buildRes = buildTrigramIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
       if not buildRes.ok:
         return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
       finalRoot = buildRes.value
     else:
-      let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnName, indexRootRes.value)
-      if not buildRes.ok:
-        return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-      finalRoot = buildRes.value
+      if bound.columnNames.len == 1:
+        let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
+        if not buildRes.ok:
+          return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        finalRoot = buildRes.value
+      else:
+        let buildRes = buildIndexForColumns(db.pager, db.catalog, bound.indexTableName, bound.columnNames, indexRootRes.value)
+        if not buildRes.ok:
+          return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        finalRoot = buildRes.value
     let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
-    let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, column: bound.columnName, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
+    let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, columns: bound.columnNames, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
     let saveRes = db.catalog.createIndexMeta(idxMeta)
     if not saveRes.ok:
       return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)

@@ -493,11 +493,11 @@ class PgDumpParser:
         # Parse column list
         columns = []
         for col in cols_str.split(","):
-            col = col.strip().strip('"')
-            # Remove any ASC/DESC/COLLATE
+            col = col.strip()
+            # Remove any ASC/DESC/COLLATE before stripping quotes
             col = re.sub(
                 r"\s+(?:ASC|DESC|COLLATE\s+\w+).*", "", col, flags=re.IGNORECASE
-            ).strip()
+            ).strip().strip('"')
             if col:
                 columns.append(col)
 
@@ -756,31 +756,12 @@ class PgDumpParser:
                 )
 
         # Associate indexes with tables
-        skipped_indexes: list[SkippedIndex] = []
         for idx in self.indexes:
             if idx.table in self.tables:
-                if len(idx.columns) == 1:
-                    existing_indexes = list(self.tables[idx.table].indexes)
-                    existing_indexes.append(idx)
-                    self.tables[idx.table] = dataclasses.replace(
-                        self.tables[idx.table], indexes=existing_indexes
-                    )
-                else:
-                    skipped_indexes.append(
-                        SkippedIndex(
-                            name=idx.name,
-                            table=idx.table,
-                            reason="Composite index not imported (single-column only)",
-                        )
-                    )
-
-        # Add skipped indexes to tables
-        for skipped in skipped_indexes:
-            if skipped.table in self.tables:
-                existing_skipped = list(self.tables[skipped.table].skipped_indexes)
-                existing_skipped.append(skipped)
-                self.tables[skipped.table] = dataclasses.replace(
-                    self.tables[skipped.table], skipped_indexes=existing_skipped
+                existing_indexes = list(self.tables[idx.table].indexes)
+                existing_indexes.append(idx)
+                self.tables[idx.table] = dataclasses.replace(
+                    self.tables[idx.table], indexes=existing_indexes
                 )
 
 
@@ -903,7 +884,7 @@ def _create_table(
         decent_type = _map_pg_type_to_decentdb(col.pg_type)
         parts: list[str] = [_quote_ident(dst_col), decent_type]
 
-        # Primary key (single-column only)
+        # Primary key (single-column only; composite PKs use table-level constraint)
         if col.name in pk_set and len(pk_set) == 1:
             parts.append("PRIMARY KEY")
         else:
@@ -924,6 +905,13 @@ def _create_table(
             )
 
         col_defs.append(" ".join(parts))
+
+    # Composite primary key as table-level constraint
+    if table.primary_key and len(pk_set) > 1:
+        pk_cols = ", ".join(
+            _quote_ident(column_name_map[table.name][c]) for c in table.primary_key
+        )
+        col_defs.append(f"PRIMARY KEY ({pk_cols})")
 
     sql = "CREATE TABLE " + _quote_ident(dst_table) + " (" + ", ".join(col_defs) + ")"
     conn.execute(sql)
@@ -1113,12 +1101,11 @@ def _create_indexes(
 ) -> None:
     """Create indexes for a table."""
     for idx in table.indexes:
-        if len(idx.columns) != 1:
-            continue  # Skip composite indexes
-
         dst_table = table_name_map.get(idx.table, idx.table)
-        src_col = idx.columns[0]
-        dst_col = column_name_map.get(idx.table, {}).get(src_col, src_col)
+        dst_cols = [
+            _quote_ident(column_name_map.get(idx.table, {}).get(c, c))
+            for c in idx.columns
+        ]
         dst_idx = _normalize_ident(
             idx.name, identifier_case=report.identifier_case if report else "lower"
         )
@@ -1129,7 +1116,7 @@ def _create_indexes(
             + " ON "
             + _quote_ident(dst_table)
             + "("
-            + _quote_ident(dst_col)
+            + ", ".join(dst_cols)
             + ")"
         )
         conn.execute(sql)
@@ -1227,7 +1214,7 @@ def convert_pg_dump_to_decentdb(
                 elapsed = task.get_time() - self.start_time
                 return f"[{timedelta(seconds=int(elapsed))}]"
 
-        overall_start_time = time.time()
+        overall_start_time = time.monotonic()
         console = Console()
         progress = Progress(
             SpinnerColumn(),
@@ -1273,15 +1260,6 @@ def convert_pg_dump_to_decentdb(
         raise ConversionError("No supported tables found in PostgreSQL dump file")
 
     tables = supported_tables
-
-    # Warn about composite primary keys (imported without uniqueness enforcement)
-    for t in tables:
-        if t.primary_key and len(t.primary_key) > 1:
-            pk_cols = ", ".join(t.primary_key)
-            report.warnings.append(
-                f"Table '{t.name}': composite primary key ({pk_cols}) imported "
-                f"without uniqueness enforcement (auto-generated rowid used instead)"
-            )
 
     # Analyze data to detect type mismatches and adjust column types if needed
     for t in tables:
@@ -1354,8 +1332,9 @@ def convert_pg_dump_to_decentdb(
     report.column_name_map = {k: dict(v) for k, v in column_name_map.items()}
     report.tables = [table_name_map[t.name] for t in ordered]
 
-    # Build set of single primary key columns for FK validation
-    # Composite PK columns are excluded since they don't get PRIMARY KEY in DecentDB
+    # Build set of primary key columns for FK validation
+    # FKs referencing a column within a composite PK are skipped because
+    # DecentDB FK enforcement requires the referenced column to be a single-column PK.
     pk_columns: set[tuple[str, str]] = set()  # (table, column)
     composite_pk_tables: set[str] = set()
     for t in ordered:
@@ -1410,9 +1389,24 @@ def convert_pg_dump_to_decentdb(
             TimeElapsedColumn,
             TimeRemainingColumn,
         )
+        from rich.progress import Task as RichTask
+        from datetime import timedelta
+
+        class TotalElapsedColumn2(TimeElapsedColumn):
+            """Shows total elapsed time since import started."""
+
+            def __init__(self, start_time):
+                super().__init__()
+                self.start_time = start_time
+
+            def render(self, task: RichTask) -> str:
+                elapsed = task.get_time() - self.start_time
+                return f"[{timedelta(seconds=int(elapsed))}]"
 
         if console is None:
             console = Console()
+        if overall_start_time is None:
+            overall_start_time = time.monotonic()
         if progress is None:
             progress = Progress(
                 SpinnerColumn(),
@@ -1420,7 +1414,7 @@ def convert_pg_dump_to_decentdb(
                 BarColumn(bar_width=None),
                 TaskProgressColumn(),
                 TimeElapsedColumn(),
-                TimeRemainingColumn(),
+                TotalElapsedColumn2(overall_start_time),
                 transient=False,
             )
 

@@ -134,7 +134,7 @@ proc addBtreeIndex(catalog: Catalog, name: string, table: string, column: string
   catalog.indexes[name] = IndexMeta(
     name: name,
     table: table,
-    column: column,
+    columns: @[column],
     rootPage: PageId(1),
     kind: ikBtree,
     unique: false
@@ -144,7 +144,7 @@ proc addTrigramIndex(catalog: Catalog, name: string, table: string, column: stri
   catalog.indexes[name] = IndexMeta(
     name: name,
     table: table,
-    column: column,
+    columns: @[column],
     rootPage: PageId(1),
     kind: ikTrigram,
     unique: false

@@ -135,7 +135,7 @@ type Statement* = ref object
   of skCreateIndex:
     indexName*: string
     indexTableName*: string
-    columnName*: string
+    columnNames*: seq[string]
     indexKind*: SqlIndexKind
     unique*: bool
   of skDropTable:
@@ -648,20 +648,21 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
     let contype = nodeGet(constraint, "contype").getStr
     if contype in ["CONSTR_UNIQUE", "CONSTR_PRIMARY"]:
       let keys = nodeGet(constraint, "keys")
-      if keys.kind != JArray or keys.len != 1:
-        return err[Statement](ERR_SQL, "Only single-column constraints supported")
-      let colName = nodeString(keys[0])
-      var found = false
-      for i, col in columns:
-        if col.name == colName:
-          found = true
-          columns[i].unique = true
-          if contype == "CONSTR_PRIMARY":
-            columns[i].primaryKey = true
-            columns[i].notNull = true
-          break
-      if not found:
-        return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
+      if keys.kind != JArray or keys.len == 0:
+        return err[Statement](ERR_SQL, "Constraint must reference at least one column")
+      for keyNode in keys:
+        let colName = nodeString(keyNode)
+        var found = false
+        for i, col in columns:
+          if col.name == colName:
+            found = true
+            columns[i].unique = keys.len == 1  # only mark unique for single-column
+            if contype == "CONSTR_PRIMARY":
+              columns[i].primaryKey = true
+              columns[i].notNull = true
+            break
+        if not found:
+          return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
     elif contype == "CONSTR_FOREIGN":
       return err[Statement](ERR_SQL, "Table-level foreign keys not supported")
   ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns))
@@ -672,12 +673,14 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-  var columnName = ""
+  var columnNames: seq[string] = @[]
   let params = nodeGet(node, "indexParams")
-  if params.kind == JArray and params.len > 0:
-    let param = params[0]["IndexElem"]
-    if nodeHas(param, "name"):
-      columnName = param["name"].getStr
+  if params.kind == JArray:
+    for p in params:
+      if nodeHas(p, "IndexElem"):
+        let param = p["IndexElem"]
+        if nodeHas(param, "name"):
+          columnNames.add(param["name"].getStr)
   var kind = ikBtree
   let methodName = nodeGet(node, "accessMethod").getStr
   if methodName.len > 0:
@@ -685,7 +688,7 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     if methodLower == "trigram":
       kind = ikTrigram
   let unique = nodeHas(node, "unique") and node["unique"].getBool
-  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnName: columnName, indexKind: kind, unique: unique))
+  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnNames: columnNames, indexKind: kind, unique: unique))
 
 proc parseDropStmt(node: JsonNode): Result[Statement] =
   let removeType = nodeGet(node, "removeType").getStr

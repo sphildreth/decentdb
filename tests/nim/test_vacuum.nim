@@ -130,7 +130,7 @@ suite "Vacuum":
     check not dbDst2.catalog.indexes.hasKey("items_name_unique2")
     var nameUniqueCount = 0
     for _, idx in dbDst2.catalog.indexes:
-      if idx.table == "items" and idx.column == "name" and idx.kind == ikBtree and idx.unique:
+      if idx.table == "items" and idx.columns == @["name"] and idx.kind == ikBtree and idx.unique:
         nameUniqueCount.inc
     check nameUniqueCount == 1
 
@@ -169,7 +169,7 @@ suite "Vacuum":
     check not dbDst2.catalog.indexes.hasKey("children_parent_id_user_idx")
     var fkChildIndexCount = 0
     for _, idx in dbDst2.catalog.indexes:
-      if idx.table == "children" and idx.column == "parent_id" and idx.kind == ikBtree:
+      if idx.table == "children" and idx.columns == @["parent_id"] and idx.kind == ikBtree:
         fkChildIndexCount.inc
     check fkChildIndexCount == 1
 
@@ -210,7 +210,7 @@ suite "Vacuum":
     var nonUniqueCount = 0
     var uniqueCount = 0
     for _, idx in dbDst2.catalog.indexes:
-      if idx.table == "children" and idx.column == "parent_id" and idx.kind == ikBtree:
+      if idx.table == "children" and idx.columns == @["parent_id"] and idx.kind == ikBtree:
         if idx.unique: uniqueCount.inc else: nonUniqueCount.inc
     check nonUniqueCount == 1
     check uniqueCount == 1

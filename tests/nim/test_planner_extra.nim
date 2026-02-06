@@ -54,7 +54,7 @@ suite "Planner Extra":
   test "planner uses trigram plan for LIKE on indexed column":
     var catalog = makeCatalog()
     addTable(catalog, "docs")
-    catalog.indexes["docs_body_trgm"] = IndexMeta(name: "docs_body_trgm", table: "docs", column: "body", rootPage: 3'u32, kind: ikTrigram, unique: false)
+    catalog.indexes["docs_body_trgm"] = IndexMeta(name: "docs_body_trgm", table: "docs", columns: @["body"], rootPage: 3'u32, kind: ikTrigram, unique: false)
     let stmt = parseSql("SELECT id FROM docs WHERE body ILIKE '%abc%'").value.statements[0]
     let planRes = plan(catalog, stmt)
     check planRes.ok
