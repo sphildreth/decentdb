@@ -13,13 +13,13 @@ proc toBytes(text: string): seq[byte] =
 suite "Catalog Public API":
   test "parseColumnType all valid types":
     check parseColumnType("INT").ok
-    check parseColumnType("INT").value == ctInt64
+    check parseColumnType("INT").value.kind == ctInt64
     check parseColumnType("INT64").ok
-    check parseColumnType("INT64").value == ctInt64
+    check parseColumnType("INT64").value.kind == ctInt64
     check parseColumnType("BIGINT").ok
     check parseColumnType("BOOL").ok
     check parseColumnType("BOOLEAN").ok
-    check parseColumnType("BOOL").value == ctBool
+    check parseColumnType("BOOL").value.kind == ctBool
     check parseColumnType("FLOAT").ok
     check parseColumnType("FLOAT64").ok
     check parseColumnType("TEXT").ok
@@ -41,7 +41,7 @@ suite "Catalog Public API":
     for typeName in @["INT", "BOOL", "FLOAT64", "TEXT", "BLOB"]:
       let parseRes = parseColumnType(typeName)
       if parseRes.ok:
-        let kind = parseRes.value
+        let kind = parseRes.value.kind
         let text = columnTypeToText(kind)
         check text.len > 0
 

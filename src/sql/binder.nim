@@ -756,6 +756,7 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     let typeRes = parseColumnType(col.typeName)
     if not typeRes.ok:
       return err[Statement](typeRes.err.code, typeRes.err.message, col.typeName)
+    # ColumnDef typeName is preserved for catalog storage; actual Column.kind is computed later.
     if col.primaryKey:
       primaryCount.inc
     if col.refTable.len > 0 and col.refColumn.len > 0:

@@ -381,6 +381,63 @@ suite "Planner":
     check splitRow(res3.value[0])[0] == "4"
     
     discard closeDb(db)
+
+  test "scalar functions and concatenation":
+    let path = makeTempDb("decentdb_sql_scalar_funcs.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE items (id INT, val INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO items (id, val, name) VALUES (1, NULL, '  AbC  ')").ok
+    check execSql(db, "INSERT INTO items (id, val, name) VALUES (2, 20, 'xy')").ok
+
+    let coalesceRes = execSql(db, "SELECT COALESCE(val, 99) FROM items ORDER BY id")
+    check coalesceRes.ok
+    check coalesceRes.value == @["99", "20"]
+
+    let nullifRes = execSql(db, "SELECT NULLIF(val, 20) FROM items ORDER BY id")
+    check nullifRes.ok
+    check nullifRes.value == @["NULL", "NULL"]
+
+    let stringFnRes = execSql(db, "SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name), TRIM(name) || '_x' FROM items WHERE id = 1")
+    check stringFnRes.ok
+    check stringFnRes.value == @["7|  abc  |  ABC  |AbC|AbC_x"]
+
+    discard closeDb(db)
+
+  test "CASE, CAST, BETWEEN, EXISTS, and LIKE ESCAPE":
+    let path = makeTempDb("decentdb_sql_case_cast_exists.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "CREATE TABLE t2 (id INT)").ok
+    check execSql(db, "INSERT INTO t (id, name) VALUES (1, 'a_%')").ok
+    check execSql(db, "INSERT INTO t (id, name) VALUES (2, 'abc')").ok
+    check execSql(db, "INSERT INTO t2 (id) VALUES (7)").ok
+
+    let caseCastRes = execSql(db, "SELECT CASE WHEN id > 1 THEN 'big' ELSE 'small' END, CAST(id AS TEXT) FROM t ORDER BY id")
+    check caseCastRes.ok
+    check caseCastRes.value == @["small|1", "big|2"]
+
+    let betweenRes = execSql(db, "SELECT id FROM t WHERE id BETWEEN 1 AND 1")
+    check betweenRes.ok
+    check betweenRes.value == @["1"]
+
+    let existsRes = execSql(db, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t2)")
+    check existsRes.ok
+    check existsRes.value.len == 2
+
+    let likeEscapeRes = execSql(db, "SELECT id FROM t WHERE name LIKE 'a#_%' ESCAPE '#'")
+    check likeEscapeRes.ok
+    check likeEscapeRes.value == @["1"]
+
+    let corrExistsRes = execSql(db, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t.id)")
+    check not corrExistsRes.ok
+
+    discard closeDb(db)
   
   test "type mismatch handling":
     let path = makeTempDb("decentdb_sql_types.db")

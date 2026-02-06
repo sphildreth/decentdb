@@ -134,7 +134,7 @@ proc refs(expr: Expr): HashSet[string] =
 proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   proc hasAggregate(items: seq[SelectItem]): bool =
     for item in items:
-      if item.expr != nil and item.expr.kind == ekFunc:
+      if item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
         return true
     false
   var conjuncts = splitAnd(stmt.whereExpr)

@@ -59,6 +59,10 @@ suite "Binder":
     let bindAmbig = bindStatement(db.catalog, stmtAmbig)
     check not bindAmbig.ok
 
+    let stmtNull = parseSingle("SELECT id FROM a WHERE NOT (id = NULL) OR id IS NULL OR id IN (1, NULL)")
+    let bindNull = bindStatement(db.catalog, stmtNull)
+    check bindNull.ok
+
     discard closeDb(db)
 
   test "bind insert/update column validation":
@@ -79,6 +83,18 @@ suite "Binder":
     let stmtType = parseSingle("INSERT INTO t (id, name) VALUES ('bad', 'ok')")
     let bindType = bindStatement(db.catalog, stmtType)
     check not bindType.ok
+
+    let stmtFuncs = parseSingle("SELECT COALESCE(name, 'x'), LENGTH(name), TRIM(name) || '_x' FROM t")
+    let bindFuncs = bindStatement(db.catalog, stmtFuncs)
+    check bindFuncs.ok
+
+    discard addTable(db, "t2", @[Column(name: "id", kind: ctInt64)])
+    let stmtExprs = parseSingle(
+      "SELECT CASE WHEN id > 1 THEN 'big' ELSE 'small' END, CAST(id AS TEXT) " &
+      "FROM t WHERE id BETWEEN 1 AND 3 AND EXISTS (SELECT 1 FROM t2)"
+    )
+    let bindExprs = bindStatement(db.catalog, stmtExprs)
+    check bindExprs.ok
 
     discard closeDb(db)
 

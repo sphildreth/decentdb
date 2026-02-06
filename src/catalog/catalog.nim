@@ -15,6 +15,13 @@ type ColumnType* = enum
   ctFloat64
   ctText
   ctBlob
+  ctDecimal
+  ctUuid
+
+type ColumnTypeSpec* = object
+  kind*: ColumnType
+  decPrecision*: uint8
+  decScale*: uint8
 
 type IndexKind* = enum
   ikBtree
@@ -28,6 +35,8 @@ type Column* = object
   primaryKey*: bool
   refTable*: string
   refColumn*: string
+  decPrecision*: uint8
+  decScale*: uint8
 
 type TableMeta* = object
   name*: string
@@ -72,26 +81,57 @@ type CatalogRecord = object
   index: IndexMeta
   view: ViewMeta
 
-proc parseColumnType*(text: string): Result[ColumnType] =
-  # Extract base type name by taking everything before the first '('
-  var baseType = text
-  let parenPos = text.find('(')
-  if parenPos >= 0:
-    baseType = text[0..<parenPos]
+proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
+  let raw = text.strip()
+  if raw.len == 0:
+    return err[ColumnTypeSpec](ERR_SQL, "Unsupported column type", text)
 
-  case baseType.strip().toUpperAscii()
-  of "INT", "INT64", "BIGINT", "INT4", "INT8":
-    ok(ctInt64)
+  var baseType = raw
+  var mods = ""
+  let parenPos = raw.find('(')
+  if parenPos >= 0:
+    baseType = raw[0..<parenPos].strip()
+    mods = raw[parenPos..^1].strip()
+
+  let baseUpper = baseType.toUpperAscii()
+  case baseUpper
+  of "INT", "INTEGER", "INT64", "BIGINT", "INT4", "INT8":
+    ok(ColumnTypeSpec(kind: ctInt64))
   of "BOOL", "BOOLEAN":
-    ok(ctBool)
+    ok(ColumnTypeSpec(kind: ctBool))
   of "FLOAT", "FLOAT64", "DOUBLE", "FLOAT8", "FLOAT4", "REAL":
-    ok(ctFloat64)
+    ok(ColumnTypeSpec(kind: ctFloat64))
   of "TEXT", "VARCHAR", "CHARACTER VARYING":
-    ok(ctText)
+    ok(ColumnTypeSpec(kind: ctText))
   of "BLOB":
-    ok(ctBlob)
+    ok(ColumnTypeSpec(kind: ctBlob))
+  of "UUID":
+    ok(ColumnTypeSpec(kind: ctUuid))
+  of "DECIMAL", "NUMERIC":
+    if mods.len == 0:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL/NUMERIC requires (p,s)", text)
+    if not (mods.startsWith("(") and mods.endsWith(")")):
+      return err[ColumnTypeSpec](ERR_SQL, "Invalid DECIMAL/NUMERIC modifiers", text)
+    let inner = mods[1 ..< mods.len-1]
+    let parts = inner.split(",")
+    if parts.len != 2:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL/NUMERIC requires (p,s)", text)
+    let pStr = parts[0].strip()
+    let sStr = parts[1].strip()
+    var pInt: int
+    var sInt: int
+    try:
+      pInt = parseInt(pStr)
+      sInt = parseInt(sStr)
+    except ValueError:
+      return err[ColumnTypeSpec](ERR_SQL, "Invalid DECIMAL/NUMERIC (p,s)", text)
+    if pInt <= 0 or pInt > 18:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL precision must be 1..18", text)
+    if sInt < 0 or sInt > pInt:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL scale must be 0..p", text)
+    ok(ColumnTypeSpec(kind: ctDecimal, decPrecision: uint8(pInt), decScale: uint8(sInt)))
   else:
-    err[ColumnType](ERR_SQL, "Unsupported column type", text)
+    err[ColumnTypeSpec](ERR_SQL, "Unsupported column type", text)
 
 proc columnTypeToText*(kind: ColumnType): string =
   case kind
@@ -100,6 +140,8 @@ proc columnTypeToText*(kind: ColumnType): string =
   of ctFloat64: "FLOAT64"
   of ctText: "TEXT"
   of ctBlob: "BLOB"
+  of ctDecimal: "DECIMAL"
+  of ctUuid: "UUID"
 
 proc encodeColumns(columns: seq[Column]): seq[byte] =
   var parts: seq[string] = @[]
@@ -114,7 +156,12 @@ proc encodeColumns(columns: seq[Column]): seq[byte] =
     if col.refTable.len > 0 and col.refColumn.len > 0:
       flags.add("ref=" & col.refTable & "." & col.refColumn)
     let flagPart = if flags.len > 0: ":" & flags.join(",") else: ""
-    parts.add(col.name & ":" & columnTypeToText(col.kind) & flagPart)
+    let typeText =
+      if col.kind == ctDecimal:
+        "DECIMAL(" & $col.decPrecision & "," & $col.decScale & ")"
+      else:
+        columnTypeToText(col.kind)
+    parts.add(col.name & ":" & typeText & flagPart)
   let joined = parts.join(";")
   var bytes: seq[byte] = @[]
   for ch in joined:
@@ -133,7 +180,10 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
     if pieces.len >= 2:
       let typeRes = parseColumnType(pieces[1])
       if typeRes.ok:
-        var col = Column(name: pieces[0], kind: typeRes.value)
+        var col = Column(name: pieces[0], kind: typeRes.value.kind)
+        if col.kind == ctDecimal:
+          col.decPrecision = typeRes.value.decPrecision
+          col.decScale = typeRes.value.decScale
         if pieces.len >= 3:
           let flags = pieces[2].split(",")
           for flag in flags:

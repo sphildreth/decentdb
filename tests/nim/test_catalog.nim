@@ -157,28 +157,28 @@ suite "Catalog":
     # Test that VARCHAR is parsed as TEXT
     let varcharRes = parseColumnType("VARCHAR")
     check varcharRes.ok
-    check varcharRes.value == ctText
+    check varcharRes.value.kind == ctText
 
     # Test that CHARACTER VARYING is parsed as TEXT
     let charVaryingRes = parseColumnType("CHARACTER VARYING")
     check charVaryingRes.ok
-    check charVaryingRes.value == ctText
+    check charVaryingRes.value.kind == ctText
 
     # Test that VARCHAR(255) is parsed as TEXT (ignoring length specification)
     let varcharWithLengthRes = parseColumnType("VARCHAR(255)")
     check varcharWithLengthRes.ok
-    check varcharWithLengthRes.value == ctText
+    check varcharWithLengthRes.value.kind == ctText
 
     # Test that CHARACTER VARYING(100) is parsed as TEXT (ignoring length specification)
     let charVaryingWithLengthRes = parseColumnType("CHARACTER VARYING(100)")
     check charVaryingWithLengthRes.ok
-    check charVaryingWithLengthRes.value == ctText
+    check charVaryingWithLengthRes.value.kind == ctText
 
     # Test case insensitivity
     let lowerCaseRes = parseColumnType("varchar")
     check lowerCaseRes.ok
-    check lowerCaseRes.value == ctText
+    check lowerCaseRes.value.kind == ctText
 
     let mixedCaseRes = parseColumnType("VarChar(100)")
     check mixedCaseRes.ok
-    check mixedCaseRes.value == ctText
+    check mixedCaseRes.value.kind == ctText

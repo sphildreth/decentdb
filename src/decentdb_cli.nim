@@ -315,6 +315,16 @@ proc csvCellToValue(cellValue: string, col: Column): Value =
     for ch in cellValue:
       bytes.add(byte(ch))
     Value(kind: vkBlob, bytes: bytes)
+  of ctDecimal:
+    try:
+      Value(kind: vkInt64, int64Val: parseBiggestInt(cellValue))
+    except:
+      Value(kind: vkNull)
+  of ctUuid:
+    var bytes: seq[byte] = @[]
+    for ch in cellValue:
+      bytes.add(byte(ch))
+    Value(kind: vkText, bytes: bytes)
 
 proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]] =
   var parser: CsvParser
@@ -397,6 +407,22 @@ proc jsonToValue(node: JsonNode, col: Column): Value =
         for ch in value:
           bytes.add(byte(ch))
       return Value(kind: vkBlob, bytes: bytes)
+    Value(kind: vkNull)
+  of ctDecimal:
+    if node.kind == JInt:
+      return Value(kind: vkInt64, int64Val: node.getBiggestInt())
+    if node.kind == JString:
+      try:
+        return Value(kind: vkInt64, int64Val: parseBiggestInt(node.getStr()))
+      except:
+        return Value(kind: vkNull)
+    Value(kind: vkNull)
+  of ctUuid:
+    if node.kind == JString:
+      var bytes: seq[byte] = @[]
+      for ch in node.getStr():
+        bytes.add(byte(ch))
+      return Value(kind: vkText, bytes: bytes)
     Value(kind: vkNull)
 
 proc readJsonRows(tableMeta: TableMeta, jsonFile: string): Result[seq[seq[Value]]] =
@@ -755,6 +781,8 @@ proc schemaDescribe*(table: string, db: string = ""): int =
       of ctFloat64: "FLOAT64"
       of ctText: "TEXT"
       of ctBlob: "BLOB"
+      of ctDecimal: "DECIMAL"
+      of ctUuid: "UUID"
     
     let notNull = if col.notNull: "YES" else: "NO"
     let primaryKey = if col.primaryKey: "YES" else: "NO"
@@ -1138,6 +1166,8 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         of ctFloat64: "FLOAT64"
         of ctText: "TEXT"
         of ctBlob: "BLOB"
+        of ctDecimal: "DECIMAL"
+        of ctUuid: "UUID"
       
       colDef &= typeName
       

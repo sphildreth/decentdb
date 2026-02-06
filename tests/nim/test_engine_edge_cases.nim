@@ -165,6 +165,36 @@ suite "Engine Complex Queries":
     check res2.value[0] == "2"
     discard closeDb(db)
 
+  test "three-valued logic with NULL in WHERE":
+    let path = makeTempDb("decentdb_engine_3vl.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, a INT, b INT)").ok
+    check execSql(db, "INSERT INTO t (id, a, b) VALUES (1, 1, 1)").ok
+    check execSql(db, "INSERT INTO t (id, a, b) VALUES (2, 1, NULL)").ok
+    check execSql(db, "INSERT INTO t (id, a, b) VALUES (3, NULL, 1)").ok
+    check execSql(db, "INSERT INTO t (id, a, b) VALUES (4, NULL, NULL)").ok
+    check execSql(db, "INSERT INTO t (id, a, b) VALUES (5, 0, 1)").ok
+
+    let andRes = execSql(db, "SELECT id FROM t WHERE a = 1 AND b = NULL ORDER BY id")
+    check andRes.ok
+    check andRes.value.len == 0
+
+    let orRes = execSql(db, "SELECT id FROM t WHERE a = 1 OR b = NULL ORDER BY id")
+    check orRes.ok
+    check orRes.value == @["1", "2"]
+
+    let notRes = execSql(db, "SELECT id FROM t WHERE NOT (a = NULL) ORDER BY id")
+    check notRes.ok
+    check notRes.value.len == 0
+
+    let inRes = execSql(db, "SELECT id FROM t WHERE a IN (1, NULL) ORDER BY id")
+    check inRes.ok
+    check inRes.value == @["1", "2"]
+
+    discard closeDb(db)
+
   test "LIKE patterns with wildcards":
     let path = makeTempDb("decentdb_engine_like.db")
     let dbRes = openDb(path)

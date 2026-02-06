@@ -306,6 +306,10 @@ proc typeCheckValue(expected: ColumnType, value: Value): Result[Void] =
     if value.kind in {vkText, vkNull}: return okVoid()
   of ctBlob:
     if value.kind in {vkBlob, vkNull}: return okVoid()
+  of ctDecimal:
+    if value.kind in {vkDecimal, vkInt64, vkNull}: return okVoid()
+  of ctUuid:
+    if value.kind in {vkText, vkNull}: return okVoid()
   err[Void](ERR_SQL, "Type mismatch")
 
 proc valuesEqual(a: Value, b: Value): bool =
@@ -1469,7 +1473,18 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let typeRes = parseColumnType(col.typeName)
         if not typeRes.ok:
           return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-        columns.add(Column(name: col.name, kind: typeRes.value, notNull: col.notNull, unique: col.unique, primaryKey: col.primaryKey, refTable: col.refTable, refColumn: col.refColumn))
+        let spec = typeRes.value
+        columns.add(Column(
+          name: col.name,
+          kind: spec.kind,
+          notNull: col.notNull,
+          unique: col.unique,
+          primaryKey: col.primaryKey,
+          refTable: col.refTable,
+          refColumn: col.refColumn,
+          decPrecision: spec.decPrecision,
+          decScale: spec.decScale
+        ))
       let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
       let saveRes = db.catalog.saveTable(db.pager, meta)
       if not saveRes.ok:
@@ -1994,7 +2009,18 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       let typeRes = parseColumnType(col.typeName)
       if not typeRes.ok:
         return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-      columns.add(Column(name: col.name, kind: typeRes.value, notNull: col.notNull, unique: col.unique, primaryKey: col.primaryKey, refTable: col.refTable, refColumn: col.refColumn))
+      let spec = typeRes.value
+      columns.add(Column(
+        name: col.name,
+        kind: spec.kind,
+        notNull: col.notNull,
+        unique: col.unique,
+        primaryKey: col.primaryKey,
+        refTable: col.refTable,
+        refColumn: col.refColumn,
+        decPrecision: spec.decPrecision,
+        decScale: spec.decScale
+      ))
     let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
     let saveRes = db.catalog.saveTable(db.pager, meta)
     if not saveRes.ok:

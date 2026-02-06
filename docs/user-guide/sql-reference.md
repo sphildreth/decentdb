@@ -130,11 +130,42 @@ Supports:
 - Pattern matching: `LIKE`, `ILIKE`
 - Null checks: `IS NULL`, `IS NOT NULL`
 - IN operator: `col IN (val1, val2, ...)`
+- Range predicates: `BETWEEN`, `NOT BETWEEN`
+- Existence predicates: `EXISTS (SELECT ...)` (non-correlated)
+- String concatenation: `lhs || rhs`
+
+NULL handling follows SQL three-valued logic:
+- Comparisons with `NULL` evaluate to `NULL` (unknown), not `TRUE` or `FALSE`
+- `NOT NULL` is `NULL`
+- In `WHERE`, only `TRUE` keeps a row (`FALSE` and `NULL` are both filtered out)
 
 ```sql
 SELECT * FROM users WHERE age > 18 AND name LIKE '%son%';
 SELECT * FROM users WHERE email IS NOT NULL;
 SELECT * FROM users WHERE id IN (1, 2, 3);
+SELECT * FROM users WHERE age BETWEEN 18 AND 30;
+SELECT * FROM users WHERE name LIKE 'a\_%' ESCAPE '\';
+```
+
+### Scalar Functions
+
+Supported scalar functions:
+- `COALESCE`
+- `NULLIF`
+- `LENGTH`
+- `LOWER`
+- `UPPER`
+- `TRIM`
+- `CAST(expr AS type)` for `INT/INTEGER/INT64`, `FLOAT/FLOAT64/REAL`, `TEXT`, `BOOL/BOOLEAN`
+- `CASE WHEN ... THEN ... ELSE ... END` and `CASE expr WHEN ... THEN ... ELSE ... END`
+
+```sql
+SELECT COALESCE(nickname, name) FROM users;
+SELECT NULLIF(status, 'active') FROM users;
+SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name) FROM users;
+SELECT TRIM(name) || '_suffix' FROM users;
+SELECT CAST(id AS TEXT) FROM users;
+SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
 ```
 
 ### JOINs

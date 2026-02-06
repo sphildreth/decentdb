@@ -19,6 +19,51 @@ suite "SQL Parser":
     check stmt.limit == 5
     check stmt.offset == 2
 
+  test "parse NULL predicates and NULL literal comparisons":
+    let stmt = parseSingle("SELECT id FROM t WHERE NOT (val = NULL) OR val IS NULL")
+    check stmt.kind == skSelect
+    check stmt.whereExpr != nil
+    check stmt.whereExpr.kind == ekBinary
+    check stmt.whereExpr.op == "OR"
+    check stmt.whereExpr.left.kind == ekUnary
+    check stmt.whereExpr.left.unOp == "NOT"
+    check stmt.whereExpr.left.expr.kind == ekBinary
+    check stmt.whereExpr.left.expr.op == "="
+    check stmt.whereExpr.left.expr.right.kind == ekLiteral
+    check stmt.whereExpr.left.expr.right.value.kind == svNull
+    check stmt.whereExpr.right.kind == ekBinary
+    check stmt.whereExpr.right.op == "IS"
+
+    let inStmt = parseSingle("SELECT id FROM t WHERE id IN (1, NULL)")
+    check inStmt.whereExpr != nil
+    check inStmt.whereExpr.kind == ekInList
+    check inStmt.whereExpr.inList.len == 2
+
+  test "parse scalar functions and concatenation":
+    let stmt = parseSingle("SELECT COALESCE(name, 'x'), LENGTH(name), TRIM(name) || '_x' FROM t")
+    check stmt.kind == skSelect
+    check stmt.selectItems.len == 3
+    check stmt.selectItems[0].expr.kind == ekFunc
+    check stmt.selectItems[0].expr.funcName == "COALESCE"
+    check stmt.selectItems[1].expr.kind == ekFunc
+    check stmt.selectItems[1].expr.funcName == "LENGTH"
+    check stmt.selectItems[2].expr.kind == ekBinary
+    check stmt.selectItems[2].expr.op == "||"
+
+  test "parse CASE, CAST, BETWEEN, EXISTS, and LIKE ESCAPE":
+    let stmt = parseSingle(
+      "SELECT CASE WHEN id > 1 THEN 'big' ELSE 'small' END, CAST(id AS TEXT) " &
+      "FROM t WHERE id BETWEEN 1 AND 3 AND EXISTS (SELECT 1 FROM t2) AND name LIKE 'a\\_%' ESCAPE '\\\\'"
+    )
+    check stmt.kind == skSelect
+    check stmt.selectItems.len == 2
+    check stmt.selectItems[0].expr.kind == ekFunc
+    check stmt.selectItems[0].expr.funcName == "CASE"
+    check stmt.selectItems[1].expr.kind == ekFunc
+    check stmt.selectItems[1].expr.funcName == "CAST"
+    check stmt.whereExpr != nil
+    check stmt.whereExpr.kind == ekBinary
+
   test "parse insert/update/delete":
     let ins = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x')")
     check ins.kind == skInsert

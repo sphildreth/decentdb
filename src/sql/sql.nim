@@ -224,6 +224,7 @@ proc nodeStringOr*(node: JsonNode, key: string, fallback: string): string =
 
 proc parseExprNode(node: JsonNode): Result[Expr]
 proc parseStatementNode(node: JsonNode): Result[Statement]
+proc selectToCanonicalSql(stmt: Statement): string
 
 proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "isnull") and node["isnull"].getBool:
@@ -279,6 +280,8 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
   var funcName = ""
   if nameParts.kind == JArray and nameParts.len > 0:
     funcName = nodeString(nameParts[^1]).toUpperAscii()
+  if funcName == "BTRIM":
+    funcName = "TRIM"
   let argsNode = nodeGet(node, "args")
   var args: seq[Expr] = @[]
   if argsNode.kind == JArray:
@@ -289,6 +292,18 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
       args.add(argRes.value)
   let isStar = nodeHas(node, "agg_star") and node["agg_star"].getBool
   ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar))
+
+proc parseListItems(node: JsonNode): seq[JsonNode] =
+  if node.kind == JArray:
+    for item in node:
+      result.add(item)
+    return
+  if nodeHas(node, "List") and nodeHas(node["List"], "items"):
+    let items = node["List"]["items"]
+    if items.kind == JArray:
+      for item in items:
+        result.add(item)
+      return
 
 proc parseBoolExpr(node: JsonNode): Result[Expr] =
   let op = nodeGet(node, "boolop").getStr
@@ -322,9 +337,46 @@ proc parseAExpr(node: JsonNode): Result[Expr] =
   elif op == "~~*":
     op = "ILIKE"
   
-  # Check for IN expression (kind = 10 for AEXPR_IN in PostgreSQL)
   let kindNode = nodeGet(node, "kind")
-  if kindNode.kind == JInt and kindNode.getInt == 10:
+  var kindName = ""
+  if kindNode.kind == JString:
+    kindName = kindNode.getStr
+  elif kindNode.kind == JInt:
+    # Older libpg_query builds expose integer enum tags.
+    if kindNode.getInt == 10:
+      kindName = "AEXPR_IN"
+
+  if kindName == "AEXPR_NULLIF":
+    let leftRes = parseExprNode(nodeGet(node, "lexpr"))
+    if not leftRes.ok:
+      return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = parseExprNode(nodeGet(node, "rexpr"))
+    if not rightRes.ok:
+      return err[Expr](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    return ok(Expr(kind: ekFunc, funcName: "NULLIF", args: @[leftRes.value, rightRes.value], isStar: false))
+
+  if kindName == "AEXPR_BETWEEN" or kindName == "AEXPR_NOT_BETWEEN":
+    let leftRes = parseExprNode(nodeGet(node, "lexpr"))
+    if not leftRes.ok:
+      return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let items = parseListItems(nodeGet(node, "rexpr"))
+    if items.len != 2:
+      return err[Expr](ERR_SQL, "BETWEEN requires lower and upper bounds")
+    let lowRes = parseExprNode(items[0])
+    if not lowRes.ok:
+      return err[Expr](lowRes.err.code, lowRes.err.message, lowRes.err.context)
+    let highRes = parseExprNode(items[1])
+    if not highRes.ok:
+      return err[Expr](highRes.err.code, highRes.err.message, highRes.err.context)
+    let geExpr = Expr(kind: ekBinary, op: ">=", left: leftRes.value, right: lowRes.value)
+    let leExpr = Expr(kind: ekBinary, op: "<=", left: leftRes.value, right: highRes.value)
+    let betweenExpr = Expr(kind: ekBinary, op: "AND", left: geExpr, right: leExpr)
+    if kindName == "AEXPR_NOT_BETWEEN":
+      return ok(Expr(kind: ekUnary, unOp: "NOT", expr: betweenExpr))
+    return ok(betweenExpr)
+
+  # Check for IN expression
+  if kindName == "AEXPR_IN":
     # This is an IN expression
     let leftRes = parseExprNode(nodeGet(node, "lexpr"))
     if not leftRes.ok:
@@ -370,11 +422,114 @@ proc parseParamRef(node: JsonNode): Result[Expr] =
   let number = nodeGet(node, "number").getInt
   ok(Expr(kind: ekParam, index: number))
 
+proc parseCoalesceExpr(node: JsonNode): Result[Expr] =
+  var args: seq[Expr] = @[]
+  let argsNode = nodeGet(node, "args")
+  if argsNode.kind == JArray:
+    for arg in argsNode:
+      let argRes = parseExprNode(arg)
+      if not argRes.ok:
+        return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+      args.add(argRes.value)
+  ok(Expr(kind: ekFunc, funcName: "COALESCE", args: args, isStar: false))
+
 proc parseTypeCast(node: JsonNode): Result[Expr] =
   let argRes = parseExprNode(nodeGet(node, "arg"))
   if not argRes.ok:
     return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
-  ok(argRes.value)
+  let typeNodeRaw = nodeGet(node, "typeName")
+
+  proc extractTypeNameWithMods(typeNode: JsonNode): string =
+    var tn = typeNode
+    if nodeHas(tn, "TypeName"):
+      tn = tn["TypeName"]
+    if tn.kind != JObject:
+      return ""
+    let names = nodeGet(tn, "names")
+    if names.kind != JArray or names.len == 0:
+      return ""
+    var base = nodeString(names[^1]).toUpperAscii()
+    let typmods = nodeGet(tn, "typmods")
+    if typmods.kind != JArray or typmods.len == 0:
+      return base
+    var mods: seq[string] = @[]
+    for m in typmods:
+      var n = m
+      if nodeHas(n, "A_Const"):
+        n = n["A_Const"]
+      if nodeHas(n, "val"):
+        n = n["val"]
+      if nodeHas(n, "Integer"):
+        n = n["Integer"]
+      if nodeHas(n, "ival"):
+        mods.add($n["ival"].getInt)
+      elif n.kind == JInt:
+        mods.add($n.getInt)
+    if mods.len == 0:
+      return base
+    base & "(" & mods.join(",") & ")"
+
+  let resolvedType = extractTypeNameWithMods(typeNodeRaw)
+  if resolvedType.len == 0:
+    return err[Expr](ERR_SQL, "CAST requires target type")
+  ok(Expr(
+    kind: ekFunc,
+    funcName: "CAST",
+    args: @[
+      argRes.value,
+      Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: resolvedType))
+    ],
+    isStar: false
+  ))
+
+proc parseCaseExpr(node: JsonNode): Result[Expr] =
+  var caseArgs: seq[Expr] = @[]
+  var simpleCaseArg: Expr = nil
+  if nodeHas(node, "arg"):
+    let argRes = parseExprNode(node["arg"])
+    if not argRes.ok:
+      return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+    simpleCaseArg = argRes.value
+
+  let whenNodes = nodeGet(node, "args")
+  if whenNodes.kind == JArray:
+    for whenNode in whenNodes:
+      if not nodeHas(whenNode, "CaseWhen"):
+        continue
+      let cw = whenNode["CaseWhen"]
+      let condRawRes = parseExprNode(nodeGet(cw, "expr"))
+      if not condRawRes.ok:
+        return err[Expr](condRawRes.err.code, condRawRes.err.message, condRawRes.err.context)
+      var condExpr = condRawRes.value
+      if simpleCaseArg != nil:
+        condExpr = Expr(kind: ekBinary, op: "=", left: simpleCaseArg, right: condExpr)
+      let resultRes = parseExprNode(nodeGet(cw, "result"))
+      if not resultRes.ok:
+        return err[Expr](resultRes.err.code, resultRes.err.message, resultRes.err.context)
+      caseArgs.add(condExpr)
+      caseArgs.add(resultRes.value)
+
+  var elseExpr = Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+  if nodeHas(node, "defresult"):
+    let elseRes = parseExprNode(node["defresult"])
+    if not elseRes.ok:
+      return err[Expr](elseRes.err.code, elseRes.err.message, elseRes.err.context)
+    elseExpr = elseRes.value
+  caseArgs.add(elseExpr)
+  ok(Expr(kind: ekFunc, funcName: "CASE", args: caseArgs, isStar: false))
+
+proc parseSubLink(node: JsonNode): Result[Expr] =
+  let linkType = nodeStringOr(node, "subLinkType", "")
+  if linkType != "EXISTS_SUBLINK":
+    return err[Expr](ERR_SQL, "Only EXISTS subqueries are supported in 0.x")
+  let subselectNode = nodeGet(node, "subselect")
+  let stmtRes = parseStatementNode(subselectNode)
+  if not stmtRes.ok:
+    return err[Expr](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
+  if stmtRes.value.kind != skSelect:
+    return err[Expr](ERR_SQL, "EXISTS requires SELECT subquery")
+  let sqlText = selectToCanonicalSql(stmtRes.value)
+  ok(Expr(kind: ekFunc, funcName: "EXISTS", args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: sqlText))], isStar: false))
 
 proc parseNullTest(node: JsonNode): Result[Expr] =
   let argRes = parseExprNode(node["arg"])
@@ -398,6 +553,12 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseBoolExpr(node["BoolExpr"])
     if nodeHas(node, "A_Expr"):
       return parseAExpr(node["A_Expr"])
+    if nodeHas(node, "CoalesceExpr"):
+      return parseCoalesceExpr(node["CoalesceExpr"])
+    if nodeHas(node, "CaseExpr"):
+      return parseCaseExpr(node["CaseExpr"])
+    if nodeHas(node, "SubLink"):
+      return parseSubLink(node["SubLink"])
     if nodeHas(node, "ParamRef"):
       return parseParamRef(node["ParamRef"])
     if nodeHas(node, "TypeCast"):
@@ -647,16 +808,31 @@ proc exprToCanonicalSql(expr: Expr): string =
   of ekUnary:
     "(" & expr.unOp & " " & exprToCanonicalSql(expr.expr) & ")"
   of ekFunc:
-    let argsText =
-      if expr.isStar:
-        "*"
-      else:
-        block:
-          var args: seq[string] = @[]
-          for arg in expr.args:
-            args.add(exprToCanonicalSql(arg))
-          args.join(", ")
-    expr.funcName & "(" & argsText & ")"
+    if expr.funcName == "CAST" and expr.args.len == 2 and expr.args[1].kind == ekLiteral and expr.args[1].value.kind == svString:
+      "CAST(" & exprToCanonicalSql(expr.args[0]) & " AS " & expr.args[1].value.strVal & ")"
+    elif expr.funcName == "CASE":
+      var text = "CASE"
+      var i = 0
+      while i + 1 < expr.args.len - 1:
+        text.add(" WHEN " & exprToCanonicalSql(expr.args[i]) & " THEN " & exprToCanonicalSql(expr.args[i + 1]))
+        i += 2
+      if expr.args.len > 0:
+        text.add(" ELSE " & exprToCanonicalSql(expr.args[^1]))
+      text.add(" END")
+      text
+    elif expr.funcName == "EXISTS" and expr.args.len == 1 and expr.args[0].kind == ekLiteral and expr.args[0].value.kind == svString:
+      "EXISTS (" & expr.args[0].value.strVal & ")"
+    else:
+      let argsText =
+        if expr.isStar:
+          "*"
+        else:
+          block:
+            var args: seq[string] = @[]
+            for arg in expr.args:
+              args.add(exprToCanonicalSql(arg))
+            args.join(", ")
+      expr.funcName & "(" & argsText & ")"
   of ekParam:
     "$" & $expr.index
   of ekInList:
@@ -752,6 +928,23 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
           let typeNames = nodeGet(typeNode, "names")
           if typeNames.kind == JArray and typeNames.len > 0:
             typeName = nodeString(typeNames[^1])
+            let typmods = nodeGet(typeNode, "typmods")
+            if typmods.kind == JArray and typmods.len > 0:
+              var mods: seq[string] = @[]
+              for m in typmods:
+                var n = m
+                if nodeHas(n, "A_Const"):
+                  n = n["A_Const"]
+                if nodeHas(n, "val"):
+                  n = n["val"]
+                if nodeHas(n, "Integer"):
+                  n = n["Integer"]
+                if nodeHas(n, "ival"):
+                  mods.add($n["ival"].getInt)
+                elif n.kind == JInt:
+                  mods.add($n.getInt)
+              if mods.len > 0:
+                typeName.add("(" & mods.join(",") & ")")
         var def = ColumnDef(name: name, typeName: typeName)
         let constraints = nodeGet(col, "constraints")
         if constraints.kind == JArray:
@@ -923,6 +1116,23 @@ proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
     let names = nodeGet(typeNode, "names")
     if names.kind == JArray and names.len > 0:
       typeName = nodeString(names[^1])
+      let typmods = nodeGet(typeNode, "typmods")
+      if typmods.kind == JArray and typmods.len > 0:
+        var mods: seq[string] = @[]
+        for m in typmods:
+          var n = m
+          if nodeHas(n, "A_Const"):
+            n = n["A_Const"]
+          if nodeHas(n, "val"):
+            n = n["val"]
+          if nodeHas(n, "Integer"):
+            n = n["Integer"]
+          if nodeHas(n, "ival"):
+            mods.add($n["ival"].getInt)
+          elif n.kind == JInt:
+            mods.add($n.getInt)
+        if mods.len > 0:
+          typeName.add("(" & mods.join(",") & ")")
   let notNull = nodeHas(node, "is_not_null") and node["is_not_null"].getBool
   let constraints = nodeGet(node, "constraints")
   var isPrimaryKey = false

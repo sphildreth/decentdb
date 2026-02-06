@@ -816,14 +816,17 @@ proc columnFromColumnDef(colDef: ColumnDef): Result[Column] =
   let typeRes = parseColumnType(colDef.typeName)
   if not typeRes.ok:
     return err[Column](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+  let spec = typeRes.value
   ok(Column(
     name: colDef.name,
-    kind: typeRes.value,
+    kind: spec.kind,
     notNull: colDef.notNull,
     unique: colDef.unique,
     primaryKey: colDef.primaryKey,
     refTable: colDef.refTable,
-    refColumn: colDef.refColumn
+    refColumn: colDef.refColumn,
+    decPrecision: spec.decPrecision,
+    decScale: spec.decScale
   ))
 
 proc createNullValue(kind: ColumnType): Value =
