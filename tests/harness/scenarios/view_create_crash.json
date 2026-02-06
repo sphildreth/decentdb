@@ -1,0 +1,19 @@
+{
+  "name": "view_create_crash",
+  "description": "Crash during CREATE VIEW DDL should not leave partial catalog state",
+  "db_path": "$TMPDIR/decentdb_view_create_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY, name TEXT); INSERT INTO t VALUES (1, 'a')",
+  "sql": "CREATE VIEW v AS SELECT id, name FROM t",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT COUNT(*) FROM t",
+    "expect_rows": [
+      "1"
+    ]
+  }
+}

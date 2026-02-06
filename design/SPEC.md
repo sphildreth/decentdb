@@ -143,6 +143,16 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 - kind (`"btree"` or `"trigram"`)
 - unique flag (0/1)
 
+**View record (0.x):**
+- kind = `"view"`
+- name
+- sql text (canonical defining `SELECT`)
+- resolved output columns (`;`-delimited)
+- dependencies (`;`-delimited, normalized object names)
+
+Compatibility note:
+- View records are an additive catalog extension in 0.x and do not require a DB header format-version bump.
+
 ### 3.3 Page types
 - B+Tree internal page
 - B+Tree leaf page
@@ -315,7 +325,7 @@ Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
 ### 6.2 Supported SQL subset (0.x baseline)
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
 - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
@@ -573,7 +583,7 @@ Define error categories:
 ## 15. Schema versioning and evolution
 ### 15.1 Schema cookie
 - Stored in main DB header (page 1)
-- Incremented on any DDL operation (CREATE TABLE, CREATE INDEX, DROP)
+- Incremented on any DDL operation (CREATE/DROP/ALTER TABLE/INDEX/VIEW)
 - Used to detect schema changes and invalidate cached metadata
 
 ### 15.2 Backward compatibility

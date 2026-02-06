@@ -2,6 +2,9 @@
   "point_lookup": { "p95_increase": 0.10 },
   "fk_join": { "p95_increase": 0.20 },
   "substring_search": { "p95_increase": 0.20 },
+  "view_point_lookup": { "p95_increase": 0.15 },
+  "view_join_lookup": { "p95_increase": 0.20 },
+  "view_like_trigram": { "p95_increase": 0.20 },
   "order_by_sort": { "p95_increase": 0.20 },
   "bulk_load": { "p95_increase": 0.15 }
 }

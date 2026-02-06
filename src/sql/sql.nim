@@ -114,6 +114,9 @@ type StatementKind* = enum
   skCreateIndex
   skDropTable
   skDropIndex
+  skCreateView
+  skDropView
+  skAlterView
   skAlterTable
   skInsert
   skSelect
@@ -142,6 +145,19 @@ type Statement* = ref object
     dropTableName*: string
   of skDropIndex:
     dropIndexName*: string
+  of skCreateView:
+    createViewName*: string
+    createViewIfNotExists*: bool
+    createViewOrReplace*: bool
+    createViewColumns*: seq[string]
+    createViewSqlText*: string
+    createViewQuery*: Statement
+  of skDropView:
+    dropViewName*: string
+    dropViewIfExists*: bool
+  of skAlterView:
+    alterViewName*: string
+    alterViewNewName*: string
   of skAlterTable:
     alterTableName*: string
     alterActions*: seq[AlterTableAction]
@@ -207,6 +223,7 @@ proc nodeStringOr*(node: JsonNode, key: string, fallback: string): string =
   fallback
 
 proc parseExprNode(node: JsonNode): Result[Expr]
+proc parseStatementNode(node: JsonNode): Result[Statement]
 
 proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "isnull") and node["isnull"].getBool:
@@ -590,6 +607,126 @@ proc parseDeleteStmt(node: JsonNode): Result[Statement] =
       return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
     whereExpr = whereRes.value
   ok(Statement(kind: skDelete, deleteTable: tableRes.value[0], deleteWhere: whereExpr))
+
+proc quoteSqlString(text: string): string =
+  result = "'"
+  for ch in text:
+    if ch == '\'':
+      result.add("''")
+    else:
+      result.add(ch)
+  result.add("'")
+
+proc exprToCanonicalSql(expr: Expr): string
+
+proc exprToCanonicalSql(expr: Expr): string =
+  if expr == nil:
+    return "NULL"
+  case expr.kind
+  of ekLiteral:
+    case expr.value.kind
+    of svNull:
+      "NULL"
+    of svInt:
+      $expr.value.intVal
+    of svFloat:
+      $expr.value.floatVal
+    of svString:
+      quoteSqlString(expr.value.strVal)
+    of svBool:
+      if expr.value.boolVal: "TRUE" else: "FALSE"
+    of svParam:
+      "$" & $expr.value.paramIndex
+  of ekColumn:
+    if expr.table.len > 0:
+      expr.table & "." & expr.name
+    else:
+      expr.name
+  of ekBinary:
+    "(" & exprToCanonicalSql(expr.left) & " " & expr.op & " " & exprToCanonicalSql(expr.right) & ")"
+  of ekUnary:
+    "(" & expr.unOp & " " & exprToCanonicalSql(expr.expr) & ")"
+  of ekFunc:
+    let argsText =
+      if expr.isStar:
+        "*"
+      else:
+        block:
+          var args: seq[string] = @[]
+          for arg in expr.args:
+            args.add(exprToCanonicalSql(arg))
+          args.join(", ")
+    expr.funcName & "(" & argsText & ")"
+  of ekParam:
+    "$" & $expr.index
+  of ekInList:
+    var parts: seq[string] = @[]
+    for item in expr.inList:
+      parts.add(exprToCanonicalSql(item))
+    "(" & exprToCanonicalSql(expr.inExpr) & " IN (" & parts.join(", ") & "))"
+
+proc selectToCanonicalSql(stmt: Statement): string =
+  var parts: seq[string] = @[]
+  var selectItems: seq[string] = @[]
+  for item in stmt.selectItems:
+    if item.isStar:
+      selectItems.add("*")
+      continue
+    var entry = exprToCanonicalSql(item.expr)
+    if item.alias.len > 0:
+      entry.add(" AS " & item.alias)
+    selectItems.add(entry)
+  if selectItems.len == 0:
+    selectItems.add("*")
+  parts.add("SELECT " & selectItems.join(", "))
+
+  if stmt.fromTable.len > 0:
+    var fromPart = "FROM " & stmt.fromTable
+    if stmt.fromAlias.len > 0:
+      fromPart.add(" " & stmt.fromAlias)
+    parts.add(fromPart)
+
+  for join in stmt.joins:
+    let joinKeyword = if join.joinType == jtLeft: "LEFT JOIN " else: "INNER JOIN "
+    var joinPart = joinKeyword & join.table
+    if join.alias.len > 0:
+      joinPart.add(" " & join.alias)
+    if join.onExpr != nil:
+      joinPart.add(" ON " & exprToCanonicalSql(join.onExpr))
+    parts.add(joinPart)
+
+  if stmt.whereExpr != nil:
+    parts.add("WHERE " & exprToCanonicalSql(stmt.whereExpr))
+
+  if stmt.groupBy.len > 0:
+    var groupParts: seq[string] = @[]
+    for expr in stmt.groupBy:
+      groupParts.add(exprToCanonicalSql(expr))
+    parts.add("GROUP BY " & groupParts.join(", "))
+
+  if stmt.havingExpr != nil:
+    parts.add("HAVING " & exprToCanonicalSql(stmt.havingExpr))
+
+  if stmt.orderBy.len > 0:
+    var orderParts: seq[string] = @[]
+    for item in stmt.orderBy:
+      var entry = exprToCanonicalSql(item.expr)
+      if not item.asc:
+        entry.add(" DESC")
+      orderParts.add(entry)
+    parts.add("ORDER BY " & orderParts.join(", "))
+
+  if stmt.limitParam > 0:
+    parts.add("LIMIT $" & $stmt.limitParam)
+  elif stmt.limit >= 0:
+    parts.add("LIMIT " & $stmt.limit)
+
+  if stmt.offsetParam > 0:
+    parts.add("OFFSET $" & $stmt.offsetParam)
+  elif stmt.offset >= 0:
+    parts.add("OFFSET " & $stmt.offset)
+
+  parts.join(" ")
 # ... Rest of file is identical, assume parseCreateStmt etc don't need changes as they don't have expression parsing flaws in context
 # Actually, parseCreateStmt etc. are fine.
 # I will output the whole file content to be safe.
@@ -690,8 +827,49 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let unique = nodeHas(node, "unique") and node["unique"].getBool
   ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnNames: columnNames, indexKind: kind, unique: unique))
 
+proc parseViewStmt(node: JsonNode): Result[Statement] =
+  let viewRes = parseRangeVar(nodeGet(node, "view"))
+  if not viewRes.ok:
+    return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+  let viewName = viewRes.value[0]
+
+  let persistence = nodeStringOr(nodeGet(node, "view"), "relpersistence", "p")
+  if persistence != "p":
+    return err[Statement](ERR_SQL, "TEMP/TEMPORARY VIEW not supported")
+
+  let checkOption = nodeStringOr(node, "withCheckOption", "NO_CHECK_OPTION")
+  if checkOption != "NO_CHECK_OPTION":
+    return err[Statement](ERR_SQL, "WITH CHECK OPTION not supported")
+
+  var aliases: seq[string] = @[]
+  let aliasNode = nodeGet(node, "aliases")
+  if aliasNode.kind == JArray:
+    for alias in aliasNode:
+      let name = nodeString(alias)
+      if name.len == 0:
+        return err[Statement](ERR_SQL, "Invalid view column name")
+      aliases.add(name)
+
+  let queryRes = parseStatementNode(nodeGet(node, "query"))
+  if not queryRes.ok:
+    return err[Statement](queryRes.err.code, queryRes.err.message, queryRes.err.context)
+  if queryRes.value.kind != skSelect:
+    return err[Statement](ERR_SQL, "CREATE VIEW requires SELECT definition", viewName)
+
+  let replace = nodeHas(node, "replace") and node["replace"].getBool
+  ok(Statement(
+    kind: skCreateView,
+    createViewName: viewName,
+    createViewIfNotExists: false,
+    createViewOrReplace: replace,
+    createViewColumns: aliases,
+    createViewSqlText: selectToCanonicalSql(queryRes.value),
+    createViewQuery: queryRes.value
+  ))
+
 proc parseDropStmt(node: JsonNode): Result[Statement] =
   let removeType = nodeGet(node, "removeType").getStr
+  let missingOk = nodeHas(node, "missing_ok") and node["missing_ok"].getBool
   let objects = nodeGet(node, "objects")
   var name = ""
   if objects.kind == JArray and objects.len > 0:
@@ -706,7 +884,23 @@ proc parseDropStmt(node: JsonNode): Result[Statement] =
       name = nodeString(obj)
   if removeType == "OBJECT_INDEX":
     return ok(Statement(kind: skDropIndex, dropIndexName: name))
-  ok(Statement(kind: skDropTable, dropTableName: name))
+  if removeType == "OBJECT_VIEW":
+    return ok(Statement(kind: skDropView, dropViewName: name, dropViewIfExists: missingOk))
+  if removeType == "OBJECT_TABLE":
+    return ok(Statement(kind: skDropTable, dropTableName: name))
+  err[Statement](ERR_SQL, "Unsupported DROP object type", removeType)
+
+proc parseRenameStmt(node: JsonNode): Result[Statement] =
+  let renameType = nodeGet(node, "renameType").getStr
+  if renameType != "OBJECT_VIEW":
+    return err[Statement](ERR_SQL, "Unsupported RENAME statement", renameType)
+  let viewRes = parseRangeVar(nodeGet(node, "relation"))
+  if not viewRes.ok:
+    return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+  let newName = nodeGet(node, "newname").getStr
+  if newName.len == 0:
+    return err[Statement](ERR_SQL, "ALTER VIEW RENAME requires new name")
+  ok(Statement(kind: skAlterView, alterViewName: viewRes.value[0], alterViewNewName: newName))
 
 proc parseTransactionStmt(node: JsonNode): Result[Statement] =
   let kindStr = nodeString(node["kind"])
@@ -789,8 +983,6 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
     actions.add(action)
   ok(Statement(kind: skAlterTable, alterTableName: tableName, alterActions: actions))
 
-proc parseStatementNode(node: JsonNode): Result[Statement]
-
 proc parseExplainStmt(node: JsonNode): Result[Statement] =
   if nodeHas(node, "options"):
     let opts = node["options"]
@@ -823,8 +1015,12 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
     return parseCreateStmt(node["CreateStmt"])
   if nodeHas(node, "IndexStmt"):
     return parseIndexStmt(node["IndexStmt"])
+  if nodeHas(node, "ViewStmt"):
+    return parseViewStmt(node["ViewStmt"])
   if nodeHas(node, "DropStmt"):
     return parseDropStmt(node["DropStmt"])
+  if nodeHas(node, "RenameStmt"):
+    return parseRenameStmt(node["RenameStmt"])
   if nodeHas(node, "AlterTableStmt"):
     return parseAlterTableStmt(node["AlterTableStmt"])
   if nodeHas(node, "TransactionStmt"):
@@ -994,7 +1190,56 @@ proc parseSql*(sql: string): Result[SqlAst] =
     )
     SqlAst(statements: @[stmt])
 
+  proc rewriteCreateViewIfNotExists(sqlText: string): string =
+    var i = 0
+
+    proc skipWs() =
+      while i < sqlText.len and sqlText[i].isSpaceAscii:
+        i.inc
+
+    proc consumeKeyword(word: string): bool =
+      skipWs()
+      let start = i
+      if start + word.len > sqlText.len:
+        return false
+      for k in 0 ..< word.len:
+        if toUpperAscii(sqlText[start + k]) != toUpperAscii(word[k]):
+          return false
+      let endPos = start + word.len
+      if endPos < sqlText.len:
+        let c = sqlText[endPos]
+        if c.isAlphaNumeric or c == '_':
+          return false
+      i = endPos
+      true
+
+    skipWs()
+    if not consumeKeyword("CREATE"):
+      return ""
+    if not consumeKeyword("VIEW"):
+      return ""
+
+    let ifStart = i
+    if not consumeKeyword("IF"):
+      return ""
+    if not consumeKeyword("NOT"):
+      return ""
+    if not consumeKeyword("EXISTS"):
+      return ""
+
+    sqlText[0 ..< ifStart] & " " & sqlText[i .. ^1]
+
   var isExplain = false
+  let rewrittenCreateView = rewriteCreateViewIfNotExists(sql)
+  if rewrittenCreateView.len > 0:
+    let rewrittenRes = parseSql(rewrittenCreateView)
+    if not rewrittenRes.ok:
+      return rewrittenRes
+    if rewrittenRes.value.statements.len != 1 or rewrittenRes.value.statements[0].kind != skCreateView:
+      return err[SqlAst](ERR_SQL, "Invalid CREATE VIEW IF NOT EXISTS statement")
+    rewrittenRes.value.statements[0].createViewIfNotExists = true
+    return rewrittenRes
+
   if sql.len >= 7:
     # Check for case-insensitive "EXPLAIN" prefix (ignoring leading whitespace is handled by tryParseFastSelect but here we want to avoid it)
     # Actually, tryParseFastSelect handles whitespace. 

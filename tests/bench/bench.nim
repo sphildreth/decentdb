@@ -144,6 +144,102 @@ proc runSubstringSearch(): BenchResult =
   discard requireOk(closeDb(db), "closeDb(like)")
   BenchResult(name: "substring_search", iterations: 100, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
 
+proc runViewPointLookup(): BenchResult =
+  let path = makeTempDb("decentdb_bench_view_point.db")
+  let db = requireOk(openDb(path), "openDb(view_point)")
+  discard requireOk(execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)"), "create artists(view_point)")
+  discard requireOk(execSql(db, "CREATE VIEW artists_v AS SELECT id, name FROM artists"), "create view artists_v")
+  var rows: seq[seq[Value]] = @[]
+  for i in 1 .. 1000:
+    rows.add(@[
+      Value(kind: vkInt64, int64Val: i),
+      Value(kind: vkText, bytes: toBytes("artist_" & $i))
+    ])
+  var opts = defaultBulkLoadOptions()
+  opts.disableIndexes = true
+  opts.durability = dmNone
+  discard requireOk(bulkLoad(db, "artists", rows, opts), "bulkLoad artists(view_point)")
+  var samples: seq[float] = @[]
+  for i in 1 .. 1000:
+    let id = i
+    let elapsed = measureMs(proc() =
+      discard execSql(db, "SELECT name FROM artists_v WHERE id = $1", @[Value(kind: vkInt64, int64Val: id)])
+    )
+    samples.add(elapsed)
+  discard requireOk(closeDb(db), "closeDb(view_point)")
+  BenchResult(name: "view_point_lookup", iterations: 1000, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
+
+proc runViewJoinLookup(): BenchResult =
+  let path = makeTempDb("decentdb_bench_view_join.db")
+  let db = requireOk(openDb(path), "openDb(view_join)")
+  discard requireOk(execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)"), "create artists(view_join)")
+  discard requireOk(execSql(db, "CREATE TABLE albums (id INT PRIMARY KEY, artistId INT REFERENCES artists(id))"), "create albums(view_join)")
+  discard requireOk(execSql(db, "CREATE TABLE tracks (id INT PRIMARY KEY, albumId INT REFERENCES albums(id))"), "create tracks(view_join)")
+  discard requireOk(execSql(db, "CREATE VIEW artist_tracks_v AS SELECT artists.id AS artistId, tracks.id AS trackId FROM artists JOIN albums ON albums.artistId = artists.id JOIN tracks ON tracks.albumId = albums.id"), "create view artist_tracks_v")
+  var artistRows: seq[seq[Value]] = @[]
+  var albumRows: seq[seq[Value]] = @[]
+  var trackRows: seq[seq[Value]] = @[]
+  var albumId = 1
+  var trackId = 1
+  for artistId in 1 .. 100:
+    artistRows.add(@[
+      Value(kind: vkInt64, int64Val: artistId),
+      Value(kind: vkText, bytes: toBytes("artist_" & $artistId))
+    ])
+    for _ in 0 ..< 5:
+      albumRows.add(@[
+        Value(kind: vkInt64, int64Val: albumId),
+        Value(kind: vkInt64, int64Val: artistId)
+      ])
+      for _ in 0 ..< 10:
+        trackRows.add(@[
+          Value(kind: vkInt64, int64Val: trackId),
+          Value(kind: vkInt64, int64Val: albumId)
+        ])
+        trackId.inc
+      albumId.inc
+  var opts = defaultBulkLoadOptions()
+  opts.disableIndexes = true
+  opts.durability = dmNone
+  discard requireOk(bulkLoad(db, "artists", artistRows, opts), "bulkLoad artists(view_join)")
+  discard requireOk(bulkLoad(db, "albums", albumRows, opts), "bulkLoad albums(view_join)")
+  discard requireOk(bulkLoad(db, "tracks", trackRows, opts), "bulkLoad tracks(view_join)")
+  var samples: seq[float] = @[]
+  for i in 1 .. 100:
+    let artistId = (i mod 100) + 1
+    let elapsed = measureMs(proc() =
+      discard execSql(db, "SELECT trackId FROM artist_tracks_v WHERE artistId = $1", @[Value(kind: vkInt64, int64Val: artistId)])
+    )
+    samples.add(elapsed)
+  discard requireOk(closeDb(db), "closeDb(view_join)")
+  BenchResult(name: "view_join_lookup", iterations: 100, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
+
+proc runViewLikeTrigram(): BenchResult =
+  let path = makeTempDb("decentdb_bench_view_like.db")
+  let db = requireOk(openDb(path), "openDb(view_like)")
+  discard requireOk(execSql(db, "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)"), "create docs(view_like)")
+  discard requireOk(execSql(db, "CREATE INDEX docs_body_trgm ON docs USING trigram (body)"), "create trigram(view_like)")
+  discard requireOk(execSql(db, "CREATE VIEW docs_v AS SELECT id, body FROM docs"), "create view docs_v")
+  var rows: seq[seq[Value]] = @[]
+  for i in 1 .. 2000:
+    let body = if i mod 5 == 0: "hello world " & $i else: "random text " & $i
+    rows.add(@[
+      Value(kind: vkInt64, int64Val: i),
+      Value(kind: vkText, bytes: toBytes(body))
+    ])
+  var opts = defaultBulkLoadOptions()
+  opts.disableIndexes = true
+  opts.durability = dmNone
+  discard requireOk(bulkLoad(db, "docs", rows, opts), "bulkLoad docs(view_like)")
+  var samples: seq[float] = @[]
+  for _ in 0 ..< 100:
+    let elapsed = measureMs(proc() =
+      discard execSql(db, "SELECT id FROM docs_v WHERE body LIKE '%world%'")
+    )
+    samples.add(elapsed)
+  discard requireOk(closeDb(db), "closeDb(view_like)")
+  BenchResult(name: "view_like_trigram", iterations: 100, samples: samples, p50Ms: percentile(samples, 50), p95Ms: percentile(samples, 95))
+
 proc runOrderBySort(): BenchResult =
   let path = makeTempDb("decentdb_bench_sort.db")
   let db = requireOk(openDb(path), "openDb(sort)")
@@ -253,6 +349,9 @@ when isMainModule:
     runPointLookup(),
     runFkJoin(),
     runSubstringSearch(),
+    runViewPointLookup(),
+    runViewJoinLookup(),
+    runViewLikeTrigram(),
     runOrderBySort(),
     runBulkLoad(),
     runTxnInsert(),

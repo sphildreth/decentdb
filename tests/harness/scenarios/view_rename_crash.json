@@ -1,0 +1,19 @@
+{
+  "name": "view_rename_crash",
+  "description": "Crash during ALTER VIEW RENAME should preserve old identity",
+  "db_path": "$TMPDIR/decentdb_view_rename_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t VALUES (1); CREATE VIEW v AS SELECT id FROM t",
+  "sql": "ALTER VIEW v RENAME TO v_new",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id FROM v",
+    "expect_rows": [
+      "1"
+    ]
+  }
+}

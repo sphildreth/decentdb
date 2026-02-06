@@ -1,0 +1,19 @@
+{
+  "name": "view_drop_crash",
+  "description": "Crash during DROP VIEW DDL should preserve pre-transaction view",
+  "db_path": "$TMPDIR/decentdb_view_drop_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t VALUES (1); CREATE VIEW v AS SELECT id FROM t",
+  "sql": "DROP VIEW v",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id FROM v",
+    "expect_rows": [
+      "1"
+    ]
+  }
+}

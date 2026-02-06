@@ -1,6 +1,7 @@
 import options
 import tables
 import sets
+import algorithm
 import strutils
 import ../errors
 import ../record/record
@@ -34,6 +35,12 @@ type TableMeta* = object
   nextRowId*: uint64
   columns*: seq[Column]
 
+type ViewMeta* = object
+  name*: string
+  sqlText*: string
+  columnNames*: seq[string]
+  dependencies*: seq[string]
+
 type IndexMeta* = object
   name*: string
   table*: string
@@ -49,17 +56,21 @@ type TrigramDelta* = ref object
 type Catalog* = ref object
   tables*: Table[string, TableMeta]
   indexes*: Table[string, IndexMeta]
+  views*: Table[string, ViewMeta]
+  dependentViews*: Table[string, HashSet[string]]
   catalogTree*: BTree
   trigramDeltas*: Table[(string, uint32), TrigramDelta]
 
 type CatalogRecordKind = enum
   crTable
   crIndex
+  crView
 
 type CatalogRecord = object
   kind: CatalogRecordKind
   table: TableMeta
   index: IndexMeta
+  view: ViewMeta
 
 proc parseColumnType*(text: string): Result[ColumnType] =
   # Extract base type name by taking everything before the first '('
@@ -172,6 +183,16 @@ proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage
   ]
   encodeRecord(values)
 
+proc makeViewRecord(name: string, sqlText: string, columnNames: seq[string], dependencies: seq[string]): seq[byte] =
+  let values = @[
+    Value(kind: vkText, bytes: stringToBytes("view")),
+    Value(kind: vkText, bytes: stringToBytes(name)),
+    Value(kind: vkText, bytes: stringToBytes(sqlText)),
+    Value(kind: vkText, bytes: stringToBytes(columnNames.join(";"))),
+    Value(kind: vkText, bytes: stringToBytes(dependencies.join(";")))
+  ]
+  encodeRecord(values)
+
 proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
   let decoded = decodeRecord(data)
   if not decoded.ok:
@@ -209,7 +230,30 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     if values.len >= 7:
       unique = values[6].int64Val != 0
     return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, columns: columns, rootPage: rootPage, kind: kind, unique: unique)))
+  if recordType == "view":
+    if values.len < 5:
+      return err[CatalogRecord](ERR_CORRUPTION, "View catalog record too short")
+    let name = bytesToString(values[1].bytes)
+    let sqlText = bytesToString(values[2].bytes)
+    let columnStr = bytesToString(values[3].bytes)
+    let depStr = bytesToString(values[4].bytes)
+    let columnNames = if columnStr.len > 0: columnStr.split(";") else: @[]
+    let dependencies = if depStr.len > 0: depStr.split(";") else: @[]
+    return ok(CatalogRecord(kind: crView, view: ViewMeta(name: name, sqlText: sqlText, columnNames: columnNames, dependencies: dependencies)))
   err[CatalogRecord](ERR_CORRUPTION, "Unknown catalog record type", recordType)
+
+proc normalizedObjectName(name: string): string =
+  name.toLowerAscii()
+
+proc rebuildDependentViewsIndex*(catalog: Catalog) =
+  catalog.dependentViews = initTable[string, HashSet[string]]()
+  for _, view in catalog.views:
+    let dependentName = normalizedObjectName(view.name)
+    for dep in view.dependencies:
+      let key = normalizedObjectName(dep)
+      if not catalog.dependentViews.hasKey(key):
+        catalog.dependentViews[key] = initHashSet[string]()
+      catalog.dependentViews[key].incl(dependentName)
 
 proc initCatalog*(pager: Pager): Result[Catalog] =
   if pager.header.rootCatalog == 0:
@@ -229,6 +273,8 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
   let catalog = Catalog(
     tables: initTable[string, TableMeta](),
     indexes: initTable[string, IndexMeta](),
+    views: initTable[string, ViewMeta](),
+    dependentViews: initTable[string, HashSet[string]](),
     catalogTree: tree,
     trigramDeltas: initTable[(string, uint32), TrigramDelta]()
   )
@@ -254,6 +300,9 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
           catalog.tables[record.table.name] = table
         of crIndex:
           catalog.indexes[record.index.name] = record.index
+        of crView:
+          catalog.views[record.view.name] = record.view
+  rebuildDependentViewsIndex(catalog)
   ok(catalog)
 
 proc trigramBufferAdd*(catalog: Catalog, indexName: string, trigram: uint32, rowid: uint64) =
@@ -344,6 +393,90 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
 
   okVoid()
 
+proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
+  if catalog.views.hasKey(view.name):
+    return err[Void](ERR_SQL, "View already exists", view.name)
+  catalog.views[view.name] = view
+  rebuildDependentViewsIndex(catalog)
+  let key = uint64(crc32c(stringToBytes("view:" & view.name)))
+  let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    catalog.views.del(view.name)
+    rebuildDependentViewsIndex(catalog)
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc saveViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
+  catalog.views[view.name] = view
+  rebuildDependentViewsIndex(catalog)
+  let key = uint64(crc32c(stringToBytes("view:" & view.name)))
+  let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
+  let updateRes = update(catalog.catalogTree, key, record)
+  if updateRes.ok:
+    if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+      catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+    return okVoid()
+  if updateRes.err.message != "Key not found":
+    return err[Void](updateRes.err.code, updateRes.err.message, updateRes.err.context)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc getView*(catalog: Catalog, name: string): Result[ViewMeta] =
+  if not catalog.views.hasKey(name):
+    return err[ViewMeta](ERR_SQL, "View not found", name)
+  ok(catalog.views[name])
+
+proc dropView*(catalog: Catalog, name: string): Result[Void] =
+  if not catalog.views.hasKey(name):
+    return err[Void](ERR_SQL, "View not found", name)
+  catalog.views.del(name)
+  rebuildDependentViewsIndex(catalog)
+  let key = uint64(crc32c(stringToBytes("view:" & name)))
+  let delRes = delete(catalog.catalogTree, key)
+  if not delRes.ok:
+    return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Void] =
+  if not catalog.views.hasKey(oldName):
+    return err[Void](ERR_SQL, "View not found", oldName)
+  if catalog.views.hasKey(newName):
+    return err[Void](ERR_SQL, "View already exists", newName)
+  var view = catalog.views[oldName]
+  let oldKey = uint64(crc32c(stringToBytes("view:" & oldName)))
+  let delRes = delete(catalog.catalogTree, oldKey)
+  if not delRes.ok:
+    return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  catalog.views.del(oldName)
+  view.name = newName
+  catalog.views[newName] = view
+  rebuildDependentViewsIndex(catalog)
+  let newKey = uint64(crc32c(stringToBytes("view:" & newName)))
+  let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
+  let insertRes = insert(catalog.catalogTree, newKey, record)
+  if not insertRes.ok:
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
+  let key = normalizedObjectName(objectName)
+  if not catalog.dependentViews.hasKey(key):
+    return @[]
+  for name in catalog.dependentViews[key]:
+    result.add(name)
+  result.sort()
+
 proc dropTable*(catalog: Catalog, name: string): Result[Void] =
   if not catalog.tables.hasKey(name):
     return err[Void](ERR_SQL, "Table not found", name)
@@ -399,3 +532,12 @@ proc getIndexByName*(catalog: Catalog, name: string): Option[IndexMeta] =
   if catalog.indexes.hasKey(name):
     return some(catalog.indexes[name])
   none(IndexMeta)
+
+proc hasTableName*(catalog: Catalog, name: string): bool =
+  catalog.tables.hasKey(name)
+
+proc hasViewName*(catalog: Catalog, name: string): bool =
+  catalog.views.hasKey(name)
+
+proc hasTableOrViewName*(catalog: Catalog, name: string): bool =
+  catalog.tables.hasKey(name) or catalog.views.hasKey(name)

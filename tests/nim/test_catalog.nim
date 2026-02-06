@@ -29,6 +29,11 @@ proc addIndex(db: Db, name: string, table: string, column: string, kind: IndexKi
   check db.catalog.createIndexMeta(meta).ok
   meta
 
+proc addView(db: Db, name: string, sqlText: string, columnNames: seq[string], dependencies: seq[string]): ViewMeta =
+  let meta = ViewMeta(name: name, sqlText: sqlText, columnNames: columnNames, dependencies: dependencies)
+  check db.catalog.createViewMeta(meta).ok
+  meta
+
 suite "Catalog":
   test "save/get/drop tables and indexes":
     let path = makeTempDb("decentdb_catalog_basic.db")
@@ -119,6 +124,34 @@ suite "Catalog":
     check idxOpt.get.rootPage == root2.value
 
     discard closeDb(db)
+
+  test "view metadata persists and dependency index is maintained":
+    let path = makeTempDb("decentdb_catalog_view_persist.db")
+    block:
+      let dbRes = openDb(path)
+      check dbRes.ok
+      let db = dbRes.value
+      let cols = @[Column(name: "id", kind: ctInt64)]
+      discard addTable(db, "t", cols)
+      discard addView(db, "v1", "SELECT id FROM t", @["id"], @["t"])
+      discard addView(db, "v2", "SELECT id FROM v1", @["id"], @["v1"])
+      let dependentsT = db.catalog.listDependentViews("t")
+      check "v1" in dependentsT
+      discard closeDb(db)
+
+    let reopenRes = openDb(path)
+    check reopenRes.ok
+    let db2 = reopenRes.value
+    let viewRes = db2.catalog.getView("v1")
+    check viewRes.ok
+    check viewRes.value.columnNames == @["id"]
+    check viewRes.value.dependencies == @["t"]
+    let dependentsV1 = db2.catalog.listDependentViews("v1")
+    check "v2" in dependentsV1
+    check db2.catalog.dropView("v2").ok
+    let dependentsAfterDrop = db2.catalog.listDependentViews("v1")
+    check dependentsAfterDrop.len == 0
+    discard closeDb(db2)
 
   test "parseColumnType supports VARCHAR as TEXT alias":
     # Test that VARCHAR is parsed as TEXT
