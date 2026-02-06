@@ -1,0 +1,18 @@
+{
+  "name": "on_conflict_do_update_rollback",
+  "description": "Crash during ON CONFLICT DO UPDATE must not commit partial row updates",
+  "db_path": "$TMPDIR/decentdb_on_conflict_do_update.ddb",
+  "setup_sql": "CREATE TABLE users (id INT PRIMARY KEY, visits INT NOT NULL); INSERT INTO users VALUES (1, 1)",
+  "sql": "INSERT INTO users VALUES (1, 9) ON CONFLICT (id) DO UPDATE SET visits = EXCLUDED.visits",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error"
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id, visits FROM users ORDER BY id",
+    "expect_rows": [
+      "1|1"
+    ]
+  }
+}

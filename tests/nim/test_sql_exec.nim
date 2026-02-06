@@ -240,6 +240,63 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "insert ON CONFLICT DO UPDATE":
+    let path = makeTempDb("decentdb_sql_exec_on_conflict_update.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, visits INT NOT NULL)").ok
+    check execSql(db, "CREATE UNIQUE INDEX users_email_uq_idx ON users (email)").ok
+    check execSql(db, "INSERT INTO users VALUES (1, 'a@x', 1)").ok
+
+    let updateOnId = execSql(
+      db,
+      "INSERT INTO users VALUES (1, 'b@x', 5) " &
+      "ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, visits = users.visits + EXCLUDED.visits"
+    )
+    check updateOnId.ok
+    let afterId = execSql(db, "SELECT id, email, visits FROM users ORDER BY id")
+    check afterId.ok
+    check afterId.value == @["1|b@x|6"]
+
+    let whereSkip = execSql(
+      db,
+      "INSERT INTO users VALUES (1, 'c@x', 9) " &
+      "ON CONFLICT (id) DO UPDATE SET visits = EXCLUDED.visits WHERE users.email = 'nope'"
+    )
+    check whereSkip.ok
+    let afterSkip = execSql(db, "SELECT id, email, visits FROM users ORDER BY id")
+    check afterSkip.ok
+    check afterSkip.value == @["1|b@x|6"]
+
+    let onConstraint = execSql(
+      db,
+      "INSERT INTO users VALUES (2, 'b@x', 3) " &
+      "ON CONFLICT ON CONSTRAINT users_email_uq_idx DO UPDATE SET visits = users.visits + 1"
+    )
+    check onConstraint.ok
+    let afterConstraint = execSql(db, "SELECT id, email, visits FROM users ORDER BY id")
+    check afterConstraint.ok
+    check afterConstraint.value == @["1|b@x|7"]
+
+    let nonTargetConflict = execSql(
+      db,
+      "INSERT INTO users VALUES (3, 'b@x', 1) " &
+      "ON CONFLICT (id) DO UPDATE SET visits = EXCLUDED.visits"
+    )
+    check not nonTargetConflict.ok
+    check nonTargetConflict.err.code == ERR_CONSTRAINT
+
+    let targetlessDoUpdate = execSql(
+      db,
+      "INSERT INTO users VALUES (1, 'z@x', 1) ON CONFLICT DO UPDATE SET visits = EXCLUDED.visits"
+    )
+    check not targetlessDoUpdate.ok
+    check targetlessDoUpdate.err.code == ERR_SQL
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),

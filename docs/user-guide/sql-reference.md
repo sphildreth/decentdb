@@ -100,12 +100,16 @@ INSERT INTO table_name (col1, col2) VALUES (val1, val2);
 INSERT INTO table_name (...) VALUES (...) ON CONFLICT DO NOTHING;
 INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO NOTHING;
 INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO NOTHING;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO UPDATE SET col3 = EXCLUDED.col3;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO UPDATE SET col3 = EXCLUDED.col3 WHERE table_name.col4 > 0;
 ```
 
 Notes:
 - `ON CONFLICT ... DO NOTHING` is supported.
 - `ON CONSTRAINT name` resolves against DecentDb unique index names.
-- `ON CONFLICT ... DO UPDATE` is not yet supported.
+- `ON CONFLICT ... DO UPDATE` is supported with explicit conflict target (`(cols)` or `ON CONSTRAINT name`).
+- In `DO UPDATE` expressions, unqualified columns resolve to the target table; `EXCLUDED.col` is supported.
+- Targetless `ON CONFLICT DO UPDATE` is not yet supported.
 - DML `RETURNING` is not yet supported.
 
 ### SELECT

@@ -1,5 +1,6 @@
 import unittest
 import os
+import tables
 
 import engine
 import sql/sql
@@ -117,7 +118,7 @@ suite "Binder":
       parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT DO NOTHING")
     )
     check anyTarget.ok
-    check anyTarget.value.insertOnConflictDoNothing
+    check anyTarget.value.insertConflictAction == icaDoNothing
     check anyTarget.value.insertConflictTargetCols.len == 0
 
     let colTarget = bindStatement(
@@ -145,6 +146,30 @@ suite "Binder":
       parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT ON CONSTRAINT users_name_idx DO NOTHING")
     )
     check not badConstraintTarget.ok
+
+    let doUpdateTargeted = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name")
+    )
+    check doUpdateTargeted.ok
+    check doUpdateTargeted.value.insertConflictAction == icaDoUpdate
+    let updateAssigns = doUpdateTargeted.value.insertConflictUpdateAssignments
+    var doUpdateAssignCount = 0
+    for _, _ in updateAssigns.pairs:
+      doUpdateAssignCount.inc
+    check doUpdateAssignCount == 1
+
+    let doUpdateNoTarget = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT DO UPDATE SET name = EXCLUDED.name")
+    )
+    check not doUpdateNoTarget.ok
+
+    let doUpdateBadSource = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT (email) DO UPDATE SET name = missing.col")
+    )
+    check not doUpdateBadSource.ok
 
     discard closeDb(db)
 

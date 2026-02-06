@@ -484,6 +484,80 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_on_conflict_do_update_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_upsert_upd_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.users (id INT PRIMARY KEY, email TEXT UNIQUE, visits INT NOT NULL); "
+                f"INSERT INTO {schema}.users VALUES (1, 'a@x', 1); "
+                f"INSERT INTO {schema}.users VALUES (1, 'b@x', 5) "
+                f"ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, visits = {schema}.users.visits + EXCLUDED.visits; "
+                f"INSERT INTO {schema}.users VALUES (1, 'c@x', 9) "
+                f"ON CONFLICT (id) DO UPDATE SET visits = EXCLUDED.visits WHERE {schema}.users.email = 'nope';"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_on_conflict_update.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup_sql = [
+                    "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, visits INT NOT NULL)",
+                    "INSERT INTO users VALUES (1, 'a@x', 1)",
+                    "INSERT INTO users VALUES (1, 'b@x', 5) "
+                    "ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, visits = users.visits + EXCLUDED.visits",
+                    "INSERT INTO users VALUES (1, 'c@x', 9) "
+                    "ON CONFLICT (id) DO UPDATE SET visits = EXCLUDED.visits WHERE users.email = 'nope'",
+                ]
+                for stmt in setup_sql:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                query = "SELECT id, email, visits FROM users ORDER BY id"
+                pg_rows = run_psql(query.replace("FROM users", f"FROM {schema}.users"))
+                payload = run_cli(query)
+                self.assertTrue(payload.get("ok"), msg=payload.get("error"))
+                self.assertEqual(payload.get("rows", []), pg_rows)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

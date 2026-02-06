@@ -540,15 +540,15 @@ proc hasInt64PkConflict(pager: Pager, table: TableMeta, values: seq[Value]): Res
       return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
   ok(false)
 
-proc hasUniqueConflictOnTarget(
+proc findConflictRowidOnTarget(
   catalog: Catalog,
   pager: Pager,
   table: TableMeta,
   values: seq[Value],
   targetCols: seq[string]
-): Result[bool] =
+): Result[Option[uint64]] =
   if targetCols.len == 0:
-    return ok(false)
+    return ok(none(uint64))
 
   var colIndices: seq[int] = @[]
   for colName in targetCols:
@@ -558,33 +558,41 @@ proc hasUniqueConflictOnTarget(
         idx = i
         break
     if idx < 0:
-      return err[bool](ERR_SQL, "Unknown ON CONFLICT target column", colName)
+      return err[Option[uint64]](ERR_SQL, "Unknown ON CONFLICT target column", colName)
     colIndices.add(idx)
 
   for ci in colIndices:
     if values[ci].kind == vkNull:
-      return ok(false)
+      return ok(none(uint64))
 
   if colIndices.len == 1:
     let ci = colIndices[0]
     let col = table.columns[ci]
     if col.primaryKey and col.kind == ctInt64 and values[ci].kind == vkInt64:
-      let rowRes = readRowAt(pager, table, cast[uint64](values[ci].int64Val))
+      let rowid = cast[uint64](values[ci].int64Val)
+      let rowRes = readRowAt(pager, table, rowid)
       if rowRes.ok:
-        return ok(true)
+        return ok(some(rowid))
       if rowRes.err.code == ERR_IO:
-        return ok(false)
-      return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+        return ok(none(uint64))
+      return err[Option[uint64]](rowRes.err.code, rowRes.err.message, rowRes.err.context)
 
     let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
     if isNone(idxOpt):
-      return err[bool](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
+      return err[Option[uint64]](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
 
-    if col.kind in {ctText, ctBlob} and values[ci].kind in {vkText, vkBlob}:
-      return indexHasAnyMatchingValue(catalog, pager, table, col.name, ci, values[ci])
-
-    let key = indexKeyFromValue(values[ci])
-    return indexHasAnyKey(pager, idxOpt.get, key)
+    let rowIdsRes = indexSeek(pager, catalog, table.name, col.name, values[ci])
+    if not rowIdsRes.ok:
+      return err[Option[uint64]](rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context)
+    for rid in rowIdsRes.value:
+      let rowRes = readRowAt(pager, table, rid)
+      if not rowRes.ok:
+        if rowRes.err.code == ERR_IO:
+          continue
+        return err[Option[uint64]](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+      if valuesEqual(rowRes.value.values[ci], values[ci]):
+        return ok(some(rid))
+    return ok(none(uint64))
 
   var matchedIndex: Option[IndexMeta] = none(IndexMeta)
   for _, idx in catalog.indexes:
@@ -592,21 +600,21 @@ proc hasUniqueConflictOnTarget(
       matchedIndex = some(idx)
       break
   if isNone(matchedIndex):
-    return err[bool](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & targetCols.join(","))
+    return err[Option[uint64]](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & targetCols.join(","))
 
   let idxMeta = matchedIndex.get
   let key = compositeIndexKey(values, colIndices)
   let idxTree = newBTree(pager, idxMeta.rootPage)
   let cursorRes = openCursorAt(idxTree, key)
   if not cursorRes.ok:
-    return err[bool](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+    return err[Option[uint64]](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   while true:
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
       if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
         break
-      return err[bool](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+      return err[Option[uint64]](nextRes.err.code, nextRes.err.message, nextRes.err.context)
     if nextRes.value[0] < key:
       continue
     if nextRes.value[0] > key:
@@ -617,7 +625,7 @@ proc hasUniqueConflictOnTarget(
     let rowRes = readRowAt(pager, table, candidateRowid)
     if not rowRes.ok:
       if rowRes.err.code != ERR_IO:
-        return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+        return err[Option[uint64]](rowRes.err.code, rowRes.err.message, rowRes.err.context)
       continue
     var allMatch = true
     for ci in colIndices:
@@ -625,8 +633,20 @@ proc hasUniqueConflictOnTarget(
         allMatch = false
         break
     if allMatch:
-      return ok(true)
-  ok(false)
+      return ok(some(candidateRowid))
+  ok(none(uint64))
+
+proc hasUniqueConflictOnTarget(
+  catalog: Catalog,
+  pager: Pager,
+  table: TableMeta,
+  values: seq[Value],
+  targetCols: seq[string]
+): Result[bool] =
+  let conflictRowRes = findConflictRowidOnTarget(catalog, pager, table, values, targetCols)
+  if not conflictRowRes.ok:
+    return err[bool](conflictRowRes.err.code, conflictRowRes.err.message, conflictRowRes.err.context)
+  ok(conflictRowRes.value.isSome)
 
 proc hasAnyUniqueConflict(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value]): Result[bool] =
   let uniqueRes = enforceUnique(catalog, pager, table, values)
@@ -1221,7 +1241,8 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
   if not notNullRes.ok:
     return err[bool](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
 
-  if bound.insertOnConflictDoNothing:
+  case bound.insertConflictAction
+  of icaDoNothing:
     if bound.insertConflictTargetCols.len > 0:
       let targetConflictRes = hasUniqueConflictOnTarget(
         db.catalog,
@@ -1240,6 +1261,79 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
         return err[bool](anyConflictRes.err.code, anyConflictRes.err.message, anyConflictRes.err.context)
       if anyConflictRes.value:
         return ok(false)
+  of icaDoUpdate:
+    let conflictRowRes = findConflictRowidOnTarget(
+      db.catalog,
+      db.pager,
+      table,
+      values,
+      bound.insertConflictTargetCols
+    )
+    if not conflictRowRes.ok:
+      return err[bool](conflictRowRes.err.code, conflictRowRes.err.message, conflictRowRes.err.context)
+    if conflictRowRes.value.isSome:
+      let conflictRowid = conflictRowRes.value.get
+      let storedRes = readRowAt(db.pager, table, conflictRowid)
+      if not storedRes.ok:
+        return err[bool](storedRes.err.code, storedRes.err.message, storedRes.err.context)
+      let stored = storedRes.value
+
+      var evalCols: seq[string] = @[]
+      var evalValues: seq[Value] = @[]
+      for i, col in table.columns:
+        evalCols.add(bound.insertTable & "." & col.name)
+        evalValues.add(stored.values[i])
+      for i, col in table.columns:
+        evalCols.add("excluded." & col.name)
+        evalValues.add(values[i])
+      let evalRow = Row(rowid: stored.rowid, columns: evalCols, values: evalValues)
+
+      if bound.insertConflictUpdateWhere != nil:
+        let whereRes = evalExpr(evalRow, bound.insertConflictUpdateWhere, params)
+        if not whereRes.ok:
+          return err[bool](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+        if not valueToBool(whereRes.value):
+          return ok(false)
+
+      var newValues = stored.values
+      for colName, expr in bound.insertConflictUpdateAssignments:
+        var idx = -1
+        for i, col in table.columns:
+          if col.name == colName:
+            idx = i
+            break
+        if idx < 0:
+          return err[bool](ERR_SQL, "Unknown column", colName)
+        let evalRes = evalExpr(evalRow, expr, params)
+        if not evalRes.ok:
+          return err[bool](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+        let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+        if not typeRes.ok:
+          return err[bool](typeRes.err.code, typeRes.err.message, colName)
+        newValues[idx] = evalRes.value
+
+      let newNotNullRes = enforceNotNull(table, newValues)
+      if not newNotNullRes.ok:
+        return err[bool](newNotNullRes.err.code, newNotNullRes.err.message, newNotNullRes.err.context)
+
+      let uniqueUpdateRes = enforceUnique(db.catalog, db.pager, table, newValues, stored.rowid)
+      if not uniqueUpdateRes.ok:
+        return err[bool](uniqueUpdateRes.err.code, uniqueUpdateRes.err.message, uniqueUpdateRes.err.context)
+
+      let fkUpdateRes = enforceForeignKeys(db.catalog, db.pager, table, newValues)
+      if not fkUpdateRes.ok:
+        return err[bool](fkUpdateRes.err.code, fkUpdateRes.err.message, fkUpdateRes.err.context)
+
+      let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, stored.values, newValues)
+      if not restrictRes.ok:
+        return err[bool](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+
+      let updateRes = updateRow(db.pager, db.catalog, bound.insertTable, stored.rowid, newValues)
+      if not updateRes.ok:
+        return err[bool](updateRes.err.code, updateRes.err.message, updateRes.err.context)
+      return ok(true)
+  of icaNone:
+    discard
 
   let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
   if not uniqueRes.ok:
@@ -1251,7 +1345,7 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
 
   let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
   if not insertRes.ok:
-    if bound.insertOnConflictDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
+    if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
       return ok(false)
     return err[bool](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   ok(true)

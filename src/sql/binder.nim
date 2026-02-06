@@ -66,6 +66,39 @@ proc cloneExpr(expr: Expr): Expr =
       listExprs.add(cloneExpr(item))
     Expr(kind: ekInList, inExpr: cloneExpr(expr.inExpr), inList: listExprs)
 
+proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
+  if expr == nil:
+    return nil
+  case expr.kind
+  of ekLiteral:
+    Expr(kind: ekLiteral, value: expr.value)
+  of ekColumn:
+    if expr.table.len == 0:
+      Expr(kind: ekColumn, table: tableName, name: expr.name)
+    else:
+      Expr(kind: ekColumn, table: expr.table, name: expr.name)
+  of ekBinary:
+    Expr(
+      kind: ekBinary,
+      op: expr.op,
+      left: qualifyInsertConflictExpr(expr.left, tableName),
+      right: qualifyInsertConflictExpr(expr.right, tableName)
+    )
+  of ekUnary:
+    Expr(kind: ekUnary, unOp: expr.unOp, expr: qualifyInsertConflictExpr(expr.expr, tableName))
+  of ekFunc:
+    var args: seq[Expr] = @[]
+    for arg in expr.args:
+      args.add(qualifyInsertConflictExpr(arg, tableName))
+    Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar)
+  of ekParam:
+    Expr(kind: ekParam, index: expr.index)
+  of ekInList:
+    var listExprs: seq[Expr] = @[]
+    for item in expr.inList:
+      listExprs.add(qualifyInsertConflictExpr(item, tableName))
+    Expr(kind: ekInList, inExpr: qualifyInsertConflictExpr(expr.inExpr, tableName), inList: listExprs)
+
 proc cloneSelectItem(item: SelectItem): SelectItem =
   SelectItem(expr: cloneExpr(item.expr), alias: item.alias, isStar: item.isStar)
 
@@ -711,7 +744,9 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
 
   var conflictTargetCols = stmt.insertConflictTargetCols
   var conflictTargetConstraint = stmt.insertConflictTargetConstraint
-  if stmt.insertOnConflictDoNothing:
+  var conflictAssignments = initTable[string, Expr]()
+  var conflictWhere: Expr = nil
+  if stmt.insertConflictAction != icaNone:
     if conflictTargetCols.len > 0 and conflictTargetConstraint.len > 0:
       return err[Statement](ERR_SQL, "ON CONFLICT cannot specify both column target and constraint target")
 
@@ -751,14 +786,50 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
           stmt.insertTable & "." & conflictTargetCols.join(",")
         )
 
+  if stmt.insertConflictAction == icaDoUpdate:
+    if conflictTargetCols.len == 0:
+      return err[Statement](ERR_SQL, "ON CONFLICT DO UPDATE requires conflict target")
+    if stmt.insertConflictUpdateAssignments.len == 0:
+      return err[Statement](ERR_SQL, "ON CONFLICT DO UPDATE requires at least one assignment")
+
+    let mapRes = buildTableMap(catalog, stmt.insertTable, "", @[])
+    if not mapRes.ok:
+      return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
+    var exprMap = mapRes.value
+    exprMap["excluded"] = table
+
+    for colName, expr in stmt.insertConflictUpdateAssignments:
+      var colIdx = -1
+      for i, col in table.columns:
+        if col.name == colName:
+          colIdx = i
+          break
+      if colIdx < 0:
+        return err[Statement](ERR_SQL, "Unknown column", colName)
+      let qualifiedExpr = qualifyInsertConflictExpr(expr, stmt.insertTable)
+      let bindRes = bindExpr(exprMap, qualifiedExpr)
+      if not bindRes.ok:
+        return err[Statement](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+      let typeRes = checkLiteralType(qualifiedExpr, table.columns[colIdx].kind, colName)
+      if not typeRes.ok:
+        return err[Statement](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+      conflictAssignments[colName] = qualifiedExpr
+
+    conflictWhere = qualifyInsertConflictExpr(stmt.insertConflictUpdateWhere, stmt.insertTable)
+    let whereRes = bindExpr(exprMap, conflictWhere)
+    if not whereRes.ok:
+      return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+
   ok(Statement(
     kind: skInsert,
     insertTable: stmt.insertTable,
     insertColumns: @[],
     insertValues: ordered,
-    insertOnConflictDoNothing: stmt.insertOnConflictDoNothing,
+    insertConflictAction: stmt.insertConflictAction,
     insertConflictTargetCols: conflictTargetCols,
-    insertConflictTargetConstraint: conflictTargetConstraint
+    insertConflictTargetConstraint: conflictTargetConstraint,
+    insertConflictUpdateAssignments: conflictAssignments,
+    insertConflictUpdateWhere: conflictWhere
   ))
 
 proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =

@@ -99,6 +99,11 @@ type AlterColumnAction* = enum
   acaSetNotNull
   acaDropNotNull
 
+type InsertConflictAction* = enum
+  icaNone
+  icaDoNothing
+  icaDoUpdate
+
 type AlterTableAction* = object
   kind*: AlterTableActionKind
   columnDef*: ColumnDef        # For ADD COLUMN
@@ -165,9 +170,11 @@ type Statement* = ref object
     insertTable*: string
     insertColumns*: seq[string]
     insertValues*: seq[Expr]
-    insertOnConflictDoNothing*: bool
+    insertConflictAction*: InsertConflictAction
     insertConflictTargetCols*: seq[string]
     insertConflictTargetConstraint*: string
+    insertConflictUpdateAssignments*: Table[string, Expr]
+    insertConflictUpdateWhere*: Expr
   of skSelect:
     selectItems*: seq[SelectItem]
     fromTable*: string
@@ -735,17 +742,19 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
           values.add(exprRes.value)
 
-  var onConflictDoNothing = false
+  var conflictAction = icaNone
   var conflictTargetCols: seq[string] = @[]
   var conflictTargetConstraint = ""
+  var conflictAssignments = initTable[string, Expr]()
+  var conflictWhere: Expr = nil
   if nodeHas(node, "onConflictClause"):
     let conflict = node["onConflictClause"]
     let action = nodeGet(conflict, "action").getStr
     case action
     of "ONCONFLICT_NOTHING":
-      onConflictDoNothing = true
+      conflictAction = icaDoNothing
     of "ONCONFLICT_UPDATE":
-      return err[Statement](ERR_SQL, "ON CONFLICT DO UPDATE not supported")
+      conflictAction = icaDoUpdate
     else:
       return err[Statement](ERR_SQL, "Unsupported ON CONFLICT action", action)
 
@@ -764,6 +773,24 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
             return err[Statement](ERR_SQL, "ON CONFLICT target expressions are not supported")
           conflictTargetCols.add(colName)
 
+    if conflictAction == icaDoUpdate:
+      let targetList = nodeGet(conflict, "targetList")
+      if targetList.kind == JArray:
+        for entry in targetList:
+          let resTarget = nodeGet(entry, "ResTarget")
+          let name = nodeGet(resTarget, "name").getStr
+          if name.len == 0:
+            return err[Statement](ERR_SQL, "ON CONFLICT DO UPDATE requires assignment target column")
+          let exprRes = parseExprNode(nodeGet(resTarget, "val"))
+          if not exprRes.ok:
+            return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+          conflictAssignments[name] = exprRes.value
+      if nodeHas(conflict, "whereClause"):
+        let whereRes = parseExprNode(nodeGet(conflict, "whereClause"))
+        if not whereRes.ok:
+          return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+        conflictWhere = whereRes.value
+
   if nodeHas(node, "returningList"):
     let returningNode = nodeGet(node, "returningList")
     if returningNode.kind == JArray and returningNode.len > 0:
@@ -774,9 +801,11 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
     insertTable: tableRes.value[0],
     insertColumns: cols,
     insertValues: values,
-    insertOnConflictDoNothing: onConflictDoNothing,
+    insertConflictAction: conflictAction,
     insertConflictTargetCols: conflictTargetCols,
-    insertConflictTargetConstraint: conflictTargetConstraint
+    insertConflictTargetConstraint: conflictTargetConstraint,
+    insertConflictUpdateAssignments: conflictAssignments,
+    insertConflictUpdateWhere: conflictWhere
   ))
 
 proc parseUpdateStmt(node: JsonNode): Result[Statement] =
