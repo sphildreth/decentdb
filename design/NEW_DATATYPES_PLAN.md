@@ -130,8 +130,9 @@ Note: DECIMAL support may require a new value encoding kind (or equivalent) to a
 1. ADR: choose DECIMAL semantics + UUID representation and SQL surface.
 2. Implement UUID type parsing + `gen_random_uuid()` + parse/format helpers.
 3. Implement DECIMAL type semantics (Option A or B) + conversions.
-4. Update CLI rendering (optional) and binding expectations (follow-up).
-5. Update documentation (SPEC/PRD/docs/user-guide) to reflect new types/functions and any format-version compatibility notes.
+4. Update import scripts/tooling to use `DECIMAL` and `UUID` (and explicit `CAST(...)`) where appropriate when importing data.
+5. Update CLI rendering (optional) and binding expectations (follow-up).
+6. Update documentation (SPEC/PRD/docs/user-guide) to reflect new types/functions and any format-version compatibility notes.
 
 ## Decisions (v1)
 

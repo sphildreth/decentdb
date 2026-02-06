@@ -708,7 +708,58 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     if not typeRes.ok:
       return err[Statement](typeRes.err.code, typeRes.err.message, typeRes.err.context)
     ordered[idx] = expr
-  ok(Statement(kind: skInsert, insertTable: stmt.insertTable, insertColumns: @[], insertValues: ordered))
+
+  var conflictTargetCols = stmt.insertConflictTargetCols
+  var conflictTargetConstraint = stmt.insertConflictTargetConstraint
+  if stmt.insertOnConflictDoNothing:
+    if conflictTargetCols.len > 0 and conflictTargetConstraint.len > 0:
+      return err[Statement](ERR_SQL, "ON CONFLICT cannot specify both column target and constraint target")
+
+    if conflictTargetConstraint.len > 0:
+      if not catalog.indexes.hasKey(conflictTargetConstraint):
+        return err[Statement](ERR_SQL, "Unknown ON CONFLICT constraint", conflictTargetConstraint)
+      let idx = catalog.indexes[conflictTargetConstraint]
+      if idx.table != stmt.insertTable:
+        return err[Statement](ERR_SQL, "ON CONFLICT constraint belongs to different table", conflictTargetConstraint)
+      if not idx.unique:
+        return err[Statement](ERR_SQL, "ON CONFLICT constraint must be unique", conflictTargetConstraint)
+      conflictTargetCols = idx.columns
+
+    if conflictTargetCols.len > 0:
+      var colSet = initHashSet[string]()
+      for col in table.columns:
+        colSet.incl(col.name)
+      for name in conflictTargetCols:
+        if not colSet.contains(name):
+          return err[Statement](ERR_SQL, "Unknown ON CONFLICT target column", name)
+
+      var matchedUniqueTarget = false
+      if conflictTargetCols.len == 1:
+        for col in table.columns:
+          if col.name == conflictTargetCols[0] and (col.primaryKey or col.unique):
+            matchedUniqueTarget = true
+            break
+      if not matchedUniqueTarget:
+        for _, idx in catalog.indexes:
+          if idx.table == stmt.insertTable and idx.unique and idx.columns == conflictTargetCols:
+            matchedUniqueTarget = true
+            break
+      if not matchedUniqueTarget:
+        return err[Statement](
+          ERR_SQL,
+          "ON CONFLICT target does not match a unique constraint",
+          stmt.insertTable & "." & conflictTargetCols.join(",")
+        )
+
+  ok(Statement(
+    kind: skInsert,
+    insertTable: stmt.insertTable,
+    insertColumns: @[],
+    insertValues: ordered,
+    insertOnConflictDoNothing: stmt.insertOnConflictDoNothing,
+    insertConflictTargetCols: conflictTargetCols,
+    insertConflictTargetConstraint: conflictTargetConstraint
+  ))
 
 proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
   if catalog.hasViewName(stmt.updateTable):

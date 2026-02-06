@@ -202,6 +202,44 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "insert ON CONFLICT DO NOTHING":
+    let path = makeTempDb("decentdb_sql_exec_on_conflict.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT, name TEXT NOT NULL)").ok
+    check execSql(db, "CREATE UNIQUE INDEX users_email_uq_idx ON users (email)").ok
+    check execSql(db, "INSERT INTO users VALUES (1, 'a@x', 'alice')").ok
+
+    let anyConflict = execSql(db, "INSERT INTO users VALUES (1, 'b@x', 'dup-id') ON CONFLICT DO NOTHING")
+    check anyConflict.ok
+    let countAfterAny = execSql(db, "SELECT COUNT(*) FROM users")
+    check countAfterAny.ok
+    check splitRow(countAfterAny.value[0])[0] == "1"
+
+    let targetConflict = execSql(db, "INSERT INTO users VALUES (2, 'a@x', 'dup-email') ON CONFLICT (email) DO NOTHING")
+    check targetConflict.ok
+    let countAfterTarget = execSql(db, "SELECT COUNT(*) FROM users")
+    check countAfterTarget.ok
+    check splitRow(countAfterTarget.value[0])[0] == "1"
+
+    let onConstraint = execSql(db, "INSERT INTO users VALUES (3, 'a@x', 'dup-email-2') ON CONFLICT ON CONSTRAINT users_email_uq_idx DO NOTHING")
+    check onConstraint.ok
+    let countAfterConstraint = execSql(db, "SELECT COUNT(*) FROM users")
+    check countAfterConstraint.ok
+    check splitRow(countAfterConstraint.value[0])[0] == "1"
+
+    let mismatch = execSql(db, "INSERT INTO users VALUES (1, 'c@x', 'dup-id-mismatch') ON CONFLICT (email) DO NOTHING")
+    check not mismatch.ok
+    check mismatch.err.code == ERR_CONSTRAINT
+
+    let notNullStillErrors = execSql(db, "INSERT INTO users VALUES (4, 'd@x', NULL) ON CONFLICT DO NOTHING")
+    check not notNullStillErrors.ok
+    check notNullStillErrors.err.code == ERR_CONSTRAINT
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),

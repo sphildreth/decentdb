@@ -98,6 +98,56 @@ suite "Binder":
 
     discard closeDb(db)
 
+  test "bind ON CONFLICT DO NOTHING targets":
+    let path = makeTempDb("decentdb_binder_on_conflict.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "users", @[
+      Column(name: "id", kind: ctInt64, primaryKey: true),
+      Column(name: "email", kind: ctText, unique: true),
+      Column(name: "name", kind: ctText)
+    ])
+    discard addIndex(db, "users_email_uq_idx", "users", "email", true)
+    discard addIndex(db, "users_name_idx", "users", "name", false)
+
+    let anyTarget = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT DO NOTHING")
+    )
+    check anyTarget.ok
+    check anyTarget.value.insertOnConflictDoNothing
+    check anyTarget.value.insertConflictTargetCols.len == 0
+
+    let colTarget = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT (email) DO NOTHING")
+    )
+    check colTarget.ok
+    check colTarget.value.insertConflictTargetCols == @["email"]
+
+    let badColTarget = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT (name) DO NOTHING")
+    )
+    check not badColTarget.ok
+
+    let constraintTarget = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT ON CONSTRAINT users_email_uq_idx DO NOTHING")
+    )
+    check constraintTarget.ok
+    check constraintTarget.value.insertConflictTargetCols == @["email"]
+
+    let badConstraintTarget = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT ON CONSTRAINT users_name_idx DO NOTHING")
+    )
+    check not badConstraintTarget.ok
+
+    discard closeDb(db)
+
   test "bind create table and index constraints":
     let path = makeTempDb("decentdb_binder_create.db")
     let dbRes = openDb(path)

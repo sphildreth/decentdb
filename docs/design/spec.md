@@ -280,6 +280,10 @@ Alternative:
 ### 6.2 Supported SQL subset (0.x baseline)
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+- UPSERT subset: `INSERT ... ON CONFLICT DO NOTHING` with optional conflict target:
+  - no target (`ON CONFLICT DO NOTHING`)
+  - column-list target (`ON CONFLICT (col[, ...]) DO NOTHING`)
+  - constraint/index-name target (`ON CONFLICT ON CONSTRAINT name DO NOTHING`)
 - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
 - Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`
 - Expression forms: searched/simple `CASE`, `CAST(expr AS type)` (narrow matrix)
@@ -288,6 +292,9 @@ Alternative:
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
+- Explicitly unsupported in 0.x baseline:
+  - `INSERT ... ON CONFLICT ... DO UPDATE`
+  - DML `RETURNING`
 
 ### 6.3 Parameterization
 - `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline

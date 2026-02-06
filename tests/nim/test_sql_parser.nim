@@ -68,6 +68,30 @@ suite "SQL Parser":
     let ins = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x')")
     check ins.kind == skInsert
     check ins.insertValues.len == 2
+    check not ins.insertOnConflictDoNothing
+    check ins.insertConflictTargetCols.len == 0
+    check ins.insertConflictTargetConstraint.len == 0
+
+    let insConflictAny = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x') ON CONFLICT DO NOTHING")
+    check insConflictAny.kind == skInsert
+    check insConflictAny.insertOnConflictDoNothing
+    check insConflictAny.insertConflictTargetCols.len == 0
+
+    let insConflictCols = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x') ON CONFLICT (id, name) DO NOTHING")
+    check insConflictCols.kind == skInsert
+    check insConflictCols.insertOnConflictDoNothing
+    check insConflictCols.insertConflictTargetCols == @["id", "name"]
+
+    let insConflictConstraint = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x') ON CONFLICT ON CONSTRAINT t_name_uq DO NOTHING")
+    check insConflictConstraint.kind == skInsert
+    check insConflictConstraint.insertOnConflictDoNothing
+    check insConflictConstraint.insertConflictTargetConstraint == "t_name_uq"
+
+    let updateUnsupportedRes = parseSql("INSERT INTO t (id, name) VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name")
+    check not updateUnsupportedRes.ok
+
+    let returningUnsupportedRes = parseSql("INSERT INTO t (id, name) VALUES (1, 'x') RETURNING id")
+    check not returningUnsupportedRes.ok
 
     let upd = parseSingle("UPDATE t SET name = 'y' WHERE id = 1")
     check upd.kind == skUpdate

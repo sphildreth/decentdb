@@ -523,6 +523,122 @@ proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values
         return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
   okVoid()
 
+proc isUniqueConflictError(errVal: DbError): bool =
+  if errVal.code != ERR_CONSTRAINT:
+    return false
+  errVal.message == "UNIQUE constraint failed" or errVal.message == "Unique constraint violation"
+
+proc hasInt64PkConflict(pager: Pager, table: TableMeta, values: seq[Value]): Result[bool] =
+  for i, col in table.columns:
+    if col.primaryKey and col.kind == ctInt64 and values[i].kind == vkInt64:
+      let rowid = cast[uint64](values[i].int64Val)
+      let rowRes = readRowAt(pager, table, rowid)
+      if rowRes.ok:
+        return ok(true)
+      if rowRes.err.code == ERR_IO:
+        return ok(false)
+      return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+  ok(false)
+
+proc hasUniqueConflictOnTarget(
+  catalog: Catalog,
+  pager: Pager,
+  table: TableMeta,
+  values: seq[Value],
+  targetCols: seq[string]
+): Result[bool] =
+  if targetCols.len == 0:
+    return ok(false)
+
+  var colIndices: seq[int] = @[]
+  for colName in targetCols:
+    var idx = -1
+    for i, col in table.columns:
+      if col.name == colName:
+        idx = i
+        break
+    if idx < 0:
+      return err[bool](ERR_SQL, "Unknown ON CONFLICT target column", colName)
+    colIndices.add(idx)
+
+  for ci in colIndices:
+    if values[ci].kind == vkNull:
+      return ok(false)
+
+  if colIndices.len == 1:
+    let ci = colIndices[0]
+    let col = table.columns[ci]
+    if col.primaryKey and col.kind == ctInt64 and values[ci].kind == vkInt64:
+      let rowRes = readRowAt(pager, table, cast[uint64](values[ci].int64Val))
+      if rowRes.ok:
+        return ok(true)
+      if rowRes.err.code == ERR_IO:
+        return ok(false)
+      return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+
+    let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
+    if isNone(idxOpt):
+      return err[bool](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
+
+    if col.kind in {ctText, ctBlob} and values[ci].kind in {vkText, vkBlob}:
+      return indexHasAnyMatchingValue(catalog, pager, table, col.name, ci, values[ci])
+
+    let key = indexKeyFromValue(values[ci])
+    return indexHasAnyKey(pager, idxOpt.get, key)
+
+  var matchedIndex: Option[IndexMeta] = none(IndexMeta)
+  for _, idx in catalog.indexes:
+    if idx.table == table.name and idx.unique and idx.columns == targetCols:
+      matchedIndex = some(idx)
+      break
+  if isNone(matchedIndex):
+    return err[bool](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & targetCols.join(","))
+
+  let idxMeta = matchedIndex.get
+  let key = compositeIndexKey(values, colIndices)
+  let idxTree = newBTree(pager, idxMeta.rootPage)
+  let cursorRes = openCursorAt(idxTree, key)
+  if not cursorRes.ok:
+    return err[bool](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+  let cursor = cursorRes.value
+  while true:
+    let nextRes = cursorNext(cursor)
+    if not nextRes.ok:
+      if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
+        break
+      return err[bool](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+    if nextRes.value[0] < key:
+      continue
+    if nextRes.value[0] > key:
+      break
+    if nextRes.value[1].len < 8:
+      continue
+    let candidateRowid = readU64LE(nextRes.value[1], 0)
+    let rowRes = readRowAt(pager, table, candidateRowid)
+    if not rowRes.ok:
+      if rowRes.err.code != ERR_IO:
+        return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+      continue
+    var allMatch = true
+    for ci in colIndices:
+      if not valuesEqual(rowRes.value.values[ci], values[ci]):
+        allMatch = false
+        break
+    if allMatch:
+      return ok(true)
+  ok(false)
+
+proc hasAnyUniqueConflict(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value]): Result[bool] =
+  let uniqueRes = enforceUnique(catalog, pager, table, values)
+  if not uniqueRes.ok:
+    if isUniqueConflictError(uniqueRes.err):
+      return ok(true)
+    return err[bool](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+  let pkConflictRes = hasInt64PkConflict(pager, table, values)
+  if not pkConflictRes.ok:
+    return err[bool](pkConflictRes.err.code, pkConflictRes.err.message, pkConflictRes.err.context)
+  ok(pkConflictRes.value)
+
 # ============================================================================
 # HIGH-005: Batched Constraint Checking for Bulk Operations
 # ============================================================================
@@ -1085,6 +1201,61 @@ proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
 
+proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[bool] =
+  let tableRes = db.catalog.getTable(bound.insertTable)
+  if not tableRes.ok:
+    return err[bool](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+
+  let valuesRes = evalInsertValues(bound, params)
+  if not valuesRes.ok:
+    return err[bool](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
+  let values = valuesRes.value
+
+  for i, col in table.columns:
+    let typeRes = typeCheckValue(col.kind, values[i])
+    if not typeRes.ok:
+      return err[bool](typeRes.err.code, typeRes.err.message, col.name)
+
+  let notNullRes = enforceNotNull(table, values)
+  if not notNullRes.ok:
+    return err[bool](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+
+  if bound.insertOnConflictDoNothing:
+    if bound.insertConflictTargetCols.len > 0:
+      let targetConflictRes = hasUniqueConflictOnTarget(
+        db.catalog,
+        db.pager,
+        table,
+        values,
+        bound.insertConflictTargetCols
+      )
+      if not targetConflictRes.ok:
+        return err[bool](targetConflictRes.err.code, targetConflictRes.err.message, targetConflictRes.err.context)
+      if targetConflictRes.value:
+        return ok(false)
+    else:
+      let anyConflictRes = hasAnyUniqueConflict(db.catalog, db.pager, table, values)
+      if not anyConflictRes.ok:
+        return err[bool](anyConflictRes.err.code, anyConflictRes.err.message, anyConflictRes.err.context)
+      if anyConflictRes.value:
+        return ok(false)
+
+  let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
+  if not uniqueRes.ok:
+    return err[bool](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+
+  let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+  if not fkRes.ok:
+    return err[bool](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+
+  let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+  if not insertRes.ok:
+    if bound.insertOnConflictDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
+      return ok(false)
+    return err[bool](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  ok(true)
+
 proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   if not db.isOpen:
     return err[Prepared](ERR_INTERNAL, "Database not open")
@@ -1240,29 +1411,9 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
           break
       output.add(rows.join("\n"))
     of skInsert:
-      let tableRes = db.catalog.getTable(bound.insertTable)
-      if not tableRes.ok:
-        return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-      let valuesRes = evalInsertValues(bound, params)
-      if not valuesRes.ok:
-        return err[seq[string]](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-      let values = valuesRes.value
-      for i, col in tableRes.value.columns:
-        let typeRes = typeCheckValue(col.kind, values[i])
-        if not typeRes.ok:
-          return err[seq[string]](typeRes.err.code, typeRes.err.message, col.name)
-      let notNullRes = enforceNotNull(tableRes.value, values)
-      if not notNullRes.ok:
-        return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-      let uniqueRes = enforceUnique(db.catalog, db.pager, tableRes.value, values)
-      if not uniqueRes.ok:
-        return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-      let fkRes = enforceForeignKeys(db.catalog, db.pager, tableRes.value, values)
-      if not fkRes.ok:
-        return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-      let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
-      if not insertRes.ok:
-        return err[seq[string]](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+      let insertExecRes = execInsertStatement(db, bound, params)
+      if not insertExecRes.ok:
+        return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
     of skUpdate:
       let execRes = execPreparedNonSelect(db, bound, params, plan)
       if not execRes.ok:
@@ -1711,29 +1862,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skInsert:
-      let tableRes = db.catalog.getTable(bound.insertTable)
-      if not tableRes.ok:
-        return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-      let valuesRes = evalInsertValues(bound, params)
-      if not valuesRes.ok:
-        return err[seq[string]](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-      let values = valuesRes.value
-      for i, col in tableRes.value.columns:
-        let typeRes = typeCheckValue(col.kind, values[i])
-        if not typeRes.ok:
-          return err[seq[string]](typeRes.err.code, typeRes.err.message, col.name)
-      let notNullRes = enforceNotNull(tableRes.value, values)
-      if not notNullRes.ok:
-        return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-      let uniqueRes = enforceUnique(db.catalog, db.pager, tableRes.value, values)
-      if not uniqueRes.ok:
-        return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-      let fkRes = enforceForeignKeys(db.catalog, db.pager, tableRes.value, values)
-      if not fkRes.ok:
-        return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-      let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
-      if not insertRes.ok:
-        return err[seq[string]](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+      let insertExecRes = execInsertStatement(db, bound, params)
+      if not insertExecRes.ok:
+        return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
     of skUpdate:
       let tableRes = db.catalog.getTable(bound.updateTable)
       if not tableRes.ok:
@@ -2258,30 +2389,10 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 0
 
   of skInsert:
-    let tableRes = db.catalog.getTable(bound.insertTable)
-    if not tableRes.ok:
-      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-    let valuesRes = evalInsertValues(bound, params)
-    if not valuesRes.ok:
-      return err[int64](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-    let values = valuesRes.value
-    for i, col in tableRes.value.columns:
-      let typeRes = typeCheckValue(col.kind, values[i])
-      if not typeRes.ok:
-        return err[int64](typeRes.err.code, typeRes.err.message, col.name)
-    let notNullRes = enforceNotNull(tableRes.value, values)
-    if not notNullRes.ok:
-      return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-    let uniqueRes = enforceUnique(db.catalog, db.pager, tableRes.value, values)
-    if not uniqueRes.ok:
-      return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-    let fkRes = enforceForeignKeys(db.catalog, db.pager, tableRes.value, values)
-    if not fkRes.ok:
-      return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-    let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
-    if not insertRes.ok:
-      return err[int64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
-    affected = 1
+    let insertExecRes = execInsertStatement(db, bound, params)
+    if not insertExecRes.ok:
+      return err[int64](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+    affected = if insertExecRes.value: 1 else: 0
 
   of skUpdate:
     let fastRes = tryFastPkUpdate(db, bound, params)

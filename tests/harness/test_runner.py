@@ -414,6 +414,76 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_on_conflict_do_nothing_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_upsert_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT NOT NULL); "
+                f"INSERT INTO {schema}.users VALUES (1, 'a@x', 'alice'); "
+                f"INSERT INTO {schema}.users VALUES (1, 'b@x', 'dup-id') ON CONFLICT DO NOTHING; "
+                f"INSERT INTO {schema}.users VALUES (2, 'a@x', 'dup-email') ON CONFLICT (email) DO NOTHING;"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_on_conflict.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup_sql = [
+                    "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT NOT NULL)",
+                    "INSERT INTO users VALUES (1, 'a@x', 'alice')",
+                    "INSERT INTO users VALUES (1, 'b@x', 'dup-id') ON CONFLICT DO NOTHING",
+                    "INSERT INTO users VALUES (2, 'a@x', 'dup-email') ON CONFLICT (email) DO NOTHING",
+                ]
+                for stmt in setup_sql:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                query = "SELECT id, email, name FROM users ORDER BY id"
+                pg_rows = run_psql(query.replace("FROM users", f"FROM {schema}.users"))
+                payload = run_cli(query)
+                self.assertTrue(payload.get("ok"), msg=payload.get("error"))
+                self.assertEqual(payload.get("rows", []), pg_rows)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

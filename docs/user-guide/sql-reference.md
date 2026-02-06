@@ -97,7 +97,16 @@ ALTER TABLE users DROP COLUMN age;
 ```sql
 INSERT INTO table_name VALUES (val1, val2, ...);
 INSERT INTO table_name (col1, col2) VALUES (val1, val2);
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT DO NOTHING;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO NOTHING;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO NOTHING;
 ```
+
+Notes:
+- `ON CONFLICT ... DO NOTHING` is supported.
+- `ON CONSTRAINT name` resolves against DecentDb unique index names.
+- `ON CONFLICT ... DO UPDATE` is not yet supported.
+- DML `RETURNING` is not yet supported.
 
 ### SELECT
 

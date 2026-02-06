@@ -1,0 +1,18 @@
+{
+  "name": "on_conflict_do_nothing_no_write",
+  "description": "Crash during ON CONFLICT DO NOTHING must leave committed data intact",
+  "db_path": "$TMPDIR/decentdb_on_conflict_do_nothing.ddb",
+  "setup_sql": "CREATE TABLE users (id INT PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'seed')",
+  "sql": "INSERT INTO users VALUES (1, 'dup') ON CONFLICT DO NOTHING",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error"
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id, name FROM users ORDER BY id",
+    "expect_rows": [
+      "1|seed"
+    ]
+  }
+}

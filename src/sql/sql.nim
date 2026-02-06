@@ -165,6 +165,9 @@ type Statement* = ref object
     insertTable*: string
     insertColumns*: seq[string]
     insertValues*: seq[Expr]
+    insertOnConflictDoNothing*: bool
+    insertConflictTargetCols*: seq[string]
+    insertConflictTargetConstraint*: string
   of skSelect:
     selectItems*: seq[SelectItem]
     fromTable*: string
@@ -731,7 +734,50 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
           if not exprRes.ok:
             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
           values.add(exprRes.value)
-  ok(Statement(kind: skInsert, insertTable: tableRes.value[0], insertColumns: cols, insertValues: values))
+
+  var onConflictDoNothing = false
+  var conflictTargetCols: seq[string] = @[]
+  var conflictTargetConstraint = ""
+  if nodeHas(node, "onConflictClause"):
+    let conflict = node["onConflictClause"]
+    let action = nodeGet(conflict, "action").getStr
+    case action
+    of "ONCONFLICT_NOTHING":
+      onConflictDoNothing = true
+    of "ONCONFLICT_UPDATE":
+      return err[Statement](ERR_SQL, "ON CONFLICT DO UPDATE not supported")
+    else:
+      return err[Statement](ERR_SQL, "Unsupported ON CONFLICT action", action)
+
+    let infer = nodeGet(conflict, "infer")
+    if infer.kind == JObject:
+      if nodeHas(infer, "conname"):
+        conflictTargetConstraint = nodeGet(infer, "conname").getStr
+      let elems = nodeGet(infer, "indexElems")
+      if elems.kind == JArray:
+        for entry in elems:
+          if not nodeHas(entry, "IndexElem"):
+            return err[Statement](ERR_SQL, "Unsupported ON CONFLICT target element")
+          let idxElem = entry["IndexElem"]
+          let colName = nodeGet(idxElem, "name").getStr
+          if colName.len == 0:
+            return err[Statement](ERR_SQL, "ON CONFLICT target expressions are not supported")
+          conflictTargetCols.add(colName)
+
+  if nodeHas(node, "returningList"):
+    let returningNode = nodeGet(node, "returningList")
+    if returningNode.kind == JArray and returningNode.len > 0:
+      return err[Statement](ERR_SQL, "INSERT RETURNING is not supported")
+
+  ok(Statement(
+    kind: skInsert,
+    insertTable: tableRes.value[0],
+    insertColumns: cols,
+    insertValues: values,
+    insertOnConflictDoNothing: onConflictDoNothing,
+    insertConflictTargetCols: conflictTargetCols,
+    insertConflictTargetConstraint: conflictTargetConstraint
+  ))
 
 proc parseUpdateStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])
