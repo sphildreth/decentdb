@@ -185,7 +185,7 @@ suite "DB Header Extended":
     check HeaderSize == 128
     check MagicBytes == "DECENTDB"
     check MagicPadded.len == 16
-    check FormatVersion == 8'u32
+    check FormatVersion == 1'u32
     check DefaultPageSize == 4096'u32
 
   test "readHeader from empty file fails":
