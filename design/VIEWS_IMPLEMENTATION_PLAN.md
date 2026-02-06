@@ -63,7 +63,7 @@ The table below is based on local CLI verification (`sqlite3`, `duckdb`) and off
 7. Column naming:
    - If explicit column list exists, it is authoritative.
    - Else derive from select-list aliases/column names.
-   - Reject mismatched explicit column counts.
+   - Reject mismatched explicit column counts with `ERR_SQL` and context `(view_name, expected_count, actual_count)`.
 8. `ALTER VIEW ... RENAME TO ...` updates the view identity and dependency graph atomically, with no change to defining SQL.
 
 ### 4.4 SQL Dialect Clarification
@@ -85,6 +85,12 @@ Additional view-specific guardrails:
    - Warm-cache p95 overhead target: <= 5%
    - First-run (compile/bind) overhead target: <= 15%
 2. Queries that do not reference views must have zero additional runtime branching in exec hot loops.
+3. Expanded query node budget:
+   - Maximum expansion depth: 16 (from Section 4.3)
+   - Maximum expanded AST nodes per statement: 10,000 (reject with `ERR_SQL` if exceeded)
+4. SQL cache behavior:
+   - Repeated `CREATE OR REPLACE VIEW` must not cause unbounded plan-cache growth.
+   - Schema-cookie bump invalidation must clear cached plans for prior schema shape.
 
 ## 6. Architecture and Module Changes
 ### 6.1 Catalog Layer (`src/catalog/catalog.nim`)
@@ -93,6 +99,11 @@ Add `ViewMeta` and in-memory map:
 - `sqlText: string` (canonical defining `SELECT`)
 - `columnNames: seq[string]` (resolved output column names)
 - `dependencies: seq[string]` (table/view names, normalized)
+
+0.x storage decision:
+- Dependencies are stored by canonical object name, not object ID.
+- `ALTER VIEW ... RENAME TO ...` must transactionally rewrite dependent-view name references.
+- Object-ID based dependency tracking is deferred post-1.0 unless required by broader rename features.
 
 Add catalog persistence record kind:
 - `kind = "view"` with fields for name/sql/columns/dependencies.
@@ -135,9 +146,10 @@ Responsibilities:
 3. Apply expansion depth limits and node-budget guardrails.
 4. Enforce read-only behavior for view targets in DML.
 
-Implementation note:
-- Current AST is table-name based for `FROM`/`JOIN`.
-- To support general views cleanly, add a derived-source representation in AST/binder output (table or expanded subquery source), rather than brittle string substitution.
+Implementation decision (0.x):
+- Expansion occurs at bind time (not plan time).
+- Binder substitutes referenced views into a derived-source AST representation (not SQL text substitution).
+- Planner receives a fully expanded/bound query tree, preserving current access-path rules where possible.
 
 ### 6.4 Planner (`src/planner/planner.nim`)
 1. Plan expanded/derived sources without changing existing access-path selection logic for base tables.
@@ -155,6 +167,7 @@ Implementation note:
 4. Bump schema cookie on create/replace/drop/rename view.
 5. Invalidate SQL plan cache via existing schema-cookie mechanism.
 6. Enforce dependency checks on object drops.
+7. Prepared statements that become stale due to view DDL must re-prepare or fail with a clear schema-changed error path (consistent with existing schema-cookie behavior).
 
 ## 7. Dependency Policy (DecentDB 0.x)
 DecentDB will use stricter dependency semantics than SQLite/DuckDB in initial release:
@@ -175,6 +188,8 @@ Rationale:
    - New ADR before implementation
    - Format version bump decision documented in `design/SPEC.md`
    - Compatibility tests (open pre-view DB; open DB with views using current engine)
+4. View DDL participates in existing schema-cookie invalidation:
+   - `CREATE VIEW`, `CREATE OR REPLACE VIEW`, `DROP VIEW`, and `ALTER VIEW ... RENAME TO ...` all increment schema cookie.
 
 ## 9. Testing Plan
 ### 9.1 Unit Tests (Nim)
@@ -193,11 +208,15 @@ Add/extend tests for:
    - view-expanded plans still choose indexes/trigram when eligible
 5. Engine DDL:
    - rename conflict detection and dependency rewrite behavior
+6. Prepared statement behavior:
+   - statement prepared before view shape change must re-prepare (or fail cleanly) on next execution
 
 ### 9.2 Property Tests
 1. Randomized create/drop/replace view sequences preserve catalog invariants.
 2. Expanded query result equivalence:
    - `SELECT ... FROM view` == inlined defining query for supported subset.
+3. Concurrent read stability:
+   - reader threads querying a view observe snapshot-consistent behavior while writer replaces/renames the view.
 
 ### 9.3 Crash-Injection Tests (Python harness + FaultyVFS)
 1. Crash between catalog record write and commit marker for `CREATE VIEW`.
@@ -205,6 +224,8 @@ Add/extend tests for:
 3. Crash during `CREATE OR REPLACE VIEW`.
 4. Crash during `ALTER VIEW ... RENAME TO ...`.
 5. Reopen and verify catalog + queryability invariants.
+6. Large-definition durability:
+   - long view SQL definitions that force catalog page splits still recover atomically.
 
 ### 9.4 Differential Tests
 For shared subset behavior:
@@ -261,7 +282,9 @@ Create an ADR before coding to lock:
 1. Catalog record format for views (`kind="view"` payload schema).
 2. Compatibility/versioning policy for databases that include views.
 3. Dependency policy (`RESTRICT` semantics and cycle handling).
-4. AST/planner representation choice for derived view sources.
+4. AST/planner representation specification for derived view sources (bind-time expansion model).
+5. Bind-time expansion rules and node-budget/error behavior.
+6. ADR process compliance with `design/adr/README.md` (template, numbering, lifecycle).
 
 ## 14. Deliverables
 1. `design/VIEWS_IMPLEMENTATION_PLAN.md` (this document)
@@ -275,3 +298,5 @@ Create an ADR before coding to lock:
 4. DuckDB `ALTER VIEW`: https://duckdb.org/docs/stable/sql/statements/alter_view.html
 5. DuckDB `DROP`: https://duckdb.org/docs/stable/sql/statements/drop
 6. Local CLI verification (`sqlite3`, `duckdb`) executed on 2026-02-06.
+7. DecentDB ADR-0004 (WAL checkpoint strategy): `design/adr/0004-wal-checkpoint-strategy.md`
+8. DecentDB ADR-0023 (isolation level specification): `design/adr/0023-isolation-level-specification.md`
