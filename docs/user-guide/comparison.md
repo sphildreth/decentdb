@@ -8,7 +8,9 @@ This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB is intentionally scoped (0.x) around:
+DecentDB is currently **pre-1.0**. This document describes the **current baseline** feature set and constraints; details may change as DecentDB approaches 1.0.
+
+DecentDB is intentionally scoped around:
 - **Priority #1:** durable ACID writes (WAL-based)
 - **Priority #2:** fast reads
 - **Concurrency model:** single process, **one writer**, many concurrent reader threads
@@ -18,13 +20,13 @@ SQLite and DuckDB are used as behavioral baselines for many SQL features, but De
 
 ## Quick summary
 
-| Area | DecentDB (0.x) | SQLite | DuckDB |
+| Area | DecentDB | SQLite | DuckDB |
 |---|---|---|---|
 | Primary focus | OLTP-style embedded DB, durability-first | Embedded general-purpose DB | Embedded analytics (OLAP) |
 | Durability model | WAL-based, fsync-on-commit by default | WAL or rollback journal, configurable | Depends on storage mode; optimized for analytics workflows |
 | Concurrency | Single writer, many readers (threads, same process) | Multi-reader, single-writer (process-safe) | Parallel query execution; analytics-oriented |
 | SQL breadth | Subset (deliberately small) | Very broad (plus extensions) | Very broad (esp. analytical SQL) |
-| Extensibility | No loadable extension / UDF plugin surface in 0.x (extend by contributing to core) | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
+| Extensibility | No loadable extension / UDF plugin surface in the current baseline (extend by contributing to core) | Rich extension ecosystem (loadable extensions, virtual tables, UDFs) | Rich extension ecosystem (install/load extensions, UDFs) |
 | Substring search (`LIKE '%pattern%'`) | Built-in trigram index option (purpose-built for interactive “contains” queries) | Typically full scan or use FTS/extensions | Typically scan or use extensions (e.g., FTS) |
 | Durability fault-injection hooks | Built-in WAL failpoints + FaultyVFS for deterministic crash/torn-write testing | Not typically exposed as a first-class user feature | Not typically exposed as a first-class user feature |
 
@@ -37,8 +39,8 @@ What “extensions” means here:
 
 ## SQL surface area
 
-DecentDB’s documented 0.x baseline includes:
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
+DecentDB’s current baseline includes:
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
 - Joins: `INNER JOIN`, `LEFT JOIN`
 - Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`
@@ -52,12 +54,12 @@ SQLite and DuckDB generally include all of the above, plus substantial additiona
 
 | Feature | DecentDB | SQLite | DuckDB |
 |---|---|---|---|
-| Non-materialized views (`CREATE VIEW ... AS SELECT ...`) | In progress (0.x); read-only views | Yes | Yes |
-| `CREATE OR REPLACE VIEW` | In scope for DecentDB (0.x) | Not supported as a single statement | Yes |
-| Updatable views | Not supported (0.x) | Via `INSTEAD OF` triggers | Limited / generally not the default |
-| `TEMP` views | Deferred (0.x) | Yes | Yes |
+| Non-materialized views (`CREATE VIEW ... AS SELECT ...`) | Yes; read-only views | Yes | Yes |
+| `CREATE OR REPLACE VIEW` | Yes | Not supported as a single statement | Yes |
+| Updatable views | Not supported | Via `INSTEAD OF` triggers | Limited / generally not the default |
+| `TEMP` views | No | Yes | Yes |
 
-### Common SQL features not in DecentDB’s 0.x baseline
+### Common SQL features not in DecentDB’s current baseline
 
 The following are widely available in SQLite and/or DuckDB, but are not part of DecentDB’s currently documented baseline scope:
 
@@ -109,7 +111,7 @@ The following are not strictly “SQL features”, but commonly expected operati
 	- **Must-have:** No.
 12. **Loadable extension ecosystem** (plugins/UDFs/virtual tables/tooling)
 	- SQLite: loadable extensions + virtual tables; DuckDB: install/load extensions and file-format tooling.
-	- DecentDB 0.x deliberately avoids a plugin surface to keep durability/correctness scope tight.
+	- DecentDB deliberately avoids a plugin surface in the current baseline to keep durability/correctness scope tight.
 	- **Must-have:** No.
 
 Notes:
@@ -129,6 +131,6 @@ SQLite and DuckDB both offer larger built-in ecosystems of types and functions. 
 |---|---|---|---|
 | B-tree secondary indexes | Yes | Yes | Yes |
 | Fast substring search for `LIKE '%pattern%'` | Yes, via trigram index on configured columns | Usually via FTS extension or full scans | Often via functions/extensions; not a primary focus |
-| Advanced index options (partial/expression/multi-column, etc.) | Not part of 0.x baseline | Many are available | Many are available |
+| Advanced index options (partial/expression/multi-column, etc.) | Not part of current baseline | Many are available | Many are available |
 
 DecentDB emphasizes predictable behavior, durability, and correctness testing rather than broad operational surface area.
