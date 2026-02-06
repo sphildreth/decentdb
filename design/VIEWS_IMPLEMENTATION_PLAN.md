@@ -24,6 +24,11 @@ This document is intentionally scoped to 0.x (pre-1.0) and focuses on non-materi
 4. Multi-schema authorization/security semantics (`SECURITY DEFINER`, etc.).
 5. Cost-based view rewrite/optimization beyond current rule-based planning.
 
+Notes:
+- SQLite supports making views effectively writable via `INSTEAD OF` triggers (i.e., DML against a view can be redirected to base tables).
+- DecentDB intentionally defers `INSTEAD OF` triggers (and therefore writable views) from the initial views release because it implies a full trigger subsystem and expands the SQL surface area substantially.
+- Demand signal for `INSTEAD OF` triggers will be gathered via target-workload schema/migration sampling (and optional public corpus sampling) before proposing follow-up work.
+
 ## 3. Baseline: SQLite and DuckDB View Capabilities
 The table below is based on local CLI verification (`sqlite3`, `duckdb`) and official engine documentation.
 
@@ -60,11 +65,22 @@ The table below is based on local CLI verification (`sqlite3`, `duckdb`) and off
 4. Replacement (`CREATE OR REPLACE`) is atomic within a transaction.
 5. Circular view references are rejected.
 6. Maximum view expansion depth is capped (default: 16) to prevent pathological plans.
-7. Column naming:
-   - If explicit column list exists, it is authoritative.
-   - Else derive from select-list aliases/column names.
+7. Column naming and shape validation:
+   - If an explicit column list exists, it is authoritative.
+   - If no explicit column list exists:
+     - Prefer select-list aliases.
+     - Else use the underlying column name when the select item is a bare column reference.
+     - Else assign a stable synthetic name `colN` (1-based) for unnamed expressions.
    - Reject mismatched explicit column counts with `ERR_SQL` and context `(view_name, expected_count, actual_count)`.
-8. `ALTER VIEW ... RENAME TO ...` updates the view identity and dependency graph atomically, with no change to defining SQL.
+   - Reject duplicate output column names (after resolution) with `ERR_SQL` and context `(view_name, column_name)`.
+8. View definition restrictions (0.x):
+   - View definitions must be pure `SELECT` statements.
+   - Parameters are not allowed in view definitions (reject with `ERR_SQL`).
+9. Namespace and name collisions:
+   - Tables and views share a single namespace; a view name must not collide with an existing table name (and vice versa).
+10. `ALTER VIEW ... RENAME TO ...` semantics (0.x):
+   - Rename is `RESTRICT`ed: it fails if any other view depends on the target view.
+   - If allowed, rename updates only the view's identity and dependency graph atomically, with no change to defining SQL.
 
 ### 4.4 SQL Dialect Clarification
 1. DecentDB view statements follow DecentDB's PostgreSQL-like SQL dialect (same as the rest of the engine SQL surface).
@@ -102,8 +118,8 @@ Add `ViewMeta` and in-memory map:
 
 0.x storage decision:
 - Dependencies are stored by canonical object name, not object ID.
-- `ALTER VIEW ... RENAME TO ...` must transactionally rewrite dependent-view name references.
-- Object-ID based dependency tracking is deferred post-1.0 unless required by broader rename features.
+- `ALTER VIEW ... RENAME TO ...` is `RESTRICT`ed when dependents exist (no dependent-view SQL rewriting in 0.x).
+- Object-ID based dependency tracking and/or dependent-view rewrite semantics are deferred post-1.0 unless required by broader rename features.
 
 Add catalog persistence record kind:
 - `kind = "view"` with fields for name/sql/columns/dependencies.
@@ -175,7 +191,9 @@ DecentDB will use stricter dependency semantics than SQLite/DuckDB in initial re
 1. `DROP TABLE` fails if dependent views exist (`RESTRICT` behavior).
 2. `DROP VIEW` fails if other views depend on it (unless `IF EXISTS` only suppresses missing-object errors, not dependency errors).
 3. `CREATE OR REPLACE VIEW` revalidates and rewrites dependency graph atomically.
-4. `ALTER VIEW ... RENAME TO ...` rewrites dependency names atomically.
+4. `ALTER VIEW ... RENAME TO ...` is `RESTRICT`ed if dependent views exist.
+5. `CREATE OR REPLACE VIEW` must not silently break dependents:
+   - If dependent views exist, the replace operation revalidates all transitive dependents against the new definition and fails the DDL if any dependent view would become invalid.
 
 Rationale:
 - Prevent silent schema drift and runtime surprises.
@@ -200,6 +218,9 @@ Add/extend tests for:
    - valid/invalid dependencies
    - cycle detection
    - column list validation
+   - synthetic column naming (`colN`) for unnamed expressions
+   - duplicate output column name rejection
+   - parameter rejection in view definitions
    - read-only DML rejection
 3. Catalog:
    - encode/decode/persist/reload for `ViewMeta`
@@ -207,7 +228,9 @@ Add/extend tests for:
 4. Planner:
    - view-expanded plans still choose indexes/trigram when eligible
 5. Engine DDL:
-   - rename conflict detection and dependency rewrite behavior
+   - rename conflict detection and dependency enforcement behavior
+   - `ALTER VIEW ... RENAME TO ...` `RESTRICT` behavior when dependent views exist
+   - `CREATE OR REPLACE VIEW` fails if it would invalidate dependent views
 6. Prepared statement behavior:
    - statement prepared before view shape change must re-prepare (or fail cleanly) on next execution
 
@@ -276,15 +299,19 @@ Acceptance:
    - Mitigation: ADR + compatibility tests + format decision documentation.
 4. Risk: Added branching affects non-view hot paths.
    - Mitigation: keep non-view fast path unchanged; benchmark gate.
+5. Risk: Name-based dependency tracking makes rename-with-dependents tricky to implement safely.
+   - Mitigation: 0.x restricts view rename when dependents exist; revisit with an ADR if/when object IDs or structured definitions are introduced.
 
 ## 13. ADR Checklist (Required Before Implementation)
 Create an ADR before coding to lock:
 1. Catalog record format for views (`kind="view"` payload schema).
 2. Compatibility/versioning policy for databases that include views.
 3. Dependency policy (`RESTRICT` semantics and cycle handling).
-4. AST/planner representation specification for derived view sources (bind-time expansion model).
-5. Bind-time expansion rules and node-budget/error behavior.
-6. ADR process compliance with `design/adr/README.md` (template, numbering, lifecycle).
+4. Rename semantics (including `RESTRICT` behavior) and whether dependency tracking is name-based or object-ID based.
+5. Output column naming and duplicate-name policy for view shapes.
+6. AST/planner representation specification for derived view sources (bind-time expansion model).
+7. Bind-time expansion rules and node-budget/error behavior.
+8. ADR process compliance with `design/adr/README.md` (template, numbering, lifecycle).
 
 ## 14. Deliverables
 1. `design/VIEWS_IMPLEMENTATION_PLAN.md` (this document)
