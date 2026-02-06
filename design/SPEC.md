@@ -32,7 +32,7 @@ Current scope (0.x, pre-1.0): single process, multi-threaded readers, single wri
 
 3. **wal/**
    - WAL file append and recovery
-   - Frame checksums, commit markers
+   - Frame trailer (checksum reserved; LSN derived from offsets in v6), commit markers
    - WAL index (in-memory map pageId -> latest frame offset for fast reads)
 
 4. **btree/**
@@ -117,6 +117,10 @@ See ADR-0016 for checksum calculation details.
 
 **Format version notes:**
 - v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
+- v5 removes per-frame WAL CRC32C validation (checksum field reserved, written as zero).
+- v6 removes per-frame WAL LSN trailer; LSNs are derived from frame end offsets.
+- v7 removes WAL `payload_size` field; payload sizes are derived from frame type and page size.
+- v8 adds a fixed WAL header with a logical end offset (`wal_end_offset`).
 - v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
 
 ### 3.4 Catalog record encoding (v2)
@@ -152,10 +156,28 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 Each frame appends:
 - `frame_type` (u8): 0=page, 1=commit, 2=checkpoint
 - `page_id` (u32, valid for page frames)
-- `payload_size` (u32)
 - payload (page image or commit metadata)
-- `frame_checksum` (u64, CRC-32C of header + payload)
-- `lsn` (u64 monotonically increasing)
+- `frame_checksum` (u64, **reserved**, written as 0 in format v5)
+
+**LSN (format v6):**
+- LSNs are derived from WAL byte offsets (frame end offset).
+- `wal_end_lsn` is the WAL end offset after the last committed frame.
+
+**WAL Header (format v8):**
+- Fixed 32-byte header at file offset 0:
+  - `magic` (8 bytes): `"DDBWAL01"`
+  - `header_version` (u32): `1`
+  - `page_size` (u32)
+  - `wal_end_offset` (u64): logical end offset of the last committed frame (0 if none)
+  - `reserved` (u64): 0
+- WAL frames start at offset `WalHeaderSize` (32 bytes).
+- Recovery scans only up to `wal_end_offset` (not physical file size).
+- Checkpoint truncation reduces WAL to header-only and resets `wal_end_offset` to 0.
+
+**Payload size (format v7):**
+- PAGE frames: `pageSize`
+- COMMIT frames: 0 bytes
+- CHECKPOINT frames: 8 bytes (`checkpoint_lsn`)
 
 **Frame Types:**
 - **PAGE (0)**: Contains modified page data
@@ -172,9 +194,10 @@ Commit rule:
 - A transaction is committed when a COMMIT frame is durably written.
 - Default durability: `fsync(wal)` on commit.
 
-**Torn Write Detection:**
+**Torn Write Detection (format v5):**
 - Frame header includes `payload_size` for validation
-- Recovery ignores incomplete frames (checksum mismatch or size truncation)
+- Recovery ignores incomplete frames (short reads / size truncation)
+- Frame type and basic invariants are validated (e.g., page_id != 0 for page frames)
 
 ### 4.2 Snapshot reads
 On read transaction start:
@@ -202,7 +225,7 @@ Checkpointed pages are copied to the main database file.
    - If no readers, `safe_truncate_lsn = last_commit_lsn`.
 4. Write CHECKPOINT frame to WAL.
 5. **Conditionally Truncate:**
-   - If `safe_truncate_lsn` allows, truncate the WAL file.
+   - If `safe_truncate_lsn` allows, truncate the WAL file to header-only.
    - If readers are blocking truncation, the WAL remains large until the next checkpoint opportunistically truncates it.
 6. Clear `checkpoint_pending` flag.
 
@@ -235,7 +258,7 @@ See ADR-0017 for detailed design.
 ### 4.5 Crash recovery
 On open:
 - scan WAL from last checkpoint
-- validate frame checksums
+- validate frame invariants (type, payload_size, lsn)
 - apply frames up to last commit boundary into walIndex view
 - DB becomes readable immediately using WAL overlay
 - optional: perform checkpoint soon after open
@@ -497,7 +520,7 @@ Not planned for 0.x. If pursued:
 ### 13.1 Error codes
 Define error categories:
 - `ERR_IO`: File I/O errors (disk full, permissions, corruption)
-- `ERR_CORRUPTION`: Database corruption detected (checksum mismatch)
+- `ERR_CORRUPTION`: Database corruption detected (invalid frame/header, checksum mismatch when applicable)
 - `ERR_CONSTRAINT`: Constraint violation (FK, unique, NOT NULL)
 - `ERR_TRANSACTION`: Transaction errors (deadlock, timeout)
 - `ERR_SQL`: SQL syntax or semantic errors
@@ -514,7 +537,7 @@ Define error categories:
 ### 13.3 Error messages
 - Include error code, human-readable message, and context
 - For constraint violations: include table/column and violating value
-- For corruption: include page ID and expected vs actual checksum
+- For corruption: include page ID and invariant details (checksum mismatch when applicable)
 
 ---
 

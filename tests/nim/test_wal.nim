@@ -3,9 +3,12 @@ import os
 import times
 import locks
 import tables
+import atomics
 import engine
 import pager/pager
+import pager/db_header
 import wal/wal
+import vfs/types
 
 proc makeTempDb(name: string): string =
   let normalizedName =
@@ -142,6 +145,50 @@ suite "WAL":
     discard closePager(pager)
     discard closeDb(db)
 
+  test "wal header stores logical end offset":
+    let path = makeTempDb("decentdb_wal_header.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    discard recover(wal)
+
+    var header = newSeq[byte](WalHeaderSize)
+    let headerRead = read(wal.vfs, wal.file, 0, header)
+    check headerRead.ok
+    check headerRead.value == WalHeaderSize
+    var magic = newString(8)
+    for i in 0 ..< 8:
+      magic[i] = char(header[i])
+    check magic == "DDBWAL01"
+    check readU64LE(header, 16) == 0
+
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+    var data = newSeq[byte](pager.pageSize)
+    for i in 0 ..< data.len:
+      data[i] = 3
+    let writerRes = beginWrite(wal)
+    check writerRes.ok
+    let writer = writerRes.value
+    check writer.writePage(pageId, data).ok
+    let commitRes = commit(writer)
+    check commitRes.ok
+
+    let headerRead2 = read(wal.vfs, wal.file, 0, header)
+    check headerRead2.ok
+    let walEnd = readU64LE(header, 16)
+    check walEnd >= uint64(WalHeaderSize)
+    check walEnd == wal.walEnd.load(moAcquire)
+    discard closePager(pager)
+    discard closeDb(db)
+
   test "checkpoint truncates WAL when no readers":
     let path = makeTempDb("decentdb_wal_checkpoint.db")
     let dbRes = openDb(path)
@@ -168,7 +215,7 @@ suite "WAL":
     let ckRes = checkpoint(wal, pager)
     check ckRes.ok
     let info = getFileInfo(path & ".wal")
-    check info.size == 0
+    check info.size == WalHeaderSize
     let readRes = readPage(pager, pageId)
     check readRes.ok
     check readRes.value == dataStr
@@ -401,7 +448,7 @@ suite "WAL":
     let ckRes = checkpoint(wal, pager)
     check ckRes.ok
     let info = getFileInfo(path & ".wal")
-    check info.size == 0
+    check info.size == WalHeaderSize
     check wal.isAborted(snap)
     wal.endRead(snap)
     discard closePager(pager)
@@ -464,9 +511,9 @@ suite "WAL":
     # Verify the long reader was aborted
     check wal.isAborted(longReader)
     
-    # Verify WAL was truncated (size should be 0 after the last checkpoint)
+    # Verify WAL was truncated (header-only after the last checkpoint)
     let finalInfo = getFileInfo(path & ".wal")
-    check finalInfo.size == 0
+    check finalInfo.size == WalHeaderSize
     
     wal.endRead(longReader)
     discard closePager(pager)

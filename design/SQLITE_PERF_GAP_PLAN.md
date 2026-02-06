@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.113082ms (after optimizations)
-- SQLite p95 commit latency: ~0.010159ms
-- **Gap:** ~11.5x slower
+- DecentDB p95 commit latency: ~0.07395ms (after optimizations)
+- SQLite p95 commit latency: ~0.00955ms
+- **Gap:** ~7.74x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
@@ -45,18 +45,16 @@ This plan targets **commit latency** specifically, but changes must not “win�
 ```
 [1 byte]   Frame type (wfPage = 0x01, wfCommit = 0x02, wfCheckpoint = 0x03)
 [4 bytes]  Page ID (uint32)
-[4 bytes]  Payload length (uint32) 
 [N bytes]  Page data (typically 4096 bytes)
-[8 bytes]  Checksum (CRC32C as uint64)
-[8 bytes]  LSN (uint64)
+[8 bytes]  Checksum (reserved, zero in v5+)
 ────────────────────────────
-Total overhead per frame: 25 bytes
+Total overhead per frame: 13 bytes
 ```
 
 **For a single-page commit (typical UPDATE):**
-- Bytes written: 25 (frame) + 25 (commit frame) = 50 bytes overhead
-- Plus 4096 bytes of actual page data = 4146 bytes total
-- CRC32C calculated on ~4097 bytes of frame data
+- Bytes written: 13 (frame) + 13 (commit frame) = 26 bytes overhead
+- Plus 4096 bytes of actual page data = 4122 bytes total
+- No per-frame CRC32C in v6 (checksum field reserved)
 
 ### SQLite Approach
 
@@ -71,9 +69,9 @@ Total overhead per frame: ~4-8 bytes
 
 **Key Differences:**
 1. **No frame type field**: SQLite infers frame type from position/context
-2. **No length field**: Page size is known from database header
-3. **No per-frame LSN**: LSN is implicit from WAL header + frame position
-4. **No per-frame CRC32C**: SQLite uses:
+2. **No length field (DecentDB v7 matches)**: Page size is known from database header
+3. **No per-frame LSN (DecentDB v6 matches)**: LSN is implicit from WAL header + frame position
+4. **No per-frame CRC32C (DecentDB v5+ matches)**: SQLite uses:
    - 32-bit salt in WAL header for each transaction
    - Per-transaction checksum (not per-page)
    - OS-level write guarantees (power loss is the main concern)
@@ -846,3 +844,334 @@ To match SQLite exactly (0.010ms), would also need:
 7. **Per-thread WAL buffers** [HIGH effort]
 
 **Conclusion**: Getting to 2× SQLite performance is achievable with medium effort (weeks). Getting to parity requires significant architectural changes (months) that sacrifice some of DecentDB's safety guarantees.
+
+---
+
+## Progress (2026-02-05)
+
+**Baseline (run_id: 20260205_174417)**  
+DecentDB vs SQLite (commit latency gap: **14.61×**)
+
+| Metric | DecentDB | SQLite |
+|---|---:|---:|
+| commit_p95_ms | 0.127369 | 0.008716 |
+| read_p95_ms | 0.001252 | 0.001854 |
+| join_p95_ms | 0.493286 | 0.371568 |
+| insert_rows_per_sec | 200,964.63 | 121,787.85 |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.045056 |
+
+### 1) Pre-size WAL frameBuffer (Section 2: Memory Copying and Buffer Allocation)
+**Change:** Pre-size `wal.frameBuffer` per commit based on pending frames to avoid incremental growth during encoding.  
+**Bench (run_id: 20260205_185403)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.127369 | 0.1127165 | **Improved** (~11.5%) |
+| read_p95_ms | 0.001252 | 0.001197 | Improved |
+| join_p95_ms | 0.493286 | 0.497524 | +0.86% (within noise) |
+| insert_rows_per_sec | 200,964.63 | 195,020.60 | -2.95% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009798 → gap **11.50×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next low-risk item: direct string-to-frame encoding (avoid string→seq copy).
+
+### 2) Direct string-to-frame encoding (Section 2: Memory Copying and Buffer Allocation)
+**Change:** Store pending pages as strings and encode directly into WAL frames to avoid string→seq allocation.  
+**Bench (run_id: 20260205_190231)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.1127165 | 0.1111285 | **Improved** (~1.4%) |
+| read_p95_ms | 0.001197 | 0.0011825 | Improved |
+| join_p95_ms | 0.497524 | 0.496702 | Improved |
+| insert_rows_per_sec | 195,020.60 | 199,036.46 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009117 → gap **12.19×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next low-risk item: release WAL lock before fsync (careful with commit window).
+
+### 3) Faster CRC32C (slicing-by-8) (Section 1: WAL Frame Format Overhead)
+**Change:** Replace byte-at-a-time CRC32C with slicing-by-8 table implementation (same polynomial/semantics).  
+**Bench (run_id: 20260205_191231)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.1111285 | 0.09579 | **Improved** (~13.8%) |
+| read_p95_ms | 0.0011825 | 0.001177 | Improved |
+| join_p95_ms | 0.496702 | 0.4711145 | Improved |
+| insert_rows_per_sec | 199,036.46 | 196,183.58 | -1.43% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009508 → gap **10.07×**  
+**Correctness/Durability:** CRC32C semantics preserved; added slow-vs-fast test for parity.  
+**Follow-ups:** Next medium effort: release lock before fsync (ADR required) or CRC32C removal (ADR required).
+
+### Rejected: Single-page direct WAL write via `writev`
+**Change:** Added streaming CRC + `writev` path for single-page commits to avoid copying payload into `frameBuffer`.  
+**Bench (run_id: 20260205_192133)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.09579 | 0.0968015 | **Regressed** (~1.1%) |
+| read_p95_ms | 0.001177 | 0.0011825 | Flat |
+| join_p95_ms | 0.4711145 | 0.473148 | Flat |
+| insert_rows_per_sec | 196,183.58 | 200,588.67 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** Possible syscall overhead from `writev` path offset the copy savings in this workload.
+
+### 4) Remove per-frame WAL CRC32C (format v5) (Section 1: WAL Frame Format Overhead)
+**Change:** Stop computing/validating per-frame CRC32C. The checksum field is now reserved and written as zero in format v5.  
+**Bench (run_id: 20260205_192941)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.09579 | 0.082635 | **Improved** (~13.7%) |
+| read_p95_ms | 0.001177 | 0.001187 | +0.85% (within noise) |
+| join_p95_ms | 0.4711145 | 0.4578895 | Improved |
+| insert_rows_per_sec | 196,183.58 | 195,730.08 | -0.23% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.008917 → gap **9.27×**  
+**Correctness/Durability:** Per-frame corruption detection removed; recovery now validates frame invariants only. WAL format version bumped to v5 (new DBs only).  
+**Follow-ups:** Next medium effort: remove per-frame LSN trailer (ADR required) or release wal lock before fsync (ADR required).
+
+### 5) Remove per-frame WAL LSN trailer (format v6) (Section 1: WAL Frame Format Overhead)
+**Change:** Remove LSN from frame trailer; LSNs are derived from WAL byte offsets (frame end offset).  
+**Bench (run_id: 20260205_193932)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.082635 | 0.0794645 | **Improved** (~3.8%) |
+| read_p95_ms | 0.001187 | 0.0011725 | Improved |
+| join_p95_ms | 0.4578895 | 0.44195 | Improved |
+| insert_rows_per_sec | 195,730.08 | 201,869.72 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009408 → gap **8.45×**  
+**Correctness/Durability:** LSNs now derived from WAL byte offsets; WAL format version bumped to v6 (new DBs only).  
+**Follow-ups:** Next medium effort: simplify frame header (remove payload length / frame type) or unify page representation for zero-copy WAL writes (ADR required).
+
+### 6) Single-page pending fast path (Section 2: Memory Copying and Buffer Allocation)
+**Change:** Avoid allocating the pending queue for single-page commits by storing the first pending page inline.  
+**Bench (run_id: 20260205_194416)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0794645 | 0.0790035 | **Improved** (~0.6%) |
+| read_p95_ms | 0.0011725 | 0.001172 | Flat |
+| join_p95_ms | 0.44195 | 0.4491985 | +1.6% (within noise) |
+| insert_rows_per_sec | 201,869.72 | 201,193.70 | -0.3% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009799 → gap **8.06×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next medium effort: simplify frame header (remove payload length / frame type) or unify page representation for zero-copy WAL writes (ADR required).
+
+### 7) Remove WAL payload length field (format v7) (Section 1: WAL Frame Format Overhead)
+**Change:** Remove `payload_length` from frame headers; payload sizes are derived from frame type and page size.  
+**Bench (run_id: 20260205_195032)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0790035 | 0.078693 | **Improved** (~0.4%) |
+| read_p95_ms | 0.001172 | 0.001177 | +0.4% (within noise) |
+| join_p95_ms | 0.4491985 | 0.4447445 | Improved |
+| insert_rows_per_sec | 201,193.70 | 200,154.99 | -0.5% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009808 → gap **8.02×**  
+**Correctness/Durability:** WAL format version bumped to v7; payload size derived from frame type and page size.  
+**Follow-ups:** Next medium effort: remove frame type field (infer from position) or unify page representation for zero-copy WAL writes (ADR required).
+
+### Rejected: Remove WAL frame type field (format v8)
+**Change:** Infer frame type from page_id sentinel values to drop the explicit frame_type byte.  
+**Bench (run_id: 20260205_195622)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.078693 | 0.0792585 | **Regressed** (~0.7%) |
+| read_p95_ms | 0.001177 | 0.001172 | Improved |
+| join_p95_ms | 0.4447445 | 0.445491 | Flat |
+| insert_rows_per_sec | 200,154.99 | 194,412.84 | -2.9% (likely noise, but commit regressed) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The header byte reduction did not offset the additional branching in this workload.
+
+### Rejected: Reuse WAL pageMeta buffer (commit allocation)
+**Change:** Reuse a WAL-level `pageMeta` buffer to avoid per-commit allocations.  
+**Bench (run_id: 20260205_200412)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.078693 | 0.0795445 | **Regressed** (~1.1%) |
+| read_p95_ms | 0.001177 | 0.0011725 | Improved |
+| join_p95_ms | 0.4447445 | 0.437396 | Improved |
+| insert_rows_per_sec | 200,154.99 | 197,863.71 | -1.1% (within noise, but commit regressed) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** Allocation reuse did not translate into lower p95 latency in this workload.
+
+### Rejected: Zero-copy WAL writev path (single-page commit)
+**Change:** Attempted to avoid copying page payload into frameBuffer by writing header + payload + trailer via `writev`-style slices.  
+**Bench (run_id: 20260205_215248)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.079329 | **Regressed** (~0.8%) |
+| read_p95_ms | 0.001182 | 0.0013225 | **Regressed** (~11.9%) |
+| join_p95_ms | 0.447451 | 0.448642 | +0.3% (within noise) |
+| insert_rows_per_sec | 198,258.17 | 197,726.38 | -0.3% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009739 → gap **8.15×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The slice-based write path increased overhead in this workload.
+
+### Rejected: Linux `sync_file_range` preflush (WAL write path)
+**Change:** Attempted best-effort `sync_file_range(..., SYNC_FILE_RANGE_WRITE)` after WAL append to overlap flush with fsync.  
+**Bench (run_id: 20260205_220612)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.0823095 | **Regressed** (~4.6%) |
+| read_p95_ms | 0.001182 | 0.0011975 | +1.3% (within noise) |
+| join_p95_ms | 0.447451 | 0.4472595 | Flat |
+| insert_rows_per_sec | 198,258.17 | 195,880.78 | -1.2% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009668 → gap **8.51×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** Preflush did not reduce fsync latency on this system; added overhead outweighed benefits.
+
+### Rejected: Release WAL lock before fsync
+**Change:** Publish WAL index before fsync and release `wal.lock` to overlap fsync with other writers.  
+**Bench (run_id: 20260205_222821)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.0806015 | **Regressed** (~2.4%) |
+| read_p95_ms | 0.001182 | 0.001197 | +1.3% (within noise) |
+| join_p95_ms | 0.447451 | 0.444224 | Improved |
+| insert_rows_per_sec | 198,258.17 | 198,198.80 | Flat |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009447 → gap **8.53×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** No benefit in single-threaded commit benchmark; extra bookkeeping likely dominates.
+
+### 8) Prepared UPDATE fast path for INT64 PK (Executor)
+**Change:** Detect `WHERE pk = $param|literal` and bypass planner/rowid scan for a direct single-row lookup/update.  
+**Bench (run_id: 20260205_211350)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.078693 | 0.0786825 | Improved (within noise) |
+| read_p95_ms | 0.001177 | 0.001182 | +0.4% (within noise) |
+| join_p95_ms | 0.4447445 | 0.447451 | +0.6% (within noise) |
+| insert_rows_per_sec | 200,154.99 | 198,258.17 | -0.95% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009227 → gap **8.53×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next high-ROI remains OS-level sync optimizations or zero-copy page cache.
+
+### 9) Skip old-row read when no secondary indexes (Storage update path)
+**Change:** In `updateRow`, avoid `readRowAt` + index maintenance when the table has no secondary/trigram indexes.  
+**Bench (run_id: 20260205_231025)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0786825 | 0.075632 | **Improved** (~3.9%) |
+| read_p95_ms | 0.001182 | 0.0012075 | +2.16% (within noise) |
+| join_p95_ms | 0.447451 | 0.4497395 | +0.51% (within noise) |
+| insert_rows_per_sec | 198,258.17 | 197,962.03 | -0.15% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009588 → gap **7.89×**  
+**Correctness/Durability:** No changes to WAL semantics or recovery.  
+**Follow-ups:** Next high-ROI remains zero-copy page cache / mmap WAL or OS-level sync optimizations (if any).
+
+### Rejected: Cache qualified column names for UPDATE fast path (Executor)
+**Change:** Cache fully-qualified column names per table to avoid per-update allocations in `tryFastPkUpdate`.  
+**Bench (run_id: 20260205_234443)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.0762835 | **Regressed** (~0.86%) |
+| read_p95_ms | 0.0012075 | 0.0011975 | Improved |
+| join_p95_ms | 0.4497395 | 0.457233 | +1.7% (within noise) |
+| insert_rows_per_sec | 197,962.03 | 195,937.41 | -1.0% (within noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009919 → gap **7.69×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The cache lookup/management overhead outweighed the avoided per-update string building in this workload.
+
+### Meta: ADR 0067 WAL mmap write path (no code change)
+**Change:** Added ADR documenting the mmap-backed WAL write path decision.  
+**Bench (run_id: 20260205_235412)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.0748005 | Improved (run-to-run noise; no code change) |
+| read_p95_ms | 0.0012075 | 0.0012225 | +1.2% (noise) |
+| join_p95_ms | 0.4497395 | 0.4669415 | +3.8% (noise) |
+| insert_rows_per_sec | 197,962.03 | 193,957.51 | -2.0% (noise) |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.01024 → gap **7.30×**  
+**Correctness/Durability:** No code change; documentation only.  
+
+### Rejected: mmap-backed WAL write path (zero-copy frame encoding)
+**Change:** Add optional mmap-backed WAL write path and encode frames directly into the mapped region (fallback to `vfs.write`).  
+**Bench (run_id: 20260206_000651)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.0763885 | **Regressed** (~1.0%) |
+| read_p95_ms | 0.0012075 | 0.0011875 | Improved |
+| join_p95_ms | 0.4497395 | 0.445741 | Improved |
+| insert_rows_per_sec | 197,962.03 | 198,576.00 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009448 → gap **8.09×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** mmap path introduced extra overhead (mapping/truncate) without improving p95 in this workload; revisit only with a WAL header/end-offset strategy that avoids per-commit truncation.
+
+### 10) WAL header + logical end offset (format v8) with mmap preallocation
+**Change:** Add a fixed WAL header with `wal_end_offset`, preallocate/mmap WAL to avoid per-commit truncation, and truncate to header-only on checkpoints. Format version bumped to v8 (ADR-0068).  
+**Bench (run_id: 20260206_002601)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.075632 | 0.074234 | **Improved** (~1.8%) |
+| read_p95_ms | 0.0012075 | 0.001177 | Improved |
+| join_p95_ms | 0.4497395 | 0.4415085 | Improved |
+| insert_rows_per_sec | 197,962.03 | 201,193.70 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009298 → gap **7.98×**  
+**Correctness/Durability:** WAL header stored/updated before fsync; recovery bounded by `wal_end_offset`; checkpoint truncation leaves header-only WAL. Format v8 (new DBs only).  
+**Follow-ups:** Evaluate further mmap fast-path tuning or OS-level sync optimizations only if commit p95 regresses in future runs.
+
+### Rejected: Dirty-page set snapshot (Pager)
+**Change:** Track dirty page IDs and snapshot only those instead of scanning the full cache each commit.  
+**Bench (run_id: 20260206_010015)**  
+
+| Metric | Before | After | Notes |
+|---|---:|---:|---|
+| commit_p95_ms | 0.0739485 | 0.074325 | **Regressed** (~0.5%) |
+| read_p95_ms | 0.001177 | 0.0011875 | +0.9% (noise) |
+| join_p95_ms | 0.506416 | 0.4615915 | Improved |
+| insert_rows_per_sec | 197,942.35 | 198,100.01 | Improved |
+| db_size_mb (bytes/1e6) | 0.086016 | 0.086016 | Unchanged |
+
+**SQLite reference (same run):** commit_p95_ms = 0.009858 → gap **7.54×**  
+**Decision:** Reverted due to commit latency regression (primary metric).  
+**Notes:** The dirty-set bookkeeping overhead outweighed the cache-scan savings for this workload; revisit only if dirty density or cache size changes materially.

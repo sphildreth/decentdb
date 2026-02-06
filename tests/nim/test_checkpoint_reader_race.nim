@@ -81,7 +81,7 @@ suite "Checkpoint Reader Race":
 
     # With no active readers and no new commits during the checkpoint, truncation is allowed.
     require db.wal.checkpoint(db.pager).ok
-    check getFileInfo(walPath).size == 0
+    check getFileInfo(walPath).size == WalHeaderSize
 
     let currentRes = db.execSql("SELECT val FROM foo WHERE id = 1")
     require currentRes.ok

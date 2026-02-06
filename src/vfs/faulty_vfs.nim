@@ -85,6 +85,9 @@ method open*(fv: FaultyVfs, path: string, mode: FileMode, create: bool): Result[
     fv.record(foOpen, action.label, action, 0, 0, res.err.code)
   res
 
+method supportsMmap*(fv: FaultyVfs): bool =
+  false
+
 method read*(fv: FaultyVfs, file: VfsFile, offset: int64, buf: var openArray[byte]): Result[int] =
   let action = fv.nextAction(foRead, buf.len)
   if action.kind == faError:
@@ -188,3 +191,9 @@ method close*(fv: FaultyVfs, file: VfsFile): Result[Void] =
   else:
     fv.record(foClose, action.label, action, 0, 0, res.err.code)
   res
+
+method mapWritable*(fv: FaultyVfs, file: VfsFile, length: int64): Result[MmapRegion] =
+  err[MmapRegion](ERR_INTERNAL, "mmap disabled in FaultyVfs", file.path)
+
+method unmap*(fv: FaultyVfs, region: MmapRegion): Result[Void] =
+  err[Void](ERR_INTERNAL, "munmap disabled in FaultyVfs", "")

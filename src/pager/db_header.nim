@@ -6,7 +6,7 @@ const
   HeaderSize* = 128
   MagicBytes* = "DECENTDB"
   MagicPadded* = MagicBytes & repeat('\0', 16 - MagicBytes.len)
-  FormatVersion* = 4'u32
+  FormatVersion* = 8'u32
   DefaultPageSize* = 4096'u32
 
 type DbHeader* = object
@@ -83,9 +83,9 @@ proc readU64LE*(buf: string, offset: int): uint64 =
     (uint64(byte(buf[offset + 6])) shl 48) or
     (uint64(byte(buf[offset + 7])) shl 56)
 
-proc crc32cTable(): array[256, uint32] =
+proc crc32cTables(): array[8, array[256, uint32]] =
   const Poly = 0x82F63B78'u32
-  var table: array[256, uint32]
+  var tables: array[8, array[256, uint32]]
   for i in 0 .. 255:
     var crc = uint32(i)
     for _ in 0 .. 7:
@@ -93,25 +93,59 @@ proc crc32cTable(): array[256, uint32] =
         crc = (crc shr 1) xor Poly
       else:
         crc = crc shr 1
-    table[i] = crc
-  table
+    tables[0][i] = crc
+  for i in 0 .. 255:
+    var crc = tables[0][i]
+    for j in 1 .. 7:
+      crc = (crc shr 8) xor tables[0][int(crc and 0xFF'u32)]
+      tables[j][i] = crc
+  tables
 
-let Crc32cTable = crc32cTable()
+let Crc32cTables = crc32cTables()
 
 proc crc32c*(data: openArray[byte]): uint32 =
-  var current = 0xFFFFFFFF'u32
-  for b in data:
-    let idx = (current xor uint32(b)) and 0xFF'u32
-    current = (current shr 8) xor Crc32cTable[int(idx)]
-  current xor 0xFFFFFFFF'u32
+  var crc = 0xFFFFFFFF'u32
+  var i = 0
+  let n = data.len
+  while i + 8 <= n:
+    crc = crc xor readU32LE(data, i)
+    crc =
+      Crc32cTables[7][int(crc and 0xFF'u32)] xor
+      Crc32cTables[6][int((crc shr 8) and 0xFF'u32)] xor
+      Crc32cTables[5][int((crc shr 16) and 0xFF'u32)] xor
+      Crc32cTables[4][int((crc shr 24) and 0xFF'u32)] xor
+      Crc32cTables[3][int(data[i + 4])] xor
+      Crc32cTables[2][int(data[i + 5])] xor
+      Crc32cTables[1][int(data[i + 6])] xor
+      Crc32cTables[0][int(data[i + 7])]
+    i += 8
+  while i < n:
+    let idx = (crc xor uint32(data[i])) and 0xFF'u32
+    crc = (crc shr 8) xor Crc32cTables[0][int(idx)]
+    i.inc
+  crc xor 0xFFFFFFFF'u32
 
 proc crc32c*(data: string): uint32 =
-  var current = 0xFFFFFFFF'u32
-  for ch in data:
-    let b = uint32(byte(ch))
-    let idx = (current xor b) and 0xFF'u32
-    current = (current shr 8) xor Crc32cTable[int(idx)]
-  current xor 0xFFFFFFFF'u32
+  var crc = 0xFFFFFFFF'u32
+  var i = 0
+  let n = data.len
+  while i + 8 <= n:
+    crc = crc xor readU32LE(data, i)
+    crc =
+      Crc32cTables[7][int(crc and 0xFF'u32)] xor
+      Crc32cTables[6][int((crc shr 8) and 0xFF'u32)] xor
+      Crc32cTables[5][int((crc shr 16) and 0xFF'u32)] xor
+      Crc32cTables[4][int((crc shr 24) and 0xFF'u32)] xor
+      Crc32cTables[3][int(byte(data[i + 4]))] xor
+      Crc32cTables[2][int(byte(data[i + 5]))] xor
+      Crc32cTables[1][int(byte(data[i + 6]))] xor
+      Crc32cTables[0][int(byte(data[i + 7]))]
+    i += 8
+  while i < n:
+    let idx = (crc xor uint32(byte(data[i]))) and 0xFF'u32
+    crc = (crc shr 8) xor Crc32cTables[0][int(idx)]
+    i.inc
+  crc xor 0xFFFFFFFF'u32
 
 proc computeHeaderChecksum(buf: openArray[byte]): uint32 =
   var combined = newSeq[byte](24 + (HeaderSize - 28))
