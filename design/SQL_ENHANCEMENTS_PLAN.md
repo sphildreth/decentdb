@@ -39,6 +39,8 @@ Rationale:
 The ordering is optimized for application value per complexity, and for minimizing cross-cutting rework.
 
 ### 5.1 Richer expression language and built-ins (**Must-have**)
+*Note: Parser choice is settled (ADR-0035 libpg_query); "parser" work below refers to AST mapping and validation.*
+
 Scope (deliver in slices):
 1. **NULL semantics & predicates**
    - `IS NULL`, `IS NOT NULL`
@@ -109,7 +111,7 @@ Tests:
 
 ### 5.6 Advanced index options (multi-column / partial / expression indexes)
 Scope:
-- Multi-column indexes first.
+- Multi-column indexes first (ADR-0069 Accepted; note: hash-based, no range scans).
 - Partial indexes next (requires predicate semantics ADR).
 - Expression indexes last (type system + expression stability prerequisite).
 
@@ -118,8 +120,22 @@ Tests:
 - Differential where feasible.
 
 ### 5.7 Broader ALTER TABLE
-Scope:
-- Expand ALTER TABLE operations in a controlled sequence.
+Scope (implement in order):
+1. **ADD COLUMN**
+   - `ALTER TABLE t ADD COLUMN col type [DEFAULT ...] [NOT NULL?]`
+   - Start with the safest subset: nullable columns with no DEFAULT expression evaluation.
+2. **RENAME COLUMN**
+   - `ALTER TABLE t RENAME COLUMN old TO new`
+   - Catalog-only change, but must be dependency-safe (indexes, constraints, views, prepared statements).
+3. **DROP COLUMN**
+   - `ALTER TABLE t DROP COLUMN col`
+   - Often implies a table rewrite/row format change depending on storage layout; treat as format/durability sensitive.
+4. **ALTER COLUMN TYPE**
+   - `ALTER TABLE t ALTER COLUMN col TYPE newType`
+   - Potential data rewrite + conversion semantics; requires a clearly specified conversion matrix and failure behavior.
+
+Notes:
+- Each operation has different catalog, rewrite, and durability implications. Prefer shipping each as a standalone slice with its own ADR, tests, and crash coverage.
 
 Gating:
 - Often touches catalog + possibly data rewrite/migration; ADR required.
@@ -146,29 +162,17 @@ These are commonly expected for usability, but should not compromise core guaran
 1. **Introspection and settings**
    - Catalog-like queries, schema introspection commands, minimal settings surface.
 2. **Explain and profiling tooling**
-   - `EXPLAIN` (plan structure), and optional profiling hooks.
+   - `EXPLAIN` (plan structure) (ADR-0050 Accepted), and optional profiling hooks.
 3. **Loadable extension ecosystem**
    - This is the largest design commitment.
    - Requires an ADR defining API/ABI stability expectations, sandboxing, and durability/correctness constraints.
    - If pursued pre-1.0, it must be deliberately minimal and safe.
 
-## 6. Work breakdown into milestones (suggested)
-Milestones are intended to be independently shippable.
-
-- **M1 (Expressions Core):** NULL predicates + `COALESCE/NULLIF` + operator precedence + minimal string funcs.
-- **M2 (Expressions Advanced):** `CASE`, `CAST` (narrow), `BETWEEN`, `IN` (non-subquery).
-- **M3 (CTEs):** non-recursive `WITH`.
-- **M4 (Set Ops):** `UNION ALL`, then `UNION`.
-- **M5 (UPSERT/RETURNING):** `ON CONFLICT DO NOTHING` + minimal `RETURNING`.
-- **M6 (Constraints):** `CHECK`.
-- **M7 (Indexes):** multi-column indexes.
-- **M8+:** ALTER TABLE expansion, triggers, window functions, operational tooling, extensions.
-
-## 7. Documentation updates policy
+## 6. Documentation updates policy
 - User-facing docs should only claim support once an item meets Section 3.
 - The comparison page should link to this document for the roadmap rather than listing every not-yet-implemented detail inline.
 
-## 8. Open questions (require ADRs before implementation)
+## 7. Open questions (require ADRs before implementation)
 - Exact NULL truth tables and comparison semantics.
 - Type coercion rules and `CAST` failure behavior.
 - DISTINCT semantics (`UNION`, `SELECT DISTINCT`, `COUNT(DISTINCT ...)` if/when added).
