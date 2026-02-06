@@ -51,3 +51,34 @@ with engine.connect() as conn:
 ## Concurrency model
 
 DecentDB is currently optimized for a single process with **one writer** and **many concurrent readers** under snapshot isolation.
+
+## Import Tools
+
+The Python bindings include two command-line tools for importing data from other databases:
+
+### SQLite Import (`decentdb-sqlite-import`)
+
+Convert SQLite databases to DecentDB format.
+
+```bash
+decentdb-sqlite-import source.db output.ddb [--overwrite] [--no-progress]
+```
+
+### PostgreSQL Import (`decentdb-pgbak-import`)
+
+Import PostgreSQL dump files (plain SQL or gzipped) into DecentDB.
+
+```bash
+# Basic usage
+decentdb-pgbak-import dump.sql.gz output.ddb
+
+# With all options
+decentdb-pgbak-import dump.sql output.ddb \
+  --overwrite \
+  --no-progress \
+  --preserve-case \
+  --report-json conversion.json \
+  --commit-every 10000
+```
+
+See the [Import Tools Guide](../development/import-tools.md) for detailed documentation.

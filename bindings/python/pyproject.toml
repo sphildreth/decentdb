@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 decentdb-sqlite-import = "decentdb.tools.sqlite_import:main"
+decentdb-pgbak-import = "decentdb.tools.pgbak_import:main"
 
 [project.entry-points."sqlalchemy.dialects"]
 decentdb = "decentdb_sqlalchemy.dialect:DecentDbDialect"

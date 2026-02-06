@@ -1,4 +1,5 @@
 [console_scripts]
+decentdb-pgbak-import = decentdb.tools.pgbak_import:main
 decentdb-sqlite-import = decentdb.tools.sqlite_import:main
 
 [sqlalchemy.dialects]

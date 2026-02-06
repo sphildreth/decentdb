@@ -9,11 +9,13 @@ decentdb.egg-info/entry_points.txt
 decentdb.egg-info/requires.txt
 decentdb.egg-info/top_level.txt
 decentdb/tools/__init__.py
+decentdb/tools/pgbak_import.py
 decentdb/tools/sqlite_import.py
 decentdb_sqlalchemy/__init__.py
 decentdb_sqlalchemy/dialect.py
 tests/test_basic.py
 tests/test_cache.py
+tests/test_pgbak_import.py
 tests/test_relationships.py
 tests/test_sqlalchemy.py
 tests/test_sqlite_import.py

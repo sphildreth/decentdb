@@ -36,6 +36,7 @@ nav:
   - Development:
     - Building from Source: development/building.md
     - Testing: development/testing.md
+    - Import Tools: development/import-tools.md
     - SQLite Import Notes: development/sqlite-import-notes.md
     - Contributing: development/contributing.md
   - Design Documents:
