@@ -5,6 +5,17 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Data Types**:
+  - `UUID` type with `GEN_RANDOM_UUID()`, `UUID_PARSE()`, and `UUID_TO_STRING()` functions.
+  - `DECIMAL(p,s)` / `NUMERIC(p,s)` type for exact fixed-point arithmetic.
+- **SQL Features**:
+  - `CAST` support for `UUID` and `DECIMAL`.
+  - Common Table Expressions (CTEs) - Non-recursive `WITH` clauses.
+  - Window Functions - `ROW_NUMBER()`.
+
 ## [0.0.1] - 2026-01-30
 
 ### Added
@@ -68,8 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Single writer only (no concurrent write transactions)
 - Single process access (no multi-process concurrency)
 - No subqueries in SELECT list
-- No window functions
-- No Common Table Expressions (WITH clauses)
+- Advanced window functions (only `ROW_NUMBER()` is supported)
+- Recursive CTEs (`WITH RECURSIVE` not supported)
 - No views
 - No stored procedures
 - Statement-time foreign key enforcement (not deferred)

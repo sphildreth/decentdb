@@ -153,6 +153,15 @@ def _map_declared_type_to_decentdb(declared_type: str) -> str:
         return "FLOAT64"
     if "BLOB" in t:
         return "BLOB"
+    if "UUID" in t:
+        return "UUID"
+    if any(k in t for k in ["DECIMAL", "NUMERIC"]):
+        # Preserve precision/scale if present (e.g. DECIMAL(10,2))
+        # Map NUMERIC to DECIMAL
+        mapped = t.replace("NUMERIC", "DECIMAL")
+        if "(" in mapped:
+             return mapped
+        return "DECIMAL(18,6)"
     if any(k in t for k in ["CHAR", "CLOB", "TEXT", "VARCHAR"]):
         return "TEXT"
 
@@ -398,8 +407,18 @@ def _copy_table_data(
     col_names = [c.name for c in table.columns]
     dst_cols = [column_name_map[table.name][c] for c in col_names]
     cols_sql = ", ".join(_quote_ident(c) for c in dst_cols)
-    placeholders = ", ".join(["?"] * len(col_names))
-    insert_sql = f"INSERT INTO {_quote_ident(dst_table)} ({cols_sql}) VALUES ({placeholders})"
+    
+    placeholders = []
+    for c in table.columns:
+        dtype = _map_declared_type_to_decentdb(c.declared_type)
+        if dtype.startswith("DECIMAL") or dtype.startswith("NUMERIC"):
+             placeholders.append(f"CAST(? AS {dtype})")
+        elif dtype == "UUID":
+             placeholders.append("CAST(? AS UUID)")
+        else:
+             placeholders.append("?")
+             
+    insert_sql = f"INSERT INTO {_quote_ident(dst_table)} ({cols_sql}) VALUES ({', '.join(placeholders)})"
 
     total = _table_row_count(sqlite_conn, table.name)
     task_id = None

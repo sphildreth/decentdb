@@ -256,15 +256,22 @@ Supported scalar functions:
 - `LOWER`
 - `UPPER`
 - `TRIM`
-- `CAST(expr AS type)` for `INT/INTEGER/INT64`, `FLOAT/FLOAT64/REAL`, `TEXT`, `BOOL/BOOLEAN`
+- `GEN_RANDOM_UUID`
+- `UUID_PARSE`
+- `UUID_TO_STRING`
+- `CAST(expr AS type)` for `INT/INTEGER/INT64`, `FLOAT/FLOAT64/REAL`, `DECIMAL/NUMERIC`, `TEXT`, `BOOL/BOOLEAN`, `UUID`
 - `CASE WHEN ... THEN ... ELSE ... END` and `CASE expr WHEN ... THEN ... ELSE ... END`
 
 ```sql
 SELECT COALESCE(nickname, name) FROM users;
 SELECT NULLIF(status, 'active') FROM users;
 SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name) FROM users;
+SELECT GEN_RANDOM_UUID();
+SELECT UUID_TO_STRING(id) FROM users;
+SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID);
 SELECT TRIM(name) || '_suffix' FROM users;
 SELECT CAST(id AS TEXT) FROM users;
+SELECT CAST('12.34' AS DECIMAL(10,2));
 SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
 ```
 

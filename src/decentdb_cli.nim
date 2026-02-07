@@ -11,6 +11,7 @@ import math
 import atomics
 import algorithm
 import ./engine
+import ./exec/exec
 import ./errors
 import ./catalog/catalog
 import ./pager/pager
@@ -324,15 +325,45 @@ proc csvCellToValue(cellValue: string, col: Column): Value =
       bytes.add(byte(ch))
     Value(kind: vkBlob, bytes: bytes)
   of ctDecimal:
-    try:
-      Value(kind: vkInt64, int64Val: parseBiggestInt(cellValue))
-    except:
+    # Parse decimal string: [-]123.456
+    var s = cellValue.strip()
+    if s.len == 0:
       Value(kind: vkNull)
+    else:
+      var negative = false
+      if s.startsWith("-"):
+         negative = true
+         s = s[1..^1]
+      elif s.startsWith("+"):
+         s = s[1..^1]
+      
+      let dotPos = s.find('.')
+      var unscaledStr = ""
+      var inputScale = 0
+      if dotPos >= 0:
+         unscaledStr = s[0..<dotPos] & s[dotPos+1..^1]
+         inputScale = s.len - 1 - dotPos
+      else:
+         unscaledStr = s
+         inputScale = 0
+      
+      try:
+         var u = parseBiggestInt(unscaledStr)
+         if negative: u = -u
+         # We need to scale to col.decScale
+         let res = scaleDecimal(u, uint8(inputScale), col.decScale)
+         if res.ok:
+           Value(kind: vkDecimal, int64Val: res.value, decimalScale: col.decScale)
+         else:
+           Value(kind: vkNull)
+      except:
+         Value(kind: vkNull)
   of ctUuid:
-    var bytes: seq[byte] = @[]
-    for ch in cellValue:
-      bytes.add(byte(ch))
-    Value(kind: vkText, bytes: bytes)
+    let res = parseUuid(cellValue)
+    if res.ok:
+      Value(kind: vkBlob, bytes: res.value)
+    else:
+      Value(kind: vkNull)
 
 proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]] =
   var parser: CsvParser
@@ -417,21 +448,51 @@ proc jsonToValue(node: JsonNode, col: Column): Value =
       return Value(kind: vkBlob, bytes: bytes)
     Value(kind: vkNull)
   of ctDecimal:
-    if node.kind == JInt:
-      return Value(kind: vkInt64, int64Val: node.getBiggestInt())
-    if node.kind == JString:
+    var s = ""
+    if node.kind == JString: s = node.getStr().strip()
+    elif node.kind == JInt: s = $node.getBiggestInt()
+    elif node.kind == JFloat: s = $node.getFloat()
+    
+    if s.len == 0:
+      Value(kind: vkNull)
+    else:
+      var negative = false
+      if s.startsWith("-"):
+         negative = true
+         s = s[1..^1]
+      elif s.startsWith("+"):
+         s = s[1..^1]
+      
+      let dotPos = s.find('.')
+      var unscaledStr = ""
+      var inputScale = 0
+      if dotPos >= 0:
+         unscaledStr = s[0..<dotPos] & s[dotPos+1..^1]
+         inputScale = s.len - 1 - dotPos
+      else:
+         unscaledStr = s
+         inputScale = 0
+      
       try:
-        return Value(kind: vkInt64, int64Val: parseBiggestInt(node.getStr()))
+         var u = parseBiggestInt(unscaledStr)
+         if negative: u = -u
+         # We need to scale to col.decScale
+         let res = scaleDecimal(u, uint8(inputScale), col.decScale)
+         if res.ok:
+           Value(kind: vkDecimal, int64Val: res.value, decimalScale: col.decScale)
+         else:
+           Value(kind: vkNull)
       except:
-        return Value(kind: vkNull)
-    Value(kind: vkNull)
+         Value(kind: vkNull)
   of ctUuid:
     if node.kind == JString:
-      var bytes: seq[byte] = @[]
-      for ch in node.getStr():
-        bytes.add(byte(ch))
-      return Value(kind: vkText, bytes: bytes)
-    Value(kind: vkNull)
+      let res = parseUuid(node.getStr())
+      if res.ok:
+        Value(kind: vkBlob, bytes: res.value)
+      else:
+        Value(kind: vkNull)
+    else:
+      Value(kind: vkNull)
 
 proc readJsonRows(tableMeta: TableMeta, jsonFile: string): Result[seq[seq[Value]]] =
   try:

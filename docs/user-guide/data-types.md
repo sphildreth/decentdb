@@ -81,6 +81,34 @@ CREATE TABLE example (
 );
 ```
 
+### DECIMAL / NUMERIC
+
+Fixed-point number with user-specified precision and scale.
+
+Suitable for financial calculations where exactness is required.
+
+Range: Precision up to 18 digits (constrained by int64 backing storage).
+
+```sql
+CREATE TABLE example (
+    balance DECIMAL(10,2),    -- 10 total digits, 2 decimal places
+    rate NUMERIC(5,4)         -- 5 total digits, 4 decimal places
+);
+```
+
+### UUID
+
+16-byte Universally Unique Identifier.
+
+Stored efficiently as 16-byte binary data.
+
+```sql
+CREATE TABLE example (
+    id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+    ref_id UUID
+);
+```
+
 ### NULL
 
 Represents missing or unknown values.
@@ -102,6 +130,9 @@ All columns can contain NULL unless marked NOT NULL.
 | FLOAT | FLOAT64 |
 | REAL | FLOAT64 |
 | DOUBLE | FLOAT64 |
+| NUMERIC | DECIMAL |
+| DECIMAL | DECIMAL |
+| UUID | UUID |
 
 ## Type Conversion
 
@@ -121,6 +152,8 @@ SELECT CAST(price AS INT) FROM products;
 | INT64 | 8 bytes | Never |
 | BOOL | 1 byte | Never |
 | FLOAT64 | 8 bytes | Never |
+| DECIMAL | 8 bytes (int64) | Never |
+| UUID | 16 bytes | Never |
 | TEXT | Variable, up to 512 bytes | > 512 bytes |
 | BLOB | Variable, up to 512 bytes | > 512 bytes |
 | NULL | 0 bytes | Never |
