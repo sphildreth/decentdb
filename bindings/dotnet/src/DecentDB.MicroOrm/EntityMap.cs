@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 internal sealed record PropertyMap(
     PropertyInfo Property,

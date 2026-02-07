@@ -1,4 +1,4 @@
-# DecentDb Testing Strategy (Python-first + Engine Unit Tests)
+# DecentDB Testing Strategy (Python-first + Engine Unit Tests)
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
@@ -81,7 +81,7 @@ For supported subset only.
 
 **PostgreSQL Version:** Target PostgreSQL 15.x for compatibility testing. CI should test against PG14, PG15, and PG16 to ensure broad compatibility.
 
-- Load identical data into PostgreSQL and DecentDb
+- Load identical data into PostgreSQL and DecentDB
 - Execute deterministic SQL
 - Compare:
   - row counts

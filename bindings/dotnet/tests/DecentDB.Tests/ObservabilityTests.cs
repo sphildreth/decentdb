@@ -1,18 +1,18 @@
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 using Xunit;
 
-namespace DecentDb.Tests
+namespace DecentDB.Tests
 {
     public class ObservabilityTests : IDisposable
     {
         private readonly string _dbPath;
-        private readonly DecentDbConnection _connection;
+        private readonly DecentDBConnection _connection;
 
         public ObservabilityTests()
         {
             _dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_obs_{Guid.NewGuid()}.ddb");
             var connStr = $"Data Source={_dbPath}";
-            _connection = new DecentDbConnection(connStr);
+            _connection = new DecentDBConnection(connStr);
             _connection.Open();
         }
 

@@ -1,13 +1,13 @@
 using System;
 using System.Runtime.InteropServices;
 
-namespace DecentDb.Native;
+namespace DecentDB.Native;
 
-public sealed class DecentDbHandle : CriticalHandle
+public sealed class DecentDBHandle : CriticalHandle
 {
     public IntPtr Handle => handle;
 
-    public DecentDbHandle(IntPtr handle) : base(IntPtr.Zero)
+    public DecentDBHandle(IntPtr handle) : base(IntPtr.Zero)
     {
         SetHandle(handle);
     }
@@ -18,18 +18,18 @@ public sealed class DecentDbHandle : CriticalHandle
     {
         if (!IsInvalid)
         {
-            DecentDbNative.decentdb_close(handle);
+            DecentDBNative.decentdb_close(handle);
             handle = IntPtr.Zero;
         }
         return true;
     }
 }
 
-public sealed class DecentDbStatementHandle : CriticalHandle
+public sealed class DecentDBStatementHandle : CriticalHandle
 {
     public IntPtr Handle => handle;
 
-    public DecentDbStatementHandle(IntPtr handle) : base(IntPtr.Zero)
+    public DecentDBStatementHandle(IntPtr handle) : base(IntPtr.Zero)
     {
         SetHandle(handle);
     }
@@ -40,7 +40,7 @@ public sealed class DecentDbStatementHandle : CriticalHandle
     {
         if (!IsInvalid)
         {
-            DecentDbNative.decentdb_finalize(handle);
+            DecentDBNative.decentdb_finalize(handle);
             handle = IntPtr.Zero;
         }
         return true;

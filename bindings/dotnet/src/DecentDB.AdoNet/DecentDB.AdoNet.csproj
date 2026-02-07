@@ -4,14 +4,14 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <Description>ADO.NET provider for DecentDB embedded database</Description>
-    <RootNamespace>DecentDb.AdoNet</RootNamespace>
-    <AssemblyName>DecentDb.AdoNet</AssemblyName>
+    <RootNamespace>DecentDB.AdoNet</RootNamespace>
+    <AssemblyName>DecentDB.AdoNet</AssemblyName>
 
     <!-- Packed via DecentDB.MicroOrm meta package. -->
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\DecentDb.Native\DecentDb.Native.csproj" />
+    <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" />
   </ItemGroup>
 </Project>

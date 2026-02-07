@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace DecentDb.AdoNet;
+namespace DecentDB.AdoNet;
 
 public enum SqlLogLevel
 {

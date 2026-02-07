@@ -4,7 +4,7 @@ set -e
 # Ensure we are in the repo root
 cd "$(dirname "$0")/.."
 
-echo "Building DecentDb engine..."
+echo "Building DecentDB engine..."
 nim c -d:release --hints:off src/decentdb.nim
 
 echo "Running crash-injection tests..."

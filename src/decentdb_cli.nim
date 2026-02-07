@@ -535,7 +535,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
               heartbeatMs: int = 0,
               format: string = "json", noRows: bool = false, params: seq[string] = @[],
               walFailpoints: seq[string] = @[], clearWalFailpoints: bool = false): int =
-  ## Execute SQL statements against a DecentDb database file.
+  ## Execute SQL statements against a DecentDB database file.
   ## Output can be rendered as json/csv/table depending on --format.
   ## (Some diagnostic modes like timing/warnings/verbose currently require json.)
 
@@ -1865,7 +1865,7 @@ proc repl*(db: string = "", format: string = "table"): int =
     return 1
 
   let database = openRes.value
-  echo "DecentDb REPL (.exit to quit)"
+  echo "DecentDB REPL (.exit to quit)"
   while true:
     stdout.write("> ")
     stdout.flushFile()

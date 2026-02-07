@@ -5,12 +5,12 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Dapper;
-using DecentDb.AdoNet;
-using DecentDb.MicroOrm;
+using DecentDB.AdoNet;
+using DecentDB.MicroOrm;
 using Xunit;
 using Xunit.Abstractions;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public sealed class MelodeeArtistSearchEngineIntegrationTests
 {
@@ -86,7 +86,7 @@ public sealed class MelodeeArtistSearchEngineIntegrationTests
         new("Pink Floyd", "PINKFLOYD", null, null, 15.5249),
     ];
 
-    [DecentDb.MicroOrm.Table("Artists")]
+    [DecentDB.MicroOrm.Table("Artists")]
     private sealed class ArtistRow
     {
         [Column("id")]
@@ -132,7 +132,7 @@ public sealed class MelodeeArtistSearchEngineIntegrationTests
         public long? LastRefreshed { get; set; }
     }
 
-    [DecentDb.MicroOrm.Table("Albums")]
+    [DecentDB.MicroOrm.Table("Albums")]
     private sealed class AlbumRow
     {
         [Column("id")]
@@ -207,7 +207,7 @@ public sealed class MelodeeArtistSearchEngineIntegrationTests
         };
     }
 
-    private static void EnsureAlternateNamesTrigramIndex(DecentDbConnection conn)
+    private static void EnsureAlternateNamesTrigramIndex(DecentDBConnection conn)
     {
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "CREATE INDEX ix_artists_alternatenames_trgm ON Artists USING trigram (AlternateNames)";
@@ -425,13 +425,13 @@ LEFT JOIN Albums al ON al.ArtistId = a.Id
 WHERE a.NameNormalized = @NameNormalized
 ";
 
-    private static async Task<List<ArtistWithAlbums>> RunDapperAsync(DecentDbConnection conn, SampleQuery q)
+    private static async Task<List<ArtistWithAlbums>> RunDapperAsync(DecentDBConnection conn, SampleQuery q)
     {
         var artists = (await conn.QueryAsync<ArtistRow>(DapperArtistsSql, BuildParams(q))).ToList();
         return await AttachAlbumsAsync(conn, artists);
     }
 
-    private static async Task<List<ArtistWithAlbums>> RunDapperIndexFriendlyAsync(DecentDbConnection conn, SampleQuery q)
+    private static async Task<List<ArtistWithAlbums>> RunDapperIndexFriendlyAsync(DecentDBConnection conn, SampleQuery q)
     {
         // Run each predicate branch as its own query so the engine can use the most appropriate index.
         // In particular, a single OR-heavy query tends to defeat btree index usage.
@@ -475,7 +475,7 @@ WHERE a.NameNormalized = @NameNormalized
         return await AttachAlbumsAsync(conn, found.Values.ToList());
     }
 
-    private static async Task<List<ArtistWithAlbums>> AttachAlbumsAsync(DecentDbConnection conn, List<ArtistRow> artists)
+    private static async Task<List<ArtistWithAlbums>> AttachAlbumsAsync(DecentDBConnection conn, List<ArtistRow> artists)
     {
         if (artists.Count == 0)
         {
@@ -510,7 +510,7 @@ WHERE a.NameNormalized = @NameNormalized
         return result;
     }
 
-    private static async Task<HashSet<long>> RunDapperArtistIdsAsync(DecentDbConnection conn, SampleQuery q)
+    private static async Task<HashSet<long>> RunDapperArtistIdsAsync(DecentDBConnection conn, SampleQuery q)
     {
         var ids = await conn.QueryAsync<long>(DapperArtistIdsSql, BuildParams(q));
         return ids.ToHashSet();
@@ -599,7 +599,7 @@ WHERE
         return ids;
     }
 
-    private static async Task<List<ArtistWithAlbums>> RunMicroOrmAsync(DecentDbContext ctx, SampleQuery q)
+    private static async Task<List<ArtistWithAlbums>> RunMicroOrmAsync(DecentDBContext ctx, SampleQuery q)
     {
         var (firstTag, inTag, outerTag) = BuildTags(q.NameNormalized);
         var artists = ctx.Set<ArtistRow>();
@@ -650,7 +650,7 @@ WHERE
         return result;
     }
 
-    private static async Task<List<ArtistRow>> RunMicroOrmIndexFriendlyArtistsAsync(DecentDbContext ctx, SampleQuery q)
+    private static async Task<List<ArtistRow>> RunMicroOrmIndexFriendlyArtistsAsync(DecentDBContext ctx, SampleQuery q)
     {
         // Same predicate as Melodee, but executed as separate queries so the engine can use
         // the relevant index for each branch instead of falling back to a table scan for a big OR.
@@ -697,7 +697,7 @@ WHERE
         return found.Values.ToList();
     }
 
-    private static async Task<List<ArtistWithAlbums>> RunMicroOrmIndexFriendlyAsync(DecentDbConnection conn, DecentDbContext ctx, SampleQuery q)
+    private static async Task<List<ArtistWithAlbums>> RunMicroOrmIndexFriendlyAsync(DecentDBConnection conn, DecentDBContext ctx, SampleQuery q)
     {
         var artists = await RunMicroOrmIndexFriendlyArtistsAsync(ctx, q);
         return await AttachAlbumsAsync(conn, artists);
@@ -740,7 +740,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             foreach (var sample in Samples)
@@ -772,7 +772,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             var sample = Samples.Last(s => s.NameNormalized == "PINKFLOYD");
@@ -829,7 +829,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             var sample = Samples.Last(s => s.NameNormalized == "PINKFLOYD");
@@ -917,7 +917,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             foreach (var sample in Samples)
@@ -949,7 +949,7 @@ WHERE
 
         try
         {
-            using var ctx = new DecentDbContext(staged, pooling: true);
+            using var ctx = new DecentDBContext(staged, pooling: true);
 
             string? lastSql = null;
             ctx.SqlExecuting += (_, e) => { lastSql = e.Sql; };
@@ -993,7 +993,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             // Makes AlternateNames substring search indexable (LIKE '%...%').
@@ -1056,13 +1056,13 @@ WHERE
         {
             // Makes AlternateNames substring search indexable (LIKE '%...%'), which is required for
             // the engine to turn the full OR predicate into a UnionDistinct of index seeks.
-            using (var conn = new DecentDbConnection($"Data Source={staged}"))
+            using (var conn = new DecentDBConnection($"Data Source={staged}"))
             {
                 conn.Open();
                 EnsureAlternateNamesTrigramIndex(conn);
             }
 
-            using var ctx = new DecentDbContext(staged, pooling: true);
+            using var ctx = new DecentDBContext(staged, pooling: true);
 
             const int warmup = 3;
             const int iterations = 15;
@@ -1117,7 +1117,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             // Makes AlternateNames substring search indexable (LIKE '%...%').
@@ -1192,7 +1192,7 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
 
             foreach (var sample in Samples)
@@ -1229,11 +1229,11 @@ WHERE
 
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={staged}");
+            using var conn = new DecentDBConnection($"Data Source={staged}");
             conn.Open();
             EnsureAlternateNamesTrigramIndex(conn);
 
-            using var ctx = new DecentDbContext(staged, pooling: true);
+            using var ctx = new DecentDBContext(staged, pooling: true);
 
             const int warmup = 3;
             const int iterations = 15;

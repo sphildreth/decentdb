@@ -5,8 +5,8 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Description>P/Invoke layer for DecentDB native library</Description>
-    <RootNamespace>DecentDb.Native</RootNamespace>
-    <AssemblyName>DecentDb.Native</AssemblyName>
+    <RootNamespace>DecentDB.Native</RootNamespace>
+    <AssemblyName>DecentDB.Native</AssemblyName>
 
     <!-- Packed via DecentDB.MicroOrm meta package. -->
     <IsPackable>false</IsPackable>

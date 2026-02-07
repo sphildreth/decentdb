@@ -3,13 +3,13 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Data.Common;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    internal sealed class DecentDbParameterCollection : DbParameterCollection
+    internal sealed class DecentDBParameterCollection : DbParameterCollection
     {
-        private readonly List<DecentDbParameter> _parameters;
+        private readonly List<DecentDBParameter> _parameters;
 
-        public DecentDbParameterCollection(List<DecentDbParameter> parameters)
+        public DecentDBParameterCollection(List<DecentDBParameter> parameters)
         {
             _parameters = parameters;
         }
@@ -20,9 +20,9 @@ namespace DecentDb.AdoNet
 
         public override int Add(object value)
         {
-            if (value is not DecentDbParameter p)
+            if (value is not DecentDBParameter p)
             {
-                throw new ArgumentException("Parameter must be a DecentDbParameter", nameof(value));
+                throw new ArgumentException("Parameter must be a DecentDBParameter", nameof(value));
             }
             _parameters.Add(p);
             return _parameters.Count - 1;
@@ -38,7 +38,7 @@ namespace DecentDb.AdoNet
 
         public override void Clear() => _parameters.Clear();
 
-        public override bool Contains(object value) => value is DecentDbParameter p && _parameters.Contains(p);
+        public override bool Contains(object value) => value is DecentDBParameter p && _parameters.Contains(p);
 
         public override bool Contains(string? value) => IndexOf(value) >= 0;
 
@@ -46,7 +46,7 @@ namespace DecentDb.AdoNet
 
         public override IEnumerator GetEnumerator() => _parameters.GetEnumerator();
 
-        public override int IndexOf(object value) => value is DecentDbParameter p ? _parameters.IndexOf(p) : -1;
+        public override int IndexOf(object value) => value is DecentDBParameter p ? _parameters.IndexOf(p) : -1;
 
         public override int IndexOf(string? parameterName)
         {
@@ -63,16 +63,16 @@ namespace DecentDb.AdoNet
 
         public override void Insert(int index, object value)
         {
-            if (value is not DecentDbParameter p)
+            if (value is not DecentDBParameter p)
             {
-                throw new ArgumentException("Parameter must be a DecentDbParameter", nameof(value));
+                throw new ArgumentException("Parameter must be a DecentDBParameter", nameof(value));
             }
             _parameters.Insert(index, p);
         }
 
         public override void Remove(object value)
         {
-            if (value is DecentDbParameter p)
+            if (value is DecentDBParameter p)
             {
                 _parameters.Remove(p);
             }
@@ -103,18 +103,18 @@ namespace DecentDb.AdoNet
 
         protected override void SetParameter(int index, DbParameter value)
         {
-            if (value is not DecentDbParameter p)
+            if (value is not DecentDBParameter p)
             {
-                throw new ArgumentException("Parameter must be a DecentDbParameter", nameof(value));
+                throw new ArgumentException("Parameter must be a DecentDBParameter", nameof(value));
             }
             _parameters[index] = p;
         }
 
         protected override void SetParameter(string parameterName, DbParameter value)
         {
-            if (value is not DecentDbParameter p)
+            if (value is not DecentDBParameter p)
             {
-                throw new ArgumentException("Parameter must be a DecentDbParameter", nameof(value));
+                throw new ArgumentException("Parameter must be a DecentDBParameter", nameof(value));
             }
 
             var idx = IndexOf(parameterName);

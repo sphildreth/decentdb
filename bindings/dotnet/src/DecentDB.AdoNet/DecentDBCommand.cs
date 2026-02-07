@@ -7,43 +7,43 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics.CodeAnalysis;
-using DecentDb.Native;
+using DecentDB.Native;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    public sealed class DecentDbCommand : DbCommand
+    public sealed class DecentDBCommand : DbCommand
     {
-        private DecentDbConnection? _connection;
+        private DecentDBConnection? _connection;
         private string _commandText = string.Empty;
         private int _commandTimeout = 30;
-        private readonly List<DecentDbParameter> _parameters = new();
-        private readonly DecentDbParameterCollection _parameterCollection;
-        private DecentDbTransaction? _transaction;
+        private readonly List<DecentDBParameter> _parameters = new();
+        private readonly DecentDBParameterCollection _parameterCollection;
+        private DecentDBTransaction? _transaction;
         private PreparedStatement? _statement;
         private bool _disposed;
 
-        public DecentDbCommand()
+        public DecentDBCommand()
         {
             _connection = null;
-            _parameterCollection = new DecentDbParameterCollection(_parameters);
+            _parameterCollection = new DecentDBParameterCollection(_parameters);
         }
 
-        public DecentDbCommand(DecentDbConnection connection)
+        public DecentDBCommand(DecentDBConnection connection)
         {
             _connection = connection;
-            _parameterCollection = new DecentDbParameterCollection(_parameters);
+            _parameterCollection = new DecentDBParameterCollection(_parameters);
             _commandTimeout = connection.DefaultCommandTimeoutSeconds;
         }
 
-        public DecentDbCommand(DecentDbConnection connection, string commandText)
+        public DecentDBCommand(DecentDBConnection connection, string commandText)
         {
             _connection = connection;
             _commandText = commandText;
-            _parameterCollection = new DecentDbParameterCollection(_parameters);
+            _parameterCollection = new DecentDBParameterCollection(_parameters);
             _commandTimeout = connection.DefaultCommandTimeoutSeconds;
         }
 
-        internal DecentDbConnection OwnerConnection => _connection ?? throw new InvalidOperationException("Command has no connection");
+        internal DecentDBConnection OwnerConnection => _connection ?? throw new InvalidOperationException("Command has no connection");
 
         [AllowNull]
         public override string CommandText
@@ -100,9 +100,9 @@ namespace DecentDb.AdoNet
                     return;
                 }
 
-                if (value is not DecentDbConnection conn)
+                if (value is not DecentDBConnection conn)
                 {
-                    throw new ArgumentException("Must be a DecentDbConnection");
+                    throw new ArgumentException("Must be a DecentDBConnection");
                 }
                 if (_statement != null)
                 {
@@ -124,7 +124,7 @@ namespace DecentDb.AdoNet
                 {
                     throw new InvalidOperationException("Cannot change transaction while command is executing");
                 }
-                _transaction = value as DecentDbTransaction;
+                _transaction = value as DecentDBTransaction;
             }
         }
 
@@ -191,7 +191,7 @@ namespace DecentDb.AdoNet
                 var stepResult = stmt.Step();
                 if (stepResult < 0)
                 {
-                    var ex = new DecentDbException(stmt.RowsAffected > 0 ? (int)stmt.RowsAffected : stepResult,
+                    var ex = new DecentDBException(stmt.RowsAffected > 0 ? (int)stmt.RowsAffected : stepResult,
                         db.LastErrorMessage, sql);
                     if (observation != null)
                     {
@@ -200,7 +200,7 @@ namespace DecentDb.AdoNet
                     throw ex;
                 }
 
-                return new DecentDbDataReader(this, stmt, stepResult, observation);
+                return new DecentDBDataReader(this, stmt, stepResult, observation);
             }
             catch (Exception ex)
             {
@@ -251,9 +251,9 @@ namespace DecentDb.AdoNet
             return CreateParameter();
         }
 
-        public new DecentDbParameter CreateParameter()
+        public new DecentDBParameter CreateParameter()
         {
-            var param = new DecentDbParameter();
+            var param = new DecentDBParameter();
             return param;
         }
 

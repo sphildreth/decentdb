@@ -3,9 +3,9 @@ using System.Data;
 using System.IO;
 using System.Threading.Tasks;
 using Xunit;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public class ConnectionTests
 {
@@ -15,7 +15,7 @@ public class ConnectionTests
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={dbPath}");
+            using var conn = new DecentDBConnection($"Data Source={dbPath}");
             Assert.Equal(ConnectionState.Closed, conn.State);
             conn.Open();
             Assert.Equal(ConnectionState.Open, conn.State);
@@ -37,7 +37,7 @@ public class ConnectionTests
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}", "subdir", "db.ddb");
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={dbPath}");
+            using var conn = new DecentDBConnection($"Data Source={dbPath}");
             conn.Open();
             Assert.Equal(ConnectionState.Open, conn.State);
             conn.Close();
@@ -56,7 +56,7 @@ public class ConnectionTests
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={dbPath};Cache Size=64MB");
+            using var conn = new DecentDBConnection($"Data Source={dbPath};Cache Size=64MB");
             conn.Open();
 
             using var cmd = conn.CreateCommand();
@@ -85,7 +85,7 @@ public class ConnectionTests
         var dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
         try
         {
-            using var conn = new DecentDbConnection($"Data Source={dbPath};Logging=0");
+            using var conn = new DecentDBConnection($"Data Source={dbPath};Logging=0");
             conn.Open();
 
             var executingEvents = new System.Collections.Generic.List<SqlExecutingEventArgs>();

@@ -3134,21 +3134,24 @@ proc execSqlRows*(db: Db, sqlText: string, params: seq[Value]): Result[seq[Row]]
   if boundStatements.len == 0:
     let parseRes = parseSql(sqlText)
     if not parseRes.ok:
-      echo "DEBUG Parse Error: ", parseRes.err.message
+      when defined(decentdbDebugLogging):
+        echo "DEBUG Parse Error: ", parseRes.err.message
       return err[seq[Row]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
     if parseRes.value.statements.len != 1:
       return err[seq[Row]](ERR_SQL, "execSqlRows expects a single SELECT statement")
     let stmt = parseRes.value.statements[0]
     let bindRes = bindStatement(db.catalog, stmt)
     if not bindRes.ok:
-      echo "DEBUG Bind Error: ", bindRes.err.message
+      when defined(decentdbDebugLogging):
+        echo "DEBUG Bind Error: ", bindRes.err.message
       return err[seq[Row]](bindRes.err.code, bindRes.err.message, bindRes.err.context)
     boundStatements = @[bindRes.value]
     if boundStatements[0].kind != skSelect:
       return err[seq[Row]](ERR_SQL, "execSqlRows expects a SELECT statement")
     let planRes = plan(db.catalog, boundStatements[0])
     if not planRes.ok:
-      echo "DEBUG Plan Error: ", planRes.err.message
+      when defined(decentdbDebugLogging):
+        echo "DEBUG Plan Error: ", planRes.err.message
       return err[seq[Row]](planRes.err.code, planRes.err.message, planRes.err.context)
     cachedPlans = @[planRes.value]
     rememberSqlCache(sqlText, boundStatements, cachedPlans)

@@ -1,4 +1,4 @@
-# DecentDb .NET benchmarks
+# DecentDB .NET benchmarks
 
 This is a lightweight, dependency-free benchmark harness for the ADO.NET provider and the Micro-ORM.
 
@@ -6,7 +6,7 @@ This is a lightweight, dependency-free benchmark harness for the ADO.NET provide
 
 From repo root:
 
-- `dotnet run -c Release --project bindings/dotnet/benchmarks/DecentDb.Benchmarks/DecentDb.Benchmarks.csproj`
+- `dotnet run -c Release --project bindings/dotnet/benchmarks/DecentDB.Benchmarks/DecentDB.Benchmarks.csproj`
 
 Notes:
 - Timings are sensitive to machine load and CPU frequency scaling.

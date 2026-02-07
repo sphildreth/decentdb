@@ -4,7 +4,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 internal sealed class ExpressionSqlBuilder<T>
 {

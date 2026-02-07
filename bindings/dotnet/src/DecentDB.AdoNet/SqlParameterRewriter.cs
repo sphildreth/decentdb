@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Data.Common;
 using System.Text;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
     public static class SqlParameterRewriter
     {

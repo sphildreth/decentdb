@@ -3,9 +3,9 @@ using System.Data;
 using System.IO;
 using System.Threading.Tasks;
 using Xunit;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public class DataReaderTests : IDisposable
 {
@@ -28,7 +28,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void StreamingBehaviorForwardOnly()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -56,7 +56,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void FieldCountAndNames()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -79,7 +79,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void GetDataTypeName()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -108,7 +108,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void GetFieldType()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -132,7 +132,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void GetOrdinal()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -150,7 +150,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void GetFieldValue()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -172,7 +172,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void IndexerAccess()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -197,7 +197,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void HasRowsAndDepth()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -222,7 +222,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void RecordsAffected()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -244,7 +244,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void GetBytes()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -279,7 +279,7 @@ public class DataReaderTests : IDisposable
     [Fact]
     public void GetGuid()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();

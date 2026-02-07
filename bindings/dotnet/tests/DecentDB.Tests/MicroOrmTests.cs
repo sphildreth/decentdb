@@ -4,11 +4,11 @@ using System.ComponentModel.DataAnnotations;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using DecentDb.AdoNet;
-using DecentDb.MicroOrm;
+using DecentDB.AdoNet;
+using DecentDB.MicroOrm;
 using Xunit;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public sealed class MicroOrmTests : IDisposable
 {
@@ -18,7 +18,7 @@ public sealed class MicroOrmTests : IDisposable
     {
         _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.ddb");
 
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -69,7 +69,7 @@ public sealed class MicroOrmTests : IDisposable
     [Fact]
     public async Task InsertQueryUpdateDelete_RoundTrip()
     {
-        using var ctx = new DecentDbContext(_dbPath);
+        using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
 
         await persons.InsertAsync(new Person { Id = 1, Name = "Alice", Age = 30 });
@@ -110,7 +110,7 @@ public sealed class MicroOrmTests : IDisposable
     [Fact]
     public async Task AnySingleAndBulkOperations()
     {
-        using var ctx = new DecentDbContext(_dbPath);
+        using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
 
         Assert.False(await persons.AnyAsync());
@@ -138,7 +138,7 @@ public sealed class MicroOrmTests : IDisposable
     [Fact]
     public async Task SupportsQueryableLinqSyntax()
     {
-        using var ctx = new DecentDbContext(_dbPath);
+        using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
 
         await persons.InsertManyAsync(new[]
@@ -171,7 +171,7 @@ public sealed class MicroOrmTests : IDisposable
     [Fact]
     public async Task StreamAsync_YieldsRowsInOrder()
     {
-        using var ctx = new DecentDbContext(_dbPath);
+        using var ctx = new DecentDBContext(_dbPath);
         var persons = ctx.Set<Person>();
 
         await persons.InsertManyAsync(new[]
@@ -193,14 +193,14 @@ public sealed class MicroOrmTests : IDisposable
     [Fact]
     public async Task AttributesControlMappingAndNullability()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "CREATE TABLE custom_people (person_id INTEGER PRIMARY KEY, full_name TEXT, not_nullable TEXT NOT NULL, optional_note TEXT)";
         cmd.ExecuteNonQuery();
 
-        using var ctx = new DecentDbContext(_dbPath);
+        using var ctx = new DecentDBContext(_dbPath);
         var set = ctx.Set<CustomPerson>();
 
         var ok = new CustomPerson

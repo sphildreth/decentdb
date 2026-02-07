@@ -10,13 +10,13 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 public sealed class DbSet<T> : IQueryable<T> where T : class, new()
 {
-    private readonly DecentDbContext _context;
+    private readonly DecentDBContext _context;
     private readonly EntityMap _map;
     private readonly List<Expression<Func<T, bool>>> _where;
     private readonly List<(PropertyInfo Property, bool Desc)> _orderBy;
@@ -25,13 +25,13 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
 
     private IQueryProvider? _queryProvider;
 
-    public DbSet(DecentDbContext context)
+    public DbSet(DecentDBContext context)
         : this(context, EntityMap.For<T>(), new(), new(), null, null)
     {
     }
 
     private DbSet(
-        DecentDbContext context,
+        DecentDBContext context,
         EntityMap map,
         List<Expression<Func<T, bool>>> where,
         List<(PropertyInfo Property, bool Desc)> orderBy,
@@ -440,7 +440,7 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         return (sb.ToString(), parameters);
     }
 
-    private DbCommand CreateCommand(DecentDbConnection conn, string sql, IEnumerable<(string Name, object? Value, int? MaxLength)> parameters)
+    private DbCommand CreateCommand(DecentDBConnection conn, string sql, IEnumerable<(string Name, object? Value, int? MaxLength)> parameters)
     {
         var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
@@ -454,7 +454,7 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         // If the provider/connection doesn't support ambient transactions, it'll throw here.
         // (In non-pooled mode, transactions should be explicitly managed.)
 
-        // Note: DecentDbCommand exposes Transaction via DbCommand.Transaction.
+        // Note: DecentDBCommand exposes Transaction via DbCommand.Transaction.
         // We set it only when we have an active context transaction.
         // Caller passes the right connection scope.
 
@@ -478,7 +478,7 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
 
     Expression IQueryable.Expression => Expression.Constant(this);
 
-    IQueryProvider IQueryable.Provider => _queryProvider ??= new DecentDbQueryProvider<T>(this);
+    IQueryProvider IQueryable.Provider => _queryProvider ??= new DecentDBQueryProvider<T>(this);
 
     IEnumerator<T> IEnumerable<T>.GetEnumerator()
     {

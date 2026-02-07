@@ -1,9 +1,9 @@
 using System;
 using System.IO;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 using Xunit;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public sealed class TypeMappingTests : IDisposable
 {
@@ -27,7 +27,7 @@ public sealed class TypeMappingTests : IDisposable
     [Fact]
     public void DateOnly_TimeOnly_TimeSpan_Guid_RoundTrip()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -86,7 +86,7 @@ public sealed class TypeMappingTests : IDisposable
     [Fact]
     public void DateTimeAndDateTimeOffset_AreUnixEpochMilliseconds()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -129,7 +129,7 @@ public sealed class TypeMappingTests : IDisposable
     [Fact]
     public void MaxLength_UsesUtf8Bytes()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();

@@ -3,21 +3,21 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Dapper;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 using Xunit;
 
-namespace DecentDb.Tests
+namespace DecentDB.Tests
 {
     public class DapperIntegrationTests : IDisposable
     {
         private readonly string _dbPath;
-        private readonly DecentDbConnection _connection;
+        private readonly DecentDBConnection _connection;
 
         public DapperIntegrationTests()
         {
             _dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_dapper_{Guid.NewGuid()}.ddb");
             var connStr = $"Data Source={_dbPath}";
-            _connection = new DecentDbConnection(connStr);
+            _connection = new DecentDBConnection(connStr);
             _connection.Open();
 
             _connection.Execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT, active INT)");

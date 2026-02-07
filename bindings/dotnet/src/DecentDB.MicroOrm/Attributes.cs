@@ -1,6 +1,6 @@
 using System;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 [AttributeUsage(AttributeTargets.Class, Inherited = false, AllowMultiple = false)]
 public sealed class TableAttribute(string name) : Attribute

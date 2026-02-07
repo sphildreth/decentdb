@@ -99,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base="bindings/dotnet/src/DecentDb.MicroOrm"
+          base="bindings/dotnet/src/DecentDB.MicroOrm"
           mkdir -p "$base/runtimes/linux-x64/native" "$base/runtimes/osx-x64/native" "$base/runtimes/win-x64/native"
           cp -v native/native-linux-x64/libdecentdb.so "$base/runtimes/linux-x64/native/libdecentdb.so"
           cp -v native/native-osx-x64/libdecentdb.dylib "$base/runtimes/osx-x64/native/libdecentdb.dylib"
@@ -126,7 +126,7 @@ jobs:
           echo "nuget_version=$nuget" >> "$GITHUB_OUTPUT"
 
       - name: Restore
-        run: dotnet restore bindings/dotnet/DecentDb.NET.sln
+        run: dotnet restore bindings/dotnet/DecentDB.NET.sln
 
       - name: Pack
         shell: bash
@@ -136,7 +136,7 @@ jobs:
             -c Release \
             -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
             -o ./artifacts \
-            bindings/dotnet/src/DecentDb.MicroOrm/DecentDb.MicroOrm.csproj
+            bindings/dotnet/src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj
 
       - name: Push
         env:

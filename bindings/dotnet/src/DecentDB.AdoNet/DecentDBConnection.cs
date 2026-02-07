@@ -6,13 +6,13 @@ using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Collections.Generic;
 using System.Text;
-using DecentDb.Native;
+using DecentDB.Native;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    public sealed class DecentDbConnection : DbConnection
+    public sealed class DecentDBConnection : DbConnection
     {
-        private Native.DecentDb? _db;
+        private Native.DecentDB? _db;
         private string _connectionString = string.Empty;
         private ConnectionState _state;
         private string _dataSource = string.Empty;
@@ -37,11 +37,11 @@ namespace DecentDb.AdoNet
             remove => _sqlExecuted -= value;
         }
 
-        public DecentDbConnection()
+        public DecentDBConnection()
         {
         }
 
-        public DecentDbConnection(string connectionString)
+        public DecentDBConnection(string connectionString)
         {
             ConnectionString = connectionString;
         }
@@ -93,7 +93,7 @@ namespace DecentDb.AdoNet
             cmd.CommandText = "BEGIN";
             cmd.ExecuteNonQuery();
 
-            return new DecentDbTransaction(this, isolationLevel);
+            return new DecentDBTransaction(this, isolationLevel);
         }
 
         public override void Close()
@@ -134,7 +134,7 @@ namespace DecentDb.AdoNet
 
             try
             {
-                _db = new Native.DecentDb(path, _nativeOptions);
+                _db = new Native.DecentDB(path, _nativeOptions);
                 _state = ConnectionState.Open;
             }
             catch (Exception ex)
@@ -146,7 +146,7 @@ namespace DecentDb.AdoNet
 
         protected override DbCommand CreateDbCommand()
         {
-            return new DecentDbCommand(this);
+            return new DecentDBCommand(this);
         }
 
         public override void ChangeDatabase(string databaseName)
@@ -163,7 +163,7 @@ namespace DecentDb.AdoNet
             _db.Checkpoint();
         }
 
-        internal Native.DecentDb GetNativeDb()
+        internal Native.DecentDB GetNativeDb()
         {
             return _db ?? throw new InvalidOperationException("Connection is not open");
         }

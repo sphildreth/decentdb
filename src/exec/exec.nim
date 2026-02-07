@@ -1571,12 +1571,14 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
   of ekLiteral:
     return ok(evalLiteral(expr.value))
   of ekParam:
-    echo "DEBUG ekParam: " & $expr.index
+    when defined(decentdbDebugLogging):
+      echo "DEBUG ekParam: " & $expr.index
     if expr.index <= 0 or expr.index > params.len:
       return err[Value](ERR_SQL, "Missing parameter", $expr.index)
     return ok(params[expr.index - 1])
   of ekColumn:
-    echo "DEBUG ekColumn: " & expr.name
+    when defined(decentdbDebugLogging):
+      echo "DEBUG ekColumn: " & expr.name
     if expr.table.len == 0:
       let lower = expr.name.toLowerAscii()
       if lower == "true": return ok(Value(kind: vkBool, boolVal: true))
@@ -1738,7 +1740,8 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     else:
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:
-    echo "DEBUG ekFunc: " & expr.funcName
+    when defined(decentdbDebugLogging):
+      echo "DEBUG ekFunc: " & expr.funcName
     let name = expr.funcName.toUpperAscii()
     if name in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
       return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
@@ -1758,10 +1761,12 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if not argRes.ok: return argRes
       if argRes.value.kind == vkNull: return ok(Value(kind: vkNull))
       if argRes.value.kind != vkText: return err[Value](ERR_SQL, "UUID_PARSE requires string")
-      echo "DEBUG argRes kind: " & $argRes.value.kind
+      when defined(decentdbDebugLogging):
+        echo "DEBUG argRes kind: " & $argRes.value.kind
       let bytesRes = parseUuid(valueToString(argRes.value))
       if not bytesRes.ok:
-        echo "UUID_PARSE Error: ", bytesRes.err.message
+        when defined(decentdbDebugLogging):
+          echo "UUID_PARSE Error: ", bytesRes.err.message
         return err[Value](bytesRes.err.code, bytesRes.err.message)
       return ok(Value(kind: vkBlob, bytes: bytesRes.value))
 
@@ -3011,7 +3016,8 @@ proc applyLimit*(rows: seq[Row], limit: int, offset: int): seq[Row] =
   rows[start ..< endIndex]
 
 proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[seq[Row]] =
-  echo "DEBUG execPlan start"
+  when defined(decentdbDebugLogging):
+    echo "DEBUG execPlan start"
   let ownsEvalContext = gEvalContextDepth == 0
   if ownsEvalContext:
     gEvalPager = pager

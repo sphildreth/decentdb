@@ -1,6 +1,6 @@
-## DecentDb Unified CLI
+## DecentDB Unified CLI
 ## 
-## This is the main entry point for all DecentDb command-line utilities.
+## This is the main entry point for all DecentDB command-line utilities.
 
 import cligen
 import ./decentdb_cli
@@ -15,7 +15,7 @@ const AsciiLogo = r"""
 
 when isMainModule:
   dispatchMulti(
-    ["multi", doc="DecentDb CLI v" & DecentDbVersion & "\n" & AsciiLogo & "\n\n"],
+    ["multi", doc="DecentDB CLI v" & DecentDbVersion & "\n" & AsciiLogo & "\n\n"],
     
     # 1. Main SQL Execution
     [decentdb_cli.cliMain, 

@@ -5,13 +5,13 @@ using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
-internal sealed class DecentDbQueryProvider<T> : IQueryProvider where T : class, new()
+internal sealed class DecentDBQueryProvider<T> : IQueryProvider where T : class, new()
 {
     private readonly DbSet<T> _root;
 
-    public DecentDbQueryProvider(DbSet<T> root)
+    public DecentDBQueryProvider(DbSet<T> root)
     {
         _root = root;
     }

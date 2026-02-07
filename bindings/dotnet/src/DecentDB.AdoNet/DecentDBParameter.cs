@@ -3,9 +3,9 @@ using System.Data;
 using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    public sealed class DecentDbParameter : DbParameter
+    public sealed class DecentDBParameter : DbParameter
     {
         private string _parameterName = string.Empty;
         private object? _value = DBNull.Value;
@@ -90,23 +90,23 @@ namespace DecentDb.AdoNet
         [AllowNull]
         public override string SourceColumn { get; set; } = string.Empty;
 
-        public DecentDbParameter()
+        public DecentDBParameter()
         {
         }
 
-        public DecentDbParameter(string name, object? value)
+        public DecentDBParameter(string name, object? value)
         {
             _parameterName = name;
             _value = value ?? DBNull.Value;
         }
 
-        public DecentDbParameter(string name, DbType dbType)
+        public DecentDBParameter(string name, DbType dbType)
         {
             _parameterName = name;
             _dbType = dbType;
         }
 
-        public DecentDbParameter(string name, DbType dbType, int size)
+        public DecentDBParameter(string name, DbType dbType, int size)
         {
             _parameterName = name;
             _dbType = dbType;

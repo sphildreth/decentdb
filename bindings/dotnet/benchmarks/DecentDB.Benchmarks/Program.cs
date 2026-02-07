@@ -1,6 +1,6 @@
 using System.Diagnostics;
-using DecentDb.AdoNet;
-using DecentDb.MicroOrm;
+using DecentDB.AdoNet;
+using DecentDB.MicroOrm;
 
 static string MakeTempDbPath()
 {
@@ -61,14 +61,14 @@ static double PercentileSorted(double[] sorted, int pct)
     return sorted[idx];
 }
 
-static void Exec(DecentDbConnection conn, string sql)
+static void Exec(DecentDBConnection conn, string sql)
 {
     using var cmd = conn.CreateCommand();
     cmd.CommandText = sql;
     cmd.ExecuteNonQuery();
 }
 
-static void Seed(DecentDbConnection conn, int rows)
+static void Seed(DecentDBConnection conn, int rows)
 {
     // Note: DROP TABLE IF EXISTS has a bug in the .NET binding, skipping it
     // Exec(conn, "DROP TABLE IF EXISTS persons");
@@ -105,7 +105,7 @@ static void Seed(DecentDbConnection conn, int rows)
 var dbPath = MakeTempDbPath();
 try
 {
-    using var conn = new DecentDbConnection($"Data Source={dbPath}");
+    using var conn = new DecentDBConnection($"Data Source={dbPath}");
     conn.Open();
 
     Seed(conn, rows: 10_000);
@@ -160,7 +160,7 @@ try
     Console.WriteLine();
     Console.WriteLine("=== Micro-ORM ===");
 
-    using var ctx = new DecentDbContext(dbPath, pooling: true);
+    using var ctx = new DecentDBContext(dbPath, pooling: true);
     var persons = ctx.Set<Person>();
 
     RunBench("GetAsync (by id)", iterations: 200, warmup: 50, action: () =>

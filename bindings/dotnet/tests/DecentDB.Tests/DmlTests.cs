@@ -3,9 +3,9 @@ using System.Data;
 using System.IO;
 using System.Threading.Tasks;
 using Xunit;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public class DmlTests : IDisposable
 {
@@ -28,7 +28,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void CreateTableAndInsert()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -47,7 +47,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void SelectWithPositionalParameters()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -81,7 +81,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void SelectWithNamedParameters()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -111,7 +111,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void SelectWithP0Parameters()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -139,7 +139,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void SelectWithMultipleParameters()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -184,7 +184,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void UpdateAndDelete()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -215,7 +215,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void ExecuteScalar()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -238,7 +238,7 @@ public class DmlTests : IDisposable
     [Fact]
     public void NullParameterHandling()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();

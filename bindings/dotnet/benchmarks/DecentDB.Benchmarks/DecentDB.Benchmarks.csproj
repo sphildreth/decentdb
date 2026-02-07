@@ -7,7 +7,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../src/DecentDb.AdoNet/DecentDb.AdoNet.csproj" />
-    <ProjectReference Include="../../src/DecentDb.MicroOrm/DecentDb.MicroOrm.csproj" />
+    <ProjectReference Include="../../src/DecentDB.AdoNet/DecentDB.AdoNet.csproj" />
+    <ProjectReference Include="../../src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj" />
   </ItemGroup>
 </Project>

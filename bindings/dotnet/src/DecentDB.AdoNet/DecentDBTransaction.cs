@@ -2,16 +2,16 @@ using System;
 using System.Data;
 using System.Data.Common;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    public sealed class DecentDbTransaction : DbTransaction
+    public sealed class DecentDBTransaction : DbTransaction
     {
-        private readonly DecentDbConnection _connection;
+        private readonly DecentDBConnection _connection;
         private readonly IsolationLevel _isolationLevel;
         private bool _disposed;
         private bool _completed;
 
-        public DecentDbTransaction(DecentDbConnection connection, IsolationLevel isolationLevel)
+        public DecentDBTransaction(DecentDBConnection connection, IsolationLevel isolationLevel)
         {
             _connection = connection;
             _isolationLevel = isolationLevel;

@@ -4,13 +4,13 @@ using System.Data;
 using System.Data.Common;
 using System.Threading;
 using System.Threading.Tasks;
-using DecentDb.Native;
+using DecentDB.Native;
 
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    public sealed class DecentDbDataReader : DbDataReader
+    public sealed class DecentDBDataReader : DbDataReader
     {
-        private readonly DecentDbCommand _command;
+        private readonly DecentDBCommand _command;
         private PreparedStatement _statement;
         private SqlObservation? _sqlObservation;
         private bool _sqlObservationCompleted;
@@ -21,7 +21,7 @@ namespace DecentDb.AdoNet
         private readonly int _initialStepResult;
         private bool _initialStepConsumed;
 
-        internal DecentDbDataReader(DecentDbCommand command, PreparedStatement statement, int initialStepResult, SqlObservation? observation)
+        internal DecentDBDataReader(DecentDBCommand command, PreparedStatement statement, int initialStepResult, SqlObservation? observation)
         {
             _command = command;
             _statement = statement;
@@ -335,7 +335,7 @@ namespace DecentDb.AdoNet
 
                 if (_initialStepResult < 0)
                 {
-                    throw new DecentDbException(_initialStepResult, "Step failed", _command.CommandText);
+                    throw new DecentDBException(_initialStepResult, "Step failed", _command.CommandText);
                 }
 
                 return _initialStepResult == 1;
@@ -344,7 +344,7 @@ namespace DecentDb.AdoNet
             var result = _statement.Step();
             if (result < 0)
             {
-                var ex = new DecentDbException(result, "Step failed", _command.CommandText);
+                var ex = new DecentDBException(result, "Step failed", _command.CommandText);
                 CompleteSqlObservationOnce(exception: ex);
                 throw ex;
             }

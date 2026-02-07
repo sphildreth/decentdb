@@ -1,6 +1,6 @@
 using System;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 internal static class DefaultTypeConverters
 {

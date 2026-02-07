@@ -1,11 +1,11 @@
-# DecentDb SPEC (Engineering Specification)
+# DecentDB SPEC (Engineering Specification)
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
 > Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
 
 ## 1. Overview
-This document defines the baseline engineering design for DecentDb:
+This document defines the baseline engineering design for DecentDB:
 - Embedded DB engine in **Nim**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
 - ACID via **WAL-based** design

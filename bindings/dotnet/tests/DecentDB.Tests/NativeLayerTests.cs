@@ -1,10 +1,10 @@
 using System;
 using System.IO;
 using Xunit;
-using DecentDbException = DecentDb.Native.DecentDbException;
-using NativeDb = DecentDb.Native.DecentDb;
+using DecentDBException = DecentDB.Native.DecentDBException;
+using NativeDb = DecentDB.Native.DecentDB;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public class NativeLayerTests : IDisposable
 {
@@ -51,7 +51,7 @@ public class NativeLayerTests : IDisposable
     public void OpenInvalidPathThrows()
     {
         var badPath = Path.Combine(Path.GetTempPath(), $"does_not_exist_{Guid.NewGuid():N}", "x.ddb");
-        var ex = Assert.Throws<DecentDbException>(() => new NativeDb(badPath));
+        var ex = Assert.Throws<DecentDBException>(() => new NativeDb(badPath));
         Assert.False(string.IsNullOrWhiteSpace(ex.Message));
     }
 
@@ -232,7 +232,7 @@ public class NativeLayerTests : IDisposable
     public void ErrorHandling()
     {
         using var db = new NativeDb(_dbPath);
-        Assert.Throws<DecentDbException>(() => db.Prepare("INVALID SQL SYNTAX"));
+        Assert.Throws<DecentDBException>(() => db.Prepare("INVALID SQL SYNTAX"));
     }
 
     [Fact]

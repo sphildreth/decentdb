@@ -2,16 +2,16 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 
-namespace DecentDb.Native;
+namespace DecentDB.Native;
 
-public sealed class DecentDb : IDisposable
+public sealed class DecentDB : IDisposable
 {
-    private readonly DecentDbHandle _handle;
+    private readonly DecentDBHandle _handle;
     private bool _disposed;
 
     public IntPtr Handle => _handle.Handle;
 
-    public DecentDb(string path, string? options = null)
+    public DecentDB(string path, string? options = null)
     {
         var pathBytes = Encoding.UTF8.GetBytes(path + "\0");
         var optBytes = options != null ? Encoding.UTF8.GetBytes(options + "\0") : Array.Empty<byte>();
@@ -22,21 +22,21 @@ public sealed class DecentDb : IDisposable
             fixed (byte* pPath = pathBytes)
             fixed (byte* pOpts = optBytes)
             {
-                ptr = DecentDbNativeUnsafe.decentdb_open(pPath, optBytes.Length > 0 ? pOpts : null);
+                ptr = DecentDBNativeUnsafe.decentdb_open(pPath, optBytes.Length > 0 ? pOpts : null);
             }
         }
 
         if (ptr == IntPtr.Zero)
         {
-            var code = DecentDbNative.decentdb_last_error_code(IntPtr.Zero);
+            var code = DecentDBNative.decentdb_last_error_code(IntPtr.Zero);
             var msg = GetErrorMessage(IntPtr.Zero);
-            throw new DecentDbException(code, msg, "Open");
+            throw new DecentDBException(code, msg, "Open");
         }
 
-        _handle = new DecentDbHandle(ptr);
+        _handle = new DecentDBHandle(ptr);
     }
 
-    public int LastErrorCode => DecentDbNative.decentdb_last_error_code(Handle);
+    public int LastErrorCode => DecentDBNative.decentdb_last_error_code(Handle);
 
     public string LastErrorMessage => GetErrorMessage(Handle);
 
@@ -44,7 +44,7 @@ public sealed class DecentDb : IDisposable
     {
         unsafe
         {
-            var ptr = DecentDbNativeUnsafe.decentdb_last_error_message(db);
+            var ptr = DecentDBNativeUnsafe.decentdb_last_error_message(db);
             if (ptr == null) return string.Empty;
             return Marshal.PtrToStringUTF8((IntPtr)ptr) ?? string.Empty;
         }
@@ -65,10 +65,10 @@ public sealed class DecentDb : IDisposable
         {
             fixed (byte* pSql = sqlBytes)
             {
-                var res = DecentDbNativeUnsafe.decentdb_prepare(Handle, pSql, out stmtPtr);
+                var res = DecentDBNativeUnsafe.decentdb_prepare(Handle, pSql, out stmtPtr);
                 if (res != 0)
                 {
-                    throw new DecentDbException(res, LastErrorMessage, sql);
+                    throw new DecentDBException(res, LastErrorMessage, sql);
                 }
             }
         }
@@ -85,17 +85,17 @@ public sealed class DecentDb : IDisposable
 
 public sealed class PreparedStatement : IDisposable
 {
-    private readonly DecentDb _db;
-    private readonly DecentDbStatementHandle _handle;
+    private readonly DecentDB _db;
+    private readonly DecentDBStatementHandle _handle;
     private bool _disposed;
     private string _sql = string.Empty;
 
     public IntPtr Handle => _handle.Handle;
 
-    internal PreparedStatement(DecentDb db, IntPtr stmtPtr)
+    internal PreparedStatement(DecentDB db, IntPtr stmtPtr)
     {
         _db = db;
-        _handle = new DecentDbStatementHandle(stmtPtr);
+        _handle = new DecentDBStatementHandle(stmtPtr);
     }
 
     public void Dispose()
@@ -107,50 +107,50 @@ public sealed class PreparedStatement : IDisposable
 
     public PreparedStatement Reset()
     {
-        var res = DecentDbNative.decentdb_reset(Handle);
+        var res = DecentDBNative.decentdb_reset(Handle);
         if (res < 0)
         {
-            throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return this;
     }
 
     public PreparedStatement ClearBindings()
     {
-        var res = DecentDbNative.decentdb_clear_bindings(Handle);
+        var res = DecentDBNative.decentdb_clear_bindings(Handle);
         if (res < 0)
         {
-            throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return this;
     }
 
     public PreparedStatement BindNull(int index1Based)
     {
-        var res = DecentDbNativeUnsafe.decentdb_bind_null(Handle, index1Based);
+        var res = DecentDBNativeUnsafe.decentdb_bind_null(Handle, index1Based);
         if (res < 0)
         {
-            throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return this;
     }
 
     public PreparedStatement BindInt64(int index1Based, long value)
     {
-        var res = DecentDbNativeUnsafe.decentdb_bind_int64(Handle, index1Based, value);
+        var res = DecentDBNativeUnsafe.decentdb_bind_int64(Handle, index1Based, value);
         if (res < 0)
         {
-            throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return this;
     }
 
     public PreparedStatement BindFloat64(int index1Based, double value)
     {
-        var res = DecentDbNativeUnsafe.decentdb_bind_float64(Handle, index1Based, value);
+        var res = DecentDBNativeUnsafe.decentdb_bind_float64(Handle, index1Based, value);
         if (res < 0)
         {
-            throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return this;
     }
@@ -168,10 +168,10 @@ public sealed class PreparedStatement : IDisposable
         {
             unsafe
             {
-                var res = DecentDbNativeUnsafe.decentdb_bind_text(Handle, index1Based, null, 0);
+                var res = DecentDBNativeUnsafe.decentdb_bind_text(Handle, index1Based, null, 0);
                 if (res < 0)
                 {
-                    throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
                 }
             }
             return this;
@@ -181,10 +181,10 @@ public sealed class PreparedStatement : IDisposable
         {
             fixed (byte* pBytes = bytes)
             {
-                var res = DecentDbNativeUnsafe.decentdb_bind_text(Handle, index1Based, pBytes, len);
+                var res = DecentDBNativeUnsafe.decentdb_bind_text(Handle, index1Based, pBytes, len);
                 if (res < 0)
                 {
-                    throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
                 }
             }
         }
@@ -198,10 +198,10 @@ public sealed class PreparedStatement : IDisposable
         {
             unsafe
             {
-                var res = DecentDbNativeUnsafe.decentdb_bind_blob(Handle, index1Based, null, 0);
+                var res = DecentDBNativeUnsafe.decentdb_bind_blob(Handle, index1Based, null, 0);
                 if (res < 0)
                 {
-                    throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
                 }
             }
             return this;
@@ -211,10 +211,10 @@ public sealed class PreparedStatement : IDisposable
         {
             fixed (byte* pBytes = bytes)
             {
-                var res = DecentDbNativeUnsafe.decentdb_bind_blob(Handle, index1Based, pBytes, len);
+                var res = DecentDBNativeUnsafe.decentdb_bind_blob(Handle, index1Based, pBytes, len);
                 if (res < 0)
                 {
-                    throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                    throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
                 }
             }
         }
@@ -223,16 +223,16 @@ public sealed class PreparedStatement : IDisposable
 
     public int Step()
     {
-        return DecentDbNative.decentdb_step(Handle);
+        return DecentDBNative.decentdb_step(Handle);
     }
 
-    public int ColumnCount => DecentDbNative.decentdb_column_count(Handle);
+    public int ColumnCount => DecentDBNative.decentdb_column_count(Handle);
 
     public string ColumnName(int col0Based)
     {
         unsafe
         {
-            var ptr = DecentDbNativeUnsafe.decentdb_column_name(Handle, col0Based);
+            var ptr = DecentDBNativeUnsafe.decentdb_column_name(Handle, col0Based);
             if (ptr == null) return string.Empty;
             return Marshal.PtrToStringUTF8((IntPtr)ptr) ?? string.Empty;
         }
@@ -240,29 +240,29 @@ public sealed class PreparedStatement : IDisposable
 
     public int ColumnType(int col0Based)
     {
-        return DecentDbNative.decentdb_column_type(Handle, col0Based);
+        return DecentDBNative.decentdb_column_type(Handle, col0Based);
     }
 
     public bool IsNull(int col0Based)
     {
-        return DecentDbNative.decentdb_column_is_null(Handle, col0Based) != 0;
+        return DecentDBNative.decentdb_column_is_null(Handle, col0Based) != 0;
     }
 
     public long GetInt64(int col0Based)
     {
-        return DecentDbNative.decentdb_column_int64(Handle, col0Based);
+        return DecentDBNative.decentdb_column_int64(Handle, col0Based);
     }
 
     public double GetFloat64(int col0Based)
     {
-        return DecentDbNative.decentdb_column_float64(Handle, col0Based);
+        return DecentDBNative.decentdb_column_float64(Handle, col0Based);
     }
 
     public string GetText(int col0Based)
     {
         unsafe
         {
-            var ptr = DecentDbNativeUnsafe.decentdb_column_text(Handle, col0Based, out var len);
+            var ptr = DecentDBNativeUnsafe.decentdb_column_text(Handle, col0Based, out var len);
             if (ptr == null || len == 0) return string.Empty;
             return Marshal.PtrToStringUTF8((IntPtr)ptr, len) ?? string.Empty;
         }
@@ -270,21 +270,21 @@ public sealed class PreparedStatement : IDisposable
 
     public byte[] GetBlob(int col0Based)
     {
-        var ptr = DecentDbNative.decentdb_column_blob(Handle, col0Based, out var len);
+        var ptr = DecentDBNative.decentdb_column_blob(Handle, col0Based, out var len);
         if (ptr == IntPtr.Zero || len == 0) return Array.Empty<byte>();
         var bytes = new byte[len];
         Marshal.Copy(ptr, bytes, 0, len);
         return bytes;
     }
 
-    public long RowsAffected => DecentDbNative.decentdb_rows_affected(Handle);
+    public long RowsAffected => DecentDBNative.decentdb_rows_affected(Handle);
 
     public RowView GetRowView()
     {
-        var res = DecentDbNative.decentdb_row_view(Handle, out var valuesPtr, out var count);
+        var res = DecentDBNative.decentdb_row_view(Handle, out var valuesPtr, out var count);
         if (res < 0)
         {
-            throw new DecentDbException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return new RowView(valuesPtr, count);
     }
@@ -314,12 +314,12 @@ public readonly struct RowView
     }
 }
 
-public class DecentDbException : Exception
+public class DecentDBException : Exception
 {
     public int ErrorCode { get; }
     public string Sql { get; }
 
-    public DecentDbException(int errorCode, string message, string sql) : base($"DecentDB error {errorCode}: {message}")
+    public DecentDBException(int errorCode, string message, string sql) : base($"DecentDB error {errorCode}: {message}")
     {
         ErrorCode = errorCode;
         Sql = sql;

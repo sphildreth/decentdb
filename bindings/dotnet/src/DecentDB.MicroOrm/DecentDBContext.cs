@@ -1,16 +1,16 @@
 using System;
 using System.Collections.Concurrent;
 using System.Data.Common;
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
-public class DecentDbContext : IDisposable
+public class DecentDBContext : IDisposable
 {
     private readonly string _connectionString;
     private readonly bool _pooling;
 
-    private DecentDbConnection? _connection;
+    private DecentDBConnection? _connection;
     private DbTransaction? _transaction;
 
     private EventHandler<SqlExecutingEventArgs>? _sqlExecuting;
@@ -46,7 +46,7 @@ public class DecentDbContext : IDisposable
 
     private readonly ConcurrentDictionary<Type, object> _sets = new();
 
-    public DecentDbContext(string connectionStringOrPath, bool pooling = true)
+    public DecentDBContext(string connectionStringOrPath, bool pooling = true)
     {
         if (string.IsNullOrWhiteSpace(connectionStringOrPath))
         {
@@ -123,7 +123,7 @@ public class DecentDbContext : IDisposable
         }
 
         // Non-pooled mode: open/close per operation.
-        var conn = new DecentDbConnection(_connectionString);
+        var conn = new DecentDBConnection(_connectionString);
         conn.Open();
         return new ConnectionScope(conn, disposeConnection: true);
     }
@@ -137,7 +137,7 @@ public class DecentDbContext : IDisposable
             return;
         }
 
-        _connection = new DecentDbConnection(_connectionString);
+        _connection = new DecentDBConnection(_connectionString);
         _connection.Open();
 
         if (_sqlExecuting != null) _connection.SqlExecuting += _sqlExecuting;
@@ -148,13 +148,13 @@ public class DecentDbContext : IDisposable
     {
         private readonly bool _disposeConnection;
 
-        public ConnectionScope(DecentDbConnection connection, bool disposeConnection)
+        public ConnectionScope(DecentDBConnection connection, bool disposeConnection)
         {
             Connection = connection;
             _disposeConnection = disposeConnection;
         }
 
-        public DecentDbConnection Connection { get; }
+        public DecentDBConnection Connection { get; }
 
         public void Dispose()
         {
@@ -179,7 +179,7 @@ public class DecentDbContext : IDisposable
             var entityType = pt.GetGenericArguments()[0];
             var set = _sets.GetOrAdd(entityType, t =>
             {
-                var ctor = pt.GetConstructor(new[] { typeof(DecentDbContext) });
+                var ctor = pt.GetConstructor(new[] { typeof(DecentDBContext) });
                 return ctor!.Invoke(new object[] { this });
             });
 

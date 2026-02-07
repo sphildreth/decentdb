@@ -2,7 +2,7 @@ using System;
 using System.Globalization;
 using System.Text;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 internal static class Conventions
 {

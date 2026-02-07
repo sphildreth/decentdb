@@ -4,7 +4,7 @@ using System.Data.Common;
 using System.Linq.Expressions;
 using System.Reflection;
 
-namespace DecentDb.MicroOrm;
+namespace DecentDB.MicroOrm;
 
 internal static class FastMaterializer<T> where T : class, new()
 {

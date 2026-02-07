@@ -1,6 +1,6 @@
 version       = "0.1.0"
-author        = "DecentDb contributors"
-description   = "DecentDb engine"
+author        = "DecentDB contributors"
+description   = "DecentDB engine"
 license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["decentdb"]
@@ -10,7 +10,7 @@ requires "cligen >= 1.7.0"
 requires "zip >= 0.3.1"
 
 
-task build_lib, "Build DecentDb shared library (C API)":
+task build_lib, "Build DecentDB shared library (C API)":
   exec "nim c --app:lib -d:libpg_query -d:release --mm:arc --threads:on --outdir:build src/c_api.nim"
 
 task test, "Run Nim + Python unit tests":

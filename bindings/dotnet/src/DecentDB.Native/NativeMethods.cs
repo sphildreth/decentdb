@@ -3,9 +3,9 @@ using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Threading;
 
-namespace DecentDb.Native;
+namespace DecentDB.Native;
 
-public static class DecentDbNative
+public static class DecentDBNative
 {
     private const string NativeLib = "decentdb";
 
@@ -46,7 +46,7 @@ public static class DecentDbNative
 
         try
         {
-            NativeLibrary.SetDllImportResolver(typeof(DecentDbNative).Assembly, (name, assembly, path) =>
+            NativeLibrary.SetDllImportResolver(typeof(DecentDBNative).Assembly, (name, assembly, path) =>
             {
                 if (name == NativeLib)
                 {
@@ -111,7 +111,7 @@ public static class DecentDbNative
             yield return AppContext.BaseDirectory;
         }
 
-        var assemblyDir = Path.GetDirectoryName(typeof(DecentDbNative).Assembly.Location);
+        var assemblyDir = Path.GetDirectoryName(typeof(DecentDBNative).Assembly.Location);
         if (!string.IsNullOrWhiteSpace(assemblyDir))
         {
             yield return assemblyDir;
@@ -167,13 +167,13 @@ public static class DecentDbNative
     public static extern void decentdb_finalize(IntPtr stmt);
 }
 
-public static unsafe class DecentDbNativeUnsafe
+public static unsafe class DecentDBNativeUnsafe
 {
     private const string NativeLib = "decentdb";
 
-    static DecentDbNativeUnsafe()
+    static DecentDBNativeUnsafe()
     {
-        DecentDbNative.EnsureInitialized();
+        DecentDBNative.EnsureInitialized();
     }
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_open")]

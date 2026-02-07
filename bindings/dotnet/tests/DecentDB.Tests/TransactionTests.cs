@@ -4,10 +4,10 @@ using System.Data.Common;
 using System.IO;
 using System.Threading.Tasks;
 using Xunit;
-using DecentDb.AdoNet;
-using DecentDb.Native;
+using DecentDB.AdoNet;
+using DecentDB.Native;
 
-namespace DecentDb.Tests;
+namespace DecentDB.Tests;
 
 public class TransactionTests : IDisposable
 {
@@ -30,7 +30,7 @@ public class TransactionTests : IDisposable
     [Fact]
     public void CommitTransaction()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -56,7 +56,7 @@ public class TransactionTests : IDisposable
     [Fact]
     public void RollbackTransaction()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -79,7 +79,7 @@ public class TransactionTests : IDisposable
     [Fact]
     public void NestedTransactionsNotSupported()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -89,7 +89,7 @@ public class TransactionTests : IDisposable
         using var tx1 = conn.BeginTransaction();
 
         // MVP: one transaction per connection at a time.
-        Assert.Throws<DecentDbException>(() => conn.BeginTransaction());
+        Assert.Throws<DecentDBException>(() => conn.BeginTransaction());
 
         tx1.Rollback();
     }
@@ -97,7 +97,7 @@ public class TransactionTests : IDisposable
     [Fact]
     public void TransactionIsolationLevelSnapshot()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
@@ -125,7 +125,7 @@ public class TransactionTests : IDisposable
     [Fact]
     public void AutoRollbackOnDispose()
     {
-        using var conn = new DecentDbConnection($"Data Source={_dbPath}");
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();

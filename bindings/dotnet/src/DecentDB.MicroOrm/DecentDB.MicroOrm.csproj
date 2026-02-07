@@ -6,7 +6,7 @@
 
     <PackageId>DecentDB.MicroOrm</PackageId>
     <Description>DecentDB Micro-ORM (.NET 10) with bundled native engine</Description>
-    <Authors>DecentDb contributors</Authors>
+    <Authors>DecentDB contributors</Authors>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageIcon>icon.png</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -24,7 +24,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\DecentDb.AdoNet\DecentDb.AdoNet.csproj" />
+    <ProjectReference Include="..\DecentDB.AdoNet\DecentDB.AdoNet.csproj" />
   </ItemGroup>
 
   <ItemGroup>

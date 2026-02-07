@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
-    <RootNamespace>DecentDb.Tests</RootNamespace>
+    <RootNamespace>DecentDB.Tests</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\DecentDb.AdoNet\DecentDb.AdoNet.csproj" />
-    <ProjectReference Include="..\..\src\DecentDb.MicroOrm\DecentDb.MicroOrm.csproj" />
+    <ProjectReference Include="..\..\src\DecentDB.AdoNet\DecentDB.AdoNet.csproj" />
+    <ProjectReference Include="..\..\src\DecentDB.MicroOrm\DecentDB.MicroOrm.csproj" />
   </ItemGroup>
 </Project>
