@@ -36,13 +36,13 @@ Examples:
 
 - Workflow: `.github/workflows/release.yml`
 - Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`
-- Output: release artifacts containing the DecentDb CLI and the native library for Linux/Windows/macOS.
+- Output: release artifacts containing the DecentDB CLI and the native library for Linux/Windows/macOS.
 
 ### NuGet publishing
 
 - Workflow: `.github/workflows/nuget.yml`
 - Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`
-- Package: `Decent.MicroOrm`
+- Package: `DecentDB.MicroOrm`
 - Target framework: `.NET 10` only (`net10.0`)
 
 Required secret:
@@ -56,11 +56,11 @@ Required secret:
 3. Create and push the tag:
 
 ```bash
-git tag -a v0.1.X -m "DecentDb 0.1.X (NuGet 1.0.0-rc.X)"
+git tag -a v0.1.X -m "DecentDB 0.1.X (NuGet 1.0.0-rc.X)"
 git push origin v0.1.X
 ```
 
 GitHub Actions will:
 
 - create a GitHub pre-release and attach binaries
-- publish `Decent.MicroOrm` as `1.0.0-rc.X`
+- publish `DecentDB.MicroOrm` as `1.0.0-rc.X`

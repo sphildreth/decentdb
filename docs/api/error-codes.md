@@ -1,6 +1,6 @@
 # Error Codes
 
-DecentDb uses specific error codes to indicate different types of failures.
+DecentDB uses specific error codes to indicate different types of failures.
 
 ## Error Code Reference
 
@@ -76,7 +76,7 @@ INSERT INTO users VALUES (2, 'alice@example.com');
 Transaction-related failures.
 
 **Common Causes:**
-- Deadlock (rare in DecentDb)
+- Deadlock (rare in DecentDB)
 - Lock timeout
 - Write conflict
 
@@ -121,7 +121,7 @@ decentdb exec --db=my.ddb --sql="SELEC * FROM users"
 Unexpected internal engine error.
 
 **Common Causes:**
-- Bug in DecentDb
+- Bug in DecentDB
 - Memory allocation failure
 - Internal assertion failure
 

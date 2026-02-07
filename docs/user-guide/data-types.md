@@ -1,6 +1,6 @@
 # Data Types
 
-DecentDb supports the following SQL data types.
+DecentDB supports the following SQL data types.
 
 ## Supported Types
 

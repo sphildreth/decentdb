@@ -1,6 +1,6 @@
 # SQL Reference
 
-DecentDb supports a PostgreSQL-like SQL subset.
+DecentDB supports a PostgreSQL-like SQL subset.
 
 See also: [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md)
 
@@ -189,7 +189,7 @@ INSERT INTO table_name (...) VALUES (...) RETURNING col1, col2;
 
 Notes:
 - `ON CONFLICT ... DO NOTHING` is supported.
-- `ON CONSTRAINT name` resolves against DecentDb unique index names.
+- `ON CONSTRAINT name` resolves against DecentDB unique index names.
 - `ON CONFLICT ... DO UPDATE` is supported with explicit conflict target (`(cols)` or `ON CONSTRAINT name`).
 - In `DO UPDATE` expressions, unqualified columns resolve to the target table; `EXCLUDED.col` is supported.
 - Targetless `ON CONFLICT DO UPDATE` is not yet supported.

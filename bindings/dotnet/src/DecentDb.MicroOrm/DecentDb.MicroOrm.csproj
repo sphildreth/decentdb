@@ -4,7 +4,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
-    <PackageId>Decent.MicroOrm</PackageId>
+    <PackageId>DecentDb.MicroOrm</PackageId>
     <Description>DecentDB Micro-ORM (.NET 10) with bundled native engine</Description>
     <Authors>DecentDb contributors</Authors>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
@@ -13,33 +13,17 @@
     <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
 
-    <!-- Default SDK-generated nuspec; avoids NU5046 issues when using a custom nuspec. -->
+    <!-- Use a custom nuspec to keep a single package without external dependencies,
+         while still emitting a net10.0 dependency group (avoids NU5128). -->
+    <NuspecFile>DecentDb.MicroOrm.nuspec</NuspecFile>
 
-    <!-- Publish as a single package that contains the managed layers + native binaries. -->
-    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
-    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
-
-    <!-- NU5128 is caused by suppressing dependency groups while still producing lib/net10.0 outputs. -->
-    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <!-- The nuspec explicitly lists lib/runtimes assets. -->
+    <IncludeBuildOutput>false</IncludeBuildOutput>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\DecentDb.AdoNet\DecentDb.AdoNet.csproj" />
   </ItemGroup>
 
-  <ItemGroup>
-    <None Include="README.md" Pack="true" PackagePath="README.md" />
-    <None Include="..\..\..\..\graphics\logo-256x256.png" Pack="true" PackagePath="icon.png" />
-    <None Include="runtimes/linux-x64/native/libdecentdb.so" Pack="true" PackagePath="runtimes/linux-x64/native/libdecentdb.so" Condition="Exists('runtimes/linux-x64/native/libdecentdb.so')" />
-    <None Include="runtimes/osx-x64/native/libdecentdb.dylib" Pack="true" PackagePath="runtimes/osx-x64/native/libdecentdb.dylib" Condition="Exists('runtimes/osx-x64/native/libdecentdb.dylib')" />
-    <None Include="runtimes/win-x64/native/decentdb.dll" Pack="true" PackagePath="runtimes/win-x64/native/decentdb.dll" Condition="Exists('runtimes/win-x64/native/decentdb.dll')" />
-  </ItemGroup>
-
-  <Target Name="IncludeProjectReferencesInPackage" DependsOnTargets="ResolveReferences">
-    <ItemGroup>
-      <BuildOutputInPackage
-        Include="@(ReferenceCopyLocalPaths->WithMetadataValue('ReferenceSourceTarget', 'ProjectReference'))"
-        TargetPath="%(Filename)%(Extension)" />
-    </ItemGroup>
-  </Target>
+  <!-- Packing is controlled by DecentDb.MicroOrm.nuspec. -->
 </Project>

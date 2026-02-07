@@ -1,4 +1,4 @@
-name: Publish NuGet (Decent.MicroOrm)
+name: Publish NuGet (DecentDb.MicroOrm)
 
 on:
   push:

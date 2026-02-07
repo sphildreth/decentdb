@@ -1,6 +1,6 @@
 # Transactions
 
-DecentDb supports ACID transactions with full durability guarantees.
+DecentDB supports ACID transactions with full durability guarantees.
 
 ## Transaction Basics
 
@@ -60,7 +60,7 @@ COMMIT;
 
 ### Isolation
 
-DecentDb uses **Snapshot Isolation**:
+DecentDB uses **Snapshot Isolation**:
 - Readers see a consistent snapshot of data as of transaction start
 - Writers block other writers (single writer model)
 - Readers never block writers
@@ -79,7 +79,7 @@ decentdb exec --db=my.ddb --sql="BEGIN; INSERT INTO logs VALUES (1, 'important')
 
 ## Single Writer Model
 
-DecentDb enforces single writer semantics:
+DecentDB enforces single writer semantics:
 
 - Only one write transaction at a time
 - Write transactions are serialized

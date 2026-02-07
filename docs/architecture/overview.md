@@ -1,6 +1,6 @@
 # Architecture Overview
 
-DecentDb is designed with a modular architecture emphasizing correctness, performance, and simplicity.
+DecentDB is designed with a modular architecture emphasizing correctness, performance, and simplicity.
 
 ## Design Principles
 

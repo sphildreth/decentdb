@@ -1,6 +1,6 @@
 # Configuration
 
-DecentDb can be configured at database creation and runtime.
+DecentDB can be configured at database creation and runtime.
 
 ## Database Configuration
 

@@ -1,6 +1,6 @@
 # Performance Tuning
 
-Tips for optimizing DecentDb performance.
+Tips for optimizing DecentDB performance.
 
 ## Cache Configuration
 
@@ -23,7 +23,7 @@ Recommendations:
 
 ### Primary Keys
 
-Always define primary keys. DecentDb automatically creates an index.
+Always define primary keys. DecentDB automatically creates an index.
 
 ```sql
 CREATE TABLE users (

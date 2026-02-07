@@ -30,7 +30,7 @@ B-Tree indexes are used for:
 
 ### Automatic Indexes
 
-DecentDb creates indexes automatically for:
+DecentDB creates indexes automatically for:
 - PRIMARY KEY columns
 - FOREIGN KEY columns
 - UNIQUE constraints

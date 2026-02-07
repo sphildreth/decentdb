@@ -1,11 +1,11 @@
-# DecentDb PRD (Product Requirements Document)
+# DecentDB PRD (Product Requirements Document)
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
 > Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
 
 ## 1. Product summary
-DecentDb is an embedded, single-machine relational database engine focused on:
+DecentDB is an embedded, single-machine relational database engine focused on:
 - **Durable ACID writes** (priority #1)
 - **Fast reads** (priority #2)
 - **Single writer + many concurrent readers** (single process, multi-threaded)

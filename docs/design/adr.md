@@ -1,6 +1,6 @@
 # Architecture Decision Records (ADRs)
 
-This directory contains Architecture Decision Records (ADRs) documenting significant architectural decisions in DecentDb.
+This directory contains Architecture Decision Records (ADRs) documenting significant architectural decisions in DecentDB.
 
 ## What is an ADR?
 

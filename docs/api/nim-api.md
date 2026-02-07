@@ -1,6 +1,6 @@
 # Nim API Reference
 
-DecentDb's native Nim API for embedded applications.
+DecentDB's native Nim API for embedded applications.
 
 ## Opening a Database
 
@@ -330,5 +330,5 @@ See the [VFS module](../architecture/storage.md) for details.
 
 ## API Stability
 
-DecentDb is currently pre-1.0 (starting at 0.0.1). Until 1.0.0, APIs may change, including breaking changes.
+DecentDB is currently pre-1.0 (starting at 0.0.1). Until 1.0.0, APIs may change, including breaking changes.
 Once 1.0.0 is released, we will follow Semantic Versioning for API compatibility.

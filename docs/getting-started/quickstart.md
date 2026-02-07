@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide will get you up and running with DecentDb in 5 minutes.
+This guide will get you up and running with DecentDB in 5 minutes.
 
 ## Create Your First Database
 

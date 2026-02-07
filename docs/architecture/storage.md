@@ -4,7 +4,7 @@ The storage engine manages how data is organized on disk.
 
 ## Page-Based Storage
 
-DecentDb uses a page-based storage model where all data is stored in fixed-size pages.
+DecentDB uses a page-based storage model where all data is stored in fixed-size pages.
 
 ### Page Size
 

@@ -1,11 +1,11 @@
-# DecentDb SPEC (Engineering Specification)
+# DecentDB SPEC (Engineering Specification)
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
 > Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
 
 ## 1. Overview
-This document defines the baseline engineering design for DecentDb:
+This document defines the baseline engineering design for DecentDB:
 - Embedded DB engine in **Nim**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
 - ACID via **WAL-based** design
@@ -272,7 +272,7 @@ Multi-process locking is out of scope for 0.x.
 ### 6.1 Parser choice
 0.x recommendation:
 - Use a Postgres-compatible parser via FFI (e.g., `libpg_query`) to accept familiar syntax.
-- Normalize parse trees into DecentDb’s internal AST immediately.
+- Normalize parse trees into DecentDB’s internal AST immediately.
 
 Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
@@ -483,7 +483,7 @@ For contains predicates:
 
 4. **Differential tests (Python)**
    - For supported SQL subset, run query on:
-     - DecentDb
+     - DecentDB
      - PostgreSQL
    - Compare result sets for deterministic queries (no timestamps/random)
 

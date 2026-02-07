@@ -1,11 +1,11 @@
 # License
 
-DecentDb is licensed under the Apache License 2.0.
+DecentDB is licensed under the Apache License 2.0.
 
 ## Apache License 2.0
 
 ```
-Copyright 2026 DecentDb Contributors
+Copyright 2026 DecentDB Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ See the [LICENSE](https://github.com/sphildreth/decentdb/blob/main/LICENSE) file
 
 ## Dependencies
 
-DecentDb uses the following open source components:
+DecentDB uses the following open source components:
 
 ### libpg_query
 
@@ -48,11 +48,11 @@ DecentDb uses the following open source components:
 
 ## Contributing
 
-By contributing to DecentDb, you agree that your contributions will be licensed under the Apache License 2.0.
+By contributing to DecentDB, you agree that your contributions will be licensed under the Apache License 2.0.
 
 ## Trademarks
 
-"DecentDb" and the DecentDb logo are trademarks of the project maintainers.
+"DecentDB" and the DecentDB logo are trademarks of the project maintainers.
 
 ## Questions?
 

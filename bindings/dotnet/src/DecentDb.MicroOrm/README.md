@@ -1,4 +1,4 @@
-# Decent.MicroOrm
+# DecentDb.MicroOrm
 
 Micro-ORM for DecentDB, targeting `.NET 10` (`net10.0`).
 
@@ -11,7 +11,7 @@ This package is intended for embedded use and includes:
 ## Install
 
 ```bash
-dotnet add package Decent.MicroOrm --prerelease
+dotnet add package DecentDb.MicroOrm --prerelease
 ```
 
 ## Notes
