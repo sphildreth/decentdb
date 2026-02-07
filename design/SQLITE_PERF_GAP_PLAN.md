@@ -1,9 +1,9 @@
 # DecentDB → SQLite Commit Latency Performance Gap Plan
 
 **Current Status:**
-- DecentDB p95 commit latency: ~0.07395ms (after optimizations)
-- SQLite p95 commit latency: ~0.00955ms
-- **Gap:** ~7.74x slower
+- DecentDB p95 commit latency: ~0.0750855ms (after optimizations)
+- SQLite p95 commit latency: ~0.009398ms
+- **Gap:** ~7.99x slower
 
 **Goal:** Define the architectural changes needed to achieve <2x SQLite's commit latency (<0.020ms)
 
