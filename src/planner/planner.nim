@@ -12,6 +12,10 @@ type PlanKind* = enum
   pkIndexSeek
   pkTrigramSeek
   pkUnionDistinct
+  pkSetUnionDistinct
+  pkSetIntersect
+  pkSetExcept
+  pkAppend
   pkFilter
   pkProject
   pkJoin
@@ -132,6 +136,23 @@ proc refs(expr: Expr): HashSet[string] =
   referencedTables(expr, result)
 
 proc planSelect(catalog: Catalog, stmt: Statement): Plan =
+  if stmt.setOpKind == sokUnionAll:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkAppend, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokUnion:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetUnionDistinct, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokIntersect:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetIntersect, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokExcept:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetExcept, left: leftPlan, right: rightPlan)
+
   proc hasAggregate(items: seq[SelectItem]): bool =
     for item in items:
       if item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:

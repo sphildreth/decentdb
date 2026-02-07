@@ -558,6 +558,256 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_insert_returning_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_returning_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.users (id INT PRIMARY KEY, email TEXT UNIQUE, visits INT NOT NULL);"
+            )
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_insert_returning.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup = run_cli("CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, visits INT NOT NULL)")
+                self.assertTrue(setup.get("ok"), msg=setup.get("error"))
+
+                query_pairs = [
+                    (
+                        "INSERT INTO users VALUES (1, 'a@x', 1) RETURNING id, email",
+                        f"INSERT INTO {schema}.users VALUES (1, 'a@x', 1) RETURNING id, email",
+                    ),
+                    (
+                        "INSERT INTO users VALUES (1, 'a@x', 4) ON CONFLICT (id) DO UPDATE "
+                        "SET visits = users.visits + EXCLUDED.visits RETURNING visits",
+                        f"INSERT INTO {schema}.users VALUES (1, 'a@x', 4) ON CONFLICT (id) DO UPDATE "
+                        f"SET visits = {schema}.users.visits + EXCLUDED.visits RETURNING visits",
+                    ),
+                    (
+                        "INSERT INTO users VALUES (1, 'dup@x', 9) ON CONFLICT DO NOTHING RETURNING id",
+                        f"INSERT INTO {schema}.users VALUES (1, 'dup@x', 9) ON CONFLICT DO NOTHING RETURNING id",
+                    ),
+                ]
+                for cli_sql, pg_sql in query_pairs:
+                    pg_rows = run_psql(pg_sql)
+                    payload = run_cli(cli_sql)
+                    self.assertTrue(payload.get("ok"), msg=f"{cli_sql}: {payload.get('error')}")
+                    self.assertEqual(payload.get("rows", []), pg_rows, msg=cli_sql)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
+    def test_non_recursive_cte_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_cte_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.users (id INT PRIMARY KEY, name TEXT); "
+                f"CREATE TABLE {schema}.t (id INT PRIMARY KEY); "
+                f"INSERT INTO {schema}.users VALUES (1, 'a'), (2, 'b'), (3, 'c'); "
+                f"INSERT INTO {schema}.t VALUES (99);"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_cte.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                for stmt in [
+                    "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+                    "CREATE TABLE t (id INT PRIMARY KEY)",
+                    "INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+                    "INSERT INTO t VALUES (99)",
+                ]:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                query_pairs = [
+                    (
+                        "WITH base AS (SELECT id, name FROM users WHERE id <= 2) "
+                        "SELECT id, name FROM base ORDER BY id",
+                        f"WITH base AS (SELECT id, name FROM {schema}.users WHERE id <= 2) "
+                        "SELECT id, name FROM base ORDER BY id",
+                    ),
+                    (
+                        "WITH a AS (SELECT id FROM users), b(x) AS (SELECT id FROM a WHERE id > 1) "
+                        "SELECT x FROM b ORDER BY x",
+                        f"WITH a AS (SELECT id FROM {schema}.users), b(x) AS (SELECT id FROM a WHERE id > 1) "
+                        "SELECT x FROM b ORDER BY x",
+                    ),
+                    (
+                        "WITH t AS (SELECT id FROM users WHERE id = 1) SELECT id FROM t",
+                        f"WITH t AS (SELECT id FROM {schema}.users WHERE id = 1) SELECT id FROM t",
+                    ),
+                ]
+
+                for cli_query, pg_query in query_pairs:
+                    pg_rows = run_psql(pg_query)
+                    payload = run_cli(cli_query)
+                    self.assertTrue(payload.get("ok"), msg=f"{cli_query}: {payload.get('error')}")
+                    self.assertEqual(payload.get("rows", []), pg_rows, msg=cli_query)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
+    def test_union_all_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_union_all_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.a (id INT); "
+                f"CREATE TABLE {schema}.b (id INT); "
+                f"INSERT INTO {schema}.a VALUES (1), (2); "
+                f"INSERT INTO {schema}.b VALUES (2), (3);"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_union_all.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                for stmt in [
+                    "CREATE TABLE a (id INT)",
+                    "CREATE TABLE b (id INT)",
+                    "INSERT INTO a VALUES (1), (2)",
+                    "INSERT INTO b VALUES (2), (3)",
+                ]:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                queries = [
+                    (
+                        "SELECT id FROM a UNION ALL SELECT id FROM b",
+                        f"SELECT id FROM {schema}.a UNION ALL SELECT id FROM {schema}.b",
+                    ),
+                    (
+                        "SELECT id FROM a UNION SELECT id FROM b",
+                        f"SELECT id FROM {schema}.a UNION SELECT id FROM {schema}.b",
+                    ),
+                    (
+                        "SELECT id FROM a INTERSECT SELECT id FROM b",
+                        f"SELECT id FROM {schema}.a INTERSECT SELECT id FROM {schema}.b",
+                    ),
+                    (
+                        "SELECT id FROM a EXCEPT SELECT id FROM b",
+                        f"SELECT id FROM {schema}.a EXCEPT SELECT id FROM {schema}.b",
+                    ),
+                ]
+                for cli_query, pg_query in queries:
+                    pg_rows = run_psql(pg_query)
+                    payload = run_cli(cli_query)
+                    self.assertTrue(payload.get("ok"), msg=f"{cli_query}: {payload.get('error')}")
+                    self.assertEqual(payload.get("rows", []), pg_rows, msg=cli_query)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

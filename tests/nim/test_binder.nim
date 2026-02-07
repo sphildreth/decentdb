@@ -44,6 +44,80 @@ proc parseSingle(sqlText: string): Statement =
   astRes.value.statements[0]
 
 suite "Binder":
+  test "bind non-recursive CTE scoping and shadowing":
+    let path = makeTempDb("decentdb_binder_cte.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "users", @[Column(name: "id", kind: ctInt64), Column(name: "name", kind: ctText)])
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64)])
+
+    let chain = bindStatement(
+      db.catalog,
+      parseSingle(
+        "WITH a AS (SELECT id FROM users), b AS (SELECT id FROM a WHERE id > 1) " &
+        "SELECT id FROM b"
+      )
+    )
+    check chain.ok
+    check chain.value.kind == skSelect
+    check chain.value.fromTable == "users"
+    check chain.value.cteNames.len == 0
+
+    let shadow = bindStatement(
+      db.catalog,
+      parseSingle("WITH t AS (SELECT id FROM users WHERE id = 1) SELECT id FROM t")
+    )
+    check shadow.ok
+    check shadow.value.fromTable == "users"
+
+    let forwardRef = bindStatement(
+      db.catalog,
+      parseSingle(
+        "WITH b AS (SELECT id FROM a), a AS (SELECT id FROM users) SELECT id FROM b"
+      )
+    )
+    check not forwardRef.ok
+
+    let badShape = bindStatement(
+      db.catalog,
+      parseSingle("WITH a AS (SELECT id FROM users ORDER BY id) SELECT id FROM a")
+    )
+    check not badShape.ok
+
+    discard closeDb(db)
+
+  test "bind set operations":
+    let path = makeTempDb("decentdb_binder_union_all.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "a", @[Column(name: "id", kind: ctInt64)])
+    discard addTable(db, "b", @[Column(name: "id", kind: ctInt64)])
+
+    let unionAll = bindStatement(db.catalog, parseSingle("SELECT id FROM a UNION ALL SELECT id FROM b"))
+    check unionAll.ok
+    check unionAll.value.kind == skSelect
+    check unionAll.value.setOpKind == sokUnionAll
+    check unionAll.value.setOpLeft != nil
+    check unionAll.value.setOpRight != nil
+
+    let unionDistinct = bindStatement(db.catalog, parseSingle("SELECT id FROM a UNION SELECT id FROM b"))
+    check unionDistinct.ok
+    check unionDistinct.value.setOpKind == sokUnion
+
+    let intersect = bindStatement(db.catalog, parseSingle("SELECT id FROM a INTERSECT SELECT id FROM b"))
+    check intersect.ok
+    check intersect.value.setOpKind == sokIntersect
+
+    let exceptStmt = bindStatement(db.catalog, parseSingle("SELECT id FROM a EXCEPT SELECT id FROM b"))
+    check exceptStmt.ok
+    check exceptStmt.value.setOpKind == sokExcept
+
+    discard closeDb(db)
+
   test "bind errors for unknown table and ambiguous column":
     let path = makeTempDb("decentdb_binder_errors.db")
     let dbRes = openDb(path)
@@ -170,6 +244,19 @@ suite "Binder":
       parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') ON CONFLICT (email) DO UPDATE SET name = missing.col")
     )
     check not doUpdateBadSource.ok
+
+    let returningBind = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') RETURNING id, email")
+    )
+    check returningBind.ok
+    check returningBind.value.insertReturning.len == 2
+
+    let badReturningBind = bindStatement(
+      db.catalog,
+      parseSingle("INSERT INTO users (id, email, name) VALUES (1, 'a@x', 'a') RETURNING missing")
+    )
+    check not badReturningBind.ok
 
     discard closeDb(db)
 

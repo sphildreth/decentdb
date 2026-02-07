@@ -297,6 +297,116 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "insert RETURNING":
+    let path = makeTempDb("decentdb_sql_exec_insert_returning.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT UNIQUE, visits INT NOT NULL)").ok
+
+    let insReturning = execSql(db, "INSERT INTO users VALUES (1, 'a@x', 1) RETURNING id, email")
+    check insReturning.ok
+    check insReturning.value == @["1|a@x"]
+
+    let insReturningStar = execSql(db, "INSERT INTO users VALUES (2, 'b@x', 3) RETURNING *")
+    check insReturningStar.ok
+    check insReturningStar.value == @["2|b@x|3"]
+
+    let doNothingNoRow = execSql(
+      db,
+      "INSERT INTO users VALUES (1, 'dup@x', 9) ON CONFLICT DO NOTHING RETURNING id"
+    )
+    check doNothingNoRow.ok
+    check doNothingNoRow.value.len == 0
+
+    let doUpdateReturning = execSql(
+      db,
+      "INSERT INTO users VALUES (1, 'a@x', 4) " &
+      "ON CONFLICT (id) DO UPDATE SET visits = users.visits + EXCLUDED.visits RETURNING visits"
+    )
+    check doUpdateReturning.ok
+    check doUpdateReturning.value == @["5"]
+
+    let doUpdateWhereSkip = execSql(
+      db,
+      "INSERT INTO users VALUES (1, 'a@x', 10) " &
+      "ON CONFLICT (id) DO UPDATE SET visits = EXCLUDED.visits WHERE users.id = 999 RETURNING id"
+    )
+    check doUpdateWhereSkip.ok
+    check doUpdateWhereSkip.value.len == 0
+
+    discard closeDb(db)
+
+  test "non-recursive CTE execution":
+    let path = makeTempDb("decentdb_sql_exec_cte.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").ok
+    check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)").ok
+    check execSql(db, "INSERT INTO users VALUES (1, 'a')").ok
+    check execSql(db, "INSERT INTO users VALUES (2, 'b')").ok
+    check execSql(db, "INSERT INTO users VALUES (3, 'c')").ok
+    check execSql(db, "INSERT INTO t VALUES (99)").ok
+
+    let basic = execSql(
+      db,
+      "WITH base AS (SELECT id, name FROM users WHERE id <= 2) " &
+      "SELECT id, name FROM base ORDER BY id"
+    )
+    check basic.ok
+    check basic.value == @[("1|a"), ("2|b")]
+
+    let chain = execSql(
+      db,
+      "WITH a AS (SELECT id FROM users), b(x) AS (SELECT id FROM a WHERE id > 1) " &
+      "SELECT x FROM b ORDER BY x"
+    )
+    check chain.ok
+    check chain.value == @[("2"), ("3")]
+
+    let shadow = execSql(db, "WITH t AS (SELECT id FROM users WHERE id = 1) SELECT id FROM t")
+    check shadow.ok
+    check shadow.value == @[("1")]
+
+    let unsupportedShape = execSql(db, "WITH a AS (SELECT id FROM users ORDER BY id) SELECT id FROM a")
+    check not unsupportedShape.ok
+
+    discard closeDb(db)
+
+  test "set operation execution":
+    let path = makeTempDb("decentdb_sql_exec_union_all.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE a (id INT)").ok
+    check execSql(db, "CREATE TABLE b (id INT)").ok
+    check execSql(db, "INSERT INTO a VALUES (1)").ok
+    check execSql(db, "INSERT INTO a VALUES (2)").ok
+    check execSql(db, "INSERT INTO b VALUES (2)").ok
+    check execSql(db, "INSERT INTO b VALUES (3)").ok
+
+    let unionAll = execSql(db, "SELECT id FROM a UNION ALL SELECT id FROM b")
+    check unionAll.ok
+    check unionAll.value == @["1", "2", "2", "3"]
+
+    let unionDistinct = execSql(db, "SELECT id FROM a UNION SELECT id FROM b")
+    check unionDistinct.ok
+    check unionDistinct.value == @["1", "2", "3"]
+
+    let intersectRes = execSql(db, "SELECT id FROM a INTERSECT SELECT id FROM b")
+    check intersectRes.ok
+    check intersectRes.value == @["2"]
+
+    let exceptRes = execSql(db, "SELECT id FROM a EXCEPT SELECT id FROM b")
+    check exceptRes.ok
+    check exceptRes.value == @["1"]
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),
@@ -432,6 +542,38 @@ suite "Planner":
     let planRes = plan(catalog, stmt)
     check planRes.ok
     check planRes.value.kind == pkStatement
+
+  test "UNION ALL plans as append":
+    var catalog = makeCatalog()
+    addTable(catalog, "a")
+    addTable(catalog, "b")
+    let stmt = parseSingle("SELECT id FROM a UNION ALL SELECT id FROM b")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    check planRes.value.kind == pkAppend
+
+  test "UNION plans as distinct set-union":
+    var catalog = makeCatalog()
+    addTable(catalog, "a")
+    addTable(catalog, "b")
+    let stmt = parseSingle("SELECT id FROM a UNION SELECT id FROM b")
+    let planRes = plan(catalog, stmt)
+    check planRes.ok
+    check planRes.value.kind == pkSetUnionDistinct
+
+  test "INTERSECT and EXCEPT plan kinds":
+    var catalog = makeCatalog()
+    addTable(catalog, "a")
+    addTable(catalog, "b")
+    let intersectStmt = parseSingle("SELECT id FROM a INTERSECT SELECT id FROM b")
+    let intersectPlan = plan(catalog, intersectStmt)
+    check intersectPlan.ok
+    check intersectPlan.value.kind == pkSetIntersect
+
+    let exceptStmt = parseSingle("SELECT id FROM a EXCEPT SELECT id FROM b")
+    let exceptPlan = plan(catalog, exceptStmt)
+    check exceptPlan.ok
+    check exceptPlan.value.kind == pkSetExcept
 
   test "statement rollback on bind error":
     let path = makeTempDb("decentdb_sql_rollback.db")

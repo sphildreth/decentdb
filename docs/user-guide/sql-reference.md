@@ -102,6 +102,8 @@ INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO NOTHING;
 INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO NOTHING;
 INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO UPDATE SET col3 = EXCLUDED.col3;
 INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO UPDATE SET col3 = EXCLUDED.col3 WHERE table_name.col4 > 0;
+INSERT INTO table_name (...) VALUES (...) RETURNING *;
+INSERT INTO table_name (...) VALUES (...) RETURNING col1, col2;
 ```
 
 Notes:
@@ -110,7 +112,8 @@ Notes:
 - `ON CONFLICT ... DO UPDATE` is supported with explicit conflict target (`(cols)` or `ON CONSTRAINT name`).
 - In `DO UPDATE` expressions, unqualified columns resolve to the target table; `EXCLUDED.col` is supported.
 - Targetless `ON CONFLICT DO UPDATE` is not yet supported.
-- DML `RETURNING` is not yet supported.
+- `INSERT ... RETURNING` is supported.
+- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not yet supported.
 
 ### SELECT
 
@@ -119,6 +122,7 @@ SELECT * FROM table_name;
 SELECT col1, col2 FROM table_name WHERE condition;
 SELECT * FROM table_name ORDER BY col1 ASC, col2 DESC;
 SELECT * FROM table_name LIMIT 10 OFFSET 20;
+SELECT id FROM a UNION ALL SELECT id FROM b;
 ```
 
 ### UPDATE
@@ -180,6 +184,39 @@ SELECT TRIM(name) || '_suffix' FROM users;
 SELECT CAST(id AS TEXT) FROM users;
 SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
 ```
+
+### Common Table Expressions (CTE)
+
+Supported CTE subset:
+- Non-recursive `WITH ...` on `SELECT`
+- Multiple CTEs in declaration order (`a`, then `b` may reference `a`)
+- Optional CTE output column list (`WITH cte(col1, ...) AS (...)`)
+
+Current limits:
+- `WITH RECURSIVE` is not supported
+- CTE bodies cannot contain `GROUP BY`/`HAVING`, `ORDER BY`, or `LIMIT/OFFSET` in 0.x
+
+```sql
+WITH recent AS (
+  SELECT id, name FROM users WHERE id > 10
+)
+SELECT name FROM recent ORDER BY id;
+
+WITH a AS (SELECT id FROM users), b(x) AS (SELECT id FROM a WHERE id > 1)
+SELECT x FROM b ORDER BY x;
+```
+
+### Set Operations
+
+Supported:
+- `UNION ALL`
+- `UNION`
+- `INTERSECT`
+- `EXCEPT`
+
+Not yet supported:
+- `INTERSECT ALL`
+- `EXCEPT ALL`
 
 ### JOINs
 
@@ -273,10 +310,9 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 ## Unsupported Features
 
 Not currently supported:
-- Subqueries in SELECT
+- Correlated subqueries in SELECT
 - Window functions
-- Common Table Expressions (CTE)
-- Views
+- Recursive CTEs (`WITH RECURSIVE`)
 - Stored procedures
 
 See [Known Limitations](../about/changelog.md#known-limitations) for details.

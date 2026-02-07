@@ -10,6 +10,47 @@ proc parseSingle(sqlText: string): Statement =
   astRes.value.statements[0]
 
 suite "SQL Parser":
+  test "parse non-recursive WITH CTEs":
+    let stmt = parseSingle(
+      "WITH base AS (SELECT id, name FROM t), filt(x) AS (SELECT id FROM base WHERE id > 1) " &
+      "SELECT x FROM filt"
+    )
+    check stmt.kind == skSelect
+    check stmt.cteNames.len == 2
+    check stmt.cteNames[0] == "base"
+    check stmt.cteColumns[0].len == 0
+    check stmt.cteQueries[0] != nil
+    check stmt.cteQueries[0].kind == skSelect
+    check stmt.cteNames[1] == "filt"
+    check stmt.cteColumns[1] == @["x"]
+    check stmt.fromTable == "filt"
+
+  test "reject WITH RECURSIVE in v0":
+    let astRes = parseSql("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t")
+    check not astRes.ok
+
+  test "parse set operations":
+    let unionAll = parseSingle("SELECT id FROM a UNION ALL SELECT id FROM b")
+    check unionAll.kind == skSelect
+    check unionAll.setOpKind == sokUnionAll
+    check unionAll.setOpLeft != nil
+    check unionAll.setOpRight != nil
+
+    let unionDistinct = parseSingle("SELECT id FROM a UNION SELECT id FROM b")
+    check unionDistinct.kind == skSelect
+    check unionDistinct.setOpKind == sokUnion
+
+    let intersectStmt = parseSql("SELECT id FROM a INTERSECT SELECT id FROM b")
+    check intersectStmt.ok
+    check intersectStmt.value.statements[0].setOpKind == sokIntersect
+
+    let exceptStmt = parseSql("SELECT id FROM a EXCEPT SELECT id FROM b")
+    check exceptStmt.ok
+    check exceptStmt.value.statements[0].setOpKind == sokExcept
+
+    let intersectAll = parseSql("SELECT id FROM a INTERSECT ALL SELECT id FROM b")
+    check not intersectAll.ok
+
   test "parse select with joins and expressions":
     let stmt = parseSingle("SELECT a.id, b.name FROM a INNER JOIN b ON a.id = b.a_id WHERE (a.id = $1 AND b.name IS NOT NULL) OR a.id > 1 ORDER BY a.id DESC LIMIT 5 OFFSET 2")
     check stmt.kind == skSelect
@@ -99,8 +140,15 @@ suite "SQL Parser":
     check conflictAssignCount == 1
     check insConflictUpdate.insertConflictUpdateWhere != nil
 
-    let returningUnsupportedRes = parseSql("INSERT INTO t (id, name) VALUES (1, 'x') RETURNING id")
-    check not returningUnsupportedRes.ok
+    let insReturning = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x') RETURNING id, name")
+    check insReturning.kind == skInsert
+    check insReturning.insertReturning.len == 2
+    check not insReturning.insertReturning[0].isStar
+
+    let insReturningStar = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x') RETURNING *")
+    check insReturningStar.kind == skInsert
+    check insReturningStar.insertReturning.len == 1
+    check insReturningStar.insertReturning[0].isStar
 
     let upd = parseSingle("UPDATE t SET name = 'y' WHERE id = 1")
     check upd.kind == skUpdate

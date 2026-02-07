@@ -327,6 +327,10 @@ Alternative:
 ### 6.2 Supported SQL subset (0.x baseline)
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+- INSERT RETURNING subset:
+  - `INSERT ... RETURNING *`
+  - `INSERT ... RETURNING <expr[, ...]>`
+  - applies to plain INSERT and `INSERT ... ON CONFLICT ...` paths
 - UPSERT subset:
   - `INSERT ... ON CONFLICT DO NOTHING` with optional conflict target:
     - no target (`ON CONFLICT DO NOTHING`)
@@ -341,14 +345,21 @@ Alternative:
 - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
 - Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`
 - Expression forms: searched/simple `CASE`, `CAST(expr AS type)` (narrow matrix)
+- Common Table Expressions (CTE): non-recursive `WITH ...` for `SELECT`
+  - CTE names resolve in declaration order and can shadow catalog objects in the statement scope
+  - v0 CTE body restrictions: `GROUP BY`/`HAVING`, `ORDER BY`, and `LIMIT/OFFSET` inside CTE bodies are not supported
+- Set operations: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
 - Explicitly unsupported in 0.x baseline:
+  - `WITH RECURSIVE`
+  - `INTERSECT ALL`, `EXCEPT ALL`
   - targetless `INSERT ... ON CONFLICT DO UPDATE ...` (without conflict target)
-  - DML `RETURNING`
+  - `UPDATE ... RETURNING`
+  - `DELETE ... RETURNING`
 
 ### 6.3 Parameterization
 - `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline

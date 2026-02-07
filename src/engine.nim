@@ -281,12 +281,27 @@ proc schemaBump(db: Db): Result[Void] =
   okVoid()
 
 proc viewDependencies(stmt: Statement): seq[string] =
+  if stmt == nil:
+    return
   var seen = initHashSet[string]()
-  if stmt != nil and stmt.kind == skSelect:
-    if stmt.fromTable.len > 0:
+  if stmt.kind == skSelect:
+    var cteNames = initHashSet[string]()
+    for cteName in stmt.cteNames:
+      cteNames.incl(cteName.toLowerAscii())
+    for query in stmt.cteQueries:
+      if query != nil and query.kind == skSelect:
+        for dep in viewDependencies(query):
+          seen.incl(dep)
+    if stmt.setOpLeft != nil and stmt.setOpLeft.kind == skSelect:
+      for dep in viewDependencies(stmt.setOpLeft):
+        seen.incl(dep)
+    if stmt.setOpRight != nil and stmt.setOpRight.kind == skSelect:
+      for dep in viewDependencies(stmt.setOpRight):
+        seen.incl(dep)
+    if stmt.fromTable.len > 0 and stmt.fromTable.toLowerAscii() notin cteNames:
       seen.incl(stmt.fromTable.toLowerAscii())
     for join in stmt.joins:
-      if join.table.len > 0:
+      if join.table.len > 0 and join.table.toLowerAscii() notin cteNames:
         seen.incl(join.table.toLowerAscii())
   for dep in seen:
     result.add(dep)
@@ -1216,30 +1231,40 @@ proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
     values.add(valueFromSql(res.value))
   ok(values)
 
+type InsertExecResult = object
+  affected: bool
+  row: Option[Row]
+
+proc buildInsertResultRow(tableName: string, table: TableMeta, rowid: uint64, values: seq[Value]): Row =
+  var cols: seq[string] = @[]
+  for col in table.columns:
+    cols.add(tableName & "." & col.name)
+  Row(rowid: rowid, columns: cols, values: values)
+
 # Forward declarations for transaction control (defined later)
 proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
 
-proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[bool] =
+proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[InsertExecResult] =
   let tableRes = db.catalog.getTable(bound.insertTable)
   if not tableRes.ok:
-    return err[bool](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    return err[InsertExecResult](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
 
   let valuesRes = evalInsertValues(bound, params)
   if not valuesRes.ok:
-    return err[bool](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
+    return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
   let values = valuesRes.value
 
   for i, col in table.columns:
     let typeRes = typeCheckValue(col.kind, values[i])
     if not typeRes.ok:
-      return err[bool](typeRes.err.code, typeRes.err.message, col.name)
+      return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
 
   let notNullRes = enforceNotNull(table, values)
   if not notNullRes.ok:
-    return err[bool](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
 
   case bound.insertConflictAction
   of icaDoNothing:
@@ -1252,15 +1277,15 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
         bound.insertConflictTargetCols
       )
       if not targetConflictRes.ok:
-        return err[bool](targetConflictRes.err.code, targetConflictRes.err.message, targetConflictRes.err.context)
+        return err[InsertExecResult](targetConflictRes.err.code, targetConflictRes.err.message, targetConflictRes.err.context)
       if targetConflictRes.value:
-        return ok(false)
+        return ok(InsertExecResult(affected: false, row: none(Row)))
     else:
       let anyConflictRes = hasAnyUniqueConflict(db.catalog, db.pager, table, values)
       if not anyConflictRes.ok:
-        return err[bool](anyConflictRes.err.code, anyConflictRes.err.message, anyConflictRes.err.context)
+        return err[InsertExecResult](anyConflictRes.err.code, anyConflictRes.err.message, anyConflictRes.err.context)
       if anyConflictRes.value:
-        return ok(false)
+        return ok(InsertExecResult(affected: false, row: none(Row)))
   of icaDoUpdate:
     let conflictRowRes = findConflictRowidOnTarget(
       db.catalog,
@@ -1270,12 +1295,12 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
       bound.insertConflictTargetCols
     )
     if not conflictRowRes.ok:
-      return err[bool](conflictRowRes.err.code, conflictRowRes.err.message, conflictRowRes.err.context)
+      return err[InsertExecResult](conflictRowRes.err.code, conflictRowRes.err.message, conflictRowRes.err.context)
     if conflictRowRes.value.isSome:
       let conflictRowid = conflictRowRes.value.get
       let storedRes = readRowAt(db.pager, table, conflictRowid)
       if not storedRes.ok:
-        return err[bool](storedRes.err.code, storedRes.err.message, storedRes.err.context)
+        return err[InsertExecResult](storedRes.err.code, storedRes.err.message, storedRes.err.context)
       let stored = storedRes.value
 
       var evalCols: seq[string] = @[]
@@ -1291,9 +1316,9 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
       if bound.insertConflictUpdateWhere != nil:
         let whereRes = evalExpr(evalRow, bound.insertConflictUpdateWhere, params)
         if not whereRes.ok:
-          return err[bool](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+          return err[InsertExecResult](whereRes.err.code, whereRes.err.message, whereRes.err.context)
         if not valueToBool(whereRes.value):
-          return ok(false)
+          return ok(InsertExecResult(affected: false, row: none(Row)))
 
       var newValues = stored.values
       for colName, expr in bound.insertConflictUpdateAssignments:
@@ -1303,52 +1328,58 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[b
             idx = i
             break
         if idx < 0:
-          return err[bool](ERR_SQL, "Unknown column", colName)
+          return err[InsertExecResult](ERR_SQL, "Unknown column", colName)
         let evalRes = evalExpr(evalRow, expr, params)
         if not evalRes.ok:
-          return err[bool](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+          return err[InsertExecResult](evalRes.err.code, evalRes.err.message, evalRes.err.context)
         let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
         if not typeRes.ok:
-          return err[bool](typeRes.err.code, typeRes.err.message, colName)
+          return err[InsertExecResult](typeRes.err.code, typeRes.err.message, colName)
         newValues[idx] = evalRes.value
 
       let newNotNullRes = enforceNotNull(table, newValues)
       if not newNotNullRes.ok:
-        return err[bool](newNotNullRes.err.code, newNotNullRes.err.message, newNotNullRes.err.context)
+        return err[InsertExecResult](newNotNullRes.err.code, newNotNullRes.err.message, newNotNullRes.err.context)
 
       let uniqueUpdateRes = enforceUnique(db.catalog, db.pager, table, newValues, stored.rowid)
       if not uniqueUpdateRes.ok:
-        return err[bool](uniqueUpdateRes.err.code, uniqueUpdateRes.err.message, uniqueUpdateRes.err.context)
+        return err[InsertExecResult](uniqueUpdateRes.err.code, uniqueUpdateRes.err.message, uniqueUpdateRes.err.context)
 
       let fkUpdateRes = enforceForeignKeys(db.catalog, db.pager, table, newValues)
       if not fkUpdateRes.ok:
-        return err[bool](fkUpdateRes.err.code, fkUpdateRes.err.message, fkUpdateRes.err.context)
+        return err[InsertExecResult](fkUpdateRes.err.code, fkUpdateRes.err.message, fkUpdateRes.err.context)
 
       let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, stored.values, newValues)
       if not restrictRes.ok:
-        return err[bool](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+        return err[InsertExecResult](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
 
       let updateRes = updateRow(db.pager, db.catalog, bound.insertTable, stored.rowid, newValues)
       if not updateRes.ok:
-        return err[bool](updateRes.err.code, updateRes.err.message, updateRes.err.context)
-      return ok(true)
+        return err[InsertExecResult](updateRes.err.code, updateRes.err.message, updateRes.err.context)
+      return ok(InsertExecResult(
+        affected: true,
+        row: some(buildInsertResultRow(bound.insertTable, table, stored.rowid, newValues))
+      ))
   of icaNone:
     discard
 
   let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
   if not uniqueRes.ok:
-    return err[bool](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+    return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
 
   let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
   if not fkRes.ok:
-    return err[bool](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
 
   let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
   if not insertRes.ok:
     if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
-      return ok(false)
-    return err[bool](insertRes.err.code, insertRes.err.message, insertRes.err.context)
-  ok(true)
+      return ok(InsertExecResult(affected: false, row: none(Row)))
+    return err[InsertExecResult](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  ok(InsertExecResult(
+    affected: true,
+    row: some(buildInsertResultRow(bound.insertTable, table, insertRes.value, values))
+  ))
 
 proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   if not db.isOpen:
@@ -1508,6 +1539,15 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
       let insertExecRes = execInsertStatement(db, bound, params)
       if not insertExecRes.ok:
         return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+      if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
+        let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
+        if not projectedRes.ok:
+          return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
+        for row in projectedRes.value:
+          var parts: seq[string] = @[]
+          for v in row.values:
+            parts.add($v)
+          output.add(parts.join("|"))
     of skUpdate:
       let execRes = execPreparedNonSelect(db, bound, params, plan)
       if not execRes.ok:
@@ -1959,6 +1999,15 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let insertExecRes = execInsertStatement(db, bound, params)
       if not insertExecRes.ok:
         return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+      if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
+        let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
+        if not projectedRes.ok:
+          return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
+        for row in projectedRes.value:
+          var parts: seq[string] = @[]
+          for value in row.values:
+            parts.add(valueToString(value))
+          output.add(parts.join("|"))
     of skUpdate:
       let tableRes = db.catalog.getTable(bound.updateTable)
       if not tableRes.ok:
@@ -2483,10 +2532,12 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 0
 
   of skInsert:
+    if bound.insertReturning.len > 0:
+      return err[int64](ERR_SQL, "INSERT RETURNING is not supported by non-select execution API")
     let insertExecRes = execInsertStatement(db, bound, params)
     if not insertExecRes.ok:
       return err[int64](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-    affected = if insertExecRes.value: 1 else: 0
+    affected = if insertExecRes.value.affected: 1 else: 0
 
   of skUpdate:
     let fastRes = tryFastPkUpdate(db, bound, params)

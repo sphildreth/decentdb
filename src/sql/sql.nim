@@ -104,6 +104,13 @@ type InsertConflictAction* = enum
   icaDoNothing
   icaDoUpdate
 
+type SetOpKind* = enum
+  sokNone
+  sokUnionAll
+  sokUnion
+  sokIntersect
+  sokExcept
+
 type AlterTableAction* = object
   kind*: AlterTableActionKind
   columnDef*: ColumnDef        # For ADD COLUMN
@@ -175,7 +182,14 @@ type Statement* = ref object
     insertConflictTargetConstraint*: string
     insertConflictUpdateAssignments*: Table[string, Expr]
     insertConflictUpdateWhere*: Expr
+    insertReturning*: seq[SelectItem]
   of skSelect:
+    cteNames*: seq[string]
+    cteColumns*: seq[seq[string]]
+    cteQueries*: seq[Statement]
+    setOpKind*: SetOpKind
+    setOpLeft*: Statement
+    setOpRight*: Statement
     selectItems*: seq[SelectItem]
     fromTable*: string
     fromAlias*: string
@@ -630,7 +644,104 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
 
+proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq[Statement])] =
+  var cteNames: seq[string] = @[]
+  var cteColumns: seq[seq[string]] = @[]
+  var cteQueries: seq[Statement] = @[]
+  if node.kind != JObject:
+    return ok((cteNames, cteColumns, cteQueries))
+  if nodeHas(node, "recursive") and node["recursive"].kind == JBool and node["recursive"].getBool:
+    return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "WITH RECURSIVE is not supported in 0.x")
+  let cteNodes = nodeGet(node, "ctes")
+  if cteNodes.kind != JArray:
+    return ok((cteNames, cteColumns, cteQueries))
+  for entry in cteNodes:
+    if not nodeHas(entry, "CommonTableExpr"):
+      continue
+    let cteNode = entry["CommonTableExpr"]
+    let cteName = nodeGet(cteNode, "ctename").getStr
+    if cteName.len == 0:
+      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE name is required")
+
+    var columns: seq[string] = @[]
+    let aliasCols = nodeGet(cteNode, "aliascolnames")
+    if aliasCols.kind == JArray:
+      for colNode in aliasCols:
+        let colName = nodeString(colNode)
+        if colName.len == 0:
+          return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "Invalid CTE column name", cteName)
+        columns.add(colName)
+
+    let queryRes = parseStatementNode(nodeGet(cteNode, "ctequery"))
+    if not queryRes.ok:
+      return err[(seq[string], seq[seq[string]], seq[Statement])](queryRes.err.code, queryRes.err.message, queryRes.err.context)
+    if queryRes.value.kind != skSelect:
+      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE query must be SELECT", cteName)
+
+    cteNames.add(cteName)
+    cteColumns.add(columns)
+    cteQueries.add(queryRes.value)
+  ok((cteNames, cteColumns, cteQueries))
+
 proc parseSelectStmt(node: JsonNode): Result[Statement] =
+  var cteNames: seq[string] = @[]
+  var cteColumns: seq[seq[string]] = @[]
+  var cteQueries: seq[Statement] = @[]
+  if nodeHas(node, "withClause"):
+    let cteRes = parseWithClause(node["withClause"])
+    if not cteRes.ok:
+      return err[Statement](cteRes.err.code, cteRes.err.message, cteRes.err.context)
+    cteNames = cteRes.value[0]
+    cteColumns = cteRes.value[1]
+    cteQueries = cteRes.value[2]
+
+  let setOp = nodeStringOr(node, "op", "SETOP_NONE")
+  if setOp != "SETOP_NONE":
+    let isAll = nodeHas(node, "all") and node["all"].kind == JBool and node["all"].getBool
+    var parsedSetOpKind = sokNone
+    case setOp
+    of "SETOP_UNION":
+      parsedSetOpKind = (if isAll: sokUnionAll else: sokUnion)
+    of "SETOP_INTERSECT":
+      if isAll:
+        return err[Statement](ERR_SQL, "INTERSECT ALL is not supported in 0.x")
+      parsedSetOpKind = sokIntersect
+    of "SETOP_EXCEPT":
+      if isAll:
+        return err[Statement](ERR_SQL, "EXCEPT ALL is not supported in 0.x")
+      parsedSetOpKind = sokExcept
+    else:
+      return err[Statement](ERR_SQL, "Set operation not supported in 0.x", setOp)
+    if nodeHas(node, "sortClause") or nodeHas(node, "limitCount") or nodeHas(node, "limitOffset"):
+      return err[Statement](ERR_SQL, "ORDER BY/LIMIT/OFFSET on set operations is not supported in 0.x")
+    let leftRes = parseSelectStmt(nodeGet(node, "larg"))
+    if not leftRes.ok:
+      return err[Statement](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = parseSelectStmt(nodeGet(node, "rarg"))
+    if not rightRes.ok:
+      return err[Statement](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    return ok(Statement(
+      kind: skSelect,
+      cteNames: cteNames,
+      cteColumns: cteColumns,
+      cteQueries: cteQueries,
+      setOpKind: parsedSetOpKind,
+      setOpLeft: leftRes.value,
+      setOpRight: rightRes.value,
+      selectItems: @[],
+      fromTable: "",
+      fromAlias: "",
+      joins: @[],
+      whereExpr: nil,
+      groupBy: @[],
+      havingExpr: nil,
+      orderBy: @[],
+      limit: -1,
+      limitParam: 0,
+      offset: -1,
+      offsetParam: 0
+    ))
+
   var items: seq[SelectItem] = @[]
   let targets = nodeGet(node, "targetList")
   if targets.kind == JArray:
@@ -712,7 +823,27 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       offsetParam = offsetRes.value.index
     else:
       return err[Statement](ERR_SQL, "OFFSET must be an integer literal or $N parameter")
-  ok(Statement(kind: skSelect, selectItems: items, fromTable: fromTable, fromAlias: fromAlias, joins: joins, whereExpr: whereExpr, groupBy: groupBy, havingExpr: havingExpr, orderBy: orderBy, limit: limit, limitParam: limitParam, offset: offset, offsetParam: offsetParam))
+  ok(Statement(
+    kind: skSelect,
+    cteNames: cteNames,
+    cteColumns: cteColumns,
+    cteQueries: cteQueries,
+    setOpKind: sokNone,
+    setOpLeft: nil,
+    setOpRight: nil,
+    selectItems: items,
+    fromTable: fromTable,
+    fromAlias: fromAlias,
+    joins: joins,
+    whereExpr: whereExpr,
+    groupBy: groupBy,
+    havingExpr: havingExpr,
+    orderBy: orderBy,
+    limit: limit,
+    limitParam: limitParam,
+    offset: offset,
+    offsetParam: offsetParam
+  ))
 
 proc parseInsertStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])
@@ -747,6 +878,7 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
   var conflictTargetConstraint = ""
   var conflictAssignments = initTable[string, Expr]()
   var conflictWhere: Expr = nil
+  var returningItems: seq[SelectItem] = @[]
   if nodeHas(node, "onConflictClause"):
     let conflict = node["onConflictClause"]
     let action = nodeGet(conflict, "action").getStr
@@ -793,8 +925,25 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
 
   if nodeHas(node, "returningList"):
     let returningNode = nodeGet(node, "returningList")
-    if returningNode.kind == JArray and returningNode.len > 0:
-      return err[Statement](ERR_SQL, "INSERT RETURNING is not supported")
+    if returningNode.kind == JArray:
+      for rt in returningNode:
+        if not nodeHas(rt, "ResTarget"):
+          continue
+        let resTarget = rt["ResTarget"]
+        let valNode = nodeGet(resTarget, "val")
+        if nodeHas(valNode, "ColumnRef"):
+          let colRes = parseColumnRef(valNode["ColumnRef"])
+          if not colRes.ok:
+            return err[Statement](colRes.err.code, colRes.err.message, colRes.err.context)
+          if colRes.value.kind == ekColumn and colRes.value.name == "*":
+            let alias = if nodeHas(resTarget, "name"): resTarget["name"].getStr else: ""
+            returningItems.add(SelectItem(expr: nil, alias: alias, isStar: true))
+            continue
+        let exprRes = parseExprNode(valNode)
+        if not exprRes.ok:
+          return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+        let alias = if nodeHas(resTarget, "name"): resTarget["name"].getStr else: ""
+        returningItems.add(SelectItem(expr: exprRes.value, alias: alias, isStar: false))
 
   ok(Statement(
     kind: skInsert,
@@ -805,7 +954,8 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
     insertConflictTargetCols: conflictTargetCols,
     insertConflictTargetConstraint: conflictTargetConstraint,
     insertConflictUpdateAssignments: conflictAssignments,
-    insertConflictUpdateWhere: conflictWhere
+    insertConflictUpdateWhere: conflictWhere,
+    insertReturning: returningItems
   ))
 
 proc parseUpdateStmt(node: JsonNode): Result[Statement] =
@@ -918,6 +1068,33 @@ proc exprToCanonicalSql(expr: Expr): string =
 
 proc selectToCanonicalSql(stmt: Statement): string =
   var parts: seq[string] = @[]
+  if stmt.cteNames.len > 0:
+    var cteParts: seq[string] = @[]
+    for i, cteName in stmt.cteNames:
+      var header = cteName
+      let cols = if i < stmt.cteColumns.len: stmt.cteColumns[i] else: @[]
+      if cols.len > 0:
+        header.add(" (" & cols.join(", ") & ")")
+      if i < stmt.cteQueries.len:
+        header.add(" AS (" & selectToCanonicalSql(stmt.cteQueries[i]) & ")")
+      else:
+        header.add(" AS (SELECT 1)")
+      cteParts.add(header)
+    parts.add("WITH " & cteParts.join(", "))
+
+  if stmt.setOpKind != sokNone:
+    if stmt.setOpLeft != nil and stmt.setOpRight != nil:
+      let opText =
+        case stmt.setOpKind
+        of sokUnionAll: " UNION ALL "
+        of sokUnion: " UNION "
+        of sokIntersect: " INTERSECT "
+        of sokExcept: " EXCEPT "
+        else: " UNION ALL "
+      parts.add(selectToCanonicalSql(stmt.setOpLeft) & opText & selectToCanonicalSql(stmt.setOpRight))
+      return parts.join(" ")
+    return parts.join(" ")
+
   var selectItems: seq[string] = @[]
   for item in stmt.selectItems:
     if item.isStar:
@@ -1460,6 +1637,12 @@ proc parseSql*(sql: string): Result[SqlAst] =
 
     let stmt = Statement(
       kind: skSelect,
+      cteNames: @[],
+      cteColumns: @[],
+      cteQueries: @[],
+      setOpKind: sokNone,
+      setOpLeft: nil,
+      setOpRight: nil,
       selectItems: @[SelectItem(expr: nil, alias: "", isStar: true)],
       fromTable: tableName,
       fromAlias: "",

@@ -277,6 +277,13 @@ proc findMaxParam(stmt: Statement): int =
   
   case stmt.kind
   of skSelect:
+    for query in stmt.cteQueries:
+      if query != nil:
+        maxIdx = max(maxIdx, findMaxParam(query))
+    if stmt.setOpLeft != nil:
+      maxIdx = max(maxIdx, findMaxParam(stmt.setOpLeft))
+    if stmt.setOpRight != nil:
+      maxIdx = max(maxIdx, findMaxParam(stmt.setOpRight))
     for item in stmt.selectItems: walk(item.expr)
     walk(stmt.whereExpr)
     for j in stmt.joins: walk(j.onExpr)
@@ -291,6 +298,9 @@ proc findMaxParam(stmt: Statement): int =
     return findMaxParam(stmt.explainInner)
   of skInsert:
     for v in stmt.insertValues: walk(v)
+    for item in stmt.insertReturning:
+      if not item.isStar:
+        walk(item.expr)
   of skUpdate:
     for _, v in stmt.assignments: walk(v)
     walk(stmt.updateWhere)
@@ -372,6 +382,10 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
       db_handle.setError(explainRes.err.code, explainRes.err.message)
       return cint(toApiCode(explainRes.err.code))
     explainLines = explainRes.value
+
+  if bound.kind == skInsert and bound.insertReturning.len > 0:
+    db_handle.setError(ERR_SQL, "INSERT RETURNING is not yet supported by C API prepare/step")
+    return cint(toApiCode(ERR_SQL))
 
   let stmt_handle = StmtHandle(
     db: db_handle,

@@ -908,7 +908,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
-  of pkTrigramSeek, pkUnionDistinct, pkJoin, pkSort, pkAggregate, pkStatement:
+  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetExcept, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement:
     materialize()
 
 proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
@@ -2709,6 +2709,81 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       if not seen.contains(r.rowid):
         seen.incl(r.rowid)
         outRows.add(r)
+    return ok(outRows)
+  of pkSetUnionDistinct:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "UNION requires matching column counts")
+    var seen = initHashSet[seq[Value]]()
+    var outRows: seq[Row] = @[]
+    for row in leftRes.value:
+      if not seen.contains(row.values):
+        seen.incl(row.values)
+        outRows.add(row)
+    for row in rightRes.value:
+      if not seen.contains(row.values):
+        seen.incl(row.values)
+        outRows.add(row)
+    return ok(outRows)
+  of pkSetIntersect:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "INTERSECT requires matching column counts")
+    var rightSet = initHashSet[seq[Value]]()
+    for row in rightRes.value:
+      rightSet.incl(row.values)
+    var emitted = initHashSet[seq[Value]]()
+    var outRows: seq[Row] = @[]
+    for row in leftRes.value:
+      if rightSet.contains(row.values) and not emitted.contains(row.values):
+        emitted.incl(row.values)
+        outRows.add(row)
+    return ok(outRows)
+  of pkSetExcept:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "EXCEPT requires matching column counts")
+    var rightSet = initHashSet[seq[Value]]()
+    for row in rightRes.value:
+      rightSet.incl(row.values)
+    var emitted = initHashSet[seq[Value]]()
+    var outRows: seq[Row] = @[]
+    for row in leftRes.value:
+      if not rightSet.contains(row.values) and not emitted.contains(row.values):
+        emitted.incl(row.values)
+        outRows.add(row)
+    return ok(outRows)
+  of pkAppend:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "UNION ALL requires matching column counts")
+    var outRows = leftRes.value
+    for row in rightRes.value:
+      outRows.add(row)
     return ok(outRows)
   of pkFilter:
     if plan.left != nil and plan.left.kind == pkTableScan:

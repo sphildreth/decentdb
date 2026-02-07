@@ -91,6 +91,26 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       lines.add(line)
       traverse(p.left, depth + 1)
       traverse(p.right, depth + 1)
+    of pkAppend:
+      line.add("Append")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetUnionDistinct:
+      line.add("SetUnionDistinct")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetIntersect:
+      line.add("SetIntersect")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetExcept:
+      line.add("SetExcept")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
     of pkFilter:
       line.add("Filter(predicate=" & renderExpr(p.predicate) & ")")
       lines.add(line)
