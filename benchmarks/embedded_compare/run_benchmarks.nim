@@ -14,6 +14,7 @@ import ../../src/engine
 import ../../src/record/record
 import ../../src/errors
 import ../../src/vfs/vfs
+import ../../src/version
 when defined(fused_join_sum_stats):
   import ../../src/exec/exec
 
@@ -295,7 +296,7 @@ proc runDecentDbInsert(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: "0.0.1",
+    engine_version: DecentDbVersion,
     dataset: "sample",
     benchmark: "insert",
     durability: "safe", # default
@@ -373,7 +374,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: "0.0.1",
+    engine_version: DecentDbVersion,
     dataset: "sample",
     benchmark: "commit_latency",
     durability: "safe",
@@ -456,7 +457,7 @@ proc runDecentDbPointRead(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: "0.0.1",
+    engine_version: DecentDbVersion,
     dataset: "sample",
     benchmark: "point_read",
     durability: "safe",
@@ -551,7 +552,7 @@ proc runDecentDbJoin(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: "0.0.1",
+    engine_version: DecentDbVersion,
     dataset: "sample",
     benchmark: "join",
     durability: "safe",

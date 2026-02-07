@@ -4,12 +4,18 @@
 
 import cligen
 import ./decentdb_cli
+import ./version
 
-const Version = "0.0.1"
+const AsciiLogo = r"""
+  ___                 _   ___  ___  
+ |   \\ ___ __ ___ _ _| |_|   \\| _ ) 
+ | |) / -_) _/ -_) ' \\  _| |) | _ \\ 
+ |___/\\___\\__\\___|_||_\\__|___/|___/ 
+"""
 
 when isMainModule:
   dispatchMulti(
-    ["multi", doc="DecentDb CLI v" & Version & "\n\nA unified tool for DecentDb operations."],
+    ["multi", doc="DecentDb CLI v" & DecentDbVersion & "\n" & AsciiLogo & "\n\n"],
     
     # 1. Main SQL Execution
     [decentdb_cli.cliMain, 

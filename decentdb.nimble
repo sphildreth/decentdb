@@ -1,4 +1,4 @@
-version       = "0.0.1"
+version       = "0.1.0"
 author        = "DecentDb contributors"
 description   = "DecentDb engine"
 license       = "Apache-2.0"
