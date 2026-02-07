@@ -578,12 +578,19 @@ proc parseTypeCast(node: JsonNode): Result[Expr] =
       var n = m
       if nodeHas(n, "A_Const"):
         n = n["A_Const"]
-      if nodeHas(n, "val"):
-        n = n["val"]
-      if nodeHas(n, "Integer"):
-        n = n["Integer"]
+      
       if nodeHas(n, "ival"):
-        mods.add($n["ival"].getInt)
+        let v = n["ival"]
+        if nodeHas(v, "ival"):
+           mods.add($v["ival"].getInt)
+        else:
+           mods.add($v.getInt)
+      elif nodeHas(n, "val"):
+        n = n["val"]
+        if nodeHas(n, "Integer"):
+          n = n["Integer"]
+        if nodeHas(n, "ival"):
+          mods.add($n["ival"].getInt)
       elif n.kind == JInt:
         mods.add($n.getInt)
     if mods.len == 0:
@@ -1331,12 +1338,19 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
                 var n = m
                 if nodeHas(n, "A_Const"):
                   n = n["A_Const"]
-                if nodeHas(n, "val"):
-                  n = n["val"]
-                if nodeHas(n, "Integer"):
-                  n = n["Integer"]
+                
                 if nodeHas(n, "ival"):
-                  mods.add($n["ival"].getInt)
+                  let v = n["ival"]
+                  if nodeHas(v, "ival"):
+                     mods.add($v["ival"].getInt)
+                  else:
+                     mods.add($v.getInt)
+                elif nodeHas(n, "val"):
+                  n = n["val"]
+                  if nodeHas(n, "Integer"):
+                    n = n["Integer"]
+                  if nodeHas(n, "ival"):
+                    mods.add($n["ival"].getInt)
                 elif n.kind == JInt:
                   mods.add($n.getInt)
               if mods.len > 0:
@@ -2020,7 +2034,7 @@ proc parseSql*(sql: string): Result[SqlAst] =
     return err[SqlAst](ERR_INTERNAL, "libpg_query required", "build with -d:libpg_query and link libpg_query")
   let parseResult = pg_query_parse(sql.cstring)
   defer: pg_query_free_parse_result(parseResult)
-  if parseResult.error.message != nil:
+  if parseResult.error != nil:
     return err[SqlAst](ERR_SQL, $parseResult.error.message)
   if parseResult.parse_tree == nil:
     return err[SqlAst](ERR_SQL, "Empty parse tree")

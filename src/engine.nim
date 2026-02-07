@@ -309,23 +309,56 @@ proc viewDependencies(stmt: Statement): seq[string] =
 proc valueFromSql(value: Value): Value =
   value
 
-proc typeCheckValue(expected: ColumnType, value: Value): Result[Void] =
-  case expected
+proc typeCheckValue(col: Column, value: Value): Result[Value] =
+  case col.kind
   of ctInt64:
-    if value.kind in {vkInt64, vkNull}: return okVoid()
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkInt64: return ok(value)
+    return err[Value](ERR_SQL, "Type mismatch: expected INT64")
   of ctBool:
-    if value.kind in {vkBool, vkNull}: return okVoid()
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkBool: return ok(value)
+    return err[Value](ERR_SQL, "Type mismatch: expected BOOL")
   of ctFloat64:
-    if value.kind in {vkFloat64, vkInt64, vkNull}: return okVoid()
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkFloat64: return ok(value)
+    if value.kind == vkInt64: return ok(Value(kind: vkFloat64, float64Val: float64(value.int64Val)))
+    return err[Value](ERR_SQL, "Type mismatch: expected FLOAT64")
   of ctText:
-    if value.kind in {vkText, vkNull}: return okVoid()
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkText: return ok(value)
+    return err[Value](ERR_SQL, "Type mismatch: expected TEXT")
   of ctBlob:
-    if value.kind in {vkBlob, vkNull}: return okVoid()
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkBlob: return ok(value)
+    return err[Value](ERR_SQL, "Type mismatch: expected BLOB")
   of ctDecimal:
-    if value.kind in {vkDecimal, vkInt64, vkNull}: return okVoid()
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkDecimal:
+       if value.decimalScale != col.decScale:
+          let res = scaleDecimal(value.int64Val, value.decimalScale, col.decScale)
+          if not res.ok: return err[Value](res.err.code, res.err.message)
+          let newVal = Value(kind: vkDecimal, int64Val: res.value, decimalScale: col.decScale)
+          if ($abs(newVal.int64Val)).len > int(col.decPrecision):
+             return err[Value](ERR_CONSTRAINT, "Precision overflow for DECIMAL")
+          return ok(newVal)
+       if ($abs(value.int64Val)).len > int(col.decPrecision):
+          return err[Value](ERR_CONSTRAINT, "Precision overflow for DECIMAL")
+       return ok(value)
+    if value.kind == vkInt64:
+       let res = scaleDecimal(value.int64Val, 0, col.decScale)
+       if not res.ok: return err[Value](res.err.code, res.err.message)
+       let newVal = Value(kind: vkDecimal, int64Val: res.value, decimalScale: col.decScale)
+       if ($abs(newVal.int64Val)).len > int(col.decPrecision):
+          return err[Value](ERR_CONSTRAINT, "Precision overflow for DECIMAL")
+       return ok(newVal)
+    return err[Value](ERR_SQL, "Type mismatch: expected DECIMAL")
   of ctUuid:
-    if value.kind in {vkText, vkNull}: return okVoid()
-  err[Void](ERR_SQL, "Type mismatch")
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkBlob:
+       if value.bytes.len == 16: return ok(value)
+       return err[Value](ERR_CONSTRAINT, "UUID must be 16 bytes")
+    return err[Value](ERR_SQL, "Type mismatch: expected UUID")
 
 proc valuesEqual(a: Value, b: Value): bool =
   if a.kind == vkNull and b.kind == vkNull:
@@ -1421,12 +1454,13 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
   let valuesRes = evalInsertValues(bound, params)
   if not valuesRes.ok:
     return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-  let values = valuesRes.value
+  var values = valuesRes.value
 
   for i, col in table.columns:
-    let typeRes = typeCheckValue(col.kind, values[i])
+    let typeRes = typeCheckValue(col, values[i])
     if not typeRes.ok:
       return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
+    values[i] = typeRes.value
 
   let notNullRes = enforceNotNull(table, values)
   if not notNullRes.ok:
@@ -1501,10 +1535,10 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
         let evalRes = evalExpr(evalRow, expr, params)
         if not evalRes.ok:
           return err[InsertExecResult](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-        let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+        let typeRes = typeCheckValue(table.columns[idx], evalRes.value)
         if not typeRes.ok:
           return err[InsertExecResult](typeRes.err.code, typeRes.err.message, colName)
-        newValues[idx] = evalRes.value
+        newValues[idx] = typeRes.value
 
       let newNotNullRes = enforceNotNull(table, newValues)
       if not newNotNullRes.ok:
@@ -2326,10 +2360,10 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
               let evalRes = evalExpr(row, expr, params)
               if not evalRes.ok:
                 return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+              let typeRes = typeCheckValue(table.columns[idx], evalRes.value)
               if not typeRes.ok:
                 return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
-              newValues[idx] = evalRes.value
+              newValues[idx] = typeRes.value
           updates.add((stored.rowid, stored.values, newValues))
         for entry in updates:
           let notNullRes = enforceNotNull(table, entry[2])
@@ -2534,10 +2568,10 @@ proc tryFastPkUpdate(db: Db, bound: Statement, params: seq[Value]): Result[Optio
       let evalRes = evalExpr(row, expr, params)
       if not evalRes.ok:
         return err[Option[int64]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-      let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+      let typeRes = typeCheckValue(table.columns[idx], evalRes.value)
       if not typeRes.ok:
         return err[Option[int64]](typeRes.err.code, typeRes.err.message, colName)
-      newValues[idx] = evalRes.value
+      newValues[idx] = typeRes.value
   let notNullRes = enforceNotNull(table, newValues)
   if not notNullRes.ok:
     return err[Option[int64]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
@@ -2953,10 +2987,10 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
               let evalRes = evalExpr(row, expr, params)
               if not evalRes.ok:
                 return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+              let typeRes = typeCheckValue(table.columns[idx], evalRes.value)
               if not typeRes.ok:
                 return err[int64](typeRes.err.code, typeRes.err.message, colName)
-              newValues[idx] = evalRes.value
+              newValues[idx] = typeRes.value
           updates.add((row.rowid, row.values, newValues))
 
         for entry in updates:
@@ -3100,18 +3134,21 @@ proc execSqlRows*(db: Db, sqlText: string, params: seq[Value]): Result[seq[Row]]
   if boundStatements.len == 0:
     let parseRes = parseSql(sqlText)
     if not parseRes.ok:
+      echo "DEBUG Parse Error: ", parseRes.err.message
       return err[seq[Row]](parseRes.err.code, parseRes.err.message, parseRes.err.context)
     if parseRes.value.statements.len != 1:
       return err[seq[Row]](ERR_SQL, "execSqlRows expects a single SELECT statement")
     let stmt = parseRes.value.statements[0]
     let bindRes = bindStatement(db.catalog, stmt)
     if not bindRes.ok:
+      echo "DEBUG Bind Error: ", bindRes.err.message
       return err[seq[Row]](bindRes.err.code, bindRes.err.message, bindRes.err.context)
     boundStatements = @[bindRes.value]
     if boundStatements[0].kind != skSelect:
       return err[seq[Row]](ERR_SQL, "execSqlRows expects a SELECT statement")
     let planRes = plan(db.catalog, boundStatements[0])
     if not planRes.ok:
+      echo "DEBUG Plan Error: ", planRes.err.message
       return err[seq[Row]](planRes.err.code, planRes.err.message, planRes.err.context)
     cachedPlans = @[planRes.value]
     rememberSqlCache(sqlText, boundStatements, cachedPlans)
@@ -3349,13 +3386,14 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
       return okVoid()
     # Validate + uniqueness precheck for the batch (before inserting anything).
     var perColKeys: seq[seq[uint64]] = newSeq[seq[uint64]](uniqueCols.len)
-    for values in batchRows:
+    for values in batchRows.mitems:
       if values.len != table.columns.len:
         return err[Void](ERR_SQL, "Column count mismatch", tableName)
       for i, col in table.columns:
-        let typeRes = typeCheckValue(col.kind, values[i])
+        let typeRes = typeCheckValue(col, values[i])
         if not typeRes.ok:
           return err[Void](typeRes.err.code, typeRes.err.message, col.name)
+        values[i] = typeRes.value
       let notNullRes = enforceNotNull(table, values)
       if not notNullRes.ok:
         return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)

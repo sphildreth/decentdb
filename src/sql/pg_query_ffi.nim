@@ -12,7 +12,7 @@ when defined(libpg_query):
   type PgQueryParseResult* {.bycopy.} = object
     parse_tree*: cstring
     stderr_buffer*: cstring
-    error*: PgQueryError
+    error*: ptr PgQueryError
 
   proc pg_query_parse*(input: cstring): PgQueryParseResult {.importc, dynlib: PgQueryLib, cdecl.}
   proc pg_query_free_parse_result*(result: PgQueryParseResult) {.importc, dynlib: PgQueryLib, cdecl.}

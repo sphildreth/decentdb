@@ -8,6 +8,8 @@ import sets
 import hashes
 import std/monotimes
 import std/times
+import std/math
+import std/sysrand
 import ../errors
 import ../sql/sql
 import ../sql/binder
@@ -36,6 +38,104 @@ var gEvalContextDepth {.threadvar.}: int
 var gEvalPager {.threadvar.}: Pager
 var gEvalCatalog {.threadvar.}: Catalog
 
+proc decimalToString(val: int64, scale: uint8): string =
+  var s = $val
+  if scale == 0: return s
+  let sign = if val < 0: "-" else: ""
+  var absVal = if val < 0: s[1..^1] else: s
+  
+  if absVal.len <= int(scale):
+    let padding = repeat('0', int(scale) - absVal.len)
+    result = sign & "0." & padding & absVal
+  else:
+    let dotPos = absVal.len - int(scale)
+    result = sign & absVal[0 ..< dotPos] & "." & absVal[dotPos ..^ 1]
+
+proc uuidToString(bytes: seq[byte]): string =
+  if bytes.len != 16: return ""
+  var s = newStringOfCap(36)
+  let hexChars = "0123456789abcdef"
+  for i, b in bytes:
+    if i == 4 or i == 6 or i == 8 or i == 10:
+      s.add('-')
+    s.add(hexChars[int(b shr 4)])
+    s.add(hexChars[int(b and 0x0F)])
+  s
+
+proc parseUuid*(text: string): Result[seq[byte]] =
+  var s = text.strip().toLowerAscii()
+  if s.startsWith("{") and s.endsWith("}"):
+    s = s[1 .. ^2]
+  s = s.replace("-", "")
+  if s.len != 32:
+    return err[seq[byte]](ERR_SQL, "Invalid UUID format")
+  var bytes = newSeq[byte](16)
+  for i in 0 ..< 16:
+    var val = 0
+    for j in 0 .. 1:
+      let c = s[i * 2 + j]
+      var digit = 0
+      if c >= '0' and c <= '9': digit = ord(c) - ord('0')
+      elif c >= 'a' and c <= 'f': digit = ord(c) - ord('a') + 10
+      else: return err[seq[byte]](ERR_SQL, "Invalid UUID character")
+      val = (val shl 4) or digit
+    bytes[i] = byte(val)
+  ok(bytes)
+
+proc scaleDecimal*(val: int64, oldScale: uint8, newScale: uint8): Result[int64] =
+  if newScale == oldScale: return ok(val)
+  if newScale > oldScale:
+    let diff = newScale - oldScale
+    if diff > 18: return err[int64](ERR_SQL, "Scale difference too large")
+    var mult: int64 = 1
+    for _ in 1 .. int(diff): mult *= 10
+    if val > 0 and val > (high(int64) div mult): return err[int64](ERR_SQL, "Decimal overflow")
+    if val < 0 and val < (low(int64) div mult): return err[int64](ERR_SQL, "Decimal overflow")
+    ok(val * mult)
+  else:
+    let diff = oldScale - newScale
+    var divi: int64 = 1
+    for _ in 1 .. int(diff): divi *= 10
+    let rem = val mod divi
+    var res = val div divi
+    if abs(rem) * 2 >= divi:
+      if val > 0: res.inc
+      else: res.dec
+    ok(res)
+
+proc compareDecimals(a: Value, b: Value): int =
+  var s1 = a.decimalScale
+  var s2 = b.decimalScale
+  var v1 = a.int64Val
+  var v2 = b.int64Val
+  
+  if s1 == s2:
+    return cmp(v1, v2)
+    
+  if s1 < s2:
+    let diff = s2 - s1
+    var mult: int64 = 1
+    var overflow = false
+    for _ in 1 .. int(diff):
+      if mult > high(int64) div 10:
+        overflow = true
+        break
+      mult *= 10
+    
+    if not overflow:
+       if v1 > 0:
+         if v1 > high(int64) div mult: return 1
+       elif v1 < 0:
+         if v1 < low(int64) div mult: return -1
+       
+       return cmp(v1 * mult, v2)
+    else:
+       if v1 > 0: return 1
+       if v1 < 0: return -1
+       return cmp(0, v2)
+  else:
+     return -compareDecimals(b, a)
+
 proc valueToString*(value: Value): string =
   case value.kind
   of vkNull: "NULL"
@@ -46,6 +146,7 @@ proc valueToString*(value: Value): string =
       "false"
   of vkInt64: $value.int64Val
   of vkFloat64: $value.float64Val
+  of vkDecimal: decimalToString(value.int64Val, value.decimalScale)
   of vkText, vkBlob:
     let n = value.bytes.len
     var s = newString(n)
@@ -1433,6 +1534,7 @@ proc compareValues*(a: Value, b: Value): int =
   of vkBool: cmp(a.boolVal, b.boolVal)
   of vkInt64: cmp(a.int64Val, b.int64Val)
   of vkFloat64: cmp(a.float64Val, b.float64Val)
+  of vkDecimal: compareDecimals(a, b)
   of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
     var lenA = a.bytes.len
     var lenB = b.bytes.len
@@ -1469,10 +1571,12 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
   of ekLiteral:
     return ok(evalLiteral(expr.value))
   of ekParam:
+    echo "DEBUG ekParam: " & $expr.index
     if expr.index <= 0 or expr.index > params.len:
       return err[Value](ERR_SQL, "Missing parameter", $expr.index)
     return ok(params[expr.index - 1])
   of ekColumn:
+    echo "DEBUG ekColumn: " & expr.name
     if expr.table.len == 0:
       let lower = expr.name.toLowerAscii()
       if lower == "true": return ok(Value(kind: vkBool, boolVal: true))
@@ -1531,8 +1635,57 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     of "+", "-", "*", "/":
       if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
-      if leftRes.value.kind notin {vkInt64, vkFloat64} or rightRes.value.kind notin {vkInt64, vkFloat64}:
+
+      let allowed = {vkInt64, vkFloat64, vkDecimal}
+      if leftRes.value.kind notin allowed or rightRes.value.kind notin allowed:
         return err[Value](ERR_SQL, "Numeric operator on non-numeric", expr.op)
+
+      if leftRes.value.kind == vkDecimal or rightRes.value.kind == vkDecimal:
+         var v1 = leftRes.value
+         var v2 = rightRes.value
+         if v1.kind == vkInt64: v1 = Value(kind: vkDecimal, int64Val: v1.int64Val, decimalScale: 0)
+         if v2.kind == vkInt64: v2 = Value(kind: vkDecimal, int64Val: v2.int64Val, decimalScale: 0)
+         
+         if v1.kind == vkFloat64 or v2.kind == vkFloat64:
+             return err[Value](ERR_SQL, "Cannot mix DECIMAL and FLOAT64 (explicit cast required)")
+             
+         let s1 = v1.decimalScale
+         let s2 = v2.decimalScale
+         case expr.op
+         of "+", "-":
+           let s = max(s1, s2)
+           let r1 = scaleDecimal(v1.int64Val, s1, s)
+           let r2 = scaleDecimal(v2.int64Val, s2, s)
+           if not r1.ok: return err[Value](r1.err.code, r1.err.message, r1.err.context)
+           if not r2.ok: return err[Value](r2.err.code, r2.err.message, r2.err.context)
+           let res = if expr.op == "+": r1.value + r2.value else: r1.value - r2.value
+           return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         of "*":
+           let s = s1 + s2
+           if s > 18: return err[Value](ERR_SQL, "Result scale > 18")
+           let res = v1.int64Val * v2.int64Val
+           return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         of "/":
+           if v2.int64Val == 0: return err[Value](ERR_SQL, "Division by zero")
+           let s = max(s1, s2)
+           let power = int(s2) + int(s) - int(s1)
+           var num = v1.int64Val
+           if power > 0:
+             var mult: int64 = 1
+             for _ in 1 .. power: mult *= 10
+             num *= mult
+           
+           let rem = num mod v2.int64Val
+           var res = num div v2.int64Val
+           if abs(rem) * 2 >= abs(v2.int64Val):
+              if (res >= 0 and v2.int64Val > 0) or (res <= 0 and v2.int64Val < 0):
+                  if res >= 0: res.inc else: res.dec
+              else:
+                  if res >= 0: res.inc else: res.dec
+           return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         else:
+           return err[Value](ERR_SQL, "Unsupported operator", expr.op)
+
       if leftRes.value.kind == vkFloat64 or rightRes.value.kind == vkFloat64:
         let l = if leftRes.value.kind == vkFloat64: leftRes.value.float64Val else: float64(leftRes.value.int64Val)
         let r = if rightRes.value.kind == vkFloat64: rightRes.value.float64Val else: float64(rightRes.value.int64Val)
@@ -1585,9 +1738,157 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     else:
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:
+    echo "DEBUG ekFunc: " & expr.funcName
     let name = expr.funcName.toUpperAscii()
     if name in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
       return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
+
+    if name == "GEN_RANDOM_UUID":
+      if expr.args.len != 0: return err[Value](ERR_SQL, "GEN_RANDOM_UUID takes no arguments")
+      var bytes = newSeq[byte](16)
+      if not urandom(bytes):
+        return err[Value](ERR_IO, "Failed to generate random UUID")
+      bytes[6] = (bytes[6] and 0x0F) or 0x40
+      bytes[8] = (bytes[8] and 0x3F) or 0x80
+      return ok(Value(kind: vkBlob, bytes: bytes))
+
+    if name == "UUID_PARSE":
+      if expr.args.len != 1: return err[Value](ERR_SQL, "UUID_PARSE requires one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok: return argRes
+      if argRes.value.kind == vkNull: return ok(Value(kind: vkNull))
+      if argRes.value.kind != vkText: return err[Value](ERR_SQL, "UUID_PARSE requires string")
+      echo "DEBUG argRes kind: " & $argRes.value.kind
+      let bytesRes = parseUuid(valueToString(argRes.value))
+      if not bytesRes.ok:
+        echo "UUID_PARSE Error: ", bytesRes.err.message
+        return err[Value](bytesRes.err.code, bytesRes.err.message)
+      return ok(Value(kind: vkBlob, bytes: bytesRes.value))
+
+    if name == "UUID_TO_STRING":
+      if expr.args.len != 1: return err[Value](ERR_SQL, "UUID_TO_STRING requires one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok: return argRes
+      if argRes.value.kind == vkNull: return ok(Value(kind: vkNull))
+      if argRes.value.kind != vkBlob or argRes.value.bytes.len != 16:
+         return err[Value](ERR_SQL, "UUID_TO_STRING requires UUID blob")
+      return ok(textValue(uuidToString(argRes.value.bytes)))
+    
+    if name == "CAST":
+      if expr.args.len != 2: return err[Value](ERR_SQL, "CAST requires value and type")
+      let valRes = evalExpr(row, expr.args[0], params)
+      if not valRes.ok: return valRes
+      if valRes.value.kind == vkNull: return ok(Value(kind: vkNull))
+      
+      let typeArg = expr.args[1]
+      if typeArg.kind != ekLiteral or typeArg.value.kind != svString:
+         return err[Value](ERR_SQL, "CAST target type must be a literal string")
+      let typeStr = typeArg.value.strVal
+      
+      let typeSpecRes = parseColumnType(typeStr)
+      if not typeSpecRes.ok:
+         return err[Value](typeSpecRes.err.code, typeSpecRes.err.message)
+      let target = typeSpecRes.value
+      
+      case target.kind
+      of ctDecimal:
+         if valRes.value.kind == vkText:
+            let s = valueToString(valRes.value).strip()
+            var str = s
+            var negative = false
+            if str.startsWith("-"):
+               negative = true
+               str = str[1..^1]
+            elif str.startsWith("+"):
+               str = str[1..^1]
+            
+            let dotPos = str.find('.')
+            var unscaledStr = ""
+            var inputScale = 0
+            if dotPos >= 0:
+               unscaledStr = str[0..<dotPos] & str[dotPos+1..^1]
+               inputScale = str.len - 1 - dotPos
+            else:
+               unscaledStr = str
+               inputScale = 0
+            
+            if unscaledStr.len == 0: return err[Value](ERR_SQL, "Invalid decimal format")
+            try:
+               var u = parseBiggestInt(unscaledStr)
+               if negative: u = -u
+               let res = scaleDecimal(u, uint8(inputScale), target.decScale)
+               if not res.ok: return err[Value](res.err.code, res.err.message)
+               return ok(Value(kind: vkDecimal, int64Val: res.value, decimalScale: target.decScale))
+            except ValueError:
+               return err[Value](ERR_SQL, "Invalid decimal format")
+               
+         elif valRes.value.kind == vkInt64:
+            let res = scaleDecimal(valRes.value.int64Val, 0, target.decScale)
+            if not res.ok: return err[Value](res.err.code, res.err.message)
+            return ok(Value(kind: vkDecimal, int64Val: res.value, decimalScale: target.decScale))
+         elif valRes.value.kind == vkDecimal:
+            let res = scaleDecimal(valRes.value.int64Val, valRes.value.decimalScale, target.decScale)
+            if not res.ok: return err[Value](res.err.code, res.err.message)
+            return ok(Value(kind: vkDecimal, int64Val: res.value, decimalScale: target.decScale))
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to DECIMAL", $valRes.value.kind)
+
+      of ctInt64:
+         case valRes.value.kind
+         of vkInt64: return ok(valRes.value)
+         of vkFloat64: return ok(Value(kind: vkInt64, int64Val: int64(valRes.value.float64Val)))
+         of vkText:
+            try:
+              let i = parseBiggestInt(valueToString(valRes.value).strip())
+              return ok(Value(kind: vkInt64, int64Val: i))
+            except ValueError:
+              return err[Value](ERR_SQL, "Invalid integer format")
+         of vkDecimal:
+            let res = scaleDecimal(valRes.value.int64Val, valRes.value.decimalScale, 0)
+            if not res.ok: return err[Value](res.err.code, res.err.message)
+            return ok(Value(kind: vkInt64, int64Val: res.value))
+         of vkBool:
+            return ok(Value(kind: vkInt64, int64Val: if valRes.value.boolVal: 1 else: 0))
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to INT", $valRes.value.kind)
+
+      of ctFloat64:
+         case valRes.value.kind
+         of vkFloat64: return ok(valRes.value)
+         of vkInt64: return ok(Value(kind: vkFloat64, float64Val: float64(valRes.value.int64Val)))
+         of vkDecimal:
+            var f = float64(valRes.value.int64Val)
+            var divS = 1.0
+            for _ in 1 .. int(valRes.value.decimalScale): divS *= 10.0
+            return ok(Value(kind: vkFloat64, float64Val: f / divS))
+         of vkText:
+            try:
+              let f = parseFloat(valueToString(valRes.value).strip())
+              return ok(Value(kind: vkFloat64, float64Val: f))
+            except ValueError:
+              return err[Value](ERR_SQL, "Invalid float format")
+         of vkBool:
+            return ok(Value(kind: vkFloat64, float64Val: if valRes.value.boolVal: 1.0 else: 0.0))
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to FLOAT", $valRes.value.kind)
+            
+      of ctUuid:
+         if valRes.value.kind == vkText:
+            let bytesRes = parseUuid(valueToString(valRes.value))
+            if not bytesRes.ok: return err[Value](bytesRes.err.code, bytesRes.err.message)
+            return ok(Value(kind: vkBlob, bytes: bytesRes.value))
+         elif valRes.value.kind == vkBlob:
+            if valRes.value.bytes.len != 16: return err[Value](ERR_SQL, "Blob size mismatch for UUID")
+            return ok(valRes.value)
+         else:
+             return err[Value](ERR_SQL, "Cannot cast to UUID", $valRes.value.kind)
+
+      of ctText:
+         if valRes.value.kind == vkBlob and valRes.value.bytes.len == 16:
+            return ok(textValue(uuidToString(valRes.value.bytes)))
+         return ok(textValue(valueToString(valRes.value)))
+      else:
+         return err[Value](ERR_SQL, "Unsupported CAST target")
 
     if name == "CASE":
       if expr.args.len == 0:
@@ -2710,6 +3011,7 @@ proc applyLimit*(rows: seq[Row], limit: int, offset: int): seq[Row] =
   rows[start ..< endIndex]
 
 proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[seq[Row]] =
+  echo "DEBUG execPlan start"
   let ownsEvalContext = gEvalContextDepth == 0
   if ownsEvalContext:
     gEvalPager = pager

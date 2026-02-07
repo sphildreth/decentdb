@@ -522,6 +522,8 @@ suite "Exec Expression Evaluation":
       ]
     )
     let castRes = evalExpr(Row(columns: @[], values: @[]), castExpr, @[])
+    if not castRes.ok:
+      echo "CAST error: ", castRes.err.message
     check castRes.ok
     check castRes.value.kind == vkInt64
     check castRes.value.int64Val == 42
