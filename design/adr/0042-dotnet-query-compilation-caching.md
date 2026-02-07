@@ -19,4 +19,4 @@ Micro-ORM query compilation (expression parsing + SQL generation + parameter ext
 
 ## References
 - design/DAPPER_SUPPORT.md (Phase 5: Query Compilation Caching)
-- bindings/dotnet/src/DecentDb.MicroOrm/ExpressionSqlBuilder.cs
+- bindings/dotnet/src/DecentDB.MicroOrm/ExpressionSqlBuilder.cs

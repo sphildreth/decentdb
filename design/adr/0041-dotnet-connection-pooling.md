@@ -9,8 +9,8 @@ DecentDB concurrency is single process, one writer, many readers. ADO.NET consum
 ## Decision
 - The ADO.NET provider does **not** implement a global cross-connection pool in the 0.x baseline.
 - Single-writer enforcement is provided by the engine’s locking semantics; the provider must not claim stronger guarantees.
-- The Micro-ORM (`DecentDbContext`) implements **context-scoped pooling**:
-  - pooled mode: a single open `DecentDbConnection` is reused within the context
+- The Micro-ORM (`DecentDBContext`) implements **context-scoped pooling**:
+  - pooled mode: a single open `DecentDBConnection` is reused within the context
   - non-pooled mode: open/close per operation
   - when a transaction is active, all operations use the transaction’s connection
 
@@ -21,5 +21,5 @@ DecentDB concurrency is single process, one writer, many readers. ADO.NET consum
 ## References
 - design/adr/0023-isolation-level-specification.md
 - design/DAPPER_SUPPORT.md (Phase 5: pooling semantics)
-- bindings/dotnet/src/DecentDb.MicroOrm/DecentDbContext.cs
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbConnection.cs
+- bindings/dotnet/src/DecentDB.MicroOrm/DecentDBContext.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBConnection.cs

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Long-running reader tests for DecentDb.
+Long-running reader tests for DecentDB.
 
 Tests WAL growth prevention, reader timeouts, and truncation behavior
 with active readers.
@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Optional
 
 
-class DecentDbAdapter:
-    """Adapter for running SQL against DecentDb via CLI."""
+class DecentDBAdapter:
+    """Adapter for running SQL against DecentDB via CLI."""
 
     def __init__(self, engine_path: str):
         self.engine_path = engine_path
@@ -83,7 +83,7 @@ class DecentDbAdapter:
 
 
 def test_reader_timeout(
-    engine: DecentDbAdapter, db_path: str, timeout_sec: int = 5
+    engine: DecentDBAdapter, db_path: str, timeout_sec: int = 5
 ) -> tuple[bool, str]:
     """
     Test: Reader holding snapshot for too long should timeout.
@@ -111,7 +111,7 @@ def test_reader_timeout(
 
 
 def test_wal_truncation_with_readers(
-    engine: DecentDbAdapter, temp_dir: str
+    engine: DecentDBAdapter, temp_dir: str
 ) -> tuple[bool, str]:
     """
     Test: WAL should be truncated safely respecting active readers.
@@ -167,7 +167,7 @@ def test_wal_truncation_with_readers(
 
 
 def test_concurrent_operations(
-    engine: DecentDbAdapter, db_path: str
+    engine: DecentDBAdapter, db_path: str
 ) -> tuple[bool, str]:
     """
     Test: Multiple sequential operations should not corrupt database.
@@ -213,7 +213,7 @@ def test_concurrent_operations(
 
 
 def test_reader_count_tracking(
-    engine: DecentDbAdapter, db_path: str
+    engine: DecentDBAdapter, db_path: str
 ) -> tuple[bool, str]:
     """
     Test: Reader count should be tracked correctly.
@@ -254,7 +254,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    engine = DecentDbAdapter(args.engine)
+    engine = DecentDBAdapter(args.engine)
 
     tests = []
     if args.test in ("timeout", "all"):

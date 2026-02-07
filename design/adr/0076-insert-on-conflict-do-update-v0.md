@@ -18,7 +18,7 @@ Add initial `INSERT ... ON CONFLICT ... DO UPDATE` support with a narrow, explic
 3. Conflict target resolution
 - Reuse ADR-0075 target validation:
   - column-list targets must match a unique surface exactly
-  - `ON CONSTRAINT name` resolves to a DecentDb unique index metadata name
+  - `ON CONSTRAINT name` resolves to a DecentDB unique index metadata name
 
 4. `DO UPDATE` expression scope
 - Assignment targets must be columns in the inserted table.

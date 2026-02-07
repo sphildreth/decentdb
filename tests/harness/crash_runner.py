@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Crash-injection test orchestrator for DecentDb.
+Crash-injection test orchestrator for DecentDB.
 
 Runs scenarios that inject faults at specific points and verify:
 - Committed data survives crashes
@@ -260,7 +260,7 @@ def run_crash_scenario(engine_path: str, scenario: dict, keep_db: bool = False) 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Crash-injection test orchestrator for DecentDb"
+        description="Crash-injection test orchestrator for DecentDB"
     )
     parser.add_argument(
         "--engine", required=True, help="Path to decentdb CLI executable"

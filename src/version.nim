@@ -25,7 +25,7 @@ func parseNimbleVersion(text: string): string =
   ""
 
 const NimblePath = joinPath(parentDir(currentSourcePath()), "..", "decentdb.nimble")
-const DecentDbVersion* = parseNimbleVersion(staticRead(NimblePath))
+const DecentDBVersion* = parseNimbleVersion(staticRead(NimblePath))
 
 static:
-  doAssert DecentDbVersion.len > 0, "Failed to parse version from nimble file: " & NimblePath
+  doAssert DecentDBVersion.len > 0, "Failed to parse version from nimble file: " & NimblePath

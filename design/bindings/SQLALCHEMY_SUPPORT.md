@@ -106,7 +106,7 @@ Python Application
           ↓
       decentdb (DB-API 2.0 driver)
           ↓
-      DecentDb.Native (ctypes/cffi or CPython extension)
+      DecentDB.Native (ctypes/cffi or CPython extension)
           ↓
       DecentDB (Nim engine, direct file I/O)
 ```

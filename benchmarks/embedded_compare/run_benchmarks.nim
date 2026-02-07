@@ -243,7 +243,7 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
 
 # --- DecentDB Benchmarks ---
 
-proc runDecentDbInsert(outputDir: string) =
+proc runDecentDBInsert(outputDir: string) =
   echo "Running DecentDB Insert Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_insert.ddb"
   registerDbArtifacts(dbPath, includeShm = false)
@@ -296,7 +296,7 @@ proc runDecentDbInsert(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: DecentDbVersion,
+    engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "insert",
     durability: "safe", # default
@@ -322,7 +322,7 @@ proc runDecentDbInsert(outputDir: string) =
   )
   writeResult(outputDir, res)
 
-proc runDecentDbCommitLatency(outputDir: string) =
+proc runDecentDBCommitLatency(outputDir: string) =
   echo "Running DecentDB Commit Latency Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_commit.ddb"
   registerDbArtifacts(dbPath, includeShm = false)
@@ -374,7 +374,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: DecentDbVersion,
+    engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "commit_latency",
     durability: "safe",
@@ -400,7 +400,7 @@ proc runDecentDbCommitLatency(outputDir: string) =
   )
   writeResult(outputDir, res)
 
-proc runDecentDbPointRead(outputDir: string) =
+proc runDecentDBPointRead(outputDir: string) =
   echo "Running DecentDB Point Read Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_read.ddb"
   registerDbArtifacts(dbPath, includeShm = false)
@@ -457,7 +457,7 @@ proc runDecentDbPointRead(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: DecentDbVersion,
+    engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "point_read",
     durability: "safe",
@@ -483,7 +483,7 @@ proc runDecentDbPointRead(outputDir: string) =
   )
   writeResult(outputDir, res)
 
-proc runDecentDbJoin(outputDir: string) =
+proc runDecentDBJoin(outputDir: string) =
   echo "Running DecentDB Join Benchmark..."
   let dbPath = getBenchDataDir() / "bench_decentdb_join.ddb"
   registerDbArtifacts(dbPath, includeShm = false)
@@ -552,7 +552,7 @@ proc runDecentDbJoin(outputDir: string) =
   let res = BenchmarkResult(
     timestamp_utc: getIsoTime(),
     engine: "DecentDB",
-    engine_version: DecentDbVersion,
+    engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "join",
     durability: "safe",
@@ -1399,10 +1399,10 @@ proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "
   let runDuck = runAll or "duckdb" in engines
   
   if runDecent:
-    runDecentDbInsert(output_dir)
-    runDecentDbCommitLatency(output_dir)
-    runDecentDbPointRead(output_dir)
-    runDecentDbJoin(output_dir)
+    runDecentDBInsert(output_dir)
+    runDecentDBCommitLatency(output_dir)
+    runDecentDBPointRead(output_dir)
+    runDecentDBJoin(output_dir)
   
   if runSqlite:
     runSqliteInsert(output_dir)

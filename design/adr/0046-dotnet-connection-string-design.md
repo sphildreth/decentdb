@@ -23,5 +23,5 @@ Dapper expects a normal `DbConnection` accepting a connection string. DecentDB a
 
 ## References
 - design/DAPPER_SUPPORT.md (Connection String Parameters)
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbConnection.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBConnection.cs
 - src/c_api.nim (native options parsing)

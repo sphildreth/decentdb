@@ -74,7 +74,7 @@ Node Application
   ├── Knex (optional, query builder)
   └── decentdb (N-API addon)
           ↓
-      DecentDb.Native (N-API → C ABI)
+      DecentDB.Native (N-API → C ABI)
           ↓
       DecentDB (Nim engine, direct file I/O)
 ```

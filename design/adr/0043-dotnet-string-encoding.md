@@ -17,5 +17,5 @@ DecentDB uses UTF-8 for TEXT and error messages at the C ABI boundary. .NET uses
 
 ## References
 - design/DAPPER_SUPPORT.md (Phase 4: Unicode and Encoding)
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbCommand.cs
-- bindings/dotnet/src/DecentDb.Native/DecentDb.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBCommand.cs
+- bindings/dotnet/src/DecentDB.Native/DecentDB.cs

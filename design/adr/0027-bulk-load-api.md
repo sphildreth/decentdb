@@ -3,7 +3,7 @@
 **Status:** Accepted
 
 ## Context
-DecentDb needs a dedicated bulk load path to ingest large datasets efficiently (PRD target: 100k rows in < 20s) while preserving:
+DecentDB needs a dedicated bulk load path to ingest large datasets efficiently (PRD target: 100k rows in < 20s) while preserving:
 - Correctness (constraints honored)
 - Snapshot isolation for readers
 - WAL-based durability by default (fsync on commit)

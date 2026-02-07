@@ -7,6 +7,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../../bindings/dotnet/src/DecentDb.MicroOrm/DecentDb.MicroOrm.csproj" />
+    <ProjectReference Include="../../../bindings/dotnet/src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj" />
   </ItemGroup>
 </Project>

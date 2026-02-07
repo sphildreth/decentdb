@@ -12,7 +12,7 @@ This repository currently supports local builds and test runs without external p
 
 ## Decision
 - The 0.x baseline continues to support local builds (repo native build output + MSBuild copy targets).
-- The planned distribution shape is a meta-package (e.g. `DecentDb.NET`) that references managed assemblies and includes platform-specific native binaries under `runtimes/`.
+- The planned distribution shape is a meta-package (e.g. `DecentDB.NET`) that references managed assemblies and includes platform-specific native binaries under `runtimes/`.
 - CI packaging and RID matrix publication are deferred until the native build pipeline is finalized.
 
 ## Consequences
@@ -21,4 +21,4 @@ This repository currently supports local builds and test runs without external p
 
 ## References
 - design/DAPPER_SUPPORT.md (NuGet Package Distribution)
-- bindings/dotnet/src/DecentDb.Native/DecentDb.targets
+- bindings/dotnet/src/DecentDB.Native/DecentDB.targets

@@ -15,7 +15,7 @@ const AsciiLogo = r"""
 
 when isMainModule:
   dispatchMulti(
-    ["multi", doc="DecentDB CLI v" & DecentDbVersion & "\n" & AsciiLogo & "\n\n"],
+    ["multi", doc="DecentDB CLI v" & DecentDBVersion & "\n" & AsciiLogo & "\n\n"],
     
     # 1. Main SQL Execution
     [decentdb_cli.cliMain, 

@@ -28,5 +28,5 @@ Dapper and other ADO.NET consumers expect predictable parameter and result type 
 ## References
 - design/adr/0005-sql-parameterization-style.md
 - design/DAPPER_SUPPORT.md (Phase 4)
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbCommand.cs
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbDataReader.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBCommand.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBDataReader.cs

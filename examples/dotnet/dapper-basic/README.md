@@ -38,7 +38,7 @@ Once the provider exists, it will need to be made discoverable either by:
 
 ```csharp
 // Example only — names/types will match the provider implementation
-DbProviderFactories.RegisterFactory("DecentDB", DecentDbFactory.Instance);
+DbProviderFactories.RegisterFactory("DecentDB", DecentDBFactory.Instance);
 ```
 
 The provider is expected to accept named parameters (e.g. `@id`) and rewrite them to DecentDB engine parameters (`$1`, `$2`, …) per ADR-0005.

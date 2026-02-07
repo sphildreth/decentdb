@@ -1,10 +1,10 @@
-using DecentDb.AdoNet;
-using DecentDb.MicroOrm;
+using DecentDB.AdoNet;
+using DecentDB.MicroOrm;
 
 var dbPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "sample.db"));
 
 // Schema setup (Micro-ORM is convention-based; it doesn't create tables for you).
-using (var conn = new DecentDbConnection($"Data Source={dbPath}"))
+using (var conn = new DecentDBConnection($"Data Source={dbPath}"))
 {
     conn.Open();
     using var cmd = conn.CreateCommand();
@@ -14,7 +14,7 @@ using (var conn = new DecentDbConnection($"Data Source={dbPath}"))
     cmd.ExecuteNonQuery();
 }
 
-using var ctx = new DecentDbContext(dbPath);
+using var ctx = new DecentDBContext(dbPath);
 var persons = ctx.Set<Person>();
 
 await persons.InsertManyAsync(new[]

@@ -300,7 +300,7 @@ Multi-process locking is out of scope for 0.x.
 - Document lock acquisition order for all operations
 
 ### 5.5 Isolation Levels (LOW-001)
-DecentDb implements **Snapshot Isolation (SI)** as the default and only isolation level.
+DecentDB implements **Snapshot Isolation (SI)** as the default and only isolation level.
 
 **Semantics:**
 - **Snapshot Acquisition**: A transaction acquires its snapshot (`snapshot_lsn`) at the beginning of the first statement (or `BEGIN` if explicit).
@@ -319,7 +319,7 @@ DecentDb implements **Snapshot Isolation (SI)** as the default and only isolatio
 ### 6.1 Parser choice
 0.x recommendation:
 - Use a Postgres-compatible parser via FFI (e.g., `libpg_query`) to accept familiar syntax.
-- Normalize parse trees into DecentDb’s internal AST immediately.
+- Normalize parse trees into DecentDB’s internal AST immediately.
 
 Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
@@ -545,7 +545,7 @@ For contains predicates:
 
 4. **Differential tests (Python)**
    - For supported SQL subset, run query on:
-     - DecentDb
+     - DecentDB
      - PostgreSQL
    - Compare result sets for deterministic queries (no timestamps/random)
 
