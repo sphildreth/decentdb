@@ -11,7 +11,8 @@ const MaxViewExpansionDepth* = 16
 const MaxExpandedAstNodes* = 10_000
 
 proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement]
-
+  # stderr.writeLine("DEBUG: bindStatement kind=", stmt.kind)
+  
 proc normalizedName(name: string): string =
   name.toLowerAscii()
 
@@ -588,6 +589,7 @@ proc buildViewOutputExprs(catalog: Catalog, stmt: Statement): Result[seq[Expr]] 
       if not baseRes.ok:
         return err[seq[Expr]](baseRes.err.code, baseRes.err.message, baseRes.err.context)
       let basePrefix = sourceName(stmt.fromTable, stmt.fromAlias)
+      # echo "DEBUG: buildViewOutputExprs basePrefix=", basePrefix, " table=", stmt.fromTable
       for col in baseRes.value.columns:
         outputExprs.add(Expr(kind: ekColumn, table: basePrefix, name: col.name))
       for join in stmt.joins:
@@ -595,6 +597,7 @@ proc buildViewOutputExprs(catalog: Catalog, stmt: Statement): Result[seq[Expr]] 
         if not tableRes.ok:
           return err[seq[Expr]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
         let joinPrefix = sourceName(join.table, join.alias)
+        # echo "DEBUG: buildViewOutputExprs joinPrefix=", joinPrefix, " table=", join.table
         for col in tableRes.value.columns:
           outputExprs.add(Expr(kind: ekColumn, table: joinPrefix, name: col.name))
     else:
@@ -620,10 +623,14 @@ proc resolveViewOutputColumnNames(
     names = explicitColumns
   else:
     names = newSeq[string](outputExprs.len)
+    var sourceStmt = expandedStmt
+    while sourceStmt.setOpKind != sokNone and sourceStmt.setOpLeft != nil:
+      sourceStmt = sourceStmt.setOpLeft
+
     for i, expr in outputExprs:
       var name = ""
-      if i < expandedStmt.selectItems.len:
-        let item = expandedStmt.selectItems[i]
+      if i < sourceStmt.selectItems.len:
+        let item = sourceStmt.selectItems[i]
         if not item.isStar and item.alias.len > 0:
           name = item.alias
       if name.len == 0 and expr.kind == ekColumn:
@@ -764,27 +771,25 @@ proc outputExprMapForColumns(
     map[normalizedName(name)] = cloneExpr(outputExprs[i])
   ok(map)
 
-proc expandSelectCteRefs(
-  catalog: Catalog,
-  stmt: Statement,
-  ctes: Table[string, ExpandedCte]
-): Result[Statement] =
-  var expanded = cloneSelectStatement(stmt)
-  expanded.cteNames = @[]
-  expanded.cteColumns = @[]
-  expanded.cteQueries = @[]
-
-  proc rewriteAllExpressions(target: var Statement, refTable: string, refAlias: string, columnMap: Table[string, Expr], allowUnqualified: bool): Result[Void] =
+proc rewriteAllExpressions(
+  target: var Statement,
+  refTable: string,
+  refAlias: string,
+  columnMap: Table[string, Expr],
+  allowUnqualified: bool,
+  skipSelectItems: bool = false
+): Result[Void] =
     var rewrittenItems: seq[SelectItem] = @[]
-    for item in target.selectItems:
-      if item.isStar:
-        rewrittenItems.add(item)
-        continue
-      let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, allowUnqualified)
-      if not exprRes.ok:
-        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-      rewrittenItems.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
-    target.selectItems = rewrittenItems
+    if not skipSelectItems:
+      for item in target.selectItems:
+        if item.isStar:
+          rewrittenItems.add(item)
+          continue
+        let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, allowUnqualified)
+        if not exprRes.ok:
+          return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+        rewrittenItems.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
+      target.selectItems = rewrittenItems
 
     let whereRes = rewriteExprForViewRef(target.whereExpr, refTable, refAlias, columnMap, allowUnqualified)
     if not whereRes.ok:
@@ -821,6 +826,67 @@ proc expandSelectCteRefs(
     target.orderBy = rewrittenOrder
     okVoid()
 
+proc pushDownQuery(
+  catalog: Catalog,
+  outer: Statement,
+  inner: Statement,
+  refTable: string,
+  refAlias: string,
+  columns: seq[string],
+  allowUnqualified: bool,
+  skipSelectItemsRewrite: bool = false
+): Result[Statement] =
+  if inner.setOpKind != sokNone:
+    let leftRes = pushDownQuery(catalog, outer, inner.setOpLeft, refTable, refAlias, columns, allowUnqualified, skipSelectItemsRewrite)
+    if not leftRes.ok: return leftRes
+    let rightRes = pushDownQuery(catalog, outer, inner.setOpRight, refTable, refAlias, columns, allowUnqualified, skipSelectItemsRewrite)
+    if not rightRes.ok: return rightRes
+    return ok(Statement(
+      kind: skSelect,
+      setOpKind: inner.setOpKind,
+      setOpLeft: leftRes.value,
+      setOpRight: rightRes.value,
+      orderBy: @[],
+      limit: -1,
+      limitParam: 0,
+      offset: -1,
+      offsetParam: 0
+    ))
+  else:
+    let mapRes = outputExprMapForColumns(catalog, inner, columns, refTable)
+    if not mapRes.ok:
+       return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
+    let columnMap = mapRes.value
+
+    var res = cloneSelectStatement(outer)
+    res.orderBy = @[]
+    res.limit = -1
+    res.limitParam = 0
+    res.offset = -1
+    res.offsetParam = 0
+    
+    let rewriteRes = rewriteAllExpressions(res, refTable, refAlias, columnMap, allowUnqualified, skipSelectItemsRewrite)
+    if not rewriteRes.ok:
+      return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
+    
+    let innerClone = cloneSelectStatement(inner)
+    res.fromTable = innerClone.fromTable
+    res.fromAlias = innerClone.fromAlias
+    res.joins = innerClone.joins & res.joins
+    res.whereExpr = andExpr(cloneExpr(innerClone.whereExpr), res.whereExpr)
+    
+    ok(res)
+
+proc expandSelectCteRefs(
+  catalog: Catalog,
+  stmt: Statement,
+  ctes: Table[string, ExpandedCte]
+): Result[Statement] =
+  var expanded = cloneSelectStatement(stmt)
+  expanded.cteNames = @[]
+  expanded.cteColumns = @[]
+  expanded.cteQueries = @[]
+
   if expanded.fromTable.len > 0 and ctes.hasKey(normalizedName(expanded.fromTable)):
     let onlySource = expanded.joins.len == 0
     let singleSourceStar = selectHasStar(expanded)
@@ -830,12 +896,14 @@ proc expandSelectCteRefs(
     let refTable = expanded.fromTable
     let refAlias = expanded.fromAlias
     let cteDef = ctes[normalizedName(refTable)]
-    let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
-    if not columnMapRes.ok:
-      return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
-    let columnMap = columnMapRes.value
 
-    if singleSourceStar:
+    var skipRewrite = false
+    if singleSourceStar and cteDef.query.setOpKind == sokNone:
+      # Optimization for single source star on simple query: replace star with explicit columns
+      let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
+      if not columnMapRes.ok:
+        return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+      let columnMap = columnMapRes.value
       var items: seq[SelectItem] = @[]
       for item in expanded.selectItems:
         if item.isStar:
@@ -844,19 +912,38 @@ proc expandSelectCteRefs(
             if columnMap.hasKey(key):
               items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
         else:
-          items.add(item)
+          let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
+          if not exprRes.ok:
+             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+          items.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
       expanded.selectItems = items
+      skipRewrite = true
 
-    let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, onlySource)
-    if not rewriteRes.ok:
-      return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
-
-    let cteQuery = cloneSelectStatement(cteDef.query)
-    let outerJoins = expanded.joins
-    expanded.fromTable = cteQuery.fromTable
-    expanded.fromAlias = cteQuery.fromAlias
-    expanded.joins = cteQuery.joins & outerJoins
-    expanded.whereExpr = andExpr(cloneExpr(cteQuery.whereExpr), expanded.whereExpr)
+    let originalOrderBy = expanded.orderBy
+    let originalLimit = expanded.limit
+    let originalLimitParam = expanded.limitParam
+    let originalOffset = expanded.offset
+    let originalOffsetParam = expanded.offsetParam
+    
+    let pushedRes = pushDownQuery(catalog, expanded, cteDef.query, refTable, refAlias, cteDef.columnNames, onlySource, skipRewrite)
+    if not pushedRes.ok:
+      return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
+    expanded = pushedRes.value
+    
+    if expanded.setOpKind != sokNone:
+        # If it became a SetOp, restore the outer query's ordering/limit
+        expanded.orderBy = originalOrderBy
+        expanded.limit = originalLimit
+        expanded.limitParam = originalLimitParam
+        expanded.offset = originalOffset
+        expanded.offsetParam = originalOffsetParam
+    else:
+        # If it is still a Select, restore ordering/limit
+        expanded.orderBy = originalOrderBy
+        expanded.limit = originalLimit
+        expanded.limitParam = originalLimitParam
+        expanded.offset = originalOffset
+        expanded.offsetParam = originalOffsetParam
 
   var joinIdx = 0
   while joinIdx < expanded.joins.len:
@@ -867,6 +954,10 @@ proc expandSelectCteRefs(
       let refTable = expanded.joins[joinIdx].table
       let refAlias = expanded.joins[joinIdx].alias
       let cteDef = ctes[normalizedName(refTable)]
+      
+      if cteDef.query.setOpKind != sokNone:
+         return err[Statement](ERR_SQL, "Joining with SetOp CTE not supported in 0.x")
+
       let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
       if not columnMapRes.ok:
         return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
@@ -892,6 +983,7 @@ proc expandSelectCteRefs(
           newJoins.add(join)
       expanded.joins = newJoins
     joinIdx.inc
+
 
   let nodeCount = countSelectNodes(expanded)
   if nodeCount > MaxExpandedAstNodes:
@@ -973,74 +1065,24 @@ proc expandSelectViews(
 
   var expanded = cloneSelectStatement(stmt)
 
-  proc expandSingleSource(refTable: string, refAlias: string, allowUnqualified: bool): Result[(ViewMeta, Statement, Statement, Table[string, Expr])] =
+  proc expandSingleSource(refTable: string, refAlias: string, allowUnqualified: bool): Result[(ViewMeta, Statement)] =
     let viewRes = catalog.getView(refTable)
     if not viewRes.ok:
-      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+      return err[(ViewMeta, Statement)](viewRes.err.code, viewRes.err.message, viewRes.err.context)
     let normalized = normalizedName(refTable)
     for existing in stack:
       if normalizedName(existing) == normalized:
-        return err[(ViewMeta, Statement, Statement, Table[string, Expr])](ERR_SQL, "Circular view reference", refTable)
+        return err[(ViewMeta, Statement)](ERR_SQL, "Circular view reference", refTable)
     let parsedRes = parseViewSelect(viewRes.value)
     if not parsedRes.ok:
-      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](parsedRes.err.code, parsedRes.err.message, parsedRes.err.context)
+      return err[(ViewMeta, Statement)](parsedRes.err.code, parsedRes.err.message, parsedRes.err.context)
     let shapeRes = ensureExpandableViewShape(viewRes.value.name, parsedRes.value)
     if not shapeRes.ok:
-      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](shapeRes.err.code, shapeRes.err.message, shapeRes.err.context)
+      return err[(ViewMeta, Statement)](shapeRes.err.code, shapeRes.err.message, shapeRes.err.context)
     let nextRes = expandSelectSources(catalog, parsedRes.value, depth + 1, stack & @[refTable])
     if not nextRes.ok:
-      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](nextRes.err.code, nextRes.err.message, nextRes.err.context)
-    let mapRes = viewColumnExprMap(catalog, nextRes.value, viewRes.value)
-    if not mapRes.ok:
-      return err[(ViewMeta, Statement, Statement, Table[string, Expr])](mapRes.err.code, mapRes.err.message, mapRes.err.context)
-    ok((viewRes.value, nextRes.value, cloneSelectStatement(nextRes.value), mapRes.value))
-
-  proc rewriteAllExpressions(target: var Statement, refTable: string, refAlias: string, columnMap: Table[string, Expr], allowUnqualified: bool): Result[Void] =
-    var rewrittenItems: seq[SelectItem] = @[]
-    for item in target.selectItems:
-      if item.isStar:
-        rewrittenItems.add(item)
-        continue
-      let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, allowUnqualified)
-      if not exprRes.ok:
-        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-      rewrittenItems.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
-    target.selectItems = rewrittenItems
-
-    let whereRes = rewriteExprForViewRef(target.whereExpr, refTable, refAlias, columnMap, allowUnqualified)
-    if not whereRes.ok:
-      return err[Void](whereRes.err.code, whereRes.err.message, whereRes.err.context)
-    target.whereExpr = whereRes.value
-
-    var rewrittenJoins: seq[JoinClause] = @[]
-    for join in target.joins:
-      let onRes = rewriteExprForViewRef(join.onExpr, refTable, refAlias, columnMap, allowUnqualified)
-      if not onRes.ok:
-        return err[Void](onRes.err.code, onRes.err.message, onRes.err.context)
-      rewrittenJoins.add(JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: onRes.value))
-    target.joins = rewrittenJoins
-
-    var rewrittenGroupBy: seq[Expr] = @[]
-    for expr in target.groupBy:
-      let exprRes = rewriteExprForViewRef(expr, refTable, refAlias, columnMap, allowUnqualified)
-      if not exprRes.ok:
-        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-      rewrittenGroupBy.add(exprRes.value)
-    target.groupBy = rewrittenGroupBy
-
-    let havingRes = rewriteExprForViewRef(target.havingExpr, refTable, refAlias, columnMap, allowUnqualified)
-    if not havingRes.ok:
-      return err[Void](havingRes.err.code, havingRes.err.message, havingRes.err.context)
-    target.havingExpr = havingRes.value
-
-    var rewrittenOrder: seq[OrderItem] = @[]
-    for item in target.orderBy:
-      let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, allowUnqualified)
-      if not exprRes.ok:
-        return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-      rewrittenOrder.add(OrderItem(expr: exprRes.value, asc: item.asc))
-    target.orderBy = rewrittenOrder
-    okVoid()
+      return err[(ViewMeta, Statement)](nextRes.err.code, nextRes.err.message, nextRes.err.context)
+    ok((viewRes.value, nextRes.value))
 
   if expanded.fromTable.len > 0 and catalog.hasViewName(expanded.fromTable):
     let onlySource = expanded.joins.len == 0
@@ -1054,12 +1096,19 @@ proc expandSelectViews(
 
     let viewMeta = sourceRes.value[0]
     let viewExpanded = sourceRes.value[1]
-    let viewCopy = sourceRes.value[2]
-    let columnMap = sourceRes.value[3]
     let refTable = expanded.fromTable
     let refAlias = expanded.fromAlias
 
-    if singleSourceStar:
+    var skipRewrite = false
+    if singleSourceStar and viewExpanded.setOpKind == sokNone:
+      # Optimization: expand star using the view's output columns (from Left if SetOp? No, only if None for now)
+      # Actually, for SetOp, we can also expand star if we trust viewMeta.columnNames
+      # But let's stick to safe path.
+      let columnMapRes = outputExprMapForColumns(catalog, viewExpanded, viewMeta.columnNames, refTable)
+      if not columnMapRes.ok:
+         return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+      let columnMap = columnMapRes.value
+      
       var items: seq[SelectItem] = @[]
       for item in expanded.selectItems:
         if item.isStar:
@@ -1068,18 +1117,36 @@ proc expandSelectViews(
             if columnMap.hasKey(key):
               items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
         else:
-          items.add(item)
+          let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
+          if not exprRes.ok:
+             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+          items.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
       expanded.selectItems = items
+      skipRewrite = true
 
-    let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, onlySource)
-    if not rewriteRes.ok:
-      return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
-
-    let outerJoins = expanded.joins
-    expanded.fromTable = viewExpanded.fromTable
-    expanded.fromAlias = viewExpanded.fromAlias
-    expanded.joins = viewCopy.joins & outerJoins
-    expanded.whereExpr = andExpr(cloneExpr(viewCopy.whereExpr), expanded.whereExpr)
+    let originalOrderBy = expanded.orderBy
+    let originalLimit = expanded.limit
+    let originalLimitParam = expanded.limitParam
+    let originalOffset = expanded.offset
+    let originalOffsetParam = expanded.offsetParam
+    
+    let pushedRes = pushDownQuery(catalog, expanded, viewExpanded, refTable, refAlias, viewMeta.columnNames, onlySource, skipRewrite)
+    if not pushedRes.ok:
+      return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
+    expanded = pushedRes.value
+    
+    if expanded.setOpKind != sokNone:
+        expanded.orderBy = originalOrderBy
+        expanded.limit = originalLimit
+        expanded.limitParam = originalLimitParam
+        expanded.offset = originalOffset
+        expanded.offsetParam = originalOffsetParam
+    else:
+        expanded.orderBy = originalOrderBy
+        expanded.limit = originalLimit
+        expanded.limitParam = originalLimitParam
+        expanded.offset = originalOffset
+        expanded.offsetParam = originalOffsetParam
 
   var joinIdx = 0
   while joinIdx < expanded.joins.len:
@@ -1093,23 +1160,31 @@ proc expandSelectViews(
       if not sourceRes.ok:
         return err[Statement](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
       let viewExpanded = sourceRes.value[1]
-      let viewCopy = sourceRes.value[2]
-      let columnMap = sourceRes.value[3]
+      let viewMeta = sourceRes.value[0]
+
+      if viewExpanded.setOpKind != sokNone:
+          return err[Statement](ERR_SQL, "Joining with SetOp view not supported in 0.x")
+
+      let columnMapRes = outputExprMapForColumns(catalog, viewExpanded, viewMeta.columnNames, refTable)
+      if not columnMapRes.ok:
+         return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+      let columnMap = columnMapRes.value
 
       let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, false)
       if not rewriteRes.ok:
         return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
 
+      let viewQuery = cloneSelectStatement(viewExpanded)
       var baseJoin = expanded.joins[joinIdx]
-      baseJoin.table = viewExpanded.fromTable
-      baseJoin.alias = viewExpanded.fromAlias
-      baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(viewCopy.whereExpr))
+      baseJoin.table = viewQuery.fromTable
+      baseJoin.alias = viewQuery.fromAlias
+      baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(viewQuery.whereExpr))
 
       var newJoins: seq[JoinClause] = @[]
       for i, join in expanded.joins:
         if i == joinIdx:
           newJoins.add(baseJoin)
-          for extra in viewCopy.joins:
+          for extra in viewQuery.joins:
             newJoins.add(extra)
         else:
           newJoins.add(join)
@@ -1153,17 +1228,21 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       whereExpr: nil,
       groupBy: @[],
       havingExpr: nil,
-      orderBy: @[],
-      limit: -1,
-      limitParam: 0,
-      offset: -1,
-      offsetParam: 0
+      orderBy: stmt.orderBy,
+      limit: stmt.limit,
+      limitParam: stmt.limitParam,
+      offset: stmt.offset,
+      offsetParam: stmt.offsetParam
     ))
 
   let expandedRes = expandSelectSources(catalog, stmt, 0, @[])
   if not expandedRes.ok:
     return err[Statement](expandedRes.err.code, expandedRes.err.message, expandedRes.err.context)
   let expanded = expandedRes.value
+
+  # If expansion resulted in a SetOp (e.g. from UNION View/CTE), we need to bind that.
+  if expanded.setOpKind != sokNone:
+    return bindSelect(catalog, expanded)
 
   let mapRes = buildTableMap(catalog, expanded.fromTable, expanded.fromAlias, expanded.joins)
   if not mapRes.ok:

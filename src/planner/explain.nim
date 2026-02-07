@@ -88,6 +88,9 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
     var line = indent
     
     case p.kind
+    of pkOneRow:
+      line.add("OneRow")
+      lines.add(line)
     of pkTableScan:
       line.add("TableScan(table=" & p.table & " alias=" & p.alias & ")")
       lines.add(line)

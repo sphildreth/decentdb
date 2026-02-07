@@ -788,6 +788,16 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     ok(c)
 
   case plan.kind
+  of pkOneRow:
+    var done = false
+    let c = RowCursor(
+      columns: @[],
+      nextFn: proc(): Result[Option[Row]] =
+        if done: return ok(none(Row))
+        done = true
+        ok(some(makeRow(@[], @[], 0)))
+    )
+    ok(c)
   of pkTableScan:
     let tableRes = catalog.getTable(plan.table)
     if not tableRes.ok:
@@ -1070,6 +1080,8 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     ok(count)
 
   case plan.kind
+  of pkOneRow:
+    return ok(some(1'i64))
   of pkProject:
     # Projection does not affect row count.
     return tryCountNoRowsFast(pager, catalog, plan.left, params)
@@ -3054,6 +3066,8 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       gEvalCatalog = nil
 
   case plan.kind
+  of pkOneRow:
+    return ok(@[makeRow(@[], @[], 0)])
   of pkTableScan:
     return tableScanRows(pager, catalog, plan.table, plan.alias)
   of pkRowidSeek:

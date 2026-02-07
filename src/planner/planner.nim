@@ -8,6 +8,7 @@ import tables
 
 type PlanKind* = enum
   pkStatement
+  pkOneRow
   pkTableScan
   pkRowidSeek
   pkIndexSeek
@@ -385,7 +386,10 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   if accessConjunctIdx >= 0:
     conjuncts.delete(accessConjunctIdx)
   if base == nil:
-    base = Plan(kind: pkTableScan, table: stmt.fromTable, alias: stmt.fromAlias)
+    if stmt.fromTable.len == 0:
+      base = Plan(kind: pkOneRow)
+    else:
+      base = Plan(kind: pkTableScan, table: stmt.fromTable, alias: stmt.fromAlias)
 
   # Predicate pushdown: apply conjuncts as early as possible (once referenced
   # tables are available), rather than applying the full WHERE before joins.
