@@ -11,6 +11,7 @@ import math
 import atomics
 import algorithm
 import ./engine
+import ./exec/exec
 import ./errors
 import ./catalog/catalog
 import ./pager/pager
@@ -158,6 +159,12 @@ proc formatSchemaSummary(database: Db): seq[string] =
         colLine &= " PRIMARY KEY"
       if col.refTable.len > 0:
         colLine &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+        let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+        let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+        if onDelete != "NO ACTION":
+          colLine &= " ON DELETE " & onDelete
+        if onUpdate != "NO ACTION":
+          colLine &= " ON UPDATE " & onUpdate
       lines.add(colLine)
 
   lines.add("Indexes: " & $indexNames.len)
@@ -167,6 +174,8 @@ proc formatSchemaSummary(database: Db): seq[string] =
     if idx.unique:
       idxLine &= " UNIQUE"
     idxLine &= " " & (if idx.kind == ikBtree: "BTREE" else: "TRIGRAM")
+    if idx.predicateSql.len > 0:
+      idxLine &= " WHERE " & idx.predicateSql
     lines.add(idxLine)
   lines
 
@@ -315,6 +324,46 @@ proc csvCellToValue(cellValue: string, col: Column): Value =
     for ch in cellValue:
       bytes.add(byte(ch))
     Value(kind: vkBlob, bytes: bytes)
+  of ctDecimal:
+    # Parse decimal string: [-]123.456
+    var s = cellValue.strip()
+    if s.len == 0:
+      Value(kind: vkNull)
+    else:
+      var negative = false
+      if s.startsWith("-"):
+         negative = true
+         s = s[1..^1]
+      elif s.startsWith("+"):
+         s = s[1..^1]
+      
+      let dotPos = s.find('.')
+      var unscaledStr = ""
+      var inputScale = 0
+      if dotPos >= 0:
+         unscaledStr = s[0..<dotPos] & s[dotPos+1..^1]
+         inputScale = s.len - 1 - dotPos
+      else:
+         unscaledStr = s
+         inputScale = 0
+      
+      try:
+         var u = parseBiggestInt(unscaledStr)
+         if negative: u = -u
+         # We need to scale to col.decScale
+         let res = scaleDecimal(u, uint8(inputScale), col.decScale)
+         if res.ok:
+           Value(kind: vkDecimal, int64Val: res.value, decimalScale: col.decScale)
+         else:
+           Value(kind: vkNull)
+      except:
+         Value(kind: vkNull)
+  of ctUuid:
+    let res = parseUuid(cellValue)
+    if res.ok:
+      Value(kind: vkBlob, bytes: res.value)
+    else:
+      Value(kind: vkNull)
 
 proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]] =
   var parser: CsvParser
@@ -398,6 +447,52 @@ proc jsonToValue(node: JsonNode, col: Column): Value =
           bytes.add(byte(ch))
       return Value(kind: vkBlob, bytes: bytes)
     Value(kind: vkNull)
+  of ctDecimal:
+    var s = ""
+    if node.kind == JString: s = node.getStr().strip()
+    elif node.kind == JInt: s = $node.getBiggestInt()
+    elif node.kind == JFloat: s = $node.getFloat()
+    
+    if s.len == 0:
+      Value(kind: vkNull)
+    else:
+      var negative = false
+      if s.startsWith("-"):
+         negative = true
+         s = s[1..^1]
+      elif s.startsWith("+"):
+         s = s[1..^1]
+      
+      let dotPos = s.find('.')
+      var unscaledStr = ""
+      var inputScale = 0
+      if dotPos >= 0:
+         unscaledStr = s[0..<dotPos] & s[dotPos+1..^1]
+         inputScale = s.len - 1 - dotPos
+      else:
+         unscaledStr = s
+         inputScale = 0
+      
+      try:
+         var u = parseBiggestInt(unscaledStr)
+         if negative: u = -u
+         # We need to scale to col.decScale
+         let res = scaleDecimal(u, uint8(inputScale), col.decScale)
+         if res.ok:
+           Value(kind: vkDecimal, int64Val: res.value, decimalScale: col.decScale)
+         else:
+           Value(kind: vkNull)
+      except:
+         Value(kind: vkNull)
+  of ctUuid:
+    if node.kind == JString:
+      let res = parseUuid(node.getStr())
+      if res.ok:
+        Value(kind: vkBlob, bytes: res.value)
+      else:
+        Value(kind: vkNull)
+    else:
+      Value(kind: vkNull)
 
 proc readJsonRows(tableMeta: TableMeta, jsonFile: string): Result[seq[seq[Value]]] =
   try:
@@ -440,7 +535,7 @@ proc cliMain*(db: string = "", sql: string = "", openClose: bool = false, timing
               heartbeatMs: int = 0,
               format: string = "json", noRows: bool = false, params: seq[string] = @[],
               walFailpoints: seq[string] = @[], clearWalFailpoints: bool = false): int =
-  ## Execute SQL statements against a DecentDb database file.
+  ## Execute SQL statements against a DecentDB database file.
   ## Output can be rendered as json/csv/table depending on --format.
   ## (Some diagnostic modes like timing/warnings/verbose currently require json.)
 
@@ -755,6 +850,8 @@ proc schemaDescribe*(table: string, db: string = ""): int =
       of ctFloat64: "FLOAT64"
       of ctText: "TEXT"
       of ctBlob: "BLOB"
+      of ctDecimal: "DECIMAL"
+      of ctUuid: "UUID"
     
     let notNull = if col.notNull: "YES" else: "NO"
     let primaryKey = if col.primaryKey: "YES" else: "NO"
@@ -782,7 +879,7 @@ proc schemaListIndexes*(db: string = "", table: string = ""): int =
 
   let database = openRes.value
   var output: seq[string] = @[]
-  output.add("Index|Table|Column|Type|Unique")
+  output.add("Index|Table|Column|Type|Unique|Predicate")
   
   for indexName, indexMeta in database.catalog.indexes:
     if table.len > 0 and indexMeta.table != table:
@@ -793,7 +890,7 @@ proc schemaListIndexes*(db: string = "", table: string = ""): int =
       of ikTrigram: "trigram"
     
     let unique = if indexMeta.unique: "YES" else: "NO"
-    output.add("$1|$2|$3|$4|$5" % [indexName, indexMeta.table, indexMeta.columns.join(","), indexType, unique])
+    output.add("$1|$2|$3|$4|$5|$6" % [indexName, indexMeta.table, indexMeta.columns.join(","), indexType, unique, indexMeta.predicateSql])
   
   discard closeDb(database)
   echo resultJson(true, rows = output)
@@ -1138,6 +1235,8 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         of ctFloat64: "FLOAT64"
         of ctText: "TEXT"
         of ctBlob: "BLOB"
+        of ctDecimal: "DECIMAL"
+        of ctUuid: "UUID"
       
       colDef &= typeName
       
@@ -1149,8 +1248,21 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         colDef &= " NOT NULL"
       if col.refTable.len > 0 and col.refColumn.len > 0:
         colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+        let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+        let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+        if onDelete != "NO ACTION":
+          colDef &= " ON DELETE " & onDelete
+        if onUpdate != "NO ACTION":
+          colDef &= " ON UPDATE " & onUpdate
       
       columnDefs.add(colDef)
+
+    for checkDef in tableMeta.checks:
+      var checkSql = "  "
+      if checkDef.name.len > 0:
+        checkSql &= "CONSTRAINT " & checkDef.name & " "
+      checkSql &= "CHECK (" & checkDef.exprSql & ")"
+      columnDefs.add(checkSql)
     
     createStmt &= columnDefs.join(",\n") & "\n);"
     sqlStatements.add(createStmt)
@@ -1596,7 +1708,19 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
         colDef &= " NOT NULL"
       if col.refTable.len > 0 and col.refColumn.len > 0:
         colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+        let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+        let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+        if onDelete != "NO ACTION":
+          colDef &= " ON DELETE " & onDelete
+        if onUpdate != "NO ACTION":
+          colDef &= " ON UPDATE " & onUpdate
       columnDefs.add(colDef)
+    for checkDef in tableMeta.checks:
+      var checkSql = "  "
+      if checkDef.name.len > 0:
+        checkSql &= "CONSTRAINT " & checkDef.name & " "
+      checkSql &= "CHECK (" & checkDef.exprSql & ")"
+      columnDefs.add(checkSql)
     createStmt &= columnDefs.join(",\n") & "\n);"
 
     let createRes = execSql(dstDb, createStmt)
@@ -1657,7 +1781,16 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
 
     # Semantic dedupe: if destination already has an equivalent index under a different
     # name, do not recreate it.
-    if idx.columns.len == 1 and isSome(dstDb.catalog.getIndexForColumn(idx.table, idx.columns[0], idx.kind, requireUnique = idx.unique)):
+    var alreadyExists = false
+    for _, dstIdx in dstDb.catalog.indexes:
+      if dstIdx.table == idx.table and
+         dstIdx.columns == idx.columns and
+         dstIdx.kind == idx.kind and
+         dstIdx.unique == idx.unique and
+         dstIdx.predicateSql == idx.predicateSql:
+        alreadyExists = true
+        break
+    if alreadyExists:
       continue
 
     var stmt = "CREATE "
@@ -1667,6 +1800,8 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
     if idx.kind == ikTrigram:
       stmt &= " USING trigram "
     stmt &= "(" & idx.columns.join(", ") & ")"
+    if idx.predicateSql.len > 0:
+      stmt &= " WHERE " & idx.predicateSql
     let idxRes = execSql(dstDb, stmt)
     if not idxRes.ok:
       discard closeDb(srcDb)
@@ -1730,7 +1865,7 @@ proc repl*(db: string = "", format: string = "table"): int =
     return 1
 
   let database = openRes.value
-  echo "DecentDb REPL (.exit to quit)"
+  echo "DecentDB REPL (.exit to quit)"
   while true:
     stdout.write("> ")
     stdout.flushFile()

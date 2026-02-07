@@ -16,6 +16,7 @@ type ValueKind* = enum
   vkBlobCompressed
   vkTextCompressedOverflow
   vkBlobCompressedOverflow
+  vkDecimal
 
 type Value* = object
   kind*: ValueKind
@@ -25,6 +26,7 @@ type Value* = object
   bytes*: seq[byte]
   overflowPage*: PageId
   overflowLen*: uint32
+  decimalScale*: uint8
 
 func zigzagEncode(n: int64): uint64 =
   (cast[uint64](n) shl 1) xor cast[uint64](n shr 63)
@@ -178,6 +180,9 @@ proc encodeValue*(value: Value): seq[byte] =
     payload = newSeq[byte](8)
     writeU32LE(payload, 0, uint32(value.overflowPage))
     writeU32LE(payload, 4, value.overflowLen)
+  of vkDecimal:
+    payload = @[byte(value.decimalScale)]
+    payload.add(encodeVarint(zigzagEncode(value.int64Val)))
   result = @[byte(value.kind)]
   result.add(encodeVarint(uint64(payload.len)))
   result.add(payload)
@@ -229,6 +234,15 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
       return err[Value](ERR_CORRUPTION, "Invalid overflow pointer length")
     value.overflowPage = PageId(readU32LE(payload, 0))
     value.overflowLen = readU32LE(payload, 4)
+  of vkDecimal:
+    if payload.len < 2:
+      return err[Value](ERR_CORRUPTION, "Invalid DECIMAL length")
+    value.decimalScale = uint8(payload[0])
+    var pOffset = 1
+    let vRes = decodeVarint(payload, pOffset)
+    if not vRes.ok:
+      return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
+    value.int64Val = zigzagDecode(vRes.value)
   ok(value)
 
 proc encodeRecord*(values: seq[Value]): seq[byte] =

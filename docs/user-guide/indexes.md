@@ -30,7 +30,7 @@ B-Tree indexes are used for:
 
 ### Automatic Indexes
 
-DecentDb creates indexes automatically for:
+DecentDB creates indexes automatically for:
 - PRIMARY KEY columns
 - FOREIGN KEY columns
 - UNIQUE constraints
@@ -48,6 +48,28 @@ CREATE TABLE orders (
     user_id INT REFERENCES users(id)
 );
 ```
+
+## Partial Indexes
+
+Create an index that only includes rows meeting a condition.
+
+```sql
+-- Index only active users
+CREATE INDEX idx_users_active ON users(id) WHERE status IS NOT NULL;
+```
+
+**Note:** v0 partial indexes only support `IS NOT NULL` predicates.
+
+## Expression Indexes
+
+Index the result of a function or expression.
+
+```sql
+-- Index lowercase name for case-insensitive search
+CREATE INDEX idx_users_lower_name ON users((LOWER(name)));
+```
+
+**Note:** v0 expression indexes support single expressions with deterministic functions (`LOWER`, `UPPER`, `TRIM`, `LENGTH`, `CAST`).
 
 ## Trigram Indexes
 
@@ -217,12 +239,5 @@ Check if:
 SELECT * FROM users WHERE LOWER(email) = 'alice@example.com';
 
 -- Better: Store lowercase or use case-insensitive comparison
-```
-
-### Slow Index Rebuild
-
-For large tables:
-```bash
-# Use bulk load options for faster rebuild
-decentdb exec --db=my.ddb --sql="PRAGMA checkpoint"  --durability=deferred
+-- Or: Create an expression index on LOWER(email)
 ```

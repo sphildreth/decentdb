@@ -85,12 +85,25 @@ type DecentDBError struct {
 	SQL     string
 }
 
+type Decimal struct {
+	Unscaled int64
+	Scale    int
+}
+
 func (e *DecentDBError) Error() string {
 	return fmt.Sprintf("decentdb error %d: %s", e.Code, e.Message)
 }
 
 type conn struct {
 	db *C.decentdb_db
+}
+
+func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
+	switch nv.Value.(type) {
+	case Decimal:
+		return nil
+	}
+	return driver.ErrSkip
 }
 
 func hasUnsupportedParamStyle(sqlText string) bool {
@@ -261,11 +274,11 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 		case float64:
 			res = C.decentdb_bind_float64(s.stmt, idx, C.double(v))
 		case bool:
-			vi := int64(0)
+			vi := 0
 			if v {
 				vi = 1
 			}
-			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(vi))
+			res = C.decentdb_bind_bool(s.stmt, idx, C.int(vi))
 		case string:
 			cs := C.CString(v)
 			res = C.decentdb_bind_text(s.stmt, idx, cs, C.int(len(v)))
@@ -280,6 +293,8 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 			// Epoch ms UTC
 			ms := v.UnixNano() / 1e6
 			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(ms))
+		case Decimal:
+			res = C.decentdb_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.int(v.Scale))
 		default:
 			return fmt.Errorf("unsupported type: %T", v)
 		}
@@ -395,6 +410,11 @@ func (r *rows) Next(dest []driver.Value) error {
 				continue
 			}
 			dest[i] = C.GoBytes(unsafe.Pointer(v.bytes), v.bytes_len)
+		case 12: // vkDecimal
+			dest[i] = Decimal{
+				Unscaled: int64(v.int64_val),
+				Scale:    int(v.decimal_scale),
+			}
 		default:
 			dest[i] = nil
 		}

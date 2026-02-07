@@ -24,4 +24,4 @@ DecentDB needs to be callable from .NET (ADO.NET provider + Micro-ORM) without a
 - design/adr/0011-memory-management-strategy.md
 - design/DAPPER_SUPPORT.md (Phase 1 / Phase 2)
 - src/c_api.nim
-- bindings/dotnet/src/DecentDb.Native/NativeMethods.cs
+- bindings/dotnet/src/DecentDB.Native/NativeMethods.cs

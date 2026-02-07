@@ -1,9 +1,9 @@
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 using Dapper;
 
 var dbPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "sample.db"));
 
-using var conn = new DecentDbConnection($"Data Source={dbPath}");
+using var conn = new DecentDBConnection($"Data Source={dbPath}");
 conn.Open();
 
 conn.Execute("DROP TABLE artists");

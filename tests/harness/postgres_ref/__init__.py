@@ -2,7 +2,7 @@
 PostgreSQL reference adapter for differential testing.
 
 Provides a unified interface to run SQL against PostgreSQL and compare
-with DecentDb results.
+with DecentDB results.
 """
 
 import os
@@ -107,10 +107,10 @@ def compare_results(
     decent_rows: list[str], postgres_rows: list[str], ignore_order: bool = False
 ) -> tuple[bool, str]:
     """
-    Compare DecentDb and PostgreSQL results.
+    Compare DecentDB and PostgreSQL results.
 
     Args:
-        decent_rows: Results from DecentDb
+        decent_rows: Results from DecentDB
         postgres_rows: Results from PostgreSQL
         ignore_order: If True, compare as sets; if False, compare as ordered lists
 
@@ -137,18 +137,18 @@ def compare_results(
         # Find first mismatch
         for i, (d, p) in enumerate(zip(decent_normalized, postgres_normalized)):
             if d != p:
-                return False, f"Row {i} differs: DecentDb='{d}' vs PostgreSQL='{p}'"
+                return False, f"Row {i} differs: DecentDB='{d}' vs PostgreSQL='{p}'"
 
         # Length mismatch
         if len(decent_normalized) < len(postgres_normalized):
             return (
                 False,
-                f"DecentDb has {len(decent_normalized)} rows, PostgreSQL has {len(postgres_normalized)}",
+                f"DecentDB has {len(decent_normalized)} rows, PostgreSQL has {len(postgres_normalized)}",
             )
         elif len(decent_normalized) > len(postgres_normalized):
             return (
                 False,
-                f"DecentDb has {len(decent_normalized)} rows, PostgreSQL has {len(postgres_normalized)}",
+                f"DecentDB has {len(decent_normalized)} rows, PostgreSQL has {len(postgres_normalized)}",
             )
 
         return True, ""

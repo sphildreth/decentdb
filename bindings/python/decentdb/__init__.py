@@ -8,6 +8,7 @@ import ctypes
 import os
 import datetime
 import decimal
+import uuid
 import re
 import collections
 import json
@@ -385,8 +386,37 @@ class Cursor:
                 ArrayType = ctypes.c_uint8 * len(param)
                 b_arr = ArrayType.from_buffer_copy(param)
                 res = self._lib.decentdb_bind_blob(self._stmt, idx, b_arr, len(param))
+            elif isinstance(param, decimal.Decimal):
+                # DecentDB supports DECIMAL as int64 + scale (0..18)
+                t = param.as_tuple()
+                exponent = t.exponent
+                if not isinstance(exponent, int):
+                    raise DataError("Decimal NaN/Inf not supported")
+                
+                scale = -exponent
+                if scale < 0:
+                    int_val = int(param)
+                    scale = 0
+                elif scale > 18:
+                    # Truncate to 18 scale
+                    quantized = param.quantize(decimal.Decimal(10) ** -18)
+                    scale = 18
+                    int_val = int(quantized * (decimal.Decimal(10) ** 18))
+                else:
+                    int_val = int(param * (decimal.Decimal(10) ** scale))
+                
+                # Check bounds
+                if int_val < -9223372036854775808 or int_val > 9223372036854775807:
+                    raise DataError("Decimal value too large for DecentDB")
+                
+                res = self._lib.decentdb_bind_decimal(self._stmt, idx, int_val, scale)
+            elif isinstance(param, uuid.UUID):
+                b = param.bytes
+                ArrayType = ctypes.c_uint8 * 16
+                b_arr = ArrayType.from_buffer_copy(b)
+                res = self._lib.decentdb_bind_blob(self._stmt, idx, b_arr, 16)
             else:
-                # Try string conversion for unknown types (e.g. Decimal, Date)
+                # Try string conversion for unknown types (e.g. Date)
                 s = str(param)
                 b = s.encode('utf-8')
                 res = self._lib.decentdb_bind_text(self._stmt, idx, b, len(b))
@@ -531,6 +561,10 @@ class Cursor:
                         row[i] = string_at(v.bytes, v.bytesLen)
                     else:
                         row[i] = b""
+                elif k == 12: # vkDecimal
+                    scale = v.decimalScale
+                    val = v.int64Val
+                    row[i] = decimal.Decimal(val) / (decimal.Decimal(10) ** scale)
                 else:
                     return self._get_row_slow()
             self._pending_select_params = None
@@ -610,6 +644,10 @@ class Cursor:
                         row[i] = string_at(v.bytes, v.bytesLen)
                     else:
                         row[i] = b""
+                elif k == 12: # vkDecimal
+                    scale = v.decimalScale
+                    val = v.int64Val
+                    row[i] = decimal.Decimal(val) / (decimal.Decimal(10) ** scale)
                 else:
                     # Unknown kinds should not occur in normalized result rows.
                     # Fall back to slow path for correctness.
@@ -650,6 +688,10 @@ class Cursor:
                     row.append(ctypes.string_at(ptr, length.value))
                 else:
                     row.append(b"")
+            elif kind == 12: # vkDecimal
+                scale = self._lib.decentdb_column_decimal_scale(self._stmt, i)
+                val = self._lib.decentdb_column_decimal_unscaled(self._stmt, i)
+                row.append(decimal.Decimal(val) / (decimal.Decimal(10) ** scale))
             else:
                 row.append(None)
         return tuple(row)

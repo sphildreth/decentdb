@@ -25,6 +25,7 @@ int decentdb_prepare(decentdb_db* db, const char* sql_utf8, decentdb_stmt** out_
 // Bind parameters: 1-based indexes match $1..$N
 int decentdb_bind_null(decentdb_stmt* stmt, int index_1_based);
 int decentdb_bind_int64(decentdb_stmt* stmt, int index_1_based, int64_t v);
+int decentdb_bind_bool(decentdb_stmt* stmt, int index_1_based, int v);
 int decentdb_bind_float64(decentdb_stmt* stmt, int index_1_based, double v);
 int decentdb_bind_text(decentdb_stmt* stmt, int index_1_based, const char* utf8, int byte_len);
 int decentdb_bind_blob(decentdb_stmt* stmt, int index_1_based, const uint8_t* data, int byte_len);
@@ -56,9 +57,15 @@ typedef struct decentdb_value_view {
 	double float64_val;
 	const uint8_t* bytes;
 	int bytes_len;
+	int decimal_scale;
 } decentdb_value_view;
 
 int decentdb_row_view(decentdb_stmt* stmt, const decentdb_value_view** out_values, int* out_count);
+
+// Decimal support
+int decentdb_bind_decimal(decentdb_stmt* stmt, int index_1_based, int64_t unscaled, int scale);
+int64_t decentdb_column_decimal_unscaled(decentdb_stmt* stmt, int col_0_based);
+int decentdb_column_decimal_scale(decentdb_stmt* stmt, int col_0_based);
 
 // Convenience API for high-overhead FFI layers (e.g. Python/ctypes):
 // reset + clear bindings + bind params (from value_view array) + step once + row_view.

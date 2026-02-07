@@ -1,10 +1,10 @@
 # First Steps
 
-Now that you have DecentDb installed, let's explore the basics.
+Now that you have DecentDB installed, let's explore the basics.
 
 ## Creating Your First Database
 
-DecentDb databases are single files, making them easy to manage:
+DecentDB databases are single files, making them easy to manage:
 
 ```bash
 # The database file is created automatically when you run your first command

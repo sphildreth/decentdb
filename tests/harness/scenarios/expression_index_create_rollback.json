@@ -1,0 +1,19 @@
+{
+  "name": "expression_index_create_rollback",
+  "description": "Crash during CREATE INDEX on expression should not corrupt data or partially commit index state",
+  "db_path": "$TMPDIR/decentdb_expression_index_create_rollback.ddb",
+  "setup_sql": "CREATE TABLE users (id INT PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'Alice')",
+  "sql": "CREATE INDEX users_name_lower_idx ON users ((LOWER(name)))",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id FROM users WHERE LOWER(name) = 'alice' ORDER BY id",
+    "expect_rows": [
+      "1"
+    ]
+  }
+}

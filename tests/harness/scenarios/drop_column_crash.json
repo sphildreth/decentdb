@@ -1,0 +1,19 @@
+{
+  "name": "drop_column_crash",
+  "description": "Crash during ALTER TABLE DROP COLUMN should not leave partial catalog state",
+  "db_path": "$TMPDIR/decentdb_drop_column_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT); INSERT INTO t VALUES (1, 10, 20)",
+  "sql": "ALTER TABLE t DROP COLUMN b",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT b FROM t ORDER BY id",
+    "expect_rows": [
+      "20"
+    ]
+  }
+}

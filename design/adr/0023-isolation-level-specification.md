@@ -4,7 +4,7 @@
 
 ### Decision
 
-DecentDb will implement **Snapshot Isolation** as its default isolation level, which provides stronger guarantees than READ_COMMITTED but simpler implementation than SERIALIZABLE.
+DecentDB will implement **Snapshot Isolation** as its default isolation level, which provides stronger guarantees than READ_COMMITTED but simpler implementation than SERIALIZABLE.
 
 ### Rationale
 

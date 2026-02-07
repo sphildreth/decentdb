@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <PackageId>DecentDB.MicroOrm</PackageId>
+    <Description>DecentDB Micro-ORM (.NET 10) with bundled native engine</Description>
+    <Authors>DecentDB contributors</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- Custom nuspec: keep a single package, but emit an empty net10.0 dependency group (avoids NU5128). -->
+    <NuspecFile>DecentDB.MicroOrm.nuspec</NuspecFile>
+    <NuspecProperties>version=$(PackageVersion)</NuspecProperties>
+
+    <!-- Publish as a single package that contains the managed layers + native binaries. -->
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
+
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DecentDB.AdoNet\DecentDB.AdoNet.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="README.md" />
+    <None Include="..\..\..\..\graphics\logo-256x256.png" Pack="true" PackagePath="icon.png" />
+    <None Include="runtimes/linux-x64/native/libdecentdb.so" Pack="true" PackagePath="runtimes/linux-x64/native/libdecentdb.so" Condition="Exists('runtimes/linux-x64/native/libdecentdb.so')" />
+    <None Include="runtimes/osx-x64/native/libdecentdb.dylib" Pack="true" PackagePath="runtimes/osx-x64/native/libdecentdb.dylib" Condition="Exists('runtimes/osx-x64/native/libdecentdb.dylib')" />
+    <None Include="runtimes/win-x64/native/decentdb.dll" Pack="true" PackagePath="runtimes/win-x64/native/decentdb.dll" Condition="Exists('runtimes/win-x64/native/decentdb.dll')" />
+  </ItemGroup>
+
+  <Target Name="IncludeProjectReferencesInPackage" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage
+        Include="@(ReferenceCopyLocalPaths->WithMetadataValue('ReferenceSourceTarget', 'ProjectReference'))"
+        TargetPath="%(Filename)%(Extension)" />
+    </ItemGroup>
+  </Target>
+</Project>

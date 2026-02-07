@@ -1,6 +1,6 @@
 # Documentation
 
-This directory contains the DecentDb documentation site built with [MkDocs](https://www.mkdocs.org/) and [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/).
+This directory contains the DecentDB documentation site built with [MkDocs](https://www.mkdocs.org/) and [Material for MkDocs](https://squidfunk.github.io/mkdocs-material/).
 
 ## Local Development
 

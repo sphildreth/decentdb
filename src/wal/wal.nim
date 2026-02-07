@@ -895,8 +895,9 @@ proc recover*(wal: Wal): Result[Void] =
     return err[Void](ERR_CORRUPTION, "WAL index non-empty but no commits found")
   
   # Log recovery summary
-  stderr.writeLine("WAL recovery complete: " & $frameCount & " frames, " & 
-                   $commitCount & " commits, " & $checkpointCount & " checkpoints")
+  when defined(decentdbDebugLogging):
+    stderr.writeLine("WAL recovery complete: " & $frameCount & " frames, " & 
+                     $commitCount & " commits, " & $checkpointCount & " checkpoints")
   
   okVoid()
 

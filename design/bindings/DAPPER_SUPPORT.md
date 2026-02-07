@@ -95,11 +95,11 @@ public class Artist
 ```
 C# Application
     ├── Dapper (optional, works via ADO.NET)
-    └── DecentDb.MicroOrm (LINQ + conventions)
+    └── DecentDB.MicroOrm (LINQ + conventions)
             ↓
-    DecentDb.AdoNet (ADO.NET provider)
+    DecentDB.AdoNet (ADO.NET provider)
             ↓
-    DecentDb.Native (P/Invoke to Nim DLL)
+    DecentDB.Native (P/Invoke to Nim DLL)
             ↓
     DecentDB (Nim engine, direct file I/O)
 ```
@@ -195,22 +195,22 @@ void decentdb_finalize(decentdb_stmt* stmt);
 Implement standard ADO.NET interfaces for Dapper compatibility:
 
 ```csharp
-public class DecentDbConnection : DbConnection
-public class DecentDbCommand : DbCommand  
-public class DecentDbParameter : DbParameter
-public class DecentDbDataReader : DbDataReader
-public class DecentDbTransaction : DbTransaction
+public class DecentDBConnection : DbConnection
+public class DecentDBCommand : DbCommand  
+public class DecentDBParameter : DbParameter
+public class DecentDBDataReader : DbDataReader
+public class DecentDBTransaction : DbTransaction
 ```
 
 ### Tasks
 
-1. **DecentDbConnection**
+1. **DecentDBConnection**
    - Connection string parsing: `Data Source=/path/to.db;Cache Size=1024`
    - Open/Close with P/Invoke to `decentdb_open`/`decentdb_close`
     - Optional connection pooling (Dapper relies on provider behavior)
    - Async support (Begin/End pattern or async/await)
 
-2. **DecentDbCommand**
+2. **DecentDBCommand**
     - SQL execution via `decentdb_prepare`/`decentdb_step` (SELECT + DML)
     - Parameter collection:
       - Accept `@name`/`@p0` for Dapper ergonomics
@@ -218,17 +218,17 @@ public class DecentDbTransaction : DbTransaction
    - Command timeout support
    - Async execution
 
-3. **DecentDbParameter**
+3. **DecentDBParameter**
    - Type mapping: C# types ↔ DecentDB types
    - Support for: int, long, string, double, bool, byte[], DateTime
 
-4. **DecentDbDataReader**
+4. **DecentDBDataReader**
    - Forward-only, read-only cursor
    - Type-safe accessors (GetInt32, GetString, etc.)
    - Column name resolution
    - IDisposable cleanup
 
-5. **DecentDbTransaction**
+5. **DecentDBTransaction**
    - BEGIN/COMMIT/ROLLBACK support
    - Savepoints (optional for 1.0.0)
    - Isolation level (Snapshot)
@@ -249,7 +249,7 @@ public class Artist {        // → table "artists"
 }
 
 // Usage
-using var db = new DecentDbContext("/path/to.db");
+using var db = new DecentDBContext("/path/to.db");
 
 // Get single record
 var artist = await db.Artists.GetAsync(1);
@@ -326,7 +326,7 @@ public class Album
    - Bulk operations (InsertMany, DeleteMany)
    - Async throughout
 
-5. **DecentDbContext**
+5. **DecentDBContext**
    - Database file path configuration
    - DbSet<T> property discovery
     - Connection management (keep warm per context / pooled by default; open/close per operation only when Pooling=false)
@@ -509,15 +509,15 @@ DecentDB currently exposes this error code set (see `ErrorCode` in the engine):
 
 | DecentDB Error Code | Meaning | Current .NET Surface |
 |---------------------|---------|----------------------|
-| `ERR_IO` | I/O / OS / VFS error | `DecentDb.Native.DecentDbException` |
-| `ERR_CORRUPTION` | On-disk corruption / invalid format | `DecentDb.Native.DecentDbException` |
-| `ERR_CONSTRAINT` | Constraint violation (PK/UNIQUE/FK/etc) | `DecentDb.Native.DecentDbException` |
-| `ERR_TRANSACTION` | Transaction / snapshot / WAL related error | `DecentDb.Native.DecentDbException` |
-| `ERR_SQL` | SQL parse/bind/exec error | `DecentDb.Native.DecentDbException` |
-| `ERR_INTERNAL` | Internal invariant failure / bug | `DecentDb.Native.DecentDbException` |
+| `ERR_IO` | I/O / OS / VFS error | `DecentDB.Native.DecentDBException` |
+| `ERR_CORRUPTION` | On-disk corruption / invalid format | `DecentDB.Native.DecentDBException` |
+| `ERR_CONSTRAINT` | Constraint violation (PK/UNIQUE/FK/etc) | `DecentDB.Native.DecentDBException` |
+| `ERR_TRANSACTION` | Transaction / snapshot / WAL related error | `DecentDB.Native.DecentDBException` |
+| `ERR_SQL` | SQL parse/bind/exec error | `DecentDB.Native.DecentDBException` |
+| `ERR_INTERNAL` | Internal invariant failure / bug | `DecentDB.Native.DecentDBException` |
 
 Notes:
-- The .NET bindings currently throw `DecentDbException` (single type) with `ErrorCode` set to the native numeric code and `Sql` set to the SQL string.
+- The .NET bindings currently throw `DecentDBException` (single type) with `ErrorCode` set to the native numeric code and `Sql` set to the SQL string.
 - More granular managed exception types (e.g., lock timeout vs disk full) are not implemented yet; introducing additional native error codes would require a design decision (ADR) because it affects all bindings.
 
 ### Error Propagation Chain
@@ -530,10 +530,10 @@ Native Layer (Nim):
 P/Invoke Layer (C#):
   - Check return codes from native calls
         - Marshal error messages from `decentdb_last_error_message(db)`
-    - Throw `DecentDbException` with code/message/sql
+    - Throw `DecentDBException` with code/message/sql
 
 ADO.NET Layer:
-    - Currently propagates `DecentDbException`
+    - Currently propagates `DecentDBException`
     - Preserves SQL and error code on the exception
 
 Micro-ORM Layer:
@@ -569,14 +569,14 @@ Note: Engine-side string length constraints are optional post-1.0 (requires ADR)
 All exceptions should preserve context for debugging:
 
 ```csharp
-public class DecentDbException : DataException
+public class DecentDBException : DataException
 {
     public string SqlStatement { get; }
     public Dictionary<string, object> Parameters { get; }
     public DateTimeOffset Timestamp { get; }
     public string NativeErrorMessage { get; }
 
-    public DecentDbException(string message, string sql, Dictionary<string, object> parameters)
+    public DecentDBException(string message, string sql, Dictionary<string, object> parameters)
         : base(message)
     {
         SqlStatement = sql;
@@ -591,7 +591,7 @@ public class DecentDbException : DataException
 Handle database-level errors that affect connection state:
 
 ```csharp
-public class DecentDbConnection : DbConnection
+public class DecentDBConnection : DbConnection
 {
     protected override void Open()
     {
@@ -756,9 +756,9 @@ while (stmt.Step() == RowAvailable)
 
 **Safe Handle Implementation:**
 ```csharp
-public class DecentDbHandle : SafeHandle
+public class DecentDBHandle : SafeHandle
 {
-    public DecentDbHandle() : base(IntPtr.Zero, true) { }
+    public DecentDBHandle() : base(IntPtr.Zero, true) { }
 
     public override bool IsInvalid => handle == IntPtr.Zero;
 
@@ -777,7 +777,7 @@ public class DecentDbHandle : SafeHandle
 
 **Statement/Reader Memory Management:**
 ```csharp
-public sealed class DecentDbStatement : IDisposable
+public sealed class DecentDBStatement : IDisposable
 {
     private IntPtr _stmtPtr;
     private bool _disposed;
@@ -798,7 +798,7 @@ public sealed class DecentDbStatement : IDisposable
         }
     }
 
-    ~DecentDbStatement()
+    ~DecentDBStatement()
     {
         Dispose(false);
     }
@@ -1012,9 +1012,9 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
 3. Basic P/Invoke layer in C#
 
 ### Sprint 2: ADO.NET
-1. DecentDbConnection implementation
-2. DecentDbCommand and Parameters
-3. DecentDbDataReader
+1. DecentDBConnection implementation
+2. DecentDBCommand and Parameters
+3. DecentDBDataReader
 4. Dapper integration tests
 
 ### Sprint 3: Micro-ORM
@@ -1124,7 +1124,7 @@ public class SqlExecutedEventArgs : SqlExecutingEventArgs
     public Exception Exception { get; }  // Null if success
 }
 
-public class DecentDbContext
+public class DecentDBContext
 {
     // Events fire only when Logging=1 or when handlers attached
     public event EventHandler<SqlExecutingEventArgs> SqlExecuting;
@@ -1140,7 +1140,7 @@ public class DecentDbContext
 **Development - Debug Logging:**
 ```csharp
 var connectionString = "Data Source=my.db;Logging=1;LogLevel=Debug";
-using var db = new DecentDbContext(connectionString);
+using var db = new DecentDBContext(connectionString);
 db.SqlExecuting += (s, e) => Console.WriteLine($"Executing SQL: {e.Sql}");
 // Logs (native-facing): "Executing SQL: SELECT * FROM artists WHERE id = $1"
 ```
@@ -1148,14 +1148,14 @@ db.SqlExecuting += (s, e) => Console.WriteLine($"Executing SQL: {e.Sql}");
 **Production - Metrics Only:**
 ```csharp
 var connectionString = "Data Source=my.db;Logging=1;LogLevel=Warning";
-using var db = new DecentDbContext(connectionString);
+using var db = new DecentDBContext(connectionString);
 db.SqlExecuted += (s, e) => metrics.RecordQueryTime(e.Duration, e.Sql);
 ```
 
 **Production - Maximum Performance:**
 ```csharp
 var connectionString = "Data Source=my.db;Logging=0";
-using var db = new DecentDbContext(connectionString);
+using var db = new DecentDBContext(connectionString);
 // Zero observability overhead
 ```
 
@@ -1202,7 +1202,7 @@ var connStr = "Data Source=dev.db;" +
               "Logging=1;" +                   // Enable SQL logging
               "LogLevel=Verbose;" +            // All SQL logged
               "Pooling=false";                 // Disable pooling for simplicity
-using var db = new DecentDbContext(connStr);
+using var db = new DecentDBContext(connStr);
 ```
 
 **Production (maximum performance):**
@@ -1214,7 +1214,7 @@ var connStr = "Data Source=/data/prod.db;" +
               "Max Pool Size=20;" +            // Higher concurrency
               "Logging=0;" +                   // Zero logging overhead
               "Busy Timeout=10000";            // 10 second lock timeout
-using var db = new DecentDbContext(connStr);
+using var db = new DecentDBContext(connStr);
 ```
 
 **Read-heavy analytics:**
@@ -1224,7 +1224,7 @@ var connStr = "Data Source=prod.db;" +
               "Checkpoint Threshold=100MB;" +  // Infrequent checkpoints
               "Command Timeout=300;" +         // 5 minute timeout
               "Logging=0";
-using var db = new DecentDbContext(connStr);
+using var db = new DecentDBContext(connStr);
 ```
 
 ### Cache Size Guidelines
@@ -1243,7 +1243,7 @@ using var db = new DecentDbContext(connStr);
 ### Checkpointing Behavior
 
 **When checkpoints occur:**
-1. Manual: provider API (e.g., `DecentDbConnection.Checkpoint()`) or CLI `decentdb checkpoint`
+1. Manual: provider API (e.g., `DecentDBConnection.Checkpoint()`) or CLI `decentdb checkpoint`
 2. Auto-size: When WAL reaches `Checkpoint Threshold`
 3. Auto-close: When connection closes (if `Checkpoint On Close=true`)
 
@@ -1290,7 +1290,7 @@ Data Source=/path/to.db;IsolationLevel=Snapshot
 
 **Usage:**
 ```csharp
-using var conn = new DecentDbConnection(connectionString);
+using var conn = new DecentDBConnection(connectionString);
 conn.Open();
 
 using var tx = conn.BeginTransaction(IsolationLevel.Snapshot);
@@ -1325,43 +1325,43 @@ db.SetCommandTimeout(60);        // Change default timeout
 
 ```csharp
 // Native interop (thin wrapper over C ABI)
-namespace DecentDb.Native
+namespace DecentDB.Native
 {
     // Controls native library loading when not using NuGet runtimes/.
-    public static class DecentDbNative
+    public static class DecentDBNative
     {
         public static void SetLibraryPath(string absolutePath);
     }
 
     // SafeHandles ensure deterministic cleanup.
-    public sealed class DecentDbHandle : SafeHandle { }
-    public sealed class DecentDbStatementHandle : SafeHandle { }
+    public sealed class DecentDBHandle : SafeHandle { }
+    public sealed class DecentDBStatementHandle : SafeHandle { }
 }
 
 // Core ADO.NET
-namespace DecentDb.AdoNet
+namespace DecentDB.AdoNet
 {
-    public class DecentDbConnection : DbConnection { }
-    public class DecentDbCommand : DbCommand { }
-    public class DecentDbParameter : DbParameter { }
-    public class DecentDbDataReader : DbDataReader { }
-    public class DecentDbTransaction : DbTransaction { }
+    public class DecentDBConnection : DbConnection { }
+    public class DecentDBCommand : DbCommand { }
+    public class DecentDBParameter : DbParameter { }
+    public class DecentDBDataReader : DbDataReader { }
+    public class DecentDBTransaction : DbTransaction { }
 
     // Optional provider-specific operations (non-standard ADO.NET)
-    public static class DecentDbConnectionExtensions
+    public static class DecentDBConnectionExtensions
     {
         // Triggers a checkpoint using the engine's supported mechanism.
-        public static void Checkpoint(this DecentDbConnection connection);
+        public static void Checkpoint(this DecentDBConnection connection);
     }
 }
 
 // Micro-ORM
-namespace DecentDb.MicroOrm
+namespace DecentDB.MicroOrm
 {
-    public class DecentDbContext : IDisposable
+    public class DecentDBContext : IDisposable
     {
         // Accepts a full connection string (recommended) or a bare path.
-        public DecentDbContext(string connectionStringOrPath, bool pooling = true);
+        public DecentDBContext(string connectionStringOrPath, bool pooling = true);
 
         public event EventHandler<SqlExecutingEventArgs>? SqlExecuting;
         public event EventHandler<SqlExecutedEventArgs>? SqlExecuted;
@@ -1407,7 +1407,7 @@ namespace DecentDb.MicroOrm
     }
 
     // Extension methods for IQueryable<T>
-    public static class DecentDbQueryableExtensions
+    public static class DecentDBQueryableExtensions
     {
         public static IQueryable<T> Where<T>(this IQueryable<T> source, Expression<Func<T, bool>> predicate);
         public static IOrderedQueryable<T> OrderBy<T, TKey>(this IQueryable<T> source, Expression<Func<T, TKey>> keySelector);
@@ -1423,7 +1423,7 @@ namespace DecentDb.MicroOrm
 
 - **Parameters**: Public APIs MAY accept named parameters (`@name`, `@p0`) for Dapper ergonomics, but the provider MUST rewrite to `$1..$N` before native execution (ADR-0005).
 - **LIMIT/OFFSET parameters**: `LIMIT $N` / `OFFSET $N` are supported; values must be non-negative INT64 and fit into `int` (ADR-0048).
-- **Result streaming**: `DecentDbDataReader` is backed by the native `prepare/bind/step/column/finalize` API and MUST be forward-only.
+- **Result streaming**: `DecentDBDataReader` is backed by the native `prepare/bind/step/column/finalize` API and MUST be forward-only.
 - **Rows affected**: `ExecuteNonQuery` uses the statement's `rows_affected` after completion.
 
 ---
@@ -1433,23 +1433,23 @@ namespace DecentDb.MicroOrm
 ### What users reference
 
 **Current (in this repo):**
-- **Dapper users** reference `DecentDb.AdoNet`.
-- **Micro-ORM users** reference `DecentDb.MicroOrm` (which depends on `DecentDb.AdoNet`).
-- `DecentDb.Native` is internal plumbing (P/Invoke + library resolution) and is not intended for direct app usage.
+- **Dapper users** reference `DecentDB.AdoNet`.
+- **Micro-ORM users** reference `DecentDB.MicroOrm` (which depends on `DecentDB.AdoNet`).
+- `DecentDB.Native` is internal plumbing (P/Invoke + library resolution) and is not intended for direct app usage.
 
-**Planned (ADR-0044):** provide a single `DecentDb.NET` meta-package that pulls in the above projects plus native binaries.
+**Planned (ADR-0044):** provide a single `DecentDB.NET` meta-package that pulls in the above projects plus native binaries.
 
 Goal: keep the common path (Dapper + `DbConnection`) simple while still enabling the high-performance native streaming reader under the hood.
 
 ### Target Package Structure (Planned)
 
 ```
-DecentDb.NET
+DecentDB.NET
 ├── lib/
 │   └── net10.0/
-│       ├── DecentDb.AdoNet.dll
-│       ├── DecentDb.MicroOrm.dll
-│       └── DecentDb.Native.dll
+│       ├── DecentDB.AdoNet.dll
+│       ├── DecentDB.MicroOrm.dll
+│       └── DecentDB.Native.dll
 ├── runtimes/
 │   ├── win-x64/
 │   │   └── native/
@@ -1463,17 +1463,17 @@ DecentDb.NET
 │   └── osx-arm64/
 │       └── native/
 │           └── libdecentdb.dylib
-└── DecentDb.NET.targets (MSBuild props for native libs)
+└── DecentDB.NET.targets (MSBuild props for native libs)
 ```
 
 ### Installation
 
 ```bash
 # Install from NuGet (planned)
-dotnet add package DecentDb.NET
+dotnet add package DecentDB.NET
 
 # Or via PackageReference
-<PackageReference Include="DecentDb.NET" Version="1.0.0" />
+<PackageReference Include="DecentDB.NET" Version="1.0.0" />
 ```
 
 ### Runtime Native Library Resolution
@@ -1486,7 +1486,7 @@ dotnet add package DecentDb.NET
 **Manual (optional):**
 ```csharp
 // If native lib is in custom location
-DecentDbNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
+DecentDBNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
 ```
 
 ### Build Process
@@ -1539,7 +1539,7 @@ DecentDbNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
 ### Verification (as of 2026-01-30)
 
 - Nim: `nimble test`
-- .NET: `dotnet test bindings/dotnet/tests/DecentDb.Tests/DecentDb.Tests.csproj -c Release`
+- .NET: `dotnet test bindings/dotnet/tests/DecentDB.Tests/DecentDB.Tests.csproj -c Release`
 - Dapper example: `dotnet run --project examples/dotnet/dapper-basic -c Release`
 
 ---
@@ -1655,13 +1655,13 @@ Dapper doesn't provide connection pooling - it relies on ADO.NET provider's pool
 
 ```csharp
 // Custom pool optimized for DecentDB's single-writer constraint
-public class DecentDbConnectionPool
+public class DecentDBConnectionPool
 {
     // Separate pools for readers and writers
-    private readonly ConcurrentBag<DecentDbConnection> _readerPool;
+    private readonly ConcurrentBag<DecentDBConnection> _readerPool;
     private readonly SemaphoreSlim _writerLock;  // Max 1 writer
     
-    public async Task<DecentDbConnection> GetReaderAsync()
+    public async Task<DecentDBConnection> GetReaderAsync()
     {
         // Reuse existing reader connection
         if (_readerPool.TryTake(out var conn))
@@ -1679,7 +1679,7 @@ public class DecentDbConnectionPool
 }
 
 // Usage
-public class DecentDbContext
+public class DecentDBContext
 {
     public async Task<List<T>> QueryAsync<T>(Expression<Func<T, bool>> predicate)
     {

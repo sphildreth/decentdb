@@ -1,6 +1,6 @@
-version       = "0.0.1"
-author        = "DecentDb contributors"
-description   = "DecentDb engine (beta)"
+version       = "0.1.0"
+author        = "DecentDB contributors"
+description   = "DecentDB engine"
 license       = "Apache-2.0"
 srcDir        = "src"
 bin           = @["decentdb"]
@@ -10,12 +10,39 @@ requires "cligen >= 1.7.0"
 requires "zip >= 0.3.1"
 
 
-task build_lib, "Build DecentDb shared library (C API)":
+task build_lib, "Build DecentDB shared library (C API)":
   exec "nim c --app:lib -d:libpg_query -d:release --mm:arc --threads:on --outdir:build src/c_api.nim"
 
-task test, "Run Nim + Python unit tests":
+task test_bindings_dotnet, "Run .NET binding tests":
+  exec "ln -sf libc_api.so build/libdecentdb.so"
+  exec "export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH && dotnet test bindings/dotnet/tests/DecentDB.Tests"
+
+task test_bindings_go, "Run Go binding tests":
+  withDir "bindings/go/decentdb-go":
+    exec "go test -v ."
+
+task test_bindings_node, "Run Node.js binding tests":
+  withDir "bindings/node/decentdb":
+    # Ensure native addon is built
+    exec "npm run build"
+    # Point to the shared library built by build_lib
+    exec "export DECENTDB_NATIVE_LIB_PATH=$PWD/../../../build/libc_api.so && npm test"
+
+task test_bindings_python, "Run Python binding tests":
+  withDir "bindings/python":
+    exec "pytest"
+
+task test_bindings, "Run all binding tests":
+  exec "nimble build_lib"
+  exec "nimble test_bindings_dotnet"
+  exec "nimble test_bindings_go"
+  exec "nimble test_bindings_node"
+  exec "nimble test_bindings_python"
+
+task test, "Run Nim + Python unit tests + Bindings":
   exec "nimble test_nim"
   exec "python -m unittest -q tests/harness/test_runner.py"
+  exec "nimble test_bindings"
 
 task test_nim, "Run Nim unit tests":
   # Use testament for parallel test execution and better reporting

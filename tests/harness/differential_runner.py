@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Differential test harness - Compare DecentDb behavior against PostgreSQL.
+Differential test harness - Compare DecentDB behavior against PostgreSQL.
 
 Runs identical SQL operations on both databases and verifies results match.
 """
@@ -19,15 +19,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from postgres_ref import PostgresRef, compare_results
 
 
-class DecentDbAdapter:
-    """Adapter for running SQL against DecentDb via CLI."""
+class DecentDBAdapter:
+    """Adapter for running SQL against DecentDB via CLI."""
 
     def __init__(self, engine_path: str):
         self.engine_path = engine_path
 
     def execute(self, db_path: str, sql: str) -> tuple[bool, list[str], str]:
         """
-        Execute SQL against DecentDb.
+        Execute SQL against DecentDB.
 
         Returns:
             Tuple of (success, rows, error_message)
@@ -297,7 +297,7 @@ DIFFERENTIAL_TESTS = [
 
 
 def run_differential_test(
-    test: DifferentialTest, decent: DecentDbAdapter, pg: PostgresRef, temp_dir: str
+    test: DifferentialTest, decent: DecentDBAdapter, pg: PostgresRef, temp_dir: str
 ) -> tuple[bool, str]:
     """
     Run a single differential test.
@@ -322,7 +322,7 @@ def run_differential_test(
         # Execute schema creation
         decent_ok, decent_err = decent.execute(db_path, test.schema_sql)[:2]
         if not decent_ok:
-            return False, f"DecentDb schema failed: {decent_err}"
+            return False, f"DecentDB schema failed: {decent_err}"
 
         pg_ok, pg_err = pg.execute_in_schema(pg_schema, test.schema_sql)[:2]
         if not pg_ok:
@@ -333,7 +333,7 @@ def run_differential_test(
         if test.setup_sql:
             decent_ok, _, decent_err = decent.execute(db_path, test.setup_sql)
             if not decent_ok:
-                return False, f"DecentDb setup failed: {decent_err}"
+                return False, f"DecentDB setup failed: {decent_err}"
 
             pg_ok, _, pg_err = pg.execute_in_schema(pg_schema, test.setup_sql)
             if not pg_ok:
@@ -349,7 +349,7 @@ def run_differential_test(
             return True, "Both failed as expected"
 
         if not decent_ok:
-            return False, f"DecentDb failed: {decent_err}"
+            return False, f"DecentDB failed: {decent_err}"
 
         if not pg_ok:
             # PostgreSQL might have different behavior - log but don't fail
@@ -372,7 +372,7 @@ def run_differential_test(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Differential test harness for DecentDb"
+        description="Differential test harness for DecentDB"
     )
     parser.add_argument(
         "--engine", required=True, help="Path to decentdb CLI executable"
@@ -391,7 +391,7 @@ def main() -> int:
         return 0
 
     # Initialize adapters
-    decent = DecentDbAdapter(args.engine)
+    decent = DecentDBAdapter(args.engine)
 
     if args.skip_pg:
         print("Skipping PostgreSQL tests (--skip-pg specified)")

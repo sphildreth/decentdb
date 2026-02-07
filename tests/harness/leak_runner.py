@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Resource leak detection tests for DecentDb.
+Resource leak detection tests for DecentDB.
 
 Verifies that resources (file handles, memory, temp files) are properly
 released after operations complete.
@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 
-class DecentDbAdapter:
-    """Adapter for running SQL against DecentDb via CLI."""
+class DecentDBAdapter:
+    """Adapter for running SQL against DecentDB via CLI."""
 
     def __init__(self, engine_path: str):
         self.engine_path = engine_path
@@ -51,7 +51,7 @@ def count_open_files(pid: int, db_path: str) -> int:
         return -1
 
 
-def test_file_handle_leak(engine: DecentDbAdapter, db_path: str) -> tuple[bool, str]:
+def test_file_handle_leak(engine: DecentDBAdapter, db_path: str) -> tuple[bool, str]:
     """
     Test: Repeated open/close should not leak file handles.
     """
@@ -79,7 +79,7 @@ def test_file_handle_leak(engine: DecentDbAdapter, db_path: str) -> tuple[bool, 
     return True, f"File handles stable: {baseline} -> {final}"
 
 
-def test_sort_temp_cleanup(engine: DecentDbAdapter, temp_dir: str) -> tuple[bool, str]:
+def test_sort_temp_cleanup(engine: DecentDBAdapter, temp_dir: str) -> tuple[bool, str]:
     """
     Test: Sort spill files should be cleaned up after query completes.
     """
@@ -123,7 +123,7 @@ def test_sort_temp_cleanup(engine: DecentDbAdapter, temp_dir: str) -> tuple[bool
     return True, "All temp files cleaned up after sort"
 
 
-def test_memory_stability(engine: DecentDbAdapter, db_path: str) -> tuple[bool, str]:
+def test_memory_stability(engine: DecentDBAdapter, db_path: str) -> tuple[bool, str]:
     """
     Test: Memory usage should stabilize after repeated operations.
     """
@@ -166,7 +166,7 @@ def test_memory_stability(engine: DecentDbAdapter, db_path: str) -> tuple[bool, 
     )
 
 
-def test_wal_growth_managed(engine: DecentDbAdapter, temp_dir: str) -> tuple[bool, str]:
+def test_wal_growth_managed(engine: DecentDBAdapter, temp_dir: str) -> tuple[bool, str]:
     """
     Test: WAL size should not grow unbounded with normal operations.
     """
@@ -212,7 +212,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    engine = DecentDbAdapter(args.engine)
+    engine = DecentDBAdapter(args.engine)
 
     tests = []
     if args.test in ("files", "all"):

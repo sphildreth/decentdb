@@ -3,6 +3,7 @@ import tables
 import sets
 import algorithm
 import strutils
+import json
 import ../errors
 import ../record/record
 import ../pager/pager
@@ -15,6 +16,13 @@ type ColumnType* = enum
   ctFloat64
   ctText
   ctBlob
+  ctDecimal
+  ctUuid
+
+type ColumnTypeSpec* = object
+  kind*: ColumnType
+  decPrecision*: uint8
+  decScale*: uint8
 
 type IndexKind* = enum
   ikBtree
@@ -28,18 +36,33 @@ type Column* = object
   primaryKey*: bool
   refTable*: string
   refColumn*: string
+  refOnDelete*: string
+  refOnUpdate*: string
+  decPrecision*: uint8
+  decScale*: uint8
+
+type CheckConstraint* = object
+  name*: string
+  exprSql*: string
 
 type TableMeta* = object
   name*: string
   rootPage*: PageId
   nextRowId*: uint64
   columns*: seq[Column]
+  checks*: seq[CheckConstraint]
 
 type ViewMeta* = object
   name*: string
   sqlText*: string
   columnNames*: seq[string]
   dependencies*: seq[string]
+
+type TriggerMeta* = object
+  name*: string
+  table*: string
+  eventsMask*: int
+  actionSql*: string
 
 type IndexMeta* = object
   name*: string
@@ -48,6 +71,7 @@ type IndexMeta* = object
   rootPage*: PageId
   kind*: IndexKind
   unique*: bool
+  predicateSql*: string
 
 type TrigramDelta* = ref object
   adds*: HashSet[uint64]
@@ -57,6 +81,7 @@ type Catalog* = ref object
   tables*: Table[string, TableMeta]
   indexes*: Table[string, IndexMeta]
   views*: Table[string, ViewMeta]
+  triggers*: Table[string, TriggerMeta]
   dependentViews*: Table[string, HashSet[string]]
   catalogTree*: BTree
   trigramDeltas*: Table[(string, uint32), TrigramDelta]
@@ -65,33 +90,66 @@ type CatalogRecordKind = enum
   crTable
   crIndex
   crView
+  crTrigger
 
 type CatalogRecord = object
   kind: CatalogRecordKind
   table: TableMeta
   index: IndexMeta
   view: ViewMeta
+  trigger: TriggerMeta
 
-proc parseColumnType*(text: string): Result[ColumnType] =
-  # Extract base type name by taking everything before the first '('
-  var baseType = text
-  let parenPos = text.find('(')
+proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
+  let raw = text.strip()
+  if raw.len == 0:
+    return err[ColumnTypeSpec](ERR_SQL, "Unsupported column type", text)
+
+  var baseType = raw
+  var mods = ""
+  let parenPos = raw.find('(')
   if parenPos >= 0:
-    baseType = text[0..<parenPos]
+    baseType = raw[0..<parenPos].strip()
+    mods = raw[parenPos..^1].strip()
 
-  case baseType.strip().toUpperAscii()
-  of "INT", "INT64", "BIGINT", "INT4", "INT8":
-    ok(ctInt64)
+  let baseUpper = baseType.toUpperAscii()
+  case baseUpper
+  of "INT", "INTEGER", "INT64", "BIGINT", "INT4", "INT8":
+    ok(ColumnTypeSpec(kind: ctInt64))
   of "BOOL", "BOOLEAN":
-    ok(ctBool)
+    ok(ColumnTypeSpec(kind: ctBool))
   of "FLOAT", "FLOAT64", "DOUBLE", "FLOAT8", "FLOAT4", "REAL":
-    ok(ctFloat64)
+    ok(ColumnTypeSpec(kind: ctFloat64))
   of "TEXT", "VARCHAR", "CHARACTER VARYING":
-    ok(ctText)
+    ok(ColumnTypeSpec(kind: ctText))
   of "BLOB":
-    ok(ctBlob)
+    ok(ColumnTypeSpec(kind: ctBlob))
+  of "UUID":
+    ok(ColumnTypeSpec(kind: ctUuid))
+  of "DECIMAL", "NUMERIC":
+    if mods.len == 0:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL/NUMERIC requires (p,s)", text)
+    if not (mods.startsWith("(") and mods.endsWith(")")):
+      return err[ColumnTypeSpec](ERR_SQL, "Invalid DECIMAL/NUMERIC modifiers", text)
+    let inner = mods[1 ..< mods.len-1]
+    let parts = inner.split(",")
+    if parts.len != 2:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL/NUMERIC requires (p,s)", text)
+    let pStr = parts[0].strip()
+    let sStr = parts[1].strip()
+    var pInt: int
+    var sInt: int
+    try:
+      pInt = parseInt(pStr)
+      sInt = parseInt(sStr)
+    except ValueError:
+      return err[ColumnTypeSpec](ERR_SQL, "Invalid DECIMAL/NUMERIC (p,s)", text)
+    if pInt <= 0 or pInt > 18:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL precision must be 1..18", text)
+    if sInt < 0 or sInt > pInt:
+      return err[ColumnTypeSpec](ERR_SQL, "DECIMAL scale must be 0..p", text)
+    ok(ColumnTypeSpec(kind: ctDecimal, decPrecision: uint8(pInt), decScale: uint8(sInt)))
   else:
-    err[ColumnType](ERR_SQL, "Unsupported column type", text)
+    err[ColumnTypeSpec](ERR_SQL, "Unsupported column type", text)
 
 proc columnTypeToText*(kind: ColumnType): string =
   case kind
@@ -100,6 +158,32 @@ proc columnTypeToText*(kind: ColumnType): string =
   of ctFloat64: "FLOAT64"
   of ctText: "TEXT"
   of ctBlob: "BLOB"
+  of ctDecimal: "DECIMAL"
+  of ctUuid: "UUID"
+
+proc normalizeFkAction(action: string): string =
+  let upper = action.strip().toUpperAscii()
+  if upper.len == 0:
+    return "NO ACTION"
+  if upper in ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL"]:
+    return upper
+  "NO ACTION"
+
+proc fkActionToCode(action: string): string =
+  case normalizeFkAction(action)
+  of "NO ACTION": "a"
+  of "RESTRICT": "r"
+  of "CASCADE": "c"
+  of "SET NULL": "n"
+  else: "a"
+
+proc fkActionFromCode(code: string): string =
+  case code.toLowerAscii()
+  of "", "a": "NO ACTION"
+  of "r": "RESTRICT"
+  of "c": "CASCADE"
+  of "n": "SET NULL"
+  else: "NO ACTION"
 
 proc encodeColumns(columns: seq[Column]): seq[byte] =
   var parts: seq[string] = @[]
@@ -113,8 +197,15 @@ proc encodeColumns(columns: seq[Column]): seq[byte] =
       flags.add("pk")
     if col.refTable.len > 0 and col.refColumn.len > 0:
       flags.add("ref=" & col.refTable & "." & col.refColumn)
+      flags.add("refdel=" & fkActionToCode(col.refOnDelete))
+      flags.add("refupd=" & fkActionToCode(col.refOnUpdate))
     let flagPart = if flags.len > 0: ":" & flags.join(",") else: ""
-    parts.add(col.name & ":" & columnTypeToText(col.kind) & flagPart)
+    let typeText =
+      if col.kind == ctDecimal:
+        "DECIMAL(" & $col.decPrecision & "," & $col.decScale & ")"
+      else:
+        columnTypeToText(col.kind)
+    parts.add(col.name & ":" & typeText & flagPart)
   let joined = parts.join(";")
   var bytes: seq[byte] = @[]
   for ch in joined:
@@ -133,7 +224,10 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
     if pieces.len >= 2:
       let typeRes = parseColumnType(pieces[1])
       if typeRes.ok:
-        var col = Column(name: pieces[0], kind: typeRes.value)
+        var col = Column(name: pieces[0], kind: typeRes.value.kind)
+        if col.kind == ctDecimal:
+          col.decPrecision = typeRes.value.decPrecision
+          col.decScale = typeRes.value.decScale
         if pieces.len >= 3:
           let flags = pieces[2].split(",")
           for flag in flags:
@@ -151,7 +245,51 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
                 if parts.len == 2:
                   col.refTable = parts[0]
                   col.refColumn = parts[1]
+              elif flag.startsWith("refdel="):
+                col.refOnDelete = fkActionFromCode(flag[7 .. ^1])
+              elif flag.startsWith("refupd="):
+                col.refOnUpdate = fkActionFromCode(flag[7 .. ^1])
+        if col.refTable.len > 0 and col.refColumn.len > 0:
+          if col.refOnDelete.len == 0:
+            col.refOnDelete = "NO ACTION"
+          if col.refOnUpdate.len == 0:
+            col.refOnUpdate = "NO ACTION"
         result.add(col)
+
+proc encodeChecks(checks: seq[CheckConstraint]): seq[byte] =
+  var arr = newJArray()
+  for checkDef in checks:
+    var node = newJObject()
+    node["name"] = %checkDef.name
+    node["expr"] = %checkDef.exprSql
+    arr.add(node)
+  let payload = $arr
+  result = newSeq[byte](payload.len)
+  for i, ch in payload:
+    result[i] = byte(ch)
+
+proc decodeChecks(bytes: seq[byte]): Result[seq[CheckConstraint]] =
+  if bytes.len == 0:
+    return ok(newSeq[CheckConstraint]())
+  var checks: seq[CheckConstraint] = @[]
+  var payload = newString(bytes.len)
+  for i, b in bytes:
+    payload[i] = char(b)
+  try:
+    let node = parseJson(payload)
+    if node.kind != JArray:
+      return err[seq[CheckConstraint]](ERR_CORRUPTION, "Invalid CHECK metadata format")
+    for item in node.items:
+      if item.kind != JObject:
+        return err[seq[CheckConstraint]](ERR_CORRUPTION, "Invalid CHECK metadata entry")
+      let exprSql = if item.hasKey("expr"): item["expr"].getStr else: ""
+      if exprSql.len == 0:
+        return err[seq[CheckConstraint]](ERR_CORRUPTION, "CHECK metadata missing expression")
+      let name = if item.hasKey("name"): item["name"].getStr else: ""
+      checks.add(CheckConstraint(name: name, exprSql: exprSql))
+  except CatchableError:
+    return err[seq[CheckConstraint]](ERR_CORRUPTION, "Invalid CHECK metadata JSON")
+  ok(checks)
 
 proc stringToBytes(text: string): seq[byte] =
   for ch in text:
@@ -161,17 +299,18 @@ proc bytesToString(bytes: seq[byte]): string =
   for b in bytes:
     result.add(char(b))
 
-proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns: seq[Column]): seq[byte] =
+proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns: seq[Column], checks: seq[CheckConstraint]): seq[byte] =
   let values = @[
     Value(kind: vkText, bytes: stringToBytes("table")),
     Value(kind: vkText, bytes: stringToBytes(name)),
     Value(kind: vkInt64, int64Val: int64(rootPage)),
     Value(kind: vkInt64, int64Val: int64(nextRowId)),
-    Value(kind: vkText, bytes: encodeColumns(columns))
+    Value(kind: vkText, bytes: encodeColumns(columns)),
+    Value(kind: vkText, bytes: encodeChecks(checks))
   ]
   encodeRecord(values)
 
-proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage: PageId, kind: IndexKind, unique: bool): seq[byte] =
+proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage: PageId, kind: IndexKind, unique: bool, predicateSql: string): seq[byte] =
   let values = @[
     Value(kind: vkText, bytes: stringToBytes("index")),
     Value(kind: vkText, bytes: stringToBytes(name)),
@@ -179,7 +318,8 @@ proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage
     Value(kind: vkText, bytes: stringToBytes(columns.join(";"))),
     Value(kind: vkInt64, int64Val: int64(rootPage)),
     Value(kind: vkText, bytes: stringToBytes(if kind == ikTrigram: "trigram" else: "btree")),
-    Value(kind: vkInt64, int64Val: int64(if unique: 1 else: 0))
+    Value(kind: vkInt64, int64Val: int64(if unique: 1 else: 0)),
+    Value(kind: vkText, bytes: stringToBytes(predicateSql))
   ]
   encodeRecord(values)
 
@@ -190,6 +330,16 @@ proc makeViewRecord(name: string, sqlText: string, columnNames: seq[string], dep
     Value(kind: vkText, bytes: stringToBytes(sqlText)),
     Value(kind: vkText, bytes: stringToBytes(columnNames.join(";"))),
     Value(kind: vkText, bytes: stringToBytes(dependencies.join(";")))
+  ]
+  encodeRecord(values)
+
+proc makeTriggerRecord(name: string, tableName: string, eventsMask: int, actionSql: string): seq[byte] =
+  let values = @[
+    Value(kind: vkText, bytes: stringToBytes("trigger")),
+    Value(kind: vkText, bytes: stringToBytes(name)),
+    Value(kind: vkText, bytes: stringToBytes(tableName)),
+    Value(kind: vkInt64, int64Val: int64(eventsMask)),
+    Value(kind: vkText, bytes: stringToBytes(actionSql))
   ]
   encodeRecord(values)
 
@@ -205,14 +355,22 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let rootPage = PageId(values[1].int64Val)
     let nextRowId = uint64(values[2].int64Val)
     let columns = decodeColumns(values[3].bytes)
-    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns)))
+    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns, checks: @[])))
   let recordType = bytesToString(values[0].bytes).toLowerAscii()
   if recordType == "table":
     let name = bytesToString(values[1].bytes)
     let rootPage = PageId(values[2].int64Val)
     let nextRowId = uint64(values[3].int64Val)
     let columns = decodeColumns(values[4].bytes)
-    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns)))
+    let checksRes =
+      if values.len >= 6:
+        decodeChecks(values[5].bytes)
+      else:
+        ok(newSeq[CheckConstraint]())
+    if not checksRes.ok:
+      return err[CatalogRecord](checksRes.err.code, checksRes.err.message, checksRes.err.context)
+    let checks = checksRes.value
+    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns, checks: checks)))
   if recordType == "index":
     if values.len < 5:
       return err[CatalogRecord](ERR_CORRUPTION, "Index catalog record too short")
@@ -223,13 +381,27 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let rootPage = PageId(values[4].int64Val)
     var kind = ikBtree
     var unique = false
+    var predicateSql = ""
     if values.len >= 6:
       let kindText = bytesToString(values[5].bytes).toLowerAscii()
       if kindText == "trigram":
         kind = ikTrigram
     if values.len >= 7:
       unique = values[6].int64Val != 0
-    return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, columns: columns, rootPage: rootPage, kind: kind, unique: unique)))
+    if values.len >= 8:
+      predicateSql = bytesToString(values[7].bytes)
+    return ok(CatalogRecord(
+      kind: crIndex,
+      index: IndexMeta(
+        name: name,
+        table: tableName,
+        columns: columns,
+        rootPage: rootPage,
+        kind: kind,
+        unique: unique,
+        predicateSql: predicateSql
+      )
+    ))
   if recordType == "view":
     if values.len < 5:
       return err[CatalogRecord](ERR_CORRUPTION, "View catalog record too short")
@@ -240,10 +412,21 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let columnNames = if columnStr.len > 0: columnStr.split(";") else: @[]
     let dependencies = if depStr.len > 0: depStr.split(";") else: @[]
     return ok(CatalogRecord(kind: crView, view: ViewMeta(name: name, sqlText: sqlText, columnNames: columnNames, dependencies: dependencies)))
+  if recordType == "trigger":
+    if values.len < 5:
+      return err[CatalogRecord](ERR_CORRUPTION, "Trigger catalog record too short")
+    let name = bytesToString(values[1].bytes)
+    let tableName = bytesToString(values[2].bytes)
+    let eventsMask = int(values[3].int64Val)
+    let actionSql = bytesToString(values[4].bytes)
+    return ok(CatalogRecord(kind: crTrigger, trigger: TriggerMeta(name: name, table: tableName, eventsMask: eventsMask, actionSql: actionSql)))
   err[CatalogRecord](ERR_CORRUPTION, "Unknown catalog record type", recordType)
 
 proc normalizedObjectName(name: string): string =
   name.toLowerAscii()
+
+proc triggerMetaKey(tableName: string, triggerName: string): string =
+  normalizedObjectName(tableName) & ":" & normalizedObjectName(triggerName)
 
 proc rebuildDependentViewsIndex*(catalog: Catalog) =
   catalog.dependentViews = initTable[string, HashSet[string]]()
@@ -274,6 +457,7 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
     tables: initTable[string, TableMeta](),
     indexes: initTable[string, IndexMeta](),
     views: initTable[string, ViewMeta](),
+    triggers: initTable[string, TriggerMeta](),
     dependentViews: initTable[string, HashSet[string]](),
     catalogTree: tree,
     trigramDeltas: initTable[(string, uint32), TrigramDelta]()
@@ -302,6 +486,8 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
           catalog.indexes[record.index.name] = record.index
         of crView:
           catalog.views[record.view.name] = record.view
+        of crTrigger:
+          catalog.triggers[triggerMetaKey(record.trigger.table, record.trigger.name)] = record.trigger
   rebuildDependentViewsIndex(catalog)
   ok(catalog)
 
@@ -342,7 +528,7 @@ proc updateTableMeta*(catalog: Catalog, table: TableMeta) =
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
   catalog.tables[table.name] = table
   let key = uint64(crc32c(stringToBytes("table:" & table.name)))
-  let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns)
+  let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns, table.checks)
   
   let updateRes = update(catalog.catalogTree, key, record)
   if updateRes.ok:
@@ -369,7 +555,7 @@ proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
-  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique)
+  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -383,7 +569,7 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
   discard delete(catalog.catalogTree, key)
-  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique)
+  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -433,9 +619,20 @@ proc getView*(catalog: Catalog, name: string): Result[ViewMeta] =
     return err[ViewMeta](ERR_SQL, "View not found", name)
   ok(catalog.views[name])
 
+proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void]
+proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void]
+
 proc dropView*(catalog: Catalog, name: string): Result[Void] =
   if not catalog.views.hasKey(name):
     return err[Void](ERR_SQL, "View not found", name)
+  var triggerNames: seq[string] = @[]
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) == normalizedObjectName(name):
+      triggerNames.add(trigger.name)
+  for triggerName in triggerNames:
+    let dropTrigRes = dropTrigger(catalog, name, triggerName)
+    if not dropTrigRes.ok:
+      return dropTrigRes
   catalog.views.del(name)
   rebuildDependentViewsIndex(catalog)
   let key = uint64(crc32c(stringToBytes("view:" & name)))
@@ -459,6 +656,20 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
   catalog.views.del(oldName)
   view.name = newName
   catalog.views[newName] = view
+  var triggerMetas: seq[TriggerMeta] = @[]
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) == normalizedObjectName(oldName):
+      triggerMetas.add(trigger)
+  for trigger in triggerMetas:
+    let dropTrigRes = dropTrigger(catalog, oldName, trigger.name)
+    if not dropTrigRes.ok:
+      return dropTrigRes
+  for trigger in triggerMetas:
+    var renamed = trigger
+    renamed.table = newName
+    let createTrigRes = createTriggerMeta(catalog, renamed)
+    if not createTrigRes.ok:
+      return createTrigRes
   rebuildDependentViewsIndex(catalog)
   let newKey = uint64(crc32c(stringToBytes("view:" & newName)))
   let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
@@ -468,6 +679,47 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
+
+proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void] =
+  let keyName = triggerMetaKey(trigger.table, trigger.name)
+  if catalog.triggers.hasKey(keyName):
+    return err[Void](ERR_SQL, "Trigger already exists", trigger.table & "." & trigger.name)
+  catalog.triggers[keyName] = trigger
+  let key = uint64(crc32c(stringToBytes("trigger:" & trigger.table & ":" & trigger.name)))
+  let record = makeTriggerRecord(trigger.name, trigger.table, trigger.eventsMask, trigger.actionSql)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    catalog.triggers.del(keyName)
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void] =
+  let keyName = triggerMetaKey(tableName, triggerName)
+  if not catalog.triggers.hasKey(keyName):
+    return err[Void](ERR_SQL, "Trigger not found", tableName & "." & triggerName)
+  catalog.triggers.del(keyName)
+  let key = uint64(crc32c(stringToBytes("trigger:" & tableName & ":" & triggerName)))
+  let delRes = delete(catalog.catalogTree, key)
+  if not delRes.ok:
+    return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc hasTrigger*(catalog: Catalog, tableName: string, triggerName: string): bool =
+  catalog.triggers.hasKey(triggerMetaKey(tableName, triggerName))
+
+proc listTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int = 0): seq[TriggerMeta] =
+  let tableKey = normalizedObjectName(tableName)
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) != tableKey:
+      continue
+    if eventMask != 0 and (trigger.eventsMask and eventMask) == 0:
+      continue
+    result.add(trigger)
+  result.sort(proc(a, b: TriggerMeta): int = cmp(a.name, b.name))
 
 proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
   let key = normalizedObjectName(objectName)
@@ -480,6 +732,14 @@ proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
 proc dropTable*(catalog: Catalog, name: string): Result[Void] =
   if not catalog.tables.hasKey(name):
     return err[Void](ERR_SQL, "Table not found", name)
+  var triggerNames: seq[string] = @[]
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) == normalizedObjectName(name):
+      triggerNames.add(trigger.name)
+  for triggerName in triggerNames:
+    let dropTrigRes = dropTrigger(catalog, name, triggerName)
+    if not dropTrigRes.ok:
+      return dropTrigRes
   catalog.tables.del(name)
   let key = uint64(crc32c(stringToBytes("table:" & name)))
   let delRes = delete(catalog.catalogTree, key)

@@ -27,8 +27,8 @@ decentdb-sqlite-import = "decentdb.tools.sqlite_import:main"
 decentdb-pgbak-import = "decentdb.tools.pgbak_import:main"
 
 [project.entry-points."sqlalchemy.dialects"]
-decentdb = "decentdb_sqlalchemy.dialect:DecentDbDialect"
-"decentdb.pysql" = "decentdb_sqlalchemy.dialect:DecentDbDialect"
+decentdb = "decentdb_sqlalchemy.dialect:DecentDBDialect"
+"decentdb.pysql" = "decentdb_sqlalchemy.dialect:DecentDBDialect"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -194,3 +194,319 @@ func TestDriver(t *testing.T) {
 		t.Fatalf("expected error for '?' parameters")
 	}
 }
+
+func TestDriver_Decimal(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-decimal-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "decimal.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Create table
+	_, err = conn.ExecContext(context.Background(), "CREATE TABLE t (d DECIMAL(18, 9))")
+	if err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+
+	// Insert using custom struct
+	val := Decimal{Unscaled: 123456789012, Scale: 9}
+	_, err = conn.ExecContext(context.Background(), "INSERT INTO t VALUES ($1)", val)
+	if err != nil {
+		t.Fatalf("INSERT failed: %v", err)
+	}
+
+	// Query
+	var v interface{}
+	err = conn.QueryRowContext(context.Background(), "SELECT d FROM t").Scan(&v)
+	if err != nil {
+		t.Fatalf("QueryRow failed: %v", err)
+	}
+
+	got, ok := v.(Decimal)
+	if !ok {
+		t.Fatalf("expected Decimal, got %T", v)
+	}
+	if got.Unscaled != 123456789012 || got.Scale != 9 {
+		t.Errorf("expected %v, got %v", val, got)
+	}
+}
+
+func TestDriver_Bool(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-bool-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "bool.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE t (b BOOL)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("INSERT INTO t VALUES ($1)", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("INSERT INTO t VALUES ($1)", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Query("SELECT b FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var b bool
+	if !rows.Next() {
+		t.Fatal("expected row 1")
+	}
+	if err := rows.Scan(&b); err != nil {
+		t.Fatal(err)
+	}
+	if !b {
+		t.Error("expected true")
+	}
+
+	if !rows.Next() {
+		t.Fatal("expected row 2")
+	}
+	if err := rows.Scan(&b); err != nil {
+		t.Fatal(err)
+	}
+	if b {
+		t.Error("expected false")
+	}
+}
+
+func TestDriver_UUID(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-uuid-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "uuid.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE t (u UUID)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test binding 16 bytes
+	u1 := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	_, err = db.Exec("INSERT INTO t VALUES ($1)", u1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var u2 []byte
+	err = db.QueryRow("SELECT u FROM t").Scan(&u2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(u2) != 16 {
+		t.Errorf("expected 16 bytes, got %d", len(u2))
+	}
+	for i := range u1 {
+		if u1[i] != u2[i] {
+			t.Errorf("byte mismatch at %d", i)
+		}
+	}
+}
+
+func TestDriver_Blob(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-blob-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "blob.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE t (id INT PRIMARY KEY, data BLOB)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blobs := [][]byte{
+		{},
+		{0x00},
+		{0xDE, 0xAD, 0xBE, 0xEF},
+		make([]byte, 256),
+	}
+	for i := range blobs[3] {
+		blobs[3][i] = byte(i)
+	}
+
+	for i, b := range blobs {
+		_, err = db.Exec("INSERT INTO t (id, data) VALUES ($1, $2)", i, b)
+		if err != nil {
+			t.Fatalf("INSERT blob[%d] failed: %v", i, err)
+		}
+	}
+
+	rows, err := db.Query("SELECT data FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	for i, expected := range blobs {
+		if !rows.Next() {
+			t.Fatalf("expected row %d", i)
+		}
+		var got []byte
+		if err := rows.Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(expected) {
+			t.Errorf("blob[%d]: expected len %d, got %d", i, len(expected), len(got))
+		} else {
+			for j := range expected {
+				if got[j] != expected[j] {
+					t.Errorf("blob[%d] byte mismatch at %d", i, j)
+					break
+				}
+			}
+		}
+	}
+}
+
+func TestDriver_Null(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-null-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "null.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE t (id INT PRIMARY KEY, i INT, t TEXT, b BOOL, f FLOAT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("INSERT INTO t (id, i, t, b, f) VALUES ($1, $2, $3, $4, $5)", 1, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var ni sql.NullInt64
+	var nt sql.NullString
+	var nb sql.NullBool
+	var nf sql.NullFloat64
+
+	err = db.QueryRow("SELECT i, t, b, f FROM t WHERE id = 1").Scan(&ni, &nt, &nb, &nf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ni.Valid {
+		t.Error("expected NULL int")
+	}
+	if nt.Valid {
+		t.Error("expected NULL text")
+	}
+	if nb.Valid {
+		t.Error("expected NULL bool")
+	}
+	if nf.Valid {
+		t.Error("expected NULL float")
+	}
+}
+
+func TestDriver_Float64Precision(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-float-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "float.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec("CREATE TABLE t (id INT PRIMARY KEY, v FLOAT)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	values := []float64{0.0, 1.0, -1.0, 3.141592653589793, 1.7976931348623157e+308, 5e-324}
+	for i, v := range values {
+		_, err = db.Exec("INSERT INTO t (id, v) VALUES ($1, $2)", i, v)
+		if err != nil {
+			t.Fatalf("INSERT float[%d] failed: %v", i, err)
+		}
+	}
+
+	rows, err := db.Query("SELECT v FROM t ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	for i, expected := range values {
+		if !rows.Next() {
+			t.Fatalf("expected row %d", i)
+		}
+		var got float64
+		if err := rows.Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != expected {
+			t.Errorf("float[%d]: expected %v, got %v", i, expected, got)
+		}
+	}
+}

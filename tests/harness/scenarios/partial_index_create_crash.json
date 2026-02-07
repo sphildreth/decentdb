@@ -1,0 +1,19 @@
+{
+  "name": "partial_index_create_crash",
+  "description": "Crash during CREATE INDEX ... WHERE should not leave partial catalog state",
+  "db_path": "$TMPDIR/decentdb_partial_index_create_crash.ddb",
+  "setup_sql": "CREATE TABLE items (id INT PRIMARY KEY, val INT); INSERT INTO items VALUES (1, NULL); INSERT INTO items VALUES (2, 10)",
+  "sql": "CREATE INDEX items_val_partial ON items (val) WHERE val IS NOT NULL",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT COUNT(*) FROM items",
+    "expect_rows": [
+      "2"
+    ]
+  }
+}

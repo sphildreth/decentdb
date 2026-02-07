@@ -4,14 +4,20 @@ import ../sql/sql
 import ../catalog/catalog
 import sets
 import strutils
+import tables
 
 type PlanKind* = enum
   pkStatement
+  pkOneRow
   pkTableScan
   pkRowidSeek
   pkIndexSeek
   pkTrigramSeek
   pkUnionDistinct
+  pkSetUnionDistinct
+  pkSetIntersect
+  pkSetExcept
+  pkAppend
   pkFilter
   pkProject
   pkJoin
@@ -87,6 +93,14 @@ proc isTrigramLikeFor(expr: Expr, table: string, alias: string, columnOut: var s
     return true
   false
 
+proc normalizeIndexExprSql(sqlText: string, table: string, alias: string): string =
+  var normalized = sqlText
+  if table.len > 0:
+    normalized = normalized.replace(table & ".", "")
+  if alias.len > 0:
+    normalized = normalized.replace(alias & ".", "")
+  normalized
+
 proc splitAnd(expr: Expr): seq[Expr] =
   if expr == nil:
     return @[]
@@ -124,6 +138,11 @@ proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
     referencedTables(expr.inExpr, tablesOut)
     for item in expr.inList:
       referencedTables(item, tablesOut)
+  of ekWindowRowNumber:
+    for part in expr.windowPartitions:
+      referencedTables(part, tablesOut)
+    for o in expr.windowOrderExprs:
+      referencedTables(o, tablesOut)
   else:
     discard
 
@@ -132,9 +151,26 @@ proc refs(expr: Expr): HashSet[string] =
   referencedTables(expr, result)
 
 proc planSelect(catalog: Catalog, stmt: Statement): Plan =
+  if stmt.setOpKind == sokUnionAll:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkAppend, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokUnion:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetUnionDistinct, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokIntersect:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetIntersect, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokExcept:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetExcept, left: leftPlan, right: rightPlan)
+
   proc hasAggregate(items: seq[SelectItem]): bool =
     for item in items:
-      if item.expr != nil and item.expr.kind == ekFunc:
+      if item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
         return true
     false
   var conjuncts = splitAnd(stmt.whereExpr)
@@ -167,6 +203,25 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         if isSome(idxOpt):
           partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
           accessIdx = i
+          break
+      if c != nil and c.kind == ekBinary and c.op == "=":
+        let leftSql = normalizeIndexExprSql(exprToCanonicalSql(c.left), stmt.fromTable, stmt.fromAlias)
+        let rightSql = normalizeIndexExprSql(exprToCanonicalSql(c.right), stmt.fromTable, stmt.fromAlias)
+        for _, idx in catalog.indexes:
+          if idx.table != stmt.fromTable or idx.kind != ikBtree or idx.columns.len != 1:
+            continue
+          if not idx.columns[0].startsWith(IndexExpressionPrefix):
+            continue
+          let idxExprSql = normalizeIndexExprSql(idx.columns[0][IndexExpressionPrefix.len .. ^1], stmt.fromTable, stmt.fromAlias)
+          if leftSql == idxExprSql and refs(c.right).len == 0:
+            partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.right)
+            accessIdx = i
+            break
+          if rightSql == idxExprSql and refs(c.left).len == 0:
+            partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.left)
+            accessIdx = i
+            break
+        if partBase != nil:
           break
 
     if partBase == nil:
@@ -291,6 +346,25 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
         accessConjunctIdx = i
         break
+    if c != nil and c.kind == ekBinary and c.op == "=":
+      let leftSql = normalizeIndexExprSql(exprToCanonicalSql(c.left), stmt.fromTable, stmt.fromAlias)
+      let rightSql = normalizeIndexExprSql(exprToCanonicalSql(c.right), stmt.fromTable, stmt.fromAlias)
+      for _, idx in catalog.indexes:
+        if idx.table != stmt.fromTable or idx.kind != ikBtree or idx.columns.len != 1:
+          continue
+        if not idx.columns[0].startsWith(IndexExpressionPrefix):
+          continue
+        let idxExprSql = normalizeIndexExprSql(idx.columns[0][IndexExpressionPrefix.len .. ^1], stmt.fromTable, stmt.fromAlias)
+        if leftSql == idxExprSql and refs(c.right).len == 0:
+          base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.right)
+          accessConjunctIdx = i
+          break
+        if rightSql == idxExprSql and refs(c.left).len == 0:
+          base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.left)
+          accessConjunctIdx = i
+          break
+      if base != nil:
+        break
   if base == nil:
     for i, c in conjuncts:
       var likeColumn = ""
@@ -312,7 +386,10 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   if accessConjunctIdx >= 0:
     conjuncts.delete(accessConjunctIdx)
   if base == nil:
-    base = Plan(kind: pkTableScan, table: stmt.fromTable, alias: stmt.fromAlias)
+    if stmt.fromTable.len == 0:
+      base = Plan(kind: pkOneRow)
+    else:
+      base = Plan(kind: pkTableScan, table: stmt.fromTable, alias: stmt.fromAlias)
 
   # Predicate pushdown: apply conjuncts as early as possible (once referenced
   # tables are available), rather than applying the full WHERE before joins.

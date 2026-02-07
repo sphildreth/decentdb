@@ -80,3 +80,5 @@ design/reviews/ACTION-PLAN.md
 testresults/
 testresults.html
 testresults.db
+
+bindings/dotnet/.idea/

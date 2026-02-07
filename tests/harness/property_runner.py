@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Property-based tests for DecentDb invariants.
+Property-based tests for DecentDB invariants.
 
 Tests that certain properties always hold regardless of the specific data or operations.
 Uses random data generation to explore the state space.
@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Optional
 
 
-class DecentDbAdapter:
-    """Adapter for running SQL against DecentDb via CLI."""
+class DecentDBAdapter:
+    """Adapter for running SQL against DecentDB via CLI."""
 
     def __init__(self, engine_path: str):
         self.engine_path = engine_path
@@ -56,7 +56,7 @@ def generate_random_int(min_val: int = -1000000, max_val: int = 1000000) -> int:
 
 
 def test_index_scan_equivalence(
-    engine: DecentDbAdapter, db_path: str, seed: int
+    engine: DecentDBAdapter, db_path: str, seed: int
 ) -> tuple[bool, str]:
     """
     Property: SELECT via index == SELECT via table scan (same results)
@@ -139,7 +139,7 @@ def test_index_scan_equivalence(
 
 
 def test_btree_ordering(
-    engine: DecentDbAdapter, db_path: str, seed: int
+    engine: DecentDBAdapter, db_path: str, seed: int
 ) -> tuple[bool, str]:
     """
     Property: BTree cursor iteration always returns sorted order.
@@ -198,7 +198,7 @@ def test_btree_ordering(
 
 
 def test_foreign_key_invariant(
-    engine: DecentDbAdapter, db_path: str, seed: int
+    engine: DecentDBAdapter, db_path: str, seed: int
 ) -> tuple[bool, str]:
     """
     Property: Foreign key constraints are never violated.
@@ -275,7 +275,7 @@ def test_foreign_key_invariant(
 
 
 def test_snapshot_isolation(
-    engine: DecentDbAdapter, db_path: str, seed: int
+    engine: DecentDBAdapter, db_path: str, seed: int
 ) -> tuple[bool, str]:
     """
     Property: Readers see consistent snapshot from transaction start.
@@ -344,7 +344,7 @@ def test_snapshot_isolation(
 
 
 def test_acid_durability_simple(
-    engine: DecentDbAdapter, db_path: str, seed: int
+    engine: DecentDBAdapter, db_path: str, seed: int
 ) -> tuple[bool, str]:
     """
     Property: Committed data persists after reopen.
@@ -389,7 +389,7 @@ def test_acid_durability_simple(
 
 
 def test_view_equivalence(
-    engine: DecentDbAdapter, db_path: str, seed: int
+    engine: DecentDBAdapter, db_path: str, seed: int
 ) -> tuple[bool, str]:
     """
     Property: SELECT from a simple view matches the inlined SELECT.
@@ -454,7 +454,7 @@ def test_view_equivalence(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Property-based tests for DecentDb")
+    parser = argparse.ArgumentParser(description="Property-based tests for DecentDB")
     parser.add_argument(
         "--engine", required=True, help="Path to decentdb CLI executable"
     )
@@ -473,7 +473,7 @@ def main() -> int:
     args = parser.parse_args()
 
     # Initialize
-    engine = DecentDbAdapter(args.engine)
+    engine = DecentDBAdapter(args.engine)
 
     if args.seed:
         random.seed(args.seed)

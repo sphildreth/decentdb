@@ -1,6 +1,6 @@
 # SQL Reference
 
-DecentDb supports a PostgreSQL-like SQL subset.
+DecentDB supports a PostgreSQL-like SQL subset.
 
 See also: [Comparison: DecentDB vs SQLite vs DuckDB](comparison.md)
 
@@ -22,7 +22,8 @@ CREATE TABLE users (
     id INT PRIMARY KEY,
     name TEXT NOT NULL,
     email TEXT UNIQUE,
-    created_at INT
+    created_at INT,
+    CHECK (name IS NULL OR LENGTH(name) > 0)
 );
 ```
 
@@ -37,7 +38,22 @@ CREATE INDEX index_name ON table_name USING trigram(column_name);
 
 -- Unique index
 CREATE UNIQUE INDEX index_name ON table_name(column_name);
+
+-- Partial index (v0 subset)
+CREATE INDEX index_name ON table_name(column_name) WHERE column_name IS NOT NULL;
+
+-- Expression index (v0 subset)
+CREATE INDEX index_name ON table_name((LOWER(column_name)));
 ```
+
+Notes:
+- Partial indexes are currently limited to single-column BTREE indexes with predicate form `column IS NOT NULL`.
+- `UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, and arbitrary partial predicates are not supported in 0.x.
+- Expression indexes are currently limited to single-expression BTREE indexes with deterministic expressions:
+  - column reference
+  - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
+  - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
+- `UNIQUE` expression indexes, partial expression indexes, and multi-expression index keys are not supported in 0.x.
 
 ### DROP TABLE / DROP INDEX
 
@@ -85,10 +101,75 @@ Example:
 ALTER TABLE users DROP COLUMN age;
 ```
 
+#### Rename Column
+
+```sql
+ALTER TABLE table_name RENAME COLUMN old_column_name TO new_column_name;
+```
+
+Renames a column in table metadata. This operation also updates index and foreign-key metadata that reference the renamed column.
+
+Example:
+```sql
+ALTER TABLE users RENAME COLUMN name TO full_name;
+```
+
+#### Alter Column Type
+
+```sql
+ALTER TABLE table_name ALTER COLUMN column_name TYPE new_datatype;
+```
+
+Changes the type of an existing column by rewriting table rows and rebuilding indexes on the table.
+
+Example:
+```sql
+ALTER TABLE users ALTER COLUMN age TYPE TEXT;
+```
+
 **Notes:**
-- `ADD COLUMN` and `DROP COLUMN` are the only supported operations in v1.0.0
-- Advanced operations like `RENAME COLUMN`, `MODIFY COLUMN` (type changes), and `ADD CONSTRAINT` are planned for future releases
+- Supported `ALTER TABLE` operations in v1.0.0: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
+- `ALTER TABLE` operations are currently rejected for tables that define `CHECK` constraints
+- `ALTER TABLE` operations are currently rejected for tables that define expression indexes
+- `RENAME COLUMN` is rejected when dependent views exist
+- `ALTER COLUMN TYPE` currently supports only `INT64`, `FLOAT64`, `TEXT`, and `BOOL`
+- `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
+- `ADD CONSTRAINT` is planned for future releases
 - Schema changes require an exclusive lock on the database
+
+### CREATE TRIGGER / DROP TRIGGER
+
+```sql
+CREATE TRIGGER trigger_name
+AFTER INSERT OR UPDATE OR DELETE ON table_name
+FOR EACH ROW
+EXECUTE FUNCTION decentdb_exec_sql('single_dml_sql');
+
+CREATE TRIGGER trigger_name
+INSTEAD OF INSERT OR UPDATE OR DELETE ON view_name
+FOR EACH ROW
+EXECUTE FUNCTION decentdb_exec_sql('single_dml_sql');
+
+DROP TRIGGER [IF EXISTS] trigger_name ON object_name;
+```
+
+Example:
+```sql
+CREATE TABLE audit (tag TEXT);
+CREATE TRIGGER users_ins_audit
+AFTER INSERT ON users
+FOR EACH ROW
+EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(tag) VALUES (''I'')');
+```
+
+**Notes:**
+- v0 trigger support is intentionally narrow:
+  - timing: `AFTER` (tables) and `INSTEAD OF` (views)
+  - events: `INSERT`, `UPDATE`, `DELETE`
+  - scope: `FOR EACH ROW` only
+- Trigger action SQL must be exactly one DML statement (`INSERT`, `UPDATE`, or `DELETE`) and cannot use parameters.
+- Trigger actions do not support `NEW`/`OLD` row references in 0.x.
+- View DML without a matching `INSTEAD OF` trigger remains read-only.
 
 ## Data Manipulation Language (DML)
 
@@ -97,7 +178,25 @@ ALTER TABLE users DROP COLUMN age;
 ```sql
 INSERT INTO table_name VALUES (val1, val2, ...);
 INSERT INTO table_name (col1, col2) VALUES (val1, val2);
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT DO NOTHING;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO NOTHING;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO NOTHING;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT (col1, col2) DO UPDATE SET col3 = EXCLUDED.col3;
+INSERT INTO table_name (...) VALUES (...) ON CONFLICT ON CONSTRAINT constraint_name DO UPDATE SET col3 = EXCLUDED.col3 WHERE table_name.col4 > 0;
+INSERT INTO table_name (...) VALUES (...) RETURNING *;
+INSERT INTO table_name (...) VALUES (...) RETURNING col1, col2;
 ```
+
+Notes:
+- `ON CONFLICT ... DO NOTHING` is supported.
+- `ON CONSTRAINT name` resolves against DecentDB unique index names.
+- `ON CONFLICT ... DO UPDATE` is supported with explicit conflict target (`(cols)` or `ON CONSTRAINT name`).
+- In `DO UPDATE` expressions, unqualified columns resolve to the target table; `EXCLUDED.col` is supported.
+- Targetless `ON CONFLICT DO UPDATE` is not yet supported.
+- `INSERT ... RETURNING` is supported.
+- `CHECK` constraints are enforced on `INSERT` and `UPDATE` (including `ON CONFLICT ... DO UPDATE`).
+- CHECK fails only when the predicate is `FALSE`; `TRUE` and `NULL` pass.
+- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not yet supported.
 
 ### SELECT
 
@@ -106,6 +205,7 @@ SELECT * FROM table_name;
 SELECT col1, col2 FROM table_name WHERE condition;
 SELECT * FROM table_name ORDER BY col1 ASC, col2 DESC;
 SELECT * FROM table_name LIMIT 10 OFFSET 20;
+SELECT id FROM a UNION ALL SELECT id FROM b;
 ```
 
 ### UPDATE
@@ -130,12 +230,83 @@ Supports:
 - Pattern matching: `LIKE`, `ILIKE`
 - Null checks: `IS NULL`, `IS NOT NULL`
 - IN operator: `col IN (val1, val2, ...)`
+- Range predicates: `BETWEEN`, `NOT BETWEEN`
+- Existence predicates: `EXISTS (SELECT ...)` (non-correlated)
+- String concatenation: `lhs || rhs`
+
+NULL handling follows SQL three-valued logic:
+- Comparisons with `NULL` evaluate to `NULL` (unknown), not `TRUE` or `FALSE`
+- `NOT NULL` is `NULL`
+- In `WHERE`, only `TRUE` keeps a row (`FALSE` and `NULL` are both filtered out)
 
 ```sql
 SELECT * FROM users WHERE age > 18 AND name LIKE '%son%';
 SELECT * FROM users WHERE email IS NOT NULL;
 SELECT * FROM users WHERE id IN (1, 2, 3);
+SELECT * FROM users WHERE age BETWEEN 18 AND 30;
+SELECT * FROM users WHERE name LIKE 'a\_%' ESCAPE '\';
 ```
+
+### Scalar Functions
+
+Supported scalar functions:
+- `COALESCE`
+- `NULLIF`
+- `LENGTH`
+- `LOWER`
+- `UPPER`
+- `TRIM`
+- `GEN_RANDOM_UUID`
+- `UUID_PARSE`
+- `UUID_TO_STRING`
+- `CAST(expr AS type)` for `INT/INTEGER/INT64`, `FLOAT/FLOAT64/REAL`, `DECIMAL/NUMERIC`, `TEXT`, `BOOL/BOOLEAN`, `UUID`
+- `CASE WHEN ... THEN ... ELSE ... END` and `CASE expr WHEN ... THEN ... ELSE ... END`
+
+```sql
+SELECT COALESCE(nickname, name) FROM users;
+SELECT NULLIF(status, 'active') FROM users;
+SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name) FROM users;
+SELECT GEN_RANDOM_UUID();
+SELECT UUID_TO_STRING(id) FROM users;
+SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID);
+SELECT TRIM(name) || '_suffix' FROM users;
+SELECT CAST(id AS TEXT) FROM users;
+SELECT CAST('12.34' AS DECIMAL(10,2));
+SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
+```
+
+### Common Table Expressions (CTE)
+
+Supported CTE subset:
+- Non-recursive `WITH ...` on `SELECT`
+- Multiple CTEs in declaration order (`a`, then `b` may reference `a`)
+- Optional CTE output column list (`WITH cte(col1, ...) AS (...)`)
+
+Current limits:
+- `WITH RECURSIVE` is not supported
+- CTE bodies cannot contain `GROUP BY`/`HAVING`, `ORDER BY`, or `LIMIT/OFFSET` in 0.x
+
+```sql
+WITH recent AS (
+  SELECT id, name FROM users WHERE id > 10
+)
+SELECT name FROM recent ORDER BY id;
+
+WITH a AS (SELECT id FROM users), b(x) AS (SELECT id FROM a WHERE id > 1)
+SELECT x FROM b ORDER BY x;
+```
+
+### Set Operations
+
+Supported:
+- `UNION ALL`
+- `UNION`
+- `INTERSECT`
+- `EXCEPT`
+
+Not yet supported:
+- `INTERSECT ALL`
+- `EXCEPT ALL`
 
 ### JOINs
 
@@ -159,6 +330,23 @@ SELECT category, SUM(amount) FROM orders GROUP BY category;
 SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 5;
 ```
 
+### Window Functions
+
+Supported window subset:
+- `ROW_NUMBER() OVER (...)`
+- `PARTITION BY` is optional
+- `ORDER BY` inside `OVER (...)` is required in 0.x
+
+```sql
+SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn
+FROM t
+ORDER BY id;
+```
+
+Current limits:
+- Only `ROW_NUMBER()` is supported.
+- Window expressions are supported only in `SELECT` projection items.
+
 ### Transactions
 
 ```sql
@@ -171,6 +359,14 @@ BEGIN;
 -- ... your operations ...
 ROLLBACK;
 ```
+
+### Explain
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 1;
+```
+
+Produces a text-based query execution plan.
 
 ## Constraints
 
@@ -188,10 +384,15 @@ CREATE TABLE users (
 ```sql
 CREATE TABLE orders (
     id INT PRIMARY KEY,
-    user_id INT REFERENCES users(id),
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
     ...
 );
 ```
+
+Notes:
+- Supported `ON DELETE` actions: `NO ACTION`/`RESTRICT`, `CASCADE`, `SET NULL`.
+- Supported `ON UPDATE` actions: `NO ACTION`/`RESTRICT`, `CASCADE`, `SET NULL`.
+- `ON DELETE SET NULL` and `ON UPDATE SET NULL` require the child FK column to be nullable.
 
 ### Unique
 
@@ -229,10 +430,9 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 ## Unsupported Features
 
 Not currently supported:
-- Subqueries in SELECT
-- Window functions
-- Common Table Expressions (CTE)
-- Views
+- Correlated subqueries in SELECT
+- Advanced window functions beyond `ROW_NUMBER()` (for example `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
+- Recursive CTEs (`WITH RECURSIVE`)
 - Stored procedures
 
 See [Known Limitations](../about/changelog.md#known-limitations) for details.

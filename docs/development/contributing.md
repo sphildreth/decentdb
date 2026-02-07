@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for your interest in contributing to DecentDb!
+Thank you for your interest in contributing to DecentDB!
 
 ## Ways to Contribute
 
@@ -203,7 +203,7 @@ proc calculatePageUtilization*(tree: BTree, pageId: PageId): Result[float]
 ### Bug Reports
 
 Include:
-- DecentDb version
+- DecentDB version
 - Operating system
 - Steps to reproduce
 - Expected vs actual behavior
@@ -331,4 +331,4 @@ Contributors will be:
 - Open a discussion
 - Ask in a PR comment
 
-Thank you for contributing to DecentDb!
+Thank you for contributing to DecentDB!

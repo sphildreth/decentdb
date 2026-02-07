@@ -18,7 +18,7 @@ git clone https://github.com/sphildreth/decentdb.git
 cd decentdb
 ```
 
-### 3. Build DecentDb
+### 3. Build DecentDB
 
 ```bash
 nimble build

@@ -1,0 +1,19 @@
+{
+  "name": "add_column_crash",
+  "description": "Crash during ALTER TABLE ADD COLUMN should not leave partial catalog state",
+  "db_path": "$TMPDIR/decentdb_add_column_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY, a INT); INSERT INTO t VALUES (1, 10)",
+  "sql": "ALTER TABLE t ADD COLUMN b INT",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT * FROM t ORDER BY id",
+    "expect_rows": [
+      "1|10"
+    ]
+  }
+}

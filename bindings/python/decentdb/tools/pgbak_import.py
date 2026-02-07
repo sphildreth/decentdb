@@ -128,9 +128,16 @@ def _map_pg_type_to_decentdb(pg_type: str) -> str:
     if base_type in ("real", "float4", "double precision", "float8", "float"):
         return "FLOAT64"
 
-    # Numeric/Decimal - store as TEXT to preserve precision
+    # Numeric/Decimal - store as DECIMAL
     if base_type in ("numeric", "decimal"):
-        return "TEXT"
+        # If original type string has modifiers, use them
+        if "(" in t:
+            return t.upper().replace("NUMERIC", "DECIMAL")
+        return "DECIMAL(18,6)"
+
+    # UUID
+    if base_type in ("uuid",):
+        return "UUID"
 
     # Binary data
     if base_type in ("bytea",):
@@ -973,7 +980,23 @@ def _copy_table_data(
 
     dst_cols = [c[1] for c in col_mapping]
     cols_sql = ", ".join(_quote_ident(c) for c in dst_cols)
-    placeholders = ", ".join(["?"] * len(dst_cols))
+    
+    col_dict = {c.name: c for c in table.columns}
+    placeholders_list = []
+    for src_col, _ in col_mapping:
+        col = col_dict.get(src_col)
+        if col:
+            decent_type = _map_pg_type_to_decentdb(col.pg_type)
+            if decent_type.startswith("DECIMAL"):
+                 placeholders_list.append(f"CAST(? AS {decent_type})")
+            elif decent_type == "UUID":
+                 placeholders_list.append("CAST(? AS UUID)")
+            else:
+                 placeholders_list.append("?")
+        else:
+             placeholders_list.append("?")
+             
+    placeholders = ", ".join(placeholders_list)
     insert_sql = (
         f"INSERT INTO {_quote_ident(dst_table)} ({cols_sql}) VALUES ({placeholders})"
     )

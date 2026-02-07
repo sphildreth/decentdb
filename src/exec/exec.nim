@@ -8,8 +8,11 @@ import sets
 import hashes
 import std/monotimes
 import std/times
+import std/math
+import std/sysrand
 import ../errors
 import ../sql/sql
+import ../sql/binder
 import ../catalog/catalog
 import ../record/record
 import ../pager/pager
@@ -31,6 +34,108 @@ type RowCursor* = ref object
   columns*: seq[string]
   nextFn: proc(): Result[Option[Row]] {.closure.}
 
+var gEvalContextDepth {.threadvar.}: int
+var gEvalPager {.threadvar.}: Pager
+var gEvalCatalog {.threadvar.}: Catalog
+
+proc decimalToString(val: int64, scale: uint8): string =
+  var s = $val
+  if scale == 0: return s
+  let sign = if val < 0: "-" else: ""
+  var absVal = if val < 0: s[1..^1] else: s
+  
+  if absVal.len <= int(scale):
+    let padding = repeat('0', int(scale) - absVal.len)
+    result = sign & "0." & padding & absVal
+  else:
+    let dotPos = absVal.len - int(scale)
+    result = sign & absVal[0 ..< dotPos] & "." & absVal[dotPos ..^ 1]
+
+proc uuidToString(bytes: seq[byte]): string =
+  if bytes.len != 16: return ""
+  var s = newStringOfCap(36)
+  let hexChars = "0123456789abcdef"
+  for i, b in bytes:
+    if i == 4 or i == 6 or i == 8 or i == 10:
+      s.add('-')
+    s.add(hexChars[int(b shr 4)])
+    s.add(hexChars[int(b and 0x0F)])
+  s
+
+proc parseUuid*(text: string): Result[seq[byte]] =
+  var s = text.strip().toLowerAscii()
+  if s.startsWith("{") and s.endsWith("}"):
+    s = s[1 .. ^2]
+  s = s.replace("-", "")
+  if s.len != 32:
+    return err[seq[byte]](ERR_SQL, "Invalid UUID format")
+  var bytes = newSeq[byte](16)
+  for i in 0 ..< 16:
+    var val = 0
+    for j in 0 .. 1:
+      let c = s[i * 2 + j]
+      var digit = 0
+      if c >= '0' and c <= '9': digit = ord(c) - ord('0')
+      elif c >= 'a' and c <= 'f': digit = ord(c) - ord('a') + 10
+      else: return err[seq[byte]](ERR_SQL, "Invalid UUID character")
+      val = (val shl 4) or digit
+    bytes[i] = byte(val)
+  ok(bytes)
+
+proc scaleDecimal*(val: int64, oldScale: uint8, newScale: uint8): Result[int64] =
+  if newScale == oldScale: return ok(val)
+  if newScale > oldScale:
+    let diff = newScale - oldScale
+    if diff > 18: return err[int64](ERR_SQL, "Scale difference too large")
+    var mult: int64 = 1
+    for _ in 1 .. int(diff): mult *= 10
+    if val > 0 and val > (high(int64) div mult): return err[int64](ERR_SQL, "Decimal overflow")
+    if val < 0 and val < (low(int64) div mult): return err[int64](ERR_SQL, "Decimal overflow")
+    ok(val * mult)
+  else:
+    let diff = oldScale - newScale
+    var divi: int64 = 1
+    for _ in 1 .. int(diff): divi *= 10
+    let rem = val mod divi
+    var res = val div divi
+    if abs(rem) * 2 >= divi:
+      if val > 0: res.inc
+      else: res.dec
+    ok(res)
+
+proc compareDecimals(a: Value, b: Value): int =
+  var s1 = a.decimalScale
+  var s2 = b.decimalScale
+  var v1 = a.int64Val
+  var v2 = b.int64Val
+  
+  if s1 == s2:
+    return cmp(v1, v2)
+    
+  if s1 < s2:
+    let diff = s2 - s1
+    var mult: int64 = 1
+    var overflow = false
+    for _ in 1 .. int(diff):
+      if mult > high(int64) div 10:
+        overflow = true
+        break
+      mult *= 10
+    
+    if not overflow:
+       if v1 > 0:
+         if v1 > high(int64) div mult: return 1
+       elif v1 < 0:
+         if v1 < low(int64) div mult: return -1
+       
+       return cmp(v1 * mult, v2)
+    else:
+       if v1 > 0: return 1
+       if v1 < 0: return -1
+       return cmp(0, v2)
+  else:
+     return -compareDecimals(b, a)
+
 proc valueToString*(value: Value): string =
   case value.kind
   of vkNull: "NULL"
@@ -41,6 +146,7 @@ proc valueToString*(value: Value): string =
       "false"
   of vkInt64: $value.int64Val
   of vkFloat64: $value.float64Val
+  of vkDecimal: decimalToString(value.int64Val, value.decimalScale)
   of vkText, vkBlob:
     let n = value.bytes.len
     var s = newString(n)
@@ -54,13 +160,28 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
   template norm(ch: char): char =
     (if caseInsensitive: toUpperAscii(ch) else: ch)
 
+  proc tokenAt(patternText: string, idx: int): tuple[kind: int, literal: char, nextIdx: int] =
+    ## kind: 0=literal, 1=single wildcard '_', 2=multi wildcard '%', 3=end
+    if idx >= patternText.len:
+      return (3, '\0', idx)
+    let ch = patternText[idx]
+    if ch == '\\':
+      if idx + 1 < patternText.len:
+        return (0, patternText[idx + 1], idx + 2)
+      return (0, '\\', idx + 1)
+    if ch == '_':
+      return (1, '\0', idx + 1)
+    if ch == '%':
+      return (2, '\0', idx + 1)
+    (0, ch, idx + 1)
+
   # Fast paths for common patterns.
   # These avoid the general wildcard matcher for the important cases:
   # - '%needle%'
   # - 'prefix%'
   # - '%suffix'
   # Only enabled when there are no '_' wildcards.
-  if pattern.find('_') < 0:
+  if pattern.find('\\') < 0 and pattern.find('_') < 0:
     if not caseInsensitive:
       # '%needle%'
       if pattern.len >= 2 and pattern[0] == '%' and pattern[^1] == '%':
@@ -83,27 +204,37 @@ proc likeMatch*(text: string, pattern: string, caseInsensitive: bool): bool =
         if suffix.len == 0:
           return true
         return text.endsWith(suffix)
-  var i = 0
-  var j = 0
-  var star = -1
-  var match = 0
+  var i = 0 # text index
+  var j = 0 # pattern raw index
+  var star = -1 # raw index of last '%'
+  var match = 0 # text index matched by last '%'
   while i < text.len:
-    if j < pattern.len and (pattern[j] == '_' or norm(pattern[j]) == norm(text[i])):
+    let tok = tokenAt(pattern, j)
+    if tok.kind == 0 and norm(tok.literal) == norm(text[i]):
       i.inc
-      j.inc
-    elif j < pattern.len and pattern[j] == '%':
+      j = tok.nextIdx
+    elif tok.kind == 1:
+      i.inc
+      j = tok.nextIdx
+    elif tok.kind == 2:
       star = j
-      j.inc
+      j = tok.nextIdx
       match = i
     elif star != -1:
-      j = star + 1
+      let starTok = tokenAt(pattern, star)
+      j = starTok.nextIdx
       match.inc
       i = match
     else:
       return false
-  while j < pattern.len and pattern[j] == '%':
-    j.inc
-  j == pattern.len
+  while true:
+    let tok = tokenAt(pattern, j)
+    if tok.kind == 2:
+      j = tok.nextIdx
+    elif tok.kind == 3:
+      return true
+    else:
+      return false
 
 const MaxLikePatternLen* = 4096
 const MaxLikeWildcards* = 128
@@ -114,9 +245,17 @@ proc likeMatchChecked*(text: string, pattern: string, caseInsensitive: bool): Re
     return err[bool](ERR_SQL, "LIKE pattern too long", "len=" & $pattern.len)
   # Count wildcards to prevent excessive backtracking
   var wildcardCount = 0
-  for ch in pattern:
-    if ch == '%':
+  var idx = 0
+  while idx < pattern.len:
+    if pattern[idx] == '\\':
+      if idx + 1 < pattern.len:
+        idx += 2
+      else:
+        idx.inc
+      continue
+    if pattern[idx] == '%':
       wildcardCount.inc
+    idx.inc
   if wildcardCount > MaxLikeWildcards:
     return err[bool](ERR_SQL, "LIKE pattern has too many wildcards", "count=" & $wildcardCount)
   ok(likeMatch(text, pattern, caseInsensitive))
@@ -132,7 +271,7 @@ type BmhSkipTable = array[256, int]
 proc parseLikePattern(pattern: string, caseInsensitive: bool): (LikeMode, string) =
   ## Extract a simple LIKE pattern into a fast match mode when possible.
   ## Returns (mode, needleText). For lmGeneric, needleText is unused.
-  if pattern.find('_') >= 0:
+  if pattern.find('_') >= 0 or pattern.find('\\') >= 0:
     return (lmGeneric, "")
 
   # For now, only optimize the case-sensitive common forms.
@@ -649,6 +788,16 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     ok(c)
 
   case plan.kind
+  of pkOneRow:
+    var done = false
+    let c = RowCursor(
+      columns: @[],
+      nextFn: proc(): Result[Option[Row]] =
+        if done: return ok(none(Row))
+        done = true
+        ok(some(makeRow(@[], @[], 0)))
+    )
+    ok(c)
   of pkTableScan:
     let tableRes = catalog.getTable(plan.table)
     if not tableRes.ok:
@@ -870,7 +1019,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
-  of pkTrigramSeek, pkUnionDistinct, pkJoin, pkSort, pkAggregate, pkStatement:
+  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetExcept, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement:
     materialize()
 
 proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
@@ -931,6 +1080,8 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     ok(count)
 
   case plan.kind
+  of pkOneRow:
+    return ok(some(1'i64))
   of pkProject:
     # Projection does not affect row count.
     return tryCountNoRowsFast(pager, catalog, plan.left, params)
@@ -1188,6 +1339,9 @@ proc estimateRowBytes*(row: Row): int =
       payloadLen = value.bytes.len
     of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
       payloadLen = 8
+    of vkDecimal:
+      # Encoded as 1-byte scale + varint(zigzag(int64)).
+      payloadLen = 1 + varintLen(cast[uint64](value.int64Val))
     result += varintLen(uint64(payloadLen)) + payloadLen
 
 proc columnIndex*(row: Row, table: string, name: string): Result[int] =
@@ -1220,6 +1374,127 @@ proc evalLiteral(value: SqlValue): Value =
     Value(kind: vkText, bytes: bytes)
   of svParam: Value(kind: vkNull)
 
+proc textValue(text: string): Value =
+  var bytes: seq[byte] = @[]
+  for ch in text:
+    bytes.add(byte(ch))
+  Value(kind: vkText, bytes: bytes)
+
+proc normalizeLikeEscapePattern(pattern: string, escapeText: string): Result[string] =
+  var escapeChar = '\0'
+  if escapeText.len == 1:
+    escapeChar = escapeText[0]
+  elif escapeText.len == 2 and escapeText[0] == escapeText[1]:
+    # libpg_query/json escaping can surface "\" as "\\"
+    escapeChar = escapeText[0]
+  else:
+    return err[string](ERR_SQL, "LIKE ESCAPE must be a single character")
+  let esc = escapeChar
+  var i = 0
+  var normalized = ""
+  while i < pattern.len:
+    let ch = pattern[i]
+    if ch == esc:
+      if i + 1 >= pattern.len:
+        return err[string](ERR_SQL, "LIKE pattern ends with escape character")
+      let nextCh = pattern[i + 1]
+      if nextCh == '%' or nextCh == '_' or nextCh == '\\':
+        normalized.add('\\')
+      normalized.add(nextCh)
+      i += 2
+      continue
+    if ch == '\\':
+      normalized.add("\\\\")
+    else:
+      normalized.add(ch)
+    i.inc
+  ok(normalized)
+
+proc canonicalCastType(typeName: string): string =
+  let t = typeName.strip().toUpperAscii()
+  if t in ["INT", "INTEGER", "INT64"]:
+    return "INT64"
+  if t in ["FLOAT", "FLOAT64", "REAL"]:
+    return "FLOAT64"
+  if t in ["TEXT"]:
+    return "TEXT"
+  if t in ["BOOL", "BOOLEAN"]:
+    return "BOOL"
+  ""
+
+proc castValue(value: Value, targetTypeRaw: string): Result[Value] =
+  let targetType = canonicalCastType(targetTypeRaw)
+  if targetType.len == 0:
+    return err[Value](ERR_SQL, "Unsupported CAST target type", targetTypeRaw)
+  if value.kind == vkNull:
+    return ok(Value(kind: vkNull))
+
+  case targetType
+  of "INT64":
+    case value.kind
+    of vkInt64:
+      return ok(value)
+    of vkDecimal:
+      var v = value.int64Val
+      for _ in 1 .. int(value.decimalScale): v = v div 10
+      return ok(Value(kind: vkInt64, int64Val: v))
+    of vkFloat64:
+      return ok(Value(kind: vkInt64, int64Val: int64(value.float64Val)))
+    of vkBool:
+      return ok(Value(kind: vkInt64, int64Val: (if value.boolVal: 1 else: 0)))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToString(value).strip()
+      try:
+        let parsed = parseBiggestInt(s)
+        return ok(Value(kind: vkInt64, int64Val: int64(parsed)))
+      except ValueError:
+        return err[Value](ERR_SQL, "Invalid CAST text-to-int value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported CAST source type")
+  of "FLOAT64":
+    case value.kind
+    of vkFloat64:
+      return ok(value)
+    of vkDecimal:
+      var f = float64(value.int64Val)
+      for _ in 1 .. int(value.decimalScale): f /= 10.0
+      return ok(Value(kind: vkFloat64, float64Val: f))
+    of vkInt64:
+      return ok(Value(kind: vkFloat64, float64Val: float64(value.int64Val)))
+    of vkBool:
+      return ok(Value(kind: vkFloat64, float64Val: (if value.boolVal: 1.0 else: 0.0)))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToString(value).strip()
+      try:
+        return ok(Value(kind: vkFloat64, float64Val: parseFloat(s)))
+      except ValueError:
+        return err[Value](ERR_SQL, "Invalid CAST text-to-float value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported CAST source type")
+  of "TEXT":
+    return ok(textValue(valueToString(value)))
+  of "BOOL":
+    case value.kind
+    of vkBool:
+      return ok(value)
+    of vkDecimal:
+      return ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
+    of vkInt64:
+      return ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
+    of vkFloat64:
+      return ok(Value(kind: vkBool, boolVal: value.float64Val != 0.0))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToString(value).strip().toLowerAscii()
+      if s in ["true", "t", "1"]:
+        return ok(Value(kind: vkBool, boolVal: true))
+      if s in ["false", "f", "0"]:
+        return ok(Value(kind: vkBool, boolVal: false))
+      return err[Value](ERR_SQL, "Invalid CAST text-to-bool value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported CAST source type")
+  else:
+    return err[Value](ERR_SQL, "Unsupported CAST target type", targetTypeRaw)
+
 proc valueToBool*(value: Value): bool =
   case value.kind
   of vkBool: value.boolVal
@@ -1227,6 +1502,51 @@ proc valueToBool*(value: Value): bool =
   of vkFloat64: value.float64Val != 0.0
   of vkText, vkBlob, vkTextCompressed, vkBlobCompressed: value.bytes.len > 0
   else: false
+
+type TruthValue = enum
+  tvFalse
+  tvTrue
+  tvUnknown
+
+proc toTruthValue(value: Value): TruthValue =
+  if value.kind == vkNull:
+    return tvUnknown
+  if valueToBool(value):
+    tvTrue
+  else:
+    tvFalse
+
+proc fromTruthValue(value: TruthValue): Value =
+  case value
+  of tvTrue:
+    Value(kind: vkBool, boolVal: true)
+  of tvFalse:
+    Value(kind: vkBool, boolVal: false)
+  of tvUnknown:
+    Value(kind: vkNull)
+
+proc truthNot(value: TruthValue): TruthValue =
+  case value
+  of tvTrue:
+    tvFalse
+  of tvFalse:
+    tvTrue
+  of tvUnknown:
+    tvUnknown
+
+proc truthAnd(left: TruthValue, right: TruthValue): TruthValue =
+  if left == tvFalse or right == tvFalse:
+    return tvFalse
+  if left == tvUnknown or right == tvUnknown:
+    return tvUnknown
+  tvTrue
+
+proc truthOr(left: TruthValue, right: TruthValue): TruthValue =
+  if left == tvTrue or right == tvTrue:
+    return tvTrue
+  if left == tvUnknown or right == tvUnknown:
+    return tvUnknown
+  tvFalse
 
 proc compareValues*(a: Value, b: Value): int =
   if a.kind != b.kind:
@@ -1236,6 +1556,7 @@ proc compareValues*(a: Value, b: Value): int =
   of vkBool: cmp(a.boolVal, b.boolVal)
   of vkInt64: cmp(a.int64Val, b.int64Val)
   of vkFloat64: cmp(a.float64Val, b.float64Val)
+  of vkDecimal: compareDecimals(a, b)
   of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
     var lenA = a.bytes.len
     var lenB = b.bytes.len
@@ -1255,6 +1576,9 @@ proc hash*(v: Value): Hash =
   of vkBool: h = h !& hash(v.boolVal)
   of vkInt64: h = h !& hash(v.int64Val)
   of vkFloat64: h = h !& hash(v.float64Val)
+  of vkDecimal:
+    h = h !& hash(v.int64Val)
+    h = h !& hash(v.decimalScale)
   of vkText, vkBlob, vkTextCompressed, vkBlobCompressed, 
      vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
      h = h !& hash(v.bytes)
@@ -1269,10 +1593,14 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
   of ekLiteral:
     return ok(evalLiteral(expr.value))
   of ekParam:
+    when defined(decentdbDebugLogging):
+      echo "DEBUG ekParam: " & $expr.index
     if expr.index <= 0 or expr.index > params.len:
       return err[Value](ERR_SQL, "Missing parameter", $expr.index)
     return ok(params[expr.index - 1])
   of ekColumn:
+    when defined(decentdbDebugLogging):
+      echo "DEBUG ekColumn: " & expr.name
     if expr.table.len == 0:
       let lower = expr.name.toLowerAscii()
       if lower == "true": return ok(Value(kind: vkBool, boolVal: true))
@@ -1286,7 +1614,7 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     if not innerRes.ok:
       return err[Value](innerRes.err.code, innerRes.err.message, innerRes.err.context)
     if expr.unOp == "NOT":
-      return ok(Value(kind: vkBool, boolVal: not valueToBool(innerRes.value)))
+      return ok(fromTruthValue(truthNot(toTruthValue(innerRes.value))))
     return innerRes
   of ekBinary:
     let leftRes = evalExpr(row, expr.left, params)
@@ -1297,26 +1625,91 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return err[Value](rightRes.err.code, rightRes.err.message, rightRes.err.context)
     case expr.op
     of "AND":
-      return ok(Value(kind: vkBool, boolVal: valueToBool(leftRes.value) and valueToBool(rightRes.value)))
+      return ok(fromTruthValue(truthAnd(toTruthValue(leftRes.value), toTruthValue(rightRes.value))))
     of "OR":
-      return ok(Value(kind: vkBool, boolVal: valueToBool(leftRes.value) or valueToBool(rightRes.value)))
+      return ok(fromTruthValue(truthOr(toTruthValue(leftRes.value), toTruthValue(rightRes.value))))
     of "=":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) == 0))
     of "!=":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) != 0))
     of "<":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) < 0))
     of "<=":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) <= 0))
     of ">":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) > 0))
     of ">=":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       return ok(Value(kind: vkBool, boolVal: compareValues(leftRes.value, rightRes.value) >= 0))
+    of "||":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      return ok(textValue(valueToString(leftRes.value) & valueToString(rightRes.value)))
     of "+", "-", "*", "/":
       if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
-      if leftRes.value.kind notin {vkInt64, vkFloat64} or rightRes.value.kind notin {vkInt64, vkFloat64}:
+
+      let allowed = {vkInt64, vkFloat64, vkDecimal}
+      if leftRes.value.kind notin allowed or rightRes.value.kind notin allowed:
         return err[Value](ERR_SQL, "Numeric operator on non-numeric", expr.op)
+
+      if leftRes.value.kind == vkDecimal or rightRes.value.kind == vkDecimal:
+         var v1 = leftRes.value
+         var v2 = rightRes.value
+         if v1.kind == vkInt64: v1 = Value(kind: vkDecimal, int64Val: v1.int64Val, decimalScale: 0)
+         if v2.kind == vkInt64: v2 = Value(kind: vkDecimal, int64Val: v2.int64Val, decimalScale: 0)
+         
+         if v1.kind == vkFloat64 or v2.kind == vkFloat64:
+             return err[Value](ERR_SQL, "Cannot mix DECIMAL and FLOAT64 (explicit cast required)")
+             
+         let s1 = v1.decimalScale
+         let s2 = v2.decimalScale
+         case expr.op
+         of "+", "-":
+           let s = max(s1, s2)
+           let r1 = scaleDecimal(v1.int64Val, s1, s)
+           let r2 = scaleDecimal(v2.int64Val, s2, s)
+           if not r1.ok: return err[Value](r1.err.code, r1.err.message, r1.err.context)
+           if not r2.ok: return err[Value](r2.err.code, r2.err.message, r2.err.context)
+           let res = if expr.op == "+": r1.value + r2.value else: r1.value - r2.value
+           return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         of "*":
+           let s = s1 + s2
+           if s > 18: return err[Value](ERR_SQL, "Result scale > 18")
+           let res = v1.int64Val * v2.int64Val
+           return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         of "/":
+           if v2.int64Val == 0: return err[Value](ERR_SQL, "Division by zero")
+           let s = max(s1, s2)
+           let power = int(s2) + int(s) - int(s1)
+           var num = v1.int64Val
+           if power > 0:
+             var mult: int64 = 1
+             for _ in 1 .. power: mult *= 10
+             num *= mult
+           
+           let rem = num mod v2.int64Val
+           var res = num div v2.int64Val
+           if abs(rem) * 2 >= abs(v2.int64Val):
+              if (res >= 0 and v2.int64Val > 0) or (res <= 0 and v2.int64Val < 0):
+                  if res >= 0: res.inc else: res.dec
+              else:
+                  if res >= 0: res.inc else: res.dec
+           return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         else:
+           return err[Value](ERR_SQL, "Unsupported operator", expr.op)
+
       if leftRes.value.kind == vkFloat64 or rightRes.value.kind == vkFloat64:
         let l = if leftRes.value.kind == vkFloat64: leftRes.value.float64Val else: float64(leftRes.value.int64Val)
         let r = if rightRes.value.kind == vkFloat64: rightRes.value.float64Val else: float64(rightRes.value.int64Val)
@@ -1350,6 +1743,8 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
         else:
           return err[Value](ERR_SQL, "Unsupported operator", expr.op)
     of "LIKE", "ILIKE":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
       let leftStr = valueToString(leftRes.value)
       let rightStr = valueToString(rightRes.value)
       let likeRes = likeMatchChecked(leftStr, rightStr, expr.op == "ILIKE")
@@ -1367,7 +1762,294 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     else:
       return err[Value](ERR_SQL, "Unsupported operator", expr.op)
   of ekFunc:
-    return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
+    when defined(decentdbDebugLogging):
+      echo "DEBUG ekFunc: " & expr.funcName
+    let name = expr.funcName.toUpperAscii()
+    if name in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+      return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
+
+    if name == "GEN_RANDOM_UUID":
+      if expr.args.len != 0: return err[Value](ERR_SQL, "GEN_RANDOM_UUID takes no arguments")
+      var bytes = newSeq[byte](16)
+      if not urandom(bytes):
+        return err[Value](ERR_IO, "Failed to generate random UUID")
+      bytes[6] = (bytes[6] and 0x0F) or 0x40
+      bytes[8] = (bytes[8] and 0x3F) or 0x80
+      return ok(Value(kind: vkBlob, bytes: bytes))
+
+    if name == "UUID_PARSE":
+      if expr.args.len != 1: return err[Value](ERR_SQL, "UUID_PARSE requires one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok: return argRes
+      if argRes.value.kind == vkNull: return ok(Value(kind: vkNull))
+      if argRes.value.kind != vkText: return err[Value](ERR_SQL, "UUID_PARSE requires string")
+      when defined(decentdbDebugLogging):
+        echo "DEBUG argRes kind: " & $argRes.value.kind
+      let bytesRes = parseUuid(valueToString(argRes.value))
+      if not bytesRes.ok:
+        when defined(decentdbDebugLogging):
+          echo "UUID_PARSE Error: ", bytesRes.err.message
+        return err[Value](bytesRes.err.code, bytesRes.err.message)
+      return ok(Value(kind: vkBlob, bytes: bytesRes.value))
+
+    if name == "UUID_TO_STRING":
+      if expr.args.len != 1: return err[Value](ERR_SQL, "UUID_TO_STRING requires one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok: return argRes
+      if argRes.value.kind == vkNull: return ok(Value(kind: vkNull))
+      if argRes.value.kind != vkBlob or argRes.value.bytes.len != 16:
+         return err[Value](ERR_SQL, "UUID_TO_STRING requires UUID blob")
+      return ok(textValue(uuidToString(argRes.value.bytes)))
+    
+    if name == "CAST":
+      if expr.args.len != 2: return err[Value](ERR_SQL, "CAST requires value and type")
+      let valRes = evalExpr(row, expr.args[0], params)
+      if not valRes.ok: return valRes
+      if valRes.value.kind == vkNull: return ok(Value(kind: vkNull))
+      
+      let typeArg = expr.args[1]
+      if typeArg.kind != ekLiteral or typeArg.value.kind != svString:
+         return err[Value](ERR_SQL, "CAST target type must be a literal string")
+      let typeStr = typeArg.value.strVal
+      
+      let typeSpecRes = parseColumnType(typeStr)
+      if not typeSpecRes.ok:
+         return err[Value](typeSpecRes.err.code, typeSpecRes.err.message)
+      let target = typeSpecRes.value
+      
+      case target.kind
+      of ctDecimal:
+         if valRes.value.kind == vkText:
+            let s = valueToString(valRes.value).strip()
+            var str = s
+            var negative = false
+            if str.startsWith("-"):
+               negative = true
+               str = str[1..^1]
+            elif str.startsWith("+"):
+               str = str[1..^1]
+            
+            let dotPos = str.find('.')
+            var unscaledStr = ""
+            var inputScale = 0
+            if dotPos >= 0:
+               unscaledStr = str[0..<dotPos] & str[dotPos+1..^1]
+               inputScale = str.len - 1 - dotPos
+            else:
+               unscaledStr = str
+               inputScale = 0
+            
+            if unscaledStr.len == 0: return err[Value](ERR_SQL, "Invalid decimal format")
+            try:
+               var u = parseBiggestInt(unscaledStr)
+               if negative: u = -u
+               let res = scaleDecimal(u, uint8(inputScale), target.decScale)
+               if not res.ok: return err[Value](res.err.code, res.err.message)
+               return ok(Value(kind: vkDecimal, int64Val: res.value, decimalScale: target.decScale))
+            except ValueError:
+               return err[Value](ERR_SQL, "Invalid decimal format")
+               
+         elif valRes.value.kind == vkInt64:
+            let res = scaleDecimal(valRes.value.int64Val, 0, target.decScale)
+            if not res.ok: return err[Value](res.err.code, res.err.message)
+            return ok(Value(kind: vkDecimal, int64Val: res.value, decimalScale: target.decScale))
+         elif valRes.value.kind == vkDecimal:
+            let res = scaleDecimal(valRes.value.int64Val, valRes.value.decimalScale, target.decScale)
+            if not res.ok: return err[Value](res.err.code, res.err.message)
+            return ok(Value(kind: vkDecimal, int64Val: res.value, decimalScale: target.decScale))
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to DECIMAL", $valRes.value.kind)
+
+      of ctInt64:
+         case valRes.value.kind
+         of vkInt64: return ok(valRes.value)
+         of vkFloat64: return ok(Value(kind: vkInt64, int64Val: int64(valRes.value.float64Val)))
+         of vkText:
+            try:
+              let i = parseBiggestInt(valueToString(valRes.value).strip())
+              return ok(Value(kind: vkInt64, int64Val: i))
+            except ValueError:
+              return err[Value](ERR_SQL, "Invalid integer format")
+         of vkDecimal:
+            let res = scaleDecimal(valRes.value.int64Val, valRes.value.decimalScale, 0)
+            if not res.ok: return err[Value](res.err.code, res.err.message)
+            return ok(Value(kind: vkInt64, int64Val: res.value))
+         of vkBool:
+            return ok(Value(kind: vkInt64, int64Val: if valRes.value.boolVal: 1 else: 0))
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to INT", $valRes.value.kind)
+
+      of ctFloat64:
+         case valRes.value.kind
+         of vkFloat64: return ok(valRes.value)
+         of vkInt64: return ok(Value(kind: vkFloat64, float64Val: float64(valRes.value.int64Val)))
+         of vkDecimal:
+            var f = float64(valRes.value.int64Val)
+            var divS = 1.0
+            for _ in 1 .. int(valRes.value.decimalScale): divS *= 10.0
+            return ok(Value(kind: vkFloat64, float64Val: f / divS))
+         of vkText:
+            try:
+              let f = parseFloat(valueToString(valRes.value).strip())
+              return ok(Value(kind: vkFloat64, float64Val: f))
+            except ValueError:
+              return err[Value](ERR_SQL, "Invalid float format")
+         of vkBool:
+            return ok(Value(kind: vkFloat64, float64Val: if valRes.value.boolVal: 1.0 else: 0.0))
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to FLOAT", $valRes.value.kind)
+            
+      of ctUuid:
+         if valRes.value.kind == vkText:
+            let bytesRes = parseUuid(valueToString(valRes.value))
+            if not bytesRes.ok: return err[Value](bytesRes.err.code, bytesRes.err.message)
+            return ok(Value(kind: vkBlob, bytes: bytesRes.value))
+         elif valRes.value.kind == vkBlob:
+            if valRes.value.bytes.len != 16: return err[Value](ERR_SQL, "Blob size mismatch for UUID")
+            return ok(valRes.value)
+         else:
+             return err[Value](ERR_SQL, "Cannot cast to UUID", $valRes.value.kind)
+
+      of ctBool:
+         case valRes.value.kind
+         of vkBool: return ok(valRes.value)
+         of vkInt64: return ok(Value(kind: vkBool, boolVal: valRes.value.int64Val != 0))
+         of vkFloat64: return ok(Value(kind: vkBool, boolVal: valRes.value.float64Val != 0.0))
+         of vkDecimal: return ok(Value(kind: vkBool, boolVal: valRes.value.int64Val != 0))
+         of vkText:
+            let s = valueToString(valRes.value).strip().toLowerAscii()
+            if s in ["true", "t", "1"]: return ok(Value(kind: vkBool, boolVal: true))
+            if s in ["false", "f", "0"]: return ok(Value(kind: vkBool, boolVal: false))
+            return err[Value](ERR_SQL, "Invalid boolean format")
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to BOOL", $valRes.value.kind)
+
+      of ctText:
+         if valRes.value.kind == vkBlob and valRes.value.bytes.len == 16:
+            return ok(textValue(uuidToString(valRes.value.bytes)))
+         return ok(textValue(valueToString(valRes.value)))
+      else:
+         return err[Value](ERR_SQL, "Unsupported CAST target")
+
+    if name == "CASE":
+      if expr.args.len == 0:
+        return ok(Value(kind: vkNull))
+      var i = 0
+      while i + 1 < expr.args.len - 1:
+        let condRes = evalExpr(row, expr.args[i], params)
+        if not condRes.ok:
+          return err[Value](condRes.err.code, condRes.err.message, condRes.err.context)
+        if toTruthValue(condRes.value) == tvTrue:
+          return evalExpr(row, expr.args[i + 1], params)
+        i += 2
+      return evalExpr(row, expr.args[^1], params)
+
+    if name == "CAST":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "CAST requires value and target type")
+      let valRes = evalExpr(row, expr.args[0], params)
+      if not valRes.ok:
+        return err[Value](valRes.err.code, valRes.err.message, valRes.err.context)
+      let targetRes = evalExpr(row, expr.args[1], params)
+      if not targetRes.ok:
+        return err[Value](targetRes.err.code, targetRes.err.message, targetRes.err.context)
+      let targetType = valueToString(targetRes.value)
+      return castValue(valRes.value, targetType)
+
+    if name == "COALESCE":
+      if expr.args.len == 0:
+        return err[Value](ERR_SQL, "COALESCE requires at least one argument")
+      for arg in expr.args:
+        let argRes = evalExpr(row, arg, params)
+        if not argRes.ok:
+          return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+        if argRes.value.kind != vkNull:
+          return ok(argRes.value)
+      return ok(Value(kind: vkNull))
+
+    if name == "NULLIF":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "NULLIF requires exactly two arguments")
+      let leftArg = evalExpr(row, expr.args[0], params)
+      if not leftArg.ok:
+        return err[Value](leftArg.err.code, leftArg.err.message, leftArg.err.context)
+      let rightArg = evalExpr(row, expr.args[1], params)
+      if not rightArg.ok:
+        return err[Value](rightArg.err.code, rightArg.err.message, rightArg.err.context)
+      if leftArg.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      if rightArg.value.kind != vkNull and compareValues(leftArg.value, rightArg.value) == 0:
+        return ok(Value(kind: vkNull))
+      return ok(leftArg.value)
+
+    if name in ["LENGTH", "LOWER", "UPPER", "TRIM"]:
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, name & " requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let text = valueToString(argRes.value)
+      case name
+      of "LENGTH":
+        return ok(Value(kind: vkInt64, int64Val: int64(text.len)))
+      of "LOWER":
+        return ok(textValue(text.toLowerAscii()))
+      of "UPPER":
+        return ok(textValue(text.toUpperAscii()))
+      of "TRIM":
+        return ok(textValue(text.strip()))
+      else:
+        discard
+
+    if name == "LIKE_ESCAPE":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "LIKE_ESCAPE requires pattern and escape character")
+      let patternRes = evalExpr(row, expr.args[0], params)
+      if not patternRes.ok:
+        return err[Value](patternRes.err.code, patternRes.err.message, patternRes.err.context)
+      let escapeRes = evalExpr(row, expr.args[1], params)
+      if not escapeRes.ok:
+        return err[Value](escapeRes.err.code, escapeRes.err.message, escapeRes.err.context)
+      if patternRes.value.kind == vkNull or escapeRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let normalizedRes = normalizeLikeEscapePattern(valueToString(patternRes.value), valueToString(escapeRes.value))
+      if not normalizedRes.ok:
+        return err[Value](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+      return ok(textValue(normalizedRes.value))
+
+    if name == "EXISTS":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "EXISTS requires subquery argument")
+      let subSqlRes = evalExpr(row, expr.args[0], params)
+      if not subSqlRes.ok:
+        return err[Value](subSqlRes.err.code, subSqlRes.err.message, subSqlRes.err.context)
+      if subSqlRes.value.kind == vkNull:
+        return ok(Value(kind: vkBool, boolVal: false))
+      if gEvalContextDepth <= 0 or gEvalPager == nil or gEvalCatalog == nil:
+        return err[Value](ERR_INTERNAL, "EXISTS requires execution context")
+      let sqlText = valueToString(subSqlRes.value)
+      let parseRes = parseSql(sqlText)
+      if not parseRes.ok:
+        return err[Value](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+      if parseRes.value.statements.len != 1:
+        return err[Value](ERR_SQL, "EXISTS subquery must contain one SELECT")
+      let stmt = parseRes.value.statements[0]
+      if stmt.kind != skSelect:
+        return err[Value](ERR_SQL, "EXISTS requires SELECT subquery")
+      let bindRes = bindStatement(gEvalCatalog, stmt)
+      if not bindRes.ok:
+        return err[Value](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+      let planRes = plan(gEvalCatalog, bindRes.value)
+      if not planRes.ok:
+        return err[Value](planRes.err.code, planRes.err.message, planRes.err.context)
+      let execRes = execPlan(gEvalPager, gEvalCatalog, planRes.value, params)
+      if not execRes.ok:
+        return err[Value](execRes.err.code, execRes.err.message, execRes.err.context)
+      return ok(Value(kind: vkBool, boolVal: execRes.value.len > 0))
+
+    return err[Value](ERR_SQL, "Unsupported function", name)
   of ekInList:
     # Evaluate the expression being tested
     let exprRes = evalExpr(row, expr.inExpr, params)
@@ -1378,18 +2060,24 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     if exprRes.value.kind == vkNull:
       return ok(Value(kind: vkNull))
     
+    var sawNull = false
     # Check if value matches any item in the IN list
     for item in expr.inList:
       let itemRes = evalExpr(row, item, params)
       if not itemRes.ok:
         return err[Value](itemRes.err.code, itemRes.err.message, itemRes.err.context)
-      
+      if itemRes.value.kind == vkNull:
+        sawNull = true
+        continue
       # Compare values
       if compareValues(exprRes.value, itemRes.value) == 0:
         return ok(Value(kind: vkBool, boolVal: true))
-    
-    # No match found
+    # No match found; SQL 3VL requires NULL if any RHS item is NULL.
+    if sawNull:
+      return ok(Value(kind: vkNull))
     return ok(Value(kind: vkBool, boolVal: false))
+  of ekWindowRowNumber:
+    return err[Value](ERR_SQL, "ROW_NUMBER window expression must be evaluated in projection context")
 
 proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: string): Result[seq[Row]] =
   let tableRes = catalog.getTable(tableName)
@@ -1555,15 +2243,83 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
     return ok(rows)
   if items.len == 1 and items[0].isStar:
     return ok(rows)
+
+  var windowValuesByItem = initTable[int, seq[Value]]()
+  for itemIdx, item in items:
+    if item.isStar or item.expr == nil or item.expr.kind != ekWindowRowNumber:
+      continue
+    let wexpr = item.expr
+    var partitionVals = newSeq[seq[Value]](rows.len)
+    var orderVals = newSeq[seq[Value]](rows.len)
+
+    for rowIdx, row in rows:
+      var pvals: seq[Value] = @[]
+      for pexpr in wexpr.windowPartitions:
+        let evalRes = evalExpr(row, pexpr, params)
+        if not evalRes.ok:
+          return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+        pvals.add(evalRes.value)
+      partitionVals[rowIdx] = pvals
+
+      var ovals: seq[Value] = @[]
+      for oexpr in wexpr.windowOrderExprs:
+        let evalRes = evalExpr(row, oexpr, params)
+        if not evalRes.ok:
+          return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+        ovals.add(evalRes.value)
+      orderVals[rowIdx] = ovals
+
+    var sortedIdx = newSeq[int](rows.len)
+    for i in 0 ..< rows.len:
+      sortedIdx[i] = i
+    sortedIdx.sort(proc(a, b: int): int =
+      for i in 0 ..< partitionVals[a].len:
+        let c = compareValues(partitionVals[a][i], partitionVals[b][i])
+        if c != 0:
+          return c
+      for i in 0 ..< orderVals[a].len:
+        let c = compareValues(orderVals[a][i], orderVals[b][i])
+        if c != 0:
+          let asc = if i < wexpr.windowOrderAsc.len: wexpr.windowOrderAsc[i] else: true
+          return if asc: c else: -c
+      cmp(a, b)
+    )
+
+    var rowNumbers = newSeq[Value](rows.len)
+    var currentRowNum = 0'i64
+    var prevIdx = -1
+    for pos, rowIdx in sortedIdx:
+      if pos == 0:
+        currentRowNum = 1
+      else:
+        var samePartition = true
+        for i in 0 ..< partitionVals[rowIdx].len:
+          if compareValues(partitionVals[rowIdx][i], partitionVals[prevIdx][i]) != 0:
+            samePartition = false
+            break
+        if samePartition:
+          currentRowNum.inc
+        else:
+          currentRowNum = 1
+      rowNumbers[rowIdx] = Value(kind: vkInt64, int64Val: currentRowNum)
+      prevIdx = rowIdx
+    windowValuesByItem[itemIdx] = rowNumbers
+
   var resultRows: seq[Row] = @[]
-  for row in rows:
+  for rowIdx, row in rows:
     var cols: seq[string] = @[]
     var vals: seq[Value] = @[]
-    for item in items:
+    for itemIdx, item in items:
       if item.isStar:
         for i, col in row.columns:
           cols.add(col)
           vals.add(row.values[i])
+      elif item.expr != nil and item.expr.kind == ekWindowRowNumber:
+        if not windowValuesByItem.hasKey(itemIdx):
+          return err[seq[Row]](ERR_INTERNAL, "Window projection state missing")
+        var name = if item.alias.len > 0: item.alias else: "row_number"
+        cols.add(name)
+        vals.add(windowValuesByItem[itemIdx][rowIdx])
       else:
         let evalRes = evalExpr(row, item.expr, params)
         if not evalRes.ok:
@@ -2296,7 +3052,22 @@ proc applyLimit*(rows: seq[Row], limit: int, offset: int): seq[Row] =
   rows[start ..< endIndex]
 
 proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[seq[Row]] =
+  when defined(decentdbDebugLogging):
+    echo "DEBUG execPlan start"
+  let ownsEvalContext = gEvalContextDepth == 0
+  if ownsEvalContext:
+    gEvalPager = pager
+    gEvalCatalog = catalog
+  gEvalContextDepth.inc
+  defer:
+    gEvalContextDepth.dec
+    if ownsEvalContext and gEvalContextDepth == 0:
+      gEvalPager = nil
+      gEvalCatalog = nil
+
   case plan.kind
+  of pkOneRow:
+    return ok(@[makeRow(@[], @[], 0)])
   of pkTableScan:
     return tableScanRows(pager, catalog, plan.table, plan.alias)
   of pkRowidSeek:
@@ -2354,6 +3125,81 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       if not seen.contains(r.rowid):
         seen.incl(r.rowid)
         outRows.add(r)
+    return ok(outRows)
+  of pkSetUnionDistinct:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "UNION requires matching column counts")
+    var seen = initHashSet[seq[Value]]()
+    var outRows: seq[Row] = @[]
+    for row in leftRes.value:
+      if not seen.contains(row.values):
+        seen.incl(row.values)
+        outRows.add(row)
+    for row in rightRes.value:
+      if not seen.contains(row.values):
+        seen.incl(row.values)
+        outRows.add(row)
+    return ok(outRows)
+  of pkSetIntersect:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "INTERSECT requires matching column counts")
+    var rightSet = initHashSet[seq[Value]]()
+    for row in rightRes.value:
+      rightSet.incl(row.values)
+    var emitted = initHashSet[seq[Value]]()
+    var outRows: seq[Row] = @[]
+    for row in leftRes.value:
+      if rightSet.contains(row.values) and not emitted.contains(row.values):
+        emitted.incl(row.values)
+        outRows.add(row)
+    return ok(outRows)
+  of pkSetExcept:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "EXCEPT requires matching column counts")
+    var rightSet = initHashSet[seq[Value]]()
+    for row in rightRes.value:
+      rightSet.incl(row.values)
+    var emitted = initHashSet[seq[Value]]()
+    var outRows: seq[Row] = @[]
+    for row in leftRes.value:
+      if not rightSet.contains(row.values) and not emitted.contains(row.values):
+        emitted.incl(row.values)
+        outRows.add(row)
+    return ok(outRows)
+  of pkAppend:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "UNION ALL requires matching column counts")
+    var outRows = leftRes.value
+    for row in rightRes.value:
+      outRows.add(row)
     return ok(outRows)
   of pkFilter:
     if plan.left != nil and plan.left.kind == pkTableScan:
@@ -2544,7 +3390,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
     proc hashJoinKeySupported(v: Value): bool {.inline.} =
       # Must match evalExpr "=" semantics. Float NaN corner cases make VkFloat64 risky.
       case v.kind
-      of vkNull, vkBool, vkInt64, vkText, vkBlob, vkTextCompressed, vkBlobCompressed,
+      of vkNull, vkBool, vkInt64, vkDecimal, vkText, vkBlob, vkTextCompressed, vkBlobCompressed,
          vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
         # Overflow values have additional state (overflowPage/overflowLen) and may not compare
         # equal to their materialized counterpart; keep them out of hash join for correctness.

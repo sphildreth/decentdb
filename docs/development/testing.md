@@ -1,6 +1,6 @@
 # Testing
 
-DecentDb has comprehensive testing at multiple levels.
+DecentDB has comprehensive testing at multiple levels.
 
 ## Test Overview
 
@@ -102,7 +102,7 @@ test "insert split update delete":
 
 ### 2. Property-Based Tests
 
-DecentDb uses invariant-style tests, and some tests include randomized loops to exercise edge cases.
+DecentDB uses invariant-style tests, and some tests include randomized loops to exercise edge cases.
 
 There is not currently a dedicated `tests/nim/test_property.nim` suite; if/when property testing is split out, it should follow the same `tests/nim/test_*.nim` naming convention so `nimble test` picks it up.
 
@@ -140,7 +140,7 @@ test "torn write ignored on recovery":
 
 ### 4. Differential Tests
 
-Compare DecentDb results with PostgreSQL.
+Compare DecentDB results with PostgreSQL.
 
 **Using Python harness**:
 ```python

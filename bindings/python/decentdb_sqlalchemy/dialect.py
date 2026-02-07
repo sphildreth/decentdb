@@ -115,7 +115,7 @@ class _DecentUUID(sqltypes.Uuid):
             return uuid.UUID(bytes=value)
         return process
 
-class DecentDbCompiler(compiler.SQLCompiler):
+class DecentDBCompiler(compiler.SQLCompiler):
     def visit_mod_binary(self, binary, operator, **kw):
         return self.process(binary.left, **kw) + " % " + self.process(binary.right, **kw)
 
@@ -137,7 +137,7 @@ class DecentDbCompiler(compiler.SQLCompiler):
         # DecentDB MVP does not support RETURNING.
         raise exc.CompileError("DecentDB does not support RETURNING")
 
-class DecentDbDDLCompiler(compiler.DDLCompiler):
+class DecentDBDDLCompiler(compiler.DDLCompiler):
     def visit_foreign_key_constraint(self, constraint, **kw):
         # DecentDB does not support table-level FOREIGN KEY constraints.
         # We must emit them inline in get_column_specification.
@@ -167,7 +167,7 @@ class DecentDbDDLCompiler(compiler.DDLCompiler):
         # unless DecentDB forbids that too. The error only mentioned FKs.
         return super().visit_create_table(create, **kw)
 
-class DecentDbTypeCompiler(compiler.GenericTypeCompiler):
+class DecentDBTypeCompiler(compiler.GenericTypeCompiler):
     def visit_integer(self, type_, **kw):
         return "INT64"
 
@@ -208,7 +208,7 @@ class DecentDbTypeCompiler(compiler.GenericTypeCompiler):
     def visit_uuid(self, type_, **kw):
         return "BLOB"
 
-class DecentDbDialect(default.DefaultDialect):
+class DecentDBDialect(default.DefaultDialect):
     name = "decentdb"
     driver = "pysql"
     supports_alter = False
@@ -243,9 +243,9 @@ class DecentDbDialect(default.DefaultDialect):
         # But we are in 2026, SA 2.0+ is standard.
     }
 
-    statement_compiler = DecentDbCompiler
-    ddl_compiler = DecentDbDDLCompiler
-    type_compiler = DecentDbTypeCompiler
+    statement_compiler = DecentDBCompiler
+    ddl_compiler = DecentDBDDLCompiler
+    type_compiler = DecentDBTypeCompiler
     
     def __init__(self, **kwargs):
         default.DefaultDialect.__init__(self, **kwargs)

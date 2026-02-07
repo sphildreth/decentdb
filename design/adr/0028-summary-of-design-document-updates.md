@@ -4,7 +4,7 @@
 
 ### Decision
 
-This ADR summarizes the comprehensive updates made to the DecentDb design documents to address identified gaps and concerns.
+This ADR summarizes the comprehensive updates made to the DecentDB design documents to address identified gaps and concerns.
 
 ### Rationale
 

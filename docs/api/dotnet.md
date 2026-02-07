@@ -4,9 +4,9 @@ DecentDB’s .NET bindings live in-repo under `bindings/dotnet/` and are intende
 
 ## Packages (in this repo)
 
-- `DecentDb.Native`: low-level native wrapper over the DecentDB C API
-- `DecentDb.AdoNet`: ADO.NET provider (`DbConnection`/`DbCommand`)
-- `DecentDb.MicroOrm`: small LINQ-style micro-ORM on top of the ADO.NET layer
+- `DecentDB.Native`: low-level native wrapper over the DecentDB C API
+- `DecentDB.AdoNet`: ADO.NET provider (`DbConnection`/`DbCommand`)
+- `DecentDB.MicroOrm`: small LINQ-style micro-ORM on top of the ADO.NET layer
 
 ## Build the native library
 
@@ -21,9 +21,9 @@ This produces a platform-specific shared library under `build/` (for example `bu
 ## ADO.NET usage
 
 ```csharp
-using DecentDb.AdoNet;
+using DecentDB.AdoNet;
 
-using var conn = new DecentDbConnection("Data Source=./sample.ddb");
+using var conn = new DecentDBConnection("Data Source=./sample.ddb");
 conn.Open();
 
 using var cmd = conn.CreateCommand();

@@ -1,0 +1,19 @@
+{
+  "name": "check_create_crash",
+  "description": "Crash during CREATE TABLE with CHECK should not leave partial catalog state",
+  "db_path": "$TMPDIR/decentdb_check_create_crash.ddb",
+  "setup_sql": "CREATE TABLE base (id INT PRIMARY KEY); INSERT INTO base VALUES (1)",
+  "sql": "CREATE TABLE accounts (id INT PRIMARY KEY, amount INT, CHECK (amount >= 0))",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT COUNT(*) FROM base",
+    "expect_rows": [
+      "1"
+    ]
+  }
+}

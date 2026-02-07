@@ -1,4 +1,4 @@
-# Memory budget validation tests for DecentDb
+# Memory budget validation tests for DecentDB
 import unittest
 import ../../src/engine
 import ../../src/record/record

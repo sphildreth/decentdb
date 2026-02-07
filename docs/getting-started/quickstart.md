@@ -1,6 +1,6 @@
 # Quick Start
 
-This guide will get you up and running with DecentDb in 5 minutes.
+This guide will get you up and running with DecentDB in 5 minutes.
 
 ## Create Your First Database
 
@@ -68,18 +68,8 @@ decentdb exec --db=myapp.ddb --sql="DROP TABLE users"
 ## Transactions
 
 ```bash
-# Begin a transaction
-decentdb exec --db=myapp.ddb --sql="BEGIN"
-
-# Multiple operations in a transaction
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (3, 'Carol', 'carol@example.com')"
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (4, 'Dave', 'dave@example.com')"
-
-# Commit the transaction
-decentdb exec --db=myapp.ddb --sql="COMMIT"
-
-# Or rollback
-decentdb exec --db=myapp.ddb --sql="ROLLBACK"
+# Execute multiple statements atomically
+decentdb exec --db=myapp.ddb --sql="BEGIN; INSERT INTO users VALUES (3, 'Carol', 'carol@example.com'); INSERT INTO users VALUES (4, 'Dave', 'dave@example.com'); COMMIT"
 ```
 
 ## Bulk Loading
@@ -107,9 +97,6 @@ decentdb checkpoint --db=myapp.ddb
 
 # Get database statistics
 decentdb stats --db=myapp.ddb
-
-# Verify database integrity
-decentdb exec --db=myapp.ddb --sql="PRAGMA integrity_check"
 ```
 
 ## Next Steps

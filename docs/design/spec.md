@@ -1,11 +1,11 @@
-# DecentDb SPEC (Engineering Specification)
+# DecentDB SPEC (Engineering Specification)
 **Date:** 2026-01-27  
 **Status:** Draft (v0.1)
 
 > Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
 
 ## 1. Overview
-This document defines the baseline engineering design for DecentDb:
+This document defines the baseline engineering design for DecentDB:
 - Embedded DB engine in **Nim**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
 - ACID via **WAL-based** design
@@ -116,7 +116,7 @@ Offset  Size  Field
 See ADR-0016 for checksum calculation details.
 
 **Format version notes:**
-- v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
+- v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag + optional partial-index predicate SQL).
 - v1 databases are not auto-migrated; open fails with `ERR_CORRUPTION` until upgraded.
 
 ### 3.4 Catalog record encoding (v2)
@@ -272,18 +272,60 @@ Multi-process locking is out of scope for 0.x.
 ### 6.1 Parser choice
 0.x recommendation:
 - Use a Postgres-compatible parser via FFI (e.g., `libpg_query`) to accept familiar syntax.
-- Normalize parse trees into DecentDb’s internal AST immediately.
+- Normalize parse trees into DecentDB’s internal AST immediately.
 
 Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
 ### 6.2 Supported SQL subset (0.x baseline)
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+- INSERT RETURNING subset:
+  - `INSERT ... RETURNING *`
+  - `INSERT ... RETURNING <expr[, ...]>`
+  - applies to plain INSERT and `INSERT ... ON CONFLICT ...` paths
+- UPSERT subset:
+  - `INSERT ... ON CONFLICT DO NOTHING` with optional conflict target:
+    - no target (`ON CONFLICT DO NOTHING`)
+    - column-list target (`ON CONFLICT (col[, ...]) DO NOTHING`)
+    - constraint/index-name target (`ON CONFLICT ON CONSTRAINT name DO NOTHING`)
+  - `INSERT ... ON CONFLICT ... DO UPDATE` with explicit target:
+    - column-list target (`ON CONFLICT (col[, ...]) DO UPDATE SET ...`)
+    - constraint/index-name target (`ON CONFLICT ON CONSTRAINT name DO UPDATE SET ...`)
+    - optional `WHERE` on `DO UPDATE`
+    - expression scope: target table columns and `EXCLUDED.col`
+    - unqualified columns in `DO UPDATE` expressions bind to target table
 - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
+- Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`
+- Expression forms: searched/simple `CASE`, `CAST(expr AS type)` (narrow matrix)
+- Common Table Expressions (CTE): non-recursive `WITH ...` for `SELECT`
+  - CTE names resolve in declaration order and can shadow catalog objects in the statement scope
+  - v0 CTE body restrictions: `GROUP BY`/`HAVING`, `ORDER BY`, and `LIMIT/OFFSET` inside CTE bodies are not supported
+- Set operations: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
-- Filters: basic comparisons, boolean ops, `LIKE`
+- Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
+- CHECK constraints in `CREATE TABLE` (column-level and table-level)
+- Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
+- Expression index subset: `CREATE INDEX ... ((<expr>))` for single-expression BTREE indexes
+  - allowed expression forms in 0.x:
+    - direct column reference
+    - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
+    - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
+  - restrictions:
+    - exactly one index expression
+    - `UNIQUE` expression indexes are not supported
+    - partial expression indexes are not supported
+- NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
+  - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
+- Explicitly unsupported in 0.x baseline:
+  - `WITH RECURSIVE`
+  - `INTERSECT ALL`, `EXCEPT ALL`
+  - targetless `INSERT ... ON CONFLICT DO UPDATE ...` (without conflict target)
+  - `UPDATE ... RETURNING`
+  - `DELETE ... RETURNING`
+  - Partial indexes beyond the v0 subset (`UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, arbitrary predicates)
+  - Expression indexes beyond the v0 subset (multi-expression keys, unsupported functions/operators, `UNIQUE`, or partial forms)
 
 ### 6.3 Parameterization
 - `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline
@@ -312,11 +354,21 @@ Alternative:
 - This differs from PostgreSQL/MySQL which defer validation to COMMIT
 
 0.x actions:
-- `RESTRICT` / `NO ACTION` on delete/update
+- `ON DELETE`: `RESTRICT` / `NO ACTION`, `CASCADE`, `SET NULL`
+- `ON UPDATE`: `RESTRICT` / `NO ACTION`, `CASCADE`, `SET NULL`
 
-Optional later:
-- `CASCADE`, `SET NULL`
-- Deferred constraint checking (transaction-commit time)
+Current 0.x limitations:
+- `ON DELETE SET NULL` and `ON UPDATE SET NULL` require nullable child FK columns.
+- Deferred constraint checking (transaction-commit time) is not supported.
+
+### 7.3 CHECK constraints
+- Supported in `CREATE TABLE` as column or table constraints.
+- Enforced at statement-time on `INSERT` and `UPDATE` (including `INSERT ... ON CONFLICT DO UPDATE`).
+- SQL semantics: CHECK fails only when the expression evaluates to `FALSE`; `TRUE` and `NULL` pass.
+- v0 restrictions:
+  - CHECK expressions must reference only columns in the same row/table.
+  - CHECK does not allow parameters, aggregate functions, or `EXISTS` in 0.x.
+  - `ALTER TABLE ... ADD CONSTRAINT CHECK` is not supported.
 
 ---
 
@@ -431,7 +483,7 @@ For contains predicates:
 
 4. **Differential tests (Python)**
    - For supported SQL subset, run query on:
-     - DecentDb
+     - DecentDB
      - PostgreSQL
    - Compare result sets for deterministic queries (no timestamps/random)
 
@@ -545,9 +597,19 @@ Define error categories:
 - Writing to older formats may trigger automatic upgrade (with user confirmation)
 
 ### 15.3 Schema changes (0.x baseline)
-- Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
-- ALTER TABLE operations: ADD COLUMN, DROP COLUMN
-- Not supported (post-1.0): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
+- Supported: CREATE TABLE, CREATE INDEX, CREATE TRIGGER, DROP TABLE, DROP INDEX, DROP TRIGGER, ALTER TABLE
+- ALTER TABLE operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, ALTER COLUMN TYPE
+  - Current v0 limitation: ALTER TABLE operations are rejected on tables that define CHECK constraints
+  - Current v0 limitation: ALTER TABLE operations are rejected on tables that define expression indexes
+  - `RENAME COLUMN` is rejected when dependent views exist
+  - `ALTER COLUMN TYPE` supports only `INT64`, `FLOAT64`, `TEXT`, `BOOL` source/target kinds
+  - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
+- Trigger operations:
+  - `AFTER` triggers on `INSERT`/`UPDATE`/`DELETE` for base tables (`FOR EACH ROW`)
+  - `INSTEAD OF` triggers on `INSERT`/`UPDATE`/`DELETE` for views (`FOR EACH ROW`)
+  - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 0.x
+  - `FOR EACH STATEMENT` triggers and `NEW`/`OLD` row references are not supported in 0.x
+- Not supported (post-1.0): ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 
 ### 15.4 Migration strategy

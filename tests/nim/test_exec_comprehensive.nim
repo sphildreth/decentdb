@@ -267,6 +267,14 @@ suite "Exec Expression Evaluation":
     check res.value.kind == vkBool
     check res.value.boolVal == false
 
+  test "evalExpr with NOT NULL returns NULL":
+    let row = Row(columns: @[], values: @[])
+    let inner = Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+    let expr = Expr(kind: ekUnary, unOp: "NOT", expr: inner)
+    let res = evalExpr(row, expr, @[])
+    check res.ok
+    check res.value.kind == vkNull
+
   test "evalExpr with AND operator":
     let row = Row(columns: @[], values: @[])
     let left = Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: true))
@@ -276,6 +284,15 @@ suite "Exec Expression Evaluation":
     check res.ok
     check res.value.boolVal == false
 
+  test "evalExpr with AND and NULL follows 3VL":
+    let row = Row(columns: @[], values: @[])
+    let left = Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: true))
+    let right = Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+    let expr = Expr(kind: ekBinary, op: "AND", left: left, right: right)
+    let res = evalExpr(row, expr, @[])
+    check res.ok
+    check res.value.kind == vkNull
+
   test "evalExpr with OR operator":
     let row = Row(columns: @[], values: @[])
     let left = Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: true))
@@ -284,6 +301,15 @@ suite "Exec Expression Evaluation":
     let res = evalExpr(row, expr, @[])
     check res.ok
     check res.value.boolVal == true
+
+  test "evalExpr with OR and NULL follows 3VL":
+    let row = Row(columns: @[], values: @[])
+    let left = Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: false))
+    let right = Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+    let expr = Expr(kind: ekBinary, op: "OR", left: left, right: right)
+    let res = evalExpr(row, expr, @[])
+    check res.ok
+    check res.value.kind == vkNull
 
   test "evalExpr with comparison operators":
     let row = Row(columns: @[], values: @[])
@@ -307,6 +333,29 @@ suite "Exec Expression Evaluation":
     
     let geExpr = Expr(kind: ekBinary, op: ">=", left: left, right: right)
     check evalExpr(row, geExpr, @[]).value.boolVal == true
+
+  test "evalExpr comparison with NULL returns NULL":
+    let row = Row(columns: @[], values: @[])
+    let left = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 5))
+    let right = Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+    let eqExpr = Expr(kind: ekBinary, op: "=", left: left, right: right)
+    let res = evalExpr(row, eqExpr, @[])
+    check res.ok
+    check res.value.kind == vkNull
+
+  test "evalExpr IN with NULL in list returns NULL on no match":
+    let row = makeRow(@["id"], @[Value(kind: vkInt64, int64Val: 42)], 1)
+    let inExpr = Expr(
+      kind: ekInList,
+      inExpr: Expr(kind: ekColumn, table: "", name: "id"),
+      inList: @[
+        Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+      ]
+    )
+    let res = evalExpr(row, inExpr, @[])
+    check res.ok
+    check res.value.kind == vkNull
 
   test "evalExpr with IS NULL":
     let row = Row(columns: @[], values: @[])
@@ -372,11 +421,132 @@ suite "Exec Expression Evaluation":
     check res.value.kind == vkInt64
     check res.value.int64Val == 3
 
+  test "evalExpr with string concatenation operator":
+    let row = Row(columns: @[], values: @[])
+    let left = Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "foo"))
+    let right = Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "bar"))
+    let expr = Expr(kind: ekBinary, op: "||", left: left, right: right)
+    let res = evalExpr(row, expr, @[])
+    check res.ok
+    check valueToString(res.value) == "foobar"
+
+  test "evalExpr with COALESCE and NULLIF":
+    let row = Row(columns: @[], values: @[])
+    let coalesceExpr = Expr(
+      kind: ekFunc,
+      funcName: "COALESCE",
+      args: @[
+        Expr(kind: ekLiteral, value: SqlValue(kind: svNull)),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 7))
+      ]
+    )
+    let coalesceRes = evalExpr(row, coalesceExpr, @[])
+    check coalesceRes.ok
+    check coalesceRes.value.kind == vkInt64
+    check coalesceRes.value.int64Val == 7
+
+    let nullifExpr = Expr(
+      kind: ekFunc,
+      funcName: "NULLIF",
+      args: @[
+        Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 9)),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 9))
+      ]
+    )
+    let nullifRes = evalExpr(row, nullifExpr, @[])
+    check nullifRes.ok
+    check nullifRes.value.kind == vkNull
+
+  test "evalExpr with string scalar functions":
+    let row = Row(columns: @[], values: @[])
+
+    let lengthExpr = Expr(
+      kind: ekFunc,
+      funcName: "LENGTH",
+      args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "  AbC  "))]
+    )
+    let lengthRes = evalExpr(row, lengthExpr, @[])
+    check lengthRes.ok
+    check lengthRes.value.kind == vkInt64
+    check lengthRes.value.int64Val == 7
+
+    let lowerExpr = Expr(
+      kind: ekFunc,
+      funcName: "LOWER",
+      args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "AbC"))]
+    )
+    let lowerRes = evalExpr(row, lowerExpr, @[])
+    check lowerRes.ok
+    check valueToString(lowerRes.value) == "abc"
+
+    let upperExpr = Expr(
+      kind: ekFunc,
+      funcName: "UPPER",
+      args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "AbC"))]
+    )
+    let upperRes = evalExpr(row, upperExpr, @[])
+    check upperRes.ok
+    check valueToString(upperRes.value) == "ABC"
+
+    let trimExpr = Expr(
+      kind: ekFunc,
+      funcName: "TRIM",
+      args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "  AbC  "))]
+    )
+    let trimRes = evalExpr(row, trimExpr, @[])
+    check trimRes.ok
+    check valueToString(trimRes.value) == "AbC"
+
+  test "evalExpr with CASE and CAST":
+    let row = Row(columns: @["id"], values: @[Value(kind: vkInt64, int64Val: 2)])
+
+    let caseExpr = Expr(
+      kind: ekFunc,
+      funcName: "CASE",
+      args: @[
+        Expr(kind: ekBinary, op: ">", left: Expr(kind: ekColumn, table: "", name: "id"), right: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1))),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "big")),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "small"))
+      ]
+    )
+    let caseRes = evalExpr(row, caseExpr, @[])
+    check caseRes.ok
+    check valueToString(caseRes.value) == "big"
+
+    let castExpr = Expr(
+      kind: ekFunc,
+      funcName: "CAST",
+      args: @[
+        Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "42")),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "INT"))
+      ]
+    )
+    let castRes = evalExpr(Row(columns: @[], values: @[]), castExpr, @[])
+    if not castRes.ok:
+      echo "CAST error: ", castRes.err.message
+    check castRes.ok
+    check castRes.value.kind == vkInt64
+    check castRes.value.int64Val == 42
+
+  test "evalExpr with LIKE_ESCAPE helper":
+    let row = Row(columns: @[], values: @[])
+    let escapeExpr = Expr(
+      kind: ekFunc,
+      funcName: "LIKE_ESCAPE",
+      args: @[
+        Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "a#_%")),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "#"))
+      ]
+    )
+    let escapeRes = evalExpr(row, escapeExpr, @[])
+    check escapeRes.ok
+    check valueToString(escapeRes.value) == "a\\_%"
+
   test "evalExpr with unsupported operator":
     let row = Row(columns: @[], values: @[])
     let left = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1))
     let right = Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 2))
-    let expr = Expr(kind: ekBinary, op: "||", left: left, right: right)
+    let expr = Expr(kind: ekBinary, op: "^^", left: left, right: right)
     let res = evalExpr(row, expr, @[])
     check not res.ok
 

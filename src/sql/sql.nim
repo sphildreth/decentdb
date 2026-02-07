@@ -28,6 +28,7 @@ type ExprKind* = enum
   ekFunc
   ekParam
   ekInList
+  ekWindowRowNumber
 
 type Expr* = ref object
   case kind*: ExprKind
@@ -52,6 +53,10 @@ type Expr* = ref object
   of ekInList:
     inExpr*: Expr
     inList*: seq[Expr]
+  of ekWindowRowNumber:
+    windowPartitions*: seq[Expr]
+    windowOrderExprs*: seq[Expr]
+    windowOrderAsc*: seq[bool]
 
 type ColumnDef* = object
   name*: string
@@ -61,6 +66,12 @@ type ColumnDef* = object
   primaryKey*: bool
   refTable*: string
   refColumn*: string
+  refOnDelete*: string
+  refOnUpdate*: string
+
+type CheckConstraintDef* = object
+  name*: string
+  expr*: Expr
 
 type SqlIndexKind* = enum
   ikBtree
@@ -99,6 +110,25 @@ type AlterColumnAction* = enum
   acaSetNotNull
   acaDropNotNull
 
+type InsertConflictAction* = enum
+  icaNone
+  icaDoNothing
+  icaDoUpdate
+
+type SetOpKind* = enum
+  sokNone
+  sokUnionAll
+  sokUnion
+  sokIntersect
+  sokExcept
+
+const TriggerEventInsertMask* = 4
+const TriggerEventDeleteMask* = 8
+const TriggerEventUpdateMask* = 16
+const TriggerEventTruncateMask* = 32
+const TriggerTimingInsteadMask* = 64
+const IndexExpressionPrefix* = "expr:"
+
 type AlterTableAction* = object
   kind*: AlterTableActionKind
   columnDef*: ColumnDef        # For ADD COLUMN
@@ -112,8 +142,10 @@ type AlterTableAction* = object
 type StatementKind* = enum
   skCreateTable
   skCreateIndex
+  skCreateTrigger
   skDropTable
   skDropIndex
+  skDropTrigger
   skCreateView
   skDropView
   skAlterView
@@ -135,16 +167,29 @@ type Statement* = ref object
   of skCreateTable:
     createTableName*: string
     columns*: seq[ColumnDef]
+    createChecks*: seq[CheckConstraintDef]
   of skCreateIndex:
     indexName*: string
     indexTableName*: string
     columnNames*: seq[string]
     indexKind*: SqlIndexKind
     unique*: bool
+    indexPredicate*: Expr
+  of skCreateTrigger:
+    triggerName*: string
+    triggerTableName*: string
+    triggerForEachRow*: bool
+    triggerEventsMask*: int
+    triggerFunctionName*: string
+    triggerActionSql*: string
   of skDropTable:
     dropTableName*: string
   of skDropIndex:
     dropIndexName*: string
+  of skDropTrigger:
+    dropTriggerName*: string
+    dropTriggerTableName*: string
+    dropTriggerIfExists*: bool
   of skCreateView:
     createViewName*: string
     createViewIfNotExists*: bool
@@ -165,7 +210,20 @@ type Statement* = ref object
     insertTable*: string
     insertColumns*: seq[string]
     insertValues*: seq[Expr]
+    insertValueRows*: seq[seq[Expr]]  # additional rows for multi-row INSERT
+    insertConflictAction*: InsertConflictAction
+    insertConflictTargetCols*: seq[string]
+    insertConflictTargetConstraint*: string
+    insertConflictUpdateAssignments*: Table[string, Expr]
+    insertConflictUpdateWhere*: Expr
+    insertReturning*: seq[SelectItem]
   of skSelect:
+    cteNames*: seq[string]
+    cteColumns*: seq[seq[string]]
+    cteQueries*: seq[Statement]
+    setOpKind*: SetOpKind
+    setOpLeft*: Statement
+    setOpRight*: Statement
     selectItems*: seq[SelectItem]
     fromTable*: string
     fromAlias*: string
@@ -224,6 +282,33 @@ proc nodeStringOr*(node: JsonNode, key: string, fallback: string): string =
 
 proc parseExprNode(node: JsonNode): Result[Expr]
 proc parseStatementNode(node: JsonNode): Result[Statement]
+proc selectToCanonicalSql(stmt: Statement): string
+proc parseSql*(sql: string): Result[SqlAst]
+
+proc parseTypeNameNode(typeNode: JsonNode): string =
+  var typeName = ""
+  if typeNode.kind == JObject:
+    let names = nodeGet(typeNode, "names")
+    if names.kind == JArray and names.len > 0:
+      typeName = nodeString(names[^1])
+      let typmods = nodeGet(typeNode, "typmods")
+      if typmods.kind == JArray and typmods.len > 0:
+        var mods: seq[string] = @[]
+        for m in typmods:
+          var n = m
+          if nodeHas(n, "A_Const"):
+            n = n["A_Const"]
+          if nodeHas(n, "val"):
+            n = n["val"]
+          if nodeHas(n, "Integer"):
+            n = n["Integer"]
+          if nodeHas(n, "ival"):
+            mods.add($n["ival"].getInt)
+          elif n.kind == JInt:
+            mods.add($n.getInt)
+        if mods.len > 0:
+          typeName.add("(" & mods.join(",") & ")")
+  typeName
 
 proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "isnull") and node["isnull"].getBool:
@@ -279,6 +364,8 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
   var funcName = ""
   if nameParts.kind == JArray and nameParts.len > 0:
     funcName = nodeString(nameParts[^1]).toUpperAscii()
+  if funcName == "BTRIM":
+    funcName = "TRIM"
   let argsNode = nodeGet(node, "args")
   var args: seq[Expr] = @[]
   if argsNode.kind == JArray:
@@ -287,8 +374,58 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
       if not argRes.ok:
         return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
       args.add(argRes.value)
+
+  let overNode = nodeGet(node, "over")
+  if overNode.kind == JObject:
+    if funcName != "ROW_NUMBER":
+      return err[Expr](ERR_SQL, "Only ROW_NUMBER window function is supported in 0.x", funcName)
+    if args.len > 0:
+      return err[Expr](ERR_SQL, "ROW_NUMBER does not take arguments in 0.x")
+
+    var partitions: seq[Expr] = @[]
+    let partitionNode = nodeGet(overNode, "partitionClause")
+    if partitionNode.kind == JArray:
+      for part in partitionNode:
+        let partRes = parseExprNode(part)
+        if not partRes.ok:
+          return err[Expr](partRes.err.code, partRes.err.message, partRes.err.context)
+        partitions.add(partRes.value)
+
+    var orderExprs: seq[Expr] = @[]
+    var orderAsc: seq[bool] = @[]
+    let orderNode = nodeGet(overNode, "orderClause")
+    if orderNode.kind == JArray:
+      for orderItem in orderNode:
+        var sortNode = orderItem
+        if nodeHas(sortNode, "SortBy"):
+          sortNode = sortNode["SortBy"]
+        let exprRes = parseExprNode(nodeGet(sortNode, "node"))
+        if not exprRes.ok:
+          return err[Expr](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+        let dir = nodeStringOr(sortNode, "sortby_dir", "SORTBY_DEFAULT")
+        orderExprs.add(exprRes.value)
+        orderAsc.add(dir != "SORTBY_DESC")
+
+    return ok(Expr(
+      kind: ekWindowRowNumber,
+      windowPartitions: partitions,
+      windowOrderExprs: orderExprs,
+      windowOrderAsc: orderAsc
+    ))
   let isStar = nodeHas(node, "agg_star") and node["agg_star"].getBool
   ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar))
+
+proc parseListItems(node: JsonNode): seq[JsonNode] =
+  if node.kind == JArray:
+    for item in node:
+      result.add(item)
+    return
+  if nodeHas(node, "List") and nodeHas(node["List"], "items"):
+    let items = node["List"]["items"]
+    if items.kind == JArray:
+      for item in items:
+        result.add(item)
+      return
 
 proc parseBoolExpr(node: JsonNode): Result[Expr] =
   let op = nodeGet(node, "boolop").getStr
@@ -322,9 +459,46 @@ proc parseAExpr(node: JsonNode): Result[Expr] =
   elif op == "~~*":
     op = "ILIKE"
   
-  # Check for IN expression (kind = 10 for AEXPR_IN in PostgreSQL)
   let kindNode = nodeGet(node, "kind")
-  if kindNode.kind == JInt and kindNode.getInt == 10:
+  var kindName = ""
+  if kindNode.kind == JString:
+    kindName = kindNode.getStr
+  elif kindNode.kind == JInt:
+    # Older libpg_query builds expose integer enum tags.
+    if kindNode.getInt == 10:
+      kindName = "AEXPR_IN"
+
+  if kindName == "AEXPR_NULLIF":
+    let leftRes = parseExprNode(nodeGet(node, "lexpr"))
+    if not leftRes.ok:
+      return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = parseExprNode(nodeGet(node, "rexpr"))
+    if not rightRes.ok:
+      return err[Expr](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    return ok(Expr(kind: ekFunc, funcName: "NULLIF", args: @[leftRes.value, rightRes.value], isStar: false))
+
+  if kindName == "AEXPR_BETWEEN" or kindName == "AEXPR_NOT_BETWEEN":
+    let leftRes = parseExprNode(nodeGet(node, "lexpr"))
+    if not leftRes.ok:
+      return err[Expr](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let items = parseListItems(nodeGet(node, "rexpr"))
+    if items.len != 2:
+      return err[Expr](ERR_SQL, "BETWEEN requires lower and upper bounds")
+    let lowRes = parseExprNode(items[0])
+    if not lowRes.ok:
+      return err[Expr](lowRes.err.code, lowRes.err.message, lowRes.err.context)
+    let highRes = parseExprNode(items[1])
+    if not highRes.ok:
+      return err[Expr](highRes.err.code, highRes.err.message, highRes.err.context)
+    let geExpr = Expr(kind: ekBinary, op: ">=", left: leftRes.value, right: lowRes.value)
+    let leExpr = Expr(kind: ekBinary, op: "<=", left: leftRes.value, right: highRes.value)
+    let betweenExpr = Expr(kind: ekBinary, op: "AND", left: geExpr, right: leExpr)
+    if kindName == "AEXPR_NOT_BETWEEN":
+      return ok(Expr(kind: ekUnary, unOp: "NOT", expr: betweenExpr))
+    return ok(betweenExpr)
+
+  # Check for IN expression
+  if kindName == "AEXPR_IN":
     # This is an IN expression
     let leftRes = parseExprNode(nodeGet(node, "lexpr"))
     if not leftRes.ok:
@@ -370,11 +544,121 @@ proc parseParamRef(node: JsonNode): Result[Expr] =
   let number = nodeGet(node, "number").getInt
   ok(Expr(kind: ekParam, index: number))
 
+proc parseCoalesceExpr(node: JsonNode): Result[Expr] =
+  var args: seq[Expr] = @[]
+  let argsNode = nodeGet(node, "args")
+  if argsNode.kind == JArray:
+    for arg in argsNode:
+      let argRes = parseExprNode(arg)
+      if not argRes.ok:
+        return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+      args.add(argRes.value)
+  ok(Expr(kind: ekFunc, funcName: "COALESCE", args: args, isStar: false))
+
 proc parseTypeCast(node: JsonNode): Result[Expr] =
   let argRes = parseExprNode(nodeGet(node, "arg"))
   if not argRes.ok:
     return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
-  ok(argRes.value)
+  let typeNodeRaw = nodeGet(node, "typeName")
+
+  proc extractTypeNameWithMods(typeNode: JsonNode): string =
+    var tn = typeNode
+    if nodeHas(tn, "TypeName"):
+      tn = tn["TypeName"]
+    if tn.kind != JObject:
+      return ""
+    let names = nodeGet(tn, "names")
+    if names.kind != JArray or names.len == 0:
+      return ""
+    var base = nodeString(names[^1]).toUpperAscii()
+    let typmods = nodeGet(tn, "typmods")
+    if typmods.kind != JArray or typmods.len == 0:
+      return base
+    var mods: seq[string] = @[]
+    for m in typmods:
+      var n = m
+      if nodeHas(n, "A_Const"):
+        n = n["A_Const"]
+      
+      if nodeHas(n, "ival"):
+        let v = n["ival"]
+        if nodeHas(v, "ival"):
+           mods.add($v["ival"].getInt)
+        else:
+           mods.add($v.getInt)
+      elif nodeHas(n, "val"):
+        n = n["val"]
+        if nodeHas(n, "Integer"):
+          n = n["Integer"]
+        if nodeHas(n, "ival"):
+          mods.add($n["ival"].getInt)
+      elif n.kind == JInt:
+        mods.add($n.getInt)
+    if mods.len == 0:
+      return base
+    base & "(" & mods.join(",") & ")"
+
+  let resolvedType = extractTypeNameWithMods(typeNodeRaw)
+  if resolvedType.len == 0:
+    return err[Expr](ERR_SQL, "CAST requires target type")
+  ok(Expr(
+    kind: ekFunc,
+    funcName: "CAST",
+    args: @[
+      argRes.value,
+      Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: resolvedType))
+    ],
+    isStar: false
+  ))
+
+proc parseCaseExpr(node: JsonNode): Result[Expr] =
+  var caseArgs: seq[Expr] = @[]
+  var simpleCaseArg: Expr = nil
+  if nodeHas(node, "arg"):
+    let argRes = parseExprNode(node["arg"])
+    if not argRes.ok:
+      return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+    simpleCaseArg = argRes.value
+
+  let whenNodes = nodeGet(node, "args")
+  if whenNodes.kind == JArray:
+    for whenNode in whenNodes:
+      if not nodeHas(whenNode, "CaseWhen"):
+        continue
+      let cw = whenNode["CaseWhen"]
+      let condRawRes = parseExprNode(nodeGet(cw, "expr"))
+      if not condRawRes.ok:
+        return err[Expr](condRawRes.err.code, condRawRes.err.message, condRawRes.err.context)
+      var condExpr = condRawRes.value
+      if simpleCaseArg != nil:
+        condExpr = Expr(kind: ekBinary, op: "=", left: simpleCaseArg, right: condExpr)
+      let resultRes = parseExprNode(nodeGet(cw, "result"))
+      if not resultRes.ok:
+        return err[Expr](resultRes.err.code, resultRes.err.message, resultRes.err.context)
+      caseArgs.add(condExpr)
+      caseArgs.add(resultRes.value)
+
+  var elseExpr = Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+  if nodeHas(node, "defresult"):
+    let elseRes = parseExprNode(node["defresult"])
+    if not elseRes.ok:
+      return err[Expr](elseRes.err.code, elseRes.err.message, elseRes.err.context)
+    elseExpr = elseRes.value
+  caseArgs.add(elseExpr)
+  ok(Expr(kind: ekFunc, funcName: "CASE", args: caseArgs, isStar: false))
+
+proc parseSubLink(node: JsonNode): Result[Expr] =
+  let linkType = nodeStringOr(node, "subLinkType", "")
+  if linkType != "EXISTS_SUBLINK":
+    return err[Expr](ERR_SQL, "Only EXISTS subqueries are supported in 0.x")
+  let subselectNode = nodeGet(node, "subselect")
+  let stmtRes = parseStatementNode(subselectNode)
+  if not stmtRes.ok:
+    return err[Expr](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
+  if stmtRes.value.kind != skSelect:
+    return err[Expr](ERR_SQL, "EXISTS requires SELECT subquery")
+  let sqlText = selectToCanonicalSql(stmtRes.value)
+  ok(Expr(kind: ekFunc, funcName: "EXISTS", args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: sqlText))], isStar: false))
 
 proc parseNullTest(node: JsonNode): Result[Expr] =
   let argRes = parseExprNode(node["arg"])
@@ -398,6 +682,12 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseBoolExpr(node["BoolExpr"])
     if nodeHas(node, "A_Expr"):
       return parseAExpr(node["A_Expr"])
+    if nodeHas(node, "CoalesceExpr"):
+      return parseCoalesceExpr(node["CoalesceExpr"])
+    if nodeHas(node, "CaseExpr"):
+      return parseCaseExpr(node["CaseExpr"])
+    if nodeHas(node, "SubLink"):
+      return parseSubLink(node["SubLink"])
     if nodeHas(node, "ParamRef"):
       return parseParamRef(node["ParamRef"])
     if nodeHas(node, "TypeCast"):
@@ -459,7 +749,104 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
 
+proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq[Statement])] =
+  var cteNames: seq[string] = @[]
+  var cteColumns: seq[seq[string]] = @[]
+  var cteQueries: seq[Statement] = @[]
+  if node.kind != JObject:
+    return ok((cteNames, cteColumns, cteQueries))
+  if nodeHas(node, "recursive") and node["recursive"].kind == JBool and node["recursive"].getBool:
+    return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "WITH RECURSIVE is not supported in 0.x")
+  let cteNodes = nodeGet(node, "ctes")
+  if cteNodes.kind != JArray:
+    return ok((cteNames, cteColumns, cteQueries))
+  for entry in cteNodes:
+    if not nodeHas(entry, "CommonTableExpr"):
+      continue
+    let cteNode = entry["CommonTableExpr"]
+    let cteName = nodeGet(cteNode, "ctename").getStr
+    if cteName.len == 0:
+      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE name is required")
+
+    var columns: seq[string] = @[]
+    let aliasCols = nodeGet(cteNode, "aliascolnames")
+    if aliasCols.kind == JArray:
+      for colNode in aliasCols:
+        let colName = nodeString(colNode)
+        if colName.len == 0:
+          return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "Invalid CTE column name", cteName)
+        columns.add(colName)
+
+    let queryRes = parseStatementNode(nodeGet(cteNode, "ctequery"))
+    if not queryRes.ok:
+      return err[(seq[string], seq[seq[string]], seq[Statement])](queryRes.err.code, queryRes.err.message, queryRes.err.context)
+    if queryRes.value.kind != skSelect:
+      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE query must be SELECT", cteName)
+
+    cteNames.add(cteName)
+    cteColumns.add(columns)
+    cteQueries.add(queryRes.value)
+  ok((cteNames, cteColumns, cteQueries))
+
 proc parseSelectStmt(node: JsonNode): Result[Statement] =
+  var cteNames: seq[string] = @[]
+  var cteColumns: seq[seq[string]] = @[]
+  var cteQueries: seq[Statement] = @[]
+  if nodeHas(node, "withClause"):
+    let cteRes = parseWithClause(node["withClause"])
+    if not cteRes.ok:
+      return err[Statement](cteRes.err.code, cteRes.err.message, cteRes.err.context)
+    cteNames = cteRes.value[0]
+    cteColumns = cteRes.value[1]
+    cteQueries = cteRes.value[2]
+
+  let setOp = nodeStringOr(node, "op", "SETOP_NONE")
+  if setOp != "SETOP_NONE":
+    let isAll = nodeHas(node, "all") and node["all"].kind == JBool and node["all"].getBool
+    var parsedSetOpKind = sokNone
+    case setOp
+    of "SETOP_UNION":
+      parsedSetOpKind = (if isAll: sokUnionAll else: sokUnion)
+    of "SETOP_INTERSECT":
+      if isAll:
+        return err[Statement](ERR_SQL, "INTERSECT ALL is not supported in 0.x")
+      parsedSetOpKind = sokIntersect
+    of "SETOP_EXCEPT":
+      if isAll:
+        return err[Statement](ERR_SQL, "EXCEPT ALL is not supported in 0.x")
+      parsedSetOpKind = sokExcept
+    else:
+      return err[Statement](ERR_SQL, "Set operation not supported in 0.x", setOp)
+    if nodeHas(node, "sortClause") or nodeHas(node, "limitCount") or nodeHas(node, "limitOffset"):
+      return err[Statement](ERR_SQL, "ORDER BY/LIMIT/OFFSET on set operations is not supported in 0.x")
+    let leftRes = parseSelectStmt(nodeGet(node, "larg"))
+    if not leftRes.ok:
+      return err[Statement](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = parseSelectStmt(nodeGet(node, "rarg"))
+    if not rightRes.ok:
+      return err[Statement](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    return ok(Statement(
+      kind: skSelect,
+      cteNames: cteNames,
+      cteColumns: cteColumns,
+      cteQueries: cteQueries,
+      setOpKind: parsedSetOpKind,
+      setOpLeft: leftRes.value,
+      setOpRight: rightRes.value,
+      selectItems: @[],
+      fromTable: "",
+      fromAlias: "",
+      joins: @[],
+      whereExpr: nil,
+      groupBy: @[],
+      havingExpr: nil,
+      orderBy: @[],
+      limit: -1,
+      limitParam: 0,
+      offset: -1,
+      offsetParam: 0
+    ))
+
   var items: seq[SelectItem] = @[]
   let targets = nodeGet(node, "targetList")
   if targets.kind == JArray:
@@ -541,7 +928,27 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       offsetParam = offsetRes.value.index
     else:
       return err[Statement](ERR_SQL, "OFFSET must be an integer literal or $N parameter")
-  ok(Statement(kind: skSelect, selectItems: items, fromTable: fromTable, fromAlias: fromAlias, joins: joins, whereExpr: whereExpr, groupBy: groupBy, havingExpr: havingExpr, orderBy: orderBy, limit: limit, limitParam: limitParam, offset: offset, offsetParam: offsetParam))
+  ok(Statement(
+    kind: skSelect,
+    cteNames: cteNames,
+    cteColumns: cteColumns,
+    cteQueries: cteQueries,
+    setOpKind: sokNone,
+    setOpLeft: nil,
+    setOpRight: nil,
+    selectItems: items,
+    fromTable: fromTable,
+    fromAlias: fromAlias,
+    joins: joins,
+    whereExpr: whereExpr,
+    groupBy: groupBy,
+    havingExpr: havingExpr,
+    orderBy: orderBy,
+    limit: limit,
+    limitParam: limitParam,
+    offset: offset,
+    offsetParam: offsetParam
+  ))
 
 proc parseInsertStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])
@@ -556,21 +963,113 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
       cols.add(resTarget["name"].getStr)
   let selectNode = nodeGet(node, "selectStmt")
   var values: seq[Expr] = @[]
+  var extraRows: seq[seq[Expr]] = @[]
   if nodeHas(selectNode, "SelectStmt"):
     let selectStmt = selectNode["SelectStmt"]
     let valuesLists = nodeGet(selectStmt, "valuesLists")
     if valuesLists.kind == JArray and valuesLists.len > 0:
-      let first = valuesLists[0]
-      var itemsNode = first
-      if nodeHas(first, "List"):
-        itemsNode = nodeGet(first["List"], "items")
-      if itemsNode.kind == JArray:
-        for v in itemsNode:
-          let exprRes = parseExprNode(v)
+      for rowIdx in 0 ..< valuesLists.len:
+        let rowNode = valuesLists[rowIdx]
+        var itemsNode = rowNode
+        if nodeHas(rowNode, "List"):
+          itemsNode = nodeGet(rowNode["List"], "items")
+        var rowValues: seq[Expr] = @[]
+        if itemsNode.kind == JArray:
+          for v in itemsNode:
+            let exprRes = parseExprNode(v)
+            if not exprRes.ok:
+              return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+            rowValues.add(exprRes.value)
+        if rowIdx == 0:
+          values = rowValues
+        else:
+          extraRows.add(rowValues)
+
+  var conflictAction = icaNone
+  var conflictTargetCols: seq[string] = @[]
+  var conflictTargetConstraint = ""
+  var conflictAssignments = initTable[string, Expr]()
+  var conflictWhere: Expr = nil
+  var returningItems: seq[SelectItem] = @[]
+  if nodeHas(node, "onConflictClause"):
+    let conflict = node["onConflictClause"]
+    let action = nodeGet(conflict, "action").getStr
+    case action
+    of "ONCONFLICT_NOTHING":
+      conflictAction = icaDoNothing
+    of "ONCONFLICT_UPDATE":
+      conflictAction = icaDoUpdate
+    else:
+      return err[Statement](ERR_SQL, "Unsupported ON CONFLICT action", action)
+
+    let infer = nodeGet(conflict, "infer")
+    if infer.kind == JObject:
+      if nodeHas(infer, "conname"):
+        conflictTargetConstraint = nodeGet(infer, "conname").getStr
+      let elems = nodeGet(infer, "indexElems")
+      if elems.kind == JArray:
+        for entry in elems:
+          if not nodeHas(entry, "IndexElem"):
+            return err[Statement](ERR_SQL, "Unsupported ON CONFLICT target element")
+          let idxElem = entry["IndexElem"]
+          let colName = nodeGet(idxElem, "name").getStr
+          if colName.len == 0:
+            return err[Statement](ERR_SQL, "ON CONFLICT target expressions are not supported")
+          conflictTargetCols.add(colName)
+
+    if conflictAction == icaDoUpdate:
+      let targetList = nodeGet(conflict, "targetList")
+      if targetList.kind == JArray:
+        for entry in targetList:
+          let resTarget = nodeGet(entry, "ResTarget")
+          let name = nodeGet(resTarget, "name").getStr
+          if name.len == 0:
+            return err[Statement](ERR_SQL, "ON CONFLICT DO UPDATE requires assignment target column")
+          let exprRes = parseExprNode(nodeGet(resTarget, "val"))
           if not exprRes.ok:
             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-          values.add(exprRes.value)
-  ok(Statement(kind: skInsert, insertTable: tableRes.value[0], insertColumns: cols, insertValues: values))
+          conflictAssignments[name] = exprRes.value
+      if nodeHas(conflict, "whereClause"):
+        let whereRes = parseExprNode(nodeGet(conflict, "whereClause"))
+        if not whereRes.ok:
+          return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
+        conflictWhere = whereRes.value
+
+  if nodeHas(node, "returningList"):
+    let returningNode = nodeGet(node, "returningList")
+    if returningNode.kind == JArray:
+      for rt in returningNode:
+        if not nodeHas(rt, "ResTarget"):
+          continue
+        let resTarget = rt["ResTarget"]
+        let valNode = nodeGet(resTarget, "val")
+        if nodeHas(valNode, "ColumnRef"):
+          let colRes = parseColumnRef(valNode["ColumnRef"])
+          if not colRes.ok:
+            return err[Statement](colRes.err.code, colRes.err.message, colRes.err.context)
+          if colRes.value.kind == ekColumn and colRes.value.name == "*":
+            let alias = if nodeHas(resTarget, "name"): resTarget["name"].getStr else: ""
+            returningItems.add(SelectItem(expr: nil, alias: alias, isStar: true))
+            continue
+        let exprRes = parseExprNode(valNode)
+        if not exprRes.ok:
+          return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+        let alias = if nodeHas(resTarget, "name"): resTarget["name"].getStr else: ""
+        returningItems.add(SelectItem(expr: exprRes.value, alias: alias, isStar: false))
+
+  ok(Statement(
+    kind: skInsert,
+    insertTable: tableRes.value[0],
+    insertColumns: cols,
+    insertValues: values,
+    insertValueRows: extraRows,
+    insertConflictAction: conflictAction,
+    insertConflictTargetCols: conflictTargetCols,
+    insertConflictTargetConstraint: conflictTargetConstraint,
+    insertConflictUpdateAssignments: conflictAssignments,
+    insertConflictUpdateWhere: conflictWhere,
+    insertReturning: returningItems
+  ))
 
 proc parseUpdateStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])
@@ -617,9 +1116,9 @@ proc quoteSqlString(text: string): string =
       result.add(ch)
   result.add("'")
 
-proc exprToCanonicalSql(expr: Expr): string
+proc exprToCanonicalSql*(expr: Expr): string
 
-proc exprToCanonicalSql(expr: Expr): string =
+proc exprToCanonicalSql*(expr: Expr): string =
   if expr == nil:
     return "NULL"
   case expr.kind
@@ -647,16 +1146,31 @@ proc exprToCanonicalSql(expr: Expr): string =
   of ekUnary:
     "(" & expr.unOp & " " & exprToCanonicalSql(expr.expr) & ")"
   of ekFunc:
-    let argsText =
-      if expr.isStar:
-        "*"
-      else:
-        block:
-          var args: seq[string] = @[]
-          for arg in expr.args:
-            args.add(exprToCanonicalSql(arg))
-          args.join(", ")
-    expr.funcName & "(" & argsText & ")"
+    if expr.funcName == "CAST" and expr.args.len == 2 and expr.args[1].kind == ekLiteral and expr.args[1].value.kind == svString:
+      "CAST(" & exprToCanonicalSql(expr.args[0]) & " AS " & expr.args[1].value.strVal & ")"
+    elif expr.funcName == "CASE":
+      var text = "CASE"
+      var i = 0
+      while i + 1 < expr.args.len - 1:
+        text.add(" WHEN " & exprToCanonicalSql(expr.args[i]) & " THEN " & exprToCanonicalSql(expr.args[i + 1]))
+        i += 2
+      if expr.args.len > 0:
+        text.add(" ELSE " & exprToCanonicalSql(expr.args[^1]))
+      text.add(" END")
+      text
+    elif expr.funcName == "EXISTS" and expr.args.len == 1 and expr.args[0].kind == ekLiteral and expr.args[0].value.kind == svString:
+      "EXISTS (" & expr.args[0].value.strVal & ")"
+    else:
+      let argsText =
+        if expr.isStar:
+          "*"
+        else:
+          block:
+            var args: seq[string] = @[]
+            for arg in expr.args:
+              args.add(exprToCanonicalSql(arg))
+            args.join(", ")
+      expr.funcName & "(" & argsText & ")"
   of ekParam:
     "$" & $expr.index
   of ekInList:
@@ -664,9 +1178,67 @@ proc exprToCanonicalSql(expr: Expr): string =
     for item in expr.inList:
       parts.add(exprToCanonicalSql(item))
     "(" & exprToCanonicalSql(expr.inExpr) & " IN (" & parts.join(", ") & "))"
+  of ekWindowRowNumber:
+    var sqlText = "ROW_NUMBER() OVER ("
+    if expr.windowPartitions.len > 0:
+      var partSql: seq[string] = @[]
+      for p in expr.windowPartitions:
+        partSql.add(exprToCanonicalSql(p))
+      sqlText.add("PARTITION BY " & partSql.join(", "))
+      if expr.windowOrderExprs.len > 0:
+        sqlText.add(" ")
+    if expr.windowOrderExprs.len > 0:
+      var orderSql: seq[string] = @[]
+      for i, o in expr.windowOrderExprs:
+        let asc = if i < expr.windowOrderAsc.len: expr.windowOrderAsc[i] else: true
+        orderSql.add(exprToCanonicalSql(o) & (if asc: " ASC" else: " DESC"))
+      sqlText.add("ORDER BY " & orderSql.join(", "))
+    sqlText.add(")")
+    sqlText
+
+proc parseStandaloneExpr*(exprSql: string): Result[Expr] =
+  let sqlText = "SELECT " & exprSql
+  let astRes = parseSql(sqlText)
+  if not astRes.ok:
+    return err[Expr](astRes.err.code, astRes.err.message, astRes.err.context)
+  if astRes.value.statements.len != 1:
+    return err[Expr](ERR_SQL, "Expression parse must produce one statement")
+  let stmt = astRes.value.statements[0]
+  if stmt.kind != skSelect:
+    return err[Expr](ERR_SQL, "Expression parse must produce SELECT")
+  if stmt.selectItems.len != 1 or stmt.selectItems[0].isStar:
+    return err[Expr](ERR_SQL, "Expression parse must produce one scalar item")
+  ok(stmt.selectItems[0].expr)
 
 proc selectToCanonicalSql(stmt: Statement): string =
   var parts: seq[string] = @[]
+  if stmt.cteNames.len > 0:
+    var cteParts: seq[string] = @[]
+    for i, cteName in stmt.cteNames:
+      var header = cteName
+      let cols = if i < stmt.cteColumns.len: stmt.cteColumns[i] else: @[]
+      if cols.len > 0:
+        header.add(" (" & cols.join(", ") & ")")
+      if i < stmt.cteQueries.len:
+        header.add(" AS (" & selectToCanonicalSql(stmt.cteQueries[i]) & ")")
+      else:
+        header.add(" AS (SELECT 1)")
+      cteParts.add(header)
+    parts.add("WITH " & cteParts.join(", "))
+
+  if stmt.setOpKind != sokNone:
+    if stmt.setOpLeft != nil and stmt.setOpRight != nil:
+      let opText =
+        case stmt.setOpKind
+        of sokUnionAll: " UNION ALL "
+        of sokUnion: " UNION "
+        of sokIntersect: " INTERSECT "
+        of sokExcept: " EXCEPT "
+        else: " UNION ALL "
+      parts.add(selectToCanonicalSql(stmt.setOpLeft) & opText & selectToCanonicalSql(stmt.setOpRight))
+      return parts.join(" ")
+    return parts.join(" ")
+
   var selectItems: seq[string] = @[]
   for item in stmt.selectItems:
     if item.isStar:
@@ -731,12 +1303,28 @@ proc selectToCanonicalSql(stmt: Statement): string =
 # Actually, parseCreateStmt etc. are fine.
 # I will output the whole file content to be safe.
 
+proc parseFkActionCode(code: string): Result[string] =
+  case code.toLowerAscii()
+  of "", "a":
+    ok("NO ACTION")
+  of "r":
+    ok("RESTRICT")
+  of "c":
+    ok("CASCADE")
+  of "n":
+    ok("SET NULL")
+  of "d":
+    err[string](ERR_SQL, "SET DEFAULT foreign key action is not supported in 0.x")
+  else:
+    err[string](ERR_SQL, "Unsupported foreign key action code", code)
+
 proc parseCreateStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   var columns: seq[ColumnDef] = @[]
+  var checks: seq[CheckConstraintDef] = @[]
   var tableConstraints: seq[JsonNode] = @[]
   let elts = nodeGet(node, "tableElts")
   if elts.kind == JArray:
@@ -752,6 +1340,30 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
           let typeNames = nodeGet(typeNode, "names")
           if typeNames.kind == JArray and typeNames.len > 0:
             typeName = nodeString(typeNames[^1])
+            let typmods = nodeGet(typeNode, "typmods")
+            if typmods.kind == JArray and typmods.len > 0:
+              var mods: seq[string] = @[]
+              for m in typmods:
+                var n = m
+                if nodeHas(n, "A_Const"):
+                  n = n["A_Const"]
+                
+                if nodeHas(n, "ival"):
+                  let v = n["ival"]
+                  if nodeHas(v, "ival"):
+                     mods.add($v["ival"].getInt)
+                  else:
+                     mods.add($v.getInt)
+                elif nodeHas(n, "val"):
+                  n = n["val"]
+                  if nodeHas(n, "Integer"):
+                    n = n["Integer"]
+                  if nodeHas(n, "ival"):
+                    mods.add($n["ival"].getInt)
+                elif n.kind == JInt:
+                  mods.add($n.getInt)
+              if mods.len > 0:
+                typeName.add("(" & mods.join(",") & ")")
         var def = ColumnDef(name: name, typeName: typeName)
         let constraints = nodeGet(col, "constraints")
         if constraints.kind == JArray:
@@ -776,6 +1388,23 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
                 let attrs = nodeGet(constraint, "pk_attrs")
                 if attrs.kind == JArray and attrs.len > 0:
                   def.refColumn = nodeString(attrs[0])
+                let delActionRes = parseFkActionCode(nodeGet(constraint, "fk_del_action").getStr)
+                if not delActionRes.ok:
+                  return err[Statement](delActionRes.err.code, delActionRes.err.message, delActionRes.err.context)
+                def.refOnDelete = delActionRes.value
+                let updActionRes = parseFkActionCode(nodeGet(constraint, "fk_upd_action").getStr)
+                if not updActionRes.ok:
+                  return err[Statement](updActionRes.err.code, updActionRes.err.message, updActionRes.err.context)
+                def.refOnUpdate = updActionRes.value
+              of "CONSTR_CHECK":
+                let rawExpr = nodeGet(constraint, "raw_expr")
+                let exprRes = parseExprNode(rawExpr)
+                if not exprRes.ok:
+                  return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+                checks.add(CheckConstraintDef(
+                  name: nodeGet(constraint, "conname").getStr,
+                  expr: exprRes.value
+                ))
               else:
                 discard
         columns.add(def)
@@ -802,7 +1431,16 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
           return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
     elif contype == "CONSTR_FOREIGN":
       return err[Statement](ERR_SQL, "Table-level foreign keys not supported")
-  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns))
+    elif contype == "CONSTR_CHECK":
+      let rawExpr = nodeGet(constraint, "raw_expr")
+      let exprRes = parseExprNode(rawExpr)
+      if not exprRes.ok:
+        return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+      checks.add(CheckConstraintDef(
+        name: nodeGet(constraint, "conname").getStr,
+        expr: exprRes.value
+      ))
+  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let idxName = nodeGet(node, "idxname").getStr
@@ -816,8 +1454,15 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     for p in params:
       if nodeHas(p, "IndexElem"):
         let param = p["IndexElem"]
-        if nodeHas(param, "name"):
+        if nodeHas(param, "name") and param["name"].kind == JString and param["name"].getStr.len > 0:
           columnNames.add(param["name"].getStr)
+        elif nodeHas(param, "expr"):
+          let exprRes = parseExprNode(param["expr"])
+          if not exprRes.ok:
+            return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+          columnNames.add(IndexExpressionPrefix & exprToCanonicalSql(exprRes.value))
+        else:
+          return err[Statement](ERR_SQL, "Unsupported index element in CREATE INDEX")
   var kind = ikBtree
   let methodName = nodeGet(node, "accessMethod").getStr
   if methodName.len > 0:
@@ -825,7 +1470,21 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     if methodLower == "trigram":
       kind = ikTrigram
   let unique = nodeHas(node, "unique") and node["unique"].getBool
-  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnNames: columnNames, indexKind: kind, unique: unique))
+  var predicate: Expr = nil
+  if nodeHas(node, "whereClause"):
+    let predRes = parseExprNode(nodeGet(node, "whereClause"))
+    if not predRes.ok:
+      return err[Statement](predRes.err.code, predRes.err.message, predRes.err.context)
+    predicate = predRes.value
+  ok(Statement(
+    kind: skCreateIndex,
+    indexName: idxName,
+    indexTableName: tableRes.value[0],
+    columnNames: columnNames,
+    indexKind: kind,
+    unique: unique,
+    indexPredicate: predicate
+  ))
 
 proc parseViewStmt(node: JsonNode): Result[Statement] =
   let viewRes = parseRangeVar(nodeGet(node, "view"))
@@ -886,21 +1545,106 @@ proc parseDropStmt(node: JsonNode): Result[Statement] =
     return ok(Statement(kind: skDropIndex, dropIndexName: name))
   if removeType == "OBJECT_VIEW":
     return ok(Statement(kind: skDropView, dropViewName: name, dropViewIfExists: missingOk))
+  if removeType == "OBJECT_TRIGGER":
+    var tableName = ""
+    var triggerName = ""
+    if objects.kind == JArray and objects.len > 0:
+      let obj = objects[0]
+      if nodeHas(obj, "List"):
+        let items = nodeGet(obj["List"], "items")
+        if items.kind == JArray and items.len >= 2:
+          tableName = nodeString(items[0])
+          triggerName = nodeString(items[1])
+    return ok(Statement(
+      kind: skDropTrigger,
+      dropTriggerName: triggerName,
+      dropTriggerTableName: tableName,
+      dropTriggerIfExists: missingOk
+    ))
   if removeType == "OBJECT_TABLE":
     return ok(Statement(kind: skDropTable, dropTableName: name))
   err[Statement](ERR_SQL, "Unsupported DROP object type", removeType)
 
+proc parseCreateTrigStmt(node: JsonNode): Result[Statement] =
+  let triggerName = nodeGet(node, "trigname").getStr
+  let tableRes = parseRangeVar(nodeGet(node, "relation"))
+  if not tableRes.ok:
+    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let tableName = tableRes.value[0]
+
+  let rowMode = nodeHas(node, "row") and node["row"].kind == JBool and node["row"].getBool
+  var eventsMask = 0
+  let eventsNode = nodeGet(node, "events")
+  if eventsNode.kind == JInt:
+    eventsMask = eventsNode.getInt
+  elif eventsNode.kind == JString:
+    try:
+      eventsMask = parseInt(eventsNode.getStr)
+    except ValueError:
+      discard
+
+  if (eventsMask and TriggerEventTruncateMask) != 0:
+    return err[Statement](ERR_SQL, "TRUNCATE triggers are not supported in 0.x")
+
+  var timingMask = 0
+  if nodeHas(node, "timing"):
+    let timingNode = node["timing"]
+    if timingNode.kind == JInt:
+      timingMask = timingNode.getInt
+    elif timingNode.kind == JString:
+      let timing = timingNode.getStr.toUpperAscii()
+      if timing.contains("INSTEAD"):
+        timingMask = TriggerTimingInsteadMask
+      elif timing.len == 0 or timing.contains("AFTER"):
+        timingMask = 0
+      else:
+        return err[Statement](ERR_SQL, "Only AFTER and INSTEAD OF triggers are supported in 0.x")
+  if timingMask != 0 and (timingMask and TriggerTimingInsteadMask) == 0:
+    return err[Statement](ERR_SQL, "Only AFTER and INSTEAD OF triggers are supported in 0.x")
+  if (timingMask and TriggerTimingInsteadMask) != 0:
+    eventsMask = eventsMask or TriggerTimingInsteadMask
+
+  let funcNameParts = nodeGet(node, "funcname")
+  var functionName = ""
+  if funcNameParts.kind == JArray and funcNameParts.len > 0:
+    functionName = nodeString(funcNameParts[^1])
+
+  let argNodes = nodeGet(node, "args")
+  var actionSql = ""
+  if argNodes.kind == JArray and argNodes.len > 0:
+    actionSql = nodeString(argNodes[0])
+
+  ok(Statement(
+    kind: skCreateTrigger,
+    triggerName: triggerName,
+    triggerTableName: tableName,
+    triggerForEachRow: rowMode,
+    triggerEventsMask: eventsMask,
+    triggerFunctionName: functionName,
+    triggerActionSql: actionSql
+  ))
+
 proc parseRenameStmt(node: JsonNode): Result[Statement] =
   let renameType = nodeGet(node, "renameType").getStr
-  if renameType != "OBJECT_VIEW":
-    return err[Statement](ERR_SQL, "Unsupported RENAME statement", renameType)
-  let viewRes = parseRangeVar(nodeGet(node, "relation"))
-  if not viewRes.ok:
-    return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
-  let newName = nodeGet(node, "newname").getStr
-  if newName.len == 0:
-    return err[Statement](ERR_SQL, "ALTER VIEW RENAME requires new name")
-  ok(Statement(kind: skAlterView, alterViewName: viewRes.value[0], alterViewNewName: newName))
+  if renameType == "OBJECT_VIEW":
+    let viewRes = parseRangeVar(nodeGet(node, "relation"))
+    if not viewRes.ok:
+      return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+    let newName = nodeGet(node, "newname").getStr
+    if newName.len == 0:
+      return err[Statement](ERR_SQL, "ALTER VIEW RENAME requires new name")
+    return ok(Statement(kind: skAlterView, alterViewName: viewRes.value[0], alterViewNewName: newName))
+  if renameType == "OBJECT_COLUMN":
+    let tableRes = parseRangeVar(nodeGet(node, "relation"))
+    if not tableRes.ok:
+      return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let oldName = nodeGet(node, "subname").getStr
+    let newName = nodeGet(node, "newname").getStr
+    if oldName.len == 0 or newName.len == 0:
+      return err[Statement](ERR_SQL, "ALTER TABLE RENAME COLUMN requires old and new names")
+    let action = AlterTableAction(kind: ataRenameColumn, columnName: oldName, newColumnName: newName)
+    return ok(Statement(kind: skAlterTable, alterTableName: tableRes.value[0], alterActions: @[action]))
+  err[Statement](ERR_SQL, "Unsupported RENAME statement", renameType)
 
 proc parseTransactionStmt(node: JsonNode): Result[Statement] =
   let kindStr = nodeString(node["kind"])
@@ -917,12 +1661,7 @@ proc parseTransactionStmt(node: JsonNode): Result[Statement] =
 
 proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
   let colName = nodeGet(node, "colname").getStr
-  let typeNode = nodeGet(node, "typeName")
-  var typeName = ""
-  if typeNode.kind == JObject:
-    let names = nodeGet(typeNode, "names")
-    if names.kind == JArray and names.len > 0:
-      typeName = nodeString(names[^1])
+  let typeName = parseTypeNameNode(nodeGet(node, "typeName"))
   let notNull = nodeHas(node, "is_not_null") and node["is_not_null"].getBool
   let constraints = nodeGet(node, "constraints")
   var isPrimaryKey = false
@@ -935,6 +1674,10 @@ proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
           isPrimaryKey = true
         elif contype == "CONSTR_UNIQUE":
           isUnique = true
+        elif contype == "CONSTR_CHECK":
+          return err[ColumnDef](ERR_SQL, "ADD COLUMN CHECK is not supported in 0.x")
+        elif contype == "CONSTR_FOREIGN":
+          return err[ColumnDef](ERR_SQL, "ADD COLUMN REFERENCES is not supported in 0.x")
   ok(ColumnDef(name: colName, typeName: typeName.toUpperAscii(), notNull: notNull, unique: isUnique, primaryKey: isPrimaryKey))
 
 proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
@@ -969,6 +1712,12 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
     of "AT_DropColumn":
       let colName = nodeGet(alterCmd, "name").getStr
       action = AlterTableAction(kind: ataDropColumn, columnName: colName)
+    of "AT_RenameColumn":
+      let oldName = nodeGet(alterCmd, "name").getStr
+      let newName = nodeGet(alterCmd, "newname").getStr
+      if oldName.len == 0 or newName.len == 0:
+        return err[Statement](ERR_SQL, "ALTER TABLE RENAME COLUMN requires old and new names")
+      action = AlterTableAction(kind: ataRenameColumn, columnName: oldName, newColumnName: newName)
     of "AT_ColumnDefault":
       let colName = nodeGet(alterCmd, "name").getStr
       if nodeHas(alterCmd, "def"):
@@ -978,6 +1727,22 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
         action = AlterTableAction(kind: ataAlterColumn, columnName: colName, alterColumnAction: acaSetDefault, alterColumnDefault: defExpr.value)
       else:
         action = AlterTableAction(kind: ataAlterColumn, columnName: colName, alterColumnAction: acaDropDefault)
+    of "AT_AlterColumnType":
+      let colName = nodeGet(alterCmd, "name").getStr
+      var typeNode = nodeGet(alterCmd, "def")
+      if nodeHas(typeNode, "ColumnDef"):
+        typeNode = nodeGet(typeNode["ColumnDef"], "typeName")
+      elif nodeHas(typeNode, "TypeName"):
+        typeNode = typeNode["TypeName"]
+      let newType = parseTypeNameNode(typeNode).toUpperAscii()
+      if colName.len == 0 or newType.len == 0:
+        return err[Statement](ERR_SQL, "ALTER COLUMN TYPE requires column and target type")
+      action = AlterTableAction(
+        kind: ataAlterColumn,
+        columnName: colName,
+        alterColumnAction: acaSetType,
+        alterColumnNewType: newType
+      )
     else:
       return err[Statement](ERR_SQL, "Unsupported ALTER TABLE operation", subtype)
     actions.add(action)
@@ -1017,6 +1782,8 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
     return parseIndexStmt(node["IndexStmt"])
   if nodeHas(node, "ViewStmt"):
     return parseViewStmt(node["ViewStmt"])
+  if nodeHas(node, "CreateTrigStmt"):
+    return parseCreateTrigStmt(node["CreateTrigStmt"])
   if nodeHas(node, "DropStmt"):
     return parseDropStmt(node["DropStmt"])
   if nodeHas(node, "RenameStmt"):
@@ -1175,6 +1942,12 @@ proc parseSql*(sql: string): Result[SqlAst] =
 
     let stmt = Statement(
       kind: skSelect,
+      cteNames: @[],
+      cteColumns: @[],
+      cteQueries: @[],
+      setOpKind: sokNone,
+      setOpLeft: nil,
+      setOpRight: nil,
       selectItems: @[SelectItem(expr: nil, alias: "", isStar: true)],
       fromTable: tableName,
       fromAlias: "",
@@ -1270,7 +2043,7 @@ proc parseSql*(sql: string): Result[SqlAst] =
     return err[SqlAst](ERR_INTERNAL, "libpg_query required", "build with -d:libpg_query and link libpg_query")
   let parseResult = pg_query_parse(sql.cstring)
   defer: pg_query_free_parse_result(parseResult)
-  if parseResult.error.message != nil:
+  if parseResult.error != nil:
     return err[SqlAst](ERR_SQL, $parseResult.error.message)
   if parseResult.parse_tree == nil:
     return err[SqlAst](ERR_SQL, "Empty parse tree")

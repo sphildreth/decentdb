@@ -1,6 +1,6 @@
-site_name: DecentDb Documentation
-site_description: DecentDb - Embedded relational database engine with ACID guarantees
-site_author: DecentDb Contributors
+site_name: DecentDB Documentation
+site_description: DecentDB - Embedded relational database engine with ACID guarantees
+site_author: DecentDB Contributors
 site_url: https://decentdb.org
 
 docs_dir: docs
@@ -105,7 +105,7 @@ markdown_extensions:
   - toc:
       permalink: true
 
-copyright: Copyright &copy; 2026 DecentDb Contributors
+copyright: Copyright &copy; 2026 DecentDB Contributors
 
 extra_css:
   - stylesheets/extra.css

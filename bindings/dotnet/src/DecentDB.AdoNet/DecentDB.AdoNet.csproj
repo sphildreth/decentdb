@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Description>ADO.NET provider for DecentDB embedded database</Description>
+    <RootNamespace>DecentDB.AdoNet</RootNamespace>
+    <AssemblyName>DecentDB.AdoNet</AssemblyName>
+
+    <!-- Packed via DecentDB.MicroOrm meta package. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" />
+  </ItemGroup>
+</Project>

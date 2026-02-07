@@ -92,3 +92,23 @@ suite "IN Operator":
     check result.ok
     # NULL IN (...) should return NULL (3-valued logic)
     check result.value.kind == vkNull
+
+  test "evaluate IN expression with NULL in list and no match":
+    let row = makeRow(
+      @["id"],
+      @[Value(kind: vkInt64, int64Val: 99)],
+      1
+    )
+
+    let inExpr = Expr(
+      kind: ekInList,
+      inExpr: Expr(kind: ekColumn, table: "", name: "id"),
+      inList: @[
+        Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)),
+        Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
+      ]
+    )
+
+    let result = evalExpr(row, inExpr, @[])
+    check result.ok
+    check result.value.kind == vkNull

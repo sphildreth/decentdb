@@ -35,22 +35,22 @@ suite "Storage Helper Functions":
 
 suite "Catalog Helper Functions":
   test "parseColumnType for all types":
-    check parseColumnType("INT").ok and parseColumnType("INT").value == ctInt64
-    check parseColumnType("INT64").ok and parseColumnType("INT64").value == ctInt64
-    check parseColumnType("BIGINT").ok and parseColumnType("BIGINT").value == ctInt64
-    check parseColumnType("INT4").ok and parseColumnType("INT4").value == ctInt64
-    check parseColumnType("INT8").ok and parseColumnType("INT8").value == ctInt64
+    check parseColumnType("INT").ok and parseColumnType("INT").value.kind == ctInt64
+    check parseColumnType("INT64").ok and parseColumnType("INT64").value.kind == ctInt64
+    check parseColumnType("BIGINT").ok and parseColumnType("BIGINT").value.kind == ctInt64
+    check parseColumnType("INT4").ok and parseColumnType("INT4").value.kind == ctInt64
+    check parseColumnType("INT8").ok and parseColumnType("INT8").value.kind == ctInt64
     
-    check parseColumnType("BOOL").ok and parseColumnType("BOOL").value == ctBool
-    check parseColumnType("BOOLEAN").ok and parseColumnType("BOOLEAN").value == ctBool
+    check parseColumnType("BOOL").ok and parseColumnType("BOOL").value.kind == ctBool
+    check parseColumnType("BOOLEAN").ok and parseColumnType("BOOLEAN").value.kind == ctBool
     
-    check parseColumnType("FLOAT").ok and parseColumnType("FLOAT").value == ctFloat64
-    check parseColumnType("FLOAT64").ok and parseColumnType("FLOAT64").value == ctFloat64
-    check parseColumnType("DOUBLE").ok and parseColumnType("DOUBLE").value == ctFloat64
+    check parseColumnType("FLOAT").ok and parseColumnType("FLOAT").value.kind == ctFloat64
+    check parseColumnType("FLOAT64").ok and parseColumnType("FLOAT64").value.kind == ctFloat64
+    check parseColumnType("DOUBLE").ok and parseColumnType("DOUBLE").value.kind == ctFloat64
     
-    check parseColumnType("TEXT").ok and parseColumnType("TEXT").value == ctText
+    check parseColumnType("TEXT").ok and parseColumnType("TEXT").value.kind == ctText
     
-    check parseColumnType("BLOB").ok and parseColumnType("BLOB").value == ctBlob
+    check parseColumnType("BLOB").ok and parseColumnType("BLOB").value.kind == ctBlob
     
     let bad = parseColumnType("BADTYPE")
     check not bad.ok
@@ -66,7 +66,7 @@ suite "Catalog Helper Functions":
     for typeName in @["INT", "BOOL", "FLOAT64", "TEXT", "BLOB"]:
       let parseRes = parseColumnType(typeName)
       if parseRes.ok:
-        let kind = parseRes.value
+        let kind = parseRes.value.kind
         let text = columnTypeToText(kind)
         # Should normalize to canonical form
         check text.len > 0

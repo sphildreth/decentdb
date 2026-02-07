@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Description>P/Invoke layer for DecentDB native library</Description>
+    <RootNamespace>DecentDB.Native</RootNamespace>
+    <AssemblyName>DecentDB.Native</AssemblyName>
+
+    <!-- Packed via DecentDB.MicroOrm meta package. -->
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  
+  <!-- Native binaries are packed by DecentDB.MicroOrm; this project stays packable=false. -->
+</Project>

@@ -1,4 +1,4 @@
-import strutils, sequtils, options
+import strutils, sequtils, options, tables
 import ../sql/sql
 import ../catalog/catalog
 import ./planner
@@ -60,6 +60,24 @@ proc renderExpr*(expr: Expr): string =
       s.add(renderExpr(item))
     s.add("))")
     s
+  of ekWindowRowNumber:
+    var s = "ROW_NUMBER() OVER ("
+    if expr.windowPartitions.len > 0:
+      s.add("PARTITION BY ")
+      for i, p in expr.windowPartitions:
+        if i > 0: s.add(", ")
+        s.add(renderExpr(p))
+      if expr.windowOrderExprs.len > 0:
+        s.add(" ")
+    if expr.windowOrderExprs.len > 0:
+      s.add("ORDER BY ")
+      for i, o in expr.windowOrderExprs:
+        if i > 0: s.add(", ")
+        s.add(renderExpr(o))
+        let asc = if i < expr.windowOrderAsc.len: expr.windowOrderAsc[i] else: true
+        s.add(if asc: " ASC" else: " DESC")
+    s.add(")")
+    s
 
 proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
   var lines: seq[string] = @[]
@@ -70,6 +88,9 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
     var line = indent
     
     case p.kind
+    of pkOneRow:
+      line.add("OneRow")
+      lines.add(line)
     of pkTableScan:
       line.add("TableScan(table=" & p.table & " alias=" & p.alias & ")")
       lines.add(line)
@@ -77,9 +98,22 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       line.add("RowidSeek(table=" & p.table & " alias=" & p.alias & " column=" & p.column & " value=" & renderExpr(p.valueExpr) & ")")
       lines.add(line)
     of pkIndexSeek:
-      let idxOpt = catalog.getBtreeIndexForColumn(p.table, p.column)
-      let idxName = if idxOpt.isSome: idxOpt.get.name else: "?"
-      line.add("IndexSeek(table=" & p.table & " column=" & p.column & " value=" & renderExpr(p.valueExpr) & " index=" & idxName & ")")
+      var idxName = "?"
+      if p.column.startsWith(IndexExpressionPrefix):
+        for _, idx in catalog.indexes:
+          if idx.table == p.table and idx.kind == ikBtree and idx.columns.len == 1 and idx.columns[0] == p.column:
+            idxName = idx.name
+            break
+      else:
+        let idxOpt = catalog.getBtreeIndexForColumn(p.table, p.column)
+        if idxOpt.isSome:
+          idxName = idxOpt.get.name
+      let colDisplay =
+        if p.column.startsWith(IndexExpressionPrefix):
+          p.column[IndexExpressionPrefix.len .. ^1]
+        else:
+          p.column
+      line.add("IndexSeek(table=" & p.table & " column=" & colDisplay & " value=" & renderExpr(p.valueExpr) & " index=" & idxName & ")")
       lines.add(line)
     of pkTrigramSeek:
       let idxOpt = catalog.getTrigramIndexForColumn(p.table, p.column)
@@ -88,6 +122,26 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       lines.add(line)
     of pkUnionDistinct:
       line.add("UnionDistinct")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkAppend:
+      line.add("Append")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetUnionDistinct:
+      line.add("SetUnionDistinct")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetIntersect:
+      line.add("SetIntersect")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetExcept:
+      line.add("SetExcept")
       lines.add(line)
       traverse(p.left, depth + 1)
       traverse(p.right, depth + 1)

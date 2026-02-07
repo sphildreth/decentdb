@@ -63,7 +63,7 @@ Go Application
           ↓
       decentdb-go (database/sql driver)
           ↓
-      DecentDb.Native (cgo binding to Nim C API)
+      DecentDB.Native (cgo binding to Nim C API)
           ↓
       DecentDB (Nim engine, direct file I/O)
 ```

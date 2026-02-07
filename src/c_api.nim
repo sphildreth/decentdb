@@ -29,6 +29,7 @@ type
     float64Val: float64
     bytes: ptr uint8
     bytesLen: cint
+    decimalScale: cint
 
   StmtHandle = ref object
     db: DbHandle
@@ -131,6 +132,9 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
       obj["ref_table"] = %col.refTable
     if col.refColumn.len > 0:
       obj["ref_column"] = %col.refColumn
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
+      obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
     arr.add(obj)
 
   let payload = $arr
@@ -251,6 +255,16 @@ proc decentdb_close*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   GC_unref(handle)
   return 0
 
+proc decentdb_checkpoint*(p: pointer): cint {.exportc, cdecl, dynlib.} =
+  if p == nil: return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = checkpointDb(handle.db)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
+
 proc decentdb_last_error_code*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil:
     return cint(globalLastErrorCode)
@@ -277,6 +291,13 @@ proc findMaxParam(stmt: Statement): int =
   
   case stmt.kind
   of skSelect:
+    for query in stmt.cteQueries:
+      if query != nil:
+        maxIdx = max(maxIdx, findMaxParam(query))
+    if stmt.setOpLeft != nil:
+      maxIdx = max(maxIdx, findMaxParam(stmt.setOpLeft))
+    if stmt.setOpRight != nil:
+      maxIdx = max(maxIdx, findMaxParam(stmt.setOpRight))
     for item in stmt.selectItems: walk(item.expr)
     walk(stmt.whereExpr)
     for j in stmt.joins: walk(j.onExpr)
@@ -291,6 +312,11 @@ proc findMaxParam(stmt: Statement): int =
     return findMaxParam(stmt.explainInner)
   of skInsert:
     for v in stmt.insertValues: walk(v)
+    for row in stmt.insertValueRows:
+      for v in row: walk(v)
+    for item in stmt.insertReturning:
+      if not item.isStar:
+        walk(item.expr)
   of skUpdate:
     for _, v in stmt.assignments: walk(v)
     walk(stmt.updateWhere)
@@ -372,6 +398,10 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
       db_handle.setError(explainRes.err.code, explainRes.err.message)
       return cint(toApiCode(explainRes.err.code))
     explainLines = explainRes.value
+
+  if bound.kind == skInsert and bound.insertReturning.len > 0:
+    db_handle.setError(ERR_SQL, "INSERT RETURNING is not yet supported by C API prepare/step")
+    return cint(toApiCode(ERR_SQL))
 
   let stmt_handle = StmtHandle(
     db: db_handle,
@@ -478,6 +508,16 @@ proc decentdb_bind_blob*(p: pointer, col: cint, data: ptr uint8, byte_len: cint)
   h.params[idx] = Value(kind: vkBlob, bytes: bytes)
   return 0
 
+proc decentdb_bind_decimal*(p: pointer, col: cint, int_val: int64, scale: cint): cint {.exportc, cdecl, dynlib.} =
+  let h = cast[StmtHandle](p)
+  let idx = bindIndex0(h, col)
+  if idx < 0: return -1
+  if scale < 0 or scale > 18:
+    h.db.setError(ERR_SQL, "Invalid decimal scale")
+    return -1
+  h.params[idx] = Value(kind: vkDecimal, int64Val: int_val, decimalScale: uint8(scale))
+  return 0
+
 proc decentdb_step*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil: return -1
   let h = cast[StmtHandle](p)
@@ -582,6 +622,11 @@ proc decentdb_column_int64*(p: pointer, col: cint): int64 {.exportc, cdecl, dynl
   if val.kind == vkInt64: return val.int64Val
   if val.kind == vkBool: return if val.boolVal: 1 else: 0
   if val.kind == vkFloat64: return int64(val.float64Val)
+  if val.kind == vkDecimal:
+    # Truncate
+    var v = val.int64Val
+    for _ in 1 .. int(val.decimalScale): v = v div 10
+    return v
   return 0
 
 proc decentdb_column_float64*(p: pointer, col: cint): float64 {.exportc, cdecl, dynlib.} =
@@ -591,6 +636,27 @@ proc decentdb_column_float64*(p: pointer, col: cint): float64 {.exportc, cdecl, 
   if val.kind == vkFloat64: return val.float64Val
   if val.kind == vkInt64: return float64(val.int64Val)
   if val.kind == vkBool: return if val.boolVal: 1.0 else: 0.0
+  if val.kind == vkDecimal:
+    # Best effort conversion to float
+    var f = float64(val.int64Val)
+    var divS = 1.0
+    for _ in 1 .. int(val.decimalScale): divS *= 10.0
+    return f / divS
+  return 0
+
+proc decentdb_column_decimal_scale*(p: pointer, col: cint): cint {.exportc, cdecl, dynlib.} =
+  let h = cast[StmtHandle](p)
+  if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return 0
+  let val = h.currentValues[col]
+  if val.kind == vkDecimal: return cint(val.decimalScale)
+  return 0
+
+proc decentdb_column_decimal_unscaled*(p: pointer, col: cint): int64 {.exportc, cdecl, dynlib.} =
+  let h = cast[StmtHandle](p)
+  if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return 0
+  let val = h.currentValues[col]
+  if val.kind == vkDecimal: return val.int64Val
+  if val.kind == vkInt64: return val.int64Val
   return 0
 
 proc decentdb_column_text*(p: pointer, col: cint, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
@@ -626,7 +692,7 @@ proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_c
     h.rowView = newSeq[DecentdbValueView](n)
   for i in 0 ..< n:
     let v = h.currentValues[i]
-    var view = DecentdbValueView(kind: cint(v.kind), isNull: 0, int64Val: 0, float64Val: 0, bytes: nil, bytesLen: 0)
+    var view = DecentdbValueView(kind: cint(v.kind), isNull: 0, int64Val: 0, float64Val: 0, bytes: nil, bytesLen: 0, decimalScale: 0)
     if v.kind == vkNull:
       view.isNull = 1
     elif v.kind == vkInt64:
@@ -635,6 +701,9 @@ proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_c
       view.int64Val = if v.boolVal: 1 else: 0
     elif v.kind == vkFloat64:
       view.float64Val = v.float64Val
+    elif v.kind == vkDecimal:
+      view.int64Val = v.int64Val
+      view.decimalScale = cint(v.decimalScale)
     elif v.kind in {vkText, vkBlob}:
       view.bytesLen = cint(v.bytes.len)
       if v.bytes.len > 0:
@@ -693,6 +762,8 @@ proc decentdb_step_with_params_row_view*(
         h.params[i] = Value(kind: vkBool, boolVal: v.int64Val != 0)
       elif kindInt == int(vkFloat64):
         h.params[i] = Value(kind: vkFloat64, float64Val: v.float64Val)
+      elif kindInt == int(vkDecimal):
+        h.params[i] = Value(kind: vkDecimal, int64Val: v.int64Val, decimalScale: uint8(v.decimalScale))
       elif kindInt == int(vkText) or kindInt == int(vkBlob):
         let byteLen = int(v.bytesLen)
         if byteLen < 0:

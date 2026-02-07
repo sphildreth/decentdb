@@ -1,8 +1,8 @@
-# DecentDb
+# DecentDB
 
 **Durable. Fast. Embedded.**
 
-DecentDb is an embedded, single-machine relational database engine focused on **durable ACID writes** and **fast reads**.
+DecentDB is an embedded, single-machine relational database engine focused on **durable ACID writes** and **fast reads**.
 
 ## Features
 
@@ -12,10 +12,17 @@ DecentDb is an embedded, single-machine relational database engine focused on **
 - **Efficient Substring Search** - Trigram inverted index for `LIKE '%pattern%'` queries
 - **Cross-Platform** - Linux, macOS, Windows support
 
+## Releases
+
+Releases are driven by Git tags and published via GitHub Actions:
+
+- Engine binaries (GitHub Releases): `docs/development/releases.md`
+- NuGet package (`DecentDB.MicroOrm`, .NET 10 only): `docs/development/releases.md`
+
 ## Quick Start
 
 ```bash
-# Install DecentDb
+# Install DecentDB
 nimble install decentdb
 
 # Create a database

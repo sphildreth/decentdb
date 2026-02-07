@@ -142,7 +142,7 @@ class DbEngine:
         self.commit(conn)
 
 
-class DecentDbEngine(DbEngine):
+class DecentDBEngine(DbEngine):
     def __init__(self, name: str = "DecentDB"):
         self.name = name
 
@@ -426,7 +426,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     engines: List[DbEngine] = []
 
     # Native/Python engines
-    engines.append(DecentDbEngine())
+    engines.append(DecentDBEngine())
     engines.append(SQLiteEngine("wal_normal"))
     engines.append(SQLiteEngine("wal_full"))
 

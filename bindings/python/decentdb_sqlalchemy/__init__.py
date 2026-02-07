@@ -1,1 +1,1 @@
-from .dialect import DecentDbDialect
+from .dialect import DecentDBDialect

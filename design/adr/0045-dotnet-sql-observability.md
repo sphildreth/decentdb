@@ -22,5 +22,5 @@ Embedded databases still need observability for debugging and production metrics
 
 ## References
 - design/DAPPER_SUPPORT.md (SQL Logging and Observability)
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbConnection.cs
-- bindings/dotnet/src/DecentDb.AdoNet/DecentDbCommand.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBConnection.cs
+- bindings/dotnet/src/DecentDB.AdoNet/DecentDBCommand.cs
