@@ -71,6 +71,7 @@ namespace DecentDB.AdoNet
                 3 => "DOUBLE",
                 4 => "TEXT",
                 5 => "BLOB",
+                12 => "DECIMAL",
                 _ => "UNKNOWN"
             };
         }
@@ -86,6 +87,7 @@ namespace DecentDB.AdoNet
                 3 => typeof(double),
                 4 => typeof(string),
                 5 => typeof(byte[]),
+                12 => typeof(decimal),
                 _ => typeof(object)
             };
         }
@@ -105,6 +107,7 @@ namespace DecentDB.AdoNet
                 3 => _statement.GetFloat64(ordinal),
                 4 => _statement.GetText(ordinal),
                 5 => _statement.GetBlob(ordinal),
+                12 => _statement.GetDecimal(ordinal),
                 _ => DBNull.Value
             };
         }
@@ -181,8 +184,16 @@ namespace DecentDB.AdoNet
             }
             else if (nonNullableType == typeof(decimal))
             {
-                var str = _statement.GetText(ordinal);
-                boxed = decimal.Parse(str);
+                var type = _statement.ColumnType(ordinal);
+                if (type == 12) 
+                {
+                    boxed = _statement.GetDecimal(ordinal);
+                }
+                else
+                {
+                    var str = _statement.GetText(ordinal);
+                    boxed = decimal.Parse(str);
+                }
             }
             else if (nonNullableType == typeof(Guid))
             {
@@ -290,6 +301,11 @@ namespace DecentDB.AdoNet
 
         public override decimal GetDecimal(int ordinal)
         {
+            var type = _statement.ColumnType(ordinal);
+            if (type == 12)
+            {
+                return _statement.GetDecimal(ordinal);
+            }
             var str = _statement.GetText(ordinal);
             return decimal.Parse(str);
         }

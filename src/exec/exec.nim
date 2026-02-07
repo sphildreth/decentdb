@@ -1422,6 +1422,10 @@ proc castValue(value: Value, targetTypeRaw: string): Result[Value] =
     case value.kind
     of vkInt64:
       return ok(value)
+    of vkDecimal:
+      var v = value.int64Val
+      for _ in 1 .. int(value.decimalScale): v = v div 10
+      return ok(Value(kind: vkInt64, int64Val: v))
     of vkFloat64:
       return ok(Value(kind: vkInt64, int64Val: int64(value.float64Val)))
     of vkBool:
@@ -1439,6 +1443,10 @@ proc castValue(value: Value, targetTypeRaw: string): Result[Value] =
     case value.kind
     of vkFloat64:
       return ok(value)
+    of vkDecimal:
+      var f = float64(value.int64Val)
+      for _ in 1 .. int(value.decimalScale): f /= 10.0
+      return ok(Value(kind: vkFloat64, float64Val: f))
     of vkInt64:
       return ok(Value(kind: vkFloat64, float64Val: float64(value.int64Val)))
     of vkBool:
@@ -1457,6 +1465,8 @@ proc castValue(value: Value, targetTypeRaw: string): Result[Value] =
     case value.kind
     of vkBool:
       return ok(value)
+    of vkDecimal:
+      return ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
     of vkInt64:
       return ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
     of vkFloat64:
@@ -1887,6 +1897,20 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
             return ok(valRes.value)
          else:
              return err[Value](ERR_SQL, "Cannot cast to UUID", $valRes.value.kind)
+
+      of ctBool:
+         case valRes.value.kind
+         of vkBool: return ok(valRes.value)
+         of vkInt64: return ok(Value(kind: vkBool, boolVal: valRes.value.int64Val != 0))
+         of vkFloat64: return ok(Value(kind: vkBool, boolVal: valRes.value.float64Val != 0.0))
+         of vkDecimal: return ok(Value(kind: vkBool, boolVal: valRes.value.int64Val != 0))
+         of vkText:
+            let s = valueToString(valRes.value).strip().toLowerAscii()
+            if s in ["true", "t", "1"]: return ok(Value(kind: vkBool, boolVal: true))
+            if s in ["false", "f", "0"]: return ok(Value(kind: vkBool, boolVal: false))
+            return err[Value](ERR_SQL, "Invalid boolean format")
+         else:
+            return err[Value](ERR_SQL, "Cannot cast to BOOL", $valRes.value.kind)
 
       of ctText:
          if valRes.value.kind == vkBlob and valRes.value.bytes.len == 16:

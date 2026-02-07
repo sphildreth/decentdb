@@ -14,7 +14,8 @@ task build_lib, "Build DecentDB shared library (C API)":
   exec "nim c --app:lib -d:libpg_query -d:release --mm:arc --threads:on --outdir:build src/c_api.nim"
 
 task test_bindings_dotnet, "Run .NET binding tests":
-  exec "dotnet test bindings/dotnet/tests/DecentDB.Tests"
+  exec "ln -sf libc_api.so build/libdecentdb.so"
+  exec "export LD_LIBRARY_PATH=$PWD/build:$LD_LIBRARY_PATH && dotnet test bindings/dotnet/tests/DecentDB.Tests"
 
 task test_bindings_go, "Run Go binding tests":
   withDir "bindings/go/decentdb-go":

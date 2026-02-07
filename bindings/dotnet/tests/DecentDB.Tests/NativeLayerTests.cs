@@ -151,6 +151,41 @@ public class NativeLayerTests : IDisposable
     }
 
     [Fact]
+    public void BoolBindingAndRetrieval()
+    {
+        using var db = new NativeDb(_dbPath);
+        EnsureOneRowTable(db);
+        const string sql = "SELECT $1 FROM one_row WHERE id = 1";
+        using var stmt = db.Prepare(sql);
+        
+        stmt.BindBool(1, true);
+        var result = stmt.Step();
+        AssertStepRow(result, db, sql);
+        Assert.True(stmt.GetBool(0));
+        
+        stmt.Reset().ClearBindings().BindBool(1, false);
+        result = stmt.Step();
+        AssertStepRow(result, db, sql);
+        Assert.False(stmt.GetBool(0));
+    }
+
+    [Fact]
+    public void GuidBindingAndRetrieval()
+    {
+        using var db = new NativeDb(_dbPath);
+        EnsureOneRowTable(db);
+        const string sql = "SELECT $1 FROM one_row WHERE id = 1";
+        using var stmt = db.Prepare(sql);
+        
+        var guid = Guid.NewGuid();
+        stmt.BindGuid(1, guid);
+        
+        var result = stmt.Step();
+        AssertStepRow(result, db, sql);
+        Assert.Equal(guid, stmt.GetGuid(0));
+    }
+
+    [Fact]
     public void FloatBindingAndRetrieval()
     {
         using var db = new NativeDb(_dbPath);

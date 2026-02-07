@@ -289,11 +289,11 @@ namespace DecentDB.AdoNet
             }
             else if (type == typeof(decimal))
             {
-                stmt.BindText(index1Based, value.ToString()!);
+                stmt.BindDecimal(index1Based, (decimal)value);
             }
             else if (type == typeof(bool))
             {
-                stmt.BindInt64(index1Based, (bool)value ? 1 : 0);
+                stmt.BindBool(index1Based, (bool)value);
             }
             else if (type == typeof(string))
             {

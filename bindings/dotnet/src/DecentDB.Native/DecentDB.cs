@@ -155,6 +155,84 @@ public sealed class PreparedStatement : IDisposable
         return this;
     }
 
+    public PreparedStatement BindBool(int index1Based, bool value)
+    {
+        var res = DecentDBNativeUnsafe.decentdb_bind_bool(Handle, index1Based, value ? 1 : 0);
+        if (res < 0)
+        {
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+        }
+        return this;
+    }
+
+    public PreparedStatement BindGuid(int index1Based, Guid value)
+    {
+        return BindBlob(index1Based, value.ToByteArray());
+    }
+
+    public PreparedStatement BindDecimal(int index1Based, decimal value)
+    {
+        // DecentDB currently supports DECIMAL backed by INT64 (approx 18 digits).
+        // C# decimal is 96-bit integer + scale. We must check if it fits in 64-bit.
+        
+        int[] bits = decimal.GetBits(value);
+        int low = bits[0];
+        int mid = bits[1];
+        int high = bits[2];
+        int flags = bits[3];
+        int scale = (flags >> 16) & 0xFF;
+        bool isNegative = (flags & 0x80000000) != 0;
+
+        if (high != 0 || (mid != 0 && (uint)mid > 0))
+        {
+            // Simplified check: only support if High is 0 and Mid is 0?
+            // Actually 64-bit int spans Low and Mid.
+            // 2^64 approx 1.8e19.
+            // If High > 0, definitely overflow.
+            // If High == 0, we have Mid and Low.
+            // We need to combine Mid and Low into a long and check signs.
+        }
+        
+        // Easier way: try to get unscaled value via BigInteger or custom logic.
+        // Or simply:
+        // decimal = unscaled * 10^-scale
+        // unscaled = decimal * 10^scale
+        // But multiplying might overflow decimal range if we aren't careful? 
+        // No, unscaled value is integer.
+        
+        // Let's rely on the fact that if we can't fit in long, we can't store it.
+        // We can check if value fits in long range regardless of scale? No.
+        
+        // Correct approach for extraction:
+        // Unscaled value = (High << 64) | (Mid << 32) | Low
+        // If High != 0, it won't fit in Int64 (unsigned).
+        // Actually, Int64 is signed. 
+        // 96-bit integer is unsigned in bits[0..2]. Sign is separate.
+        
+        if (high != 0) 
+        {
+             throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
+        }
+        
+        // Combine Mid and Low
+        ulong unscaledU = ((ulong)(uint)mid << 32) | (uint)low;
+        
+        if (unscaledU > (ulong)long.MaxValue + (ulong)(isNegative ? 1 : 0))
+        {
+             throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
+        }
+        
+        long unscaled = (long)unscaledU;
+        if (isNegative) unscaled = -unscaled;
+        
+        var res = DecentDBNativeUnsafe.decentdb_bind_decimal(Handle, index1Based, unscaled, scale);
+        if (res < 0)
+        {
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+        }
+        return this;
+    }
+
     public PreparedStatement BindText(int index1Based, string value)
     {
         var bytes = Encoding.UTF8.GetBytes(value);
@@ -248,6 +326,25 @@ public sealed class PreparedStatement : IDisposable
         return DecentDBNative.decentdb_column_is_null(Handle, col0Based) != 0;
     }
 
+    public bool GetBool(int col0Based)
+    {
+        // Check if actually boolean or int64?
+        // Native returns INT64 for BOOL type in C API (row_view returns kind=2 bool, val=0/1).
+        // decentdb_column_int64 returns 0/1.
+        // We can just check != 0.
+        return GetInt64(col0Based) != 0;
+    }
+    
+    public Guid GetGuid(int col0Based)
+    {
+        var bytes = GetBlob(col0Based);
+        if (bytes.Length == 16)
+        {
+            return new Guid(bytes);
+        }
+        return Guid.Empty; // Or throw? For now strict 16 bytes.
+    }
+
     public long GetInt64(int col0Based)
     {
         return DecentDBNative.decentdb_column_int64(Handle, col0Based);
@@ -256,6 +353,21 @@ public sealed class PreparedStatement : IDisposable
     public double GetFloat64(int col0Based)
     {
         return DecentDBNative.decentdb_column_float64(Handle, col0Based);
+    }
+
+    public decimal GetDecimal(int col0Based)
+    {
+        long unscaled = DecentDBNativeUnsafe.decentdb_column_decimal_unscaled(Handle, col0Based);
+        int scale = DecentDBNativeUnsafe.decentdb_column_decimal_scale(Handle, col0Based);
+        // decimal(int lo, int mid, int hi, bool isNegative, byte scale)
+        bool isNegative = unscaled < 0;
+        ulong u = isNegative ? (ulong)(-unscaled) : (ulong)unscaled;
+        
+        int lo = (int)(u & 0xFFFFFFFF);
+        int mid = (int)(u >> 32);
+        int hi = 0;
+        
+        return new decimal(lo, mid, hi, isNegative, (byte)scale);
     }
 
     public string GetText(int col0Based)

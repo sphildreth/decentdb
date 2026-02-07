@@ -191,6 +191,12 @@ public static unsafe class DecentDBNativeUnsafe
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_int64")]
     public static extern int decentdb_bind_int64(IntPtr stmt, int index1Based, long v);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_bool")]
+    public static extern int decentdb_bind_bool(IntPtr stmt, int index1Based, int v);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_decimal")]
+    public static extern int decentdb_bind_decimal(IntPtr stmt, int index1Based, long v, int scale);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_float64")]
     public static extern int decentdb_bind_float64(IntPtr stmt, int index1Based, double v);
 
@@ -205,6 +211,12 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_text")]
     public static extern byte* decentdb_column_text(IntPtr stmt, int col0Based, out int outByteLen);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_decimal_scale")]
+    public static extern int decentdb_column_decimal_scale(IntPtr stmt, int col0Based);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_decimal_unscaled")]
+    public static extern long decentdb_column_decimal_unscaled(IntPtr stmt, int col0Based);
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -216,6 +228,7 @@ public struct DecentdbValueView
     public double float64_val;
     public IntPtr bytes;
     public int bytes_len;
+    public int decimal_scale;
 }
 
 public enum DbValueKind : int
@@ -225,5 +238,6 @@ public enum DbValueKind : int
     Bool = 2,
     Float64 = 3,
     Text = 4,
-    Blob = 5
+    Blob = 5,
+    Decimal = 12
 }
