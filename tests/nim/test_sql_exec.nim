@@ -879,6 +879,53 @@ suite "Planner":
 
     discard closeDb(db)
 
+  test "INSTEAD OF view triggers fire per affected row":
+    let path = makeTempDb("decentdb_sql_instead_triggers.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE base (id INT PRIMARY KEY, val INT)").ok
+    check execSql(db, "CREATE TABLE audit (tag TEXT)").ok
+    check execSql(db, "INSERT INTO base VALUES (1, 10)").ok
+    check execSql(db, "INSERT INTO base VALUES (2, 20)").ok
+    check execSql(db, "CREATE VIEW v AS SELECT id, val FROM base").ok
+
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_vi INSTEAD OF INSERT ON v FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''I'')')"
+    ).ok
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_vu INSTEAD OF UPDATE ON v FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''U'')')"
+    ).ok
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_vd INSTEAD OF DELETE ON v FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''D'')')"
+    ).ok
+
+    check execSql(db, "INSERT INTO v VALUES (9, 90)").ok
+    check execSql(db, "UPDATE v SET val = val + 1 WHERE id <= 2").ok
+    check execSql(db, "DELETE FROM v WHERE id = 1").ok
+
+    let auditRes = execSql(db, "SELECT tag, COUNT(*) FROM audit GROUP BY tag ORDER BY tag")
+    check auditRes.ok
+    check auditRes.value.toHashSet == toHashSet(@["D|1", "I|1", "U|2"])
+
+    let baseRes = execSql(db, "SELECT id, val FROM base ORDER BY id")
+    check baseRes.ok
+    check baseRes.value == @["1|10", "2|20"]
+
+    check execSql(db, "DROP TRIGGER trg_vd ON v").ok
+    let deleteNoTrig = execSql(db, "DELETE FROM v WHERE id = 2")
+    check not deleteNoTrig.ok
+    check deleteNoTrig.err.code == ERR_SQL
+
+    discard closeDb(db)
+
   test "AFTER triggers fire per-row for INSERT/UPDATE/DELETE and DROP TRIGGER stops firing":
     let path = makeTempDb("decentdb_sql_after_triggers.db")
     let dbRes = openDb(path)

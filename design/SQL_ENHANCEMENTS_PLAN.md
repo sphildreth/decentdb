@@ -163,7 +163,7 @@ These are commonly expected for usability, but should not compromise core guaran
    - Catalog-like queries, schema introspection commands, minimal settings surface.
 2. **Explain and profiling tooling**
    - `EXPLAIN` (plan structure) (ADR-0050 Accepted), and optional profiling hooks.
-3. **Loadable extension ecosystem**
+3. **Loadable extension ecosystem** **deferred, see https://github.com/sphildreth/decentdb/issues/7**
    - This is the largest design commitment.
    - Requires an ADR defining API/ABI stability expectations, sandboxing, and durability/correctness constraints.
    - If pursued pre-1.0, it must be deliberately minimal and safe.

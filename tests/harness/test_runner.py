@@ -1328,6 +1328,97 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_instead_of_view_triggers_match_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_instead_trigger_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.base (id INT PRIMARY KEY, val INT); "
+                f"INSERT INTO {schema}.base VALUES (1, 10), (2, 20); "
+                f"CREATE TABLE {schema}.audit (tag TEXT); "
+                f"CREATE VIEW {schema}.v AS SELECT id, val FROM {schema}.base; "
+                f"CREATE FUNCTION {schema}.decentdb_exec_sql() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                f"BEGIN EXECUTE TG_ARGV[0]; IF TG_OP = 'DELETE' THEN RETURN OLD; END IF; RETURN NEW; END; $$; "
+                f"CREATE TRIGGER trg_vi INSTEAD OF INSERT ON {schema}.v FOR EACH ROW "
+                f"EXECUTE FUNCTION {schema}.decentdb_exec_sql('INSERT INTO {schema}.audit(tag) VALUES (''I'')'); "
+                f"CREATE TRIGGER trg_vu INSTEAD OF UPDATE ON {schema}.v FOR EACH ROW "
+                f"EXECUTE FUNCTION {schema}.decentdb_exec_sql('INSERT INTO {schema}.audit(tag) VALUES (''U'')'); "
+                f"CREATE TRIGGER trg_vd INSTEAD OF DELETE ON {schema}.v FOR EACH ROW "
+                f"EXECUTE FUNCTION {schema}.decentdb_exec_sql('INSERT INTO {schema}.audit(tag) VALUES (''D'')'); "
+                f"INSERT INTO {schema}.v VALUES (9, 90); "
+                f"UPDATE {schema}.v SET val = val + 1 WHERE id <= 2; "
+                f"DELETE FROM {schema}.v WHERE id = 1;"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_instead_trigger.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup_sql = [
+                    "CREATE TABLE base (id INT PRIMARY KEY, val INT)",
+                    "INSERT INTO base VALUES (1, 10)",
+                    "INSERT INTO base VALUES (2, 20)",
+                    "CREATE TABLE audit (tag TEXT)",
+                    "CREATE VIEW v AS SELECT id, val FROM base",
+                    "CREATE TRIGGER trg_vi INSTEAD OF INSERT ON v FOR EACH ROW "
+                    "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(tag) VALUES (''I'')')",
+                    "CREATE TRIGGER trg_vu INSTEAD OF UPDATE ON v FOR EACH ROW "
+                    "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(tag) VALUES (''U'')')",
+                    "CREATE TRIGGER trg_vd INSTEAD OF DELETE ON v FOR EACH ROW "
+                    "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(tag) VALUES (''D'')')",
+                    "INSERT INTO v VALUES (9, 90)",
+                    "UPDATE v SET val = val + 1 WHERE id <= 2",
+                    "DELETE FROM v WHERE id = 1",
+                ]
+                for stmt in setup_sql:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                query = "SELECT tag, COUNT(*) FROM audit GROUP BY tag ORDER BY tag"
+                pg_rows = run_psql(query.replace("FROM audit", f"FROM {schema}.audit"))
+                payload = run_cli(query)
+                self.assertTrue(payload.get("ok"), msg=payload.get("error"))
+                self.assertEqual(payload.get("rows", []), pg_rows)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
     def test_row_number_window_matches_postgres(self) -> None:
         psql = shutil.which("psql")
         cli = os.environ.get("DECENTDB")

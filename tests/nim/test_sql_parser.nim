@@ -281,6 +281,15 @@ suite "SQL Parser":
     check (trig.triggerEventsMask and TriggerEventUpdateMask) != 0
     check trig.triggerFunctionName == "decentdb_exec_sql"
 
+    let insteadTrig = parseSingle(
+      "CREATE TRIGGER trg_v INSTEAD OF INSERT ON v FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(id) VALUES (2)')"
+    )
+    check insteadTrig.kind == skCreateTrigger
+    check insteadTrig.triggerTableName == "v"
+    check (insteadTrig.triggerEventsMask and TriggerEventInsertMask) != 0
+    check (insteadTrig.triggerEventsMask and TriggerTimingInsteadMask) != 0
+
     let dropTrig = parseSingle("DROP TRIGGER IF EXISTS trg ON t")
     check dropTrig.kind == skDropTrigger
     check dropTrig.dropTriggerName == "trg"

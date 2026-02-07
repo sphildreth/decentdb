@@ -1205,7 +1205,31 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
 
 proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
   if catalog.hasViewName(stmt.insertTable):
-    return err[Statement](ERR_SQL, "View is read-only", stmt.insertTable)
+    if stmt.insertConflictAction != icaNone:
+      return err[Statement](ERR_SQL, "INSERT ... ON CONFLICT is not supported for views in 0.x", stmt.insertTable)
+    if stmt.insertReturning.len > 0:
+      return err[Statement](ERR_SQL, "INSERT ... RETURNING is not supported for views in 0.x", stmt.insertTable)
+    let triggers = catalog.listTriggersForTable(stmt.insertTable, TriggerEventInsertMask)
+    var hasInstead = false
+    for trigger in triggers:
+      if (trigger.eventsMask and TriggerTimingInsteadMask) != 0:
+        hasInstead = true
+        break
+    if not hasInstead:
+      return err[Statement](ERR_SQL, "View is read-only", stmt.insertTable)
+    let viewRes = catalog.getView(stmt.insertTable)
+    if not viewRes.ok:
+      return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+    let targetCols = if stmt.insertColumns.len == 0: viewRes.value.columnNames else: stmt.insertColumns
+    if stmt.insertValues.len != targetCols.len:
+      return err[Statement](ERR_SQL, "Column count mismatch", stmt.insertTable)
+    var colSet = initHashSet[string]()
+    for col in viewRes.value.columnNames:
+      colSet.incl(col)
+    for colName in targetCols:
+      if not colSet.contains(colName):
+        return err[Statement](ERR_SQL, "Unknown column", colName)
+    return ok(stmt)
   let tableRes = catalog.getTable(stmt.insertTable)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -1338,7 +1362,24 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
 
 proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
   if catalog.hasViewName(stmt.updateTable):
-    return err[Statement](ERR_SQL, "View is read-only", stmt.updateTable)
+    let triggers = catalog.listTriggersForTable(stmt.updateTable, TriggerEventUpdateMask)
+    var hasInstead = false
+    for trigger in triggers:
+      if (trigger.eventsMask and TriggerTimingInsteadMask) != 0:
+        hasInstead = true
+        break
+    if not hasInstead:
+      return err[Statement](ERR_SQL, "View is read-only", stmt.updateTable)
+    let viewRes = catalog.getView(stmt.updateTable)
+    if not viewRes.ok:
+      return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+    var colSet = initHashSet[string]()
+    for col in viewRes.value.columnNames:
+      colSet.incl(col)
+    for colName, _ in stmt.assignments:
+      if not colSet.contains(colName):
+        return err[Statement](ERR_SQL, "Unknown column", colName)
+    return ok(stmt)
   let tableRes = catalog.getTable(stmt.updateTable)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -1364,7 +1405,15 @@ proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
 
 proc bindDelete(catalog: Catalog, stmt: Statement): Result[Statement] =
   if catalog.hasViewName(stmt.deleteTable):
-    return err[Statement](ERR_SQL, "View is read-only", stmt.deleteTable)
+    let triggers = catalog.listTriggersForTable(stmt.deleteTable, TriggerEventDeleteMask)
+    var hasInstead = false
+    for trigger in triggers:
+      if (trigger.eventsMask and TriggerTimingInsteadMask) != 0:
+        hasInstead = true
+        break
+    if not hasInstead:
+      return err[Statement](ERR_SQL, "View is read-only", stmt.deleteTable)
+    return ok(stmt)
   let mapRes = buildTableMap(catalog, stmt.deleteTable, "", @[])
   if not mapRes.ok:
     return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
@@ -1695,9 +1744,17 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
   ok(stmt)
 
 proc bindCreateTrigger(catalog: Catalog, stmt: Statement): Result[Statement] =
-  let tableRes = catalog.getTable(stmt.triggerTableName)
-  if not tableRes.ok:
-    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let isInstead = (stmt.triggerEventsMask and TriggerTimingInsteadMask) != 0
+  if isInstead:
+    let viewRes = catalog.getView(stmt.triggerTableName)
+    if not viewRes.ok:
+      return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+  else:
+    let tableRes = catalog.getTable(stmt.triggerTableName)
+    if not tableRes.ok:
+      if catalog.hasViewName(stmt.triggerTableName):
+        return err[Statement](ERR_SQL, "AFTER triggers require a base table target", stmt.triggerTableName)
+      return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
 
   if stmt.triggerName.len == 0:
     return err[Statement](ERR_SQL, "Trigger name is required")
@@ -1736,9 +1793,10 @@ proc bindCreateTrigger(catalog: Catalog, stmt: Statement): Result[Statement] =
 proc bindDropTrigger(catalog: Catalog, stmt: Statement): Result[Statement] =
   if stmt.dropTriggerName.len == 0 or stmt.dropTriggerTableName.len == 0:
     return err[Statement](ERR_SQL, "DROP TRIGGER requires trigger name and table")
-  let tableRes = catalog.getTable(stmt.dropTriggerTableName)
-  if not tableRes.ok:
-    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let hasTable = catalog.hasTableName(stmt.dropTriggerTableName)
+  let hasView = catalog.hasViewName(stmt.dropTriggerTableName)
+  if not hasTable and not hasView:
+    return err[Statement](ERR_SQL, "Object not found", stmt.dropTriggerTableName)
   if not catalog.hasTrigger(stmt.dropTriggerTableName, stmt.dropTriggerName):
     if stmt.dropTriggerIfExists:
       return ok(stmt)

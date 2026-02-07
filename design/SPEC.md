@@ -360,6 +360,10 @@ Alternative:
   - events: `INSERT`, `UPDATE`, `DELETE`
   - `FOR EACH ROW` on base tables
   - action form: `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')`
+- INSTEAD OF trigger subset:
+  - events: `INSERT`, `UPDATE`, `DELETE`
+  - `FOR EACH ROW` on views
+  - action form: `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')`
 - Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
@@ -368,7 +372,8 @@ Alternative:
   - `WITH RECURSIVE`
   - `INTERSECT ALL`, `EXCEPT ALL`
   - Advanced window functions beyond `ROW_NUMBER()` (e.g., `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
-  - `INSTEAD OF` triggers and `FOR EACH STATEMENT` triggers
+  - `FOR EACH STATEMENT` triggers
+  - `NEW`/`OLD` row references in trigger actions
   - targetless `INSERT ... ON CONFLICT DO UPDATE ...` (without conflict target)
   - `UPDATE ... RETURNING`
   - `DELETE ... RETURNING`
@@ -652,8 +657,9 @@ Define error categories:
   - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
 - Trigger operations:
   - `AFTER` triggers on `INSERT`/`UPDATE`/`DELETE` for base tables (`FOR EACH ROW`)
+  - `INSTEAD OF` triggers on `INSERT`/`UPDATE`/`DELETE` for views (`FOR EACH ROW`)
   - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 0.x
-  - `INSTEAD OF` and `FOR EACH STATEMENT` triggers are not supported in 0.x
+  - `FOR EACH STATEMENT` triggers and `NEW`/`OLD` row references are not supported in 0.x
 - Not supported (post-1.0): ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 

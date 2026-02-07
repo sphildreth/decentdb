@@ -619,9 +619,20 @@ proc getView*(catalog: Catalog, name: string): Result[ViewMeta] =
     return err[ViewMeta](ERR_SQL, "View not found", name)
   ok(catalog.views[name])
 
+proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void]
+proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void]
+
 proc dropView*(catalog: Catalog, name: string): Result[Void] =
   if not catalog.views.hasKey(name):
     return err[Void](ERR_SQL, "View not found", name)
+  var triggerNames: seq[string] = @[]
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) == normalizedObjectName(name):
+      triggerNames.add(trigger.name)
+  for triggerName in triggerNames:
+    let dropTrigRes = dropTrigger(catalog, name, triggerName)
+    if not dropTrigRes.ok:
+      return dropTrigRes
   catalog.views.del(name)
   rebuildDependentViewsIndex(catalog)
   let key = uint64(crc32c(stringToBytes("view:" & name)))
@@ -645,6 +656,20 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
   catalog.views.del(oldName)
   view.name = newName
   catalog.views[newName] = view
+  var triggerMetas: seq[TriggerMeta] = @[]
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) == normalizedObjectName(oldName):
+      triggerMetas.add(trigger)
+  for trigger in triggerMetas:
+    let dropTrigRes = dropTrigger(catalog, oldName, trigger.name)
+    if not dropTrigRes.ok:
+      return dropTrigRes
+  for trigger in triggerMetas:
+    var renamed = trigger
+    renamed.table = newName
+    let createTrigRes = createTriggerMeta(catalog, renamed)
+    if not createTrigRes.ok:
+      return createTrigRes
   rebuildDependentViewsIndex(catalog)
   let newKey = uint64(crc32c(stringToBytes("view:" & newName)))
   let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)

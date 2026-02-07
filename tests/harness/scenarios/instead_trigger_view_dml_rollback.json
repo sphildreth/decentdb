@@ -1,0 +1,20 @@
+{
+  "name": "instead_trigger_view_dml_rollback",
+  "description": "Crash during view DML with INSTEAD OF trigger must not commit partial trigger-side writes",
+  "db_path": "$TMPDIR/decentdb_instead_trigger_view_dml_rollback.ddb",
+  "setup_sql": "CREATE TABLE base (id INT PRIMARY KEY, val INT); CREATE TABLE audit (tag TEXT); CREATE VIEW v AS SELECT id, val FROM base; CREATE TRIGGER trg_vi INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''I'')')",
+  "sql": "INSERT INTO v VALUES (1, 10)",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT COUNT(*) FROM base UNION ALL SELECT COUNT(*) FROM audit",
+    "expect_rows": [
+      "0",
+      "0"
+    ]
+  }
+}

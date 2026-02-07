@@ -595,8 +595,9 @@ Define error categories:
   - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
 - Trigger operations:
   - `AFTER` triggers on `INSERT`/`UPDATE`/`DELETE` for base tables (`FOR EACH ROW`)
+  - `INSTEAD OF` triggers on `INSERT`/`UPDATE`/`DELETE` for views (`FOR EACH ROW`)
   - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 0.x
-  - `INSTEAD OF` and `FOR EACH STATEMENT` triggers are not supported in 0.x
+  - `FOR EACH STATEMENT` triggers and `NEW`/`OLD` row references are not supported in 0.x
 - Not supported (post-1.0): ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 

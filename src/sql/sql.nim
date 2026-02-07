@@ -126,6 +126,7 @@ const TriggerEventInsertMask* = 4
 const TriggerEventDeleteMask* = 8
 const TriggerEventUpdateMask* = 16
 const TriggerEventTruncateMask* = 32
+const TriggerTimingInsteadMask* = 64
 
 type AlterTableAction* = object
   kind*: AlterTableActionKind
@@ -1554,15 +1555,23 @@ proc parseCreateTrigStmt(node: JsonNode): Result[Statement] =
   if (eventsMask and TriggerEventTruncateMask) != 0:
     return err[Statement](ERR_SQL, "TRUNCATE triggers are not supported in 0.x")
 
+  var timingMask = 0
   if nodeHas(node, "timing"):
     let timingNode = node["timing"]
     if timingNode.kind == JInt:
-      if timingNode.getInt != 0:
-        return err[Statement](ERR_SQL, "Only AFTER triggers are supported in 0.x")
+      timingMask = timingNode.getInt
     elif timingNode.kind == JString:
-      let timing = timingNode.getStr
-      if timing.len > 0 and timing != "TRIGGER_TYPE_AFTER":
-        return err[Statement](ERR_SQL, "Only AFTER triggers are supported in 0.x")
+      let timing = timingNode.getStr.toUpperAscii()
+      if timing.contains("INSTEAD"):
+        timingMask = TriggerTimingInsteadMask
+      elif timing.len == 0 or timing.contains("AFTER"):
+        timingMask = 0
+      else:
+        return err[Statement](ERR_SQL, "Only AFTER and INSTEAD OF triggers are supported in 0.x")
+  if timingMask != 0 and (timingMask and TriggerTimingInsteadMask) == 0:
+    return err[Statement](ERR_SQL, "Only AFTER and INSTEAD OF triggers are supported in 0.x")
+  if (timingMask and TriggerTimingInsteadMask) != 0:
+    eventsMask = eventsMask or TriggerTimingInsteadMask
 
   let funcNameParts = nodeGet(node, "funcname")
   var functionName = ""

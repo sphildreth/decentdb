@@ -406,6 +406,32 @@ suite "Binder":
     let deleteView = bindStatement(db.catalog, parseSingle("DELETE FROM v"))
     check not deleteView.ok
 
+    check db.catalog.createTriggerMeta(TriggerMeta(
+      name: "v_ins",
+      table: "v",
+      eventsMask: TriggerTimingInsteadMask or TriggerEventInsertMask,
+      actionSql: "INSERT INTO t (id, name) VALUES (1, 'x')"
+    )).ok
+    check db.catalog.createTriggerMeta(TriggerMeta(
+      name: "v_upd",
+      table: "v",
+      eventsMask: TriggerTimingInsteadMask or TriggerEventUpdateMask,
+      actionSql: "UPDATE t SET name = 'y' WHERE id = 1"
+    )).ok
+    check db.catalog.createTriggerMeta(TriggerMeta(
+      name: "v_del",
+      table: "v",
+      eventsMask: TriggerTimingInsteadMask or TriggerEventDeleteMask,
+      actionSql: "DELETE FROM t WHERE id = 1"
+    )).ok
+
+    let insertViewWithInstead = bindStatement(db.catalog, parseSingle("INSERT INTO v (id) VALUES (1)"))
+    check insertViewWithInstead.ok
+    let updateViewWithInstead = bindStatement(db.catalog, parseSingle("UPDATE v SET id = 2"))
+    check updateViewWithInstead.ok
+    let deleteViewWithInstead = bindStatement(db.catalog, parseSingle("DELETE FROM v"))
+    check deleteViewWithInstead.ok
+
     discard closeDb(db)
 
   test "bind strict dependency semantics":
@@ -506,6 +532,7 @@ suite "Binder":
 
     discard addTable(db, "t", @[Column(name: "id", kind: ctInt64)])
     discard addTable(db, "audit", @[Column(name: "id", kind: ctInt64)])
+    discard addView(db, "v", "SELECT id FROM t", @["id"], @["t"])
 
     let okTrigger = bindStatement(
       db.catalog,
@@ -552,9 +579,39 @@ suite "Binder":
     )
     check not actionWithParams.ok
 
+    let insteadOnView = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg_v INSTEAD OF INSERT ON v FOR EACH ROW " &
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES (2)')"
+      )
+    )
+    check insteadOnView.ok
+
+    let afterOnView = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg_v_bad AFTER INSERT ON v FOR EACH ROW " &
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES (3)')"
+      )
+    )
+    check not afterOnView.ok
+
+    let insteadOnTable = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg_t_bad INSTEAD OF INSERT ON t FOR EACH ROW " &
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES (4)')"
+      )
+    )
+    check not insteadOnTable.ok
+
     check db.catalog.createTriggerMeta(TriggerMeta(name: "existing", table: "t", eventsMask: TriggerEventInsertMask, actionSql: "INSERT INTO audit (id) VALUES (9)")).ok
     let dropOk = bindStatement(db.catalog, parseSingle("DROP TRIGGER existing ON t"))
     check dropOk.ok
+    check db.catalog.createTriggerMeta(TriggerMeta(name: "existing_v", table: "v", eventsMask: TriggerTimingInsteadMask or TriggerEventInsertMask, actionSql: "INSERT INTO audit (id) VALUES (10)")).ok
+    let dropViewTrig = bindStatement(db.catalog, parseSingle("DROP TRIGGER existing_v ON v"))
+    check dropViewTrig.ok
     let dropMissing = bindStatement(db.catalog, parseSingle("DROP TRIGGER missing ON t"))
     check not dropMissing.ok
     let dropMissingIf = bindStatement(db.catalog, parseSingle("DROP TRIGGER IF EXISTS missing ON t"))

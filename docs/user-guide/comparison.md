@@ -56,7 +56,7 @@ SQLite and DuckDB generally include all of the above, plus substantial additiona
 |---|---|---|---|
 | Non-materialized views (`CREATE VIEW ... AS SELECT ...`) | Yes; read-only views | Yes | Yes |
 | `CREATE OR REPLACE VIEW` | Yes | Not supported as a single statement | Yes |
-| Updatable views | Not supported | Via `INSTEAD OF` triggers | Limited / generally not the default |
+| Updatable views | Limited: via narrow `INSTEAD OF` trigger subset (`decentdb_exec_sql('<single DML>')`, no `NEW`/`OLD`) | Via `INSTEAD OF` triggers | Limited / generally not the default |
 | `TEMP` views | No | Yes | Yes |
 
 ### Common SQL features not in DecentDB’s current baseline
@@ -100,7 +100,7 @@ Legend: **Must-have** = expected by most real-world application SQL (not necessa
 	- Baseline DecentDB supports a narrow `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` subset.
 	- Broader window semantics remain a follow-on.
 9. **Advanced triggers** (`INSTEAD OF`, `NEW`/`OLD` row references, statement-level variants)
-	- Baseline DecentDB supports a narrow AFTER-row trigger subset using `decentdb_exec_sql('<single DML>')`.
+	- Baseline DecentDB supports narrow AFTER-row and INSTEAD OF-row trigger subsets using `decentdb_exec_sql('<single DML>')`.
 	- Broader trigger semantics remain a follow-on.
 
 The following are not strictly “SQL features”, but commonly expected operational capabilities that SQLite and DuckDB provide:

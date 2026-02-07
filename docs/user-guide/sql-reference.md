@@ -136,7 +136,12 @@ AFTER INSERT OR UPDATE OR DELETE ON table_name
 FOR EACH ROW
 EXECUTE FUNCTION decentdb_exec_sql('single_dml_sql');
 
-DROP TRIGGER [IF EXISTS] trigger_name ON table_name;
+CREATE TRIGGER trigger_name
+INSTEAD OF INSERT OR UPDATE OR DELETE ON view_name
+FOR EACH ROW
+EXECUTE FUNCTION decentdb_exec_sql('single_dml_sql');
+
+DROP TRIGGER [IF EXISTS] trigger_name ON object_name;
 ```
 
 Example:
@@ -150,11 +155,12 @@ EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(tag) VALUES (''I'')');
 
 **Notes:**
 - v0 trigger support is intentionally narrow:
-  - timing: `AFTER` only
+  - timing: `AFTER` (tables) and `INSTEAD OF` (views)
   - events: `INSERT`, `UPDATE`, `DELETE`
-  - scope: base tables only, `FOR EACH ROW` only
+  - scope: `FOR EACH ROW` only
 - Trigger action SQL must be exactly one DML statement (`INSERT`, `UPDATE`, or `DELETE`) and cannot use parameters.
-- `INSTEAD OF` triggers are not supported in 0.x.
+- Trigger actions do not support `NEW`/`OLD` row references in 0.x.
+- View DML without a matching `INSTEAD OF` trigger remains read-only.
 
 ## Data Manipulation Language (DML)
 

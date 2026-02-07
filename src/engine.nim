@@ -1652,11 +1652,8 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
 const MaxTriggerExecutionDepth = 16
 var gTriggerExecutionDepth {.threadvar.}: int
 
-proc executeAfterTriggers(db: Db, tableName: string, eventMask: int, affectedRows: int64): Result[Void] =
-  if affectedRows <= 0:
-    return okVoid()
-  let triggers = db.catalog.listTriggersForTable(tableName, eventMask)
-  if triggers.len == 0:
+proc runTriggerActions(db: Db, triggers: seq[TriggerMeta], affectedRows: int64): Result[Void] =
+  if affectedRows <= 0 or triggers.len == 0:
     return okVoid()
   if gTriggerExecutionDepth >= MaxTriggerExecutionDepth:
     return err[Void](ERR_SQL, "Trigger recursion depth exceeded", "max_depth=" & $MaxTriggerExecutionDepth)
@@ -1669,6 +1666,35 @@ proc executeAfterTriggers(db: Db, tableName: string, eventMask: int, affectedRow
       if not execRes.ok:
         return err[Void](execRes.err.code, "Trigger action failed: " & execRes.err.message, trigger.name)
   okVoid()
+
+proc executeAfterTriggers(db: Db, tableName: string, eventMask: int, affectedRows: int64): Result[Void] =
+  var afterTriggers: seq[TriggerMeta] = @[]
+  for trigger in db.catalog.listTriggersForTable(tableName, eventMask):
+    if (trigger.eventsMask and TriggerTimingInsteadMask) == 0:
+      afterTriggers.add(trigger)
+  runTriggerActions(db, afterTriggers, affectedRows)
+
+proc executeInsteadTriggers(db: Db, objectName: string, eventMask: int, affectedRows: int64): Result[Void] =
+  var insteadTriggers: seq[TriggerMeta] = @[]
+  for trigger in db.catalog.listTriggersForTable(objectName, eventMask):
+    if (trigger.eventsMask and TriggerTimingInsteadMask) != 0:
+      insteadTriggers.add(trigger)
+  runTriggerActions(db, insteadTriggers, affectedRows)
+
+proc countViewRows(db: Db, viewName: string, whereExpr: Expr, params: seq[Value]): Result[int64] =
+  var countSql = "SELECT COUNT(*) FROM " & viewName
+  if whereExpr != nil:
+    countSql.add(" WHERE " & exprToCanonicalSql(whereExpr))
+  let rowsRes = execSql(db, countSql, params)
+  if not rowsRes.ok:
+    return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  if rowsRes.value.len == 0:
+    return ok(0'i64)
+  let countText = rowsRes.value[0].strip()
+  try:
+    ok(parseBiggestInt(countText).int64)
+  except ValueError:
+    err[int64](ERR_INTERNAL, "Invalid COUNT(*) result", countText)
 
 proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] =
   if not prepared.db.isOpen:
@@ -1729,21 +1755,26 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
           break
       output.add(rows.join("\n"))
     of skInsert:
-      let insertExecRes = execInsertStatement(db, bound, params)
-      if not insertExecRes.ok:
-        return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-      let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
-      if not triggerRes.ok:
-        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-      if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
-        let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
-        if not projectedRes.ok:
-          return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
-        for row in projectedRes.value:
-          var parts: seq[string] = @[]
-          for v in row.values:
-            parts.add($v)
-          output.add(parts.join("|"))
+      if db.catalog.hasViewName(bound.insertTable):
+        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: 1 else: 0)
+        if not insteadRes.ok:
+          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+      else:
+        let insertExecRes = execInsertStatement(db, bound, params)
+        if not insertExecRes.ok:
+          return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
+        if not triggerRes.ok:
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+        if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
+          let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
+          if not projectedRes.ok:
+            return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
+          for row in projectedRes.value:
+            var parts: seq[string] = @[]
+            for v in row.values:
+              parts.add($v)
+            output.add(parts.join("|"))
     of skUpdate:
       let execRes = execPreparedNonSelect(db, bound, params, plan)
       if not execRes.ok:
@@ -2230,110 +2261,131 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skInsert:
-      let insertExecRes = execInsertStatement(db, bound, params)
-      if not insertExecRes.ok:
-        return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-      let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
-      if not triggerRes.ok:
-        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-      if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
-        let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
-        if not projectedRes.ok:
-          return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
-        for row in projectedRes.value:
-          var parts: seq[string] = @[]
-          for value in row.values:
-            parts.add(valueToString(value))
-          output.add(parts.join("|"))
+      if db.catalog.hasViewName(bound.insertTable):
+        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: 1 else: 0)
+        if not insteadRes.ok:
+          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+      else:
+        let insertExecRes = execInsertStatement(db, bound, params)
+        if not insertExecRes.ok:
+          return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
+        if not triggerRes.ok:
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+        if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
+          let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
+          if not projectedRes.ok:
+            return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
+          for row in projectedRes.value:
+            var parts: seq[string] = @[]
+            for value in row.values:
+              parts.add(valueToString(value))
+            output.add(parts.join("|"))
     of skUpdate:
-      let tableRes = db.catalog.getTable(bound.updateTable)
-      if not tableRes.ok:
-        return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-      let table = tableRes.value
-      var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
-      var cols: seq[string] = @[]
-      for col in table.columns:
-        cols.add(bound.updateTable & "." & col.name)
+      if db.catalog.hasViewName(bound.updateTable):
+        let countRes = countViewRows(db, bound.updateTable, bound.updateWhere, params)
+        if not countRes.ok:
+          return err[seq[string]](countRes.err.code, countRes.err.message, countRes.err.context)
+        let insteadRes = executeInsteadTriggers(db, bound.updateTable, TriggerEventUpdateMask, countRes.value)
+        if not insteadRes.ok:
+          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+      else:
+        let tableRes = db.catalog.getTable(bound.updateTable)
+        if not tableRes.ok:
+          return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+        let table = tableRes.value
+        var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
+        var cols: seq[string] = @[]
+        for col in table.columns:
+          cols.add(bound.updateTable & "." & col.name)
 
-      # Use planner to find matching rowids (leveraging indexes when possible)
-      let rowidsRes = findMatchingRowids(bound.updateTable, bound.updateWhere)
-      if not rowidsRes.ok:
-        return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+        # Use planner to find matching rowids (leveraging indexes when possible)
+        let rowidsRes = findMatchingRowids(bound.updateTable, bound.updateWhere)
+        if not rowidsRes.ok:
+          return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
 
-      for rowid in rowidsRes.value:
-        let storedRes = readRowAt(db.pager, table, rowid)
-        if not storedRes.ok:
-          continue
-        let stored = storedRes.value
-        let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
-        var newValues = stored.values
-        for colName, expr in bound.assignments:
-          var idx = -1
-          for i, col in table.columns:
-            if col.name == colName:
-              idx = i
-              break
-          if idx >= 0:
-            let evalRes = evalExpr(row, expr, params)
-            if not evalRes.ok:
-              return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-            let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
-            if not typeRes.ok:
-              return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
-            newValues[idx] = evalRes.value
-        updates.add((stored.rowid, stored.values, newValues))
-      for entry in updates:
-        let notNullRes = enforceNotNull(table, entry[2])
-        if not notNullRes.ok:
-          return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-        let checkRes = enforceChecks(table, entry[2])
-        if not checkRes.ok:
-          return err[seq[string]](checkRes.err.code, checkRes.err.message, checkRes.err.context)
-        let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
-        if not uniqueRes.ok:
-          return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-        let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
-        if not fkRes.ok:
-          return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-        let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
-        if not restrictRes.ok:
-          return err[seq[string]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
-      for entry in updates:
-        let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
-        if not upRes.ok:
-          return err[seq[string]](upRes.err.code, upRes.err.message, upRes.err.context)
-      let triggerRes = executeAfterTriggers(db, bound.updateTable, TriggerEventUpdateMask, int64(updates.len))
-      if not triggerRes.ok:
-        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+        for rowid in rowidsRes.value:
+          let storedRes = readRowAt(db.pager, table, rowid)
+          if not storedRes.ok:
+            continue
+          let stored = storedRes.value
+          let row = Row(rowid: stored.rowid, columns: cols, values: stored.values)
+          var newValues = stored.values
+          for colName, expr in bound.assignments:
+            var idx = -1
+            for i, col in table.columns:
+              if col.name == colName:
+                idx = i
+                break
+            if idx >= 0:
+              let evalRes = evalExpr(row, expr, params)
+              if not evalRes.ok:
+                return err[seq[string]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+              if not typeRes.ok:
+                return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
+              newValues[idx] = evalRes.value
+          updates.add((stored.rowid, stored.values, newValues))
+        for entry in updates:
+          let notNullRes = enforceNotNull(table, entry[2])
+          if not notNullRes.ok:
+            return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+          let checkRes = enforceChecks(table, entry[2])
+          if not checkRes.ok:
+            return err[seq[string]](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+          let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
+          if not uniqueRes.ok:
+            return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+          let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
+          if not fkRes.ok:
+            return err[seq[string]](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+          let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+          if not restrictRes.ok:
+            return err[seq[string]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+        for entry in updates:
+          let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
+          if not upRes.ok:
+            return err[seq[string]](upRes.err.code, upRes.err.message, upRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.updateTable, TriggerEventUpdateMask, int64(updates.len))
+        if not triggerRes.ok:
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
     of skDelete:
-      let tableRes = db.catalog.getTable(bound.deleteTable)
-      if not tableRes.ok:
-        return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-      let table = tableRes.value
-      var deletions: seq[StoredRow] = @[]
+      if db.catalog.hasViewName(bound.deleteTable):
+        let countRes = countViewRows(db, bound.deleteTable, bound.deleteWhere, params)
+        if not countRes.ok:
+          return err[seq[string]](countRes.err.code, countRes.err.message, countRes.err.context)
+        let insteadRes = executeInsteadTriggers(db, bound.deleteTable, TriggerEventDeleteMask, countRes.value)
+        if not insteadRes.ok:
+          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+      else:
+        let tableRes = db.catalog.getTable(bound.deleteTable)
+        if not tableRes.ok:
+          return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+        let table = tableRes.value
+        var deletions: seq[StoredRow] = @[]
 
-      # Use planner to find matching rowids (leveraging indexes when possible)
-      let rowidsRes = findMatchingRowids(bound.deleteTable, bound.deleteWhere)
-      if not rowidsRes.ok:
-        return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+        # Use planner to find matching rowids (leveraging indexes when possible)
+        let rowidsRes = findMatchingRowids(bound.deleteTable, bound.deleteWhere)
+        if not rowidsRes.ok:
+          return err[seq[string]](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
 
-      for rowid in rowidsRes.value:
-        let storedRes = readRowAt(db.pager, table, rowid)
-        if not storedRes.ok:
-          continue
-        let stored = storedRes.value
-        deletions.add(stored)
-      for row in deletions:
-        let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
-        if not restrictRes.ok:
-          return err[seq[string]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
-      for row in deletions:
-        let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
-        if not delRes.ok:
-          return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
-      let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, int64(deletions.len))
-      if not triggerRes.ok:
-        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+        for rowid in rowidsRes.value:
+          let storedRes = readRowAt(db.pager, table, rowid)
+          if not storedRes.ok:
+            continue
+          let stored = storedRes.value
+          deletions.add(stored)
+        for row in deletions:
+          let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
+          if not restrictRes.ok:
+            return err[seq[string]](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+        for row in deletions:
+          let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
+          if not delRes.ok:
+            return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, int64(deletions.len))
+        if not triggerRes.ok:
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
     of skExplain:
       if bound.explainInner.kind != skSelect:
         return err[seq[string]](ERR_SQL, "EXPLAIN currently supports SELECT only")
@@ -2825,122 +2877,146 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   of skInsert:
     if bound.insertReturning.len > 0:
       return err[int64](ERR_SQL, "INSERT RETURNING is not supported by non-select execution API")
-    let insertExecRes = execInsertStatement(db, bound, params)
-    if not insertExecRes.ok:
-      return err[int64](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-    affected = if insertExecRes.value.affected: 1 else: 0
-    let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
-    if not triggerRes.ok:
-      return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+    if db.catalog.hasViewName(bound.insertTable):
+      affected = if bound.insertValues.len > 0: 1 else: 0
+      let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
+      if not insteadRes.ok:
+        return err[int64](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+    else:
+      let insertExecRes = execInsertStatement(db, bound, params)
+      if not insertExecRes.ok:
+        return err[int64](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+      affected = if insertExecRes.value.affected: 1 else: 0
+      let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
+      if not triggerRes.ok:
+        return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
 
   of skUpdate:
-    let fastRes = tryFastPkUpdate(db, bound, params)
-    if not fastRes.ok:
-      return err[int64](fastRes.err.code, fastRes.err.message, fastRes.err.context)
-    if fastRes.value.isSome:
-      affected = fastRes.value.get
+    if db.catalog.hasViewName(bound.updateTable):
+      let countRes = countViewRows(db, bound.updateTable, bound.updateWhere, params)
+      if not countRes.ok:
+        return err[int64](countRes.err.code, countRes.err.message, countRes.err.context)
+      affected = countRes.value
+      let insteadRes = executeInsteadTriggers(db, bound.updateTable, TriggerEventUpdateMask, affected)
+      if not insteadRes.ok:
+        return err[int64](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
     else:
-      let tableRes = db.catalog.getTable(bound.updateTable)
+      let fastRes = tryFastPkUpdate(db, bound, params)
+      if not fastRes.ok:
+        return err[int64](fastRes.err.code, fastRes.err.message, fastRes.err.context)
+      if fastRes.value.isSome:
+        affected = fastRes.value.get
+      else:
+        let tableRes = db.catalog.getTable(bound.updateTable)
+        if not tableRes.ok:
+          return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+        let table = tableRes.value
+        var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
+        var cols: seq[string] = @[]
+        for col in table.columns:
+          cols.add(bound.updateTable & "." & col.name)
+
+        var rows: seq[Row] = @[]
+        if plan != nil:
+          let rowsRes = execPlan(db.pager, db.catalog, plan, params)
+          if not rowsRes.ok:
+            return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+          rows = rowsRes.value
+        else:
+          let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
+          if not rowidsRes.ok:
+            return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
+          for rowid in rowidsRes.value:
+            let storedRes = readRowAt(db.pager, table, rowid)
+            if not storedRes.ok: continue
+            rows.add(Row(rowid: storedRes.value.rowid, columns: cols, values: storedRes.value.values))
+
+        for row in rows:
+          var newValues = row.values
+          for colName, expr in bound.assignments:
+            var idx = -1
+            for i, col in table.columns:
+              if col.name == colName:
+                idx = i
+                break
+            if idx >= 0:
+              let evalRes = evalExpr(row, expr, params)
+              if not evalRes.ok:
+                return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+              let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
+              if not typeRes.ok:
+                return err[int64](typeRes.err.code, typeRes.err.message, colName)
+              newValues[idx] = evalRes.value
+          updates.add((row.rowid, row.values, newValues))
+
+        for entry in updates:
+          let notNullRes = enforceNotNull(table, entry[2])
+          if not notNullRes.ok:
+            return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+          let checkRes = enforceChecks(table, entry[2])
+          if not checkRes.ok:
+            return err[int64](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+          let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
+          if not uniqueRes.ok:
+            return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+          let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
+          if not fkRes.ok:
+            return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+          let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+          if not restrictRes.ok:
+            return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+        for entry in updates:
+          let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
+          if not upRes.ok:
+            return err[int64](upRes.err.code, upRes.err.message, upRes.err.context)
+
+        affected = int64(updates.len)
+      let triggerRes = executeAfterTriggers(db, bound.updateTable, TriggerEventUpdateMask, affected)
+      if not triggerRes.ok:
+        return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+
+  of skDelete:
+    if db.catalog.hasViewName(bound.deleteTable):
+      let countRes = countViewRows(db, bound.deleteTable, bound.deleteWhere, params)
+      if not countRes.ok:
+        return err[int64](countRes.err.code, countRes.err.message, countRes.err.context)
+      affected = countRes.value
+      let insteadRes = executeInsteadTriggers(db, bound.deleteTable, TriggerEventDeleteMask, affected)
+      if not insteadRes.ok:
+        return err[int64](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+    else:
+      let tableRes = db.catalog.getTable(bound.deleteTable)
       if not tableRes.ok:
         return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
-      var updates: seq[(uint64, seq[Value], seq[Value])] = @[]
-      var cols: seq[string] = @[]
-      for col in table.columns:
-        cols.add(bound.updateTable & "." & col.name)
-
-      var rows: seq[Row] = @[]
+      var deletions: seq[Row] = @[]
       if plan != nil:
         let rowsRes = execPlan(db.pager, db.catalog, plan, params)
         if not rowsRes.ok:
           return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-        rows = rowsRes.value
+        deletions = rowsRes.value
       else:
-        let rowidsRes = findMatchingRowidsPrepared(db, bound.updateTable, bound.updateWhere, params)
+        let rowidsRes = findMatchingRowidsPrepared(db, bound.deleteTable, bound.deleteWhere, params)
         if not rowidsRes.ok:
           return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
         for rowid in rowidsRes.value:
           let storedRes = readRowAt(db.pager, table, rowid)
           if not storedRes.ok: continue
-          rows.add(Row(rowid: storedRes.value.rowid, columns: cols, values: storedRes.value.values))
+          deletions.add(Row(rowid: storedRes.value.rowid, columns: @[], values: storedRes.value.values))
 
-      for row in rows:
-        var newValues = row.values
-        for colName, expr in bound.assignments:
-          var idx = -1
-          for i, col in table.columns:
-            if col.name == colName:
-              idx = i
-              break
-          if idx >= 0:
-            let evalRes = evalExpr(row, expr, params)
-            if not evalRes.ok:
-              return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-            let typeRes = typeCheckValue(table.columns[idx].kind, evalRes.value)
-            if not typeRes.ok:
-              return err[int64](typeRes.err.code, typeRes.err.message, colName)
-            newValues[idx] = evalRes.value
-        updates.add((row.rowid, row.values, newValues))
-
-      for entry in updates:
-        let notNullRes = enforceNotNull(table, entry[2])
-        if not notNullRes.ok:
-          return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-        let checkRes = enforceChecks(table, entry[2])
-        if not checkRes.ok:
-          return err[int64](checkRes.err.code, checkRes.err.message, checkRes.err.context)
-        let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
-        if not uniqueRes.ok:
-          return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-        let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
-        if not fkRes.ok:
-          return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-        let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+      for row in deletions:
+        let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
         if not restrictRes.ok:
           return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
-      for entry in updates:
-        let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
-        if not upRes.ok:
-          return err[int64](upRes.err.code, upRes.err.message, upRes.err.context)
+      for row in deletions:
+        let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
+        if not delRes.ok:
+          return err[int64](delRes.err.code, delRes.err.message, delRes.err.context)
 
-      affected = int64(updates.len)
-    let triggerRes = executeAfterTriggers(db, bound.updateTable, TriggerEventUpdateMask, affected)
-    if not triggerRes.ok:
-      return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-
-  of skDelete:
-    let tableRes = db.catalog.getTable(bound.deleteTable)
-    if not tableRes.ok:
-      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-    let table = tableRes.value
-    var deletions: seq[Row] = @[]
-    if plan != nil:
-      let rowsRes = execPlan(db.pager, db.catalog, plan, params)
-      if not rowsRes.ok:
-        return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      deletions = rowsRes.value
-    else:
-      let rowidsRes = findMatchingRowidsPrepared(db, bound.deleteTable, bound.deleteWhere, params)
-      if not rowidsRes.ok:
-        return err[int64](rowidsRes.err.code, rowidsRes.err.message, rowidsRes.err.context)
-      for rowid in rowidsRes.value:
-        let storedRes = readRowAt(db.pager, table, rowid)
-        if not storedRes.ok: continue
-        deletions.add(Row(rowid: storedRes.value.rowid, columns: @[], values: storedRes.value.values))
-
-    for row in deletions:
-      let restrictRes = enforceRestrictOnDelete(db.catalog, db.pager, table, row.values)
-      if not restrictRes.ok:
-        return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
-    for row in deletions:
-      let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
-      if not delRes.ok:
-        return err[int64](delRes.err.code, delRes.err.message, delRes.err.context)
-
-    affected = int64(deletions.len)
-    let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, affected)
-    if not triggerRes.ok:
-      return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+      affected = int64(deletions.len)
+      let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, affected)
+      if not triggerRes.ok:
+        return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
 
   of skBegin:
     let beginRes = beginTransaction(db)
