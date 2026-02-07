@@ -18,7 +18,7 @@ internal static class DefaultTypeConverters
             TimeOnly t => t.Ticks, // ticks since midnight
             TimeSpan ts => ts.Ticks, // ticks
             Guid g => g.ToByteArray(),
-            decimal dec => dec.ToString(),
+            decimal dec => dec,
             char ch => ch.ToString(),
             Enum e => Convert.ToInt64(e),
             _ => value

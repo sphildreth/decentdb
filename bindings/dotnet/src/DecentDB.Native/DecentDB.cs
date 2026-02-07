@@ -167,7 +167,19 @@ public sealed class PreparedStatement : IDisposable
 
     public PreparedStatement BindGuid(int index1Based, Guid value)
     {
-        return BindBlob(index1Based, value.ToByteArray());
+        unsafe
+        {
+            var bytes = stackalloc byte[16];
+            if (!value.TryWriteBytes(new Span<byte>(bytes, 16)))
+                throw new InvalidOperationException("Failed to write Guid bytes");
+            
+            var res = DecentDBNativeUnsafe.decentdb_bind_blob(Handle, index1Based, bytes, 16);
+            if (res < 0)
+            {
+                throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+            }
+        }
+        return this;
     }
 
     public PreparedStatement BindDecimal(int index1Based, decimal value)
@@ -175,7 +187,8 @@ public sealed class PreparedStatement : IDisposable
         // DecentDB currently supports DECIMAL backed by INT64 (approx 18 digits).
         // C# decimal is 96-bit integer + scale. We must check if it fits in 64-bit.
         
-        int[] bits = decimal.GetBits(value);
+        Span<int> bits = stackalloc int[4];
+        decimal.GetBits(value, bits);
         int low = bits[0];
         int mid = bits[1];
         int high = bits[2];
@@ -183,32 +196,6 @@ public sealed class PreparedStatement : IDisposable
         int scale = (flags >> 16) & 0xFF;
         bool isNegative = (flags & 0x80000000) != 0;
 
-        if (high != 0 || (mid != 0 && (uint)mid > 0))
-        {
-            // Simplified check: only support if High is 0 and Mid is 0?
-            // Actually 64-bit int spans Low and Mid.
-            // 2^64 approx 1.8e19.
-            // If High > 0, definitely overflow.
-            // If High == 0, we have Mid and Low.
-            // We need to combine Mid and Low into a long and check signs.
-        }
-        
-        // Easier way: try to get unscaled value via BigInteger or custom logic.
-        // Or simply:
-        // decimal = unscaled * 10^-scale
-        // unscaled = decimal * 10^scale
-        // But multiplying might overflow decimal range if we aren't careful? 
-        // No, unscaled value is integer.
-        
-        // Let's rely on the fact that if we can't fit in long, we can't store it.
-        // We can check if value fits in long range regardless of scale? No.
-        
-        // Correct approach for extraction:
-        // Unscaled value = (High << 64) | (Mid << 32) | Low
-        // If High != 0, it won't fit in Int64 (unsigned).
-        // Actually, Int64 is signed. 
-        // 96-bit integer is unsigned in bits[0..2]. Sign is separate.
-        
         if (high != 0) 
         {
              throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
@@ -337,12 +324,29 @@ public sealed class PreparedStatement : IDisposable
     
     public Guid GetGuid(int col0Based)
     {
-        var bytes = GetBlob(col0Based);
-        if (bytes.Length == 16)
+        unsafe
         {
-            return new Guid(bytes);
+            // Try to get as blob first, as UUIDs are stored as blobs
+            int len;
+            var ptr = (byte*)DecentDBNative.decentdb_column_blob(Handle, col0Based, out len);
+            
+            if (ptr != null && len == 16)
+            {
+                return new Guid(new ReadOnlySpan<byte>(ptr, 16));
+            }
+            
+            // Fallback: check text if blob failed or length mismatch (e.g. legacy text UUIDs?)
+            // Although ADR 0091 says text will no longer be accepted for ctUuid, 
+            // we might still have text columns that contain UUID strings.
+            ptr = DecentDBNativeUnsafe.decentdb_column_text(Handle, col0Based, out len);
+            if (ptr != null && len > 0)
+            {
+                var s = new string((sbyte*)ptr, 0, len, System.Text.Encoding.UTF8);
+                if (Guid.TryParse(s, out var g)) return g;
+            }
+            
+            return Guid.Empty;
         }
-        return Guid.Empty; // Or throw? For now strict 16 bytes.
     }
 
     public long GetInt64(int col0Based)

@@ -574,6 +574,11 @@ proc ensureExpandableViewShape(viewName: string, stmt: Statement): Result[Void] 
   okVoid()
 
 proc buildViewOutputExprs(catalog: Catalog, stmt: Statement): Result[seq[Expr]] =
+  if stmt.setOpKind != sokNone:
+    # For SetOps (UNION, INTERSECT, EXCEPT), the output columns are determined by the left-hand side.
+    # The parser/binder ensures that right-hand side matches in count/type.
+    return buildViewOutputExprs(catalog, stmt.setOpLeft)
+
   var outputExprs: seq[Expr] = @[]
   for item in stmt.selectItems:
     if item.isStar:
