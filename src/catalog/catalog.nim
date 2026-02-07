@@ -36,6 +36,8 @@ type Column* = object
   primaryKey*: bool
   refTable*: string
   refColumn*: string
+  refOnDelete*: string
+  refOnUpdate*: string
   decPrecision*: uint8
   decScale*: uint8
 
@@ -63,6 +65,7 @@ type IndexMeta* = object
   rootPage*: PageId
   kind*: IndexKind
   unique*: bool
+  predicateSql*: string
 
 type TrigramDelta* = ref object
   adds*: HashSet[uint64]
@@ -149,6 +152,30 @@ proc columnTypeToText*(kind: ColumnType): string =
   of ctDecimal: "DECIMAL"
   of ctUuid: "UUID"
 
+proc normalizeFkAction(action: string): string =
+  let upper = action.strip().toUpperAscii()
+  if upper.len == 0:
+    return "NO ACTION"
+  if upper in ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL"]:
+    return upper
+  "NO ACTION"
+
+proc fkActionToCode(action: string): string =
+  case normalizeFkAction(action)
+  of "NO ACTION": "a"
+  of "RESTRICT": "r"
+  of "CASCADE": "c"
+  of "SET NULL": "n"
+  else: "a"
+
+proc fkActionFromCode(code: string): string =
+  case code.toLowerAscii()
+  of "", "a": "NO ACTION"
+  of "r": "RESTRICT"
+  of "c": "CASCADE"
+  of "n": "SET NULL"
+  else: "NO ACTION"
+
 proc encodeColumns(columns: seq[Column]): seq[byte] =
   var parts: seq[string] = @[]
   for col in columns:
@@ -161,6 +188,8 @@ proc encodeColumns(columns: seq[Column]): seq[byte] =
       flags.add("pk")
     if col.refTable.len > 0 and col.refColumn.len > 0:
       flags.add("ref=" & col.refTable & "." & col.refColumn)
+      flags.add("refdel=" & fkActionToCode(col.refOnDelete))
+      flags.add("refupd=" & fkActionToCode(col.refOnUpdate))
     let flagPart = if flags.len > 0: ":" & flags.join(",") else: ""
     let typeText =
       if col.kind == ctDecimal:
@@ -207,6 +236,15 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
                 if parts.len == 2:
                   col.refTable = parts[0]
                   col.refColumn = parts[1]
+              elif flag.startsWith("refdel="):
+                col.refOnDelete = fkActionFromCode(flag[7 .. ^1])
+              elif flag.startsWith("refupd="):
+                col.refOnUpdate = fkActionFromCode(flag[7 .. ^1])
+        if col.refTable.len > 0 and col.refColumn.len > 0:
+          if col.refOnDelete.len == 0:
+            col.refOnDelete = "NO ACTION"
+          if col.refOnUpdate.len == 0:
+            col.refOnUpdate = "NO ACTION"
         result.add(col)
 
 proc encodeChecks(checks: seq[CheckConstraint]): seq[byte] =
@@ -263,7 +301,7 @@ proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns:
   ]
   encodeRecord(values)
 
-proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage: PageId, kind: IndexKind, unique: bool): seq[byte] =
+proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage: PageId, kind: IndexKind, unique: bool, predicateSql: string): seq[byte] =
   let values = @[
     Value(kind: vkText, bytes: stringToBytes("index")),
     Value(kind: vkText, bytes: stringToBytes(name)),
@@ -271,7 +309,8 @@ proc makeIndexRecord(name: string, table: string, columns: seq[string], rootPage
     Value(kind: vkText, bytes: stringToBytes(columns.join(";"))),
     Value(kind: vkInt64, int64Val: int64(rootPage)),
     Value(kind: vkText, bytes: stringToBytes(if kind == ikTrigram: "trigram" else: "btree")),
-    Value(kind: vkInt64, int64Val: int64(if unique: 1 else: 0))
+    Value(kind: vkInt64, int64Val: int64(if unique: 1 else: 0)),
+    Value(kind: vkText, bytes: stringToBytes(predicateSql))
   ]
   encodeRecord(values)
 
@@ -323,13 +362,27 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let rootPage = PageId(values[4].int64Val)
     var kind = ikBtree
     var unique = false
+    var predicateSql = ""
     if values.len >= 6:
       let kindText = bytesToString(values[5].bytes).toLowerAscii()
       if kindText == "trigram":
         kind = ikTrigram
     if values.len >= 7:
       unique = values[6].int64Val != 0
-    return ok(CatalogRecord(kind: crIndex, index: IndexMeta(name: name, table: tableName, columns: columns, rootPage: rootPage, kind: kind, unique: unique)))
+    if values.len >= 8:
+      predicateSql = bytesToString(values[7].bytes)
+    return ok(CatalogRecord(
+      kind: crIndex,
+      index: IndexMeta(
+        name: name,
+        table: tableName,
+        columns: columns,
+        rootPage: rootPage,
+        kind: kind,
+        unique: unique,
+        predicateSql: predicateSql
+      )
+    ))
   if recordType == "view":
     if values.len < 5:
       return err[CatalogRecord](ERR_CORRUPTION, "View catalog record too short")
@@ -469,7 +522,7 @@ proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
-  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique)
+  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -483,7 +536,7 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
   discard delete(catalog.catalogTree, key)
-  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique)
+  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)

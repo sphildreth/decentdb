@@ -1253,6 +1253,8 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
       primaryKey: col.primaryKey,
       refTable: col.refTable,
       refColumn: col.refColumn,
+      refOnDelete: col.refOnDelete,
+      refOnUpdate: col.refOnUpdate,
       decPrecision: spec.decPrecision,
       decScale: spec.decScale
     ))
@@ -1260,6 +1262,12 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     if col.primaryKey:
       primaryCount.inc
     if col.refTable.len > 0 and col.refColumn.len > 0:
+      let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+      let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+      if onDelete == "SET NULL" and col.notNull:
+        return err[Statement](ERR_SQL, "ON DELETE SET NULL requires nullable child column", col.name)
+      if onUpdate == "SET NULL" and col.notNull:
+        return err[Statement](ERR_SQL, "ON UPDATE SET NULL requires nullable child column", col.name)
       let parentRes = catalog.getTable(col.refTable)
       if not parentRes.ok:
         return err[Statement](parentRes.err.code, parentRes.err.message, col.refTable)
@@ -1270,7 +1278,7 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
           break
       if not parentHasColumn:
         return err[Statement](ERR_SQL, "Referenced column not found", col.refTable & "." & col.refColumn)
-      let parentIdx = catalog.getBtreeIndexForColumn(col.refTable, col.refColumn)
+      let parentIdx = catalog.getIndexForColumn(col.refTable, col.refColumn, ikBtree, requireUnique = true)
       var isInt64Pk = false
       for parentCol in parentRes.value.columns:
         if parentCol.name == col.refColumn and parentCol.primaryKey and parentCol.kind == ctInt64:
@@ -1278,7 +1286,7 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
           break
 
       if not isInt64Pk:
-        if isNone(parentIdx) or not parentIdx.get.unique:
+        if isNone(parentIdx):
           return err[Statement](ERR_SQL, "Referenced column must be indexed uniquely", col.refTable & "." & col.refColumn)
   if primaryCount > 1:
     for col in stmt.columns:
@@ -1320,6 +1328,27 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](ERR_SQL, "Trigram index on multiple columns not supported")
   if stmt.indexKind == sql.ikTrigram and stmt.unique:
     return err[Statement](ERR_SQL, "Trigram index cannot be UNIQUE", stmt.columnNames[0])
+  if stmt.indexPredicate != nil:
+    if stmt.indexKind != sql.ikBtree:
+      return err[Statement](ERR_SQL, "Partial indexes are supported only for BTREE in 0.x")
+    if stmt.columnNames.len != 1:
+      return err[Statement](ERR_SQL, "Partial indexes support only single-column BTREE indexes in 0.x")
+    if stmt.unique:
+      return err[Statement](ERR_SQL, "UNIQUE partial indexes are not supported in 0.x")
+    var map = initTable[string, TableMeta]()
+    map[stmt.indexTableName] = tableRes.value
+    let predBind = bindExpr(map, stmt.indexPredicate)
+    if not predBind.ok:
+      return err[Statement](predBind.err.code, predBind.err.message, predBind.err.context)
+    let p = stmt.indexPredicate
+    let supported =
+      p.kind == ekBinary and p.op == "IS NOT" and
+      p.left != nil and p.left.kind == ekColumn and
+      (p.left.table.len == 0 or p.left.table == stmt.indexTableName) and
+      p.left.name == stmt.columnNames[0] and
+      p.right != nil and p.right.kind == ekLiteral and p.right.value.kind == svNull
+    if not supported:
+      return err[Statement](ERR_SQL, "Partial index predicate must be `<indexed_column> IS NOT NULL` in 0.x")
   ok(stmt)
 
 proc validateDependentViewsForReplacement(catalog: Catalog, candidate: ViewMeta): Result[Void] =

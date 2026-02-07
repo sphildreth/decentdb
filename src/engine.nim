@@ -1185,11 +1185,74 @@ proc enforceConstraintsBatch*(
   
   ok(allFailures)
 
-proc referencingChildren(catalog: Catalog, table: string, column: string): seq[(string, string)] =
+type ChildFkRef = object
+  tableName: string
+  columnName: string
+  onDelete: string
+  onUpdate: string
+
+proc normalizeFkAction(action: string): string =
+  let upper = action.strip().toUpperAscii()
+  if upper.len == 0:
+    return "NO ACTION"
+  upper
+
+proc referencingChildren(catalog: Catalog, table: string, column: string): seq[ChildFkRef] =
   for _, meta in catalog.tables:
     for col in meta.columns:
       if col.refTable == table and col.refColumn == column:
-        result.add((meta.name, col.name))
+        result.add(ChildFkRef(
+          tableName: meta.name,
+          columnName: col.name,
+          onDelete: normalizeFkAction(col.refOnDelete),
+          onUpdate: normalizeFkAction(col.refOnUpdate)
+        ))
+
+proc columnIndexInTable(table: TableMeta, columnName: string): int =
+  for i, col in table.columns:
+    if col.name == columnName:
+      return i
+  -1
+
+proc findReferencingRows(catalog: Catalog, pager: Pager, childTable: TableMeta, childColumn: string, parentValue: Value): Result[seq[StoredRow]] =
+  var matches: seq[StoredRow] = @[]
+  if parentValue.kind == vkNull:
+    return ok(matches)
+
+  let childColIdx = columnIndexInTable(childTable, childColumn)
+  if childColIdx < 0:
+    return err[seq[StoredRow]](ERR_INTERNAL, "Missing FK child column", childTable.name & "." & childColumn)
+
+  let idxOpt = catalog.getBtreeIndexForColumn(childTable.name, childColumn)
+  if isNone(idxOpt):
+    var isInt64Pk = false
+    for cCol in childTable.columns:
+      if cCol.name == childColumn and cCol.primaryKey and cCol.kind == ctInt64:
+        isInt64Pk = true
+        break
+    if isInt64Pk and parentValue.kind == vkInt64:
+      let targetId = cast[uint64](parentValue.int64Val)
+      let rowRes = readRowAt(pager, childTable, targetId)
+      if rowRes.ok:
+        if valuesEqual(rowRes.value.values[childColIdx], parentValue):
+          matches.add(rowRes.value)
+      elif rowRes.err.code != ERR_IO:
+        return err[seq[StoredRow]](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+      return ok(matches)
+    return err[seq[StoredRow]](ERR_INTERNAL, "Missing FK child index", childTable.name & "." & childColumn)
+
+  let rowIdsRes = indexSeek(pager, catalog, childTable.name, childColumn, parentValue)
+  if not rowIdsRes.ok:
+    return err[seq[StoredRow]](rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context)
+  for rowid in rowIdsRes.value:
+    let rowRes = readRowAt(pager, childTable, rowid)
+    if not rowRes.ok:
+      if rowRes.err.code == ERR_IO:
+        continue
+      return err[seq[StoredRow]](rowRes.err.code, rowRes.err.message, rowRes.err.context)
+    if valuesEqual(rowRes.value.values[childColIdx], parentValue):
+      matches.add(rowRes.value)
+  ok(matches)
 
 proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, oldValues: seq[Value], newValues: seq[Value]): Result[Void] =
   for i, col in table.columns:
@@ -1203,33 +1266,54 @@ proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, o
     if oldVal.kind == vkNull:
       continue
     for child in children:
-      let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
-      if isNone(idxOpt):
-        # Check if the referencing column is an optimized INT64 PRIMARY KEY.
-        let childTableRes = catalog.getTable(child[0])
-        if childTableRes.ok:
-          var isInt64Pk = false
-          for cCol in childTableRes.value.columns:
-            if cCol.name == child[1] and cCol.primaryKey and cCol.kind == ctInt64:
-              isInt64Pk = true
-              break
-          if isInt64Pk:
-            if oldVal.kind == vkInt64:
-              let targetId = cast[uint64](oldVal.int64Val)
-              let rowRes = readRowAt(pager, childTableRes.value, targetId)
-              if rowRes.ok:
-                return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
-              elif rowRes.err.code != ERR_IO:
-                return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
-              continue
+      let childTableRes = catalog.getTable(child.tableName)
+      if not childTableRes.ok:
+        return err[Void](childTableRes.err.code, childTableRes.err.message, childTableRes.err.context)
+      let childTable = childTableRes.value
+      let refsRes = findReferencingRows(catalog, pager, childTable, child.columnName, oldVal)
+      if not refsRes.ok:
+        return err[Void](refsRes.err.code, refsRes.err.message, refsRes.err.context)
+      let refs = refsRes.value
+      if refs.len == 0:
+        continue
 
-        return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
-      let key = indexKeyFromValue(oldVal)
-      let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
-      if not anyRes.ok:
-        return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
-      if anyRes.value:
+      case child.onUpdate
+      of "NO ACTION", "RESTRICT":
         return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+      of "CASCADE", "SET NULL":
+        let childColIdx = columnIndexInTable(childTable, child.columnName)
+        if childColIdx < 0:
+          return err[Void](ERR_INTERNAL, "Missing FK child column", child.tableName & "." & child.columnName)
+        for row in refs:
+          let existsRes = readRowAt(pager, childTable, row.rowid)
+          if not existsRes.ok:
+            if existsRes.err.code == ERR_IO:
+              continue
+            return err[Void](existsRes.err.code, existsRes.err.message, existsRes.err.context)
+          let current = existsRes.value
+          var newValues = current.values
+          if child.onUpdate == "CASCADE":
+            newValues[childColIdx] = newVal
+          else:
+            newValues[childColIdx] = Value(kind: vkNull)
+
+          let notNullRes = enforceNotNull(childTable, newValues)
+          if not notNullRes.ok:
+            return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+          let checkRes = enforceChecks(childTable, newValues)
+          if not checkRes.ok:
+            return err[Void](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+          let uniqueRes = enforceUnique(catalog, pager, childTable, newValues, current.rowid)
+          if not uniqueRes.ok:
+            return err[Void](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+          let cascadeRes = enforceRestrictOnParent(catalog, pager, childTable, current.values, newValues)
+          if not cascadeRes.ok:
+            return err[Void](cascadeRes.err.code, cascadeRes.err.message, cascadeRes.err.context)
+          let upRes = updateRow(pager, catalog, child.tableName, current.rowid, newValues)
+          if not upRes.ok:
+            return err[Void](upRes.err.code, upRes.err.message, upRes.err.context)
+      else:
+        return err[Void](ERR_SQL, "Unsupported ON UPDATE action", child.onUpdate)
   okVoid()
 
 proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, oldValues: seq[Value]): Result[Void] =
@@ -1241,33 +1325,67 @@ proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, o
     if oldVal.kind == vkNull:
       continue
     for child in children:
-      let idxOpt = catalog.getBtreeIndexForColumn(child[0], child[1])
-      if isNone(idxOpt):
-        # Check if the referencing column is an optimized INT64 PRIMARY KEY
-        let childTableRes = catalog.getTable(child[0])
-        if childTableRes.ok:
-           var isInt64Pk = false
-           for cCol in childTableRes.value.columns:
-             if cCol.name == child[1] and cCol.primaryKey and cCol.kind == ctInt64:
-               isInt64Pk = true
-               break
-           if isInt64Pk:
-              if oldVal.kind == vkInt64:
-                let targetId = cast[uint64](oldVal.int64Val)
-                let rowRes = readRowAt(pager, childTableRes.value, targetId)
-                if rowRes.ok:
-                   return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
-                elif rowRes.err.code != ERR_IO:
-                   return err[Void](rowRes.err.code, rowRes.err.message, rowRes.err.context)
-                continue
+      let childTableRes = catalog.getTable(child.tableName)
+      if not childTableRes.ok:
+        return err[Void](childTableRes.err.code, childTableRes.err.message, childTableRes.err.context)
+      let childTable = childTableRes.value
+      let refsRes = findReferencingRows(catalog, pager, childTable, child.columnName, oldVal)
+      if not refsRes.ok:
+        return err[Void](refsRes.err.code, refsRes.err.message, refsRes.err.context)
+      let refs = refsRes.value
+      if refs.len == 0:
+        continue
 
-        return err[Void](ERR_INTERNAL, "Missing FK child index", child[0] & "." & child[1])
-      let key = indexKeyFromValue(oldVal)
-      let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
-      if not anyRes.ok:
-        return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
-      if anyRes.value:
+      case child.onDelete
+      of "NO ACTION", "RESTRICT":
         return err[Void](ERR_CONSTRAINT, "FOREIGN KEY RESTRICT violation", table.name & "." & col.name)
+      of "CASCADE":
+        for row in refs:
+          let cascadeRes = enforceRestrictOnDelete(catalog, pager, childTable, row.values)
+          if not cascadeRes.ok:
+            return err[Void](cascadeRes.err.code, cascadeRes.err.message, cascadeRes.err.context)
+        for row in refs:
+          let existsRes = readRowAt(pager, childTable, row.rowid)
+          if not existsRes.ok:
+            if existsRes.err.code == ERR_IO:
+              continue
+            return err[Void](existsRes.err.code, existsRes.err.message, existsRes.err.context)
+          let delRes = deleteRow(pager, catalog, child.tableName, row.rowid)
+          if not delRes.ok:
+            return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+      of "SET NULL":
+        let childColIdx = columnIndexInTable(childTable, child.columnName)
+        if childColIdx < 0:
+          return err[Void](ERR_INTERNAL, "Missing FK child column", child.tableName & "." & child.columnName)
+        for row in refs:
+          let existsRes = readRowAt(pager, childTable, row.rowid)
+          if not existsRes.ok:
+            if existsRes.err.code == ERR_IO:
+              continue
+            return err[Void](existsRes.err.code, existsRes.err.message, existsRes.err.context)
+          let current = existsRes.value
+          var newValues = current.values
+          newValues[childColIdx] = Value(kind: vkNull)
+          let notNullRes = enforceNotNull(childTable, newValues)
+          if not notNullRes.ok:
+            return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+          let checkRes = enforceChecks(childTable, newValues)
+          if not checkRes.ok:
+            return err[Void](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+          let uniqueRes = enforceUnique(catalog, pager, childTable, newValues, current.rowid)
+          if not uniqueRes.ok:
+            return err[Void](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+          let fkRes = enforceForeignKeys(catalog, pager, childTable, newValues)
+          if not fkRes.ok:
+            return err[Void](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+          let restrictRes = enforceRestrictOnParent(catalog, pager, childTable, current.values, newValues)
+          if not restrictRes.ok:
+            return err[Void](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+          let upRes = updateRow(pager, catalog, child.tableName, current.rowid, newValues)
+          if not upRes.ok:
+            return err[Void](upRes.err.code, upRes.err.message, upRes.err.context)
+      else:
+        return err[Void](ERR_SQL, "Unsupported ON DELETE action", child.onDelete)
   okVoid()
 
 proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
@@ -1821,6 +1939,8 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           primaryKey: col.primaryKey,
           refTable: col.refTable,
           refColumn: col.refColumn,
+          refOnDelete: col.refOnDelete,
+          refOnUpdate: col.refOnUpdate,
           decPrecision: spec.decPrecision,
           decScale: spec.decScale
         ))
@@ -1907,6 +2027,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let indexRootRes = initTableRoot(db.pager)
       if not indexRootRes.ok:
         return err[seq[string]](indexRootRes.err.code, indexRootRes.err.message, indexRootRes.err.context)
+      let predicateSql = if bound.indexPredicate != nil: exprToCanonicalSql(bound.indexPredicate) else: ""
       if bound.unique:
         let tableRes = db.catalog.getTable(bound.indexTableName)
         if not tableRes.ok:
@@ -1979,17 +2100,25 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         finalRoot = buildRes.value
       else:
         if bound.columnNames.len == 1:
-          let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
+          let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value, predicateSql)
           if not buildRes.ok:
             return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
           finalRoot = buildRes.value
         else:
-          let buildRes = buildIndexForColumns(db.pager, db.catalog, bound.indexTableName, bound.columnNames, indexRootRes.value)
+          let buildRes = buildIndexForColumns(db.pager, db.catalog, bound.indexTableName, bound.columnNames, indexRootRes.value, predicateSql)
           if not buildRes.ok:
             return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
           finalRoot = buildRes.value
       let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
-      let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, columns: bound.columnNames, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
+      let idxMeta = IndexMeta(
+        name: bound.indexName,
+        table: bound.indexTableName,
+        columns: bound.columnNames,
+        rootPage: finalRoot,
+        kind: idxKind,
+        unique: bound.unique,
+        predicateSql: predicateSql
+      )
       let saveRes = db.catalog.createIndexMeta(idxMeta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
@@ -2355,6 +2484,8 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         primaryKey: col.primaryKey,
         refTable: col.refTable,
         refColumn: col.refColumn,
+        refOnDelete: col.refOnDelete,
+        refOnUpdate: col.refOnUpdate,
         decPrecision: spec.decPrecision,
         decScale: spec.decScale
       ))
@@ -2445,6 +2576,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     let indexRootRes = initTableRoot(db.pager)
     if not indexRootRes.ok:
       return err[int64](indexRootRes.err.code, indexRootRes.err.message, indexRootRes.err.context)
+    let predicateSql = if bound.indexPredicate != nil: exprToCanonicalSql(bound.indexPredicate) else: ""
     if bound.unique:
       let tableRes = db.catalog.getTable(bound.indexTableName)
       if not tableRes.ok:
@@ -2516,17 +2648,25 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       finalRoot = buildRes.value
     else:
       if bound.columnNames.len == 1:
-        let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
+        let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value, predicateSql)
         if not buildRes.ok:
           return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
         finalRoot = buildRes.value
       else:
-        let buildRes = buildIndexForColumns(db.pager, db.catalog, bound.indexTableName, bound.columnNames, indexRootRes.value)
+        let buildRes = buildIndexForColumns(db.pager, db.catalog, bound.indexTableName, bound.columnNames, indexRootRes.value, predicateSql)
         if not buildRes.ok:
           return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
         finalRoot = buildRes.value
     let idxKind = if bound.indexKind == sql.ikTrigram: catalog.ikTrigram else: catalog.ikBtree
-    let idxMeta = IndexMeta(name: bound.indexName, table: bound.indexTableName, columns: bound.columnNames, rootPage: finalRoot, kind: idxKind, unique: bound.unique)
+    let idxMeta = IndexMeta(
+      name: bound.indexName,
+      table: bound.indexTableName,
+      columns: bound.columnNames,
+      rootPage: finalRoot,
+      kind: idxKind,
+      unique: bound.unique,
+      predicateSql: predicateSql
+    )
     let saveRes = db.catalog.createIndexMeta(idxMeta)
     if not saveRes.ok:
       return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)

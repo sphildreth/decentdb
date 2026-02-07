@@ -79,6 +79,21 @@ proc indexColumnIndices*(table: TableMeta, idx: IndexMeta): seq[int] =
         result.add(i)
         break
 
+proc shouldIncludeInIndex(table: TableMeta, idx: IndexMeta, values: seq[Value]): bool =
+  ## v0 partial-index support: only `<indexed_column> IS NOT NULL`.
+  if idx.predicateSql.len == 0:
+    return true
+  if idx.columns.len != 1:
+    return false
+  var ci = -1
+  for i, col in table.columns:
+    if col.name == idx.columns[0]:
+      ci = i
+      break
+  if ci < 0 or ci >= values.len:
+    return false
+  values[ci].kind != vkNull
+
 proc valueText(value: Value): string =
   var s = ""
   for b in value.bytes:
@@ -403,6 +418,8 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     for _, idx in catalog.indexes:
       if idx.table != tableName:
         continue
+      if not shouldIncludeInIndex(table, idx, values):
+        continue
       if idx.kind == ikBtree:
         let colIndices = indexColumnIndices(table, idx)
         if colIndices.len == idx.columns.len and colIndices.len > 0:
@@ -509,21 +526,26 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     for _, idx in catalog.indexes:
       if idx.table != tableName:
         continue
+      let oldIncluded = shouldIncludeInIndex(table, idx, oldRes.value.values)
+      let newIncluded = shouldIncludeInIndex(table, idx, values)
       if idx.kind == ikBtree:
         let colIndices = indexColumnIndices(table, idx)
         if colIndices.len == idx.columns.len and colIndices.len > 0:
-          let idxTree = newBTree(pager, idx.rootPage)
-          let oldKey = compositeIndexKey(oldRes.value.values, colIndices)
-          let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
-          if not delRes.ok:
-            return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-          let newKey = compositeIndexKey(values, colIndices)
-          let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
-          if not idxInsert.ok:
-            return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
-          let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
-          if not syncRes.ok:
-            return syncRes
+          if oldIncluded or newIncluded:
+            let idxTree = newBTree(pager, idx.rootPage)
+            if oldIncluded:
+              let oldKey = compositeIndexKey(oldRes.value.values, colIndices)
+              let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
+              if not delRes.ok:
+                return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+            if newIncluded:
+              let newKey = compositeIndexKey(values, colIndices)
+              let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
+              if not idxInsert.ok:
+                return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
+            let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
+            if not syncRes.ok:
+              return syncRes
       else:
         if idx.columns.len == 1:
           var valueIndex = -1
@@ -532,9 +554,18 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
               valueIndex = i
               break
           if valueIndex >= 0:
-            let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], values[valueIndex])
-            if not updateRes.ok:
-              return updateRes
+            if oldIncluded and newIncluded:
+              let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], values[valueIndex])
+              if not updateRes.ok:
+                return updateRes
+            elif oldIncluded and not newIncluded:
+              let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, oldRes.value.values[valueIndex], Value(kind: vkNull))
+              if not updateRes.ok:
+                return updateRes
+            elif (not oldIncluded) and newIncluded:
+              let updateRes = updateTrigramIndex(pager, catalog, idx, rowid, Value(kind: vkNull), values[valueIndex])
+              if not updateRes.ok:
+                return updateRes
   let normalizedRes = normalizeValues(pager, values)
   if not normalizedRes.ok:
     return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
@@ -554,6 +585,8 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
   for _, idx in catalog.indexes:
     if idx.table != tableName:
+      continue
+    if not shouldIncludeInIndex(table, idx, oldRes.value.values):
       continue
     if idx.kind == ikBtree:
       let colIndices = indexColumnIndices(table, idx)
@@ -584,7 +617,7 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
   okVoid()
 
-proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[PageId] =
+proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId, predicateSql: string = ""): Result[PageId] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
     return err[PageId](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -599,10 +632,12 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
   let rowsRes = scanTable(pager, table)
   if not rowsRes.ok:
     return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  let idxMeta = IndexMeta(table: tableName, columns: @[columnName], predicateSql: predicateSql)
   var pairs: seq[(uint64, uint64)] = @[]
-  pairs.setLen(rowsRes.value.len)
-  for i, row in rowsRes.value:
-    pairs[i] = (indexKeyFromValue(row.values[columnIndex]), row.rowid)
+  for row in rowsRes.value:
+    if not shouldIncludeInIndex(table, idxMeta, row.values):
+      continue
+    pairs.add((indexKeyFromValue(row.values[columnIndex]), row.rowid))
   pairs.sort(proc(a, b: (uint64, uint64)): int =
     let c = cmp(a[0], b[0])
     if c != 0: c else: cmp(a[1], b[1])
@@ -617,7 +652,7 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
     return err[PageId](buildRes.err.code, buildRes.err.message, buildRes.err.context)
   ok(buildRes.value)
 
-proc buildIndexForColumns*(pager: Pager, catalog: Catalog, tableName: string, columnNames: seq[string], indexRoot: PageId): Result[PageId] =
+proc buildIndexForColumns*(pager: Pager, catalog: Catalog, tableName: string, columnNames: seq[string], indexRoot: PageId, predicateSql: string = ""): Result[PageId] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
     return err[PageId](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -635,10 +670,12 @@ proc buildIndexForColumns*(pager: Pager, catalog: Catalog, tableName: string, co
   let rowsRes = scanTable(pager, table)
   if not rowsRes.ok:
     return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+  let idxMeta = IndexMeta(table: tableName, columns: columnNames, predicateSql: predicateSql)
   var pairs: seq[(uint64, uint64)] = @[]
-  pairs.setLen(rowsRes.value.len)
-  for i, row in rowsRes.value:
-    pairs[i] = (compositeIndexKey(row.values, colIndices), row.rowid)
+  for row in rowsRes.value:
+    if not shouldIncludeInIndex(table, idxMeta, row.values):
+      continue
+    pairs.add((compositeIndexKey(row.values, colIndices), row.rowid))
   pairs.sort(proc(a, b: (uint64, uint64)): int =
     let c = cmp(a[0], b[0])
     if c != 0: c else: cmp(a[1], b[1])
@@ -725,12 +762,12 @@ proc rebuildIndex*(pager: Pager, catalog: Catalog, index: IndexMeta): Result[Voi
     newRoot = buildRes.value
   else:
     if index.columns.len == 1:
-      let buildRes = buildIndexForColumn(pager, catalog, index.table, index.columns[0], index.rootPage)
+      let buildRes = buildIndexForColumn(pager, catalog, index.table, index.columns[0], index.rootPage, index.predicateSql)
       if not buildRes.ok:
         return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
       newRoot = buildRes.value
     else:
-      let buildRes = buildIndexForColumns(pager, catalog, index.table, index.columns, index.rootPage)
+      let buildRes = buildIndexForColumns(pager, catalog, index.table, index.columns, index.rootPage, index.predicateSql)
       if not buildRes.ok:
         return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
       newRoot = buildRes.value
@@ -825,6 +862,8 @@ proc columnFromColumnDef(colDef: ColumnDef): Result[Column] =
     primaryKey: colDef.primaryKey,
     refTable: colDef.refTable,
     refColumn: colDef.refColumn,
+    refOnDelete: colDef.refOnDelete,
+    refOnUpdate: colDef.refOnUpdate,
     decPrecision: spec.decPrecision,
     decScale: spec.decScale
   ))

@@ -38,7 +38,14 @@ CREATE INDEX index_name ON table_name USING trigram(column_name);
 
 -- Unique index
 CREATE UNIQUE INDEX index_name ON table_name(column_name);
+
+-- Partial index (v0 subset)
+CREATE INDEX index_name ON table_name(column_name) WHERE column_name IS NOT NULL;
 ```
+
+Notes:
+- Partial indexes are currently limited to single-column BTREE indexes with predicate form `column IS NOT NULL`.
+- `UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, and arbitrary partial predicates are not supported in 0.x.
 
 ### DROP TABLE / DROP INDEX
 
@@ -273,10 +280,15 @@ CREATE TABLE users (
 ```sql
 CREATE TABLE orders (
     id INT PRIMARY KEY,
-    user_id INT REFERENCES users(id),
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
     ...
 );
 ```
+
+Notes:
+- Supported `ON DELETE` actions: `NO ACTION`/`RESTRICT`, `CASCADE`, `SET NULL`.
+- Supported `ON UPDATE` actions: `NO ACTION`/`RESTRICT`, `CASCADE`, `SET NULL`.
+- `ON DELETE SET NULL` and `ON UPDATE SET NULL` require the child FK column to be nullable.
 
 ### Unique
 

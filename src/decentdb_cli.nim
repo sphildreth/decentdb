@@ -158,6 +158,12 @@ proc formatSchemaSummary(database: Db): seq[string] =
         colLine &= " PRIMARY KEY"
       if col.refTable.len > 0:
         colLine &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+        let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+        let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+        if onDelete != "NO ACTION":
+          colLine &= " ON DELETE " & onDelete
+        if onUpdate != "NO ACTION":
+          colLine &= " ON UPDATE " & onUpdate
       lines.add(colLine)
 
   lines.add("Indexes: " & $indexNames.len)
@@ -167,6 +173,8 @@ proc formatSchemaSummary(database: Db): seq[string] =
     if idx.unique:
       idxLine &= " UNIQUE"
     idxLine &= " " & (if idx.kind == ikBtree: "BTREE" else: "TRIGRAM")
+    if idx.predicateSql.len > 0:
+      idxLine &= " WHERE " & idx.predicateSql
     lines.add(idxLine)
   lines
 
@@ -810,7 +818,7 @@ proc schemaListIndexes*(db: string = "", table: string = ""): int =
 
   let database = openRes.value
   var output: seq[string] = @[]
-  output.add("Index|Table|Column|Type|Unique")
+  output.add("Index|Table|Column|Type|Unique|Predicate")
   
   for indexName, indexMeta in database.catalog.indexes:
     if table.len > 0 and indexMeta.table != table:
@@ -821,7 +829,7 @@ proc schemaListIndexes*(db: string = "", table: string = ""): int =
       of ikTrigram: "trigram"
     
     let unique = if indexMeta.unique: "YES" else: "NO"
-    output.add("$1|$2|$3|$4|$5" % [indexName, indexMeta.table, indexMeta.columns.join(","), indexType, unique])
+    output.add("$1|$2|$3|$4|$5|$6" % [indexName, indexMeta.table, indexMeta.columns.join(","), indexType, unique, indexMeta.predicateSql])
   
   discard closeDb(database)
   echo resultJson(true, rows = output)
@@ -1179,6 +1187,12 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         colDef &= " NOT NULL"
       if col.refTable.len > 0 and col.refColumn.len > 0:
         colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+        let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+        let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+        if onDelete != "NO ACTION":
+          colDef &= " ON DELETE " & onDelete
+        if onUpdate != "NO ACTION":
+          colDef &= " ON UPDATE " & onUpdate
       
       columnDefs.add(colDef)
 
@@ -1633,6 +1647,12 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
         colDef &= " NOT NULL"
       if col.refTable.len > 0 and col.refColumn.len > 0:
         colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
+        let onDelete = if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION"
+        let onUpdate = if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION"
+        if onDelete != "NO ACTION":
+          colDef &= " ON DELETE " & onDelete
+        if onUpdate != "NO ACTION":
+          colDef &= " ON UPDATE " & onUpdate
       columnDefs.add(colDef)
     for checkDef in tableMeta.checks:
       var checkSql = "  "
@@ -1700,7 +1720,16 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
 
     # Semantic dedupe: if destination already has an equivalent index under a different
     # name, do not recreate it.
-    if idx.columns.len == 1 and isSome(dstDb.catalog.getIndexForColumn(idx.table, idx.columns[0], idx.kind, requireUnique = idx.unique)):
+    var alreadyExists = false
+    for _, dstIdx in dstDb.catalog.indexes:
+      if dstIdx.table == idx.table and
+         dstIdx.columns == idx.columns and
+         dstIdx.kind == idx.kind and
+         dstIdx.unique == idx.unique and
+         dstIdx.predicateSql == idx.predicateSql:
+        alreadyExists = true
+        break
+    if alreadyExists:
       continue
 
     var stmt = "CREATE "
@@ -1710,6 +1739,8 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
     if idx.kind == ikTrigram:
       stmt &= " USING trigram "
     stmt &= "(" & idx.columns.join(", ") & ")"
+    if idx.predicateSql.len > 0:
+      stmt &= " WHERE " & idx.predicateSql
     let idxRes = execSql(dstDb, stmt)
     if not idxRes.ok:
       discard closeDb(srcDb)

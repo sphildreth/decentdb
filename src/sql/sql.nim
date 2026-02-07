@@ -61,6 +61,8 @@ type ColumnDef* = object
   primaryKey*: bool
   refTable*: string
   refColumn*: string
+  refOnDelete*: string
+  refOnUpdate*: string
 
 type CheckConstraintDef* = object
   name*: string
@@ -158,6 +160,7 @@ type Statement* = ref object
     columnNames*: seq[string]
     indexKind*: SqlIndexKind
     unique*: bool
+    indexPredicate*: Expr
   of skDropTable:
     dropTableName*: string
   of skDropIndex:
@@ -1179,6 +1182,21 @@ proc selectToCanonicalSql(stmt: Statement): string =
 # Actually, parseCreateStmt etc. are fine.
 # I will output the whole file content to be safe.
 
+proc parseFkActionCode(code: string): Result[string] =
+  case code.toLowerAscii()
+  of "", "a":
+    ok("NO ACTION")
+  of "r":
+    ok("RESTRICT")
+  of "c":
+    ok("CASCADE")
+  of "n":
+    ok("SET NULL")
+  of "d":
+    err[string](ERR_SQL, "SET DEFAULT foreign key action is not supported in 0.x")
+  else:
+    err[string](ERR_SQL, "Unsupported foreign key action code", code)
+
 proc parseCreateStmt(node: JsonNode): Result[Statement] =
   let rel = unwrapRangeVar(node["relation"])
   let tableRes = parseRangeVar(rel)
@@ -1242,6 +1260,14 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
                 let attrs = nodeGet(constraint, "pk_attrs")
                 if attrs.kind == JArray and attrs.len > 0:
                   def.refColumn = nodeString(attrs[0])
+                let delActionRes = parseFkActionCode(nodeGet(constraint, "fk_del_action").getStr)
+                if not delActionRes.ok:
+                  return err[Statement](delActionRes.err.code, delActionRes.err.message, delActionRes.err.context)
+                def.refOnDelete = delActionRes.value
+                let updActionRes = parseFkActionCode(nodeGet(constraint, "fk_upd_action").getStr)
+                if not updActionRes.ok:
+                  return err[Statement](updActionRes.err.code, updActionRes.err.message, updActionRes.err.context)
+                def.refOnUpdate = updActionRes.value
               of "CONSTR_CHECK":
                 let rawExpr = nodeGet(constraint, "raw_expr")
                 let exprRes = parseExprNode(rawExpr)
@@ -1309,7 +1335,21 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     if methodLower == "trigram":
       kind = ikTrigram
   let unique = nodeHas(node, "unique") and node["unique"].getBool
-  ok(Statement(kind: skCreateIndex, indexName: idxName, indexTableName: tableRes.value[0], columnNames: columnNames, indexKind: kind, unique: unique))
+  var predicate: Expr = nil
+  if nodeHas(node, "whereClause"):
+    let predRes = parseExprNode(nodeGet(node, "whereClause"))
+    if not predRes.ok:
+      return err[Statement](predRes.err.code, predRes.err.message, predRes.err.context)
+    predicate = predRes.value
+  ok(Statement(
+    kind: skCreateIndex,
+    indexName: idxName,
+    indexTableName: tableRes.value[0],
+    columnNames: columnNames,
+    indexKind: kind,
+    unique: unique,
+    indexPredicate: predicate
+  ))
 
 proc parseViewStmt(node: JsonNode): Result[Statement] =
   let viewRes = parseRangeVar(nodeGet(node, "view"))
@@ -1438,6 +1478,8 @@ proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
           isUnique = true
         elif contype == "CONSTR_CHECK":
           return err[ColumnDef](ERR_SQL, "ADD COLUMN CHECK is not supported in 0.x")
+        elif contype == "CONSTR_FOREIGN":
+          return err[ColumnDef](ERR_SQL, "ADD COLUMN REFERENCES is not supported in 0.x")
   ok(ColumnDef(name: colName, typeName: typeName.toUpperAscii(), notNull: notNull, unique: isUnique, primaryKey: isPrimaryKey))
 
 proc parseAlterTableStmt(node: JsonNode): Result[Statement] =

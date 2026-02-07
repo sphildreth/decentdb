@@ -285,6 +285,30 @@ suite "Binder":
     let bindFk3 = bindStatement(db.catalog, stmtFk3)
     check bindFk3.ok
 
+    let stmtFkCascade = parseSingle("CREATE TABLE child_cascade (id INT, parent_id INT REFERENCES parent(id) ON DELETE CASCADE)")
+    let bindFkCascade = bindStatement(db.catalog, stmtFkCascade)
+    check bindFkCascade.ok
+
+    let stmtFkSetNull = parseSingle("CREATE TABLE child_setnull (id INT, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)")
+    let bindFkSetNull = bindStatement(db.catalog, stmtFkSetNull)
+    check bindFkSetNull.ok
+
+    let stmtFkSetNullNotNull = parseSingle("CREATE TABLE child_setnull_bad (id INT, parent_id INT NOT NULL REFERENCES parent(id) ON DELETE SET NULL)")
+    let bindFkSetNullNotNull = bindStatement(db.catalog, stmtFkSetNullNotNull)
+    check not bindFkSetNullNotNull.ok
+
+    let stmtFkOnUpdateCascade = parseSingle("CREATE TABLE child_upd (id INT, parent_id INT REFERENCES parent(id) ON UPDATE CASCADE)")
+    let bindFkOnUpdateCascade = bindStatement(db.catalog, stmtFkOnUpdateCascade)
+    check bindFkOnUpdateCascade.ok
+
+    let stmtFkOnUpdateSetNull = parseSingle("CREATE TABLE child_upd_null (id INT, parent_id INT REFERENCES parent(id) ON UPDATE SET NULL)")
+    let bindFkOnUpdateSetNull = bindStatement(db.catalog, stmtFkOnUpdateSetNull)
+    check bindFkOnUpdateSetNull.ok
+
+    let stmtFkOnUpdateSetNullBad = parseSingle("CREATE TABLE child_upd_null_bad (id INT, parent_id INT NOT NULL REFERENCES parent(id) ON UPDATE SET NULL)")
+    let bindFkOnUpdateSetNullBad = bindStatement(db.catalog, stmtFkOnUpdateSetNullBad)
+    check not bindFkOnUpdateSetNullBad.ok
+
     let stmtIdxBad = parseSingle("CREATE INDEX t_trgm ON parent USING trigram (id)")
     let bindIdxBad = bindStatement(db.catalog, stmtIdxBad)
     check not bindIdxBad.ok
@@ -292,6 +316,22 @@ suite "Binder":
     let stmtIdxUniq = parseSingle("CREATE UNIQUE INDEX t_trgm2 ON parent USING trigram (id)")
     let bindIdxUniq = bindStatement(db.catalog, stmtIdxUniq)
     check not bindIdxUniq.ok
+
+    let stmtPartialOk = parseSingle("CREATE INDEX parent_id_partial ON parent (id) WHERE id IS NOT NULL")
+    let bindPartialOk = bindStatement(db.catalog, stmtPartialOk)
+    check bindPartialOk.ok
+
+    let stmtPartialBadExpr = parseSingle("CREATE INDEX parent_id_partial_bad ON parent (id) WHERE id > 0")
+    let bindPartialBadExpr = bindStatement(db.catalog, stmtPartialBadExpr)
+    check not bindPartialBadExpr.ok
+
+    let stmtPartialBadUnique = parseSingle("CREATE UNIQUE INDEX parent_id_partial_uq ON parent (id) WHERE id IS NOT NULL")
+    let bindPartialBadUnique = bindStatement(db.catalog, stmtPartialBadUnique)
+    check not bindPartialBadUnique.ok
+
+    let stmtPartialBadMulti = parseSingle("CREATE INDEX parent_multi_partial ON parent (id, id) WHERE id IS NOT NULL")
+    let bindPartialBadMulti = bindStatement(db.catalog, stmtPartialBadMulti)
+    check not bindPartialBadMulti.ok
 
     let stmtCheckOk = parseSingle(
       "CREATE TABLE chk_ok (" &

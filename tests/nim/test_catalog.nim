@@ -24,8 +24,16 @@ proc addTable(db: Db, name: string, columns: seq[Column]): TableMeta =
   check db.catalog.saveTable(db.pager, meta).ok
   meta
 
-proc addIndex(db: Db, name: string, table: string, column: string, kind: IndexKind, root: PageId): IndexMeta =
-  let meta = IndexMeta(name: name, table: table, columns: @[column], rootPage: root, kind: kind, unique: false)
+proc addIndex(db: Db, name: string, table: string, column: string, kind: IndexKind, root: PageId, predicateSql: string = ""): IndexMeta =
+  let meta = IndexMeta(
+    name: name,
+    table: table,
+    columns: @[column],
+    rootPage: root,
+    kind: kind,
+    unique: false,
+    predicateSql: predicateSql
+  )
   check db.catalog.createIndexMeta(meta).ok
   meta
 
@@ -44,7 +52,7 @@ suite "Catalog":
     let cols = @[
       Column(name: "id", kind: ctInt64, notNull: true, primaryKey: true),
       Column(name: "name", kind: ctText, unique: true),
-      Column(name: "artist_id", kind: ctInt64, refTable: "artist", refColumn: "id")
+      Column(name: "artist_id", kind: ctInt64, refTable: "artist", refColumn: "id", refOnDelete: "CASCADE", refOnUpdate: "RESTRICT")
     ]
     let tableMeta = addTable(db, "album", cols)
     let idxRoot = initTableRoot(db.pager)
@@ -76,12 +84,15 @@ suite "Catalog":
       let cols = @[
         Column(name: "id", kind: ctInt64, notNull: true, primaryKey: true),
         Column(name: "name", kind: ctText, unique: true),
-        Column(name: "artist_id", kind: ctInt64, refTable: "artist", refColumn: "id")
+        Column(name: "artist_id", kind: ctInt64, refTable: "artist", refColumn: "id", refOnDelete: "CASCADE", refOnUpdate: "RESTRICT")
       ]
       discard addTable(db, "album", cols)
       let idxRoot = initTableRoot(db.pager)
       check idxRoot.ok
       discard addIndex(db, "album_name_trgm", "album", "name", ikTrigram, idxRoot.value)
+      let idxRoot2 = initTableRoot(db.pager)
+      check idxRoot2.ok
+      discard addIndex(db, "album_name_partial", "album", "name", ikBtree, idxRoot2.value, "name IS NOT NULL")
       discard closeDb(db)
 
     let reopenRes = openDb(path)
@@ -95,10 +106,15 @@ suite "Catalog":
     check tableRes.value.columns[1].unique
     check tableRes.value.columns[2].refTable == "artist"
     check tableRes.value.columns[2].refColumn == "id"
+    check tableRes.value.columns[2].refOnDelete == "CASCADE"
+    check tableRes.value.columns[2].refOnUpdate == "RESTRICT"
 
     let idxOpt = db2.catalog.getTrigramIndexForColumn("album", "name")
     check isSome(idxOpt)
     check idxOpt.get.kind == ikTrigram
+    let partialIdx = db2.catalog.getIndexByName("album_name_partial")
+    check isSome(partialIdx)
+    check partialIdx.get.predicateSql == "name IS NOT NULL"
 
     discard closeDb(db2)
 

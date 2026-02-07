@@ -131,6 +131,9 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
       obj["ref_table"] = %col.refTable
     if col.refColumn.len > 0:
       obj["ref_column"] = %col.refColumn
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
+      obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
     arr.add(obj)
 
   let payload = $arr

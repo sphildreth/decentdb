@@ -116,7 +116,7 @@ Offset  Size  Field
 See ADR-0016 for checksum calculation details.
 
 **Format version notes:**
-- v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag).
+- v2 adds catalog-encoded column constraints (NOT NULL/UNIQUE/PK/FK) and index metadata (kind + unique flag + optional partial-index predicate SQL).
 - v5 removes per-frame WAL CRC32C validation (checksum field reserved, written as zero).
 - v6 removes per-frame WAL LSN trailer; LSNs are derived from frame end offsets.
 - v7 removes WAL `payload_size` field; payload sizes are derived from frame type and page size.
@@ -352,6 +352,7 @@ Alternative:
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
 - CHECK constraints in `CREATE TABLE` (column-level and table-level)
+- Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
@@ -361,6 +362,7 @@ Alternative:
   - targetless `INSERT ... ON CONFLICT DO UPDATE ...` (without conflict target)
   - `UPDATE ... RETURNING`
   - `DELETE ... RETURNING`
+  - Partial indexes beyond the v0 subset (`UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, arbitrary predicates)
 
 ### 6.3 Parameterization
 - `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline
@@ -389,11 +391,12 @@ Alternative:
 - This differs from PostgreSQL/MySQL which defer validation to COMMIT
 
 0.x actions:
-- `RESTRICT` / `NO ACTION` on delete/update
+- `ON DELETE`: `RESTRICT` / `NO ACTION`, `CASCADE`, `SET NULL`
+- `ON UPDATE`: `RESTRICT` / `NO ACTION`, `CASCADE`, `SET NULL`
 
-Optional later:
-- `CASCADE`, `SET NULL`
-- Deferred constraint checking (transaction-commit time)
+Current 0.x limitations:
+- `ON DELETE SET NULL` and `ON UPDATE SET NULL` require nullable child FK columns.
+- Deferred constraint checking (transaction-commit time) is not supported.
 
 ### 7.3 CHECK constraints
 - Supported in `CREATE TABLE` as column or table constraints.

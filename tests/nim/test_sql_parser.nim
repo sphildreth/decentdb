@@ -161,10 +161,14 @@ suite "SQL Parser":
     check del.kind == skDelete
 
   test "parse create table and index":
-    let crt = parseSingle("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL UNIQUE, parent_id INT REFERENCES parent(id))")
+    let crt = parseSingle("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL UNIQUE, parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE RESTRICT)")
     check crt.kind == skCreateTable
     check crt.columns.len == 3
     check crt.createChecks.len == 0
+    check crt.columns[2].refTable == "parent"
+    check crt.columns[2].refColumn == "id"
+    check crt.columns[2].refOnDelete == "CASCADE"
+    check crt.columns[2].refOnUpdate == "RESTRICT"
 
     let crtChecks = parseSingle(
       "CREATE TABLE t_check (" &
@@ -180,6 +184,14 @@ suite "SQL Parser":
     let idx = parseSingle("CREATE INDEX t_name_trgm ON t USING trigram (name)")
     check idx.kind == skCreateIndex
     check idx.indexKind == ikTrigram
+    check idx.indexPredicate == nil
+
+    let partialIdx = parseSingle("CREATE INDEX t_name_partial ON t (name) WHERE name IS NOT NULL")
+    check partialIdx.kind == skCreateIndex
+    check partialIdx.indexKind == ikBtree
+    check partialIdx.indexPredicate != nil
+    check partialIdx.indexPredicate.kind == ekBinary
+    check partialIdx.indexPredicate.op == "IS NOT"
 
   test "parse drop and transactions":
     let drt = parseSingle("DROP TABLE t")

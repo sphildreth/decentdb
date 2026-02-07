@@ -458,6 +458,62 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "foreign key ON DELETE CASCADE and SET NULL":
+    let path = makeTempDb("decentdb_sql_exec_fk_actions.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY, code TEXT UNIQUE)").ok
+    check execSql(db, "CREATE UNIQUE INDEX parent_id_uq ON parent (id)").ok
+    check execSql(db, "CREATE TABLE child_cascade (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE)").ok
+    check execSql(db, "CREATE TABLE child_setnull (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)").ok
+    check execSql(db, "CREATE TABLE child_upd_cascade (id INT PRIMARY KEY, parent_code TEXT REFERENCES parent(code) ON UPDATE CASCADE)").ok
+    check execSql(db, "CREATE TABLE child_upd_setnull (id INT PRIMARY KEY, parent_code TEXT REFERENCES parent(code) ON UPDATE SET NULL)").ok
+
+    check execSql(db, "INSERT INTO parent VALUES (1, 'a')").ok
+    check execSql(db, "INSERT INTO parent VALUES (2, 'b')").ok
+    check execSql(db, "INSERT INTO child_cascade VALUES (10, 1)").ok
+    check execSql(db, "INSERT INTO child_setnull VALUES (20, 1)").ok
+    check execSql(db, "INSERT INTO child_cascade VALUES (11, 2)").ok
+    check execSql(db, "INSERT INTO child_setnull VALUES (21, 2)").ok
+    check execSql(db, "INSERT INTO child_upd_cascade VALUES (30, 'b')").ok
+    check execSql(db, "INSERT INTO child_upd_setnull VALUES (40, 'b')").ok
+
+    check execSql(db, "DELETE FROM parent WHERE id = 1").ok
+
+    let cascadeRows = execSql(db, "SELECT id, parent_id FROM child_cascade ORDER BY id")
+    check cascadeRows.ok
+    check cascadeRows.value == @["11|2"]
+
+    let setNullRows = execSql(db, "SELECT id, parent_id FROM child_setnull ORDER BY id")
+    check setNullRows.ok
+    check setNullRows.value == @["20|NULL", "21|2"]
+
+    check execSql(db, "UPDATE parent SET code = 'b2' WHERE id = 2").ok
+    let updCascadeRows = execSql(db, "SELECT id, parent_code FROM child_upd_cascade ORDER BY id")
+    check updCascadeRows.ok
+    check updCascadeRows.value == @["30|b2"]
+    let updSetNullRows = execSql(db, "SELECT id, parent_code FROM child_upd_setnull ORDER BY id")
+    check updSetNullRows.ok
+    check updSetNullRows.value == @["40|NULL"]
+
+    let setNullNotNull = execSql(
+      db,
+      "CREATE TABLE child_setnull_bad (id INT PRIMARY KEY, parent_id INT NOT NULL REFERENCES parent(id) ON DELETE SET NULL)"
+    )
+    check not setNullNotNull.ok
+    check setNullNotNull.err.code == ERR_SQL
+
+    let onUpdateSetNullNotNull = execSql(
+      db,
+      "CREATE TABLE child_upd_bad (id INT PRIMARY KEY, parent_code TEXT NOT NULL REFERENCES parent(code) ON UPDATE SET NULL)"
+    )
+    check not onUpdateSetNullNotNull.ok
+    check onUpdateSetNullNotNull.err.code == ERR_SQL
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),
@@ -724,6 +780,71 @@ suite "Planner":
 
     let corrExistsRes = execSql(db, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t.id)")
     check not corrExistsRes.ok
+
+    discard closeDb(db)
+
+  test "partial index (IS NOT NULL) maintenance and planning":
+    let path = makeTempDb("decentdb_sql_partial_index.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, val INT)").ok
+    check execSql(db, "INSERT INTO items VALUES (1, NULL)").ok
+    check execSql(db, "INSERT INTO items VALUES (2, 10)").ok
+    check execSql(db, "INSERT INTO items VALUES (3, 10)").ok
+    check execSql(db, "INSERT INTO items VALUES (4, 20)").ok
+    check execSql(db, "CREATE INDEX items_val_partial ON items (val) WHERE val IS NOT NULL").ok
+
+    let explainRes = execSql(db, "EXPLAIN SELECT id FROM items WHERE val = 10")
+    check explainRes.ok
+    var sawIndexSeek = false
+    for line in explainRes.value:
+      if line.contains("IndexSeek("):
+        sawIndexSeek = true
+        break
+    check sawIndexSeek
+
+    let q1 = execSql(db, "SELECT id FROM items WHERE val = 10 ORDER BY id")
+    check q1.ok
+    check q1.value == @["2", "3"]
+
+    check execSql(db, "UPDATE items SET val = NULL WHERE id = 2").ok
+    let q2 = execSql(db, "SELECT id FROM items WHERE val = 10 ORDER BY id")
+    check q2.ok
+    check q2.value == @["3"]
+
+    check execSql(db, "UPDATE items SET val = 10 WHERE id = 1").ok
+    let q3 = execSql(db, "SELECT id FROM items WHERE val = 10 ORDER BY id")
+    check q3.ok
+    check q3.value == @["1", "3"]
+
+    check execSql(db, "DELETE FROM items WHERE id = 3").ok
+    let q4 = execSql(db, "SELECT id FROM items WHERE val = 10 ORDER BY id")
+    check q4.ok
+    check q4.value == @["1"]
+
+    discard closeDb(db)
+
+  test "partial index unsupported shapes rejected":
+    let path = makeTempDb("decentdb_sql_partial_index_reject.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val INT, txt TEXT)").ok
+
+    let badPredicate = execSql(db, "CREATE INDEX t_val_partial_bad ON t (val) WHERE val > 0")
+    check not badPredicate.ok
+
+    let badUnique = execSql(db, "CREATE UNIQUE INDEX t_val_partial_uq ON t (val) WHERE val IS NOT NULL")
+    check not badUnique.ok
+
+    let badMulti = execSql(db, "CREATE INDEX t_pair_partial ON t (id, val) WHERE id IS NOT NULL")
+    check not badMulti.ok
+
+    let badTrgm = execSql(db, "CREATE INDEX t_txt_partial_trgm ON t USING trigram (txt) WHERE txt IS NOT NULL")
+    check not badTrgm.ok
 
     discard closeDb(db)
   

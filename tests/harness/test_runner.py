@@ -915,6 +915,190 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_fk_actions_match_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_fk_actions_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.parent (id INT PRIMARY KEY, code TEXT UNIQUE); "
+                f"CREATE TABLE {schema}.child_cascade (id INT PRIMARY KEY, parent_id INT REFERENCES {schema}.parent(id) ON DELETE CASCADE); "
+                f"CREATE TABLE {schema}.child_setnull (id INT PRIMARY KEY, parent_id INT REFERENCES {schema}.parent(id) ON DELETE SET NULL); "
+                f"CREATE TABLE {schema}.child_upd_cascade (id INT PRIMARY KEY, parent_code TEXT REFERENCES {schema}.parent(code) ON UPDATE CASCADE); "
+                f"CREATE TABLE {schema}.child_upd_setnull (id INT PRIMARY KEY, parent_code TEXT REFERENCES {schema}.parent(code) ON UPDATE SET NULL); "
+                f"INSERT INTO {schema}.parent VALUES (1, 'a'), (2, 'b'); "
+                f"INSERT INTO {schema}.child_cascade VALUES (10,1), (11,2); "
+                f"INSERT INTO {schema}.child_setnull VALUES (20,1), (21,2); "
+                f"INSERT INTO {schema}.child_upd_cascade VALUES (30, 'b'); "
+                f"INSERT INTO {schema}.child_upd_setnull VALUES (40, 'b'); "
+                f"DELETE FROM {schema}.parent WHERE id = 1; "
+                f"UPDATE {schema}.parent SET code = 'b2' WHERE id = 2;"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_fk_actions.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup_statements = [
+                    "CREATE TABLE parent (id INT PRIMARY KEY, code TEXT UNIQUE)",
+                    "CREATE UNIQUE INDEX parent_id_uq ON parent (id)",
+                    "CREATE TABLE child_cascade (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE CASCADE)",
+                    "CREATE TABLE child_setnull (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id) ON DELETE SET NULL)",
+                    "CREATE TABLE child_upd_cascade (id INT PRIMARY KEY, parent_code TEXT REFERENCES parent(code) ON UPDATE CASCADE)",
+                    "CREATE TABLE child_upd_setnull (id INT PRIMARY KEY, parent_code TEXT REFERENCES parent(code) ON UPDATE SET NULL)",
+                    "INSERT INTO parent VALUES (1, 'a'), (2, 'b')",
+                    "INSERT INTO child_cascade VALUES (10,1), (11,2)",
+                    "INSERT INTO child_setnull VALUES (20,1), (21,2)",
+                    "INSERT INTO child_upd_cascade VALUES (30, 'b')",
+                    "INSERT INTO child_upd_setnull VALUES (40, 'b')",
+                    "DELETE FROM parent WHERE id = 1",
+                    "UPDATE parent SET code = 'b2' WHERE id = 2",
+                ]
+                for stmt in setup_statements:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                for cli_query, pg_query in [
+                    (
+                        "SELECT id, parent_id FROM child_cascade ORDER BY id",
+                        f"SELECT id, parent_id FROM {schema}.child_cascade ORDER BY id",
+                    ),
+                    (
+                        "SELECT id, parent_id FROM child_setnull ORDER BY id",
+                        f"SELECT id, parent_id FROM {schema}.child_setnull ORDER BY id",
+                    ),
+                    (
+                        "SELECT id, parent_code FROM child_upd_cascade ORDER BY id",
+                        f"SELECT id, parent_code FROM {schema}.child_upd_cascade ORDER BY id",
+                    ),
+                    (
+                        "SELECT id, parent_code FROM child_upd_setnull ORDER BY id",
+                        f"SELECT id, parent_code FROM {schema}.child_upd_setnull ORDER BY id",
+                    ),
+                ]:
+                    pg_rows = run_psql(pg_query)
+                    payload = run_cli(cli_query)
+                    self.assertTrue(payload.get("ok"), msg=f"{cli_query}: {payload.get('error')}")
+                    self.assertEqual(payload.get("rows", []), pg_rows, msg=cli_query)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
+    def test_partial_index_is_not_null_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_partial_idx_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.items (id INT PRIMARY KEY, val INT); "
+                f"CREATE INDEX {schema}_items_val_partial ON {schema}.items (val) WHERE val IS NOT NULL; "
+                f"INSERT INTO {schema}.items VALUES (1, NULL); "
+                f"INSERT INTO {schema}.items VALUES (2, 10); "
+                f"INSERT INTO {schema}.items VALUES (3, 10); "
+                f"INSERT INTO {schema}.items VALUES (4, 20); "
+                f"UPDATE {schema}.items SET val = NULL WHERE id = 2; "
+                f"UPDATE {schema}.items SET val = 10 WHERE id = 1; "
+                f"DELETE FROM {schema}.items WHERE id = 3;"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_partial_index.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup_sql = [
+                    "CREATE TABLE items (id INT PRIMARY KEY, val INT)",
+                    "CREATE INDEX items_val_partial ON items (val) WHERE val IS NOT NULL",
+                    "INSERT INTO items VALUES (1, NULL)",
+                    "INSERT INTO items VALUES (2, 10)",
+                    "INSERT INTO items VALUES (3, 10)",
+                    "INSERT INTO items VALUES (4, 20)",
+                    "UPDATE items SET val = NULL WHERE id = 2",
+                    "UPDATE items SET val = 10 WHERE id = 1",
+                    "DELETE FROM items WHERE id = 3",
+                ]
+                for stmt in setup_sql:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                query = "SELECT id FROM items WHERE val = 10 ORDER BY id"
+                pg_rows = run_psql(query.replace("FROM items", f"FROM {schema}.items"))
+                payload = run_cli(query)
+                self.assertTrue(payload.get("ok"), msg=payload.get("error"))
+                self.assertEqual(payload.get("rows", []), pg_rows)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()
