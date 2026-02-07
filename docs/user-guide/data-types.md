@@ -109,7 +109,10 @@ Implicit conversions happen automatically when safe:
 - INT → FLOAT (for comparisons)
 - Any type can become NULL
 
-Explicit conversion requires CAST (not yet implemented).
+Explicit conversion uses CAST:
+```sql
+SELECT CAST(price AS INT) FROM products;
+```
 
 ## Storage Details
 

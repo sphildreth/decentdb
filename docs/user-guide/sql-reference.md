@@ -353,6 +353,14 @@ BEGIN;
 ROLLBACK;
 ```
 
+### Explain
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 1;
+```
+
+Produces a text-based query execution plan.
+
 ## Constraints
 
 ### Primary Key

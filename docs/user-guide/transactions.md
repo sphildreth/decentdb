@@ -10,11 +10,6 @@ DecentDB supports ACID transactions with full durability guarantees.
 BEGIN;
 ```
 
-Or using the CLI:
-```bash
-decentdb exec --db=my.ddb --sql="BEGIN"
-```
-
 ### Committing a Transaction
 
 ```sql
@@ -88,21 +83,15 @@ DecentDB enforces single writer semantics:
 
 ## Durability Modes
 
-### Full (Default)
+Durability is configured via the `--wal-sync-mode` option at startup or in the configuration file.
 
-```sql
-PRAGMA wal_sync_mode = FULL;
-```
+### Full (Default)
 
 - fsync on every commit
 - Maximum durability
 - Slower performance
 
 ### Normal
-
-```sql
-PRAGMA wal_sync_mode = NORMAL;
-```
 
 - fdatasync on commit
 - Good balance of safety and speed
@@ -151,19 +140,12 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 
 ### Handle Errors with Rollback
 
+When using the CLI `exec` command with a multi-statement string, if an error occurs, the transaction is automatically rolled back if `BEGIN` was used.
+
 ```bash
-#!/bin/bash
-set -e
-
-decentdb exec --db=my.ddb --sql="BEGIN"
-
-if ! decentdb exec --db=my.ddb --sql="INSERT INTO users VALUES (1, 'Alice')"; then
-    decentdb exec --db=my.ddb --sql="ROLLBACK"
-    echo "Transaction failed, rolled back"
-    exit 1
-fi
-
-decentdb exec --db=my.ddb --sql="COMMIT"
+# The entire string is executed as one session.
+# If INSERT fails, the transaction is rolled back (or fails to commit).
+decentdb exec --db=my.ddb --sql="BEGIN; INSERT INTO users VALUES (1, 'Alice'); COMMIT"
 ```
 
 ## Transaction State
