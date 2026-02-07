@@ -1,6 +1,6 @@
 # Micro-ORM + LINQ example
 
-This example uses `DecentDb.MicroOrm` (`DecentDbContext` + `DbSet<T>`) with convention-based mapping and a small LINQ-like query surface.
+This example uses `DecentDB.MicroOrm` (`DecentDbContext` + `DbSet<T>`) with convention-based mapping and a small LINQ-like query surface.
 
 ## Run
 

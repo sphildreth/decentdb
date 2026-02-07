@@ -1,17 +1,17 @@
-# DecentDb.MicroOrm
+# DecentDB.MicroOrm
 
 Micro-ORM for DecentDB, targeting `.NET 10` (`net10.0`).
 
 This package is intended for embedded use and includes:
 
-- `DecentDb.MicroOrm` (LINQ-style query surface)
+- `DecentDB.MicroOrm` (LINQ-style query surface)
 - `DecentDb.AdoNet` (ADO.NET provider)
 - `DecentDb.Native` (P/Invoke layer)
 
 ## Install
 
 ```bash
-dotnet add package DecentDb.MicroOrm --prerelease
+dotnet add package DecentDB.MicroOrm --prerelease
 ```
 
 ## Notes

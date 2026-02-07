@@ -8,9 +8,9 @@
     <RootNamespace>DecentDb.Native</RootNamespace>
     <AssemblyName>DecentDb.Native</AssemblyName>
 
-    <!-- Packed via Decent.MicroOrm meta package. -->
+    <!-- Packed via DecentDB.MicroOrm meta package. -->
     <IsPackable>false</IsPackable>
   </PropertyGroup>
   
-  <!-- Native binaries are packed by Decent.MicroOrm; this project stays packable=false. -->
+  <!-- Native binaries are packed by DecentDB.MicroOrm; this project stays packable=false. -->
 </Project>

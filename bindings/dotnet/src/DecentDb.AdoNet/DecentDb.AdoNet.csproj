@@ -7,7 +7,7 @@
     <RootNamespace>DecentDb.AdoNet</RootNamespace>
     <AssemblyName>DecentDb.AdoNet</AssemblyName>
 
-    <!-- Packed via Decent.MicroOrm meta package. -->
+    <!-- Packed via DecentDB.MicroOrm meta package. -->
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
