@@ -75,10 +75,172 @@ proc indexColumnIndices*(table: TableMeta, idx: IndexMeta): seq[int] =
   ## Map index column names to column indices in the table.
   result = @[]
   for colName in idx.columns:
+    if colName.startsWith(IndexExpressionPrefix):
+      continue
     for i, col in table.columns:
       if col.name == colName:
         result.add(i)
         break
+
+proc isExpressionIndexToken(token: string): bool =
+  token.startsWith(IndexExpressionPrefix)
+
+proc expressionIndexSql(token: string): string =
+  if token.len <= IndexExpressionPrefix.len:
+    return ""
+  token[IndexExpressionPrefix.len .. ^1]
+
+proc valueToIndexText(value: Value): string =
+  case value.kind
+  of vkNull:
+    "NULL"
+  of vkBool:
+    if value.boolVal: "true" else: "false"
+  of vkInt64:
+    $value.int64Val
+  of vkFloat64:
+    $value.float64Val
+  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+    var s = ""
+    for b in value.bytes:
+      s.add(char(b))
+    s
+  else:
+    ""
+
+proc castExpressionValue(value: Value, targetKind: ColumnType): Result[Value] =
+  if value.kind == vkNull:
+    return ok(Value(kind: vkNull))
+
+  case targetKind
+  of ctInt64:
+    case value.kind
+    of vkInt64:
+      ok(value)
+    of vkFloat64:
+      ok(Value(kind: vkInt64, int64Val: int64(value.float64Val)))
+    of vkBool:
+      ok(Value(kind: vkInt64, int64Val: (if value.boolVal: 1 else: 0)))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToIndexText(value).strip()
+      try:
+        ok(Value(kind: vkInt64, int64Val: int64(parseBiggestInt(s))))
+      except ValueError:
+        err[Value](ERR_SQL, "Invalid expression index cast value", s)
+    else:
+      err[Value](ERR_SQL, "Unsupported expression index cast source")
+  of ctFloat64:
+    case value.kind
+    of vkFloat64:
+      ok(value)
+    of vkInt64:
+      ok(Value(kind: vkFloat64, float64Val: float64(value.int64Val)))
+    of vkBool:
+      ok(Value(kind: vkFloat64, float64Val: (if value.boolVal: 1.0 else: 0.0)))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToIndexText(value).strip()
+      try:
+        ok(Value(kind: vkFloat64, float64Val: parseFloat(s)))
+      except ValueError:
+        err[Value](ERR_SQL, "Invalid expression index cast value", s)
+    else:
+      err[Value](ERR_SQL, "Unsupported expression index cast source")
+  of ctText:
+    var bytes: seq[byte] = @[]
+    for ch in valueToIndexText(value):
+      bytes.add(byte(ch))
+    ok(Value(kind: vkText, bytes: bytes))
+  of ctBool:
+    case value.kind
+    of vkBool:
+      ok(value)
+    of vkInt64:
+      ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
+    of vkFloat64:
+      ok(Value(kind: vkBool, boolVal: value.float64Val != 0.0))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToIndexText(value).strip().toLowerAscii()
+      if s in ["true", "t", "1"]:
+        return ok(Value(kind: vkBool, boolVal: true))
+      if s in ["false", "f", "0"]:
+        return ok(Value(kind: vkBool, boolVal: false))
+      err[Value](ERR_SQL, "Invalid expression index cast value", s)
+    else:
+      err[Value](ERR_SQL, "Unsupported expression index cast source")
+  else:
+    err[Value](ERR_SQL, "Unsupported expression index cast target")
+
+proc evalExpressionIndexExpr(table: TableMeta, values: seq[Value], expr: Expr): Result[Value] =
+  if expr == nil:
+    return err[Value](ERR_SQL, "Expression index expression is missing")
+  case expr.kind
+  of ekColumn:
+    for i, col in table.columns:
+      if col.name == expr.name:
+        if i < values.len:
+          return ok(values[i])
+        return err[Value](ERR_CORRUPTION, "Row column count does not match table metadata", table.name)
+    err[Value](ERR_SQL, "Expression index column not found", expr.name)
+  of ekFunc:
+    let fn = expr.funcName.toUpperAscii()
+    if fn in ["LOWER", "UPPER", "TRIM", "LENGTH"]:
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "Expression index function arity mismatch", fn)
+      let argRes = evalExpressionIndexExpr(table, values, expr.args[0])
+      if not argRes.ok:
+        return argRes
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let textVal = valueToIndexText(argRes.value)
+      if fn == "LENGTH":
+        return ok(Value(kind: vkInt64, int64Val: int64(textVal.len)))
+      let mapped =
+        if fn == "LOWER":
+          textVal.toLowerAscii()
+        elif fn == "UPPER":
+          textVal.toUpperAscii()
+        else:
+          textVal.strip()
+      var outBytes: seq[byte] = @[]
+      for ch in mapped:
+        outBytes.add(byte(ch))
+      return ok(Value(kind: vkText, bytes: outBytes))
+    if fn == "CAST":
+      if expr.args.len != 2 or expr.args[1] == nil or expr.args[1].kind != ekLiteral or expr.args[1].value.kind != svString:
+        return err[Value](ERR_SQL, "Expression index CAST requires explicit target type")
+      let argRes = evalExpressionIndexExpr(table, values, expr.args[0])
+      if not argRes.ok:
+        return argRes
+      let targetRes = parseColumnType(expr.args[1].value.strVal)
+      if not targetRes.ok:
+        return err[Value](targetRes.err.code, targetRes.err.message, targetRes.err.context)
+      if targetRes.value.kind notin {ctInt64, ctFloat64, ctText, ctBool}:
+        return err[Value](ERR_SQL, "Expression index CAST target not supported in 0.x", expr.args[1].value.strVal)
+      return castExpressionValue(argRes.value, targetRes.value.kind)
+    err[Value](ERR_SQL, "Unsupported expression index function", fn)
+  else:
+    err[Value](ERR_SQL, "Unsupported expression index expression")
+
+proc indexKeyForRow(table: TableMeta, idx: IndexMeta, values: seq[Value]): Result[uint64] =
+  if idx.columns.len == 1 and isExpressionIndexToken(idx.columns[0]):
+    let exprSql = expressionIndexSql(idx.columns[0])
+    let parseRes = parseSql("SELECT " & exprSql & " FROM " & table.name)
+    if not parseRes.ok:
+      return err[uint64](parseRes.err.code, "Invalid expression index expression: " & parseRes.err.message, parseRes.err.context)
+    if parseRes.value.statements.len != 1 or parseRes.value.statements[0].kind != skSelect:
+      return err[uint64](ERR_SQL, "Invalid expression index expression", exprSql)
+    let selectStmt = parseRes.value.statements[0]
+    if selectStmt.selectItems.len != 1 or selectStmt.selectItems[0].isStar or selectStmt.selectItems[0].expr == nil:
+      return err[uint64](ERR_SQL, "Expression index requires a single expression", exprSql)
+    let evalRes = evalExpressionIndexExpr(table, values, selectStmt.selectItems[0].expr)
+    if not evalRes.ok:
+      return err[uint64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+    return ok(indexKeyFromValue(evalRes.value))
+
+  let colIndices = indexColumnIndices(table, idx)
+  if colIndices.len != idx.columns.len or colIndices.len == 0:
+    return err[uint64](ERR_SQL, "Invalid index column mapping", idx.name)
+  ok(compositeIndexKey(values, colIndices))
 
 proc shouldIncludeInIndex(table: TableMeta, idx: IndexMeta, values: seq[Value]): bool =
   ## v0 partial-index support: only `<indexed_column> IS NOT NULL`.
@@ -422,9 +584,10 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
       if not shouldIncludeInIndex(table, idx, values):
         continue
       if idx.kind == ikBtree:
-        let colIndices = indexColumnIndices(table, idx)
-        if colIndices.len == idx.columns.len and colIndices.len > 0:
-          indexKeys.add((idx, compositeIndexKey(values, colIndices)))
+        let keyRes = indexKeyForRow(table, idx, values)
+        if not keyRes.ok:
+          return err[uint64](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+        indexKeys.add((idx, keyRes.value))
       else:
         # Trigram indexes are always single-column
         if idx.columns.len == 1:
@@ -530,23 +693,25 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       let oldIncluded = shouldIncludeInIndex(table, idx, oldRes.value.values)
       let newIncluded = shouldIncludeInIndex(table, idx, values)
       if idx.kind == ikBtree:
-        let colIndices = indexColumnIndices(table, idx)
-        if colIndices.len == idx.columns.len and colIndices.len > 0:
-          if oldIncluded or newIncluded:
-            let idxTree = newBTree(pager, idx.rootPage)
-            if oldIncluded:
-              let oldKey = compositeIndexKey(oldRes.value.values, colIndices)
-              let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
-              if not delRes.ok:
-                return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-            if newIncluded:
-              let newKey = compositeIndexKey(values, colIndices)
-              let idxInsert = insert(idxTree, newKey, encodeRowId(rowid))
-              if not idxInsert.ok:
-                return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
-            let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
-            if not syncRes.ok:
-              return syncRes
+        if oldIncluded or newIncluded:
+          let idxTree = newBTree(pager, idx.rootPage)
+          if oldIncluded:
+            let oldKeyRes = indexKeyForRow(table, idx, oldRes.value.values)
+            if not oldKeyRes.ok:
+              return err[Void](oldKeyRes.err.code, oldKeyRes.err.message, oldKeyRes.err.context)
+            let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeRowId(rowid))
+            if not delRes.ok:
+              return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+          if newIncluded:
+            let newKeyRes = indexKeyForRow(table, idx, values)
+            if not newKeyRes.ok:
+              return err[Void](newKeyRes.err.code, newKeyRes.err.message, newKeyRes.err.context)
+            let idxInsert = insert(idxTree, newKeyRes.value, encodeRowId(rowid))
+            if not idxInsert.ok:
+              return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
+          let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
+          if not syncRes.ok:
+            return syncRes
       else:
         if idx.columns.len == 1:
           var valueIndex = -1
@@ -590,16 +755,16 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     if not shouldIncludeInIndex(table, idx, oldRes.value.values):
       continue
     if idx.kind == ikBtree:
-      let colIndices = indexColumnIndices(table, idx)
-      if colIndices.len == idx.columns.len and colIndices.len > 0:
-        let idxTree = newBTree(pager, idx.rootPage)
-        let oldKey = compositeIndexKey(oldRes.value.values, colIndices)
-        let delRes = deleteKeyValue(idxTree, oldKey, encodeRowId(rowid))
-        if not delRes.ok:
-          return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-        let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
-        if not syncRes.ok:
-          return syncRes
+      let oldKeyRes = indexKeyForRow(table, idx, oldRes.value.values)
+      if not oldKeyRes.ok:
+        return err[Void](oldKeyRes.err.code, oldKeyRes.err.message, oldKeyRes.err.context)
+      let idxTree = newBTree(pager, idx.rootPage)
+      let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeRowId(rowid))
+      if not delRes.ok:
+        return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+      let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
+      if not syncRes.ok:
+        return syncRes
     else:
       if idx.columns.len == 1:
         var valueIndex = -1
@@ -691,6 +856,39 @@ proc buildIndexForColumns*(pager: Pager, catalog: Catalog, tableName: string, co
     return err[PageId](buildRes.err.code, buildRes.err.message, buildRes.err.context)
   ok(buildRes.value)
 
+proc buildIndexForExpression*(pager: Pager, catalog: Catalog, tableName: string, expressionToken: string, indexRoot: PageId): Result[PageId] =
+  if not isExpressionIndexToken(expressionToken):
+    return err[PageId](ERR_SQL, "Expression index token is invalid", expressionToken)
+  let tableRes = catalog.getTable(tableName)
+  if not tableRes.ok:
+    return err[PageId](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
+  let rowsRes = scanTable(pager, table)
+  if not rowsRes.ok:
+    return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+
+  let idxMeta = IndexMeta(table: tableName, columns: @[expressionToken])
+  var pairs: seq[(uint64, uint64)] = @[]
+  for row in rowsRes.value:
+    let keyRes = indexKeyForRow(table, idxMeta, row.values)
+    if not keyRes.ok:
+      return err[PageId](keyRes.err.code, keyRes.err.message, keyRes.err.context)
+    pairs.add((keyRes.value, row.rowid))
+  pairs.sort(proc(a, b: (uint64, uint64)): int =
+    let c = cmp(a[0], b[0])
+    if c != 0: c else: cmp(a[1], b[1])
+  )
+
+  var entries: seq[(uint64, seq[byte])] = @[]
+  entries.setLen(pairs.len)
+  for i, pair in pairs:
+    entries[i] = (pair[0], encodeRowId(pair[1]))
+  let idxTree = newBTree(pager, indexRoot)
+  let buildRes = bulkBuildFromSorted(idxTree, entries)
+  if not buildRes.ok:
+    return err[PageId](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+  ok(buildRes.value)
+
 proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, columnName: string, indexRoot: PageId): Result[PageId] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
@@ -762,7 +960,12 @@ proc rebuildIndex*(pager: Pager, catalog: Catalog, index: IndexMeta): Result[Voi
       return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
     newRoot = buildRes.value
   else:
-    if index.columns.len == 1:
+    if index.columns.len == 1 and isExpressionIndexToken(index.columns[0]):
+      let buildRes = buildIndexForExpression(pager, catalog, index.table, index.columns[0], index.rootPage)
+      if not buildRes.ok:
+        return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+      newRoot = buildRes.value
+    elif index.columns.len == 1:
       let buildRes = buildIndexForColumn(pager, catalog, index.table, index.columns[0], index.rootPage, index.predicateSql)
       if not buildRes.ok:
         return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
@@ -784,10 +987,17 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
     return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-  let indexOpt = catalog.getBtreeIndexForColumn(tableName, column)
-  if isNone(indexOpt):
+  var idxOpt: Option[IndexMeta] = none(IndexMeta)
+  if isExpressionIndexToken(column):
+    for _, idx in catalog.indexes:
+      if idx.table == tableName and idx.kind == ikBtree and idx.columns.len == 1 and idx.columns[0] == column:
+        idxOpt = some(idx)
+        break
+  else:
+    idxOpt = catalog.getBtreeIndexForColumn(tableName, column)
+  if isNone(idxOpt):
     return err[seq[uint64]](ERR_SQL, "Index not found", tableName & "." & column)
-  let idx = indexOpt.get
+  let idx = idxOpt.get
   let idxTree = newBTree(pager, idx.rootPage)
   let needle = indexKeyFromValue(value)
   let cursorRes = openCursorAt(idxTree, needle)

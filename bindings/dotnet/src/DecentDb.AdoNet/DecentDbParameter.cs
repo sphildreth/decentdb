@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 
 namespace DecentDb.AdoNet
 {
@@ -15,6 +16,7 @@ namespace DecentDb.AdoNet
         private ParameterDirection _direction = ParameterDirection.Input;
         private bool _isNullable;
 
+        [AllowNull]
         public override string ParameterName
         {
             get => _parameterName;
@@ -85,7 +87,8 @@ namespace DecentDb.AdoNet
 
         public override DataRowVersion SourceVersion { get; set; } = DataRowVersion.Current;
 
-        public override string? SourceColumn { get; set; }
+        [AllowNull]
+        public override string SourceColumn { get; set; } = string.Empty;
 
         public DecentDbParameter()
         {

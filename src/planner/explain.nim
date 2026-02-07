@@ -1,4 +1,4 @@
-import strutils, sequtils, options
+import strutils, sequtils, options, tables
 import ../sql/sql
 import ../catalog/catalog
 import ./planner
@@ -95,9 +95,22 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       line.add("RowidSeek(table=" & p.table & " alias=" & p.alias & " column=" & p.column & " value=" & renderExpr(p.valueExpr) & ")")
       lines.add(line)
     of pkIndexSeek:
-      let idxOpt = catalog.getBtreeIndexForColumn(p.table, p.column)
-      let idxName = if idxOpt.isSome: idxOpt.get.name else: "?"
-      line.add("IndexSeek(table=" & p.table & " column=" & p.column & " value=" & renderExpr(p.valueExpr) & " index=" & idxName & ")")
+      var idxName = "?"
+      if p.column.startsWith(IndexExpressionPrefix):
+        for _, idx in catalog.indexes:
+          if idx.table == p.table and idx.kind == ikBtree and idx.columns.len == 1 and idx.columns[0] == p.column:
+            idxName = idx.name
+            break
+      else:
+        let idxOpt = catalog.getBtreeIndexForColumn(p.table, p.column)
+        if idxOpt.isSome:
+          idxName = idxOpt.get.name
+      let colDisplay =
+        if p.column.startsWith(IndexExpressionPrefix):
+          p.column[IndexExpressionPrefix.len .. ^1]
+        else:
+          p.column
+      line.add("IndexSeek(table=" & p.table & " column=" & colDisplay & " value=" & renderExpr(p.valueExpr) & " index=" & idxName & ")")
       lines.add(line)
     of pkTrigramSeek:
       let idxOpt = catalog.getTrigramIndexForColumn(p.table, p.column)

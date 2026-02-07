@@ -333,6 +333,22 @@ suite "Binder":
     let bindPartialBadMulti = bindStatement(db.catalog, stmtPartialBadMulti)
     check not bindPartialBadMulti.ok
 
+    let stmtExprOk = parseSingle("CREATE INDEX parent_id_txt_expr ON parent ((CAST(id AS TEXT)))")
+    let bindExprOk = bindStatement(db.catalog, stmtExprOk)
+    check bindExprOk.ok
+
+    let stmtExprBadShape = parseSingle("CREATE INDEX parent_id_expr_bad ON parent ((id + 1))")
+    let bindExprBadShape = bindStatement(db.catalog, stmtExprBadShape)
+    check not bindExprBadShape.ok
+
+    let stmtExprUnique = parseSingle("CREATE UNIQUE INDEX parent_id_expr_uq ON parent ((LOWER(id)))")
+    let bindExprUnique = bindStatement(db.catalog, stmtExprUnique)
+    check not bindExprUnique.ok
+
+    let stmtExprPartial = parseSingle("CREATE INDEX parent_id_expr_partial ON parent ((CAST(id AS TEXT))) WHERE id IS NOT NULL")
+    let bindExprPartial = bindStatement(db.catalog, stmtExprPartial)
+    check not bindExprPartial.ok
+
     let stmtCheckOk = parseSingle(
       "CREATE TABLE chk_ok (" &
       "id INT, amount INT, " &
@@ -476,6 +492,22 @@ suite "Binder":
     discard addView(db, "tv", "SELECT id FROM t", @["id"], @["t"])
     let blockedByView = bindStatement(db.catalog, parseSingle("ALTER TABLE t RENAME COLUMN name TO full_name"))
     check not blockedByView.ok
+
+    discard closeDb(db)
+
+  test "bind ALTER TABLE blocked for expression-indexed tables":
+    let path = makeTempDb("decentdb_binder_alter_expr_index.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64), Column(name: "name", kind: ctText)])
+    discard addIndex(db, "t_name_lower_expr_idx", "t", IndexExpressionPrefix & "LOWER(name)", false)
+
+    let alterAdd = bindStatement(db.catalog, parseSingle("ALTER TABLE t ADD COLUMN extra INT"))
+    check not alterAdd.ok
+    let alterRename = bindStatement(db.catalog, parseSingle("ALTER TABLE t RENAME COLUMN name TO full_name"))
+    check not alterRename.ok
 
     discard closeDb(db)
 

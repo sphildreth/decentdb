@@ -1,4 +1,5 @@
 import unittest
+import strutils
 
 import sql/sql
 import tables
@@ -197,6 +198,12 @@ suite "SQL Parser":
     check idx.kind == skCreateIndex
     check idx.indexKind == ikTrigram
     check idx.indexPredicate == nil
+
+    let exprIdx = parseSingle("CREATE INDEX t_name_lower_idx ON t ((LOWER(name)))")
+    check exprIdx.kind == skCreateIndex
+    check exprIdx.indexKind == ikBtree
+    check exprIdx.columnNames.len == 1
+    check exprIdx.columnNames[0].startsWith(IndexExpressionPrefix)
 
     let partialIdx = parseSingle("CREATE INDEX t_name_partial ON t (name) WHERE name IS NOT NULL")
     check partialIdx.kind == skCreateIndex

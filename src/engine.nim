@@ -2154,7 +2154,12 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
         finalRoot = buildRes.value
       else:
-        if bound.columnNames.len == 1:
+        if bound.columnNames.len == 1 and bound.columnNames[0].startsWith(IndexExpressionPrefix):
+          let buildRes = buildIndexForExpression(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
+          if not buildRes.ok:
+            return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+          finalRoot = buildRes.value
+        elif bound.columnNames.len == 1:
           let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value, predicateSql)
           if not buildRes.ok:
             return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
@@ -2756,7 +2761,12 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
       finalRoot = buildRes.value
     else:
-      if bound.columnNames.len == 1:
+      if bound.columnNames.len == 1 and bound.columnNames[0].startsWith(IndexExpressionPrefix):
+        let buildRes = buildIndexForExpression(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value)
+        if not buildRes.ok:
+          return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        finalRoot = buildRes.value
+      elif bound.columnNames.len == 1:
         let buildRes = buildIndexForColumn(db.pager, db.catalog, bound.indexTableName, bound.columnNames[0], indexRootRes.value, predicateSql)
         if not buildRes.ok:
           return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)

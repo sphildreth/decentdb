@@ -1,6 +1,6 @@
 # DecentDB SQL Enhancements Plan (Pre-1.0)
 **Date:** 2026-02-06  
-**Status:** Draft
+**Status:** Implemented in 0.x baseline (except explicitly deferred extension ecosystem)
 
 ## 1. Purpose
 DecentDB’s current SQL surface is intentionally scoped. This document defines the **planned** SQL and operational enhancements required to remove “not in current baseline” items from user-facing documentation, while preserving DecentDB’s priorities:
@@ -11,6 +11,21 @@ DecentDB’s current SQL surface is intentionally scoped. This document defines 
 - **Definition of Done:** tests from day one (unit + property + crash-injection + differential)
 
 This is a roadmap/plan document only. It does **not** change behavior by itself.
+
+## 1.1 Implementation status snapshot (2026-02-07)
+- ✅ 5.1 Richer expression language and built-ins
+- ✅ 5.2 UPSERT and DML conveniences
+- ✅ 5.3 CTEs (non-recursive)
+- ✅ 5.4 Set operations (`UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`)
+- ✅ 5.5 Advanced constraints (CHECK + FK `CASCADE`/`SET NULL`)
+- ✅ 5.6 Advanced index options (multi-column + partial v0 subset + expression v0 subset)
+- ✅ 5.7 Broader ALTER TABLE (`ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`)
+- ✅ 5.8 Triggers (AFTER-row + INSTEAD OF-row subsets)
+- ✅ 5.9 Window functions (v0 `ROW_NUMBER()` subset)
+- ✅ 5.10 Operational capabilities:
+  - introspection via existing CLI schema/info commands
+  - `EXPLAIN` implemented
+  - loadable extension ecosystem remains intentionally deferred (see issue link in §5.10)
 
 ## 2. Non-negotiables and gating rules
 1. **No persistent format or recovery changes without an ADR**.

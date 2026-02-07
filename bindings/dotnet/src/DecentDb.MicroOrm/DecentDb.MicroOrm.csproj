@@ -13,9 +13,14 @@
     <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
 
+    <!-- Default SDK-generated nuspec; avoids NU5046 issues when using a custom nuspec. -->
+
     <!-- Publish as a single package that contains the managed layers + native binaries. -->
     <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
+
+    <!-- NU5128 is caused by suppressing dependency groups while still producing lib/net10.0 outputs. -->
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

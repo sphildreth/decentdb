@@ -2,6 +2,7 @@ using System;
 using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Collections.Generic;
 using System.Text;
@@ -45,6 +46,7 @@ namespace DecentDb.AdoNet
             ConnectionString = connectionString;
         }
 
+        [AllowNull]
         public override string ConnectionString
         {
             get => _connectionString;

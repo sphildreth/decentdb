@@ -4,6 +4,7 @@ import ../sql/sql
 import ../catalog/catalog
 import sets
 import strutils
+import tables
 
 type PlanKind* = enum
   pkStatement
@@ -90,6 +91,14 @@ proc isTrigramLikeFor(expr: Expr, table: string, alias: string, columnOut: var s
   if alias.len > 0 and isTrigramLike(expr, alias, columnOut, patternOut, insensitive):
     return true
   false
+
+proc normalizeIndexExprSql(sqlText: string, table: string, alias: string): string =
+  var normalized = sqlText
+  if table.len > 0:
+    normalized = normalized.replace(table & ".", "")
+  if alias.len > 0:
+    normalized = normalized.replace(alias & ".", "")
+  normalized
 
 proc splitAnd(expr: Expr): seq[Expr] =
   if expr == nil:
@@ -193,6 +202,25 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         if isSome(idxOpt):
           partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
           accessIdx = i
+          break
+      if c != nil and c.kind == ekBinary and c.op == "=":
+        let leftSql = normalizeIndexExprSql(exprToCanonicalSql(c.left), stmt.fromTable, stmt.fromAlias)
+        let rightSql = normalizeIndexExprSql(exprToCanonicalSql(c.right), stmt.fromTable, stmt.fromAlias)
+        for _, idx in catalog.indexes:
+          if idx.table != stmt.fromTable or idx.kind != ikBtree or idx.columns.len != 1:
+            continue
+          if not idx.columns[0].startsWith(IndexExpressionPrefix):
+            continue
+          let idxExprSql = normalizeIndexExprSql(idx.columns[0][IndexExpressionPrefix.len .. ^1], stmt.fromTable, stmt.fromAlias)
+          if leftSql == idxExprSql and refs(c.right).len == 0:
+            partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.right)
+            accessIdx = i
+            break
+          if rightSql == idxExprSql and refs(c.left).len == 0:
+            partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.left)
+            accessIdx = i
+            break
+        if partBase != nil:
           break
 
     if partBase == nil:
@@ -316,6 +344,25 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
       if isSome(idxOpt):
         base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
         accessConjunctIdx = i
+        break
+    if c != nil and c.kind == ekBinary and c.op == "=":
+      let leftSql = normalizeIndexExprSql(exprToCanonicalSql(c.left), stmt.fromTable, stmt.fromAlias)
+      let rightSql = normalizeIndexExprSql(exprToCanonicalSql(c.right), stmt.fromTable, stmt.fromAlias)
+      for _, idx in catalog.indexes:
+        if idx.table != stmt.fromTable or idx.kind != ikBtree or idx.columns.len != 1:
+          continue
+        if not idx.columns[0].startsWith(IndexExpressionPrefix):
+          continue
+        let idxExprSql = normalizeIndexExprSql(idx.columns[0][IndexExpressionPrefix.len .. ^1], stmt.fromTable, stmt.fromAlias)
+        if leftSql == idxExprSql and refs(c.right).len == 0:
+          base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.right)
+          accessConjunctIdx = i
+          break
+        if rightSql == idxExprSql and refs(c.left).len == 0:
+          base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idx.columns[0], valueExpr: c.left)
+          accessConjunctIdx = i
+          break
+      if base != nil:
         break
   if base == nil:
     for i, c in conjuncts:

@@ -16,7 +16,6 @@ namespace DecentDb.AdoNet
         private bool _sqlObservationCompleted;
         private bool _hasRows;
         private bool _isClosed;
-        private int _depth;
         private int _recordsAffected;
 
         private readonly int _initialStepResult;
@@ -32,7 +31,7 @@ namespace DecentDb.AdoNet
             _recordsAffected = -1;
         }
 
-        public override int Depth => _depth;
+        public override int Depth => 0;
 
         public override int FieldCount => _statement.ColumnCount;
 
@@ -52,9 +51,9 @@ namespace DecentDb.AdoNet
             }
         }
 
-        public override object? this[int ordinal] => GetValue(ordinal);
+        public override object this[int ordinal] => GetValue(ordinal);
 
-        public override object? this[string name] => GetValue(GetOrdinal(name));
+        public override object this[string name] => GetValue(GetOrdinal(name));
 
         public override string GetName(int ordinal)
         {
@@ -91,7 +90,7 @@ namespace DecentDb.AdoNet
             };
         }
 
-        public override object? GetValue(int ordinal)
+        public override object GetValue(int ordinal)
         {
             if (_statement.IsNull(ordinal))
             {

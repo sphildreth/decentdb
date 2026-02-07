@@ -879,6 +879,67 @@ suite "Planner":
 
     discard closeDb(db)
 
+  test "expression index (LOWER(column)) maintenance and planning":
+    let path = makeTempDb("decentdb_sql_expression_index.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").ok
+    check execSql(db, "INSERT INTO users VALUES (1, 'Alice')").ok
+    check execSql(db, "INSERT INTO users VALUES (2, 'ALICE')").ok
+    check execSql(db, "INSERT INTO users VALUES (3, 'Bob')").ok
+
+    check execSql(db, "CREATE INDEX users_name_lower_idx ON users ((LOWER(name)))").ok
+
+    let explainRes = execSql(db, "EXPLAIN SELECT id FROM users WHERE LOWER(name) = 'alice'")
+    check explainRes.ok
+    check explainRes.value.len > 0
+    var sawIndexSeek = false
+    for line in explainRes.value:
+      if "IndexSeek" in line:
+        sawIndexSeek = true
+        break
+    check sawIndexSeek
+
+    let q1 = execSql(db, "SELECT id FROM users WHERE LOWER(name) = 'alice' ORDER BY id")
+    check q1.ok
+    check q1.value == @["1", "2"]
+
+    check execSql(db, "UPDATE users SET name = 'Charlie' WHERE id = 2").ok
+    let q2 = execSql(db, "SELECT id FROM users WHERE LOWER(name) = 'alice' ORDER BY id")
+    check q2.ok
+    check q2.value == @["1"]
+
+    check execSql(db, "DELETE FROM users WHERE id = 1").ok
+    let q3 = execSql(db, "SELECT id FROM users WHERE LOWER(name) = 'alice' ORDER BY id")
+    check q3.ok
+    check q3.value.len == 0
+
+    discard closeDb(db)
+
+  test "expression index unsupported shapes rejected":
+    let path = makeTempDb("decentdb_sql_expression_index_reject.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, name TEXT)").ok
+
+    let badExpr = execSql(db, "CREATE INDEX t_expr_bad ON t ((id + 1))")
+    check not badExpr.ok
+
+    let badUnique = execSql(db, "CREATE UNIQUE INDEX t_expr_uq ON t ((LOWER(name)))")
+    check not badUnique.ok
+
+    let badPartial = execSql(db, "CREATE INDEX t_expr_partial ON t ((LOWER(name))) WHERE name IS NOT NULL")
+    check not badPartial.ok
+
+    let badMixed = execSql(db, "CREATE INDEX t_expr_mixed ON t ((LOWER(name)), id)")
+    check not badMixed.ok
+
+    discard closeDb(db)
+
   test "INSTEAD OF view triggers fire per affected row":
     let path = makeTempDb("decentdb_sql_instead_triggers.db")
     let dbRes = openDb(path)
@@ -923,6 +984,15 @@ suite "Planner":
     let deleteNoTrig = execSql(db, "DELETE FROM v WHERE id = 2")
     check not deleteNoTrig.ok
     check deleteNoTrig.err.code == ERR_SQL
+
+    check execSql(db, "DROP VIEW v").ok
+    check execSql(db, "CREATE VIEW v AS SELECT id, val FROM base").ok
+    let recreateTrig = execSql(
+      db,
+      "CREATE TRIGGER trg_vi INSTEAD OF INSERT ON v FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''I2'')')"
+    )
+    check recreateTrig.ok
 
     discard closeDb(db)
 

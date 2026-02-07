@@ -41,11 +41,19 @@ CREATE UNIQUE INDEX index_name ON table_name(column_name);
 
 -- Partial index (v0 subset)
 CREATE INDEX index_name ON table_name(column_name) WHERE column_name IS NOT NULL;
+
+-- Expression index (v0 subset)
+CREATE INDEX index_name ON table_name((LOWER(column_name)));
 ```
 
 Notes:
 - Partial indexes are currently limited to single-column BTREE indexes with predicate form `column IS NOT NULL`.
 - `UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, and arbitrary partial predicates are not supported in 0.x.
+- Expression indexes are currently limited to single-expression BTREE indexes with deterministic expressions:
+  - column reference
+  - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
+  - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
+- `UNIQUE` expression indexes, partial expression indexes, and multi-expression index keys are not supported in 0.x.
 
 ### DROP TABLE / DROP INDEX
 
@@ -122,6 +130,7 @@ ALTER TABLE users ALTER COLUMN age TYPE TEXT;
 **Notes:**
 - Supported `ALTER TABLE` operations in v1.0.0: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
 - `ALTER TABLE` operations are currently rejected for tables that define `CHECK` constraints
+- `ALTER TABLE` operations are currently rejected for tables that define expression indexes
 - `RENAME COLUMN` is rejected when dependent views exist
 - `ALTER COLUMN TYPE` currently supports only `INT64`, `FLOAT64`, `TEXT`, and `BOOL`
 - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys

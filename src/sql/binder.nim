@@ -1502,6 +1502,61 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   if stmt.columnNames.len == 0:
     return err[Statement](ERR_SQL, "CREATE INDEX requires at least one column")
+  var hasExpression = false
+  for colName in stmt.columnNames:
+    if colName.startsWith(IndexExpressionPrefix):
+      hasExpression = true
+      break
+
+  if hasExpression:
+    if stmt.columnNames.len != 1:
+      return err[Statement](ERR_SQL, "Expression indexes support only a single expression in 0.x")
+    if stmt.indexKind != sql.ikBtree:
+      return err[Statement](ERR_SQL, "Expression indexes are supported only for BTREE in 0.x")
+    if stmt.unique:
+      return err[Statement](ERR_SQL, "UNIQUE expression indexes are not supported in 0.x")
+    if stmt.indexPredicate != nil:
+      return err[Statement](ERR_SQL, "Partial expression indexes are not supported in 0.x")
+
+    let exprSql = stmt.columnNames[0][IndexExpressionPrefix.len .. ^1]
+    let parseRes = parseSql("SELECT " & exprSql & " FROM " & stmt.indexTableName)
+    if not parseRes.ok:
+      return err[Statement](parseRes.err.code, "Invalid expression index expression: " & parseRes.err.message, parseRes.err.context)
+    if parseRes.value.statements.len != 1 or parseRes.value.statements[0].kind != skSelect:
+      return err[Statement](ERR_SQL, "Invalid expression index expression", exprSql)
+    let parsedSelect = parseRes.value.statements[0]
+    if parsedSelect.selectItems.len != 1 or parsedSelect.selectItems[0].isStar:
+      return err[Statement](ERR_SQL, "Expression index requires exactly one expression", exprSql)
+    let expr = parsedSelect.selectItems[0].expr
+    if expr == nil:
+      return err[Statement](ERR_SQL, "Expression index expression is required")
+
+    let mapRes = buildTableMap(catalog, stmt.indexTableName, "", @[])
+    if not mapRes.ok:
+      return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
+    let exprBind = bindExpr(mapRes.value, expr)
+    if not exprBind.ok:
+      return err[Statement](exprBind.err.code, exprBind.err.message, exprBind.err.context)
+
+    var supported = false
+    case expr.kind
+    of ekColumn:
+      supported = true
+    of ekFunc:
+      let fn = expr.funcName.toUpperAscii()
+      if fn in ["LOWER", "UPPER", "TRIM", "LENGTH"]:
+        supported = expr.args.len == 1 and expr.args[0] != nil and expr.args[0].kind == ekColumn
+      elif fn == "CAST":
+        if expr.args.len == 2 and expr.args[0] != nil and expr.args[0].kind == ekColumn and
+            expr.args[1] != nil and expr.args[1].kind == ekLiteral and expr.args[1].value.kind == svString:
+          let castTypeRes = parseColumnType(expr.args[1].value.strVal)
+          supported = castTypeRes.ok and castTypeRes.value.kind in {ctInt64, ctFloat64, ctText, ctBool}
+    else:
+      discard
+    if not supported:
+      return err[Statement](ERR_SQL, "Expression index supports only `column`, `LOWER/UPPER/TRIM/LENGTH(column)`, or `CAST(column AS type)` in 0.x")
+    return ok(stmt)
+
   for colName in stmt.columnNames:
     var found = false
     for col in tableRes.value.columns:
@@ -1671,6 +1726,9 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
+  for _, idx in catalog.indexes:
+    if idx.table == stmt.alterTableName and idx.columns.len == 1 and idx.columns[0].startsWith(IndexExpressionPrefix):
+      return err[Statement](ERR_SQL, "ALTER TABLE on tables with expression indexes is not supported in 0.x", stmt.alterTableName)
   if table.checks.len > 0:
     return err[Statement](ERR_SQL, "ALTER TABLE on tables with CHECK constraints is not supported in 0.x", stmt.alterTableName)
   let dependentViews = catalog.listDependentViews(stmt.alterTableName)

@@ -1,3 +1,7 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using Dapper;
 using DecentDb.AdoNet;
 using Xunit;
@@ -69,20 +73,18 @@ namespace DecentDb.Tests
         }
 
         [Fact]
-        public void TestDapperAsync()
+        public async Task TestDapperAsync()
         {
             // Verify async methods work (even if sync-over-async internally)
-            var task = _connection.QueryAsync<User>("SELECT * FROM users");
-            task.Wait();
-            var users = task.Result;
+            var users = await _connection.QueryAsync<User>("SELECT * FROM users");
             Assert.Equal(2, users.Count());
         }
 
         class User
         {
             public int Id { get; set; }
-            public string Name { get; set; }
-            public string Email { get; set; }
+            public required string Name { get; set; }
+            public required string Email { get; set; }
             public bool Active { get; set; }
         }
     }

@@ -1099,6 +1099,82 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_expression_index_lower_matches_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_expr_idx_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.users (id INT PRIMARY KEY, name TEXT); "
+                f"CREATE INDEX {schema}_users_name_lower_idx ON {schema}.users ((LOWER(name))); "
+                f"INSERT INTO {schema}.users VALUES (1, 'Alice'); "
+                f"INSERT INTO {schema}.users VALUES (2, 'ALICE'); "
+                f"INSERT INTO {schema}.users VALUES (3, 'Bob'); "
+                f"UPDATE {schema}.users SET name = 'Charlie' WHERE id = 2; "
+                f"DELETE FROM {schema}.users WHERE id = 3;"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_expression_index.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup_sql = [
+                    "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+                    "CREATE INDEX users_name_lower_idx ON users ((LOWER(name)))",
+                    "INSERT INTO users VALUES (1, 'Alice')",
+                    "INSERT INTO users VALUES (2, 'ALICE')",
+                    "INSERT INTO users VALUES (3, 'Bob')",
+                    "UPDATE users SET name = 'Charlie' WHERE id = 2",
+                    "DELETE FROM users WHERE id = 3",
+                ]
+                for stmt in setup_sql:
+                    payload = run_cli(stmt)
+                    self.assertTrue(payload.get("ok"), msg=f"{stmt}: {payload.get('error')}")
+
+                query = "SELECT id FROM users WHERE LOWER(name) = 'alice' ORDER BY id"
+                pg_rows = run_psql(query.replace("FROM users", f"FROM {schema}.users"))
+                payload = run_cli(query)
+                self.assertTrue(payload.get("ok"), msg=payload.get("error"))
+                self.assertEqual(payload.get("rows", []), pg_rows)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
     def test_rename_column_matches_postgres(self) -> None:
         psql = shutil.which("psql")
         cli = os.environ.get("DECENTDB")

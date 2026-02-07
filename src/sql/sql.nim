@@ -127,6 +127,7 @@ const TriggerEventDeleteMask* = 8
 const TriggerEventUpdateMask* = 16
 const TriggerEventTruncateMask* = 32
 const TriggerTimingInsteadMask* = 64
+const IndexExpressionPrefix* = "expr:"
 
 type AlterTableAction* = object
   kind*: AlterTableActionKind
@@ -1430,8 +1431,15 @@ proc parseIndexStmt(node: JsonNode): Result[Statement] =
     for p in params:
       if nodeHas(p, "IndexElem"):
         let param = p["IndexElem"]
-        if nodeHas(param, "name"):
+        if nodeHas(param, "name") and param["name"].kind == JString and param["name"].getStr.len > 0:
           columnNames.add(param["name"].getStr)
+        elif nodeHas(param, "expr"):
+          let exprRes = parseExprNode(param["expr"])
+          if not exprRes.ok:
+            return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+          columnNames.add(IndexExpressionPrefix & exprToCanonicalSql(exprRes.value))
+        else:
+          return err[Statement](ERR_SQL, "Unsupported index element in CREATE INDEX")
   var kind = ikBtree
   let methodName = nodeGet(node, "accessMethod").getStr
   if methodName.len > 0:

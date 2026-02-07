@@ -6,13 +6,14 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics.CodeAnalysis;
 using DecentDb.Native;
 
 namespace DecentDb.AdoNet
 {
     public sealed class DecentDbCommand : DbCommand
     {
-        private DecentDbConnection _connection;
+        private DecentDbConnection? _connection;
         private string _commandText = string.Empty;
         private int _commandTimeout = 30;
         private readonly List<DecentDbParameter> _parameters = new();
@@ -23,7 +24,7 @@ namespace DecentDb.AdoNet
 
         public DecentDbCommand()
         {
-            _connection = null!;
+            _connection = null;
             _parameterCollection = new DecentDbParameterCollection(_parameters);
         }
 
@@ -42,8 +43,9 @@ namespace DecentDb.AdoNet
             _commandTimeout = connection.DefaultCommandTimeoutSeconds;
         }
 
-        internal DecentDbConnection OwnerConnection => _connection;
+        internal DecentDbConnection OwnerConnection => _connection ?? throw new InvalidOperationException("Command has no connection");
 
+        [AllowNull]
         public override string CommandText
         {
             get => _commandText;
@@ -83,11 +85,21 @@ namespace DecentDb.AdoNet
 
         public override UpdateRowSource UpdatedRowSource { get; set; }
 
-        protected override DbConnection DbConnection
+        protected override DbConnection? DbConnection
         {
             get => _connection;
             set
             {
+                if (value == null)
+                {
+                    if (_statement != null)
+                    {
+                        throw new InvalidOperationException("Cannot change connection while command is executing");
+                    }
+                    _connection = null;
+                    return;
+                }
+
                 if (value is not DecentDbConnection conn)
                 {
                     throw new ArgumentException("Must be a DecentDbConnection");
@@ -99,6 +111,7 @@ namespace DecentDb.AdoNet
                 _connection = conn;
             }
         }
+
 
         protected override DbParameterCollection DbParameterCollection => _parameterCollection;
 
@@ -153,6 +166,11 @@ namespace DecentDb.AdoNet
 
         protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
         {
+            if (_connection == null)
+            {
+                throw new InvalidOperationException("Command has no connection");
+            }
+
             var db = _connection.GetNativeDb();
             var (sql, paramMap) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
 
@@ -241,7 +259,7 @@ namespace DecentDb.AdoNet
 
         public override void Prepare()
         {
-            if (_connection.State != ConnectionState.Open)
+            if (_connection == null || _connection.State != ConnectionState.Open)
             {
                 throw new InvalidOperationException("Connection must be open to prepare command");
             }

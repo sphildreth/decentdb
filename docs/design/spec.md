@@ -306,6 +306,15 @@ Alternative:
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
 - CHECK constraints in `CREATE TABLE` (column-level and table-level)
 - Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
+- Expression index subset: `CREATE INDEX ... ((<expr>))` for single-expression BTREE indexes
+  - allowed expression forms in 0.x:
+    - direct column reference
+    - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
+    - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
+  - restrictions:
+    - exactly one index expression
+    - `UNIQUE` expression indexes are not supported
+    - partial expression indexes are not supported
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
@@ -316,6 +325,7 @@ Alternative:
   - `UPDATE ... RETURNING`
   - `DELETE ... RETURNING`
   - Partial indexes beyond the v0 subset (`UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, arbitrary predicates)
+  - Expression indexes beyond the v0 subset (multi-expression keys, unsupported functions/operators, `UNIQUE`, or partial forms)
 
 ### 6.3 Parameterization
 - `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline
@@ -590,6 +600,7 @@ Define error categories:
 - Supported: CREATE TABLE, CREATE INDEX, CREATE TRIGGER, DROP TABLE, DROP INDEX, DROP TRIGGER, ALTER TABLE
 - ALTER TABLE operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, ALTER COLUMN TYPE
   - Current v0 limitation: ALTER TABLE operations are rejected on tables that define CHECK constraints
+  - Current v0 limitation: ALTER TABLE operations are rejected on tables that define expression indexes
   - `RENAME COLUMN` is rejected when dependent views exist
   - `ALTER COLUMN TYPE` supports only `INT64`, `FLOAT64`, `TEXT`, `BOOL` source/target kinds
   - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys

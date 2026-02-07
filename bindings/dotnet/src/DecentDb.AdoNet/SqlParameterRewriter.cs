@@ -258,14 +258,14 @@ namespace DecentDb.AdoNet
             return (rewritten.ToString(), paramMap);
         }
 
-        private static bool TryResolveNamed(Dictionary<string, DbParameter> parametersByName, string name, out DbParameter parameter)
+        private static bool TryResolveNamed(Dictionary<string, DbParameter> parametersByName, string name, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out DbParameter? parameter)
         {
             if (parametersByName.TryGetValue(name, out parameter)) return true;
             if (parametersByName.TryGetValue("@" + name, out parameter)) return true;
             return false;
         }
 
-        private static bool TryResolveIndexed(Dictionary<string, DbParameter> parametersByName, int index1Based, out DbParameter parameter)
+        private static bool TryResolveIndexed(Dictionary<string, DbParameter> parametersByName, int index1Based, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out DbParameter? parameter)
         {
             if (parametersByName.TryGetValue("$" + index1Based, out parameter)) return true;
             if (parametersByName.TryGetValue(index1Based.ToString(), out parameter)) return true;
@@ -277,7 +277,7 @@ namespace DecentDb.AdoNet
                 if (parametersByName.TryGetValue("p" + pNum, out parameter)) return true;
             }
 
-            parameter = null!;
+            parameter = null;
             return false;
         }
 
