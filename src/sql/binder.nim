@@ -897,13 +897,19 @@ proc expandSelectCteRefs(
     let refAlias = expanded.fromAlias
     let cteDef = ctes[normalizedName(refTable)]
 
-    var skipRewrite = false
-    if singleSourceStar and cteDef.query.setOpKind == sokNone:
-      # Optimization for single source star on simple query: replace star with explicit columns
+    # Build column map for rewriting CTE alias references (e.g. b(x) → users.id)
+    var columnMap: Table[string, Expr]
+    var hasColumnMap = false
+    if cteDef.query.setOpKind == sokNone:
       let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
       if not columnMapRes.ok:
         return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
-      let columnMap = columnMapRes.value
+      columnMap = columnMapRes.value
+      hasColumnMap = true
+
+    var skipRewrite = false
+    if singleSourceStar and hasColumnMap:
+      # Optimization for single source star on simple query: replace star with explicit columns
       var items: seq[SelectItem] = @[]
       for item in expanded.selectItems:
         if item.isStar:
@@ -930,20 +936,23 @@ proc expandSelectCteRefs(
       return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
     expanded = pushedRes.value
     
-    if expanded.setOpKind != sokNone:
-        # If it became a SetOp, restore the outer query's ordering/limit
-        expanded.orderBy = originalOrderBy
-        expanded.limit = originalLimit
-        expanded.limitParam = originalLimitParam
-        expanded.offset = originalOffset
-        expanded.offsetParam = originalOffsetParam
-    else:
-        # If it is still a Select, restore ordering/limit
-        expanded.orderBy = originalOrderBy
-        expanded.limit = originalLimit
-        expanded.limitParam = originalLimitParam
-        expanded.offset = originalOffset
-        expanded.offsetParam = originalOffsetParam
+    # Restore outer query's ordering/limit, rewriting through column map
+    # so CTE alias references (e.g. ORDER BY x) resolve to underlying columns
+    var restoredOrderBy = originalOrderBy
+    if hasColumnMap and restoredOrderBy.len > 0:
+      var rewrittenOrder: seq[OrderItem] = @[]
+      for item in restoredOrderBy:
+        let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
+        if not exprRes.ok:
+          return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+        rewrittenOrder.add(OrderItem(expr: exprRes.value, asc: item.asc))
+      restoredOrderBy = rewrittenOrder
+
+    expanded.orderBy = restoredOrderBy
+    expanded.limit = originalLimit
+    expanded.limitParam = originalLimitParam
+    expanded.offset = originalOffset
+    expanded.offsetParam = originalOffsetParam
 
   var joinIdx = 0
   while joinIdx < expanded.joins.len:

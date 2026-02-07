@@ -14,6 +14,12 @@ proc makeTempDb(name: string): string =
   if fileExists(path & "-wal"): removeFile(path & "-wal")
   path
 
+proc textValue(text: string): Value =
+  var bytes: seq[byte] = @[]
+  for ch in text:
+    bytes.add(byte(ch))
+  Value(kind: vkText, bytes: bytes)
+
 proc setupDummy(db: Db) =
   let c = execSql(db, "CREATE TABLE dummy (id INT)", @[])
   if not c.ok: echo "Dummy Create Error: ", c.err.message
@@ -349,7 +355,7 @@ suite "Datatypes - Basic":
     """, @[])
     check c.ok
     
-    let i1 = execSql(db, "INSERT INTO bools VALUES (1, true, false)", @[])
+    let i1 = execSql(db, "INSERT INTO bools VALUES (1, CAST(1 AS BOOL), CAST(0 AS BOOL))", @[])
     check i1.ok
     
     let s1 = execSqlRows(db, "SELECT b1, b2 FROM bools WHERE id = 1", @[])
