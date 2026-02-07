@@ -53,3 +53,61 @@ def test_uuid(db_path):
     assert r2 == u2.bytes
     
     conn.close()
+
+def test_blob(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t_blob (id INT64, data BLOB)")
+
+    blobs = [
+        b'',
+        b'\x00',
+        b'\xDE\xAD\xBE\xEF',
+        bytes(range(256)),
+    ]
+
+    for i, b in enumerate(blobs):
+        cur.execute("INSERT INTO t_blob VALUES (?, ?)", (i, b))
+
+    cur.execute("SELECT data FROM t_blob ORDER BY id")
+    rows = cur.fetchall()
+    assert len(rows) == len(blobs)
+
+    for i, expected in enumerate(blobs):
+        assert rows[i][0] == expected, f"blob[{i}] mismatch"
+
+    conn.close()
+
+def test_float64(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t_float (id INT64, v FLOAT64)")
+
+    values = [0.0, 1.0, -1.0, 3.141592653589793, 1.7976931348623157e+308, 5e-324]
+    for i, v in enumerate(values):
+        cur.execute("INSERT INTO t_float VALUES (?, ?)", (i, v))
+
+    cur.execute("SELECT v FROM t_float ORDER BY id")
+    rows = cur.fetchall()
+    assert len(rows) == len(values)
+
+    for i, expected in enumerate(values):
+        assert rows[i][0] == expected, f"float[{i}]: expected {expected}, got {rows[i][0]}"
+
+    conn.close()
+
+def test_null(db_path):
+    conn = decentdb.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t_null (id INT64, i INT64, t TEXT, b BOOL, f FLOAT64)")
+
+    cur.execute("INSERT INTO t_null VALUES (?, ?, ?, ?, ?)", (1, None, None, None, None))
+
+    cur.execute("SELECT i, t, b, f FROM t_null WHERE id = 1")
+    row = cur.fetchone()
+    assert row[0] is None
+    assert row[1] is None
+    assert row[2] is None
+    assert row[3] is None
+
+    conn.close()

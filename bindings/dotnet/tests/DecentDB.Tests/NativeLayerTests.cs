@@ -264,6 +264,45 @@ public class NativeLayerTests : IDisposable
     }
 
     [Fact]
+    public void DecimalBindingAndRetrieval()
+    {
+        using var db = new NativeDb(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE t_dec (id INTEGER PRIMARY KEY, v DECIMAL(18,4))");
+        createStmt.Step();
+
+        using var insertStmt = db.Prepare("INSERT INTO t_dec (id, v) VALUES ($1, $2)");
+        insertStmt.BindInt64(1, 1);
+        insertStmt.BindDecimal(2, 123.4567m);
+        insertStmt.Step();
+
+        using var selectStmt = db.Prepare("SELECT v FROM t_dec WHERE id = 1");
+        var result = selectStmt.Step();
+        AssertStepRow(result, db, "SELECT v FROM t_dec WHERE id = 1");
+
+        Assert.Equal(123.4567m, selectStmt.GetDecimal(0));
+    }
+
+    [Fact]
+    public void UuidColumnRoundTrip()
+    {
+        using var db = new NativeDb(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE t_uuid (id INTEGER PRIMARY KEY, u UUID)");
+        createStmt.Step();
+
+        var guid = Guid.NewGuid();
+        using var insertStmt = db.Prepare("INSERT INTO t_uuid (id, u) VALUES ($1, $2)");
+        insertStmt.BindInt64(1, 1);
+        insertStmt.BindGuid(2, guid);
+        insertStmt.Step();
+
+        using var selectStmt = db.Prepare("SELECT u FROM t_uuid WHERE id = 1");
+        var result = selectStmt.Step();
+        AssertStepRow(result, db, "SELECT u FROM t_uuid WHERE id = 1");
+
+        Assert.Equal(guid, selectStmt.GetGuid(0));
+    }
+
+    [Fact]
     public void ErrorHandling()
     {
         using var db = new NativeDb(_dbPath);
