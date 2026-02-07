@@ -1430,9 +1430,22 @@ proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
     values.add(valueFromSql(res.value))
   ok(values)
 
+proc evalInsertExprs(exprs: seq[Expr], params: seq[Value]): Result[seq[Value]] =
+  var values: seq[Value] = @[]
+  for expr in exprs:
+    let res = evalExpr(Row(), expr, params)
+    if not res.ok:
+      return err[seq[Value]](res.err.code, res.err.message, res.err.context)
+    values.add(valueFromSql(res.value))
+  ok(values)
+
 type InsertExecResult = object
   affected: bool
   row: Option[Row]
+
+type MultiInsertResult = object
+  totalAffected: int64
+  rows: seq[Row]
 
 proc buildInsertResultRow(tableName: string, table: TableMeta, rowid: uint64, values: seq[Value]): Row =
   var cols: seq[string] = @[]
@@ -1586,6 +1599,36 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
     affected: true,
     row: some(buildInsertResultRow(bound.insertTable, table, insertRes.value, values))
   ))
+
+proc execInsertRowExprs(db: Db, bound: Statement, exprs: seq[Expr], params: seq[Value]): Result[InsertExecResult] =
+  ## Execute INSERT for a single extra row (multi-row INSERT VALUES).
+  ## Builds a temporary statement with the given exprs as insertValues.
+  var rowBound = bound
+  rowBound.insertValues = exprs
+  rowBound.insertValueRows = @[]
+  execInsertStatement(db, rowBound, params)
+
+proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value]): Result[MultiInsertResult] =
+  ## Execute all rows of a multi-row INSERT, returning total affected and result rows.
+  var multi = MultiInsertResult(totalAffected: 0, rows: @[])
+  # First row (from insertValues)
+  let firstRes = execInsertStatement(db, bound, params)
+  if not firstRes.ok:
+    return err[MultiInsertResult](firstRes.err.code, firstRes.err.message, firstRes.err.context)
+  if firstRes.value.affected:
+    multi.totalAffected.inc
+  if firstRes.value.row.isSome:
+    multi.rows.add(firstRes.value.row.get)
+  # Extra rows (from insertValueRows)
+  for extraExprs in bound.insertValueRows:
+    let extraRes = execInsertRowExprs(db, bound, extraExprs, params)
+    if not extraRes.ok:
+      return err[MultiInsertResult](extraRes.err.code, extraRes.err.message, extraRes.err.context)
+    if extraRes.value.affected:
+      multi.totalAffected.inc
+    if extraRes.value.row.isSome:
+      multi.rows.add(extraRes.value.row.get)
+  ok(multi)
 
 proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   if not db.isOpen:
@@ -1790,18 +1833,19 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
       output.add(rows.join("\n"))
     of skInsert:
       if db.catalog.hasViewName(bound.insertTable):
-        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: 1 else: 0)
+        let rowCount = int64(1 + bound.insertValueRows.len)
+        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
         if not insteadRes.ok:
           return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
       else:
-        let insertExecRes = execInsertStatement(db, bound, params)
-        if not insertExecRes.ok:
-          return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
+        let multiRes = execAllInsertRows(db, bound, params)
+        if not multiRes.ok:
+          return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
         if not triggerRes.ok:
           return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-        if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
-          let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
+        if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
+          let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
           if not projectedRes.ok:
             return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
           for row in projectedRes.value:
@@ -2301,18 +2345,19 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skInsert:
       if db.catalog.hasViewName(bound.insertTable):
-        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: 1 else: 0)
+        let rowCount = int64(1 + bound.insertValueRows.len)
+        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
         if not insteadRes.ok:
           return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
       else:
-        let insertExecRes = execInsertStatement(db, bound, params)
-        if not insertExecRes.ok:
-          return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
+        let multiRes = execAllInsertRows(db, bound, params)
+        if not multiRes.ok:
+          return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
         if not triggerRes.ok:
           return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-        if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
-          let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
+        if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
+          let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
           if not projectedRes.ok:
             return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
           for row in projectedRes.value:
@@ -2922,15 +2967,15 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     if bound.insertReturning.len > 0:
       return err[int64](ERR_SQL, "INSERT RETURNING is not supported by non-select execution API")
     if db.catalog.hasViewName(bound.insertTable):
-      affected = if bound.insertValues.len > 0: 1 else: 0
+      affected = if bound.insertValues.len > 0: int64(1 + bound.insertValueRows.len) else: 0
       let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
       if not insteadRes.ok:
         return err[int64](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
     else:
-      let insertExecRes = execInsertStatement(db, bound, params)
-      if not insertExecRes.ok:
-        return err[int64](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
-      affected = if insertExecRes.value.affected: 1 else: 0
+      let multiRes = execAllInsertRows(db, bound, params)
+      if not multiRes.ok:
+        return err[int64](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+      affected = multiRes.value.totalAffected
       let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
       if not triggerRes.ok:
         return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)

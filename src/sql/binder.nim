@@ -341,6 +341,10 @@ proc hasParamsInDmlStatement(stmt: Statement): bool =
     for expr in stmt.insertValues:
       if hasParamsInExpr(expr):
         return true
+    for row in stmt.insertValueRows:
+      for expr in row:
+        if hasParamsInExpr(expr):
+          return true
     if hasParamsInExpr(stmt.insertConflictUpdateWhere):
       return true
     for _, expr in stmt.insertConflictUpdateAssignments:
@@ -1349,6 +1353,23 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
       return err[Statement](typeRes.err.code, typeRes.err.message, typeRes.err.context)
     ordered[idx] = expr
 
+  # Validate and reorder extra value rows (for multi-row INSERT)
+  var orderedExtraRows: seq[seq[Expr]] = @[]
+  for rowVals in stmt.insertValueRows:
+    if rowVals.len != targetCols.len:
+      return err[Statement](ERR_SQL, "Column count mismatch", stmt.insertTable)
+    var rowOrdered = newSeq[Expr](table.columns.len)
+    for i in 0 ..< rowOrdered.len:
+      rowOrdered[i] = nullExpr()
+    for i, colName in targetCols:
+      let idx = colIndex[colName]
+      let expr = rowVals[i]
+      let typeRes = checkLiteralType(expr, table.columns[idx].kind, colName)
+      if not typeRes.ok:
+        return err[Statement](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+      rowOrdered[idx] = expr
+    orderedExtraRows.add(rowOrdered)
+
   var conflictTargetCols = stmt.insertConflictTargetCols
   var conflictTargetConstraint = stmt.insertConflictTargetConstraint
   var conflictAssignments = initTable[string, Expr]()
@@ -1445,6 +1466,7 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     insertTable: stmt.insertTable,
     insertColumns: @[],
     insertValues: ordered,
+    insertValueRows: orderedExtraRows,
     insertConflictAction: stmt.insertConflictAction,
     insertConflictTargetCols: conflictTargetCols,
     insertConflictTargetConstraint: conflictTargetConstraint,

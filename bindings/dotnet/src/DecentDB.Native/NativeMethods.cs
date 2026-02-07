@@ -127,6 +127,9 @@ public static class DecentDBNative
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_close")]
     public static extern int decentdb_close(IntPtr db);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_checkpoint")]
+    public static extern int decentdb_checkpoint(IntPtr db);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_last_error_code")]
     public static extern int decentdb_last_error_code(IntPtr db);
 

@@ -210,6 +210,7 @@ type Statement* = ref object
     insertTable*: string
     insertColumns*: seq[string]
     insertValues*: seq[Expr]
+    insertValueRows*: seq[seq[Expr]]  # additional rows for multi-row INSERT
     insertConflictAction*: InsertConflictAction
     insertConflictTargetCols*: seq[string]
     insertConflictTargetConstraint*: string
@@ -962,20 +963,27 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
       cols.add(resTarget["name"].getStr)
   let selectNode = nodeGet(node, "selectStmt")
   var values: seq[Expr] = @[]
+  var extraRows: seq[seq[Expr]] = @[]
   if nodeHas(selectNode, "SelectStmt"):
     let selectStmt = selectNode["SelectStmt"]
     let valuesLists = nodeGet(selectStmt, "valuesLists")
     if valuesLists.kind == JArray and valuesLists.len > 0:
-      let first = valuesLists[0]
-      var itemsNode = first
-      if nodeHas(first, "List"):
-        itemsNode = nodeGet(first["List"], "items")
-      if itemsNode.kind == JArray:
-        for v in itemsNode:
-          let exprRes = parseExprNode(v)
-          if not exprRes.ok:
-            return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-          values.add(exprRes.value)
+      for rowIdx in 0 ..< valuesLists.len:
+        let rowNode = valuesLists[rowIdx]
+        var itemsNode = rowNode
+        if nodeHas(rowNode, "List"):
+          itemsNode = nodeGet(rowNode["List"], "items")
+        var rowValues: seq[Expr] = @[]
+        if itemsNode.kind == JArray:
+          for v in itemsNode:
+            let exprRes = parseExprNode(v)
+            if not exprRes.ok:
+              return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+            rowValues.add(exprRes.value)
+        if rowIdx == 0:
+          values = rowValues
+        else:
+          extraRows.add(rowValues)
 
   var conflictAction = icaNone
   var conflictTargetCols: seq[string] = @[]
@@ -1054,6 +1062,7 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
     insertTable: tableRes.value[0],
     insertColumns: cols,
     insertValues: values,
+    insertValueRows: extraRows,
     insertConflictAction: conflictAction,
     insertConflictTargetCols: conflictTargetCols,
     insertConflictTargetConstraint: conflictTargetConstraint,

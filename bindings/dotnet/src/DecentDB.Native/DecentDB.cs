@@ -77,7 +77,11 @@ public sealed class DecentDB : IDisposable
 
     public void Checkpoint()
     {
-        using var stmt = Prepare("PRAGMA wal_checkpoint(TRUNCATE)");
+        var res = DecentDBNative.decentdb_checkpoint(Handle);
+        if (res != 0)
+        {
+            throw new DecentDBException(res, LastErrorMessage, "Checkpoint");
+        }
     }
 
     internal IntPtr GetDbHandle() => Handle;

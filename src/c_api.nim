@@ -255,6 +255,16 @@ proc decentdb_close*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   GC_unref(handle)
   return 0
 
+proc decentdb_checkpoint*(p: pointer): cint {.exportc, cdecl, dynlib.} =
+  if p == nil: return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = checkpointDb(handle.db)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
+
 proc decentdb_last_error_code*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil:
     return cint(globalLastErrorCode)
@@ -302,6 +312,8 @@ proc findMaxParam(stmt: Statement): int =
     return findMaxParam(stmt.explainInner)
   of skInsert:
     for v in stmt.insertValues: walk(v)
+    for row in stmt.insertValueRows:
+      for v in row: walk(v)
     for item in stmt.insertReturning:
       if not item.isStar:
         walk(item.expr)
