@@ -60,6 +60,24 @@ proc renderExpr*(expr: Expr): string =
       s.add(renderExpr(item))
     s.add("))")
     s
+  of ekWindowRowNumber:
+    var s = "ROW_NUMBER() OVER ("
+    if expr.windowPartitions.len > 0:
+      s.add("PARTITION BY ")
+      for i, p in expr.windowPartitions:
+        if i > 0: s.add(", ")
+        s.add(renderExpr(p))
+      if expr.windowOrderExprs.len > 0:
+        s.add(" ")
+    if expr.windowOrderExprs.len > 0:
+      s.add("ORDER BY ")
+      for i, o in expr.windowOrderExprs:
+        if i > 0: s.add(", ")
+        s.add(renderExpr(o))
+        let asc = if i < expr.windowOrderAsc.len: expr.windowOrderAsc[i] else: true
+        s.add(if asc: " ASC" else: " DESC")
+    s.add(")")
+    s
 
 proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
   var lines: seq[string] = @[]

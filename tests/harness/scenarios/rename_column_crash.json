@@ -1,0 +1,19 @@
+{
+  "name": "rename_column_crash",
+  "description": "Crash during ALTER TABLE RENAME COLUMN should not leave partial catalog state",
+  "db_path": "$TMPDIR/decentdb_rename_column_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY, a INT); INSERT INTO t VALUES (1, 10)",
+  "sql": "ALTER TABLE t RENAME COLUMN a TO b",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT a FROM t ORDER BY id",
+    "expect_rows": [
+      "10"
+    ]
+  }
+}

@@ -40,7 +40,7 @@ What “extensions” means here:
 ## SQL surface area
 
 DecentDB’s current baseline includes:
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
 - Joins: `INNER JOIN`, `LEFT JOIN`
 - Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`
@@ -96,10 +96,12 @@ Legend: **Must-have** = expected by most real-world application SQL (not necessa
 	- Partial/expression indexes also imply more complex planner rules and predicate semantics.
 	- **Must-have:** No.
 
-8. **Window functions** (`... OVER (...)`) (analytics-oriented)
-	- Powerful, but primarily an analytics feature and can require non-trivial executor/planner work.
-9. **Triggers** (`CREATE TRIGGER`, including `INSTEAD OF` triggers)
-	- Large surface area and complexity; also the usual prerequisite for updatable views.
+8. **Advanced window functions** (`RANK`, `DENSE_RANK`, `LAG`, frames, etc.) (analytics-oriented)
+	- Baseline DecentDB supports a narrow `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` subset.
+	- Broader window semantics remain a follow-on.
+9. **Advanced triggers** (`INSTEAD OF`, `NEW`/`OLD` row references, statement-level variants)
+	- Baseline DecentDB supports a narrow AFTER-row trigger subset using `decentdb_exec_sql('<single DML>')`.
+	- Broader trigger semantics remain a follow-on.
 
 The following are not strictly “SQL features”, but commonly expected operational capabilities that SQLite and DuckDB provide:
 

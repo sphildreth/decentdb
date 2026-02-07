@@ -325,7 +325,7 @@ Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
 ### 6.2 Supported SQL subset (0.x baseline)
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
 - INSERT RETURNING subset:
   - `INSERT ... RETURNING *`
@@ -349,9 +349,17 @@ Alternative:
   - CTE names resolve in declaration order and can shadow catalog objects in the statement scope
   - v0 CTE body restrictions: `GROUP BY`/`HAVING`, `ORDER BY`, and `LIMIT/OFFSET` inside CTE bodies are not supported
 - Set operations: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`
+- Window functions (v0 subset): `ROW_NUMBER() OVER (...)`
+  - `PARTITION BY` optional
+  - `ORDER BY` inside `OVER (...)` required in 0.x
+  - supported only in `SELECT` projection items
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
 - CHECK constraints in `CREATE TABLE` (column-level and table-level)
+- AFTER trigger subset:
+  - events: `INSERT`, `UPDATE`, `DELETE`
+  - `FOR EACH ROW` on base tables
+  - action form: `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')`
 - Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
@@ -359,6 +367,8 @@ Alternative:
 - Explicitly unsupported in 0.x baseline:
   - `WITH RECURSIVE`
   - `INTERSECT ALL`, `EXCEPT ALL`
+  - Advanced window functions beyond `ROW_NUMBER()` (e.g., `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
+  - `INSTEAD OF` triggers and `FOR EACH STATEMENT` triggers
   - targetless `INSERT ... ON CONFLICT DO UPDATE ...` (without conflict target)
   - `UPDATE ... RETURNING`
   - `DELETE ... RETURNING`
@@ -634,10 +644,17 @@ Define error categories:
 - Writing to older formats may trigger automatic upgrade (with user confirmation)
 
 ### 15.3 Schema changes (0.x baseline)
-- Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
-- ALTER TABLE operations: ADD COLUMN, DROP COLUMN
+- Supported: CREATE TABLE, CREATE INDEX, CREATE TRIGGER, DROP TABLE, DROP INDEX, DROP TRIGGER, ALTER TABLE
+- ALTER TABLE operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, ALTER COLUMN TYPE
   - Current v0 limitation: ALTER TABLE operations are rejected on tables that define CHECK constraints
-- Not supported (post-1.0): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
+  - `RENAME COLUMN` is rejected when dependent views exist
+  - `ALTER COLUMN TYPE` supports only `INT64`, `FLOAT64`, `TEXT`, `BOOL` source/target kinds
+  - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
+- Trigger operations:
+  - `AFTER` triggers on `INSERT`/`UPDATE`/`DELETE` for base tables (`FOR EACH ROW`)
+  - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 0.x
+  - `INSTEAD OF` and `FOR EACH STATEMENT` triggers are not supported in 0.x
+- Not supported (post-1.0): ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 
 ### 15.4 Migration strategy

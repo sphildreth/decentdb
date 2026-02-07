@@ -93,11 +93,68 @@ Example:
 ALTER TABLE users DROP COLUMN age;
 ```
 
+#### Rename Column
+
+```sql
+ALTER TABLE table_name RENAME COLUMN old_column_name TO new_column_name;
+```
+
+Renames a column in table metadata. This operation also updates index and foreign-key metadata that reference the renamed column.
+
+Example:
+```sql
+ALTER TABLE users RENAME COLUMN name TO full_name;
+```
+
+#### Alter Column Type
+
+```sql
+ALTER TABLE table_name ALTER COLUMN column_name TYPE new_datatype;
+```
+
+Changes the type of an existing column by rewriting table rows and rebuilding indexes on the table.
+
+Example:
+```sql
+ALTER TABLE users ALTER COLUMN age TYPE TEXT;
+```
+
 **Notes:**
-- `ADD COLUMN` and `DROP COLUMN` are the only supported operations in v1.0.0
+- Supported `ALTER TABLE` operations in v1.0.0: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
 - `ALTER TABLE` operations are currently rejected for tables that define `CHECK` constraints
-- Advanced operations like `RENAME COLUMN`, `MODIFY COLUMN` (type changes), and `ADD CONSTRAINT` are planned for future releases
+- `RENAME COLUMN` is rejected when dependent views exist
+- `ALTER COLUMN TYPE` currently supports only `INT64`, `FLOAT64`, `TEXT`, and `BOOL`
+- `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
+- `ADD CONSTRAINT` is planned for future releases
 - Schema changes require an exclusive lock on the database
+
+### CREATE TRIGGER / DROP TRIGGER
+
+```sql
+CREATE TRIGGER trigger_name
+AFTER INSERT OR UPDATE OR DELETE ON table_name
+FOR EACH ROW
+EXECUTE FUNCTION decentdb_exec_sql('single_dml_sql');
+
+DROP TRIGGER [IF EXISTS] trigger_name ON table_name;
+```
+
+Example:
+```sql
+CREATE TABLE audit (tag TEXT);
+CREATE TRIGGER users_ins_audit
+AFTER INSERT ON users
+FOR EACH ROW
+EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(tag) VALUES (''I'')');
+```
+
+**Notes:**
+- v0 trigger support is intentionally narrow:
+  - timing: `AFTER` only
+  - events: `INSERT`, `UPDATE`, `DELETE`
+  - scope: base tables only, `FOR EACH ROW` only
+- Trigger action SQL must be exactly one DML statement (`INSERT`, `UPDATE`, or `DELETE`) and cannot use parameters.
+- `INSTEAD OF` triggers are not supported in 0.x.
 
 ## Data Manipulation Language (DML)
 
@@ -251,6 +308,23 @@ SELECT category, SUM(amount) FROM orders GROUP BY category;
 SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 5;
 ```
 
+### Window Functions
+
+Supported window subset:
+- `ROW_NUMBER() OVER (...)`
+- `PARTITION BY` is optional
+- `ORDER BY` inside `OVER (...)` is required in 0.x
+
+```sql
+SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn
+FROM t
+ORDER BY id;
+```
+
+Current limits:
+- Only `ROW_NUMBER()` is supported.
+- Window expressions are supported only in `SELECT` projection items.
+
 ### Transactions
 
 ```sql
@@ -327,7 +401,7 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 
 Not currently supported:
 - Correlated subqueries in SELECT
-- Window functions
+- Advanced window functions beyond `ROW_NUMBER()` (for example `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
 - Recursive CTEs (`WITH RECURSIVE`)
 - Stored procedures
 

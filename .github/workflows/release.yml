@@ -1,0 +1,102 @@
+name: Release (GitHub)
+
+on:
+  push:
+    tags:
+      - "v0.1.*"
+      - "v1.0.0"
+      - "v1.0.0-rc.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build artifacts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "stable"
+
+      - name: Build CLI (release)
+        run: nimble build -d:release
+
+      - name: Build native library (C API)
+        run: nimble build_lib
+
+      - name: Stage artifacts (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -v ./decentdb dist/
+          if [ -f ./build/libc_api.so ]; then cp -v ./build/libc_api.so dist/libdecentdb.so; fi
+          if [ -f ./build/libc_api.dylib ]; then cp -v ./build/libc_api.dylib dist/libdecentdb.dylib; fi
+          if [ -f ./build/libdecentdb.so ]; then cp -v ./build/libdecentdb.so dist/libdecentdb.so; fi
+          if [ -f ./build/libdecentdb.dylib ]; then cp -v ./build/libdecentdb.dylib dist/libdecentdb.dylib; fi
+
+      - name: Stage artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Force .\decentdb.exe dist\
+          if (Test-Path .\build\libc_api.dll) { Copy-Item -Force .\build\libc_api.dll dist\decentdb.dll }
+          if (Test-Path .\build\decentdb.dll) { Copy-Item -Force .\build\decentdb.dll dist\decentdb.dll }
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          OUT="decentdb-${TAG}-${{ runner.os }}-x64.tar.gz"
+          tar -C dist -czf "$OUT" .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = "$env:GITHUB_REF_NAME"
+          $out = "decentdb-$tag-$env:RUNNER_OS-x64.zip"
+          Compress-Archive -Path dist\* -DestinationPath $out -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            decentdb-${{ github.ref_name }}-${{ runner.os }}-x64.tar.gz
+            decentdb-${{ github.ref_name }}-${{ runner.os }}-x64.zip
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ startsWith(github.ref_name, 'v0.1.') || startsWith(github.ref_name, 'v1.0.0-rc.') }}
+          files: |
+            artifacts/**/decentdb-${{ github.ref_name }}-Linux-x64.tar.gz
+            artifacts/**/decentdb-${{ github.ref_name }}-macOS-x64.tar.gz
+            artifacts/**/decentdb-${{ github.ref_name }}-Windows-x64.zip

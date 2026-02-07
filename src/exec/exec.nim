@@ -1734,6 +1734,8 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     if sawNull:
       return ok(Value(kind: vkNull))
     return ok(Value(kind: vkBool, boolVal: false))
+  of ekWindowRowNumber:
+    return err[Value](ERR_SQL, "ROW_NUMBER window expression must be evaluated in projection context")
 
 proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: string): Result[seq[Row]] =
   let tableRes = catalog.getTable(tableName)
@@ -1899,15 +1901,83 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
     return ok(rows)
   if items.len == 1 and items[0].isStar:
     return ok(rows)
+
+  var windowValuesByItem = initTable[int, seq[Value]]()
+  for itemIdx, item in items:
+    if item.isStar or item.expr == nil or item.expr.kind != ekWindowRowNumber:
+      continue
+    let wexpr = item.expr
+    var partitionVals = newSeq[seq[Value]](rows.len)
+    var orderVals = newSeq[seq[Value]](rows.len)
+
+    for rowIdx, row in rows:
+      var pvals: seq[Value] = @[]
+      for pexpr in wexpr.windowPartitions:
+        let evalRes = evalExpr(row, pexpr, params)
+        if not evalRes.ok:
+          return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+        pvals.add(evalRes.value)
+      partitionVals[rowIdx] = pvals
+
+      var ovals: seq[Value] = @[]
+      for oexpr in wexpr.windowOrderExprs:
+        let evalRes = evalExpr(row, oexpr, params)
+        if not evalRes.ok:
+          return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+        ovals.add(evalRes.value)
+      orderVals[rowIdx] = ovals
+
+    var sortedIdx = newSeq[int](rows.len)
+    for i in 0 ..< rows.len:
+      sortedIdx[i] = i
+    sortedIdx.sort(proc(a, b: int): int =
+      for i in 0 ..< partitionVals[a].len:
+        let c = compareValues(partitionVals[a][i], partitionVals[b][i])
+        if c != 0:
+          return c
+      for i in 0 ..< orderVals[a].len:
+        let c = compareValues(orderVals[a][i], orderVals[b][i])
+        if c != 0:
+          let asc = if i < wexpr.windowOrderAsc.len: wexpr.windowOrderAsc[i] else: true
+          return if asc: c else: -c
+      cmp(a, b)
+    )
+
+    var rowNumbers = newSeq[Value](rows.len)
+    var currentRowNum = 0'i64
+    var prevIdx = -1
+    for pos, rowIdx in sortedIdx:
+      if pos == 0:
+        currentRowNum = 1
+      else:
+        var samePartition = true
+        for i in 0 ..< partitionVals[rowIdx].len:
+          if compareValues(partitionVals[rowIdx][i], partitionVals[prevIdx][i]) != 0:
+            samePartition = false
+            break
+        if samePartition:
+          currentRowNum.inc
+        else:
+          currentRowNum = 1
+      rowNumbers[rowIdx] = Value(kind: vkInt64, int64Val: currentRowNum)
+      prevIdx = rowIdx
+    windowValuesByItem[itemIdx] = rowNumbers
+
   var resultRows: seq[Row] = @[]
-  for row in rows:
+  for rowIdx, row in rows:
     var cols: seq[string] = @[]
     var vals: seq[Value] = @[]
-    for item in items:
+    for itemIdx, item in items:
       if item.isStar:
         for i, col in row.columns:
           cols.add(col)
           vals.add(row.values[i])
+      elif item.expr != nil and item.expr.kind == ekWindowRowNumber:
+        if not windowValuesByItem.hasKey(itemIdx):
+          return err[seq[Row]](ERR_INTERNAL, "Window projection state missing")
+        var name = if item.alias.len > 0: item.alias else: "row_number"
+        cols.add(name)
+        vals.add(windowValuesByItem[itemIdx][rowIdx])
       else:
         let evalRes = evalExpr(row, item.expr, params)
         if not evalRes.ok:

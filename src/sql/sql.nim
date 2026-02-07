@@ -28,6 +28,7 @@ type ExprKind* = enum
   ekFunc
   ekParam
   ekInList
+  ekWindowRowNumber
 
 type Expr* = ref object
   case kind*: ExprKind
@@ -52,6 +53,10 @@ type Expr* = ref object
   of ekInList:
     inExpr*: Expr
     inList*: seq[Expr]
+  of ekWindowRowNumber:
+    windowPartitions*: seq[Expr]
+    windowOrderExprs*: seq[Expr]
+    windowOrderAsc*: seq[bool]
 
 type ColumnDef* = object
   name*: string
@@ -117,6 +122,11 @@ type SetOpKind* = enum
   sokIntersect
   sokExcept
 
+const TriggerEventInsertMask* = 4
+const TriggerEventDeleteMask* = 8
+const TriggerEventUpdateMask* = 16
+const TriggerEventTruncateMask* = 32
+
 type AlterTableAction* = object
   kind*: AlterTableActionKind
   columnDef*: ColumnDef        # For ADD COLUMN
@@ -130,8 +140,10 @@ type AlterTableAction* = object
 type StatementKind* = enum
   skCreateTable
   skCreateIndex
+  skCreateTrigger
   skDropTable
   skDropIndex
+  skDropTrigger
   skCreateView
   skDropView
   skAlterView
@@ -161,10 +173,21 @@ type Statement* = ref object
     indexKind*: SqlIndexKind
     unique*: bool
     indexPredicate*: Expr
+  of skCreateTrigger:
+    triggerName*: string
+    triggerTableName*: string
+    triggerForEachRow*: bool
+    triggerEventsMask*: int
+    triggerFunctionName*: string
+    triggerActionSql*: string
   of skDropTable:
     dropTableName*: string
   of skDropIndex:
     dropIndexName*: string
+  of skDropTrigger:
+    dropTriggerName*: string
+    dropTriggerTableName*: string
+    dropTriggerIfExists*: bool
   of skCreateView:
     createViewName*: string
     createViewIfNotExists*: bool
@@ -259,6 +282,31 @@ proc parseStatementNode(node: JsonNode): Result[Statement]
 proc selectToCanonicalSql(stmt: Statement): string
 proc parseSql*(sql: string): Result[SqlAst]
 
+proc parseTypeNameNode(typeNode: JsonNode): string =
+  var typeName = ""
+  if typeNode.kind == JObject:
+    let names = nodeGet(typeNode, "names")
+    if names.kind == JArray and names.len > 0:
+      typeName = nodeString(names[^1])
+      let typmods = nodeGet(typeNode, "typmods")
+      if typmods.kind == JArray and typmods.len > 0:
+        var mods: seq[string] = @[]
+        for m in typmods:
+          var n = m
+          if nodeHas(n, "A_Const"):
+            n = n["A_Const"]
+          if nodeHas(n, "val"):
+            n = n["val"]
+          if nodeHas(n, "Integer"):
+            n = n["Integer"]
+          if nodeHas(n, "ival"):
+            mods.add($n["ival"].getInt)
+          elif n.kind == JInt:
+            mods.add($n.getInt)
+        if mods.len > 0:
+          typeName.add("(" & mods.join(",") & ")")
+  typeName
+
 proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "isnull") and node["isnull"].getBool:
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svNull)))
@@ -323,6 +371,44 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
       if not argRes.ok:
         return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
       args.add(argRes.value)
+
+  let overNode = nodeGet(node, "over")
+  if overNode.kind == JObject:
+    if funcName != "ROW_NUMBER":
+      return err[Expr](ERR_SQL, "Only ROW_NUMBER window function is supported in 0.x", funcName)
+    if args.len > 0:
+      return err[Expr](ERR_SQL, "ROW_NUMBER does not take arguments in 0.x")
+
+    var partitions: seq[Expr] = @[]
+    let partitionNode = nodeGet(overNode, "partitionClause")
+    if partitionNode.kind == JArray:
+      for part in partitionNode:
+        let partRes = parseExprNode(part)
+        if not partRes.ok:
+          return err[Expr](partRes.err.code, partRes.err.message, partRes.err.context)
+        partitions.add(partRes.value)
+
+    var orderExprs: seq[Expr] = @[]
+    var orderAsc: seq[bool] = @[]
+    let orderNode = nodeGet(overNode, "orderClause")
+    if orderNode.kind == JArray:
+      for orderItem in orderNode:
+        var sortNode = orderItem
+        if nodeHas(sortNode, "SortBy"):
+          sortNode = sortNode["SortBy"]
+        let exprRes = parseExprNode(nodeGet(sortNode, "node"))
+        if not exprRes.ok:
+          return err[Expr](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+        let dir = nodeStringOr(sortNode, "sortby_dir", "SORTBY_DEFAULT")
+        orderExprs.add(exprRes.value)
+        orderAsc.add(dir != "SORTBY_DESC")
+
+    return ok(Expr(
+      kind: ekWindowRowNumber,
+      windowPartitions: partitions,
+      windowOrderExprs: orderExprs,
+      windowOrderAsc: orderAsc
+    ))
   let isStar = nodeHas(node, "agg_star") and node["agg_star"].getBool
   ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar))
 
@@ -1074,6 +1160,23 @@ proc exprToCanonicalSql*(expr: Expr): string =
     for item in expr.inList:
       parts.add(exprToCanonicalSql(item))
     "(" & exprToCanonicalSql(expr.inExpr) & " IN (" & parts.join(", ") & "))"
+  of ekWindowRowNumber:
+    var sqlText = "ROW_NUMBER() OVER ("
+    if expr.windowPartitions.len > 0:
+      var partSql: seq[string] = @[]
+      for p in expr.windowPartitions:
+        partSql.add(exprToCanonicalSql(p))
+      sqlText.add("PARTITION BY " & partSql.join(", "))
+      if expr.windowOrderExprs.len > 0:
+        sqlText.add(" ")
+    if expr.windowOrderExprs.len > 0:
+      var orderSql: seq[string] = @[]
+      for i, o in expr.windowOrderExprs:
+        let asc = if i < expr.windowOrderAsc.len: expr.windowOrderAsc[i] else: true
+        orderSql.add(exprToCanonicalSql(o) & (if asc: " ASC" else: " DESC"))
+      sqlText.add("ORDER BY " & orderSql.join(", "))
+    sqlText.add(")")
+    sqlText
 
 proc parseStandaloneExpr*(exprSql: string): Result[Expr] =
   let sqlText = "SELECT " & exprSql
@@ -1410,21 +1513,98 @@ proc parseDropStmt(node: JsonNode): Result[Statement] =
     return ok(Statement(kind: skDropIndex, dropIndexName: name))
   if removeType == "OBJECT_VIEW":
     return ok(Statement(kind: skDropView, dropViewName: name, dropViewIfExists: missingOk))
+  if removeType == "OBJECT_TRIGGER":
+    var tableName = ""
+    var triggerName = ""
+    if objects.kind == JArray and objects.len > 0:
+      let obj = objects[0]
+      if nodeHas(obj, "List"):
+        let items = nodeGet(obj["List"], "items")
+        if items.kind == JArray and items.len >= 2:
+          tableName = nodeString(items[0])
+          triggerName = nodeString(items[1])
+    return ok(Statement(
+      kind: skDropTrigger,
+      dropTriggerName: triggerName,
+      dropTriggerTableName: tableName,
+      dropTriggerIfExists: missingOk
+    ))
   if removeType == "OBJECT_TABLE":
     return ok(Statement(kind: skDropTable, dropTableName: name))
   err[Statement](ERR_SQL, "Unsupported DROP object type", removeType)
 
+proc parseCreateTrigStmt(node: JsonNode): Result[Statement] =
+  let triggerName = nodeGet(node, "trigname").getStr
+  let tableRes = parseRangeVar(nodeGet(node, "relation"))
+  if not tableRes.ok:
+    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let tableName = tableRes.value[0]
+
+  let rowMode = nodeHas(node, "row") and node["row"].kind == JBool and node["row"].getBool
+  var eventsMask = 0
+  let eventsNode = nodeGet(node, "events")
+  if eventsNode.kind == JInt:
+    eventsMask = eventsNode.getInt
+  elif eventsNode.kind == JString:
+    try:
+      eventsMask = parseInt(eventsNode.getStr)
+    except ValueError:
+      discard
+
+  if (eventsMask and TriggerEventTruncateMask) != 0:
+    return err[Statement](ERR_SQL, "TRUNCATE triggers are not supported in 0.x")
+
+  if nodeHas(node, "timing"):
+    let timingNode = node["timing"]
+    if timingNode.kind == JInt:
+      if timingNode.getInt != 0:
+        return err[Statement](ERR_SQL, "Only AFTER triggers are supported in 0.x")
+    elif timingNode.kind == JString:
+      let timing = timingNode.getStr
+      if timing.len > 0 and timing != "TRIGGER_TYPE_AFTER":
+        return err[Statement](ERR_SQL, "Only AFTER triggers are supported in 0.x")
+
+  let funcNameParts = nodeGet(node, "funcname")
+  var functionName = ""
+  if funcNameParts.kind == JArray and funcNameParts.len > 0:
+    functionName = nodeString(funcNameParts[^1])
+
+  let argNodes = nodeGet(node, "args")
+  var actionSql = ""
+  if argNodes.kind == JArray and argNodes.len > 0:
+    actionSql = nodeString(argNodes[0])
+
+  ok(Statement(
+    kind: skCreateTrigger,
+    triggerName: triggerName,
+    triggerTableName: tableName,
+    triggerForEachRow: rowMode,
+    triggerEventsMask: eventsMask,
+    triggerFunctionName: functionName,
+    triggerActionSql: actionSql
+  ))
+
 proc parseRenameStmt(node: JsonNode): Result[Statement] =
   let renameType = nodeGet(node, "renameType").getStr
-  if renameType != "OBJECT_VIEW":
-    return err[Statement](ERR_SQL, "Unsupported RENAME statement", renameType)
-  let viewRes = parseRangeVar(nodeGet(node, "relation"))
-  if not viewRes.ok:
-    return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
-  let newName = nodeGet(node, "newname").getStr
-  if newName.len == 0:
-    return err[Statement](ERR_SQL, "ALTER VIEW RENAME requires new name")
-  ok(Statement(kind: skAlterView, alterViewName: viewRes.value[0], alterViewNewName: newName))
+  if renameType == "OBJECT_VIEW":
+    let viewRes = parseRangeVar(nodeGet(node, "relation"))
+    if not viewRes.ok:
+      return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
+    let newName = nodeGet(node, "newname").getStr
+    if newName.len == 0:
+      return err[Statement](ERR_SQL, "ALTER VIEW RENAME requires new name")
+    return ok(Statement(kind: skAlterView, alterViewName: viewRes.value[0], alterViewNewName: newName))
+  if renameType == "OBJECT_COLUMN":
+    let tableRes = parseRangeVar(nodeGet(node, "relation"))
+    if not tableRes.ok:
+      return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let oldName = nodeGet(node, "subname").getStr
+    let newName = nodeGet(node, "newname").getStr
+    if oldName.len == 0 or newName.len == 0:
+      return err[Statement](ERR_SQL, "ALTER TABLE RENAME COLUMN requires old and new names")
+    let action = AlterTableAction(kind: ataRenameColumn, columnName: oldName, newColumnName: newName)
+    return ok(Statement(kind: skAlterTable, alterTableName: tableRes.value[0], alterActions: @[action]))
+  err[Statement](ERR_SQL, "Unsupported RENAME statement", renameType)
 
 proc parseTransactionStmt(node: JsonNode): Result[Statement] =
   let kindStr = nodeString(node["kind"])
@@ -1441,29 +1621,7 @@ proc parseTransactionStmt(node: JsonNode): Result[Statement] =
 
 proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
   let colName = nodeGet(node, "colname").getStr
-  let typeNode = nodeGet(node, "typeName")
-  var typeName = ""
-  if typeNode.kind == JObject:
-    let names = nodeGet(typeNode, "names")
-    if names.kind == JArray and names.len > 0:
-      typeName = nodeString(names[^1])
-      let typmods = nodeGet(typeNode, "typmods")
-      if typmods.kind == JArray and typmods.len > 0:
-        var mods: seq[string] = @[]
-        for m in typmods:
-          var n = m
-          if nodeHas(n, "A_Const"):
-            n = n["A_Const"]
-          if nodeHas(n, "val"):
-            n = n["val"]
-          if nodeHas(n, "Integer"):
-            n = n["Integer"]
-          if nodeHas(n, "ival"):
-            mods.add($n["ival"].getInt)
-          elif n.kind == JInt:
-            mods.add($n.getInt)
-        if mods.len > 0:
-          typeName.add("(" & mods.join(",") & ")")
+  let typeName = parseTypeNameNode(nodeGet(node, "typeName"))
   let notNull = nodeHas(node, "is_not_null") and node["is_not_null"].getBool
   let constraints = nodeGet(node, "constraints")
   var isPrimaryKey = false
@@ -1514,6 +1672,12 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
     of "AT_DropColumn":
       let colName = nodeGet(alterCmd, "name").getStr
       action = AlterTableAction(kind: ataDropColumn, columnName: colName)
+    of "AT_RenameColumn":
+      let oldName = nodeGet(alterCmd, "name").getStr
+      let newName = nodeGet(alterCmd, "newname").getStr
+      if oldName.len == 0 or newName.len == 0:
+        return err[Statement](ERR_SQL, "ALTER TABLE RENAME COLUMN requires old and new names")
+      action = AlterTableAction(kind: ataRenameColumn, columnName: oldName, newColumnName: newName)
     of "AT_ColumnDefault":
       let colName = nodeGet(alterCmd, "name").getStr
       if nodeHas(alterCmd, "def"):
@@ -1523,6 +1687,22 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
         action = AlterTableAction(kind: ataAlterColumn, columnName: colName, alterColumnAction: acaSetDefault, alterColumnDefault: defExpr.value)
       else:
         action = AlterTableAction(kind: ataAlterColumn, columnName: colName, alterColumnAction: acaDropDefault)
+    of "AT_AlterColumnType":
+      let colName = nodeGet(alterCmd, "name").getStr
+      var typeNode = nodeGet(alterCmd, "def")
+      if nodeHas(typeNode, "ColumnDef"):
+        typeNode = nodeGet(typeNode["ColumnDef"], "typeName")
+      elif nodeHas(typeNode, "TypeName"):
+        typeNode = typeNode["TypeName"]
+      let newType = parseTypeNameNode(typeNode).toUpperAscii()
+      if colName.len == 0 or newType.len == 0:
+        return err[Statement](ERR_SQL, "ALTER COLUMN TYPE requires column and target type")
+      action = AlterTableAction(
+        kind: ataAlterColumn,
+        columnName: colName,
+        alterColumnAction: acaSetType,
+        alterColumnNewType: newType
+      )
     else:
       return err[Statement](ERR_SQL, "Unsupported ALTER TABLE operation", subtype)
     actions.add(action)
@@ -1562,6 +1742,8 @@ proc parseStatementNode(node: JsonNode): Result[Statement] =
     return parseIndexStmt(node["IndexStmt"])
   if nodeHas(node, "ViewStmt"):
     return parseViewStmt(node["ViewStmt"])
+  if nodeHas(node, "CreateTrigStmt"):
+    return parseCreateTrigStmt(node["CreateTrigStmt"])
   if nodeHas(node, "DropStmt"):
     return parseDropStmt(node["DropStmt"])
   if nodeHas(node, "RenameStmt"):

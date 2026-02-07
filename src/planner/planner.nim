@@ -128,6 +128,11 @@ proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
     referencedTables(expr.inExpr, tablesOut)
     for item in expr.inList:
       referencedTables(item, tablesOut)
+  of ekWindowRowNumber:
+    for part in expr.windowPartitions:
+      referencedTables(part, tablesOut)
+    for o in expr.windowOrderExprs:
+      referencedTables(o, tablesOut)
   else:
     discard
 

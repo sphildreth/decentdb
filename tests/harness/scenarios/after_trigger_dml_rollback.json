@@ -1,0 +1,20 @@
+{
+  "name": "after_trigger_dml_rollback",
+  "description": "Crash during DML with AFTER trigger must not commit partial parent/trigger writes",
+  "db_path": "$TMPDIR/decentdb_after_trigger_dml_rollback.ddb",
+  "setup_sql": "CREATE TABLE src (id INT PRIMARY KEY); CREATE TABLE audit (tag TEXT); CREATE TRIGGER trg_i AFTER INSERT ON src FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''I'')')",
+  "sql": "INSERT INTO src VALUES (1)",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT COUNT(*) FROM src UNION ALL SELECT COUNT(*) FROM audit",
+    "expect_rows": [
+      "0",
+      "0"
+    ]
+  }
+}

@@ -105,6 +105,18 @@ suite "SQL Parser":
     check stmt.whereExpr != nil
     check stmt.whereExpr.kind == ekBinary
 
+  test "parse ROW_NUMBER window expression":
+    let stmt = parseSingle(
+      "SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id DESC) AS rn FROM t"
+    )
+    check stmt.kind == skSelect
+    check stmt.selectItems.len == 2
+    check stmt.selectItems[1].expr.kind == ekWindowRowNumber
+    check stmt.selectItems[1].expr.windowPartitions.len == 1
+    check stmt.selectItems[1].expr.windowOrderExprs.len == 1
+    check stmt.selectItems[1].expr.windowOrderAsc.len == 1
+    check stmt.selectItems[1].expr.windowOrderAsc[0] == false
+
   test "parse insert/update/delete":
     let ins = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x')")
     check ins.kind == skInsert
@@ -239,3 +251,38 @@ suite "SQL Parser":
     check av.kind == skAlterView
     check av.alterViewName == "v"
     check av.alterViewNewName == "v_new"
+
+    let rc = parseSingle("ALTER TABLE t RENAME COLUMN old_name TO new_name")
+    check rc.kind == skAlterTable
+    check rc.alterTableName == "t"
+    check rc.alterActions.len == 1
+    check rc.alterActions[0].kind == ataRenameColumn
+    check rc.alterActions[0].columnName == "old_name"
+    check rc.alterActions[0].newColumnName == "new_name"
+
+    let setType = parseSingle("ALTER TABLE t ALTER COLUMN amount TYPE FLOAT64")
+    check setType.kind == skAlterTable
+    check setType.alterTableName == "t"
+    check setType.alterActions.len == 1
+    check setType.alterActions[0].kind == ataAlterColumn
+    check setType.alterActions[0].columnName == "amount"
+    check setType.alterActions[0].alterColumnAction == acaSetType
+    check setType.alterActions[0].alterColumnNewType == "FLOAT64"
+
+    let trig = parseSingle(
+      "CREATE TRIGGER trg AFTER INSERT OR UPDATE ON t FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit(id) VALUES (1)')"
+    )
+    check trig.kind == skCreateTrigger
+    check trig.triggerName == "trg"
+    check trig.triggerTableName == "t"
+    check trig.triggerForEachRow
+    check (trig.triggerEventsMask and TriggerEventInsertMask) != 0
+    check (trig.triggerEventsMask and TriggerEventUpdateMask) != 0
+    check trig.triggerFunctionName == "decentdb_exec_sql"
+
+    let dropTrig = parseSingle("DROP TRIGGER IF EXISTS trg ON t")
+    check dropTrig.kind == skDropTrigger
+    check dropTrig.dropTriggerName == "trg"
+    check dropTrig.dropTriggerTableName == "t"
+    check dropTrig.dropTriggerIfExists

@@ -58,6 +58,12 @@ type ViewMeta* = object
   columnNames*: seq[string]
   dependencies*: seq[string]
 
+type TriggerMeta* = object
+  name*: string
+  table*: string
+  eventsMask*: int
+  actionSql*: string
+
 type IndexMeta* = object
   name*: string
   table*: string
@@ -75,6 +81,7 @@ type Catalog* = ref object
   tables*: Table[string, TableMeta]
   indexes*: Table[string, IndexMeta]
   views*: Table[string, ViewMeta]
+  triggers*: Table[string, TriggerMeta]
   dependentViews*: Table[string, HashSet[string]]
   catalogTree*: BTree
   trigramDeltas*: Table[(string, uint32), TrigramDelta]
@@ -83,12 +90,14 @@ type CatalogRecordKind = enum
   crTable
   crIndex
   crView
+  crTrigger
 
 type CatalogRecord = object
   kind: CatalogRecordKind
   table: TableMeta
   index: IndexMeta
   view: ViewMeta
+  trigger: TriggerMeta
 
 proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
   let raw = text.strip()
@@ -324,6 +333,16 @@ proc makeViewRecord(name: string, sqlText: string, columnNames: seq[string], dep
   ]
   encodeRecord(values)
 
+proc makeTriggerRecord(name: string, tableName: string, eventsMask: int, actionSql: string): seq[byte] =
+  let values = @[
+    Value(kind: vkText, bytes: stringToBytes("trigger")),
+    Value(kind: vkText, bytes: stringToBytes(name)),
+    Value(kind: vkText, bytes: stringToBytes(tableName)),
+    Value(kind: vkInt64, int64Val: int64(eventsMask)),
+    Value(kind: vkText, bytes: stringToBytes(actionSql))
+  ]
+  encodeRecord(values)
+
 proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
   let decoded = decodeRecord(data)
   if not decoded.ok:
@@ -393,10 +412,21 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let columnNames = if columnStr.len > 0: columnStr.split(";") else: @[]
     let dependencies = if depStr.len > 0: depStr.split(";") else: @[]
     return ok(CatalogRecord(kind: crView, view: ViewMeta(name: name, sqlText: sqlText, columnNames: columnNames, dependencies: dependencies)))
+  if recordType == "trigger":
+    if values.len < 5:
+      return err[CatalogRecord](ERR_CORRUPTION, "Trigger catalog record too short")
+    let name = bytesToString(values[1].bytes)
+    let tableName = bytesToString(values[2].bytes)
+    let eventsMask = int(values[3].int64Val)
+    let actionSql = bytesToString(values[4].bytes)
+    return ok(CatalogRecord(kind: crTrigger, trigger: TriggerMeta(name: name, table: tableName, eventsMask: eventsMask, actionSql: actionSql)))
   err[CatalogRecord](ERR_CORRUPTION, "Unknown catalog record type", recordType)
 
 proc normalizedObjectName(name: string): string =
   name.toLowerAscii()
+
+proc triggerMetaKey(tableName: string, triggerName: string): string =
+  normalizedObjectName(tableName) & ":" & normalizedObjectName(triggerName)
 
 proc rebuildDependentViewsIndex*(catalog: Catalog) =
   catalog.dependentViews = initTable[string, HashSet[string]]()
@@ -427,6 +457,7 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
     tables: initTable[string, TableMeta](),
     indexes: initTable[string, IndexMeta](),
     views: initTable[string, ViewMeta](),
+    triggers: initTable[string, TriggerMeta](),
     dependentViews: initTable[string, HashSet[string]](),
     catalogTree: tree,
     trigramDeltas: initTable[(string, uint32), TrigramDelta]()
@@ -455,6 +486,8 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
           catalog.indexes[record.index.name] = record.index
         of crView:
           catalog.views[record.view.name] = record.view
+        of crTrigger:
+          catalog.triggers[triggerMetaKey(record.trigger.table, record.trigger.name)] = record.trigger
   rebuildDependentViewsIndex(catalog)
   ok(catalog)
 
@@ -622,6 +655,47 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
 
+proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void] =
+  let keyName = triggerMetaKey(trigger.table, trigger.name)
+  if catalog.triggers.hasKey(keyName):
+    return err[Void](ERR_SQL, "Trigger already exists", trigger.table & "." & trigger.name)
+  catalog.triggers[keyName] = trigger
+  let key = uint64(crc32c(stringToBytes("trigger:" & trigger.table & ":" & trigger.name)))
+  let record = makeTriggerRecord(trigger.name, trigger.table, trigger.eventsMask, trigger.actionSql)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    catalog.triggers.del(keyName)
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void] =
+  let keyName = triggerMetaKey(tableName, triggerName)
+  if not catalog.triggers.hasKey(keyName):
+    return err[Void](ERR_SQL, "Trigger not found", tableName & "." & triggerName)
+  catalog.triggers.del(keyName)
+  let key = uint64(crc32c(stringToBytes("trigger:" & tableName & ":" & triggerName)))
+  let delRes = delete(catalog.catalogTree, key)
+  if not delRes.ok:
+    return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc hasTrigger*(catalog: Catalog, tableName: string, triggerName: string): bool =
+  catalog.triggers.hasKey(triggerMetaKey(tableName, triggerName))
+
+proc listTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int = 0): seq[TriggerMeta] =
+  let tableKey = normalizedObjectName(tableName)
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) != tableKey:
+      continue
+    if eventMask != 0 and (trigger.eventsMask and eventMask) == 0:
+      continue
+    result.add(trigger)
+  result.sort(proc(a, b: TriggerMeta): int = cmp(a.name, b.name))
+
 proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
   let key = normalizedObjectName(objectName)
   if not catalog.dependentViews.hasKey(key):
@@ -633,6 +707,14 @@ proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
 proc dropTable*(catalog: Catalog, name: string): Result[Void] =
   if not catalog.tables.hasKey(name):
     return err[Void](ERR_SQL, "Table not found", name)
+  var triggerNames: seq[string] = @[]
+  for _, trigger in catalog.triggers:
+    if normalizedObjectName(trigger.table) == normalizedObjectName(name):
+      triggerNames.add(trigger.name)
+  for triggerName in triggerNames:
+    let dropTrigRes = dropTrigger(catalog, name, triggerName)
+    if not dropTrigRes.ok:
+      return dropTrigRes
   catalog.tables.del(name)
   let key = uint64(crc32c(stringToBytes("table:" & name)))
   let delRes = delete(catalog.catalogTree, key)

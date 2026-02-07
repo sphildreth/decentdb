@@ -1649,6 +1649,27 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
 # Forward declaration
 proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil): Result[int64]
 
+const MaxTriggerExecutionDepth = 16
+var gTriggerExecutionDepth {.threadvar.}: int
+
+proc executeAfterTriggers(db: Db, tableName: string, eventMask: int, affectedRows: int64): Result[Void] =
+  if affectedRows <= 0:
+    return okVoid()
+  let triggers = db.catalog.listTriggersForTable(tableName, eventMask)
+  if triggers.len == 0:
+    return okVoid()
+  if gTriggerExecutionDepth >= MaxTriggerExecutionDepth:
+    return err[Void](ERR_SQL, "Trigger recursion depth exceeded", "max_depth=" & $MaxTriggerExecutionDepth)
+  gTriggerExecutionDepth.inc
+  defer:
+    gTriggerExecutionDepth.dec
+  for _ in 0 ..< int(affectedRows):
+    for trigger in triggers:
+      let execRes = execSql(db, trigger.actionSql, @[])
+      if not execRes.ok:
+        return err[Void](execRes.err.code, "Trigger action failed: " & execRes.err.message, trigger.name)
+  okVoid()
+
 proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] =
   if not prepared.db.isOpen:
     return err[seq[string]](ERR_INTERNAL, "Database not open")
@@ -1711,6 +1732,9 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
       let insertExecRes = execInsertStatement(db, bound, params)
       if not insertExecRes.ok:
         return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+      let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
+      if not triggerRes.ok:
+        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
       if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
         let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
         if not projectedRes.ok:
@@ -1728,7 +1752,7 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
        let execRes = execPreparedNonSelect(db, bound, params, plan)
        if not execRes.ok:
          return err[seq[string]](execRes.err.code, execRes.err.message, execRes.err.context)
-    of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skCreateView, skDropView, skAlterView, skAlterTable:
+    of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skAlterTable:
        # DDL invalidates prepared statements anyway
        return execSql(db, prepared.sql, params)
 
@@ -1907,7 +1931,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       output.add(parts.join("|"))
     ok(output)
   for i, bound in boundStatements:
-    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
+    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
     # stderr.writeLine("execSql: i=" & $i & " kind=" & $bound.kind & " isWrite=" & $isWrite)
     var autoCommit = false
     if isWrite and db.activeWriter == nil and db.wal != nil:
@@ -2125,6 +2149,30 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let bumpRes = schemaBump(db)
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    of skCreateTrigger:
+      let triggerMeta = TriggerMeta(
+        name: bound.triggerName,
+        table: bound.triggerTableName,
+        eventsMask: bound.triggerEventsMask,
+        actionSql: bound.triggerActionSql
+      )
+      let createRes = db.catalog.createTriggerMeta(triggerMeta)
+      if not createRes.ok:
+        return err[seq[string]](createRes.err.code, createRes.err.message, createRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    of skDropTrigger:
+      if not db.catalog.hasTrigger(bound.dropTriggerTableName, bound.dropTriggerName):
+        if not bound.dropTriggerIfExists:
+          return err[seq[string]](ERR_SQL, "Trigger not found", bound.dropTriggerTableName & "." & bound.dropTriggerName)
+      else:
+        let dropRes = db.catalog.dropTrigger(bound.dropTriggerTableName, bound.dropTriggerName)
+        if not dropRes.ok:
+          return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropIndex:
       let dropRes = db.catalog.dropIndex(bound.dropIndexName)
       if not dropRes.ok:
@@ -2185,6 +2233,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let insertExecRes = execInsertStatement(db, bound, params)
       if not insertExecRes.ok:
         return err[seq[string]](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
+      let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, if insertExecRes.value.affected: 1 else: 0)
+      if not triggerRes.ok:
+        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
       if bound.insertReturning.len > 0 and insertExecRes.value.row.isSome:
         let projectedRes = projectRows(@[insertExecRes.value.row.get], bound.insertReturning, params)
         if not projectedRes.ok:
@@ -2251,6 +2302,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
         if not upRes.ok:
           return err[seq[string]](upRes.err.code, upRes.err.message, upRes.err.context)
+      let triggerRes = executeAfterTriggers(db, bound.updateTable, TriggerEventUpdateMask, int64(updates.len))
+      if not triggerRes.ok:
+        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
     of skDelete:
       let tableRes = db.catalog.getTable(bound.deleteTable)
       if not tableRes.ok:
@@ -2277,6 +2331,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
         if not delRes.ok:
           return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
+      let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, int64(deletions.len))
+      if not triggerRes.ok:
+        return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
     of skExplain:
       if bound.explainInner.kind != skSelect:
         return err[seq[string]](ERR_SQL, "EXPLAIN currently supports SELECT only")
@@ -2452,7 +2509,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   if bound.kind == skSelect:
     return err[int64](ERR_INTERNAL, "execPreparedNonSelect called with SELECT")
 
-  let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
+  let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
   var autoCommit = false
   if isWrite and db.activeWriter == nil and db.wal != nil:
     let beginRes = beginTransaction(db)
@@ -2684,6 +2741,34 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
+  of skCreateTrigger:
+    let triggerMeta = TriggerMeta(
+      name: bound.triggerName,
+      table: bound.triggerTableName,
+      eventsMask: bound.triggerEventsMask,
+      actionSql: bound.triggerActionSql
+    )
+    let createRes = db.catalog.createTriggerMeta(triggerMeta)
+    if not createRes.ok:
+      return err[int64](createRes.err.code, createRes.err.message, createRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
+  of skDropTrigger:
+    if not db.catalog.hasTrigger(bound.dropTriggerTableName, bound.dropTriggerName):
+      if not bound.dropTriggerIfExists:
+        return err[int64](ERR_SQL, "Trigger not found", bound.dropTriggerTableName & "." & bound.dropTriggerName)
+    else:
+      let dropRes = db.catalog.dropTrigger(bound.dropTriggerTableName, bound.dropTriggerName)
+      if not dropRes.ok:
+        return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+    let bumpRes = schemaBump(db)
+    if not bumpRes.ok:
+      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    affected = 0
+
   of skCreateView:
     let dependencies = viewDependencies(bound.createViewQuery)
     let viewMeta = ViewMeta(
@@ -2744,6 +2829,9 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     if not insertExecRes.ok:
       return err[int64](insertExecRes.err.code, insertExecRes.err.message, insertExecRes.err.context)
     affected = if insertExecRes.value.affected: 1 else: 0
+    let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
+    if not triggerRes.ok:
+      return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
 
   of skUpdate:
     let fastRes = tryFastPkUpdate(db, bound, params)
@@ -2816,6 +2904,9 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
           return err[int64](upRes.err.code, upRes.err.message, upRes.err.context)
 
       affected = int64(updates.len)
+    let triggerRes = executeAfterTriggers(db, bound.updateTable, TriggerEventUpdateMask, affected)
+    if not triggerRes.ok:
+      return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
 
   of skDelete:
     let tableRes = db.catalog.getTable(bound.deleteTable)
@@ -2847,6 +2938,9 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         return err[int64](delRes.err.code, delRes.err.message, delRes.err.context)
 
     affected = int64(deletions.len)
+    let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, affected)
+    if not triggerRes.ok:
+      return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
 
   of skBegin:
     let beginRes = beginTransaction(db)

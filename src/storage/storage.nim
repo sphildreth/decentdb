@@ -1,6 +1,7 @@
 import options
 import tables
 import algorithm
+import strutils
 import ../errors
 import ../record/record
 import ../pager/pager
@@ -871,6 +872,174 @@ proc columnFromColumnDef(colDef: ColumnDef): Result[Column] =
 proc createNullValue(kind: ColumnType): Value =
   Value(kind: vkNull)
 
+proc stringToTextValue(text: string): Value =
+  var bytes: seq[byte] = @[]
+  for ch in text:
+    bytes.add(byte(ch))
+  Value(kind: vkText, bytes: bytes)
+
+proc valueToStringForAlter(value: Value): string =
+  case value.kind
+  of vkNull:
+    "NULL"
+  of vkBool:
+    if value.boolVal: "true" else: "false"
+  of vkInt64:
+    $value.int64Val
+  of vkFloat64:
+    $value.float64Val
+  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+    var s = ""
+    for b in value.bytes:
+      s.add(char(b))
+    s
+  else:
+    ""
+
+proc convertValueForAlter(value: Value, targetKind: ColumnType): Result[Value] =
+  if value.kind == vkNull:
+    return ok(Value(kind: vkNull))
+
+  case targetKind
+  of ctInt64:
+    case value.kind
+    of vkInt64:
+      return ok(value)
+    of vkFloat64:
+      return ok(Value(kind: vkInt64, int64Val: int64(value.float64Val)))
+    of vkBool:
+      return ok(Value(kind: vkInt64, int64Val: (if value.boolVal: 1 else: 0)))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToStringForAlter(value).strip()
+      try:
+        let parsed = parseBiggestInt(s)
+        return ok(Value(kind: vkInt64, int64Val: int64(parsed)))
+      except ValueError:
+        return err[Value](ERR_SQL, "Invalid type conversion text-to-int value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported type conversion source type")
+  of ctFloat64:
+    case value.kind
+    of vkFloat64:
+      return ok(value)
+    of vkInt64:
+      return ok(Value(kind: vkFloat64, float64Val: float64(value.int64Val)))
+    of vkBool:
+      return ok(Value(kind: vkFloat64, float64Val: (if value.boolVal: 1.0 else: 0.0)))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToStringForAlter(value).strip()
+      try:
+        return ok(Value(kind: vkFloat64, float64Val: parseFloat(s)))
+      except ValueError:
+        return err[Value](ERR_SQL, "Invalid type conversion text-to-float value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported type conversion source type")
+  of ctText:
+    return ok(stringToTextValue(valueToStringForAlter(value)))
+  of ctBool:
+    case value.kind
+    of vkBool:
+      return ok(value)
+    of vkInt64:
+      return ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
+    of vkFloat64:
+      return ok(Value(kind: vkBool, boolVal: value.float64Val != 0.0))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToStringForAlter(value).strip().toLowerAscii()
+      if s in ["true", "t", "1"]:
+        return ok(Value(kind: vkBool, boolVal: true))
+      if s in ["false", "f", "0"]:
+        return ok(Value(kind: vkBool, boolVal: false))
+      return err[Value](ERR_SQL, "Invalid type conversion text-to-bool value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported type conversion source type")
+  else:
+    return err[Value](ERR_SQL, "Unsupported type conversion target type", columnTypeToText(targetKind))
+
+proc alterColumnTypeInTable(pager: Pager, catalog: Catalog, table: var TableMeta, columnName: string, newTypeName: string): Result[Void] =
+  let originalTableMeta = table
+  var columnIndex = -1
+  for i, col in table.columns:
+    if col.name == columnName:
+      columnIndex = i
+      break
+  if columnIndex < 0:
+    return err[Void](ERR_SQL, "Column not found", columnName)
+
+  let targetTypeRes = parseColumnType(newTypeName)
+  if not targetTypeRes.ok:
+    return err[Void](targetTypeRes.err.code, targetTypeRes.err.message, targetTypeRes.err.context)
+  let targetSpec = targetTypeRes.value
+
+  if targetSpec.kind notin {ctInt64, ctFloat64, ctText, ctBool}:
+    return err[Void](ERR_SQL, "ALTER COLUMN TYPE target not supported in 0.x", newTypeName)
+  if table.columns[columnIndex].kind notin {ctInt64, ctFloat64, ctText, ctBool}:
+    return err[Void](ERR_SQL, "ALTER COLUMN TYPE source not supported in 0.x", columnName)
+
+  if table.columns[columnIndex].kind == targetSpec.kind and
+     table.columns[columnIndex].decPrecision == targetSpec.decPrecision and
+     table.columns[columnIndex].decScale == targetSpec.decScale:
+    return okVoid()
+
+  let oldTree = newBTree(pager, table.rootPage)
+  let cursorRes = openCursor(oldTree)
+  if not cursorRes.ok:
+    return err[Void](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
+
+  let newRootRes = initTableRoot(pager)
+  if not newRootRes.ok:
+    return err[Void](newRootRes.err.code, newRootRes.err.message, newRootRes.err.context)
+
+  let newRoot = newRootRes.value
+  var newTree = newBTree(pager, newRoot)
+  let cursor = cursorRes.value
+
+  while true:
+    let nextRes = cursorNext(cursor)
+    if not nextRes.ok:
+      break
+
+    let rowid = nextRes.value[0]
+    let valueBytes = nextRes.value[1]
+    let overflow = nextRes.value[2]
+    if valueBytes.len == 0 and overflow == 0'u32:
+      continue
+
+    let decoded = decodeRecordWithOverflow(pager, valueBytes)
+    if not decoded.ok:
+      return err[Void](decoded.err.code, decoded.err.message, decoded.err.context)
+    if columnIndex >= decoded.value.len:
+      return err[Void](ERR_CORRUPTION, "Row column count does not match table metadata", table.name)
+
+    var newValues = decoded.value
+    let convertedRes = convertValueForAlter(decoded.value[columnIndex], targetSpec.kind)
+    if not convertedRes.ok:
+      return err[Void](convertedRes.err.code, convertedRes.err.message, "rowid=" & $rowid & ",column=" & columnName)
+    newValues[columnIndex] = convertedRes.value
+
+    let normalizedRes = normalizeValues(pager, newValues)
+    if not normalizedRes.ok:
+      return err[Void](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+    let record = encodeRecord(normalizedRes.value)
+    let insertRes = insert(newTree, rowid, record)
+    if not insertRes.ok:
+      return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+
+  table.columns[columnIndex].kind = targetSpec.kind
+  table.columns[columnIndex].decPrecision = targetSpec.decPrecision
+  table.columns[columnIndex].decScale = targetSpec.decScale
+  table.rootPage = newRoot
+
+  # Rebuild indexes against the rewritten table contents and updated column type.
+  updateTableMeta(catalog, table)
+  for _, idx in catalog.indexes:
+    if idx.table == table.name:
+      let rebuildRes = rebuildIndex(pager, catalog, idx)
+      if not rebuildRes.ok:
+        updateTableMeta(catalog, originalTableMeta)
+        return rebuildRes
+  okVoid()
+
 proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, columnName: string): Result[Void] =
   var columnIndex = -1
   for i, col in table.columns:
@@ -1014,6 +1183,67 @@ proc addColumnToTable(pager: Pager, catalog: Catalog, table: var TableMeta, colD
   
   okVoid()
 
+proc renameColumnInTable(pager: Pager, catalog: Catalog, table: var TableMeta, oldName: string, newName: string): Result[Void] =
+  var oldIndex = -1
+  for i, col in table.columns:
+    if col.name == oldName:
+      oldIndex = i
+    if col.name == newName:
+      return err[Void](ERR_SQL, "Column already exists", newName)
+  if oldIndex < 0:
+    return err[Void](ERR_SQL, "Column not found", oldName)
+
+  table.columns[oldIndex].name = newName
+  for col in table.columns.mitems:
+    if col.refTable == table.name and col.refColumn == oldName:
+      col.refColumn = newName
+
+  var updatedIndexes: seq[IndexMeta] = @[]
+  for _, idx in catalog.indexes:
+    if idx.table != table.name:
+      continue
+    var changed = false
+    var meta = idx
+    for idxCol in meta.columns.mitems:
+      if idxCol == oldName:
+        idxCol = newName
+        changed = true
+    if meta.predicateSql.len > 0:
+      let oldPredBare = oldName & " IS NOT NULL"
+      let newPredBare = newName & " IS NOT NULL"
+      let oldPredParen = "(" & oldName & " IS NOT NULL)"
+      let newPredParen = "(" & newName & " IS NOT NULL)"
+      if meta.predicateSql == oldPredBare:
+        meta.predicateSql = newPredBare
+        changed = true
+      elif meta.predicateSql == oldPredParen:
+        meta.predicateSql = newPredParen
+        changed = true
+    if changed:
+      updatedIndexes.add(meta)
+
+  for idxMeta in updatedIndexes:
+    let saveIdxRes = saveIndexMeta(catalog, idxMeta)
+    if not saveIdxRes.ok:
+      return saveIdxRes
+
+  var tableNames: seq[string] = @[]
+  for tableName, _ in catalog.tables:
+    if tableName != table.name:
+      tableNames.add(tableName)
+  for tableName in tableNames:
+    var other = catalog.tables[tableName]
+    var changed = false
+    for col in other.columns.mitems:
+      if col.refTable == table.name and col.refColumn == oldName:
+        col.refColumn = newName
+        changed = true
+    if changed:
+      let saveRes = saveTable(catalog, pager, other)
+      if not saveRes.ok:
+        return saveRes
+  okVoid()
+
 proc alterTable*(pager: Pager, catalog: Catalog, tableName: string, actions: seq[AlterTableAction]): Result[Void] =
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
@@ -1034,6 +1264,20 @@ proc alterTable*(pager: Pager, catalog: Catalog, tableName: string, actions: seq
       let dropRes = dropColumnFromTable(pager, catalog, table, action.columnName)
       if not dropRes.ok:
         return dropRes
+
+    of ataRenameColumn:
+      let renameRes = renameColumnInTable(pager, catalog, table, action.columnName, action.newColumnName)
+      if not renameRes.ok:
+        return renameRes
+
+    of ataAlterColumn:
+      case action.alterColumnAction
+      of acaSetType:
+        let alterRes = alterColumnTypeInTable(pager, catalog, table, action.columnName, action.alterColumnNewType)
+        if not alterRes.ok:
+          return alterRes
+      else:
+        return err[Void](ERR_INTERNAL, "ALTER TABLE ALTER COLUMN action not yet supported", $action.alterColumnAction)
     
     else:
       return err[Void](ERR_INTERNAL, "ALTER TABLE action not yet supported", $action.kind)

@@ -430,3 +430,162 @@ suite "Binder":
     check not cycleReplace.ok
 
     discard closeDb(db)
+
+  test "bind ALTER TABLE RENAME COLUMN constraints":
+    let path = makeTempDb("decentdb_binder_rename_column.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64), Column(name: "name", kind: ctText)])
+
+    let okRename = bindStatement(db.catalog, parseSingle("ALTER TABLE t RENAME COLUMN name TO full_name"))
+    check okRename.ok
+
+    let missing = bindStatement(db.catalog, parseSingle("ALTER TABLE t RENAME COLUMN missing TO full_name"))
+    check not missing.ok
+
+    let exists = bindStatement(db.catalog, parseSingle("ALTER TABLE t RENAME COLUMN name TO id"))
+    check not exists.ok
+
+    discard addView(db, "tv", "SELECT id FROM t", @["id"], @["t"])
+    let blockedByView = bindStatement(db.catalog, parseSingle("ALTER TABLE t RENAME COLUMN name TO full_name"))
+    check not blockedByView.ok
+
+    discard closeDb(db)
+
+  test "bind ALTER TABLE ALTER COLUMN TYPE constraints":
+    let path = makeTempDb("decentdb_binder_alter_column_type.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(
+      db,
+      "parent",
+      @[
+        Column(name: "id", kind: ctInt64, primaryKey: true),
+        Column(name: "code", kind: ctText, unique: true)
+      ]
+    )
+    discard addTable(
+      db,
+      "child",
+      @[
+        Column(name: "id", kind: ctInt64, primaryKey: true),
+        Column(name: "parent_id", kind: ctInt64, refTable: "parent", refColumn: "id"),
+        Column(name: "code_ref", kind: ctText, refTable: "parent", refColumn: "code")
+      ]
+    )
+
+    let okSetType = bindStatement(db.catalog, parseSingle("ALTER TABLE parent ALTER COLUMN code TYPE INT"))
+    check not okSetType.ok
+
+    let blockedPk = bindStatement(db.catalog, parseSingle("ALTER TABLE parent ALTER COLUMN id TYPE TEXT"))
+    check not blockedPk.ok
+
+    let blockedReferenced = bindStatement(db.catalog, parseSingle("ALTER TABLE parent ALTER COLUMN code TYPE BOOL"))
+    check not blockedReferenced.ok
+
+    let blockedFkChild = bindStatement(db.catalog, parseSingle("ALTER TABLE child ALTER COLUMN parent_id TYPE TEXT"))
+    check not blockedFkChild.ok
+
+    let badTarget = bindStatement(db.catalog, parseSingle("ALTER TABLE child ALTER COLUMN code_ref TYPE BLOB"))
+    check not badTarget.ok
+
+    discard addTable(db, "isolated", @[Column(name: "v", kind: ctText)])
+    let isolatedOk = bindStatement(db.catalog, parseSingle("ALTER TABLE isolated ALTER COLUMN v TYPE BOOL"))
+    check isolatedOk.ok
+
+    discard closeDb(db)
+
+  test "bind CREATE/DROP TRIGGER constraints":
+    let path = makeTempDb("decentdb_binder_triggers.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64)])
+    discard addTable(db, "audit", @[Column(name: "id", kind: ctInt64)])
+
+    let okTrigger = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW " &
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES (1)')"
+      )
+    )
+    check okTrigger.ok
+
+    let badFn = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg2 AFTER INSERT ON t FOR EACH ROW " &
+        "EXECUTE FUNCTION other_fn('INSERT INTO audit (id) VALUES (1)')"
+      )
+    )
+    check not badFn.ok
+
+    let stmtLevel = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg3 AFTER INSERT ON t FOR EACH STATEMENT " &
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES (1)')"
+      )
+    )
+    check not stmtLevel.ok
+
+    let badActionKind = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg4 AFTER INSERT ON t FOR EACH ROW " &
+        "EXECUTE FUNCTION decentdb_exec_sql('SELECT id FROM t')"
+      )
+    )
+    check not badActionKind.ok
+
+    let actionWithParams = bindStatement(
+      db.catalog,
+      parseSingle(
+        "CREATE TRIGGER trg5 AFTER INSERT ON t FOR EACH ROW " &
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES ($1)')"
+      )
+    )
+    check not actionWithParams.ok
+
+    check db.catalog.createTriggerMeta(TriggerMeta(name: "existing", table: "t", eventsMask: TriggerEventInsertMask, actionSql: "INSERT INTO audit (id) VALUES (9)")).ok
+    let dropOk = bindStatement(db.catalog, parseSingle("DROP TRIGGER existing ON t"))
+    check dropOk.ok
+    let dropMissing = bindStatement(db.catalog, parseSingle("DROP TRIGGER missing ON t"))
+    check not dropMissing.ok
+    let dropMissingIf = bindStatement(db.catalog, parseSingle("DROP TRIGGER IF EXISTS missing ON t"))
+    check dropMissingIf.ok
+
+    discard closeDb(db)
+
+  test "bind ROW_NUMBER window subset constraints":
+    let path = makeTempDb("decentdb_binder_window_row_number.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64), Column(name: "grp", kind: ctText)])
+
+    let okWindow = bindStatement(
+      db.catalog,
+      parseSingle("SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn FROM t")
+    )
+    check okWindow.ok
+
+    let missingOrder = bindStatement(
+      db.catalog,
+      parseSingle("SELECT ROW_NUMBER() OVER (PARTITION BY grp) FROM t")
+    )
+    check not missingOrder.ok
+
+    let windowInWhere = bindStatement(
+      db.catalog,
+      parseSingle("SELECT id FROM t WHERE ROW_NUMBER() OVER (ORDER BY id) > 1")
+    )
+    check not windowInWhere.ok
+
+    discard closeDb(db)

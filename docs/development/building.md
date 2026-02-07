@@ -332,8 +332,8 @@ Before creating a release:
 4. [ ] Documentation built
 5. [ ] Binaries built for all platforms
 6. [ ] Version bumped (e.g. `0.0.1` -> `0.0.2`) and changelog updated
-7. [ ] Git tag created: `git tag -a v0.0.1 -m "Release 0.0.1"`
-8. [ ] Tag pushed: `git push origin v0.0.1`
+7. [ ] Git tag created: `git tag -a v0.1.1 -m "DecentDb 0.1.1 (NuGet 1.0.0-rc.1)"`
+8. [ ] Tag pushed: `git push origin v0.1.1`
 
 ## Next Steps
 

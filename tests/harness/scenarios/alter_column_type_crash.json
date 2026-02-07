@@ -1,0 +1,20 @@
+{
+  "name": "alter_column_type_crash",
+  "description": "Crash during ALTER TABLE ALTER COLUMN TYPE should not leave partial schema/data",
+  "db_path": "$TMPDIR/decentdb_alter_column_type_crash.ddb",
+  "setup_sql": "CREATE TABLE t (id INT PRIMARY KEY, val TEXT); INSERT INTO t VALUES (1, '10'); INSERT INTO t VALUES (2, '20')",
+  "sql": "ALTER TABLE t ALTER COLUMN val TYPE INT",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id, val FROM t ORDER BY id",
+    "expect_rows": [
+      "1|10",
+      "2|20"
+    ]
+  }
+}

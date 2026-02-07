@@ -67,6 +67,19 @@ proc cloneExpr(expr: Expr): Expr =
     for item in expr.inList:
       listExprs.add(cloneExpr(item))
     Expr(kind: ekInList, inExpr: cloneExpr(expr.inExpr), inList: listExprs)
+  of ekWindowRowNumber:
+    var partitions: seq[Expr] = @[]
+    for part in expr.windowPartitions:
+      partitions.add(cloneExpr(part))
+    var orderExprs: seq[Expr] = @[]
+    for o in expr.windowOrderExprs:
+      orderExprs.add(cloneExpr(o))
+    Expr(
+      kind: ekWindowRowNumber,
+      windowPartitions: partitions,
+      windowOrderExprs: orderExprs,
+      windowOrderAsc: expr.windowOrderAsc
+    )
 
 proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
   if expr == nil:
@@ -100,6 +113,19 @@ proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
     for item in expr.inList:
       listExprs.add(qualifyInsertConflictExpr(item, tableName))
     Expr(kind: ekInList, inExpr: qualifyInsertConflictExpr(expr.inExpr, tableName), inList: listExprs)
+  of ekWindowRowNumber:
+    var partitions: seq[Expr] = @[]
+    for part in expr.windowPartitions:
+      partitions.add(qualifyInsertConflictExpr(part, tableName))
+    var orderExprs: seq[Expr] = @[]
+    for o in expr.windowOrderExprs:
+      orderExprs.add(qualifyInsertConflictExpr(o, tableName))
+    Expr(
+      kind: ekWindowRowNumber,
+      windowPartitions: partitions,
+      windowOrderExprs: orderExprs,
+      windowOrderAsc: expr.windowOrderAsc
+    )
 
 proc cloneSelectItem(item: SelectItem): SelectItem =
   SelectItem(expr: cloneExpr(item.expr), alias: item.alias, isStar: item.isStar)
@@ -182,6 +208,11 @@ proc countExprNodes(expr: Expr): int =
     result += countExprNodes(expr.inExpr)
     for item in expr.inList:
       result += countExprNodes(item)
+  of ekWindowRowNumber:
+    for part in expr.windowPartitions:
+      result += countExprNodes(part)
+    for o in expr.windowOrderExprs:
+      result += countExprNodes(o)
   else:
     discard
 
@@ -239,10 +270,43 @@ proc hasParamsInExpr(expr: Expr): bool =
       if hasParamsInExpr(item):
         return true
     false
+  of ekWindowRowNumber:
+    for part in expr.windowPartitions:
+      if hasParamsInExpr(part):
+        return true
+    for o in expr.windowOrderExprs:
+      if hasParamsInExpr(o):
+        return true
+    false
   of ekLiteral:
     expr.value.kind == svParam
   else:
     false
+
+proc hasWindowInExpr(expr: Expr): bool =
+  if expr == nil:
+    return false
+  case expr.kind
+  of ekWindowRowNumber:
+    return true
+  of ekBinary:
+    return hasWindowInExpr(expr.left) or hasWindowInExpr(expr.right)
+  of ekUnary:
+    return hasWindowInExpr(expr.expr)
+  of ekFunc:
+    for arg in expr.args:
+      if hasWindowInExpr(arg):
+        return true
+    return false
+  of ekInList:
+    if hasWindowInExpr(expr.inExpr):
+      return true
+    for item in expr.inList:
+      if hasWindowInExpr(item):
+        return true
+    return false
+  else:
+    return false
 
 proc hasParamsInSelect(stmt: Statement): bool =
   for query in stmt.cteQueries:
@@ -269,6 +333,33 @@ proc hasParamsInSelect(stmt: Statement): bool =
     if hasParamsInExpr(item.expr):
       return true
   stmt.limitParam > 0 or stmt.offsetParam > 0
+
+proc hasParamsInDmlStatement(stmt: Statement): bool =
+  case stmt.kind
+  of skInsert:
+    for expr in stmt.insertValues:
+      if hasParamsInExpr(expr):
+        return true
+    if hasParamsInExpr(stmt.insertConflictUpdateWhere):
+      return true
+    for _, expr in stmt.insertConflictUpdateAssignments:
+      if hasParamsInExpr(expr):
+        return true
+    for item in stmt.insertReturning:
+      if not item.isStar and hasParamsInExpr(item.expr):
+        return true
+    false
+  of skUpdate:
+    if hasParamsInExpr(stmt.updateWhere):
+      return true
+    for _, expr in stmt.assignments:
+      if hasParamsInExpr(expr):
+        return true
+    false
+  of skDelete:
+    hasParamsInExpr(stmt.deleteWhere)
+  else:
+    false
 
 proc buildTableMap(catalog: Catalog, fromTable: string, fromAlias: string, joins: seq[JoinClause]): Result[Table[string, TableMeta]] =
   var map = initTable[string, TableMeta]()
@@ -342,6 +433,20 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
       if not itemRes.ok:
         return itemRes
     okVoid()
+  of ekWindowRowNumber:
+    for part in expr.windowPartitions:
+      let partRes = bindExpr(map, part)
+      if not partRes.ok:
+        return partRes
+    if expr.windowOrderExprs.len == 0:
+      return err[Void](ERR_SQL, "ROW_NUMBER window requires ORDER BY in 0.x")
+    if expr.windowOrderAsc.len != expr.windowOrderExprs.len:
+      return err[Void](ERR_SQL, "ROW_NUMBER window ORDER BY metadata mismatch")
+    for o in expr.windowOrderExprs:
+      let orderRes = bindExpr(map, o)
+      if not orderRes.ok:
+        return orderRes
+    okVoid()
   else:
     okVoid()
 
@@ -381,6 +486,8 @@ proc validateCheckExpr(expr: Expr): Result[Void] =
       if not itemRes.ok:
         return itemRes
     return okVoid()
+  of ekWindowRowNumber:
+    return err[Void](ERR_SQL, "CHECK expression cannot use window functions")
   else:
     return okVoid()
 
@@ -595,6 +702,25 @@ proc rewriteExprForViewRef(
         return err[Expr](itemRes.err.code, itemRes.err.message, itemRes.err.context)
       listExprs.add(itemRes.value)
     ok(Expr(kind: ekInList, inExpr: inExprRes.value, inList: listExprs))
+  of ekWindowRowNumber:
+    var partitions: seq[Expr] = @[]
+    for part in expr.windowPartitions:
+      let partRes = rewriteExprForViewRef(part, refTable, refAlias, columnMap, allowUnqualified)
+      if not partRes.ok:
+        return err[Expr](partRes.err.code, partRes.err.message, partRes.err.context)
+      partitions.add(partRes.value)
+    var orderExprs: seq[Expr] = @[]
+    for o in expr.windowOrderExprs:
+      let orderRes = rewriteExprForViewRef(o, refTable, refAlias, columnMap, allowUnqualified)
+      if not orderRes.ok:
+        return err[Expr](orderRes.err.code, orderRes.err.message, orderRes.err.context)
+      orderExprs.add(orderRes.value)
+    ok(Expr(
+      kind: ekWindowRowNumber,
+      windowPartitions: partitions,
+      windowOrderExprs: orderExprs,
+      windowOrderAsc: expr.windowOrderAsc
+    ))
   else:
     ok(cloneExpr(expr))
 
@@ -1041,24 +1167,37 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
   for item in expanded.selectItems:
     if item.isStar:
       continue
+    if hasWindowInExpr(item.expr):
+      if item.expr.kind != ekWindowRowNumber:
+        return err[Statement](ERR_SQL, "Only top-level ROW_NUMBER window expressions are supported in 0.x")
     let res = bindExpr(map, item.expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
+  if hasWindowInExpr(expanded.whereExpr):
+    return err[Statement](ERR_SQL, "Window functions are not allowed in WHERE in 0.x")
   let whereRes = bindExpr(map, expanded.whereExpr)
   if not whereRes.ok:
     return err[Statement](whereRes.err.code, whereRes.err.message, whereRes.err.context)
   for join in expanded.joins:
+    if hasWindowInExpr(join.onExpr):
+      return err[Statement](ERR_SQL, "Window functions are not allowed in JOIN predicates in 0.x")
     let onRes = bindExpr(map, join.onExpr)
     if not onRes.ok:
       return err[Statement](onRes.err.code, onRes.err.message, onRes.err.context)
   for expr in expanded.groupBy:
+    if hasWindowInExpr(expr):
+      return err[Statement](ERR_SQL, "Window functions are not allowed in GROUP BY in 0.x")
     let res = bindExpr(map, expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
+  if hasWindowInExpr(expanded.havingExpr):
+    return err[Statement](ERR_SQL, "Window functions are not allowed in HAVING in 0.x")
   let havingRes = bindExpr(map, expanded.havingExpr)
   if not havingRes.ok:
     return err[Statement](havingRes.err.code, havingRes.err.message, havingRes.err.context)
   for item in expanded.orderBy:
+    if hasWindowInExpr(item.expr):
+      return err[Statement](ERR_SQL, "Window functions are not allowed in ORDER BY in 0.x")
     let res = bindExpr(map, item.expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
@@ -1485,6 +1624,7 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
   let table = tableRes.value
   if table.checks.len > 0:
     return err[Statement](ERR_SQL, "ALTER TABLE on tables with CHECK constraints is not supported in 0.x", stmt.alterTableName)
+  let dependentViews = catalog.listDependentViews(stmt.alterTableName)
   for action in stmt.alterActions:
     case action.kind
     of ataAddColumn:
@@ -1510,16 +1650,99 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
           break
       if not found:
         return err[Statement](ERR_SQL, "Column does not exist", action.columnName)
+    of ataRenameColumn:
+      if dependentViews.len > 0:
+        return err[Statement](ERR_SQL, "Cannot rename column on table with dependent views", stmt.alterTableName)
+      var oldFound = false
+      var newFound = false
+      for col in table.columns:
+        if col.name == action.columnName:
+          oldFound = true
+        if col.name == action.newColumnName:
+          newFound = true
+      if not oldFound:
+        return err[Statement](ERR_SQL, "Column does not exist", action.columnName)
+      if newFound:
+        return err[Statement](ERR_SQL, "Column already exists", action.newColumnName)
     of ataAlterColumn:
       var found = false
+      var foundCol = Column()
       for col in table.columns:
         if col.name == action.columnName:
           found = true
+          foundCol = col
           break
       if not found:
         return err[Statement](ERR_SQL, "Column does not exist", action.columnName)
+      if action.alterColumnAction == acaSetType:
+        if foundCol.primaryKey:
+          return err[Statement](ERR_SQL, "Cannot alter type of PRIMARY KEY column", action.columnName)
+        if foundCol.refTable.len > 0 and foundCol.refColumn.len > 0:
+          return err[Statement](ERR_SQL, "Cannot alter type of FOREIGN KEY child column", action.columnName)
+        for otherTableName, otherTable in catalog.tables:
+          for otherCol in otherTable.columns:
+            if otherCol.refTable == stmt.alterTableName and otherCol.refColumn == action.columnName:
+              return err[Statement](ERR_SQL, "Cannot alter type of column referenced by FOREIGN KEY", stmt.alterTableName & "." & action.columnName)
+        let targetTypeRes = parseColumnType(action.alterColumnNewType)
+        if not targetTypeRes.ok:
+          return err[Statement](targetTypeRes.err.code, targetTypeRes.err.message, targetTypeRes.err.context)
+        if targetTypeRes.value.kind notin {ctInt64, ctFloat64, ctText, ctBool}:
+          return err[Statement](ERR_SQL, "ALTER COLUMN TYPE target not supported in 0.x", action.alterColumnNewType)
+        if foundCol.kind notin {ctInt64, ctFloat64, ctText, ctBool}:
+          return err[Statement](ERR_SQL, "ALTER COLUMN TYPE source not supported in 0.x", action.columnName)
     else:
       return err[Statement](ERR_SQL, "Unsupported ALTER TABLE action")
+  ok(stmt)
+
+proc bindCreateTrigger(catalog: Catalog, stmt: Statement): Result[Statement] =
+  let tableRes = catalog.getTable(stmt.triggerTableName)
+  if not tableRes.ok:
+    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+
+  if stmt.triggerName.len == 0:
+    return err[Statement](ERR_SQL, "Trigger name is required")
+  if not stmt.triggerForEachRow:
+    return err[Statement](ERR_SQL, "FOR EACH STATEMENT triggers are not supported in 0.x")
+  if (stmt.triggerEventsMask and (TriggerEventInsertMask or TriggerEventUpdateMask or TriggerEventDeleteMask)) == 0:
+    return err[Statement](ERR_SQL, "Trigger must include INSERT, UPDATE, or DELETE event")
+
+  let fn = stmt.triggerFunctionName.toLowerAscii()
+  if fn != "decentdb_exec_sql":
+    return err[Statement](ERR_SQL, "Only decentdb_exec_sql trigger action function is supported in 0.x", stmt.triggerFunctionName)
+  if stmt.triggerActionSql.len == 0:
+    return err[Statement](ERR_SQL, "Trigger action SQL is required")
+  if catalog.hasTrigger(stmt.triggerTableName, stmt.triggerName):
+    return err[Statement](ERR_SQL, "Trigger already exists", stmt.triggerTableName & "." & stmt.triggerName)
+
+  let parseRes = parseSql(stmt.triggerActionSql)
+  if not parseRes.ok:
+    return err[Statement](parseRes.err.code, "Invalid trigger action SQL: " & parseRes.err.message, parseRes.err.context)
+  if parseRes.value.statements.len != 1:
+    return err[Statement](ERR_SQL, "Trigger action must contain exactly one statement")
+  let actionStmt = parseRes.value.statements[0]
+  if actionStmt.kind notin {skInsert, skUpdate, skDelete}:
+    return err[Statement](ERR_SQL, "Trigger action must be INSERT, UPDATE, or DELETE in 0.x")
+  if actionStmt.kind == skInsert and actionStmt.insertReturning.len > 0:
+    return err[Statement](ERR_SQL, "Trigger action INSERT ... RETURNING is not supported in 0.x")
+  if hasParamsInDmlStatement(actionStmt):
+    return err[Statement](ERR_SQL, "Trigger action cannot use parameters in 0.x")
+
+  let boundAction = bindStatement(catalog, actionStmt)
+  if not boundAction.ok:
+    return err[Statement](boundAction.err.code, "Invalid trigger action SQL: " & boundAction.err.message, boundAction.err.context)
+
+  ok(stmt)
+
+proc bindDropTrigger(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if stmt.dropTriggerName.len == 0 or stmt.dropTriggerTableName.len == 0:
+    return err[Statement](ERR_SQL, "DROP TRIGGER requires trigger name and table")
+  let tableRes = catalog.getTable(stmt.dropTriggerTableName)
+  if not tableRes.ok:
+    return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  if not catalog.hasTrigger(stmt.dropTriggerTableName, stmt.dropTriggerName):
+    if stmt.dropTriggerIfExists:
+      return ok(stmt)
+    return err[Statement](ERR_SQL, "Trigger not found", stmt.dropTriggerTableName & "." & stmt.dropTriggerName)
   ok(stmt)
 
 proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
@@ -1536,12 +1759,16 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     bindCreateTable(catalog, stmt)
   of skCreateIndex:
     bindCreateIndex(catalog, stmt)
+  of skCreateTrigger:
+    bindCreateTrigger(catalog, stmt)
   of skCreateView:
     bindCreateView(catalog, stmt)
   of skDropTable:
     bindDropTable(catalog, stmt)
   of skDropIndex:
     ok(stmt)
+  of skDropTrigger:
+    bindDropTrigger(catalog, stmt)
   of skDropView:
     bindDropView(catalog, stmt)
   of skAlterView:

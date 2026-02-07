@@ -783,6 +783,37 @@ suite "Planner":
 
     discard closeDb(db)
 
+  test "ROW_NUMBER window function subset":
+    let path = makeTempDb("decentdb_sql_window_row_number.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'a')").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'a')").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 'b')").ok
+    check execSql(db, "INSERT INTO t VALUES (4, 'a')").ok
+
+    let winRes = execSql(
+      db,
+      "SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn FROM t ORDER BY id"
+    )
+    check winRes.ok
+    check winRes.value == @["1|1", "2|2", "3|1", "4|3"]
+
+    let descRes = execSql(
+      db,
+      "SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id DESC) AS rn FROM t WHERE grp = 'a' ORDER BY id"
+    )
+    check descRes.ok
+    check descRes.value == @["1|3", "2|2", "4|1"]
+
+    let badWindow = execSql(db, "SELECT ROW_NUMBER() OVER (PARTITION BY grp) FROM t")
+    check not badWindow.ok
+
+    discard closeDb(db)
+
   test "partial index (IS NOT NULL) maintenance and planning":
     let path = makeTempDb("decentdb_sql_partial_index.db")
     let dbRes = openDb(path)
@@ -845,6 +876,74 @@ suite "Planner":
 
     let badTrgm = execSql(db, "CREATE INDEX t_txt_partial_trgm ON t USING trigram (txt) WHERE txt IS NOT NULL")
     check not badTrgm.ok
+
+    discard closeDb(db)
+
+  test "AFTER triggers fire per-row for INSERT/UPDATE/DELETE and DROP TRIGGER stops firing":
+    let path = makeTempDb("decentdb_sql_after_triggers.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE src (id INT PRIMARY KEY, val INT)").ok
+    check execSql(db, "CREATE TABLE audit (tag TEXT)").ok
+
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_i AFTER INSERT ON src FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''I'')')"
+    ).ok
+    check execSql(db, "INSERT INTO src VALUES (1, 10)").ok
+    check execSql(db, "INSERT INTO src VALUES (2, 20)").ok
+
+    check execSql(db, "DROP TRIGGER trg_i ON src").ok
+    check execSql(db, "INSERT INTO src VALUES (3, 30)").ok
+
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_u AFTER UPDATE ON src FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''U'')')"
+    ).ok
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_d AFTER DELETE ON src FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (tag) VALUES (''D'')')"
+    ).ok
+
+    check execSql(db, "UPDATE src SET val = val + 1").ok
+    check execSql(db, "DELETE FROM src WHERE id IN (1, 2)").ok
+
+    let auditRes = execSql(db, "SELECT tag, COUNT(*) FROM audit GROUP BY tag ORDER BY tag")
+    check auditRes.ok
+    check auditRes.value.toHashSet == toHashSet(@["D|2", "I|2", "U|3"])
+
+    discard closeDb(db)
+
+  test "trigger action failure aborts parent DML statement":
+    let path = makeTempDb("decentdb_sql_trigger_failure_rollback.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)").ok
+    check execSql(db, "CREATE TABLE audit (id INT PRIMARY KEY)").ok
+    check execSql(
+      db,
+      "CREATE TRIGGER trg_fail AFTER INSERT ON src FOR EACH ROW " &
+      "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit (id) VALUES (1)')"
+    ).ok
+
+    check execSql(db, "INSERT INTO src VALUES (1)").ok
+    let failInsert = execSql(db, "INSERT INTO src VALUES (2)")
+    check not failInsert.ok
+
+    let srcRows = execSql(db, "SELECT id FROM src ORDER BY id")
+    check srcRows.ok
+    check srcRows.value == @["1"]
+
+    let auditRows = execSql(db, "SELECT id FROM audit ORDER BY id")
+    check auditRows.ok
+    check auditRows.value == @["1"]
 
     discard closeDb(db)
   

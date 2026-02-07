@@ -587,10 +587,17 @@ Define error categories:
 - Writing to older formats may trigger automatic upgrade (with user confirmation)
 
 ### 15.3 Schema changes (0.x baseline)
-- Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
-- ALTER TABLE operations: ADD COLUMN, DROP COLUMN
+- Supported: CREATE TABLE, CREATE INDEX, CREATE TRIGGER, DROP TABLE, DROP INDEX, DROP TRIGGER, ALTER TABLE
+- ALTER TABLE operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, ALTER COLUMN TYPE
   - Current v0 limitation: ALTER TABLE operations are rejected on tables that define CHECK constraints
-- Not supported (post-1.0): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
+  - `RENAME COLUMN` is rejected when dependent views exist
+  - `ALTER COLUMN TYPE` supports only `INT64`, `FLOAT64`, `TEXT`, `BOOL` source/target kinds
+  - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
+- Trigger operations:
+  - `AFTER` triggers on `INSERT`/`UPDATE`/`DELETE` for base tables (`FOR EACH ROW`)
+  - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 0.x
+  - `INSTEAD OF` and `FOR EACH STATEMENT` triggers are not supported in 0.x
+- Not supported (post-1.0): ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 
 ### 15.4 Migration strategy

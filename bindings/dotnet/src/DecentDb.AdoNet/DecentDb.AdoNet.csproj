@@ -6,6 +6,9 @@
     <Description>ADO.NET provider for DecentDB embedded database</Description>
     <RootNamespace>DecentDb.AdoNet</RootNamespace>
     <AssemblyName>DecentDb.AdoNet</AssemblyName>
+
+    <!-- Packed via Decent.MicroOrm meta package. -->
+    <IsPackable>false</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
