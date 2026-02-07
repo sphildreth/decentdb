@@ -1181,6 +1181,13 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
       
       columnDefs.add(colDef)
+
+    for checkDef in tableMeta.checks:
+      var checkSql = "  "
+      if checkDef.name.len > 0:
+        checkSql &= "CONSTRAINT " & checkDef.name & " "
+      checkSql &= "CHECK (" & checkDef.exprSql & ")"
+      columnDefs.add(checkSql)
     
     createStmt &= columnDefs.join(",\n") & "\n);"
     sqlStatements.add(createStmt)
@@ -1627,6 +1634,12 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
       if col.refTable.len > 0 and col.refColumn.len > 0:
         colDef &= " REFERENCES " & col.refTable & "(" & col.refColumn & ")"
       columnDefs.add(colDef)
+    for checkDef in tableMeta.checks:
+      var checkSql = "  "
+      if checkDef.name.len > 0:
+        checkSql &= "CONSTRAINT " & checkDef.name & " "
+      checkSql &= "CHECK (" & checkDef.exprSql & ")"
+      columnDefs.add(checkSql)
     createStmt &= columnDefs.join(",\n") & "\n);"
 
     let createRes = execSql(dstDb, createStmt)

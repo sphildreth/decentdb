@@ -293,6 +293,31 @@ suite "Binder":
     let bindIdxUniq = bindStatement(db.catalog, stmtIdxUniq)
     check not bindIdxUniq.ok
 
+    let stmtCheckOk = parseSingle(
+      "CREATE TABLE chk_ok (" &
+      "id INT, amount INT, " &
+      "CHECK (amount >= 0), " &
+      "CONSTRAINT id_pos CHECK (id > 0 OR id IS NULL))"
+    )
+    let bindCheckOk = bindStatement(db.catalog, stmtCheckOk)
+    check bindCheckOk.ok
+
+    let stmtCheckBadCol = parseSingle("CREATE TABLE chk_bad_col (id INT, CHECK (missing > 0))")
+    let bindCheckBadCol = bindStatement(db.catalog, stmtCheckBadCol)
+    check not bindCheckBadCol.ok
+
+    let stmtCheckParam = parseSingle("CREATE TABLE chk_param (id INT, CHECK (id > $1))")
+    let bindCheckParam = bindStatement(db.catalog, stmtCheckParam)
+    check not bindCheckParam.ok
+
+    let stmtCheckExists = parseSingle("CREATE TABLE chk_exists (id INT, CHECK (EXISTS (SELECT 1)))")
+    let bindCheckExists = bindStatement(db.catalog, stmtCheckExists)
+    check not bindCheckExists.ok
+
+    let stmtCheckUnsupportedFn = parseSingle("CREATE TABLE chk_fn (id INT, CHECK (ABS(id) > 0))")
+    let bindCheckUnsupportedFn = bindStatement(db.catalog, stmtCheckUnsupportedFn)
+    check not bindCheckUnsupportedFn.ok
+
     discard closeDb(db)
 
   test "bind create view and select expansion":

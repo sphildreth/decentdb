@@ -304,6 +304,7 @@ Alternative:
 - Set operations: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
+- CHECK constraints in `CREATE TABLE` (column-level and table-level)
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
@@ -346,6 +347,15 @@ Alternative:
 Optional later:
 - `CASCADE`, `SET NULL`
 - Deferred constraint checking (transaction-commit time)
+
+### 7.3 CHECK constraints
+- Supported in `CREATE TABLE` as column or table constraints.
+- Enforced at statement-time on `INSERT` and `UPDATE` (including `INSERT ... ON CONFLICT DO UPDATE`).
+- SQL semantics: CHECK fails only when the expression evaluates to `FALSE`; `TRUE` and `NULL` pass.
+- v0 restrictions:
+  - CHECK expressions must reference only columns in the same row/table.
+  - CHECK does not allow parameters, aggregate functions, or `EXISTS` in 0.x.
+  - `ALTER TABLE ... ADD CONSTRAINT CHECK` is not supported.
 
 ---
 
@@ -576,6 +586,7 @@ Define error categories:
 ### 15.3 Schema changes (0.x baseline)
 - Supported: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
 - ALTER TABLE operations: ADD COLUMN, DROP COLUMN
+  - Current v0 limitation: ALTER TABLE operations are rejected on tables that define CHECK constraints
 - Not supported (post-1.0): RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 

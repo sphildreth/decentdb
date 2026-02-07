@@ -3,6 +3,7 @@ import tables
 import sets
 import algorithm
 import strutils
+import json
 import ../errors
 import ../record/record
 import ../pager/pager
@@ -38,11 +39,16 @@ type Column* = object
   decPrecision*: uint8
   decScale*: uint8
 
+type CheckConstraint* = object
+  name*: string
+  exprSql*: string
+
 type TableMeta* = object
   name*: string
   rootPage*: PageId
   nextRowId*: uint64
   columns*: seq[Column]
+  checks*: seq[CheckConstraint]
 
 type ViewMeta* = object
   name*: string
@@ -203,6 +209,41 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
                   col.refColumn = parts[1]
         result.add(col)
 
+proc encodeChecks(checks: seq[CheckConstraint]): seq[byte] =
+  var arr = newJArray()
+  for checkDef in checks:
+    var node = newJObject()
+    node["name"] = %checkDef.name
+    node["expr"] = %checkDef.exprSql
+    arr.add(node)
+  let payload = $arr
+  result = newSeq[byte](payload.len)
+  for i, ch in payload:
+    result[i] = byte(ch)
+
+proc decodeChecks(bytes: seq[byte]): Result[seq[CheckConstraint]] =
+  if bytes.len == 0:
+    return ok(newSeq[CheckConstraint]())
+  var checks: seq[CheckConstraint] = @[]
+  var payload = newString(bytes.len)
+  for i, b in bytes:
+    payload[i] = char(b)
+  try:
+    let node = parseJson(payload)
+    if node.kind != JArray:
+      return err[seq[CheckConstraint]](ERR_CORRUPTION, "Invalid CHECK metadata format")
+    for item in node.items:
+      if item.kind != JObject:
+        return err[seq[CheckConstraint]](ERR_CORRUPTION, "Invalid CHECK metadata entry")
+      let exprSql = if item.hasKey("expr"): item["expr"].getStr else: ""
+      if exprSql.len == 0:
+        return err[seq[CheckConstraint]](ERR_CORRUPTION, "CHECK metadata missing expression")
+      let name = if item.hasKey("name"): item["name"].getStr else: ""
+      checks.add(CheckConstraint(name: name, exprSql: exprSql))
+  except CatchableError:
+    return err[seq[CheckConstraint]](ERR_CORRUPTION, "Invalid CHECK metadata JSON")
+  ok(checks)
+
 proc stringToBytes(text: string): seq[byte] =
   for ch in text:
     result.add(byte(ch))
@@ -211,13 +252,14 @@ proc bytesToString(bytes: seq[byte]): string =
   for b in bytes:
     result.add(char(b))
 
-proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns: seq[Column]): seq[byte] =
+proc makeTableRecord(name: string, rootPage: PageId, nextRowId: uint64, columns: seq[Column], checks: seq[CheckConstraint]): seq[byte] =
   let values = @[
     Value(kind: vkText, bytes: stringToBytes("table")),
     Value(kind: vkText, bytes: stringToBytes(name)),
     Value(kind: vkInt64, int64Val: int64(rootPage)),
     Value(kind: vkInt64, int64Val: int64(nextRowId)),
-    Value(kind: vkText, bytes: encodeColumns(columns))
+    Value(kind: vkText, bytes: encodeColumns(columns)),
+    Value(kind: vkText, bytes: encodeChecks(checks))
   ]
   encodeRecord(values)
 
@@ -255,14 +297,22 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let rootPage = PageId(values[1].int64Val)
     let nextRowId = uint64(values[2].int64Val)
     let columns = decodeColumns(values[3].bytes)
-    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns)))
+    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns, checks: @[])))
   let recordType = bytesToString(values[0].bytes).toLowerAscii()
   if recordType == "table":
     let name = bytesToString(values[1].bytes)
     let rootPage = PageId(values[2].int64Val)
     let nextRowId = uint64(values[3].int64Val)
     let columns = decodeColumns(values[4].bytes)
-    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns)))
+    let checksRes =
+      if values.len >= 6:
+        decodeChecks(values[5].bytes)
+      else:
+        ok(newSeq[CheckConstraint]())
+    if not checksRes.ok:
+      return err[CatalogRecord](checksRes.err.code, checksRes.err.message, checksRes.err.context)
+    let checks = checksRes.value
+    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns, checks: checks)))
   if recordType == "index":
     if values.len < 5:
       return err[CatalogRecord](ERR_CORRUPTION, "Index catalog record too short")
@@ -392,7 +442,7 @@ proc updateTableMeta*(catalog: Catalog, table: TableMeta) =
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
   catalog.tables[table.name] = table
   let key = uint64(crc32c(stringToBytes("table:" & table.name)))
-  let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns)
+  let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns, table.checks)
   
   let updateRes = update(catalog.catalogTree, key, record)
   if updateRes.ok:

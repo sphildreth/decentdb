@@ -164,6 +164,18 @@ suite "SQL Parser":
     let crt = parseSingle("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL UNIQUE, parent_id INT REFERENCES parent(id))")
     check crt.kind == skCreateTable
     check crt.columns.len == 3
+    check crt.createChecks.len == 0
+
+    let crtChecks = parseSingle(
+      "CREATE TABLE t_check (" &
+      "id INT CHECK (id > 0), " &
+      "amount INT, " &
+      "CONSTRAINT amount_nonneg CHECK (amount >= 0))"
+    )
+    check crtChecks.kind == skCreateTable
+    check crtChecks.createChecks.len == 2
+    check crtChecks.createChecks[0].expr != nil
+    check crtChecks.createChecks[1].name == "amount_nonneg"
 
     let idx = parseSingle("CREATE INDEX t_name_trgm ON t USING trigram (name)")
     check idx.kind == skCreateIndex

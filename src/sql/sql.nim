@@ -62,6 +62,10 @@ type ColumnDef* = object
   refTable*: string
   refColumn*: string
 
+type CheckConstraintDef* = object
+  name*: string
+  expr*: Expr
+
 type SqlIndexKind* = enum
   ikBtree
   ikTrigram
@@ -147,6 +151,7 @@ type Statement* = ref object
   of skCreateTable:
     createTableName*: string
     columns*: seq[ColumnDef]
+    createChecks*: seq[CheckConstraintDef]
   of skCreateIndex:
     indexName*: string
     indexTableName*: string
@@ -249,6 +254,7 @@ proc nodeStringOr*(node: JsonNode, key: string, fallback: string): string =
 proc parseExprNode(node: JsonNode): Result[Expr]
 proc parseStatementNode(node: JsonNode): Result[Statement]
 proc selectToCanonicalSql(stmt: Statement): string
+proc parseSql*(sql: string): Result[SqlAst]
 
 proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "isnull") and node["isnull"].getBool:
@@ -1003,9 +1009,9 @@ proc quoteSqlString(text: string): string =
       result.add(ch)
   result.add("'")
 
-proc exprToCanonicalSql(expr: Expr): string
+proc exprToCanonicalSql*(expr: Expr): string
 
-proc exprToCanonicalSql(expr: Expr): string =
+proc exprToCanonicalSql*(expr: Expr): string =
   if expr == nil:
     return "NULL"
   case expr.kind
@@ -1065,6 +1071,20 @@ proc exprToCanonicalSql(expr: Expr): string =
     for item in expr.inList:
       parts.add(exprToCanonicalSql(item))
     "(" & exprToCanonicalSql(expr.inExpr) & " IN (" & parts.join(", ") & "))"
+
+proc parseStandaloneExpr*(exprSql: string): Result[Expr] =
+  let sqlText = "SELECT " & exprSql
+  let astRes = parseSql(sqlText)
+  if not astRes.ok:
+    return err[Expr](astRes.err.code, astRes.err.message, astRes.err.context)
+  if astRes.value.statements.len != 1:
+    return err[Expr](ERR_SQL, "Expression parse must produce one statement")
+  let stmt = astRes.value.statements[0]
+  if stmt.kind != skSelect:
+    return err[Expr](ERR_SQL, "Expression parse must produce SELECT")
+  if stmt.selectItems.len != 1 or stmt.selectItems[0].isStar:
+    return err[Expr](ERR_SQL, "Expression parse must produce one scalar item")
+  ok(stmt.selectItems[0].expr)
 
 proc selectToCanonicalSql(stmt: Statement): string =
   var parts: seq[string] = @[]
@@ -1165,6 +1185,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   var columns: seq[ColumnDef] = @[]
+  var checks: seq[CheckConstraintDef] = @[]
   var tableConstraints: seq[JsonNode] = @[]
   let elts = nodeGet(node, "tableElts")
   if elts.kind == JArray:
@@ -1221,6 +1242,15 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
                 let attrs = nodeGet(constraint, "pk_attrs")
                 if attrs.kind == JArray and attrs.len > 0:
                   def.refColumn = nodeString(attrs[0])
+              of "CONSTR_CHECK":
+                let rawExpr = nodeGet(constraint, "raw_expr")
+                let exprRes = parseExprNode(rawExpr)
+                if not exprRes.ok:
+                  return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+                checks.add(CheckConstraintDef(
+                  name: nodeGet(constraint, "conname").getStr,
+                  expr: exprRes.value
+                ))
               else:
                 discard
         columns.add(def)
@@ -1247,7 +1277,16 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
           return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
     elif contype == "CONSTR_FOREIGN":
       return err[Statement](ERR_SQL, "Table-level foreign keys not supported")
-  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns))
+    elif contype == "CONSTR_CHECK":
+      let rawExpr = nodeGet(constraint, "raw_expr")
+      let exprRes = parseExprNode(rawExpr)
+      if not exprRes.ok:
+        return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+      checks.add(CheckConstraintDef(
+        name: nodeGet(constraint, "conname").getStr,
+        expr: exprRes.value
+      ))
+  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let idxName = nodeGet(node, "idxname").getStr
@@ -1397,6 +1436,8 @@ proc parseColumnDef(node: JsonNode): Result[ColumnDef] =
           isPrimaryKey = true
         elif contype == "CONSTR_UNIQUE":
           isUnique = true
+        elif contype == "CONSTR_CHECK":
+          return err[ColumnDef](ERR_SQL, "ADD COLUMN CHECK is not supported in 0.x")
   ok(ColumnDef(name: colName, typeName: typeName.toUpperAscii(), notNull: notNull, unique: isUnique, primaryKey: isPrimaryKey))
 
 proc parseAlterTableStmt(node: JsonNode): Result[Statement] =

@@ -981,6 +981,8 @@ proc alterTable*(pager: Pager, catalog: Catalog, tableName: string, actions: seq
     return err[Void](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   
   var table = tableRes.value
+  if table.checks.len > 0:
+    return err[Void](ERR_SQL, "ALTER TABLE on tables with CHECK constraints is not supported in 0.x", tableName)
   
   for action in actions:
     case action.kind

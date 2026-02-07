@@ -22,7 +22,8 @@ CREATE TABLE users (
     id INT PRIMARY KEY,
     name TEXT NOT NULL,
     email TEXT UNIQUE,
-    created_at INT
+    created_at INT,
+    CHECK (name IS NULL OR LENGTH(name) > 0)
 );
 ```
 
@@ -87,6 +88,7 @@ ALTER TABLE users DROP COLUMN age;
 
 **Notes:**
 - `ADD COLUMN` and `DROP COLUMN` are the only supported operations in v1.0.0
+- `ALTER TABLE` operations are currently rejected for tables that define `CHECK` constraints
 - Advanced operations like `RENAME COLUMN`, `MODIFY COLUMN` (type changes), and `ADD CONSTRAINT` are planned for future releases
 - Schema changes require an exclusive lock on the database
 
@@ -113,6 +115,8 @@ Notes:
 - In `DO UPDATE` expressions, unqualified columns resolve to the target table; `EXCLUDED.col` is supported.
 - Targetless `ON CONFLICT DO UPDATE` is not yet supported.
 - `INSERT ... RETURNING` is supported.
+- `CHECK` constraints are enforced on `INSERT` and `UPDATE` (including `ON CONFLICT ... DO UPDATE`).
+- CHECK fails only when the predicate is `FALSE`; `TRUE` and `NULL` pass.
 - `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not yet supported.
 
 ### SELECT

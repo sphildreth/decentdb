@@ -345,6 +345,45 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
   else:
     okVoid()
 
+proc validateCheckExpr(expr: Expr): Result[Void] =
+  if expr == nil:
+    return err[Void](ERR_SQL, "CHECK expression cannot be empty")
+  case expr.kind
+  of ekParam:
+    return err[Void](ERR_SQL, "CHECK expression cannot use parameters")
+  of ekUnary:
+    return validateCheckExpr(expr.expr)
+  of ekBinary:
+    let leftRes = validateCheckExpr(expr.left)
+    if not leftRes.ok:
+      return leftRes
+    return validateCheckExpr(expr.right)
+  of ekFunc:
+    let fn = expr.funcName.toUpperAscii()
+    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+      return err[Void](ERR_SQL, "CHECK expression cannot use aggregate functions", expr.funcName)
+    if fn == "EXISTS":
+      return err[Void](ERR_SQL, "CHECK expression cannot use EXISTS in 0.x")
+    let allowed = ["CASE", "CAST", "COALESCE", "NULLIF", "LENGTH", "LOWER", "UPPER", "TRIM", "LIKE_ESCAPE"]
+    if fn notin allowed:
+      return err[Void](ERR_SQL, "Unsupported function in CHECK expression", expr.funcName)
+    for arg in expr.args:
+      let argRes = validateCheckExpr(arg)
+      if not argRes.ok:
+        return argRes
+    return okVoid()
+  of ekInList:
+    let lhsRes = validateCheckExpr(expr.inExpr)
+    if not lhsRes.ok:
+      return lhsRes
+    for item in expr.inList:
+      let itemRes = validateCheckExpr(item)
+      if not itemRes.ok:
+        return itemRes
+    return okVoid()
+  else:
+    return okVoid()
+
 proc sourceName(sourceTable: string, sourceAlias: string): string =
   if sourceAlias.len > 0: sourceAlias else: sourceTable
 
@@ -1200,10 +1239,23 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](ERR_SQL, "Object already exists", stmt.createTableName)
 
   var primaryCount = 0
+  var tableColumns: seq[Column] = @[]
   for col in stmt.columns:
     let typeRes = parseColumnType(col.typeName)
     if not typeRes.ok:
       return err[Statement](typeRes.err.code, typeRes.err.message, col.typeName)
+    let spec = typeRes.value
+    tableColumns.add(Column(
+      name: col.name,
+      kind: spec.kind,
+      notNull: col.notNull,
+      unique: col.unique,
+      primaryKey: col.primaryKey,
+      refTable: col.refTable,
+      refColumn: col.refColumn,
+      decPrecision: spec.decPrecision,
+      decScale: spec.decScale
+    ))
     # ColumnDef typeName is preserved for catalog storage; actual Column.kind is computed later.
     if col.primaryKey:
       primaryCount.inc
@@ -1232,6 +1284,20 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     for col in stmt.columns:
       if col.primaryKey and not col.notNull:
         return err[Statement](ERR_SQL, "Composite primary key column must be NOT NULL", col.name)
+
+  if stmt.createChecks.len > 0:
+    var map = initTable[string, TableMeta]()
+    map[stmt.createTableName] = TableMeta(
+      name: stmt.createTableName,
+      columns: tableColumns
+    )
+    for checkDef in stmt.createChecks:
+      let validateRes = validateCheckExpr(checkDef.expr)
+      if not validateRes.ok:
+        return err[Statement](validateRes.err.code, validateRes.err.message, validateRes.err.context)
+      let bindRes = bindExpr(map, checkDef.expr)
+      if not bindRes.ok:
+        return err[Statement](bindRes.err.code, bindRes.err.message, bindRes.err.context)
   ok(stmt)
 
 proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
@@ -1388,6 +1454,8 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
+  if table.checks.len > 0:
+    return err[Statement](ERR_SQL, "ALTER TABLE on tables with CHECK constraints is not supported in 0.x", stmt.alterTableName)
   for action in stmt.alterActions:
     case action.kind
     of ataAddColumn:

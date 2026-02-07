@@ -407,6 +407,57 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  test "CHECK constraints enforce false-only failure and persist":
+    let path = makeTempDb("decentdb_sql_exec_check_constraints.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    var db = dbRes.value
+
+    check execSql(
+      db,
+      "CREATE TABLE accounts (" &
+      "id INT PRIMARY KEY, " &
+      "amount INT, " &
+      "note TEXT, " &
+      "CONSTRAINT amount_nonneg CHECK (amount >= 0), " &
+      "CHECK (note IS NULL OR LENGTH(note) > 0))"
+    ).ok
+
+    check execSql(db, "INSERT INTO accounts VALUES (1, 10, 'ok')").ok
+    check execSql(db, "INSERT INTO accounts VALUES (2, NULL, NULL)").ok
+
+    let badInsert = execSql(db, "INSERT INTO accounts VALUES (3, -1, 'bad')")
+    check not badInsert.ok
+    check badInsert.err.code == ERR_CONSTRAINT
+
+    let badUpdate = execSql(db, "UPDATE accounts SET amount = -5 WHERE id = 1")
+    check not badUpdate.ok
+    check badUpdate.err.code == ERR_CONSTRAINT
+
+    let rowsBeforeClose = execSql(db, "SELECT id, amount, note FROM accounts ORDER BY id")
+    check rowsBeforeClose.ok
+    check rowsBeforeClose.value == @["1|10|ok", "2|NULL|NULL"]
+
+    discard closeDb(db)
+
+    let reopenRes = openDb(path)
+    check reopenRes.ok
+    db = reopenRes.value
+
+    let badAfterReopen = execSql(db, "INSERT INTO accounts VALUES (4, -9, 'bad')")
+    check not badAfterReopen.ok
+    check badAfterReopen.err.code == ERR_CONSTRAINT
+
+    let alterBlocked = execSql(db, "ALTER TABLE accounts ADD COLUMN extra INT")
+    check not alterBlocked.ok
+    check alterBlocked.err.code == ERR_SQL
+
+    let rowsAfterReopen = execSql(db, "SELECT id, amount, note FROM accounts ORDER BY id")
+    check rowsAfterReopen.ok
+    check rowsAfterReopen.value == @["1|10|ok", "2|NULL|NULL"]
+
+    discard closeDb(db)
+
 proc makeCatalog(): Catalog =
   Catalog(
     tables: initTable[string, TableMeta](),

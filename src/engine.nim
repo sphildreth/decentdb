@@ -389,6 +389,37 @@ proc enforceNotNull(table: TableMeta, values: seq[Value]): Result[Void] =
       return err[Void](ERR_CONSTRAINT, "NOT NULL constraint failed", table.name & "." & col.name)
   okVoid()
 
+proc enforceChecks(table: TableMeta, values: seq[Value]): Result[Void] =
+  if table.checks.len == 0:
+    return okVoid()
+  if values.len != table.columns.len:
+    return err[Void](ERR_SQL, "Column count mismatch for CHECK evaluation", table.name)
+
+  var rowCols: seq[string] = @[]
+  for col in table.columns:
+    rowCols.add(table.name & "." & col.name)
+  let row = makeRow(rowCols, values)
+
+  for checkDef in table.checks:
+    let exprRes = parseStandaloneExpr(checkDef.exprSql)
+    if not exprRes.ok:
+      return err[Void](ERR_CORRUPTION, "Invalid CHECK expression in catalog", table.name)
+    let evalRes = evalExpr(row, exprRes.value, @[])
+    if not evalRes.ok:
+      return err[Void](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+    if evalRes.value.kind == vkNull:
+      continue
+    if evalRes.value.kind != vkBool:
+      return err[Void](ERR_SQL, "CHECK expression must evaluate to BOOL", table.name)
+    if not evalRes.value.boolVal:
+      let context =
+        if checkDef.name.len > 0:
+          table.name & "." & checkDef.name
+        else:
+          table.name
+      return err[Void](ERR_CONSTRAINT, "CHECK constraint failed", context)
+  okVoid()
+
 proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq[Value], rowid: uint64 = 0): Result[Void] =
   # Count PK columns to detect composite PKs
   var pkCount = 0
@@ -681,6 +712,7 @@ proc hasAnyUniqueConflict(catalog: Catalog, pager: Pager, table: TableMeta, valu
 type ConstraintBatchOptions* = object
   ## Options for batch constraint checking
   checkNotNull*: bool
+  checkChecks*: bool
   checkUnique*: bool
   checkForeignKeys*: bool
   skipInt64PkOptimization*: bool  # When true, always check via index even for INT64 PK
@@ -689,6 +721,7 @@ proc defaultConstraintBatchOptions*(): ConstraintBatchOptions =
   ## Return default options (all checks enabled)
   ConstraintBatchOptions(
     checkNotNull: true,
+    checkChecks: true,
     checkUnique: true,
     checkForeignKeys: true,
     skipInt64PkOptimization: false
@@ -1094,6 +1127,21 @@ proc enforceConstraintsBatch*(
             details: table.name & "." & col.name
           ))
           break
+
+  if options.checkChecks:
+    for rowIdx, row in rows:
+      let checkRes = enforceChecks(table, row.values)
+      if not checkRes.ok:
+        if checkRes.err.code == ERR_CONSTRAINT:
+          allFailures.add((
+            rowIdx: rowIdx,
+            constraint: "CHECK",
+            details: checkRes.err.context
+          ))
+        else:
+          return err[seq[tuple[rowIdx: int, constraint: string, details: string]]](
+            checkRes.err.code, checkRes.err.message, checkRes.err.context
+          )
   
   if options.checkUnique:
     let uniqueRes = enforceUniqueBatch(catalog, pager, table, rows, options)
@@ -1265,6 +1313,9 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
   let notNullRes = enforceNotNull(table, values)
   if not notNullRes.ok:
     return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+  let checkRes = enforceChecks(table, values)
+  if not checkRes.ok:
+    return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
 
   case bound.insertConflictAction
   of icaDoNothing:
@@ -1340,6 +1391,9 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
       let newNotNullRes = enforceNotNull(table, newValues)
       if not newNotNullRes.ok:
         return err[InsertExecResult](newNotNullRes.err.code, newNotNullRes.err.message, newNotNullRes.err.context)
+      let newCheckRes = enforceChecks(table, newValues)
+      if not newCheckRes.ok:
+        return err[InsertExecResult](newCheckRes.err.code, newCheckRes.err.message, newCheckRes.err.context)
 
       let uniqueUpdateRes = enforceUnique(db.catalog, db.pager, table, newValues, stored.rowid)
       if not uniqueUpdateRes.ok:
@@ -1770,7 +1824,10 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           decPrecision: spec.decPrecision,
           decScale: spec.decScale
         ))
-      let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
+      var checks: seq[catalog.CheckConstraint] = @[]
+      for checkDef in bound.createChecks:
+        checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
+      let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
       let saveRes = db.catalog.saveTable(db.pager, meta)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
@@ -2049,6 +2106,9 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let notNullRes = enforceNotNull(table, entry[2])
         if not notNullRes.ok:
           return err[seq[string]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+        let checkRes = enforceChecks(table, entry[2])
+        if not checkRes.ok:
+          return err[seq[string]](checkRes.err.code, checkRes.err.message, checkRes.err.context)
         let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
         if not uniqueRes.ok:
           return err[seq[string]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
@@ -2238,6 +2298,9 @@ proc tryFastPkUpdate(db: Db, bound: Statement, params: seq[Value]): Result[Optio
   let notNullRes = enforceNotNull(table, newValues)
   if not notNullRes.ok:
     return err[Option[int64]](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+  let checkRes = enforceChecks(table, newValues)
+  if not checkRes.ok:
+    return err[Option[int64]](checkRes.err.code, checkRes.err.message, checkRes.err.context)
   let uniqueRes = enforceUnique(db.catalog, db.pager, table, newValues, row.rowid)
   if not uniqueRes.ok:
     return err[Option[int64]](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
@@ -2295,7 +2358,10 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         decPrecision: spec.decPrecision,
         decScale: spec.decScale
       ))
-    let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
+    var checks: seq[catalog.CheckConstraint] = @[]
+    for checkDef in bound.createChecks:
+      checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
+    let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
     let saveRes = db.catalog.saveTable(db.pager, meta)
     if not saveRes.ok:
       return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
@@ -2592,6 +2658,9 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         let notNullRes = enforceNotNull(table, entry[2])
         if not notNullRes.ok:
           return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+        let checkRes = enforceChecks(table, entry[2])
+        if not checkRes.ok:
+          return err[int64](checkRes.err.code, checkRes.err.message, checkRes.err.context)
         let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
         if not uniqueRes.ok:
           return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
@@ -2970,6 +3039,9 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
       let notNullRes = enforceNotNull(table, values)
       if not notNullRes.ok:
         return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+      let checkRes = enforceChecks(table, values)
+      if not checkRes.ok:
+        return err[Void](checkRes.err.code, checkRes.err.message, checkRes.err.context)
       let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
       if not fkRes.ok:
         return err[Void](fkRes.err.code, fkRes.err.message, fkRes.err.context)

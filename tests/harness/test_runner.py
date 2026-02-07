@@ -808,6 +808,113 @@ class DifferentialLikeTests(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_check_constraints_match_postgres(self) -> None:
+        psql = shutil.which("psql")
+        cli = os.environ.get("DECENTDB")
+        if cli is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            candidate = repo_root / "decentdb"
+            if candidate.exists():
+                cli = str(candidate)
+        if not psql or not cli:
+            self.skipTest("psql or decentdb not available")
+        if "PGDATABASE" not in os.environ:
+            self.skipTest("PGDATABASE not set for PostgreSQL differential test")
+
+        schema = f"decentdb_check_{random.randint(1000, 9999)}"
+
+        def run_psql(sql: str) -> list[str]:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip())
+            return [line for line in proc.stdout.strip().splitlines() if line]
+
+        def run_psql_expect_error(sql: str) -> bool:
+            proc = subprocess.run(
+                [psql, "-X", "-q", "-t", "-A", "-c", sql],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return proc.returncode != 0
+
+        try:
+            run_psql(
+                f"CREATE SCHEMA {schema}; "
+                f"CREATE TABLE {schema}.accounts ("
+                "id INT PRIMARY KEY, "
+                "amount INT, "
+                "note TEXT, "
+                "CONSTRAINT amount_nonneg CHECK (amount >= 0), "
+                "CHECK (note IS NULL OR LENGTH(note) > 0)"
+                ");"
+            )
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "diff_check_constraints.ddb"
+
+                def run_cli(sql: str) -> dict:
+                    proc = subprocess.run(
+                        [cli, "exec", "--db", str(db_path), "--sql", sql],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    return json.loads(proc.stdout.strip() or "{}")
+
+                setup = run_cli(
+                    "CREATE TABLE accounts ("
+                    "id INT PRIMARY KEY, "
+                    "amount INT, "
+                    "note TEXT, "
+                    "CONSTRAINT amount_nonneg CHECK (amount >= 0), "
+                    "CHECK (note IS NULL OR LENGTH(note) > 0))"
+                )
+                self.assertTrue(setup.get("ok"), msg=setup.get("error"))
+
+                for cli_sql, pg_sql in [
+                    (
+                        "INSERT INTO accounts VALUES (1, 10, 'ok')",
+                        f"INSERT INTO {schema}.accounts VALUES (1, 10, 'ok')",
+                    ),
+                    (
+                        "INSERT INTO accounts VALUES (2, NULL, NULL)",
+                        f"INSERT INTO {schema}.accounts VALUES (2, NULL, NULL)",
+                    ),
+                ]:
+                    payload = run_cli(cli_sql)
+                    self.assertTrue(payload.get("ok"), msg=f"{cli_sql}: {payload.get('error')}")
+                    run_psql(pg_sql)
+
+                self.assertTrue(
+                    run_psql_expect_error(f"INSERT INTO {schema}.accounts VALUES (3, -1, 'bad')")
+                )
+                bad_insert = run_cli("INSERT INTO accounts VALUES (3, -1, 'bad')")
+                self.assertFalse(bad_insert.get("ok", False))
+
+                self.assertTrue(
+                    run_psql_expect_error(f"UPDATE {schema}.accounts SET amount = -5 WHERE id = 1")
+                )
+                bad_update = run_cli("UPDATE accounts SET amount = -5 WHERE id = 1")
+                self.assertFalse(bad_update.get("ok", False))
+
+                pg_rows = run_psql(f"SELECT id, amount, note FROM {schema}.accounts ORDER BY id")
+                payload = run_cli("SELECT id, amount, note FROM accounts ORDER BY id")
+                self.assertTrue(payload.get("ok"), msg=payload.get("error"))
+                self.assertEqual(payload.get("rows", []), pg_rows)
+        except RuntimeError as exc:
+            self.skipTest(f"PostgreSQL setup failed: {exc}")
+        finally:
+            try:
+                run_psql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()
