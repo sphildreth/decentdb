@@ -449,6 +449,145 @@ public class AdoNetLayerTests : IDisposable
         Assert.Equal(42L, result);
     }
     
+    // ───── GetSchema tests ─────
+
+    [Fact]
+    public void GetSchema_MetaDataCollections()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        var dt = conn.GetSchema();
+        Assert.Equal("MetaDataCollections", dt.TableName);
+        Assert.True(dt.Rows.Count >= 3);
+
+        var names = new System.Collections.Generic.HashSet<string>();
+        foreach (DataRow row in dt.Rows)
+            names.Add((string)row["CollectionName"]);
+
+        Assert.Contains("MetaDataCollections", names);
+        Assert.Contains("Tables", names);
+        Assert.Contains("Columns", names);
+    }
+
+    [Fact]
+    public void GetSchema_Tables_ReturnsCreatedTables()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE schema_t1 (id INTEGER PRIMARY KEY, val TEXT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "CREATE TABLE schema_t2 (id INTEGER PRIMARY KEY, num INTEGER)";
+        cmd.ExecuteNonQuery();
+
+        var dt = conn.GetSchema("Tables");
+        Assert.Equal("Tables", dt.TableName);
+
+        var tableNames = new System.Collections.Generic.HashSet<string>();
+        foreach (DataRow row in dt.Rows)
+            tableNames.Add((string)row["TABLE_NAME"]);
+
+        Assert.Contains("schema_t1", tableNames);
+        Assert.Contains("schema_t2", tableNames);
+    }
+
+    [Fact]
+    public void GetSchema_Columns_AllTables()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE schema_cols (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score FLOAT64)";
+        cmd.ExecuteNonQuery();
+
+        var dt = conn.GetSchema("Columns");
+        Assert.Equal("Columns", dt.TableName);
+
+        // Find our table's columns
+        var found = new System.Collections.Generic.List<DataRow>();
+        foreach (DataRow row in dt.Rows)
+        {
+            if ((string)row["TABLE_NAME"] == "schema_cols")
+                found.Add(row);
+        }
+
+        Assert.Equal(3, found.Count);
+    }
+
+    [Fact]
+    public void GetSchema_Columns_FilteredByTable()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE filtered_a (id INTEGER PRIMARY KEY, a_val TEXT)";
+        cmd.ExecuteNonQuery();
+        cmd.CommandText = "CREATE TABLE filtered_b (id INTEGER PRIMARY KEY, b_val INTEGER)";
+        cmd.ExecuteNonQuery();
+
+        var dt = conn.GetSchema("Columns", new[] { "filtered_a" });
+
+        // Should only contain columns from filtered_a
+        foreach (DataRow row in dt.Rows)
+            Assert.Equal("filtered_a", (string)row["TABLE_NAME"]);
+
+        Assert.Equal(2, dt.Rows.Count); // id + a_val
+    }
+
+    [Fact]
+    public void GetSchema_Columns_IncludesPkAndNullability()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE schema_pk (pk_id INTEGER PRIMARY KEY, required_name TEXT NOT NULL, optional_note TEXT)";
+        cmd.ExecuteNonQuery();
+
+        var dt = conn.GetSchema("Columns", new[] { "schema_pk" });
+
+        DataRow? pkRow = null, reqRow = null, optRow = null;
+        foreach (DataRow row in dt.Rows)
+        {
+            switch ((string)row["COLUMN_NAME"])
+            {
+                case "pk_id": pkRow = row; break;
+                case "required_name": reqRow = row; break;
+                case "optional_note": optRow = row; break;
+            }
+        }
+
+        Assert.NotNull(pkRow);
+        Assert.True((bool)pkRow!["IS_PRIMARY_KEY"]);
+
+        Assert.NotNull(reqRow);
+        Assert.False((bool)reqRow!["IS_NULLABLE"]); // NOT NULL
+
+        Assert.NotNull(optRow);
+        Assert.True((bool)optRow!["IS_NULLABLE"]); // nullable
+    }
+
+    [Fact]
+    public void GetSchema_UnsupportedCollection_Throws()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        Assert.Throws<ArgumentException>(() => conn.GetSchema("Indexes"));
+    }
+
+    [Fact]
+    public void GetSchema_WhenClosed_Throws()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        // Don't open — should throw
+        Assert.Throws<InvalidOperationException>(() => conn.GetSchema());
+    }
+
     // Helper class for testing
     private class FakeDbConnection : DbConnection
     {

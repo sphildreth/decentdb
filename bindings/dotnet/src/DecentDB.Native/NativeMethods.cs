@@ -168,6 +168,9 @@ public static class DecentDBNative
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_finalize")]
     public static extern void decentdb_finalize(IntPtr stmt);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_free")]
+    public static extern void decentdb_free(IntPtr ptr);
 }
 
 public static unsafe class DecentDBNativeUnsafe
@@ -220,6 +223,12 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_decimal_unscaled")]
     public static extern long decentdb_column_decimal_unscaled(IntPtr stmt, int col0Based);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_list_tables_json")]
+    public static extern IntPtr decentdb_list_tables_json(IntPtr db, out int outLen);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_get_table_columns_json")]
+    public static extern IntPtr decentdb_get_table_columns_json(IntPtr db, byte* tableNameUtf8, out int outLen);
 }
 
 [StructLayout(LayoutKind.Sequential)]

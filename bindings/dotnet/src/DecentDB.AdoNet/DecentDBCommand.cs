@@ -344,6 +344,10 @@ namespace DecentDB.AdoNet
             {
                 stmt.BindBlob(index1Based, ((Guid)value).ToByteArray());
             }
+            else if (type.IsEnum)
+            {
+                stmt.BindInt64(index1Based, Convert.ToInt64(value));
+            }
             else
             {
                 throw new NotSupportedException($"Unsupported parameter type: {type.FullName}");

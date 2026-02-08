@@ -87,6 +87,52 @@ public sealed class DecentDB : IDisposable
     }
 
     internal IntPtr GetDbHandle() => Handle;
+
+    /// <summary>
+    /// Returns a JSON array of table names, e.g. ["users","items"].
+    /// </summary>
+    public string ListTablesJson()
+    {
+        var ptr = DecentDBNativeUnsafe.decentdb_list_tables_json(Handle, out var len);
+        if (ptr == IntPtr.Zero) return "[]";
+        try
+        {
+            return Marshal.PtrToStringUTF8(ptr, len) ?? "[]";
+        }
+        finally
+        {
+            DecentDBNative.decentdb_free(ptr);
+        }
+    }
+
+    /// <summary>
+    /// Returns a JSON array of column metadata for a given table.
+    /// </summary>
+    public string GetTableColumnsJson(string tableName)
+    {
+        var nameBytes = Encoding.UTF8.GetBytes(tableName + "\0");
+        IntPtr ptr;
+        int len;
+        unsafe
+        {
+            fixed (byte* pName = nameBytes)
+            {
+                ptr = DecentDBNativeUnsafe.decentdb_get_table_columns_json(Handle, pName, out len);
+            }
+        }
+        if (ptr == IntPtr.Zero)
+        {
+            throw new DecentDBException(LastErrorCode, LastErrorMessage, "GetTableColumnsJson");
+        }
+        try
+        {
+            return Marshal.PtrToStringUTF8(ptr, len) ?? "[]";
+        }
+        finally
+        {
+            DecentDBNative.decentdb_free(ptr);
+        }
+    }
 }
 
 public sealed class PreparedStatement : IDisposable

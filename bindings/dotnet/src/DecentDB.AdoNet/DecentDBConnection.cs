@@ -343,5 +343,125 @@ namespace DecentDB.AdoNet
             Close();
             base.Dispose(disposing);
         }
+
+        // ───── Schema introspection (JSON) ─────
+
+        /// <summary>
+        /// Returns a JSON array of table names, e.g. ["users","items"].
+        /// </summary>
+        public string ListTablesJson()
+        {
+            return GetNativeDb().ListTablesJson();
+        }
+
+        /// <summary>
+        /// Returns a JSON array of column metadata for a given table.
+        /// Each element: {"name":"col","type":"INTEGER","not_null":false,"unique":false,"primary_key":false,...}
+        /// </summary>
+        public string GetTableColumnsJson(string tableName)
+        {
+            return GetNativeDb().GetTableColumnsJson(tableName);
+        }
+
+        // ───── ADO.NET GetSchema ─────
+
+        /// <summary>
+        /// Returns the list of supported schema collections.
+        /// </summary>
+        public override DataTable GetSchema()
+        {
+            return GetSchema("MetaDataCollections");
+        }
+
+        /// <summary>
+        /// Returns schema information for the specified collection.
+        /// Supported collections: MetaDataCollections, Tables, Columns.
+        /// </summary>
+        public override DataTable GetSchema(string collectionName)
+        {
+            return GetSchema(collectionName, null);
+        }
+
+        /// <summary>
+        /// Returns schema information for the specified collection, optionally
+        /// filtered by <paramref name="restrictionValues"/>.
+        /// For "Columns", the first restriction is the table name.
+        /// </summary>
+        public override DataTable GetSchema(string collectionName, string?[]? restrictionValues)
+        {
+            if (_db == null)
+                throw new InvalidOperationException("Connection is not open");
+
+            switch (collectionName.ToUpperInvariant())
+            {
+                case "METADATACOLLECTIONS":
+                    return BuildMetaDataCollectionsTable();
+                case "TABLES":
+                    return BuildTablesTable();
+                case "COLUMNS":
+                    string? tableFilter = restrictionValues is { Length: > 0 } ? restrictionValues[0] : null;
+                    return BuildColumnsTable(tableFilter);
+                default:
+                    throw new ArgumentException($"Unsupported schema collection: {collectionName}", nameof(collectionName));
+            }
+        }
+
+        private static DataTable BuildMetaDataCollectionsTable()
+        {
+            var dt = new DataTable("MetaDataCollections");
+            dt.Columns.Add("CollectionName", typeof(string));
+            dt.Columns.Add("NumberOfRestrictions", typeof(int));
+
+            dt.Rows.Add("MetaDataCollections", 0);
+            dt.Rows.Add("Tables", 0);
+            dt.Rows.Add("Columns", 1);
+            return dt;
+        }
+
+        private DataTable BuildTablesTable()
+        {
+            var dt = new DataTable("Tables");
+            dt.Columns.Add("TABLE_NAME", typeof(string));
+            dt.Columns.Add("TABLE_TYPE", typeof(string));
+
+            var json = System.Text.Json.JsonDocument.Parse(ListTablesJson());
+            foreach (var element in json.RootElement.EnumerateArray())
+            {
+                dt.Rows.Add(element.GetString(), "TABLE");
+            }
+            return dt;
+        }
+
+        private DataTable BuildColumnsTable(string? tableFilter)
+        {
+            var dt = new DataTable("Columns");
+            dt.Columns.Add("TABLE_NAME", typeof(string));
+            dt.Columns.Add("COLUMN_NAME", typeof(string));
+            dt.Columns.Add("DATA_TYPE", typeof(string));
+            dt.Columns.Add("IS_NULLABLE", typeof(bool));
+            dt.Columns.Add("IS_UNIQUE", typeof(bool));
+            dt.Columns.Add("IS_PRIMARY_KEY", typeof(bool));
+
+            var tables = System.Text.Json.JsonDocument.Parse(ListTablesJson());
+            foreach (var tableElement in tables.RootElement.EnumerateArray())
+            {
+                var tableName = tableElement.GetString()!;
+                if (tableFilter != null && !string.Equals(tableName, tableFilter, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var cols = System.Text.Json.JsonDocument.Parse(GetTableColumnsJson(tableName));
+                foreach (var col in cols.RootElement.EnumerateArray())
+                {
+                    dt.Rows.Add(
+                        tableName,
+                        col.GetProperty("name").GetString(),
+                        col.GetProperty("type").GetString(),
+                        !col.GetProperty("not_null").GetBoolean(),
+                        col.GetProperty("unique").GetBoolean(),
+                        col.GetProperty("primary_key").GetBoolean());
+                }
+            }
+            return dt;
+        }
     }
 }
