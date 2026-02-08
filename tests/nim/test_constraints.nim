@@ -66,9 +66,9 @@ suite "Constraints":
     check updParent.err.code == ERR_CONSTRAINT
     check execSql(db, "DELETE FROM children WHERE id = 1").ok
     check execSql(db, "DELETE FROM parents WHERE id = 1").ok
+    # INT PRIMARY KEY allows NULL → auto-increment (ADR-0092)
     let nullParent = execSql(db, "INSERT INTO parents (id, name) VALUES (NULL, 'B')")
-    check not nullParent.ok
-    check nullParent.err.code == ERR_CONSTRAINT
+    check nullParent.ok
     discard closeDb(db)
 
   test "unique constraint rejects duplicates":
