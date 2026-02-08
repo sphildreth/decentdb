@@ -178,18 +178,32 @@ proc calculatePageUtilization*(tree: BTree, pageId: PageId): Result[float]
 ### High Priority
 
 - [ ] Cost-based query optimizer
-- [x] Online schema migrations (ALTER TABLE) - **IMPLEMENTED in v1.0.0**
+-
+   The planner currently lacks a true cost model (e.g., cardinality/selectivity estimates, costed join ordering, and costed access-path selection). High priority because it is the main unlock for closing the performance gap on multi-join and selective-filter queries without relying on manual query rewrites.
 - [ ] Additional SQL functions
+-
+   The SQL surface area is still missing many “everyday” built-in functions (string, math, date/time, and common utility functions) that users expect for real workloads and ORMs. High priority because it reduces friction immediately and tends to be incremental work with clear, testable semantics.
 - [ ] Performance benchmarks
+-
+   The project needs a tighter, reproducible benchmark suite (micro + macro) with stable datasets, clear baselines, and automation to catch regressions (ideally runnable in CI or in a repeatable local harness). High priority because performance work is hard to prioritize (and easy to regress) without consistent numbers and a shared methodology.
 - [ ] More crash test scenarios
+-
+   Crash-injection coverage should expand to include more “unlucky timing” cases around WAL writing, fsync boundaries, checkpointing, and recovery paths (including partial writes/torn pages and interrupted truncation). High priority because durability/correctness claims depend on surviving these edge cases, and tests are the fastest way to prevent regressions.
 
 ### Medium Priority
 
 - [ ] Additional VFS implementations
+-
+   Today the default VFS is OS-backed; additional VFS backends (e.g., in-memory for tests/benchmarks, or a constrained/portable VFS for embedded targets) would broaden where DecentDB can run and improve testability. Medium priority because it’s valuable but tends to be platform- and integration-heavy.
 - [ ] Query caching improvements
+-
+   There’s limited reuse of work across repeated queries (e.g., prepared/bound statement reuse, plan caching, and safe result/page-level caching under snapshot isolation). Medium priority because it can yield big wins for repeated workloads, but needs careful invalidation semantics to preserve correctness.
 - [ ] Compression support
+-
+   Storage currently writes raw pages/records/WAL frames; compression would reduce IO and file size (especially for text-heavy datasets) but requires clear choices about where compression lives (page vs record vs WAL), thresholds, and CPU tradeoffs. Medium priority because it’s impactful, but easy to get wrong without careful benchmarking and format considerations.
 - [ ] Better error messages
-- [ ] GUI tools
+-
+   Many errors are technically correct but could be more actionable (more context like operation/object name, friendlier phrasing, and consistent codes), especially for SQL parse/bind/exec failures. Medium priority because it improves usability and debuggability, but doesn’t usually unblock core correctness/performance work.
 
 ### Documentation
 

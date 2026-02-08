@@ -77,8 +77,8 @@ For remaining roadmap and deferred capabilities, use:
 
 ## Data types and functions
 
-DecentDB’s baseline types are intentionally minimal:
-- `NULL`, `INT64`, `BOOL`, `FLOAT64`, `TEXT` (UTF-8), `BLOB`
+DecentDB’s baseline types are intentionally small:
+- `NULL`, `INT64`, `BOOL`, `FLOAT64`, `TEXT` (UTF-8), `BLOB`, `UUID`, `DECIMAL(p,s)` / `NUMERIC(p,s)`
 
 SQLite and DuckDB both offer larger built-in ecosystems of types and functions. DuckDB, in particular, has many analytics-oriented types and functions (dates/times, decimals, nested types, extensive math/statistics), while SQLite’s strength is portability, flexibility, and a long list of optional extensions.
 

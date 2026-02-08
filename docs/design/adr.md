@@ -1,192 +1,58 @@
 # Architecture Decision Records (ADRs)
 
-This directory contains Architecture Decision Records (ADRs) documenting significant architectural decisions in DecentDB.
+DecentDB uses Architecture Decision Records (ADRs) to capture **important technical decisions** (especially those affecting durability, recovery, persistent formats, and SQL semantics) along with the reasoning and trade-offs.
+
+The canonical ADRs live in the repository at `design/adr/`.
 
 ## What is an ADR?
 
-An Architecture Decision Record (ADR) captures an important architectural decision made along with its context and consequences.
+An ADR is a short document describing:
 
-Format:
-- **Title**: Decision name
-- **Status**: Proposed, Accepted, Deprecated, Superseded
-- **Context**: Why we needed to decide
-- **Decision**: What we decided
-- **Consequences**: What happens because of this decision
+- **Decision**: what we chose to do
+- **Rationale**: why this choice
+- **Alternatives considered**: what we didn’t choose
+- **Trade-offs**: what gets better/worse
+- **References**: relevant code/PRs/issues/spec sections
 
-## ADR Index
+DecentDB ADRs follow the template in `design/adr/0000-template.md`.
 
-### Storage & File Format
+## When an ADR is required
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0016 | Database Header Checksum | ✅ Accepted |
-| ADR-0020 | Overflow Pages for BLOBs | ✅ Accepted |
-| ADR-0029 | Freelist Page Format | ✅ Accepted |
-| ADR-0030 | Record Format | ✅ Accepted |
-| ADR-0031 | Overflow Page Format | ✅ Accepted |
-| ADR-0032 | BTree Page Layout | ✅ Accepted |
+Per the project workflow, you must write an ADR *before* implementing changes that could affect:
 
-### WAL & Durability
+- Persistent formats (DB header, page layout, WAL format, index/postings formats)
+- Durability, recovery, checkpointing, or truncation strategy
+- Locking/concurrency semantics that affect correctness
+- SQL dialect behavior (including edge-case semantics)
+- Adding/removing significant dependencies
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0002 | WAL Commit Record Format | ✅ Accepted |
-| ADR-0003 | Snapshot LSN Atomicity | ✅ Accepted |
-| ADR-0004 | WAL Checkpoint Strategy | ✅ Accepted |
-| ADR-0017 | Bulk Load API Design | ✅ Accepted |
-| ADR-0018 | Checkpointing Reader Count | ✅ Accepted |
-| ADR-0019 | WAL Retention for Active Readers | ✅ Accepted |
-| ADR-0023 | Isolation Level Specification | ✅ Accepted |
-| ADR-0024 | WAL Growth Prevention | ✅ Accepted |
-| ADR-0033 | WAL Frame Format | ✅ Accepted |
-| ADR-0037 | Group Commit / WAL Batching | ⏳ Proposed (Post-1.0) |
+If you’re unsure, write the ADR—small ADRs are cheaper than silent, implicit decisions.
 
-### SQL & Query Processing
+## How to create an ADR
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0005 | SQL Parameterization | ✅ Accepted |
-| ADR-0035 | SQL Parser libpg_query | ✅ Accepted |
-| ADR-0038 | Cost-Based Optimization | ⏳ Proposed (Post-1.0) |
+1. Copy `design/adr/0000-template.md` to `design/adr/NNNN-short-title.md`
+2. Pick the next sequential `NNNN` (4 digits, zero-padded)
+3. Use a short kebab-case title
+4. Fill in every section (keep it concise and specific)
+5. Link the ADR from the PR description and call out any compatibility / durability impact
 
-### Data Model
+## Numbering rules
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0006 | Foreign Key Index Creation | ✅ Accepted |
-| ADR-0009 | Foreign Key Enforcement Timing | ✅ Accepted |
-| ADR-0036 | Catalog Constraints & Index Metadata | ✅ Accepted |
+- Numbers are sequential and must not be reused.
+- If two PRs race, the later PR renumbers to the next available `NNNN`.
 
-### Search
+## Status lifecycle
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0007 | Trigram Postings Storage | ✅ Accepted |
-| ADR-0008 | Trigram Pattern Length Guardrails | ✅ Accepted |
+- **Proposed**: under review
+- **Accepted**: approved (and implemented or actively being implemented)
+- **Superseded**: replaced by a newer ADR (link it in References)
+- **Rejected**: considered and explicitly not chosen
 
-### Infrastructure
+## Finding ADRs
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0001 | Page Size (4096 default) | ✅ Accepted |
-| ADR-0010 | Error Handling Strategy | ✅ Accepted |
-| ADR-0011 | Memory Management Strategy | ✅ Accepted |
-| ADR-0012 | B+Tree Space Management | ✅ Accepted |
-| ADR-0013 | Index Statistics Strategy | ✅ Accepted |
-| ADR-0014 | Performance Targets | ✅ Accepted |
-| ADR-0015 | Testing Strategy Enhancements | ✅ Accepted |
-| ADR-0021 | Sort Buffer Memory Limits | ✅ Accepted |
-| ADR-0022 | External Merge Sort | ✅ Accepted |
-| ADR-0025 | Memory Leak Prevention | ✅ Accepted |
-| ADR-0026 | Race Condition Testing | ✅ Accepted |
-| ADR-0027 | Bulk Load API Specification | ✅ Accepted |
+This docs page intentionally does **not** maintain a manual ADR index (it quickly becomes stale). To browse decisions:
 
-### Documentation
+- Open the `design/adr/` folder in the repo and sort by filename/number.
+- Start with the ADRs referenced by `design/SPEC.md` and the relevant subsystem docs.
 
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-0028 | Summary of Design Document Updates | ✅ Accepted |
-
-### CLI & API
-
-| ADR | Title | Status |
-|-----|-------|--------|
-| ADR-003 | CLI Engine Enhancements | ✅ Accepted |
-
-## How to Create an ADR
-
-1. Copy the template:
-   - `design/adr/0000-template.md` → `design/adr/NNNN-short-title.md`
-2. Choose the next sequential number `NNNN` (4 digits, zero-padded).
-3. Use a short, kebab-case title.
-4. Fill out every section and keep it concise.
-5. Open a PR for review and link the ADR in the PR description.
-
-## ADR Template
-
-```markdown
-# ADR-XXXX: Title
-
-**Status:** Proposed / Accepted / Deprecated / Superseded by ADR-YYYY
-
-**Date:** YYYY-MM-DD
-
-## Context
-
-What is the issue that we're seeing that is motivating this decision or change?
-
-## Decision
-
-What is the change that we're proposing or have agreed to implement?
-
-## Consequences
-
-What becomes easier or more difficult to do because of this change?
-
-### Positive
-
-- Benefit 1
-- Benefit 2
-
-### Negative
-
-- Drawback 1
-- Drawback 2
-
-### Neutral
-
-- Observation 1
-
-## Alternatives Considered
-
-### Alternative A
-
-Why it was rejected.
-
-### Alternative B
-
-Why it was rejected.
-
-## References
-
-- Link to related issues
-- Link to related PRs
-- External resources
-```
-
-## Reading ADRs
-
-ADRs are located in `design/adr/` directory.
-
-Note: The index on this page is a curated subset and may lag behind the full list.
-
-To read about a specific decision:
-1. Find it in the index above
-2. Open the corresponding file
-3. Read context, decision, and consequences
-
-## ADR Lifecycle
-
-```
-Proposed → Accepted → (Deprecated | Superseded)
-   ↓
-Rejected
-```
-
-- **Proposed**: Under review
-- **Accepted**: Merged and implemented
-- **Deprecated**: No longer relevant, but kept for history
-- **Superseded**: Replaced by newer ADR
-- **Rejected**: Not accepted
-
-## Why ADRs?
-
-1. **Documentation**: Capture why decisions were made
-2. **Onboarding**: New team members understand history
-3. **Review**: Force thinking through consequences
-4. **Transparency**: Visible decision-making process
-
-## Questions?
-
-See individual ADR files for specific decisions.
-For ADR process questions, open a discussion.
+For the authoritative ADR workflow details, see `design/adr/README.md`.

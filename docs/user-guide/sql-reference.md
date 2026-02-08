@@ -128,7 +128,7 @@ ALTER TABLE users ALTER COLUMN age TYPE TEXT;
 ```
 
 **Notes:**
-- Supported `ALTER TABLE` operations in v1.0.0: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
+- Supported `ALTER TABLE` operations in 0.x: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
 - `ALTER TABLE` operations are currently rejected for tables that define `CHECK` constraints
 - `ALTER TABLE` operations are currently rejected for tables that define expression indexes
 - `RENAME COLUMN` is rejected when dependent views exist
@@ -136,6 +136,33 @@ ALTER TABLE users ALTER COLUMN age TYPE TEXT;
 - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
 - `ADD CONSTRAINT` is planned for future releases
 - Schema changes require an exclusive lock on the database
+
+### CREATE VIEW / DROP VIEW / ALTER VIEW
+
+```sql
+CREATE VIEW view_name AS SELECT ...;
+CREATE VIEW IF NOT EXISTS view_name AS SELECT ...;
+CREATE OR REPLACE VIEW view_name AS SELECT ...;
+
+DROP VIEW [IF EXISTS] view_name;
+
+ALTER VIEW view_name RENAME TO new_name;
+```
+
+Example:
+```sql
+CREATE VIEW active_users AS
+  SELECT id, email FROM users WHERE status = 'active';
+
+ALTER VIEW active_users RENAME TO active_users_v1;
+DROP VIEW active_users_v1;
+```
+
+**Notes:**
+- View definitions must be a pure `SELECT` statement.
+- Views are read-only unless you define `INSTEAD OF` triggers for DML.
+- Parameters (`$1`, etc.) are not allowed in view definitions.
+- Dropping or renaming a view is `RESTRICT`ed when dependent views exist.
 
 ### CREATE TRIGGER / DROP TRIGGER
 

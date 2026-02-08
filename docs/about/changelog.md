@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-02-07
 
 ### Added
 - **Data Types**:
@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `CAST` support for `UUID` and `DECIMAL`.
   - Common Table Expressions (CTEs) - Non-recursive `WITH` clauses.
   - Window Functions - `ROW_NUMBER()`.
+  - Non-materialized, read-only `VIEW`s (`CREATE VIEW`, `CREATE OR REPLACE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`).
+  - Triggers (`CREATE TRIGGER`, `DROP TRIGGER`): `AFTER` row triggers on tables and `INSTEAD OF` row triggers on views, with a constrained action surface.
 
 ## [0.0.1] - 2026-01-30
 
@@ -78,12 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Single writer only (no concurrent write transactions)
 - Single process access (no multi-process concurrency)
-- No subqueries in SELECT list
+- Subqueries are limited: only `EXISTS (SELECT ...)` is supported (no scalar subqueries, including in SELECT lists)
 - Advanced window functions (only `ROW_NUMBER()` is supported)
 - Recursive CTEs (`WITH RECURSIVE` not supported)
-- No views
+- Views are read-only (no `INSERT`/`UPDATE`/`DELETE` targeting a view); parameters are not allowed in view definitions
+- Triggers are intentionally narrow in 0.x: `AFTER` (tables) and `INSTEAD OF` (views), `FOR EACH ROW` only, and actions must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` (no `NEW`/`OLD`)
 - No stored procedures
-- Statement-time foreign key enforcement (not deferred)
+- Statement-time foreign key enforcement only (no deferred/deferrable constraints)
 - No full-text search with ranking (trigram only)
 - No replication
 - No built-in encryption

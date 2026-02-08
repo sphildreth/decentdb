@@ -35,7 +35,7 @@ This file defines how coding agents should operate in this repository.
 ## 3. Expected agent workflow
 ### 3.1 Before coding
 1. Read: PRD.md, SPEC.md, TESTING_STRATEGY.md
-2. Determine if your change requires an ADR (see docs/adr/README.md)
+2. Determine if your change requires an ADR (see design/adr/README.md)
 3. Create a small implementation plan:
    - Scope (what’s included/excluded)
    - Modules/files to change
