@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `INSERT ... ON CONFLICT DO NOTHING` and `INSERT ... ON CONFLICT DO UPDATE` (upsert).
   - `INTEGER PRIMARY KEY` auto-increment: columns auto-assign sequential IDs when omitted from INSERT.
   - `<>` operator (alias for `!=`).
+  - `EXPLAIN ANALYZE` for query plan output with actual execution metrics (row counts, timing).
 - **C API**:
   - `decentdb_checkpoint()` for WAL-to-database synchronization.
   - `decentdb_free()` for API-allocated memory.

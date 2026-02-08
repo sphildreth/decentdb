@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -705,5 +706,76 @@ func TestOpenDirect_AutoIncrement(t *testing.T) {
 	}
 	if ids[0] >= ids[1] {
 		t.Errorf("auto-increment IDs should be increasing: %d, %d", ids[0], ids[1])
+	}
+}
+
+func TestExplainAnalyze(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-explain-analyze-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	dsn := fmt.Sprintf("file:%s", dbPath)
+
+	db, err := sql.Open("decentdb", dsn)
+	if err != nil {
+		t.Fatalf("failed to open: %v", err)
+	}
+	defer db.Close()
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx := context.Background()
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE t (id INT, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO t VALUES (1, 'Alice')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO t VALUES (2, 'Bob')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "INSERT INTO t VALUES (3, 'Charlie')"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := conn.QueryContext(ctx, "EXPLAIN ANALYZE SELECT * FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, line)
+	}
+
+	planText := ""
+	for _, l := range lines {
+		planText += l + "\n"
+	}
+
+	if len(lines) == 0 {
+		t.Fatal("expected plan output, got 0 lines")
+	}
+
+	if !strings.Contains(planText, "Project") {
+		t.Errorf("expected 'Project' in plan output, got: %s", planText)
+	}
+	if !strings.Contains(planText, "Actual Rows: 3") {
+		t.Errorf("expected 'Actual Rows: 3' in plan output, got: %s", planText)
+	}
+	if !strings.Contains(planText, "Actual Time:") {
+		t.Errorf("expected 'Actual Time:' in plan output, got: %s", planText)
 	}
 }

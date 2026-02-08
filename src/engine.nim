@@ -1784,8 +1784,22 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
       let res = rollbackTransaction(db)
       if not res.ok: return err[seq[string]](res.err.code, res.err.message, res.err.context)
     of skExplain:
-      let explainStr = explainPlanLines(db.catalog, plan).join("\n")
-      output.add(explainStr)
+      if bound.explainAnalyze:
+        let t0 = getMonoTime()
+        let rowsRes = execPlan(db.pager, db.catalog, plan, params)
+        let t1 = getMonoTime()
+        if not rowsRes.ok:
+          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        let metrics = PlanMetrics(
+          actualRows: rowsRes.value.len,
+          actualTimeMs: (t1 - t0).inNanoseconds.float64 / 1_000_000.0
+        )
+        let lines = explainAnalyzePlanLines(db.catalog, plan, metrics)
+        for line in lines:
+          output.add(line)
+      else:
+        let explainStr = explainPlanLines(db.catalog, plan).join("\n")
+        output.add(explainStr)
     of skSelect:
       let cursorRes = openRowCursor(db.pager, db.catalog, plan, params)
       if not cursorRes.ok:
@@ -2460,9 +2474,24 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not planRes.ok:
           return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
         p = planRes.value
-      let lines = explainPlanLines(db.catalog, p)
-      for line in lines:
-        output.add(line)
+      if bound.explainAnalyze:
+        # Execute the query and measure actual metrics
+        let t0 = getMonoTime()
+        let rowsRes = execPlan(db.pager, db.catalog, p, params)
+        let t1 = getMonoTime()
+        if not rowsRes.ok:
+          return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        let metrics = PlanMetrics(
+          actualRows: rowsRes.value.len,
+          actualTimeMs: (t1 - t0).inNanoseconds.float64 / 1_000_000.0
+        )
+        let lines = explainAnalyzePlanLines(db.catalog, p, metrics)
+        for line in lines:
+          output.add(line)
+      else:
+        let lines = explainPlanLines(db.catalog, p)
+        for line in lines:
+          output.add(line)
     of skSelect:
       let selectRes = runSelect(bound, if i < cachedPlans.len: cachedPlans[i] else: nil)
       if not selectRes.ok:

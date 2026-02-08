@@ -52,7 +52,7 @@ DecentDB's current baseline includes:
 - Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`
 - Operators: `+`, `-`, `*`, `/`, `||` (string concatenation)
 - Parameters: positional `$1, $2, ...` (Postgres-style)
-- `EXPLAIN` plan output
+- `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 
 SQLite and DuckDB generally include all of the above, plus substantial additional SQL.
 
@@ -76,7 +76,7 @@ DecentDB has implemented many previously planned baseline features, including:
 - Trigger subsets (`AFTER` row triggers on tables, `INSTEAD OF` row triggers on views)
 - Window subset (`ROW_NUMBER() OVER (...)`)
 - Indexing options (multi-column, partial v0 subset, expression index v0 subset)
-- `EXPLAIN` plan output
+- `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 
 For remaining roadmap and deferred capabilities, use:
 - [DecentDB SQL Enhancements Plan](../../design/SQL_ENHANCEMENTS_PLAN.md)

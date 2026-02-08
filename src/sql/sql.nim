@@ -163,7 +163,7 @@ type Statement* = ref object
   case kind*: StatementKind
   of skExplain:
     explainInner*: Statement
-    explainHasOptions*: bool
+    explainAnalyze*: bool
   of skCreateTable:
     createTableName*: string
     columns*: seq[ColumnDef]
@@ -1750,21 +1750,26 @@ proc parseAlterTableStmt(node: JsonNode): Result[Statement] =
   ok(Statement(kind: skAlterTable, alterTableName: tableName, alterActions: actions))
 
 proc parseExplainStmt(node: JsonNode): Result[Statement] =
+  var analyze = false
   if nodeHas(node, "options"):
     let opts = node["options"]
-    if opts.kind == JArray and opts.len > 0:
-      return err[Statement](ERR_SQL, "EXPLAIN options not supported")
+    if opts.kind == JArray:
+      for opt in opts:
+        if nodeHas(opt, "DefElem"):
+          let defName = nodeString(nodeGet(opt["DefElem"], "defname"))
+          if defName == "analyze":
+            analyze = true
+          else:
+            return err[Statement](ERR_SQL, "EXPLAIN option not supported", defName)
+        else:
+          return err[Statement](ERR_SQL, "EXPLAIN options not supported")
 
   let queryNode = nodeGet(node, "query")
-  # nodeGet returns JNull if missing, or the node.
-  # But we want to ensure it's a valid statement node.
-  # PG query structure for ExplainStmt has "query" field.
-  
   let innerRes = parseStatementNode(queryNode)
   if not innerRes.ok:
     return err[Statement](innerRes.err.code, innerRes.err.message, innerRes.err.context)
   
-  ok(Statement(kind: skExplain, explainInner: innerRes.value, explainHasOptions: false))
+  ok(Statement(kind: skExplain, explainInner: innerRes.value, explainAnalyze: analyze))
 
 proc parseStatementNode(node: JsonNode): Result[Statement] =
   if nodeHas(node, "ExplainStmt"):

@@ -3,6 +3,11 @@ import ../sql/sql
 import ../catalog/catalog
 import ./planner
 
+type
+  PlanMetrics* = object
+    actualRows*: int
+    actualTimeMs*: float64
+
 proc renderExpr*(expr: Expr): string
 
 proc renderSelectItem*(item: SelectItem): string =
@@ -184,3 +189,10 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
 
   traverse(plan, 0)
   result = lines
+
+proc explainAnalyzePlanLines*(catalog: Catalog, plan: Plan, metrics: PlanMetrics): seq[string] =
+  ## Render EXPLAIN ANALYZE output: plan lines followed by actual execution metrics.
+  result = explainPlanLines(catalog, plan)
+  result.add("---")
+  result.add("Actual Rows: " & $metrics.actualRows)
+  result.add("Actual Time: " & formatFloat(metrics.actualTimeMs, ffDecimal, 3) & " ms")
