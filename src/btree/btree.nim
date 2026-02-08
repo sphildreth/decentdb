@@ -9,6 +9,7 @@ const
   PageTypeInternal* = 1'u8
   PageTypeLeaf* = 2'u8
   MaxLeafInlineValueBytes = 512
+  PageFlagDeltaKeys* = 0x01'u8  # byte[1] flag: keys are delta-encoded
 
 type
   InternalNodeIndex = ref object of RootRef
@@ -57,6 +58,8 @@ type BTreeCursorStream* = ref object
   leafPage*: string
   offset*: int
   remaining*: int
+  deltaEncoded*: bool
+  prevKey*: uint64
 
 type LeafValue = object
   inline: seq[byte]
@@ -70,6 +73,7 @@ proc readLeafCells(page: string): Result[(seq[uint64], seq[seq[byte]], seq[uint3
     return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Page too small")
   if byte(page[0]) != PageTypeLeaf:
     return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Not a leaf page")
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   let nextLeaf = PageId(readU32LE(page, 4))
   var keys: seq[uint64] = @[]
@@ -81,6 +85,7 @@ proc readLeafCells(page: string): Result[(seq[uint64], seq[seq[byte]], seq[uint3
   if page.len > 0:
     copyMem(addr data[0], unsafeAddr page[0], page.len)
 
+  var prevKey: uint64 = 0
   for _ in 0 ..< count:
     if offset >= page.len:
       return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](ERR_CORRUPTION, "Leaf cell out of bounds")
@@ -88,7 +93,8 @@ proc readLeafCells(page: string): Result[(seq[uint64], seq[seq[byte]], seq[uint3
     let keyRes = decodeVarint(data, offset)
     if not keyRes.ok:
       return err[(seq[uint64], seq[seq[byte]], seq[uint32], PageId)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
-    let key = keyRes.value
+    let key = if deltaEncoded: prevKey + keyRes.value else: keyRes.value
+    prevKey = key
 
     let ctrlRes = decodeVarint(data, offset)
     if not ctrlRes.ok:
@@ -126,6 +132,7 @@ proc readLeafCellsView(page: string): Result[(seq[uint64], seq[int], seq[int], s
     return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Page too small")
   if byte(page[0]) != PageTypeLeaf:
     return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Not a leaf page")
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   let nextLeaf = PageId(readU32LE(page, 4))
   var keys = newSeq[uint64](count)
@@ -134,6 +141,7 @@ proc readLeafCellsView(page: string): Result[(seq[uint64], seq[int], seq[int], s
   var overflows = newSeq[uint32](count)
   var offset = 8
 
+  var prevKey: uint64 = 0
   for i in 0 ..< count:
     if offset >= page.len:
       return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](ERR_CORRUPTION, "Leaf cell out of bounds")
@@ -141,7 +149,9 @@ proc readLeafCellsView(page: string): Result[(seq[uint64], seq[int], seq[int], s
     let keyRes = decodeVarint(page, offset)
     if not keyRes.ok:
       return err[(seq[uint64], seq[int], seq[int], seq[uint32], PageId)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
-    keys[i] = keyRes.value
+    let key = if deltaEncoded: prevKey + keyRes.value else: keyRes.value
+    prevKey = key
+    keys[i] = key
 
     let ctrlRes = decodeVarint(page, offset)
     if not ctrlRes.ok:
@@ -170,8 +180,8 @@ proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)]
   if page.len < 8:
     return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Page too small")
   if byte(page[0]) != PageTypeInternal:
-    # stderr.writeLine("FAIL: Not an internal page (type=" & $int(byte(page[0])) & ") ...")
     return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Not an internal page (type=" & $int(byte(page[0])) & ")")
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   let rightChild = readU32LE(page, 4)
   var keys: seq[uint64] = @[]
@@ -182,6 +192,7 @@ proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)]
   if page.len > 0:
     copyMem(addr data[0], unsafeAddr page[0], page.len)
 
+  var prevKey: uint64 = 0
   for _ in 0 ..< count:
     if offset >= page.len:
       return err[(seq[uint64], seq[uint32], uint32)](ERR_CORRUPTION, "Internal cell out of bounds")
@@ -189,7 +200,8 @@ proc readInternalCells(page: string): Result[(seq[uint64], seq[uint32], uint32)]
     let keyRes = decodeVarint(data, offset)
     if not keyRes.ok:
       return err[(seq[uint64], seq[uint32], uint32)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
-    let key = keyRes.value
+    let key = if deltaEncoded: prevKey + keyRes.value else: keyRes.value
+    prevKey = key
 
     let childRes = decodeVarint(data, offset)
     if not childRes.ok:
@@ -280,12 +292,14 @@ proc getOrBuildInternalIndex(page: string, entry: CacheEntry): Result[InternalNo
   if page.len < 8:
     return err[InternalNodeIndex](ERR_CORRUPTION, "Page too small")
   
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   let rightChild = readU32LE(page, 4)
   var keys = newSeq[uint64](count)
   var children = newSeq[uint32](count)
   var offset = 8
   
+  var prevKey: uint64 = 0
   for i in 0 ..< count:
     if offset >= page.len:
       return err[InternalNodeIndex](ERR_CORRUPTION, "Internal cell out of bounds")
@@ -293,6 +307,9 @@ proc getOrBuildInternalIndex(page: string, entry: CacheEntry): Result[InternalNo
     var k: uint64
     if not decodeVarintFast(page, offset, k):
       return err[InternalNodeIndex](ERR_CORRUPTION, "Invalid key varint")
+    if deltaEncoded:
+      k = prevKey + k
+      prevKey = k
     keys[i] = k
     
     var c: uint64
@@ -313,6 +330,7 @@ proc getOrBuildLeafIndex(page: string, entry: CacheEntry): Result[LeafNodeIndex]
   if page.len < 8:
     return err[LeafNodeIndex](ERR_CORRUPTION, "Page too small")
     
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   var keys = newSeq[uint64](count)
   var valueOffsets = newSeq[int](count)
@@ -320,6 +338,7 @@ proc getOrBuildLeafIndex(page: string, entry: CacheEntry): Result[LeafNodeIndex]
   var overflows = newSeq[uint32](count)
   var offset = 8
   
+  var prevKey: uint64 = 0
   for i in 0 ..< count:
     if offset >= page.len:
       return err[LeafNodeIndex](ERR_CORRUPTION, "Leaf cell out of bounds")
@@ -327,6 +346,9 @@ proc getOrBuildLeafIndex(page: string, entry: CacheEntry): Result[LeafNodeIndex]
     var k: uint64
     if not decodeVarintFast(page, offset, k):
       return err[LeafNodeIndex](ERR_CORRUPTION, "Invalid key varint")
+    if deltaEncoded:
+      k = prevKey + k
+      prevKey = k
     keys[i] = k
     
     var ctrl: uint64
@@ -372,10 +394,12 @@ proc findChildInPage(page: string, searchKey: uint64): Result[uint32] =
   if page.len < 8:
     return err[uint32](ERR_CORRUPTION, "Page too small")
   
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   let rightChild = readU32LE(page, 4)
   var offset = 8
   
+  var prevKey: uint64 = 0
   for _ in 0 ..< count:
     if offset >= page.len:
       return err[uint32](ERR_CORRUPTION, "Internal cell out of bounds")
@@ -383,7 +407,8 @@ proc findChildInPage(page: string, searchKey: uint64): Result[uint32] =
     let keyRes = decodeVarint(page, offset)
     if not keyRes.ok:
       return err[uint32](keyRes.err.code, keyRes.err.message, keyRes.err.context)
-    let key = keyRes.value
+    let key = if deltaEncoded: prevKey + keyRes.value else: keyRes.value
+    prevKey = key
     
     let childRes = decodeVarint(page, offset)
     if not childRes.ok:
@@ -490,14 +515,19 @@ proc findLeafLeftmost(tree: BTree, key: uint64): Result[PageId] =
       
       # Decode all keys inline
       var offset = 8
+      let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
       var keyVals: array[256, uint64]
       var childVals: array[256, uint32]
       
+      var prevKey: uint64 = 0
       for i in 0 ..< count:
         # Decode key varint
         var k: uint64
         if not decodeVarintFast(page, offset, k):
           return err[Void](ERR_CORRUPTION, "Invalid key varint")
+        if deltaEncoded:
+          k = prevKey + k
+          prevKey = k
         
         if i < 256:
           keyVals[i] = k
@@ -604,7 +634,10 @@ proc chooseLeafSplitPoint(keys: seq[uint64], values: seq[seq[byte]], overflows: 
   if minSplitAt < 0 or maxSplitAt < 0 or minSplitAt > maxSplitAt:
     return err[int](ERR_IO, "Leaf overflow")
 
-  var splitAt = keys.len div 2
+  # Bias split toward keeping the left page fuller. This improves average page
+  # utilization from ~50% to ~67% at the cost of slightly more frequent splits
+  # on the right side.
+  var splitAt = keys.len * 2 div 3
   if splitAt < minSplitAt: splitAt = minSplitAt
   if splitAt > maxSplitAt: splitAt = maxSplitAt
   ok(splitAt)
@@ -653,9 +686,11 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
       return err[Void](ERR_CORRUPTION, "Page too small")
     if byte(page[0]) != PageTypeLeaf:
       return err[Void](ERR_CORRUPTION, "Not a leaf page")
+    let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
     let count = int(readU16LE(page, 2))
     var offset = 8
     
+    var prevKey: uint64 = 0
     for _ in 0 ..< count:
       if offset >= page.len:
         return err[Void](ERR_CORRUPTION, "Leaf cell out of bounds")
@@ -664,6 +699,9 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
       var k: uint64
       if not decodeVarintFast(page, offset, k):
         return err[Void](ERR_CORRUPTION, "Invalid key varint")
+      if deltaEncoded:
+        k = prevKey + k
+        prevKey = k
       
       # Decode control varint inline
       var ctrl: uint64
@@ -747,9 +785,11 @@ proc containsKey*(tree: BTree, key: uint64): Result[bool] =
     return err[bool](ERR_CORRUPTION, "Page too small")
   if byte(page[0]) != PageTypeLeaf:
     return err[bool](ERR_CORRUPTION, "Not a leaf page")
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   var offset = 8
   
+  var prevKey: uint64 = 0
   for _ in 0 ..< count:
     if offset >= page.len:
       return err[bool](ERR_CORRUPTION, "Leaf cell out of bounds")
@@ -757,6 +797,9 @@ proc containsKey*(tree: BTree, key: uint64): Result[bool] =
     var k: uint64
     if not decodeVarintFast(page, offset, k):
       return err[bool](ERR_CORRUPTION, "Invalid key varint")
+    if deltaEncoded:
+      k = prevKey + k
+      prevKey = k
     
     var ctrl: uint64
     if not decodeVarintFast(page, offset, ctrl):
@@ -951,7 +994,9 @@ proc openCursorStream*(tree: BTree): Result[BTreeCursorStream] =
         nextLeaf: nextLeaf,
         leafPage: leafPage,
         offset: 8,
-        remaining: count
+        remaining: count,
+        deltaEncoded: byte(leafPage[1]) == PageFlagDeltaKeys,
+        prevKey: 0
       ))
     if children.len == 0:
       return err[BTreeCursorStream](ERR_CORRUPTION, "Empty internal page")
@@ -988,6 +1033,8 @@ proc cursorNextStream*(cursor: BTreeCursorStream): Result[(uint64, string, int, 
     cursor.leafPage = leafPage
     cursor.offset = 8
     cursor.remaining = count
+    cursor.deltaEncoded = byte(leafPage[1]) == PageFlagDeltaKeys
+    cursor.prevKey = 0
     return cursorNextStream(cursor)
 
   if cursor.offset >= cursor.leafPage.len:
@@ -996,7 +1043,8 @@ proc cursorNextStream*(cursor: BTreeCursorStream): Result[(uint64, string, int, 
   let keyRes = decodeVarint(cursor.leafPage, cursor.offset)
   if not keyRes.ok:
     return err[(uint64, string, int, int, uint32)](keyRes.err.code, keyRes.err.message, keyRes.err.context)
-  let key = keyRes.value
+  let key = if cursor.deltaEncoded: cursor.prevKey + keyRes.value else: keyRes.value
+  cursor.prevKey = key
 
   let ctrlRes = decodeVarint(cursor.leafPage, cursor.offset)
   if not ctrlRes.ok:
@@ -1063,14 +1111,17 @@ proc encodeLeaf(keys: seq[uint64], values: seq[seq[byte]], overflows: seq[uint32
     return err[string](ERR_INTERNAL, "Leaf encode length mismatch")
   var buf = newString(pageSize)
   buf[0] = char(PageTypeLeaf)
-  buf[1] = '\0'
+  buf[1] = char(PageFlagDeltaKeys)
   let count = uint16(keys.len)
   buf[2] = char(byte(count and 0xFF))
   buf[3] = char(byte((count shr 8) and 0xFF))
   writeU32LE(buf, 4, uint32(nextLeaf))
   var offset = 8
+  var prevKey: uint64 = 0
   for i in 0 ..< keys.len:
-    let keyBytes = encodeVarint(keys[i])
+    let delta = keys[i] - prevKey
+    let keyBytes = encodeVarint(delta)
+    prevKey = keys[i]
     var control: uint64 = 0
     let valueLen = values[i].len
     if overflows[i] != 0:
@@ -1099,14 +1150,17 @@ proc encodeInternal(keys: seq[uint64], children: seq[uint32], rightChild: uint32
     return err[string](ERR_INTERNAL, "Internal encode length mismatch")
   var buf = newString(pageSize)
   buf[0] = char(PageTypeInternal)
-  buf[1] = '\0'
+  buf[1] = char(PageFlagDeltaKeys)
   let count = uint16(keys.len)
   buf[2] = char(byte(count and 0xFF))
   buf[3] = char(byte((count shr 8) and 0xFF))
   writeU32LE(buf, 4, rightChild)
   var offset = 8
+  var prevKey: uint64 = 0
   for i in 0 ..< keys.len:
-    let keyBytes = encodeVarint(keys[i])
+    let delta = keys[i] - prevKey
+    let keyBytes = encodeVarint(delta)
+    prevKey = keys[i]
     let childBytes = encodeVarint(uint64(children[i]))
 
     if offset + keyBytes.len + childBytes.len > pageSize:
@@ -1243,6 +1297,7 @@ proc scanLeafLastKey(page: string): Result[(uint64, int, int)] =
     return err[(uint64, int, int)](ERR_CORRUPTION, "Page too small")
   if byte(page[0]) != PageTypeLeaf:
     return err[(uint64, int, int)](ERR_CORRUPTION, "Not a leaf page")
+  let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
   let count = int(readU16LE(page, 2))
   var offset = 8
   var lastKey: uint64 = 0
@@ -1250,6 +1305,7 @@ proc scanLeafLastKey(page: string): Result[(uint64, int, int)] =
   if count == 0:
     return ok((0'u64, 8, 0))
 
+  var prevKey: uint64 = 0
   for i in 0 ..< count:
     if offset >= page.len:
       return err[(uint64, int, int)](ERR_CORRUPTION, "Leaf cell out of bounds")
@@ -1257,6 +1313,9 @@ proc scanLeafLastKey(page: string): Result[(uint64, int, int)] =
     var val: uint64
     if not decodeVarintFast(page, offset, val):
        return err[(uint64, int, int)](ERR_CORRUPTION, "Invalid varint")
+    if deltaEncoded:
+      val = prevKey + val
+      prevKey = val
     lastKey = val
 
     var ctrl: uint64
@@ -1287,8 +1346,10 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte],
     if scanRes.ok:
       let (lastKey, usedBytes, count) = scanRes.value
       if (count == 0 or key > lastKey):
-         # stderr.writeLine("Fast append hit")
-         let keyBytes = encodeVarint(key)
+         let isDelta = byte(page[1]) == PageFlagDeltaKeys
+         # Delta-encode the key relative to the last key when using delta format
+         let encodedKey = if isDelta: key - lastKey else: key
+         let keyBytes = encodeVarint(encodedKey)
          var ctrlBytes: seq[byte]
          var valLen = 0
          if leafOv != 0:
@@ -1396,7 +1457,15 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte],
   if encodeRes.ok:
     discard writePage(tree.pager, pageId, encodeRes.value)
     return ok(none(SplitResult))
-  let mid = keys.len div 2
+  var mid = keys.len * 2 div 3
+  # Validate both halves fit; fall back to even split if needed
+  block validateSplit:
+    let leftKeys2 = keys[0 ..< mid]
+    let leftChildren2 = children[0 ..< mid]
+    let leftRC = if mid < children.len: children[mid] else: rightChild
+    let tryLeft = encodeInternal(leftKeys2, leftChildren2, leftRC, tree.pager.pageSize)
+    if not tryLeft.ok:
+      mid = keys.len div 2
   let promoted = keys[mid]
   let leftKeys = keys[0 ..< mid]
   let rightKeys = keys[mid + 1 ..< keys.len]

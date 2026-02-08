@@ -23,6 +23,7 @@ proc initTableRoot*(pager: Pager): Result[PageId] =
   let root = rootRes.value
   var buf = newString(pager.pageSize)
   buf[0] = char(PageTypeLeaf)
+  buf[1] = char(PageFlagDeltaKeys)
   writeU32LE(buf, 4, 0)
   let writeRes = writePage(pager, root, buf)
   if not writeRes.ok:
@@ -34,10 +35,14 @@ proc encodeRowId(rowid: uint64): seq[byte] =
   writeU64LE(buf, 0, rowid)
   buf
 
-proc decodeRowId(data: seq[byte]): Result[uint64] =
-  if data.len < 8:
-    return err[uint64](ERR_CORRUPTION, "Index rowid payload too short")
-  ok(readU64LE(data, 0))
+proc sortPreservingPrefix*(data: openArray[byte]): uint64 =
+  ## Encode up to the first 8 bytes of `data` as a big-endian uint64.
+  ## This preserves lexicographic sort order for the prefix.
+  var r: uint64 = 0
+  let n = min(data.len, 8)
+  for i in 0 ..< n:
+    r = r or (uint64(data[i]) shl (56 - i * 8))
+  r
 
 proc indexKeyFromValue*(value: Value): uint64 =
   case value.kind
@@ -48,11 +53,57 @@ proc indexKeyFromValue*(value: Value): uint64 =
   of vkFloat64:
     cast[uint64](value.float64Val)
   of vkText, vkBlob:
-    uint64(crc32c(value.bytes))
+    sortPreservingPrefix(value.bytes)
   of vkTextOverflow, vkBlobOverflow:
     0'u64
   else:
     0'u64
+
+proc isTextBlobIndex*(table: TableMeta, idx: IndexMeta): bool =
+  ## Returns true if this is a single-column index on a TEXT or BLOB column.
+  if idx.columns.len != 1:
+    return false
+  for col in table.columns:
+    if col.name == idx.columns[0]:
+      return col.kind in {ctText, ctBlob}
+  false
+
+proc encodeIndexEntry*(rowid: uint64, value: Value, isTextBlob: bool): seq[byte] =
+  ## Encode an index entry. For TEXT/BLOB indexes, embeds the value bytes
+  ## alongside the rowid so post-verification reads are unnecessary.
+  if isTextBlob and value.kind in {vkText, vkBlob}:
+    let vlen = value.bytes.len
+    var buf = encodeVarint(uint64(vlen))
+    if vlen > 0:
+      let oldLen = buf.len
+      buf.setLen(oldLen + vlen)
+      copyMem(addr buf[oldLen], unsafeAddr value.bytes[0], vlen)
+    let oldLen = buf.len
+    buf.setLen(oldLen + 8)
+    writeU64LE(buf, oldLen, rowid)
+    buf
+  else:
+    encodeRowId(rowid)
+
+proc decodeIndexEntry*(data: openArray[byte], isTextBlob: bool): Result[tuple[rowid: uint64, valueBytes: seq[byte]]] =
+  ## Decode an index entry. For TEXT/BLOB indexes, extracts the embedded value.
+  if isTextBlob:
+    var offset = 0
+    let vlenRes = decodeVarint(data, offset)
+    if not vlenRes.ok:
+      return err[tuple[rowid: uint64, valueBytes: seq[byte]]](vlenRes.err.code, vlenRes.err.message, vlenRes.err.context)
+    let vlen = int(vlenRes.value)
+    if offset + vlen + 8 > data.len:
+      return err[tuple[rowid: uint64, valueBytes: seq[byte]]](ERR_CORRUPTION, "Index entry too short for TEXT/BLOB")
+    var vb = newSeq[byte](vlen)
+    if vlen > 0:
+      copyMem(addr vb[0], unsafeAddr data[offset], vlen)
+    let rowid = readU64LE(data, offset + vlen)
+    ok((rowid: rowid, valueBytes: vb))
+  else:
+    if data.len < 8:
+      return err[tuple[rowid: uint64, valueBytes: seq[byte]]](ERR_CORRUPTION, "Index rowid payload too short")
+    ok((rowid: readU64LE(data, 0), valueBytes: newSeq[byte]()))
 
 proc compositeIndexKey*(values: seq[Value], columnIndices: seq[int]): uint64 =
   ## Hash multiple column values into a single uint64 key for composite indexes.
@@ -271,7 +322,37 @@ proc uniqueTrigrams(text: string): seq[uint32] =
       seen.incl(g)
       result.add(g)
 
+const
+  PostingsChunkThreshold = 400  # bytes; keep below B+Tree inline limit (512)
+
+proc trigramChunkKey(trigram: uint32, chunkId: uint16): uint64 =
+  (uint64(trigram) shl 16) or uint64(chunkId)
+
+proc loadPostingsChunked(tree: BTree, trigram: uint32): Result[seq[byte]] =
+  ## Load all postings chunks for a trigram and concatenate.
+  var result_bytes: seq[byte] = @[]
+  var chunkId: uint16 = 0
+  while true:
+    let key = trigramChunkKey(trigram, chunkId)
+    let findRes = find(tree, key)
+    if not findRes.ok:
+      if findRes.err.code == ERR_IO:
+        break
+      return err[seq[byte]](findRes.err.code, findRes.err.message, findRes.err.context)
+    result_bytes.add(findRes.value[1])
+    chunkId.inc
+    if chunkId == 0: break  # overflow protection
+  ok(result_bytes)
+
 proc loadPostings(tree: BTree, trigram: uint32): Result[seq[byte]] =
+  # Try new chunked format first (chunk 0)
+  let key0 = trigramChunkKey(trigram, 0)
+  let find0 = find(tree, key0)
+  if find0.ok:
+    return loadPostingsChunked(tree, trigram)
+  if find0.err.code != ERR_IO:
+    return err[seq[byte]](find0.err.code, find0.err.message, find0.err.context)
+  # Fall back to legacy single-key format
   let key = uint64(trigram)
   let findRes = find(tree, key)
   if findRes.ok:
@@ -280,22 +361,66 @@ proc loadPostings(tree: BTree, trigram: uint32): Result[seq[byte]] =
     return ok(newSeq[byte]())
   err[seq[byte]](findRes.err.code, findRes.err.message, findRes.err.context)
 
-proc storePostings(tree: BTree, trigram: uint32, data: seq[byte]): Result[Void] =
-  let key = uint64(trigram)
-  if data.len == 0:
+proc deleteAllChunks(tree: BTree, trigram: uint32): Result[Void] =
+  ## Delete all postings chunks for a trigram.
+  var chunkId: uint16 = 0
+  while true:
+    let key = trigramChunkKey(trigram, chunkId)
     let delRes = delete(tree, key)
-    if delRes.ok or delRes.err.code == ERR_IO:
-      return okVoid()
-    return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-  let findRes = find(tree, key)
-  if findRes.ok:
-    let updateRes = update(tree, key, data)
-    if not updateRes.ok:
-      return err[Void](updateRes.err.code, updateRes.err.message, updateRes.err.context)
-    return okVoid()
-  let insertRes = insert(tree, key, data)
-  if not insertRes.ok:
-    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+    if not delRes.ok:
+      if delRes.err.code == ERR_IO:
+        break
+      return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+    chunkId.inc
+    if chunkId == 0: break
+  # Also delete legacy key if present
+  let legacyKey = uint64(trigram)
+  let legacyDel = delete(tree, legacyKey)
+  if not legacyDel.ok and legacyDel.err.code != ERR_IO:
+    return err[Void](legacyDel.err.code, legacyDel.err.message, legacyDel.err.context)
+  okVoid()
+
+proc storePostings(tree: BTree, trigram: uint32, data: seq[byte]): Result[Void] =
+  if data.len == 0:
+    return deleteAllChunks(tree, trigram)
+  # Delete legacy key if present
+  discard delete(tree, uint64(trigram))
+  # Split data into chunks
+  var offset = 0
+  var chunkId: uint16 = 0
+  while offset < data.len:
+    let chunkEnd = min(offset + PostingsChunkThreshold, data.len)
+    # Ensure we don't split in the middle of a varint: extend to next varint boundary
+    var end_pos = chunkEnd
+    if end_pos < data.len:
+      # Find a varint boundary: scan forward until we hit a byte < 0x80 (varint terminator)
+      while end_pos < data.len and end_pos > offset:
+        if byte(data[end_pos - 1]) < 0x80:
+          break
+        end_pos.inc
+      if end_pos >= data.len:
+        end_pos = data.len
+    let chunk = data[offset ..< end_pos]
+    let key = trigramChunkKey(trigram, chunkId)
+    let findRes = find(tree, key)
+    if findRes.ok:
+      let updateRes = update(tree, key, chunk)
+      if not updateRes.ok:
+        return err[Void](updateRes.err.code, updateRes.err.message, updateRes.err.context)
+    else:
+      let insertRes = insert(tree, key, chunk)
+      if not insertRes.ok:
+        return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+    offset = end_pos
+    chunkId.inc
+  # Delete any old chunks beyond the new count
+  while true:
+    let key = trigramChunkKey(trigram, chunkId)
+    let delRes = delete(tree, key)
+    if not delRes.ok:
+      break
+    chunkId.inc
+    if chunkId == 0: break
   okVoid()
 
 proc getTrigramPostings*(pager: Pager, index: IndexMeta, trigram: uint32): Result[seq[uint64]] =
@@ -583,7 +708,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         storedValues[i] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
         break
 
-  var indexKeys: seq[(IndexMeta, uint64)] = @[]
+  var indexKeys: seq[(IndexMeta, uint64, Value)] = @[]
   var trigramValues: seq[(IndexMeta, Value)] = @[]
   if updateIndexes:
     for _, idx in catalog.indexes:
@@ -595,7 +720,14 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         let keyRes = indexKeyForRow(table, idx, storedValues)
         if not keyRes.ok:
           return err[uint64](keyRes.err.code, keyRes.err.message, keyRes.err.context)
-        indexKeys.add((idx, keyRes.value))
+        # Identify the value for TEXT/BLOB single-column indexes
+        var idxValue = Value(kind: vkNull)
+        if isTextBlobIndex(table, idx) and idx.columns.len == 1:
+          for i, col in table.columns:
+            if col.name == idx.columns[0]:
+              idxValue = storedValues[i]
+              break
+        indexKeys.add((idx, keyRes.value, idxValue))
       else:
         # Trigram indexes are always single-column
         if idx.columns.len == 1:
@@ -617,7 +749,8 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   if updateIndexes:
     for entry in indexKeys:
       let idxTree = newBTree(pager, entry[0].rootPage)
-      let idxInsert = insert(idxTree, entry[1], encodeRowId(rowid))
+      let textBlob = isTextBlobIndex(table, entry[0])
+      let idxInsert = insert(idxTree, entry[1], encodeIndexEntry(rowid, entry[2], textBlob))
       if not idxInsert.ok:
         return err[uint64](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
       let syncRes = syncIndexRoot(catalog, entry[0].name, idxTree)
@@ -703,18 +836,31 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       if idx.kind == ikBtree:
         if oldIncluded or newIncluded:
           let idxTree = newBTree(pager, idx.rootPage)
+          let textBlob = isTextBlobIndex(table, idx)
           if oldIncluded:
             let oldKeyRes = indexKeyForRow(table, idx, oldRes.value.values)
             if not oldKeyRes.ok:
               return err[Void](oldKeyRes.err.code, oldKeyRes.err.message, oldKeyRes.err.context)
-            let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeRowId(rowid))
+            var oldIdxValue = Value(kind: vkNull)
+            if textBlob and idx.columns.len == 1:
+              for i, col in table.columns:
+                if col.name == idx.columns[0]:
+                  oldIdxValue = oldRes.value.values[i]
+                  break
+            let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeIndexEntry(rowid, oldIdxValue, textBlob))
             if not delRes.ok:
               return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
           if newIncluded:
             let newKeyRes = indexKeyForRow(table, idx, values)
             if not newKeyRes.ok:
               return err[Void](newKeyRes.err.code, newKeyRes.err.message, newKeyRes.err.context)
-            let idxInsert = insert(idxTree, newKeyRes.value, encodeRowId(rowid))
+            var newIdxValue = Value(kind: vkNull)
+            if textBlob and idx.columns.len == 1:
+              for i, col in table.columns:
+                if col.name == idx.columns[0]:
+                  newIdxValue = values[i]
+                  break
+            let idxInsert = insert(idxTree, newKeyRes.value, encodeIndexEntry(rowid, newIdxValue, textBlob))
             if not idxInsert.ok:
               return err[Void](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
           let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
@@ -767,7 +913,14 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       if not oldKeyRes.ok:
         return err[Void](oldKeyRes.err.code, oldKeyRes.err.message, oldKeyRes.err.context)
       let idxTree = newBTree(pager, idx.rootPage)
-      let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeRowId(rowid))
+      let textBlob = isTextBlobIndex(table, idx)
+      var oldIdxValue = Value(kind: vkNull)
+      if textBlob and idx.columns.len == 1:
+        for i, col in table.columns:
+          if col.name == idx.columns[0]:
+            oldIdxValue = oldRes.value.values[i]
+            break
+      let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeIndexEntry(rowid, oldIdxValue, textBlob))
       if not delRes.ok:
         return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
       let syncRes = syncIndexRoot(catalog, idx.name, idxTree)
@@ -807,19 +960,20 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
   if not rowsRes.ok:
     return err[PageId](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
   let idxMeta = IndexMeta(table: tableName, columns: @[columnName], predicateSql: predicateSql)
-  var pairs: seq[(uint64, uint64)] = @[]
+  let textBlob = table.columns[columnIndex].kind in {ctText, ctBlob}
+  var triples: seq[(uint64, uint64, Value)] = @[]
   for row in rowsRes.value:
     if not shouldIncludeInIndex(table, idxMeta, row.values):
       continue
-    pairs.add((indexKeyFromValue(row.values[columnIndex]), row.rowid))
-  pairs.sort(proc(a, b: (uint64, uint64)): int =
+    triples.add((indexKeyFromValue(row.values[columnIndex]), row.rowid, row.values[columnIndex]))
+  triples.sort(proc(a, b: (uint64, uint64, Value)): int =
     let c = cmp(a[0], b[0])
     if c != 0: c else: cmp(a[1], b[1])
   )
   var entries: seq[(uint64, seq[byte])] = @[]
-  entries.setLen(pairs.len)
-  for i, pair in pairs:
-    entries[i] = (pair[0], encodeRowId(pair[1]))
+  entries.setLen(triples.len)
+  for i, triple in triples:
+    entries[i] = (triple[0], encodeIndexEntry(triple[1], triple[2], textBlob))
   let idxTree = newBTree(pager, indexRoot)
   let buildRes = bulkBuildFromSorted(idxTree, entries)
   if not buildRes.ok:
@@ -928,12 +1082,26 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
     return err[PageId](scanRes.err.code, scanRes.err.message, scanRes.err.context)
 
   var entries: seq[(uint64, seq[byte])] = @[]
-  entries.setLen(postingsByTrigram.len)
   var i = 0
   for trigram, ids in postingsByTrigram:
     # scanTableEach yields rowids in ascending order (table btree key order),
     # so ids are already sorted and unique per trigram.
-    entries[i] = (uint64(trigram), encodePostingsSorted(ids))
+    let encoded = encodePostingsSorted(ids)
+    # Split into chunks for the chunked postings format
+    var offset = 0
+    var chunkId: uint16 = 0
+    while offset < encoded.len:
+      var end_pos = min(offset + PostingsChunkThreshold, encoded.len)
+      if end_pos < encoded.len:
+        while end_pos < encoded.len and end_pos > offset:
+          if byte(encoded[end_pos - 1]) < 0x80:
+            break
+          end_pos.inc
+        if end_pos >= encoded.len:
+          end_pos = encoded.len
+      entries.add((trigramChunkKey(trigram, chunkId), encoded[offset ..< end_pos]))
+      offset = end_pos
+      chunkId.inc
     i.inc
   entries.sort(proc(a, b: (uint64, seq[byte])): int = cmp(a[0], b[0]))
 
@@ -946,6 +1114,7 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
 proc resetIndexRoot(pager: Pager, root: PageId): Result[Void] =
   var buf = newString(pager.pageSize)
   buf[0] = char(PageTypeLeaf)
+  buf[1] = char(PageFlagDeltaKeys)
   buf[2] = '\0'
   buf[3] = '\0'
   writeU32LE(buf, 4, 0'u32)
@@ -995,6 +1164,7 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
     return err[seq[uint64]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let table = tableRes.value
   var idxOpt: Option[IndexMeta] = none(IndexMeta)
   if isExpressionIndexToken(column):
     for _, idx in catalog.indexes:
@@ -1006,6 +1176,7 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   if isNone(idxOpt):
     return err[seq[uint64]](ERR_SQL, "Index not found", tableName & "." & column)
   let idx = idxOpt.get
+  let textBlob = isTextBlobIndex(table, idx)
   let idxTree = newBTree(pager, idx.rootPage)
   let needle = indexKeyFromValue(value)
   let cursorRes = openCursorAt(idxTree, needle)
@@ -1013,6 +1184,7 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
     return err[seq[uint64]](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   var matches: seq[uint64] = @[]
+  let needleBytes = if textBlob and value.kind in {vkText, vkBlob}: value.bytes else: @[]
   while true:
     let nextRes = cursorNext(cursor)
     if not nextRes.ok:
@@ -1024,9 +1196,13 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
     if nextRes.value[0] > needle:
       break
     if nextRes.value[0] == needle:
-      let rowidRes = decodeRowId(nextRes.value[1])
-      if rowidRes.ok:
-        matches.add(rowidRes.value)
+      let entryRes = decodeIndexEntry(nextRes.value[1], textBlob)
+      if entryRes.ok:
+        if textBlob:
+          if entryRes.value.valueBytes == needleBytes:
+            matches.add(entryRes.value.rowid)
+        else:
+          matches.add(entryRes.value.rowid)
   ok(matches)
 
 proc indexHasAnyKey*(pager: Pager, index: IndexMeta, key: uint64): Result[bool] =
@@ -1047,7 +1223,7 @@ proc indexHasAnyKey*(pager: Pager, index: IndexMeta, key: uint64): Result[bool] 
       return ok(true)
   ok(false)
 
-proc indexHasOtherRowid*(pager: Pager, index: IndexMeta, key: uint64, rowid: uint64): Result[bool] =
+proc indexHasOtherRowid*(pager: Pager, index: IndexMeta, key: uint64, rowid: uint64, isTextBlob: bool = false, valueBytes: seq[byte] = @[]): Result[bool] =
   let idxTree = newBTree(pager, index.rootPage)
   let cursorRes = openCursorAt(idxTree, key)
   if not cursorRes.ok:
@@ -1062,9 +1238,14 @@ proc indexHasOtherRowid*(pager: Pager, index: IndexMeta, key: uint64, rowid: uin
     if nextRes.value[0] > key:
       break
     if nextRes.value[0] == key:
-      let rowidRes = decodeRowId(nextRes.value[1])
-      if rowidRes.ok and rowidRes.value != rowid:
-        return ok(true)
+      let entryRes = decodeIndexEntry(nextRes.value[1], isTextBlob)
+      if entryRes.ok:
+        if isTextBlob:
+          if entryRes.value.valueBytes == valueBytes and entryRes.value.rowid != rowid:
+            return ok(true)
+        else:
+          if entryRes.value.rowid != rowid:
+            return ok(true)
   ok(false)
 
 # ALTER TABLE implementation

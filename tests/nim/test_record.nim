@@ -36,22 +36,21 @@ suite "Record":
     check decodedValues[7].bytes == @[byte 1, 2, 3, 4]
 
   test "compact int64 encoding":
-    # Small positive
+    # Small positive — uses compact vkInt1 kind + zero-length payload
     var v = Value(kind: vkInt64, int64Val: 1)
     var enc = encodeValue(v)
-    # 1 byte kind + 1 byte len + 1 byte payload (zigzag(1) = 2)
-    check enc.len == 3
+    check enc.len == 2  # kind + length(0)
     
-    # Small negative
+    # Small negative — still uses full format
     v = Value(kind: vkInt64, int64Val: -1)
     enc = encodeValue(v)
     # 1 byte kind + 1 byte len + 1 byte payload (zigzag(-1) = 1)
     check enc.len == 3
 
-    # Zero
+    # Zero — uses compact vkInt0 kind + zero-length payload
     v = Value(kind: vkInt64, int64Val: 0)
     enc = encodeValue(v)
-    check enc.len == 3
+    check enc.len == 2  # kind + length(0)
 
     # Large value (int64.high)
     v = Value(kind: vkInt64, int64Val: int64.high)

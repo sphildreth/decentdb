@@ -17,6 +17,11 @@ type ValueKind* = enum
   vkTextCompressedOverflow
   vkBlobCompressedOverflow
   vkDecimal
+  # Compact single-byte kinds (no length/payload)
+  vkBoolFalse
+  vkBoolTrue
+  vkInt0
+  vkInt1
 
 type Value* = object
   kind*: ValueKind
@@ -164,13 +169,27 @@ proc compressValue*(value: Value): Value =
 
 proc encodeValue*(value: Value): seq[byte] =
   var payload: seq[byte] = @[]
+  var kind = value.kind
   case value.kind
   of vkNull:
     payload = @[]
-  of vkBool:
-    payload = @[byte(if value.boolVal: 1 else: 0)]
-  of vkInt64:
-    payload = encodeVarint(zigzagEncode(value.int64Val))
+  of vkBool, vkBoolFalse, vkBoolTrue:
+    # Use compact kind — no payload needed
+    if value.boolVal:
+      kind = vkBoolTrue
+    else:
+      kind = vkBoolFalse
+    payload = @[]
+  of vkInt64, vkInt0, vkInt1:
+    if value.int64Val == 0:
+      kind = vkInt0
+      payload = @[]
+    elif value.int64Val == 1:
+      kind = vkInt1
+      payload = @[]
+    else:
+      kind = vkInt64
+      payload = encodeVarint(zigzagEncode(value.int64Val))
   of vkFloat64:
     payload = newSeq[byte](8)
     writeU64LE(payload, 0, cast[uint64](value.float64Val))
@@ -183,7 +202,7 @@ proc encodeValue*(value: Value): seq[byte] =
   of vkDecimal:
     payload = @[byte(value.decimalScale)]
     payload.add(encodeVarint(zigzagEncode(value.int64Val)))
-  result = @[byte(value.kind)]
+  result = @[byte(kind)]
   result.add(encodeVarint(uint64(payload.len)))
   result.add(payload)
 
@@ -195,6 +214,7 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
     return err[Value](ERR_CORRUPTION, "Unknown value kind")
   let kind = ValueKind(kindValue)
   offset.inc
+
   let lenRes = decodeVarint(data, offset)
   if not lenRes.ok:
     return err[Value](lenRes.err.code, lenRes.err.message, lenRes.err.context)
@@ -207,6 +227,18 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
   case kind
   of vkNull:
     discard
+  of vkBoolFalse:
+    value.kind = vkBool
+    value.boolVal = false
+  of vkBoolTrue:
+    value.kind = vkBool
+    value.boolVal = true
+  of vkInt0:
+    value.kind = vkInt64
+    value.int64Val = 0
+  of vkInt1:
+    value.kind = vkInt64
+    value.int64Val = 1
   of vkBool:
     if payload.len != 1:
       return err[Value](ERR_CORRUPTION, "Invalid BOOL length")

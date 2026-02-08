@@ -6,7 +6,7 @@ const
   HeaderSize* = 128
   MagicBytes* = "DECENTDB"
   MagicPadded* = MagicBytes & repeat('\0', 16 - MagicBytes.len)
-  FormatVersion* = 2'u32
+  FormatVersion* = 3'u32
   DefaultPageSize* = 4096'u32
 
 type DbHeader* = object

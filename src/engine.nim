@@ -399,32 +399,6 @@ proc valueBytesKey(value: Value): string =
   else:
     ""
 
-proc indexHasAnyMatchingValue(
-  catalog: Catalog,
-  pager: Pager,
-  table: TableMeta,
-  columnName: string,
-  columnIndex: int,
-  value: Value,
-  excludeRowid: uint64 = 0
-): Result[bool] =
-  ## Safety net for hashed index keys (TEXT/BLOB):
-  ## look up candidate rowids by hash key, then verify exact value bytes.
-  let rowIdsRes = indexSeek(pager, catalog, table.name, columnName, value)
-  if not rowIdsRes.ok:
-    return err[bool](rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context)
-  for rid in rowIdsRes.value:
-    if excludeRowid != 0 and rid == excludeRowid:
-      continue
-    let rowRes = readRowAt(pager, table, rid)
-    if rowRes.ok:
-      if valuesEqual(rowRes.value.values[columnIndex], value):
-        return ok(true)
-    else:
-      if rowRes.err.code != ERR_IO:
-        return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
-  ok(false)
-
 proc enforceNotNull(table: TableMeta, values: seq[Value], skipAutoIncrementPk: bool = false): Result[Void] =
   for i, col in table.columns:
     if col.notNull and values[i].kind == vkNull:
@@ -480,28 +454,27 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
       let idxOpt = catalog.getBtreeIndexForColumn(table.name, col.name)
       if isNone(idxOpt):
         return err[Void](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & col.name)
-      if col.kind in {ctText, ctBlob} and values[i].kind in {vkText, vkBlob}:
-        let anyRes = indexHasAnyMatchingValue(
-          catalog, pager, table, col.name, i, values[i], excludeRowid = rowid
-        )
-        if not anyRes.ok:
-          return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
-        if anyRes.value:
-          return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
-      else:
-        let key = indexKeyFromValue(values[i])
-        if rowid == 0:
+      let isTextBlob = col.kind in {ctText, ctBlob} and values[i].kind in {vkText, vkBlob}
+      let key = indexKeyFromValue(values[i])
+      if rowid == 0:
+        if isTextBlob:
+          let otherRes = indexHasOtherRowid(pager, idxOpt.get, key, 0'u64, isTextBlob = true, valueBytes = values[i].bytes)
+          if not otherRes.ok:
+            return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
+          if otherRes.value:
+            return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+        else:
           let anyRes = indexHasAnyKey(pager, idxOpt.get, key)
           if not anyRes.ok:
             return err[Void](anyRes.err.code, anyRes.err.message, anyRes.err.context)
           if anyRes.value:
             return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
-        else:
-          let otherRes = indexHasOtherRowid(pager, idxOpt.get, key, rowid)
-          if not otherRes.ok:
-            return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
-          if otherRes.value:
-            return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
+      else:
+        let otherRes = indexHasOtherRowid(pager, idxOpt.get, key, rowid, isTextBlob = isTextBlob, valueBytes = if isTextBlob: values[i].bytes else: @[])
+        if not otherRes.ok:
+          return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
+        if otherRes.value:
+          return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
   # Check composite unique indexes (including composite PKs)
   for _, idx in catalog.indexes:
     if idx.table != table.name or idx.columns.len < 2 or not idx.unique:
@@ -592,17 +565,10 @@ proc enforceForeignKeys(catalog: Catalog, pager: Pager, table: TableMeta, values
     if parentColIdx < 0:
       return err[Void](ERR_INTERNAL, "Missing FK parent column", col.refTable & "." & col.refColumn)
     if parentRes.value.columns[parentColIdx].kind in {ctText, ctBlob} and values[i].kind in {vkText, vkBlob}:
-      let existsRes = indexHasAnyMatchingValue(
-        catalog,
-        pager,
-        parentRes.value,
-        col.refColumn,
-        parentColIdx,
-        values[i]
-      )
-      if not existsRes.ok:
-        return err[Void](existsRes.err.code, existsRes.err.message, existsRes.err.context)
-      if not existsRes.value:
+      let rowIdsRes = indexSeek(pager, catalog, col.refTable, col.refColumn, values[i])
+      if not rowIdsRes.ok:
+        return err[Void](rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context)
+      if rowIdsRes.value.len == 0:
         return err[Void](ERR_CONSTRAINT, "FOREIGN KEY constraint failed", table.name & "." & col.name)
     else:
       let key = indexKeyFromValue(values[i])
@@ -832,8 +798,8 @@ proc enforceUniqueBatch*(
   # For each unique column, collect all keys to check
   for colInfo in uniqueCols:
     if table.columns[colInfo.colIdx].kind in {ctText, ctBlob}:
-      # TEXT/BLOB btree indexes are currently hash-keyed (CRC32C). To avoid
-      # hash-collision false positives, verify exact values by reading rows.
+      # TEXT/BLOB indexes now embed value bytes. Use indexHasOtherRowid
+      # with embedded value comparison instead of post-verification reads.
       if isNone(colInfo.idxOpt):
         return err[seq[tuple[rowIdx: int, colName: string]]](
           ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & colInfo.colName
@@ -857,14 +823,14 @@ proc enforceUniqueBatch*(
           byValue[k] = (value: values[colInfo.colIdx], rowid: rowData.rowid, rowIdxs: @[rowIdx])
 
       for k, info in byValue.pairs:
-        let existsRes = indexHasAnyMatchingValue(
-          catalog,
+        let key = indexKeyFromValue(info.value)
+        let existsRes = indexHasOtherRowid(
           pager,
-          table,
-          colInfo.colName,
-          colInfo.colIdx,
-          info.value,
-          excludeRowid = info.rowid
+          colInfo.idxOpt.get,
+          key,
+          info.rowid,
+          isTextBlob = true,
+          valueBytes = info.value.bytes
         )
         if not existsRes.ok:
           return err[seq[tuple[rowIdx: int, colName: string]]](
@@ -1065,19 +1031,12 @@ proc enforceForeignKeysBatch*(
         byVal[k].refs.add((rowIdx: fkRef.rowIdx, colName: fkRef.colName))
 
       for k, info in byVal.pairs:
-        let existsRes = indexHasAnyMatchingValue(
-          catalog,
-          pager,
-          parentTable,
-          refKey.refColumn,
-          parentColIdx,
-          info.value
-        )
-        if not existsRes.ok:
+        let rowIdsRes = indexSeek(pager, catalog, parentTable.name, refKey.refColumn, info.value)
+        if not rowIdsRes.ok:
           return err[seq[tuple[rowIdx: int, colName: string]]](
-            existsRes.err.code, existsRes.err.message, existsRes.err.context
+            rowIdsRes.err.code, rowIdsRes.err.message, rowIdsRes.err.context
           )
-        if not existsRes.value:
+        if rowIdsRes.value.len == 0:
           for keyRef in info.refs:
             let keyRefRowIdx = keyRef.rowIdx
             let keyRefColName = keyRef.colName
