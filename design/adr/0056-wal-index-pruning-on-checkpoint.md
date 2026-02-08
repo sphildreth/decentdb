@@ -1,6 +1,6 @@
 ## Prune WAL In-Memory Index Entries After Checkpoint
 **Date:** 2026-02-01
-**Status:** Proposed
+**Status:** Accepted
 
 ### Decision
 

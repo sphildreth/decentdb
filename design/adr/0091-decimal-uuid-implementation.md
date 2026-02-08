@@ -1,7 +1,7 @@
 # Implementation Details for DECIMAL and UUID
 
 **Date:** 2026-02-07
-**Status:** Draft
+**Status:** Accepted
 
 ## Context
 ADR 0072 introduced `DECIMAL(p,s)` and `UUID` types. This ADR clarifies the implementation details regarding runtime enforcement and function support.

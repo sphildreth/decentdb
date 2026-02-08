@@ -81,15 +81,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Single writer only (no concurrent write transactions)
 - Single process access (no multi-process concurrency)
-- No subqueries in SELECT list
-- No window functions
-- No Common Table Expressions (WITH clauses)
-- No views
 - No stored procedures
 - Statement-time foreign key enforcement (not deferred)
-- No full-text search with ranking (trigram only)
+- No full-text search with ranking (trigram substring matching only)
 - No replication
 - No built-in encryption
+- Window functions limited to ROW_NUMBER (no RANK, DENSE_RANK, LAG, LEAD, etc.)
+- Only non-recursive CTEs supported (no `WITH RECURSIVE`)
+- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not supported (only `INSERT ... RETURNING`)
+- `ADD CONSTRAINT` (post-creation) is not supported
+- Targetless `ON CONFLICT DO UPDATE` is not supported
 
 ## Contributors
 

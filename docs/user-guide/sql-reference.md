@@ -142,7 +142,7 @@ ALTER TABLE users ALTER COLUMN age TYPE TEXT;
 - `RENAME COLUMN` is rejected when dependent views exist
 - `ALTER COLUMN TYPE` currently supports only `INT64`, `FLOAT64`, `TEXT`, and `BOOL`
 - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
-- `ADD CONSTRAINT` is planned for future releases
+- `ADD CONSTRAINT` is not supported
 - Schema changes require an exclusive lock on the database
 
 ### CREATE VIEW / DROP VIEW / ALTER VIEW
@@ -235,11 +235,11 @@ Notes:
 - `ON CONSTRAINT name` resolves against DecentDB unique index names.
 - `ON CONFLICT ... DO UPDATE` is supported with explicit conflict target (`(cols)` or `ON CONSTRAINT name`).
 - In `DO UPDATE` expressions, unqualified columns resolve to the target table; `EXCLUDED.col` is supported.
-- Targetless `ON CONFLICT DO UPDATE` is not yet supported.
+- Targetless `ON CONFLICT DO UPDATE` is not supported.
 - `INSERT ... RETURNING` is supported.
 - `CHECK` constraints are enforced on `INSERT` and `UPDATE` (including `ON CONFLICT ... DO UPDATE`).
 - CHECK fails only when the predicate is `FALSE`; `TRUE` and `NULL` pass.
-- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not yet supported.
+- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not supported.
 
 ### SELECT
 
@@ -349,7 +349,7 @@ Supported:
 - `INTERSECT`
 - `EXCEPT`
 
-Not yet supported:
+Not supported:
 - `INTERSECT ALL`
 - `EXCEPT ALL`
 

@@ -652,7 +652,7 @@ proc resolveViewOutputColumnNames(
     seen.incl(key)
   ok(names)
 
-proc viewColumnExprMap(catalog: Catalog, expandedViewStmt: Statement, viewMeta: ViewMeta): Result[Table[string, Expr]] =
+proc viewColumnExprMap(catalog: Catalog, expandedViewStmt: Statement, viewMeta: ViewMeta): Result[Table[string, Expr]] {.used.} =
   let outputExprsRes = buildViewOutputExprs(catalog, expandedViewStmt)
   if not outputExprsRes.ok:
     return err[Table[string, Expr]](outputExprsRes.err.code, outputExprsRes.err.message, outputExprsRes.err.context)

@@ -1443,7 +1443,7 @@ proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
     values.add(valueFromSql(res.value))
   ok(values)
 
-proc evalInsertExprs(exprs: seq[Expr], params: seq[Value]): Result[seq[Value]] =
+proc evalInsertExprs(exprs: seq[Expr], params: seq[Value]): Result[seq[Value]] {.used.} =
   var values: seq[Value] = @[]
   for expr in exprs:
     let res = evalExpr(Row(), expr, params)

@@ -39,6 +39,8 @@ method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[Vfs
         openMode = fmReadWrite
       if not open(f, path, openMode):
         return err[VfsFile](ERR_IO, "Failed to create file", path)
+      when not defined(windows):
+        discard posix.chmod(path.cstring, 0o600.Mode)
     else:
       if mode == fmReadWrite:
         openMode = fmReadWriteExisting

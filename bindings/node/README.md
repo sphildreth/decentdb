@@ -10,7 +10,7 @@ These bindings are designed to sit on top of DecentDB’s stable native C ABI (`
 
 ## Status
 
-Scaffolded: build/test wiring + initial API surface. The addon currently expects a DecentDB native library built from `src/c_api.nim` to be available at runtime.
+The N-API native addon and JS wrapper are production-ready (26 tests covering all data types, error handling, schema introspection, transactions, async iteration, and statement lifecycle).
 
 ## Build native library (local)
 

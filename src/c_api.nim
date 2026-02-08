@@ -364,8 +364,13 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
   let db_handle = cast[DbHandle](p)
   db_handle.clearError()
 
+  const MaxSqlLen = 1_048_576 # 1 MB
+  let sqlStr = $sql_text
+  if sqlStr.len > MaxSqlLen:
+    db_handle.setError(ERR_SQL, "SQL text exceeds maximum length (" & $MaxSqlLen & " bytes)")
+    return cint(toApiCode(ERR_SQL))
 
-  let parseRes = parseSql($sql_text)
+  let parseRes = parseSql(sqlStr)
   if not parseRes.ok:
     db_handle.setError(parseRes.err.code, parseRes.err.message)
     return cint(toApiCode(parseRes.err.code))
@@ -538,8 +543,15 @@ proc decentdb_bind_text*(p: pointer, col: cint, utf8: cstring, byte_len: cint): 
   let h = cast[StmtHandle](p)
   let idx = bindIndex0(h, col)
   if idx < 0: return -1
+  if byte_len < 0:
+    h.db.setError(ERR_SQL, "Invalid byte_len for text binding")
+    return -1
   var bytes = newSeq[byte](byte_len)
-  if byte_len > 0: copyMem(addr bytes[0], utf8, byte_len)
+  if byte_len > 0:
+    if utf8 == nil:
+      h.db.setError(ERR_SQL, "NULL pointer with non-zero byte_len")
+      return -1
+    copyMem(addr bytes[0], utf8, byte_len)
   h.params[idx] = Value(kind: vkText, bytes: bytes)
   return 0
 
@@ -547,8 +559,15 @@ proc decentdb_bind_blob*(p: pointer, col: cint, data: ptr uint8, byte_len: cint)
   let h = cast[StmtHandle](p)
   let idx = bindIndex0(h, col)
   if idx < 0: return -1
+  if byte_len < 0:
+    h.db.setError(ERR_SQL, "Invalid byte_len for blob binding")
+    return -1
   var bytes = newSeq[byte](byte_len)
-  if byte_len > 0: copyMem(addr bytes[0], data, byte_len)
+  if byte_len > 0:
+    if data == nil:
+      h.db.setError(ERR_SQL, "NULL pointer with non-zero byte_len")
+      return -1
+    copyMem(addr bytes[0], data, byte_len)
   h.params[idx] = Value(kind: vkBlob, bytes: bytes)
   return 0
 

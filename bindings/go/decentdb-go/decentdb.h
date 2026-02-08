@@ -43,6 +43,15 @@ const char* decentdb_column_name(decentdb_stmt* stmt, int col_0_based);
 int decentdb_column_type(decentdb_stmt* stmt, int col_0_based);
 
 // Column accessors (valid after step() returns 1)
+//
+// LIFETIME: Pointers returned by decentdb_column_text() and decentdb_column_blob()
+// are borrowed from the statement's internal row buffer. They become INVALID when:
+//   - decentdb_step() is called again (next row overwrites the buffer)
+//   - decentdb_reset() is called
+//   - decentdb_finalize() is called
+//   - decentdb_close() is called on the parent database
+// Callers must copy the data if they need it beyond the next step/reset/finalize.
+// The same lifetime rules apply to decentdb_row_view() output pointers.
 int decentdb_column_is_null(decentdb_stmt* stmt, int col_0_based);
 int64_t decentdb_column_int64(decentdb_stmt* stmt, int col_0_based);
 double decentdb_column_float64(decentdb_stmt* stmt, int col_0_based);

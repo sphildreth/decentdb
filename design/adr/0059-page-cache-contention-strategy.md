@@ -1,6 +1,6 @@
 ## Page Cache Contention Strategy
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Accepted
 
 ### Decision
 Draft a strategy for addressing page cache contention without changing correctness invariants, or explicitly document and ADR any locking/invariant changes required.

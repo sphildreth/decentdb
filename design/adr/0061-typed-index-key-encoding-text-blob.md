@@ -1,6 +1,6 @@
 ## Typed/Comparable Index Key Encoding for TEXT/BLOB
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Deferred
 
 ### Decision
 Draft a design to replace CRC32C-hash keys for TEXT/BLOB btree indexes with a typed, comparable encoding that supports correct equality and ordering/range semantics.

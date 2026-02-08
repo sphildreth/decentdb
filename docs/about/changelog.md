@@ -102,14 +102,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Single writer only (no concurrent write transactions)
 - Single process access (no multi-process concurrency)
 - Subqueries are limited: only `EXISTS (SELECT ...)` is supported (no scalar subqueries, including in SELECT lists)
-- Advanced window functions (only `ROW_NUMBER()` is supported)
-- Recursive CTEs (`WITH RECURSIVE` not supported)
+- Window functions limited to `ROW_NUMBER()` (no RANK, DENSE_RANK, LAG, LEAD, etc.)
+- Only non-recursive CTEs supported (no `WITH RECURSIVE`)
 - Views are read-only (no `INSERT`/`UPDATE`/`DELETE` targeting a view); parameters are not allowed in view definitions
-- Triggers are intentionally narrow in 0.x: `AFTER` (tables) and `INSTEAD OF` (views), `FOR EACH ROW` only, and actions must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` (no `NEW`/`OLD`)
+- Triggers are intentionally narrow: `AFTER` (tables) and `INSTEAD OF` (views), `FOR EACH ROW` only, and actions must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` (no `NEW`/`OLD`)
 - No stored procedures
 - Statement-time foreign key enforcement only (no deferred/deferrable constraints)
-- No full-text search with ranking (trigram only)
+- No full-text search with ranking (trigram substring matching only)
 - No replication
 - No built-in encryption
+- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not supported (only `INSERT ... RETURNING`)
+- `ADD CONSTRAINT` (post-creation) is not supported
+- Targetless `ON CONFLICT DO UPDATE` is not supported
 
 ## Contributors

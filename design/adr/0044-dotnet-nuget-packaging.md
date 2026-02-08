@@ -1,6 +1,6 @@
 # ADR-0044: .NET / NuGet Packaging Strategy
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-01-30
 
 ## Context

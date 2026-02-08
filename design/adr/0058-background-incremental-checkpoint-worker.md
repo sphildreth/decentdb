@@ -1,6 +1,6 @@
 ## Background / Incremental Checkpoint Worker
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Deferred
 
 ### Decision
 Draft a design for an incremental/background checkpoint worker that can spread checkpoint work over time while preserving Snapshot Isolation and the one-writer/many-reader model.

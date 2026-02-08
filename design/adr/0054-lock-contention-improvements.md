@@ -1,7 +1,7 @@
 # Lock Contention Improvements
 
 **Date:** 2026-02-01
-**Status:** Draft
+**Status:** Deferred
 
 ## Context
 High contention observed on the catalog lock (`schemaLock`) and pager cache locks during mixed read/write workloads.

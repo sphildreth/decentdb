@@ -1,6 +1,6 @@
 ## Transactional Freelist/Header Updates
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Deferred
 
 ### Decision
 Draft a design to make freelist mutations and DB header updates crash-safe and transactional, instead of being persisted (and fsynced) outside the WAL during an active transaction.

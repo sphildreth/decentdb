@@ -1,7 +1,7 @@
 # Fine-grained WAL Locking Strategy
 
 **Date:** 2026-02-01
-**Status:** Draft
+**Status:** Deferred
 
 ## Context
 Current WAL locking uses a coarse-grained mutex around the entire append operation. This serializes all writers and can become a bottleneck under high concurrency.

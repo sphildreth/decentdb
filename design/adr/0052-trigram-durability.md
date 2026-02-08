@@ -1,7 +1,7 @@
 # Trigram Index Delta Durability Model
 
 **Date:** 2026-02-01
-**Status:** Proposed
+**Status:** Accepted
 
 ## Decision
 

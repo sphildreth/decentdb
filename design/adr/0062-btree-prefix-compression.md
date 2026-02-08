@@ -1,6 +1,6 @@
 ## B+Tree Prefix Compression
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Deferred
 
 ### Decision
 Draft a design for prefix compression in btree pages to reduce key storage and improve fanout.

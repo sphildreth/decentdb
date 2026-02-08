@@ -1,6 +1,6 @@
 ## Thread-Safety Contract and Snapshot Context Handling
 **Date:** 2026-02-01
-**Status:** Proposed
+**Status:** Deferred
 
 ### Decision
 

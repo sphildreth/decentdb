@@ -1,6 +1,6 @@
 # Freelist Atomicity During Checkpoint
 **Date:** 2026-02-01
-**Status:** Proposed
+**Status:** Deferred
 
 ## Decision
 Document the current single-threaded freelist design and define the atomicity requirements for the future multi-reader phase. The freelist must maintain ACID guarantees during checkpoint operations, specifically ensuring that:

@@ -78,6 +78,10 @@ test_pk_fk.ddb-wal
 # Local review/action-plan notes (do not commit)
 design/reviews/ACTION-PLAN.md
 
+# Debug/scratch artifacts
+debug_ast
+snippet.nim
+
 # Testament artifacts
 testresults/
 testresults.html

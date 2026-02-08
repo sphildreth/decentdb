@@ -1,6 +1,6 @@
 ## WAL-safe Page Cache Eviction / Flush Pipeline
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Accepted
 
 ### Decision
 Draft a design that guarantees dirty page eviction/flushes cannot write uncommitted bytes into the main DB file, and define how eviction interacts with commit/checkpoint.

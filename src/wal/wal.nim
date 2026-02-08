@@ -222,7 +222,7 @@ proc readFrame(vfs: Vfs, file: VfsFile, offset: int64, pageSize: uint32): Result
   if headerRes.value < HeaderSize:
     return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_IO, "Short header read")
   let rawFrameType = header[0]
-  if rawFrameType > 2:
+  if rawFrameType > uint8(ord(high(WalFrameType))):
     return err[(WalFrameType, uint32, seq[byte], uint64, int64)](ERR_CORRUPTION, "Invalid frame type", "type=" & $rawFrameType)
   let frameType = WalFrameType(rawFrameType)
   let pageId = readU32LE(header, 1)

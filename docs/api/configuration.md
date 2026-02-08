@@ -264,3 +264,35 @@ opts.syncInterval = 5
 opts.disableIndexes = true
 cachePages = 8192  # 32MB
 ```
+
+## File Permissions
+
+On POSIX systems (Linux, macOS), DecentDB creates database and WAL files with
+mode `0600` (owner read/write only). This prevents other users on the same
+machine from reading the database contents.
+
+To use different permissions, set the desired umask before opening the database,
+or change permissions on the files after creation.
+
+## Resource Limits
+
+DecentDB enforces the following internal limits:
+
+| Resource | Limit | Notes |
+|----------|-------|-------|
+| SQL text length | 1 MB | Rejected at `prepare()` with `ERR_SQL` |
+| AST node count | 10,000 | Prevents excessively complex queries |
+| CTE/view expansion depth | 16 | Prevents infinite recursion |
+| Trigger recursion depth | 16 | Prevents infinite trigger chains |
+| Bind text/blob size | ~2 GB | Limited by `int32` byte length parameter |
+
+The following resources are **not** limited by default:
+
+| Resource | Notes |
+|----------|-------|
+| Query result set size | Use `LIMIT` to bound large queries |
+| JOIN cardinality | Cartesian products can exhaust memory |
+| Subquery nesting depth | Deep nesting may exhaust stack |
+
+For an embedded single-process database these are lower risk than for a networked
+server, but callers should use `LIMIT` clauses and validate input complexity.

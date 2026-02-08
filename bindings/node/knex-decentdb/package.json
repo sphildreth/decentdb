@@ -1,11 +1,11 @@
 {
   "name": "knex-decentdb",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "private": true,
   "description": "Knex client/dialect for DecentDB",
   "main": "index.js",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "peerDependencies": {
     "knex": ">=2"

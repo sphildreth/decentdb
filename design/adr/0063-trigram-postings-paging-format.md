@@ -1,6 +1,6 @@
 ## Trigram Postings Paging / Streaming Storage Format
 **Date:** 2026-02-02
-**Status:** Proposed
+**Status:** Deferred
 
 ### Decision
 Draft a design for paging/streaming trigram postings to avoid decoding large postings lists into memory.

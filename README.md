@@ -30,7 +30,7 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 ## Status
 
-- Current version: **0.0.1** (beta)
+- Current version: **1.0.0**
 - Planned initial stable release: **1.0.0** once the engine is feature-complete, unit tests are more robust, and benchmarks are acceptable.
 
 ## Features
