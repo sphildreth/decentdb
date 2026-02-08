@@ -848,6 +848,19 @@ class Connection:
         )
         return json.loads(payload)
 
+    def list_indexes(self):
+        """Return metadata about all indexes as a list of dicts."""
+        payload = self._call_json_api("decentdb_list_indexes_json")
+        return json.loads(payload)
+
+    def checkpoint(self):
+        """Flush the WAL to the main database file."""
+        if self._closed:
+            raise ProgrammingError("Connection closed")
+        rc = self._lib.decentdb_checkpoint(self._db)
+        if rc != 0:
+            _raise_error(self._db, sql="checkpoint", params=None)
+
     def __enter__(self):
         return self
         

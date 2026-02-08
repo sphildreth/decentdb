@@ -118,6 +118,13 @@ def load_library():
 
     _lib.decentdb_get_table_columns_json.argtypes = [c_void_p, c_char_p, POINTER(c_int)]
     _lib.decentdb_get_table_columns_json.restype = c_void_p
+
+    _lib.decentdb_list_indexes_json.argtypes = [c_void_p, POINTER(c_int)]
+    _lib.decentdb_list_indexes_json.restype = c_void_p
+
+    # Checkpoint (flush WAL to main database file)
+    _lib.decentdb_checkpoint.argtypes = [c_void_p]
+    _lib.decentdb_checkpoint.restype = c_int
     
     # decentdb_open
     _lib.decentdb_open.argtypes = [c_char_p, c_char_p]

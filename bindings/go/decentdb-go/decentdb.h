@@ -82,6 +82,17 @@ int decentdb_step_with_params_row_view(
 int64_t decentdb_rows_affected(decentdb_stmt* stmt);
 void decentdb_finalize(decentdb_stmt* stmt);
 
+// Checkpoint (flush WAL to main database file)
+int decentdb_checkpoint(decentdb_db* db);
+
+// Memory management for API-allocated buffers
+void decentdb_free(void* p);
+
+// Schema introspection (JSON payloads; caller frees with decentdb_free)
+const char* decentdb_list_tables_json(decentdb_db* db, int* out_len);
+const char* decentdb_get_table_columns_json(decentdb_db* db, const char* table_utf8, int* out_len);
+const char* decentdb_list_indexes_json(decentdb_db* db, int* out_len);
+
 #ifdef __cplusplus
 }
 #endif

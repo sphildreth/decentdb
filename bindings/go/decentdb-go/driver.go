@@ -4,12 +4,14 @@ package decentdb
 #cgo LDFLAGS: -L${SRCDIR}/../../../build -lc_api -Wl,-rpath,${SRCDIR}/../../../build
 #include "decentdb.h"
 #include <stdlib.h>
+#include <string.h>
 */
 import "C"
 import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -98,6 +100,61 @@ type conn struct {
 	db *C.decentdb_db
 }
 
+// DB provides direct access to DecentDB-specific operations beyond
+// the standard database/sql interface.
+type DB struct {
+	c *conn
+}
+
+// OpenDirect opens a DecentDB database for direct (non-sql.DB) access,
+// exposing checkpoint and schema introspection methods.
+func OpenDirect(path string) (*DB, error) {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	cOpts := C.CString("")
+	defer C.free(unsafe.Pointer(cOpts))
+
+	db := C.decentdb_open(cPath, cOpts)
+	if db == nil {
+		return nil, errors.New("failed to open database")
+	}
+	code := int(C.decentdb_last_error_code(db))
+	if code != 0 {
+		msg := C.GoString(C.decentdb_last_error_message(db))
+		C.decentdb_close(db)
+		return nil, &DecentDBError{Code: code, Message: msg}
+	}
+	return &DB{c: &conn{db: db}}, nil
+}
+
+// Close closes the database.
+func (d *DB) Close() error { return d.c.Close() }
+
+// Checkpoint flushes the WAL to the main database file.
+func (d *DB) Checkpoint() error { return d.c.Checkpoint() }
+
+// ListTables returns the names of all tables.
+func (d *DB) ListTables() ([]string, error) { return d.c.ListTables() }
+
+// GetTableColumns returns column metadata for a given table.
+func (d *DB) GetTableColumns(tableName string) ([]ColumnInfo, error) { return d.c.GetTableColumns(tableName) }
+
+// ListIndexes returns metadata about all indexes.
+func (d *DB) ListIndexes() ([]IndexInfo, error) { return d.c.ListIndexes() }
+
+// Exec executes a SQL statement and returns the number of affected rows.
+func (d *DB) Exec(sql string, args ...driver.Value) (int64, error) {
+	namedArgs := make([]driver.NamedValue, len(args))
+	for i, a := range args {
+		namedArgs[i] = driver.NamedValue{Ordinal: i + 1, Value: a}
+	}
+	result, err := d.c.ExecContext(context.Background(), sql, namedArgs)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
 	switch nv.Value.(type) {
 	case Decimal:
@@ -171,6 +228,103 @@ func (c *conn) Close() error {
 		c.db = nil
 	}
 	return nil
+}
+
+// Checkpoint flushes the WAL to the main database file.
+func (c *conn) Checkpoint() error {
+	if c.db == nil {
+		return errors.New("connection is closed")
+	}
+	res := C.decentdb_checkpoint(c.db)
+	if res != 0 {
+		msg := C.GoString(C.decentdb_last_error_message(c.db))
+		return &DecentDBError{Code: int(res), Message: msg}
+	}
+	return nil
+}
+
+// ListTables returns the names of all tables in the database.
+func (c *conn) ListTables() ([]string, error) {
+	if c.db == nil {
+		return nil, errors.New("connection is closed")
+	}
+	var outLen C.int
+	ptr := C.decentdb_list_tables_json(c.db, &outLen)
+	if ptr == nil {
+		msg := C.GoString(C.decentdb_last_error_message(c.db))
+		return nil, &DecentDBError{Code: int(C.decentdb_last_error_code(c.db)), Message: msg}
+	}
+	defer C.decentdb_free(unsafe.Pointer(ptr))
+	jsonStr := C.GoStringN(ptr, outLen)
+	var tables []string
+	if err := json.Unmarshal([]byte(jsonStr), &tables); err != nil {
+		return nil, fmt.Errorf("failed to parse table list: %w", err)
+	}
+	return tables, nil
+}
+
+// ColumnInfo describes a column in a table.
+type ColumnInfo struct {
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	NotNull    bool   `json:"not_null"`
+	Unique     bool   `json:"unique"`
+	PrimaryKey bool   `json:"primary_key"`
+	RefTable   string `json:"ref_table,omitempty"`
+	RefColumn  string `json:"ref_column,omitempty"`
+	RefOnDelete string `json:"ref_on_delete,omitempty"`
+	RefOnUpdate string `json:"ref_on_update,omitempty"`
+}
+
+// GetTableColumns returns column metadata for a given table.
+func (c *conn) GetTableColumns(tableName string) ([]ColumnInfo, error) {
+	if c.db == nil {
+		return nil, errors.New("connection is closed")
+	}
+	cName := C.CString(tableName)
+	defer C.free(unsafe.Pointer(cName))
+	var outLen C.int
+	ptr := C.decentdb_get_table_columns_json(c.db, cName, &outLen)
+	if ptr == nil {
+		msg := C.GoString(C.decentdb_last_error_message(c.db))
+		return nil, &DecentDBError{Code: int(C.decentdb_last_error_code(c.db)), Message: msg}
+	}
+	defer C.decentdb_free(unsafe.Pointer(ptr))
+	jsonStr := C.GoStringN(ptr, outLen)
+	var cols []ColumnInfo
+	if err := json.Unmarshal([]byte(jsonStr), &cols); err != nil {
+		return nil, fmt.Errorf("failed to parse column info: %w", err)
+	}
+	return cols, nil
+}
+
+// IndexInfo describes an index in the database.
+type IndexInfo struct {
+	Name    string   `json:"name"`
+	Table   string   `json:"table"`
+	Columns []string `json:"columns"`
+	Unique  bool     `json:"unique"`
+	Kind    string   `json:"kind"`
+}
+
+// ListIndexes returns metadata about all indexes in the database.
+func (c *conn) ListIndexes() ([]IndexInfo, error) {
+	if c.db == nil {
+		return nil, errors.New("connection is closed")
+	}
+	var outLen C.int
+	ptr := C.decentdb_list_indexes_json(c.db, &outLen)
+	if ptr == nil {
+		msg := C.GoString(C.decentdb_last_error_message(c.db))
+		return nil, &DecentDBError{Code: int(C.decentdb_last_error_code(c.db)), Message: msg}
+	}
+	defer C.decentdb_free(unsafe.Pointer(ptr))
+	jsonStr := C.GoStringN(ptr, outLen)
+	var indexes []IndexInfo
+	if err := json.Unmarshal([]byte(jsonStr), &indexes); err != nil {
+		return nil, fmt.Errorf("failed to parse index info: %w", err)
+	}
+	return indexes, nil
 }
 
 func (c *conn) Begin() (driver.Tx, error) {

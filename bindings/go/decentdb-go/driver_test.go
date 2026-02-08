@@ -510,3 +510,200 @@ func TestDriver_Float64Precision(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenDirect_Checkpoint(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	db, err := OpenDirect(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDirect failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO chk (v) VALUES ($1)", "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.Checkpoint()
+	if err != nil {
+		t.Fatalf("Checkpoint failed: %v", err)
+	}
+}
+
+func TestOpenDirect_ListTables(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	db, err := OpenDirect(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDirect failed: %v", err)
+	}
+	defer db.Close()
+
+	tables, err := db.ListTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 0 {
+		t.Fatalf("expected 0 tables, got %d", len(tables))
+	}
+
+	if _, err := db.Exec("CREATE TABLE alpha (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE beta (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	tables, err = db.ListTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 2 {
+		t.Fatalf("expected 2 tables, got %d", len(tables))
+	}
+}
+
+func TestOpenDirect_GetTableColumns(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	db, err := OpenDirect(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDirect failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+
+	cols, err := db.GetTableColumns("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cols) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(cols))
+	}
+	if cols[0].Name != "id" {
+		t.Errorf("expected first column 'id', got '%s'", cols[0].Name)
+	}
+	if !cols[0].PrimaryKey {
+		t.Error("expected id to be primary key")
+	}
+	if cols[1].Name != "name" || !cols[1].NotNull {
+		t.Error("expected name to be NOT NULL")
+	}
+}
+
+func TestOpenDirect_ListIndexes(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	db, err := OpenDirect(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDirect failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE INDEX idx_items_name ON items (name)"); err != nil {
+		t.Fatal(err)
+	}
+
+	indexes, err := db.ListIndexes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(indexes) < 1 {
+		t.Fatalf("expected at least 1 index, got %d", len(indexes))
+	}
+	found := false
+	for _, idx := range indexes {
+		if idx.Name == "idx_items_name" {
+			found = true
+			if idx.Table != "items" {
+				t.Errorf("expected table 'items', got '%s'", idx.Table)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected to find idx_items_name index")
+	}
+}
+
+func TestOpenDirect_AutoIncrement(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "decentdb-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbPath := filepath.Join(tmpDir, "test.ddb")
+	db, err := OpenDirect(dbPath)
+	if err != nil {
+		t.Fatalf("OpenDirect failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE auto (id INTEGER PRIMARY KEY, val TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO auto (val) VALUES ($1)", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO auto (val) VALUES ($1)", "b"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use sql.Open for query since OpenDirect.Exec doesn't return rows
+	sqlDB, err := sql.Open("decentdb", fmt.Sprintf("file:%s", dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+
+	rows, err := sqlDB.Query("SELECT id, val FROM auto ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		var val string
+		if err := rows.Scan(&id, &val); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(ids))
+	}
+	if ids[0] >= ids[1] {
+		t.Errorf("auto-increment IDs should be increasing: %d, %d", ids[0], ids[1])
+	}
+}
