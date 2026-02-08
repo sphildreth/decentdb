@@ -575,16 +575,24 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   if not isExplicitRowId:
     rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
 
+  # Back-fill auto-assigned rowid into PK column so it's stored with the row
+  var storedValues = values
+  if not isExplicitRowId and pkCount <= 1:
+    for i, col in table.columns:
+      if col.primaryKey and col.kind == ctInt64:
+        storedValues[i] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
+        break
+
   var indexKeys: seq[(IndexMeta, uint64)] = @[]
   var trigramValues: seq[(IndexMeta, Value)] = @[]
   if updateIndexes:
     for _, idx in catalog.indexes:
       if idx.table != tableName:
         continue
-      if not shouldIncludeInIndex(table, idx, values):
+      if not shouldIncludeInIndex(table, idx, storedValues):
         continue
       if idx.kind == ikBtree:
-        let keyRes = indexKeyForRow(table, idx, values)
+        let keyRes = indexKeyForRow(table, idx, storedValues)
         if not keyRes.ok:
           return err[uint64](keyRes.err.code, keyRes.err.message, keyRes.err.context)
         indexKeys.add((idx, keyRes.value))
@@ -597,8 +605,8 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
               valueIndex = i
               break
           if valueIndex >= 0:
-            trigramValues.add((idx, values[valueIndex]))
-  let normalizedRes = normalizeValues(pager, values)
+            trigramValues.add((idx, storedValues[valueIndex]))
+  let normalizedRes = normalizeValues(pager, storedValues)
   if not normalizedRes.ok:
     return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
   let record = encodeRecord(normalizedRes.value)

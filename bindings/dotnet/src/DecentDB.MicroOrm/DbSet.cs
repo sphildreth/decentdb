@@ -179,9 +179,19 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         var vals = new List<string>();
         var parameters = new List<(string Name, object? Value, int? MaxLength)>();
 
+        var pk = _map.PrimaryKey;
+        bool omitPk = false;
+
         foreach (var prop in _map.Properties)
         {
             if (prop.IsIgnored) continue;
+
+            // Omit integer PK with default value — engine will auto-assign
+            if (prop.IsPrimaryKey && pk != null && IsDefaultIntegerPk(pk, entity))
+            {
+                omitPk = true;
+                continue;
+            }
 
             var v = prop.Property.GetValue(entity);
             if (!prop.IsNullable && v == null)
@@ -196,9 +206,40 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         }
 
         var sql = $"INSERT INTO {_map.TableName} ({string.Join(", ", cols)}) VALUES ({string.Join(", ", vals)})";
+
+        if (omitPk)
+        {
+            sql += $" RETURNING {_map.PrimaryKeyColumnName}";
+        }
+
         using var scope = _context.AcquireConnectionScope();
         using var cmd = CreateCommand(scope.Connection, sql, parameters);
-        await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+        if (omitPk)
+        {
+            using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                var returnedId = reader.GetInt64(0);
+                pk!.SetValue(entity, Convert.ChangeType(returnedId, pk.PropertyType));
+            }
+        }
+        else
+        {
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static bool IsDefaultIntegerPk(PropertyInfo pk, T entity)
+    {
+        var pkType = pk.PropertyType;
+        if (pkType == typeof(long) || pkType == typeof(int) || pkType == typeof(short))
+        {
+            var val = pk.GetValue(entity);
+            if (val == null) return true;
+            return Convert.ToInt64(val) == 0;
+        }
+        return false;
     }
 
     public async Task InsertManyAsync(IEnumerable<T> entities, CancellationToken cancellationToken = default)
@@ -332,6 +373,59 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         return rows;
     }
 
+    public async Task UpsertAsync(T entity, CancellationToken cancellationToken = default)
+    {
+        var pk = _map.PrimaryKey ?? throw new InvalidOperationException("Missing primary key");
+        var pkCol = _map.PrimaryKeyColumnName;
+
+        var cols = new List<string>();
+        var vals = new List<string>();
+        var sets = new List<string>();
+        var parameters = new List<(string Name, object? Value, int? MaxLength)>();
+
+        foreach (var prop in _map.Properties)
+        {
+            if (prop.IsIgnored) continue;
+            var v = prop.Property.GetValue(entity);
+            var paramName = $"@p{parameters.Count}";
+            cols.Add(prop.ColumnName);
+            vals.Add(paramName);
+            parameters.Add((paramName, v, prop.MaxLength));
+
+            if (!prop.IsPrimaryKey)
+            {
+                sets.Add($"{prop.ColumnName} = {paramName}");
+            }
+        }
+
+        var sql = $"INSERT INTO {_map.TableName} ({string.Join(", ", cols)}) VALUES ({string.Join(", ", vals)}) ON CONFLICT ({pkCol}) DO UPDATE SET {string.Join(", ", sets)}";
+        using var scope = _context.AcquireConnectionScope();
+        using var cmd = CreateCommand(scope.Connection, sql, parameters);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task InsertOrIgnoreAsync(T entity, CancellationToken cancellationToken = default)
+    {
+        var cols = new List<string>();
+        var vals = new List<string>();
+        var parameters = new List<(string Name, object? Value, int? MaxLength)>();
+
+        foreach (var prop in _map.Properties)
+        {
+            if (prop.IsIgnored) continue;
+            var v = prop.Property.GetValue(entity);
+            var paramName = $"@p{parameters.Count}";
+            cols.Add(prop.ColumnName);
+            vals.Add(paramName);
+            parameters.Add((paramName, v, prop.MaxLength));
+        }
+
+        var sql = $"INSERT INTO {_map.TableName} ({string.Join(", ", cols)}) VALUES ({string.Join(", ", vals)}) ON CONFLICT DO NOTHING";
+        using var scope = _context.AcquireConnectionScope();
+        using var cmd = CreateCommand(scope.Connection, sql, parameters);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task<T?> SingleOrDefaultAsync(CancellationToken cancellationToken = default)
     {
         var list = await Take(2).ToListAsync(cancellationToken);
@@ -345,6 +439,60 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         var item = await SingleOrDefaultAsync(cancellationToken);
         if (item == null) throw new InvalidOperationException("Sequence contains no elements");
         return item;
+    }
+
+    /// <summary>
+    /// Projects each entity to a subset of columns using a selector expression.
+    /// Only simple property access is supported (e.g. x => new { x.Name, x.Age }).
+    /// </summary>
+    public async Task<List<TResult>> SelectAsync<TResult>(
+        Expression<Func<T, TResult>> selector,
+        CancellationToken cancellationToken = default)
+    {
+        var columns = ExtractProjectionColumns(selector);
+        var (sql, parameters) = BuildSelectSql(selectCount: false, projectionColumns: columns);
+
+        using var scope = _context.AcquireConnectionScope();
+        using var cmd = CreateCommand(scope.Connection, sql, parameters);
+        using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        var compiled = selector.Compile();
+        var entityMapper = FastMaterializer<T>.Bind(_map, reader);
+        var list = new List<TResult>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var entity = entityMapper(reader);
+            list.Add(compiled(entity));
+        }
+        return list;
+    }
+
+    private List<string> ExtractProjectionColumns(LambdaExpression selector)
+    {
+        var cols = new List<string>();
+        switch (selector.Body)
+        {
+            case MemberExpression me when me.Member is PropertyInfo pi:
+                cols.Add(_map.GetPropertyMap(pi).ColumnName);
+                break;
+            case NewExpression ne:
+                foreach (var arg in ne.Arguments)
+                {
+                    if (arg is MemberExpression ma && ma.Member is PropertyInfo pa)
+                        cols.Add(_map.GetPropertyMap(pa).ColumnName);
+                }
+                break;
+            case MemberInitExpression mi:
+                foreach (var binding in mi.Bindings)
+                {
+                    if (binding is MemberAssignment assign && assign.Expression is MemberExpression mae && mae.Member is PropertyInfo pai)
+                        cols.Add(_map.GetPropertyMap(pai).ColumnName);
+                }
+                break;
+            default:
+                throw new NotSupportedException("Projection selector must use property access or anonymous type constructor");
+        }
+        return cols;
     }
 
     private DbSet<T> AddOrderBy<TValue>(Expression<Func<T, TValue>> keySelector, bool desc, bool thenBy)
@@ -367,7 +515,8 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
     private (string Sql, List<(string Name, object? Value, int? MaxLength)> Parameters) BuildSelectSql(
         bool selectCount,
         bool selectExists = false,
-        int? overrideTake = null)
+        int? overrideTake = null,
+        List<string>? projectionColumns = null)
     {
         var sb = new StringBuilder();
         var parameters = new List<(string Name, object? Value, int? MaxLength)>();
@@ -379,6 +528,11 @@ public sealed class DbSet<T> : IQueryable<T> where T : class, new()
         else if (selectExists)
         {
             sb.Append("SELECT 1");
+        }
+        else if (projectionColumns is { Count: > 0 })
+        {
+            sb.Append("SELECT ");
+            sb.Append(string.Join(", ", projectionColumns));
         }
         else
         {

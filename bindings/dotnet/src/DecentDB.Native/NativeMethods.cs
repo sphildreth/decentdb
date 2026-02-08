@@ -229,6 +229,9 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_get_table_columns_json")]
     public static extern IntPtr decentdb_get_table_columns_json(IntPtr db, byte* tableNameUtf8, out int outLen);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_list_indexes_json")]
+    public static extern IntPtr decentdb_list_indexes_json(IntPtr db, out int outLen);
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Data.Common;
+using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using DecentDB.AdoNet;
 
 namespace DecentDB.MicroOrm;
@@ -185,6 +189,52 @@ public class DecentDBContext : IDisposable
 
             prop.SetValue(this, set);
         }
+    }
+
+    public async Task<int> ExecuteNonQueryAsync(string sql, params object?[] args)
+    {
+        using var scope = AcquireConnectionScope();
+        using var cmd = BuildRawCommand(scope.Connection, sql, args);
+        return await cmd.ExecuteNonQueryAsync();
+    }
+
+    public async Task<T?> ExecuteScalarAsync<T>(string sql, params object?[] args)
+    {
+        using var scope = AcquireConnectionScope();
+        using var cmd = BuildRawCommand(scope.Connection, sql, args);
+        var result = await cmd.ExecuteScalarAsync();
+        if (result == null || result is DBNull) return default;
+        return (T)Convert.ChangeType(result, typeof(T));
+    }
+
+    public async Task<List<T>> QueryAsync<T>(string sql, params object?[] args) where T : class, new()
+    {
+        var map = EntityMap.For<T>();
+        using var scope = AcquireConnectionScope();
+        using var cmd = BuildRawCommand(scope.Connection, sql, args);
+        using var reader = await cmd.ExecuteReaderAsync();
+        var mapper = FastMaterializer<T>.Bind(map, reader);
+        var list = new List<T>();
+        while (await reader.ReadAsync())
+        {
+            list.Add(mapper(reader));
+        }
+        return list;
+    }
+
+    private DbCommand BuildRawCommand(DecentDBConnection conn, string sql, object?[] args)
+    {
+        var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        if (_transaction != null) cmd.Transaction = _transaction;
+        for (int i = 0; i < args.Length; i++)
+        {
+            var p = cmd.CreateParameter();
+            p.ParameterName = $"@p{i}";
+            p.Value = DefaultTypeConverters.ToDbValue(args[i]);
+            cmd.Parameters.Add(p);
+        }
+        return cmd;
     }
 
     public void Dispose()

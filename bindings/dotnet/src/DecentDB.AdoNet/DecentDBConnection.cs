@@ -363,6 +363,14 @@ namespace DecentDB.AdoNet
             return GetNativeDb().GetTableColumnsJson(tableName);
         }
 
+        /// <summary>
+        /// Returns a JSON array of index metadata objects.
+        /// </summary>
+        public string ListIndexesJson()
+        {
+            return GetNativeDb().ListIndexesJson();
+        }
+
         // ───── ADO.NET GetSchema ─────
 
         /// <summary>
@@ -401,6 +409,9 @@ namespace DecentDB.AdoNet
                 case "COLUMNS":
                     string? tableFilter = restrictionValues is { Length: > 0 } ? restrictionValues[0] : null;
                     return BuildColumnsTable(tableFilter);
+                case "INDEXES":
+                    string? indexTableFilter = restrictionValues is { Length: > 0 } ? restrictionValues[0] : null;
+                    return BuildIndexesTable(indexTableFilter);
                 default:
                     throw new ArgumentException($"Unsupported schema collection: {collectionName}", nameof(collectionName));
             }
@@ -415,6 +426,7 @@ namespace DecentDB.AdoNet
             dt.Rows.Add("MetaDataCollections", 0);
             dt.Rows.Add("Tables", 0);
             dt.Rows.Add("Columns", 1);
+            dt.Rows.Add("Indexes", 1);
             return dt;
         }
 
@@ -460,6 +472,38 @@ namespace DecentDB.AdoNet
                         col.GetProperty("unique").GetBoolean(),
                         col.GetProperty("primary_key").GetBoolean());
                 }
+            }
+            return dt;
+        }
+
+        private DataTable BuildIndexesTable(string? tableFilter)
+        {
+            var dt = new DataTable("Indexes");
+            dt.Columns.Add("INDEX_NAME", typeof(string));
+            dt.Columns.Add("TABLE_NAME", typeof(string));
+            dt.Columns.Add("COLUMNS", typeof(string));
+            dt.Columns.Add("IS_UNIQUE", typeof(bool));
+            dt.Columns.Add("INDEX_TYPE", typeof(string));
+
+            var json = System.Text.Json.JsonDocument.Parse(ListIndexesJson());
+            foreach (var idx in json.RootElement.EnumerateArray())
+            {
+                var tableName = idx.GetProperty("table").GetString()!;
+                if (tableFilter != null && !string.Equals(tableName, tableFilter, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var columns = new List<string>();
+                foreach (var col in idx.GetProperty("columns").EnumerateArray())
+                {
+                    columns.Add(col.GetString()!);
+                }
+
+                dt.Rows.Add(
+                    idx.GetProperty("name").GetString(),
+                    tableName,
+                    string.Join(", ", columns),
+                    idx.GetProperty("unique").GetBoolean(),
+                    idx.GetProperty("kind").GetString());
             }
             return dt;
         }

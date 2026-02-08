@@ -425,9 +425,11 @@ proc indexHasAnyMatchingValue(
         return err[bool](rowRes.err.code, rowRes.err.message, rowRes.err.context)
   ok(false)
 
-proc enforceNotNull(table: TableMeta, values: seq[Value]): Result[Void] =
+proc enforceNotNull(table: TableMeta, values: seq[Value], skipAutoIncrementPk: bool = false): Result[Void] =
   for i, col in table.columns:
     if col.notNull and values[i].kind == vkNull:
+      if skipAutoIncrementPk and col.primaryKey and col.kind == ctInt64:
+        continue
       return err[Void](ERR_CONSTRAINT, "NOT NULL constraint failed", table.name & "." & col.name)
   okVoid()
 
@@ -769,7 +771,7 @@ proc defaultConstraintBatchOptions*(): ConstraintBatchOptions =
     skipInt64PkOptimization: false
   )
 
-proc enforceNotNullBatch*(table: TableMeta, rows: seq[seq[Value]]): Result[seq[int]] =
+proc enforceNotNullBatch*(table: TableMeta, rows: seq[seq[Value]], skipAutoIncrementPk: bool = false): Result[seq[int]] =
   ## Batch NOT NULL constraint checking for multiple rows.
   ## Returns the indices of rows that failed the check, or empty seq if all passed.
   ## This is more efficient than calling enforceNotNull for each row individually
@@ -782,6 +784,8 @@ proc enforceNotNullBatch*(table: TableMeta, rows: seq[seq[Value]]): Result[seq[i
     
     for i, col in table.columns:
       if col.notNull and values[i].kind == vkNull:
+        if skipAutoIncrementPk and col.primaryKey and col.kind == ctInt64:
+          continue
         failedIndices.add(rowIdx)
         break  # Only record once per row
   
@@ -1153,7 +1157,7 @@ proc enforceConstraintsBatch*(
     for row in rows:
       allValues.add(row.values)
     
-    let notNullRes = enforceNotNullBatch(table, allValues)
+    let notNullRes = enforceNotNullBatch(table, allValues, skipAutoIncrementPk = true)
     if not notNullRes.ok:
       return err[seq[tuple[rowIdx: int, constraint: string, details: string]]](
         notNullRes.err.code, notNullRes.err.message, notNullRes.err.context
@@ -1484,7 +1488,7 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
       return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
     values[i] = typeRes.value
 
-  let notNullRes = enforceNotNull(table, values)
+  let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
   if not notNullRes.ok:
     return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
   let checkRes = enforceChecks(table, values)
@@ -1604,6 +1608,12 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
     if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
       return ok(InsertExecResult(affected: false, row: none(Row)))
     return err[InsertExecResult](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+
+  # Back-fill auto-increment PK value so RETURNING sees the assigned id
+  for i, col in table.columns:
+    if col.primaryKey and col.kind == ctInt64 and values[i].kind == vkNull:
+      values[i] = Value(kind: vkInt64, int64Val: cast[int64](insertRes.value))
+
   ok(InsertExecResult(
     affected: true,
     row: some(buildInsertResultRow(bound.insertTable, table, insertRes.value, values))
@@ -3451,7 +3461,7 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
         if not typeRes.ok:
           return err[Void](typeRes.err.code, typeRes.err.message, col.name)
         values[i] = typeRes.value
-      let notNullRes = enforceNotNull(table, values)
+      let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
       if not notNullRes.ok:
         return err[Void](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
       let checkRes = enforceChecks(table, values)

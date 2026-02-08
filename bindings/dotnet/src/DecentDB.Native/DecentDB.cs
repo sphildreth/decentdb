@@ -133,6 +133,26 @@ public sealed class DecentDB : IDisposable
             DecentDBNative.decentdb_free(ptr);
         }
     }
+
+    /// <summary>
+    /// Returns a JSON array of index metadata objects.
+    /// </summary>
+    public string ListIndexesJson()
+    {
+        var ptr = DecentDBNativeUnsafe.decentdb_list_indexes_json(Handle, out int len);
+        if (ptr == IntPtr.Zero)
+        {
+            throw new DecentDBException(LastErrorCode, LastErrorMessage, "ListIndexesJson");
+        }
+        try
+        {
+            return Marshal.PtrToStringUTF8(ptr, len) ?? "[]";
+        }
+        finally
+        {
+            DecentDBNative.decentdb_free(ptr);
+        }
+    }
 }
 
 public sealed class PreparedStatement : IDisposable

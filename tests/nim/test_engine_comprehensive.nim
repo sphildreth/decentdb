@@ -369,3 +369,82 @@ suite "Engine Comprehensive":
     check split(selectRes.value[0], "|")[0] == "2"
 
     discard closeDb(db)
+
+  test "INSERT auto-increment for INTEGER PRIMARY KEY":
+    let path = makeTempDb("decentdb_engine_auto_inc.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    let createRes = execSql(db, "CREATE TABLE autoinc (id INTEGER PRIMARY KEY, name TEXT)")
+    check createRes.ok
+
+    # Insert without specifying id — should auto-assign
+    let ins1 = execSql(db, "INSERT INTO autoinc (name) VALUES ('Alice')")
+    check ins1.ok
+
+    let ins2 = execSql(db, "INSERT INTO autoinc (name) VALUES ('Bob')")
+    check ins2.ok
+
+    # Insert with explicit id
+    let ins3 = execSql(db, "INSERT INTO autoinc (id, name) VALUES (10, 'Carol')")
+    check ins3.ok
+
+    # Check all rows
+    let selRes = execSql(db, "SELECT id, name FROM autoinc ORDER BY id")
+    check selRes.ok
+    check selRes.value.len == 3
+
+    # Auto-assigned ids should be 1 and 2
+    let row0 = split(selRes.value[0], "|")
+    check row0[0] == "1"
+    check row0[1] == "Alice"
+
+    let row1 = split(selRes.value[1], "|")
+    check row1[0] == "2"
+    check row1[1] == "Bob"
+
+    let row2 = split(selRes.value[2], "|")
+    check row2[0] == "10"
+    check row2[1] == "Carol"
+
+    discard closeDb(db)
+
+  test "INSERT RETURNING with auto-increment":
+    let path = makeTempDb("decentdb_engine_auto_inc_ret.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    let createRes = execSql(db, "CREATE TABLE rettest (id INTEGER PRIMARY KEY, val TEXT)")
+    check createRes.ok
+
+    let insRes = execSql(db, "INSERT INTO rettest (val) VALUES ('hello') RETURNING id")
+    check insRes.ok
+    check insRes.value.len == 1
+    let returnedId = split(insRes.value[0], "|")[0]
+    check returnedId == "1"
+
+    let ins2Res = execSql(db, "INSERT INTO rettest (val) VALUES ('world') RETURNING id, val")
+    check ins2Res.ok
+    check ins2Res.value.len == 1
+    let row = split(ins2Res.value[0], "|")
+    check row[0] == "2"
+    check row[1] == "world"
+
+    discard closeDb(db)
+
+  test "auto-increment does not skip NOT NULL on non-PK columns":
+    let path = makeTempDb("decentdb_engine_auto_inc_notnull.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    let createRes = execSql(db, "CREATE TABLE strict (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+    check createRes.ok
+
+    # Omitting name (NOT NULL) should fail
+    let insRes = execSql(db, "INSERT INTO strict (id) VALUES (1)")
+    check not insRes.ok
+
+    discard closeDb(db)

@@ -577,7 +577,7 @@ public class AdoNetLayerTests : IDisposable
         using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
-        Assert.Throws<ArgumentException>(() => conn.GetSchema("Indexes"));
+        Assert.Throws<ArgumentException>(() => conn.GetSchema("FooBar"));
     }
 
     [Fact]

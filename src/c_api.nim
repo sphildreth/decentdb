@@ -48,6 +48,8 @@ type
     readTxnActive: bool
     readTxn: ReadTxn
     rowView: seq[DecentdbValueView]
+    returningRows: seq[seq[Value]]
+    returningPos: int
 
 var globalLastErrorCode {.threadvar.}: int
 var globalLastErrorMessage {.threadvar.}: string
@@ -135,6 +137,32 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
     if col.refTable.len > 0 and col.refColumn.len > 0:
       obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
       obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
+    arr.add(obj)
+
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
+proc decentdb_list_indexes_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of index metadata objects.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var arr = newJArray()
+  for name, idx in dbh.db.catalog.indexes:
+    var obj = newJObject()
+    obj["name"] = %idx.name
+    obj["table"] = %idx.table
+    var cols = newJArray()
+    for c in idx.columns:
+      cols.add(%c)
+    obj["columns"] = cols
+    obj["unique"] = %idx.unique
+    obj["kind"] = %(if idx.kind == ikBtree: "btree" else: "trigram")
     arr.add(obj)
 
   let payload = $arr
@@ -400,8 +428,20 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
     explainLines = explainRes.value
 
   if bound.kind == skInsert and bound.insertReturning.len > 0:
-    db_handle.setError(ERR_SQL, "INSERT RETURNING is not yet supported by C API prepare/step")
-    return cint(toApiCode(ERR_SQL))
+    # Build column names from RETURNING clause
+    for item in bound.insertReturning:
+      if item.isStar:
+        let tableRes = db_handle.db.catalog.getTable(bound.insertTable)
+        if tableRes.ok:
+          for col in tableRes.value.columns:
+            colNames.add(col.name)
+      else:
+        var name = if item.alias.len > 0: item.alias else: ""
+        if name.len == 0 and item.expr != nil and item.expr.kind == ekColumn:
+          name = item.expr.name
+        if name.len == 0:
+          name = "column" & $colNames.len
+        colNames.add(name)
 
   let stmt_handle = StmtHandle(
     db: db_handle,
@@ -418,7 +458,9 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
     currentValues: @[],
     isDone: false,
     readTxnActive: false,
-    rowView: @[]
+    rowView: @[],
+    returningRows: @[],
+    returningPos: 0
   )
 
   GC_ref(stmt_handle)
@@ -446,6 +488,8 @@ proc decentdb_reset*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   h.affectedRows = 0
   h.isDone = false
   h.explainPos = 0
+  h.returningRows = @[]
+  h.returningPos = 0
   return 0
 
 proc decentdb_clear_bindings*(p: pointer): cint {.exportc, cdecl, dynlib.} =
@@ -536,6 +580,40 @@ proc decentdb_step*(p: pointer): cint {.exportc, cdecl, dynlib.} =
       return 0
     h.currentValues = @[valueTextFromString(h.explainLines[h.explainPos])]
     h.explainPos.inc
+    h.hasRow = true
+    return 1
+
+  if h.statement.kind == skInsert and h.statement.insertReturning.len > 0:
+    # INSERT RETURNING: execute via engine.execSql on first step, cache rows
+    if h.returningRows.len == 0 and h.returningPos == 0:
+      let execRes = engine.execSql(h.db.db, h.sql, h.params)
+      if not execRes.ok:
+        h.db.setError(execRes.err.code, execRes.err.message)
+        return -1
+      # Parse pipe-delimited result rows into Value sequences
+      for line in execRes.value:
+        var rowVals: seq[Value] = @[]
+        for part in line.split('|'):
+          if part == "NULL":
+            rowVals.add(Value(kind: vkNull))
+          else:
+            try:
+              let intVal = parseBiggestInt(part)
+              rowVals.add(Value(kind: vkInt64, int64Val: int64(intVal)))
+            except ValueError:
+              try:
+                let floatVal = parseFloat(part)
+                rowVals.add(Value(kind: vkFloat64, float64Val: floatVal))
+              except ValueError:
+                rowVals.add(valueTextFromString(part))
+        h.returningRows.add(rowVals)
+    if h.returningPos >= h.returningRows.len:
+      h.isDone = true
+      h.hasRow = false
+      h.currentValues = @[]
+      return 0
+    h.currentValues = h.returningRows[h.returningPos]
+    h.returningPos.inc
     h.hasRow = true
     return 1
 

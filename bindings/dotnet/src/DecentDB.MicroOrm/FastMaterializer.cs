@@ -18,7 +18,14 @@ internal static class FastMaterializer<T> where T : class, new()
         var ordinals = new int[template.MappedProperties.Length];
         for (var i = 0; i < ordinals.Length; i++)
         {
-            ordinals[i] = reader.GetOrdinal(template.MappedProperties[i].ColumnName);
+            try
+            {
+                ordinals[i] = reader.GetOrdinal(template.MappedProperties[i].ColumnName);
+            }
+            catch (IndexOutOfRangeException)
+            {
+                ordinals[i] = -1; // column not in result set (projection)
+            }
         }
 
         return r =>
@@ -26,6 +33,7 @@ internal static class FastMaterializer<T> where T : class, new()
             var obj = template.Factory();
             for (var i = 0; i < ordinals.Length; i++)
             {
+                if (ordinals[i] < 0) continue;
                 template.Assigners[i](obj, r, ordinals[i]);
             }
             return obj;
