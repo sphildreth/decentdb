@@ -26,7 +26,6 @@ METRICS = [
     ("join_p95_ms", "Join Latency", "lower"),
     ("commit_p95_ms", "Commit Latency", "lower"),
     ("insert_rows_per_sec", "Insert Throughput", "higher"),
-    ("db_size_mb", "Storage Efficiency", "lower"),
 ]
 
 def load_data():
