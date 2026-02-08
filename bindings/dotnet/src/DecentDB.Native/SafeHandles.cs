@@ -27,10 +27,13 @@ public sealed class DecentDBHandle : CriticalHandle
 
 public sealed class DecentDBStatementHandle : CriticalHandle
 {
+    private readonly DecentDBHandle _dbHandle;
+
     public IntPtr Handle => handle;
 
-    public DecentDBStatementHandle(IntPtr handle) : base(IntPtr.Zero)
+    public DecentDBStatementHandle(IntPtr handle, DecentDBHandle dbHandle) : base(IntPtr.Zero)
     {
+        _dbHandle = dbHandle ?? throw new ArgumentNullException(nameof(dbHandle));
         SetHandle(handle);
     }
 
@@ -40,7 +43,14 @@ public sealed class DecentDBStatementHandle : CriticalHandle
     {
         if (!IsInvalid)
         {
-            DecentDBNative.decentdb_finalize(handle);
+            // Only finalize the statement if the parent database handle is still
+            // valid. When the DB is closed first (e.g. during GC finalization at
+            // process exit), the native state is already torn down and calling
+            // decentdb_finalize would access freed memory (SIGSEGV).
+            if (!_dbHandle.IsClosed)
+            {
+                DecentDBNative.decentdb_finalize(handle);
+            }
             handle = IntPtr.Zero;
         }
         return true;

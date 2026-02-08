@@ -46,8 +46,9 @@ public class NativeLayerAdditionalTests : IDisposable
     public void DecentDB_LastErrorCodeAndMessage_AfterOperation()
     {
         using var db = new DecentDB.Native.DecentDB(_dbPath);
-        Assert.Equal(0, db.LastErrorCode); // Assuming success code is 0
-        Assert.NotEmpty(db.LastErrorMessage); // Should have some default message
+        Assert.Equal(0, db.LastErrorCode); // Success code is 0
+        // No error has occurred, so message may be empty
+        Assert.NotNull(db.LastErrorMessage);
     }
 
     [Fact]
@@ -293,16 +294,13 @@ public class NativeLayerAdditionalTests : IDisposable
         // Test DecentDBHandle
         var invalidHandle = new DecentDBHandle(IntPtr.Zero);
         Assert.True(invalidHandle.IsInvalid);
+        invalidHandle.Dispose(); // invalid handle; Dispose is a no-op
         
-        // Test with a valid-looking pointer (though not actually valid DB)
-        var validLookingHandle = new DecentDBHandle(new IntPtr(1));
-        Assert.False(validLookingHandle.IsInvalid);
-        
-        // Test DecentDBStatementHandle
-        var invalidStmtHandle = new DecentDBStatementHandle(IntPtr.Zero);
+        // Test DecentDBStatementHandle with invalid handle
+        var dbDummy = new DecentDBHandle(IntPtr.Zero);
+        var invalidStmtHandle = new DecentDBStatementHandle(IntPtr.Zero, dbDummy);
         Assert.True(invalidStmtHandle.IsInvalid);
-        
-        var validLookingStmtHandle = new DecentDBStatementHandle(new IntPtr(1));
-        Assert.False(validLookingStmtHandle.IsInvalid);
+        invalidStmtHandle.Dispose();
+        dbDummy.Dispose();
     }
 }

@@ -11,6 +11,8 @@ public sealed class DecentDB : IDisposable
 
     public IntPtr Handle => _handle.Handle;
 
+    internal DecentDBHandle DbHandle => _handle;
+
     public DecentDB(string path, string? options = null)
     {
         var pathBytes = Encoding.UTF8.GetBytes(path + "\0");
@@ -99,7 +101,7 @@ public sealed class PreparedStatement : IDisposable
     internal PreparedStatement(DecentDB db, IntPtr stmtPtr)
     {
         _db = db;
-        _handle = new DecentDBStatementHandle(stmtPtr);
+        _handle = new DecentDBStatementHandle(stmtPtr, db.DbHandle);
     }
 
     public void Dispose()
@@ -224,8 +226,9 @@ public sealed class PreparedStatement : IDisposable
         return this;
     }
 
-    public PreparedStatement BindText(int index1Based, string value)
+    public PreparedStatement BindText(int index1Based, string? value)
     {
+        if (value == null) return BindNull(index1Based);
         var bytes = Encoding.UTF8.GetBytes(value);
         return BindTextBytes(index1Based, bytes);
     }

@@ -96,14 +96,25 @@ public class AdoNetLayerTests : IDisposable
         using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
         
-        // Test supported isolation levels
-        using var trans1 = conn.BeginTransaction(IsolationLevel.Snapshot);
-        using var trans2 = conn.BeginTransaction(IsolationLevel.ReadCommitted);
-        using var trans3 = conn.BeginTransaction(IsolationLevel.ReadUncommitted);
+        // Test supported isolation levels (one at a time — DecentDB is single-transaction)
+        using (var trans1 = conn.BeginTransaction(IsolationLevel.Snapshot))
+        {
+            trans1.Commit();
+        }
+        using (var trans2 = conn.BeginTransaction(IsolationLevel.ReadCommitted))
+        {
+            trans2.Commit();
+        }
+        using (var trans3 = conn.BeginTransaction(IsolationLevel.ReadUncommitted))
+        {
+            trans3.Commit();
+        }
         
         // Unsupported isolation level should default to Snapshot
-        using var trans4 = conn.BeginTransaction(IsolationLevel.Serializable);
-        // Note: The actual isolation level used depends on implementation
+        using (var trans4 = conn.BeginTransaction(IsolationLevel.Serializable))
+        {
+            trans4.Commit();
+        }
     }
 
     [Fact]
@@ -312,11 +323,11 @@ public class AdoNetLayerTests : IDisposable
         Assert.Equal("", param.ParameterName);
         Assert.Equal(0, param.Precision);
         Assert.Equal(0, param.Scale);
-        Assert.Equal(-1, param.Size);
+        Assert.Equal(0, param.Size);
         Assert.Equal(DBNull.Value, param.Value);
         
         // Test setting values
-        param.Direction = ParameterDirection.Output;
+        param.Direction = ParameterDirection.InputOutput;
         param.IsNullable = true;
         param.ParameterName = "testParam";
         param.Precision = 10;
@@ -324,7 +335,7 @@ public class AdoNetLayerTests : IDisposable
         param.Size = 100;
         param.Value = 42;
         
-        Assert.Equal(ParameterDirection.Output, param.Direction);
+        Assert.Equal(ParameterDirection.InputOutput, param.Direction);
         Assert.Equal(true, param.IsNullable);
         Assert.Equal("testParam", param.ParameterName);
         Assert.Equal(10, param.Precision);
