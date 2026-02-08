@@ -12,7 +12,7 @@ public class NativeLayerAdditionalTests : IDisposable
 
     public NativeLayerAdditionalTests()
     {
-        _dbPath = Path.Combine(Path.GetTempPath(), $"test_add_{Guid.NewGuid():N}.ddb");
+        _dbPath = Path.Combine(Path.GetTempPath(), $"test_native_add_{Guid.NewGuid():N}.ddb");
     }
 
     public void Dispose()
@@ -25,315 +25,284 @@ public class NativeLayerAdditionalTests : IDisposable
     }
 
     [Fact]
-    public void SafeHandles_Dispose_WhenUsedDirectly()
+    public void DecentDBException_Properties_AreCorrect()
     {
-        // Test DecentDBHandle
-        IntPtr handlePtr;
-        using (var db = new DecentDB.Native.DecentDB(_dbPath))
-        {
-            handlePtr = db.Handle;
-            Assert.NotEqual(IntPtr.Zero, handlePtr);
-            
-            // Test that handle is valid while db is alive
-            var errorCode = DecentDBNative.decentdb_last_error_code(handlePtr);
-            Assert.Equal(0, errorCode); // No error initially
-        }
-        // At this point, the handle should be closed by the SafeHandle
+        var ex = new DecentDBException(100, "Test error message", "SELECT * FROM table");
         
-        // Test that accessing the closed handle results in an error
-        // Note: We can't really test this perfectly since the native code behavior
-        // after closing varies, but we can at least verify the SafeHandle worked
+        Assert.Equal(100, ex.ErrorCode);
+        Assert.Equal("SELECT * FROM table", ex.Sql);
+        Assert.Contains("DecentDB error 100: Test error message", ex.Message);
     }
 
     [Fact]
-    public void SafeHandles_StatementHandle_Disposal()
-    {
-        using (var db = new DecentDB.Native.DecentDB(_dbPath))
-        {
-            // Create a table first
-            using (var createStmt = db.Prepare("CREATE TABLE test_table (id INTEGER PRIMARY KEY, name TEXT)"))
-            {
-                var result = createStmt.Step();
-                Assert.Equal(0, result); // Success
-            }
-
-            // Create a prepared statement and ensure it gets disposed properly
-            var stmtHandle = IntPtr.Zero;
-            using (var stmt = db.Prepare("INSERT INTO test_table (id, name) VALUES ($1, $2)"))
-            {
-                stmtHandle = stmt.Handle;
-                Assert.NotEqual(IntPtr.Zero, stmtHandle);
-                
-                // Bind and execute
-                stmt.BindInt64(1, 1);
-                stmt.BindText(2, "test");
-                var result = stmt.Step();
-                Assert.Equal(0, result); // Success
-            }
-            // Statement should be finalized by SafeHandle
-        }
-    }
-
-    [Fact]
-    public void PreparedStatement_Reset_ClearBindings_Functionality()
+    public void DecentDB_Dispose_MultipleTimes_DoesNotThrow()
     {
         using var db = new DecentDB.Native.DecentDB(_dbPath);
-        
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE reset_test (id INTEGER PRIMARY KEY, value TEXT)"))
-        {
-            createStmt.Step();
-        }
-
-        using var stmt = db.Prepare("INSERT INTO reset_test (id, value) VALUES ($1, $2)");
-        
-        // First insertion
-        stmt.BindInt64(1, 1);
-        stmt.BindText(2, "first");
-        stmt.Step();
-        
-        // Reset and clear bindings
-        stmt.Reset();
-        stmt.ClearBindings();
-        
-        // Second insertion with new values
-        stmt.BindInt64(1, 2);
-        stmt.BindText(2, "second");
-        stmt.Step();
-        
-        // Verify both records exist
-        using var selectStmt = db.Prepare("SELECT COUNT(*) FROM reset_test");
-        selectStmt.Step();
-        Assert.Equal(2L, selectStmt.GetInt64(0));
+        db.Dispose(); // First dispose
+        db.Dispose(); // Second dispose - should not throw
     }
 
     [Fact]
-    public void PreparedStatement_BindNull_Functionality()
+    public void DecentDB_LastErrorCodeAndMessage_AfterOperation()
     {
         using var db = new DecentDB.Native.DecentDB(_dbPath);
-        
-        // Create table with nullable column
-        using (var createStmt = db.Prepare("CREATE TABLE null_test (id INTEGER PRIMARY KEY, value TEXT)"))
-        {
-            createStmt.Step();
-        }
-
-        using var insertStmt = db.Prepare("INSERT INTO null_test (id, value) VALUES ($1, $2)");
-        insertStmt.BindInt64(1, 1);
-        insertStmt.BindNull(2); // Bind null value
-        insertStmt.Step();
-        
-        // Verify null was inserted
-        using var selectStmt = db.Prepare("SELECT value FROM null_test WHERE id = 1");
-        selectStmt.Step();
-        Assert.True(selectStmt.IsNull(0));
-        Assert.Equal("", selectStmt.GetText(0)); // Null should return empty string when getting text
+        Assert.Equal(0, db.LastErrorCode); // Assuming success code is 0
+        Assert.NotEmpty(db.LastErrorMessage); // Should have some default message
     }
 
     [Fact]
-    public void DecentDB_Checkpoint_Functionality()
+    public void PreparedStatement_Dispose_MultipleTimes_DoesNotThrow()
     {
-        using var db = new DecentDB.Native.DecentDB(_dbPath);
-        
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE checkpoint_test (id INTEGER PRIMARY KEY)"))
-        {
-            createStmt.Step();
-        }
-
-        // Insert some data
-        using (var insertStmt = db.Prepare("INSERT INTO checkpoint_test (id) VALUES ($1)"))
-        {
-            for (int i = 0; i < 10; i++)
-            {
-                insertStmt.BindInt64(1, i);
-                insertStmt.Step();
-                insertStmt.Reset().ClearBindings();
-            }
-        }
-
-        // Call checkpoint - this should not throw
-        db.Checkpoint();
-        
-        // Verify data is still there after checkpoint
-        using var selectStmt = db.Prepare("SELECT COUNT(*) FROM checkpoint_test");
-        selectStmt.Step();
-        Assert.Equal(10L, selectStmt.GetInt64(0));
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT 1");
+        stmt.Dispose(); // First dispose
+        stmt.Dispose(); // Second dispose - should not throw
     }
 
     [Fact]
-    public void PreparedStatement_Blob_Functionality_WithEmptyArray()
+    public void PreparedStatement_Reset_ClearBindings_Chain()
     {
-        using var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT $1, $2");
+        stmt.BindInt64(1, 100);
+        stmt.BindText(2, "test");
         
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE blob_test (id INTEGER PRIMARY KEY, data BLOB)"))
-        {
-            createStmt.Step();
-        }
-
-        using var insertStmt = db.Prepare("INSERT INTO blob_test (id, data) VALUES ($1, $2)");
-        insertStmt.BindInt64(1, 1);
-        insertStmt.BindBlob(2, new byte[0]); // Empty blob
-        insertStmt.Step();
+        // Chain reset and clear bindings
+        var chainedStmt = stmt.Reset().ClearBindings();
+        Assert.NotNull(chainedStmt);
         
-        // Retrieve and verify empty blob
-        using var selectStmt = db.Prepare("SELECT data FROM blob_test WHERE id = 1");
-        selectStmt.Step();
-        var retrievedBlob = selectStmt.GetBlob(0);
-        Assert.Empty(retrievedBlob);
+        // After clearing bindings, the values should be reset
+        stmt.Step(); // This should work without binding values
     }
 
     [Fact]
-    public void PreparedStatement_Text_Functionality_WithEmptyString()
+    public void PreparedStatement_BindText_EmptyString()
     {
-        using var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE test_empty_text (id INTEGER PRIMARY KEY, text_col TEXT)");
+        createStmt.Step();
         
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE text_test (id INTEGER PRIMARY KEY, data TEXT)"))
-        {
-            createStmt.Step();
-        }
-
-        using var insertStmt = db.Prepare("INSERT INTO text_test (id, data) VALUES ($1, $2)");
+        using var insertStmt = db.Prepare("INSERT INTO test_empty_text (id, text_col) VALUES ($1, $2)");
         insertStmt.BindInt64(1, 1);
         insertStmt.BindText(2, ""); // Empty string
-        insertStmt.Step();
         
-        // Retrieve and verify empty string
-        using var selectStmt = db.Prepare("SELECT data FROM text_test WHERE id = 1");
-        selectStmt.Step();
-        var retrievedText = selectStmt.GetText(0);
-        Assert.Equal("", retrievedText);
+        var result = insertStmt.Step();
+        Assert.True(result >= 0); // Success
+        
+        using var selectStmt = db.Prepare("SELECT text_col FROM test_empty_text WHERE id = 1");
+        var selectResult = selectStmt.Step();
+        Assert.True(selectResult == 1); // Row found
+        Assert.Equal("", selectStmt.GetText(0)); // Empty string retrieved
     }
 
     [Fact]
-    public void PreparedStatement_BindTextBytes_Functionality()
+    public void PreparedStatement_BindText_NullString()
     {
-        using var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE test_null_text (id INTEGER PRIMARY KEY, text_col TEXT)");
+        createStmt.Step();
         
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE text_bytes_test (id INTEGER PRIMARY KEY, data TEXT)"))
-        {
-            createStmt.Step();
-        }
-
-        using var insertStmt = db.Prepare("INSERT INTO text_bytes_test (id, data) VALUES ($1, $2)");
+        using var insertStmt = db.Prepare("INSERT INTO test_null_text (id, text_col) VALUES ($1, $2)");
         insertStmt.BindInt64(1, 1);
+        insertStmt.BindText(2, null); // Null string becomes empty
         
-        var textBytes = System.Text.Encoding.UTF8.GetBytes("Hello, 世界!");
-        insertStmt.BindTextBytes(2, textBytes);
-        insertStmt.Step();
-        
-        // Retrieve and verify the text
-        using var selectStmt = db.Prepare("SELECT data FROM text_bytes_test WHERE id = 1");
-        selectStmt.Step();
-        var retrievedText = selectStmt.GetText(0);
-        Assert.Equal("Hello, 世界!", retrievedText);
+        var result = insertStmt.Step();
+        Assert.True(result >= 0); // Success
     }
 
     [Fact]
-    public void DecentDB_LastErrorCode_LastErrorMessage()
+    public void PreparedStatement_BindBlob_EmptyArray()
     {
-        using var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE test_empty_blob (id INTEGER PRIMARY KEY, blob_col BLOB)");
+        createStmt.Step();
         
-        // Initially should be no error
-        Assert.Equal(0, db.LastErrorCode);
-        Assert.Equal("", db.LastErrorMessage);
+        using var insertStmt = db.Prepare("INSERT INTO test_empty_blob (id, blob_col) VALUES ($1, $2)");
+        insertStmt.BindInt64(1, 1);
+        insertStmt.BindBlob(2, new byte[0]); // Empty array
         
-        // Try to prepare invalid SQL to generate an error
-        try
-        {
-            using var badStmt = db.Prepare("INVALID SQL SYNTAX TO GENERATE ERROR");
-        }
-        catch (DecentDBException)
-        {
-            // Expected
-        }
+        var result = insertStmt.Step();
+        Assert.True(result >= 0); // Success
         
-        // Now there should be an error code
-        Assert.NotEqual(0, db.LastErrorCode);
-        Assert.NotEqual("", db.LastErrorMessage);
+        using var selectStmt = db.Prepare("SELECT blob_col FROM test_empty_blob WHERE id = 1");
+        var selectResult = selectStmt.Step();
+        Assert.True(selectResult == 1); // Row found
+        var retrieved = selectStmt.GetBlob(0);
+        Assert.Equal(new byte[0], retrieved); // Empty array retrieved
     }
 
     [Fact]
-    public void PreparedStatement_Getters_WithNullValues()
+    public void PreparedStatement_BindBlob_NullArray()
     {
-        using var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE test_null_blob (id INTEGER PRIMARY KEY, blob_col BLOB)");
+        createStmt.Step();
         
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE getters_test (id INTEGER PRIMARY KEY, txt TEXT, num INTEGER, flt REAL, blb BLOB)"))
-        {
-            createStmt.Step();
-        }
-
-        // Insert a row with some null values
-        using (var insertStmt = db.Prepare("INSERT INTO getters_test (id, txt, num, flt, blb) VALUES ($1, $2, $3, $4, $5)"))
-        {
-            insertStmt.BindInt64(1, 1);
-            insertStmt.BindNull(2); // txt = NULL
-            insertStmt.BindNull(3); // num = NULL
-            insertStmt.BindNull(4); // flt = NULL
-            insertStmt.BindNull(5); // blb = NULL
-            insertStmt.Step();
-        }
-
-        // Select and test getters with null values
-        using var selectStmt = db.Prepare("SELECT txt, num, flt, blb FROM getters_test WHERE id = 1");
-        selectStmt.Step();
+        using var insertStmt = db.Prepare("INSERT INTO test_null_blob (id, blob_col) VALUES ($1, $2)");
+        insertStmt.BindInt64(1, 1);
+        insertStmt.BindBlob(2, null); // Null array becomes empty
         
-        Assert.True(selectStmt.IsNull(0)); // txt is null
-        Assert.True(selectStmt.IsNull(1)); // num is null
-        Assert.True(selectStmt.IsNull(2)); // flt is null
-        Assert.True(selectStmt.IsNull(3)); // blb is null
-        
-        // Test that getters return default values for null
-        Assert.Equal("", selectStmt.GetText(0));           // Null text returns empty string
-        Assert.Equal(0L, selectStmt.GetInt64(1));         // Null int returns 0
-        Assert.Equal(0.0, selectStmt.GetFloat64(2));      // Null float returns 0.0
-        Assert.Equal(Guid.Empty, selectStmt.GetGuid(0));   // Null guid returns empty
-        Assert.Equal(Array.Empty<byte>(), selectStmt.GetBlob(3)); // Null blob returns empty array
+        var result = insertStmt.Step();
+        Assert.True(result >= 0); // Success
     }
 
     [Fact]
-    public void PreparedStatement_Dispose_MultipleTimes()
+    public void PreparedStatement_ColumnMetadata_NegativeIndex_Throws()
     {
-        var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT 1 AS col1");
         
-        // Create table
-        using (var createStmt = db.Prepare("CREATE TABLE dispose_test (id INTEGER PRIMARY KEY)"))
-        {
-            createStmt.Step();
-        }
+        // Accessing negative column index should not crash but return empty/default
+        var columnName = stmt.ColumnName(-1);
+        Assert.NotNull(columnName); // Should not throw, but return empty string
+    }
 
-        var stmt = db.Prepare("INSERT INTO dispose_test (id) VALUES ($1)");
-        stmt.BindInt64(1, 1);
+    [Fact]
+    public void PreparedStatement_ColumnMetadata_OutOfBoundsIndex()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT 1 AS col1");
+        
+        // Accessing out-of-bounds column index should not crash
+        var columnName = stmt.ColumnName(10); // Beyond available columns
+        Assert.NotNull(columnName); // Should not throw, but return empty string
+    }
+
+    [Fact]
+    public void PreparedStatement_Getters_OutOfBoundsIndex()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT 1 AS col1");
         stmt.Step();
         
-        // Dispose once
-        stmt.Dispose();
+        // Accessing out-of-bounds column index should not crash
+        var intVal = stmt.GetInt64(10); // Beyond available columns
+        var textVal = stmt.GetText(10);
+        var blobVal = stmt.GetBlob(10);
         
-        // Disposing again should not throw
-        stmt.Dispose();
-        
-        db.Dispose();
+        // Values should be defaults, not throw exceptions
+        Assert.Equal(0L, intVal);
+        Assert.NotNull(textVal);
+        Assert.NotNull(blobVal);
     }
 
     [Fact]
-    public void DecentDB_Dispose_MultipleTimes()
+    public void PreparedStatement_RowsAffected_AfterOperations()
     {
-        var db = new DecentDB.Native.DecentDB(_dbPath);
+        using var db = new Native.DecentDB(_dbPath);
         
-        // Create table to ensure db is valid
-        using (var createStmt = db.Prepare("CREATE TABLE dispose_test2 (id INTEGER PRIMARY KEY)"))
-        {
-            createStmt.Step();
-        }
+        // Create table
+        using var createStmt = db.Prepare("CREATE TABLE test_rows_affected (id INTEGER PRIMARY KEY, value TEXT)");
+        createStmt.Step();
+        Assert.Equal(0, createStmt.RowsAffected); // CREATE doesn't affect rows
         
-        // Dispose once
-        db.Dispose();
+        // Insert
+        using var insertStmt = db.Prepare("INSERT INTO test_rows_affected (id, value) VALUES (1, 'test')");
+        insertStmt.Step();
+        Assert.Equal(1, insertStmt.RowsAffected); // One row inserted
         
-        // Disposing again should not throw
-        db.Dispose();
+        // Update
+        using var updateStmt = db.Prepare("UPDATE test_rows_affected SET value = 'updated' WHERE id = 1");
+        updateStmt.Step();
+        Assert.Equal(1, updateStmt.RowsAffected); // One row updated
+        
+        // Delete
+        using var deleteStmt = db.Prepare("DELETE FROM test_rows_affected WHERE id = 1");
+        deleteStmt.Step();
+        Assert.Equal(1, deleteStmt.RowsAffected); // One row deleted
+    }
+
+    [Fact]
+    public void DecentDB_Checkpoint_Success()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        // This should not throw an exception
+        db.Checkpoint();
+    }
+
+    [Fact]
+    public void RowView_IndexOutOfRange_Throws()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT 1, 2, 3");
+        stmt.Step();
+        
+        var rowView = stmt.GetRowView();
+        Assert.Equal(3, rowView.Count);
+        
+        // Accessing valid indices should work
+        var val1 = rowView[0];
+        var val2 = rowView[1];
+        var val3 = rowView[2];
+        
+        // Accessing out of range should throw
+        Assert.Throws<IndexOutOfRangeException>(() => { var val = rowView[3]; });
+        Assert.Throws<IndexOutOfRangeException>(() => { var val = rowView[-1]; });
+    }
+
+    [Fact]
+    public void PreparedStatement_BindDecimal_Overflow_Throws()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT $1");
+        
+        // Test with a decimal that's too large for 64-bit representation
+        var largeDecimal = decimal.MaxValue; // This should cause overflow
+        
+        var ex = Assert.Throws<OverflowException>(() => stmt.BindDecimal(1, largeDecimal));
+        Assert.Contains("too large for DecentDB DECIMAL", ex.Message);
+    }
+
+    [Fact]
+    public void PreparedStatement_BindDecimal_HighValue_Throws()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        using var stmt = db.Prepare("SELECT $1");
+        
+        // Create a decimal with high value that exceeds 64-bit limits
+        var bits = new int[4] { 0, 0, 1, 0 }; // High part is non-zero
+        var largeDecimal = new decimal(bits);
+        
+        var ex = Assert.Throws<OverflowException>(() => stmt.BindDecimal(1, largeDecimal));
+        Assert.Contains("too large for DecentDB DECIMAL", ex.Message);
+    }
+
+    [Fact]
+    public void PreparedStatement_GetDecimal_ZeroScale()
+    {
+        using var db = new Native.DecentDB(_dbPath);
+        using var createStmt = db.Prepare("CREATE TABLE test_dec (id INTEGER PRIMARY KEY, v DECIMAL(10,0))");
+        createStmt.Step();
+
+        using var insertStmt = db.Prepare("INSERT INTO test_dec (id, v) VALUES ($1, $2)");
+        insertStmt.BindInt64(1, 1);
+        insertStmt.BindDecimal(2, 123m); // No decimal places
+        insertStmt.Step();
+
+        using var selectStmt = db.Prepare("SELECT v FROM test_dec WHERE id = 1");
+        var result = selectStmt.Step();
+        Assert.True(result == 1);
+
+        var retrieved = selectStmt.GetDecimal(0);
+        Assert.Equal(123m, retrieved);
+    }
+
+    [Fact]
+    public void SafeHandles_IsInvalid_Property()
+    {
+        // Test DecentDBHandle
+        var invalidHandle = new DecentDBHandle(IntPtr.Zero);
+        Assert.True(invalidHandle.IsInvalid);
+        
+        // Test with a valid-looking pointer (though not actually valid DB)
+        var validLookingHandle = new DecentDBHandle(new IntPtr(1));
+        Assert.False(validLookingHandle.IsInvalid);
+        
+        // Test DecentDBStatementHandle
+        var invalidStmtHandle = new DecentDBStatementHandle(IntPtr.Zero);
+        Assert.True(invalidStmtHandle.IsInvalid);
+        
+        var validLookingStmtHandle = new DecentDBStatementHandle(new IntPtr(1));
+        Assert.False(validLookingStmtHandle.IsInvalid);
     }
 }

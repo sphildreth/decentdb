@@ -169,6 +169,14 @@ namespace DecentDB.AdoNet
                     }
                 }
 
+                if (ch == '?')
+                {
+                    var idx = AllocateIndex();
+                    rewritten.Append('$').Append(idx);
+                    iPos++;
+                    continue;
+                }
+
                 if (ch == '@' && iPos + 1 < sql.Length)
                 {
                     var start = iPos;
