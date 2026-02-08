@@ -235,9 +235,10 @@ Check if:
 3. Selectivity is high enough
 
 ```sql
--- Index won't be used (function on column)
+-- Index won't be used (function on column without expression index)
 SELECT * FROM users WHERE LOWER(email) = 'alice@example.com';
 
--- Better: Store lowercase or use case-insensitive comparison
--- Or: Create an expression index on LOWER(email)
+-- Fix: Create an expression index
+CREATE INDEX idx_email_lower ON users((LOWER(email)));
+-- Now LOWER(email) lookups use the expression index
 ```

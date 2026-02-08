@@ -1811,6 +1811,10 @@ proc bindCreateView(catalog: Catalog, stmt: Statement): Result[Statement] =
   ok(bound)
 
 proc bindDropTable(catalog: Catalog, stmt: Statement): Result[Statement] =
+  if stmt.dropTableName notin catalog.tables:
+    if stmt.dropTableIfExists:
+      return ok(stmt)
+    return err[Statement](ERR_SQL, "Table not found", stmt.dropTableName)
   let deps = catalog.listDependentViews(stmt.dropTableName)
   if deps.len > 0:
     return err[Statement](ERR_SQL, "Cannot drop table with dependent views", stmt.dropTableName)

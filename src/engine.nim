@@ -2156,21 +2156,24 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropTable:
-      let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
-      if dependentViews.len > 0:
-        return err[seq[string]](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
-      var toDrop: seq[string] = @[]
-      for name, idx in db.catalog.indexes:
-        if idx.table == bound.dropTableName:
-          toDrop.add(name)
-      for idxName in toDrop:
-        discard db.catalog.dropIndex(idxName)
-      let dropRes = db.catalog.dropTable(bound.dropTableName)
-      if not dropRes.ok:
-        return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if bound.dropTableIfExists and bound.dropTableName notin db.catalog.tables:
+        discard  # IF EXISTS: silently skip
+      else:
+        let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
+        if dependentViews.len > 0:
+          return err[seq[string]](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
+        var toDrop: seq[string] = @[]
+        for name, idx in db.catalog.indexes:
+          if idx.table == bound.dropTableName:
+            toDrop.add(name)
+        for idxName in toDrop:
+          discard db.catalog.dropIndex(idxName)
+        let dropRes = db.catalog.dropTable(bound.dropTableName)
+        if not dropRes.ok:
+          return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skAlterTable:
       let alterRes = alterTable(db.pager, db.catalog, bound.alterTableName, bound.alterActions)
       if not alterRes.ok:
@@ -2761,21 +2764,24 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 0
 
   of skDropTable:
-    let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
-    if dependentViews.len > 0:
-      return err[int64](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
-    var toDrop: seq[string] = @[]
-    for name, idx in db.catalog.indexes:
-      if idx.table == bound.dropTableName:
-        toDrop.add(name)
-    for idxName in toDrop:
-      discard db.catalog.dropIndex(idxName)
-    let dropRes = db.catalog.dropTable(bound.dropTableName)
-    if not dropRes.ok:
-      return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    if bound.dropTableIfExists and bound.dropTableName notin db.catalog.tables:
+      discard  # IF EXISTS: silently skip
+    else:
+      let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
+      if dependentViews.len > 0:
+        return err[int64](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
+      var toDrop: seq[string] = @[]
+      for name, idx in db.catalog.indexes:
+        if idx.table == bound.dropTableName:
+          toDrop.add(name)
+      for idxName in toDrop:
+        discard db.catalog.dropIndex(idxName)
+      let dropRes = db.catalog.dropTable(bound.dropTableName)
+      if not dropRes.ok:
+        return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skAlterTable:

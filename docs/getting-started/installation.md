@@ -59,3 +59,19 @@ decentdb --help
 ```
 
 You should see the help output with available commands.
+
+## Language Bindings
+
+To use DecentDB from other languages, build the shared C API library:
+
+```bash
+nimble build_lib
+```
+
+This produces `build/libc_api.so` (Linux), `build/libc_api.dylib` (macOS), or `build/decentdb.dll` (Windows).
+
+See the binding-specific guides for setup:
+- [.NET](../api/dotnet.md)
+- [Go](../api/go.md)
+- [Python](../api/python.md)
+- [Node.js](../api/node.md)

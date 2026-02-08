@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Window Functions - `ROW_NUMBER()`.
   - Non-materialized, read-only `VIEW`s (`CREATE VIEW`, `CREATE OR REPLACE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`).
   - Triggers (`CREATE TRIGGER`, `DROP TRIGGER`): `AFTER` row triggers on tables and `INSTEAD OF` row triggers on views, with a constrained action surface.
+  - `INSERT ... RETURNING` for retrieving auto-assigned values.
+  - `INSERT ... ON CONFLICT DO NOTHING` and `INSERT ... ON CONFLICT DO UPDATE` (upsert).
+  - `INTEGER PRIMARY KEY` auto-increment: columns auto-assign sequential IDs when omitted from INSERT.
+  - `<>` operator (alias for `!=`).
+- **C API**:
+  - `decentdb_checkpoint()` for WAL-to-database synchronization.
+  - `decentdb_free()` for API-allocated memory.
+  - `decentdb_list_tables_json()`, `decentdb_get_table_columns_json()`, `decentdb_list_indexes_json()` for schema introspection.
+  - INSERT RETURNING support in prepare/step path.
+- **Language Bindings**:
+  - **.NET**: Full ADO.NET provider (DbConnection, DbCommand, DbDataReader), MicroOrm (DbSet, DecentDBContext), ConnectionStringBuilder, DbProviderFactory, GetSchema(), UpsertAsync, SelectAsync projection, raw SQL methods.
+  - **Go**: `database/sql` driver, `OpenDirect` API with Checkpoint, ListTables, GetTableColumns, ListIndexes, Decimal type.
+  - **Python**: DB-API 2.0, SQLAlchemy dialect, checkpoint, list_indexes, import tools.
+  - **Node.js**: N-API addon with Database/Statement classes, async iteration, checkpoint, schema introspection, Knex integration.
 
 ## [0.0.1] - 2026-01-30
 
@@ -38,18 +52,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full documentation site with MkDocs
 
 ### SQL Support
-- CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE
-- SELECT, INSERT, UPDATE, DELETE
-- WHERE, ORDER BY, LIMIT, OFFSET
+- CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE (ADD/DROP/RENAME COLUMN, ALTER COLUMN TYPE)
+- SELECT (with DISTINCT), INSERT, UPDATE, DELETE
+- WHERE, ORDER BY (ASC/DESC), LIMIT, OFFSET
 - INNER JOIN, LEFT JOIN
 - Aggregate functions: COUNT, SUM, AVG, MIN, MAX
 - GROUP BY, HAVING
-- Parameters: $1, $2, ...
+- SET operations: UNION, UNION ALL, INTERSECT, EXCEPT
+- BETWEEN, EXISTS, IS NULL, IS NOT NULL
+- COALESCE, NULLIF, CASE WHEN, CAST
+- LOWER, UPPER, TRIM, LENGTH
+- Parameters: $1, $2, ... (Postgres-style)
 - Data types: NULL, INT64, TEXT, BLOB, BOOL, FLOAT64
-- Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL
+- Constraints: PRIMARY KEY, FOREIGN KEY (CASCADE/SET NULL/RESTRICT), UNIQUE, NOT NULL, CHECK, DEFAULT
 - Transactions: BEGIN, COMMIT, ROLLBACK
-- LIKE, ILIKE pattern matching with trigram index support
+- LIKE, ILIKE pattern matching with ESCAPE clause and trigram index support
 - IN operator for list membership
+- String concatenation: ||
+- Arithmetic operators: +, -, *, /
+- EXPLAIN query plans
 
 ### Performance
 - Point lookups: P95 < 10ms

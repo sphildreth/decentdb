@@ -58,7 +58,7 @@ DecentDB is designed with a modular architecture emphasizing correctness, perfor
 ### Execution Engine (`exec/`)
 
 - Iterator-based (Volcano) model
-- Operators: Scan, Filter, Project, Join, Sort, Limit
+- Operators: Scan, Filter, Project, Join, Sort, Limit, Aggregate, Window
 - Expression evaluation
 - Row materialization
 
@@ -66,7 +66,8 @@ DecentDB is designed with a modular architecture emphasizing correctness, perfor
 
 - Table operations (scan, insert, update, delete)
 - Index operations (seek, range scan)
-- Constraint enforcement (PK, FK, UNIQUE, NOT NULL)
+- Constraint enforcement (PK, FK, UNIQUE, NOT NULL, CHECK)
+- Auto-increment for INTEGER PRIMARY KEY columns
 - Trigram index management
 - Bulk load operations
 
@@ -270,3 +271,16 @@ Add to execution engine:
 - [WAL & Recovery](wal.md) - Durability, checkpoints
 - [B+Tree Details](btree.md) - Node structure, splits
 - [Query Execution](query-execution.md) - Operators, planning
+
+## C API and Language Bindings
+
+DecentDB exposes a C API (`src/c_api.nim`) with 35+ functions for use by language bindings:
+
+| Binding | Interface | Notes |
+|---------|-----------|-------|
+| [.NET](../api/dotnet.md) | ADO.NET + MicroOrm | P/Invoke via `DecentDB.Native` |
+| [Go](../api/go.md) | `database/sql` driver + Direct API | CGO linking |
+| [Python](../api/python.md) | DB-API 2.0 + SQLAlchemy | ctypes loading |
+| [Node.js](../api/node.md) | N-API addon + Knex | Dynamic loading |
+
+All bindings support: schema introspection (list tables, columns, indexes), checkpoint, all data types, and auto-increment INTEGER PRIMARY KEY.

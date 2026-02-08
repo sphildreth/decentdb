@@ -184,6 +184,7 @@ type Statement* = ref object
     triggerActionSql*: string
   of skDropTable:
     dropTableName*: string
+    dropTableIfExists*: bool
   of skDropIndex:
     dropIndexName*: string
   of skDropTrigger:
@@ -1562,7 +1563,7 @@ proc parseDropStmt(node: JsonNode): Result[Statement] =
       dropTriggerIfExists: missingOk
     ))
   if removeType == "OBJECT_TABLE":
-    return ok(Statement(kind: skDropTable, dropTableName: name))
+    return ok(Statement(kind: skDropTable, dropTableName: name, dropTableIfExists: missingOk))
   err[Statement](ERR_SQL, "Unsupported DROP object type", removeType)
 
 proc parseCreateTrigStmt(node: JsonNode): Result[Statement] =

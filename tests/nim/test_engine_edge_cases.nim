@@ -477,3 +477,37 @@ suite "Engine Edge Cases":
     let res = execSql(db, "INSERT INTO t (name) VALUES ('test')")
     check not res.ok
     discard closeDb(db)
+
+  test "DROP TABLE IF EXISTS on nonexistent table succeeds":
+    let path = makeTempDb("decentdb_engine_drop_if_exists.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    # Should succeed silently when table doesn't exist
+    let res = execSql(db, "DROP TABLE IF EXISTS nonexistent")
+    check res.ok
+    discard closeDb(db)
+
+  test "DROP TABLE IF EXISTS on existing table drops it":
+    let path = makeTempDb("decentdb_engine_drop_if_exists2.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT)").ok
+    check execSql(db, "INSERT INTO t (id) VALUES (1)").ok
+    # Should drop the table
+    let dropRes = execSql(db, "DROP TABLE IF EXISTS t")
+    check dropRes.ok
+    # Table should be gone
+    let selRes = execSql(db, "SELECT * FROM t")
+    check not selRes.ok
+    discard closeDb(db)
+
+  test "DROP TABLE without IF EXISTS on nonexistent table fails":
+    let path = makeTempDb("decentdb_engine_drop_no_if_exists.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, "DROP TABLE nonexistent")
+    check not res.ok
+    discard closeDb(db)

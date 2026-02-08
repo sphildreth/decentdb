@@ -75,6 +75,25 @@ decentdb exec --db=myapp.ddb --sql="DROP TABLE users"
 decentdb exec --db=myapp.ddb --sql="BEGIN; INSERT INTO users VALUES (3, 'Carol', 'carol@example.com'); INSERT INTO users VALUES (4, 'Dave', 'dave@example.com'); COMMIT"
 ```
 
+## Advanced Queries
+
+```bash
+# Aggregates and GROUP BY
+decentdb exec --db=myapp.ddb --sql="SELECT COUNT(*) FROM users"
+
+# DISTINCT values
+decentdb exec --db=myapp.ddb --sql="SELECT DISTINCT name FROM users"
+
+# JOINs
+decentdb exec --db=myapp.ddb --sql="SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"
+
+# Upsert (insert or update on conflict)
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (id, name) VALUES (1, 'Alice Updated') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name"
+
+# INSERT RETURNING (get auto-assigned id)
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name, email) VALUES ('Eve', 'eve@example.com') RETURNING id"
+```
+
 ## Bulk Loading
 
 For large datasets, use the bulk load API:

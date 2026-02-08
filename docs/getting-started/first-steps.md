@@ -37,7 +37,9 @@ decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE id = 1"
 
 # Pattern matching
 decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE name LIKE 'A%'"
-decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE name LIKE 'A%'"
+
+# Case-insensitive pattern matching
+decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE name ILIKE '%alice%'"
 ```
 
 ### Updating and Deleting
@@ -57,7 +59,7 @@ decentdb exec --db=myapp.ddb --sql="DELETE FROM users WHERE id = 3"
 ```bash
 # Create tables with foreign keys
 decentdb exec --db=myapp.ddb --sql="CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)"
-decentdb exec --db=myapp.ddb --sql="CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT REFERENCES artists(id), title TEXT)"
+decentdb exec --db=myapp.ddb --sql="CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT REFERENCES artists(id) ON DELETE CASCADE, title TEXT)"
 
 # Insert related data
 decentdb exec --db=myapp.ddb --sql="INSERT INTO artists (name) VALUES ('The Beatles')"
@@ -127,6 +129,18 @@ decentdb list-indexes --db=myapp.ddb
 ### Modifying Schema
 
 ```bash
+# Add a column
+decentdb exec --db=myapp.ddb --sql="ALTER TABLE users ADD COLUMN email TEXT"
+
+# Rename a column
+decentdb exec --db=myapp.ddb --sql="ALTER TABLE users RENAME COLUMN name TO full_name"
+
+# Change a column type
+decentdb exec --db=myapp.ddb --sql="ALTER TABLE users ALTER COLUMN full_name TYPE TEXT"
+
+# Drop a column
+decentdb exec --db=myapp.ddb --sql="ALTER TABLE users DROP COLUMN email"
+
 # Drop an index
 decentdb exec --db=myapp.ddb --sql="DROP INDEX idx_users_name"
 
@@ -136,7 +150,8 @@ decentdb exec --db=myapp.ddb --sql="DROP TABLE users"
 
 ## Next Steps
 
-- Learn about [Data Types](data-types.md)
-- Explore [Performance Tuning](performance.md)
-- Read the full [SQL Reference](sql-reference.md)
+- Learn about [Data Types](../user-guide/data-types.md)
+- Explore [Performance Tuning](../user-guide/performance.md)
+- Read the full [SQL Reference](../user-guide/sql-reference.md)
 - Check out the [CLI Reference](../api/cli-reference.md)
+- Use with [.NET](../api/dotnet.md), [Go](../api/go.md), [Python](../api/python.md), or [Node.js](../api/node.md)

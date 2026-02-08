@@ -128,15 +128,20 @@ All columns can contain NULL unless marked NOT NULL.
 |-------|---------|
 | INTEGER | INT64 |
 | INT | INT64 |
+| BIGINT | INT64 |
+| SERIAL | INT64 (auto-increment) |
 | TEXT | TEXT |
 | VARCHAR | TEXT |
 | CHARACTER VARYING | TEXT |
+| CHAR | TEXT |
 | BLOB | BLOB |
+| BYTEA | BLOB |
 | BOOLEAN | BOOL |
 | BOOL | BOOL |
 | FLOAT | FLOAT64 |
 | REAL | FLOAT64 |
 | DOUBLE | FLOAT64 |
+| DOUBLE PRECISION | FLOAT64 |
 | NUMERIC | DECIMAL |
 | DECIMAL | DECIMAL |
 | UUID | UUID |
@@ -164,6 +169,10 @@ SELECT CAST(price AS INT) FROM products;
 | TEXT | Variable, up to 512 bytes | > 512 bytes |
 | BLOB | Variable, up to 512 bytes | > 512 bytes |
 | NULL | 0 bytes | Never |
+
+### Compression
+
+TEXT and BLOB values are automatically compressed with zlib when stored on overflow pages. This is transparent to the application — values are decompressed on read.
 
 ## Best Practices
 

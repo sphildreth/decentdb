@@ -5,11 +5,19 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-02-08
 
 ### Added
 - `INTEGER PRIMARY KEY` columns now support auto-increment: omit the column from INSERT and the next sequential ID is assigned automatically (ADR-0092)
 - `PRIMARY KEY` implies `NOT NULL` for single-column integer primary keys
+- `INSERT ... RETURNING` for retrieving auto-assigned values
+- `INSERT ... ON CONFLICT DO NOTHING` and `ON CONFLICT DO UPDATE` (upsert)
+- `<>` operator (alias for `!=`)
+- C API: `decentdb_checkpoint()`, `decentdb_free()`, `decentdb_list_tables_json()`, `decentdb_get_table_columns_json()`, `decentdb_list_indexes_json()`
+- .NET: Full ADO.NET provider, MicroOrm with DbSet/Context, ConnectionStringBuilder, DbProviderFactory, GetSchema(), UpsertAsync, SelectAsync projection, raw SQL
+- Go: `database/sql` driver, OpenDirect API with Checkpoint, ListTables, GetTableColumns, ListIndexes
+- Python: DB-API 2.0 with checkpoint, list_indexes, SQLAlchemy dialect
+- Node.js: N-API addon with Database/Statement, async iteration, checkpoint, schema introspection, Knex integration
 
 ## [0.0.1] - 2026-01-30
 

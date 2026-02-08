@@ -64,6 +64,29 @@ CREATE INDEX idx_name_trgm ON users USING trigram(name);
 SELECT * FROM users WHERE name LIKE '%john%';
 ```
 
+### Expression Indexes
+
+Index a computed expression for faster lookups:
+
+```sql
+-- Index on lowercase name for case-insensitive search
+CREATE INDEX idx_name_lower ON users((LOWER(name)));
+
+-- Query automatically uses the index
+SELECT * FROM users WHERE LOWER(name) = 'alice';
+```
+
+Supported expressions: `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`, `CAST(col AS type)`.
+
+### Partial Indexes
+
+Index only rows that satisfy a condition:
+
+```sql
+-- Index only non-null emails
+CREATE INDEX idx_email_nonnull ON users(email) WHERE email IS NOT NULL;
+```
+
 ### When to Index
 
 DO index:

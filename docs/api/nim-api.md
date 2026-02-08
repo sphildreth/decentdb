@@ -63,6 +63,32 @@ if selectRes.ok:
     echo row  # "1|Alice"
 ```
 
+### INSERT RETURNING
+
+Use `INSERT ... RETURNING` to get auto-assigned values back:
+
+```nim
+let res = execSql(db, "INSERT INTO users (name) VALUES ('Alice') RETURNING id, name")
+if res.ok:
+  echo res.value[0]  # "1|Alice"
+```
+
+### Upsert (ON CONFLICT)
+
+```nim
+# Insert or update on conflict
+discard execSql(db, """
+  INSERT INTO users (id, name) VALUES (1, 'Alice')
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+""")
+
+# Insert or ignore
+discard execSql(db, """
+  INSERT INTO users (id, name) VALUES (1, 'Alice')
+  ON CONFLICT DO NOTHING
+""")
+```
+
 ## Transactions
 
 ### Manual Transaction Control

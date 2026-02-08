@@ -58,6 +58,8 @@ src/decentdb_schema
 src/decentdb_data
 *.db
 *.db-wal
+*.ddb
+*.ddb-wal
 *.wal
 *.tmp
 nimble.develop

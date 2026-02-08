@@ -31,6 +31,8 @@ Constraints:
 - `PRIMARY KEY` — enforces uniqueness. `INTEGER PRIMARY KEY` columns are implicitly `NOT NULL` and support auto-increment when omitted from INSERT statements.
 - `NOT NULL` — rejects NULL values.
 - `UNIQUE` — enforces uniqueness via a secondary index.
+- `CHECK (expression)` — row-level validation; the expression must evaluate to `TRUE` or `NULL` (only `FALSE` is a violation).
+- `DEFAULT value` — default value used when column is omitted from INSERT.
 - `REFERENCES table(column)` — foreign key constraint (see [Foreign Keys](#foreign-keys)).
 
 ### CREATE INDEX
@@ -244,6 +246,7 @@ Notes:
 ```sql
 SELECT * FROM table_name;
 SELECT col1, col2 FROM table_name WHERE condition;
+SELECT DISTINCT col1 FROM table_name;
 SELECT * FROM table_name ORDER BY col1 ASC, col2 DESC;
 SELECT * FROM table_name LIMIT 10 OFFSET 20;
 SELECT id FROM a UNION ALL SELECT id FROM b;
@@ -266,9 +269,10 @@ DELETE FROM table_name WHERE condition;
 ### WHERE Clause
 
 Supports:
-- Comparison operators: `=`, `!=`, `<`, `<=`, `>`, `>=`
+- Comparison operators: `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`
 - Logical operators: `AND`, `OR`, `NOT`
-- Pattern matching: `LIKE`, `ILIKE`
+- Arithmetic operators: `+`, `-`, `*`, `/`
+- Pattern matching: `LIKE`, `ILIKE` (case-insensitive), with optional `ESCAPE` clause
 - Null checks: `IS NULL`, `IS NOT NULL`
 - IN operator: `col IN (val1, val2, ...)`
 - Range predicates: `BETWEEN`, `NOT BETWEEN`
@@ -454,6 +458,32 @@ CREATE TABLE users (
     ...
 );
 ```
+
+### CHECK
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    price REAL CHECK (price > 0),
+    CHECK (name IS NULL OR LENGTH(name) > 0)
+);
+```
+
+CHECK constraints are evaluated on INSERT and UPDATE (including `ON CONFLICT DO UPDATE`). A CHECK expression that evaluates to `TRUE` or `NULL` passes; only `FALSE` is a violation.
+
+### DEFAULT
+
+```sql
+CREATE TABLE users (
+    id INT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT DEFAULT 'active',
+    ref UUID DEFAULT GEN_RANDOM_UUID()
+);
+```
+
+DEFAULT values are used when a column is omitted from an INSERT statement.
 
 ## Parameters
 

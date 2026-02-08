@@ -39,14 +39,20 @@ What “extensions” means here:
 
 ## SQL surface area
 
-DecentDB’s current baseline includes:
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
-- DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
+DecentDB's current baseline includes:
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `DROP VIEW`, `ALTER TABLE`, `ALTER VIEW ... RENAME TO ...`
+- DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `INSERT ... RETURNING`, `INSERT ... ON CONFLICT`
 - Joins: `INNER JOIN`, `LEFT JOIN`
-- Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`
+- Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`, `HAVING`, `DISTINCT`
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- Predicates: basic comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`), `AND`/`OR`, `LIKE` (plus trigram acceleration on configured columns)
+- Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
+- CTEs: non-recursive `WITH ... AS`
+- Window functions: `ROW_NUMBER() OVER (...)`
+- Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
+- Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`
+- Operators: `+`, `-`, `*`, `/`, `||` (string concatenation)
 - Parameters: positional `$1, $2, ...` (Postgres-style)
+- `EXPLAIN` plan output
 
 SQLite and DuckDB generally include all of the above, plus substantial additional SQL.
 
