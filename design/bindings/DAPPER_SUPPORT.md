@@ -386,9 +386,10 @@ public class Product
 **Recommendation**: Use `id` (INT64 auto-increment) for performance, `Guid` only when needed:
 ```csharp
 // High performance (sequential inserts, clustered index)
+// INT PRIMARY KEY columns auto-increment when omitted from INSERT
 public class Order
 {
-    public long Id { get; set; }  // INT64, auto-increment recommended
+    public long Id { get; set; }  // INT64, auto-incremented by DecentDB
 }
 
 // Distributed/Microservices (when ID must be generated client-side)

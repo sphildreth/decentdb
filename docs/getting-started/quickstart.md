@@ -12,12 +12,15 @@ decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name
 ## Insert Data
 
 ```bash
-# Insert a single row
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
+# Insert a single row (id is auto-assigned)
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')"
 
-# Insert with parameters
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (\$1, \$2, \$3)" \
-  --params=int:2 --params=text:Bob --params=text:bob@example.com
+# Insert with explicit id
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (10, 'Bob', 'bob@example.com')"
+
+# Insert with parameters (id auto-assigned)
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name, email) VALUES (\$1, \$2)" \
+  --params=text:Carol --params=text:carol@example.com
 ```
 
 ## Query Data

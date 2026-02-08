@@ -32,10 +32,13 @@ let createRes = execSql(db, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"
 if not createRes.ok:
   echo "Error: ", createRes.err.message
 
-# Insert data
-let insertRes = execSql(db, "INSERT INTO users VALUES (1, 'Alice')")
+# Insert data (id auto-assigned when omitted)
+let insertRes = execSql(db, "INSERT INTO users (name) VALUES ('Alice')")
 if insertRes.ok:
   echo "Inserted, rows affected: ", insertRes.value.len
+
+# Insert with explicit id
+let insertRes2 = execSql(db, "INSERT INTO users VALUES (10, 'Bob')")
 ```
 
 ### With Parameters

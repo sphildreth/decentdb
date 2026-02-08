@@ -1,6 +1,7 @@
 using System;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -319,7 +320,7 @@ public class AdoNetLayerTests : IDisposable
         
         // Test default values
         Assert.Equal(ParameterDirection.Input, param.Direction);
-        Assert.Equal(false, param.IsNullable);
+        Assert.False(param.IsNullable);
         Assert.Equal("", param.ParameterName);
         Assert.Equal(0, param.Precision);
         Assert.Equal(0, param.Scale);
@@ -336,7 +337,7 @@ public class AdoNetLayerTests : IDisposable
         param.Value = 42;
         
         Assert.Equal(ParameterDirection.InputOutput, param.Direction);
-        Assert.Equal(true, param.IsNullable);
+        Assert.True(param.IsNullable);
         Assert.Equal("testParam", param.ParameterName);
         Assert.Equal(10, param.Precision);
         Assert.Equal(2, param.Scale);
@@ -427,6 +428,7 @@ public class AdoNetLayerTests : IDisposable
         conn.Open();
         
         using var cmd = conn.CreateCommand() as DecentDBCommand;
+        Assert.NotNull(cmd);
         cmd.CommandText = "CREATE TABLE IF NOT EXISTS test_async (id INTEGER PRIMARY KEY, name TEXT)";
         
         var result = await cmd.ExecuteNonQueryAsync(CancellationToken.None);
@@ -440,6 +442,7 @@ public class AdoNetLayerTests : IDisposable
         conn.Open();
         
         using var cmd = conn.CreateCommand() as DecentDBCommand;
+        Assert.NotNull(cmd);
         cmd.CommandText = "SELECT 42";
         
         var result = await cmd.ExecuteScalarAsync(CancellationToken.None);
@@ -449,7 +452,8 @@ public class AdoNetLayerTests : IDisposable
     // Helper class for testing
     private class FakeDbConnection : DbConnection
     {
-        public override string ConnectionString { get; set; }
+        [AllowNull]
+        public override string ConnectionString { get; set; } = "";
         public override string Database => "FakeDb";
         public override string DataSource => "FakeSource";
         public override string ServerVersion => "1.0.0";
@@ -458,7 +462,7 @@ public class AdoNetLayerTests : IDisposable
         public override void ChangeDatabase(string databaseName) { }
         public override void Close() { }
         public override void Open() { }
-        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) => null;
-        protected override DbCommand CreateDbCommand() => null;
+        protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel) => null!;
+        protected override DbCommand CreateDbCommand() => null!;
     }
 }

@@ -30,18 +30,14 @@ using var cmd = conn.CreateCommand();
 cmd.CommandText = "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)";
 cmd.ExecuteNonQuery();
 
-cmd.CommandText = "INSERT INTO users (id, name) VALUES (@id, @name)";
-var pId = cmd.CreateParameter();
-pId.ParameterName = "@id";
-pId.Value = 1;
-cmd.Parameters.Add(pId);
+cmd.CommandText = "INSERT INTO users (name) VALUES (@name)";
 
 var pName = cmd.CreateParameter();
 pName.ParameterName = "@name";
 pName.Value = "Alice";
 cmd.Parameters.Add(pName);
 
-cmd.ExecuteNonQuery();
+cmd.ExecuteNonQuery();  // id is auto-assigned
 ```
 
 ## Parameter style

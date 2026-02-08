@@ -25,11 +25,21 @@ Recommendations:
 
 Always define primary keys. DecentDB automatically creates an index.
 
+`INTEGER PRIMARY KEY` columns support auto-increment — omit the column from INSERT and DecentDB assigns the next sequential ID.
+
 ```sql
 CREATE TABLE users (
-    id INT PRIMARY KEY,  -- Automatically indexed
+    id INT PRIMARY KEY,  -- Automatically indexed, auto-incremented
     name TEXT
 );
+
+-- id is auto-assigned (1, 2, 3, ...)
+INSERT INTO users (name) VALUES ('Alice');
+INSERT INTO users (name) VALUES ('Bob');
+
+-- Explicit id also works; counter advances past it
+INSERT INTO users VALUES (100, 'Carol');
+INSERT INTO users (name) VALUES ('Dave');  -- id = 101
 ```
 
 ### Foreign Keys

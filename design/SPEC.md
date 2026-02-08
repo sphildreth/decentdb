@@ -402,6 +402,9 @@ Alternative:
 ### 7.1 Primary keys
 - Default rowid PK if none specified
 - Unique index enforces PK uniqueness
+- `INTEGER PRIMARY KEY` implies `NOT NULL`
+- `INTEGER PRIMARY KEY` columns support auto-increment: if the column is omitted from an `INSERT`, DecentDB automatically assigns the next sequential ID (see ADR-0036, ADR-0092)
+- Explicit values are still accepted and update the internal counter
 
 ### 7.2 Foreign keys
 - Enforced at statement time (**Note:** differs from SQL standard which enforces at transaction commit)

@@ -141,7 +141,7 @@ public class NativeLayerAdditionalTests : IDisposable
         
         using var insertStmt = db.Prepare("INSERT INTO test_null_blob (id, blob_col) VALUES ($1, $2)");
         insertStmt.BindInt64(1, 1);
-        insertStmt.BindBlob(2, null); // Null array becomes empty
+        insertStmt.BindBlob(2, null!); // Null array becomes empty
         
         var result = insertStmt.Step();
         Assert.True(result >= 0); // Success

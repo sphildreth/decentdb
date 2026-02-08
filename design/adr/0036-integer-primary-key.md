@@ -68,3 +68,5 @@ For such tables:
 ## Implementation status
 
 Implemented in the engine and covered by unit tests ("Primary Key Optimization"). This ADR does not require a `FormatVersion` bump because it does not change the on-disk page/record encoding; it changes how rowids are assigned and which indexes are created for integer-PK tables.
+
+See also: [ADR-0092](0092-integer-pk-auto-increment.md) — completes the auto-increment behavior anticipated in section "Constraints" above.

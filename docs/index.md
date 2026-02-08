@@ -29,7 +29,7 @@ nimble install decentdb
 decentdb exec --db=mydb.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"
 
 # Insert data
-decentdb exec --db=mydb.ddb --sql="INSERT INTO users VALUES (1, 'Alice')"
+decentdb exec --db=mydb.ddb --sql="INSERT INTO users (name) VALUES ('Alice')"
 
 # Query
 decentdb exec --db=mydb.ddb --sql="SELECT * FROM users"

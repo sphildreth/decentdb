@@ -232,7 +232,7 @@ public sealed class DecentDBContextTests : IDisposable
 
     private sealed class DerivedTestContext : DecentDBContext
     {
-        public DbSet<TestPerson> Persons { get; set; }
+        public DbSet<TestPerson> Persons { get; set; } = null!;
 
         public DerivedTestContext(string connectionString) : base(connectionString)
         {

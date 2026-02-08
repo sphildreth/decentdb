@@ -65,7 +65,7 @@ public class MicroOrmLayerTests : IDisposable
     public void DecentDBContext_Constructor_WithInvalidPath_Throws()
     {
         Assert.Throws<ArgumentException>(() => new DecentDBContext(""));
-        Assert.Throws<ArgumentException>(() => new DecentDBContext(null));
+        Assert.Throws<ArgumentException>(() => new DecentDBContext(null!));
         Assert.Throws<ArgumentException>(() => new DecentDBContext("   "));
     }
 
@@ -520,14 +520,14 @@ public class MicroOrmLayerTests : IDisposable
     public class TestEntity
     {
         public int Id { get; set; }
-        public string Name { get; set; }
+        public string Name { get; set; } = "";
     }
 
     public class ProductEntity
     {
         public int Id { get; set; }
         [Required]
-        public string Name { get; set; }
+        public string Name { get; set; } = "";
         public decimal Price { get; set; }
     }
 }

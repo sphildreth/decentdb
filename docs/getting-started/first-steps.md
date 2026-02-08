@@ -16,12 +16,14 @@ decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name
 ### Inserting Data
 
 ```bash
-# Single row
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (1, 'Alice')"
+# Single row (id is auto-assigned when omitted)
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name) VALUES ('Alice')"
 
-# Multiple rows with parameters
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (\$1, \$2)" --params=int:2 --params=text:Bob
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (\$1, \$2)" --params=int:3 --params=text:Carol
+# With explicit id
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (10, 'Bob')"
+
+# With parameters (id auto-assigned)
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name) VALUES (\$1)" --params=text:Carol
 ```
 
 ### Querying Data
@@ -58,8 +60,8 @@ decentdb exec --db=myapp.ddb --sql="CREATE TABLE artists (id INT PRIMARY KEY, na
 decentdb exec --db=myapp.ddb --sql="CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT REFERENCES artists(id), title TEXT)"
 
 # Insert related data
-decentdb exec --db=myapp.ddb --sql="INSERT INTO artists VALUES (1, 'The Beatles')"
-decentdb exec --db=myapp.ddb --sql="INSERT INTO albums VALUES (1, 1, 'Abbey Road')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO artists (name) VALUES ('The Beatles')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO albums (artist_id, title) VALUES (1, 'Abbey Road')"
 ```
 
 ### Joining Tables
@@ -100,8 +102,8 @@ Group multiple operations into atomic transactions:
 decentdb exec --db=myapp.ddb --sql="BEGIN"
 
 # Multiple operations
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (4, 'Dave')"
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users VALUES (5, 'Eve')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name) VALUES ('Dave')"
+decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name) VALUES ('Eve')"
 
 # Commit (or ROLLBACK to cancel)
 decentdb exec --db=myapp.ddb --sql="COMMIT"

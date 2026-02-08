@@ -40,7 +40,8 @@ func main() {
   }
 
   // DecentDB uses Postgres-style placeholders ($1..$N)
-  if _, err := db.Exec("INSERT INTO users (id, name) VALUES ($1, $2)", 1, "Alice"); err != nil {
+  // id is auto-assigned when omitted from the column list
+  if _, err := db.Exec("INSERT INTO users (name) VALUES ($1)", "Alice"); err != nil {
     panic(err)
   }
 }

@@ -27,6 +27,12 @@ CREATE TABLE users (
 );
 ```
 
+Constraints:
+- `PRIMARY KEY` — enforces uniqueness. `INTEGER PRIMARY KEY` columns are implicitly `NOT NULL` and support auto-increment when omitted from INSERT statements.
+- `NOT NULL` — rejects NULL values.
+- `UNIQUE` — enforces uniqueness via a secondary index.
+- `REFERENCES table(column)` — foreign key constraint (see [Foreign Keys](#foreign-keys)).
+
 ### CREATE INDEX
 
 ```sql
@@ -215,6 +221,14 @@ INSERT INTO table_name (...) VALUES (...) RETURNING col1, col2;
 ```
 
 Notes:
+- `INTEGER PRIMARY KEY` columns support auto-increment. If the column is omitted from the INSERT column list, DecentDB automatically assigns the next sequential ID:
+  ```sql
+  CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+  INSERT INTO users (name) VALUES ('Alice');  -- id auto-assigned as 1
+  INSERT INTO users (name) VALUES ('Bob');    -- id auto-assigned as 2
+  INSERT INTO users VALUES (10, 'Carol');     -- explicit id = 10
+  INSERT INTO users (name) VALUES ('Dave');   -- id auto-assigned as 11
+  ```
 - `ON CONFLICT ... DO NOTHING` is supported.
 - `ON CONSTRAINT name` resolves against DecentDB unique index names.
 - `ON CONFLICT ... DO UPDATE` is supported with explicit conflict target (`(cols)` or `ON CONSTRAINT name`).

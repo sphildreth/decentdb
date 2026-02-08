@@ -18,6 +18,13 @@ CREATE TABLE example (
 );
 ```
 
+`INTEGER PRIMARY KEY` columns support auto-increment: if the column is omitted from an `INSERT` statement, DecentDB automatically assigns the next sequential ID. Explicit values are also accepted.
+
+```sql
+INSERT INTO example (count) VALUES (42);       -- id auto-assigned
+INSERT INTO example VALUES (100, 7, 999);      -- explicit id = 100
+```
+
 ### TEXT
 
 Variable-length UTF-8 string.
@@ -160,7 +167,7 @@ SELECT CAST(price AS INT) FROM products;
 
 ## Best Practices
 
-1. Use INT for primary keys and counters
+1. Use INT for primary keys and counters (auto-incremented when omitted from INSERT)
 2. Use TEXT for names, descriptions, JSON
 3. Use BLOB for binary data, images
 4. Use BOOL for flags and states

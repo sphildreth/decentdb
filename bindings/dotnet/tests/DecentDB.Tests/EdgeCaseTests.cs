@@ -239,7 +239,7 @@ public class EdgeCaseTests : IDisposable
         }
 
         cmd.CommandText = "SELECT COUNT(*) FROM test_decimal";
-        var count = (long)cmd.ExecuteScalar();
+        var count = (long)(cmd.ExecuteScalar() ?? 0L);
         Assert.Equal(decimals.Length, count);
     }
 
@@ -349,7 +349,7 @@ public class EdgeCaseTests : IDisposable
         using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = "SELECT COUNT(*) FROM test_concurrent";
-            var count = (long)cmd.ExecuteScalar();
+        var count = (long)(cmd.ExecuteScalar() ?? 0L);
             Assert.Equal(5, count);
         }
     }
@@ -358,7 +358,7 @@ public class EdgeCaseTests : IDisposable
     {
         public int Id { get; set; }
         
-        public string Name { get; set; }
+        public string Name { get; set; } = "";
         
         public decimal Price { get; set; }
     }

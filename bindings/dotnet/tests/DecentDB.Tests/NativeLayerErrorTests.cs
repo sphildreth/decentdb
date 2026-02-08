@@ -234,7 +234,7 @@ public class NativeLayerErrorTests : IDisposable
         // Test the SetLibraryPath method with invalid inputs
         Assert.Throws<ArgumentException>(() => DecentDBNative.SetLibraryPath(""));
         Assert.Throws<ArgumentException>(() => DecentDBNative.SetLibraryPath("   "));
-        Assert.Throws<ArgumentException>(() => DecentDBNative.SetLibraryPath(null));
+        Assert.Throws<ArgumentException>(() => DecentDBNative.SetLibraryPath(null!));
     }
 
     [Fact]

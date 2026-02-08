@@ -40,8 +40,8 @@ from sqlalchemy import create_engine
 engine = create_engine("decentdb+pysql:////path/to/database.ddb")
 
 with engine.connect() as conn:
-    conn.execute(sqlalchemy.text("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT)"))
-    conn.execute(sqlalchemy.text("INSERT INTO users VALUES (1, 'Alice')"))
+    conn.execute(sqlalchemy.text("CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)"))
+    conn.execute(sqlalchemy.text("INSERT INTO users (name) VALUES ('Alice')"))  # id auto-assigned
     conn.commit()
 
     rows = conn.execute(sqlalchemy.text("SELECT * FROM users")).all()
