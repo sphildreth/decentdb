@@ -41,6 +41,7 @@ type Db* = ref object
   cachePages*: int                   # Cache size for diagnostics
   sqlCache*: Table[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]]
   sqlCacheOrder*: seq[string]
+  cachedFlushHandler: proc(pageId: PageId, data: string): Result[Void]
 
 type Prepared* = ref object
   db*: Db
@@ -261,8 +262,16 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     forceTruncateOnTimeout = true,
     memoryThreshold = 256 * 1024 * 1024,  # 256MB memory limit for WAL index
     maxWalBytesPerReader = 256 * 1024 * 1024,  # HIGH-006: 256MB per reader limit
-    readerCheckIntervalMs = 5000)  # HIGH-006: Check readers every 5 seconds
+    readerCheckIntervalMs = 5000,  # HIGH-006: Check readers every 5 seconds
+    checkpointCheckInterval = 64)  # Only evaluate time/memory every 64 commits
   
+  # Create flush handler once, reuse across all transactions
+  dbRef.cachedFlushHandler = proc(pageId: PageId, data: string): Result[Void] =
+    var payload = newSeq[byte](data.len)
+    if data.len > 0:
+      copyMem(addr payload[0], unsafeAddr data[0], data.len)
+    dbRef.activeWriter.flushPage(pageId, payload)
+
   ok(dbRef)
 
 proc schemaBump(db: Db): Result[Void] =
@@ -3630,19 +3639,11 @@ proc beginTransaction*(db: Db): Result[Void] =
   
   db.activeWriter = writerRes.value
   
-  let writer = db.activeWriter
-  
   # Begin tracking page allocations for this transaction (HIGH-003)
   beginTxnPageTracking(db.pager)
   
   # Install flush handler to allow evicting dirty pages during large transactions
-  db.pager.flushHandler = proc(pageId: PageId, data: string): Result[Void] =
-    # Convert page data (string) to WAL payload (seq[byte])
-    var payload = newSeq[byte](data.len)
-    if data.len > 0:
-      copyMem(addr payload[0], unsafeAddr data[0], data.len)
-      
-    writer.flushPage(pageId, payload)
+  db.pager.flushHandler = db.cachedFlushHandler
 
   okVoid()
 
@@ -3659,45 +3660,58 @@ proc commitTransaction*(db: Db): Result[Void] =
   # This means trigram indexes may be temporarily out of sync after crash
   # until a checkpoint completes. The B+Tree data is always durable.
 
-  let dirtyPages = snapshotDirtyPages(db.pager)
-  var pageIds: seq[PageId] = @[]
+  # Fast path: single dirty page avoids snapshotDirtyPages scan + allocation
+  let dirtyCount = db.pager.txnDirtyCount
+  if dirtyCount == 1:
+    let dirtyId = db.pager.txnLastDirtyId
+    let (pageId, pageData) = snapshotSingleDirtyPage(db.pager, dirtyId)
+    if pageData.len > 0:
+      let writeRes = writePageDirect(db.activeWriter, pageId, pageData)
+      if not writeRes.ok:
+        discard rollback(db.activeWriter)
+        db.activeWriter = nil
+        db.pager.flushHandler = nil
+        clearCache(db.pager)
+        return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
 
-  # Optimization: Use writePageDirect to avoid double allocation/copy
-  for entry in dirtyPages:
-    let writeRes = writePageDirect(db.activeWriter, entry[0], entry[1])
-    if not writeRes.ok:
-      discard rollback(db.activeWriter)
+    let commitRes = commit(db.activeWriter)
+    if not commitRes.ok:
       db.activeWriter = nil
       db.pager.flushHandler = nil
       clearCache(db.pager)
-      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-    pageIds.add(entry[0])
+      return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
 
-  let commitRes = commit(db.activeWriter)
-  if not commitRes.ok:
-    db.activeWriter = nil
-    db.pager.flushHandler = nil
-    clearCache(db.pager)
-    return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+    if pageData.len > 0:
+      markPageCommitted(db.pager, dirtyId, commitRes.value)
+  else:
+    # Multi-page path: use full snapshot scan
+    let dirtyPages = snapshotDirtyPages(db.pager)
+    var pageIds: seq[PageId] = @[]
 
-  if pageIds.len > 0:
-    markPagesCommitted(db.pager, pageIds, commitRes.value)
+    for entry in dirtyPages:
+      let writeRes = writePageDirect(db.activeWriter, entry[0], entry[1])
+      if not writeRes.ok:
+        discard rollback(db.activeWriter)
+        db.activeWriter = nil
+        db.pager.flushHandler = nil
+        clearCache(db.pager)
+        return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+      pageIds.add(entry[0])
 
-  # MED-003: Check if checkpoint will be triggered and flush trigram deltas first
-  # This ensures trigram indexes are consistent with the checkpointed data
-  var willCheckpoint = false
+    let commitRes = commit(db.activeWriter)
+    if not commitRes.ok:
+      db.activeWriter = nil
+      db.pager.flushHandler = nil
+      clearCache(db.pager)
+      return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
+
+    if pageIds.len > 0:
+      markPagesCommitted(db.pager, pageIds, commitRes.value)
+
+  # MED-003: Check if checkpoint will be triggered and flush trigram deltas first.
+  # Use byte threshold as a fast gate; maybeCheckpoint handles time/memory checks
+  # with its own lazy evaluation interval.
   if db.wal.checkpointEveryBytes > 0 and db.wal.endOffset >= db.wal.checkpointEveryBytes:
-    willCheckpoint = true
-  if db.wal.checkpointEveryMs > 0:
-    let elapsedMs = int64((epochTime() - db.wal.lastCheckpointAt) * 1000)
-    if elapsedMs >= db.wal.checkpointEveryMs:
-      willCheckpoint = true
-  if db.wal.checkpointMemoryThreshold > 0:
-    let memUsage = estimateIndexMemoryUsage(db.wal)
-    if memUsage >= db.wal.checkpointMemoryThreshold:
-      willCheckpoint = true
-  
-  if willCheckpoint:
     let trigramFlushRes = flushTrigramDeltas(db.pager, db.catalog)
     if not trigramFlushRes.ok:
       db.activeWriter = nil

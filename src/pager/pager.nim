@@ -53,6 +53,9 @@ type Pager* = ref object
   txnAllocatedPages*: seq[PageId]  # Pages allocated during current transaction (HIGH-003)
   inTransaction*: bool             # Whether a transaction is active (HIGH-003)
   flushHandler*: proc(pageId: PageId, data: string): Result[Void]
+  # Optimization: Track dirty page count during transaction to enable single-page fast path
+  txnDirtyCount*: int              # Number of pages dirtied in current transaction
+  txnLastDirtyId*: PageId          # Last page marked dirty (valid when txnDirtyCount >= 1)
 
 type PageHandle* = object
   pager*: Pager
@@ -351,8 +354,13 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
   defer: release(shard.lock)
   if entry.pinCount > 0:
     entry.pinCount.dec
-  if dirty:
+  if dirty and not entry.dirty:
     entry.dirty = true
+    pager.txnDirtyCount.inc
+    pager.txnLastDirtyId = entry.id
+  elif dirty:
+    # Already dirty — still update last dirty ID (may be same page re-dirtied)
+    pager.txnLastDirtyId = entry.id
   okVoid()
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[string]
@@ -682,11 +690,15 @@ proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
     return err[Void](pinRes.err.code, pinRes.err.message, pinRes.err.context)
   let entry = pinRes.value
   acquire(entry.lock)
+  let wasDirty = entry.dirty
   entry.data = data
   entry.dirty = true
   entry.aux = nil
   release(entry.lock)
-  discard unpinPage(pager, entry, dirty = true)
+  if not wasDirty:
+    pager.txnDirtyCount.inc
+  pager.txnLastDirtyId = pageId
+  discard unpinPage(pager, entry, dirty = false)
   okVoid()
 
 proc writePageDirectFile*(pager: Pager, pageId: PageId, data: string): Result[Void] =
@@ -742,6 +754,34 @@ proc snapshotDirtyPages*(pager: Pager): seq[(PageId, string)] =
     let copy = entry.data
     release(entry.lock)
     result.add((entry.id, copy))
+
+proc snapshotSingleDirtyPage*(pager: Pager, pageId: PageId): (PageId, string) =
+  ## Fast path: snapshot a single known-dirty page without scanning all shards.
+  let cache = pager.cache
+  let shard = shardFor(cache, pageId)
+  acquire(shard.lock)
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
+    acquire(entry.lock)
+    result = (pageId, entry.data)
+    release(entry.lock)
+  release(shard.lock)
+
+proc markPageCommitted*(pager: Pager, pageId: PageId, lsn: uint64) =
+  ## Fast path: mark a single page as committed without seq allocation.
+  let cache = pager.cache
+  acquire(pager.overlayLock)
+  pager.overriddenPages.excl(pageId)
+  release(pager.overlayLock)
+  let shard = shardFor(cache, pageId)
+  acquire(shard.lock)
+  if shard.pages.hasKey(pageId):
+    let entry = shard.pages[pageId]
+    acquire(entry.lock)
+    entry.dirty = false
+    entry.lsn = lsn
+    release(entry.lock)
+  release(shard.lock)
 
 proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
   let cache = pager.cache
@@ -956,6 +996,8 @@ proc beginTxnPageTracking*(pager: Pager) =
   ## Call this when a transaction begins.
   pager.inTransaction = true
   pager.txnAllocatedPages = @[]
+  pager.txnDirtyCount = 0
+  pager.txnLastDirtyId = 0
 
 proc endTxnPageTracking*(pager: Pager) =
   ## End tracking page allocations for the current transaction.

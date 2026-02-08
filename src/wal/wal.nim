@@ -49,48 +49,61 @@ type ReaderInfo* = object
   bytesAtStart*: int64   # WAL size when reader started
   abortedFlag*: ptr Atomic[bool]  # Shared atomic flag for lock-free abort check
 
-type Wal* = ref object
-  vfs*: Vfs
-  file*: VfsFile
-  path*: string
-  pageSize*: uint32
-  walEnd*: Atomic[uint64]
-  endOffset*: int64
-  index*: Table[PageId, seq[WalIndexEntry]]
-  dirtySinceCheckpoint: Table[PageId, WalIndexEntry]
-  lock*: Lock
-  indexLock*: Lock
-  readerLock*: Lock
-  readers*: Table[int, ReaderInfo]
-  abortedReaders*: HashSet[int]
-  nextReaderId*: int
-  failpoints*: Table[string, WalFailpoint]
-  checkpointPending*: bool
-  lastCheckpointAt*: float
-  checkpointEveryBytes*: int64
-  checkpointEveryMs*: int64
-  readerWarnMs*: int64
-  readerTimeoutMs*: int64
-  forceTruncateOnTimeout*: bool
-  warnings*: seq[string]
-  # Memory tracking for WAL index
-  indexMemoryBytes*: int64
-  checkpointMemoryThreshold*: int64  # Trigger checkpoint when index exceeds this
-  # Optimization: Reusable buffer for frame encoding to avoid allocations
-  frameBuffer*: seq[byte]
-  # Optimization: Optional mmap-backed WAL write path
-  mmapEnabled*: bool
-  mmapPtr*: pointer
-  mmapLen*: int
-  # HIGH-006: Long-running reader resource management
-  maxWalBytesPerReader*: int64  # Max WAL bytes a reader can pin (0 = disabled)
-  readerCheckIntervalMs*: int64  # How often to check readers (0 = check every operation)
-  lastReaderCheckAt*: float  # Last time reader check was performed
-  totalReadersAborted*: int64  # Stats: total readers aborted due to timeout
-  totalWarningsIssued*: int64  # Stats: total warnings issued
-  # Optimization: Lazy checkpoint evaluation counters
-  commitsSinceCheckpointCheck*: int64  # Commits since last full checkpoint check
-  checkpointCheckInterval*: int64      # Check time/memory every N commits (0 = always)
+type
+  WalWriter* = ref object
+    wal*: Wal
+    pending*: seq[WalPendingPage]
+    pendingSingle*: WalPendingPage
+    hasPendingSingle*: bool
+    active*: bool
+    flushed*: Table[PageId, WalIndexEntry]
+    # Reusable buffer for page metadata during commit (avoids per-commit seq allocation)
+    pageMeta*: seq[(PageId, WalIndexEntry)]
+
+  Wal* = ref object
+    vfs*: Vfs
+    file*: VfsFile
+    path*: string
+    pageSize*: uint32
+    walEnd*: Atomic[uint64]
+    endOffset*: int64
+    index*: Table[PageId, seq[WalIndexEntry]]
+    dirtySinceCheckpoint: Table[PageId, WalIndexEntry]
+    lock*: Lock
+    indexLock*: Lock
+    readerLock*: Lock
+    readers*: Table[int, ReaderInfo]
+    abortedReaders*: HashSet[int]
+    nextReaderId*: int
+    failpoints*: Table[string, WalFailpoint]
+    checkpointPending*: bool
+    lastCheckpointAt*: float
+    checkpointEveryBytes*: int64
+    checkpointEveryMs*: int64
+    readerWarnMs*: int64
+    readerTimeoutMs*: int64
+    forceTruncateOnTimeout*: bool
+    warnings*: seq[string]
+    # Memory tracking for WAL index
+    indexMemoryBytes*: int64
+    checkpointMemoryThreshold*: int64  # Trigger checkpoint when index exceeds this
+    # Optimization: Reusable buffer for frame encoding to avoid allocations
+    frameBuffer*: seq[byte]
+    # Optimization: Optional mmap-backed WAL write path
+    mmapEnabled*: bool
+    mmapPtr*: pointer
+    mmapLen*: int
+    # HIGH-006: Long-running reader resource management
+    maxWalBytesPerReader*: int64  # Max WAL bytes a reader can pin (0 = disabled)
+    readerCheckIntervalMs*: int64  # How often to check readers (0 = check every operation)
+    lastReaderCheckAt*: float  # Last time reader check was performed
+    totalReadersAborted*: int64  # Stats: total readers aborted due to timeout
+    totalWarningsIssued*: int64  # Stats: total warnings issued
+    # Optimization: Lazy checkpoint evaluation counters
+    commitsSinceCheckpointCheck*: int64  # Commits since last full checkpoint check
+    checkpointCheckInterval*: int64      # Check time/memory every N commits (0 = always)
+    # Optimization: Cached WalWriter to avoid per-transaction allocation
+    cachedWriter*: WalWriter
 
 const HeaderSize = 1 + 4
 const TrailerSize = 8
@@ -949,12 +962,13 @@ proc isAborted*(wal: Wal, txn: ReadTxn): bool =
   result = txn.id in wal.abortedReaders
   release(wal.readerLock)
 
-proc setCheckpointConfig*(wal: Wal, everyBytes: int64, everyMs: int64, readerWarnMs: int64 = 0, readerTimeoutMs: int64 = 0, forceTruncateOnTimeout: bool = false, memoryThreshold: int64 = 0, maxWalBytesPerReader: int64 = 0, readerCheckIntervalMs: int64 = 0) =
+proc setCheckpointConfig*(wal: Wal, everyBytes: int64, everyMs: int64, readerWarnMs: int64 = 0, readerTimeoutMs: int64 = 0, forceTruncateOnTimeout: bool = false, memoryThreshold: int64 = 0, maxWalBytesPerReader: int64 = 0, readerCheckIntervalMs: int64 = 0, checkpointCheckInterval: int64 = 0) =
   ## Configure checkpoint and reader management settings.
   ## 
   ## HIGH-006 parameters:
   ## - maxWalBytesPerReader: Maximum WAL bytes a single reader can pin (0 = disabled)
   ## - readerCheckIntervalMs: Minimum time between reader checks (0 = check every operation)
+  ## - checkpointCheckInterval: Only evaluate time/memory thresholds every N commits (0 = always)
   wal.checkpointEveryBytes = everyBytes
   wal.checkpointEveryMs = everyMs
   wal.readerWarnMs = readerWarnMs
@@ -964,6 +978,7 @@ proc setCheckpointConfig*(wal: Wal, everyBytes: int64, everyMs: int64, readerWar
   # HIGH-006: Long-running reader resource management
   wal.maxWalBytesPerReader = maxWalBytesPerReader
   wal.readerCheckIntervalMs = readerCheckIntervalMs
+  wal.checkpointCheckInterval = checkpointCheckInterval
 
 proc estimateIndexMemoryUsage*(wal: Wal): int64 =
   ## Estimate memory usage of the WAL index in bytes.
@@ -1066,18 +1081,17 @@ proc readPageWithSnapshot*(pager: Pager, wal: Wal, snapshot: uint64, pageId: Pag
     return ok(s)
   readPageDirect(pager, pageId)
 
-type WalWriter* = ref object
-  wal*: Wal
-  pending*: seq[WalPendingPage]
-  pendingSingle*: WalPendingPage
-  hasPendingSingle*: bool
-  active*: bool
-  flushed*: Table[PageId, WalIndexEntry]
-
 proc beginWrite*(wal: Wal): Result[WalWriter] =
   acquire(wal.lock)
-  let writer = WalWriter(wal: wal, pending: @[], active: true, hasPendingSingle: false, flushed: initTable[PageId, WalIndexEntry]())
-  ok(writer)
+  if wal.cachedWriter == nil:
+    wal.cachedWriter = WalWriter(wal: wal, pending: @[], active: true, hasPendingSingle: false, flushed: initTable[PageId, WalIndexEntry](), pageMeta: @[])
+  else:
+    wal.cachedWriter.pending.setLen(0)
+    wal.cachedWriter.hasPendingSingle = false
+    wal.cachedWriter.flushed.clear()
+    wal.cachedWriter.pageMeta.setLen(0)
+    wal.cachedWriter.active = true
+  ok(wal.cachedWriter)
 
 proc addPending(writer: WalWriter, entry: WalPendingPage) =
   if writer.pending.len > 0:
@@ -1134,7 +1148,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
   # Optimization: Batch all writes into a single buffer and single fsync
   # This reduces lock contention and system calls significantly.
   
-  var pageMeta: seq[(PageId, WalIndexEntry)] = @[]
+  writer.pageMeta.setLen(0)
   let startOffset = max(writer.wal.endOffset, int64(WalHeaderSize))
   var currentOffset = startOffset
   
@@ -1208,7 +1222,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
         else:
           encodeFrameIntoPtr(dest, mapOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
       let frameEnd = frameStart + int64(len)
-      pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
+      writer.pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
       mapOffset += len
       currentOffset = frameEnd
 
@@ -1220,7 +1234,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
         else:
           encodeFrameIntoPtr(dest, mapOffset, wfPage, uint32(entry.pageId), entry.bytes)
       let frameEnd = currentOffset + int64(len)
-      pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
+      writer.pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
       mapOffset += len
       currentOffset += int64(len)
 
@@ -1241,7 +1255,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
         else:
           encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
       let frameEnd = frameStart + int64(len)
-      pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
+      writer.pageMeta.add((writer.pendingSingle.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: frameStart)))
       bufferOffset += len
       currentOffset = frameEnd
 
@@ -1253,7 +1267,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
         else:
           encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
       let frameEnd = currentOffset + int64(len)
-      pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
+      writer.pageMeta.add((entry.pageId, WalIndexEntry(lsn: uint64(frameEnd), offset: currentOffset)))
       bufferOffset += len
       currentOffset += int64(len)
 
@@ -1297,7 +1311,7 @@ proc commit*(writer: WalWriter): Result[uint64] =
     writer.wal.dirtySinceCheckpoint[pageId] = entry
   
   # Add pending pages to index
-  for entry in pageMeta:
+  for entry in writer.pageMeta:
     if not writer.wal.index.hasKey(entry[0]):
       writer.wal.index[entry[0]] = @[]
     writer.wal.index[entry[0]].add(entry[1])
@@ -1308,12 +1322,12 @@ proc commit*(writer: WalWriter): Result[uint64] =
   writer.wal.walEnd.store(commitLsn, moRelease)
   writer.active = false
   release(writer.wal.lock)
-  writer.pending = @[]
+  writer.pending.setLen(0)
   writer.hasPendingSingle = false
   ok(commitLsn)
 
 proc rollback*(writer: WalWriter): Result[Void] =
-  writer.pending = @[]
+  writer.pending.setLen(0)
   writer.hasPendingSingle = false
   writer.flushed.clear()
   writer.active = false
