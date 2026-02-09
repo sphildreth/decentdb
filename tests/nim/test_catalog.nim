@@ -6,6 +6,7 @@ import options
 import catalog/catalog
 import pager/pager
 import storage/storage
+import sql/sql
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
@@ -198,3 +199,61 @@ suite "Catalog":
     let mixedCaseRes = parseColumnType("VarChar(100)")
     check mixedCaseRes.ok
     check mixedCaseRes.value.kind == ctText
+
+  test "reverse fk cache tracks parent references":
+    let path = makeTempDb("decentdb_catalog_reverse_fk.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    let parentCols = @[Column(name: "id", kind: ctInt64, primaryKey: true)]
+    let childCols = @[
+      Column(name: "id", kind: ctInt64, primaryKey: true),
+      Column(
+        name: "parent_id",
+        kind: ctInt64,
+        refTable: "parent",
+        refColumn: "id",
+        refOnDelete: "RESTRICT",
+        refOnUpdate: "NO ACTION"
+      )
+    ]
+    discard addTable(db, "parent", parentCols)
+    discard addTable(db, "child", childCols)
+
+    check db.catalog.hasReferencingChildren("parent")
+    let refs = db.catalog.referencingChildren("parent", "id")
+    check refs.len == 1
+    check refs[0].tableName == "child"
+    check refs[0].columnName == "parent_id"
+
+    check db.catalog.dropTable("child").ok
+    check db.catalog.referencingChildren("parent", "id").len == 0
+    check not db.catalog.hasReferencingChildren("parent")
+
+    discard closeDb(db)
+
+  test "trigger fast gate tracks table event mask":
+    let path = makeTempDb("decentdb_catalog_trigger_gate.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    let cols = @[Column(name: "id", kind: ctInt64, primaryKey: true)]
+    discard addTable(db, "t", cols)
+
+    let triggerMeta = TriggerMeta(
+      name: "trg_update",
+      table: "t",
+      eventsMask: TriggerEventUpdateMask,
+      actionSql: "UPDATE t SET id = id"
+    )
+    check db.catalog.createTriggerMeta(triggerMeta).ok
+    check db.catalog.hasTriggersForTable("t")
+    check db.catalog.hasTriggersForTable("t", TriggerEventUpdateMask)
+    check not db.catalog.hasTriggersForTable("t", TriggerEventDeleteMask)
+
+    check db.catalog.dropTrigger("t", "trg_update").ok
+    check not db.catalog.hasTriggersForTable("t")
+
+    discard closeDb(db)

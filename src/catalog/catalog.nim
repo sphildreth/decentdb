@@ -64,6 +64,12 @@ type TriggerMeta* = object
   eventsMask*: int
   actionSql*: string
 
+type ReferencingChildFk* = object
+  tableName*: string
+  columnName*: string
+  onDelete*: string
+  onUpdate*: string
+
 type IndexMeta* = object
   name*: string
   table*: string
@@ -83,6 +89,9 @@ type Catalog* = ref object
   views*: Table[string, ViewMeta]
   triggers*: Table[string, TriggerMeta]
   dependentViews*: Table[string, HashSet[string]]
+  reverseFkRefs*: Table[(string, string), seq[ReferencingChildFk]]
+  tablesWithReferencingChildren*: HashSet[string]
+  triggerEventMaskByTable*: Table[string, int]
   catalogTree*: BTree
   trigramDeltas*: Table[(string, uint32), TrigramDelta]
 
@@ -428,6 +437,36 @@ proc normalizedObjectName(name: string): string =
 proc triggerMetaKey(tableName: string, triggerName: string): string =
   normalizedObjectName(tableName) & ":" & normalizedObjectName(triggerName)
 
+proc rebuildReverseFkCache(catalog: Catalog) =
+  catalog.reverseFkRefs = initTable[(string, string), seq[ReferencingChildFk]]()
+  catalog.tablesWithReferencingChildren = initHashSet[string]()
+  for _, meta in catalog.tables:
+    for col in meta.columns:
+      if col.refTable.len == 0 or col.refColumn.len == 0:
+        continue
+      let key = (col.refTable, col.refColumn)
+      if not catalog.reverseFkRefs.hasKey(key):
+        catalog.reverseFkRefs[key] = @[]
+      catalog.reverseFkRefs[key].add(ReferencingChildFk(
+        tableName: meta.name,
+        columnName: col.name,
+        onDelete: normalizeFkAction(col.refOnDelete),
+        onUpdate: normalizeFkAction(col.refOnUpdate)
+      ))
+      catalog.tablesWithReferencingChildren.incl(normalizedObjectName(col.refTable))
+  for key, refs in mpairs(catalog.reverseFkRefs):
+    refs.sort(proc(a, b: ReferencingChildFk): int =
+      let tableCmp = cmp(a.tableName, b.tableName)
+      if tableCmp != 0: tableCmp else: cmp(a.columnName, b.columnName)
+    )
+
+proc rebuildTriggerCache(catalog: Catalog) =
+  catalog.triggerEventMaskByTable = initTable[string, int]()
+  for _, trigger in catalog.triggers:
+    let key = normalizedObjectName(trigger.table)
+    let existing = if catalog.triggerEventMaskByTable.hasKey(key): catalog.triggerEventMaskByTable[key] else: 0
+    catalog.triggerEventMaskByTable[key] = existing or trigger.eventsMask
+
 proc rebuildDependentViewsIndex*(catalog: Catalog) =
   catalog.dependentViews = initTable[string, HashSet[string]]()
   for _, view in catalog.views:
@@ -459,6 +498,9 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
     views: initTable[string, ViewMeta](),
     triggers: initTable[string, TriggerMeta](),
     dependentViews: initTable[string, HashSet[string]](),
+    reverseFkRefs: initTable[(string, string), seq[ReferencingChildFk]](),
+    tablesWithReferencingChildren: initHashSet[string](),
+    triggerEventMaskByTable: initTable[string, int](),
     catalogTree: tree,
     trigramDeltas: initTable[(string, uint32), TrigramDelta]()
   )
@@ -489,6 +531,8 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
         of crTrigger:
           catalog.triggers[triggerMetaKey(record.trigger.table, record.trigger.name)] = record.trigger
   rebuildDependentViewsIndex(catalog)
+  rebuildReverseFkCache(catalog)
+  rebuildTriggerCache(catalog)
   ok(catalog)
 
 proc trigramBufferAdd*(catalog: Catalog, indexName: string, trigram: uint32, rowid: uint64) =
@@ -526,7 +570,12 @@ proc updateTableMeta*(catalog: Catalog, table: TableMeta) =
   catalog.tables[table.name] = table
 
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
+  var rebuildFk = true
+  if catalog.tables.hasKey(table.name):
+    rebuildFk = catalog.tables[table.name].columns != table.columns
   catalog.tables[table.name] = table
+  if rebuildFk:
+    rebuildReverseFkCache(catalog)
   let key = uint64(crc32c(stringToBytes("table:" & table.name)))
   let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns, table.checks)
   
@@ -691,6 +740,7 @@ proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void] =
   if not insertRes.ok:
     catalog.triggers.del(keyName)
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  rebuildTriggerCache(catalog)
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
@@ -704,14 +754,34 @@ proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Res
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  rebuildTriggerCache(catalog)
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
+
+proc referencingChildren*(catalog: Catalog, tableName: string, columnName: string): seq[ReferencingChildFk] =
+  let key = (tableName, columnName)
+  if catalog.reverseFkRefs.hasKey(key):
+    return catalog.reverseFkRefs[key]
+  @[]
+
+proc hasReferencingChildren*(catalog: Catalog, tableName: string): bool =
+  normalizedObjectName(tableName) in catalog.tablesWithReferencingChildren
+
+proc hasTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int = 0): bool =
+  let key = normalizedObjectName(tableName)
+  if not catalog.triggerEventMaskByTable.hasKey(key):
+    return false
+  if eventMask == 0:
+    return true
+  (catalog.triggerEventMaskByTable[key] and eventMask) != 0
 
 proc hasTrigger*(catalog: Catalog, tableName: string, triggerName: string): bool =
   catalog.triggers.hasKey(triggerMetaKey(tableName, triggerName))
 
 proc listTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int = 0): seq[TriggerMeta] =
+  if not catalog.hasTriggersForTable(tableName, eventMask):
+    return @[]
   let tableKey = normalizedObjectName(tableName)
   for _, trigger in catalog.triggers:
     if normalizedObjectName(trigger.table) != tableKey:
@@ -741,6 +811,7 @@ proc dropTable*(catalog: Catalog, name: string): Result[Void] =
     if not dropTrigRes.ok:
       return dropTrigRes
   catalog.tables.del(name)
+  rebuildReverseFkCache(catalog)
   let key = uint64(crc32c(stringToBytes("table:" & name)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:

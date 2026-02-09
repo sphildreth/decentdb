@@ -43,12 +43,23 @@ type Db* = ref object
   sqlCacheOrder*: seq[string]
   cachedFlushHandler: proc(pageId: PageId, data: string): Result[Void]
 
+type UpdateWriteProfile* = object
+  hasUpdateTriggers*: bool
+  hasCheckConstraints*: bool
+  hasNotNullOnUpdatedCols*: bool
+  hasUniqueOnUpdatedCols*: bool
+  hasForeignKeysOnUpdatedCols*: bool
+  isParentOfForeignKeys*: bool
+  updatesIndexedColumns*: bool
+  isSimpleUpdate*: bool
+
 type Prepared* = ref object
   db*: Db
   sql*: string
   schemaCookie*: uint32
   statements*: seq[Statement]
   plans*: seq[Plan]
+  updateProfiles*: seq[UpdateWriteProfile]
 
 type DurabilityMode* = enum
   dmFull
@@ -1190,29 +1201,6 @@ proc enforceConstraintsBatch*(
   
   ok(allFailures)
 
-type ChildFkRef = object
-  tableName: string
-  columnName: string
-  onDelete: string
-  onUpdate: string
-
-proc normalizeFkAction(action: string): string =
-  let upper = action.strip().toUpperAscii()
-  if upper.len == 0:
-    return "NO ACTION"
-  upper
-
-proc referencingChildren(catalog: Catalog, table: string, column: string): seq[ChildFkRef] =
-  for _, meta in catalog.tables:
-    for col in meta.columns:
-      if col.refTable == table and col.refColumn == column:
-        result.add(ChildFkRef(
-          tableName: meta.name,
-          columnName: col.name,
-          onDelete: normalizeFkAction(col.refOnDelete),
-          onUpdate: normalizeFkAction(col.refOnUpdate)
-        ))
-
 proc columnIndexInTable(table: TableMeta, columnName: string): int =
   for i, col in table.columns:
     if col.name == columnName:
@@ -1261,7 +1249,7 @@ proc findReferencingRows(catalog: Catalog, pager: Pager, childTable: TableMeta, 
 
 proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, oldValues: seq[Value], newValues: seq[Value]): Result[Void] =
   for i, col in table.columns:
-    let children = referencingChildren(catalog, table.name, col.name)
+    let children = catalog.referencingChildren(table.name, col.name)
     if children.len == 0:
       continue
     let oldVal = oldValues[i]
@@ -1323,7 +1311,7 @@ proc enforceRestrictOnParent(catalog: Catalog, pager: Pager, table: TableMeta, o
 
 proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, oldValues: seq[Value]): Result[Void] =
   for i, col in table.columns:
-    let children = referencingChildren(catalog, table.name, col.name)
+    let children = catalog.referencingChildren(table.name, col.name)
     if children.len == 0:
       continue
     let oldVal = oldValues[i]
@@ -1608,6 +1596,54 @@ proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value]): Result[Mul
       multi.rows.add(extraRes.value.row.get)
   ok(multi)
 
+proc buildUpdateWriteProfile(catalog: Catalog, table: TableMeta, assignments: Table[string, Expr]): UpdateWriteProfile =
+  var updatedCols = initHashSet[string]()
+  for colName, _ in assignments:
+    updatedCols.incl(colName)
+
+  var hasNotNullOnUpdated = false
+  var hasUniqueOnUpdated = false
+  var hasForeignKeysOnUpdated = false
+  for col in table.columns:
+    if col.name notin updatedCols:
+      continue
+    if col.notNull:
+      hasNotNullOnUpdated = true
+    if col.unique or col.primaryKey:
+      hasUniqueOnUpdated = true
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      hasForeignKeysOnUpdated = true
+
+  var updatesIndexedColumns = false
+  for _, idx in catalog.indexes:
+    if idx.table != table.name:
+      continue
+    for idxCol in idx.columns:
+      if idxCol.startsWith(IndexExpressionPrefix):
+        updatesIndexedColumns = true
+        break
+      if idxCol in updatedCols:
+        updatesIndexedColumns = true
+        break
+    if updatesIndexedColumns:
+      break
+
+  result.hasUpdateTriggers = catalog.hasTriggersForTable(table.name, TriggerEventUpdateMask)
+  result.hasCheckConstraints = table.checks.len > 0
+  result.hasNotNullOnUpdatedCols = hasNotNullOnUpdated
+  result.hasUniqueOnUpdatedCols = hasUniqueOnUpdated
+  result.hasForeignKeysOnUpdatedCols = hasForeignKeysOnUpdated
+  result.isParentOfForeignKeys = catalog.hasReferencingChildren(table.name)
+  result.updatesIndexedColumns = updatesIndexedColumns
+  result.isSimpleUpdate =
+    not result.hasUpdateTriggers and
+    not result.hasCheckConstraints and
+    not result.hasNotNullOnUpdatedCols and
+    not result.hasUniqueOnUpdatedCols and
+    not result.hasForeignKeysOnUpdatedCols and
+    not result.isParentOfForeignKeys and
+    not result.updatesIndexedColumns
+
 proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   if not db.isOpen:
     return err[Prepared](ERR_INTERNAL, "Database not open")
@@ -1618,6 +1654,7 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
 
   var boundStatements: seq[Statement] = @[]
   var plans: seq[Plan] = @[]
+  var updateProfiles: seq[UpdateWriteProfile] = @[]
 
   for stmt in parseRes.value.statements:
     let bindRes = bindStatement(db.catalog, stmt)
@@ -1625,6 +1662,7 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
       return err[Prepared](bindRes.err.code, bindRes.err.message, bindRes.err.context)
     let bound = bindRes.value
     boundStatements.add(bound)
+    updateProfiles.add(UpdateWriteProfile())
 
     if bound.kind == skSelect:
       let planRes = plan(db.catalog, bound)
@@ -1636,6 +1674,7 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
       if not tableRes.ok:
         return err[Prepared](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
+      updateProfiles[^1] = buildUpdateWriteProfile(db.catalog, table, bound.assignments)
       var selectItems: seq[SelectItem] = @[]
       for col in table.columns:
         selectItems.add(SelectItem(expr: Expr(kind: ekColumn, name: col.name, table: bound.updateTable)))
@@ -1696,13 +1735,14 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
     sql: sqlText,
     schemaCookie: db.schemaCookie,
     statements: boundStatements,
-    plans: plans
+    plans: plans,
+    updateProfiles: updateProfiles
   ))
 
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
 
 # Forward declaration
-proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil): Result[int64]
+proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil, updateProfile: UpdateWriteProfile = UpdateWriteProfile()): Result[int64]
 
 const MaxTriggerExecutionDepth = 16
 var gTriggerExecutionDepth {.threadvar.}: int
@@ -1723,6 +1763,8 @@ proc runTriggerActions(db: Db, triggers: seq[TriggerMeta], affectedRows: int64):
   okVoid()
 
 proc executeAfterTriggers(db: Db, tableName: string, eventMask: int, affectedRows: int64): Result[Void] =
+  if not db.catalog.hasTriggersForTable(tableName, eventMask):
+    return okVoid()
   var afterTriggers: seq[TriggerMeta] = @[]
   for trigger in db.catalog.listTriggersForTable(tableName, eventMask):
     if (trigger.eventsMask and TriggerTimingInsteadMask) == 0:
@@ -1730,6 +1772,8 @@ proc executeAfterTriggers(db: Db, tableName: string, eventMask: int, affectedRow
   runTriggerActions(db, afterTriggers, affectedRows)
 
 proc executeInsteadTriggers(db: Db, objectName: string, eventMask: int, affectedRows: int64): Result[Void] =
+  if not db.catalog.hasTriggersForTable(objectName, eventMask):
+    return okVoid()
   var insteadTriggers: seq[TriggerMeta] = @[]
   for trigger in db.catalog.listTriggersForTable(objectName, eventMask):
     if (trigger.eventsMask and TriggerTimingInsteadMask) != 0:
@@ -1767,6 +1811,7 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
     prepared.schemaCookie = newPrep.schemaCookie
     prepared.statements = newPrep.statements
     prepared.plans = newPrep.plans
+    prepared.updateProfiles = newPrep.updateProfiles
 
   let db = prepared.db
   var output: seq[string] = @[]
@@ -1846,7 +1891,12 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
               parts.add($v)
             output.add(parts.join("|"))
     of skUpdate:
-      let execRes = execPreparedNonSelect(db, bound, params, plan)
+      let updateProfile =
+        if i < prepared.updateProfiles.len:
+          prepared.updateProfiles[i]
+        else:
+          UpdateWriteProfile()
+      let execRes = execPreparedNonSelect(db, bound, params, plan, updateProfile)
       if not execRes.ok:
         return err[seq[string]](execRes.err.code, execRes.err.message, execRes.err.context)
     of skDelete:
@@ -2647,7 +2697,7 @@ proc tryFastPkUpdate(db: Db, bound: Statement, params: seq[Value]): Result[Optio
     return err[Option[int64]](upRes.err.code, upRes.err.message, upRes.err.context)
   ok(some(1'i64))
 
-proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil): Result[int64] =
+proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil, updateProfile: UpdateWriteProfile = UpdateWriteProfile()): Result[int64] =
   ## Execute a single already-bound non-SELECT statement and return rows affected.
   ## Intended for the native C ABI / Go driver.
   if not db.isOpen:
@@ -3018,6 +3068,16 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         for col in table.columns:
           cols.add(bound.updateTable & "." & col.name)
 
+        var assignmentIndices: seq[(int, string, Expr)] = @[]
+        for colName, expr in bound.assignments:
+          var idx = -1
+          for i, col in table.columns:
+            if col.name == colName:
+              idx = i
+              break
+          if idx >= 0:
+            assignmentIndices.add((idx, colName, expr))
+
         var rows: seq[Row] = @[]
         if plan != nil:
           let rowsRes = execPlan(db.pager, db.catalog, plan, params)
@@ -3035,38 +3095,34 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
 
         for row in rows:
           var newValues = row.values
-          for colName, expr in bound.assignments:
-            var idx = -1
-            for i, col in table.columns:
-              if col.name == colName:
-                idx = i
-                break
-            if idx >= 0:
-              let evalRes = evalExpr(row, expr, params)
-              if not evalRes.ok:
-                return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
-              let typeRes = typeCheckValue(table.columns[idx], evalRes.value)
-              if not typeRes.ok:
-                return err[int64](typeRes.err.code, typeRes.err.message, colName)
-              newValues[idx] = typeRes.value
+          for assignment in assignmentIndices:
+            let (idx, colName, expr) = assignment
+            let evalRes = evalExpr(row, expr, params)
+            if not evalRes.ok:
+              return err[int64](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+            let typeRes = typeCheckValue(table.columns[idx], evalRes.value)
+            if not typeRes.ok:
+              return err[int64](typeRes.err.code, typeRes.err.message, colName)
+            newValues[idx] = typeRes.value
           updates.add((row.rowid, row.values, newValues))
 
-        for entry in updates:
-          let notNullRes = enforceNotNull(table, entry[2])
-          if not notNullRes.ok:
-            return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-          let checkRes = enforceChecks(table, entry[2])
-          if not checkRes.ok:
-            return err[int64](checkRes.err.code, checkRes.err.message, checkRes.err.context)
-          let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
-          if not uniqueRes.ok:
-            return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
-          let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
-          if not fkRes.ok:
-            return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
-          let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
-          if not restrictRes.ok:
-            return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
+        if not updateProfile.isSimpleUpdate:
+          for entry in updates:
+            let notNullRes = enforceNotNull(table, entry[2])
+            if not notNullRes.ok:
+              return err[int64](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+            let checkRes = enforceChecks(table, entry[2])
+            if not checkRes.ok:
+              return err[int64](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+            let uniqueRes = enforceUnique(db.catalog, db.pager, table, entry[2], entry[0])
+            if not uniqueRes.ok:
+              return err[int64](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+            let fkRes = enforceForeignKeys(db.catalog, db.pager, table, entry[2])
+            if not fkRes.ok:
+              return err[int64](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+            let restrictRes = enforceRestrictOnParent(db.catalog, db.pager, table, entry[1], entry[2])
+            if not restrictRes.ok:
+              return err[int64](restrictRes.err.code, restrictRes.err.message, restrictRes.err.context)
         for entry in updates:
           let upRes = updateRow(db.pager, db.catalog, bound.updateTable, entry[0], entry[2])
           if not upRes.ok:

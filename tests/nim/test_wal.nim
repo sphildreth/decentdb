@@ -145,6 +145,100 @@ suite "WAL":
     discard closePager(pager)
     discard closeDb(db)
 
+  test "commit pruning keeps only latest version with no readers":
+    let path = makeTempDb("decentdb_wal_prune_no_readers.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+
+    var lastPayload = ""
+    for marker in [11'u8, 22'u8, 33'u8]:
+      var data = newSeq[byte](pager.pageSize)
+      for i in 0 ..< data.len:
+        data[i] = marker
+      lastPayload = bytesToPageString(data)
+      let writerRes = beginWrite(wal)
+      check writerRes.ok
+      let writer = writerRes.value
+      check writer.writePage(pageId, data).ok
+      check commit(writer).ok
+      check wal.index.hasKey(pageId)
+      check wal.index[pageId].len == 1
+
+    let snap = wal.beginRead()
+    let readRes = readPageWithSnapshot(pager, wal, snap.snapshot, pageId)
+    check readRes.ok
+    check readRes.value == lastPayload
+    wal.endRead(snap)
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "commit pruning retains oldest-reader base version":
+    let path = makeTempDb("decentdb_wal_prune_active_reader.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 2)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let walRes = newWal(db.vfs, path & ".wal")
+    check walRes.ok
+    let wal = walRes.value
+    let pageRes = allocatePage(pager)
+    check pageRes.ok
+    let pageId = pageRes.value
+
+    proc commitMarker(marker: uint8): string =
+      var data = newSeq[byte](pager.pageSize)
+      for i in 0 ..< data.len:
+        data[i] = marker
+      let payload = bytesToPageString(data)
+      let writerRes = beginWrite(wal)
+      check writerRes.ok
+      let writer = writerRes.value
+      check writer.writePage(pageId, data).ok
+      check commit(writer).ok
+      return payload
+
+    let payload1 = commitMarker(1)
+    let oldReader = wal.beginRead()
+    discard commitMarker(2)
+    let payload3 = commitMarker(3)
+    check wal.index.hasKey(pageId)
+    check wal.index[pageId].len >= 3
+
+    let readOld = readPageWithSnapshot(pager, wal, oldReader.snapshot, pageId)
+    check readOld.ok
+    check readOld.value == payload1
+    wal.endRead(oldReader)
+
+    let readerAt3 = wal.beginRead()
+    let payload4 = commitMarker(4)
+    check wal.index.hasKey(pageId)
+    check wal.index[pageId].len == 2
+
+    let readAt3 = readPageWithSnapshot(pager, wal, readerAt3.snapshot, pageId)
+    check readAt3.ok
+    check readAt3.value == payload3
+    wal.endRead(readerAt3)
+
+    let latestReader = wal.beginRead()
+    let readLatest = readPageWithSnapshot(pager, wal, latestReader.snapshot, pageId)
+    check readLatest.ok
+    check readLatest.value == payload4
+    wal.endRead(latestReader)
+    discard closePager(pager)
+    discard closeDb(db)
+
   test "wal header stores logical end offset":
     let path = makeTempDb("decentdb_wal_header.db")
     let dbRes = openDb(path)

@@ -15,6 +15,8 @@ import ../../src/record/record
 import ../../src/errors
 import ../../src/vfs/vfs
 import ../../src/version
+when defined(bench_breakdown):
+  import ../../src/wal/wal
 when defined(fused_join_sum_stats):
   import ../../src/exec/exec
 
@@ -90,6 +92,11 @@ proc duckExec(con: duckdb_connection, sql: string) =
 # Global variable for benchmark data directory (on real disk, not tmpfs)
 var gDataDir*: string = ""
 
+# Global durability profile for benchmarks.
+# - safe: aims for durable commits (SQLite synchronous=FULL; DecentDB default; DuckDB adds CHECKPOINT barriers)
+# - default: engine defaults (SQLite synchronous=NORMAL; DuckDB no CHECKPOINT barrier)
+var gDurability*: string = "safe"
+
 # Paths to benchmark database files to remove at end.
 var gCleanupPaths: seq[string] = @[]
 
@@ -149,6 +156,7 @@ type
     ops_per_sec: float
     rows_processed: int
     checksum_u64: uint64
+    commit_breakdown_ns: JsonNode
 
   BenchmarkArtifacts = object
     db_path: string
@@ -202,6 +210,21 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
   let safeFilename = "$#__$#__$#__$#.jsonl" % [res.engine, res.dataset, res.benchmark, timestampShort]
   let path = outputDir / safeFilename
   
+  var metricsNode = %*{
+    "latencies_us": res.metrics.latencies_us,
+    "p50_us": res.metrics.p50_us,
+    "p95_us": res.metrics.p95_us,
+    "p99_us": res.metrics.p99_us,
+    "p50_ns": res.metrics.p50_ns,
+    "p95_ns": res.metrics.p95_ns,
+    "p99_ns": res.metrics.p99_ns,
+    "ops_per_sec": res.metrics.ops_per_sec,
+    "rows_processed": res.metrics.rows_processed,
+    "checksum_u64": res.metrics.checksum_u64
+  }
+  if res.metrics.commit_breakdown_ns != nil and res.metrics.commit_breakdown_ns.kind != JNull:
+    metricsNode["commit_breakdown_ns"] = res.metrics.commit_breakdown_ns
+
   let jsonNode = %*{
     "timestamp_utc": res.timestamp_utc,
     "engine": res.engine,
@@ -211,18 +234,7 @@ proc writeResult(outputDir: string, res: BenchmarkResult) =
     "durability": res.durability,
     "threads": res.threads,
     "iterations": res.iterations,
-    "metrics": {
-      "latencies_us": res.metrics.latencies_us,
-      "p50_us": res.metrics.p50_us,
-      "p95_us": res.metrics.p95_us,
-      "p99_us": res.metrics.p99_us,
-      "p50_ns": res.metrics.p50_ns,
-      "p95_ns": res.metrics.p95_ns,
-      "p99_ns": res.metrics.p99_ns,
-      "ops_per_sec": res.metrics.ops_per_sec,
-      "rows_processed": res.metrics.rows_processed,
-      "checksum_u64": res.metrics.checksum_u64
-    },
+    "metrics": metricsNode,
     "artifacts": {
       "db_path": res.artifacts.db_path,
       "db_size_bytes": res.artifacts.db_size_bytes,
@@ -262,11 +274,15 @@ proc runDecentDBInsert(outputDir: string) =
     raise newException(IOError, "Failed to prepare statement: " & prepRes.err.message)
   let stmt = prepRes.value
 
-  let iterations = 1000
+  let iterations = 10_000
   var latencies: seq[int] = @[]
   var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
+
+  let beginRes = execSql(db, "BEGIN")
+  if not beginRes.ok:
+    raise newException(IOError, "DecentDB insert benchmark BEGIN failed: " & beginRes.err.message)
   
   for i in 1..iterations:
     let name = "User" & $i
@@ -282,6 +298,10 @@ proc runDecentDBInsert(outputDir: string) =
     let ns = nanosBetween(t0, t1)
     latenciesNs.add(ns)
     latencies.add(int(ns div 1000))
+
+  let commitRes = execSql(db, "COMMIT")
+  if not commitRes.ok:
+    raise newException(IOError, "DecentDB insert benchmark COMMIT failed: " & commitRes.err.message)
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
@@ -299,7 +319,7 @@ proc runDecentDBInsert(outputDir: string) =
     engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "insert",
-    durability: "safe", # default
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -347,19 +367,72 @@ proc runDecentDBCommitLatency(outputDir: string) =
   let iterations = 1000
   var latencies: seq[int] = @[]
   var latenciesNs: seq[int64] = @[]
+  when defined(bench_breakdown):
+    var marshalTotalNs: int64 = 0
+    var preCommitTotalNs: int64 = 0
+    var walEncodeWriteTotalNs: int64 = 0
+    var walHeaderWriteTotalNs: int64 = 0
+    var walFsyncTotalNs: int64 = 0
+    var walIndexPublishTotalNs: int64 = 0
   
   let start = getMonoTime()
   
   for i in 1..iterations:
+    when defined(bench_breakdown):
+      let marshalStart = getMonoTime()
+    # Fair timing boundary: parameter construction/marshaling happens before t0,
+    # matching SQLite's current benchmark structure.
+    let value = "value" & $i
+    let valueBytes = toBytes(value)
+    let params = @[
+      Value(kind: vkText, bytes: valueBytes)
+    ]
+    when defined(bench_breakdown):
+      marshalTotalNs += nanosBetween(marshalStart, getMonoTime())
+
+    when defined(bench_breakdown):
+      clearLastCommitBreakdown()
+
     let t0 = getMonoTime()
-    # Each UPDATE is a separate transaction with durable commit
-    discard execPrepared(stmt, @[
-      Value(kind: vkText, bytes: toBytes("value" & $i))
-    ])
+    # Each UPDATE is a separate transaction with durable commit.
+    let execRes = execPrepared(stmt, params)
+    if not execRes.ok:
+      raise newException(IOError, "DecentDB commit benchmark execution failed: " & execRes.err.message)
     let t1 = getMonoTime()
     let ns = nanosBetween(t0, t1)
     latenciesNs.add(ns)
     latencies.add(int(ns div 1000))
+
+    when defined(bench_breakdown):
+      let c = takeLastCommitBreakdown()
+      walEncodeWriteTotalNs += c.walEncodeWriteNs
+      walHeaderWriteTotalNs += c.walHeaderWriteNs
+      walFsyncTotalNs += c.walFsyncNs
+      walIndexPublishTotalNs += c.walIndexPublishNs
+      let walTotal = c.walEncodeWriteNs + c.walHeaderWriteNs + c.walFsyncNs + c.walIndexPublishNs
+      let preCommit = ns - walTotal
+      if preCommit > 0:
+        preCommitTotalNs += preCommit
+
+  var commitBreakdownNode = newJNull()
+  when defined(bench_breakdown):
+    let walTotalNs = walEncodeWriteTotalNs + walHeaderWriteTotalNs + walFsyncTotalNs + walIndexPublishTotalNs
+    commitBreakdownNode = %*{
+      "param_marshal_ns_total": marshalTotalNs,
+      "param_marshal_ns_avg": if iterations > 0: marshalTotalNs div int64(iterations) else: 0'i64,
+      "statement_precommit_ns_total": preCommitTotalNs,
+      "statement_precommit_ns_avg": if iterations > 0: preCommitTotalNs div int64(iterations) else: 0'i64,
+      "wal_encode_write_ns_total": walEncodeWriteTotalNs,
+      "wal_encode_write_ns_avg": if iterations > 0: walEncodeWriteTotalNs div int64(iterations) else: 0'i64,
+      "wal_header_write_ns_total": walHeaderWriteTotalNs,
+      "wal_header_write_ns_avg": if iterations > 0: walHeaderWriteTotalNs div int64(iterations) else: 0'i64,
+      "wal_fsync_ns_total": walFsyncTotalNs,
+      "wal_fsync_ns_avg": if iterations > 0: walFsyncTotalNs div int64(iterations) else: 0'i64,
+      "wal_index_publish_ns_total": walIndexPublishTotalNs,
+      "wal_index_publish_ns_avg": if iterations > 0: walIndexPublishTotalNs div int64(iterations) else: 0'i64,
+      "wal_total_ns_total": walTotalNs,
+      "wal_total_ns_avg": if iterations > 0: walTotalNs div int64(iterations) else: 0'i64
+    }
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
@@ -377,7 +450,7 @@ proc runDecentDBCommitLatency(outputDir: string) =
     engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "commit_latency",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -390,7 +463,8 @@ proc runDecentDBCommitLatency(outputDir: string) =
       p99_ns: p99ns,
       ops_per_sec: opsPerSec,
       rows_processed: iterations,
-      checksum_u64: 0
+      checksum_u64: 0,
+      commit_breakdown_ns: commitBreakdownNode
     ),
     artifacts: BenchmarkArtifacts(
       db_path: dbPath,
@@ -460,7 +534,7 @@ proc runDecentDBPointRead(outputDir: string) =
     engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "point_read",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -555,7 +629,7 @@ proc runDecentDBJoin(outputDir: string) =
     engine_version: DecentDBVersion,
     dataset: "sample",
     benchmark: "join",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -605,7 +679,10 @@ proc runSqliteInsert(outputDir: string) =
 
   # Configure for fair durability comparison
   sqliteExec(db, "PRAGMA journal_mode = WAL")
-  sqliteExec(db, "PRAGMA synchronous = FULL")  # Durable commits like DecentDB
+  if gDurability == "safe":
+    sqliteExec(db, "PRAGMA synchronous = FULL")  # Durable commits
+  else:
+    sqliteExec(db, "PRAGMA synchronous = NORMAL")
   
   sqliteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
   
@@ -614,11 +691,15 @@ proc runSqliteInsert(outputDir: string) =
     raise newException(IOError, "Failed to prepare statement: " & $sqlite3_errmsg(db))
   defer: discard sqlite3_finalize(stmt)
   
-  let iterations = 1000
+  let iterations = 10_000
   var latencies: seq[int] = @[]
   var latenciesNs: seq[int64] = @[]
   
   let start = getMonoTime()
+
+  # Match DuckDB/DecentDB insert contract: measure bulk insert throughput in a
+  # single transaction (commit cost is not charged per-row).
+  sqliteExec(db, "BEGIN IMMEDIATE")
   
   for i in 1..iterations:
     let name = "User" & $i
@@ -628,12 +709,16 @@ proc runSqliteInsert(outputDir: string) =
     discard sqlite3_bind_int64(stmt, 1, int64(i))
     discard sqlite3_bind_text(stmt, 2, name.cstring, cint(name.len), SQLITE_TRANSIENT)
     discard sqlite3_bind_text(stmt, 3, email.cstring, cint(email.len), SQLITE_TRANSIENT)
-    discard sqlite3_step(stmt)
+    let rc = sqlite3_step(stmt)
+    if rc != SQLITE_DONE:
+      raise newException(IOError, "SQLite insert failed: " & $sqlite3_errmsg(db))
     discard sqlite3_reset(stmt)
     let t1 = getMonoTime()
     let ns = nanosBetween(t0, t1)
     latenciesNs.add(ns)
     latencies.add(int(ns div 1000))
+
+  sqliteExec(db, "COMMIT")
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
@@ -651,7 +736,7 @@ proc runSqliteInsert(outputDir: string) =
     engine_version: $sqlite3_libversion(),
     dataset: "sample",
     benchmark: "insert",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -692,7 +777,10 @@ proc runSqliteCommitLatency(outputDir: string) =
 
   # Configure for fair durability comparison
   sqliteExec(db, "PRAGMA journal_mode = WAL")
-  sqliteExec(db, "PRAGMA synchronous = FULL")  # Durable commits
+  if gDurability == "safe":
+    sqliteExec(db, "PRAGMA synchronous = FULL")  # Durable commits
+  else:
+    sqliteExec(db, "PRAGMA synchronous = NORMAL")
   
   sqliteExec(db, "CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT)")
   sqliteExec(db, "INSERT INTO kv VALUES (1, 'initial')")
@@ -736,7 +824,7 @@ proc runSqliteCommitLatency(outputDir: string) =
     engine_version: $sqlite3_libversion(),
     dataset: "sample",
     benchmark: "commit_latency",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -776,7 +864,10 @@ proc runSqlitePointRead(outputDir: string) =
   defer: discard sqlite3_close(db)
 
   sqliteExec(db, "PRAGMA journal_mode = WAL")
-  sqliteExec(db, "PRAGMA synchronous = FULL")
+  if gDurability == "safe":
+    sqliteExec(db, "PRAGMA synchronous = FULL")
+  else:
+    sqliteExec(db, "PRAGMA synchronous = NORMAL")
   
   sqliteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)")
   
@@ -834,7 +925,7 @@ proc runSqlitePointRead(outputDir: string) =
     engine_version: $sqlite3_libversion(),
     dataset: "sample",
     benchmark: "point_read",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -874,7 +965,10 @@ proc runSqliteJoin(outputDir: string) =
   defer: discard sqlite3_close(db)
 
   sqliteExec(db, "PRAGMA journal_mode = WAL")
-  sqliteExec(db, "PRAGMA synchronous = FULL")
+  if gDurability == "safe":
+    sqliteExec(db, "PRAGMA synchronous = FULL")
+  else:
+    sqliteExec(db, "PRAGMA synchronous = NORMAL")
   
   sqliteExec(db, "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
   sqliteExec(db, "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)")
@@ -942,7 +1036,7 @@ proc runSqliteJoin(outputDir: string) =
     engine_version: $sqlite3_libversion(),
     dataset: "sample",
     benchmark: "join",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -992,7 +1086,7 @@ proc runDuckdbInsert(outputDir: string) =
     raise newException(IOError, "Failed to prepare statement")
   defer: duckdb_destroy_prepare(addr stmt)
   
-  let iterations = 250000
+  let iterations = 10_000
   var latencies: seq[int] = @[] # Not used for insert
   
   let start = getMonoTime()
@@ -1014,6 +1108,12 @@ proc runDuckdbInsert(outputDir: string) =
     # Actually duckdb_execute_prepared doesn't reset bindings, we overwrite them.
     
   duckExec(con, "COMMIT")
+
+  # DuckDB does not expose a SQLite-like synchronous setting.
+  # For a closer "durable after commit" barrier in safe mode, force a CHECKPOINT
+  # to synchronize the WAL into the database file.
+  if gDurability == "safe":
+    duckExec(con, "CHECKPOINT")
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration
@@ -1026,7 +1126,7 @@ proc runDuckdbInsert(outputDir: string) =
     engine_version: $duckdb_library_version(),
     dataset: "sample",
     benchmark: "insert",
-    durability: "safe", # Default
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -1091,13 +1191,11 @@ proc runDuckdbCommitLatency(outputDir: string) =
     if duckdb_execute_prepared(stmt, addr res) != DuckDBSuccess:
        quit("Update failed")
     duckdb_destroy_result(addr res)
-    
-    # DuckDB auto-commit?
-    # "By default, DuckDB runs in auto-commit mode."
-    # But does it sync to disk?
-    # We can force checkpoint if we want "safe" durability like SQLite synchronous=FULL
-    # but that might be extremely slow.
-    # We'll just rely on default auto-commit for now and note it.
+
+    # In safe mode, add a durability barrier by checkpointing after the transaction.
+    # This synchronizes WAL contents into the DB file.
+    if gDurability == "safe":
+      duckExec(con, "CHECKPOINT")
     
     let t1 = getMonoTime()
     let ns = nanosBetween(t0, t1)
@@ -1120,7 +1218,7 @@ proc runDuckdbCommitLatency(outputDir: string) =
     engine_version: $duckdb_library_version(),
     dataset: "sample",
     benchmark: "commit_latency",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -1221,7 +1319,7 @@ proc runDuckdbPointRead(outputDir: string) =
     engine_version: $duckdb_library_version(),
     dataset: "sample",
     benchmark: "point_read",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -1331,7 +1429,7 @@ proc runDuckdbJoin(outputDir: string) =
     engine_version: $duckdb_library_version(),
     dataset: "sample",
     benchmark: "join",
-    durability: "safe",
+    durability: gDurability,
     threads: 1,
     iterations: iterations,
     metrics: BenchmarkMetrics(
@@ -1366,7 +1464,7 @@ proc clearOldData(outputDir: string) =
         removeFile(path)
         echo "Removed stale: ", path
 
-proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "", args: seq[string]) =
+proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "", durability: string = "safe", args: seq[string]) =
   defer:
     cleanupRegisteredArtifacts()
 
@@ -1375,6 +1473,12 @@ proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "
     quit(1)
   
   let output_dir = args[0]
+
+  # Durability profile
+  gDurability = durability.toLowerAscii()
+  if gDurability != "safe" and gDurability != "default":
+    echo "Error: --durability must be 'safe' or 'default' (got: ", durability, ")"
+    quit(1)
   
   # Set the global data directory for benchmark files (on real disk for fair fsync comparison)
   if data_dir.len > 0:
@@ -1386,6 +1490,7 @@ proc benchmark(engines: string = "all", clear: bool = true, data_dir: string = "
   echo "Starting benchmarks..."
   echo "Output directory: ", output_dir
   echo "Engines: ", engines
+  echo "Durability profile: ", gDurability
   
   createDir(output_dir)
   
@@ -1422,5 +1527,6 @@ when isMainModule:
   dispatch(benchmark, help = {
     "engines": "Comma-separated list of engines to run (decentdb, sqlite, duckdb) or 'all'",
     "clear": "Clear old benchmark data before running (default: true)",
-    "data_dir": "Directory for benchmark database files (use real disk, not tmpfs for fair fsync comparison)"
+    "data_dir": "Directory for benchmark database files (use real disk, not tmpfs for fair fsync comparison)",
+    "durability": "Durability profile: safe (durable-ish) or default (engine defaults)"
   })

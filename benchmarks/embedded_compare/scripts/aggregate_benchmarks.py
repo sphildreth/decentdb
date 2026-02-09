@@ -4,7 +4,8 @@
 This script is REQUIRED by PRD/SPEC.
 
 Inputs:
-  - benchmarks/raw/**/*.jsonl or *.json
+    - benchmarks/embedded_compare/raw/sample/**/*.jsonl or *.json (default)
+    - pass --input to aggregate a different raw folder
 Output:
   - data/bench_summary.json
 
@@ -59,7 +60,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--input",
-        default="benchmarks/embedded_compare/raw",
+        default="benchmarks/embedded_compare/raw/sample",
         help="Folder containing raw benchmark outputs",
     )
     ap.add_argument(
@@ -80,6 +81,17 @@ def main():
 
     if not records:
         raise SystemExit("No valid benchmark records found")
+
+    # Enforce that we are aggregating a single durability profile.
+    # Mixing safe/default (or other) profiles makes the summary misleading.
+    all_durabilities = sorted({r.get("durability") for r in records if r.get("durability")})
+    if len(all_durabilities) > 1:
+        raise SystemExit(
+            "Mixed durability profiles found in input: "
+            + ", ".join(all_durabilities)
+            + ". Re-run with a clean output directory or aggregate a single run folder."
+        )
+    durability_profile = all_durabilities[0] if all_durabilities else "unknown"
 
     data = defaultdict(lambda: defaultdict(list))
 
@@ -149,7 +161,8 @@ def main():
         "metadata": {
             "run_id": run_id,
             "machine": machine,
-            "notes": "Generated from raw benchmark outputs in benchmarks/raw/",
+            "durability_profile": durability_profile,
+            "notes": f"Generated from raw benchmark outputs in {inp}",
             "units": {
                 "read_p95_ms": "ms (lower is better)",
                 "join_p95_ms": "ms (lower is better)",

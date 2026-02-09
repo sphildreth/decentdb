@@ -1,10 +1,12 @@
 import locks
+import atomics
 import ../errors
 
 type VfsFile* = ref object
   path*: string
   file*: File
   lock*: Lock
+  bufferedDirty*: Atomic[bool]
 
 type MmapRegion* = object
   base*: pointer
