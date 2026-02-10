@@ -1,25 +1,34 @@
-# SQL Gap Plan: Close Commit Latency Gap vs SQLite
+# SQL Gap Plan: Close Insert Throughput Gap vs SQLite
 **Date:** 2026-02-09
 **Status:** Planning document (no implementation)
 
 ## Objective
 
-Reduce the `commit_p95_ms` gap between DecentDB and SQLite in the embedded comparison benchmarks while preserving:
+Reduce the `insert_rows_per_sec` gap between DecentDB and SQLite in the embedded comparison benchmarks while preserving:
 
 - Durable ACID writes by default (fsync-on-commit).
 - Snapshot isolation and reader correctness.
-- No statistically meaningful regressions in other tracked metrics (`read_p95_ms`, `join_p95_ms`, `insert_rows_per_sec`).
+- No statistically meaningful regressions in other tracked metrics (`commit_p95_ms`, `read_p95_ms`, `join_p95_ms`).
 
-Baseline (from `benchmarks/embedded_compare/data/bench_summary.json`, run_id `20260208_223353`):
+Baseline (from `benchmarks/embedded_compare/data/bench_summary.json`, run_id `20260210_003117`, durability `safe`, real disk `--data-dir=.bench_data`):
 
 | Metric | DecentDB | SQLite | Gap |
 |---|---:|---:|---:|
-| `commit_p95_ms` | 0.03723 | 0.009397 | ~3.96x |
-| `read_p95_ms` | 0.001332 | 0.002014 | DecentDB faster |
-| `join_p95_ms` | 0.393489 | 0.399029 | ~parity |
-| `insert_rows_per_sec` | 151,837 | 111,136 | DecentDB faster |
+| `insert_rows_per_sec` | 286,722 | 1,129,688 | ~3.94x (SQLite faster) |
+| `commit_p95_ms` | 3.027207 | 3.017667 | ~parity |
+| `read_p95_ms` | 0.001222 | 0.001993 | DecentDB faster |
+| `join_p95_ms` | 0.409328 | 0.440357 | DecentDB slightly faster |
 
-The commit latency microbenchmark is `runDecentDBCommitLatency` / `runSqliteCommitLatency` in `benchmarks/embedded_compare/run_benchmarks.nim`.
+The insert throughput microbenchmark is `runDecentDBInsert` / `runSqliteInsert` in `benchmarks/embedded_compare/run_benchmarks.nim`.
+
+## Fairness Contract (Non-Negotiable)
+
+We do **not** “game” or “cheat” the benchmarks. Improvements must come from DecentDB internals.
+
+- No DecentDB-only benchmark loop optimizations (e.g., reusing buffers/params/latency arrays only for DecentDB).
+- Any benchmark harness changes must apply equally to all engines or be clearly documented as measuring a different layer.
+- Keep durability comparable (`--durability=safe`), and keep the benchmark disk-backed (`--data-dir=.bench_data`).
+- Target end state: DecentDB **outperforms SQLite fairly and squarely** on the same workload.
 
 ## Constraints (Non-Negotiables)
 
@@ -31,13 +40,11 @@ The commit latency microbenchmark is `runDecentDBCommitLatency` / `runSqliteComm
 
 ## What The Reviews Agree On (Likely Contributors)
 
-These items are repeatedly identified across `design/SQL_GAP_*.md` reviews, and most are visible in current code:
+These items are repeatedly identified across `design/SQL_GAP_*.md` reviews, and most are visible in current code. Some are commit-latency specific; for inserts we expect the dominant costs to sit in the engine → storage → pager → B-tree insert path.
 
 1. **Benchmark timing asymmetry (fix first)**
-   - DecentDB includes parameter marshaling inside the timed region:
-     `toBytes("value" & $i)` occurs after `t0` in `runDecentDBCommitLatency` (`benchmarks/embedded_compare/run_benchmarks.nim`).
-   - SQLite constructs the string before `t0` (`runSqliteCommitLatency`).
-   - This can inflate the apparent engine gap; normalize before attributing wins.
+  - Any timing boundary differences between engines can dominate at microsecond scales.
+  - Do not attribute wins until we have confirmed that per-iteration work (parameter creation/binding, statement execution, commit) is comparable.
 
 2. **WAL “double write” per commit**
    - `src/wal/wal.nim` `WalWriter.commit` appends frames, then updates the WAL header at offset 0 (`writeWalHeader`), then calls `fsync`:
@@ -59,41 +66,36 @@ These items are repeatedly identified across `design/SQL_GAP_*.md` reviews, and 
 
 ## Plan
 
-### Phase 0 (P0): Measurement + Fairness Guardrails
+### Phase 0 (P0): Measurement + “No Cheating” Guardrails
 
-Goal: make sure we are measuring DecentDB, not benchmark harness artifacts, and get a component breakdown so we optimize the right thing.
+Goal: keep the comparison apples-to-apples while we iterate quickly on real engine improvements.
 
 **Tasks**
 
-- [ ] **Normalize commit benchmark timing boundaries**
-  - Update `benchmarks/embedded_compare/run_benchmarks.nim` so DecentDB and SQLite include equivalent parameter construction/binding overhead inside or outside `t0..t1`.
-  - Preferred: move `toBytes(...)` outside the timed region for DecentDB to match SQLite’s current structure, then consider a second run mode that times “full app path” for both engines.
+- [ ] **Keep insert benchmark workload symmetric across engines**
+  - If we ever adjust iteration structure, it must apply to all engines or be explicitly a different benchmark.
+  - Avoid DecentDB-only reuse tricks; those are not allowed as wins.
 
-- [ ] **Add commit latency breakdown instrumentation**
-  - Add per-iteration breakdown (or aggregated counters) for the DecentDB commit benchmark:
-    - parameter marshaling
-    - statement execution (pre-commit)
-    - WAL frame encode/write
-    - WAL header update
-    - fsync
-    - WAL index update + publish (`walEnd.store`)
-  - Keep it behind a compile-time flag (or benchmark-only code) to avoid perturbing production code.
-
-- [ ] **Define a stable benchmark protocol**
-  - Median-of-N runs (N>=5) for comparison.
-  - Ensure `--data-dir` points to real disk (the runner already warns about tmpfs; see `benchmarks/embedded_compare/run_benchmarks.nim`).
-  - Record run manifest details (machine, filesystem, mount, power governor) consistent with `design/COMPARISON_BENCHMARK_PLAN.md` “Fairness Contract”.
+- [ ] **Use breakdown instrumentation to identify the next bottleneck**
+  - Run with `-d:bench_breakdown` periodically to see where time is going (engine vs storage vs pager vs B-tree).
+  - Use aggregated counters (not per-iteration logging) to avoid perturbing timings.
 
 **Exit criteria**
 
-- We can state “top 2 contributors to `commit_p95_ms`” with numbers.
-- `commit_p95_ms` comparison is apples-to-apples across engines.
+- We can name the top contributors to insert time with numbers.
+- We have a stable baseline run_id captured in this doc.
 
-### Phase 1 (P0/P1): Low-Risk Wins (No Format Changes)
+### Phase 1 (P0/P1): Low-Risk Insert Throughput Wins (No Format Changes)
 
-Goal: reduce syscall/CPU overhead without altering WAL/db formats or weakening durability semantics.
+Goal: reduce per-insert CPU/allocations on the hot path without altering WAL/db formats or weakening durability semantics.
 
-**P0: VFS syscall reduction**
+**Likely high ROI areas (based on current insert baseline)**
+
+- B-tree insert path: avoid decoding/encoding and minimize page-touching on sequential workloads.
+- Pager/write path: ensure copy-on-write upgrades and cache entry mutations are minimal.
+- Engine insert execution: minimize per-row allocations when there is no `RETURNING`.
+
+**P0: VFS syscall reduction (guardrail for later)**
 
 - [ ] **Remove per-write `flushFile`**
   - In `src/vfs/os_vfs.nim`, remove `flushFile(file.file)` from `write`/`writeStr`.
@@ -112,15 +114,15 @@ Goal: reduce syscall/CPU overhead without altering WAL/db formats or weakening d
   - Make capacity growth strategy explicit to avoid realloc churn across iterations (especially for small commits).
   - Confirm with Phase 0 breakdown that allocations are on the hot path before investing heavily.
 
-**P1: Reduce generic statement overhead for the commit microbench**
+**P1: Reduce generic statement overhead in insert hot path**
 
 - [ ] **Prepared-statement “write profile”**
-  - For prepared `UPDATE` statements, precompute per-table flags:
+  - For prepared write statements (INSERT/UPDATE/DELETE), precompute per-table flags:
     - does the table have triggers for the event?
     - does it have CHECK/UNIQUE constraints?
     - does it have FKs or act as a parent for any FKs?
     - do any secondary indexes need maintenance for the updated columns?
-  - If the profile indicates “simple update”, take a minimal fast path that avoids repeated catalog scans and trigger discovery.
+  - If the profile indicates “simple insert”, take a minimal fast path that avoids repeated catalog scans and trigger discovery.
 
 - [ ] **Reverse FK lookup cache**
   - Replace the catalog scan in `src/engine.nim` `referencingChildren` with a reverse map in catalog metadata:
@@ -134,30 +136,29 @@ Goal: reduce syscall/CPU overhead without altering WAL/db formats or weakening d
 
 **Exit criteria**
 
-- `commit_p95_ms` improves measurably (median-of-5 runs) with no regressions in other tracked metrics beyond noise thresholds.
+- `insert_rows_per_sec` improves measurably (median-of-5 runs) with no regressions in other tracked metrics beyond noise thresholds.
 
-### Phase 2 (P1/P2): WAL Index + Commit Path Restructuring (No On-Disk Format Change)
+### Phase 2 (P1/P2): Storage/Pager/B-tree Structural Wins (No On-Disk Format Change)
 
-Goal: reduce commit-time work that is currently paid on every transaction, especially for hot-updated pages and no-reader scenarios.
+Goal: reduce page mutations and data movement during insert-heavy workloads while preserving snapshot semantics.
 
 **Tasks**
 
-- [ ] **WAL index pruning keyed to active readers**
-  - If there are no active readers, retain only the latest version per page in the in-memory WAL index.
-  - If readers exist, retain only versions needed for the oldest active snapshot (min snapshot LSN).
-  - Add targeted tests for snapshot correctness and recovery behavior with long-running readers (see `design/SPEC.md` snapshot rules; `design/TESTING_STRATEGY.md` concurrency/crash testing).
+- [ ] **Minimize root/metadata writes on sequential inserts**
+  - For the common case “append to rightmost leaf,” avoid touching internal nodes unless the tree height changes.
+  - Ensure any cached-rightmost-leaf optimization remains correct under splits and under concurrent readers.
 
-- [ ] **Evaluate commit-critical-path ordering**
-  - `WalWriter.commit` updates the WAL index after `fsync`. Confirm via Phase 0 breakdown whether index update is a meaningful fraction of latency.
-  - If it is, evaluate safe reordering or batching that does not violate:
-    - readers only seeing data after durable commit (publication via `walEnd.store(moRelease)`)
-    - writer “read-your-writes” behavior
+- [ ] **Avoid redundant page header writes**
+  - Where safe, update only the necessary fields and avoid rewriting large page buffers when changes are localized.
 
-### Phase 3 (ADR Required): Remove WAL Header Rewrite From Commit
+- [ ] **Validate lock ordering and pin/unpin correctness**
+  - Performance wins must not introduce deadlocks, hangs, or reader-writer correctness regressions.
 
-This is the highest potential impact item, but it crosses into recovery semantics and possibly format changes. It should be attempted only if Phases 1–2 leave a material gap.
+### Phase 3 (ADR Required): Bigger Swings (Only If Needed)
 
-**Background**
+These are high-impact but higher-risk items that may require format or semantic changes. Do not implement without following ADR workflow.
+
+**Candidate A: WAL header rewrite removal from commit**
 
 - Current WAL format (SPEC v8) uses `wal_end_offset` in the fixed header and recovery scans only up to it.
 - `WalWriter.commit` writes frames then rewrites the header with the new end offset, then fsyncs.
@@ -183,7 +184,7 @@ This is the highest potential impact item, but it crosses into recovery semantic
 
 **Exit criteria**
 
-- `commit_p95_ms` approaches SQLite (target: <= 1.5x gap) without any durability/correctness regression under crash-injection and differential tests.
+- `insert_rows_per_sec` approaches SQLite and keeps improving beyond parity (target: exceed SQLite fairly) without any durability/correctness regression under crash-injection and differential tests.
 
 ## Validation and Gating
 
@@ -198,10 +199,10 @@ For each change:
 
 Suggested guardrails (per-change, median-of-5 runs):
 
-- `commit_p95_ms`: must improve.
+- `insert_rows_per_sec`: must improve.
 - `read_p95_ms`: must not worsen beyond noise (target <= +2%).
 - `join_p95_ms`: must not worsen beyond noise (target <= +2%).
-- `insert_rows_per_sec`: must not decrease beyond noise (target >= -2%).
+- `commit_p95_ms`: must not worsen beyond noise (target <= +2%).
 
 ## Explicitly Deferred / Out Of Scope For This Plan
 
