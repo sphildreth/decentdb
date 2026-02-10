@@ -1,8 +1,8 @@
 # DecentDB SPEC (Engineering Specification)
 **Date:** 2026-01-27  
-**Status:** Draft (v0.1)
+**Status:** Released (v1.0)
 
-> Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
+> This document describes the 1.0 baseline scope.
 
 ## 1. Overview
 This document defines the baseline engineering design for DecentDB:
@@ -12,7 +12,7 @@ This document defines the baseline engineering design for DecentDB:
 - Storage: **paged file + B+Trees**, with **trigram inverted index** for search
 - **Mandatory Overflow Pages** for BLOB/Large TEXT support
 
-Current scope (0.x, pre-1.0): single process, multi-threaded readers, single writer.
+Current scope (1.0): single process, multi-threaded readers, single writer.
 
 ---
 
@@ -63,7 +63,7 @@ Current scope (0.x, pre-1.0): single process, multi-threaded readers, single wri
 9. **exec/**
    - Volcano (iterator) engine operators:
      - TableScan, IndexSeek, Filter, Project
-    - NestedLoopJoin (0.x baseline)
+    - NestedLoopJoin (1.0 baseline)
      - Sort (External Merge Sort capable, see ADR-0022), Limit/Offset
    - Row materialization in reusable buffers (avoid per-row heap alloc)
 
@@ -143,7 +143,7 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 - kind (`"btree"` or `"trigram"`)
 - unique flag (0/1)
 
-**View record (0.x):**
+**View record (1.0):**
 - kind = `"view"`
 - name
 - sql text (canonical defining `SELECT`)
@@ -151,18 +151,18 @@ Catalog records are stored in a B+Tree keyed by CRC-32C of record names.
 - dependencies (`;`-delimited, normalized object names)
 
 Compatibility note:
-- View records are an additive catalog extension in 0.x and do not require a DB header format-version bump.
+- View records are an additive catalog extension in 1.0 and do not require a DB header format-version bump.
 
 ### 3.3 Page types
 - B+Tree internal page
 - B+Tree leaf page
 - Overflow page (baseline requirement)
-- Freelist trunk/leaf (or single freelist chain for 0.x)
+- Freelist trunk/leaf (or single freelist chain for 1.0)
 
 ---
 
 ## 4. Transactions, durability, and recovery (WAL-only)
-### 4.1 WAL frame format (0.x baseline)
+### 4.1 WAL frame format (1.0 baseline)
 Each frame appends:
 - `frame_type` (u8): 0=page, 1=commit, 2=checkpoint
 - `page_id` (u32, valid for page frames)
@@ -284,14 +284,14 @@ On open:
 - Multiple concurrent readers
 - Each reader uses snapshot_lsn and does not block on writer except for brief schema locks
 
-### 5.3 Locks and latches (0.x baseline)
+### 5.3 Locks and latches (1.0 baseline)
 - `schemaLock`: RW lock around catalog changes
 - Page cache: per-page latch + global eviction lock
 - WAL append: mutex for serializing frame writes (enforces single-writer)
 
 **Note:** The WAL append mutex enforces the single-writer constraint at the storage layer. While the architecture supports only one writer transaction at a time by design, the mutex provides defense-in-depth against programming errors.
 
-Multi-process locking is out of scope for 0.x.
+Multi-process locking is out of scope for 1.0.
 
 ### 5.4 Deadlock detection and prevention
 - Writer acquires locks in a consistent order to avoid deadlocks
@@ -317,14 +317,14 @@ DecentDB implements **Snapshot Isolation (SI)** as the default and only isolatio
 
 ## 6. SQL parsing & compatibility (Postgres-like)
 ### 6.1 Parser choice
-0.x recommendation:
+1.0 recommendation:
 - Use a Postgres-compatible parser via FFI (e.g., `libpg_query`) to accept familiar syntax.
 - Normalize parse trees into DecentDB’s internal AST immediately.
 
 Alternative:
 - Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
-### 6.2 Supported SQL subset (0.x baseline)
+### 6.2 Supported SQL subset (1.0 baseline)
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `EXPLAIN`, `EXPLAIN ANALYZE`
 - INSERT RETURNING subset:
@@ -351,7 +351,7 @@ Alternative:
 - Set operations: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`
 - Window functions (v0 subset): `ROW_NUMBER() OVER (...)`
   - `PARTITION BY` optional
-  - `ORDER BY` inside `OVER (...)` required in 0.x
+  - `ORDER BY` inside `OVER (...)` required in 1.0
   - supported only in `SELECT` projection items
 - Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
@@ -366,7 +366,7 @@ Alternative:
   - action form: `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')`
 - Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
 - Expression index subset: `CREATE INDEX ... ((<expr>))` for single-expression BTREE indexes
-  - allowed expression forms in 0.x:
+  - allowed expression forms in 1.0:
     - direct column reference
     - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
     - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
@@ -377,7 +377,7 @@ Alternative:
 - NULL semantics: SQL three-valued logic for `NOT`/`AND`/`OR`, comparisons with `NULL`, `IN (...)`, and `LIKE`/`ILIKE`
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
-- Explicitly unsupported in 0.x baseline:
+- Explicitly unsupported in 1.0 baseline:
   - `WITH RECURSIVE`
   - `INTERSECT ALL`, `EXCEPT ALL`
   - Advanced window functions beyond `ROW_NUMBER()` (e.g., `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
@@ -390,7 +390,7 @@ Alternative:
   - Expression indexes beyond the v0 subset (multi-expression keys, unsupported functions/operators, `UNIQUE`, or partial forms)
 
 ### 6.3 Parameterization
-- `$1, $2, ...` positional (Postgres style) — chosen for the 0.x baseline
+- `$1, $2, ...` positional (Postgres style) — chosen for the 1.0 baseline
   - Consistent with libpg_query parser choice
   - Simple to implement and test
   - Well-understood by developers familiar with PostgreSQL
@@ -418,11 +418,11 @@ Alternative:
 - Violations cause immediate error and statement rollback
 - This differs from PostgreSQL/MySQL which defer validation to COMMIT
 
-0.x actions:
+1.0 actions:
 - `ON DELETE`: `RESTRICT` / `NO ACTION`, `CASCADE`, `SET NULL`
 - `ON UPDATE`: `RESTRICT` / `NO ACTION`, `CASCADE`, `SET NULL`
 
-Current 0.x limitations:
+Current 1.0 limitations:
 - `ON DELETE SET NULL` and `ON UPDATE SET NULL` require nullable child FK columns.
 - Deferred constraint checking (transaction-commit time) is not supported.
 
@@ -432,7 +432,7 @@ Current 0.x limitations:
 - SQL semantics: CHECK fails only when the expression evaluates to `FALSE`; `TRUE` and `NULL` pass.
 - v0 restrictions:
   - CHECK expressions must reference only columns in the same row/table.
-  - CHECK does not allow parameters, aggregate functions, or `EXISTS` in 0.x.
+  - CHECK does not allow parameters, aggregate functions, or `EXISTS` in 1.0.
   - `ALTER TABLE ... ADD CONSTRAINT CHECK` is not supported.
 
 ---
@@ -446,7 +446,7 @@ Current 0.x limitations:
 
 ### 8.2 Index data model
 For each indexed TEXT column:
-- Normalize to uppercase (configurable; 0.x assumes uppercase inputs are already normalized)
+- Normalize to uppercase (configurable; 1.0 assumes uppercase inputs are already normalized)
 - Generate trigrams across a canonical form (define whitespace/punctuation handling)
 
 Store:
@@ -479,11 +479,11 @@ Maintain postings count per trigram.
 - If rarest trigram count exceeds a threshold (e.g., >100k), require additional predicate or cap results.
 - Provide an engine setting for thresholds.
 
-### 8.5 Storage format for postings (0.x baseline)
+### 8.5 Storage format for postings (1.0 baseline)
 - Store postings lists in a dedicated B+Tree keyed by trigram:
   - key: trigram
   - value: compressed postings blob (delta-encoded varints)
-- Updates (0.x choice: in-memory buffers):
+- Updates (1.0 choice: in-memory buffers):
   - Maintain small in-memory buffers per trigram (max buffer size: 4KB)
   - Flush buffers to B+Tree during transaction commit
   - If buffer exceeds size, flush immediately and create new buffer
@@ -514,7 +514,7 @@ For contains predicates:
 - Prefer driving from the most selective candidate set (smallest).
 
 ### 9.1 Index statistics (heuristic-based)
-0.x uses simple heuristics without full statistics collection:
+1.0 uses simple heuristics without full statistics collection:
 - Assume uniform distribution for equality predicates
 - For trigram indexes: use actual posting list counts (stored in index metadata)
 - For B+Tree indexes: estimate selectivity based on index type:
@@ -589,7 +589,7 @@ Track:
 ---
 
 ## 12. Future compatibility: Npgsql / PostgreSQL wire protocol
-Not planned for 0.x. If pursued:
+Not planned for 1.0. If pursued:
 - Implement pgwire subset as a server endpoint
 - Add minimal catalog responses for clients
 - Maintain dialect compatibility with libpg_query parser
@@ -661,7 +661,7 @@ Define error categories:
 - Engine can read older format versions (read-only compatibility)
 - Writing to older formats may trigger automatic upgrade (with user confirmation)
 
-### 15.3 Schema changes (0.x baseline)
+### 15.3 Schema changes (1.0 baseline)
 - Supported: CREATE TABLE, CREATE INDEX, CREATE TRIGGER, DROP TABLE, DROP INDEX, DROP TRIGGER, ALTER TABLE
 - ALTER TABLE operations: ADD COLUMN, DROP COLUMN, RENAME COLUMN, ALTER COLUMN TYPE
   - Current v0 limitation: ALTER TABLE operations are rejected on tables that define CHECK constraints
@@ -672,8 +672,8 @@ Define error categories:
 - Trigger operations:
   - `AFTER` triggers on `INSERT`/`UPDATE`/`DELETE` for base tables (`FOR EACH ROW`)
   - `INSTEAD OF` triggers on `INSERT`/`UPDATE`/`DELETE` for views (`FOR EACH ROW`)
-  - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 0.x
-  - `FOR EACH STATEMENT` triggers and `NEW`/`OLD` row references are not supported in 0.x
+  - Trigger action must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` in 1.0
+  - `FOR EACH STATEMENT` triggers and `NEW`/`OLD` row references are not supported in 1.0
 - Not supported (post-1.0): ADD CONSTRAINT
 - Schema changes require exclusive lock (no active readers or writers)
 
@@ -730,6 +730,6 @@ db.set_config("trigram_postings_threshold", 50000)
 - Compaction: rebuild B+Tree from scratch, freeing empty pages
 
 ### 17.3 Merge/rebalance (post-1.0)
-- Not implemented in 0.x to simplify code
+- Not implemented in 1.0 to simplify code
 - Compaction provides equivalent space recovery
 - Future: implement merge for delete-heavy workloads

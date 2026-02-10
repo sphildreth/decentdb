@@ -80,7 +80,7 @@ method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte])
       zeroMem(addr overlapped, sizeof(overlapped))
       overlapped.offset = DWORD(uint64(offset) and 0xFFFFFFFF'u64)
       overlapped.offsetHigh = DWORD((uint64(offset) shr 32) and 0xFFFFFFFF'u64)
-      let handle = get_osfhandle(file.file.getFileHandle())
+      let handle = get_osfhandle(cint(file.file.getFileHandle()))
       if ReadFile(handle, addr buf[0], DWORD(buf.len), addr bytesRead, addr overlapped) == 0:
         return err[int](ERR_IO, "Read failed", file.path)
       ok(int(bytesRead))
@@ -107,7 +107,7 @@ method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Resu
       zeroMem(addr overlapped, sizeof(overlapped))
       overlapped.offset = DWORD(uint64(offset) and 0xFFFFFFFF'u64)
       overlapped.offsetHigh = DWORD((uint64(offset) shr 32) and 0xFFFFFFFF'u64)
-      let handle = get_osfhandle(file.file.getFileHandle())
+      let handle = get_osfhandle(cint(file.file.getFileHandle()))
       if ReadFile(handle, addr buf[0], DWORD(buf.len), addr bytesRead, addr overlapped) == 0:
         return err[int](ERR_IO, "Read failed", file.path)
       ok(int(bytesRead))
@@ -165,7 +165,7 @@ method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
     
     when defined(windows):
       # Windows: Use FlushFileBuffers for OS-level sync
-      let handle = get_osfhandle(file.file.getFileHandle())
+      let handle = get_osfhandle(cint(file.file.getFileHandle()))
       if handle == INVALID_HANDLE_VALUE:
         return err[Void](ERR_IO, "Invalid file handle for fsync", file.path)
       if FlushFileBuffers(handle) == 0:
@@ -196,7 +196,7 @@ method truncate*(vfs: OsVfs, file: VfsFile, size: int64): Result[Void] =
         file.bufferedDirty.store(false, moRelease)
       when defined(windows):
         setFilePos(file.file, size)
-        let handle = get_osfhandle(file.file.getFileHandle())
+        let handle = get_osfhandle(cint(file.file.getFileHandle()))
         if setEndOfFile(handle) == 0:
           return err[Void](ERR_IO, "Truncate failed", file.path)
       else:

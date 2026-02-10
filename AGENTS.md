@@ -10,7 +10,7 @@ This file defines how coding agents should operate in this repository.
 - Correctness is enforced via **tests from day one** (unit + property + crash-injection + differential testing).
 
 ## 2. Scope boundaries
-### Current Scope (0.x, pre-1.0)
+### Current Scope (1.0)
 - WAL-only durability (fsync on commit by default)
 - Paged storage + page cache
 - B+Tree tables and secondary indexes
@@ -30,7 +30,7 @@ This file defines how coding agents should operate in this repository.
 - PostgreSQL wire protocol (Npgsql compatibility)
 - Full PostgreSQL system catalogs / extensions
 - Cost-based optimizer / statistics-driven planning
-- Online compaction/vacuum beyond minimal maintenance hooks
+- Online incremental compaction/vacuum (full offline VACUUM is supported via the CLI)
 
 ## 3. Expected agent workflow
 ### 3.1 Before coding

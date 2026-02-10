@@ -1,8 +1,8 @@
 # DecentDB PRD (Product Requirements Document)
 **Date:** 2026-01-27  
-**Status:** Draft (v0.1)
+**Status:** Released (v1.0)
 
-> Note: This repo is past the initial milestone. This document describes the current 0.x (pre-1.0) baseline scope.
+> This document describes the 1.0 baseline scope.
 
 ## 1. Product summary
 DecentDB is an embedded, single-machine relational database engine focused on:
@@ -20,7 +20,7 @@ The initial target workload is music-library style data:
 The project emphasizes **testing and correctness from day 1**, using a **Python-driven test harness** plus engine-level unit and property tests.
 
 ## 2. Goals
-### 2.1 Functional goals (0.x baseline)
+### 2.1 Functional goals (1.0 baseline)
 1. **Relational core**
    - Tables with typed columns (baseline types: NULL, INT64, BOOL, FLOAT64, TEXT (UTF-8), BLOB)
    - Primary keys (rowid or explicit PK)
@@ -54,18 +54,18 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
       - minimum effective pattern length rules
       - optional requirement of additional filters for short patterns
 
-6. **Data portability (0.x baseline)**
+6. **Data portability (1.0 baseline)**
     - Database file is portable across platforms (little-endian format)
     - Export to SQL dump format for backup/migration
     - Import from SQL dump or CSV
 
-7. **Bulk load API (0.x baseline)**
+7. **Bulk load API (1.0 baseline)**
     - Dedicated high-throughput API for loading large datasets
     - Configurable durability options (see ADR-0027)
     - Maintains snapshot isolation for concurrent readers
     - Performance target: 100k records in < 20 seconds
 
-### 2.3 Non-functional goals (0.x baseline)
+### 2.3 Non-functional goals (1.0 baseline)
 - Cross-platform: Linux/Windows/macOS
 - Deterministic tests: reproducible failure cases with seeded randomness
 - Measurable performance (tested on reference hardware: Intel i5-8400 or equivalent, 16GB RAM, NVMe SSD):
@@ -75,7 +75,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
   - writes should be durable by default (fsync on commit)
   - bulk load: 100k records in < 20 seconds using dedicated bulk_load() API
 
-## 4. Non-goals (0.x baseline)
+## 4. Non-goals (1.0 baseline)
 - Multi-process concurrency (future)
 - Full PostgreSQL semantics, system catalogs, extensions, or wire protocol
 - Advanced query optimizer (cost-based, statistics-driven)
