@@ -25,6 +25,9 @@ import ./storage/storage
 import ./btree/btree
 import ./wal/wal
 
+when defined(bench_breakdown):
+  import ./utils/bench_breakdown
+
 type Db* = ref object
   path*: string
   vfs*: Vfs
@@ -1382,6 +1385,22 @@ proc enforceRestrictOnDelete(catalog: Catalog, pager: Pager, table: TableMeta, o
   okVoid()
 
 proc evalInsertValues(stmt: Statement, params: seq[Value]): Result[seq[Value]] =
+  # Hot-path: INSERT ... VALUES ($1, $2, ...) is extremely common.
+  # Avoid evalExpr/valueFromSql overhead when all values are parameters.
+  if stmt.insertValues.len > 0:
+    var allParams = true
+    var fastValues = newSeq[Value](stmt.insertValues.len)
+    for i, expr in stmt.insertValues:
+      if expr.kind != ekParam:
+        allParams = false
+        break
+      let paramIdx = expr.index - 1
+      if paramIdx < 0 or paramIdx >= params.len:
+        return err[seq[Value]](ERR_SQL, "Parameter index out of bounds", $expr.index)
+      fastValues[i] = params[paramIdx]
+    if allParams:
+      return ok(fastValues)
+
   var values: seq[Value] = @[]
   for expr in stmt.insertValues:
     let res = evalExpr(Row(), expr, params)
@@ -1418,29 +1437,69 @@ proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
 
-proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[InsertExecResult] =
+proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: bool): Result[InsertExecResult] =
+  when defined(bench_breakdown):
+    let engStart = getMonoTime()
+    var nsEvalValues: int64 = 0
+    var nsTypeCheck: int64 = 0
+    var nsConstraints: int64 = 0
+    var nsStorage: int64 = 0
+    defer:
+      if result.ok:
+        let engTotal = int64(inNanoseconds(getMonoTime() - engStart))
+        addEngineTotalNs(engTotal)
+        addEngineEvalValuesNs(nsEvalValues)
+        addEngineTypeCheckNs(nsTypeCheck)
+        addEngineConstraintsNs(nsConstraints)
+        addEngineStorageCallNs(nsStorage)
+
   let tableRes = db.catalog.getTable(bound.insertTable)
   if not tableRes.ok:
     return err[InsertExecResult](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
 
-  let valuesRes = evalInsertValues(bound, params)
+  var valuesRes: Result[seq[Value]]
+  when defined(bench_breakdown):
+    let t0 = getMonoTime()
+    valuesRes = evalInsertValues(bound, params)
+    nsEvalValues = int64(inNanoseconds(getMonoTime() - t0))
+  else:
+    valuesRes = evalInsertValues(bound, params)
   if not valuesRes.ok:
     return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
   var values = valuesRes.value
 
-  for i, col in table.columns:
-    let typeRes = typeCheckValue(col, values[i])
-    if not typeRes.ok:
-      return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
-    values[i] = typeRes.value
+  when defined(bench_breakdown):
+    let t1 = getMonoTime()
+    for i, col in table.columns:
+      let typeRes = typeCheckValue(col, values[i])
+      if not typeRes.ok:
+        return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
+      values[i] = typeRes.value
+    nsTypeCheck = int64(inNanoseconds(getMonoTime() - t1))
+  else:
+    for i, col in table.columns:
+      let typeRes = typeCheckValue(col, values[i])
+      if not typeRes.ok:
+        return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
+      values[i] = typeRes.value
 
-  let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
-  if not notNullRes.ok:
-    return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-  let checkRes = enforceChecks(table, values)
-  if not checkRes.ok:
-    return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+  when defined(bench_breakdown):
+    let t2 = getMonoTime()
+    let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
+    if not notNullRes.ok:
+      return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    let checkRes = enforceChecks(table, values)
+    if not checkRes.ok:
+      return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+    nsConstraints += int64(inNanoseconds(getMonoTime() - t2))
+  else:
+    let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
+    if not notNullRes.ok:
+      return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    let checkRes = enforceChecks(table, values)
+    if not checkRes.ok:
+      return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
 
   case bound.insertConflictAction
   of icaDoNothing:
@@ -1537,62 +1596,96 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value]): Result[I
         return err[InsertExecResult](updateRes.err.code, updateRes.err.message, updateRes.err.context)
       return ok(InsertExecResult(
         affected: true,
-        row: some(buildInsertResultRow(bound.insertTable, table, stored.rowid, newValues))
+        row: if wantRow: some(buildInsertResultRow(bound.insertTable, table, stored.rowid, newValues)) else: none(Row)
       ))
   of icaNone:
     discard
 
-  let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
-  if not uniqueRes.ok:
-    return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+  when defined(bench_breakdown):
+    let t3 = getMonoTime()
+    let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
+    if not uniqueRes.ok:
+      return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
 
-  let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
-  if not fkRes.ok:
-    return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+    if not fkRes.ok:
+      return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    nsConstraints += int64(inNanoseconds(getMonoTime() - t3))
 
-  let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+    let t4 = getMonoTime()
+    let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+    nsStorage = int64(inNanoseconds(getMonoTime() - t4))
+    if not insertRes.ok:
+      if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
+        return ok(InsertExecResult(affected: false, row: none(Row)))
+      return err[InsertExecResult](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+
+    if wantRow:
+      # Back-fill auto-increment PK value so RETURNING sees the assigned id
+      for i, col in table.columns:
+        if col.primaryKey and col.kind == ctInt64 and values[i].kind == vkNull:
+          values[i] = Value(kind: vkInt64, int64Val: cast[int64](insertRes.value))
+
+      return ok(InsertExecResult(
+        affected: true,
+        row: some(buildInsertResultRow(bound.insertTable, table, insertRes.value, values))
+      ))
+    else:
+      return ok(InsertExecResult(affected: true, row: none(Row)))
+  else:
+    let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
+    if not uniqueRes.ok:
+      return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+
+    let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+    if not fkRes.ok:
+      return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+
+    let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
   if not insertRes.ok:
     if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
       return ok(InsertExecResult(affected: false, row: none(Row)))
     return err[InsertExecResult](insertRes.err.code, insertRes.err.message, insertRes.err.context)
 
-  # Back-fill auto-increment PK value so RETURNING sees the assigned id
-  for i, col in table.columns:
-    if col.primaryKey and col.kind == ctInt64 and values[i].kind == vkNull:
-      values[i] = Value(kind: vkInt64, int64Val: cast[int64](insertRes.value))
+  if wantRow:
+    # Back-fill auto-increment PK value so RETURNING sees the assigned id
+    for i, col in table.columns:
+      if col.primaryKey and col.kind == ctInt64 and values[i].kind == vkNull:
+        values[i] = Value(kind: vkInt64, int64Val: cast[int64](insertRes.value))
 
-  ok(InsertExecResult(
-    affected: true,
-    row: some(buildInsertResultRow(bound.insertTable, table, insertRes.value, values))
-  ))
+    return ok(InsertExecResult(
+      affected: true,
+      row: some(buildInsertResultRow(bound.insertTable, table, insertRes.value, values))
+    ))
+  ok(InsertExecResult(affected: true, row: none(Row)))
 
-proc execInsertRowExprs(db: Db, bound: Statement, exprs: seq[Expr], params: seq[Value]): Result[InsertExecResult] =
+proc execInsertRowExprs(db: Db, bound: Statement, exprs: seq[Expr], params: seq[Value], wantRow: bool): Result[InsertExecResult] =
   ## Execute INSERT for a single extra row (multi-row INSERT VALUES).
   ## Builds a temporary statement with the given exprs as insertValues.
   var rowBound = bound
   rowBound.insertValues = exprs
   rowBound.insertValueRows = @[]
-  execInsertStatement(db, rowBound, params)
+  execInsertStatement(db, rowBound, params, wantRow)
 
-proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value]): Result[MultiInsertResult] =
+proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value], wantRows: bool): Result[MultiInsertResult] =
   ## Execute all rows of a multi-row INSERT, returning total affected and result rows.
   var multi = MultiInsertResult(totalAffected: 0, rows: @[])
   # First row (from insertValues)
-  let firstRes = execInsertStatement(db, bound, params)
+  let firstRes = execInsertStatement(db, bound, params, wantRows)
   if not firstRes.ok:
     return err[MultiInsertResult](firstRes.err.code, firstRes.err.message, firstRes.err.context)
   if firstRes.value.affected:
     multi.totalAffected.inc
-  if firstRes.value.row.isSome:
+  if wantRows and firstRes.value.row.isSome:
     multi.rows.add(firstRes.value.row.get)
   # Extra rows (from insertValueRows)
   for extraExprs in bound.insertValueRows:
-    let extraRes = execInsertRowExprs(db, bound, extraExprs, params)
+    let extraRes = execInsertRowExprs(db, bound, extraExprs, params, wantRows)
     if not extraRes.ok:
       return err[MultiInsertResult](extraRes.err.code, extraRes.err.message, extraRes.err.context)
     if extraRes.value.affected:
       multi.totalAffected.inc
-    if extraRes.value.row.isSome:
+    if wantRows and extraRes.value.row.isSome:
       multi.rows.add(extraRes.value.row.get)
   ok(multi)
 
@@ -1875,7 +1968,7 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
         if not insteadRes.ok:
           return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
       else:
-        let multiRes = execAllInsertRows(db, bound, params)
+        let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0)
         if not multiRes.ok:
           return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
         let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
@@ -2395,7 +2488,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not insteadRes.ok:
           return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
       else:
-        let multiRes = execAllInsertRows(db, bound, params)
+        let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0)
         if not multiRes.ok:
           return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
         let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
@@ -3035,7 +3128,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       if not insteadRes.ok:
         return err[int64](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
     else:
-      let multiRes = execAllInsertRows(db, bound, params)
+      let multiRes = execAllInsertRows(db, bound, params, wantRows = false)
       if not multiRes.ok:
         return err[int64](multiRes.err.code, multiRes.err.message, multiRes.err.context)
       affected = multiRes.value.totalAffected

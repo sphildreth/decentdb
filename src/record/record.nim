@@ -278,10 +278,146 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
   ok(value)
 
 proc encodeRecord*(values: seq[Value]): seq[byte] =
-  result = @[]
-  result.add(encodeVarint(uint64(values.len)))
+  proc varintLen(v: uint64): int {.inline.} =
+    var x = v
+    result = 1
+    while x >= 0x80'u64:
+      inc result
+      x = x shr 7
+
+  proc putVarint(dst: var seq[byte], offset: var int, v: uint64) {.inline.} =
+    var x = v
+    while true:
+      let b = byte(x and 0x7F'u64)
+      x = x shr 7
+      if x == 0:
+        dst[offset] = b
+        inc offset
+        break
+      dst[offset] = b or 0x80'u8
+      inc offset
+
+  proc putU32LE(dst: var seq[byte], offset: var int, v: uint32) {.inline.} =
+    dst[offset] = byte(v and 0xFF'u32)
+    dst[offset + 1] = byte((v shr 8) and 0xFF'u32)
+    dst[offset + 2] = byte((v shr 16) and 0xFF'u32)
+    dst[offset + 3] = byte((v shr 24) and 0xFF'u32)
+    offset += 4
+
+  proc putU64LE(dst: var seq[byte], offset: var int, v: uint64) {.inline.} =
+    dst[offset] = byte(v and 0xFF'u64)
+    dst[offset + 1] = byte((v shr 8) and 0xFF'u64)
+    dst[offset + 2] = byte((v shr 16) and 0xFF'u64)
+    dst[offset + 3] = byte((v shr 24) and 0xFF'u64)
+    dst[offset + 4] = byte((v shr 32) and 0xFF'u64)
+    dst[offset + 5] = byte((v shr 40) and 0xFF'u64)
+    dst[offset + 6] = byte((v shr 48) and 0xFF'u64)
+    dst[offset + 7] = byte((v shr 56) and 0xFF'u64)
+    offset += 8
+
+  # Pre-size the output to avoid repeated reallocations.
+  var totalLen = varintLen(uint64(values.len))
   for value in values:
-    result.add(encodeValue(value))
+    var kind = value.kind
+    var payloadLen = 0
+    case value.kind
+    of vkNull:
+      payloadLen = 0
+    of vkBool:
+      kind = if value.boolVal: vkBoolTrue else: vkBoolFalse
+      payloadLen = 0
+    of vkBoolFalse, vkBoolTrue:
+      kind = value.kind
+      payloadLen = 0
+    of vkInt0, vkInt1:
+      kind = value.kind
+      payloadLen = 0
+    of vkInt64:
+      if value.int64Val == 0:
+        kind = vkInt0
+        payloadLen = 0
+      elif value.int64Val == 1:
+        kind = vkInt1
+        payloadLen = 0
+      else:
+        kind = vkInt64
+        payloadLen = varintLen(zigzagEncode(value.int64Val))
+    of vkFloat64:
+      payloadLen = 8
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      payloadLen = value.bytes.len
+    of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+      payloadLen = 8
+    of vkDecimal:
+      payloadLen = 1 + varintLen(zigzagEncode(value.int64Val))
+    totalLen += 1 + varintLen(uint64(payloadLen)) + payloadLen
+
+  result = newSeq[byte](totalLen)
+  var offset = 0
+  putVarint(result, offset, uint64(values.len))
+  for value in values:
+    var kind = value.kind
+    var payloadLen = 0
+
+    case value.kind
+    of vkNull:
+      payloadLen = 0
+    of vkBool:
+      kind = if value.boolVal: vkBoolTrue else: vkBoolFalse
+      payloadLen = 0
+    of vkBoolFalse, vkBoolTrue:
+      kind = value.kind
+      payloadLen = 0
+    of vkInt0, vkInt1:
+      kind = value.kind
+      payloadLen = 0
+    of vkInt64:
+      if value.int64Val == 0:
+        kind = vkInt0
+        payloadLen = 0
+      elif value.int64Val == 1:
+        kind = vkInt1
+        payloadLen = 0
+      else:
+        kind = vkInt64
+        payloadLen = varintLen(zigzagEncode(value.int64Val))
+    of vkFloat64:
+      payloadLen = 8
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      payloadLen = value.bytes.len
+    of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+      payloadLen = 8
+    of vkDecimal:
+      payloadLen = 1 + varintLen(zigzagEncode(value.int64Val))
+
+    result[offset] = byte(kind)
+    inc offset
+    putVarint(result, offset, uint64(payloadLen))
+
+    case kind
+    of vkNull, vkBoolTrue, vkBoolFalse, vkInt0, vkInt1:
+      discard
+    of vkBool:
+      # Should have been normalized to vkBoolTrue/vkBoolFalse above.
+      # payloadLen is 0, so the kind byte is exactly two bytes behind `offset`.
+      result[offset - 2] = byte(if value.boolVal: vkBoolTrue else: vkBoolFalse)
+    of vkInt64:
+      putVarint(result, offset, zigzagEncode(value.int64Val))
+    of vkFloat64:
+      putU64LE(result, offset, cast[uint64](value.float64Val))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      if payloadLen > 0:
+        copyMem(addr result[offset], unsafeAddr value.bytes[0], payloadLen)
+        offset += payloadLen
+    of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+      putU32LE(result, offset, uint32(value.overflowPage))
+      putU32LE(result, offset, value.overflowLen)
+    of vkDecimal:
+      result[offset] = byte(value.decimalScale)
+      inc offset
+      putVarint(result, offset, zigzagEncode(value.int64Val))
+
+  doAssert offset == result.len
 
 proc decodeRecord*(data: openArray[byte]): Result[seq[Value]] =
   var offset = 0

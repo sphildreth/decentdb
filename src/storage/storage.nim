@@ -12,6 +12,11 @@ import ../search/search
 import ../sql/sql
 import sets
 
+when defined(bench_breakdown):
+  import std/monotimes
+  import times
+  import ../utils/bench_breakdown
+
 type StoredRow* = object
   rowid*: uint64
   values*: seq[Value]
@@ -595,7 +600,8 @@ proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Voi
 
 proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
   var resultValues: seq[Value] = @[]
-  for value in values:
+  var changed = false
+  for i, value in values:
     var processedValue = value
     if value.kind in {vkText, vkBlob}:
       processedValue = compressValue(value)
@@ -604,7 +610,7 @@ proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
       let pageRes = writeOverflowChain(pager, processedValue.bytes)
       if not pageRes.ok:
         return err[seq[Value]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-      
+
       let overflowKind = case processedValue.kind
         of vkText: vkTextOverflow
         of vkBlob: vkBlobOverflow
@@ -612,10 +618,24 @@ proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
         of vkBlobCompressed: vkBlobCompressedOverflow
         else: vkTextOverflow
 
-      resultValues.add(Value(kind: overflowKind, overflowPage: pageRes.value, overflowLen: uint32(processedValue.bytes.len)))
+      if not changed:
+        changed = true
+        resultValues = newSeq[Value](values.len)
+        for j in 0 ..< i:
+          resultValues[j] = values[j]
+      resultValues[i] = Value(kind: overflowKind, overflowPage: pageRes.value, overflowLen: uint32(processedValue.bytes.len))
     else:
-      resultValues.add(processedValue)
-  ok(resultValues)
+      if not changed and processedValue.kind != value.kind:
+        changed = true
+        resultValues = newSeq[Value](values.len)
+        for j in 0 ..< i:
+          resultValues[j] = values[j]
+      if changed:
+        resultValues[i] = processedValue
+  if changed:
+    ok(resultValues)
+  else:
+    ok(values)
 
 proc readRowAt*(pager: Pager, table: TableMeta, rowid: uint64): Result[StoredRow] =
   let tree = newBTree(pager, table.rootPage)
@@ -674,6 +694,21 @@ proc scanTableEach*(pager: Pager, table: TableMeta, body: proc(row: StoredRow): 
   okVoid()
 
 proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool): Result[uint64] =
+  when defined(bench_breakdown):
+    let storStart = getMonoTime()
+    var nsNormalize: int64 = 0
+    var nsEncode: int64 = 0
+    var nsBtree: int64 = 0
+    var nsMeta: int64 = 0
+    defer:
+      if result.ok:
+        let storTotal = int64(inNanoseconds(getMonoTime() - storStart))
+        addStorageTotalNs(storTotal)
+        addStorageNormalizeNs(nsNormalize)
+        addStorageEncodeRecordNs(nsEncode)
+        addStorageBtreeInsertNs(nsBtree)
+        addStorageTableMetaNs(nsMeta)
+
   let tableRes = catalog.getTable(tableName)
   if not tableRes.ok:
     return err[uint64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
@@ -738,12 +773,31 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
               break
           if valueIndex >= 0:
             trigramValues.add((idx, storedValues[valueIndex]))
-  let normalizedRes = normalizeValues(pager, storedValues)
+  var normalizedRes: Result[seq[Value]]
+  when defined(bench_breakdown):
+    let t0 = getMonoTime()
+    normalizedRes = normalizeValues(pager, storedValues)
+    nsNormalize = int64(inNanoseconds(getMonoTime() - t0))
+  else:
+    normalizedRes = normalizeValues(pager, storedValues)
   if not normalizedRes.ok:
     return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
-  let record = encodeRecord(normalizedRes.value)
+  var record: seq[byte]
+  when defined(bench_breakdown):
+    let t1 = getMonoTime()
+    record = encodeRecord(normalizedRes.value)
+    nsEncode = int64(inNanoseconds(getMonoTime() - t1))
+  else:
+    record = encodeRecord(normalizedRes.value)
+
   let tree = newBTree(pager, table.rootPage)
-  let insertRes = insert(tree, rowid, record, checkUnique = true)
+  var insertRes: Result[Void]
+  when defined(bench_breakdown):
+    let t2 = getMonoTime()
+    insertRes = insert(tree, rowid, record, checkUnique = true)
+    nsBtree = int64(inNanoseconds(getMonoTime() - t2))
+  else:
+    insertRes = insert(tree, rowid, record, checkUnique = true)
   if not insertRes.ok:
     return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   if updateIndexes:
@@ -763,26 +817,49 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
       for g in grams:
         catalog.trigramBufferAdd(entry[0].name, g, rowid)
    
-  if isExplicitRowId:
-    if rowid >= table.nextRowId:
+  when defined(bench_breakdown):
+    let t3 = getMonoTime()
+    if isExplicitRowId:
+      if rowid >= table.nextRowId:
+        table.nextRowId = rowid + 1
+    else:
       table.nextRowId = rowid + 1
+
+    table.rootPage = tree.root
+
+    if table.rootPage != tableRes.value.rootPage:
+      let saveRes = saveTable(catalog, pager, table)
+      if not saveRes.ok:
+        return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    else:
+      updateTableMeta(catalog, table)
+    nsMeta = int64(inNanoseconds(getMonoTime() - t3))
+    return ok(rowid)
   else:
+    if isExplicitRowId:
+      if rowid >= table.nextRowId:
+        table.nextRowId = rowid + 1
+    else:
       table.nextRowId = rowid + 1
 
-  table.rootPage = tree.root
+    table.rootPage = tree.root
 
-  if table.rootPage != tableRes.value.rootPage:
-    let saveRes = saveTable(catalog, pager, table)
-    if not saveRes.ok:
-      return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-  else:
-    updateTableMeta(catalog, table)
+    if table.rootPage != tableRes.value.rootPage:
+      let saveRes = saveTable(catalog, pager, table)
+      if not saveRes.ok:
+        return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    else:
+      updateTableMeta(catalog, table)
 
-
-  ok(rowid)
+    ok(rowid)
 
 proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
-  insertRowInternal(pager, catalog, tableName, values, true)
+  var hasIndexes = false
+  for _, idx in catalog.indexes:
+    if idx.table == tableName:
+      hasIndexes = true
+      break
+  insertRowInternal(pager, catalog, tableName, values, hasIndexes)
 
 proc insertRowNoIndexes*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
   insertRowInternal(pager, catalog, tableName, values, false)

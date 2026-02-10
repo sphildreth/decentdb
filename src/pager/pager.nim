@@ -9,6 +9,11 @@ import sets
 import ./db_header
 import ../utils/perf
 
+when defined(bench_breakdown):
+  import std/monotimes
+  import times
+  import ../utils/bench_breakdown
+
 type PageId* = uint32
 type PageOverlay* = proc(pageId: PageId): Option[string]
 type ReadGuard* = proc(): Result[Void]
@@ -681,6 +686,55 @@ proc release*(handle: var PageHandle) =
     discard unpinPage(handle.pager, handle.entry)
     handle.pinned = false
     handle.entry = nil
+
+proc acquirePageRw*(pager: Pager, pageId: PageId): Result[PageHandle] =
+  ## Acquire a mutable handle to a page.
+  ##
+  ## On the first write to a clean cached page, this clones the page buffer
+  ## (copy-on-first-write) so any previously borrowed read-only views remain
+  ## valid and immutable.
+  ##
+  ## Caller MUST call release() on the returned handle.
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
+
+  let pinRes = pinPage(pager, pageId)
+  if not pinRes.ok:
+    return err[PageHandle](pinRes.err.code, pinRes.err.message, pinRes.err.context)
+  let entry = pinRes.value
+
+  acquire(entry.lock)
+  if not entry.dirty:
+    entry.data = cloneString(entry.data)
+    entry.dirty = true
+    entry.aux = nil
+    pager.txnDirtyCount.inc
+  pager.txnLastDirtyId = pageId
+
+  ok(PageHandle(pager: pager, entry: entry, pinned: true))
+
+proc upgradeToRw*(handle: var PageHandle): Result[Void] =
+  ## Upgrade an already-acquired page handle to writable.
+  ##
+  ## The handle must be pinned and have the entry lock held (i.e. created via
+  ## acquirePageRo/acquirePageRw). This avoids re-pinning/re-locking the page.
+  when defined(bench_breakdown):
+    let t0 = getMonoTime()
+    defer:
+      if result.ok:
+        addPagerUpgradeNs(int64(inNanoseconds(getMonoTime() - t0)))
+  if handle.entry == nil or not handle.pinned:
+    return err[Void](ERR_INTERNAL, "Cannot upgrade non-cached page handle")
+  let pager = handle.pager
+  let entry = handle.entry
+  if not entry.dirty:
+    entry.data = cloneString(entry.data)
+    entry.dirty = true
+    entry.aux = nil
+    pager.txnDirtyCount.inc
+  pager.txnLastDirtyId = entry.id
+  okVoid()
 
 proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   if data.len != pager.pageSize:

@@ -1,9 +1,16 @@
 import options
+import tables
+import locks
 import ../errors
 import ../pager/pager
 import ../pager/db_header
 import ../record/record
 import sets
+
+when defined(bench_breakdown):
+  import std/monotimes
+  import times
+  import ../utils/bench_breakdown
 
 const
   PageTypeInternal* = 1'u8
@@ -26,6 +33,46 @@ type
 type BTree* = ref object
   pager*: Pager
   root*: PageId
+
+type AppendCacheEntry = object
+  leaf: PageId
+  lastKey: uint64
+  usedBytes: int
+  count: int
+  deltaEncoded: bool
+  pinnedEntry: CacheEntry
+
+var gAppendCache {.threadvar.}: Table[PageId, AppendCacheEntry]
+
+proc invalidateAppendCache(tree: BTree) {.inline.} =
+  if gAppendCache.len == 0:
+    return
+  if gAppendCache.hasKey(tree.root):
+    let old = gAppendCache[tree.root]
+    if old.pinnedEntry != nil:
+      discard unpinPage(tree.pager, old.pinnedEntry)
+    gAppendCache.del(tree.root)
+
+proc updateAppendCache(tree: BTree, leaf: PageId, lastKey: uint64, usedBytes: int, count: int, deltaEncoded: bool, pinnedEntry: CacheEntry = nil) {.inline.} =
+  if gAppendCache.len == 0:
+    gAppendCache = initTable[PageId, AppendCacheEntry]()
+
+  var keepPinned = pinnedEntry
+  if gAppendCache.hasKey(tree.root):
+    let old = gAppendCache[tree.root]
+    if keepPinned == nil and old.leaf == leaf:
+      keepPinned = old.pinnedEntry
+    elif old.pinnedEntry != nil and old.pinnedEntry != keepPinned:
+      discard unpinPage(tree.pager, old.pinnedEntry)
+
+  gAppendCache[tree.root] = AppendCacheEntry(
+    leaf: leaf,
+    lastKey: lastKey,
+    usedBytes: usedBytes,
+    count: count,
+    deltaEncoded: deltaEncoded,
+    pinnedEntry: keepPinned
+  )
 
 type BTreeCursor* = ref object
   tree*: BTree
@@ -1291,6 +1338,128 @@ type SplitResult = object
   promoted: uint64
   newPage: PageId
 
+proc tryAppendToCachedRightmostLeaf(tree: BTree, key: uint64, value: seq[byte]): Result[bool] =
+  ## Fast path for sequential inserts.
+  ## If we have an append-cache entry for the rightmost leaf and the new key is
+  ## greater than the cached lastKey, attempt an in-place append directly on
+  ## that leaf (no traversal through internal nodes).
+  ##
+  ## Returns ok(true) if append succeeded and no further work is needed.
+  ## Returns ok(false) to fall back to the general insert path.
+  if gAppendCache.len == 0 or not gAppendCache.hasKey(tree.root):
+    return ok(false)
+
+  let cached = gAppendCache[tree.root]
+  if cached.leaf == 0 or key <= cached.lastKey:
+    return ok(false)
+
+  let prepRes = prepareLeafValue(tree, value)
+  if not prepRes.ok:
+    return err[bool](prepRes.err.code, prepRes.err.message, prepRes.err.context)
+  let leafVal = prepRes.value.inline
+  let leafOv = prepRes.value.overflow
+
+  var entry = cached.pinnedEntry
+  var pinnedNow = false
+  if entry == nil:
+    let pinRes = pinPage(tree.pager, cached.leaf)
+    if not pinRes.ok:
+      return ok(false)
+    entry = pinRes.value
+    pinnedNow = true
+
+  acquire(entry.lock)
+  var shouldUnpin = false
+  var succeeded = false
+  var newWriteOffset = cached.usedBytes
+  var newCount = cached.count
+  var isDelta = cached.deltaEncoded
+  try:
+    if entry.data.len < 8 or byte(entry.data[0]) != PageTypeLeaf:
+      invalidateAppendCache(tree)
+      shouldUnpin = pinnedNow
+      return ok(false)
+
+    if PageId(readU32LE(entry.data, 4)) != 0:
+      invalidateAppendCache(tree)
+      shouldUnpin = pinnedNow
+      return ok(false)
+
+    let pageCount = int(readU16LE(entry.data, 2))
+    isDelta = byte(entry.data[1]) == PageFlagDeltaKeys
+    if pageCount != cached.count or isDelta != cached.deltaEncoded:
+      invalidateAppendCache(tree)
+      shouldUnpin = pinnedNow
+      return ok(false)
+
+    proc encodeVarintToBuf(v: uint64, buf: var array[10, byte]): int {.inline.} =
+      var x = v
+      var i = 0
+      while true:
+        var b = byte(x and 0x7F'u64)
+        x = x shr 7
+        if x != 0:
+          b = b or 0x80'u8
+        buf[i] = b
+        inc i
+        if x == 0:
+          break
+      i
+
+    let encodedKey = if isDelta: key - cached.lastKey else: key
+    var keyBuf: array[10, byte]
+    let keyLen = encodeVarintToBuf(encodedKey, keyBuf)
+    var ctrlBuf: array[10, byte]
+    var valLen = 0
+    let ctrlLen =
+      if leafOv != 0:
+        encodeVarintToBuf((uint64(leafOv) shl 1) or 1'u64, ctrlBuf)
+      else:
+        valLen = leafVal.len
+        encodeVarintToBuf(uint64(valLen) shl 1, ctrlBuf)
+
+    let usedBytes = cached.usedBytes
+    let count = cached.count
+    if usedBytes < 8 or count < 0 or usedBytes + keyLen + ctrlLen + valLen > tree.pager.pageSize:
+      shouldUnpin = pinnedNow
+      return ok(false)
+
+    var h = PageHandle(pager: tree.pager, entry: entry, pinned: true)
+    let upRes = upgradeToRw(h)
+    if not upRes.ok:
+      return err[bool](upRes.err.code, upRes.err.message, upRes.err.context)
+
+    newCount = count + 1
+    let newCountU16 = uint16(newCount)
+    entry.data[2] = char(byte(newCountU16 and 0xFF))
+    entry.data[3] = char(byte((newCountU16 shr 8) and 0xFF))
+
+    var writeOffset = usedBytes
+    for i in 0 ..< keyLen:
+      entry.data[writeOffset] = char(keyBuf[i])
+      inc writeOffset
+    for i in 0 ..< ctrlLen:
+      entry.data[writeOffset] = char(ctrlBuf[i])
+      inc writeOffset
+    if valLen > 0:
+      copyMem(addr entry.data[writeOffset], unsafeAddr leafVal[0], valLen)
+      writeOffset += valLen
+
+    newWriteOffset = writeOffset
+    succeeded = true
+  finally:
+    release(entry.lock)
+    if shouldUnpin:
+      discard unpinPage(tree.pager, entry)
+
+  if succeeded:
+    updateAppendCache(tree, cached.leaf, key, newWriteOffset, newCount, isDelta, pinnedEntry = entry)
+    return ok(true)
+
+  if pinnedNow:
+    updateAppendCache(tree, cached.leaf, cached.lastKey, cached.usedBytes, cached.count, cached.deltaEncoded, pinnedEntry = nil)
+  ok(false)
+
 proc scanLeafLastKey(page: string): Result[(uint64, int, int)] =
   ## Returns (lastKey, usedBytes, count)
   if page.len < 8:
@@ -1330,52 +1499,274 @@ proc scanLeafLastKey(page: string): Result[(uint64, int, int)] =
   ok((lastKey, offset, count))
 
 proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte], checkUnique: bool): Result[Option[SplitResult]] =
-  let pageRes = readPageRo(tree.pager, pageId)
-  if not pageRes.ok:
-    return err[Option[SplitResult]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
-  let page = pageRes.value
-  if byte(page[0]) == PageTypeLeaf:
-    let prepRes = prepareLeafValue(tree, value)
-    if not prepRes.ok:
-      return err[Option[SplitResult]](prepRes.err.code, prepRes.err.message, prepRes.err.context)
-    let leafVal = prepRes.value.inline
-    let leafOv = prepRes.value.overflow
+  var haveLeafValue = false
+  var leafVal: seq[byte] = @[]
+  var leafOv: uint32 = 0'u32
 
-    # Optimization: Fast path for append (sequential inserts)
+  # If this is the cached rightmost leaf, try a pinned-entry append before we
+  # acquire any handle (avoids per-insert pin/unpin on sequential inserts).
+  if gAppendCache.len > 0 and gAppendCache.hasKey(tree.root):
+    let cached = gAppendCache[tree.root]
+    if cached.leaf == pageId and key > cached.lastKey:
+      let prepRes = prepareLeafValue(tree, value)
+      if not prepRes.ok:
+        return err[Option[SplitResult]](prepRes.err.code, prepRes.err.message, prepRes.err.context)
+      leafVal = prepRes.value.inline
+      leafOv = prepRes.value.overflow
+      haveLeafValue = true
+
+      var entry = cached.pinnedEntry
+      var pinnedNow = false
+      if entry == nil:
+        let pin2 = pinPage(tree.pager, pageId)
+        if pin2.ok:
+          entry = pin2.value
+          pinnedNow = true
+
+      if entry != nil:
+        acquire(entry.lock)
+        defer: release(entry.lock)
+
+        let pageCount = int(readU16LE(entry.data, 2))
+        let isDelta = byte(entry.data[1]) == PageFlagDeltaKeys
+        if pageCount != cached.count or isDelta != cached.deltaEncoded:
+          if pinnedNow:
+            discard unpinPage(tree.pager, entry)
+          invalidateAppendCache(tree)
+        else:
+          proc encodeVarintToBuf(v: uint64, buf: var array[10, byte]): int {.inline.} =
+            var x = v
+            var i = 0
+            while true:
+              var b = byte(x and 0x7F'u64)
+              x = x shr 7
+              if x != 0:
+                b = b or 0x80'u8
+              buf[i] = b
+              inc i
+              if x == 0:
+                break
+            i
+
+          let encodedKey = if isDelta: key - cached.lastKey else: key
+          var keyBuf: array[10, byte]
+          let keyLen = encodeVarintToBuf(encodedKey, keyBuf)
+          var ctrlBuf: array[10, byte]
+          var valLen = 0
+          let ctrlLen =
+            if leafOv != 0:
+              encodeVarintToBuf((uint64(leafOv) shl 1) or 1'u64, ctrlBuf)
+            else:
+              valLen = leafVal.len
+              encodeVarintToBuf(uint64(valLen) shl 1, ctrlBuf)
+
+          let usedBytes = cached.usedBytes
+          let count = cached.count
+          if usedBytes >= 8 and count >= 0 and usedBytes + keyLen + ctrlLen + valLen <= tree.pager.pageSize:
+            var tmp = PageHandle(pager: tree.pager, entry: entry, pinned: true)
+            let upRes = upgradeToRw(tmp)
+            if upRes.ok:
+              let newCount = uint16(count + 1)
+              entry.data[2] = char(byte(newCount and 0xFF))
+              entry.data[3] = char(byte((newCount shr 8) and 0xFF))
+
+              var writeOffset = usedBytes
+              for i in 0 ..< keyLen:
+                entry.data[writeOffset] = char(keyBuf[i])
+                inc writeOffset
+              for i in 0 ..< ctrlLen:
+                entry.data[writeOffset] = char(ctrlBuf[i])
+                inc writeOffset
+              if valLen > 0:
+                copyMem(addr entry.data[writeOffset], unsafeAddr leafVal[0], valLen)
+                writeOffset += valLen
+
+              updateAppendCache(tree, pageId, key, writeOffset, count + 1, isDelta, pinnedEntry = entry)
+              return ok(none(SplitResult))
+
+          # Append not possible; if we pinned a new entry for this attempt, do not keep it pinned.
+          if pinnedNow:
+            discard unpinPage(tree.pager, entry)
+            updateAppendCache(tree, cached.leaf, cached.lastKey, cached.usedBytes, cached.count, cached.deltaEncoded, pinnedEntry = nil)
+
+  let hRes = acquirePageRo(tree.pager, pageId)
+  if not hRes.ok:
+    return err[Option[SplitResult]](hRes.err.code, hRes.err.message, hRes.err.context)
+  var h = hRes.value
+  defer: release(h)
+
+  let page =
+    if h.entry != nil:
+      h.entry.data
+    else:
+      h.data
+
+  if byte(page[0]) == PageTypeLeaf:
+    proc encodeVarintToBuf(v: uint64, buf: var array[10, byte]): int {.inline.} =
+      var x = v
+      var i = 0
+      while true:
+        var b = byte(x and 0x7F'u64)
+        x = x shr 7
+        if x != 0:
+          b = b or 0x80'u8
+        buf[i] = b
+        inc i
+        if x == 0:
+          break
+      i
+
+    if not haveLeafValue:
+      let prepRes = prepareLeafValue(tree, value)
+      if not prepRes.ok:
+        return err[Option[SplitResult]](prepRes.err.code, prepRes.err.message, prepRes.err.context)
+      leafVal = prepRes.value.inline
+      leafOv = prepRes.value.overflow
+      haveLeafValue = true
+
+    # Optimization: Fast path for append (sequential inserts).
+    # Avoid O(cells) scanning of the leaf by caching the last-key and used-bytes
+    # for the rightmost leaf per tree root.
+    if gAppendCache.len > 0 and gAppendCache.hasKey(tree.root):
+      let cached = gAppendCache[tree.root]
+      if cached.leaf == pageId and key > cached.lastKey:
+        let nextLeaf = PageId(readU32LE(page, 4))
+        let pageCount = int(readU16LE(page, 2))
+        if pageCount != cached.count:
+          invalidateAppendCache(tree)
+        else:
+          let isDelta = byte(page[1]) == PageFlagDeltaKeys
+          if isDelta == cached.deltaEncoded:
+            let encodedKey = if isDelta: key - cached.lastKey else: key
+            var keyBuf: array[10, byte]
+            let keyLen = encodeVarintToBuf(encodedKey, keyBuf)
+            var ctrlBuf: array[10, byte]
+            var valLen = 0
+            let ctrlLen =
+              if leafOv != 0:
+                encodeVarintToBuf((uint64(leafOv) shl 1) or 1'u64, ctrlBuf)
+              else:
+                valLen = leafVal.len
+                encodeVarintToBuf(uint64(valLen) shl 1, ctrlBuf)
+
+            let usedBytes = cached.usedBytes
+            let count = cached.count
+            if usedBytes >= 8 and count >= 0 and usedBytes + keyLen + ctrlLen + valLen <= tree.pager.pageSize:
+              if h.entry == nil or not h.pinned:
+                return err[Option[SplitResult]](ERR_INTERNAL, "Leaf page handle not cached", "page_id=" & $pageId)
+              let upRes = upgradeToRw(h)
+              if not upRes.ok:
+                return err[Option[SplitResult]](upRes.err.code, upRes.err.message, upRes.err.context)
+
+              let newCount = uint16(count + 1)
+              h.entry.data[2] = char(byte(newCount and 0xFF))
+              h.entry.data[3] = char(byte((newCount shr 8) and 0xFF))
+
+              var writeOffset = usedBytes
+              for i in 0 ..< keyLen:
+                h.entry.data[writeOffset] = char(keyBuf[i])
+                inc writeOffset
+              for i in 0 ..< ctrlLen:
+                h.entry.data[writeOffset] = char(ctrlBuf[i])
+                inc writeOffset
+              if valLen > 0:
+                copyMem(addr h.entry.data[writeOffset], unsafeAddr leafVal[0], valLen)
+                writeOffset += valLen
+
+              updateAppendCache(tree, pageId, key, writeOffset, count + 1, isDelta)
+              return ok(none(SplitResult))
+            elif nextLeaf == 0 and usedBytes >= 8 and count >= 0:
+              # Rightmost leaf split on append: avoid decoding/re-encoding.
+              # Old page remains intact; we create a new right leaf with only the new key/value,
+              # and set old.nextLeaf -> newPage.
+              if h.entry == nil or not h.pinned:
+                return err[Option[SplitResult]](ERR_INTERNAL, "Leaf page handle not cached", "page_id=" & $pageId)
+              let upRes = upgradeToRw(h)
+              if not upRes.ok:
+                return err[Option[SplitResult]](upRes.err.code, upRes.err.message, upRes.err.context)
+
+              let newRes = allocatePage(tree.pager)
+              if not newRes.ok:
+                return err[Option[SplitResult]](newRes.err.code, newRes.err.message, newRes.err.context)
+              let newPage = newRes.value
+
+              var buf = newString(tree.pager.pageSize)
+              buf[0] = char(PageTypeLeaf)
+              buf[1] = if isDelta: char(PageFlagDeltaKeys) else: char(0)
+              let newCountU16 = 1'u16
+              buf[2] = char(byte(newCountU16 and 0xFF))
+              buf[3] = char(byte((newCountU16 shr 8) and 0xFF))
+              writeU32LE(buf, 4, 0)
+              var writeOffset = 8
+              for i in 0 ..< keyLen:
+                buf[writeOffset] = char(keyBuf[i])
+                inc writeOffset
+              for i in 0 ..< ctrlLen:
+                buf[writeOffset] = char(ctrlBuf[i])
+                inc writeOffset
+              if valLen > 0:
+                copyMem(addr buf[writeOffset], unsafeAddr leafVal[0], valLen)
+                writeOffset += valLen
+
+              let writeRes = writePage(tree.pager, newPage, buf)
+              if not writeRes.ok:
+                return err[Option[SplitResult]](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+
+              # Link old -> new
+              writeU32LE(h.entry.data, 4, uint32(newPage))
+
+              # New leaf becomes the rightmost append target.
+              updateAppendCache(tree, newPage, key, writeOffset, 1, isDelta)
+              return ok(some(SplitResult(promoted: key, newPage: newPage)))
+
+    # Fallback: scan the leaf to find the last key and append position.
     let scanRes = scanLeafLastKey(page)
     if scanRes.ok:
       let (lastKey, usedBytes, count) = scanRes.value
       if (count == 0 or key > lastKey):
-         let isDelta = byte(page[1]) == PageFlagDeltaKeys
-         # Delta-encode the key relative to the last key when using delta format
-         let encodedKey = if isDelta: key - lastKey else: key
-         let keyBytes = encodeVarint(encodedKey)
-         var ctrlBytes: seq[byte]
-         var valLen = 0
-         if leafOv != 0:
-            ctrlBytes = encodeVarint((uint64(leafOv) shl 1) or 1)
-         else:
+        let isDelta = byte(page[1]) == PageFlagDeltaKeys
+        # Delta-encode the key relative to the last key when using delta format
+        let encodedKey = if isDelta: key - lastKey else: key
+        var keyBuf: array[10, byte]
+        let keyLen = encodeVarintToBuf(encodedKey, keyBuf)
+        var ctrlBuf: array[10, byte]
+        var valLen = 0
+        let ctrlLen =
+          if leafOv != 0:
+            encodeVarintToBuf((uint64(leafOv) shl 1) or 1'u64, ctrlBuf)
+          else:
             valLen = leafVal.len
-            ctrlBytes = encodeVarint(uint64(valLen) shl 1)
-         
-         if usedBytes + keyBytes.len + ctrlBytes.len + valLen <= tree.pager.pageSize:
-             var newPage = page 
-             let newCount = uint16(count + 1)
-             newPage[2] = char(byte(newCount and 0xFF))
-             newPage[3] = char(byte((newCount shr 8) and 0xFF))
-             
-             var writeOffset = usedBytes
-             for b in keyBytes:
-               newPage[writeOffset] = char(b)
-               writeOffset.inc
-             for b in ctrlBytes:
-               newPage[writeOffset] = char(b)
-               writeOffset.inc
-             if valLen > 0:
-               copyMem(addr newPage[writeOffset], unsafeAddr leafVal[0], valLen)
-             
-             discard writePage(tree.pager, pageId, newPage)
-             return ok(none(SplitResult))
+            encodeVarintToBuf(uint64(valLen) shl 1, ctrlBuf)
+
+        if usedBytes + keyLen + ctrlLen + valLen <= tree.pager.pageSize:
+          if h.entry == nil or not h.pinned:
+            return err[Option[SplitResult]](ERR_INTERNAL, "Leaf page handle not cached", "page_id=" & $pageId)
+          let upRes = upgradeToRw(h)
+          if not upRes.ok:
+            return err[Option[SplitResult]](upRes.err.code, upRes.err.message, upRes.err.context)
+
+          let newCount = uint16(count + 1)
+          h.entry.data[2] = char(byte(newCount and 0xFF))
+          h.entry.data[3] = char(byte((newCount shr 8) and 0xFF))
+
+          var writeOffset = usedBytes
+          for i in 0 ..< keyLen:
+            h.entry.data[writeOffset] = char(keyBuf[i])
+            inc writeOffset
+          for i in 0 ..< ctrlLen:
+            h.entry.data[writeOffset] = char(ctrlBuf[i])
+            inc writeOffset
+          if valLen > 0:
+            copyMem(addr h.entry.data[writeOffset], unsafeAddr leafVal[0], valLen)
+            writeOffset += valLen
+
+          updateAppendCache(tree, pageId, key, writeOffset, count + 1, isDelta)
+          return ok(none(SplitResult))
+
+    # Not an append. Release the pinned handle before doing the slow path, which
+    # may call writePage() on this same page and would deadlock if we still hold
+    # entry.lock.
+    release(h)
 
     let parsed = readLeafCells(page)
     if not parsed.ok:
@@ -1395,9 +1786,17 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte],
       keys.add(key)
       values.add(leafVal)
       overflows.add(leafOv)
+    invalidateAppendCache(tree)
     let encodeRes = encodeLeaf(keys, values, overflows, nextLeaf, tree.pager.pageSize)
     if encodeRes.ok:
       discard writePage(tree.pager, pageId, encodeRes.value)
+      # Re-encoding invalidates the append cache. If this was an append to the
+      # rightmost leaf, re-establish the cache for the new page image.
+      if key == keys[^1] and nextLeaf == 0:
+        let scan2 = scanLeafLastKey(encodeRes.value)
+        if scan2.ok:
+          let (lastKey2, usedBytes2, count2) = scan2.value
+          updateAppendCache(tree, pageId, lastKey2, usedBytes2, count2, byte(encodeRes.value[1]) == PageFlagDeltaKeys)
       return ok(none(SplitResult))
 
     let splitRes = chooseLeafSplitPoint(keys, values, overflows, tree.pager.pageSize)
@@ -1422,7 +1821,18 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte],
     if not leftBufRes.ok:
       return err[Option[SplitResult]](leftBufRes.err.code, leftBufRes.err.message, leftBufRes.err.context)
     discard writePage(tree.pager, pageId, leftBufRes.value)
+    # After a leaf split, sequential inserts will continue on the rightmost leaf.
+    invalidateAppendCache(tree)
+    if nextLeaf == 0:
+      let scan3 = scanLeafLastKey(rightBufRes.value)
+      if scan3.ok:
+        let (lastKey3, usedBytes3, count3) = scan3.value
+        updateAppendCache(tree, newPage, lastKey3, usedBytes3, count3, byte(rightBufRes.value[1]) == PageFlagDeltaKeys)
     return ok(some(SplitResult(promoted: rightKeys[0], newPage: newPage)))
+
+  # Internal page: release the handle before descending.
+  release(h)
+
   let internalRes = readInternalCells(page)
   if not internalRes.ok:
     return err[Option[SplitResult]](internalRes.err.code, internalRes.err.message, internalRes.err.context)
@@ -1488,6 +1898,19 @@ proc insertRecursive(tree: BTree, pageId: PageId, key: uint64, value: seq[byte],
   ok(some(SplitResult(promoted: promoted, newPage: newPage)))
 
 proc insert*(tree: BTree, key: uint64, value: seq[byte], checkUnique: bool = false): Result[Void] =
+  when defined(bench_breakdown):
+    let t0 = getMonoTime()
+    defer:
+      if result.ok:
+        addBtreeTotalNs(int64(inNanoseconds(getMonoTime() - t0)))
+
+  let fastRes = tryAppendToCachedRightmostLeaf(tree, key, value)
+  if not fastRes.ok:
+    return err[Void](fastRes.err.code, fastRes.err.message, fastRes.err.context)
+  if fastRes.value:
+    return okVoid()
+
+  let oldRoot = tree.root
   let splitRes = insertRecursive(tree, tree.root, key, value, checkUnique)
   if not splitRes.ok:
     return err[Void](splitRes.err.code, splitRes.err.message, splitRes.err.context)
@@ -1505,9 +1928,14 @@ proc insert*(tree: BTree, key: uint64, value: seq[byte], checkUnique: bool = fal
       return err[Void](bufRes.err.code, bufRes.err.message, bufRes.err.context)
     discard writePage(tree.pager, newRoot, bufRes.value)
     tree.root = newRoot
+    # Preserve append cache across a root split.
+    if gAppendCache.len > 0 and gAppendCache.hasKey(oldRoot):
+      gAppendCache[newRoot] = gAppendCache[oldRoot]
+      gAppendCache.del(oldRoot)
   okVoid()
 
 proc update*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
+  invalidateAppendCache(tree)
   let leafRes = findLeaf(tree, key)
   if not leafRes.ok:
     return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)
@@ -1548,6 +1976,7 @@ proc update*(tree: BTree, key: uint64, value: seq[byte]): Result[Void] =
   err[Void](ERR_IO, "Key not found")
 
 proc delete*(tree: BTree, key: uint64): Result[Void] =
+  invalidateAppendCache(tree)
   let leafRes = findLeaf(tree, key)
   if not leafRes.ok:
     return err[Void](leafRes.err.code, leafRes.err.message, leafRes.err.context)

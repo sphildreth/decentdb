@@ -17,6 +17,7 @@ import ../../src/vfs/vfs
 import ../../src/version
 when defined(bench_breakdown):
   import ../../src/wal/wal
+  import ../../src/utils/bench_breakdown
 when defined(fused_join_sum_stats):
   import ../../src/exec/exec
 
@@ -283,7 +284,10 @@ proc runDecentDBInsert(outputDir: string) =
   let beginRes = execSql(db, "BEGIN")
   if not beginRes.ok:
     raise newException(IOError, "DecentDB insert benchmark BEGIN failed: " & beginRes.err.message)
-  
+
+  when defined(bench_breakdown):
+    resetInsertBenchBreakdown()
+
   for i in 1..iterations:
     let name = "User" & $i
     let email = "user" & $i & "@example.com"
@@ -298,6 +302,9 @@ proc runDecentDBInsert(outputDir: string) =
     let ns = nanosBetween(t0, t1)
     latenciesNs.add(ns)
     latencies.add(int(ns div 1000))
+
+  when defined(bench_breakdown):
+    echo formatInsertBenchBreakdown()
 
   let commitRes = execSql(db, "COMMIT")
   if not commitRes.ok:

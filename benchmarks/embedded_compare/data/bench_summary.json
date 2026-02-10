@@ -1,29 +1,29 @@
 {
   "engines": {
     "DecentDB": {
-      "commit_p95_ms": 3.015453,
-      "insert_rows_per_sec": 126728.256599374,
-      "join_p95_ms": 0.386556,
-      "read_p95_ms": 0.001242
+      "commit_p95_ms": 3.014993,
+      "insert_rows_per_sec": 138725.1161822848,
+      "join_p95_ms": 0.411453,
+      "read_p95_ms": 0.001232
     },
     "DuckDB": {
-      "commit_p95_ms": 12.097667,
-      "insert_rows_per_sec": 10822.8973545592,
-      "join_p95_ms": 1.780804,
-      "read_p95_ms": 0.211317
+      "commit_p95_ms": 12.055503,
+      "insert_rows_per_sec": 10786.49746247647,
+      "join_p95_ms": 1.608321,
+      "read_p95_ms": 0.195788
     },
     "SQLite": {
-      "commit_p95_ms": 3.01411,
-      "insert_rows_per_sec": 1106929.37790569,
-      "join_p95_ms": 0.377359,
-      "read_p95_ms": 0.002364
+      "commit_p95_ms": 3.016566,
+      "insert_rows_per_sec": 1109139.307897072,
+      "join_p95_ms": 0.387147,
+      "read_p95_ms": 0.001994
     }
   },
   "metadata": {
     "durability_profile": "safe",
     "machine": "batman (AMD Ryzen 9 3900X 12-Core Processor)",
     "notes": "Generated from raw benchmark outputs in benchmarks/embedded_compare/raw/sample",
-    "run_id": "20260209_172027",
+    "run_id": "20260209_181347",
     "units": {
       "commit_p95_ms": "ms (lower is better)",
       "insert_rows_per_sec": "rows/sec (higher is better)",
