@@ -26,6 +26,104 @@ from statistics import median
 from datetime import datetime, timezone
 
 
+def _safe_float(x):
+    if x is None:
+        return None
+    try:
+        if isinstance(x, bool):
+            return None
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_nearest(records, n_ops_target):
+    """Pick record with n_ops closest to target."""
+    best = None
+    best_dist = None
+    for r in records:
+        n = r.get("n_ops")
+        if n is None:
+            continue
+        dist = abs(int(n) - int(n_ops_target))
+        if best is None or dist < best_dist:
+            best = r
+            best_dist = dist
+    return best
+
+
+def merge_python_embedded_compare_results(engines, py_results_path):
+    """Merge additional engines from benchmarks/python_embedded_compare.
+
+    This is intentionally best-effort and only fills metrics we can derive.
+    Missing metrics remain absent (or null), and the chart generator will
+    omit those bars.
+    """
+    p = Path(py_results_path)
+    if not p.exists():
+        return False
+
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+
+    results = doc.get("results")
+    if not isinstance(results, list):
+        return False
+
+    # Map python engine names -> embedded_compare display names.
+    name_map = {
+        "H2(JDBC)": "H2",
+        "Derby(JDBC)": "Apache Derby",
+        "HSQLDB(JDBC)": "HSQLDB",
+        "LiteDB": "LiteDB",
+        "Firebird": "Firebird",
+    }
+
+    # Group python rows by (engine, bench)
+    grouped = defaultdict(list)
+    for row in results:
+        eng = row.get("engine")
+        bench = row.get("bench")
+        if not eng or not bench:
+            continue
+        grouped[(eng, bench)].append(row)
+
+    # We align to embedded_compare's point_read iterations=100000.
+    target_n_ops = 100_000
+
+    for (py_engine, py_bench), rows in grouped.items():
+        out_name = name_map.get(py_engine)
+        if out_name is None:
+            # Ignore SQLite variants / DecentDB / DuckDB from python run to
+            # avoid conflicting with native embedded_compare results.
+            continue
+
+        if out_name in ("SQLite", "DecentDB", "DuckDB"):
+            continue
+
+        if out_name not in engines:
+            engines[out_name] = {}
+
+        chosen = _pick_nearest(rows, target_n_ops)
+        if chosen is None:
+            continue
+
+        if py_bench == "point_select":
+            p95_us_per_op = _safe_float(chosen.get("p95_us_per_op"))
+            if p95_us_per_op is not None and p95_us_per_op != 0:
+                engines[out_name]["read_p95_ms"] = p95_us_per_op / 1000.0
+
+        elif py_bench == "insert_txn":
+            # Convert p50 us/op into rows/sec (higher is better).
+            p50_us_per_op = _safe_float(chosen.get("p50_us_per_op"))
+            if p50_us_per_op is not None and p50_us_per_op != 0:
+                engines[out_name]["insert_rows_per_sec"] = 1_000_000.0 / p50_us_per_op
+
+    return True
+
+
 def iter_records(paths):
     for p in paths:
         if p.suffix == ".json":
@@ -67,6 +165,11 @@ def main():
         "--output",
         default="benchmarks/embedded_compare/data/bench_summary.json",
         help="Output JSON path",
+    )
+    ap.add_argument(
+        "--python-embedded-compare-results",
+        default="benchmarks/python_embedded_compare/out/results_merged.json",
+        help="Optional results file from python_embedded_compare to merge extra engines",
     )
     args = ap.parse_args()
 
@@ -172,6 +275,13 @@ def main():
         },
         "engines": engines,
     }
+
+    merged = merge_python_embedded_compare_results(
+        result["engines"],
+        args.python_embedded_compare_results,
+    )
+    if merged:
+        result["metadata"]["notes"] += f"; merged extra engines from {args.python_embedded_compare_results}"
 
     outp.parent.mkdir(parents=True, exist_ok=True)
     with outp.open("w", encoding="utf-8") as f:

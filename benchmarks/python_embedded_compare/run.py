@@ -191,6 +191,45 @@ class DuckDbEngine(DbEngine):
         return duckdb.connect(db_path)
 
 
+class FirebirdEngine(DbEngine):
+    def __init__(self):
+        self.name = "Firebird"
+
+    def open(self, db_path: str):
+        # Optional: requires the `fdb` package and local Firebird client/embedded libs.
+        # For embedded mode, DSN is the file path.
+        import fdb
+
+        user = os.environ.get("FIREBIRD_USER", "sysdba")
+        password = os.environ.get("FIREBIRD_PASSWORD", "masterkey")
+        charset = os.environ.get("FIREBIRD_CHARSET", "UTF8")
+
+        # Create DB if needed.
+        if not os.path.exists(db_path):
+            try:
+                fdb.create_database(dsn=db_path, user=user, password=password, charset=charset)
+            except Exception:
+                # If create fails (e.g., permissions/embedded misconfig), fall back to connect.
+                pass
+
+        conn = fdb.connect(dsn=db_path, user=user, password=password, charset=charset)
+        try:
+            conn.autocommit = False
+        except Exception:
+            pass
+        return conn
+
+    def begin(self, conn) -> None:
+        # fdb uses implicit transaction start; explicit BEGIN may be unsupported.
+        try:
+            conn.begin()
+        except Exception:
+            pass
+
+    def commit(self, conn) -> None:
+        conn.commit()
+
+
 class JdbcEngine(DbEngine):
     def __init__(
         self,
@@ -256,6 +295,23 @@ def _rm_tree(path: str) -> None:
         return
 
 
+def _remove_db_files(db_path: str) -> None:
+    # Best-effort cleanup across engines (SQLite/DuckDB/JDBC/H2).
+    candidates = [
+        db_path,
+        db_path + "-wal",
+        db_path + "-shm",
+        db_path + ".mv.db",
+        db_path + ".trace.db",
+        db_path + ".lck",
+    ]
+    for p in candidates:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+
 def _manifest(extra: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -290,12 +346,7 @@ def _run_one(
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", engine.name)
     db_path = os.path.join(db_dir, f"bench_{safe_name}_{bench}_{n_ops}.db")
 
-    # Remove common sidecar files.
-    for p in [db_path, db_path + "-wal", db_path + "-shm", db_path + ".mv.db", db_path + ".trace.db", db_path + ".lck"]:
-        try:
-            os.remove(p)
-        except FileNotFoundError:
-            pass
+    _remove_db_files(db_path)
 
     conn = engine.open(db_path)
     try:
@@ -326,11 +377,7 @@ def _run_one(
             if bench == "insert_txn":
                 engine.close(conn)
                 # Start over
-                for p in [db_path, db_path + "-wal", db_path + "-shm"]:
-                    try:
-                        os.remove(p)
-                    except FileNotFoundError:
-                        pass
+                _remove_db_files(db_path)
                 conn = engine.open(db_path)
                 engine.setup_schema(conn)
 
@@ -343,11 +390,7 @@ def _run_one(
 
             if bench == "insert_txn":
                 engine.close(conn)
-                for p in [db_path, db_path + "-wal", db_path + "-shm"]:
-                    try:
-                        os.remove(p)
-                    except FileNotFoundError:
-                        pass
+                _remove_db_files(db_path)
                 conn = engine.open(db_path)
                 engine.setup_schema(conn)
 
@@ -434,6 +477,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         import duckdb  # noqa: F401
 
         engines.append(DuckDbEngine())
+    except Exception:
+        pass
+
+    # Firebird embedded (optional)
+    try:
+        import fdb  # noqa: F401
+
+        engines.append(FirebirdEngine())
     except Exception:
         pass
 
