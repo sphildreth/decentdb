@@ -181,15 +181,16 @@ proc shardFor(cache: PageCache, pageId: PageId): PageCacheShard =
   cache.shards[idx]
 
 proc invalidatePage*(pager: Pager, pageId: PageId) =
-  ## Invalidate a page in the cache if it is not dirty.
+  ## Invalidate a page in the cache if it is not dirty and not pinned.
   ## Used by checkpointing to ensure readers don't see stale cached pages
   ## after the DB file has been updated from WAL.
   let shard = shardFor(pager.cache, pageId)
   acquire(shard.lock)
   if shard.pages.hasKey(pageId):
     let entry = shard.pages[pageId]
-    if not entry.dirty:
-      # Only evict if not dirty. If dirty, it contains newer data than DB.
+    if not entry.dirty and entry.pinCount == 0:
+      # Only evict if not dirty and not pinned. Dirty pages contain newer data
+      # than DB. Pinned pages are actively referenced (e.g. by B-tree append cache).
       shard.pages.del(pageId)
       # Note: We don't remove from clock immediately (lazy removal via tombstones)
       # or we can iterate clock? Lazy is fine, evictIfNeeded handles missing entries.
@@ -470,8 +471,15 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
       perf.OverlayHits.inc()
+      when defined(pager_trace):
+        if pageId == PageId(70):
+          let cnt = if overlayRes.get.len >= 4 and byte(overlayRes.get[0]) == 2: int(uint16(byte(overlayRes.get[2])) or (uint16(byte(overlayRes.get[3])) shl 8)) else: -1
+          echo "withPageRo(", pageId, ") OVERLAY HIT: keyCount=", cnt
       return body(overlayRes.get)
     perf.OverlayMisses.inc()
+    when defined(pager_trace):
+      if pageId == PageId(70):
+        echo "withPageRo(", pageId, ") OVERLAY MISS"
     return withPageRoCached(pager, pageId, some(pager.overlaySnapshot), body)
   withPageRoCached(pager, pageId, none(uint64), body)
 
@@ -581,12 +589,20 @@ proc acquirePageRo*(pager: Pager, pageId: PageId): Result[PageHandle] =
           perf.OverlayHits.inc()
           let data = overlayRes.get
           acquire(entry.lock)
+          when defined(pager_trace):
+            if pageId == PageId(70):
+              let oldCnt = if entry.data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+              let newCnt = if data.len >= 4 and byte(data[0]) == 2: int(uint16(byte(data[2])) or (uint16(byte(data[3])) shl 8)) else: -1
+              echo "acquirePageRo(", pageId, ") OVERLAY HIT: oldKeyCount=", oldCnt, " newKeyCount=", newCnt, " dirty=", entry.dirty
           entry.data = data
           entry.lsn = high(uint64)
           entry.aux = nil
           release(entry.lock)
        else:
           perf.OverlayMisses.inc()
+          when defined(pager_trace):
+            if pageId == PageId(70):
+              echo "acquirePageRo(", pageId, ") OVERLAY MISS: dirty=", entry.dirty, " lsn=", entry.lsn
     
     acquire(entry.lock)
     # Snapshot isolation check
@@ -729,6 +745,10 @@ proc upgradeToRw*(handle: var PageHandle): Result[Void] =
   let pager = handle.pager
   let entry = handle.entry
   if not entry.dirty:
+    when defined(pager_trace):
+      if entry.id == PageId(70):
+        let cnt = if entry.data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+        echo "upgradeToRw(", entry.id, "): cloneString keyCount=", cnt, " pinCount=", entry.pinCount
     entry.data = cloneString(entry.data)
     entry.dirty = true
     entry.aux = nil
@@ -745,6 +765,11 @@ proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   let entry = pinRes.value
   acquire(entry.lock)
   let wasDirty = entry.dirty
+  when defined(pager_trace):
+    let oldCount = if data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+    let newCount = if data.len >= 4 and byte(data[0]) == 2: int(uint16(byte(data[2])) or (uint16(byte(data[3])) shl 8)) else: -1
+    if pageId == PageId(70):
+      echo "writePage(", pageId, "): oldCount=", oldCount, " newCount=", newCount, " wasDirty=", wasDirty, " entryId=", entry.id
   entry.data = data
   entry.dirty = true
   entry.aux = nil
@@ -817,8 +842,21 @@ proc snapshotSingleDirtyPage*(pager: Pager, pageId: PageId): (PageId, string) =
   if shard.pages.hasKey(pageId):
     let entry = shard.pages[pageId]
     acquire(entry.lock)
+    when defined(pager_trace):
+      if pageId == PageId(70):
+        let cnt = if entry.data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+        echo "snapshotSingleDirtyPage(", pageId, "): keyCount=", cnt, " dirty=", entry.dirty, " entryId=", entry.id
     result = (pageId, entry.data)
     release(entry.lock)
+  else:
+    when defined(pager_trace):
+      if pageId == PageId(70):
+        echo "snapshotSingleDirtyPage(", pageId, "): NOT IN CACHE! shard.len=", shard.pages.len, " shard.cap=", shard.capacity
+        # Dump all pages in this shard
+        var shardPages: seq[PageId] = @[]
+        for k, v in shard.pages:
+          shardPages.add(k)
+        echo "  shard pages: ", shardPages
   release(shard.lock)
 
 proc markPageCommitted*(pager: Pager, pageId: PageId, lsn: uint64) =

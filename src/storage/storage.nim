@@ -599,6 +599,17 @@ proc syncIndexRoot(catalog: Catalog, indexName: string, tree: BTree): Result[Voi
   okVoid()
 
 proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
+  # Fast path: check if any value could possibly need normalization.
+  # Values need normalization only if they are TEXT/BLOB with len > 128 (compression threshold).
+  let overflowThreshold = pager.pageSize - 128
+  var needsWork = false
+  for value in values:
+    if value.kind in {vkText, vkBlob} and value.bytes.len > 128:
+      needsWork = true
+      break
+  if not needsWork:
+    return ok(values)
+
   var resultValues: seq[Value] = @[]
   var changed = false
   for i, value in values:
@@ -606,7 +617,7 @@ proc normalizeValues*(pager: Pager, values: seq[Value]): Result[seq[Value]] =
     if value.kind in {vkText, vkBlob}:
       processedValue = compressValue(value)
 
-    if processedValue.kind in {vkText, vkBlob, vkTextCompressed, vkBlobCompressed} and processedValue.bytes.len > (pager.pageSize - 128):
+    if processedValue.kind in {vkText, vkBlob, vkTextCompressed, vkBlobCompressed} and processedValue.bytes.len > overflowThreshold:
       let pageRes = writeOverflowChain(pager, processedValue.bytes)
       if not pageRes.ok:
         return err[seq[Value]](pageRes.err.code, pageRes.err.message, pageRes.err.context)
@@ -693,7 +704,7 @@ proc scanTableEach*(pager: Pager, table: TableMeta, body: proc(row: StoredRow): 
       return cbRes
   okVoid()
 
-proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool): Result[uint64] =
+proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool, int64PkIdx: int = -2): Result[uint64] =
   when defined(bench_breakdown):
     let storStart = getMonoTime()
     var nsNormalize: int64 = 0
@@ -709,56 +720,78 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         addStorageBtreeInsertNs(nsBtree)
         addStorageTableMetaNs(nsMeta)
 
-  let tableRes = catalog.getTable(tableName)
-  if not tableRes.ok:
-    return err[uint64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-  var table = tableRes.value
-  if values.len != table.columns.len:
+  # Use pointer into catalog hash table to avoid copying TableMeta.
+  # Safe because we hold the writer lock and don't rehash catalog.tables.
+  let tablePtr = catalog.getTablePtr(tableName)
+  if tablePtr == nil:
+    return err[uint64](ERR_SQL, "Table not found", tableName)
+  if values.len != tablePtr.columns.len:
     return err[uint64](ERR_SQL, "Column count mismatch", tableName)
+  let origRootPage = tablePtr.rootPage
   
   var rowid: uint64 = 0
   var isExplicitRowId = false
   
-  # INT64 PK optimization: only applies to single-column PKs
-  var pkCount = 0
-  for col in table.columns:
-    if col.primaryKey:
-      inc pkCount
-  if pkCount <= 1:
-    for i, col in table.columns:
-      if col.primaryKey and col.kind == ctInt64:
-        if values[i].kind == vkInt64:
-          rowid = cast[uint64](values[i].int64Val)
-          isExplicitRowId = true
-        break
+  # INT64 PK optimization: use precomputed hint when available
+  if int64PkIdx >= 0:
+    # Fast path: single INT64 PK at known column index
+    if values[int64PkIdx].kind == vkInt64:
+      rowid = cast[uint64](values[int64PkIdx].int64Val)
+      isExplicitRowId = true
+  elif int64PkIdx == -2:
+    # No hint: detect PK columns dynamically
+    var pkCount = 0
+    for col in tablePtr.columns:
+      if col.primaryKey:
+        inc pkCount
+    if pkCount <= 1:
+      for i, col in tablePtr.columns:
+        if col.primaryKey and col.kind == ctInt64:
+          if values[i].kind == vkInt64:
+            rowid = cast[uint64](values[i].int64Val)
+            isExplicitRowId = true
+          break
+  # int64PkIdx == -1: no single INT64 PK, skip detection
   
   if not isExplicitRowId:
-    rowid = if table.nextRowId == 0: 1'u64 else: table.nextRowId
+    rowid = if tablePtr.nextRowId == 0: 1'u64 else: tablePtr.nextRowId
 
-  # Back-fill auto-assigned rowid into PK column so it's stored with the row
-  var storedValues = values
-  if not isExplicitRowId and pkCount <= 1:
-    for i, col in table.columns:
-      if col.primaryKey and col.kind == ctInt64:
-        storedValues[i] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
-        break
+  # Back-fill auto-assigned rowid into PK column so it's stored with the row.
+  # Avoid copying the values seq when no backfill is needed (explicit rowid case).
+  var storedValues: seq[Value]
+  if isExplicitRowId:
+    storedValues = values  # Nim ARC: move if last use, shallow copy otherwise
+  else:
+    storedValues = values
+    if int64PkIdx >= 0:
+      storedValues[int64PkIdx] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
+    elif int64PkIdx == -2:
+      var pkCount = 0
+      for col in tablePtr.columns:
+        if col.primaryKey:
+          inc pkCount
+      if pkCount <= 1:
+        for i, col in tablePtr.columns:
+          if col.primaryKey and col.kind == ctInt64:
+            storedValues[i] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
+            break
 
-  var indexKeys: seq[(IndexMeta, uint64, Value)] = @[]
-  var trigramValues: seq[(IndexMeta, Value)] = @[]
+  var indexKeys: seq[(IndexMeta, uint64, Value)]
+  var trigramValues: seq[(IndexMeta, Value)]
   if updateIndexes:
     for _, idx in catalog.indexes:
       if idx.table != tableName:
         continue
-      if not shouldIncludeInIndex(table, idx, storedValues):
+      if not shouldIncludeInIndex(tablePtr[], idx, storedValues):
         continue
       if idx.kind == ikBtree:
-        let keyRes = indexKeyForRow(table, idx, storedValues)
+        let keyRes = indexKeyForRow(tablePtr[], idx, storedValues)
         if not keyRes.ok:
           return err[uint64](keyRes.err.code, keyRes.err.message, keyRes.err.context)
         # Identify the value for TEXT/BLOB single-column indexes
         var idxValue = Value(kind: vkNull)
-        if isTextBlobIndex(table, idx) and idx.columns.len == 1:
-          for i, col in table.columns:
+        if isTextBlobIndex(tablePtr[], idx) and idx.columns.len == 1:
+          for i, col in tablePtr.columns:
             if col.name == idx.columns[0]:
               idxValue = storedValues[i]
               break
@@ -767,7 +800,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         # Trigram indexes are always single-column
         if idx.columns.len == 1:
           var valueIndex = -1
-          for i, col in table.columns:
+          for i, col in tablePtr.columns:
             if col.name == idx.columns[0]:
               valueIndex = i
               break
@@ -790,7 +823,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   else:
     record = encodeRecord(normalizedRes.value)
 
-  let tree = newBTree(pager, table.rootPage)
+  let tree = newBTree(pager, tablePtr.rootPage)
   var insertRes: Result[Void]
   when defined(bench_breakdown):
     let t2 = getMonoTime()
@@ -803,7 +836,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   if updateIndexes:
     for entry in indexKeys:
       let idxTree = newBTree(pager, entry[0].rootPage)
-      let textBlob = isTextBlobIndex(table, entry[0])
+      let textBlob = isTextBlobIndex(tablePtr[], entry[0])
       let idxInsert = insert(idxTree, entry[1], encodeIndexEntry(rowid, entry[2], textBlob))
       if not idxInsert.ok:
         return err[uint64](idxInsert.err.code, idxInsert.err.message, idxInsert.err.context)
@@ -820,36 +853,32 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   when defined(bench_breakdown):
     let t3 = getMonoTime()
     if isExplicitRowId:
-      if rowid >= table.nextRowId:
-        table.nextRowId = rowid + 1
+      if rowid >= tablePtr.nextRowId:
+        tablePtr.nextRowId = rowid + 1
     else:
-      table.nextRowId = rowid + 1
+      tablePtr.nextRowId = rowid + 1
 
-    table.rootPage = tree.root
+    tablePtr.rootPage = tree.root
 
-    if table.rootPage != tableRes.value.rootPage:
-      let saveRes = saveTable(catalog, pager, table)
+    if tablePtr.rootPage != origRootPage:
+      let saveRes = saveTable(catalog, pager, tablePtr[])
       if not saveRes.ok:
         return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-    else:
-      updateTableMeta(catalog, table)
     nsMeta = int64(inNanoseconds(getMonoTime() - t3))
     return ok(rowid)
   else:
     if isExplicitRowId:
-      if rowid >= table.nextRowId:
-        table.nextRowId = rowid + 1
+      if rowid >= tablePtr.nextRowId:
+        tablePtr.nextRowId = rowid + 1
     else:
-      table.nextRowId = rowid + 1
+      tablePtr.nextRowId = rowid + 1
 
-    table.rootPage = tree.root
+    tablePtr.rootPage = tree.root
 
-    if table.rootPage != tableRes.value.rootPage:
-      let saveRes = saveTable(catalog, pager, table)
+    if tablePtr.rootPage != origRootPage:
+      let saveRes = saveTable(catalog, pager, tablePtr[])
       if not saveRes.ok:
         return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-    else:
-      updateTableMeta(catalog, table)
 
     ok(rowid)
 
@@ -860,6 +889,10 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
       hasIndexes = true
       break
   insertRowInternal(pager, catalog, tableName, values, hasIndexes)
+
+proc insertRowWithHint*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], hasIndexes: bool, int64PkIdx: int = -2): Result[uint64] =
+  ## Insert with precomputed hints. int64PkIdx: -2 = unknown, -1 = no single INT64 PK, >= 0 = column index
+  insertRowInternal(pager, catalog, tableName, values, hasIndexes, int64PkIdx)
 
 proc insertRowNoIndexes*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
   insertRowInternal(pager, catalog, tableName, values, false)

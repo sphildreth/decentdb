@@ -56,6 +56,18 @@ type UpdateWriteProfile* = object
   updatesIndexedColumns*: bool
   isSimpleUpdate*: bool
 
+type InsertWriteProfile* = object
+  valid*: bool                     ## true when profile has been computed
+  hasChecks*: bool                 ## table has CHECK constraints
+  hasForeignKeys*: bool            ## any column has FK references
+  hasNonPkUniqueColumns*: bool     ## UNIQUE columns besides INT64 PK exist
+  hasCompositeUniqueIndexes*: bool ## multi-column unique indexes exist
+  hasSecondaryIndexes*: bool       ## table has secondary indexes
+  isView*: bool                    ## target is a view (needs INSTEAD triggers)
+  hasInsertTriggers*: bool         ## table has AFTER INSERT triggers
+  singleInt64PkIdx*: int          ## column index of single INT64 PK (-1 if none/composite)
+  allParamIndices*: seq[int]       ## param indices when all insert values are direct params (empty = slow path)
+
 type Prepared* = ref object
   db*: Db
   sql*: string
@@ -63,6 +75,7 @@ type Prepared* = ref object
   statements*: seq[Statement]
   plans*: seq[Plan]
   updateProfiles*: seq[UpdateWriteProfile]
+  insertProfiles*: seq[InsertWriteProfile]
 
 type DurabilityMode* = enum
   dmFull
@@ -382,6 +395,19 @@ proc typeCheckValue(col: Column, value: Value): Result[Value] =
        if value.bytes.len == 16: return ok(value)
        return err[Value](ERR_CONSTRAINT, "UUID must be 16 bytes")
     return err[Value](ERR_SQL, "Type mismatch: expected UUID")
+
+proc typeCheckFast(col: Column, value: Value): bool {.inline.} =
+  ## Returns true if value trivially matches the column type (no conversion needed).
+  if value.kind == vkNull:
+    return true
+  case col.kind
+  of ctInt64: value.kind == vkInt64
+  of ctBool: value.kind == vkBool
+  of ctFloat64: value.kind == vkFloat64
+  of ctText: value.kind == vkText
+  of ctBlob: value.kind == vkBlob
+  of ctDecimal: value.kind == vkDecimal and value.decimalScale == col.decScale
+  of ctUuid: value.kind == vkBlob and value.bytes.len == 16
 
 proc valuesEqual(a: Value, b: Value): bool =
   if a.kind == vkNull and b.kind == vkNull:
@@ -1437,7 +1463,7 @@ proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
 
-proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: bool): Result[InsertExecResult] =
+proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: bool, profile: InsertWriteProfile = InsertWriteProfile()): Result[InsertExecResult] =
   when defined(bench_breakdown):
     let engStart = getMonoTime()
     var nsEvalValues: int64 = 0
@@ -1453,53 +1479,70 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
         addEngineConstraintsNs(nsConstraints)
         addEngineStorageCallNs(nsStorage)
 
-  let tableRes = db.catalog.getTable(bound.insertTable)
-  if not tableRes.ok:
-    return err[InsertExecResult](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-  let table = tableRes.value
+  let tablePtr = db.catalog.getTablePtr(bound.insertTable)
+  if tablePtr == nil:
+    return err[InsertExecResult](ERR_SQL, "Table not found", bound.insertTable)
+  template table: untyped = tablePtr[]
 
-  var valuesRes: Result[seq[Value]]
+  var values: seq[Value]
   when defined(bench_breakdown):
     let t0 = getMonoTime()
-    valuesRes = evalInsertValues(bound, params)
+    if profile.valid and profile.allParamIndices.len > 0:
+      values = newSeq[Value](profile.allParamIndices.len)
+      for i, paramIdx in profile.allParamIndices:
+        values[i] = params[paramIdx]
+    else:
+      let valuesRes = evalInsertValues(bound, params)
+      if not valuesRes.ok:
+        return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
+      values = valuesRes.value
     nsEvalValues = int64(inNanoseconds(getMonoTime() - t0))
   else:
-    valuesRes = evalInsertValues(bound, params)
-  if not valuesRes.ok:
-    return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-  var values = valuesRes.value
+    if profile.valid and profile.allParamIndices.len > 0:
+      values = newSeq[Value](profile.allParamIndices.len)
+      for i, paramIdx in profile.allParamIndices:
+        values[i] = params[paramIdx]
+    else:
+      let valuesRes = evalInsertValues(bound, params)
+      if not valuesRes.ok:
+        return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
+      values = valuesRes.value
 
   when defined(bench_breakdown):
     let t1 = getMonoTime()
     for i, col in table.columns:
-      let typeRes = typeCheckValue(col, values[i])
-      if not typeRes.ok:
-        return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
-      values[i] = typeRes.value
+      if not typeCheckFast(col, values[i]):
+        let typeRes = typeCheckValue(col, values[i])
+        if not typeRes.ok:
+          return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
+        values[i] = typeRes.value
     nsTypeCheck = int64(inNanoseconds(getMonoTime() - t1))
   else:
     for i, col in table.columns:
-      let typeRes = typeCheckValue(col, values[i])
-      if not typeRes.ok:
-        return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
-      values[i] = typeRes.value
+      if not typeCheckFast(col, values[i]):
+        let typeRes = typeCheckValue(col, values[i])
+        if not typeRes.ok:
+          return err[InsertExecResult](typeRes.err.code, typeRes.err.message, col.name)
+        values[i] = typeRes.value
 
   when defined(bench_breakdown):
     let t2 = getMonoTime()
     let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
     if not notNullRes.ok:
       return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-    let checkRes = enforceChecks(table, values)
-    if not checkRes.ok:
-      return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+    if not profile.valid or profile.hasChecks:
+      let checkRes = enforceChecks(table, values)
+      if not checkRes.ok:
+        return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
     nsConstraints += int64(inNanoseconds(getMonoTime() - t2))
   else:
     let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
     if not notNullRes.ok:
       return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
-    let checkRes = enforceChecks(table, values)
-    if not checkRes.ok:
-      return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
+    if not profile.valid or profile.hasChecks:
+      let checkRes = enforceChecks(table, values)
+      if not checkRes.ok:
+        return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
 
   case bound.insertConflictAction
   of icaDoNothing:
@@ -1603,17 +1646,22 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
 
   when defined(bench_breakdown):
     let t3 = getMonoTime()
-    let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
-    if not uniqueRes.ok:
-      return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+    if not profile.valid or profile.hasNonPkUniqueColumns or profile.hasCompositeUniqueIndexes:
+      let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
+      if not uniqueRes.ok:
+        return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
 
-    let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
-    if not fkRes.ok:
-      return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    if not profile.valid or profile.hasForeignKeys:
+      let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+      if not fkRes.ok:
+        return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
     nsConstraints += int64(inNanoseconds(getMonoTime() - t3))
 
     let t4 = getMonoTime()
-    let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+    let insertRes = if profile.valid:
+        insertRowWithHint(db.pager, db.catalog, bound.insertTable, values, profile.hasSecondaryIndexes, profile.singleInt64PkIdx)
+      else:
+        insertRow(db.pager, db.catalog, bound.insertTable, values)
     nsStorage = int64(inNanoseconds(getMonoTime() - t4))
     if not insertRes.ok:
       if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
@@ -1633,15 +1681,20 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
     else:
       return ok(InsertExecResult(affected: true, row: none(Row)))
   else:
-    let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
-    if not uniqueRes.ok:
-      return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
+    if not profile.valid or profile.hasNonPkUniqueColumns or profile.hasCompositeUniqueIndexes:
+      let uniqueRes = enforceUnique(db.catalog, db.pager, table, values)
+      if not uniqueRes.ok:
+        return err[InsertExecResult](uniqueRes.err.code, uniqueRes.err.message, uniqueRes.err.context)
 
-    let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
-    if not fkRes.ok:
-      return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
+    if not profile.valid or profile.hasForeignKeys:
+      let fkRes = enforceForeignKeys(db.catalog, db.pager, table, values)
+      if not fkRes.ok:
+        return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
 
-    let insertRes = insertRow(db.pager, db.catalog, bound.insertTable, values)
+    let insertRes = if profile.valid:
+        insertRowWithHint(db.pager, db.catalog, bound.insertTable, values, profile.hasSecondaryIndexes, profile.singleInt64PkIdx)
+      else:
+        insertRow(db.pager, db.catalog, bound.insertTable, values)
   if not insertRes.ok:
     if bound.insertConflictAction == icaDoNothing and bound.insertConflictTargetCols.len == 0 and isUniqueConflictError(insertRes.err):
       return ok(InsertExecResult(affected: false, row: none(Row)))
@@ -1659,19 +1712,19 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
     ))
   ok(InsertExecResult(affected: true, row: none(Row)))
 
-proc execInsertRowExprs(db: Db, bound: Statement, exprs: seq[Expr], params: seq[Value], wantRow: bool): Result[InsertExecResult] =
+proc execInsertRowExprs(db: Db, bound: Statement, exprs: seq[Expr], params: seq[Value], wantRow: bool, profile: InsertWriteProfile = InsertWriteProfile()): Result[InsertExecResult] =
   ## Execute INSERT for a single extra row (multi-row INSERT VALUES).
   ## Builds a temporary statement with the given exprs as insertValues.
   var rowBound = bound
   rowBound.insertValues = exprs
   rowBound.insertValueRows = @[]
-  execInsertStatement(db, rowBound, params, wantRow)
+  execInsertStatement(db, rowBound, params, wantRow, profile)
 
-proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value], wantRows: bool): Result[MultiInsertResult] =
+proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value], wantRows: bool, profile: InsertWriteProfile = InsertWriteProfile()): Result[MultiInsertResult] =
   ## Execute all rows of a multi-row INSERT, returning total affected and result rows.
   var multi = MultiInsertResult(totalAffected: 0, rows: @[])
   # First row (from insertValues)
-  let firstRes = execInsertStatement(db, bound, params, wantRows)
+  let firstRes = execInsertStatement(db, bound, params, wantRows, profile)
   if not firstRes.ok:
     return err[MultiInsertResult](firstRes.err.code, firstRes.err.message, firstRes.err.context)
   if firstRes.value.affected:
@@ -1680,7 +1733,7 @@ proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value], wantRows: b
     multi.rows.add(firstRes.value.row.get)
   # Extra rows (from insertValueRows)
   for extraExprs in bound.insertValueRows:
-    let extraRes = execInsertRowExprs(db, bound, extraExprs, params, wantRows)
+    let extraRes = execInsertRowExprs(db, bound, extraExprs, params, wantRows, profile)
     if not extraRes.ok:
       return err[MultiInsertResult](extraRes.err.code, extraRes.err.message, extraRes.err.context)
     if extraRes.value.affected:
@@ -1737,6 +1790,45 @@ proc buildUpdateWriteProfile(catalog: Catalog, table: TableMeta, assignments: Ta
     not result.isParentOfForeignKeys and
     not result.updatesIndexedColumns
 
+proc buildInsertWriteProfile(catalog: Catalog, tableName: string): InsertWriteProfile =
+  result.valid = true
+  result.singleInt64PkIdx = -1
+  result.isView = catalog.hasViewName(tableName)
+  if result.isView:
+    return
+  let tableRes = catalog.getTable(tableName)
+  if not tableRes.ok:
+    return
+  let table = tableRes.value
+  result.hasChecks = table.checks.len > 0
+  result.hasInsertTriggers = catalog.hasTriggersForTable(tableName, TriggerEventInsertMask)
+  # Check for FK refs and non-PK unique columns
+  var pkCount = 0
+  for col in table.columns:
+    if col.primaryKey:
+      inc pkCount
+  for i, col in table.columns:
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      result.hasForeignKeys = true
+    if col.unique and not col.primaryKey:
+      result.hasNonPkUniqueColumns = true
+    if col.primaryKey and pkCount == 1 and col.kind != ctInt64:
+      # Non-INT64 PK: btree won't enforce uniqueness, need enforceUnique
+      result.hasNonPkUniqueColumns = true
+    if col.primaryKey and pkCount > 1:
+      # Composite PK: handled by composite unique index check
+      result.hasNonPkUniqueColumns = true
+    if col.primaryKey and pkCount == 1 and col.kind == ctInt64:
+      result.singleInt64PkIdx = i
+      # INT64 PK uniqueness is enforced by btree.insert(checkUnique=true)
+  # Check for composite unique indexes
+  for _, idx in catalog.indexes:
+    if idx.table != tableName:
+      continue
+    result.hasSecondaryIndexes = true
+    if idx.columns.len >= 2 and idx.unique:
+      result.hasCompositeUniqueIndexes = true
+
 proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   if not db.isOpen:
     return err[Prepared](ERR_INTERNAL, "Database not open")
@@ -1748,6 +1840,7 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   var boundStatements: seq[Statement] = @[]
   var plans: seq[Plan] = @[]
   var updateProfiles: seq[UpdateWriteProfile] = @[]
+  var insertProfiles: seq[InsertWriteProfile] = @[]
 
   for stmt in parseRes.value.statements:
     let bindRes = bindStatement(db.catalog, stmt)
@@ -1756,6 +1849,22 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
     let bound = bindRes.value
     boundStatements.add(bound)
     updateProfiles.add(UpdateWriteProfile())
+    if bound.kind == skInsert:
+      var profile = buildInsertWriteProfile(db.catalog, bound.insertTable)
+      # Precompute param index mapping for fast eval
+      if bound.insertValues.len > 0:
+        var indices = newSeq[int](bound.insertValues.len)
+        var allParams = true
+        for i, expr in bound.insertValues:
+          if expr.kind != ekParam or expr.index < 1:
+            allParams = false
+            break
+          indices[i] = expr.index - 1
+        if allParams:
+          profile.allParamIndices = indices
+      insertProfiles.add(profile)
+    else:
+      insertProfiles.add(InsertWriteProfile())
 
     if bound.kind == skSelect:
       let planRes = plan(db.catalog, bound)
@@ -1829,7 +1938,8 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
     schemaCookie: db.schemaCookie,
     statements: boundStatements,
     plans: plans,
-    updateProfiles: updateProfiles
+    updateProfiles: updateProfiles,
+    insertProfiles: insertProfiles
   ))
 
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
@@ -1905,6 +2015,7 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
     prepared.statements = newPrep.statements
     prepared.plans = newPrep.plans
     prepared.updateProfiles = newPrep.updateProfiles
+    prepared.insertProfiles = newPrep.insertProfiles
 
   let db = prepared.db
   var output: seq[string] = @[]
@@ -1962,18 +2073,29 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
           break
       output.add(rows.join("\n"))
     of skInsert:
-      if db.catalog.hasViewName(bound.insertTable):
+      let insertProfile =
+        if i < prepared.insertProfiles.len:
+          prepared.insertProfiles[i]
+        else:
+          InsertWriteProfile()
+      if insertProfile.valid and insertProfile.isView:
+        let rowCount = int64(1 + bound.insertValueRows.len)
+        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
+        if not insteadRes.ok:
+          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+      elif not insertProfile.valid and db.catalog.hasViewName(bound.insertTable):
         let rowCount = int64(1 + bound.insertValueRows.len)
         let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
         if not insteadRes.ok:
           return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
       else:
-        let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0)
+        let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0, profile = insertProfile)
         if not multiRes.ok:
           return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
-        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
-        if not triggerRes.ok:
-          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+        if not insertProfile.valid or insertProfile.hasInsertTriggers:
+          let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
+          if not triggerRes.ok:
+            return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
         if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
           let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
           if not projectedRes.ok:
@@ -3815,6 +3937,8 @@ proc commitTransaction*(db: Db): Result[Void] =
 
   # Fast path: single dirty page avoids snapshotDirtyPages scan + allocation
   let dirtyCount = db.pager.txnDirtyCount
+  when defined(pager_trace):
+    echo "commitTransaction: dirtyCount=", dirtyCount, " lastDirtyId=", db.pager.txnLastDirtyId
   if dirtyCount == 1:
     let dirtyId = db.pager.txnLastDirtyId
     let (pageId, pageData) = snapshotSingleDirtyPage(db.pager, dirtyId)

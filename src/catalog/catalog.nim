@@ -569,6 +569,13 @@ proc updateTableMeta*(catalog: Catalog, table: TableMeta) =
   ## Use with caution: changes will be lost on crash if not followed by saveTable eventually.
   catalog.tables[table.name] = table
 
+proc updateTableMetaFast*(catalog: Catalog, tableName: string, nextRowId: uint64, rootPage: PageId) {.inline.} =
+  ## Updates only nextRowId and rootPage in the in-memory table metadata.
+  ## Avoids copying the entire TableMeta struct when only these fields change.
+  catalog.tables.withValue(tableName, entry):
+    entry.nextRowId = nextRowId
+    entry.rootPage = rootPage
+
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
   var rebuildFk = true
   if catalog.tables.hasKey(table.name):
@@ -600,6 +607,13 @@ proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
   if not catalog.tables.hasKey(name):
     return err[TableMeta](ERR_SQL, "Table not found", name)
   ok(catalog.tables[name])
+
+proc getTablePtr*(catalog: Catalog, name: string): ptr TableMeta =
+  ## Returns a mutable pointer into the catalog table map. Caller must not
+  ## hold this across operations that could rehash catalog.tables.
+  catalog.tables.withValue(name, v):
+    return addr v[]
+  return nil
 
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   catalog.indexes[index.name] = index
