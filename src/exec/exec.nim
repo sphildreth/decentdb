@@ -873,7 +873,9 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     if isNone(indexOpt):
       return err[RowCursor](ERR_SQL, "Index not found", plan.table & "." & plan.column)
     let idx = indexOpt.get
+    let textBlob = isTextBlobIndex(table, idx)
     let needle = indexKeyFromValue(valueRes.value)
+    let needleBytes = if textBlob and valueRes.value.kind in {vkText, vkBlob}: valueRes.value.bytes else: @[]
     let idxTree = newBTree(pager, idx.rootPage)
     let idxCursorRes = openCursorAt(idxTree, needle)
     if not idxCursorRes.ok:
@@ -883,10 +885,6 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     var cols: seq[string] = @[]
     for col in table.columns:
       cols.add(prefix & "." & col.name)
-    proc decodeRowIdBytes(data: seq[byte]): Result[uint64] =
-      if data.len < 8:
-        return err[uint64](ERR_CORRUPTION, "Index rowid payload too short")
-      ok(readU64LE(data, 0))
     let c = RowCursor(
       columns: cols,
       nextFn: proc(): Result[Option[Row]] =
@@ -898,14 +896,15 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
             continue
           if nextRes.value[0] > needle:
             return ok(none(Row))
-          let rowidRes = decodeRowIdBytes(nextRes.value[1])
-          if not rowidRes.ok:
-            # Skip corrupt rowid payloads.
+          let entryRes = decodeIndexEntry(nextRes.value[1], textBlob)
+          if not entryRes.ok:
             continue
-          let readRes = readRowAt(pager, table, rowidRes.value)
+          if textBlob and entryRes.value.valueBytes != needleBytes:
+            continue
+          let readRes = readRowAt(pager, table, entryRes.value.rowid)
           if not readRes.ok:
             continue
-          return ok(some(makeRow(cols, readRes.value.values, rowidRes.value)))
+          return ok(some(makeRow(cols, readRes.value.values, entryRes.value.rowid)))
     )
     ok(c)
 
@@ -1133,14 +1132,20 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:
       return err[Option[int64]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
-    # Only safe for non-hashed key types.
-    if valueRes.value.kind notin {vkInt64, vkBool, vkFloat64}:
-      return ok(none(int64))
+    let tableRes2 = catalog.getTable(plan.table)
+    if not tableRes2.ok:
+      return err[Option[int64]](tableRes2.err.code, tableRes2.err.message, tableRes2.err.context)
     let indexOpt = catalog.getBtreeIndexForColumn(plan.table, plan.column)
     if isNone(indexOpt):
       return err[Option[int64]](ERR_SQL, "Index not found", plan.table & "." & plan.column)
     let idx = indexOpt.get
+    let textBlob = isTextBlobIndex(tableRes2.value, idx)
+    # For non-TEXT/BLOB types, key comparison is sufficient.
+    # For TEXT/BLOB types, we need to compare embedded values.
+    if not textBlob and valueRes.value.kind notin {vkInt64, vkBool, vkFloat64}:
+      return ok(none(int64))
     let needle = indexKeyFromValue(valueRes.value)
+    let needleBytes = if textBlob and valueRes.value.kind in {vkText, vkBlob}: valueRes.value.bytes else: @[]
     let tB = getMonoTime()
     let idxTree = newBTree(pager, idx.rootPage)
     let idxCursorRes = openCursorAt(idxTree, needle)
@@ -1158,7 +1163,12 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
         continue
       if key > needle:
         break
-      count.inc
+      if textBlob:
+        let entryRes = decodeIndexEntry(nextRes.value[1], true)
+        if entryRes.ok and entryRes.value.valueBytes == needleBytes:
+          count.inc
+      else:
+        count.inc
     let tD = getMonoTime()
     if (tD - tA).inNanoseconds > 1000:
        stderr.writeLine("Seek: Eval=" & $((tB - tA).inNanoseconds) & "ns Open=" & $((tC - tB).inNanoseconds) & "ns Scan=" & $((tD - tC).inNanoseconds) & "ns")
@@ -1329,7 +1339,7 @@ proc estimateRowBytes*(row: Row): int =
     result.inc
     var payloadLen = 0
     case value.kind
-    of vkNull:
+    of vkNull, vkBoolFalse, vkBoolTrue, vkInt0, vkInt1:
       payloadLen = 0
     of vkBool:
       payloadLen = 1
@@ -1572,7 +1582,7 @@ proc hash*(v: Value): Hash =
   var h: Hash = 0
   h = h !& hash(v.kind)
   case v.kind
-  of vkNull: discard
+  of vkNull, vkBoolFalse, vkBoolTrue, vkInt0, vkInt1: discard
   of vkBool: h = h !& hash(v.boolVal)
   of vkInt64: h = h !& hash(v.int64Val)
   of vkFloat64: h = h !& hash(v.float64Val)
@@ -2682,11 +2692,16 @@ proc tryFuseJoinSumAggregate(
         return ok(none(seq[Row]))
       if kindK == vkNull:
         continue
-      if kindK != vkInt64:
-        continue
       var key: int64 = 0
-      if not parseInt64PayloadStr(leafPage, payStartK, payLenK, key):
-        return ok(none(seq[Row]))
+      if kindK == vkInt0:
+        key = 0
+      elif kindK == vkInt1:
+        key = 1
+      elif kindK == vkInt64:
+        if not parseInt64PayloadStr(leafPage, payStartK, payLenK, key):
+          return ok(none(seq[Row]))
+      else:
+        continue
       if key < 0 or key > maxDenseKey:
         continue
       if int(key) >= namesPresent.len or not namesPresent[int(key)]:
@@ -2702,6 +2717,10 @@ proc tryFuseJoinSumAggregate(
       case kindAmt
       of vkNull:
         addVal = 0.0
+      of vkInt0:
+        addVal = 0.0
+      of vkInt1:
+        addVal = 1.0
       of vkInt64:
         var tmp: int64 = 0
         if not parseInt64PayloadStr(leafPage, payStartA, payLenA, tmp):
@@ -3391,7 +3410,8 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       # Must match evalExpr "=" semantics. Float NaN corner cases make VkFloat64 risky.
       case v.kind
       of vkNull, vkBool, vkInt64, vkDecimal, vkText, vkBlob, vkTextCompressed, vkBlobCompressed,
-         vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+         vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow,
+         vkBoolFalse, vkBoolTrue, vkInt0, vkInt1:
         # Overflow values have additional state (overflowPage/overflowLen) and may not compare
         # equal to their materialized counterpart; keep them out of hash join for correctness.
         v.overflowLen == 0'u32 and v.overflowPage == PageId(0)

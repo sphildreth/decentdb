@@ -9,6 +9,11 @@ import sets
 import ./db_header
 import ../utils/perf
 
+when defined(bench_breakdown):
+  import std/monotimes
+  import times
+  import ../utils/bench_breakdown
+
 type PageId* = uint32
 type PageOverlay* = proc(pageId: PageId): Option[string]
 type ReadGuard* = proc(): Result[Void]
@@ -56,6 +61,8 @@ type Pager* = ref object
   # Optimization: Track dirty page count during transaction to enable single-page fast path
   txnDirtyCount*: int              # Number of pages dirtied in current transaction
   txnLastDirtyId*: PageId          # Last page marked dirty (valid when txnDirtyCount >= 1)
+  txnDirtyPages*: seq[PageId]      # All pages dirtied in current transaction (for fast commit)
+  preExtendedSize: int64           # File has been ftruncated to at least this many bytes
 
 type PageHandle* = object
   pager*: Pager
@@ -112,7 +119,7 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
     return err[Pager](ERR_CORRUPTION, "File size not aligned to page size", file.path)
   let count = if fileInfo.size == 0: 0'u32 else: uint32(fileInfo.size div pageSize)
   let cache = newPageCache(cachePages)
-  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0)
+  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0, preExtendedSize: fileInfo.size)
   pager.overriddenPages = initHashSet[PageId]()
   initLock(pager.lock)
   initLock(pager.overlayLock)
@@ -176,15 +183,16 @@ proc shardFor(cache: PageCache, pageId: PageId): PageCacheShard =
   cache.shards[idx]
 
 proc invalidatePage*(pager: Pager, pageId: PageId) =
-  ## Invalidate a page in the cache if it is not dirty.
+  ## Invalidate a page in the cache if it is not dirty and not pinned.
   ## Used by checkpointing to ensure readers don't see stale cached pages
   ## after the DB file has been updated from WAL.
   let shard = shardFor(pager.cache, pageId)
   acquire(shard.lock)
   if shard.pages.hasKey(pageId):
     let entry = shard.pages[pageId]
-    if not entry.dirty:
-      # Only evict if not dirty. If dirty, it contains newer data than DB.
+    if not entry.dirty and entry.pinCount == 0:
+      # Only evict if not dirty and not pinned. Dirty pages contain newer data
+      # than DB. Pinned pages are actively referenced (e.g. by B-tree append cache).
       shard.pages.del(pageId)
       # Note: We don't remove from clock immediately (lazy removal via tombstones)
       # or we can iterate clock? Lazy is fine, evictIfNeeded handles missing entries.
@@ -357,6 +365,7 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
   if dirty and not entry.dirty:
     entry.dirty = true
     pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(entry.id)
     pager.txnLastDirtyId = entry.id
   elif dirty:
     # Already dirty — still update last dirty ID (may be same page re-dirtied)
@@ -365,7 +374,7 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[string]
 
-proc cloneString(buf: string): string =
+proc cloneString*(buf: string): string =
   if buf.len == 0:
     return ""
   result = newString(buf.len)
@@ -465,8 +474,15 @@ proc withPageRo*[T](pager: Pager, pageId: PageId, body: proc(page: string): Resu
     let overlayRes = pager.overlay(pageId)
     if overlayRes.isSome:
       perf.OverlayHits.inc()
+      when defined(pager_trace):
+        if pageId == PageId(70):
+          let cnt = if overlayRes.get.len >= 4 and byte(overlayRes.get[0]) == 2: int(uint16(byte(overlayRes.get[2])) or (uint16(byte(overlayRes.get[3])) shl 8)) else: -1
+          echo "withPageRo(", pageId, ") OVERLAY HIT: keyCount=", cnt
       return body(overlayRes.get)
     perf.OverlayMisses.inc()
+    when defined(pager_trace):
+      if pageId == PageId(70):
+        echo "withPageRo(", pageId, ") OVERLAY MISS"
     return withPageRoCached(pager, pageId, some(pager.overlaySnapshot), body)
   withPageRoCached(pager, pageId, none(uint64), body)
 
@@ -576,12 +592,20 @@ proc acquirePageRo*(pager: Pager, pageId: PageId): Result[PageHandle] =
           perf.OverlayHits.inc()
           let data = overlayRes.get
           acquire(entry.lock)
+          when defined(pager_trace):
+            if pageId == PageId(70):
+              let oldCnt = if entry.data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+              let newCnt = if data.len >= 4 and byte(data[0]) == 2: int(uint16(byte(data[2])) or (uint16(byte(data[3])) shl 8)) else: -1
+              echo "acquirePageRo(", pageId, ") OVERLAY HIT: oldKeyCount=", oldCnt, " newKeyCount=", newCnt, " dirty=", entry.dirty
           entry.data = data
           entry.lsn = high(uint64)
           entry.aux = nil
           release(entry.lock)
        else:
           perf.OverlayMisses.inc()
+          when defined(pager_trace):
+            if pageId == PageId(70):
+              echo "acquirePageRo(", pageId, ") OVERLAY MISS: dirty=", entry.dirty, " lsn=", entry.lsn
     
     acquire(entry.lock)
     # Snapshot isolation check
@@ -682,7 +706,62 @@ proc release*(handle: var PageHandle) =
     handle.pinned = false
     handle.entry = nil
 
-proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
+proc acquirePageRw*(pager: Pager, pageId: PageId): Result[PageHandle] =
+  ## Acquire a mutable handle to a page.
+  ##
+  ## On the first write to a clean cached page, this clones the page buffer
+  ## (copy-on-first-write) so any previously borrowed read-only views remain
+  ## valid and immutable.
+  ##
+  ## Caller MUST call release() on the returned handle.
+  if pager.rollbackInProgress.load(moAcquire):
+    acquire(pager.rollbackLock)
+    release(pager.rollbackLock)
+
+  let pinRes = pinPage(pager, pageId)
+  if not pinRes.ok:
+    return err[PageHandle](pinRes.err.code, pinRes.err.message, pinRes.err.context)
+  let entry = pinRes.value
+
+  acquire(entry.lock)
+  if not entry.dirty:
+    entry.data = cloneString(entry.data)
+    entry.dirty = true
+    entry.aux = nil
+    pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(pageId)
+  pager.txnLastDirtyId = pageId
+
+  ok(PageHandle(pager: pager, entry: entry, pinned: true))
+
+proc upgradeToRw*(handle: var PageHandle): Result[Void] =
+  ## Upgrade an already-acquired page handle to writable.
+  ##
+  ## The handle must be pinned and have the entry lock held (i.e. created via
+  ## acquirePageRo/acquirePageRw). This avoids re-pinning/re-locking the page.
+  when defined(bench_breakdown):
+    let t0 = getMonoTime()
+    defer:
+      if result.ok:
+        addPagerUpgradeNs(int64(inNanoseconds(getMonoTime() - t0)))
+  if handle.entry == nil or not handle.pinned:
+    return err[Void](ERR_INTERNAL, "Cannot upgrade non-cached page handle")
+  let pager = handle.pager
+  let entry = handle.entry
+  if not entry.dirty:
+    when defined(pager_trace):
+      if entry.id == PageId(70):
+        let cnt = if entry.data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+        echo "upgradeToRw(", entry.id, "): cloneString keyCount=", cnt, " pinCount=", entry.pinCount
+    entry.data = cloneString(entry.data)
+    entry.dirty = true
+    entry.aux = nil
+    pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(entry.id)
+  pager.txnLastDirtyId = entry.id
+  okVoid()
+
+proc writePage*(pager: Pager, pageId: PageId, data: sink string): Result[Void] =
   if data.len != pager.pageSize:
     return err[Void](ERR_IO, "Page write size mismatch", "page_id=" & $pageId)
   let pinRes = pinPage(pager, pageId)
@@ -691,14 +770,48 @@ proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   let entry = pinRes.value
   acquire(entry.lock)
   let wasDirty = entry.dirty
+  when defined(pager_trace):
+    let oldCount = if data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+    let newCount = if data.len >= 4 and byte(data[0]) == 2: int(uint16(byte(data[2])) or (uint16(byte(data[3])) shl 8)) else: -1
+    if pageId == PageId(70):
+      echo "writePage(", pageId, "): oldCount=", oldCount, " newCount=", newCount, " wasDirty=", wasDirty, " entryId=", entry.id
   entry.data = data
   entry.dirty = true
   entry.aux = nil
   release(entry.lock)
   if not wasDirty:
     pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(pageId)
   pager.txnLastDirtyId = pageId
   discard unpinPage(pager, entry, dirty = false)
+  okVoid()
+
+proc writeNewPage*(pager: Pager, pageId: PageId, data: sink string): Result[Void] =
+  ## Write a freshly allocated page directly into the cache without reading from
+  ## disk first.  This avoids the redundant disk read + extra allocation that
+  ## ``writePage`` performs via ``pinPage``.  Only use for pages returned by
+  ## ``allocatePage`` that have never been read.
+  if data.len != pager.pageSize:
+    return err[Void](ERR_IO, "Page write size mismatch", "page_id=" & $pageId)
+  let cache = pager.cache
+  let shard = shardFor(cache, pageId)
+  acquire(shard.lock)
+  # If somehow already cached, fall back to normal writePage.
+  if shard.pages.hasKey(pageId):
+    release(shard.lock)
+    return writePage(pager, pageId, data)
+  let evictRes = evictIfNeededLocked(pager, shard)
+  if not evictRes.ok:
+    release(shard.lock)
+    return err[Void](evictRes.err.code, evictRes.err.message, evictRes.err.context)
+  let entry = CacheEntry(id: pageId, data: data, lsn: 0, dirty: true, pinCount: 0, refBit: true)
+  initLock(entry.lock)
+  shard.pages[pageId] = entry
+  shard.clock.add(pageId)
+  release(shard.lock)
+  pager.txnDirtyCount.inc
+  pager.txnDirtyPages.add(pageId)
+  pager.txnLastDirtyId = pageId
   okVoid()
 
 proc writePageDirectFile*(pager: Pager, pageId: PageId, data: string): Result[Void] =
@@ -741,19 +854,30 @@ proc flushAll*(pager: Pager): Result[Void] =
 
 proc snapshotDirtyPages*(pager: Pager): seq[(PageId, string)] =
   let cache = pager.cache
-  var entries: seq[CacheEntry] = @[]
-  for shard in cache.shards:
+  result = newSeqOfCap[(PageId, string)](pager.txnDirtyPages.len)
+  for pageId in pager.txnDirtyPages:
+    let shard = shardFor(cache, pageId)
     acquire(shard.lock)
-    for _, entry in shard.pages:
-      entries.add(entry)
+    if shard.pages.hasKey(pageId):
+      let entry = shard.pages[pageId]
+      if entry.dirty:
+        result.add((entry.id, entry.data))
     release(shard.lock)
-  for entry in entries:
-    if not entry.dirty:
-      continue
-    acquire(entry.lock)
-    let copy = entry.data
-    release(entry.lock)
-    result.add((entry.id, copy))
+
+proc collectDirtyPageRefs*(pager: Pager): seq[(PageId, pointer, int)] =
+  ## Collect references to dirty page data without copying.
+  ## Uses txnDirtyPages list for O(n) lookup instead of O(shards*pages) scan.
+  ## SAFETY: Returned pointers are valid only while no cache modifications occur.
+  let cache = pager.cache
+  result = newSeqOfCap[(PageId, pointer, int)](pager.txnDirtyPages.len)
+  for pageId in pager.txnDirtyPages:
+    let shard = shardFor(cache, pageId)
+    acquire(shard.lock)
+    if shard.pages.hasKey(pageId):
+      let entry = shard.pages[pageId]
+      if entry.dirty:
+        result.add((entry.id, cast[pointer](unsafeAddr entry.data[0]), entry.data.len))
+    release(shard.lock)
 
 proc snapshotSingleDirtyPage*(pager: Pager, pageId: PageId): (PageId, string) =
   ## Fast path: snapshot a single known-dirty page without scanning all shards.
@@ -763,8 +887,21 @@ proc snapshotSingleDirtyPage*(pager: Pager, pageId: PageId): (PageId, string) =
   if shard.pages.hasKey(pageId):
     let entry = shard.pages[pageId]
     acquire(entry.lock)
+    when defined(pager_trace):
+      if pageId == PageId(70):
+        let cnt = if entry.data.len >= 4 and byte(entry.data[0]) == 2: int(uint16(byte(entry.data[2])) or (uint16(byte(entry.data[3])) shl 8)) else: -1
+        echo "snapshotSingleDirtyPage(", pageId, "): keyCount=", cnt, " dirty=", entry.dirty, " entryId=", entry.id
     result = (pageId, entry.data)
     release(entry.lock)
+  else:
+    when defined(pager_trace):
+      if pageId == PageId(70):
+        echo "snapshotSingleDirtyPage(", pageId, "): NOT IN CACHE! shard.len=", shard.pages.len, " shard.cap=", shard.capacity
+        # Dump all pages in this shard
+        var shardPages: seq[PageId] = @[]
+        for k, v in shard.pages:
+          shardPages.add(k)
+        echo "  shard pages: ", shardPages
   release(shard.lock)
 
 proc markPageCommitted*(pager: Pager, pageId: PageId, lsn: uint64) =
@@ -790,16 +927,19 @@ proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
     for pageId in pageIds:
       pager.overriddenPages.excl(pageId)
     release(pager.overlayLock)
-  for pageId in pageIds:
-    let shard = shardFor(cache, pageId)
+  # Batch: scan each shard once marking all its dirty pages committed.
+  # This reduces lock acquisitions from N to numShards.
+  for shard in cache.shards:
     acquire(shard.lock)
-    if shard.pages.hasKey(pageId):
-      let entry = shard.pages[pageId]
-      acquire(entry.lock)
-      entry.dirty = false
-      entry.lsn = lsn
-      release(entry.lock)
+    for _, entry in shard.pages:
+      if entry.dirty:
+        acquire(entry.lock)
+        entry.dirty = false
+        entry.lsn = lsn
+        release(entry.lock)
     release(shard.lock)
+  pager.txnDirtyCount = 0
+  pager.txnDirtyPages.setLen(0)
 
 proc isDirty*(pager: Pager, pageId: PageId): bool =
   let shard = shardFor(pager.cache, pageId)
@@ -878,17 +1018,24 @@ proc closePager*(pager: Pager): Result[Void] =
   let flushRes = flushAll(pager)
   if not flushRes.ok:
     return flushRes
+  # Trim pre-extended file back to actual data size.
+  let actualSize = pageOffset(pager, pager.pageCount + 1)
+  if pager.preExtendedSize > actualSize:
+    discard pager.vfs.truncate(pager.file, actualSize)
+    pager.preExtendedSize = actualSize
   okVoid()
 
 proc appendBlankPage(pager: Pager): Result[PageId] =
   let newId = pager.pageCount + 1
-  var data = newString(pager.pageSize)
-  let offset = pageOffset(pager, newId)
-  let res = pager.vfs.writeStr(pager.file, offset, data)
-  if not res.ok:
-    return err[PageId](res.err.code, res.err.message, res.err.context)
-  if res.value < pager.pageSize:
-    return err[PageId](ERR_IO, "Short write on new page", "page_id=" & $newId)
+  let fileEnd = pageOffset(pager, newId) + pager.pageSize
+  # Pre-extend the file in 64-page (256KB) chunks to amortize ftruncate syscalls.
+  if fileEnd > pager.preExtendedSize:
+    let chunkPages = 64
+    let extendTarget = fileEnd + int64(chunkPages * pager.pageSize)
+    let truncRes = pager.vfs.truncate(pager.file, extendTarget)
+    if not truncRes.ok:
+      return err[PageId](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    pager.preExtendedSize = extendTarget
   pager.pageCount = newId
   ok(newId)
 
@@ -997,6 +1144,7 @@ proc beginTxnPageTracking*(pager: Pager) =
   pager.inTransaction = true
   pager.txnAllocatedPages = @[]
   pager.txnDirtyCount = 0
+  pager.txnDirtyPages.setLen(0)
   pager.txnLastDirtyId = 0
 
 proc endTxnPageTracking*(pager: Pager) =

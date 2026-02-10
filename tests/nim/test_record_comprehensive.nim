@@ -42,7 +42,7 @@ suite "Record Comprehensive":
     
     let boolVal = Value(kind: vkBool, boolVal: true)
     let boolEncoded = encodeValue(boolVal)
-    check boolEncoded[0] == byte(vkBool)
+    check boolEncoded[0] == byte(vkBoolTrue)
     
     let intVal = Value(kind: vkInt64, int64Val: 123)
     let intEncoded = encodeValue(intVal)

@@ -86,16 +86,16 @@ suite "EXPLAIN Statement":
     
     discard closeDb(db)
 
-  test "EXPLAIN options fail":
+  test "EXPLAIN unsupported options fail":
     let path = makeTempDb("decentdb_explain_opts.db")
     let dbRes = openDb(path)
     check dbRes.ok
     let db = dbRes.value
     check execSql(db, "CREATE TABLE t (id INT)").ok
     
-    let res = execSql(db, "EXPLAIN (ANALYZE) SELECT * FROM t")
+    let res = execSql(db, "EXPLAIN (VERBOSE) SELECT * FROM t")
     check not res.ok
-    check res.err.message == "EXPLAIN options not supported"
+    check "not supported" in res.err.message
     
     discard closeDb(db)
 
@@ -196,5 +196,143 @@ suite "EXPLAIN Statement":
 
     check lines.len > 0
     check "Project" in lines.join("\n")
+    discard decentdb_close(h)
+
+  test "EXPLAIN ANALYZE returns plan with actual metrics":
+    let path = makeTempDb("decentdb_explain_analyze.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, 'Alice')").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'Bob')").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 'Charlie')").ok
+
+    let res = execSql(db, "EXPLAIN ANALYZE SELECT * FROM t")
+    check res.ok
+    check res.value.len > 0
+    let planText = res.value.join("\n")
+    check "Project" in planText
+    check "Actual Rows: 3" in planText
+    check "Actual Time:" in planText
+    check "ms" in planText
+
+    discard closeDb(db)
+
+  test "EXPLAIN ANALYZE with filter":
+    let path = makeTempDb("decentdb_explain_analyze_filter.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT, name TEXT)").ok
+    for i in 1..10:
+      check execSql(db, "INSERT INTO t VALUES ($1, 'name')", @[Value(kind: vkInt64, int64Val: int64(i))]).ok
+
+    let res = execSql(db, "EXPLAIN ANALYZE SELECT * FROM t WHERE id > 5")
+    check res.ok
+    let planText = res.value.join("\n")
+    check "Filter" in planText
+    check "Actual Rows: 5" in planText
+
+    discard closeDb(db)
+
+  test "EXPLAIN ANALYZE empty result":
+    let path = makeTempDb("decentdb_explain_analyze_empty.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT)").ok
+
+    let res = execSql(db, "EXPLAIN ANALYZE SELECT * FROM t")
+    check res.ok
+    let planText = res.value.join("\n")
+    check "Actual Rows: 0" in planText
+
+    discard closeDb(db)
+
+  test "EXPLAIN ANALYZE does not modify data":
+    let path = makeTempDb("decentdb_explain_analyze_readonly.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1)").ok
+
+    let res = execSql(db, "EXPLAIN ANALYZE SELECT * FROM t")
+    check res.ok
+    # Verify data unchanged
+    let rows = execSql(db, "SELECT COUNT(*) FROM t")
+    check rows.ok
+    check rows.value[0] == "1"
+
+    discard closeDb(db)
+
+  test "EXPLAIN ANALYZE INSERT fails":
+    let path = makeTempDb("decentdb_explain_analyze_insert.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT)").ok
+
+    let res = execSql(db, "EXPLAIN ANALYZE INSERT INTO t VALUES (1)")
+    check not res.ok
+    check res.err.message == "EXPLAIN currently supports SELECT only"
+
+    discard closeDb(db)
+
+  test "EXPLAIN (ANALYZE) parenthesized syntax":
+    let path = makeTempDb("decentdb_explain_paren_analyze.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1)").ok
+
+    let res = execSql(db, "EXPLAIN (ANALYZE) SELECT * FROM t")
+    check res.ok
+    let planText = res.value.join("\n")
+    check "Actual Rows: 1" in planText
+
+    discard closeDb(db)
+
+  test "C API: EXPLAIN ANALYZE yields plan with metrics":
+    let path = makeTempDb("decentdb_explain_analyze_capi.db")
+    let h = decentdb_open(path.cstring, nil)
+    check h != nil
+
+    proc execNoRows(sqlText: string) =
+      var stmt: pointer = nil
+      check decentdb_prepare(h, sqlText.cstring, addr stmt) == 0
+      check stmt != nil
+      check decentdb_step(stmt) == 0
+      decentdb_finalize(stmt)
+
+    execNoRows("CREATE TABLE t (id INT, name TEXT)")
+    execNoRows("INSERT INTO t VALUES (1, 'A')")
+    execNoRows("INSERT INTO t VALUES (2, 'B')")
+
+    var stmt: pointer = nil
+    check decentdb_prepare(h, "EXPLAIN ANALYZE SELECT * FROM t".cstring, addr stmt) == 0
+    check stmt != nil
+
+    var lines: seq[string] = @[]
+    while true:
+      let rc = decentdb_step(stmt)
+      if rc == 0:
+        break
+      check rc == 1
+      var n: cint = 0
+      let p = decentdb_column_text(stmt, 0, addr n)
+      check p != nil
+      var line = newString(int(n))
+      if n > 0:
+        copyMem(addr line[0], p, int(n))
+      lines.add(line)
+    decentdb_finalize(stmt)
+
+    let planText = lines.join("\n")
+    check "Project" in planText
+    check "Actual Rows: 2" in planText
+    check "Actual Time:" in planText
     discard decentdb_close(h)
 

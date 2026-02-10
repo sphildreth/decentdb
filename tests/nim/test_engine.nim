@@ -81,3 +81,32 @@ suite "Engine":
     check db.isOpen
     check db.pageSize == DefaultPageSize
     discard closeDb(db)
+
+  test "prepare computes simple update profile":
+    let path = makeTempDb("decentdb_engine_update_profile_simple.db")
+    let res = openDb(path)
+    check res.ok
+    let db = res.value
+    check execSql(db, "CREATE TABLE kv (id INT PRIMARY KEY, v TEXT)").ok
+    let prepRes = prepare(db, "UPDATE kv SET v = $1 WHERE id = 1")
+    check prepRes.ok
+    let prepared = prepRes.value
+    check prepared.updateProfiles.len == 1
+    check prepared.updateProfiles[0].isSimpleUpdate
+    check not prepared.updateProfiles[0].updatesIndexedColumns
+    discard closeDb(db)
+
+  test "prepare marks indexed updates as non-simple":
+    let path = makeTempDb("decentdb_engine_update_profile_indexed.db")
+    let res = openDb(path)
+    check res.ok
+    let db = res.value
+    check execSql(db, "CREATE TABLE kv (id INT PRIMARY KEY, v TEXT)").ok
+    check execSql(db, "CREATE INDEX kv_v_idx ON kv(v)").ok
+    let prepRes = prepare(db, "UPDATE kv SET v = $1 WHERE id = 1")
+    check prepRes.ok
+    let prepared = prepRes.value
+    check prepared.updateProfiles.len == 1
+    check not prepared.updateProfiles[0].isSimpleUpdate
+    check prepared.updateProfiles[0].updatesIndexedColumns
+    discard closeDb(db)

@@ -413,6 +413,15 @@ EXPLAIN SELECT * FROM users WHERE id = 1;
 
 Produces a text-based query execution plan.
 
+### Explain Analyze
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM users WHERE id = 1;
+```
+
+Executes the query and produces the execution plan annotated with actual row counts
+and execution time. The parenthesized form `EXPLAIN (ANALYZE) ...` is also supported.
+
 ## Constraints
 
 ### Primary Key

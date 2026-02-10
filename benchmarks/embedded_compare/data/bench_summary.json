@@ -1,28 +1,36 @@
 {
   "engines": {
     "DecentDB": {
-      "commit_p95_ms": 0.034805,
-      "insert_rows_per_sec": 155472.6368159204,
-      "join_p95_ms": 0.397136,
-      "read_p95_ms": 0.001213
+      "commit_p95_ms": 3.013048,
+      "insert_rows_per_sec": 1117193.609652553,
+      "join_p95_ms": 0.369754,
+      "read_p95_ms": 0.001183
     },
     "DuckDB": {
-      "commit_p95_ms": 0.160572,
-      "insert_rows_per_sec": 11414.75057902464,
-      "join_p95_ms": 1.638397,
-      "read_p95_ms": 0.189376
+      "commit_p95_ms": 12.05525,
+      "insert_rows_per_sec": 10754.0757947262,
+      "join_p95_ms": 1.42727,
+      "read_p95_ms": 0.190067
+    },
+    "H2": {
+      "read_p95_ms": 0.01785111746
+    },
+    "LiteDB": {
+      "insert_rows_per_sec": 207065.68668992823,
+      "read_p95_ms": 0.018636946209999998
     },
     "SQLite": {
-      "commit_p95_ms": 0.01054,
-      "insert_rows_per_sec": 110204.9812651532,
-      "join_p95_ms": 0.436901,
-      "read_p95_ms": 0.001964
+      "commit_p95_ms": 3.006095,
+      "insert_rows_per_sec": 1110247.585211502,
+      "join_p95_ms": 0.390333,
+      "read_p95_ms": 0.002014
     }
   },
   "metadata": {
+    "durability_profile": "safe",
     "machine": "batman (AMD Ryzen 9 3900X 12-Core Processor)",
-    "notes": "Generated from raw benchmark outputs in benchmarks/raw/",
-    "run_id": "20260208_043917",
+    "notes": "Generated from raw benchmark outputs in benchmarks/embedded_compare/raw/sample; merged extra engines from benchmarks/python_embedded_compare/out/results_merged.json",
+    "run_id": "20260210_211430",
     "units": {
       "commit_p95_ms": "ms (lower is better)",
       "insert_rows_per_sec": "rows/sec (higher is better)",

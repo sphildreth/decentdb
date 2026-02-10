@@ -1,5 +1,6 @@
 import os
 import locks
+import atomics
 import ./types
 import ../errors
 when defined(windows):
@@ -24,6 +25,18 @@ template withFileLock(file: VfsFile, body: untyped) =
     body
   finally:
     release(file.lock)
+
+proc flushBufferedWritesIfNeeded(file: VfsFile): Result[Void] =
+  if not file.bufferedDirty.load(moAcquire):
+    return okVoid()
+  withFileLock(file):
+    if file.bufferedDirty.load(moAcquire):
+      try:
+        flushFile(file.file)
+      except IOError, OSError:
+        return err[Void](ERR_IO, "Flush failed", file.path)
+      file.bufferedDirty.store(false, moRelease)
+  okVoid()
 
 method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[VfsFile] =
   var f: File
@@ -50,12 +63,16 @@ method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[Vfs
     return err[VfsFile](ERR_IO, "Failed to open file", path)
   let vf = VfsFile(path: path, file: f)
   initLock(vf.lock)
+  vf.bufferedDirty.store(false, moRelaxed)
   ok(vf)
 
 method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte]): Result[int] =
   ## Read without lock - pread is thread-safe and position-independent.
   if buf.len == 0:
     return ok(0)
+  let flushRes = flushBufferedWritesIfNeeded(file)
+  if not flushRes.ok:
+    return err[int](flushRes.err.code, flushRes.err.message, flushRes.err.context)
   try:
     when defined(windows):
       var bytesRead: DWORD = 0
@@ -80,6 +97,9 @@ method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Resu
   ## Read without lock - pread is thread-safe and position-independent.
   if buf.len == 0:
     return ok(0)
+  let flushRes = flushBufferedWritesIfNeeded(file)
+  if not flushRes.ok:
+    return err[int](flushRes.err.code, flushRes.err.message, flushRes.err.context)
   try:
     when defined(windows):
       var bytesRead: DWORD = 0
@@ -109,7 +129,7 @@ method write*(vfs: OsVfs, file: VfsFile, offset: int64, buf: openArray[byte]): R
       else:
         setFilePos(file.file, offset)
         bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
-        flushFile(file.file)
+        file.bufferedDirty.store(true, moRelease)
     except IOError, OSError:
       return err[int](ERR_IO, "Write failed", file.path)
     if bytesWritten != buf.len:
@@ -125,7 +145,7 @@ method writeStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: string): Result[
       else:
         setFilePos(file.file, offset)
         bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
-        flushFile(file.file)
+        file.bufferedDirty.store(true, moRelease)
     except IOError, OSError:
       return err[int](ERR_IO, "Write failed", file.path)
     if bytesWritten != buf.len:
@@ -141,6 +161,7 @@ method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
   try:
     # First flush stdio buffers to ensure all data is in kernel buffers
     flushFile(file.file)
+    file.bufferedDirty.store(false, moRelease)
     
     when defined(windows):
       # Windows: Use FlushFileBuffers for OS-level sync
@@ -170,6 +191,9 @@ method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
 method truncate*(vfs: OsVfs, file: VfsFile, size: int64): Result[Void] =
   withFileLock(file):
     try:
+      if file.bufferedDirty.load(moAcquire):
+        flushFile(file.file)
+        file.bufferedDirty.store(false, moRelease)
       when defined(windows):
         setFilePos(file.file, size)
         let handle = get_osfhandle(file.file.getFileHandle())
@@ -186,6 +210,9 @@ method truncate*(vfs: OsVfs, file: VfsFile, size: int64): Result[Void] =
 method close*(vfs: OsVfs, file: VfsFile): Result[Void] =
   withFileLock(file):
     try:
+      if file.bufferedDirty.load(moAcquire):
+        flushFile(file.file)
+        file.bufferedDirty.store(false, moRelease)
       close(file.file)
     except OSError:
       return err[Void](ERR_IO, "Close failed", file.path)

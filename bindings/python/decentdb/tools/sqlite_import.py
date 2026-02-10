@@ -255,11 +255,6 @@ def _load_table_schema(sqlite_conn: sqlite3.Connection, table: str) -> SqliteTab
 
 
 def _validate_supported(table: SqliteTable) -> None:
-    pk_cols = [c for c in table.columns if c.pk]
-    if len(pk_cols) > 1:
-        raise ConversionError(
-            f"Composite primary key not supported by DecentDB: {table.name} ({', '.join(c.name for c in pk_cols)})"
-        )
 
     fk_by_from: dict[str, list[SqliteForeignKey]] = defaultdict(list)
     for fk in table.foreign_keys:
@@ -322,6 +317,8 @@ def _create_table_mapped(
     column_name_map: dict[str, dict[str, str]],
 ) -> None:
     fk_map: dict[str, SqliteForeignKey] = {fk.from_column: fk for fk in table.foreign_keys}
+    pk_cols = [c for c in table.columns if c.pk]
+    composite_pk = len(pk_cols) > 1
 
     col_defs: list[str] = []
     for col in table.columns:
@@ -329,8 +326,10 @@ def _create_table_mapped(
         dst_col = column_name_map[table.name][col.name]
         parts: list[str] = [_quote_ident(dst_col), _map_declared_type_to_decentdb(col.declared_type)]
 
-        if col.pk:
+        if col.pk and not composite_pk:
             parts.append("PRIMARY KEY")
+        elif col.pk and composite_pk:
+            parts.append("NOT NULL")
         else:
             if col.unique:
                 parts.append("UNIQUE")
@@ -346,6 +345,12 @@ def _create_table_mapped(
             )
 
         col_defs.append(" ".join(parts))
+
+    if composite_pk:
+        pk_col_names = ", ".join(
+            _quote_ident(column_name_map[table.name][c.name]) for c in pk_cols
+        )
+        col_defs.append(f"PRIMARY KEY ({pk_col_names})")
 
     sql = "CREATE TABLE " + _quote_ident(dst_table) + " (" + ", ".join(col_defs) + ")"
     conn.execute(sql)

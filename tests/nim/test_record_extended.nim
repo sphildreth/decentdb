@@ -82,28 +82,30 @@ suite "Record Extended":
   test "encodeValue null":
     let val = Value(kind: vkNull)
     let encoded = encodeValue(val)
-    # Should be: kind (0) + length varint (0)
+    # kind + varint length(0)
     check encoded.len == 2
     check encoded[0] == byte(vkNull)
-    check encoded[1] == byte(0)
 
   test "encodeValue bool true":
     let val = Value(kind: vkBool, boolVal: true)
     let encoded = encodeValue(val)
-    check encoded[0] == byte(vkBool)
-    check encoded[2] == byte(1)
+    # Compact: vkBoolTrue kind + varint length(0)
+    check encoded.len == 2
+    check encoded[0] == byte(vkBoolTrue)
 
   test "encodeValue bool false":
     let val = Value(kind: vkBool, boolVal: false)
     let encoded = encodeValue(val)
-    check encoded[2] == byte(0)
+    # Compact: vkBoolFalse kind + varint length(0)
+    check encoded.len == 2
+    check encoded[0] == byte(vkBoolFalse)
 
   test "encodeValue int64 zero":
     let val = Value(kind: vkInt64, int64Val: 0)
     let encoded = encodeValue(val)
-    check encoded[0] == byte(vkInt64)
-    # With varint encoding: kind (1) + length (1) + payload (1) = 3 bytes
-    check encoded.len == 3
+    # Compact: vkInt0 kind + varint length(0)
+    check encoded.len == 2
+    check encoded[0] == byte(vkInt0)
 
   test "encodeValue int64 negative":
     let val = Value(kind: vkInt64, int64Val: -1)

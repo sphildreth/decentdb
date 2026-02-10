@@ -41,6 +41,8 @@ tests/bench/tmp/
 benchmarks/embedded_compare/raw/
 benchmarks/embedded_compare/aggregated/
 benchmarks/embedded_compare/tmp_*/
+.bench_data/
+
 --
 tests/nim/
 !tests/nim/
@@ -88,3 +90,5 @@ testresults.html
 testresults.db
 
 bindings/dotnet/.idea/
+bindings/dotnet/v
+bindings/dotnet/v

@@ -119,14 +119,14 @@ task bench_embedded, "Run embedded database comparison benchmarks":
 
 task bench_embedded_sample, "Run embedded benchmarks and aggregate sample data":
   exec "nimble bench_embedded"
-  exec "./build/run_benchmarks benchmarks/embedded_compare/raw/sample --engines=all"
+  exec "./build/run_benchmarks benchmarks/embedded_compare/raw/sample --engines=all --data-dir=.bench_data --durability=safe"
 
 task bench_embedded_run, "Run embedded benchmarks (engines: decentdb,sqlite,duckdb or all)":
   exec "nimble bench_embedded"
   exec "./build/run_benchmarks benchmarks/raw sample --engines=all"
 
 task bench_embedded_aggregate, "Aggregate raw benchmark results":
-  exec "python3 benchmarks/embedded_compare/scripts/aggregate_benchmarks.py"
+  exec "python3 benchmarks/embedded_compare/scripts/aggregate_benchmarks.py --input benchmarks/embedded_compare/raw/sample"
 
 task bench_embedded_chart, "Generate README benchmark chart":
   exec "benchmarks/embedded_compare/venv/bin/python3 benchmarks/embedded_compare/scripts/make_readme_chart.py"

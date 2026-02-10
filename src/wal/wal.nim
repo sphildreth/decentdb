@@ -11,6 +11,9 @@ import ../pager/db_header
 import ../vfs/types
 import ../utils/perf
 
+when defined(bench_breakdown):
+  import std/monotimes
+
 type WalFrameType* = enum
   wfPage = 0
   wfCommit = 1
@@ -40,6 +43,8 @@ type WalPendingPage = object
   bytes: seq[byte]
   str: string
   isString: bool
+  dataPtr: pointer    # Zero-copy: pointer to page data (valid only during commit)
+  dataPtrLen: int     # Length of data at dataPtr
 
 type ReaderInfo* = object
   ## Extended information about a reader for resource management
@@ -111,6 +116,28 @@ const WalHeaderMagic = "DDBWAL01"
 const WalHeaderVersion = 1'u32
 const WalHeaderSize* = 32
 const WalMmapInitialSize = 1024 * 1024
+
+when defined(bench_breakdown):
+  type WalCommitBreakdown* = object
+    walEncodeWriteNs*: int64
+    walHeaderWriteNs*: int64
+    walFsyncNs*: int64
+    walIndexPublishNs*: int64
+
+  var gLastCommitBreakdown {.threadvar.}: WalCommitBreakdown
+  var gHasLastCommitBreakdown {.threadvar.}: bool
+
+  proc clearLastCommitBreakdown*() =
+    gHasLastCommitBreakdown = false
+    gLastCommitBreakdown = WalCommitBreakdown()
+
+  proc takeLastCommitBreakdown*(): WalCommitBreakdown =
+    if gHasLastCommitBreakdown:
+      result = gLastCommitBreakdown
+      gHasLastCommitBreakdown = false
+      gLastCommitBreakdown = WalCommitBreakdown()
+    else:
+      result = WalCommitBreakdown()
 
 proc writeU32LEPtr(buf: ptr UncheckedArray[byte], offset: int, value: uint32) =
   buf[offset] = byte(value and 0xFF)
@@ -192,6 +219,19 @@ proc encodeFrameIntoString(dest: var seq[byte], offset: int, frameType: WalFrame
   writeU64LE(dest, offset + HeaderSize + payload.len, 0)
   result = needed
 
+proc encodeFrameIntoRaw(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: pointer, payloadLen: int): int =
+  let needed = HeaderSize + payloadLen + TrailerSize
+  if dest.len < offset + needed:
+    dest.setLen(max(dest.len * 2, offset + needed))
+  
+  dest[offset] = byte(frameType)
+  writeU32LE(dest, offset + 1, pageId)
+  if payloadLen > 0:
+    copyMem(addr dest[offset + HeaderSize], payload, payloadLen)
+  
+  writeU64LE(dest, offset + HeaderSize + payloadLen, 0)
+  result = needed
+
 proc encodeFrameIntoPtr(dest: ptr UncheckedArray[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): int =
   let needed = HeaderSize + payload.len + TrailerSize
   dest[offset] = byte(frameType)
@@ -208,6 +248,15 @@ proc encodeFrameIntoPtrString(dest: ptr UncheckedArray[byte], offset: int, frame
   if payload.len > 0:
     copyMem(addr dest[offset + HeaderSize], unsafeAddr payload[0], payload.len)
   writeU64LEPtr(dest, offset + HeaderSize + payload.len, 0)
+  result = needed
+
+proc encodeFrameIntoPtrRaw(dest: ptr UncheckedArray[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: pointer, payloadLen: int): int =
+  let needed = HeaderSize + payloadLen + TrailerSize
+  dest[offset] = byte(frameType)
+  writeU32LEPtr(dest, offset + 1, pageId)
+  if payloadLen > 0:
+    copyMem(addr dest[offset + HeaderSize], payload, payloadLen)
+  writeU64LEPtr(dest, offset + HeaderSize + payloadLen, 0)
   result = needed
 
 proc encodeFrame(frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): seq[byte] =
@@ -355,6 +404,17 @@ proc unmapWalIfMapped*(wal: Wal) =
   wal.mmapPtr = nil
   wal.mmapLen = 0
 
+proc ensureFrameBufferCapacity(wal: Wal, requiredLen: int) =
+  ## Grow the reusable frame buffer geometrically to avoid repeated realloc churn.
+  if requiredLen <= 0:
+    return
+  if wal.frameBuffer.len >= requiredLen:
+    return
+  var target = max(wal.frameBuffer.len, 16384)
+  while target < requiredLen:
+    target = target * 2
+  wal.frameBuffer.setLen(target)
+
 proc ensureWalMmapCapacity(wal: Wal, requiredEnd: int64): Result[bool] =
   if not wal.mmapEnabled:
     return ok(false)
@@ -392,6 +452,10 @@ proc ensureWalMmapCapacity(wal: Wal, requiredEnd: int64): Result[bool] =
   ok(true)
 
 proc writeWalHeader(wal: Wal, walEnd: uint64): Result[Void] =
+  if wal.mmapEnabled and wal.mmapPtr == nil:
+    let mmapRes = ensureWalMmapCapacity(wal, WalHeaderSize)
+    if mmapRes.ok and not mmapRes.value:
+      discard
   if wal.mmapPtr != nil:
     let dest = cast[ptr UncheckedArray[byte]](wal.mmapPtr)
     encodeWalHeaderPtr(dest, wal.pageSize, walEnd)
@@ -510,6 +574,30 @@ proc minReaderSnapshot*(wal: Wal): Option[uint64] =
       has = true
   release(wal.readerLock)
   if has: some(minSnap) else: none(uint64)
+
+proc pruneWalVersions(entries: var seq[WalIndexEntry], minSnapshot: Option[uint64]) =
+  ## Prune in-memory WAL versions while preserving snapshot correctness:
+  ## - no readers: keep only latest
+  ## - active readers: keep newest version <= oldest snapshot, plus all newer versions
+  if entries.len <= 1:
+    return
+  if minSnapshot.isNone:
+    let latest = entries[^1]
+    entries.setLen(1)
+    entries[0] = latest
+    return
+
+  let oldestSnapshot = minSnapshot.get
+  var floorIdx = -1
+  for i in countdown(entries.len - 1, 0):
+    if entries[i].lsn <= oldestSnapshot:
+      floorIdx = i
+      break
+  if floorIdx <= 0:
+    # floorIdx < 0: no version visible to oldest snapshot, keep all newer versions.
+    # floorIdx == 0: nothing older than kept floor entry.
+    return
+  entries = entries[floorIdx .. ^1]
 
 proc shouldCheckReaders*(wal: Wal): bool =
   ## HIGH-006: Determine if we should perform reader checks now.
@@ -1109,12 +1197,20 @@ proc writePage*(writer: WalWriter, pageId: PageId, data: seq[byte]): Result[Void
   writer.addPending(WalPendingPage(pageId: pageId, bytes: data, str: "", isString: false))
   okVoid()
 
-proc writePageDirect*(writer: WalWriter, pageId: PageId, data: string): Result[Void] =
+proc writePageDirect*(writer: WalWriter, pageId: PageId, data: sink string): Result[Void] =
   ## Write page data directly without intermediate allocation.
   ## Stores string data directly to avoid extra allocation/copy before encoding.
   if not writer.active:
     return err[Void](ERR_TRANSACTION, "No active transaction")
   writer.addPending(WalPendingPage(pageId: pageId, bytes: @[], str: data, isString: true))
+  okVoid()
+
+proc writePageZeroCopy*(writer: WalWriter, pageId: PageId, dataPtr: pointer, dataLen: int): Result[Void] =
+  ## Write page data using a pointer to avoid copying.
+  ## SAFETY: dataPtr must remain valid until commit() completes.
+  if not writer.active:
+    return err[Void](ERR_TRANSACTION, "No active transaction")
+  writer.addPending(WalPendingPage(pageId: pageId, dataPtr: dataPtr, dataPtrLen: dataLen))
   okVoid()
 
 proc noteFlushedPage*(writer: WalWriter, pageId: PageId, lsn: uint64, offset: int64) =
@@ -1144,6 +1240,10 @@ proc commit*(writer: WalWriter): Result[uint64] =
   if not writer.active:
     release(writer.wal.lock)
     return err[uint64](ERR_TRANSACTION, "No active transaction")
+
+  when defined(bench_breakdown):
+    var breakdown = WalCommitBreakdown()
+    gHasLastCommitBreakdown = false
   
   # Optimization: Batch all writes into a single buffer and single fsync
   # This reduces lock contention and system calls significantly.
@@ -1155,10 +1255,14 @@ proc commit*(writer: WalWriter): Result[uint64] =
   # Compute total length upfront (commit frame included)
   var totalLen = HeaderSize + TrailerSize # commit frame
   if writer.hasPendingSingle:
-    let payloadLen = if writer.pendingSingle.isString: writer.pendingSingle.str.len else: writer.pendingSingle.bytes.len
+    let payloadLen = if writer.pendingSingle.dataPtr != nil: writer.pendingSingle.dataPtrLen
+                     elif writer.pendingSingle.isString: writer.pendingSingle.str.len
+                     else: writer.pendingSingle.bytes.len
     totalLen += HeaderSize + TrailerSize + payloadLen
   for entry in writer.pending:
-    let payloadLen = if entry.isString: entry.str.len else: entry.bytes.len
+    let payloadLen = if entry.dataPtr != nil: entry.dataPtrLen
+                     elif entry.isString: entry.str.len
+                     else: entry.bytes.len
     totalLen += HeaderSize + TrailerSize + payloadLen
 
   let fpRes = applyFailpoint(writer.wal, "wal_write_frame", totalLen)
@@ -1170,13 +1274,14 @@ proc commit*(writer: WalWriter): Result[uint64] =
   let writeLen = fpRes.value
   if writeLen < totalLen:
     # Partial write path (simulate torn write)
-    if writer.wal.frameBuffer.len < totalLen:
-      writer.wal.frameBuffer.setLen(totalLen)
+    ensureFrameBufferCapacity(writer.wal, totalLen)
     var bufferOffset = 0
     if writer.hasPendingSingle:
       perf.WalGrowthWriter.inc()
       let len =
-        if writer.pendingSingle.isString:
+        if writer.pendingSingle.dataPtr != nil:
+          encodeFrameIntoRaw(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.dataPtr, writer.pendingSingle.dataPtrLen)
+        elif writer.pendingSingle.isString:
           encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
         else:
           encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
@@ -1184,7 +1289,9 @@ proc commit*(writer: WalWriter): Result[uint64] =
     for entry in writer.pending:
       perf.WalGrowthWriter.inc()
       let len =
-        if entry.isString:
+        if entry.dataPtr != nil:
+          encodeFrameIntoRaw(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.dataPtr, entry.dataPtrLen)
+        elif entry.isString:
           encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.str)
         else:
           encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
@@ -1210,6 +1317,8 @@ proc commit*(writer: WalWriter): Result[uint64] =
       return err[uint64](mmapRes.err.code, mmapRes.err.message, mmapRes.err.context)
     useMmap = mmapRes.value
 
+  when defined(bench_breakdown):
+    let encodeWriteStart = getMonoTime()
   if useMmap:
     let dest = cast[ptr UncheckedArray[byte]](writer.wal.mmapPtr)
     var mapOffset = int(startOffset)
@@ -1217,7 +1326,9 @@ proc commit*(writer: WalWriter): Result[uint64] =
       perf.WalGrowthWriter.inc()
       let frameStart = currentOffset
       let len =
-        if writer.pendingSingle.isString:
+        if writer.pendingSingle.dataPtr != nil:
+          encodeFrameIntoPtrRaw(dest, mapOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.dataPtr, writer.pendingSingle.dataPtrLen)
+        elif writer.pendingSingle.isString:
           encodeFrameIntoPtrString(dest, mapOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
         else:
           encodeFrameIntoPtr(dest, mapOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
@@ -1229,7 +1340,9 @@ proc commit*(writer: WalWriter): Result[uint64] =
     for entry in writer.pending:
       perf.WalGrowthWriter.inc()
       let len =
-        if entry.isString:
+        if entry.dataPtr != nil:
+          encodeFrameIntoPtrRaw(dest, mapOffset, wfPage, uint32(entry.pageId), entry.dataPtr, entry.dataPtrLen)
+        elif entry.isString:
           encodeFrameIntoPtrString(dest, mapOffset, wfPage, uint32(entry.pageId), entry.str)
         else:
           encodeFrameIntoPtr(dest, mapOffset, wfPage, uint32(entry.pageId), entry.bytes)
@@ -1243,14 +1356,15 @@ proc commit*(writer: WalWriter): Result[uint64] =
     mapOffset += commitLen
     currentOffset += int64(commitLen)
   else:
-    if writer.wal.frameBuffer.len < totalLen:
-      writer.wal.frameBuffer.setLen(totalLen)
+    ensureFrameBufferCapacity(writer.wal, totalLen)
     var bufferOffset = 0
     if writer.hasPendingSingle:
       perf.WalGrowthWriter.inc()
       let frameStart = currentOffset
       let len =
-        if writer.pendingSingle.isString:
+        if writer.pendingSingle.dataPtr != nil:
+          encodeFrameIntoRaw(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.dataPtr, writer.pendingSingle.dataPtrLen)
+        elif writer.pendingSingle.isString:
           encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.str)
         else:
           encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(writer.pendingSingle.pageId), writer.pendingSingle.bytes)
@@ -1262,7 +1376,9 @@ proc commit*(writer: WalWriter): Result[uint64] =
     for entry in writer.pending:
       perf.WalGrowthWriter.inc()
       let len =
-        if entry.isString:
+        if entry.dataPtr != nil:
+          encodeFrameIntoRaw(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.dataPtr, entry.dataPtrLen)
+        elif entry.isString:
           encodeFrameIntoString(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.str)
         else:
           encodeFrameInto(writer.wal.frameBuffer, bufferOffset, wfPage, uint32(entry.pageId), entry.bytes)
@@ -1283,12 +1399,19 @@ proc commit*(writer: WalWriter): Result[uint64] =
         release(writer.wal.lock)
         return err[uint64](writeRes.err.code, writeRes.err.message, writeRes.err.context)
 
+  when defined(bench_breakdown):
+    breakdown.walEncodeWriteNs = int64(inNanoseconds(getMonoTime() - encodeWriteStart))
+
   let newEnd = startOffset + int64(totalLen)
+  when defined(bench_breakdown):
+    let headerStart = getMonoTime()
   let headerRes = writeWalHeader(writer.wal, uint64(newEnd))
   if not headerRes.ok:
     writer.active = false
     release(writer.wal.lock)
     return err[uint64](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+  when defined(bench_breakdown):
+    breakdown.walHeaderWriteNs = int64(inNanoseconds(getMonoTime() - headerStart))
   writer.wal.endOffset = newEnd
   
   let syncFail = applyFailpoint(writer.wal, "wal_fsync", 0)
@@ -1296,11 +1419,18 @@ proc commit*(writer: WalWriter): Result[uint64] =
     writer.active = false
     release(writer.wal.lock)
     return err[uint64](syncFail.err.code, syncFail.err.message, syncFail.err.context)
+  when defined(bench_breakdown):
+    let fsyncStart = getMonoTime()
   let syncRes = writer.wal.vfs.fsync(writer.wal.file)
   if not syncRes.ok:
     writer.active = false
     release(writer.wal.lock)
     return err[uint64](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+  when defined(bench_breakdown):
+    breakdown.walFsyncNs = int64(inNanoseconds(getMonoTime() - fsyncStart))
+
+  when defined(bench_breakdown):
+    let indexStart = getMonoTime()
   acquire(writer.wal.indexLock)
   
   # Add flushed pages to index first
@@ -1317,9 +1447,28 @@ proc commit*(writer: WalWriter): Result[uint64] =
     writer.wal.index[entry[0]].add(entry[1])
     writer.wal.dirtySinceCheckpoint[entry[0]] = entry[1]
 
+  # Prune old versions for all pages touched in this commit
+  let minSnapshot = writer.wal.minReaderSnapshot()
+  for pageId, _ in writer.flushed:
+    if writer.wal.index.hasKey(pageId):
+      var entries = writer.wal.index[pageId]
+      pruneWalVersions(entries, minSnapshot)
+      writer.wal.index[pageId] = entries
+  for entry in writer.pageMeta:
+    let pageId = entry[0]
+    if writer.wal.index.hasKey(pageId):
+      var entries = writer.wal.index[pageId]
+      if entries.len > 1:
+        pruneWalVersions(entries, minSnapshot)
+        writer.wal.index[pageId] = entries
+
   release(writer.wal.indexLock)
   let commitLsn = uint64(writer.wal.endOffset)
   writer.wal.walEnd.store(commitLsn, moRelease)
+  when defined(bench_breakdown):
+    breakdown.walIndexPublishNs = int64(inNanoseconds(getMonoTime() - indexStart))
+    gLastCommitBreakdown = breakdown
+    gHasLastCommitBreakdown = true
   writer.active = false
   release(writer.wal.lock)
   writer.pending.setLen(0)

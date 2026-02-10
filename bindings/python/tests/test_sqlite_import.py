@@ -95,6 +95,45 @@ def test_sqlite_to_decentdb_convert(tmp_path):
         conn.close()
 
 
+def test_sqlite_composite_pk_import(tmp_path):
+    sqlite_path = str(tmp_path / "src.sqlite")
+    decent_path = str(tmp_path / "dst.decentdb")
+
+    conn = sqlite3.connect(sqlite_path)
+    try:
+        conn.execute(
+            "CREATE TABLE user_props (user_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY (user_id, key))"
+        )
+        conn.execute("INSERT INTO user_props VALUES ('u1', 'lang', 'en')")
+        conn.execute("INSERT INTO user_props VALUES ('u1', 'theme', 'dark')")
+        conn.execute("INSERT INTO user_props VALUES ('u2', 'lang', 'fr')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = convert_sqlite_to_decentdb(
+        sqlite_path=sqlite_path,
+        decentdb_path=decent_path,
+        overwrite=False,
+        show_progress=False,
+    )
+
+    assert report.rows_copied.get("user_props") == 3
+
+    ddb = decentdb.connect(decent_path)
+    try:
+        assert ddb.execute("SELECT COUNT(*) FROM user_props").fetchone()[0] == 3
+
+        # Composite PK enforces uniqueness
+        with pytest.raises(decentdb.IntegrityError):
+            ddb.execute(
+                "INSERT INTO user_props (user_id, key, value) VALUES (?, ?, ?)",
+                ("u1", "lang", "duplicate"),
+            )
+    finally:
+        ddb.close()
+
+
 def test_sqlite_to_decentdb_convert_chunked_commits(tmp_path):
     sqlite_path = str(tmp_path / "src.sqlite")
     decent_path = str(tmp_path / "dst.decentdb")

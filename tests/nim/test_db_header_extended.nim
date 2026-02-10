@@ -133,7 +133,7 @@ suite "DB Header Extended":
 
   test "decodeHeaderUnsafe extracts correct values":
     let header = DbHeader(
-      formatVersion: 2'u32,
+      formatVersion: 3'u32,
       pageSize: 4096'u32,
       schemaCookie: 100'u32,
       rootCatalog: 1'u32,
@@ -145,7 +145,7 @@ suite "DB Header Extended":
     let buf = encodeHeader(header)
     let decoded = decodeHeaderUnsafe(buf)
     check decoded.ok
-    check decoded.value.formatVersion == 2'u32
+    check decoded.value.formatVersion == 3'u32
     check decoded.value.pageSize == 4096'u32
     check decoded.value.schemaCookie == 100'u32
     check decoded.value.rootCatalog == 1'u32
@@ -185,7 +185,7 @@ suite "DB Header Extended":
     check HeaderSize == 128
     check MagicBytes == "DECENTDB"
     check MagicPadded.len == 16
-    check FormatVersion == 2'u32
+    check FormatVersion == 3'u32
     check DefaultPageSize == 4096'u32
 
   test "readHeader from empty file fails":
