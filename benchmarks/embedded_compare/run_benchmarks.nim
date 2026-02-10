@@ -306,9 +306,11 @@ proc runDecentDBInsert(outputDir: string) =
   when defined(bench_breakdown):
     echo formatInsertBenchBreakdown()
 
+  let commitStart = getMonoTime()
   let commitRes = execSql(db, "COMMIT")
   if not commitRes.ok:
     raise newException(IOError, "DecentDB insert benchmark COMMIT failed: " & commitRes.err.message)
+  let commitNs = inNanoseconds(getMonoTime() - commitStart)
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration

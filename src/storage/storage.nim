@@ -17,6 +17,12 @@ when defined(bench_breakdown):
   import times
   import ../utils/bench_breakdown
 
+# Thread-local reusable BTree to avoid per-insert heap allocation
+var gReusableBTree {.threadvar.}: BTree
+
+# Thread-local reusable record buffer to avoid per-insert allocation
+var gRecordBuf {.threadvar.}: seq[byte]
+
 type StoredRow* = object
   rowid*: uint64
   values*: seq[Value]
@@ -704,7 +710,7 @@ proc scanTableEach*(pager: Pager, table: TableMeta, body: proc(row: StoredRow): 
       return cbRes
   okVoid()
 
-proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool, int64PkIdx: int = -2): Result[uint64] =
+proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], updateIndexes: bool, int64PkIdx: int = -2, preTablePtr: ptr TableMeta = nil, skipNormalize: bool = false): Result[uint64] =
   when defined(bench_breakdown):
     let storStart = getMonoTime()
     var nsNormalize: int64 = 0
@@ -720,9 +726,9 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         addStorageBtreeInsertNs(nsBtree)
         addStorageTableMetaNs(nsMeta)
 
-  # Use pointer into catalog hash table to avoid copying TableMeta.
-  # Safe because we hold the writer lock and don't rehash catalog.tables.
-  let tablePtr = catalog.getTablePtr(tableName)
+  # Use pre-resolved pointer if available, otherwise look up.
+  let tablePtr = if preTablePtr != nil: preTablePtr
+                 else: catalog.getTablePtr(tableName)
   if tablePtr == nil:
     return err[uint64](ERR_SQL, "Table not found", tableName)
   if values.len != tablePtr.columns.len:
@@ -757,14 +763,15 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
     rowid = if tablePtr.nextRowId == 0: 1'u64 else: tablePtr.nextRowId
 
   # Back-fill auto-assigned rowid into PK column so it's stored with the row.
-  # Avoid copying the values seq when no backfill is needed (explicit rowid case).
-  var storedValues: seq[Value]
+  # When rowid is explicit (common case), avoid copying the values seq entirely.
+  var backfilledValues: seq[Value]
+  var valuesPtr: ptr seq[Value]
   if isExplicitRowId:
-    storedValues = values  # Nim ARC: move if last use, shallow copy otherwise
+    valuesPtr = unsafeAddr values
   else:
-    storedValues = values
+    backfilledValues = values
     if int64PkIdx >= 0:
-      storedValues[int64PkIdx] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
+      backfilledValues[int64PkIdx] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
     elif int64PkIdx == -2:
       var pkCount = 0
       for col in tablePtr.columns:
@@ -773,8 +780,10 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
       if pkCount <= 1:
         for i, col in tablePtr.columns:
           if col.primaryKey and col.kind == ctInt64:
-            storedValues[i] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
+            backfilledValues[i] = Value(kind: vkInt64, int64Val: cast[int64](rowid))
             break
+    valuesPtr = addr backfilledValues
+  template storedValues: untyped = valuesPtr[]
 
   var indexKeys: seq[(IndexMeta, uint64, Value)]
   var trigramValues: seq[(IndexMeta, Value)]
@@ -806,31 +815,56 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
               break
           if valueIndex >= 0:
             trigramValues.add((idx, storedValues[valueIndex]))
-  var normalizedRes: Result[seq[Value]]
+  # Inline fast-path normalization check to avoid Result[seq[Value]] copy.
+  # Benchmark data has small TEXT values that never need compression or overflow.
+  var needsNormalize = false
+  if not skipNormalize:
+    for value in storedValues:
+      if value.kind in {vkText, vkBlob} and value.bytes.len > 128:
+        needsNormalize = true
+        break
+  # Encode record into thread-local reusable buffer to avoid per-insert allocation.
+  var recordLen: int
   when defined(bench_breakdown):
-    let t0 = getMonoTime()
-    normalizedRes = normalizeValues(pager, storedValues)
-    nsNormalize = int64(inNanoseconds(getMonoTime() - t0))
+    var nsNormalize0: int64 = 0
+    if needsNormalize:
+      let t0 = getMonoTime()
+      let normalizedRes = normalizeValues(pager, storedValues)
+      nsNormalize0 = int64(inNanoseconds(getMonoTime() - t0))
+      if not normalizedRes.ok:
+        return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+      nsNormalize = nsNormalize0
+      let t1 = getMonoTime()
+      recordLen = encodeRecordTo(normalizedRes.value, gRecordBuf)
+      nsEncode = int64(inNanoseconds(getMonoTime() - t1))
+    else:
+      let t1 = getMonoTime()
+      recordLen = encodeRecordTo(storedValues, gRecordBuf)
+      nsEncode = int64(inNanoseconds(getMonoTime() - t1))
   else:
-    normalizedRes = normalizeValues(pager, storedValues)
-  if not normalizedRes.ok:
-    return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
-  var record: seq[byte]
-  when defined(bench_breakdown):
-    let t1 = getMonoTime()
-    record = encodeRecord(normalizedRes.value)
-    nsEncode = int64(inNanoseconds(getMonoTime() - t1))
-  else:
-    record = encodeRecord(normalizedRes.value)
+    if needsNormalize:
+      let normalizedRes = normalizeValues(pager, storedValues)
+      if not normalizedRes.ok:
+        return err[uint64](normalizedRes.err.code, normalizedRes.err.message, normalizedRes.err.context)
+      recordLen = encodeRecordTo(normalizedRes.value, gRecordBuf)
+    else:
+      recordLen = encodeRecordTo(storedValues, gRecordBuf)
+  gRecordBuf.setLen(recordLen)
 
-  let tree = newBTree(pager, tablePtr.rootPage)
+  # Reuse thread-local BTree to avoid heap allocation per insert.
+  if gReusableBTree == nil:
+    gReusableBTree = newBTree(pager, tablePtr.rootPage)
+  else:
+    gReusableBTree.pager = pager
+    gReusableBTree.root = tablePtr.rootPage
+  let tree = gReusableBTree
   var insertRes: Result[Void]
   when defined(bench_breakdown):
     let t2 = getMonoTime()
-    insertRes = insert(tree, rowid, record, checkUnique = true)
+    insertRes = insert(tree, rowid, gRecordBuf, checkUnique = true)
     nsBtree = int64(inNanoseconds(getMonoTime() - t2))
   else:
-    insertRes = insert(tree, rowid, record, checkUnique = true)
+    insertRes = insert(tree, rowid, gRecordBuf, checkUnique = true)
   if not insertRes.ok:
     return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   if updateIndexes:
@@ -893,6 +927,46 @@ proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[V
 proc insertRowWithHint*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], hasIndexes: bool, int64PkIdx: int = -2): Result[uint64] =
   ## Insert with precomputed hints. int64PkIdx: -2 = unknown, -1 = no single INT64 PK, >= 0 = column index
   insertRowInternal(pager, catalog, tableName, values, hasIndexes, int64PkIdx)
+
+proc insertRowWithPtr*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value], hasIndexes: bool, int64PkIdx: int, tablePtr: ptr TableMeta, skipNormalize: bool = false): Result[uint64] =
+  ## Insert with precomputed hints and pre-resolved table pointer, avoiding redundant hash lookup.
+  insertRowInternal(pager, catalog, tableName, values, hasIndexes, int64PkIdx, tablePtr, skipNormalize)
+
+proc insertRowDirect*(pager: Pager, catalog: Catalog, values: openArray[Value], int64PkIdx: int, tablePtr: ptr TableMeta): Result[uint64] =
+  ## Ultra-fast insert path for prepared statements with known schema.
+  ## Preconditions (caller must guarantee):
+  ##   - tablePtr is valid and non-nil
+  ##   - values.len == tablePtr.columns.len
+  ##   - int64PkIdx >= 0 and values[int64PkIdx].kind == vkInt64
+  ##   - No secondary indexes on this table
+  ##   - No values need normalization (all TEXT/BLOB < 128 bytes)
+  let origRootPage = tablePtr.rootPage
+  let rowid = cast[uint64](values[int64PkIdx].int64Val)
+
+  # Encode record into thread-local reusable buffer.
+  let recordLen = encodeRecordTo(values, gRecordBuf)
+  gRecordBuf.setLen(recordLen)
+
+  # Reuse thread-local BTree.
+  if gReusableBTree == nil:
+    gReusableBTree = newBTree(pager, tablePtr.rootPage)
+  else:
+    gReusableBTree.pager = pager
+    gReusableBTree.root = tablePtr.rootPage
+  let tree = gReusableBTree
+  let insertRes = insert(tree, rowid, gRecordBuf, checkUnique = true)
+  if not insertRes.ok:
+    return err[uint64](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+
+  # Update table metadata.
+  if rowid >= tablePtr.nextRowId:
+    tablePtr.nextRowId = rowid + 1
+  tablePtr.rootPage = tree.root
+  if tablePtr.rootPage != origRootPage:
+    let saveRes = saveTable(catalog, pager, tablePtr[])
+    if not saveRes.ok:
+      return err[uint64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+  ok(rowid)
 
 proc insertRowNoIndexes*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
   insertRowInternal(pager, catalog, tableName, values, false)

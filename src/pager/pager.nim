@@ -61,6 +61,8 @@ type Pager* = ref object
   # Optimization: Track dirty page count during transaction to enable single-page fast path
   txnDirtyCount*: int              # Number of pages dirtied in current transaction
   txnLastDirtyId*: PageId          # Last page marked dirty (valid when txnDirtyCount >= 1)
+  txnDirtyPages*: seq[PageId]      # All pages dirtied in current transaction (for fast commit)
+  preExtendedSize: int64           # File has been ftruncated to at least this many bytes
 
 type PageHandle* = object
   pager*: Pager
@@ -117,7 +119,7 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
     return err[Pager](ERR_CORRUPTION, "File size not aligned to page size", file.path)
   let count = if fileInfo.size == 0: 0'u32 else: uint32(fileInfo.size div pageSize)
   let cache = newPageCache(cachePages)
-  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0)
+  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0, preExtendedSize: fileInfo.size)
   pager.overriddenPages = initHashSet[PageId]()
   initLock(pager.lock)
   initLock(pager.overlayLock)
@@ -363,6 +365,7 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
   if dirty and not entry.dirty:
     entry.dirty = true
     pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(entry.id)
     pager.txnLastDirtyId = entry.id
   elif dirty:
     # Already dirty — still update last dirty ID (may be same page re-dirtied)
@@ -371,7 +374,7 @@ proc unpinPage*(pager: Pager, entry: CacheEntry, dirty: bool = false): Result[Vo
 
 proc readPageDirect*(pager: Pager, pageId: PageId): Result[string]
 
-proc cloneString(buf: string): string =
+proc cloneString*(buf: string): string =
   if buf.len == 0:
     return ""
   result = newString(buf.len)
@@ -726,6 +729,7 @@ proc acquirePageRw*(pager: Pager, pageId: PageId): Result[PageHandle] =
     entry.dirty = true
     entry.aux = nil
     pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(pageId)
   pager.txnLastDirtyId = pageId
 
   ok(PageHandle(pager: pager, entry: entry, pinned: true))
@@ -753,10 +757,11 @@ proc upgradeToRw*(handle: var PageHandle): Result[Void] =
     entry.dirty = true
     entry.aux = nil
     pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(entry.id)
   pager.txnLastDirtyId = entry.id
   okVoid()
 
-proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
+proc writePage*(pager: Pager, pageId: PageId, data: sink string): Result[Void] =
   if data.len != pager.pageSize:
     return err[Void](ERR_IO, "Page write size mismatch", "page_id=" & $pageId)
   let pinRes = pinPage(pager, pageId)
@@ -776,8 +781,37 @@ proc writePage*(pager: Pager, pageId: PageId, data: string): Result[Void] =
   release(entry.lock)
   if not wasDirty:
     pager.txnDirtyCount.inc
+    pager.txnDirtyPages.add(pageId)
   pager.txnLastDirtyId = pageId
   discard unpinPage(pager, entry, dirty = false)
+  okVoid()
+
+proc writeNewPage*(pager: Pager, pageId: PageId, data: sink string): Result[Void] =
+  ## Write a freshly allocated page directly into the cache without reading from
+  ## disk first.  This avoids the redundant disk read + extra allocation that
+  ## ``writePage`` performs via ``pinPage``.  Only use for pages returned by
+  ## ``allocatePage`` that have never been read.
+  if data.len != pager.pageSize:
+    return err[Void](ERR_IO, "Page write size mismatch", "page_id=" & $pageId)
+  let cache = pager.cache
+  let shard = shardFor(cache, pageId)
+  acquire(shard.lock)
+  # If somehow already cached, fall back to normal writePage.
+  if shard.pages.hasKey(pageId):
+    release(shard.lock)
+    return writePage(pager, pageId, data)
+  let evictRes = evictIfNeededLocked(pager, shard)
+  if not evictRes.ok:
+    release(shard.lock)
+    return err[Void](evictRes.err.code, evictRes.err.message, evictRes.err.context)
+  let entry = CacheEntry(id: pageId, data: data, lsn: 0, dirty: true, pinCount: 0, refBit: true)
+  initLock(entry.lock)
+  shard.pages[pageId] = entry
+  shard.clock.add(pageId)
+  release(shard.lock)
+  pager.txnDirtyCount.inc
+  pager.txnDirtyPages.add(pageId)
+  pager.txnLastDirtyId = pageId
   okVoid()
 
 proc writePageDirectFile*(pager: Pager, pageId: PageId, data: string): Result[Void] =
@@ -820,19 +854,30 @@ proc flushAll*(pager: Pager): Result[Void] =
 
 proc snapshotDirtyPages*(pager: Pager): seq[(PageId, string)] =
   let cache = pager.cache
-  var entries: seq[CacheEntry] = @[]
-  for shard in cache.shards:
+  result = newSeqOfCap[(PageId, string)](pager.txnDirtyPages.len)
+  for pageId in pager.txnDirtyPages:
+    let shard = shardFor(cache, pageId)
     acquire(shard.lock)
-    for _, entry in shard.pages:
-      entries.add(entry)
+    if shard.pages.hasKey(pageId):
+      let entry = shard.pages[pageId]
+      if entry.dirty:
+        result.add((entry.id, entry.data))
     release(shard.lock)
-  for entry in entries:
-    if not entry.dirty:
-      continue
-    acquire(entry.lock)
-    let copy = entry.data
-    release(entry.lock)
-    result.add((entry.id, copy))
+
+proc collectDirtyPageRefs*(pager: Pager): seq[(PageId, pointer, int)] =
+  ## Collect references to dirty page data without copying.
+  ## Uses txnDirtyPages list for O(n) lookup instead of O(shards*pages) scan.
+  ## SAFETY: Returned pointers are valid only while no cache modifications occur.
+  let cache = pager.cache
+  result = newSeqOfCap[(PageId, pointer, int)](pager.txnDirtyPages.len)
+  for pageId in pager.txnDirtyPages:
+    let shard = shardFor(cache, pageId)
+    acquire(shard.lock)
+    if shard.pages.hasKey(pageId):
+      let entry = shard.pages[pageId]
+      if entry.dirty:
+        result.add((entry.id, cast[pointer](unsafeAddr entry.data[0]), entry.data.len))
+    release(shard.lock)
 
 proc snapshotSingleDirtyPage*(pager: Pager, pageId: PageId): (PageId, string) =
   ## Fast path: snapshot a single known-dirty page without scanning all shards.
@@ -882,16 +927,19 @@ proc markPagesCommitted*(pager: Pager, pageIds: seq[PageId], lsn: uint64) =
     for pageId in pageIds:
       pager.overriddenPages.excl(pageId)
     release(pager.overlayLock)
-  for pageId in pageIds:
-    let shard = shardFor(cache, pageId)
+  # Batch: scan each shard once marking all its dirty pages committed.
+  # This reduces lock acquisitions from N to numShards.
+  for shard in cache.shards:
     acquire(shard.lock)
-    if shard.pages.hasKey(pageId):
-      let entry = shard.pages[pageId]
-      acquire(entry.lock)
-      entry.dirty = false
-      entry.lsn = lsn
-      release(entry.lock)
+    for _, entry in shard.pages:
+      if entry.dirty:
+        acquire(entry.lock)
+        entry.dirty = false
+        entry.lsn = lsn
+        release(entry.lock)
     release(shard.lock)
+  pager.txnDirtyCount = 0
+  pager.txnDirtyPages.setLen(0)
 
 proc isDirty*(pager: Pager, pageId: PageId): bool =
   let shard = shardFor(pager.cache, pageId)
@@ -970,17 +1018,24 @@ proc closePager*(pager: Pager): Result[Void] =
   let flushRes = flushAll(pager)
   if not flushRes.ok:
     return flushRes
+  # Trim pre-extended file back to actual data size.
+  let actualSize = pageOffset(pager, pager.pageCount + 1)
+  if pager.preExtendedSize > actualSize:
+    discard pager.vfs.truncate(pager.file, actualSize)
+    pager.preExtendedSize = actualSize
   okVoid()
 
 proc appendBlankPage(pager: Pager): Result[PageId] =
   let newId = pager.pageCount + 1
-  var data = newString(pager.pageSize)
-  let offset = pageOffset(pager, newId)
-  let res = pager.vfs.writeStr(pager.file, offset, data)
-  if not res.ok:
-    return err[PageId](res.err.code, res.err.message, res.err.context)
-  if res.value < pager.pageSize:
-    return err[PageId](ERR_IO, "Short write on new page", "page_id=" & $newId)
+  let fileEnd = pageOffset(pager, newId) + pager.pageSize
+  # Pre-extend the file in 64-page (256KB) chunks to amortize ftruncate syscalls.
+  if fileEnd > pager.preExtendedSize:
+    let chunkPages = 64
+    let extendTarget = fileEnd + int64(chunkPages * pager.pageSize)
+    let truncRes = pager.vfs.truncate(pager.file, extendTarget)
+    if not truncRes.ok:
+      return err[PageId](truncRes.err.code, truncRes.err.message, truncRes.err.context)
+    pager.preExtendedSize = extendTarget
   pager.pageCount = newId
   ok(newId)
 
@@ -1089,6 +1144,7 @@ proc beginTxnPageTracking*(pager: Pager) =
   pager.inTransaction = true
   pager.txnAllocatedPages = @[]
   pager.txnDirtyCount = 0
+  pager.txnDirtyPages.setLen(0)
   pager.txnLastDirtyId = 0
 
 proc endTxnPageTracking*(pager: Pager) =

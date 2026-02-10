@@ -65,8 +65,11 @@ type InsertWriteProfile* = object
   hasSecondaryIndexes*: bool       ## table has secondary indexes
   isView*: bool                    ## target is a view (needs INSTEAD triggers)
   hasInsertTriggers*: bool         ## table has AFTER INSERT triggers
+  hasNotNullConstraints*: bool     ## true if any non-PK column has NOT NULL (needs enforceNotNull)
   singleInt64PkIdx*: int          ## column index of single INT64 PK (-1 if none/composite)
   allParamIndices*: seq[int]       ## param indices when all insert values are direct params (empty = slow path)
+  isIdentityParamMapping*: bool    ## true when allParamIndices = [0,1,...,n-1] (can use params directly)
+  hasTextBlobColumns*: bool        ## true if any column is TEXT/BLOB (might need normalization)
 
 type Prepared* = ref object
   db*: Db
@@ -76,6 +79,11 @@ type Prepared* = ref object
   plans*: seq[Plan]
   updateProfiles*: seq[UpdateWriteProfile]
   insertProfiles*: seq[InsertWriteProfile]
+  # Fast-path flag: single INSERT, identity params, no constraints/triggers/RETURNING
+  isFastInsert*: bool
+  fastInsertProfile*: InsertWriteProfile
+  fastInsertBound*: int  ## index into statements for the INSERT
+  fastInsertTablePtr*: ptr TableMeta  ## cached table pointer for fast path
 
 type DurabilityMode* = enum
   dmFull
@@ -1463,6 +1471,9 @@ proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
 
+# Thread-local reusable values seq to avoid per-insert allocation
+var gInsertValues {.threadvar.}: seq[Value]
+
 proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: bool, profile: InsertWriteProfile = InsertWriteProfile()): Result[InsertExecResult] =
   when defined(bench_breakdown):
     let engStart = getMonoTime()
@@ -1484,29 +1495,44 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
     return err[InsertExecResult](ERR_SQL, "Table not found", bound.insertTable)
   template table: untyped = tablePtr[]
 
-  var values: seq[Value]
+  var useParamsDirect = false
   when defined(bench_breakdown):
     let t0 = getMonoTime()
-    if profile.valid and profile.allParamIndices.len > 0:
-      values = newSeq[Value](profile.allParamIndices.len)
+    if profile.valid and profile.isIdentityParamMapping and params.len == profile.allParamIndices.len:
+      useParamsDirect = true
+    elif profile.valid and profile.allParamIndices.len > 0:
+      let numVals = profile.allParamIndices.len
+      if gInsertValues.len != numVals:
+        gInsertValues.setLen(numVals)
       for i, paramIdx in profile.allParamIndices:
-        values[i] = params[paramIdx]
+        gInsertValues[i] = params[paramIdx]
     else:
       let valuesRes = evalInsertValues(bound, params)
       if not valuesRes.ok:
         return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-      values = valuesRes.value
+      gInsertValues = valuesRes.value
     nsEvalValues = int64(inNanoseconds(getMonoTime() - t0))
   else:
-    if profile.valid and profile.allParamIndices.len > 0:
-      values = newSeq[Value](profile.allParamIndices.len)
+    if profile.valid and profile.isIdentityParamMapping and params.len == profile.allParamIndices.len:
+      useParamsDirect = true
+    elif profile.valid and profile.allParamIndices.len > 0:
+      let numVals = profile.allParamIndices.len
+      if gInsertValues.len != numVals:
+        gInsertValues.setLen(numVals)
       for i, paramIdx in profile.allParamIndices:
-        values[i] = params[paramIdx]
+        gInsertValues[i] = params[paramIdx]
     else:
       let valuesRes = evalInsertValues(bound, params)
       if not valuesRes.ok:
         return err[InsertExecResult](valuesRes.err.code, valuesRes.err.message, valuesRes.err.context)
-      values = valuesRes.value
+      gInsertValues = valuesRes.value
+  # Use pointer to avoid per-access branch in the template.
+  var valuesPtr: ptr seq[Value]
+  if useParamsDirect:
+    valuesPtr = unsafeAddr params
+  else:
+    valuesPtr = addr gInsertValues
+  template values: untyped = valuesPtr[]
 
   when defined(bench_breakdown):
     let t1 = getMonoTime()
@@ -1527,18 +1553,20 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
 
   when defined(bench_breakdown):
     let t2 = getMonoTime()
-    let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
-    if not notNullRes.ok:
-      return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    if not profile.valid or profile.hasNotNullConstraints:
+      let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
+      if not notNullRes.ok:
+        return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
     if not profile.valid or profile.hasChecks:
       let checkRes = enforceChecks(table, values)
       if not checkRes.ok:
         return err[InsertExecResult](checkRes.err.code, checkRes.err.message, checkRes.err.context)
     nsConstraints += int64(inNanoseconds(getMonoTime() - t2))
   else:
-    let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
-    if not notNullRes.ok:
-      return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
+    if not profile.valid or profile.hasNotNullConstraints:
+      let notNullRes = enforceNotNull(table, values, skipAutoIncrementPk = true)
+      if not notNullRes.ok:
+        return err[InsertExecResult](notNullRes.err.code, notNullRes.err.message, notNullRes.err.context)
     if not profile.valid or profile.hasChecks:
       let checkRes = enforceChecks(table, values)
       if not checkRes.ok:
@@ -1659,7 +1687,7 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
 
     let t4 = getMonoTime()
     let insertRes = if profile.valid:
-        insertRowWithHint(db.pager, db.catalog, bound.insertTable, values, profile.hasSecondaryIndexes, profile.singleInt64PkIdx)
+        insertRowWithPtr(db.pager, db.catalog, bound.insertTable, values, profile.hasSecondaryIndexes, profile.singleInt64PkIdx, tablePtr)
       else:
         insertRow(db.pager, db.catalog, bound.insertTable, values)
     nsStorage = int64(inNanoseconds(getMonoTime() - t4))
@@ -1692,7 +1720,7 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
         return err[InsertExecResult](fkRes.err.code, fkRes.err.message, fkRes.err.context)
 
     let insertRes = if profile.valid:
-        insertRowWithHint(db.pager, db.catalog, bound.insertTable, values, profile.hasSecondaryIndexes, profile.singleInt64PkIdx)
+        insertRowWithPtr(db.pager, db.catalog, bound.insertTable, values, profile.hasSecondaryIndexes, profile.singleInt64PkIdx, tablePtr)
       else:
         insertRow(db.pager, db.catalog, bound.insertTable, values)
   if not insertRes.ok:
@@ -1821,6 +1849,10 @@ proc buildInsertWriteProfile(catalog: Catalog, tableName: string): InsertWritePr
     if col.primaryKey and pkCount == 1 and col.kind == ctInt64:
       result.singleInt64PkIdx = i
       # INT64 PK uniqueness is enforced by btree.insert(checkUnique=true)
+    if col.notNull and not col.primaryKey:
+      result.hasNotNullConstraints = true
+    if col.kind in {ctText, ctBlob}:
+      result.hasTextBlobColumns = true
   # Check for composite unique indexes
   for _, idx in catalog.indexes:
     if idx.table != tableName:
@@ -1862,6 +1894,13 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
           indices[i] = expr.index - 1
         if allParams:
           profile.allParamIndices = indices
+          # Check if indices are a straight identity mapping [0,1,...,n-1]
+          var isIdentity = true
+          for i, idx in indices:
+            if idx != i:
+              isIdentity = false
+              break
+          profile.isIdentityParamMapping = isIdentity
       insertProfiles.add(profile)
     else:
       insertProfiles.add(InsertWriteProfile())
@@ -1932,7 +1971,7 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
     else:
       plans.add(nil)
 
-  ok(Prepared(
+  var result = Prepared(
     db: db,
     sql: sqlText,
     schemaCookie: db.schemaCookie,
@@ -1940,7 +1979,22 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
     plans: plans,
     updateProfiles: updateProfiles,
     insertProfiles: insertProfiles
-  ))
+  )
+  # Detect fast-path: single INSERT statement with identity params, no constraints/triggers/RETURNING
+  if boundStatements.len == 1 and boundStatements[0].kind == skInsert:
+    let prof = insertProfiles[0]
+    let bound = boundStatements[0]
+    if prof.valid and prof.isIdentityParamMapping and
+       not prof.hasInsertTriggers and not prof.isView and
+       not prof.hasNonPkUniqueColumns and not prof.hasCompositeUniqueIndexes and
+       not prof.hasForeignKeys and not prof.hasNotNullConstraints and not prof.hasChecks and
+       bound.insertReturning.len == 0 and bound.insertValueRows.len == 0 and
+       bound.insertConflictAction == icaNone:
+      result.isFastInsert = true
+      result.fastInsertProfile = prof
+      result.fastInsertBound = 0
+      result.fastInsertTablePtr = db.catalog.getTablePtr(bound.insertTable)
+  ok(result)
 
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
 
@@ -2016,8 +2070,34 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
     prepared.plans = newPrep.plans
     prepared.updateProfiles = newPrep.updateProfiles
     prepared.insertProfiles = newPrep.insertProfiles
+    prepared.isFastInsert = newPrep.isFastInsert
+    prepared.fastInsertProfile = newPrep.fastInsertProfile
+    prepared.fastInsertBound = newPrep.fastInsertBound
+    prepared.fastInsertTablePtr = newPrep.fastInsertTablePtr
 
   let db = prepared.db
+
+  # Fast path: single INSERT with identity params, no constraints/triggers/RETURNING.
+  # Bypasses execInsertStatement to eliminate Result[InsertExecResult] wrapping.
+  if prepared.isFastInsert:
+    let profile = prepared.fastInsertProfile
+    let tablePtr = prepared.fastInsertTablePtr
+    if tablePtr != nil and params.len == profile.allParamIndices.len:
+      # Type check (required for correctness)
+      for i, col in tablePtr.columns:
+        if not typeCheckFast(col, params[i]):
+          let typeRes = typeCheckValue(col, params[i])
+          if not typeRes.ok:
+            return err[seq[string]](typeRes.err.code, typeRes.err.message, col.name)
+      # Direct storage insert — skips execInsertStatement overhead
+      let insertRes = insertRowDirect(db.pager, db.catalog,
+                                        params, profile.singleInt64PkIdx, tablePtr)
+      if not insertRes.ok:
+        return err[seq[string]](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+      var r: Result[seq[string]]
+      r.ok = true
+      return r
+
   var output: seq[string] = @[]
 
   for i, bound in prepared.statements:
@@ -2089,22 +2169,28 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
         if not insteadRes.ok:
           return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
       else:
-        let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0, profile = insertProfile)
-        if not multiRes.ok:
-          return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
-        if not insertProfile.valid or insertProfile.hasInsertTriggers:
-          let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
-          if not triggerRes.ok:
-            return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-        if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
-          let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
-          if not projectedRes.ok:
-            return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
-          for row in projectedRes.value:
-            var parts: seq[string] = @[]
-            for v in row.values:
-              parts.add($v)
-            output.add(parts.join("|"))
+        # Fast path: single-row insert, no RETURNING, no triggers → skip MultiInsertResult allocation
+        if insertProfile.valid and not insertProfile.hasInsertTriggers and bound.insertReturning.len == 0 and bound.insertValueRows.len == 0:
+          let singleRes = execInsertStatement(db, bound, params, wantRow = false, profile = insertProfile)
+          if not singleRes.ok:
+            return err[seq[string]](singleRes.err.code, singleRes.err.message, singleRes.err.context)
+        else:
+          let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0, profile = insertProfile)
+          if not multiRes.ok:
+            return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+          if not insertProfile.valid or insertProfile.hasInsertTriggers:
+            let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
+            if not triggerRes.ok:
+              return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+          if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
+            let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
+            if not projectedRes.ok:
+              return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
+            for row in projectedRes.value:
+              var parts: seq[string] = @[]
+              for v in row.values:
+                parts.add($v)
+              output.add(parts.join("|"))
     of skUpdate:
       let updateProfile =
         if i < prepared.updateProfiles.len:
@@ -3942,7 +4028,8 @@ proc commitTransaction*(db: Db): Result[Void] =
   if dirtyCount == 1:
     let dirtyId = db.pager.txnLastDirtyId
     let (pageId, pageData) = snapshotSingleDirtyPage(db.pager, dirtyId)
-    if pageData.len > 0:
+    let hasDirtyPage = pageData.len > 0
+    if hasDirtyPage:
       let writeRes = writePageDirect(db.activeWriter, pageId, pageData)
       if not writeRes.ok:
         discard rollback(db.activeWriter)
@@ -3958,22 +4045,22 @@ proc commitTransaction*(db: Db): Result[Void] =
       clearCache(db.pager)
       return err[Void](commitRes.err.code, commitRes.err.message, commitRes.err.context)
 
-    if pageData.len > 0:
+    if hasDirtyPage:
       markPageCommitted(db.pager, dirtyId, commitRes.value)
   else:
-    # Multi-page path: use full snapshot scan
-    let dirtyPages = snapshotDirtyPages(db.pager)
-    var pageIds: seq[PageId] = @[]
+    # Multi-page path: zero-copy scan passes data pointers to WAL writer
+    let dirtyRefs = collectDirtyPageRefs(db.pager)
+    var pageIds = newSeqOfCap[PageId](dirtyRefs.len)
 
-    for entry in dirtyPages:
-      let writeRes = writePageDirect(db.activeWriter, entry[0], entry[1])
+    for entry in dirtyRefs:
+      pageIds.add(entry[0])
+      let writeRes = writePageZeroCopy(db.activeWriter, entry[0], entry[1], entry[2])
       if not writeRes.ok:
         discard rollback(db.activeWriter)
         db.activeWriter = nil
         db.pager.flushHandler = nil
         clearCache(db.pager)
         return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-      pageIds.add(entry[0])
 
     let commitRes = commit(db.activeWriter)
     if not commitRes.ok:
