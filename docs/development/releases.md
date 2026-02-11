@@ -41,19 +41,28 @@ Examples:
 ### GitHub release binaries
 
 - Workflow: `.github/workflows/release.yml`
-- Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`, `v1.0.1-rc.*`, `v1.0.1`
+- Trigger: tags `v*`
 - Output: release artifacts containing the DecentDB CLI and the native library for Linux/Windows/macOS.
 
 ### NuGet publishing
 
 - Workflow: `.github/workflows/nuget.yml`
-- Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`, `v1.0.1-rc.*`, `v1.0.1`
+- Trigger: tags `v*`
 - Package: `DecentDB.MicroOrm`
 - Target framework: `.NET 10` only (`net10.0`)
+- Publishing targets:
+  - **GitHub Packages**: Automatically published using `GITHUB_TOKEN` (no configuration needed)
+  - **NuGet.org**: Published if `NUGET_API_KEY` secret is configured
 
-Required secret:
+Required secrets:
 
-- `NUGET_API_KEY` (repo Actions secret)
+- `NUGET_API_KEY` (optional) - API key for publishing to NuGet.org
+  - Obtain from: https://www.nuget.org/account/apikeys
+  - Create a new API key with "Push" permission for the `DecentDB.MicroOrm` package
+  - Add the secret to repository settings: Settings → Secrets and variables → Actions → New repository secret
+  - If not configured, packages will still be published to GitHub Packages
+
+Both publish steps use `continue-on-error: true`, so if one target fails, the other will still be attempted.
 
 ## Creating a pre-release
 
