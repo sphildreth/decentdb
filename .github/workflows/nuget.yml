@@ -98,6 +98,7 @@ jobs:
           New-Item -ItemType Directory -Force out | Out-Null
           if (Test-Path .\decentdb.dll) { Copy-Item -Force .\decentdb.dll out\decentdb.dll }
           if (Test-Path .\build\decentdb.dll) { Copy-Item -Force .\build\decentdb.dll out\decentdb.dll }
+          if (Test-Path .\build\c_api.dll) { Copy-Item -Force .\build\c_api.dll out\decentdb.dll }
           if (Test-Path .\build\libc_api.dll) { Copy-Item -Force .\build\libc_api.dll out\decentdb.dll }
           if (!(Test-Path .\out\decentdb.dll)) { throw "Native DLL not found" }
 
