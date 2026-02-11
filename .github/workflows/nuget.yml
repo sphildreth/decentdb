@@ -21,7 +21,7 @@ jobs:
         include:
           - os: ubuntu-latest
             rid: linux-x64
-          - os: macos-latest
+          - os: macos-13
             rid: osx-x64
           - os: windows-latest
             rid: win-x64
@@ -34,6 +34,37 @@ jobs:
         uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: "stable"
+
+      - name: Build libpg_query (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          cd /tmp/libpg_query
+          make
+          sudo make install
+          sudo ldconfig
+
+      - name: Build libpg_query (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          cd /tmp/libpg_query
+          make
+          sudo make install
+
+      - name: Build libpg_query (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          repo_root="$PWD"
+          git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          cd /tmp/libpg_query
+          make
+          mkdir -p "$repo_root/build/lib"
+          cp libpg_query.a "$repo_root/build/lib/"
+
+      - name: Install dependencies
+        run: nimble setup -y
 
       - name: Build native library (C API)
         run: nimble build_lib
