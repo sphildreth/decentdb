@@ -27,6 +27,7 @@ suite "Dirty Eviction Atomicity":
     let fileRes = vfs.open("test_dirty_eviction.db", fmReadWrite, true)
     require fileRes.ok
     let file = fileRes.value
+    defer: discard vfs.close(file)
     
     # Initialize header
     var header = DbHeader(
@@ -47,6 +48,7 @@ suite "Dirty Eviction Atomicity":
     let pagerRes = newPager(vfs, file, 2)
     require pagerRes.ok
     let pager = pagerRes.value
+    defer: discard closePager(pager)
 
     beginTxnPageTracking(pager)
     

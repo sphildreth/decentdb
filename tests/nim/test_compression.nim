@@ -78,6 +78,7 @@ suite "Value Compression":
     let fileRes = vfs.open(TEST_DB, fmReadWrite, true)
     require fileRes.ok
     let file = fileRes.value
+    defer: discard vfs.close(file)
     
     # Initialize DB header
     var header = DbHeader(
@@ -105,6 +106,7 @@ suite "Value Compression":
       echo "Pager Init Failed: ", pagerRes.err.message
     require pagerRes.ok
     let pager = pagerRes.value
+    defer: discard closePager(pager)
     
     # Case 1: Compressed Inline
     # "aaaa..." x 200. Fits in page (4096), but > 128.
@@ -155,4 +157,3 @@ suite "Value Compression":
     check decodedRes3.value[0].kind == vkText
     check decodedRes3.value[0].bytes == hugeBytes
 
-    discard closePager(pager)
