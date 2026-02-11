@@ -26,6 +26,7 @@ suite "JOIN Fallback Correctness":
     let dbRes = openDb("test_join_overflow.db")
     check dbRes.ok
     let db = dbRes.value
+    defer: discard closeDb(db)
     check db.execSql("CREATE TABLE users (id int, name text)").ok
     check db.execSql("CREATE TABLE logins (user_id int, ts int)").ok
     
