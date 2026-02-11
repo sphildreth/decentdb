@@ -28,6 +28,37 @@ jobs:
         with:
           nim-version: "stable"
 
+      - name: Build libpg_query (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          cd /tmp/libpg_query
+          make
+          sudo make install
+          sudo ldconfig
+
+      - name: Build libpg_query (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          cd /tmp/libpg_query
+          make
+          sudo make install
+
+      - name: Build libpg_query (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          repo_root="$PWD"
+          git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
+          cd /tmp/libpg_query
+          make
+          mkdir -p "$repo_root/build/lib"
+          cp libpg_query.a "$repo_root/build/lib/"
+
+      - name: Install dependencies
+        run: nimble setup -y
+
       - name: Build CLI (release)
         run: nimble build -d:release
 
