@@ -39,6 +39,7 @@ suite "WAL checkpoint race condition tests":
     let fileRes = vfs.open(dbPath, fmReadWrite, true)
     check fileRes.ok
     let dbFile = fileRes.value
+    defer: discard vfs.close(dbFile)
     
     # Write initial header and pad to page size
     let header = DbHeader(
@@ -60,10 +61,14 @@ suite "WAL checkpoint race condition tests":
     let pagerRes = newPager(vfs, dbFile, cachePages = 100)
     check pagerRes.ok
     let pager = pagerRes.value
+    defer: discard closePager(pager)
     
     let walRes = newWal(vfs, walPath)
     check walRes.ok
     let wal = walRes.value
+    defer:
+      unmapWalIfMapped(wal)
+      discard vfs.close(wal.file)
     
     # Allocate pages through pager first
     let page2Res = allocatePage(pager)
@@ -129,6 +134,7 @@ suite "WAL checkpoint race condition tests":
     let fileRes = vfs.open(dbPath, fmReadWrite, true)
     check fileRes.ok
     let dbFile = fileRes.value
+    defer: discard vfs.close(dbFile)
     
     let header = DbHeader(
       formatVersion: FormatVersion,
@@ -149,10 +155,14 @@ suite "WAL checkpoint race condition tests":
     let pagerRes = newPager(vfs, dbFile, cachePages = 100)
     check pagerRes.ok
     let pager = pagerRes.value
+    defer: discard closePager(pager)
     
     let walRes = newWal(vfs, walPath)
     check walRes.ok
     let wal = walRes.value
+    defer:
+      unmapWalIfMapped(wal)
+      discard vfs.close(wal.file)
     
     # Allocate pages first
     var pageIds: seq[PageId] = @[]
@@ -178,6 +188,7 @@ suite "WAL checkpoint race condition tests":
 
     # Pin a reader snapshot at lsnBefore so truncation is unsafe.
     let reader = beginRead(wal)
+    defer: wal.endRead(reader)
     check reader.snapshot == lsnBefore
     
     # Simulate: new commit happens (simulating concurrent activity)

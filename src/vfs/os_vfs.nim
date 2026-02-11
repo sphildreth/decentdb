@@ -75,15 +75,11 @@ method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte])
     return err[int](flushRes.err.code, flushRes.err.message, flushRes.err.context)
   try:
     when defined(windows):
-      var bytesRead: DWORD = 0
-      var overlapped: OVERLAPPED
-      zeroMem(addr overlapped, sizeof(overlapped))
-      overlapped.offset = DWORD(uint64(offset) and 0xFFFFFFFF'u64)
-      overlapped.offsetHigh = DWORD((uint64(offset) shr 32) and 0xFFFFFFFF'u64)
-      let handle = winlean.get_osfhandle(cint(file.file.getFileHandle()))
-      if winlean.readFile(handle, addr buf[0], int32(buf.len), cast[ptr int32](addr bytesRead), addr overlapped) == 0:
-        return err[int](ERR_IO, "Read failed", file.path)
-      ok(int(bytesRead))
+      # Windows stdio file handles don't support POSIX pread; serialize with a per-file lock.
+      withFileLock(file):
+        setFilePos(file.file, offset)
+        let bytesRead = file.file.readBuffer(addr buf[0], buf.len)
+        ok(bytesRead)
     else:
       let fd = cast[cint](file.file.getFileHandle())
       let res = pread(fd, addr buf[0], buf.len, offset.Off)
@@ -102,15 +98,11 @@ method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Resu
     return err[int](flushRes.err.code, flushRes.err.message, flushRes.err.context)
   try:
     when defined(windows):
-      var bytesRead: DWORD = 0
-      var overlapped: OVERLAPPED
-      zeroMem(addr overlapped, sizeof(overlapped))
-      overlapped.offset = DWORD(uint64(offset) and 0xFFFFFFFF'u64)
-      overlapped.offsetHigh = DWORD((uint64(offset) shr 32) and 0xFFFFFFFF'u64)
-      let handle = winlean.get_osfhandle(cint(file.file.getFileHandle()))
-      if winlean.readFile(handle, addr buf[0], int32(buf.len), cast[ptr int32](addr bytesRead), addr overlapped) == 0:
-        return err[int](ERR_IO, "Read failed", file.path)
-      ok(int(bytesRead))
+      # Windows stdio file handles don't support POSIX pread; serialize with a per-file lock.
+      withFileLock(file):
+        setFilePos(file.file, offset)
+        let bytesRead = file.file.readBuffer(addr buf[0], buf.len)
+        ok(bytesRead)
     else:
       let fd = cast[cint](file.file.getFileHandle())
       let res = pread(fd, addr buf[0], buf.len, offset.Off)
