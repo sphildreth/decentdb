@@ -48,10 +48,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          repo_root="$PWD"
           git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
           cd /tmp/libpg_query
           make
-          cp libpg_query.a /usr/local/lib/ 2>/dev/null || cp libpg_query.a /mingw64/lib/ 2>/dev/null || true
+          mkdir -p "$repo_root/build/lib"
+          cp libpg_query.a "$repo_root/build/lib/"
 
       - name: Install dependencies
         run: nimble setup -y

@@ -1,6 +1,4 @@
 when defined(libpg_query):
-  const PgQueryLib = "libpg_query.so"
-
   type PgQueryError* {.bycopy.} = object
     message*: cstring
     funcname*: cstring
@@ -14,8 +12,8 @@ when defined(libpg_query):
     stderr_buffer*: cstring
     error*: ptr PgQueryError
 
-  proc pg_query_parse*(input: cstring): PgQueryParseResult {.importc, dynlib: PgQueryLib, cdecl.}
-  proc pg_query_free_parse_result*(result: PgQueryParseResult) {.importc, dynlib: PgQueryLib, cdecl.}
+  proc pg_query_parse*(input: cstring): PgQueryParseResult {.importc, cdecl.}
+  proc pg_query_free_parse_result*(result: PgQueryParseResult) {.importc, cdecl.}
 else:
   type PgQueryError* = object
   type PgQueryParseResult* = object
