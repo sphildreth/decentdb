@@ -2,16 +2,14 @@ name: Publish NuGet (DecentDB.MicroOrm)
 
 on:
   push:
-    tags:
-      - "v0.1.*"
-      - "v1.0.0"
-      - "v1.0.0-rc.*"
-      - "v1.0.1"
-      - "v1.0.1-rc.*"
+    tags: [
+      "v*"
+    ]
   workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   build-native:
@@ -150,7 +148,11 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
 
-          if [[ "$tag" =~ ^v1\.0\.1$ ]]; then
+          if [[ "$tag" =~ ^v1\.0\.2$ ]]; then
+            nuget="1.0.2"
+          elif [[ "$tag" =~ ^v1\.0\.2-rc\.([0-9]+)$ ]]; then
+            nuget="1.0.2-rc.${BASH_REMATCH[1]}"
+          elif [[ "$tag" =~ ^v1\.0\.1$ ]]; then
             nuget="1.0.1"
           elif [[ "$tag" =~ ^v1\.0\.1-rc\.([0-9]+)$ ]]; then
             nuget="1.0.1-rc.${BASH_REMATCH[1]}"
@@ -180,14 +182,29 @@ jobs:
             -o ./artifacts \
             bindings/dotnet/src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj
 
-      - name: Push
+      - name: Publish to GitHub Packages
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet nuget push ./artifacts/*.nupkg \
+            --api-key "${{ secrets.GITHUB_TOKEN }}" \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --skip-duplicate
+
+      - name: Publish to NuGet.org
+        continue-on-error: true
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$NUGET_API_KEY"
-          dotnet nuget push ./artifacts/*.nupkg \
-            --api-key "$NUGET_API_KEY" \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
+          if [ -n "$NUGET_API_KEY" ]; then
+            dotnet nuget push ./artifacts/*.nupkg \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          else
+            echo "NUGET_API_KEY not set, skipping NuGet.org publish"
+            exit 1
+          fi

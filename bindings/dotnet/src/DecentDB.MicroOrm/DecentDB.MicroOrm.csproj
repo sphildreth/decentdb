@@ -5,11 +5,12 @@
     <Nullable>enable</Nullable>
 
     <PackageId>DecentDB.MicroOrm</PackageId>
-    <Description>DecentDB Micro-ORM (.NET 10) with bundled native engine</Description>
+    <Description>Lightweight Micro-ORM for DecentDB with bundled native runtime</Description>
     <Authors>DecentDB contributors</Authors>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageIcon>icon.png</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/sphildreth/decentdb</PackageProjectUrl>
     <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
 

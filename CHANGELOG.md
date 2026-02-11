@@ -5,7 +5,12 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.1] - Unreleased
+## [1.0.2] - Unreleased
+
+### Changed
+- NuGet package now publishes to both GitHub Packages and NuGet.org
+
+## [1.0.1] - 2026-02-11
 
 ### Fixed
 - .NET: NuGet package packing now places managed assemblies under `lib/net10.0/` so nuget.org correctly reports supported frameworks.
