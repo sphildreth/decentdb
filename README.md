@@ -28,10 +28,6 @@ ACID first. Everything else… eventually.
 
 DecentDB is a embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation. DecentDB provides a PostgreSQL-like SQL interface with ACID transactions, efficient B+Tree storage, and concurrent read access. It is not intended to be the best embedded database engine, but not terrible, a decent better than some engine.
 
-## Status
-
-- Current version: **1.0.0**
-
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
