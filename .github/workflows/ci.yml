@@ -59,5 +59,12 @@ jobs:
       - name: Build
         run: nimble build -d:release
 
+      - name: Run Nim tests (macOS)
+        if: runner.os == 'macOS'
+        env:
+          DYLD_LIBRARY_PATH: /usr/local/lib:/opt/homebrew/lib
+        run: nimble test_nim
+
       - name: Run Nim tests
+        if: runner.os != 'macOS'
         run: nimble test_nim
