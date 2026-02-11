@@ -6,6 +6,8 @@ on:
       - "v0.1.*"
       - "v1.0.0"
       - "v1.0.0-rc.*"
+      - "v1.0.1"
+      - "v1.0.1-rc.*"
   workflow_dispatch:
 
 permissions:
@@ -148,7 +150,11 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
 
-          if [[ "$tag" =~ ^v1\.0\.0$ ]]; then
+          if [[ "$tag" =~ ^v1\.0\.1$ ]]; then
+            nuget="1.0.1"
+          elif [[ "$tag" =~ ^v1\.0\.1-rc\.([0-9]+)$ ]]; then
+            nuget="1.0.1-rc.${BASH_REMATCH[1]}"
+          elif [[ "$tag" =~ ^v1\.0\.0$ ]]; then
             nuget="1.0.0"
           elif [[ "$tag" =~ ^v1\.0\.0-rc\.([0-9]+)$ ]]; then
             nuget="1.0.0-rc.${BASH_REMATCH[1]}"

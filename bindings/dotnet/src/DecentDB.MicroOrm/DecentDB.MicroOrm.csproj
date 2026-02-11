@@ -13,13 +13,12 @@
     <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
 
-    <!-- Custom nuspec: keep a single package, but emit an empty net10.0 dependency group (avoids NU5128). -->
-    <NuspecFile>DecentDB.MicroOrm.nuspec</NuspecFile>
-    <NuspecProperties>version=$(PackageVersion)</NuspecProperties>
-
     <!-- Publish as a single package that contains the managed layers + native binaries. -->
     <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
+
+    <!-- SDK-style packing infers supported TFMs from lib/<tfm>; suppress NU5128 noise. -->
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
 
   </PropertyGroup>
 
