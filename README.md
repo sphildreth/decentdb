@@ -66,7 +66,7 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 ## Performance (at a glance)
 
 <p align="center">
-    <img src="benchmarks/embedded_compare/assets/decentdb-benchmarks.svg" alt="Decent performance..." width="50%" />
+    <img src="benchmarks/embedded_compare/assets/decentdb-speedup.png" alt="Decent performance..." width="75%" />
 </p>
 
 **How this chart is produced**
