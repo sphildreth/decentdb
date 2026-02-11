@@ -79,7 +79,7 @@ method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte])
       withFileLock(file):
         setFilePos(file.file, offset)
         let bytesRead = file.file.readBuffer(addr buf[0], buf.len)
-        ok(bytesRead)
+        return ok(bytesRead)
     else:
       let fd = cast[cint](file.file.getFileHandle())
       let res = pread(fd, addr buf[0], buf.len, offset.Off)
@@ -102,7 +102,7 @@ method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Resu
       withFileLock(file):
         setFilePos(file.file, offset)
         let bytesRead = file.file.readBuffer(addr buf[0], buf.len)
-        ok(bytesRead)
+        return ok(bytesRead)
     else:
       let fd = cast[cint](file.file.getFileHandle())
       let res = pread(fd, addr buf[0], buf.len, offset.Off)
