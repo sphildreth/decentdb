@@ -29,7 +29,7 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="README.md" />
-    <None Include="..\..\..\..\graphics\logo-256x256.png" Pack="true" PackagePath="icon.png" />
+    <None Include="icon.png" Pack="true" PackagePath="\" />
     <None Include="runtimes/linux-x64/native/libdecentdb.so" Pack="true" PackagePath="runtimes/linux-x64/native/libdecentdb.so" Condition="Exists('runtimes/linux-x64/native/libdecentdb.so')" />
     <None Include="runtimes/osx-x64/native/libdecentdb.dylib" Pack="true" PackagePath="runtimes/osx-x64/native/libdecentdb.dylib" Condition="Exists('runtimes/osx-x64/native/libdecentdb.dylib')" />
     <None Include="runtimes/win-x64/native/decentdb.dll" Pack="true" PackagePath="runtimes/win-x64/native/decentdb.dll" Condition="Exists('runtimes/win-x64/native/decentdb.dll')" />
