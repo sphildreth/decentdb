@@ -83,8 +83,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item -Force .\decentdb.exe dist\
+          if (Test-Path .\build\c_api.dll) { Copy-Item -Force .\build\c_api.dll dist\decentdb.dll }
           if (Test-Path .\build\libc_api.dll) { Copy-Item -Force .\build\libc_api.dll dist\decentdb.dll }
           if (Test-Path .\build\decentdb.dll) { Copy-Item -Force .\build\decentdb.dll dist\decentdb.dll }
+          if (!(Test-Path .\dist\decentdb.dll)) { throw "Native DLL not found" }
 
       - name: Package (Linux/macOS)
         if: runner.os != 'Windows'
@@ -104,7 +106,7 @@ jobs:
           Compress-Archive -Path dist\* -DestinationPath $out -Force
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: release-${{ matrix.os }}
           path: |
@@ -118,7 +120,7 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v3
         with:
           path: artifacts
 
