@@ -5,6 +5,30 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - Unreleased
+
+### Fixed
+- .NET: NuGet package packing now places managed assemblies under `lib/net10.0/` so nuget.org correctly reports supported frameworks.
+
+## [1.0.0] - 2026-02-10
+
+### Changed
+- Optimized pager with transaction-scoped dirty page tracking for faster commit processing
+- Introduced zero-copy WAL writes to avoid data copying during commit operations
+- Added thread-local reusable buffers in storage layer to reduce heap allocations during row inserts
+- Added `insertRowDirect` fast path for inserts with known schema, bypassing normalization and redundant lookups
+- Optimized `TableMeta` updates with in-place `nextRowId`/`rootPage` mutation instead of full struct copies
+- Added insert write profiling to precompute constraint/index metadata for optimized execution paths
+- Added fast path in value normalization to skip unnecessary work for small TEXT/BLOB values
+- Introduced reverse foreign key cache in catalog for efficient parent-table constraint lookups
+- Enhanced VFS buffered writes with atomic operations
+- Added WAL commit pruning logic to maintain snapshot correctness based on active readers
+
+### Added
+- Composite primary key support in SQLite import tool
+- CI workflow for automated testing
+- Benchmarking support for Firebird in embedded database comparison
+
 ## [0.1.0] - 2026-02-07
 
 ### Added

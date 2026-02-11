@@ -1,16 +1,36 @@
 # .NET (C#) Bindings
 
-DecentDB's .NET bindings live in-repo under `bindings/dotnet/` and provide full ADO.NET and micro-ORM support for embedded use.
+DecentDB ships .NET bindings (ADO.NET + Micro-ORM) for embedded use.
 
-## Packages
+For most .NET applications, **the preferred way to consume DecentDB is the published NuGet package** [`DecentDB.MicroOrm`](https://www.nuget.org/packages/DecentDB.MicroOrm/), which bundles the managed layers plus the native engine.
 
-| Package | Description |
+## NuGet (preferred)
+
+```bash
+dotnet add package DecentDB.MicroOrm
+# If you want pre-release builds:
+dotnet add package DecentDB.MicroOrm --prerelease
+```
+
+Notes:
+
+- This is currently the only published NuGet package; it includes `DecentDB.MicroOrm`, `DecentDB.AdoNet`, and `DecentDB.Native`.
+- Targets `.NET 10` (`net10.0`).
+- Ships native assets under `runtimes/{rid}/native/` for: `linux-x64`, `osx-x64`, `win-x64`.
+
+## Assemblies
+
+The NuGet package includes these assemblies:
+
+| Assembly | Description |
 |---------|-------------|
 | `DecentDB.Native` | Low-level P/Invoke wrapper over the DecentDB C API |
 | `DecentDB.AdoNet` | ADO.NET provider (`DbConnection`, `DbCommand`, `DbDataReader`) |
 | `DecentDB.MicroOrm` | Micro-ORM with `DbSet<T>`, `DecentDBContext`, LINQ-style queries |
 
-## Build the native library
+## Build the native library (from source)
+
+If you need a RID not shipped by the NuGet package or you're working in this repo:
 
 ```bash
 nimble build_lib

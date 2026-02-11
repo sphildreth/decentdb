@@ -30,18 +30,24 @@ Examples:
 - GitHub: full release
 - NuGet: `1.0.0`
 
+### Patch releases
+
+- Tag: `v1.0.Z` (e.g. `v1.0.1`)
+- GitHub: full release
+- NuGet: `1.0.Z`
+
 ## Workflows
 
 ### GitHub release binaries
 
 - Workflow: `.github/workflows/release.yml`
-- Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`
+- Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`, `v1.0.1-rc.*`, `v1.0.1`
 - Output: release artifacts containing the DecentDB CLI and the native library for Linux/Windows/macOS.
 
 ### NuGet publishing
 
 - Workflow: `.github/workflows/nuget.yml`
-- Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`
+- Trigger: tags `v0.1.*`, `v1.0.0-rc.*`, `v1.0.0`, `v1.0.1-rc.*`, `v1.0.1`
 - Package: `DecentDB.MicroOrm`
 - Target framework: `.NET 10` only (`net10.0`)
 
