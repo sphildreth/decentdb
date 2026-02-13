@@ -17,7 +17,7 @@ public sealed class ProviderSmokeTests : IDisposable
     }
 
     [Fact]
-    public void UseDecentDb_RegistersProviderExtension()
+    public void UseDecentDB_RegistersProviderExtension()
     {
         var optionsBuilder = new DbContextOptionsBuilder();
         optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
@@ -27,7 +27,7 @@ public sealed class ProviderSmokeTests : IDisposable
     }
 
     [Fact]
-    public void UseDecentDb_CanOpenRelationalConnection()
+    public void UseDecentDB_CanOpenRelationalConnection()
     {
         var optionsBuilder = new DbContextOptionsBuilder<SmokeDbContext>();
         optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
@@ -40,7 +40,7 @@ public sealed class ProviderSmokeTests : IDisposable
     }
 
     [Fact]
-    public void UseDecentDb_WithExistingDbConnection_UsesSameConnection()
+    public void UseDecentDB_WithExistingDbConnection_UsesSameConnection()
     {
         using var connection = new DecentDBConnection($"Data Source={_dbPath}");
         var optionsBuilder = new DbContextOptionsBuilder<SmokeDbContext>();

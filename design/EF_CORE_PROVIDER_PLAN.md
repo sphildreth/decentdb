@@ -116,9 +116,9 @@ Issue linkage:
 - This step is the core deliverable for DecentDB issue #20 (the `.UseDecentDB(...)` provider entrypoint analogous to `.UseSqlite(...)`).
 
 Provider surface area should mirror other relational providers:
-- `DecentDbDbContextOptionsBuilder` (provider-specific options)
-- `DecentDbOptionsExtension` (stores connection string/options)
-- `AddEntityFrameworkDecentDb()` (internal wiring hook)
+- `DDecentDBbContextOptionsBuilder` (provider-specific options)
+- `DecentDBOptionsExtension` (stores connection string/options)
+- `AddEntityFrameworkDecentDB()` (internal wiring hook)
 
 Repo layout note:
 - In this repository, .NET bindings live under `bindings/dotnet/`. The provider projects should be created under `bindings/dotnet/src/` and added to `bindings/dotnet/DecentDB.NET.sln`.
@@ -147,8 +147,8 @@ Packaging decision (ADR required):
 Goal: Map CLR types to DecentDB storage and SQL literals consistently, including existing DecentDB epoch/ticks/day-number conventions.
 
 Deliverables:
-- `DecentDbTypeMappingSource : RelationalTypeMappingSource`
-- `DecentDbSqlGenerationHelper : RelationalSqlGenerationHelper` (quoting, delimiters)
+- `DecentDBTypeMappingSource : RelationalTypeMappingSource`
+- `DecentDBSqlGenerationHelper : RelationalSqlGenerationHelper` (quoting, delimiters)
 - Value converters where needed to keep storage stable and performant.
 
 Key decisions to pin down (documented in the ADR and/or provider docs):
@@ -173,8 +173,8 @@ Initial mapping targets (v0):
 Goal: Translate EF Core expression trees into correct, idiomatic DecentDB SQL with good parameterization and minimal overhead.
 
 Core components (typical EF relational provider shape):
-- `DecentDbSqlExpressionFactory`
-- `DecentDbQuerySqlGenerator` (+ factory)
+- `DecentDBSqlExpressionFactory`
+- `DecentDBQuerySqlGenerator` (+ factory)
 - Query translation/visitors:
   - method translating visitor factory
   - member translating visitor provider
@@ -212,8 +212,8 @@ Performance notes:
 Goal: Reuse DecentDB’s existing `DbConnection`/`DbCommand`/`DbDataReader` plumbing rather than inventing a second execution stack.
 
 Deliverables:
-- `DecentDbRelationalConnection : RelationalConnection` that creates/uses `DecentDB.AdoNet` connections
-- `DecentDbCommandBuilder` integration (as needed) for parameter creation
+- `DecentDBRelationalConnection : RelationalConnection` that creates/uses `DecentDB.AdoNet` connections
+- `DecentDBCommandBuilder` integration (as needed) for parameter creation
 - Transaction integration:
   - `RelationalTransaction` wrapping `DbTransaction`
   - correct behavior for nested/ambient transactions (document limitations)
@@ -242,7 +242,7 @@ Goal: Keep the core provider free of a NodaTime dependency, and offer NodaTime s
 Deliverables:
 - New project/package: `DecentDB.EntityFrameworkCore.NodaTime`
 - Public extension:
-  - `UseNodaTime()` on `DecentDbDbContextOptionsBuilder` (or provider options builder)
+  - `UseNodaTime()` on `DecentDBDbContextOptionsBuilder` (or provider options builder)
 - Adds:
   - NodaTime type mappings
   - value converters for stable storage aligned with DecentDB conventions
@@ -287,8 +287,8 @@ Goal: Support EF Core inserts/updates/deletes with correct generated-value handl
 
 Deliverables (typical EF relational provider shape):
 - Update SQL generation:
-  - `DecentDbUpdateSqlGenerator : UpdateSqlGenerator`
-  - `DecentDbModificationCommandBatchFactory` and batching configuration
+  - `DecentDBUpdateSqlGenerator : UpdateSqlGenerator`
+  - `DecentDBModificationCommandBatchFactory` and batching configuration
 - Value generation:
   - Identity/auto-increment keys via `INSERT ... RETURNING`
   - Database defaults (e.g., `DEFAULT ...`) via `INSERT ... RETURNING` where DecentDB can return the computed value
