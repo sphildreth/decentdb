@@ -48,6 +48,25 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 }
 ```
 
+### EF Core provider type mappings (Phase 2)
+
+Phase 2 aligns EF Core provider type mappings with the existing ADO.NET/MicroOrm conventions:
+
+| CLR type | EF store type | DecentDB storage representation |
+|---|---|---|
+| `bool` | `BOOLEAN` | native boolean |
+| `byte`, `short`, `int`, `long` | `INTEGER` | signed integer |
+| `float`, `double` | `REAL` | floating-point |
+| `decimal` | `DECIMAL` | native DECIMAL (unscaled + scale; see ADR-0091) |
+| `Guid` | `UUID` | 16-byte blob UUID (see ADR-0091) |
+| `string` | `TEXT` | UTF-8 text |
+| `byte[]` | `BLOB` | binary blob |
+| `DateTime` | `INTEGER` | Unix epoch milliseconds (UTC) |
+| `DateTimeOffset` | `INTEGER` | Unix epoch milliseconds (UTC) |
+| `DateOnly` | `INTEGER` | day offset from Unix epoch day |
+| `TimeOnly` | `INTEGER` | ticks since midnight |
+| `TimeSpan` | `INTEGER` | ticks |
+
 ## Assemblies
 
 The NuGet package includes these assemblies:

@@ -47,16 +47,16 @@ Exit criteria:
 
 ## Phase 2: Relational Type Mapping (M0)
 
-- [ ] Phase 2 complete
-- [ ] Implement `RelationalTypeMappingSource` for DecentDB-supported types
-- [ ] Implement SQL literal generation/quoting helpers
-- [ ] Align date/time storage conventions with existing .NET rules (epoch/ticks/day-number) and document them
-- [ ] Validate DECIMAL/UUID behavior against `design/adr/0091-decimal-uuid-implementation.md`
-- [ ] Unit tests: type mapping round-trip tests (CLR -> parameter -> storage -> materialization)
-- [ ] Documentation: provider type mapping table (initial v0 set)
+- [x] Phase 2 complete
+- [x] Implement `RelationalTypeMappingSource` for DecentDB-supported types
+- [x] Implement SQL literal generation/quoting helpers
+- [x] Align date/time storage conventions with existing .NET rules (epoch/ticks/day-number) and document them
+- [x] Validate DECIMAL/UUID behavior against `design/adr/0091-decimal-uuid-implementation.md`
+- [x] Unit tests: type mapping round-trip tests (CLR -> parameter -> storage -> materialization)
+- [x] Documentation: provider type mapping table (initial v0 set)
 
 Exit criteria:
-- [ ] Common CLR types map deterministically and round-trip in tests
+- [x] Common CLR types map deterministically and round-trip in tests
 
 ---
 
