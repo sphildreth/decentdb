@@ -74,9 +74,9 @@ dotnet ef database update
 
 For `IDesignTimeDbContextFactory<TContext>` projects, keep `UseDecentDb("Data Source=...")` in the factory so `dotnet ef` can create the context.
 
-### EF Core provider type mappings (Phase 2)
+### EF Core provider type mappings
 
-Phase 2 aligns EF Core provider type mappings with the existing ADO.NET/MicroOrm conventions:
+EF Core provider type mappings with the existing ADO.NET/MicroOrm conventions:
 
 | CLR type | EF store type | DecentDB storage representation |
 |---|---|---|
@@ -93,7 +93,7 @@ Phase 2 aligns EF Core provider type mappings with the existing ADO.NET/MicroOrm
 | `TimeOnly` | `INTEGER` | ticks since midnight |
 | `TimeSpan` | `INTEGER` | ticks |
 
-### EF Core query translation scope (Phase 3)
+### EF Core query translation scope
 
 Current supported query translation subset:
 
