@@ -32,7 +32,7 @@ Notes:
 
 The EF Core provider entrypoint (`UseDecentDb`) is being implemented under [issue #20](https://github.com/sphildreth/decentdb/issues/20).
 
-Phase 1 currently provides provider wiring and connectivity smoke coverage; query translation and migrations are planned in later phases.
+Phase 3 now includes a minimal relational query translation slice (basic filters/order/paging and common string operators). SaveChanges, migrations, and broader conformance are still planned in later phases.
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
@@ -66,6 +66,19 @@ Phase 2 aligns EF Core provider type mappings with the existing ADO.NET/MicroOrm
 | `DateOnly` | `INTEGER` | day offset from Unix epoch day |
 | `TimeOnly` | `INTEGER` | ticks since midnight |
 | `TimeSpan` | `INTEGER` | ticks |
+
+### EF Core query translation scope (Phase 3)
+
+Current supported query translation subset:
+
+- Basic `Where`, `OrderBy`, `Skip`, and `Take` translation.
+- Paging uses `LIMIT/OFFSET`.
+- Null/bool relational semantics are emitted by EF relational SQL generation (`IS NULL`, boolean predicates).
+- String operators: `Contains`, `StartsWith`, `EndsWith` translate to `LIKE` patterns for literal string arguments, with wildcard escaping for literal `%` and `_`.
+
+Current guardrails:
+
+- `IN (...)` lists are capped at **1000 values**; larger lists fail fast with a provider error.
 
 ## Assemblies
 

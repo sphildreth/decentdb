@@ -62,19 +62,19 @@ Exit criteria:
 
 ## Phase 3: Query Translation + SQL Generation (M0)
 
-- [ ] Phase 3 complete
-- [ ] Implement query SQL generator pipeline (expression factory + query SQL generator + translators)
-- [ ] Ensure generated SQL targets DecentDB’s supported subset (`design/SPEC.md`), not “full PostgreSQL”
-- [ ] Implement paging translation using `LIMIT/OFFSET` (avoid `OFFSET ... FETCH` unless engine support is added)
-- [ ] Implement null/bool semantics (`IS NULL`, `TRUE/FALSE`) consistent with DecentDB
-- [ ] Implement common string ops (`Contains`, `StartsWith`, `EndsWith`) with correct LIKE escaping
-- [ ] Define a policy for large `IN (...)` lists (max size error vs alternate rewrite; document)
-- [ ] Unit tests: SQL generation tests for supported LINQ patterns (golden SQL + parameters)
-- [ ] Integration tests: execute a small set of translated queries against a real DecentDB file
+- [x] Phase 3 complete
+- [x] Implement query SQL generator pipeline (expression factory + query SQL generator + translators)
+- [x] Ensure generated SQL targets DecentDB’s supported subset (`design/SPEC.md`), not “full PostgreSQL”
+- [x] Implement paging translation using `LIMIT/OFFSET` (avoid `OFFSET ... FETCH` unless engine support is added)
+- [x] Implement null/bool semantics (`IS NULL`, `TRUE/FALSE`) consistent with DecentDB
+- [x] Implement common string ops (`Contains`, `StartsWith`, `EndsWith`) with correct LIKE escaping
+- [x] Define a policy for large `IN (...)` lists (max size error vs alternate rewrite; document)
+- [x] Unit tests: SQL generation tests for supported LINQ patterns (golden SQL + parameters)
+- [x] Integration tests: execute a small set of translated queries against a real DecentDB file
 
 Exit criteria:
-- [ ] Basic LINQ queries work end-to-end with parameters and correct results
-- [ ] A conformance test seed set is running (even if tiny)
+- [x] Basic LINQ queries work end-to-end with parameters and correct results
+- [x] A conformance test seed set is running (even if tiny)
 
 ---
 
