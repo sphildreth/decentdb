@@ -228,7 +228,9 @@ type Statement* = ref object
     selectItems*: seq[SelectItem]
     fromTable*: string
     fromAlias*: string
+    fromSubquery*: Statement
     joins*: seq[JoinClause]
+    joinSubqueries*: seq[Statement]
     whereExpr*: Expr
     groupBy*: seq[Expr]
     havingExpr*: Expr
@@ -650,16 +652,17 @@ proc parseCaseExpr(node: JsonNode): Result[Expr] =
 
 proc parseSubLink(node: JsonNode): Result[Expr] =
   let linkType = nodeStringOr(node, "subLinkType", "")
-  if linkType != "EXISTS_SUBLINK":
-    return err[Expr](ERR_SQL, "Only EXISTS subqueries are supported in 0.x")
+  if linkType != "EXISTS_SUBLINK" and linkType != "EXPR_SUBLINK":
+    return err[Expr](ERR_SQL, "Only EXISTS and scalar subqueries are supported")
   let subselectNode = nodeGet(node, "subselect")
   let stmtRes = parseStatementNode(subselectNode)
   if not stmtRes.ok:
     return err[Expr](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
   if stmtRes.value.kind != skSelect:
-    return err[Expr](ERR_SQL, "EXISTS requires SELECT subquery")
+    return err[Expr](ERR_SQL, "Subquery requires SELECT statement")
   let sqlText = selectToCanonicalSql(stmtRes.value)
-  ok(Expr(kind: ekFunc, funcName: "EXISTS", args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: sqlText))], isStar: false))
+  let funcName = if linkType == "EXISTS_SUBLINK": "EXISTS" else: "SCALAR_SUBQUERY"
+  ok(Expr(kind: ekFunc, funcName: funcName, args: @[Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: sqlText))], isStar: false))
 
 proc parseNullTest(node: JsonNode): Result[Expr] =
   let argRes = parseExprNode(node["arg"])
@@ -714,7 +717,27 @@ proc parseRangeVar(node: JsonNode): Result[(string, string)] =
       alias = aliasNode["aliasname"].getStr
   ok((relname, alias))
 
-proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string, joins: var seq[JoinClause]): Result[Void] =
+proc parseRangeSubselect(node: JsonNode): Result[(Statement, string)] =
+  let subNode = if nodeHas(node, "RangeSubselect"): node["RangeSubselect"] else: node
+  let subqueryNode = nodeGet(subNode, "subquery")
+  let stmtRes = parseStatementNode(subqueryNode)
+  if not stmtRes.ok:
+    return err[(Statement, string)](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
+  if stmtRes.value.kind != skSelect:
+    return err[(Statement, string)](ERR_SQL, "Subquery in FROM must be SELECT")
+  var alias = ""
+  if nodeHas(subNode, "alias"):
+    var aliasNode = subNode["alias"]
+    if nodeHas(aliasNode, "Alias"):
+      aliasNode = aliasNode["Alias"]
+    if nodeHas(aliasNode, "aliasname"):
+      alias = aliasNode["aliasname"].getStr
+  if alias.len == 0:
+    return err[(Statement, string)](ERR_SQL, "Subquery in FROM requires an alias")
+  ok((stmtRes.value, alias))
+
+proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string, joins: var seq[JoinClause],
+                   fromSubquery: var Statement, joinSubqueries: var seq[Statement]): Result[Void] =
   if nodeHas(node, "RangeVar") or nodeHas(node, "relname"):
     let rvRes = parseRangeVar(node)
     if not rvRes.ok:
@@ -724,20 +747,41 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
       baseAlias = rvRes.value[1]
     else:
       joins.add(JoinClause(joinType: jtInner, table: rvRes.value[0], alias: rvRes.value[1], onExpr: nil))
+      joinSubqueries.add(nil)
+    return okVoid()
+  if nodeHas(node, "RangeSubselect"):
+    let subRes = parseRangeSubselect(node)
+    if not subRes.ok:
+      return err[Void](subRes.err.code, subRes.err.message, subRes.err.context)
+    if baseTable.len == 0:
+      fromSubquery = subRes.value[0]
+      baseTable = subRes.value[1]
+      baseAlias = subRes.value[1]
+    else:
+      joins.add(JoinClause(joinType: jtInner, table: subRes.value[1], alias: subRes.value[1], onExpr: nil))
+      joinSubqueries.add(subRes.value[0])
     return okVoid()
   if nodeHas(node, "JoinExpr"):
     let join = node["JoinExpr"]
-    let leftRes = parseFromItem(join["larg"], baseTable, baseAlias, joins)
+    let leftRes = parseFromItem(join["larg"], baseTable, baseAlias, joins, fromSubquery, joinSubqueries)
     if not leftRes.ok:
       return err[Void](leftRes.err.code, leftRes.err.message, leftRes.err.context)
     var rightTable = ""
     var rightAlias = ""
+    var rightSubquery: Statement = nil
     if nodeHas(join, "rarg"):
       let rarg = join["rarg"]
-      let rvRes = parseRangeVar(rarg)
-      if rvRes.ok:
-        rightTable = rvRes.value[0]
-        rightAlias = rvRes.value[1]
+      if nodeHas(rarg, "RangeSubselect"):
+        let subRes = parseRangeSubselect(rarg)
+        if subRes.ok:
+          rightSubquery = subRes.value[0]
+          rightTable = subRes.value[1]
+          rightAlias = subRes.value[1]
+      else:
+        let rvRes = parseRangeVar(rarg)
+        if rvRes.ok:
+          rightTable = rvRes.value[0]
+          rightAlias = rvRes.value[1]
     let joinKindStr = if nodeHas(join, "jointype"): join["jointype"].getStr else: ""
     let joinKind = if joinKindStr == "JOIN_LEFT": jtLeft else: jtInner
     var onExpr: Expr = nil
@@ -747,6 +791,7 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
         onExpr = onRes.value
     if rightTable.len > 0:
       joins.add(JoinClause(joinType: joinKind, table: rightTable, alias: rightAlias, onExpr: onExpr))
+      joinSubqueries.add(rightSubquery)
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
 
@@ -837,7 +882,9 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       selectItems: @[],
       fromTable: "",
       fromAlias: "",
+      fromSubquery: nil,
       joins: @[],
+      joinSubqueries: @[],
       whereExpr: nil,
       groupBy: @[],
       havingExpr: nil,
@@ -867,11 +914,13 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
         items.add(SelectItem(expr: exprRes.value, alias: alias, isStar: false))
   var fromTable = ""
   var fromAlias = ""
+  var fromSubquery: Statement = nil
   var joins: seq[JoinClause] = @[]
+  var joinSubqueries: seq[Statement] = @[]
   let fromClause = nodeGet(node, "fromClause")
   if fromClause.kind == JArray and fromClause.len > 0:
     for item in fromClause:
-      let res = parseFromItem(item, fromTable, fromAlias, joins)
+      let res = parseFromItem(item, fromTable, fromAlias, joins, fromSubquery, joinSubqueries)
       if not res.ok:
         return err[Statement](res.err.code, res.err.message, res.err.context)
   var whereExpr: Expr = nil
@@ -940,7 +989,9 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     selectItems: items,
     fromTable: fromTable,
     fromAlias: fromAlias,
+    fromSubquery: fromSubquery,
     joins: joins,
+    joinSubqueries: joinSubqueries,
     whereExpr: whereExpr,
     groupBy: groupBy,
     havingExpr: havingExpr,
@@ -1161,6 +1212,8 @@ proc exprToCanonicalSql*(expr: Expr): string =
       text
     elif expr.funcName == "EXISTS" and expr.args.len == 1 and expr.args[0].kind == ekLiteral and expr.args[0].value.kind == svString:
       "EXISTS (" & expr.args[0].value.strVal & ")"
+    elif expr.funcName == "SCALAR_SUBQUERY" and expr.args.len == 1 and expr.args[0].kind == ekLiteral and expr.args[0].value.kind == svString:
+      "(" & expr.args[0].value.strVal & ")"
     else:
       let argsText =
         if expr.isStar:
@@ -1957,7 +2010,9 @@ proc parseSql*(sql: string): Result[SqlAst] =
       selectItems: @[SelectItem(expr: nil, alias: "", isStar: true)],
       fromTable: tableName,
       fromAlias: "",
+      fromSubquery: nil,
       joins: @[],
+      joinSubqueries: @[],
       whereExpr: whereExpr,
       groupBy: @[],
       havingExpr: nil,

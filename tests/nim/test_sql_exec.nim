@@ -1087,3 +1087,113 @@ suite "Planner":
     check badUpdate.err.code == ERR_SQL
     
     discard closeDb(db)
+
+  test "subquery in FROM clause":
+    let path = makeTempDb("decentdb_subquery_from.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT, genre TEXT)").ok
+    check execSql(db, "CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT, title TEXT)").ok
+    discard execSql(db, "INSERT INTO artists (id, name, genre) VALUES (1, 'Beatles', 'Rock')")
+    discard execSql(db, "INSERT INTO artists (id, name, genre) VALUES (2, 'Miles', 'Jazz')")
+    discard execSql(db, "INSERT INTO artists (id, name, genre) VALUES (3, 'Bach', 'Classical')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'Abbey Road')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id, title) VALUES (11, 1, 'Let It Be')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id, title) VALUES (12, 2, 'Kind of Blue')")
+
+    # Simple subquery in FROM
+    let r1 = execSql(db, "SELECT sub.name FROM (SELECT name FROM artists WHERE id = 1) AS sub")
+    check r1.ok
+    check r1.value.len == 1
+    check splitRow(r1.value[0])[0] == "Beatles"
+
+    # Subquery with LIMIT in FROM (the EF Core pattern)
+    let r2 = execSql(db, """
+      SELECT a1.name FROM (
+        SELECT id, name FROM artists ORDER BY id LIMIT 2
+      ) AS a1 ORDER BY a1.name
+    """)
+    check r2.ok
+    check r2.value.len == 2
+    let row0 = splitRow(r2.value[0])[0]
+    let row1 = splitRow(r2.value[1])[0]
+    check row0 == "Beatles"
+    check row1 == "Miles"
+
+    # Subquery with LIMIT + LEFT JOIN (the exact EF Core pattern)
+    let r3 = execSql(db, """
+      SELECT a1.id, a1.name, a0.title
+      FROM (
+        SELECT id, name FROM artists WHERE id = 1 LIMIT 1
+      ) AS a1
+      LEFT JOIN albums AS a0 ON a1.id = a0.artist_id
+      ORDER BY a1.id
+    """)
+    check r3.ok
+    let r3row0 = splitRow(r3.value[0])
+    check r3row0[0] == "1"
+    check r3row0[1] == "Beatles"
+    check r3row0[2] == "Abbey Road"
+    let r3row1 = splitRow(r3.value[1])
+    check r3row1[2] == "Let It Be"
+
+    # Subquery in FROM with no matching rows in LEFT JOIN
+    let r4 = execSql(db, """
+      SELECT a1.name, a0.title
+      FROM (
+        SELECT id, name FROM artists WHERE id = 3 LIMIT 1
+      ) AS a1
+      LEFT JOIN albums AS a0 ON a1.id = a0.artist_id
+    """)
+    check r4.ok
+    check r4.value.len == 1
+    let r4row = splitRow(r4.value[0])
+    check r4row[0] == "Bach"
+    check r4row[1] == "NULL"
+
+    discard closeDb(db)
+
+  test "scalar subquery and nested aggregates":
+    let path = makeTempDb("decentdb_scalar_subquery.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)").ok
+    check execSql(db, "CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT, title TEXT)").ok
+    check execSql(db, "CREATE TABLE tracks (id INT PRIMARY KEY, album_id INT, play_count INT)").ok
+    discard execSql(db, "INSERT INTO artists (id, name) VALUES (1, 'A1')")
+    discard execSql(db, "INSERT INTO artists (id, name) VALUES (2, 'A2')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id, title) VALUES (1, 1, 'X')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id, title) VALUES (2, 1, 'Y')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id, title) VALUES (3, 2, 'Z')")
+    discard execSql(db, "INSERT INTO tracks (id, album_id, play_count) VALUES (1, 1, 100)")
+    discard execSql(db, "INSERT INTO tracks (id, album_id, play_count) VALUES (2, 1, 200)")
+    discard execSql(db, "INSERT INTO tracks (id, album_id, play_count) VALUES (3, 3, 50)")
+
+    # Correlated scalar subquery: count albums per artist
+    let r1 = execSql(db, "SELECT a.name, (SELECT COUNT(*) FROM albums a0 WHERE a0.artist_id = a.id) FROM artists a ORDER BY a.id")
+    check r1.ok
+    check r1.value.len == 2
+    let r1a = splitRow(r1.value[0])
+    check r1a[0] == "A1"
+    check r1a[1] == "2"
+    let r1b = splitRow(r1.value[1])
+    check r1b[0] == "A2"
+    check r1b[1] == "1"
+
+    # Nested aggregate: COALESCE(SUM(...), 0)
+    let r2 = execSql(db, "SELECT COALESCE(SUM(play_count), 0) FROM tracks")
+    check r2.ok
+    check r2.value.len == 1
+    let r2val = splitRow(r2.value[0])
+    check r2val[0] == "350.0"
+
+    # Nested aggregate on empty set (SUM returns 0.0 float, COALESCE picks that over literal 0)
+    let r3 = execSql(db, "SELECT COALESCE(SUM(play_count), 0) FROM tracks WHERE id < 0")
+    check r3.ok
+    check r3.value.len == 1
+    let r3val = splitRow(r3.value[0])
+    check r3val[0] == "0.0"
+
+    discard closeDb(db)

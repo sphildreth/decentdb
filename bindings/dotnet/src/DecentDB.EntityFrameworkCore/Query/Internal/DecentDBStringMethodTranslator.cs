@@ -35,33 +35,66 @@ public sealed class DecentDBStringMethodTranslator : IMethodCallTranslator
             return null;
         }
 
-        if (arguments[0] is not SqlConstantExpression { Value: string patternValue })
+        var argument = arguments[0];
+
+        if (argument is SqlConstantExpression { Value: string patternValue })
         {
-            return null;
+            string pattern;
+            if (method.Equals(StringContainsMethod))
+            {
+                pattern = $"%{EscapeLikePattern(patternValue)}%";
+            }
+            else if (method.Equals(StringStartsWithMethod))
+            {
+                pattern = $"{EscapeLikePattern(patternValue)}%";
+            }
+            else if (method.Equals(StringEndsWithMethod))
+            {
+                pattern = $"%{EscapeLikePattern(patternValue)}";
+            }
+            else
+            {
+                return null;
+            }
+
+            return _sqlExpressionFactory.Like(
+                instance,
+                _sqlExpressionFactory.Constant(pattern),
+                _sqlExpressionFactory.Constant("\\"));
         }
 
-        string pattern;
+        // Handle parameterized arguments by building the LIKE pattern with
+        // string concatenation (rendered as || by DecentDBQuerySqlGenerator).
         if (method.Equals(StringContainsMethod))
         {
-            pattern = $"%{EscapeLikePattern(patternValue)}%";
-        }
-        else if (method.Equals(StringStartsWithMethod))
-        {
-            pattern = $"{EscapeLikePattern(patternValue)}%";
-        }
-        else if (method.Equals(StringEndsWithMethod))
-        {
-            pattern = $"%{EscapeLikePattern(patternValue)}";
-        }
-        else
-        {
-            return null;
+            return _sqlExpressionFactory.Like(
+                instance,
+                _sqlExpressionFactory.Add(
+                    _sqlExpressionFactory.Add(
+                        _sqlExpressionFactory.Constant("%"),
+                        argument),
+                    _sqlExpressionFactory.Constant("%")));
         }
 
-        return _sqlExpressionFactory.Like(
-            instance,
-            _sqlExpressionFactory.Constant(pattern),
-            _sqlExpressionFactory.Constant("\\"));
+        if (method.Equals(StringStartsWithMethod))
+        {
+            return _sqlExpressionFactory.Like(
+                instance,
+                _sqlExpressionFactory.Add(
+                    argument,
+                    _sqlExpressionFactory.Constant("%")));
+        }
+
+        if (method.Equals(StringEndsWithMethod))
+        {
+            return _sqlExpressionFactory.Like(
+                instance,
+                _sqlExpressionFactory.Add(
+                    _sqlExpressionFactory.Constant("%"),
+                    argument));
+        }
+
+        return null;
     }
 
     private static string EscapeLikePattern(string value)

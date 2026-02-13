@@ -13,6 +13,7 @@ type PlanKind* = enum
   pkRowidSeek
   pkIndexSeek
   pkTrigramSeek
+  pkSubqueryScan
   pkUnionDistinct
   pkSetUnionDistinct
   pkSetIntersect
@@ -40,6 +41,7 @@ type Plan* = ref object
   joinOn*: Expr
   left*: Plan
   right*: Plan
+  subPlan*: Plan
   orderBy*: seq[OrderItem]
   limit*: int
   limitParam*: int
@@ -168,9 +170,27 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     let rightPlan = planSelect(catalog, stmt.setOpRight)
     return Plan(kind: pkSetExcept, left: leftPlan, right: rightPlan)
 
+  proc exprHasAggregate(expr: Expr): bool =
+    if expr == nil: return false
+    case expr.kind
+    of ekFunc:
+      if expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+        return true
+      for arg in expr.args:
+        if exprHasAggregate(arg): return true
+    of ekBinary:
+      return exprHasAggregate(expr.left) or exprHasAggregate(expr.right)
+    of ekUnary:
+      return exprHasAggregate(expr.expr)
+    of ekInList:
+      if exprHasAggregate(expr.inExpr): return true
+      for item in expr.inList:
+        if exprHasAggregate(item): return true
+    else: discard
+    false
   proc hasAggregate(items: seq[SelectItem]): bool =
     for item in items:
-      if item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+      if exprHasAggregate(item.expr):
         return true
     false
   var conjuncts = splitAnd(stmt.whereExpr)
@@ -179,6 +199,41 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   let tableRes = catalog.getTable(stmt.fromTable)
   # Planning should only run on bound statements, but keep a safe fallback.
   let tableMeta = if tableRes.ok: tableRes.value else: TableMeta()
+
+  # When the FROM source is a subquery, recursively plan it and use as base.
+  if stmt.fromSubquery != nil:
+    let innerPlan = planSelect(catalog, stmt.fromSubquery)
+    base = Plan(kind: pkSubqueryScan, subPlan: innerPlan, table: stmt.fromTable, alias: stmt.fromAlias)
+    # Apply WHERE filters.
+    for c in conjuncts:
+      base = Plan(kind: pkFilter, predicate: c, left: base)
+    conjuncts = @[]
+    # Build join plans (handling subquery join sources too).
+    var available = initHashSet[string]()
+    if stmt.fromAlias.len > 0:
+      available.incl(stmt.fromAlias)
+    available.incl(stmt.fromTable)
+    for i, join in stmt.joins:
+      var rightPlan: Plan = nil
+      if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
+        let joinInner = planSelect(catalog, stmt.joinSubqueries[i])
+        rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
+      else:
+        rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
+      base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+      if join.alias.len > 0:
+        available.incl(join.alias)
+      available.incl(join.table)
+    if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
+      base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+    else:
+      base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+    if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+      base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
+    return base
+
   proc isRowidPkColumn(colName: string): bool =
     if not tableRes.ok:
       return false
@@ -412,16 +467,20 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         remaining.add(c)
     conjuncts = remaining
   applyEligible()
-  for join in stmt.joins:
+  for i, join in stmt.joins:
     var rightPlan: Plan = nil
-    var joinIdxCol = ""
-    var joinIdxVal: Expr = nil
-    if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
-      let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
-      if isSome(idxOpt):
-        rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
-    if rightPlan == nil:
-      rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
+    if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
+      let joinInner = planSelect(catalog, stmt.joinSubqueries[i])
+      rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
+    else:
+      var joinIdxCol = ""
+      var joinIdxVal: Expr = nil
+      if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
+        let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
+        if isSome(idxOpt):
+          rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
+      if rightPlan == nil:
+        rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
     base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
     if join.alias.len > 0:
       available.incl(join.alias)

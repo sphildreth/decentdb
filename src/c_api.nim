@@ -326,6 +326,11 @@ proc findMaxParam(stmt: Statement): int =
       maxIdx = max(maxIdx, findMaxParam(stmt.setOpLeft))
     if stmt.setOpRight != nil:
       maxIdx = max(maxIdx, findMaxParam(stmt.setOpRight))
+    if stmt.fromSubquery != nil:
+      maxIdx = max(maxIdx, findMaxParam(stmt.fromSubquery))
+    for sq in stmt.joinSubqueries:
+      if sq != nil:
+        maxIdx = max(maxIdx, findMaxParam(sq))
     for item in stmt.selectItems: walk(item.expr)
     walk(stmt.whereExpr)
     for j in stmt.joins: walk(j.onExpr)
