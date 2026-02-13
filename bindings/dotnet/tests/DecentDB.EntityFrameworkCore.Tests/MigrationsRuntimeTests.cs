@@ -67,6 +67,19 @@ public sealed class MigrationsRuntimeTests : IDisposable
     }
 
     [Fact]
+    public void EnsureCreated_CanCreateTablesWithForeignKeys()
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<FkDbContext>();
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
+
+        using var context = new FkDbContext(optionsBuilder.Options);
+        context.Database.EnsureDeleted();
+
+        // Should not throw "Table-level foreign keys not supported".
+        context.Database.EnsureCreated();
+    }
+
+    [Fact]
     public void UnsupportedMigrationsOperation_ThrowsActionableError()
     {
         using var context = CreateContext();
@@ -148,6 +161,57 @@ public sealed class MigrationEntity
 {
     public int Id { get; set; }
     public string Name { get; set; } = string.Empty;
+}
+
+public sealed class FkDbContext : DbContext
+{
+    public FkDbContext(DbContextOptions<FkDbContext> options)
+        : base(options)
+    {
+    }
+
+    public DbSet<FkArtist> Artists => Set<FkArtist>();
+    public DbSet<FkAlbum> Albums => Set<FkAlbum>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<FkArtist>(entity =>
+        {
+            entity.ToTable("fk_artists");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            entity.Property(x => x.Name).HasColumnName("name");
+        });
+
+        modelBuilder.Entity<FkAlbum>(entity =>
+        {
+            entity.ToTable("fk_albums");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id").ValueGeneratedOnAdd();
+            entity.Property(x => x.Title).HasColumnName("title");
+            entity.Property(x => x.ArtistId).HasColumnName("artist_id");
+
+            entity.HasOne(x => x.Artist)
+                .WithMany(x => x.Albums)
+                .HasForeignKey(x => x.ArtistId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+}
+
+public sealed class FkArtist
+{
+    public long Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public List<FkAlbum> Albums { get; set; } = [];
+}
+
+public sealed class FkAlbum
+{
+    public long Id { get; set; }
+    public string Title { get; set; } = string.Empty;
+    public long ArtistId { get; set; }
+    public FkArtist Artist { get; set; } = null!;
 }
 
 [DbContext(typeof(MigrationDbContext))]
