@@ -30,17 +30,17 @@ Exit criteria:
 ## Phase 1: v0 Scope ADR + Provider Skeleton (M0 Start)
 
 - [ ] Phase 1 complete
-- [ ] Create and accept the v0 scope ADR (`design/adr/00xx-efcore-provider-v0-scope.md`)
-- [ ] Create `bindings/dotnet/src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj`
-- [ ] Add project to `bindings/dotnet/DecentDB.NET.sln` and CI build/test scripts
-- [ ] Add `UseDecentDb(connectionString, optionsAction)` and (optional) `UseDecentDb(DbConnection, optionsAction)`
-- [ ] Implement provider `IDbContextOptionsExtension` and service registration (Relational provider wiring)
-- [ ] Basic connection validation and “can connect” smoke test
-- [ ] Unit tests: create `bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests` (or similar) with xUnit; add first smoke tests
-- [ ] Documentation: add a minimal usage snippet (DI + `AddDbContextFactory` example) and link DecentDB issue #20
+- [x] Create and accept the v0 scope ADR (`design/adr/00xx-efcore-provider-v0-scope.md`)
+- [x] Create `bindings/dotnet/src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj`
+- [x] Add project to `bindings/dotnet/DecentDB.NET.sln` and CI build/test scripts
+- [x] Add `UseDecentDb(connectionString, optionsAction)` and (optional) `UseDecentDb(DbConnection, optionsAction)`
+- [x] Implement provider `IDbContextOptionsExtension` and service registration (Relational provider wiring)
+- [x] Basic connection validation and “can connect” smoke test
+- [x] Unit tests: create `bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests` (or similar) with xUnit; add first smoke tests
+- [x] Documentation: add a minimal usage snippet (DI + `AddDbContextFactory` example) and link DecentDB issue #20
 
 Exit criteria:
-- [ ] `DbContext` can be configured with `UseDecentDb(...)` and open a connection
+- [x] `DbContext` can be configured with `UseDecentDb(...)` and open a connection
 - [ ] Tests run in CI on Windows/macOS/Linux
 
 ---

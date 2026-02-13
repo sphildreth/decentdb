@@ -2,7 +2,9 @@
 
 DecentDB ships .NET bindings (ADO.NET + Micro-ORM) for embedded use.
 
-For most .NET applications, **the preferred way to consume DecentDB is the published NuGet package** [`DecentDB.MicroOrm`](https://www.nuget.org/packages/DecentDB.MicroOrm/), which bundles the managed layers plus the native engine.
+For most .NET applications, choose the package based on API level:
+- [`DecentDB.MicroOrm`](https://www.nuget.org/packages/DecentDB.MicroOrm/) for LINQ-style Micro-ORM usage.
+- [`DecentDB.AdoNet`](https://www.nuget.org/packages/DecentDB.AdoNet/) for direct ADO.NET usage and EF provider dependencies.
 
 
 ### .NET NuGet packages
@@ -13,15 +15,38 @@ For most .NET applications, **the preferred way to consume DecentDB is the publi
 
 ```bash
 dotnet add package DecentDB.MicroOrm
+dotnet add package DecentDB.AdoNet
 # If you want pre-release builds:
 dotnet add package DecentDB.MicroOrm --prerelease
+dotnet add package DecentDB.AdoNet --prerelease
 ```
 
 Notes:
 
-- This is currently the only published NuGet package; it includes `DecentDB.MicroOrm`, `DecentDB.AdoNet`, and `DecentDB.Native`.
-- Targets `.NET 10` (`net10.0`).
+- Both packages target `.NET 10` (`net10.0`).
+- `DecentDB.MicroOrm` remains a one-package install for Micro-ORM users.
+- `DecentDB.AdoNet` carries `DecentDB.Native` and native runtime assets for ADO.NET/EF-provider use.
 - Ships native assets under `runtimes/{rid}/native/` for: `linux-x64`, `osx-x64`, `win-x64`.
+
+## EF Core provider status
+
+The EF Core provider entrypoint (`UseDecentDb`) is being implemented under [issue #20](https://github.com/sphildreth/decentdb/issues/20).
+
+Phase 1 currently provides provider wiring and connectivity smoke coverage; query translation and migrations are planned in later phases.
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+
+var services = new ServiceCollection();
+
+services.AddDbContextFactory<AppDbContext>(options =>
+    options.UseDecentDb("Data Source=./app.ddb"));
+
+public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
+{
+}
+```
 
 ## Assemblies
 

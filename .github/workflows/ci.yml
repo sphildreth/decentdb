@@ -27,6 +27,11 @@ jobs:
         with:
           nim-version: "stable"
 
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
       - name: Build libpg_query (Ubuntu)
         if: runner.os == 'Linux'
         run: |
@@ -70,3 +75,9 @@ jobs:
       - name: Run Nim tests
         if: runner.os != 'macOS'
         run: nimble test_nim
+
+      - name: Run .NET tests (AdoNet + MicroOrm)
+        run: dotnet test bindings/dotnet/tests/DecentDB.Tests/DecentDB.Tests.csproj -v minimal
+
+      - name: Run .NET tests (EF Core provider)
+        run: dotnet test bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/DecentDB.EntityFrameworkCore.Tests.csproj -v minimal
