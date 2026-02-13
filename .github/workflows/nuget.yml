@@ -1,4 +1,4 @@
-name: Publish NuGet (DecentDB.MicroOrm)
+name: Publish NuGet (.NET packages)
 
 on:
   push:
@@ -180,7 +180,23 @@ jobs:
             -c Release \
             -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
             -o ./artifacts \
+            bindings/dotnet/src/DecentDB.AdoNet/DecentDB.AdoNet.csproj
+          dotnet pack \
+            -c Release \
+            -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
+            -o ./artifacts \
             bindings/dotnet/src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj
+
+      - name: Verify DecentDB.AdoNet package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="$(ls ./artifacts/DecentDB.AdoNet.*.nupkg | head -n1)"
+          unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.AdoNet.dll"
+          unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.Native.dll"
+          unzip -l "$pkg" | grep -q "runtimes/linux-x64/native/libdecentdb.so"
+          unzip -l "$pkg" | grep -q "runtimes/osx-x64/native/libdecentdb.dylib"
+          unzip -l "$pkg" | grep -q "runtimes/win-x64/native/decentdb.dll"
 
       - name: Publish to GitHub Packages
         continue-on-error: true

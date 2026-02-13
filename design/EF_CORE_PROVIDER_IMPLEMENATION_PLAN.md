@@ -11,19 +11,19 @@ Conventions:
 
 ## Phase 0: Prereqs, ADRs, and Packaging Foundation
 
-- [ ] Phase 0 complete
-- [ ] Accept ADR-0093 (`design/adr/0093-dotnet-nuget-packaging-adonet-package.md`) and update/supersede ADR-0044 (`design/adr/0044-dotnet-nuget-packaging.md`)
-- [ ] Decide and document the NuGet layout for native runtime assets when publishing `DecentDB.AdoNet` (RID matrix, file paths, duplication policy)
-- [ ] Make `bindings/dotnet/src/DecentDB.AdoNet/DecentDB.AdoNet.csproj` packable and publishable (PackageId/metadata)
-- [ ] Ensure `DecentDB.AdoNet` NuGet includes native engine assets under `runtimes/{rid}/native/` (same RID set as today)
-- [ ] Ensure `DecentDB.AdoNet` consumers get `DecentDB.Native` correctly (dependency or included assembly)
-- [ ] Update CI to build/test/pack/publish `DecentDB.AdoNet` (and keep `DecentDB.MicroOrm` publishing intact)
-- [ ] Add/confirm a versioning policy for multiple .NET packages published from this repo
-- [ ] Documentation: update `README.md` or `docs/` to mention `DecentDB.AdoNet` as a published package
+- [x] Phase 0 complete
+- [x] Accept ADR-0093 (`design/adr/0093-dotnet-nuget-packaging-adonet-package.md`) and update/supersede ADR-0044 (`design/adr/0044-dotnet-nuget-packaging.md`)
+- [x] Decide and document the NuGet layout for native runtime assets when publishing `DecentDB.AdoNet` (RID matrix, file paths, duplication policy)
+- [x] Make `bindings/dotnet/src/DecentDB.AdoNet/DecentDB.AdoNet.csproj` packable and publishable (PackageId/metadata)
+- [x] Ensure `DecentDB.AdoNet` NuGet includes native engine assets under `runtimes/{rid}/native/` (same RID set as today)
+- [x] Ensure `DecentDB.AdoNet` consumers get `DecentDB.Native` correctly (dependency or included assembly)
+- [x] Update CI to build/test/pack/publish `DecentDB.AdoNet` (and keep `DecentDB.MicroOrm` publishing intact)
+- [x] Add/confirm a versioning policy for multiple .NET packages published from this repo
+- [x] Documentation: update `README.md` or `docs/` to mention `DecentDB.AdoNet` as a published package
 
 Exit criteria:
-- [ ] CI can produce/publish a `DecentDB.AdoNet` package with correct runtime assets
-- [ ] Existing .NET tests still pass
+- [x] CI can produce/publish a `DecentDB.AdoNet` package with correct runtime assets
+- [x] Existing .NET tests still pass
 
 ---
 

@@ -1,17 +1,23 @@
 ## ADR-0093: Publish DecentDB.AdoNet as a NuGet Package
 **Date:** 2026-02-13
-**Status:** Proposed
+**Status:** Accepted
 
 ### Decision
 
 - Publish `DecentDB.AdoNet` as a standalone NuGet package.
   - It must include:
     - `DecentDB.AdoNet` managed assembly
-    - `DecentDB.Native` managed assembly (or equivalent dependency that brings it)
+    - `DecentDB.Native` managed assembly
     - native engine assets under `runtimes/{rid}/native/` for the same RID matrix currently published
 - EF Core provider package(s) (`DecentDB.EntityFrameworkCore*`) depend on `DecentDB.AdoNet` (not on `DecentDB.MicroOrm`).
 - `DecentDB.MicroOrm` should remain the “one-liner” package for MicroOrm users, but should not be required for EF Core scenarios.
-  - Follow-up (recommended): rework `DecentDB.MicroOrm` packaging to depend on `DecentDB.AdoNet` instead of embedding duplicate assemblies and native assets.
+- Packaging policy for Phase 0:
+  - `DecentDB.AdoNet` includes `DecentDB.Native.dll` and ships native runtime assets directly.
+  - `DecentDB.MicroOrm` remains self-contained and also ships native runtime assets.
+  - Short-term runtime asset duplication across both packages is explicitly accepted to minimize churn.
+- Versioning policy for .NET NuGet packages:
+  - `DecentDB.MicroOrm` and `DecentDB.AdoNet` use the same package version.
+  - Version is sourced in CI (`dotnet pack -p:PackageVersion=...` from the release tag), not hard-coded in each `.csproj`.
 
 ### Rationale
 
@@ -31,7 +37,7 @@
 ### Trade-offs
 
 - More packages to version and publish (CI/workflow changes).
-- Requires careful handling to avoid duplicate assemblies/assets when apps reference both MicroOrm and the EF provider.
+- Runtime assets are duplicated in both .NET packages in the short term (larger total download footprint).
 - If native assets move to `DecentDB.AdoNet`, existing “single package contains everything” messaging needs updating.
 
 ### References
@@ -39,4 +45,3 @@
 - `design/adr/0044-dotnet-nuget-packaging.md` (current single-package strategy)
 - `design/EF_CORE_PROVIDER_PLAN.md` (EF Core provider plan; packaging prerequisite)
 - `.github/workflows/nuget.yml` (current NuGet publishing pipeline)
-

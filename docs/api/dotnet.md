@@ -4,7 +4,12 @@ DecentDB ships .NET bindings (ADO.NET + Micro-ORM) for embedded use.
 
 For most .NET applications, **the preferred way to consume DecentDB is the published NuGet package** [`DecentDB.MicroOrm`](https://www.nuget.org/packages/DecentDB.MicroOrm/), which bundles the managed layers plus the native engine.
 
-## NuGet (preferred)
+
+### .NET NuGet packages
+
+- `DecentDB.MicroOrm`: use this for the LINQ-style Micro-ORM experience (includes ADO.NET + native runtime assets).
+- `DecentDB.AdoNet`: use this for direct ADO.NET access (and for EF Core provider dependencies).
+- Current packaged native RID assets: `linux-x64`, `osx-x64`, `win-x64`.
 
 ```bash
 dotnet add package DecentDB.MicroOrm
