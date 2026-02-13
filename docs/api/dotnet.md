@@ -49,7 +49,7 @@ using Microsoft.Extensions.DependencyInjection;
 var services = new ServiceCollection();
 
 services.AddDbContextFactory<AppDbContext>(options =>
-    options.UseDecentDb("Data Source=./app.ddb"));
+    options.UseDecentDB("Data Source=./app.ddb"));
 
 public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
 {
@@ -72,7 +72,7 @@ dotnet ef migrations add InitialCreate
 dotnet ef database update
 ```
 
-For `IDesignTimeDbContextFactory<TContext>` projects, keep `UseDecentDb("Data Source=...")` in the factory so `dotnet ef` can create the context.
+For `IDesignTimeDbContextFactory<TContext>` projects, keep `UseDecentDB("Data Source=...")` in the factory so `dotnet ef` can create the context.
 
 ### EF Core provider type mappings
 
@@ -115,7 +115,7 @@ dotnet add package DecentDB.EntityFrameworkCore.NodaTime
 ```
 
 ```csharp
-options.UseDecentDb("Data Source=./app.ddb", decent => decent.UseNodaTime());
+options.UseDecentDB("Data Source=./app.ddb", decent => decent.UseNodaTime());
 ```
 
 Supported NodaTime types in the extension package:

@@ -33,14 +33,14 @@ Exit criteria:
 - [x] Create and accept the v0 scope ADR (`design/adr/00xx-efcore-provider-v0-scope.md`)
 - [x] Create `bindings/dotnet/src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj`
 - [x] Add project to `bindings/dotnet/DecentDB.NET.sln` and CI build/test scripts
-- [x] Add `UseDecentDb(connectionString, optionsAction)` and (optional) `UseDecentDb(DbConnection, optionsAction)`
+- [x] Add `UseDecentDB(connectionString, optionsAction)` and (optional) `UseDecentDB(DbConnection, optionsAction)`
 - [x] Implement provider `IDbContextOptionsExtension` and service registration (Relational provider wiring)
 - [x] Basic connection validation and “can connect” smoke test
 - [x] Unit tests: create `bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests` (or similar) with xUnit; add first smoke tests
 - [x] Documentation: add a minimal usage snippet (DI + `AddDbContextFactory` example) and link DecentDB issue #20
 
 Exit criteria:
-- [x] `DbContext` can be configured with `UseDecentDb(...)` and open a connection
+- [x] `DbContext` can be configured with `UseDecentDB(...)` and open a connection
 - [x] Tests run in CI on Windows/macOS/Linux
 
 ---

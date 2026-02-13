@@ -50,7 +50,7 @@ public sealed class ConformanceSubsetTests : IDisposable
     private AppDbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
-        optionsBuilder.UseDecentDb($"Data Source={_dbPath}");
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         return new AppDbContext(optionsBuilder.Options);
     }
 

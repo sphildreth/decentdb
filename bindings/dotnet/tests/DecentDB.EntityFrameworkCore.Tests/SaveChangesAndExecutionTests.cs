@@ -149,7 +149,7 @@ public sealed class SaveChangesAndExecutionTests : IDisposable
     private AppDbContext CreateContext(ILoggerFactory? loggerFactory = null)
     {
         var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
-        optionsBuilder.UseDecentDb($"Data Source={_dbPath}");
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         optionsBuilder.EnableDetailedErrors();
 
         if (loggerFactory != null)

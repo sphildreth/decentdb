@@ -30,7 +30,7 @@ public sealed class DecentDBOptionsExtension : RelationalOptionsExtension
     {
         if (Connection == null && string.IsNullOrWhiteSpace(ConnectionString))
         {
-            throw new InvalidOperationException("UseDecentDb requires a non-empty connection string or an existing DbConnection.");
+            throw new InvalidOperationException("UseDecentDB requires a non-empty connection string or an existing DbConnection.");
         }
     }
 
@@ -67,7 +67,7 @@ public sealed class DecentDBOptionsExtension : RelationalOptionsExtension
             => 0;
 
         public override void PopulateDebugInfo(IDictionary<string, string> debugInfo)
-            => debugInfo["DecentDB:UseDecentDb"] = "1";
+            => debugInfo["DecentDB:UseDecentDB"] = "1";
 
         public override bool ShouldUseSameServiceProvider(DbContextOptionsExtensionInfo other)
             => other is ExtensionInfo;

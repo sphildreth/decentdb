@@ -8,7 +8,7 @@ Key intent:
 - Keep the initial scope tight (v0), then expand based on real usage.
 
 Related upstream issues this plan should address:
-- DecentDB issue #20: EF Core `DbContextOptionsBuilder` extension (`UseDecentDb`) for EF Core compatibility.
+- DecentDB issue #20: EF Core `DbContextOptionsBuilder` extension (`UseDecentDB`) for EF Core compatibility.
 - DecentDB issue #19: NodaTime support for date/time values (requested for MicroOrm; also relevant as an EF provider extension).
 
 Target end state (what “done” means for this plan):
@@ -30,7 +30,7 @@ Note: EF Core providers execute via **ADO.NET abstractions** (`DbConnection`/`Db
 ## 0. Milestones and Success Criteria
 
 Milestone 0 (M0) is successful when:
-- A `DbContext` can connect via `UseDecentDb(...)`.
+- A `DbContext` can connect via `UseDecentDB(...)`.
 - Basic LINQ queries translate to correct DecentDB SQL and execute correctly.
 - Pagination uses `LIMIT`/`OFFSET` and parameters are used (no SQL injection footguns).
 - Transactions work (explicit and ambient).
@@ -106,14 +106,14 @@ Suggested ADR name:
 Deliverables:
 - New project/package: `DecentDB.EntityFrameworkCore`
 - Public entrypoints:
-  - `UseDecentDb(connectionString, optionsAction)`
-  - `UseDecentDb(DbConnection, optionsAction)` (optional but often useful for tests/hosting)
+  - `UseDecentDB(connectionString, optionsAction)`
+  - `UseDecentDB(DbConnection, optionsAction)` (optional but often useful for tests/hosting)
 - Provider registration:
   - Implement EF Core `IDbContextOptionsExtension`
   - Register provider services via `EntityFrameworkRelationalServicesBuilder`
 
 Issue linkage:
-- This step is the core deliverable for DecentDB issue #20 (the `.UseDecentDb(...)` provider entrypoint analogous to `.UseSqlite(...)`).
+- This step is the core deliverable for DecentDB issue #20 (the `.UseDecentDB(...)` provider entrypoint analogous to `.UseSqlite(...)`).
 
 Provider surface area should mirror other relational providers:
 - `DecentDbDbContextOptionsBuilder` (provider-specific options)

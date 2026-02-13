@@ -49,7 +49,7 @@ public sealed class NodaTimeIntegrationTests : IDisposable
     private NodaDbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<NodaDbContext>();
-        optionsBuilder.UseDecentDb($"Data Source={_dbPath}", options => options.UseNodaTime());
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}", options => options.UseNodaTime());
         return new NodaDbContext(optionsBuilder.Options);
     }
 

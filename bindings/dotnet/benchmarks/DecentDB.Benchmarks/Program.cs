@@ -219,7 +219,7 @@ try
     Console.WriteLine("=== EF Core Provider ===");
 
     var efOptions = new DbContextOptionsBuilder<EfBenchContext>()
-        .UseDecentDb($"Data Source={dbPath}")
+        .UseDecentDB($"Data Source={dbPath}")
         .Options;
     using var ef = new EfBenchContext(efOptions);
 
@@ -241,11 +241,11 @@ try
     Console.WriteLine($"{"EF alloc/query",-28} avg={efAlloc} bytes");
 
     var servicesNoPool = new ServiceCollection();
-    servicesNoPool.AddDbContext<EfBenchContext>(o => o.UseDecentDb($"Data Source={dbPath}"));
+    servicesNoPool.AddDbContext<EfBenchContext>(o => o.UseDecentDB($"Data Source={dbPath}"));
     using var providerNoPool = servicesNoPool.BuildServiceProvider();
 
     var servicesPool = new ServiceCollection();
-    servicesPool.AddDbContextPool<EfBenchContext>(o => o.UseDecentDb($"Data Source={dbPath}"));
+    servicesPool.AddDbContextPool<EfBenchContext>(o => o.UseDecentDB($"Data Source={dbPath}"));
     using var providerPool = servicesPool.BuildServiceProvider();
 
     RunBench("EF no-pool Count()", iterations: 120, warmup: 20, action: () =>

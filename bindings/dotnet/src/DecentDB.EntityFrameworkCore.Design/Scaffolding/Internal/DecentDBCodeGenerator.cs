@@ -15,7 +15,7 @@ public sealed class DecentDBCodeGenerator : ProviderCodeGenerator
         string connectionString,
         MethodCallCodeFragment? providerOptions)
         => new(
-            "UseDecentDb",
+            "UseDecentDB",
             providerOptions is null
                 ? new object[] { connectionString }
                 : new object[] { connectionString, providerOptions });

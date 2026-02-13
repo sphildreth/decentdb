@@ -6,7 +6,7 @@
 
 - Introduce a Phase 1 provider skeleton package: `DecentDB.EntityFrameworkCore`.
 - v0 scope for this first provider increment is limited to:
-  - `UseDecentDb(connectionString, optionsAction)` and `UseDecentDb(DbConnection, optionsAction)` entrypoints.
+  - `UseDecentDB(connectionString, optionsAction)` and `UseDecentDB(DbConnection, optionsAction)` entrypoints.
   - EF Core options extension + relational provider service registration wiring.
   - basic provider smoke coverage proving configuration and connection open through EF relational connection services.
 - Explicitly out of scope for v0 Phase 1:
@@ -17,7 +17,7 @@
 
 ### Rationale
 
-- Keeps the first EF Core milestone small and testable while unblocking issue #20 (`UseDecentDb` provider entrypoint).
+- Keeps the first EF Core milestone small and testable while unblocking issue #20 (`UseDecentDB` provider entrypoint).
 - Aligns with the phased plan by delivering provider wiring before translation/update/migrations layers.
 - Reduces risk by using existing `DecentDB.AdoNet` connection behavior for initial connectivity.
 

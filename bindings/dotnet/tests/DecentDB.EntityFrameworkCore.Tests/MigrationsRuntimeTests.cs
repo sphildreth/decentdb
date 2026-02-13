@@ -87,7 +87,7 @@ public sealed class MigrationsRuntimeTests : IDisposable
     private MigrationDbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<MigrationDbContext>();
-        optionsBuilder.UseDecentDb($"Data Source={_dbPath}");
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         return new MigrationDbContext(optionsBuilder.Options);
     }
 

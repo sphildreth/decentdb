@@ -6,6 +6,8 @@ namespace DecentDB.EntityFrameworkCore.Tests;
 
 public sealed class DesignTimeToolingTests
 {
+    private static readonly TimeSpan DotnetCommandTimeout = TimeSpan.FromMinutes(5);
+
     [Fact]
     public void DotnetEf_MigrationsAdd_AndDatabaseUpdate_Work()
     {
@@ -76,7 +78,7 @@ public sealed class DesignTimeToolingTests
                                     public SampleContext CreateDbContext(string[] args)
                                     {
                                         var optionsBuilder = new DbContextOptionsBuilder<SampleContext>();
-                                        optionsBuilder.UseDecentDb("Data Source=__DB_PATH__");
+                                        optionsBuilder.UseDecentDB("Data Source=__DB_PATH__");
                                         return new SampleContext(optionsBuilder.Options);
                                     }
                                 }
@@ -147,8 +149,27 @@ public sealed class DesignTimeToolingTests
         };
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start dotnet process.");
-        var output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
-        process.WaitForExit();
+
+        // Avoid deadlocks: read stdout/stderr concurrently while the process runs.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+
+        if (!process.WaitForExit((int)DotnetCommandTimeout.TotalMilliseconds))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+
+            throw new TimeoutException($"dotnet {arguments} timed out after {DotnetCommandTimeout}.");
+        }
+
+        Task.WaitAll(stdoutTask, stderrTask);
+        var output = stdoutTask.Result + stderrTask.Result;
         return (process.ExitCode, output);
     }
 

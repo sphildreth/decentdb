@@ -57,7 +57,7 @@ public sealed class GaConformanceTests : IDisposable
         EnsureSchemaAndSeed();
 
         var services = new ServiceCollection();
-        services.AddDbContextPool<GaDbContext>(options => options.UseDecentDb($"Data Source={_dbPath}"));
+        services.AddDbContextPool<GaDbContext>(options => options.UseDecentDB($"Data Source={_dbPath}"));
         using var provider = services.BuildServiceProvider();
 
         for (var i = 0; i < 20; i++)
@@ -71,7 +71,7 @@ public sealed class GaConformanceTests : IDisposable
     private GaDbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<GaDbContext>();
-        optionsBuilder.UseDecentDb($"Data Source={_dbPath}");
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         return new GaDbContext(optionsBuilder.Options);
     }
 

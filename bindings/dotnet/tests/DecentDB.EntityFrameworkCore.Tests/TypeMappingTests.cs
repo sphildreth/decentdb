@@ -132,7 +132,7 @@ public sealed class TypeMappingTests : IDisposable
     private DbContext CreateContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<SmokeDbContext>();
-        optionsBuilder.UseDecentDb($"Data Source={_dbPath}");
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         return new SmokeDbContext(optionsBuilder.Options);
     }
 
