@@ -207,3 +207,27 @@ Exit criteria:
 Exit criteria:
 - [ ] Provider meets M3 “GA” criteria in `design/EF_CORE_PROVIDER_PLAN.md`
 
+---
+
+## Phase 12: Release and Version Bump (DecentDB 1.1.0)
+
+- [ ] Phase 12 complete
+- [ ] Bump DecentDB version to `1.1.0` across:
+  - [ ] Nim package metadata (`decentdb.nimble`)
+  - [ ] .NET package versions for all published packages (`DecentDB.MicroOrm`, `DecentDB.AdoNet`, `DecentDB.EntityFrameworkCore*`)
+  - [ ] Any version references in docs/examples (search repo-wide for previous version strings)
+- [ ] Update `CHANGELOG.md` with a `1.1.0` entry describing:
+  - [ ] EF Core provider introduction and major supported features (query pipeline, SaveChanges, migrations)
+  - [ ] New/changed NuGet publishing model (standalone `DecentDB.AdoNet` if adopted)
+  - [ ] Notable limitations / known gaps (with issue links)
+- [ ] Documentation sweep:
+  - [ ] Add EF Core “getting started” and “migrations” docs (if not already done)
+  - [ ] Add package matrix and installation guidance (MicroOrm vs AdoNet vs EF provider)
+  - [ ] Ensure docs reflect DecentDB’s SQL subset and any provider-specific translation notes
+- [ ] Final CI validation for release:
+  - [ ] Tests green (engine + .NET)
+  - [ ] NuGet packaging artifacts include correct runtime assets
+
+Exit criteria:
+- [ ] Repo version and documentation consistently reflect `1.1.0`
+- [ ] Release notes are complete and accurate for users upgrading to `1.1.0`
