@@ -1,10 +1,12 @@
 using DecentDB.EntityFrameworkCore.Storage.Internal;
 using DecentDB.EntityFrameworkCore.Metadata.Conventions.Internal;
 using DecentDB.EntityFrameworkCore.Diagnostics;
+using DecentDB.EntityFrameworkCore.Migrations.Internal;
 using DecentDB.EntityFrameworkCore.Query.Internal;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata.Conventions.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Storage;
 using DecentDB.EntityFrameworkCore.Update.Internal;
@@ -23,7 +25,10 @@ public static class DecentDBServiceCollectionExtensions
         builder.TryAdd<IDatabaseProvider, DatabaseProvider<DecentDBOptionsExtension>>();
         builder.TryAdd<IProviderConventionSetBuilder, DecentDBConventionSetBuilder>();
         builder.TryAdd<IRelationalConnection, DecentDBRelationalConnection>();
+        builder.TryAdd<IRelationalTransactionFactory, DecentDBRelationalTransactionFactory>();
         builder.TryAdd<IRelationalDatabaseCreator, DecentDBDatabaseCreator>();
+        builder.TryAdd<IHistoryRepository, DecentDBHistoryRepository>();
+        builder.TryAdd<IMigrationsSqlGenerator, DecentDBMigrationsSqlGenerator>();
         builder.TryAdd<ISqlGenerationHelper, DecentDBSqlGenerationHelper>();
         builder.TryAdd<IRelationalTypeMappingSource, DecentDBTypeMappingSource>();
         builder.TryAdd<IQuerySqlGeneratorFactory, DecentDBQuerySqlGeneratorFactory>();

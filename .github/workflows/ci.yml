@@ -32,6 +32,13 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Install dotnet-ef
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet tool update --global dotnet-ef --version "10.*" || dotnet tool install --global dotnet-ef --version "10.*"
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
       - name: Build libpg_query (Ubuntu)
         if: runner.os == 'Linux'
         run: |

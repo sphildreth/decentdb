@@ -30,9 +30,17 @@ Notes:
 
 ## EF Core provider status
 
-The EF Core provider entrypoint (`UseDecentDb`) is being implemented under [issue #20](https://github.com/sphildreth/decentdb/issues/20).
+DecentDB now publishes EF Core packages:
 
-Phase 3 now includes a minimal relational query translation slice (basic filters/order/paging and common string operators). SaveChanges, migrations, and broader conformance are still planned in later phases.
+- `DecentDB.EntityFrameworkCore` (runtime provider)
+- `DecentDB.EntityFrameworkCore.Design` (design-time tooling)
+- `DecentDB.EntityFrameworkCore.NodaTime` (optional NodaTime mappings)
+
+Use the package that matches your scenario:
+
+- Prefer `DecentDB.MicroOrm` for lightweight LINQ-style access without EF infrastructure.
+- Prefer `DecentDB.AdoNet` for direct SQL/command control.
+- Prefer `DecentDB.EntityFrameworkCore` when you need DbContext, change tracking, and migrations tooling.
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
@@ -47,6 +55,24 @@ public sealed class AppDbContext(DbContextOptions<AppDbContext> options) : DbCon
 {
 }
 ```
+
+### EF Core migrations (design-time)
+
+Install packages:
+
+```bash
+dotnet add package DecentDB.EntityFrameworkCore
+dotnet add package DecentDB.EntityFrameworkCore.Design
+```
+
+Create/apply migrations:
+
+```bash
+dotnet ef migrations add InitialCreate
+dotnet ef database update
+```
+
+For `IDesignTimeDbContextFactory<TContext>` projects, keep `UseDecentDb("Data Source=...")` in the factory so `dotnet ef` can create the context.
 
 ### EF Core provider type mappings (Phase 2)
 
@@ -79,6 +105,24 @@ Current supported query translation subset:
 Current guardrails:
 
 - `IN (...)` lists are capped at **1000 values**; larger lists fail fast with a provider error.
+- Correlated subqueries and some set-operation/generated-subquery shapes are currently unsupported by the engine SQL subset and are tracked under [issue #20](https://github.com/sphildreth/decentdb/issues/20).
+- Provider conformance skip list is maintained in `bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/ConformanceSkipList.md`.
+
+### EF Core NodaTime extension
+
+```bash
+dotnet add package DecentDB.EntityFrameworkCore.NodaTime
+```
+
+```csharp
+options.UseDecentDb("Data Source=./app.ddb", decent => decent.UseNodaTime());
+```
+
+Supported NodaTime types in the extension package:
+
+- `Instant` -> `INTEGER` (Unix epoch milliseconds)
+- `LocalDate` -> `INTEGER` (day offset from Unix epoch day)
+- `LocalDateTime` -> `INTEGER` (UTC epoch milliseconds via UTC zone conversion)
 
 ## Assemblies
 

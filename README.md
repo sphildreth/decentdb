@@ -51,7 +51,7 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 | Language | Toolkit | Description | Documentation |
 |---|---|---|---|
-| C# | ADO.NET + Dapper + MicroOrm (LINQ) | Embedded provider + LINQ-style `IQueryable` Micro-ORM for querying DecentDB files | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
+| C# | ADO.NET + Dapper + MicroOrm (LINQ) + EF Core provider | Embedded provider APIs, LINQ-style Micro-ORM, and EF Core integration for DbContext/migrations workflows | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
 | Go | `database/sql` + sqlc | Embedded `database/sql` driver optimized for sqlc-generated queries | [decentdb.org/api/go](https://decentdb.org/api/go/) |
 | Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
 | Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |

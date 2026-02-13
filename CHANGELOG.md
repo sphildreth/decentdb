@@ -5,7 +5,21 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.2] - Unreleased
+## [1.1.0] - Unreleased
+
+### Added
+- .NET: `DecentDB.EntityFrameworkCore` runtime provider package (query pipeline, SaveChanges update pipeline, runtime migrations support).
+- .NET: `DecentDB.EntityFrameworkCore.Design` package and design-time tooling support for `dotnet ef migrations add`, `dotnet ef database update`, and `dotnet ef dbcontext scaffold`.
+- .NET: `DecentDB.EntityFrameworkCore.NodaTime` optional package with `UseNodaTime()` mappings for `Instant`, `LocalDate`, and `LocalDateTime`.
+
+### Changed
+- NuGet publishing now packs and pushes EF Core provider packages alongside `DecentDB.AdoNet` and `DecentDB.MicroOrm`.
+- Versioning policy for published .NET packages remains synchronized via CI-supplied package version.
+
+### Known limitations
+- EF Core correlated-subquery/set-operation query shapes that require unsupported DecentDB SQL FROM items remain unsupported (tracked under issue #20).
+
+## [1.0.2] - 2026-02-13
 
 ### Changed
 - NuGet package now publishes to both GitHub Packages and NuGet.org

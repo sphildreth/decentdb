@@ -20,5 +20,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\DecentDB.AdoNet\DecentDB.AdoNet.csproj" />
     <ProjectReference Include="..\..\src\DecentDB.EntityFrameworkCore\DecentDB.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="..\..\src\DecentDB.EntityFrameworkCore.NodaTime\DecentDB.EntityFrameworkCore.NodaTime.csproj" />
   </ItemGroup>
 </Project>

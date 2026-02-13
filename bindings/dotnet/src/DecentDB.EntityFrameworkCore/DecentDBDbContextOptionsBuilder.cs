@@ -9,4 +9,7 @@ public sealed class DecentDBDbContextOptionsBuilder : RelationalDbContextOptions
         : base(optionsBuilder)
     {
     }
+
+    public DbContextOptionsBuilder ContextOptionsBuilder
+        => OptionsBuilder;
 }
