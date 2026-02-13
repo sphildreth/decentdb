@@ -40,6 +40,18 @@ public sealed class TypeMappingTests : IDisposable
     }
 
     [Fact]
+    public void TypeMappingSource_MapsStoreTypeAliasesUsedBySchemaDiscovery()
+    {
+        using var context = CreateContext();
+        var mappingSource = context.GetService<IRelationalTypeMappingSource>();
+
+        // DecentDB schema discovery currently returns these type names.
+        Assert.Equal("INTEGER", mappingSource.FindMapping("INT64")!.StoreType);
+        Assert.Equal("INTEGER", mappingSource.FindMapping("INT32")!.StoreType);
+        Assert.Equal("REAL", mappingSource.FindMapping("FLOAT64")!.StoreType);
+    }
+
+    [Fact]
     public void TypeMappings_RoundTripDateTimeGuidAndDecimal()
     {
         using var context = CreateContext();
