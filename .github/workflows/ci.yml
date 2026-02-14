@@ -73,6 +73,16 @@ jobs:
       - name: Build
         run: nimble build -d:release
 
+      - name: Build shared library (C API)
+        shell: bash
+        run: |
+          nimble build_lib
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            ln -sf libc_api.so build/libdecentdb.so
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            ln -sf libc_api.dylib build/libdecentdb.dylib
+          fi
+
       - name: Run Nim tests (macOS)
         if: runner.os == 'macOS'
         env:
@@ -84,7 +94,15 @@ jobs:
         run: nimble test_nim
 
       - name: Run .NET tests (AdoNet + MicroOrm)
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build
         run: dotnet test bindings/dotnet/tests/DecentDB.Tests/DecentDB.Tests.csproj -v minimal
 
       - name: Run .NET tests (EF Core provider)
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build
         run: dotnet test bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/DecentDB.EntityFrameworkCore.Tests.csproj -v minimal
