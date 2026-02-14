@@ -11,9 +11,11 @@
     <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
+    <PackageReference Include="NodaTime" Version="3.2.2" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../../bindings/dotnet/src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="../../../bindings/dotnet/src/DecentDB.EntityFrameworkCore.NodaTime/DecentDB.EntityFrameworkCore.NodaTime.csproj" />
   </ItemGroup>
 </Project>

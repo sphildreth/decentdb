@@ -307,13 +307,29 @@ proc decentdb_last_error_message*(p: pointer): cstring {.exportc, cdecl, dynlib.
 
 proc findMaxParam(stmt: Statement): int =
   var maxIdx = 0
+  proc scanSqlForParams(sql: string) =
+    var i = 0
+    while i < sql.len:
+      if sql[i] == '$' and i + 1 < sql.len and sql[i + 1].isDigit:
+        var j = i + 1
+        while j < sql.len and sql[j].isDigit: inc j
+        let idx = parseInt(sql[i + 1 ..< j])
+        maxIdx = max(maxIdx, idx)
+        i = j
+      else:
+        inc i
   proc walk(e: Expr) =
     if e == nil: return
     case e.kind
     of ekParam: maxIdx = max(maxIdx, e.index)
     of ekBinary: walk(e.left); walk(e.right)
     of ekUnary: walk(e.expr)
-    of ekFunc: (for a in e.args: walk(a))
+    of ekFunc:
+      if e.funcName in ["EXISTS", "SCALAR_SUBQUERY"]:
+        if e.args.len == 1 and e.args[0].kind == ekLiteral and
+           e.args[0].value.kind == svString:
+          scanSqlForParams(e.args[0].value.strVal)
+      for a in e.args: walk(a)
     of ekInList: walk(e.inExpr); (for a in e.inList: walk(a))
     else: discard
   
@@ -670,6 +686,19 @@ proc decentdb_step*(p: pointer): cint {.exportc, cdecl, dynlib.} =
     body()
 
   let stepRes = withSnapshot(proc(): cint =
+    # Set up eval context so subquery expressions (EXISTS, SCALAR_SUBQUERY)
+    # can access pager/catalog during row-by-row cursor streaming.
+    let ownsCtx = gEvalContextDepth == 0
+    if ownsCtx:
+      gEvalPager = db.pager
+      gEvalCatalog = db.catalog
+    gEvalContextDepth.inc
+    defer:
+      gEvalContextDepth.dec
+      if ownsCtx and gEvalContextDepth == 0:
+        gEvalPager = nil
+        gEvalCatalog = nil
+
     if h.cursor == nil:
       let curRes = openRowCursor(db.pager, db.catalog, h.plan, h.params)
       if not curRes.ok:

@@ -22,6 +22,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="DecentDB.EntityFrameworkCore" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" />
   </ItemGroup>
 

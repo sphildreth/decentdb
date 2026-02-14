@@ -215,4 +215,100 @@ public class TrackService
             .Take(count)
             .ToListAsync();
     }
+
+    // --- Showcase: GroupBy ---
+    public async Task<List<TrackStats>> GetTrackStatsByGenreAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks
+            .AsNoTracking()
+            .Where(t => t.Genre != null)
+            .GroupBy(t => t.Genre!)
+            .Select(g => new TrackStats
+            {
+                Genre = g.Key,
+                TrackCount = g.Count(),
+                AvgDuration = g.Average(t => (double)t.DurationSeconds),
+                TotalPlays = g.Sum(t => t.PlayCount)
+            })
+            .OrderByDescending(s => s.TotalPlays)
+            .ToListAsync();
+    }
+
+    // --- Showcase: DISTINCT ---
+    public async Task<List<string>> GetDistinctGenresAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks
+            .AsNoTracking()
+            .Where(t => t.Genre != null)
+            .Select(t => t.Genre!)
+            .Distinct()
+            .OrderBy(g => g)
+            .ToListAsync();
+    }
+
+    // --- Showcase: Conditional projection ---
+    public async Task<List<string>> GetTrackDurationLabelsAsync(int count = 10)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks
+            .AsNoTracking()
+            .OrderByDescending(t => t.PlayCount)
+            .Take(count)
+            .Select(t =>
+                t.Title + " — " +
+                (t.DurationSeconds > 420 ? "Long"
+                : t.DurationSeconds > 240 ? "Medium"
+                : "Short"))
+            .ToListAsync();
+    }
+
+    // --- Showcase: String manipulation ---
+    public async Task<List<string>> GetTrimmedTitlesAsync(int count = 5)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks
+            .AsNoTracking()
+            .OrderBy(t => t.Title)
+            .Take(count)
+            .Select(t => t.Title.Trim().ToUpper())
+            .ToListAsync();
+    }
+
+    // --- Showcase: String.Length ---
+    public async Task<int> GetMaxTitleLengthAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks
+            .MaxAsync(t => t.Title.Length);
+    }
+
+    // --- Showcase: Any / All ---
+    public async Task<bool> AnyExplicitTracksAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks.AnyAsync(t => t.IsExplicit);
+    }
+
+    // --- Showcase: Math operations ---
+    public async Task<double> GetAverageRatingRoundedAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Tracks
+            .Where(t => t.Rating != null)
+            .AverageAsync(t => Math.Round(t.Rating!.Value, 1));
+    }
+
+    // --- Showcase: Filtered Include ---
+    public async Task<List<Album>> GetAlbumsWithLongTracksAsync(int count = 5)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums
+            .AsNoTracking()
+            .Include(a => a.Tracks.Where(t => t.DurationSeconds > 420))
+            .OrderByDescending(a => a.TotalDurationSeconds)
+            .Take(count)
+            .ToListAsync();
+    }
 }

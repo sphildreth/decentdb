@@ -265,7 +265,7 @@ namespace DecentDB.AdoNet
             }
         }
 
-        private void BindParameter(PreparedStatement stmt, int index1Based, DbParameter parameter)
+        internal static void BindParameter(PreparedStatement stmt, int index1Based, DbParameter parameter)
         {
             var value = parameter.Value;
             if (value == null || value == DBNull.Value)

@@ -20,12 +20,14 @@ public class PerformanceMetrics
         var result = await action();
         stopwatch.Stop();
 
-        _measurements.Add(new Measurement
+        var measurement = new Measurement
         {
             Operation = operation,
             ElapsedMilliseconds = stopwatch.ElapsedMilliseconds,
             Details = details
-        });
+        };
+        _measurements.Add(measurement);
+        PrintMeasurement(measurement);
 
         return result;
     }
@@ -36,12 +38,20 @@ public class PerformanceMetrics
         await action();
         stopwatch.Stop();
 
-        _measurements.Add(new Measurement
+        var measurement = new Measurement
         {
             Operation = operation,
             ElapsedMilliseconds = stopwatch.ElapsedMilliseconds,
             Details = details
-        });
+        };
+        _measurements.Add(measurement);
+        PrintMeasurement(measurement);
+    }
+
+    private static void PrintMeasurement(Measurement m)
+    {
+        var details = m.Details != null ? $" ({m.Details})" : "";
+        Console.WriteLine($"  ✓ {m.Operation,-48} {m.ElapsedMilliseconds,6}ms{details}");
     }
 
     public void PrintReport()

@@ -185,4 +185,78 @@ public class AlbumService
             .Take(count)
             .ToListAsync();
     }
+
+    // --- Showcase: GroupBy ---
+    public async Task<List<AlbumsByDecade>> GetAlbumCountByDecadeAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums
+            .AsNoTracking()
+            .GroupBy(a => (a.ReleaseYear / 10) * 10)
+            .Select(g => new AlbumsByDecade
+            {
+                Decade = g.Key,
+                Count = g.Count(),
+                AvgTracks = g.Average(a => (double)a.TotalTracks)
+            })
+            .OrderBy(d => d.Decade)
+            .ToListAsync();
+    }
+
+    // --- Showcase: AsSplitQuery ---
+    public async Task<Album?> GetByIdWithAllDetailsSplitAsync(int id)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums
+            .AsNoTracking()
+            .AsSplitQuery()
+            .Include(a => a.Artist)
+            .Include(a => a.Tracks)
+            .FirstOrDefaultAsync(a => a.Id == id);
+    }
+
+    // --- Showcase: String operations ---
+    public async Task<List<Album>> SearchByTitleCaseInsensitiveAsync(string searchTerm)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums
+            .AsNoTracking()
+            .Where(a => a.Title.ToLower().Contains(searchTerm.ToLower()))
+            .OrderBy(a => a.Title)
+            .Take(10)
+            .ToListAsync();
+    }
+
+    // --- Showcase: Conditional projection ---
+    public async Task<List<string>> GetAlbumSizeLabelsAsync(int count = 10)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums
+            .AsNoTracking()
+            .OrderByDescending(a => a.TotalTracks)
+            .Take(count)
+            .Select(a =>
+                a.Title + ": " +
+                (a.TotalTracks > 15 ? "Large"
+                : a.TotalTracks > 8 ? "Medium"
+                : "Small") + " (" + a.TotalTracks.ToString() + " tracks)")
+            .ToListAsync();
+    }
+
+    // --- Showcase: FromSqlRaw ---
+    public async Task<List<Album>> GetRecentAlbumsRawSqlAsync(int year)
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums
+            .FromSqlRaw("SELECT * FROM albums WHERE release_year >= {0} ORDER BY release_year DESC LIMIT 10", year)
+            .AsNoTracking()
+            .ToListAsync();
+    }
+
+    // --- Showcase: Min / Max ---
+    public async Task<int> GetMaxTracksOnAlbumAsync()
+    {
+        await using var context = await _contextFactory.CreateDbContextAsync();
+        return await context.Albums.MaxAsync(a => a.TotalTracks);
+    }
 }

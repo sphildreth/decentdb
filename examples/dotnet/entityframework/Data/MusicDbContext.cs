@@ -13,6 +13,7 @@ public class MusicDbContext : DbContext
     public DbSet<Artist> Artists => Set<Artist>();
     public DbSet<Album> Albums => Set<Album>();
     public DbSet<Track> Tracks => Set<Track>();
+    public DbSet<Event> Events => Set<Event>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -21,6 +22,7 @@ public class MusicDbContext : DbContext
         ConfigureArtist(modelBuilder);
         ConfigureAlbum(modelBuilder);
         ConfigureTrack(modelBuilder);
+        ConfigureEvent(modelBuilder);
     }
 
     private void ConfigureArtist(ModelBuilder modelBuilder)
@@ -208,6 +210,81 @@ public class MusicDbContext : DbContext
             entity.HasOne(e => e.Album)
                 .WithMany(a => a.Tracks)
                 .HasForeignKey(e => e.AlbumId)
+                .OnDelete(DeleteBehavior.Cascade);
+        });
+    }
+
+    private void ConfigureEvent(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Event>(entity =>
+        {
+            entity.ToTable("events");
+
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id)
+                .HasColumnName("id")
+                .ValueGeneratedOnAdd();
+
+            entity.Property(e => e.Name)
+                .HasColumnName("name")
+                .IsRequired()
+                .HasMaxLength(300);
+
+            entity.Property(e => e.Venue)
+                .HasColumnName("venue")
+                .HasMaxLength(200);
+
+            entity.Property(e => e.City)
+                .HasColumnName("city")
+                .HasMaxLength(100);
+
+            entity.Property(e => e.Country)
+                .HasColumnName("country")
+                .HasMaxLength(100);
+
+            // NodaTime Instant — stored as INTEGER (Unix milliseconds)
+            entity.Property(e => e.TicketSaleStart)
+                .HasColumnName("ticket_sale_start")
+                .IsRequired();
+
+            entity.Property(e => e.DoorsOpen)
+                .HasColumnName("doors_open");
+
+            // NodaTime LocalDate — stored as INTEGER (days since epoch)
+            entity.Property(e => e.EventDate)
+                .HasColumnName("event_date")
+                .IsRequired();
+
+            // Standard DateTime — coexists with NodaTime in the same table
+            entity.Property(e => e.CreatedAt)
+                .HasColumnName("created_at")
+                .IsRequired();
+
+            entity.Property(e => e.CapacityTotal)
+                .HasColumnName("capacity_total")
+                .IsRequired();
+
+            entity.Property(e => e.TicketsSold)
+                .HasColumnName("tickets_sold")
+                .IsRequired();
+
+            entity.Property(e => e.TicketPrice)
+                .HasColumnName("ticket_price")
+                .IsRequired();
+
+            entity.Property(e => e.ArtistId)
+                .HasColumnName("artist_id")
+                .IsRequired();
+
+            entity.HasIndex(e => e.EventDate)
+                .HasDatabaseName("ix_events_event_date");
+
+            entity.HasIndex(e => e.ArtistId)
+                .HasDatabaseName("ix_events_artist_id");
+
+            entity.HasOne(e => e.Artist)
+                .WithMany()
+                .HasForeignKey(e => e.ArtistId)
                 .OnDelete(DeleteBehavior.Cascade);
         });
     }

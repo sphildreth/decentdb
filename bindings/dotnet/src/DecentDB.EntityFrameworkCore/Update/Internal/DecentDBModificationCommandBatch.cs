@@ -46,9 +46,17 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
 
         try
         {
-            foreach (var command in _commands)
+            var nativeDb = (connection.DbConnection as AdoNet.DecentDBConnection)?.GetNativeDb();
+            if (nativeDb != null)
             {
-                ExecuteCommand(connection.DbConnection, command);
+                ExecuteWithStatementReuse(connection.DbConnection, nativeDb);
+            }
+            else
+            {
+                foreach (var command in _commands)
+                {
+                    ExecuteCommand(connection.DbConnection, command);
+                }
             }
         }
         finally
@@ -57,6 +65,293 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
             {
                 connection.Close();
             }
+        }
+    }
+
+    /// <summary>
+    /// Executes commands with prepared statement reuse. Commands with the same SQL
+    /// shape (same table, entity state, and column set) share a single prepared
+    /// statement via Reset/ClearBindings/rebind, avoiding re-parsing overhead.
+    /// </summary>
+    private void ExecuteWithStatementReuse(DbConnection dbConnection, Native.DecentDB nativeDb)
+    {
+        string? currentSql = null;
+        Native.PreparedStatement? currentStmt = null;
+
+        try
+        {
+            foreach (var command in _commands)
+            {
+                var columns = command.ColumnModifications;
+                var readColumns = columns.Where(c => c.IsRead).ToList();
+                var writeColumns = columns.Where(c => c.IsWrite).ToList();
+                var conditionColumns = columns.Where(c => c.IsCondition).ToList();
+
+                var sql = BuildSqlTemplate(command, writeColumns, readColumns, conditionColumns);
+
+                if (currentStmt != null && currentSql == sql)
+                {
+                    currentStmt.Reset().ClearBindings();
+                }
+                else
+                {
+                    currentStmt?.Dispose();
+                    currentStmt = null;
+                    currentStmt = nativeDb.Prepare(sql);
+                    currentSql = sql;
+                }
+
+                BindAllParameters(currentStmt, command, writeColumns, conditionColumns);
+                ExecuteStepAndRead(currentStmt, command, readColumns);
+            }
+        }
+        finally
+        {
+            currentStmt?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Builds the SQL string for a command using $1, $2, ... positional parameters
+    /// directly (DecentDB native format). Uses deterministic parameter ordering so
+    /// identical column sets produce the same SQL, enabling prepared statement reuse.
+    /// </summary>
+    private string BuildSqlTemplate(
+        IReadOnlyModificationCommand command,
+        List<IColumnModification> writeColumns,
+        List<IColumnModification> readColumns,
+        List<IColumnModification> conditionColumns)
+    {
+        var table = _dependencies.SqlGenerationHelper.DelimitIdentifier(command.TableName, command.Schema);
+        var sql = new StringBuilder();
+        var paramOrdinal = 0;
+
+        switch (command.EntityState)
+        {
+            case EntityState.Added:
+                sql.Append("INSERT INTO ").Append(table);
+                if (writeColumns.Count > 0)
+                {
+                    sql.Append(" (");
+                    for (var i = 0; i < writeColumns.Count; i++)
+                    {
+                        if (i > 0) sql.Append(", ");
+                        sql.Append(_dependencies.SqlGenerationHelper.DelimitIdentifier(writeColumns[i].ColumnName));
+                    }
+                    sql.Append(") VALUES (");
+                    for (var i = 0; i < writeColumns.Count; i++)
+                    {
+                        if (i > 0) sql.Append(", ");
+                        sql.Append('$').Append(++paramOrdinal);
+                    }
+                    sql.Append(')');
+                }
+                else
+                {
+                    sql.Append(" DEFAULT VALUES");
+                }
+                if (readColumns.Count > 0)
+                {
+                    sql.Append(" RETURNING ");
+                    for (var i = 0; i < readColumns.Count; i++)
+                    {
+                        if (i > 0) sql.Append(", ");
+                        sql.Append(_dependencies.SqlGenerationHelper.DelimitIdentifier(readColumns[i].ColumnName));
+                    }
+                }
+                break;
+
+            case EntityState.Modified:
+                sql.Append("UPDATE ").Append(table).Append(" SET ");
+                if (writeColumns.Count > 0)
+                {
+                    for (var i = 0; i < writeColumns.Count; i++)
+                    {
+                        if (i > 0) sql.Append(", ");
+                        sql.Append(_dependencies.SqlGenerationHelper.DelimitIdentifier(writeColumns[i].ColumnName))
+                            .Append(" = $").Append(++paramOrdinal);
+                    }
+                }
+                else if (conditionColumns.Count > 0)
+                {
+                    var quoted = _dependencies.SqlGenerationHelper.DelimitIdentifier(conditionColumns[0].ColumnName);
+                    sql.Append(quoted).Append(" = ").Append(quoted);
+                }
+                else
+                {
+                    sql.Append("1 = 1");
+                }
+                AppendWhereTemplate(sql, conditionColumns, ref paramOrdinal);
+                break;
+
+            case EntityState.Deleted:
+                sql.Append("DELETE FROM ").Append(table);
+                AppendWhereTemplate(sql, conditionColumns, ref paramOrdinal);
+                break;
+
+            default:
+                throw new NotSupportedException($"Entity state '{command.EntityState}' is not supported.");
+        }
+
+        return sql.ToString();
+    }
+
+    private void AppendWhereTemplate(
+        StringBuilder sql,
+        List<IColumnModification> conditionColumns,
+        ref int paramOrdinal)
+    {
+        if (conditionColumns.Count == 0) return;
+
+        sql.Append(" WHERE ");
+        var first = true;
+        for (var i = 0; i < conditionColumns.Count; i++)
+        {
+            var column = conditionColumns[i];
+            var value = ConvertToProviderValue(column, column.UseOriginalValue ? column.OriginalValue : column.Value);
+            var colName = _dependencies.SqlGenerationHelper.DelimitIdentifier(column.ColumnName);
+
+            if (value is null or DBNull)
+            {
+                if (!first) sql.Append(" AND ");
+                sql.Append(colName).Append(" IS NULL");
+                first = false;
+            }
+            else
+            {
+                if (!first) sql.Append(" AND ");
+                sql.Append(colName).Append(" = $").Append(++paramOrdinal);
+                first = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Binds parameter values directly to a native prepared statement.
+    /// Parameter indices match the @p1, @p2, ... order from BuildSqlTemplate.
+    /// </summary>
+    private void BindAllParameters(
+        Native.PreparedStatement stmt,
+        IReadOnlyModificationCommand command,
+        List<IColumnModification> writeColumns,
+        List<IColumnModification> conditionColumns)
+    {
+        var paramIndex = 1; // 1-based to match $1, $2, ...
+
+        // Write columns first (VALUES or SET clause)
+        for (var i = 0; i < writeColumns.Count; i++)
+        {
+            var value = ConvertToProviderValue(writeColumns[i], writeColumns[i].Value);
+            BindValue(stmt, paramIndex++, value);
+        }
+
+        // Condition columns (WHERE clause) — skip NULLs since they use IS NULL
+        for (var i = 0; i < conditionColumns.Count; i++)
+        {
+            var value = ConvertToProviderValue(conditionColumns[i],
+                conditionColumns[i].UseOriginalValue ? conditionColumns[i].OriginalValue : conditionColumns[i].Value);
+            if (value is null or DBNull) continue;
+            BindValue(stmt, paramIndex++, value);
+        }
+    }
+
+    private static void BindValue(Native.PreparedStatement stmt, int index1Based, object? value)
+    {
+        if (value == null || value == DBNull.Value)
+        {
+            stmt.BindNull(index1Based);
+            return;
+        }
+
+        var type = value.GetType();
+        if (type == typeof(long) || type == typeof(int) || type == typeof(short) || type == typeof(byte))
+            stmt.BindInt64(index1Based, Convert.ToInt64(value));
+        else if (type == typeof(ulong) || type == typeof(uint) || type == typeof(ushort))
+            stmt.BindInt64(index1Based, (long)Convert.ToUInt64(value));
+        else if (type == typeof(double) || type == typeof(float))
+            stmt.BindFloat64(index1Based, Convert.ToDouble(value));
+        else if (type == typeof(decimal))
+            stmt.BindDecimal(index1Based, (decimal)value);
+        else if (type == typeof(bool))
+            stmt.BindBool(index1Based, (bool)value);
+        else if (type == typeof(string))
+            stmt.BindText(index1Based, (string)value);
+        else if (type == typeof(DateTime))
+        {
+            var dt = (DateTime)value;
+            var utc = dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime();
+            stmt.BindInt64(index1Based, new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeMilliseconds());
+        }
+        else if (type == typeof(DateTimeOffset))
+            stmt.BindInt64(index1Based, ((DateTimeOffset)value).ToUniversalTime().ToUnixTimeMilliseconds());
+        else if (type == typeof(TimeSpan))
+            stmt.BindInt64(index1Based, ((TimeSpan)value).Ticks);
+        else if (type == typeof(DateOnly))
+        {
+            var epoch = DateOnly.FromDateTime(DateTime.UnixEpoch);
+            stmt.BindInt64(index1Based, ((DateOnly)value).DayNumber - epoch.DayNumber);
+        }
+        else if (type == typeof(TimeOnly))
+            stmt.BindInt64(index1Based, ((TimeOnly)value).Ticks);
+        else if (type == typeof(byte[]))
+            stmt.BindBlob(index1Based, (byte[])value);
+        else if (type == typeof(Guid))
+            stmt.BindBlob(index1Based, ((Guid)value).ToByteArray());
+        else if (type.IsEnum)
+            stmt.BindInt64(index1Based, Convert.ToInt64(value));
+        else
+            throw new NotSupportedException($"Unsupported parameter type: {type.FullName}");
+    }
+
+    private void ExecuteStepAndRead(
+        Native.PreparedStatement stmt,
+        IReadOnlyModificationCommand command,
+        List<IColumnModification> readColumns)
+    {
+        try
+        {
+            var stepResult = stmt.Step();
+            if (stepResult < 0)
+            {
+                throw new Native.DecentDBException(stepResult, "Step failed", command.TableName);
+            }
+
+            if (readColumns.Count > 0 && stepResult > 0)
+            {
+                for (var i = 0; i < readColumns.Count; i++)
+                {
+                    object value;
+                    if (stmt.IsNull(i))
+                    {
+                        value = DBNull.Value;
+                    }
+                    else
+                    {
+                        var colType = stmt.ColumnType(i);
+                        value = colType switch
+                        {
+                            1 => (object)stmt.GetInt64(i),
+                            3 => stmt.GetFloat64(i),
+                            _ => stmt.GetText(i)
+                        };
+                    }
+                    readColumns[i].Value = ConvertReadValue(readColumns[i], value);
+                }
+            }
+            else if ((command.EntityState == EntityState.Modified || command.EntityState == EntityState.Deleted)
+                     && stmt.RowsAffected != 1)
+            {
+                throw new DbUpdateConcurrencyException(
+                    $"The database operation was expected to affect 1 row(s), but actually affected {stmt.RowsAffected} row(s).",
+                    command.Entries);
+            }
+        }
+        catch (DbUpdateException) { throw; }
+        catch (Exception ex)
+        {
+            throw new DbUpdateException(
+                $"DecentDB failed to execute {command.EntityState} command for table '{command.TableName}'.",
+                ex, command.Entries);
         }
     }
 

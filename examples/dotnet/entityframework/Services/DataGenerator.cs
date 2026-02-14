@@ -1,4 +1,5 @@
 using EntityFrameworkDemo.Models;
+using NodaTime;
 
 namespace EntityFrameworkDemo.Services;
 
@@ -249,5 +250,72 @@ public class DataGenerator
 
         var selectedLines = lines.OrderBy(x => Random.Next()).Take(4);
         return string.Join("\n", selectedLines);
+    }
+
+    private static readonly string[] Venues = new[]
+    {
+        "Madison Square Garden", "The O2 Arena", "Wembley Stadium", "Red Rocks Amphitheatre",
+        "Sydney Opera House", "Royal Albert Hall", "Hollywood Bowl", "Ryman Auditorium",
+        "Fillmore", "Brixton Academy", "Olympia", "Budokan", "Paradiso", "Melkweg",
+        "Berghain", "The Roundhouse", "Forum", "Palladium"
+    };
+
+    private static readonly string[] Cities = new[]
+    {
+        "New York", "London", "Los Angeles", "Nashville", "Sydney", "Tokyo",
+        "Berlin", "Amsterdam", "Paris", "Melbourne", "Chicago", "Austin",
+        "Manchester", "Stockholm", "Toronto", "Seattle"
+    };
+
+    public static List<Event> GenerateEventsForArtists(List<Artist> artists, int eventsPerArtist = 5)
+    {
+        var events = new List<Event>();
+        var baseDate = new LocalDate(2024, 1, 1);
+
+        foreach (var artist in artists)
+        {
+            int count = Random.Next(2, eventsPerArtist + 1);
+            for (int i = 0; i < count; i++)
+            {
+                int daysOffset = Random.Next(0, 730); // within 2 years
+                var eventDate = baseDate.PlusDays(daysOffset);
+
+                // Ticket sales start 30-90 days before event
+                int saleLeadDays = Random.Next(30, 91);
+                var saleDate = eventDate.PlusDays(-saleLeadDays);
+                var ticketSaleStart = saleDate.AtMidnight()
+                    .InZoneLeniently(DateTimeZone.Utc)
+                    .ToInstant()
+                    .Plus(Duration.FromHours(Random.Next(8, 18)));
+
+                // Doors open on event day, 1-3 hours before show
+                var doorsOpen = eventDate.AtMidnight()
+                    .InZoneLeniently(DateTimeZone.Utc)
+                    .ToInstant()
+                    .Plus(Duration.FromHours(Random.Next(17, 20)));
+
+                var capacity = Random.Next(500, 20001);
+                var sold = Random.Next((int)(capacity * 0.4), capacity + 1);
+
+                events.Add(new Event
+                {
+                    Name = $"{artist.Name} Live at {Venues[Random.Next(Venues.Length)]}",
+                    Venue = Venues[Random.Next(Venues.Length)],
+                    City = Cities[Random.Next(Cities.Length)],
+                    Country = Countries[Random.Next(Countries.Length)],
+                    TicketSaleStart = ticketSaleStart,
+                    DoorsOpen = doorsOpen,
+                    EventDate = eventDate,
+                    CreatedAt = DateTime.UtcNow,
+                    CapacityTotal = capacity,
+                    TicketsSold = sold,
+                    TicketPrice = Math.Round(Random.NextDouble() * 200 + 25, 2),
+                    ArtistId = artist.Id,
+                    Artist = artist
+                });
+            }
+        }
+
+        return events;
     }
 }

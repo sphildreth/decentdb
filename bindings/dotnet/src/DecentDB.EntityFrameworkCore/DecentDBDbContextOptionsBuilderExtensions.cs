@@ -65,5 +65,9 @@ public static class DecentDBDbContextOptionsBuilderExtensions
             ?? new DecentDB.EntityFrameworkCore.DecentDBOptionsExtension();
 
     private static void ConfigureWarnings(DbContextOptionsBuilder optionsBuilder)
-        => optionsBuilder.ConfigureWarnings(w => w.Log(RelationalEventId.AmbientTransactionWarning));
+        => optionsBuilder.ConfigureWarnings(w =>
+        {
+            w.Log(RelationalEventId.AmbientTransactionWarning);
+            w.Ignore(RelationalEventId.MultipleCollectionIncludeWarning);
+        });
 }

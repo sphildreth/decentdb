@@ -1197,3 +1197,67 @@ suite "Planner":
     check r3val[0] == "0.0"
 
     discard closeDb(db)
+
+  test "math and string functions":
+    let dbRes = openDb(":memory:")
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER)")
+    discard execSql(db, "INSERT INTO items (id, name, price, qty) VALUES (1, 'Hello World', 12.75, -5)")
+    discard execSql(db, "INSERT INTO items (id, name, price, qty) VALUES (2, 'Test Item', 9.3, 10)")
+
+    # ABS
+    let r1 = execSql(db, "SELECT ABS(qty) FROM items WHERE id = 1")
+    check r1.ok
+    check r1.value.len == 1
+    check splitRow(r1.value[0])[0] == "5"
+
+    let r1b = execSql(db, "SELECT ABS(price) FROM items WHERE id = 1")
+    check r1b.ok
+    check splitRow(r1b.value[0])[0] == "12.75"
+
+    # ROUND
+    let r2 = execSql(db, "SELECT ROUND(price, 1) FROM items WHERE id = 1")
+    check r2.ok
+    check splitRow(r2.value[0])[0] == "12.8"
+
+    let r2b = execSql(db, "SELECT ROUND(price) FROM items WHERE id = 1")
+    check r2b.ok
+    check splitRow(r2b.value[0])[0] == "13.0"
+
+    # CEIL / CEILING
+    let r3c = execSql(db, "SELECT CEIL(price) FROM items WHERE id = 2")
+    check r3c.ok
+    check splitRow(r3c.value[0])[0] == "10.0"
+
+    let r3d = execSql(db, "SELECT CEILING(price) FROM items WHERE id = 1")
+    check r3d.ok
+    check splitRow(r3d.value[0])[0] == "13.0"
+
+    # FLOOR
+    let r4 = execSql(db, "SELECT FLOOR(price) FROM items WHERE id = 1")
+    check r4.ok
+    check splitRow(r4.value[0])[0] == "12.0"
+
+    # REPLACE
+    let r5 = execSql(db, "SELECT REPLACE(name, 'World', 'Nim') FROM items WHERE id = 1")
+    check r5.ok
+    check splitRow(r5.value[0])[0] == "Hello Nim"
+
+    # SUBSTRING / SUBSTR
+    let r6 = execSql(db, "SELECT SUBSTRING(name, 1, 5) FROM items WHERE id = 1")
+    check r6.ok
+    check splitRow(r6.value[0])[0] == "Hello"
+
+    let r6b = execSql(db, "SELECT SUBSTR(name, 7) FROM items WHERE id = 1")
+    check r6b.ok
+    check splitRow(r6b.value[0])[0] == "World"
+
+    # NULL propagation
+    let r7 = execSql(db, "SELECT ABS(NULL), ROUND(NULL), CEIL(NULL), FLOOR(NULL), REPLACE(NULL, 'a', 'b'), SUBSTRING(NULL, 1, 2)")
+    check r7.ok
+    let r7vals = splitRow(r7.value[0])
+    for v in r7vals:
+      check v == "NULL"
+
+    discard closeDb(db)

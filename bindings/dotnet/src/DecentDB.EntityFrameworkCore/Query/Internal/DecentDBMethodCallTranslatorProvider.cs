@@ -7,6 +7,9 @@ public sealed class DecentDBMethodCallTranslatorProvider : RelationalMethodCallT
     public DecentDBMethodCallTranslatorProvider(RelationalMethodCallTranslatorProviderDependencies dependencies)
         : base(dependencies)
     {
-        AddTranslators([new DecentDBStringMethodTranslator(dependencies.SqlExpressionFactory)]);
+        AddTranslators([
+            new DecentDBStringMethodTranslator(dependencies.SqlExpressionFactory),
+            new DecentDBMathTranslator(dependencies.SqlExpressionFactory)
+        ]);
     }
 }

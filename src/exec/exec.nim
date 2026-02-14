@@ -6,6 +6,7 @@ import algorithm
 import atomics
 import sets
 import hashes
+import math
 import std/monotimes
 import std/times
 import std/math
@@ -34,9 +35,9 @@ type RowCursor* = ref object
   columns*: seq[string]
   nextFn: proc(): Result[Option[Row]] {.closure.}
 
-var gEvalContextDepth {.threadvar.}: int
-var gEvalPager {.threadvar.}: Pager
-var gEvalCatalog {.threadvar.}: Catalog
+var gEvalContextDepth* {.threadvar.}: int
+var gEvalPager* {.threadvar.}: Pager
+var gEvalCatalog* {.threadvar.}: Catalog
 
 proc decimalToString(val: int64, scale: uint8): string =
   var s = $val
@@ -2118,6 +2119,162 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
         return ok(textValue(text.strip()))
       else:
         discard
+
+    if name == "REPLACE":
+      if expr.args.len != 3:
+        return err[Value](ERR_SQL, "REPLACE requires exactly three arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let fromRes = evalExpr(row, expr.args[1], params)
+      if not fromRes.ok:
+        return err[Value](fromRes.err.code, fromRes.err.message, fromRes.err.context)
+      if fromRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let toRes = evalExpr(row, expr.args[2], params)
+      if not toRes.ok:
+        return err[Value](toRes.err.code, toRes.err.message, toRes.err.context)
+      if toRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      return ok(textValue(valueToString(strRes.value).replace(
+        valueToString(fromRes.value), valueToString(toRes.value))))
+
+    if name in ["SUBSTR", "SUBSTRING"]:
+      if expr.args.len < 2 or expr.args.len > 3:
+        return err[Value](ERR_SQL, name & " requires 2 or 3 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let startRes = evalExpr(row, expr.args[1], params)
+      if not startRes.ok:
+        return err[Value](startRes.err.code, startRes.err.message, startRes.err.context)
+      if startRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let text = valueToString(strRes.value)
+      # SQL SUBSTRING is 1-based; convert to 0-based
+      var startIdx = 0
+      case startRes.value.kind
+      of vkInt64: startIdx = int(startRes.value.int64Val) - 1
+      of vkFloat64: startIdx = int(startRes.value.float64Val) - 1
+      else: return err[Value](ERR_SQL, name & " start position must be numeric")
+      if startIdx < 0: startIdx = 0
+      if startIdx >= text.len:
+        return ok(textValue(""))
+      if expr.args.len == 3:
+        let lenRes = evalExpr(row, expr.args[2], params)
+        if not lenRes.ok:
+          return err[Value](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+        if lenRes.value.kind == vkNull:
+          return ok(Value(kind: vkNull))
+        var subLen = 0
+        case lenRes.value.kind
+        of vkInt64: subLen = int(lenRes.value.int64Val)
+        of vkFloat64: subLen = int(lenRes.value.float64Val)
+        else: return err[Value](ERR_SQL, name & " length must be numeric")
+        if subLen < 0: subLen = 0
+        let endIdx = min(startIdx + subLen, text.len)
+        return ok(textValue(text[startIdx ..< endIdx]))
+      else:
+        return ok(textValue(text[startIdx ..< text.len]))
+
+    if name == "ABS":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "ABS requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      case argRes.value.kind
+      of vkInt64:
+        return ok(Value(kind: vkInt64, int64Val: abs(argRes.value.int64Val)))
+      of vkFloat64:
+        return ok(Value(kind: vkFloat64, float64Val: abs(argRes.value.float64Val)))
+      of vkDecimal:
+        let d = argRes.value.int64Val
+        if d < 0:
+          return ok(Value(kind: vkDecimal, int64Val: -d, decimalScale: argRes.value.decimalScale))
+        return ok(argRes.value)
+      else:
+        return err[Value](ERR_SQL, "ABS requires numeric argument")
+
+    if name == "ROUND":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "ROUND requires 1 or 2 arguments")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var decimals = 0
+      if expr.args.len == 2:
+        let decRes = evalExpr(row, expr.args[1], params)
+        if not decRes.ok:
+          return err[Value](decRes.err.code, decRes.err.message, decRes.err.context)
+        if decRes.value.kind == vkNull:
+          return ok(Value(kind: vkNull))
+        case decRes.value.kind
+        of vkInt64: decimals = int(decRes.value.int64Val)
+        of vkFloat64: decimals = int(decRes.value.float64Val)
+        else: return err[Value](ERR_SQL, "ROUND decimal places must be numeric")
+      let factor = pow(10.0, float64(decimals))
+      case argRes.value.kind
+      of vkInt64:
+        if decimals >= 0:
+          return ok(argRes.value)
+        let rounded = round(float64(argRes.value.int64Val) / factor) * factor
+        return ok(Value(kind: vkInt64, int64Val: int64(rounded)))
+      of vkFloat64:
+        let rounded = round(argRes.value.float64Val * factor) / factor
+        return ok(Value(kind: vkFloat64, float64Val: rounded))
+      of vkDecimal:
+        let asFloat = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+        let rounded = round(asFloat * factor) / factor
+        return ok(Value(kind: vkFloat64, float64Val: rounded))
+      else:
+        return err[Value](ERR_SQL, "ROUND requires numeric argument")
+
+    if name in ["CEIL", "CEILING"]:
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, name & " requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      case argRes.value.kind
+      of vkInt64:
+        return ok(argRes.value)
+      of vkFloat64:
+        return ok(Value(kind: vkFloat64, float64Val: ceil(argRes.value.float64Val)))
+      of vkDecimal:
+        let asFloat = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+        return ok(Value(kind: vkFloat64, float64Val: ceil(asFloat)))
+      else:
+        return err[Value](ERR_SQL, name & " requires numeric argument")
+
+    if name == "FLOOR":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "FLOOR requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      case argRes.value.kind
+      of vkInt64:
+        return ok(argRes.value)
+      of vkFloat64:
+        return ok(Value(kind: vkFloat64, float64Val: floor(argRes.value.float64Val)))
+      of vkDecimal:
+        let asFloat = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+        return ok(Value(kind: vkFloat64, float64Val: floor(asFloat)))
+      else:
+        return err[Value](ERR_SQL, "FLOOR requires numeric argument")
 
     if name == "LIKE_ESCAPE":
       if expr.args.len != 2:
