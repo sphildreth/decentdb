@@ -125,6 +125,10 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       let idxName = if idxOpt.isSome: idxOpt.get.name else: "?"
       line.add("TrigramSeek(table=" & p.table & " column=" & p.column & " pattern=" & renderExpr(p.likeExpr) & " insensitive=" & $p.likeInsensitive & " index=" & idxName & ")")
       lines.add(line)
+    of pkSubqueryScan:
+      line.add("SubqueryScan(alias=" & p.alias & ")")
+      lines.add(line)
+      traverse(p.subPlan, depth + 1)
     of pkUnionDistinct:
       line.add("UnionDistinct")
       lines.add(line)

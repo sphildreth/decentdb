@@ -3,15 +3,45 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <PackageId>DecentDB.AdoNet</PackageId>
     <Description>ADO.NET provider for DecentDB embedded database</Description>
+    <Authors>DecentDB contributors</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/sphildreth/decentdb</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <RootNamespace>DecentDB.AdoNet</RootNamespace>
     <AssemblyName>DecentDB.AdoNet</AssemblyName>
+    <SuppressDependenciesWhenPacking>true</SuppressDependenciesWhenPacking>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);IncludeProjectReferencesInPackage</TargetsForTfmSpecificBuildOutput>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
 
-    <!-- Packed via DecentDB.MicroOrm meta package. -->
-    <IsPackable>false</IsPackable>
+    <IsPackable>true</IsPackable>
   </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DecentDB.EntityFrameworkCore" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\DecentDB.Native\DecentDB.Native.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../DecentDB.MicroOrm/README.md" Pack="true" PackagePath="README.md" />
+    <None Include="../DecentDB.MicroOrm/icon.png" Pack="true" PackagePath="\" />
+    <None Include="../DecentDB.MicroOrm/runtimes/linux-x64/native/libdecentdb.so" Pack="true" PackagePath="runtimes/linux-x64/native/libdecentdb.so" Condition="Exists('../DecentDB.MicroOrm/runtimes/linux-x64/native/libdecentdb.so')" />
+    <None Include="../DecentDB.MicroOrm/runtimes/osx-x64/native/libdecentdb.dylib" Pack="true" PackagePath="runtimes/osx-x64/native/libdecentdb.dylib" Condition="Exists('../DecentDB.MicroOrm/runtimes/osx-x64/native/libdecentdb.dylib')" />
+    <None Include="../DecentDB.MicroOrm/runtimes/win-x64/native/decentdb.dll" Pack="true" PackagePath="runtimes/win-x64/native/decentdb.dll" Condition="Exists('../DecentDB.MicroOrm/runtimes/win-x64/native/decentdb.dll')" />
+  </ItemGroup>
+
+  <Target Name="IncludeProjectReferencesInPackage" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage
+        Include="@(ReferenceCopyLocalPaths->WithMetadataValue('ReferenceSourceTarget', 'ProjectReference'))"
+        TargetPath="%(Filename)%(Extension)" />
+    </ItemGroup>
+  </Target>
 </Project>

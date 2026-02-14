@@ -8,7 +8,7 @@ This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB is currently **pre-1.0**. This document describes the **current baseline** feature set and constraints; details may change as DecentDB approaches 1.0.
+DecentDB is currently at **v1.1**. This document describes the current feature set and constraints; details may change as DecentDB continues to evolve.
 
 DecentDB is intentionally scoped around:
 - **Priority #1:** durable ACID writes (WAL-based)
@@ -49,7 +49,7 @@ DecentDB's current baseline includes:
 - CTEs: non-recursive `WITH ... AS`
 - Window functions: `ROW_NUMBER() OVER (...)`
 - Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
-- Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`
+- Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`
 - Operators: `+`, `-`, `*`, `/`, `||` (string concatenation)
 - Parameters: positional `$1, $2, ...` (Postgres-style)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output

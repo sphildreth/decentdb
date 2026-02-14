@@ -1,4 +1,4 @@
-name: Publish NuGet (DecentDB.MicroOrm)
+name: Publish NuGet (.NET packages)
 
 on:
   push:
@@ -148,7 +148,11 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
 
-          if [[ "$tag" =~ ^v1\.0\.2$ ]]; then
+          if [[ "$tag" =~ ^v1\.1\.0$ ]]; then
+            nuget="1.1.0"
+          elif [[ "$tag" =~ ^v1\.1\.0-rc\.([0-9]+)$ ]]; then
+            nuget="1.1.0-rc.${BASH_REMATCH[1]}"
+          elif [[ "$tag" =~ ^v1\.0\.2$ ]]; then
             nuget="1.0.2"
           elif [[ "$tag" =~ ^v1\.0\.2-rc\.([0-9]+)$ ]]; then
             nuget="1.0.2-rc.${BASH_REMATCH[1]}"
@@ -180,7 +184,45 @@ jobs:
             -c Release \
             -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
             -o ./artifacts \
+            bindings/dotnet/src/DecentDB.AdoNet/DecentDB.AdoNet.csproj
+          dotnet pack \
+            -c Release \
+            -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
+            -o ./artifacts \
             bindings/dotnet/src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj
+          dotnet pack \
+            -c Release \
+            -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
+            -o ./artifacts \
+            bindings/dotnet/src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj
+          dotnet pack \
+            -c Release \
+            -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
+            -o ./artifacts \
+            bindings/dotnet/src/DecentDB.EntityFrameworkCore.Design/DecentDB.EntityFrameworkCore.Design.csproj
+          dotnet pack \
+            -c Release \
+            -p:PackageVersion="${{ steps.ver.outputs.nuget_version }}" \
+            -o ./artifacts \
+            bindings/dotnet/src/DecentDB.EntityFrameworkCore.NodaTime/DecentDB.EntityFrameworkCore.NodaTime.csproj
+
+      - name: Verify DecentDB.AdoNet package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="$(ls ./artifacts/DecentDB.AdoNet.*.nupkg | head -n1)"
+          unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.AdoNet.dll"
+          unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.Native.dll"
+          unzip -l "$pkg" | grep -q "runtimes/linux-x64/native/libdecentdb.so"
+          unzip -l "$pkg" | grep -q "runtimes/osx-x64/native/libdecentdb.dylib"
+          unzip -l "$pkg" | grep -q "runtimes/win-x64/native/decentdb.dll"
+
+      - name: Verify EF Core package contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="$(ls ./artifacts/DecentDB.EntityFrameworkCore.*.nupkg | head -n1)"
+          unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.EntityFrameworkCore.dll"
 
       - name: Publish to GitHub Packages
         continue-on-error: true

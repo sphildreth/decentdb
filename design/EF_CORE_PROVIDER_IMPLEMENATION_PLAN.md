@@ -1,0 +1,233 @@
+# EF Core Provider Phased Implementation Plan (DecentDB)
+
+This document is the execution checklist for `design/EF_CORE_PROVIDER_PLAN.md`. It breaks the work into phases with concrete deliverables, tests, and documentation updates.
+
+Conventions:
+- Each phase starts with a checkbox; keep it unchecked until the phase exit criteria are met.
+- Any dependency/architecture change requires an ADR under `design/adr/`.
+- Code locations are for this repository layout: .NET bindings under `bindings/dotnet/`.
+
+---
+
+## Phase 0: Prereqs, ADRs, and Packaging Foundation
+
+- [x] Phase 0 complete
+- [x] Accept ADR-0093 (`design/adr/0093-dotnet-nuget-packaging-adonet-package.md`) and update/supersede ADR-0044 (`design/adr/0044-dotnet-nuget-packaging.md`)
+- [x] Decide and document the NuGet layout for native runtime assets when publishing `DecentDB.AdoNet` (RID matrix, file paths, duplication policy)
+- [x] Make `bindings/dotnet/src/DecentDB.AdoNet/DecentDB.AdoNet.csproj` packable and publishable (PackageId/metadata)
+- [x] Ensure `DecentDB.AdoNet` NuGet includes native engine assets under `runtimes/{rid}/native/` (same RID set as today)
+- [x] Ensure `DecentDB.AdoNet` consumers get `DecentDB.Native` correctly (dependency or included assembly)
+- [x] Update CI to build/test/pack/publish `DecentDB.AdoNet` (and keep `DecentDB.MicroOrm` publishing intact)
+- [x] Add/confirm a versioning policy for multiple .NET packages published from this repo
+- [x] Documentation: update `README.md` or `docs/` to mention `DecentDB.AdoNet` as a published package
+
+Exit criteria:
+- [x] CI can produce/publish a `DecentDB.AdoNet` package with correct runtime assets
+- [x] Existing .NET tests still pass
+
+---
+
+## Phase 1: v0 Scope ADR + Provider Skeleton (M0 Start)
+
+- [x] Phase 1 complete
+- [x] Create and accept the v0 scope ADR (`design/adr/00xx-efcore-provider-v0-scope.md`)
+- [x] Create `bindings/dotnet/src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj`
+- [x] Add project to `bindings/dotnet/DecentDB.NET.sln` and CI build/test scripts
+- [x] Add `UseDecentDB(connectionString, optionsAction)` and (optional) `UseDecentDB(DbConnection, optionsAction)`
+- [x] Implement provider `IDbContextOptionsExtension` and service registration (Relational provider wiring)
+- [x] Basic connection validation and “can connect” smoke test
+- [x] Unit tests: create `bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests` (or similar) with xUnit; add first smoke tests
+- [x] Documentation: add a minimal usage snippet (DI + `AddDbContextFactory` example) and link DecentDB issue #20
+
+Exit criteria:
+- [x] `DbContext` can be configured with `UseDecentDB(...)` and open a connection
+- [x] Tests run in CI on Windows/macOS/Linux
+
+---
+
+## Phase 2: Relational Type Mapping (M0)
+
+- [x] Phase 2 complete
+- [x] Implement `RelationalTypeMappingSource` for DecentDB-supported types
+- [x] Implement SQL literal generation/quoting helpers
+- [x] Align date/time storage conventions with existing .NET rules (epoch/ticks/day-number) and document them
+- [x] Validate DECIMAL/UUID behavior against `design/adr/0091-decimal-uuid-implementation.md`
+- [x] Unit tests: type mapping round-trip tests (CLR -> parameter -> storage -> materialization)
+- [x] Documentation: provider type mapping table (initial v0 set)
+
+Exit criteria:
+- [x] Common CLR types map deterministically and round-trip in tests
+
+---
+
+## Phase 3: Query Translation + SQL Generation (M0)
+
+- [x] Phase 3 complete
+- [x] Implement query SQL generator pipeline (expression factory + query SQL generator + translators)
+- [x] Ensure generated SQL targets DecentDB’s supported subset (`design/SPEC.md`), not “full PostgreSQL”
+- [x] Implement paging translation using `LIMIT/OFFSET` (avoid `OFFSET ... FETCH` unless engine support is added)
+- [x] Implement null/bool semantics (`IS NULL`, `TRUE/FALSE`) consistent with DecentDB
+- [x] Implement common string ops (`Contains`, `StartsWith`, `EndsWith`) with correct LIKE escaping
+- [x] Define a policy for large `IN (...)` lists (max size error vs alternate rewrite; document)
+- [x] Unit tests: SQL generation tests for supported LINQ patterns (golden SQL + parameters)
+- [x] Integration tests: execute a small set of translated queries against a real DecentDB file
+
+Exit criteria:
+- [x] Basic LINQ queries work end-to-end with parameters and correct results
+- [x] A conformance test seed set is running (even if tiny)
+
+---
+
+## Phase 4: Execution, Diagnostics, and Error Mapping (M0)
+
+- [x] Phase 4 complete
+- [x] Implement `RelationalConnection` integration using `DecentDB.AdoNet`
+- [x] Implement command/parameter creation aligned with DecentDB positional parameters (`$1`, `$2`, ...) (see `design/adr/0005-sql-parameterization-style.md`)
+- [x] Implement transaction integration (explicit `BeginTransaction` and best-effort `TransactionScope`)
+- [x] Implement error/exception mapping:
+- [x] Define and document the mapping policy (table or code-first)
+- [x] Map concurrency/update failures to EF exceptions (`DbUpdateException`, `DbUpdateConcurrencyException`) where applicable
+- [x] Define a conservative transient failure policy; add `IExecutionStrategy` only if justified
+- [x] Add provider diagnostics/logging hooks (EF Core logging + timings where feasible)
+- [x] Unit tests: exception mapping tests (error code -> expected EF exception type)
+- [x] Integration tests: transaction tests (commit/rollback) and exception mapping with real engine errors
+
+Exit criteria:
+- [x] EF diagnostics show executed SQL and parameters (at least at debug logging)
+- [x] Exceptions surfaced to EF callers are predictable and tested
+
+---
+
+## Phase 5: Conformance Ramp (M0 Exit)
+
+- [x] Phase 5 complete
+- [x] Choose and pin the EF Core provider test source:
+- [x] Vendor a pinned subset from EF Core repo, or implement an equivalent harness
+- [x] Create and maintain a skip list (every skip has an issue link + reason)
+- [x] Expand conformance coverage for:
+- [x] Basic query translation
+- [x] Parameters
+- [x] Includes + `AsSplitQuery`
+- [x] Transactions
+- [x] Add CI gates for the conformance suite subset
+- [x] Documentation: testing/CI notes for running the EF provider tests locally
+
+Exit criteria:
+- [x] “M0” definition in `design/EF_CORE_PROVIDER_PLAN.md` is met with repeatable tests in CI
+
+---
+
+## Phase 6: SaveChanges / Update Pipeline (M1)
+
+- [x] Phase 6 complete
+- [x] Implement `UpdateSqlGenerator` and modification command batching
+- [x] Support identity key propagation via `INSERT ... RETURNING`
+- [x] Support database defaults via `INSERT ... RETURNING` where DecentDB returns computed values
+- [x] Implement concurrency token checks
+- [x] Confirm behavior for affected rows and concurrency exceptions is EF-correct
+- [x] Conformance tests: EF update pipeline subset (insert/update/delete, concurrency)
+- [x] Integration tests: multi-row insert/update/delete and transaction interactions
+- [x] Documentation: supported generated value behaviors and known limitations
+
+Exit criteria:
+- [x] `SaveChanges` works for typical entity graphs with generated keys and concurrency
+
+---
+
+## Phase 7: Migrations Runtime (M2)
+
+- [x] Phase 7 complete
+- [x] Implement `IRelationalDatabaseCreator` with idempotent `EnsureCreated/EnsureDeleted` semantics
+- [x] Implement `IHistoryRepository` for `__EFMigrationsHistory`
+- [x] Implement `IMigrationsSqlGenerator` emitting DecentDB DDL (limited to DecentDB-supported DDL subset)
+- [x] Fail-fast for unsupported DDL with actionable error messages
+- [x] (Optional, post-M2) ADR + engine validation for any “table rebuild” behavior; add crash/recovery tests before enabling
+- [x] Integration tests: apply migrations to empty DB, then upgrade an existing DB
+- [x] Documentation: supported DDL operations and migration limitations/workarounds
+
+Exit criteria:
+- [x] Migrations can be applied programmatically (`context.Database.Migrate()`) with tested outcomes
+
+---
+
+## Phase 8: Migrations Design-Time (M2 Prereq)
+
+- [x] Phase 8 complete
+- [x] Create `DecentDB.EntityFrameworkCore.Design` package and register `IDesignTimeServices`
+- [x] Ensure `dotnet ef migrations add` works for a minimal sample project
+- [x] Ensure `dotnet ef database update` works via the provider
+- [x] Add a “getting started” docs page for EF provider migrations (commands + minimal configuration)
+- [x] Tests: add at least one integration test project that exercises design-time tooling in CI (as feasible)
+
+Exit criteria:
+- [x] `dotnet ef migrations add` and `dotnet ef database update` work with DecentDB provider in a representative sample
+
+---
+
+## Phase 9: Scaffolding / Reverse Engineering (Optional for v1+)
+
+- [x] Phase 9 complete
+- [x] Implement `IDatabaseModelFactory` using DecentDB schema discovery
+- [x] Generate DbContext/entity code consistent with provider type mappings
+- [x] Handle key schema edge cases (composite keys, indexes, nullability, defaults)
+- [x] Tests: schema discovery + scaffolding output validation (non-snapshot where possible)
+- [x] Documentation: scaffolding usage and limitations
+
+Exit criteria:
+- [x] `dotnet ef dbcontext scaffold` (or equivalent) produces usable models for common schemas
+
+---
+
+## Phase 10: NodaTime Extension (Parallel Track)
+
+- [x] Phase 10 complete
+- [x] Create `DecentDB.EntityFrameworkCore.NodaTime` package
+- [x] Implement `UseNodaTime()` extension wiring
+- [x] Add NodaTime type mappings + converters aligned with DecentDB storage conventions
+- [x] Tests: NodaTime round-trip integration tests
+- [x] Documentation: which NodaTime types are supported and their storage representation
+
+Exit criteria:
+- [x] NodaTime types round-trip correctly in EF queries and SaveChanges
+
+---
+
+## Phase 11: GA Hardening (M3)
+
+- [x] Phase 11 complete
+- [x] Expand conformance suite coverage toward “expected provider” behavior (GroupBy/aggregates, set ops, correlated subqueries) per `design/EF_CORE_PROVIDER_PLAN.md`
+- [x] Keep skip list small and justified; track gaps as issues with clear engine/provider prerequisites
+- [x] Performance: implement and run the benchmark suite:
+- [x] Translation time
+- [x] End-to-end latency vs raw `DecentDB.AdoNet`
+- [x] Allocations per query
+- [x] Validate `AddDbContextPool` correctness and throughput impact
+- [x] Documentation: supported feature matrix, known gaps, and compatibility notes
+
+Exit criteria:
+- [x] Provider meets M3 “GA” criteria in `design/EF_CORE_PROVIDER_PLAN.md`
+
+---
+
+## Phase 12: Release and Version Bump (DecentDB 1.1.0)
+
+- [x] Phase 12 complete
+- [x] Bump DecentDB version to `1.1.0` across:
+  - [x] Nim package metadata (`decentdb.nimble`)
+  - [x] .NET package versions for all published packages (`DecentDB.MicroOrm`, `DecentDB.AdoNet`, `DecentDB.EntityFrameworkCore*`)
+  - [x] Any version references in docs/examples (search repo-wide for previous version strings)
+- [x] Update `CHANGELOG.md` with a `1.1.0` entry describing:
+  - [x] EF Core provider introduction and major supported features (query pipeline, SaveChanges, migrations)
+  - [x] New/changed NuGet publishing model (standalone `DecentDB.AdoNet` if adopted)
+  - [x] Notable limitations / known gaps (with issue links)
+- [x] Documentation sweep:
+  - [x] Add EF Core “getting started” and “migrations” docs (if not already done)
+  - [x] Add package matrix and installation guidance (MicroOrm vs AdoNet vs EF provider)
+  - [x] Ensure docs reflect DecentDB’s SQL subset and any provider-specific translation notes
+- [x] Final CI validation for release:
+  - [x] Tests green (engine + .NET)
+  - [x] NuGet packaging artifacts include correct runtime assets
+
+Exit criteria:
+- [x] Repo version and documentation consistently reflect `1.1.0`
+- [x] Release notes are complete and accurate for users upgrading to `1.1.0`

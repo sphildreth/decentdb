@@ -168,6 +168,15 @@ proc cloneSelectStatement(stmt: Statement): Statement =
   var orderBy: seq[OrderItem] = @[]
   for item in stmt.orderBy:
     orderBy.add(cloneOrderItem(item))
+  var clonedFromSubquery: Statement = nil
+  if stmt.fromSubquery != nil and stmt.fromSubquery.kind == skSelect:
+    clonedFromSubquery = cloneSelectStatement(stmt.fromSubquery)
+  var clonedJoinSubqueries: seq[Statement] = @[]
+  for sq in stmt.joinSubqueries:
+    if sq != nil and sq.kind == skSelect:
+      clonedJoinSubqueries.add(cloneSelectStatement(sq))
+    else:
+      clonedJoinSubqueries.add(sq)
   Statement(
     kind: skSelect,
     cteNames: stmt.cteNames,
@@ -179,7 +188,9 @@ proc cloneSelectStatement(stmt: Statement): Statement =
     selectItems: selectItems,
     fromTable: stmt.fromTable,
     fromAlias: stmt.fromAlias,
+    fromSubquery: clonedFromSubquery,
     joins: joins,
+    joinSubqueries: clonedJoinSubqueries,
     whereExpr: cloneExpr(stmt.whereExpr),
     groupBy: groupBy,
     havingExpr: cloneExpr(stmt.havingExpr),
@@ -317,6 +328,11 @@ proc hasParamsInSelect(stmt: Statement): bool =
     return true
   if stmt.setOpRight != nil and stmt.setOpRight.kind == skSelect and hasParamsInSelect(stmt.setOpRight):
     return true
+  if stmt.fromSubquery != nil and hasParamsInSelect(stmt.fromSubquery):
+    return true
+  for sq in stmt.joinSubqueries:
+    if sq != nil and hasParamsInSelect(sq):
+      return true
   for item in stmt.selectItems:
     if not item.isStar and hasParamsInExpr(item.expr):
       return true
@@ -404,6 +420,81 @@ proc resolveColumn(map: Table[string, TableMeta], table: string, name: string): 
     return err[ColumnType](ERR_SQL, "Ambiguous column", name)
   ok(found[0])
 
+proc inferExprType(catalog: Catalog, map: Table[string, TableMeta], expr: Expr): ColumnType =
+  if expr == nil:
+    return ctText
+  case expr.kind
+  of ekLiteral:
+    case expr.value.kind
+    of svInt: return ctInt64
+    of svFloat: return ctFloat64
+    of svBool: return ctBool
+    of svString: return ctText
+    else: return ctText
+  of ekColumn:
+    let res = resolveColumn(map, expr.table, expr.name)
+    if res.ok:
+      return res.value
+    return ctText
+  of ekFunc:
+    let fn = expr.funcName.toUpperAscii()
+    if fn in ["COUNT", "SUM"]:
+      return ctInt64
+    if fn in ["AVG"]:
+      return ctFloat64
+    if fn == "SCALAR_SUBQUERY":
+      return ctInt64
+    if fn == "CAST" and expr.args.len >= 2 and expr.args[1].kind == ekLiteral and expr.args[1].value.kind == svString:
+      let typeName = expr.args[1].value.strVal.toUpperAscii()
+      if typeName in ["INTEGER", "INT", "INT64", "BIGINT"]: return ctInt64
+      if typeName in ["REAL", "FLOAT", "DOUBLE", "DOUBLE PRECISION"]: return ctFloat64
+      if typeName in ["BOOLEAN", "BOOL"]: return ctBool
+      return ctText
+    return ctText
+  else:
+    return ctText
+
+proc subqueryTableMeta(catalog: Catalog, subquery: Statement, alias: string): Result[TableMeta] =
+  ## Derive a synthetic TableMeta from a subquery's SELECT items.
+  var columns: seq[Column] = @[]
+  # Build a table map for the subquery's own sources to resolve column types.
+  var innerMap = initTable[string, TableMeta]()
+  if subquery.fromTable.len > 0 and subquery.fromSubquery == nil:
+    let res = catalog.getTable(subquery.fromTable)
+    if res.ok:
+      innerMap[subquery.fromTable] = res.value
+      if subquery.fromAlias.len > 0:
+        innerMap[subquery.fromAlias] = res.value
+  for join in subquery.joins:
+    let res = catalog.getTable(join.table)
+    if res.ok:
+      innerMap[join.table] = res.value
+      if join.alias.len > 0:
+        innerMap[join.alias] = res.value
+  for item in subquery.selectItems:
+    if item.isStar:
+      if subquery.fromTable.len > 0:
+        let tblRes = catalog.getTable(subquery.fromTable)
+        if tblRes.ok:
+          for col in tblRes.value.columns:
+            columns.add(Column(name: col.name, kind: col.kind))
+        for join in subquery.joins:
+          let joinRes = catalog.getTable(join.table)
+          if joinRes.ok:
+            for col in joinRes.value.columns:
+              columns.add(Column(name: col.name, kind: col.kind))
+    else:
+      var colName: string
+      if item.alias.len > 0:
+        colName = item.alias
+      elif item.expr != nil and item.expr.kind == ekColumn:
+        colName = item.expr.name
+      else:
+        colName = "?column?"
+      let colType = inferExprType(catalog, innerMap, item.expr)
+      columns.add(Column(name: colName, kind: colType))
+  ok(TableMeta(name: alias, columns: columns))
+
 proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
   if expr == nil:
     return okVoid()
@@ -472,8 +563,8 @@ proc validateCheckExpr(expr: Expr): Result[Void] =
     let fn = expr.funcName.toUpperAscii()
     if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
       return err[Void](ERR_SQL, "CHECK expression cannot use aggregate functions", expr.funcName)
-    if fn == "EXISTS":
-      return err[Void](ERR_SQL, "CHECK expression cannot use EXISTS in 0.x")
+    if fn == "EXISTS" or fn == "SCALAR_SUBQUERY":
+      return err[Void](ERR_SQL, "CHECK expression cannot use subqueries")
     let allowed = ["CASE", "CAST", "COALESCE", "NULLIF", "LENGTH", "LOWER", "UPPER", "TRIM", "LIKE_ESCAPE"]
     if fn notin allowed:
       return err[Void](ERR_SQL, "Unsupported function in CHECK expression", expr.funcName)
@@ -504,10 +595,16 @@ proc directSelectDependencies(stmt: Statement): seq[string] =
   for name in stmt.cteNames:
     cteNames.incl(normalizedName(name))
   var seen = initHashSet[string]()
-  if stmt.fromTable.len > 0 and normalizedName(stmt.fromTable) notin cteNames:
+  if stmt.fromTable.len > 0 and stmt.fromSubquery == nil and normalizedName(stmt.fromTable) notin cteNames:
     seen.incl(normalizedName(stmt.fromTable))
-  for join in stmt.joins:
-    if normalizedName(join.table) notin cteNames:
+  if stmt.fromSubquery != nil:
+    for dep in directSelectDependencies(stmt.fromSubquery):
+      seen.incl(dep)
+  for i, join in stmt.joins:
+    if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
+      for dep in directSelectDependencies(stmt.joinSubqueries[i]):
+        seen.incl(dep)
+    elif normalizedName(join.table) notin cteNames:
       seen.incl(normalizedName(join.table))
   for query in stmt.cteQueries:
     if query != nil and query.kind == skSelect:
@@ -987,14 +1084,25 @@ proc expandSelectCteRefs(
       baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(cteQuery.whereExpr))
 
       var newJoins: seq[JoinClause] = @[]
+      var newJoinSubqueries: seq[Statement] = @[]
       for i, join in expanded.joins:
         if i == joinIdx:
           newJoins.add(baseJoin)
+          if i < expanded.joinSubqueries.len:
+            newJoinSubqueries.add(expanded.joinSubqueries[i])
+          else:
+            newJoinSubqueries.add(nil)
           for extra in cteQuery.joins:
             newJoins.add(extra)
+            newJoinSubqueries.add(nil)
         else:
           newJoins.add(join)
+          if i < expanded.joinSubqueries.len:
+            newJoinSubqueries.add(expanded.joinSubqueries[i])
+          else:
+            newJoinSubqueries.add(nil)
       expanded.joins = newJoins
+      expanded.joinSubqueries = newJoinSubqueries
     joinIdx.inc
 
 
@@ -1194,14 +1302,25 @@ proc expandSelectViews(
       baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(viewQuery.whereExpr))
 
       var newJoins: seq[JoinClause] = @[]
+      var newJoinSubqueries: seq[Statement] = @[]
       for i, join in expanded.joins:
         if i == joinIdx:
           newJoins.add(baseJoin)
+          if i < expanded.joinSubqueries.len:
+            newJoinSubqueries.add(expanded.joinSubqueries[i])
+          else:
+            newJoinSubqueries.add(nil)
           for extra in viewQuery.joins:
             newJoins.add(extra)
+            newJoinSubqueries.add(nil)
         else:
           newJoins.add(join)
+          if i < expanded.joinSubqueries.len:
+            newJoinSubqueries.add(expanded.joinSubqueries[i])
+          else:
+            newJoinSubqueries.add(nil)
       expanded.joins = newJoins
+      expanded.joinSubqueries = newJoinSubqueries
     joinIdx.inc
 
   let nodeCount = countSelectNodes(expanded)
@@ -1237,7 +1356,9 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       selectItems: @[],
       fromTable: "",
       fromAlias: "",
+      fromSubquery: nil,
       joins: @[],
+      joinSubqueries: @[],
       whereExpr: nil,
       groupBy: @[],
       havingExpr: nil,
@@ -1251,16 +1372,63 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
   let expandedRes = expandSelectSources(catalog, stmt, 0, @[])
   if not expandedRes.ok:
     return err[Statement](expandedRes.err.code, expandedRes.err.message, expandedRes.err.context)
-  let expanded = expandedRes.value
+  var expanded = expandedRes.value
 
   # If expansion resulted in a SetOp (e.g. from UNION View/CTE), we need to bind that.
   if expanded.setOpKind != sokNone:
     return bindSelect(catalog, expanded)
 
-  let mapRes = buildTableMap(catalog, expanded.fromTable, expanded.fromAlias, expanded.joins)
+  # Recursively bind subqueries in FROM and JOIN positions, then build
+  # synthetic TableMeta entries so the outer query can resolve their columns.
+  if expanded.fromSubquery != nil:
+    let subRes = bindStatement(catalog, expanded.fromSubquery)
+    if not subRes.ok:
+      return err[Statement](subRes.err.code, subRes.err.message, subRes.err.context)
+    expanded.fromSubquery = subRes.value
+  var boundJoinSubqueries: seq[Statement] = @[]
+  for sq in expanded.joinSubqueries:
+    if sq != nil:
+      let subRes = bindStatement(catalog, sq)
+      if not subRes.ok:
+        return err[Statement](subRes.err.code, subRes.err.message, subRes.err.context)
+      boundJoinSubqueries.add(subRes.value)
+    else:
+      boundJoinSubqueries.add(nil)
+  expanded.joinSubqueries = boundJoinSubqueries
+
+  # When FROM is a subquery, pass empty fromTable so buildTableMap only resolves
+  # real join tables (the subquery alias is added below).
+  let mapFromTable = if expanded.fromSubquery != nil: "" else: expanded.fromTable
+  let mapFromAlias = if expanded.fromSubquery != nil: "" else: expanded.fromAlias
+  # Filter out joins backed by subqueries so buildTableMap doesn't try to look
+  # them up in the catalog.
+  var realJoins: seq[JoinClause] = @[]
+  for i, join in expanded.joins:
+    if i < expanded.joinSubqueries.len and expanded.joinSubqueries[i] != nil:
+      continue
+    realJoins.add(join)
+  var mapRes = buildTableMap(catalog, mapFromTable, mapFromAlias, realJoins)
   if not mapRes.ok:
     return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
-  let map = mapRes.value
+  var map = mapRes.value
+
+  # Add synthetic table metadata for subquery sources.
+  if expanded.fromSubquery != nil:
+    let metaRes = subqueryTableMeta(catalog, expanded.fromSubquery, expanded.fromAlias)
+    if not metaRes.ok:
+      return err[Statement](metaRes.err.code, metaRes.err.message, metaRes.err.context)
+    map[expanded.fromTable] = metaRes.value
+    if expanded.fromAlias.len > 0:
+      map[expanded.fromAlias] = metaRes.value
+  for i, sq in expanded.joinSubqueries:
+    if sq != nil and i < expanded.joins.len:
+      let join = expanded.joins[i]
+      let metaRes = subqueryTableMeta(catalog, sq, join.alias)
+      if not metaRes.ok:
+        return err[Statement](metaRes.err.code, metaRes.err.message, metaRes.err.context)
+      map[join.table] = metaRes.value
+      if join.alias.len > 0:
+        map[join.alias] = metaRes.value
   for item in expanded.selectItems:
     if item.isStar:
       continue

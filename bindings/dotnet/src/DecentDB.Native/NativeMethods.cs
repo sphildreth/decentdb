@@ -34,11 +34,6 @@ public static class DecentDBNative
 
     private static void RegisterDllImportResolver()
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return;
-        }
-
         if (Interlocked.Exchange(ref s_resolverRegistered, 1) != 0)
         {
             return;
@@ -86,9 +81,10 @@ public static class DecentDBNative
 
         foreach (var dir in EnumerateProbeDirectories())
         {
-            yield return Path.Combine(dir, "libdecentdb.so");
-            yield return Path.Combine(dir, "libc_api.so");
-            yield return Path.Combine(dir, "decentdb.so");
+            foreach (var libName in PlatformLibraryNames())
+            {
+                yield return Path.Combine(dir, libName);
+            }
         }
 
         foreach (var baseDir in EnumerateProbeDirectories())
@@ -97,10 +93,33 @@ public static class DecentDBNative
             for (var cursor = di; cursor != null; cursor = cursor.Parent)
             {
                 var buildDir = Path.Combine(cursor.FullName, "build");
-                yield return Path.Combine(buildDir, "libdecentdb.so");
-                yield return Path.Combine(buildDir, "libc_api.so");
-                yield return Path.Combine(buildDir, "decentdb.so");
+                foreach (var libName in PlatformLibraryNames())
+                {
+                    yield return Path.Combine(buildDir, libName);
+                }
             }
+        }
+    }
+
+    private static IEnumerable<string> PlatformLibraryNames()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            yield return "decentdb.dll";
+            yield return "c_api.dll";
+            yield return "libdecentdb.dll";
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            yield return "libdecentdb.dylib";
+            yield return "libc_api.dylib";
+            yield return "decentdb.dylib";
+        }
+        else
+        {
+            yield return "libdecentdb.so";
+            yield return "libc_api.so";
+            yield return "decentdb.so";
         }
     }
 

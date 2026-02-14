@@ -30,11 +30,11 @@ Examples:
 - GitHub: full release
 - NuGet: `1.0.0`
 
-### Patch releases
+### Minor and patch releases
 
-- Tag: `v1.0.Z` (e.g. `v1.0.1`)
+- Tag: `v1.Y.Z` (e.g. `v1.1.0`, `v1.1.1`)
 - GitHub: full release
-- NuGet: `1.0.Z`
+- NuGet: `1.Y.Z`
 
 ## Workflows
 
@@ -48,7 +48,12 @@ Examples:
 
 - Workflow: `.github/workflows/nuget.yml`
 - Trigger: tags `v*`
-- Package: `DecentDB.MicroOrm`
+- Packages:
+  - `DecentDB.AdoNet`
+  - `DecentDB.MicroOrm`
+  - `DecentDB.EntityFrameworkCore`
+  - `DecentDB.EntityFrameworkCore.Design`
+  - `DecentDB.EntityFrameworkCore.NodaTime`
 - Target framework: `.NET 10` only (`net10.0`)
 - Publishing targets:
   - **GitHub Packages**: Automatically published using `GITHUB_TOKEN` (no configuration needed)
@@ -58,7 +63,7 @@ Required secrets:
 
 - `NUGET_API_KEY` (optional) - API key for publishing to NuGet.org
   - Obtain from: https://www.nuget.org/account/apikeys
-  - Create a new API key with "Push" permission for the `DecentDB.MicroOrm` package
+  - Create a new API key with "Push" permission for the published `DecentDB.*` packages
   - Add the secret to repository settings: Settings → Secrets and variables → Actions → New repository secret
   - If not configured, packages will still be published to GitHub Packages
 
@@ -78,4 +83,4 @@ git push origin v0.1.X
 GitHub Actions will:
 
 - create a GitHub pre-release and attach binaries
-- publish `DecentDB.MicroOrm` as `1.0.0-rc.X`
+- publish all `DecentDB.*` NuGet packages as `1.0.0-rc.X`

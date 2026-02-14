@@ -92,3 +92,4 @@ testresults.db
 bindings/dotnet/.idea/
 bindings/dotnet/v
 bindings/dotnet/v
+:memory:*

@@ -1,8 +1,8 @@
 # ADR-0044: .NET / NuGet Packaging Strategy
 
-**Status**: Accepted (Implemented)
+**Status**: Superseded by ADR-0093
 **Date**: 2026-01-30
-**Updated**: 2026-02-11
+**Updated**: 2026-02-13
 
 ## Context
 For a good Dapper experience, .NET users should be able to add a single NuGet package that brings:
@@ -12,17 +12,19 @@ For a good Dapper experience, .NET users should be able to add a single NuGet pa
 This repository also supports local builds and test runs from source.
 
 ## Decision
-- We ship a single published NuGet package: **`DecentDB.MicroOrm`**.
-  - It includes `DecentDB.MicroOrm`, `DecentDB.AdoNet`, and `DecentDB.Native` under `lib/net10.0/`.
-  - It includes the native engine under `runtimes/{rid}/native/`.
-- CI builds and publishes a RID matrix package for `linux-x64`, `osx-x64`, and `win-x64` via `.github/workflows/nuget.yml`.
-- Local-from-source workflows remain supported (repo native build output + MSBuild copy targets).
+- Historical decision (2026-01-30): publish a single package (`DecentDB.MicroOrm`) containing managed + native layers.
+- This ADR is now superseded by ADR-0093 (2026-02-13), which changes .NET publishing to:
+  - publish both `DecentDB.MicroOrm` and `DecentDB.AdoNet`
+  - keep the same RID runtime asset matrix (`linux-x64`, `osx-x64`, `win-x64`)
+  - keep package versions in sync via CI-supplied `PackageVersion`
+  - accept short-term native asset duplication across both packages
 
 ## Consequences
-- **Pros**: One-package install for .NET apps; native assets resolved via standard NuGet RID selection.
-- **Cons**: Native assets are currently limited to the published RID set; additional RIDs require extending CI.
+- **Pros**: EF-provider consumers can depend on `DecentDB.AdoNet` directly without taking `DecentDB.MicroOrm`; MicroOrm users keep the one-package install.
+- **Cons**: Two packages must be published per release and native assets are duplicated in the short term.
 
 ## References
 - design/DAPPER_SUPPORT.md (NuGet Package Distribution)
 - .github/workflows/nuget.yml
 - bindings/dotnet/src/DecentDB.Native/DecentDB.targets
+- design/adr/0093-dotnet-nuget-packaging-adonet-package.md

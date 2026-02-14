@@ -40,6 +40,21 @@ type HeartbeatCtx = object
   everyMs: int
   label: string
 
+var gVacuumFlushWriter {.threadvar.}: WalWriter
+
+proc vacuumFlushHandler(pageId: PageId, data: string): Result[Void] =
+  if gVacuumFlushWriter == nil:
+    return okVoid()
+
+  var bytes = newSeq[byte](data.len)
+  if data.len > 0:
+    copyMem(addr bytes[0], unsafeAddr data[0], data.len)
+
+  let writeRes = writePage(gVacuumFlushWriter, pageId, bytes)
+  if not writeRes.ok:
+    return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+  okVoid()
+
 proc heartbeatThread(ctx: ptr HeartbeatCtx) {.thread.} =
   ## Periodically prints a heartbeat to stderr while a long-running operation
   ## is in progress. Intended for CLI usability; output always goes to stderr
@@ -1586,6 +1601,9 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
   # Install a flush handler to ensure evicted dirty pages go to WAL, not DB file.
   # IMPORTANT: Do not fsync/commit per evicted page (too slow under small caches).
   # Instead, append evicted pages into dstDb.activeWriter and commit in batches.
+  gVacuumFlushWriter = nil
+  defer:
+    gVacuumFlushWriter = nil
   if dstDb.wal != nil:
     let writerRes = beginWrite(dstDb.wal)
     if not writerRes.ok:
@@ -1594,21 +1612,9 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
       echo resultJson(false, writerRes.err)
       return 1
     dstDb.activeWriter = writerRes.value
+    gVacuumFlushWriter = writerRes.value
 
-  dstDb.pager.flushHandler = proc(pageId: PageId, data: string): Result[Void] =
-    if dstDb.wal == nil:
-      return okVoid()
-    if dstDb.activeWriter == nil:
-      return err[Void](ERR_TRANSACTION, "VACUUM flush requires active WAL writer")
-
-    var bytes = newSeq[byte](data.len)
-    if data.len > 0:
-      copyMem(addr bytes[0], unsafeAddr data[0], data.len)
-
-    let writeRes = writePage(dstDb.activeWriter, pageId, bytes)
-    if not writeRes.ok:
-      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-    okVoid()
+  dstDb.pager.flushHandler = vacuumFlushHandler
 
   if dstDb.catalog.tables.len != 0 or dstDb.catalog.indexes.len != 0:
     discard closeDb(srcDb)
@@ -1652,8 +1658,10 @@ proc vacuumCmd*(db: string = "", output: string = "", overwrite: bool = false, c
     let nextWriterRes = beginWrite(db.wal)
     if not nextWriterRes.ok:
       db.activeWriter = nil
+      gVacuumFlushWriter = nil
       return err[Void](nextWriterRes.err.code, nextWriterRes.err.message, nextWriterRes.err.context)
     db.activeWriter = nextWriterRes.value
+    gVacuumFlushWriter = nextWriterRes.value
     okVoid()
 
   # Toposort tables by inline FK dependencies.

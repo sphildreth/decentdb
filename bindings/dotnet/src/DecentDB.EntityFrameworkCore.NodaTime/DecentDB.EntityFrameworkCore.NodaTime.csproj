@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <PackageId>DecentDB.EntityFrameworkCore.NodaTime</PackageId>
+    <Description>NodaTime mappings for DecentDB EntityFrameworkCore provider</Description>
+    <Authors>DecentDB contributors</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/sphildreth/decentdb</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <RootNamespace>DecentDB.EntityFrameworkCore.NodaTime</RootNamespace>
+    <AssemblyName>DecentDB.EntityFrameworkCore.NodaTime</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
+    <PackageReference Include="NodaTime" Version="3.2.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DecentDB.EntityFrameworkCore\DecentDB.EntityFrameworkCore.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../DecentDB.MicroOrm/README.md" Pack="true" PackagePath="README.md" />
+    <None Include="../DecentDB.MicroOrm/icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>

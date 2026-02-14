@@ -278,7 +278,7 @@ DecentDB exposes a C API (`src/c_api.nim`) with 35+ functions for use by languag
 
 | Binding | Interface | Notes |
 |---------|-----------|-------|
-| [.NET](../api/dotnet.md) | ADO.NET + MicroOrm | P/Invoke via `DecentDB.Native` |
+| [.NET](../api/dotnet.md) | ADO.NET + MicroOrm + EF Core | P/Invoke via `DecentDB.Native` |
 | [Go](../api/go.md) | `database/sql` driver + Direct API | CGO linking |
 | [Python](../api/python.md) | DB-API 2.0 + SQLAlchemy | ctypes loading |
 | [Node.js](../api/node.md) | N-API addon + Knex | Dynamic loading |

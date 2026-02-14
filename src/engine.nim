@@ -44,7 +44,6 @@ type Db* = ref object
   cachePages*: int                   # Cache size for diagnostics
   sqlCache*: Table[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]]
   sqlCacheOrder*: seq[string]
-  cachedFlushHandler: proc(pageId: PageId, data: string): Result[Void]
 
 type UpdateWriteProfile* = object
   hasUpdateTriggers*: bool
@@ -300,13 +299,6 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
     readerCheckIntervalMs = 5000,  # HIGH-006: Check readers every 5 seconds
     checkpointCheckInterval = 64)  # Only evaluate time/memory every 64 commits
   
-  # Create flush handler once, reuse across all transactions
-  dbRef.cachedFlushHandler = proc(pageId: PageId, data: string): Result[Void] =
-    var payload = newSeq[byte](data.len)
-    if data.len > 0:
-      copyMem(addr payload[0], unsafeAddr data[0], data.len)
-    dbRef.activeWriter.flushPage(pageId, payload)
-
   ok(dbRef)
 
 proc schemaBump(db: Db): Result[Void] =
@@ -1971,7 +1963,7 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
     else:
       plans.add(nil)
 
-  var result = Prepared(
+  var prepared = Prepared(
     db: db,
     sql: sqlText,
     schemaCookie: db.schemaCookie,
@@ -1990,11 +1982,11 @@ proc prepare*(db: Db, sqlText: string): Result[Prepared] =
        not prof.hasForeignKeys and not prof.hasNotNullConstraints and not prof.hasChecks and
        bound.insertReturning.len == 0 and bound.insertValueRows.len == 0 and
        bound.insertConflictAction == icaNone:
-      result.isFastInsert = true
-      result.fastInsertProfile = prof
-      result.fastInsertBound = 0
-      result.fastInsertTablePtr = db.catalog.getTablePtr(bound.insertTable)
-  ok(result)
+      prepared.isFastInsert = true
+      prepared.fastInsertProfile = prof
+      prepared.fastInsertBound = 0
+      prepared.fastInsertTablePtr = db.catalog.getTablePtr(bound.insertTable)
+  ok(prepared)
 
 proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
 
@@ -4003,8 +3995,14 @@ proc beginTransaction*(db: Db): Result[Void] =
   # Begin tracking page allocations for this transaction (HIGH-003)
   beginTxnPageTracking(db.pager)
   
-  # Install flush handler to allow evicting dirty pages during large transactions
-  db.pager.flushHandler = db.cachedFlushHandler
+  # Install flush handler to allow evicting dirty pages during large transactions.
+  # Capture writer (not db) to avoid ref cycles under ARC.
+  let writer = db.activeWriter
+  db.pager.flushHandler = proc(pageId: PageId, data: string): Result[Void] =
+    var payload = newSeq[byte](data.len)
+    if data.len > 0:
+      copyMem(addr payload[0], unsafeAddr data[0], data.len)
+    writer.flushPage(pageId, payload)
 
   okVoid()
 

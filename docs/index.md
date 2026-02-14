@@ -21,7 +21,7 @@ DecentDB is an embedded, single-machine relational database engine focused on **
 Releases are driven by Git tags and published via GitHub Actions:
 
 - Engine binaries (GitHub Releases): `docs/development/releases.md`
-- NuGet package (`DecentDB.MicroOrm`, .NET 10 only): `docs/development/releases.md`
+- NuGet packages (`.NET 10`): `DecentDB.AdoNet`, `DecentDB.MicroOrm`, `DecentDB.EntityFrameworkCore`, `DecentDB.EntityFrameworkCore.Design`, `DecentDB.EntityFrameworkCore.NodaTime`
 
 ## Quick Start
 

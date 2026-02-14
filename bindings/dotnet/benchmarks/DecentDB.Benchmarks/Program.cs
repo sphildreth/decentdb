@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using DecentDB.AdoNet;
+using DecentDB.EntityFrameworkCore;
 using DecentDB.MicroOrm;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 static string MakeTempDbPath()
 {
@@ -50,6 +53,21 @@ static double[] RunBench(string name, int iterations, int warmup, Action action)
 
     Console.WriteLine($"{name,-28} p50={p50,8:0.000}ms  p95={p95,8:0.000}ms  iters={iterations}");
     return samples;
+}
+
+static long MeasureAllocationsPerIteration(Action action, int iterations)
+{
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    GC.Collect();
+    var before = GC.GetAllocatedBytesForCurrentThread();
+    for (var i = 0; i < iterations; i++)
+    {
+        action();
+    }
+
+    var after = GC.GetAllocatedBytesForCurrentThread();
+    return (after - before) / Math.Max(iterations, 1);
 }
 
 static double PercentileSorted(double[] sorted, int pct)
@@ -196,6 +214,53 @@ try
             enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
     });
+
+    Console.WriteLine();
+    Console.WriteLine("=== EF Core Provider ===");
+
+    var efOptions = new DbContextOptionsBuilder<EfBenchContext>()
+        .UseDecentDB($"Data Source={dbPath}")
+        .Options;
+    using var ef = new EfBenchContext(efOptions);
+
+    RunBench("EF translation (ToQueryString)", iterations: 200, warmup: 30, action: () =>
+    {
+        _ = ef.Persons.Where(p => p.Age >= 50).OrderBy(p => p.Id).Skip(10).Take(20).ToQueryString();
+    });
+
+    RunBench("EF end-to-end (FirstOrDefault)", iterations: 200, warmup: 50, action: () =>
+    {
+        var p = ef.Persons.Where(x => x.Id == 1234).Select(x => new { x.Id, x.Name, x.Age }).FirstOrDefault();
+        if (p is null) throw new InvalidOperationException("missing row");
+    });
+
+    var efAlloc = MeasureAllocationsPerIteration(() =>
+    {
+        _ = ef.Persons.Where(p => p.Age >= 50).OrderBy(p => p.Id).Take(50).ToList();
+    }, iterations: 100);
+    Console.WriteLine($"{"EF alloc/query",-28} avg={efAlloc} bytes");
+
+    var servicesNoPool = new ServiceCollection();
+    servicesNoPool.AddDbContext<EfBenchContext>(o => o.UseDecentDB($"Data Source={dbPath}"));
+    using var providerNoPool = servicesNoPool.BuildServiceProvider();
+
+    var servicesPool = new ServiceCollection();
+    servicesPool.AddDbContextPool<EfBenchContext>(o => o.UseDecentDB($"Data Source={dbPath}"));
+    using var providerPool = servicesPool.BuildServiceProvider();
+
+    RunBench("EF no-pool Count()", iterations: 120, warmup: 20, action: () =>
+    {
+        using var scope = providerNoPool.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<EfBenchContext>();
+        _ = context.Persons.Count(p => p.Age >= 50);
+    });
+
+    RunBench("EF pooled Count()", iterations: 120, warmup: 20, action: () =>
+    {
+        using var scope = providerPool.CreateScope();
+        var context = scope.ServiceProvider.GetRequiredService<EfBenchContext>();
+        _ = context.Persons.Count(p => p.Age >= 50);
+    });
 }
 finally
 {
@@ -207,4 +272,26 @@ public sealed class Person
     public long Id { get; set; }
     public string Name { get; set; } = "";
     public int Age { get; set; }
+}
+
+public sealed class EfBenchContext : DbContext
+{
+    public EfBenchContext(DbContextOptions<EfBenchContext> options)
+        : base(options)
+    {
+    }
+
+    public Microsoft.EntityFrameworkCore.DbSet<Person> Persons => Set<Person>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Person>(entity =>
+        {
+            entity.ToTable("persons");
+            entity.HasKey(p => p.Id);
+            entity.Property(p => p.Id).HasColumnName("id");
+            entity.Property(p => p.Name).HasColumnName("name");
+            entity.Property(p => p.Age).HasColumnName("age");
+        });
+    }
 }

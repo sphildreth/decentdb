@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>true</IsPackable>
+    <PackageId>DecentDB.EntityFrameworkCore</PackageId>
+    <Description>Entity Framework Core provider for DecentDB</Description>
+    <Authors>DecentDB contributors</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/sphildreth/decentdb</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/sphildreth/decentdb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <RootNamespace>DecentDB.EntityFrameworkCore</RootNamespace>
+    <AssemblyName>DecentDB.EntityFrameworkCore</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Proxies" Version="10.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.0">
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DecentDB.AdoNet\DecentDB.AdoNet.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../DecentDB.MicroOrm/README.md" Pack="true" PackagePath="README.md" />
+    <None Include="../DecentDB.MicroOrm/icon.png" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>

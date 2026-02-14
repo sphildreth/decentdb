@@ -9,5 +9,6 @@
   <ItemGroup>
     <ProjectReference Include="../../src/DecentDB.AdoNet/DecentDB.AdoNet.csproj" />
     <ProjectReference Include="../../src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj" />
+    <ProjectReference Include="../../src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj" />
   </ItemGroup>
 </Project>
