@@ -1199,7 +1199,8 @@ suite "Planner":
     discard closeDb(db)
 
   test "math and string functions":
-    let dbRes = openDb(":memory:")
+    let path = makeTempDb("decentdb_math_funcs.ddb")
+    let dbRes = openDb(path)
     check dbRes.ok
     let db = dbRes.value
     discard execSql(db, "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER)")

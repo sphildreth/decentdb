@@ -97,12 +97,12 @@ jobs:
         shell: bash
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/build
-          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build:/usr/local/lib:/opt/homebrew/lib
         run: dotnet test bindings/dotnet/tests/DecentDB.Tests/DecentDB.Tests.csproj -v minimal
 
       - name: Run .NET tests (EF Core provider)
         shell: bash
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/build
-          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build:/usr/local/lib:/opt/homebrew/lib
         run: dotnet test bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/DecentDB.EntityFrameworkCore.Tests.csproj -v minimal
