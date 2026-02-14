@@ -1,46 +1,54 @@
 # .NET (C#) Bindings
 
-DecentDB ships .NET bindings (ADO.NET + Micro-ORM) for embedded use.
+DecentDB ships .NET bindings at multiple API levels:
 
-For most .NET applications, choose the package based on API level:
-- [`DecentDB.MicroOrm`](https://www.nuget.org/packages/DecentDB.MicroOrm/) for LINQ-style Micro-ORM usage.
-- [`DecentDB.AdoNet`](https://www.nuget.org/packages/DecentDB.AdoNet/) for direct ADO.NET usage and EF provider dependencies.
+- [`DecentDB.EntityFrameworkCore`](https://www.nuget.org/packages/DecentDB.EntityFrameworkCore/) for full EF Core DbContext, change tracking, migrations, and LINQ-to-SQL.
+- [`DecentDB.MicroOrm`](https://www.nuget.org/packages/DecentDB.MicroOrm/) for lightweight LINQ-style Micro-ORM usage.
+- [`DecentDB.AdoNet`](https://www.nuget.org/packages/DecentDB.AdoNet/) for direct ADO.NET usage.
 
 
 ### .NET NuGet packages
 
+- `DecentDB.EntityFrameworkCore`: use this for EF Core DbContext, LINQ queries, change tracking, and migrations.
+- `DecentDB.EntityFrameworkCore.Design`: add this alongside the above for `dotnet ef` design-time commands.
+- `DecentDB.EntityFrameworkCore.NodaTime`: optional extension for NodaTime type mappings (`Instant`, `LocalDate`, `LocalDateTime`).
 - `DecentDB.MicroOrm`: use this for the LINQ-style Micro-ORM experience (includes ADO.NET + native runtime assets).
-- `DecentDB.AdoNet`: use this for direct ADO.NET access (and for EF Core provider dependencies).
+- `DecentDB.AdoNet`: use this for direct ADO.NET access.
 - Current packaged native RID assets: `linux-x64`, `osx-x64`, `win-x64`.
 
 ```bash
+# EF Core (recommended for most applications)
+dotnet add package DecentDB.EntityFrameworkCore
+dotnet add package DecentDB.EntityFrameworkCore.Design  # for dotnet ef commands
+dotnet add package DecentDB.EntityFrameworkCore.NodaTime # optional: NodaTime support
+
+# Micro-ORM (lightweight alternative)
 dotnet add package DecentDB.MicroOrm
+
+# ADO.NET (low-level)
 dotnet add package DecentDB.AdoNet
-# If you want pre-release builds:
-dotnet add package DecentDB.MicroOrm --prerelease
-dotnet add package DecentDB.AdoNet --prerelease
 ```
 
 Notes:
 
-- Both packages target `.NET 10` (`net10.0`).
+- All packages target `.NET 10` (`net10.0`).
+- `DecentDB.EntityFrameworkCore` depends on `DecentDB.AdoNet` (which includes native runtime assets).
 - `DecentDB.MicroOrm` remains a one-package install for Micro-ORM users.
-- `DecentDB.AdoNet` carries `DecentDB.Native` and native runtime assets for ADO.NET/EF-provider use.
 - Ships native assets under `runtimes/{rid}/native/` for: `linux-x64`, `osx-x64`, `win-x64`.
 
-## EF Core provider status
+## EF Core Provider
 
-DecentDB now publishes EF Core packages:
+DecentDB includes a full EF Core provider:
 
-- `DecentDB.EntityFrameworkCore` (runtime provider)
-- `DecentDB.EntityFrameworkCore.Design` (design-time tooling)
-- `DecentDB.EntityFrameworkCore.NodaTime` (optional NodaTime mappings)
+- `DecentDB.EntityFrameworkCore` — runtime provider (query pipeline, SaveChanges, schema creation)
+- `DecentDB.EntityFrameworkCore.Design` — design-time tooling (`dotnet ef migrations`, `dotnet ef dbcontext scaffold`)
+- `DecentDB.EntityFrameworkCore.NodaTime` — optional NodaTime type mappings
 
 Use the package that matches your scenario:
 
+- Prefer `DecentDB.EntityFrameworkCore` for full DbContext, change tracking, LINQ queries, and migrations.
 - Prefer `DecentDB.MicroOrm` for lightweight LINQ-style access without EF infrastructure.
 - Prefer `DecentDB.AdoNet` for direct SQL/command control.
-- Prefer `DecentDB.EntityFrameworkCore` when you need DbContext, change tracking, and migrations tooling.
 
 ```csharp
 using Microsoft.EntityFrameworkCore;
@@ -95,17 +103,60 @@ EF Core provider type mappings with the existing ADO.NET/MicroOrm conventions:
 
 ### EF Core query translation scope
 
-Current supported query translation subset:
+Supported LINQ-to-SQL translation:
 
-- Basic `Where`, `OrderBy`, `Skip`, and `Take` translation.
-- Paging uses `LIMIT/OFFSET`.
-- Null/bool relational semantics are emitted by EF relational SQL generation (`IS NULL`, boolean predicates).
-- String operators: `Contains`, `StartsWith`, `EndsWith` translate to `LIKE` patterns for literal string arguments, with wildcard escaping for literal `%` and `_`.
+**Core query operators:**
+
+- `Where`, `OrderBy`/`OrderByDescending`, `ThenBy`/`ThenByDescending`
+- `Skip`, `Take` (translated to `LIMIT`/`OFFSET`)
+- `Select` projections (anonymous types, DTOs)
+- `Distinct`
+- `GroupBy` with aggregate projections
+- `Include`/`ThenInclude` (eager loading), `AsSplitQuery`
+- Filtered `Include` (e.g., `Include(a => a.Tracks.Where(...))`)
+- `Any`, `All`
+- `Count`, `Sum`, `Min`, `Max`, `Average`
+- `FirstOrDefault`, `SingleOrDefault`
+- Subqueries in FROM clauses
+- `EXISTS` and scalar subqueries in SELECT lists
+- `FromSqlRaw` for raw SQL pass-through
+
+**String method translation:**
+
+| C# method | SQL |
+|---|---|
+| `string.Contains(value)` | `LIKE '%' \|\| @p \|\| '%'` |
+| `string.StartsWith(value)` | `LIKE @p \|\| '%'` |
+| `string.EndsWith(value)` | `LIKE '%' \|\| @p` |
+| `string.ToUpper()` | `UPPER(column)` |
+| `string.ToLower()` | `LOWER(column)` |
+| `string.Trim()` | `TRIM(column)` |
+| `string.TrimStart()` | `LTRIM(column)` |
+| `string.TrimEnd()` | `RTRIM(column)` |
+| `string.Substring(start)` | `SUBSTRING(column, start+1)` |
+| `string.Substring(start, len)` | `SUBSTRING(column, start+1, len)` |
+| `string.Replace(old, new)` | `REPLACE(column, old, new)` |
+| `string.Length` | `LENGTH(column)` |
+
+**Math method translation:**
+
+| C# method | SQL |
+|---|---|
+| `Math.Abs(x)` | `ABS(x)` |
+| `Math.Round(x)` / `Math.Round(x, d)` | `ROUND(x)` / `ROUND(x, d)` |
+| `Math.Ceiling(x)` | `CEIL(x)` |
+| `Math.Floor(x)` | `FLOOR(x)` |
+| `Math.Max(a, b)` | `CASE WHEN a > b THEN a ELSE b END` |
+| `Math.Min(a, b)` | `CASE WHEN a < b THEN a ELSE b END` |
+
+**Conditional expressions:**
+
+- Ternary (`a ? b : c`) translates to `CASE WHEN ... THEN ... ELSE ... END`
+- Null-coalescing (`a ?? b`) translates to `COALESCE(a, b)`
 
 Current guardrails:
 
 - `IN (...)` lists are capped at **1000 values**; larger lists fail fast with a provider error.
-- Correlated subqueries and some set-operation/generated-subquery shapes are currently unsupported by the engine SQL subset and are tracked under [issue #20](https://github.com/sphildreth/decentdb/issues/20).
 - Provider conformance skip list is maintained in `bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/ConformanceSkipList.md`.
 
 ### EF Core NodaTime extension
@@ -126,13 +177,16 @@ Supported NodaTime types in the extension package:
 
 ## Assemblies
 
-The NuGet package includes these assemblies:
+The NuGet packages include these assemblies:
 
 | Assembly | Description |
 |---------|-------------|
 | `DecentDB.Native` | Low-level P/Invoke wrapper over the DecentDB C API |
 | `DecentDB.AdoNet` | ADO.NET provider (`DbConnection`, `DbCommand`, `DbDataReader`) |
 | `DecentDB.MicroOrm` | Micro-ORM with `DbSet<T>`, `DecentDBContext`, LINQ-style queries |
+| `DecentDB.EntityFrameworkCore` | EF Core runtime provider (query pipeline, SaveChanges, migrations) |
+| `DecentDB.EntityFrameworkCore.Design` | EF Core design-time tooling (`dotnet ef` commands) |
+| `DecentDB.EntityFrameworkCore.NodaTime` | Optional NodaTime type mappings for EF Core |
 
 ## Build the native library (from source)
 
@@ -340,5 +394,6 @@ You can also write `$N` directly.
 
 ## Examples
 
+- EF Core + NodaTime demo: `examples/dotnet/entityframework/` — comprehensive showcase with 67 benchmarked operations covering CRUD, pagination, Include/ThenInclude, GroupBy, DISTINCT, projections, CASE WHEN, string/math operations, Any/Min/Max, FromSqlRaw, AsSplitQuery, filtered Include, and NodaTime (`Instant`, `LocalDate`, `DateTime` coexistence).
 - Dapper example: `examples/dotnet/dapper-basic/`
 - Micro-ORM + LINQ example: `examples/dotnet/microorm-linq/`

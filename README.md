@@ -32,12 +32,12 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
-- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, CTEs, Window Functions, and Rich Types (UUID, DECIMAL)
+- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, CTEs, subqueries, window functions, and rich types (UUID, DECIMAL)
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 - 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
-- 📊 **Rich Query Support** - Aggregates, UPSERT, Set Operations, and Scalar Functions
+- 📊 **Rich Query Support** - Aggregates, subqueries (FROM, EXISTS, scalar), UPSERT, set operations, and scalar functions (string, math, UUID)
 - ⚡ **Triggers** - AFTER and INSTEAD OF triggers for complex logic
 - 📦 **Single File Database** - Portable database stored in a single file
 - 🌐 **Cross-Platform** - Runs on Linux, macOS, and Windows
@@ -46,13 +46,14 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - 📁 **Import/Export Tools** - CSV and JSON data import/export capabilities
 - 🧩 **Parameterized Queries** - Safe parameter binding to prevent SQL injection
 - 🧾 **Transaction Support** - BEGIN, COMMIT, ROLLBACK for atomic operations
+- 🏗️ **EF Core Provider** - Full Entity Framework Core integration with LINQ translation, migrations, and NodaTime support
 
 ## Languages/Toolkits/SDKs
 
 | Language | Toolkit | Description | Documentation |
 |---|---|---|---|
-| C# | ADO.NET + Dapper + MicroOrm (LINQ) + EF Core provider | Embedded provider APIs, LINQ-style Micro-ORM, and EF Core integration for DbContext/migrations workflows | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
-| Go | `database/sql` + sqlc | Embedded `database/sql` driver optimized for sqlc-generated queries | [decentdb.org/api/go](https://decentdb.org/api/go/) |
+| C# | ADO.NET + Dapper + MicroOrm (LINQ) + EF Core | Embedded ADO.NET provider, LINQ Micro-ORM, and EF Core integration with DbContext, migrations, and NodaTime support | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
+| Go | `database/sql` driver | Embedded `database/sql` driver with `$N` positional parameters | [decentdb.org/api/go](https://decentdb.org/api/go/) |
 | Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
 | Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 

@@ -276,7 +276,7 @@ Supports:
 - Null checks: `IS NULL`, `IS NOT NULL`
 - IN operator: `col IN (val1, val2, ...)`
 - Range predicates: `BETWEEN`, `NOT BETWEEN`
-- Existence predicates: `EXISTS (SELECT ...)` (non-correlated)
+- Existence predicates: `EXISTS (SELECT ...)`
 - String concatenation: `lhs || rhs`
 
 NULL handling follows SQL three-valued logic:
@@ -295,22 +295,39 @@ SELECT * FROM users WHERE name LIKE 'a\_%' ESCAPE '\';
 ### Scalar Functions
 
 Supported scalar functions:
+
+**General:**
 - `COALESCE`
 - `NULLIF`
+- `CAST(expr AS type)` for `INT/INTEGER/INT64`, `FLOAT/FLOAT64/REAL`, `DECIMAL/NUMERIC`, `TEXT`, `BOOL/BOOLEAN`, `UUID`
+- `CASE WHEN ... THEN ... ELSE ... END` and `CASE expr WHEN ... THEN ... ELSE ... END`
+
+**String:**
 - `LENGTH`
 - `LOWER`
 - `UPPER`
 - `TRIM`
+- `REPLACE`
+- `SUBSTRING` / `SUBSTR`
+
+**Math:**
+- `ABS`
+- `ROUND`
+- `CEIL` / `CEILING`
+- `FLOOR`
+
+**UUID:**
 - `GEN_RANDOM_UUID`
 - `UUID_PARSE`
 - `UUID_TO_STRING`
-- `CAST(expr AS type)` for `INT/INTEGER/INT64`, `FLOAT/FLOAT64/REAL`, `DECIMAL/NUMERIC`, `TEXT`, `BOOL/BOOLEAN`, `UUID`
-- `CASE WHEN ... THEN ... ELSE ... END` and `CASE expr WHEN ... THEN ... ELSE ... END`
 
 ```sql
 SELECT COALESCE(nickname, name) FROM users;
 SELECT NULLIF(status, 'active') FROM users;
 SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name) FROM users;
+SELECT REPLACE(name, 'old', 'new') FROM users;
+SELECT SUBSTRING(name, 1, 3) FROM users;
+SELECT ABS(balance), ROUND(price, 2), CEIL(rating), FLOOR(rating) FROM products;
 SELECT GEN_RANDOM_UUID();
 SELECT UUID_TO_STRING(id) FROM users;
 SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID);
@@ -510,7 +527,6 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 ## Unsupported Features
 
 Not currently supported:
-- Correlated subqueries in SELECT
 - Advanced window functions beyond `ROW_NUMBER()` (for example `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
 - Recursive CTEs (`WITH RECURSIVE`)
 - Stored procedures
