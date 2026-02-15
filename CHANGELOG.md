@@ -8,8 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.1.1] - 2026-02-15
 
 ### Fixed
+- **SQL Engine**: `ORDER BY DESC` with table-aliased columns now sorts correctly. Previously, post-projection columns lost their table alias prefix, causing qualified lookups like `"e"."name"` to fail silently — rows were returned in insertion order instead of descending order.
+- **SQL Engine**: `CREATE UNIQUE INDEX` now correctly enforces uniqueness on INSERT and UPDATE. Previously, `enforceUnique` used raw byte reads to extract rowids from index entries, but TEXT/BLOB index entries use a variable-length encoding — the rowid was read from the wrong offset, so duplicate values were silently accepted.
 - **SQL Engine**: Scalar subqueries and `EXISTS` expressions now work correctly with mixed-case (quoted) table and column names. Previously, `selectToCanonicalSql` emitted identifiers without double-quoting, causing libpg_query to lowercase them on re-parse, leading to "Table not found" errors for tables created with quoted mixed-case names (e.g. `"Artists"`).
 - **SQL Engine**: Correlated `EXISTS` subqueries now correctly substitute outer-row column references. Previously, `EXISTS` evaluation did not call `substituteCorrelatedStmt`, so any `EXISTS (SELECT ... WHERE inner.col = outer.col)` failed with "Unknown table".
+
+### Added
+- Python: SQLite import tool now maps `GUID`, `UNIQUEIDENTIFIER`, and `CHAR(36)` declared types to `UUID`.
+- Python: SQLite import tool `--detect-uuid` flag inspects TEXT column data and promotes to UUID if values match UUID format.
+- .NET: 23 EF Core integration tests mirroring Melodee `ArtistSearchEngineServiceDbContext` query patterns (INSERT, UPDATE, DELETE, ORDER BY, Include, correlated subqueries, pagination, etc.).
+
+### Changed
+- .NET: Updated `EntityFrameworkDemo` example NuGet dependencies — EF Core 10.0.0 → 10.0.3, DependencyInjection 10.0.0 → 10.0.3, Logging.Console 10.0.0 → 10.0.3, NodaTime 3.2.2 → 3.3.0.
 
 ## [1.1.0] - 2026-02-14
 
