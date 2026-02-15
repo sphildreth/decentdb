@@ -5,6 +5,19 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-02-15
+
+### Fixed
+- **SQL Engine**: `FALSE` literal now parsed correctly. libpg_query's protobuf encoding omits the `boolval` field for `false` (protobuf default elision), so `WHERE col = FALSE` and `UPDATE ... SET flag = FALSE` were rejected as parse errors.
+- **SQL Engine**: Large integer literals (values > 2,147,483,647) are now handled correctly. libpg_query represents these as Float AST nodes internally; the parser now recovers whole-number floats as `svInt` values.
+- **SQL Engine**: Type coercion for cross-type literals — `bool` ↔ `INT64` and `FLOAT64` → `INT64` (whole numbers) are now allowed in INSERT and UPDATE statements. This fixes UPDATE failures on SQLite-imported databases where `BOOLEAN` columns are stored as `INT64`.
+- **SQL Engine**: `ORDER BY` now resolves SELECT-list aliases (e.g. `SELECT COUNT(*) AS "AlbumCount" ... ORDER BY "AlbumCount"`).
+- .NET: EF Core DECIMAL type mapping now uses `DECIMAL(18,4)` instead of bare `DECIMAL`, which DecentDB requires precision and scale for.
+
+### Added
+- **SQL Engine**: Scalar subquery deferral past Sort+Limit — queries with correlated scalar subqueries in the SELECT list (e.g. `SELECT ..., (SELECT COUNT(*) ...) ... ORDER BY ... LIMIT N`) now defer subquery evaluation until after sorting and limiting, yielding up to **14× speedup** on large tables.
+- .NET: 15 comprehensive EF Core CRUD tests covering all 17 CLR data types (bool, byte, short, int, long, float, double, decimal, string, byte[], DateTime, DateTimeOffset, DateOnly, TimeOnly, TimeSpan, Guid, enum), nullable variant lifecycle, edge-case values, SQLite-imported schema with type coercion, async operations, bulk delete, pagination with correlated COUNT subquery, and ChangeTracker.Clear recovery.
+
 ## [1.1.1] - 2026-02-15
 
 ### Fixed
