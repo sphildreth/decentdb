@@ -1473,3 +1473,30 @@ suite "Planner":
     check r2.value.len == 1
 
     discard closeDb(db)
+
+  test "ORDER BY DESC with table alias":
+    let path = makeTempDb("decentdb_orderby_alias.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL)").ok
+    check execSql(db, "INSERT INTO items (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')").ok
+    # Unquoted alias DESC
+    let r1 = execSql(db, "SELECT e.name FROM items AS e ORDER BY e.name DESC")
+    check r1.ok
+    check r1.value.len == 3
+    check splitRow(r1.value[0])[0] == "c"
+    check splitRow(r1.value[2])[0] == "a"
+    # Quoted alias DESC
+    let r2b = execSql(db, """SELECT "e"."name" FROM "items" AS "e" ORDER BY "e"."name" DESC""")
+    check r2b.ok
+    check r2b.value.len == 3
+    check splitRow(r2b.value[0])[0] == "c"
+    check splitRow(r2b.value[2])[0] == "a"
+    # ASC still works
+    let r3 = execSql(db, "SELECT e.name FROM items AS e ORDER BY e.name ASC")
+    check r3.ok
+    check r3.value.len == 3
+    check splitRow(r3.value[0])[0] == "a"
+    check splitRow(r3.value[2])[0] == "c"
+    discard closeDb(db)

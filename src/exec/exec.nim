@@ -1360,7 +1360,8 @@ proc columnIndex*(row: Row, table: string, name: string): Result[int] =
     for i, col in row.columns:
       if col == key:
         return ok(i)
-    return err[int](ERR_SQL, "Unknown column", key)
+    # Qualified lookup failed (e.g. post-projection columns lack alias prefix);
+    # fall through to unqualified matching below.
   var matches: seq[int] = @[]
   for i, col in row.columns:
     if col == name or col.endsWith("." & name):
@@ -1368,7 +1369,8 @@ proc columnIndex*(row: Row, table: string, name: string): Result[int] =
   if matches.len == 1:
     return ok(matches[0])
   if matches.len == 0:
-    return err[int](ERR_SQL, "Unknown column", name)
+    let ctx = if table.len > 0: table & "." & name else: name
+    return err[int](ERR_SQL, "Unknown column", ctx)
   err[int](ERR_SQL, "Ambiguous column", name)
 
 proc evalLiteral(value: SqlValue): Value =

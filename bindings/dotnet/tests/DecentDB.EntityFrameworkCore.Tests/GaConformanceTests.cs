@@ -34,7 +34,7 @@ public sealed class GaConformanceTests : IDisposable
     }
 
     [Fact]
-    public void CorrelatedSubquery_IsTrackedAsKnownGap()
+    public void CorrelatedSubquery_WithExists_Works()
     {
         EnsureSchemaAndSeed();
         using var context = CreateContext();
@@ -46,9 +46,15 @@ public sealed class GaConformanceTests : IDisposable
             .ToQueryString();
 
         Assert.Contains("EXISTS", correlated);
-        Assert.Throws<DecentDB.Native.DecentDBException>(() => context.Items
+
+        var results = context.Items
             .Where(x => context.Items.Any(other => other.Category == x.Category && other.Value > x.Value))
-            .ToList());
+            .OrderBy(x => x.Id)
+            .Select(x => x.Id)
+            .ToList();
+
+        // Items: (1,A,10), (2,A,20), (3,B,30). Item 1 has another A-category item with higher value.
+        Assert.Contains(1L, results);
     }
 
     [Fact]
