@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import json
 import os
+import re
 import sqlite3
 from collections import defaultdict, deque
 from typing import Any, Iterable, Iterator, Sequence
@@ -155,6 +156,12 @@ def _map_declared_type_to_decentdb(declared_type: str) -> str:
         return "BLOB"
     if "UUID" in t:
         return "UUID"
+    if "GUID" in t:
+        return "UUID"
+    if "UNIQUEIDENTIFIER" in t:
+        return "UUID"
+    if "CHAR(36)" in t:
+        return "UUID"
     if any(k in t for k in ["DECIMAL", "NUMERIC"]):
         # Preserve precision/scale if present (e.g. DECIMAL(10,2))
         # Map NUMERIC to DECIMAL
@@ -177,7 +184,7 @@ def _iter_user_tables(sqlite_conn: sqlite3.Connection) -> Iterator[str]:
         yield str(name)
 
 
-def _load_table_schema(sqlite_conn: sqlite3.Connection, table: str) -> SqliteTable:
+def _load_table_schema(sqlite_conn: sqlite3.Connection, table: str, detect_uuid: bool = False) -> SqliteTable:
     # Columns
     cols: list[SqliteColumn] = []
     # PRAGMA table_info: cid, name, type, notnull, dflt_value, pk
@@ -192,6 +199,24 @@ def _load_table_schema(sqlite_conn: sqlite3.Connection, table: str) -> SqliteTab
 
     if not cols:
         raise ConversionError(f"Table has no columns: {table}")
+        
+    if detect_uuid:
+        uuid_pattern = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+        for i, col in enumerate(cols):
+            mapped = _map_declared_type_to_decentdb(col.declared_type)
+            if mapped == "TEXT":
+                 # Check first 5 non-null values
+                q = f"SELECT {_quote_ident(col.name)} FROM {_quote_ident(table)} WHERE {_quote_ident(col.name)} IS NOT NULL LIMIT 5"
+                rows = sqlite_conn.execute(q).fetchall()
+                if rows:
+                    is_uuid = True
+                    for (val,) in rows:
+                        if not isinstance(val, str) or not uuid_pattern.match(val):
+                            is_uuid = False
+                            break
+                    if is_uuid:
+                        # Patch declared type to force UUID mapping
+                        cols[i] = dataclasses.replace(cols[i], declared_type="UUID")
 
     # Foreign keys
     fks: list[SqliteForeignKey] = []
@@ -212,6 +237,24 @@ def _load_table_schema(sqlite_conn: sqlite3.Connection, table: str) -> SqliteTab
     # PRAGMA index_list: seq, name, unique, origin, partial
     col_pos = {c.name: i for i, c in enumerate(cols)}
 
+    # Helper to check if a column looks like a UUID
+    uuid_pattern = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+    
+    def looks_like_uuid(col_name: str) -> bool:
+        # Check first 5 non-null values
+        q = f"SELECT {_quote_ident(col_name)} FROM {_quote_ident(table)} WHERE {_quote_ident(col_name)} IS NOT NULL LIMIT 5"
+        rows = sqlite_conn.execute(q).fetchall()
+        if not rows:
+            return False
+        for (val,) in rows:
+            if not isinstance(val, str) or not uuid_pattern.match(val):
+                return False
+        return True
+
+    # Check for undetectable UUID columns (declared as TEXT/CHAR but containing UUIDs)
+    # Only if requested or if we want to be smart. For now, let's just use the declared type updates.
+    # But if we want to support "--detect-uuid", we would do it here.
+    
     for row in sqlite_conn.execute(f"PRAGMA index_list({_quote_ident(table)})").fetchall():
         idx_name = str(row[1])
         unique = bool(row[2])
@@ -499,6 +542,7 @@ def convert_sqlite_to_decentdb(
     commit_every: int = 5_000,
     cache_pages: int | None = None,
     cache_mb: int | None = None,
+    detect_uuid: bool = False,
 ) -> ConversionReport:
     if not os.path.exists(sqlite_path):
         raise FileNotFoundError(sqlite_path)
@@ -519,7 +563,7 @@ def convert_sqlite_to_decentdb(
 
     report = ConversionReport(sqlite_path=sqlite_path, decentdb_path=decentdb_path, identifier_case=identifier_case)
 
-    tables = [_load_table_schema(sqlite_conn, t) for t in _iter_user_tables(sqlite_conn)]
+    tables = [_load_table_schema(sqlite_conn, t, detect_uuid=detect_uuid) for t in _iter_user_tables(sqlite_conn)]
     for t in tables:
         _validate_supported(t)
 
@@ -710,6 +754,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="Override DecentDB cache size in pages (DefaultPageSize pages)",
     )
+    p.add_argument(
+        "--detect-uuid",
+        action="store_true",
+        help="Inspect TEXT column data and promote to UUID if values are valid UUID strings",
+    )
     args = p.parse_args(argv)
 
     report = convert_sqlite_to_decentdb(
@@ -721,6 +770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         commit_every=int(args.commit_every),
         cache_mb=args.cache_mb,
         cache_pages=args.cache_pages,
+        detect_uuid=bool(args.detect_uuid),
     )
 
     if args.report_json:

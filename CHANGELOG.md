@@ -5,6 +5,12 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-02-15
+
+### Fixed
+- **SQL Engine**: Scalar subqueries and `EXISTS` expressions now work correctly with mixed-case (quoted) table and column names. Previously, `selectToCanonicalSql` emitted identifiers without double-quoting, causing libpg_query to lowercase them on re-parse, leading to "Table not found" errors for tables created with quoted mixed-case names (e.g. `"Artists"`).
+- **SQL Engine**: Correlated `EXISTS` subqueries now correctly substitute outer-row column references. Previously, `EXISTS` evaluation did not call `substituteCorrelatedStmt`, so any `EXISTS (SELECT ... WHERE inner.col = outer.col)` failed with "Unknown table".
+
 ## [1.1.0] - 2026-02-14
 
 ### Added

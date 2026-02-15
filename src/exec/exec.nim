@@ -2310,7 +2310,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       let stmt = parseRes.value.statements[0]
       if stmt.kind != skSelect:
         return err[Value](ERR_SQL, "EXISTS requires SELECT subquery")
-      let bindRes = bindStatement(gEvalCatalog, stmt)
+      # Substitute correlated column references with literal values from the current row
+      let innerTables = collectInnerTables(stmt)
+      let substituted = substituteCorrelatedStmt(stmt, innerTables, row)
+      let bindRes = bindStatement(gEvalCatalog, substituted)
       if not bindRes.ok:
         return err[Value](bindRes.err.code, bindRes.err.message, bindRes.err.context)
       let planRes = plan(gEvalCatalog, bindRes.value)
