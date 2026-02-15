@@ -492,10 +492,15 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     base = Plan(kind: pkFilter, predicate: c, left: base)
   if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
     base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
   else:
+    # Place Sort before Project so that ORDER BY sees the original column
+    # names (not aliases) and expensive projections (e.g. scalar subqueries)
+    # run only on the sorted (and possibly limited) result set.
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
     base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
-  if stmt.orderBy.len > 0:
-    base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
   if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
     base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
   base

@@ -1460,12 +1460,27 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
   let havingRes = bindExpr(map, expanded.havingExpr)
   if not havingRes.ok:
     return err[Statement](havingRes.err.code, havingRes.err.message, havingRes.err.context)
-  for item in expanded.orderBy:
+  for i in 0 ..< expanded.orderBy.len:
+    var item = expanded.orderBy[i]
     if hasWindowInExpr(item.expr):
       return err[Statement](ERR_SQL, "Window functions are not allowed in ORDER BY in 0.x")
     let res = bindExpr(map, item.expr)
     if not res.ok:
-      return err[Statement](res.err.code, res.err.message, res.err.context)
+      # When an unqualified column doesn't resolve, try SELECT-list aliases.
+      if item.expr != nil and item.expr.kind == ekColumn and item.expr.table.len == 0:
+        var found = false
+        for si in expanded.selectItems:
+          if si.alias.len > 0 and si.alias == item.expr.name:
+            expanded.orderBy[i] = OrderItem(expr: cloneExpr(si.expr), asc: item.asc)
+            let aliasRes = bindExpr(map, expanded.orderBy[i].expr)
+            if not aliasRes.ok:
+              return err[Statement](aliasRes.err.code, aliasRes.err.message, aliasRes.err.context)
+            found = true
+            break
+        if not found:
+          return err[Statement](res.err.code, res.err.message, res.err.context)
+      else:
+        return err[Statement](res.err.code, res.err.message, res.err.context)
   ok(expanded)
 
 proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =

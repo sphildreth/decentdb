@@ -707,6 +707,25 @@ proc matchLikeInRecordStr(pager: Pager, recordPage: string, recordStart: int, re
     offset += length
   ok(false)
 
+proc exprContainsScalarSubquery*(expr: Expr): bool =
+  ## Returns true when `expr` (or any sub-expression) is a SCALAR_SUBQUERY call.
+  if expr == nil: return false
+  case expr.kind
+  of ekFunc:
+    if expr.funcName == "SCALAR_SUBQUERY": return true
+    for arg in expr.args:
+      if exprContainsScalarSubquery(arg): return true
+  of ekBinary:
+    return exprContainsScalarSubquery(expr.left) or exprContainsScalarSubquery(expr.right)
+  of ekUnary:
+    return exprContainsScalarSubquery(expr.expr)
+  of ekInList:
+    if exprContainsScalarSubquery(expr.inExpr): return true
+    for item in expr.inList:
+      if exprContainsScalarSubquery(item): return true
+  else: discard
+  false
+
 proc makeRow*(columns: seq[string], values: seq[Value], rowid: uint64 = 0): Row =
   Row(rowid: rowid, columns: columns, values: values)
 
@@ -980,6 +999,9 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     let childPlan =
       if plan.left != nil and plan.left.kind == pkSort:
         # Sorting requires materialization; preserve existing optimized path.
+        nil
+      elif plan.left != nil and plan.left.kind == pkProject and plan.left.left != nil and plan.left.left.kind == pkSort:
+        # Limit → Project → Sort also requires materialization.
         nil
       else:
         plan.left
@@ -3964,6 +3986,18 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       if not inputRes.ok:
         return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
       return sortRowsWithConfig(inputRes.value, plan.left.orderBy, params, limit, offset)
+
+    # Limit → Project → Sort: fuse sort+limit, then project.
+    # This ensures scalar subqueries in projections run only on the limited set.
+    if plan.left.kind == pkProject and plan.left.left != nil and plan.left.left.kind == pkSort:
+      let sortNode = plan.left.left
+      let inputRes = execPlan(pager, catalog, sortNode.left, params)
+      if not inputRes.ok:
+        return err[seq[Row]](inputRes.err.code, inputRes.err.message, inputRes.err.context)
+      let sortedRes = sortRowsWithConfig(inputRes.value, sortNode.orderBy, params, limit, offset)
+      if not sortedRes.ok:
+        return err[seq[Row]](sortedRes.err.code, sortedRes.err.message, sortedRes.err.context)
+      return projectRows(sortedRes.value, plan.left.projections, params)
 
     let inputRes = execPlan(pager, catalog, plan.left, params)
     if not inputRes.ok:

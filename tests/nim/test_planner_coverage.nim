@@ -66,7 +66,8 @@ suite "Planner Coverage":
     check bindRes.ok
     let planRes = plan(db.catalog, bindRes.value)
     check planRes.ok
-    check planRes.value.kind == pkSort
+    check planRes.value.kind == pkProject
+    check planRes.value.left.kind == pkSort
     
     discard closeDb(db)
 
