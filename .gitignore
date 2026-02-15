@@ -90,6 +90,8 @@ testresults.html
 testresults.db
 
 bindings/dotnet/.idea/
+.idea/
 bindings/dotnet/v
 bindings/dotnet/v
 :memory:*
+

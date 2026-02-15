@@ -131,7 +131,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          prerelease: ${{ startsWith(github.ref_name, 'v0.1.') || startsWith(github.ref_name, 'v1.0.0-rc.') || startsWith(github.ref_name, 'v1.0.1-rc.') || startsWith(github.ref_name, 'v1.1.0-rc.') }}
+          prerelease: ${{ startsWith(github.ref_name, 'v0.1.') || startsWith(github.ref_name, 'v1.0.0-rc.') || startsWith(github.ref_name, 'v1.0.1-rc.') || startsWith(github.ref_name, 'v1.1.0-rc.') || startsWith(github.ref_name, 'v1.1.1-rc.') }}
           files: |
             artifacts/**/decentdb-${{ github.ref_name }}-Linux-x64.tar.gz
             artifacts/**/decentdb-${{ github.ref_name }}-macOS-x64.tar.gz

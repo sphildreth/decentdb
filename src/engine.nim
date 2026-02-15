@@ -515,10 +515,19 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
           return err[Void](otherRes.err.code, otherRes.err.message, otherRes.err.context)
         if otherRes.value:
           return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
-  # Check composite unique indexes (including composite PKs)
+  # Check unique indexes (composite and single-column CREATE UNIQUE INDEX)
   for _, idx in catalog.indexes:
-    if idx.table != table.name or idx.columns.len < 2 or not idx.unique:
+    if idx.table != table.name or not idx.unique:
       continue
+    # Skip single-column indexes already covered by inline col.unique above
+    if idx.columns.len == 1:
+      var coveredInline = false
+      for col in table.columns:
+        if col.name == idx.columns[0] and col.unique:
+          coveredInline = true
+          break
+      if coveredInline:
+        continue
     let colIndices = indexColumnIndices(table, idx)
     if colIndices.len != idx.columns.len:
       continue
@@ -531,6 +540,7 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
     if hasNull:
       continue
     let key = compositeIndexKey(values, colIndices)
+    let textBlob = isTextBlobIndex(table, idx)
     # Look up candidate rowids by hash key, then verify exact column values
     let idxTree = newBTree(pager, idx.rootPage)
     let cursorRes = openCursorAt(idxTree, key)
@@ -547,9 +557,10 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
         continue
       if nextRes.value[0] > key:
         break
-      if nextRes.value[1].len < 8:
+      let entryRes = decodeIndexEntry(nextRes.value[1], textBlob)
+      if not entryRes.ok:
         continue
-      let candidateRowid = readU64LE(nextRes.value[1], 0)
+      let candidateRowid = entryRes.value.rowid
       if rowid != 0 and candidateRowid == rowid:
         continue
       let rowRes = readRowAt(pager, table, candidateRowid)
@@ -1845,13 +1856,23 @@ proc buildInsertWriteProfile(catalog: Catalog, tableName: string): InsertWritePr
       result.hasNotNullConstraints = true
     if col.kind in {ctText, ctBlob}:
       result.hasTextBlobColumns = true
-  # Check for composite unique indexes
+  # Check for unique indexes (composite and single-column via CREATE UNIQUE INDEX)
   for _, idx in catalog.indexes:
     if idx.table != tableName:
       continue
     result.hasSecondaryIndexes = true
-    if idx.columns.len >= 2 and idx.unique:
-      result.hasCompositeUniqueIndexes = true
+    if idx.unique:
+      if idx.columns.len >= 2:
+        result.hasCompositeUniqueIndexes = true
+      else:
+        # Single-column unique index: check if already covered by col.unique
+        var coveredInline = false
+        for col in table.columns:
+          if col.name == idx.columns[0] and col.unique:
+            coveredInline = true
+            break
+        if not coveredInline:
+          result.hasNonPkUniqueColumns = true
 
 proc prepare*(db: Db, sqlText: string): Result[Prepared] =
   if not db.isOpen:

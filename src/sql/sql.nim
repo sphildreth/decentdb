@@ -1168,6 +1168,16 @@ proc quoteSqlString(text: string): string =
       result.add(ch)
   result.add("'")
 
+proc quoteIdent*(name: string): string =
+  ## Double-quote a SQL identifier, escaping embedded double quotes per SQL standard.
+  result = "\""
+  for ch in name:
+    if ch == '"':
+      result.add("\"\"")
+    else:
+      result.add(ch)
+  result.add("\"")
+
 proc exprToCanonicalSql*(expr: Expr): string
 
 proc exprToCanonicalSql*(expr: Expr): string =
@@ -1190,9 +1200,9 @@ proc exprToCanonicalSql*(expr: Expr): string =
       "$" & $expr.value.paramIndex
   of ekColumn:
     if expr.table.len > 0:
-      expr.table & "." & expr.name
+      quoteIdent(expr.table) & "." & quoteIdent(expr.name)
     else:
-      expr.name
+      quoteIdent(expr.name)
   of ekBinary:
     "(" & exprToCanonicalSql(expr.left) & " " & expr.op & " " & exprToCanonicalSql(expr.right) & ")"
   of ekUnary:
@@ -1269,10 +1279,13 @@ proc selectToCanonicalSql(stmt: Statement): string =
   if stmt.cteNames.len > 0:
     var cteParts: seq[string] = @[]
     for i, cteName in stmt.cteNames:
-      var header = cteName
+      var header = quoteIdent(cteName)
       let cols = if i < stmt.cteColumns.len: stmt.cteColumns[i] else: @[]
       if cols.len > 0:
-        header.add(" (" & cols.join(", ") & ")")
+        var quotedCols: seq[string] = @[]
+        for c in cols:
+          quotedCols.add(quoteIdent(c))
+        header.add(" (" & quotedCols.join(", ") & ")")
       if i < stmt.cteQueries.len:
         header.add(" AS (" & selectToCanonicalSql(stmt.cteQueries[i]) & ")")
       else:
@@ -1300,23 +1313,23 @@ proc selectToCanonicalSql(stmt: Statement): string =
       continue
     var entry = exprToCanonicalSql(item.expr)
     if item.alias.len > 0:
-      entry.add(" AS " & item.alias)
+      entry.add(" AS " & quoteIdent(item.alias))
     selectItems.add(entry)
   if selectItems.len == 0:
     selectItems.add("*")
   parts.add("SELECT " & selectItems.join(", "))
 
   if stmt.fromTable.len > 0:
-    var fromPart = "FROM " & stmt.fromTable
+    var fromPart = "FROM " & quoteIdent(stmt.fromTable)
     if stmt.fromAlias.len > 0:
-      fromPart.add(" " & stmt.fromAlias)
+      fromPart.add(" " & quoteIdent(stmt.fromAlias))
     parts.add(fromPart)
 
   for join in stmt.joins:
     let joinKeyword = if join.joinType == jtLeft: "LEFT JOIN " else: "INNER JOIN "
-    var joinPart = joinKeyword & join.table
+    var joinPart = joinKeyword & quoteIdent(join.table)
     if join.alias.len > 0:
-      joinPart.add(" " & join.alias)
+      joinPart.add(" " & quoteIdent(join.alias))
     if join.onExpr != nil:
       joinPart.add(" ON " & exprToCanonicalSql(join.onExpr))
     parts.add(joinPart)

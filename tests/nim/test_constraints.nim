@@ -82,3 +82,41 @@ suite "Constraints":
     check not dup.ok
     check dup.err.code == ERR_CONSTRAINT
     discard closeDb(db)
+
+  test "CREATE UNIQUE INDEX rejects duplicates on INSERT":
+    let path = makeTempDb("decentdb_unique_idx.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, code TEXT)").ok
+    check execSql(db, "CREATE UNIQUE INDEX ux_code ON items(code)").ok
+    check execSql(db, "INSERT INTO items (id, code) VALUES (1, 'X')").ok
+    let dup = execSql(db, "INSERT INTO items (id, code) VALUES (2, 'X')")
+    check not dup.ok
+    check dup.err.code == ERR_CONSTRAINT
+    discard closeDb(db)
+
+  test "CREATE UNIQUE INDEX allows multiple NULLs":
+    let path = makeTempDb("decentdb_unique_idx_null.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, code TEXT)").ok
+    check execSql(db, "CREATE UNIQUE INDEX ux_code ON items(code)").ok
+    check execSql(db, "INSERT INTO items (id, code) VALUES (1, NULL)").ok
+    check execSql(db, "INSERT INTO items (id, code) VALUES (2, NULL)").ok
+    discard closeDb(db)
+
+  test "UNIQUE INDEX rejects duplicates on UPDATE":
+    let path = makeTempDb("decentdb_unique_idx_upd.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, code TEXT)").ok
+    check execSql(db, "CREATE UNIQUE INDEX ux_code ON items(code)").ok
+    check execSql(db, "INSERT INTO items (id, code) VALUES (1, 'A')").ok
+    check execSql(db, "INSERT INTO items (id, code) VALUES (2, 'B')").ok
+    let upd = execSql(db, "UPDATE items SET code = 'A' WHERE id = 2")
+    check not upd.ok
+    check upd.err.code == ERR_CONSTRAINT
+    discard closeDb(db)

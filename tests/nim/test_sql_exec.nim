@@ -779,7 +779,8 @@ suite "Planner":
     check likeEscapeRes.value == @["1"]
 
     let corrExistsRes = execSql(db, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.id = t.id)")
-    check not corrExistsRes.ok
+    check corrExistsRes.ok
+    check corrExistsRes.value.len == 0  # no matching rows (t.id is 1 or 2, t2.id is 7)
 
     discard closeDb(db)
 
@@ -1261,4 +1262,241 @@ suite "Planner":
     for v in r7vals:
       check v == "NULL"
 
+    discard closeDb(db)
+
+  test "mixed-case table names with scalar subquery":
+    let path = makeTempDb("decentdb_mixedcase_subquery.ddb")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    # Create tables with mixed-case quoted identifiers (as ORMs like EF Core do)
+    check execSql(db, """CREATE TABLE "Artists" ("Id" INT PRIMARY KEY, "Name" TEXT)""").ok
+    check execSql(db, """CREATE TABLE "Albums" ("Id" INT PRIMARY KEY, "ArtistId" INT, "Title" TEXT)""").ok
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (1, 'Beatles')""")
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (2, 'Stones')""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId", "Title") VALUES (1, 1, 'Abbey Road')""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId", "Title") VALUES (2, 1, 'Let It Be')""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId", "Title") VALUES (3, 2, 'Exile')""")
+
+    # Correlated scalar subquery with mixed-case table and column names
+    let r1 = execSql(db, """
+      SELECT "a"."Id", "a"."Name",
+        (SELECT COUNT(*) FROM "Albums" AS "a0" WHERE "a0"."ArtistId" = "a"."Id") AS "AlbumCount"
+      FROM "Artists" AS "a"
+      ORDER BY "a"."Id"
+    """)
+    check r1.ok
+    check r1.value.len == 2
+    let r1a = splitRow(r1.value[0])
+    check r1a[0] == "1"
+    check r1a[1] == "Beatles"
+    check r1a[2] == "2"
+    let r1b = splitRow(r1.value[1])
+    check r1b[0] == "2"
+    check r1b[1] == "Stones"
+    check r1b[2] == "1"
+
+    discard closeDb(db)
+
+  test "mixed-case table names with EXISTS subquery":
+    let path = makeTempDb("decentdb_mixedcase_exists.ddb")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, """CREATE TABLE "Artists" ("Id" INT PRIMARY KEY, "Name" TEXT)""").ok
+    check execSql(db, """CREATE TABLE "Albums" ("Id" INT PRIMARY KEY, "ArtistId" INT)""").ok
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (1, 'Beatles')""")
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (2, 'Solo')""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId") VALUES (1, 1)""")
+
+    # Correlated EXISTS with mixed-case tables
+    let r1 = execSql(db, """
+      SELECT "a"."Name"
+      FROM "Artists" AS "a"
+      WHERE EXISTS (SELECT 1 FROM "Albums" AS "al" WHERE "al"."ArtistId" = "a"."Id")
+    """)
+    check r1.ok
+    check r1.value.len == 1
+    check splitRow(r1.value[0])[0] == "Beatles"
+
+    # NOT EXISTS with mixed-case tables
+    let r2 = execSql(db, """
+      SELECT "a"."Name"
+      FROM "Artists" AS "a"
+      WHERE NOT EXISTS (SELECT 1 FROM "Albums" AS "al" WHERE "al"."ArtistId" = "a"."Id")
+    """)
+    check r2.ok
+    check r2.value.len == 1
+    check splitRow(r2.value[0])[0] == "Solo"
+
+    discard closeDb(db)
+
+  test "mixed-case columns in scalar subquery":
+    let path = makeTempDb("decentdb_mixedcase_cols.ddb")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, """CREATE TABLE "Orders" ("OrderId" INT PRIMARY KEY, "CustomerId" INT)""").ok
+    check execSql(db, """CREATE TABLE "Items" ("ItemId" INT PRIMARY KEY, "OrderId" INT, "Price" REAL)""").ok
+    discard execSql(db, """INSERT INTO "Orders" ("OrderId", "CustomerId") VALUES (1, 100)""")
+    discard execSql(db, """INSERT INTO "Orders" ("OrderId", "CustomerId") VALUES (2, 100)""")
+    discard execSql(db, """INSERT INTO "Items" ("ItemId", "OrderId", "Price") VALUES (1, 1, 9.99)""")
+    discard execSql(db, """INSERT INTO "Items" ("ItemId", "OrderId", "Price") VALUES (2, 1, 4.50)""")
+    discard execSql(db, """INSERT INTO "Items" ("ItemId", "OrderId", "Price") VALUES (3, 2, 20.0)""")
+
+    # Scalar subquery referencing mixed-case column names
+    let r1 = execSql(db, """
+      SELECT "o"."OrderId",
+        (SELECT COUNT(*) FROM "Items" AS "i" WHERE "i"."OrderId" = "o"."OrderId") AS "ItemCount"
+      FROM "Orders" AS "o"
+      ORDER BY "o"."OrderId"
+    """)
+    check r1.ok
+    check r1.value.len == 2
+    check splitRow(r1.value[0])[0] == "1"
+    check splitRow(r1.value[0])[1] == "2"
+    check splitRow(r1.value[1])[0] == "2"
+    check splitRow(r1.value[1])[1] == "1"
+
+    discard closeDb(db)
+
+  test "multiple scalar subqueries with mixed-case tables":
+    let path = makeTempDb("decentdb_multi_subquery_mc.ddb")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, """CREATE TABLE "Artists" ("Id" INT PRIMARY KEY, "Name" TEXT)""").ok
+    check execSql(db, """CREATE TABLE "Albums" ("Id" INT PRIMARY KEY, "ArtistId" INT)""").ok
+    check execSql(db, """CREATE TABLE "Songs" ("Id" INT PRIMARY KEY, "ArtistId" INT)""").ok
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (1, 'A1')""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId") VALUES (1, 1)""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId") VALUES (2, 1)""")
+    discard execSql(db, """INSERT INTO "Songs" ("Id", "ArtistId") VALUES (1, 1)""")
+    discard execSql(db, """INSERT INTO "Songs" ("Id", "ArtistId") VALUES (2, 1)""")
+    discard execSql(db, """INSERT INTO "Songs" ("Id", "ArtistId") VALUES (3, 1)""")
+
+    # Two scalar subqueries in same SELECT
+    let r1 = execSql(db, """
+      SELECT "a"."Name",
+        (SELECT COUNT(*) FROM "Albums" AS "al" WHERE "al"."ArtistId" = "a"."Id") AS "AlbumCount",
+        (SELECT COUNT(*) FROM "Songs" AS "s" WHERE "s"."ArtistId" = "a"."Id") AS "SongCount"
+      FROM "Artists" AS "a"
+      WHERE "a"."Id" = 1
+    """)
+    check r1.ok
+    check r1.value.len == 1
+    let vals = splitRow(r1.value[0])
+    check vals[0] == "A1"
+    check vals[1] == "2"
+    check vals[2] == "3"
+
+    discard closeDb(db)
+
+  test "scalar subquery with LIMIT and OFFSET on mixed-case tables":
+    let path = makeTempDb("decentdb_subquery_limit_mc.ddb")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, """CREATE TABLE "Artists" ("Id" INT PRIMARY KEY, "Name" TEXT)""").ok
+    check execSql(db, """CREATE TABLE "Albums" ("Id" INT PRIMARY KEY, "ArtistId" INT)""").ok
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (1, 'First')""")
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (2, 'Second')""")
+    discard execSql(db, """INSERT INTO "Artists" ("Id", "Name") VALUES (3, 'Third')""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId") VALUES (1, 1)""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId") VALUES (2, 2)""")
+    discard execSql(db, """INSERT INTO "Albums" ("Id", "ArtistId") VALUES (3, 2)""")
+
+    # The exact pattern from the bug report: subquery + ORDER BY + LIMIT + OFFSET
+    let r1 = execSql(db, """
+      SELECT "a"."Id", "a"."Name",
+        (SELECT COUNT(*) FROM "Albums" AS "a0" WHERE "a0"."ArtistId" = "a"."Id") AS "AlbumCount"
+      FROM "Artists" AS "a"
+      ORDER BY "a"."Id"
+      LIMIT 100
+      OFFSET 0
+    """)
+    check r1.ok
+    check r1.value.len == 3
+    check splitRow(r1.value[0])[2] == "1"
+    check splitRow(r1.value[1])[2] == "2"
+    check splitRow(r1.value[2])[2] == "0"
+
+    # LIMIT + OFFSET restricting results
+    let r2 = execSql(db, """
+      SELECT "a"."Id",
+        (SELECT COUNT(*) FROM "Albums" AS "a0" WHERE "a0"."ArtistId" = "a"."Id") AS "AlbumCount"
+      FROM "Artists" AS "a"
+      ORDER BY "a"."Id"
+      LIMIT 1
+      OFFSET 1
+    """)
+    check r2.ok
+    check r2.value.len == 1
+    check splitRow(r2.value[0])[0] == "2"
+    check splitRow(r2.value[0])[1] == "2"
+
+    discard closeDb(db)
+
+  test "lowercase tables still work with subqueries (regression guard)":
+    let path = makeTempDb("decentdb_lowercase_subquery_guard.ddb")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)").ok
+    check execSql(db, "CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT)").ok
+    discard execSql(db, "INSERT INTO artists (id, name) VALUES (1, 'A1')")
+    discard execSql(db, "INSERT INTO albums (id, artist_id) VALUES (1, 1)")
+    discard execSql(db, "INSERT INTO albums (id, artist_id) VALUES (2, 1)")
+
+    let r1 = execSql(db, """
+      SELECT a.name,
+        (SELECT COUNT(*) FROM albums a0 WHERE a0.artist_id = a.id)
+      FROM artists a ORDER BY a.id
+    """)
+    check r1.ok
+    check r1.value.len == 1
+    check splitRow(r1.value[0])[0] == "A1"
+    check splitRow(r1.value[0])[1] == "2"
+
+    # Correlated EXISTS with lowercase
+    let r2 = execSql(db, """
+      SELECT a.name FROM artists a
+      WHERE EXISTS (SELECT 1 FROM albums al WHERE al.artist_id = a.id)
+    """)
+    check r2.ok
+    check r2.value.len == 1
+
+    discard closeDb(db)
+
+  test "ORDER BY DESC with table alias":
+    let path = makeTempDb("decentdb_orderby_alias.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT NOT NULL)").ok
+    check execSql(db, "INSERT INTO items (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')").ok
+    # Unquoted alias DESC
+    let r1 = execSql(db, "SELECT e.name FROM items AS e ORDER BY e.name DESC")
+    check r1.ok
+    check r1.value.len == 3
+    check splitRow(r1.value[0])[0] == "c"
+    check splitRow(r1.value[2])[0] == "a"
+    # Quoted alias DESC
+    let r2b = execSql(db, """SELECT "e"."name" FROM "items" AS "e" ORDER BY "e"."name" DESC""")
+    check r2b.ok
+    check r2b.value.len == 3
+    check splitRow(r2b.value[0])[0] == "c"
+    check splitRow(r2b.value[2])[0] == "a"
+    # ASC still works
+    let r3 = execSql(db, "SELECT e.name FROM items AS e ORDER BY e.name ASC")
+    check r3.ok
+    check r3.value.len == 3
+    check splitRow(r3.value[0])[0] == "a"
+    check splitRow(r3.value[2])[0] == "c"
     discard closeDb(db)

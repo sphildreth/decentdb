@@ -1360,7 +1360,8 @@ proc columnIndex*(row: Row, table: string, name: string): Result[int] =
     for i, col in row.columns:
       if col == key:
         return ok(i)
-    return err[int](ERR_SQL, "Unknown column", key)
+    # Qualified lookup failed (e.g. post-projection columns lack alias prefix);
+    # fall through to unqualified matching below.
   var matches: seq[int] = @[]
   for i, col in row.columns:
     if col == name or col.endsWith("." & name):
@@ -1368,7 +1369,8 @@ proc columnIndex*(row: Row, table: string, name: string): Result[int] =
   if matches.len == 1:
     return ok(matches[0])
   if matches.len == 0:
-    return err[int](ERR_SQL, "Unknown column", name)
+    let ctx = if table.len > 0: table & "." & name else: name
+    return err[int](ERR_SQL, "Unknown column", ctx)
   err[int](ERR_SQL, "Ambiguous column", name)
 
 proc evalLiteral(value: SqlValue): Value =
@@ -2310,7 +2312,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       let stmt = parseRes.value.statements[0]
       if stmt.kind != skSelect:
         return err[Value](ERR_SQL, "EXISTS requires SELECT subquery")
-      let bindRes = bindStatement(gEvalCatalog, stmt)
+      # Substitute correlated column references with literal values from the current row
+      let innerTables = collectInnerTables(stmt)
+      let substituted = substituteCorrelatedStmt(stmt, innerTables, row)
+      let bindRes = bindStatement(gEvalCatalog, substituted)
       if not bindRes.ok:
         return err[Value](bindRes.err.code, bindRes.err.message, bindRes.err.context)
       let planRes = plan(gEvalCatalog, bindRes.value)

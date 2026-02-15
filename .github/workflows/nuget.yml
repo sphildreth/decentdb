@@ -148,7 +148,11 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
 
-          if [[ "$tag" =~ ^v1\.1\.0$ ]]; then
+          if [[ "$tag" =~ ^v1\.1\.1$ ]]; then
+            nuget="1.1.1"
+          elif [[ "$tag" =~ ^v1\.1\.1-rc\.([0-9]+)$ ]]; then
+            nuget="1.1.1-rc.${BASH_REMATCH[1]}"
+          elif [[ "$tag" =~ ^v1\.1\.0$ ]]; then
             nuget="1.1.0"
           elif [[ "$tag" =~ ^v1\.1\.0-rc\.([0-9]+)$ ]]; then
             nuget="1.1.0-rc.${BASH_REMATCH[1]}"

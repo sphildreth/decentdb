@@ -1,6 +1,5 @@
 using Microsoft.EntityFrameworkCore.Design;
 using Microsoft.EntityFrameworkCore.Scaffolding;
-using Microsoft.EntityFrameworkCore.Scaffolding.Internal;
 
 namespace DecentDB.EntityFrameworkCore.Design.Scaffolding.Internal;
 

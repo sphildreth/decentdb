@@ -5,6 +5,22 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-02-15
+
+### Fixed
+- **SQL Engine**: `ORDER BY DESC` with table-aliased columns now sorts correctly. Previously, post-projection columns lost their table alias prefix, causing qualified lookups to fail silently — rows were returned in insertion order instead of descending order.
+- **SQL Engine**: `CREATE UNIQUE INDEX` now correctly enforces uniqueness on INSERT and UPDATE. Previously, `enforceUnique` used raw byte reads to extract rowids from TEXT/BLOB index entries, reading from the wrong offset — duplicate values were silently accepted.
+- **SQL Engine**: Scalar subqueries and `EXISTS` expressions now work correctly with mixed-case (quoted) table and column names.
+- **SQL Engine**: Correlated `EXISTS` subqueries now correctly substitute outer-row column references.
+
+### Added
+- Python: SQLite import tool now maps `GUID`, `UNIQUEIDENTIFIER`, and `CHAR(36)` declared types to `UUID`.
+- Python: SQLite import tool `--detect-uuid` flag inspects TEXT column data and promotes to UUID if values match UUID format.
+- .NET: 23 EF Core integration tests mirroring Melodee `ArtistSearchEngineServiceDbContext` query patterns.
+
+### Changed
+- .NET: Updated `EntityFrameworkDemo` example NuGet dependencies to latest versions.
+
 ## [1.1.0] - 2026-02-14
 
 ### Added
