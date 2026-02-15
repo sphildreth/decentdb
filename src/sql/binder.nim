@@ -39,7 +39,14 @@ proc literalType(expr: Expr): Option[ColumnType] =
 proc checkLiteralType(expr: Expr, expected: ColumnType, columnName: string): Result[Void] =
   let lit = literalType(expr)
   if isSome(lit) and lit.get != expected:
-    return err[Void](ERR_SQL, "Type mismatch for column", columnName)
+    let actual = lit.get
+    # Allow compatible coercions that typeCheckValue will handle at runtime.
+    let compatible =
+      (expected == ctInt64 and actual in {ctBool, ctFloat64}) or
+      (expected == ctFloat64 and actual == ctInt64) or
+      (expected == ctBool and actual == ctInt64)
+    if not compatible:
+      return err[Void](ERR_SQL, "Type mismatch for column", columnName)
   okVoid()
 
 proc cloneExpr(expr: Expr): Expr

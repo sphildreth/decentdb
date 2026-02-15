@@ -1083,10 +1083,14 @@ suite "Planner":
       echo "Valid insert failed: ", validInsert.err.message
     check validInsert.ok
     
-    # Update wrong type
-    let badUpdate = execSql(db, "UPDATE t SET flag = 1 WHERE id = 1") # 1 is int, not bool in strict mode?
+    # Update wrong type (text for bool)
+    let badUpdate = execSql(db, "UPDATE t SET flag = 'bad' WHERE id = 1")
     check not badUpdate.ok
     check badUpdate.err.code == ERR_SQL
+
+    # Int → Bool coercion should succeed
+    let intToBoolUpdate = execSql(db, "UPDATE t SET flag = 1 WHERE id = 1")
+    check intToBoolUpdate.ok
     
     discard closeDb(db)
 
