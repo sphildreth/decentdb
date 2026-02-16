@@ -30,7 +30,7 @@ public sealed class TypeMappingTests : IDisposable
         Assert.Equal("REAL", GetMapping<double>(mappingSource).StoreType);
         Assert.Equal("TEXT", GetMapping<string>(mappingSource).StoreType);
         Assert.Equal("BLOB", GetMapping<byte[]>(mappingSource).StoreType);
-        Assert.Equal("DECIMAL", GetMapping<decimal>(mappingSource).StoreType);
+        Assert.Equal("DECIMAL(18,4)", GetMapping<decimal>(mappingSource).StoreType);
         Assert.Equal("UUID", GetMapping<Guid>(mappingSource).StoreType);
         Assert.Equal("INTEGER", GetMapping<DateTime>(mappingSource).StoreType);
         Assert.Equal("INTEGER", GetMapping<DateTimeOffset>(mappingSource).StoreType);

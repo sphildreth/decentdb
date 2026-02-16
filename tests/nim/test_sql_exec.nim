@@ -7,6 +7,7 @@ import errors
 import tables
 import sets
 import sql/sql
+import sql/binder
 import planner/planner
 import catalog/catalog
 import pager/pager
@@ -638,8 +639,8 @@ suite "Planner":
     check p.kind == pkLimit
     check p.limit == 5
     check p.offset == 2
-    check p.left.kind == pkSort
-    check p.left.left.kind == pkProject
+    check p.left.kind == pkProject
+    check p.left.left.kind == pkSort
     check p.left.left.left.kind == pkTableScan
 
   test "non-select statements return statement plan":
@@ -1082,10 +1083,14 @@ suite "Planner":
       echo "Valid insert failed: ", validInsert.err.message
     check validInsert.ok
     
-    # Update wrong type
-    let badUpdate = execSql(db, "UPDATE t SET flag = 1 WHERE id = 1") # 1 is int, not bool in strict mode?
+    # Update wrong type (text for bool)
+    let badUpdate = execSql(db, "UPDATE t SET flag = 'bad' WHERE id = 1")
     check not badUpdate.ok
     check badUpdate.err.code == ERR_SQL
+
+    # Int → Bool coercion should succeed
+    let intToBoolUpdate = execSql(db, "UPDATE t SET flag = 1 WHERE id = 1")
+    check intToBoolUpdate.ok
     
     discard closeDb(db)
 
@@ -1499,4 +1504,103 @@ suite "Planner":
     check r3.value.len == 3
     check splitRow(r3.value[0])[0] == "a"
     check splitRow(r3.value[2])[0] == "c"
+    discard closeDb(db)
+
+  test "ORDER BY alias resolves to select-list expression":
+    let path = makeTempDb("decentdb_order_by_alias.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE products (id INT64 PRIMARY KEY, price INT64, name TEXT)")
+    discard execSql(db, "INSERT INTO products (id, price, name) VALUES (1, 30, 'c')")
+    discard execSql(db, "INSERT INTO products (id, price, name) VALUES (2, 10, 'a')")
+    discard execSql(db, "INSERT INTO products (id, price, name) VALUES (3, 20, 'b')")
+
+    # ORDER BY alias ASC
+    let r1 = execSql(db, "SELECT price AS cost FROM products ORDER BY cost ASC")
+    check r1.ok
+    check r1.value.len == 3
+    check splitRow(r1.value[0])[0] == "10"
+    check splitRow(r1.value[1])[0] == "20"
+    check splitRow(r1.value[2])[0] == "30"
+
+    # ORDER BY alias DESC
+    let r2 = execSql(db, "SELECT price AS cost FROM products ORDER BY cost DESC")
+    check r2.ok
+    check r2.value.len == 3
+    check splitRow(r2.value[0])[0] == "30"
+    check splitRow(r2.value[2])[0] == "10"
+
+    # ORDER BY alias with LIMIT
+    let r3a = execSql(db, "SELECT id, price AS cost FROM products ORDER BY cost DESC LIMIT 2")
+    check r3a.ok
+    check r3a.value.len == 2
+    check splitRow(r3a.value[0])[0] == "1"  # price 30
+    check splitRow(r3a.value[1])[0] == "3"  # price 20
+
+    # ORDER BY original column still works alongside aliased columns
+    let r4 = execSql(db, "SELECT id, price AS cost FROM products ORDER BY id ASC")
+    check r4.ok
+    check r4.value.len == 3
+    check splitRow(r4.value[0])[0] == "1"
+    check splitRow(r4.value[2])[0] == "3"
+
+    discard closeDb(db)
+
+  test "scalar subquery deferred past sort+limit":
+    let path = makeTempDb("decentdb_subquery_defer.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE authors (id INT64 PRIMARY KEY, name TEXT)")
+    discard execSql(db, "CREATE TABLE books (id INT64 PRIMARY KEY, author_id INT64, title TEXT)")
+    for i in 1..50:
+      discard execSql(db, "INSERT INTO authors (id, name) VALUES (" & $i & ", 'Author " & $i & "')")
+    for i in 1..200:
+      let authorId = ((i - 1) mod 50) + 1
+      discard execSql(db, "INSERT INTO books (id, author_id, title) VALUES (" & $i & ", " & $authorId & ", 'Book " & $i & "')")
+
+    # Query with correlated scalar subquery, ORDER BY, and LIMIT
+    let r1 = execSql(db, """
+      SELECT a.id, a.name,
+             (SELECT COUNT(*) FROM books AS b WHERE b.author_id = a.id) AS book_count
+      FROM authors AS a
+      ORDER BY a.id
+      LIMIT 5
+    """)
+    check r1.ok
+    check r1.value.len == 5
+    # Each author gets 4 books (200 books / 50 authors)
+    for i in 0..4:
+      let cols = splitRow(r1.value[i])
+      check cols[0] == $(i + 1)
+      check cols[2] == "4"
+
+    # Verify plan shape: Limit → Project(subquery) → Sort → Scan
+    let parseRes = parseSql("SELECT a.id, (SELECT COUNT(*) FROM books AS b WHERE b.author_id = a.id) AS book_count FROM authors AS a ORDER BY a.id LIMIT 5")
+    check parseRes.ok
+    let bindRes = bindStatement(db.catalog, parseRes.value.statements[0])
+    check bindRes.ok
+    let planRes = plan(db.catalog, bindRes.value)
+    check planRes.ok
+    let p = planRes.value
+    check p.kind == pkLimit
+    check p.left.kind == pkProject
+    check p.left.left.kind == pkSort
+
+    # ORDER BY alias on the subquery result
+    let r2 = execSql(db, """
+      SELECT a.id, a.name,
+             (SELECT COUNT(*) FROM books AS b WHERE b.author_id = a.id) AS book_count
+      FROM authors AS a
+      ORDER BY book_count DESC
+      LIMIT 3
+    """)
+    check r2.ok
+    check r2.value.len == 3
+    # All authors have 4 books, so any 3 are valid; just check count
+    for i in 0..2:
+      let cols = splitRow(r2.value[i])
+      check cols[2] == "4"
+
     discard closeDb(db)

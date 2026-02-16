@@ -148,30 +148,26 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
 
-          if [[ "$tag" =~ ^v1\.1\.1$ ]]; then
-            nuget="1.1.1"
-          elif [[ "$tag" =~ ^v1\.1\.1-rc\.([0-9]+)$ ]]; then
-            nuget="1.1.1-rc.${BASH_REMATCH[1]}"
-          elif [[ "$tag" =~ ^v1\.1\.0$ ]]; then
-            nuget="1.1.0"
-          elif [[ "$tag" =~ ^v1\.1\.0-rc\.([0-9]+)$ ]]; then
-            nuget="1.1.0-rc.${BASH_REMATCH[1]}"
-          elif [[ "$tag" =~ ^v1\.0\.2$ ]]; then
-            nuget="1.0.2"
-          elif [[ "$tag" =~ ^v1\.0\.2-rc\.([0-9]+)$ ]]; then
-            nuget="1.0.2-rc.${BASH_REMATCH[1]}"
-          elif [[ "$tag" =~ ^v1\.0\.1$ ]]; then
-            nuget="1.0.1"
-          elif [[ "$tag" =~ ^v1\.0\.1-rc\.([0-9]+)$ ]]; then
-            nuget="1.0.1-rc.${BASH_REMATCH[1]}"
-          elif [[ "$tag" =~ ^v1\.0\.0$ ]]; then
-            nuget="1.0.0"
-          elif [[ "$tag" =~ ^v1\.0\.0-rc\.([0-9]+)$ ]]; then
-            nuget="1.0.0-rc.${BASH_REMATCH[1]}"
-          elif [[ "$tag" =~ ^v0\.1\.([0-9]+)$ ]]; then
-            nuget="1.0.0-rc.${BASH_REMATCH[1]}"
+          # Tags are expected to be:
+          # - vX.Y.Z
+          # - vX.Y.Z-rc.N
+          # With a legacy mapping for v0.1.P -> 1.0.0-rc.P
+          if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)(-rc\.([0-9]+))?$ ]]; then
+            major="${BASH_REMATCH[1]}"
+            minor="${BASH_REMATCH[2]}"
+            patch="${BASH_REMATCH[3]}"
+            rc_num="${BASH_REMATCH[5]:-}"
+
+            if [[ "$major" == "0" && "$minor" == "1" && -z "$rc_num" ]]; then
+              nuget="1.0.0-rc.${patch}"
+            else
+              nuget="${major}.${minor}.${patch}"
+              if [[ -n "$rc_num" ]]; then
+                nuget+="-rc.${rc_num}"
+              fi
+            fi
           else
-            echo "Unsupported tag: $tag" >&2
+            echo "Unsupported tag: $tag (expected vX.Y.Z or vX.Y.Z-rc.N)" >&2
             exit 1
           fi
 

@@ -350,10 +350,16 @@ proc typeCheckValue(col: Column, value: Value): Result[Value] =
   of ctInt64:
     if value.kind == vkNull: return ok(value)
     if value.kind == vkInt64: return ok(value)
+    if value.kind == vkBool: return ok(Value(kind: vkInt64, int64Val: if value.boolVal: 1'i64 else: 0'i64))
+    if value.kind == vkFloat64:
+      let i = int64(value.float64Val)
+      if float64(i) == value.float64Val:
+        return ok(Value(kind: vkInt64, int64Val: i))
     return err[Value](ERR_SQL, "Type mismatch: expected INT64")
   of ctBool:
     if value.kind == vkNull: return ok(value)
     if value.kind == vkBool: return ok(value)
+    if value.kind == vkInt64: return ok(Value(kind: vkBool, boolVal: value.int64Val != 0))
     return err[Value](ERR_SQL, "Type mismatch: expected BOOL")
   of ctFloat64:
     if value.kind == vkNull: return ok(value)

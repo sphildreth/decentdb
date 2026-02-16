@@ -23,7 +23,7 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         var longMapping = new LongTypeMapping("INTEGER", DbType.Int64);
         var floatMapping = new FloatTypeMapping("REAL", DbType.Single);
         var doubleMapping = new DoubleTypeMapping("REAL", DbType.Double);
-        var decimalMapping = new DecimalTypeMapping("DECIMAL", DbType.Decimal, precision: null, scale: null);
+        var decimalMapping = new DecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
         var stringMapping = new StringTypeMapping("TEXT", DbType.String);
         var blobMapping = new ByteArrayTypeMapping("BLOB", DbType.Binary);
 

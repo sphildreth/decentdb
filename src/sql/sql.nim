@@ -329,6 +329,13 @@ proc parseAConst*(node: JsonNode): Result[Expr] =
   if nodeHas(node, "fval"):
     let floatNode = node["fval"]
     let strVal = if nodeHas(floatNode, "fval"): floatNode["fval"].getStr else: floatNode.getStr
+    # libpg_query emits integers > INT32_MAX as float nodes; recover them.
+    if strVal.len > 0 and strVal.find('.') < 0 and strVal.find('e') < 0 and strVal.find('E') < 0:
+      try:
+        let i = parseBiggestInt(strVal)
+        return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: int64(i))))
+      except ValueError:
+        discard
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svFloat, floatVal: parseFloat(strVal))))
   let valNode = nodeGet(node, "val")
   if nodeHas(valNode, "Integer"):
@@ -348,6 +355,8 @@ proc parseAConst*(node: JsonNode): Result[Expr] =
     let boolNode = node["boolval"]
     if nodeHas(boolNode, "boolval"):
       return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: boolNode["boolval"].getBool)))
+    # pg_query omits boolval field when false (protobuf default); empty object means false.
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: false)))
   err[Expr](ERR_SQL, "Unsupported A_Const")
 
 proc parseColumnRef(node: JsonNode): Result[Expr] =
