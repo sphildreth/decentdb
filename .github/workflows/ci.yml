@@ -71,9 +71,8 @@ jobs:
             cd /tmp/libpg_query
             make
           fi
-          cd /tmp/libpg_query
-          sudo make install
-          sudo ldconfig
+          mkdir -p build/lib
+          cp /tmp/libpg_query/libpg_query.a build/lib/
 
       - name: Build libpg_query (macOS)
         if: runner.os == 'macOS'
@@ -83,8 +82,8 @@ jobs:
             cd /tmp/libpg_query
             make
           fi
-          cd /tmp/libpg_query
-          sudo make install
+          mkdir -p build/lib
+          cp /tmp/libpg_query/libpg_query.a build/lib/
 
       - name: Build libpg_query (Windows)
         if: runner.os == 'Windows'
