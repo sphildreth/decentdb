@@ -41,8 +41,8 @@ jobs:
           git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
           cd /tmp/libpg_query
           make
-          sudo make install
-          sudo ldconfig
+          mkdir -p "$GITHUB_WORKSPACE/build/lib"
+          cp libpg_query.a "$GITHUB_WORKSPACE/build/lib/"
 
       - name: Build libpg_query (macOS)
         if: runner.os == 'macOS'
@@ -50,7 +50,8 @@ jobs:
           git clone --depth 1 https://github.com/pganalyze/libpg_query.git /tmp/libpg_query
           cd /tmp/libpg_query
           make
-          sudo make install
+          mkdir -p "$GITHUB_WORKSPACE/build/lib"
+          cp libpg_query.a "$GITHUB_WORKSPACE/build/lib/"
 
       - name: Build libpg_query (Windows)
         if: runner.os == 'Windows'
