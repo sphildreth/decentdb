@@ -304,20 +304,137 @@ proc indexKeyForRow(table: TableMeta, idx: IndexMeta, values: seq[Value]): Resul
     return err[uint64](ERR_SQL, "Invalid index column mapping", idx.name)
   ok(compositeIndexKey(values, colIndices))
 
+var predicateCache {.threadvar.}: Table[string, Expr]
+var predicateCacheReady {.threadvar.}: bool
+
+proc parsePredicateExpr(predicateSql: string, tableName: string): Expr =
+  ## Parse a predicate SQL string into an Expr, using a cache.
+  if not predicateCacheReady:
+    predicateCache = initTable[string, Expr]()
+    predicateCacheReady = true
+  let key = tableName & ":" & predicateSql
+  if predicateCache.hasKey(key):
+    return predicateCache[key]
+  let wrapped = "SELECT 1 FROM " & tableName & " WHERE " & predicateSql
+  let res = parseSql(wrapped)
+  if res.ok and res.value.statements.len > 0:
+    let stmt = res.value.statements[0]
+    if stmt.kind == skSelect and stmt.whereExpr != nil:
+      predicateCache[key] = stmt.whereExpr
+      return stmt.whereExpr
+  return nil
+
+proc evalPredicateValue(table: TableMeta, values: seq[Value], expr: Expr): Value =
+  ## Evaluate a simple predicate expression against row values.
+  ## Returns vkBool true/false, or vkNull if not evaluable.
+  if expr == nil:
+    return Value(kind: vkNull)
+  case expr.kind
+  of ekLiteral:
+    case expr.value.kind
+    of svNull: return Value(kind: vkNull)
+    of svInt: return Value(kind: vkInt64, int64Val: expr.value.intVal)
+    of svFloat: return Value(kind: vkFloat64, float64Val: expr.value.floatVal)
+    of svString:
+      var bytes: seq[byte] = @[]
+      for c in expr.value.strVal: bytes.add(byte(c))
+      return Value(kind: vkText, bytes: bytes)
+    of svBool: return Value(kind: vkBool, boolVal: expr.value.boolVal)
+    of svParam: return Value(kind: vkNull)
+  of ekColumn:
+    for i, col in table.columns:
+      if col.name == expr.name:
+        if i < values.len: return values[i]
+        return Value(kind: vkNull)
+    return Value(kind: vkNull)
+  of ekBinary:
+    let lv = evalPredicateValue(table, values, expr.left)
+    let rv = evalPredicateValue(table, values, expr.right)
+    # IS / IS NOT (handles NULL, IS TRUE, IS FALSE)
+    if expr.op == "IS" or expr.op == "IS NOT":
+      let rvIsNull = rv.kind == vkNull
+      let rvBool = not rvIsNull and rv.kind in {vkBool, vkBoolTrue, vkBoolFalse}
+      let rvTrue = rvBool and (rv.boolVal or rv.kind == vkBoolTrue)
+      var matched: bool
+      if rvIsNull:
+        matched = lv.kind == vkNull
+      elif rvBool:
+        if lv.kind == vkNull:
+          matched = false
+        else:
+          let lvBool = lv.kind in {vkBool, vkBoolTrue, vkBoolFalse} and (lv.boolVal or lv.kind == vkBoolTrue)
+          matched = if rvTrue: lvBool else: not lvBool
+      else:
+        matched = false
+      if expr.op == "IS NOT":
+        matched = not matched
+      return Value(kind: vkBool, boolVal: matched)
+    # Boolean AND/OR — SQL three-valued logic (must precede NULL propagation)
+    if expr.op == "AND":
+      let lvIsNull = lv.kind == vkNull
+      let rvIsNull = rv.kind == vkNull
+      let lvTrue = not lvIsNull and lv.kind in {vkBool, vkBoolTrue, vkBoolFalse} and (lv.boolVal or lv.kind == vkBoolTrue)
+      let rvTrue = not rvIsNull and rv.kind in {vkBool, vkBoolTrue, vkBoolFalse} and (rv.boolVal or rv.kind == vkBoolTrue)
+      # FALSE AND anything = FALSE
+      if not lvIsNull and not lvTrue: return Value(kind: vkBool, boolVal: false)
+      if not rvIsNull and not rvTrue: return Value(kind: vkBool, boolVal: false)
+      if lvTrue and rvTrue: return Value(kind: vkBool, boolVal: true)
+      return Value(kind: vkNull)
+    if expr.op == "OR":
+      let lvIsNull = lv.kind == vkNull
+      let rvIsNull = rv.kind == vkNull
+      let lvTrue = not lvIsNull and lv.kind in {vkBool, vkBoolTrue, vkBoolFalse} and (lv.boolVal or lv.kind == vkBoolTrue)
+      let rvTrue = not rvIsNull and rv.kind in {vkBool, vkBoolTrue, vkBoolFalse} and (rv.boolVal or rv.kind == vkBoolTrue)
+      # TRUE OR anything = TRUE
+      if lvTrue: return Value(kind: vkBool, boolVal: true)
+      if rvTrue: return Value(kind: vkBool, boolVal: true)
+      if not lvIsNull and not rvIsNull: return Value(kind: vkBool, boolVal: false)
+      return Value(kind: vkNull)
+    # Standard comparisons — NULL propagates
+    if lv.kind == vkNull or rv.kind == vkNull:
+      return Value(kind: vkNull)
+    # Compare integers
+    if lv.kind in {vkInt64, vkInt0, vkInt1} and rv.kind in {vkInt64, vkInt0, vkInt1}:
+      let a = if lv.kind == vkInt0: 0'i64 elif lv.kind == vkInt1: 1'i64 else: lv.int64Val
+      let b = if rv.kind == vkInt0: 0'i64 elif rv.kind == vkInt1: 1'i64 else: rv.int64Val
+      case expr.op
+      of "=": return Value(kind: vkBool, boolVal: a == b)
+      of "!=", "<>": return Value(kind: vkBool, boolVal: a != b)
+      of "<": return Value(kind: vkBool, boolVal: a < b)
+      of ">": return Value(kind: vkBool, boolVal: a > b)
+      of "<=": return Value(kind: vkBool, boolVal: a <= b)
+      of ">=": return Value(kind: vkBool, boolVal: a >= b)
+      else: discard
+    # Compare floats
+    if lv.kind == vkFloat64 and rv.kind == vkFloat64:
+      case expr.op
+      of "=": return Value(kind: vkBool, boolVal: lv.float64Val == rv.float64Val)
+      of "!=", "<>": return Value(kind: vkBool, boolVal: lv.float64Val != rv.float64Val)
+      of "<": return Value(kind: vkBool, boolVal: lv.float64Val < rv.float64Val)
+      of ">": return Value(kind: vkBool, boolVal: lv.float64Val > rv.float64Val)
+      of "<=": return Value(kind: vkBool, boolVal: lv.float64Val <= rv.float64Val)
+      of ">=": return Value(kind: vkBool, boolVal: lv.float64Val >= rv.float64Val)
+      else: discard
+    return Value(kind: vkNull)
+  of ekUnary:
+    if expr.unOp == "NOT":
+      let v = evalPredicateValue(table, values, expr.expr)
+      if v.kind == vkNull: return Value(kind: vkNull)
+      if v.kind in {vkBool, vkBoolTrue, vkBoolFalse}:
+        let b = v.boolVal or v.kind == vkBoolTrue
+        return Value(kind: vkBool, boolVal: not b)
+    return Value(kind: vkNull)
+  else:
+    return Value(kind: vkNull)
+
 proc shouldIncludeInIndex(table: TableMeta, idx: IndexMeta, values: seq[Value]): bool =
-  ## v0 partial-index support: only `<indexed_column> IS NOT NULL`.
   if idx.predicateSql.len == 0:
     return true
-  if idx.columns.len != 1:
-    return false
-  var ci = -1
-  for i, col in table.columns:
-    if col.name == idx.columns[0]:
-      ci = i
-      break
-  if ci < 0 or ci >= values.len:
-    return false
-  values[ci].kind != vkNull
+  let predExpr = parsePredicateExpr(idx.predicateSql, idx.table)
+  if predExpr == nil:
+    return true
+  let evalResult = evalPredicateValue(table, values, predExpr)
+  evalResult.kind in {vkBool, vkBoolTrue} and (evalResult.boolVal or evalResult.kind == vkBoolTrue)
 
 proc valueText(value: Value): string =
   var s = ""

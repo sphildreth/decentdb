@@ -394,6 +394,17 @@ proc typeCheckValue(col: Column, value: Value): Result[Value] =
        if ($abs(newVal.int64Val)).len > int(col.decPrecision):
           return err[Value](ERR_CONSTRAINT, "Precision overflow for DECIMAL")
        return ok(newVal)
+    if value.kind == vkFloat64:
+       # Convert float64 to scaled integer representation for DECIMAL storage
+       let scale = col.decScale
+       var multiplier: float64 = 1.0
+       for i in 0 ..< int(scale):
+         multiplier *= 10.0
+       let scaled = int64(value.float64Val * multiplier + (if value.float64Val >= 0: 0.5 else: -0.5))
+       let newVal = Value(kind: vkDecimal, int64Val: scaled, decimalScale: scale)
+       if ($abs(newVal.int64Val)).len > int(col.decPrecision):
+          return err[Value](ERR_CONSTRAINT, "Precision overflow for DECIMAL")
+       return ok(newVal)
     return err[Value](ERR_SQL, "Type mismatch: expected DECIMAL")
   of ctUuid:
     if value.kind == vkNull: return ok(value)
@@ -2172,44 +2183,82 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
           break
       output.add(rows.join("\n"))
     of skInsert:
-      let insertProfile =
-        if i < prepared.insertProfiles.len:
-          prepared.insertProfiles[i]
+      # INSERT INTO...SELECT: execute SELECT and insert each row
+      if bound.insertSelectQuery != nil:
+        let selPlanRes = plan(db.catalog, bound.insertSelectQuery)
+        if not selPlanRes.ok:
+          return err[seq[string]](selPlanRes.err.code, selPlanRes.err.message, selPlanRes.err.context)
+        let selRows = execPlan(db.pager, db.catalog, selPlanRes.value, params)
+        if not selRows.ok:
+          return err[seq[string]](selRows.err.code, selRows.err.message, selRows.err.context)
+        let tablePtr = db.catalog.getTablePtr(bound.insertTable)
+        if tablePtr == nil:
+          return err[seq[string]](ERR_SQL, "Table not found", bound.insertTable)
+        let table = tablePtr[]
+        let targetCols = if bound.insertColumns.len == 0:
+          table.columns.mapIt(it.name)
         else:
-          InsertWriteProfile()
-      if insertProfile.valid and insertProfile.isView:
-        let rowCount = int64(1 + bound.insertValueRows.len)
-        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
-        if not insteadRes.ok:
-          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
-      elif not insertProfile.valid and db.catalog.hasViewName(bound.insertTable):
-        let rowCount = int64(1 + bound.insertValueRows.len)
-        let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
-        if not insteadRes.ok:
-          return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+          bound.insertColumns
+        # Build column index for reordering
+        var colIndex = initTable[string, int]()
+        for ci, col in table.columns:
+          colIndex[col.name] = ci
+        for row in selRows.value:
+          var vals = newSeq[Value](table.columns.len)
+          for vi in 0 ..< vals.len:
+            vals[vi] = Value(kind: vkNull)
+          for ci, colName in targetCols:
+            if ci < row.values.len and colIndex.hasKey(colName):
+              let idx = colIndex[colName]
+              let checked = typeCheckValue(table.columns[idx], row.values[ci])
+              if not checked.ok:
+                return err[seq[string]](checked.err.code, checked.err.message, checked.err.context)
+              vals[idx] = checked.value
+          let insRes = insertRow(db.pager, db.catalog, bound.insertTable, vals)
+          if not insRes.ok:
+            return err[seq[string]](insRes.err.code, insRes.err.message, insRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, int64(selRows.value.len))
+        if not triggerRes.ok:
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
       else:
-        # Fast path: single-row insert, no RETURNING, no triggers → skip MultiInsertResult allocation
-        if insertProfile.valid and not insertProfile.hasInsertTriggers and bound.insertReturning.len == 0 and bound.insertValueRows.len == 0:
-          let singleRes = execInsertStatement(db, bound, params, wantRow = false, profile = insertProfile)
-          if not singleRes.ok:
-            return err[seq[string]](singleRes.err.code, singleRes.err.message, singleRes.err.context)
+        let insertProfile =
+          if i < prepared.insertProfiles.len:
+            prepared.insertProfiles[i]
+          else:
+            InsertWriteProfile()
+        if insertProfile.valid and insertProfile.isView:
+          let rowCount = int64(1 + bound.insertValueRows.len)
+          let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
+          if not insteadRes.ok:
+            return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
+        elif not insertProfile.valid and db.catalog.hasViewName(bound.insertTable):
+          let rowCount = int64(1 + bound.insertValueRows.len)
+          let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
+          if not insteadRes.ok:
+            return err[seq[string]](insteadRes.err.code, insteadRes.err.message, insteadRes.err.context)
         else:
-          let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0, profile = insertProfile)
-          if not multiRes.ok:
-            return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
-          if not insertProfile.valid or insertProfile.hasInsertTriggers:
-            let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
-            if not triggerRes.ok:
-              return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
-          if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
-            let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
-            if not projectedRes.ok:
-              return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
-            for row in projectedRes.value:
-              var parts: seq[string] = @[]
-              for v in row.values:
-                parts.add($v)
-              output.add(parts.join("|"))
+          # Fast path: single-row insert, no RETURNING, no triggers → skip MultiInsertResult allocation
+          if insertProfile.valid and not insertProfile.hasInsertTriggers and bound.insertReturning.len == 0 and bound.insertValueRows.len == 0:
+            let singleRes = execInsertStatement(db, bound, params, wantRow = false, profile = insertProfile)
+            if not singleRes.ok:
+              return err[seq[string]](singleRes.err.code, singleRes.err.message, singleRes.err.context)
+          else:
+            let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0, profile = insertProfile)
+            if not multiRes.ok:
+              return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+            if not insertProfile.valid or insertProfile.hasInsertTriggers:
+              let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
+              if not triggerRes.ok:
+                return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+            if bound.insertReturning.len > 0 and multiRes.value.rows.len > 0:
+              let projectedRes = projectRows(multiRes.value.rows, bound.insertReturning, params)
+              if not projectedRes.ok:
+                return err[seq[string]](projectedRes.err.code, projectedRes.err.message, projectedRes.err.context)
+              for row in projectedRes.value:
+                var parts: seq[string] = @[]
+                for v in row.values:
+                  parts.add($v)
+                output.add(parts.join("|"))
     of skUpdate:
       let updateProfile =
         if i < prepared.updateProfiles.len:
@@ -2709,7 +2758,42 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skInsert:
-      if db.catalog.hasViewName(bound.insertTable):
+      if bound.insertSelectQuery != nil:
+        let selPlanRes = plan(db.catalog, bound.insertSelectQuery)
+        if not selPlanRes.ok:
+          return err[seq[string]](selPlanRes.err.code, selPlanRes.err.message, selPlanRes.err.context)
+        let selRows = execPlan(db.pager, db.catalog, selPlanRes.value, params)
+        if not selRows.ok:
+          return err[seq[string]](selRows.err.code, selRows.err.message, selRows.err.context)
+        let tablePtr = db.catalog.getTablePtr(bound.insertTable)
+        if tablePtr == nil:
+          return err[seq[string]](ERR_SQL, "Table not found", bound.insertTable)
+        let table = tablePtr[]
+        let targetCols = if bound.insertColumns.len == 0:
+          table.columns.mapIt(it.name)
+        else:
+          bound.insertColumns
+        var colIndex = initTable[string, int]()
+        for ci, col in table.columns:
+          colIndex[col.name] = ci
+        for row in selRows.value:
+          var vals = newSeq[Value](table.columns.len)
+          for vi in 0 ..< vals.len:
+            vals[vi] = Value(kind: vkNull)
+          for ci, colName in targetCols:
+            if ci < row.values.len and colIndex.hasKey(colName):
+              let idx = colIndex[colName]
+              let checked = typeCheckValue(table.columns[idx], row.values[ci])
+              if not checked.ok:
+                return err[seq[string]](checked.err.code, checked.err.message, checked.err.context)
+              vals[idx] = checked.value
+          let insRes = insertRow(db.pager, db.catalog, bound.insertTable, vals)
+          if not insRes.ok:
+            return err[seq[string]](insRes.err.code, insRes.err.message, insRes.err.context)
+        let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, int64(selRows.value.len))
+        if not triggerRes.ok:
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+      elif db.catalog.hasViewName(bound.insertTable):
         let rowCount = int64(1 + bound.insertValueRows.len)
         let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, if bound.insertValues.len > 0: rowCount else: 0)
         if not insteadRes.ok:
@@ -3349,7 +3433,44 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   of skInsert:
     if bound.insertReturning.len > 0:
       return err[int64](ERR_SQL, "INSERT RETURNING is not supported by non-select execution API")
-    if db.catalog.hasViewName(bound.insertTable):
+    if bound.insertSelectQuery != nil:
+      let selPlanRes = plan(db.catalog, bound.insertSelectQuery)
+      if not selPlanRes.ok:
+        return err[int64](selPlanRes.err.code, selPlanRes.err.message, selPlanRes.err.context)
+      let selRows = execPlan(db.pager, db.catalog, selPlanRes.value, params)
+      if not selRows.ok:
+        return err[int64](selRows.err.code, selRows.err.message, selRows.err.context)
+      let tablePtr = db.catalog.getTablePtr(bound.insertTable)
+      if tablePtr == nil:
+        return err[int64](ERR_SQL, "Table not found", bound.insertTable)
+      let table = tablePtr[]
+      let targetCols = if bound.insertColumns.len == 0:
+        table.columns.mapIt(it.name)
+      else:
+        bound.insertColumns
+      var colIndex = initTable[string, int]()
+      for ci, col in table.columns:
+        colIndex[col.name] = ci
+      affected = 0
+      for row in selRows.value:
+        var vals = newSeq[Value](table.columns.len)
+        for vi in 0 ..< vals.len:
+          vals[vi] = Value(kind: vkNull)
+        for ci, colName in targetCols:
+          if ci < row.values.len and colIndex.hasKey(colName):
+            let idx = colIndex[colName]
+            let checked = typeCheckValue(table.columns[idx], row.values[ci])
+            if not checked.ok:
+              return err[int64](checked.err.code, checked.err.message, checked.err.context)
+            vals[idx] = checked.value
+        let insRes = insertRow(db.pager, db.catalog, bound.insertTable, vals)
+        if not insRes.ok:
+          return err[int64](insRes.err.code, insRes.err.message, insRes.err.context)
+        affected += 1
+      let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
+      if not triggerRes.ok:
+        return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
+    elif db.catalog.hasViewName(bound.insertTable):
       affected = if bound.insertValues.len > 0: int64(1 + bound.insertValueRows.len) else: 0
       let insteadRes = executeInsteadTriggers(db, bound.insertTable, TriggerEventInsertMask, affected)
       if not insteadRes.ok:

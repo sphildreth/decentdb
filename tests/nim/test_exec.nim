@@ -134,7 +134,7 @@ suite "Exec Plans":
     check rowVals.len == 5
     check rowVals[0].kind == vkInt64
     check rowVals[0].int64Val == 1
-    check rowVals[1].float64Val == 40.0   # SUM(10 + 30)
+    check rowVals[1].int64Val == 40       # SUM(10 + 30)
     check rowVals[2].float64Val == 20.0   # AVG(10, 30)
     check rowVals[3].int64Val == 10       # MIN(10, 30)
     check rowVals[4].int64Val == 30       # MAX(10, 30)

@@ -323,15 +323,15 @@ suite "Binder":
 
     let stmtPartialBadExpr = parseSingle("CREATE INDEX parent_id_partial_bad ON parent (id) WHERE id > 0")
     let bindPartialBadExpr = bindStatement(db.catalog, stmtPartialBadExpr)
-    check not bindPartialBadExpr.ok
+    check bindPartialBadExpr.ok
 
     let stmtPartialBadUnique = parseSingle("CREATE UNIQUE INDEX parent_id_partial_uq ON parent (id) WHERE id IS NOT NULL")
     let bindPartialBadUnique = bindStatement(db.catalog, stmtPartialBadUnique)
-    check not bindPartialBadUnique.ok
+    check bindPartialBadUnique.ok
 
     let stmtPartialBadMulti = parseSingle("CREATE INDEX parent_multi_partial ON parent (id, id) WHERE id IS NOT NULL")
     let bindPartialBadMulti = bindStatement(db.catalog, stmtPartialBadMulti)
-    check not bindPartialBadMulti.ok
+    check bindPartialBadMulti.ok
 
     let stmtExprOk = parseSingle("CREATE INDEX parent_id_txt_expr ON parent ((CAST(id AS TEXT)))")
     let bindExprOk = bindStatement(db.catalog, stmtExprOk)

@@ -43,7 +43,8 @@ proc checkLiteralType(expr: Expr, expected: ColumnType, columnName: string): Res
     # Allow compatible coercions that typeCheckValue will handle at runtime.
     let compatible =
       (expected == ctInt64 and actual in {ctBool, ctFloat64}) or
-      (expected == ctFloat64 and actual == ctInt64) or
+      (expected == ctFloat64 and actual in {ctInt64, ctDecimal}) or
+      (expected == ctDecimal and actual in {ctFloat64, ctInt64}) or
       (expected == ctBool and actual == ctInt64)
     if not compatible:
       return err[Void](ERR_SQL, "Type mismatch for column", columnName)
@@ -568,7 +569,7 @@ proc validateCheckExpr(expr: Expr): Result[Void] =
     return validateCheckExpr(expr.right)
   of ekFunc:
     let fn = expr.funcName.toUpperAscii()
-    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
       return err[Void](ERR_SQL, "CHECK expression cannot use aggregate functions", expr.funcName)
     if fn == "EXISTS" or fn == "SCALAR_SUBQUERY":
       return err[Void](ERR_SQL, "CHECK expression cannot use subqueries")
@@ -1525,6 +1526,40 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     table.columns.mapIt(it.name)
   else:
     stmt.insertColumns
+
+  # INSERT INTO...SELECT: bind the inner SELECT and validate column count
+  if stmt.insertSelectQuery != nil:
+    let selBind = bindStatement(catalog, stmt.insertSelectQuery)
+    if not selBind.ok:
+      return err[Statement](selBind.err.code, selBind.err.message, selBind.err.context)
+    stmt.insertSelectQuery = selBind.value
+    # Validate target columns exist
+    var colIndex = initTable[string, int]()
+    for i, col in table.columns:
+      colIndex[col.name] = i
+    for colName in targetCols:
+      if not colIndex.hasKey(colName):
+        return err[Statement](ERR_SQL, "Unknown column", colName)
+    # Validate SELECT column count matches target columns
+    if stmt.insertSelectQuery.selectItems.len > 0:
+      var selectColCount = 0
+      for item in stmt.insertSelectQuery.selectItems:
+        if item.isStar:
+          # Star expands to all columns from the source table
+          if stmt.insertSelectQuery.fromTable.len > 0:
+            let srcTable = catalog.getTable(stmt.insertSelectQuery.fromTable)
+            if srcTable.ok:
+              selectColCount += srcTable.value.columns.len
+            else:
+              selectColCount += 1
+          else:
+            selectColCount += 1
+        else:
+          selectColCount += 1
+      if selectColCount != targetCols.len:
+        return err[Statement](ERR_SQL, "Column count mismatch", stmt.insertTable)
+    return ok(stmt)
+
   if stmt.insertValues.len != targetCols.len:
     return err[Statement](ERR_SQL, "Column count mismatch", stmt.insertTable)
   var colIndex = initTable[string, int]()
@@ -1878,25 +1913,12 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](ERR_SQL, "Trigram index cannot be UNIQUE", stmt.columnNames[0])
   if stmt.indexPredicate != nil:
     if stmt.indexKind != sql.ikBtree:
-      return err[Statement](ERR_SQL, "Partial indexes are supported only for BTREE in 0.x")
-    if stmt.columnNames.len != 1:
-      return err[Statement](ERR_SQL, "Partial indexes support only single-column BTREE indexes in 0.x")
-    if stmt.unique:
-      return err[Statement](ERR_SQL, "UNIQUE partial indexes are not supported in 0.x")
+      return err[Statement](ERR_SQL, "Partial indexes are supported only for BTREE")
     var map = initTable[string, TableMeta]()
     map[stmt.indexTableName] = tableRes.value
     let predBind = bindExpr(map, stmt.indexPredicate)
     if not predBind.ok:
       return err[Statement](predBind.err.code, predBind.err.message, predBind.err.context)
-    let p = stmt.indexPredicate
-    let supported =
-      p.kind == ekBinary and p.op == "IS NOT" and
-      p.left != nil and p.left.kind == ekColumn and
-      (p.left.table.len == 0 or p.left.table == stmt.indexTableName) and
-      p.left.name == stmt.columnNames[0] and
-      p.right != nil and p.right.kind == ekLiteral and p.right.value.kind == svNull
-    if not supported:
-      return err[Statement](ERR_SQL, "Partial index predicate must be `<indexed_column> IS NOT NULL` in 0.x")
   ok(stmt)
 
 proc validateDependentViewsForReplacement(catalog: Catalog, candidate: ViewMeta): Result[Void] =
