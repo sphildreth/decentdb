@@ -5,6 +5,29 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-02-21
+
+### Added
+- **SQL Engine**: `GROUP_CONCAT` and `STRING_AGG` aggregate functions.
+- **SQL Engine**: `INSERT INTO ... SELECT` statement support across all execution paths (prepared, non-prepared, non-select API).
+- **SQL Engine**: `IN (subquery)` predicate support (e.g. `WHERE id IN (SELECT id FROM other_table)`).
+- **SQL Engine**: `printf()` scalar function.
+- **SQL Engine**: General filtered/partial index support — predicates beyond `IS NOT NULL` are now allowed, including `UNIQUE` filtered indexes and complex `WHERE` clauses.
+- .NET: `SqliteCompatibilityTests` — 18 SQL-level compatibility tests covering patterns used by Melodee (GROUP_CONCAT, INSERT INTO...SELECT, IN subquery, printf, filtered indexes, etc.).
+- .NET: `EfFunctionsLikeTests` — EF Core `EF.Functions.Like()` integration test.
+
+### Fixed
+- **SQL Engine**: SUM now preserves input type — returns `INT64` when all accumulated values are integers, `FLOAT64` when any float is present. Previously always returned `FLOAT64`.
+- **SQL Engine**: SUM/AVG/MIN/MAX on empty result sets now return `NULL` per SQL standard. Previously returned `0`/`0.0`/default values. COUNT on empty sets correctly returns `0`.
+- **SQL Engine**: AND/OR operators now implement SQL three-valued logic — `FALSE AND NULL` correctly evaluates to `FALSE`, and `TRUE OR NULL` correctly evaluates to `TRUE`. Previously any `NULL` operand propagated `NULL` regardless.
+- **SQL Engine**: `IS`/`IS NOT` operators now support `IS TRUE`, `IS FALSE`, `IS NOT TRUE`, and `IS NOT FALSE` in addition to `IS NULL`/`IS NOT NULL`.
+- **SQL Engine**: `INSERT INTO ... SELECT` now correctly fires AFTER INSERT triggers. Previously triggers were only executed for regular INSERT statements.
+- **SQL Engine**: Float-to-DECIMAL coercion in INSERT/UPDATE — float literals (e.g. `3.14`) are now correctly coerced to DECIMAL type when the target column has DECIMAL precision/scale.
+- **SQL Engine**: Filtered index predicate evaluator rewritten to correctly evaluate rows against arbitrary `WHERE` clauses, fixing false negatives in index maintenance.
+- **SQL Engine**: Filtered index predicate cache now defensively initialized per thread, consistent with other threadvar patterns.
+- **SQL Engine**: `GROUP_CONCAT`/`STRING_AGG` now correctly recognized by the query planner as aggregate functions, preventing "evaluated elsewhere" errors when used without `GROUP BY`.
+- .NET: EF Core `DecentDBTypeMappingSource` now respects precision and scale from model configuration for DECIMAL columns, instead of always using `DECIMAL(18,4)`.
+
 ## [1.1.3] - 2026-02-18
 
 ### Fixed

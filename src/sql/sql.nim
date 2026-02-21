@@ -212,6 +212,7 @@ type Statement* = ref object
     insertColumns*: seq[string]
     insertValues*: seq[Expr]
     insertValueRows*: seq[seq[Expr]]  # additional rows for multi-row INSERT
+    insertSelectQuery*: Statement     # for INSERT INTO...SELECT
     insertConflictAction*: InsertConflictAction
     insertConflictTargetCols*: seq[string]
     insertConflictTargetConstraint*: string
@@ -661,6 +662,20 @@ proc parseCaseExpr(node: JsonNode): Result[Expr] =
 
 proc parseSubLink(node: JsonNode): Result[Expr] =
   let linkType = nodeStringOr(node, "subLinkType", "")
+  if linkType == "ANY_SUBLINK":
+    # IN (subquery): parse test expression and subquery
+    let testExprNode = nodeGet(node, "testexpr")
+    let testRes = parseExprNode(testExprNode)
+    if not testRes.ok:
+      return err[Expr](testRes.err.code, testRes.err.message, testRes.err.context)
+    let subselectNode = nodeGet(node, "subselect")
+    let stmtRes = parseStatementNode(subselectNode)
+    if not stmtRes.ok:
+      return err[Expr](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
+    if stmtRes.value.kind != skSelect:
+      return err[Expr](ERR_SQL, "Subquery requires SELECT statement")
+    let sqlText = selectToCanonicalSql(stmtRes.value)
+    return ok(Expr(kind: ekFunc, funcName: "IN_SUBQUERY", args: @[testRes.value, Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: sqlText))], isStar: false))
   if linkType != "EXISTS_SUBLINK" and linkType != "EXPR_SUBLINK":
     return err[Expr](ERR_SQL, "Only EXISTS and scalar subqueries are supported")
   let subselectNode = nodeGet(node, "subselect")
@@ -1025,6 +1040,7 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
   let selectNode = nodeGet(node, "selectStmt")
   var values: seq[Expr] = @[]
   var extraRows: seq[seq[Expr]] = @[]
+  var insertSelect: Statement = nil
   if nodeHas(selectNode, "SelectStmt"):
     let selectStmt = selectNode["SelectStmt"]
     let valuesLists = nodeGet(selectStmt, "valuesLists")
@@ -1045,6 +1061,12 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
           values = rowValues
         else:
           extraRows.add(rowValues)
+    elif nodeHas(selectStmt, "targetList") or nodeHas(selectStmt, "fromClause"):
+      # INSERT INTO...SELECT: parse the inner SELECT statement
+      let selRes = parseSelectStmt(selectStmt)
+      if not selRes.ok:
+        return err[Statement](selRes.err.code, selRes.err.message, selRes.err.context)
+      insertSelect = selRes.value
 
   var conflictAction = icaNone
   var conflictTargetCols: seq[string] = @[]
@@ -1124,6 +1146,7 @@ proc parseInsertStmt(node: JsonNode): Result[Statement] =
     insertColumns: cols,
     insertValues: values,
     insertValueRows: extraRows,
+    insertSelectQuery: insertSelect,
     insertConflictAction: conflictAction,
     insertConflictTargetCols: conflictTargetCols,
     insertConflictTargetConstraint: conflictTargetConstraint,

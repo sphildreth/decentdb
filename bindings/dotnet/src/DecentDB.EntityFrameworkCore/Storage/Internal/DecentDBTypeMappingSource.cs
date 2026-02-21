@@ -129,6 +129,13 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         var clrType = Nullable.GetUnderlyingType(mappingInfo.ClrType ?? typeof(object)) ?? mappingInfo.ClrType;
         if (clrType != null && _clrMappings.TryGetValue(clrType, out var clrMapping))
         {
+            // For decimal types, respect precision/scale from EF Core model configuration
+            // (e.g. HavePrecision, HasPrecision, or HasColumnType with precision)
+            if (clrType == typeof(decimal))
+            {
+                return CreateDecimalMapping(mappingInfo, mappingInfo.StoreTypeName);
+            }
+
             return clrMapping;
         }
 
@@ -138,11 +145,66 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
             var normalized = NormalizeStoreTypeName(storeType);
             if (_storeMappings.TryGetValue(normalized, out var storeMapping))
             {
+                // For DECIMAL/NUMERIC store types, respect precision/scale from store type name or mappingInfo
+                if (normalized is "DECIMAL" or "NUMERIC")
+                {
+                    return CreateDecimalMapping(mappingInfo, mappingInfo.StoreTypeName ?? storeType);
+                }
+
                 return storeMapping;
             }
         }
 
         return null;
+    }
+
+    private static DecimalTypeMapping CreateDecimalMapping(
+        in RelationalTypeMappingInfo mappingInfo,
+        string? storeTypeName)
+    {
+        const int defaultPrecision = 18;
+        const int defaultScale = 4;
+
+        var precision = mappingInfo.Precision;
+        var scale = mappingInfo.Scale;
+
+        // If precision/scale not provided by EF Core model, try parsing from store type name
+        if (!precision.HasValue && !scale.HasValue && !string.IsNullOrWhiteSpace(storeTypeName))
+        {
+            (precision, scale) = ParsePrecisionScale(storeTypeName);
+        }
+
+        var p = precision ?? defaultPrecision;
+        var s = scale ?? defaultScale;
+
+        return new DecimalTypeMapping($"DECIMAL({p},{s})", DbType.Decimal, precision: p, scale: s);
+    }
+
+    private static (int? precision, int? scale) ParsePrecisionScale(string storeTypeName)
+    {
+        var openParen = storeTypeName.IndexOf('(');
+        var closeParen = storeTypeName.IndexOf(')');
+        if (openParen < 0 || closeParen <= openParen)
+        {
+            return (null, null);
+        }
+
+        var inner = storeTypeName.AsSpan()[(openParen + 1)..closeParen];
+        var commaIdx = inner.IndexOf(',');
+
+        if (commaIdx >= 0
+            && int.TryParse(inner[..commaIdx].Trim(), out var p)
+            && int.TryParse(inner[(commaIdx + 1)..].Trim(), out var s))
+        {
+            return (p, s);
+        }
+
+        if (int.TryParse(inner.Trim(), out var pOnly))
+        {
+            return (pOnly, null);
+        }
+
+        return (null, null);
     }
 
     private static string NormalizeStoreTypeName(string storeTypeName)

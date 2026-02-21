@@ -712,7 +712,7 @@ proc exprContainsScalarSubquery*(expr: Expr): bool =
   if expr == nil: return false
   case expr.kind
   of ekFunc:
-    if expr.funcName == "SCALAR_SUBQUERY": return true
+    if expr.funcName == "SCALAR_SUBQUERY" or expr.funcName == "IN_SUBQUERY": return true
     for arg in expr.args:
       if exprContainsScalarSubquery(arg): return true
   of ekBinary:
@@ -1905,7 +1905,7 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     when defined(decentdbDebugLogging):
       echo "DEBUG ekFunc: " & expr.funcName
     let name = expr.funcName.toUpperAscii()
-    if name in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+    if name in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
       return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
 
     if name == "GEN_RANDOM_UUID":
@@ -2164,6 +2164,59 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return ok(textValue(valueToString(strRes.value).replace(
         valueToString(fromRes.value), valueToString(toRes.value))))
 
+    if name == "PRINTF":
+      if expr.args.len < 1:
+        return err[Value](ERR_SQL, "PRINTF requires at least a format argument")
+      let fmtRes = evalExpr(row, expr.args[0], params)
+      if not fmtRes.ok:
+        return err[Value](fmtRes.err.code, fmtRes.err.message, fmtRes.err.context)
+      if fmtRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var argVals: seq[Value] = @[]
+      for ai in 1 ..< expr.args.len:
+        let argRes = evalExpr(row, expr.args[ai], params)
+        if not argRes.ok:
+          return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+        argVals.add(argRes.value)
+      let fmt = valueToString(fmtRes.value)
+      var formatted = ""
+      var argIdx = 0
+      var i = 0
+      while i < fmt.len:
+        if fmt[i] == '%' and i + 1 < fmt.len:
+          let spec = fmt[i + 1]
+          case spec
+          of 's':
+            if argIdx < argVals.len:
+              formatted.add(valueToString(argVals[argIdx]))
+              argIdx += 1
+          of 'd', 'i':
+            if argIdx < argVals.len:
+              let v = argVals[argIdx]
+              case v.kind
+              of vkInt64: formatted.add($v.int64Val)
+              of vkFloat64: formatted.add($int64(v.float64Val))
+              else: formatted.add(valueToString(v))
+              argIdx += 1
+          of 'f':
+            if argIdx < argVals.len:
+              let v = argVals[argIdx]
+              case v.kind
+              of vkFloat64: formatted.add($v.float64Val)
+              of vkInt64: formatted.add($float64(v.int64Val))
+              else: formatted.add(valueToString(v))
+              argIdx += 1
+          of '%':
+            formatted.add('%')
+          else:
+            formatted.add('%')
+            formatted.add(spec)
+          i += 2
+        else:
+          formatted.add(fmt[i])
+          i += 1
+      return ok(textValue(formatted))
+
     if name in ["SUBSTR", "SUBSTRING"]:
       if expr.args.len < 2 or expr.args.len > 3:
         return err[Value](ERR_SQL, name & " requires 2 or 3 arguments")
@@ -2347,6 +2400,53 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if not execRes.ok:
         return err[Value](execRes.err.code, execRes.err.message, execRes.err.context)
       return ok(Value(kind: vkBool, boolVal: execRes.value.len > 0))
+
+    if name == "IN_SUBQUERY":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "IN_SUBQUERY requires test expression and subquery")
+      let testRes = evalExpr(row, expr.args[0], params)
+      if not testRes.ok:
+        return err[Value](testRes.err.code, testRes.err.message, testRes.err.context)
+      if testRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let subSqlRes = evalExpr(row, expr.args[1], params)
+      if not subSqlRes.ok:
+        return err[Value](subSqlRes.err.code, subSqlRes.err.message, subSqlRes.err.context)
+      if subSqlRes.value.kind == vkNull:
+        return ok(Value(kind: vkBool, boolVal: false))
+      if gEvalContextDepth <= 0 or gEvalPager == nil or gEvalCatalog == nil:
+        return err[Value](ERR_INTERNAL, "IN_SUBQUERY requires execution context")
+      let sqlText = valueToString(subSqlRes.value)
+      let parseRes = parseSql(sqlText)
+      if not parseRes.ok:
+        return err[Value](parseRes.err.code, parseRes.err.message, parseRes.err.context)
+      if parseRes.value.statements.len != 1:
+        return err[Value](ERR_SQL, "IN subquery must contain one SELECT")
+      let stmt = parseRes.value.statements[0]
+      if stmt.kind != skSelect:
+        return err[Value](ERR_SQL, "IN subquery requires SELECT statement")
+      let innerTables = collectInnerTables(stmt)
+      let substituted = substituteCorrelatedStmt(stmt, innerTables, row)
+      let bindRes = bindStatement(gEvalCatalog, substituted)
+      if not bindRes.ok:
+        return err[Value](bindRes.err.code, bindRes.err.message, bindRes.err.context)
+      let planRes = plan(gEvalCatalog, bindRes.value)
+      if not planRes.ok:
+        return err[Value](planRes.err.code, planRes.err.message, planRes.err.context)
+      let execRes = execPlan(gEvalPager, gEvalCatalog, planRes.value, params)
+      if not execRes.ok:
+        return err[Value](execRes.err.code, execRes.err.message, execRes.err.context)
+      var sawNull = false
+      for subRow in execRes.value:
+        if subRow.values.len > 0:
+          let v = subRow.values[0]
+          if v.kind == vkNull:
+            sawNull = true
+          elif v == testRes.value:
+            return ok(Value(kind: vkBool, boolVal: true))
+      if sawNull:
+        return ok(Value(kind: vkNull))
+      return ok(Value(kind: vkBool, boolVal: false))
 
     if name == "SCALAR_SUBQUERY":
       if expr.args.len != 1:
@@ -2673,14 +2773,17 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
 type AggState = object
   count: int64
   sum: float64
+  sumIsInt: bool  # true when all accumulated values were integers
   min: Value
   max: Value
   initialized: bool
+  concatValues: seq[string]  # accumulated values for GROUP_CONCAT/STRING_AGG
 
 type AggSpec = object
   ## Describes one aggregate sub-expression found in the SELECT list.
   funcName: string
   argExpr: Expr  # nil for COUNT(*)
+  separatorExpr: Expr  # second arg for GROUP_CONCAT/STRING_AGG
   itemIdx: int   # which SelectItem this belongs to
 
 proc collectAggSpecs(items: seq[SelectItem]): seq[AggSpec] =
@@ -2691,9 +2794,10 @@ proc collectAggSpecs(items: seq[SelectItem]): seq[AggSpec] =
     case expr.kind
     of ekFunc:
       let fn = expr.funcName.toUpperAscii()
-      if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+      if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
         let arg = if expr.args.len > 0: expr.args[0] else: nil
-        specs.add(AggSpec(funcName: fn, argExpr: arg, itemIdx: itemIdx))
+        let sep = if expr.args.len > 1: expr.args[1] else: nil
+        specs.add(AggSpec(funcName: fn, argExpr: arg, separatorExpr: sep, itemIdx: itemIdx))
         return  # don't recurse into aggregate args
       for a in expr.args:
         walk(a, itemIdx)
@@ -2713,7 +2817,7 @@ proc substituteAggResult(expr: Expr, aggValues: Table[int, Value], aggIdx: var i
   case expr.kind
   of ekFunc:
     let fn = expr.funcName.toUpperAscii()
-    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
       let val = aggValues.getOrDefault(aggIdx, Value(kind: vkNull))
       aggIdx.inc
       return Expr(kind: ekLiteral, value: valueToSqlLiteral(val))
@@ -2753,6 +2857,8 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
     
     if not groups.hasKey(keyParts):
       var initStates = newSeq[AggState](aggSpecs.len)
+      for idx in 0 ..< initStates.len:
+        initStates[idx].sumIsInt = true
       groups[keyParts] = initStates
       groupRows[keyParts] = row
     
@@ -2769,18 +2875,25 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
               if spec.funcName == "SUM" or spec.funcName == "AVG":
                 let addVal = if val.kind == vkFloat64: val.float64Val else: float(val.int64Val)
                 states[i].sum += addVal
+                if val.kind == vkFloat64:
+                  states[i].sumIsInt = false
               if spec.funcName == "MIN":
                 if not states[i].initialized or compareValues(val, states[i].min) < 0:
                   states[i].min = val
               if spec.funcName == "MAX":
                 if not states[i].initialized or compareValues(val, states[i].max) > 0:
                   states[i].max = val
+              if spec.funcName in ["GROUP_CONCAT", "STRING_AGG"]:
+                states[i].concatValues.add(valueToString(val))
               states[i].initialized = true
 
   
   if rows.len == 0 and groupBy.len == 0:
     # Scalar aggregate on empty set
-    groups[newSeq[Value]()] = newSeq[AggState](aggSpecs.len)
+    var emptyStates = newSeq[AggState](aggSpecs.len)
+    for idx in 0 ..< emptyStates.len:
+      emptyStates[idx].sumIsInt = true
+    groups[newSeq[Value]()] = emptyStates
     groupRows[newSeq[Value]()] = Row(columns: @[], values: @[])
 
   var resultRows: seq[Row] = @[]
@@ -2793,14 +2906,42 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
       of "COUNT":
         aggValues[i] = Value(kind: vkInt64, int64Val: state.count)
       of "SUM":
-        aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum)
+        if not state.initialized:
+          aggValues[i] = Value(kind: vkNull)
+        elif state.sumIsInt:
+          aggValues[i] = Value(kind: vkInt64, int64Val: int64(state.sum))
+        else:
+          aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum)
       of "AVG":
-        let avg = if state.count == 0: 0.0 else: state.sum / float(state.count)
-        aggValues[i] = Value(kind: vkFloat64, float64Val: avg)
+        if not state.initialized:
+          aggValues[i] = Value(kind: vkNull)
+        else:
+          aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum / float(state.count))
       of "MIN":
-        aggValues[i] = state.min
+        if not state.initialized:
+          aggValues[i] = Value(kind: vkNull)
+        else:
+          aggValues[i] = state.min
       of "MAX":
-        aggValues[i] = state.max
+        if not state.initialized:
+          aggValues[i] = Value(kind: vkNull)
+        else:
+          aggValues[i] = state.max
+      of "GROUP_CONCAT", "STRING_AGG":
+        if state.concatValues.len == 0:
+          aggValues[i] = Value(kind: vkNull)
+        else:
+          var separator = ","
+          if spec.separatorExpr != nil:
+            let sepRes = evalExpr(groupRows.getOrDefault(key, Row()), spec.separatorExpr, params)
+            if sepRes.ok and sepRes.value.kind in {vkText, vkBlob}:
+              separator = valueToString(sepRes.value)
+            elif sepRes.ok and sepRes.value.kind != vkNull:
+              separator = valueToString(sepRes.value)
+          let joined = state.concatValues.join(separator)
+          var bytes: seq[byte] = @[]
+          for c in joined: bytes.add(byte(c))
+          aggValues[i] = Value(kind: vkText, bytes: bytes)
       else:
         aggValues[i] = Value(kind: vkNull)
 
@@ -2810,7 +2951,7 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
     for item in items:
       let substituted = substituteAggResult(item.expr, aggValues, aggIdx)
       let colName = if item.alias.len > 0: item.alias
-                    elif item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX"]:
+                    elif item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
                       item.expr.funcName.toLowerAscii()
                     elif item.expr != nil and item.expr.kind == ekColumn:
                       item.expr.name

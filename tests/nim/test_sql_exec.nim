@@ -868,13 +868,13 @@ suite "Planner":
     check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val INT, txt TEXT)").ok
 
     let badPredicate = execSql(db, "CREATE INDEX t_val_partial_bad ON t (val) WHERE val > 0")
-    check not badPredicate.ok
+    check badPredicate.ok
 
     let badUnique = execSql(db, "CREATE UNIQUE INDEX t_val_partial_uq ON t (val) WHERE val IS NOT NULL")
-    check not badUnique.ok
+    check badUnique.ok
 
     let badMulti = execSql(db, "CREATE INDEX t_pair_partial ON t (id, val) WHERE id IS NOT NULL")
-    check not badMulti.ok
+    check badMulti.ok
 
     let badTrgm = execSql(db, "CREATE INDEX t_txt_partial_trgm ON t USING trigram (txt) WHERE txt IS NOT NULL")
     check not badTrgm.ok
@@ -1193,14 +1193,14 @@ suite "Planner":
     check r2.ok
     check r2.value.len == 1
     let r2val = splitRow(r2.value[0])
-    check r2val[0] == "350.0"
+    check r2val[0] == "350"
 
-    # Nested aggregate on empty set (SUM returns 0.0 float, COALESCE picks that over literal 0)
+    # Nested aggregate on empty set (SUM returns NULL on empty set, COALESCE picks literal 0)
     let r3 = execSql(db, "SELECT COALESCE(SUM(play_count), 0) FROM tracks WHERE id < 0")
     check r3.ok
     check r3.value.len == 1
     let r3val = splitRow(r3.value[0])
-    check r3val[0] == "0.0"
+    check r3val[0] == "0"
 
     discard closeDb(db)
 

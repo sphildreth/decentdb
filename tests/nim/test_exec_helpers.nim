@@ -109,10 +109,10 @@ suite "Exec Helpers Extended":
     for row in agg.value:
       let sumIdx = columnIndex(row, "", "sum")
       check sumIdx.ok
-      let sumVal = row.values[sumIdx.value].float64Val
-      if sumVal == 5.0:
+      let sumVal = row.values[sumIdx.value].int64Val
+      if sumVal == 5:
         sawSum5 = true
-      elif sumVal == 1.0:
+      elif sumVal == 1:
         sawSum1 = true
     check sawSum5 and sawSum1
 
