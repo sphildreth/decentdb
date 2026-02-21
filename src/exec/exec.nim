@@ -1406,6 +1406,8 @@ proc evalLiteral(value: SqlValue): Value =
     for ch in value.strVal:
       bytes.add(byte(ch))
     Value(kind: vkText, bytes: bytes)
+  of svBlob:
+    Value(kind: vkBlob, bytes: value.blobVal)
   of svParam: Value(kind: vkNull)
 
 proc textValue(text: string): Value =
@@ -1633,7 +1635,7 @@ proc valueToSqlLiteral(v: Value): SqlValue =
   of vkText, vkTextOverflow, vkTextCompressed, vkTextCompressedOverflow:
     SqlValue(kind: svString, strVal: valueToString(v))
   of vkBlob, vkBlobOverflow, vkBlobCompressed, vkBlobCompressedOverflow:
-    SqlValue(kind: svString, strVal: valueToString(v))
+    SqlValue(kind: svBlob, blobVal: v.bytes)
 
 proc collectInnerTables(stmt: Statement): seq[string] =
   ## Collect all table names/aliases from a SELECT's FROM clause.

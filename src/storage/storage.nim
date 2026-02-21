@@ -340,6 +340,7 @@ proc evalPredicateValue(table: TableMeta, values: seq[Value], expr: Expr): Value
       for c in expr.value.strVal: bytes.add(byte(c))
       return Value(kind: vkText, bytes: bytes)
     of svBool: return Value(kind: vkBool, boolVal: expr.value.boolVal)
+    of svBlob: return Value(kind: vkBlob, bytes: expr.value.blobVal)
     of svParam: return Value(kind: vkNull)
   of ekColumn:
     for i, col in table.columns:

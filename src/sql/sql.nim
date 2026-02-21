@@ -1,6 +1,7 @@
 import tables
 import json
 import strutils
+import sequtils
 import ../errors
 import ./pg_query_ffi
 
@@ -11,6 +12,7 @@ type SqlValueKind* = enum
   svString
   svBool
   svParam
+  svBlob
 
 type SqlValue* = object
   kind*: SqlValueKind
@@ -19,6 +21,7 @@ type SqlValue* = object
   strVal*: string
   boolVal*: bool
   paramIndex*: int
+  blobVal*: seq[byte]
 
 type ExprKind* = enum
   ekLiteral
@@ -358,6 +361,18 @@ proc parseAConst*(node: JsonNode): Result[Expr] =
       return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: boolNode["boolval"].getBool)))
     # pg_query omits boolval field when false (protobuf default); empty object means false.
     return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: false)))
+  if nodeHas(node, "bsval"):
+    # Hex blob literal: X'DEADBEEF' → bsval: "xDEADBEEF"
+    let bsNode = node["bsval"]
+    let hexStr = if nodeHas(bsNode, "bsval"): bsNode["bsval"].getStr else: bsNode.getStr
+    var hex = hexStr
+    if hex.len > 0 and (hex[0] == 'x' or hex[0] == 'X'):
+      hex = hex[1..^1]
+    var bytes: seq[byte] = @[]
+    for i in countup(0, hex.len - 1, 2):
+      let pair = if i + 1 < hex.len: hex[i..i+1] else: hex[i..i]
+      bytes.add(byte(parseHexInt(pair)))
+    return ok(Expr(kind: ekLiteral, value: SqlValue(kind: svBlob, blobVal: bytes)))
   err[Expr](ERR_SQL, "Unsupported A_Const")
 
 proc parseColumnRef(node: JsonNode): Result[Expr] =
@@ -1228,6 +1243,8 @@ proc exprToCanonicalSql*(expr: Expr): string =
       quoteSqlString(expr.value.strVal)
     of svBool:
       if expr.value.boolVal: "TRUE" else: "FALSE"
+    of svBlob:
+      "X'" & expr.value.blobVal.mapIt(it.toHex(2)).join("") & "'"
     of svParam:
       "$" & $expr.value.paramIndex
   of ekColumn:

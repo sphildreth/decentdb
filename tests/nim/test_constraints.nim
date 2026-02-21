@@ -2,6 +2,8 @@ import unittest
 import os
 import engine
 import errors
+import record/record
+import exec/exec
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
@@ -119,4 +121,83 @@ suite "Constraints":
     let upd = execSql(db, "UPDATE items SET code = 'A' WHERE id = 2")
     check not upd.ok
     check upd.err.code == ERR_CONSTRAINT
+    discard closeDb(db)
+
+  test "Self-referencing FK CREATE TABLE succeeds":
+    let path = makeTempDb("decentdb_selfref_fk.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, """CREATE TABLE comments (
+      id INT PRIMARY KEY,
+      parent_id INT NULL REFERENCES comments(id) ON DELETE CASCADE,
+      body TEXT NOT NULL
+    )""").ok
+    discard closeDb(db)
+
+  test "Self-referencing FK INSERT root and child":
+    let path = makeTempDb("decentdb_selfref_fk_insert.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, """CREATE TABLE comments (
+      id INT PRIMARY KEY,
+      parent_id INT NULL REFERENCES comments(id) ON DELETE CASCADE,
+      body TEXT NOT NULL
+    )""").ok
+    check execSql(db, "INSERT INTO comments (id, parent_id, body) VALUES (1, NULL, 'root')").ok
+    check execSql(db, "INSERT INTO comments (id, parent_id, body) VALUES (2, 1, 'reply')").ok
+    let sel = execSqlRows(db, "SELECT id, parent_id, body FROM comments ORDER BY id", @[])
+    check sel.ok
+    check sel.value.len == 2
+    check sel.value[0].values[2].kind == vkText
+    check cast[string](sel.value[0].values[2].bytes) == "root"
+    check cast[string](sel.value[1].values[2].bytes) == "reply"
+    check sel.value[1].values[1].int64Val == 1
+    discard closeDb(db)
+
+  test "Self-referencing FK rejects invalid parent":
+    let path = makeTempDb("decentdb_selfref_fk_reject.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, """CREATE TABLE comments (
+      id INT PRIMARY KEY,
+      parent_id INT NULL REFERENCES comments(id),
+      body TEXT NOT NULL
+    )""").ok
+    let ins = execSql(db, "INSERT INTO comments (id, parent_id, body) VALUES (1, 999, 'orphan')")
+    check not ins.ok
+    discard closeDb(db)
+
+  test "Self-referencing FK CASCADE DELETE removes children":
+    let path = makeTempDb("decentdb_selfref_fk_cascade.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    check execSql(db, """CREATE TABLE comments (
+      id INT PRIMARY KEY,
+      parent_id INT NULL REFERENCES comments(id) ON DELETE CASCADE,
+      body TEXT NOT NULL
+    )""").ok
+    check execSql(db, "INSERT INTO comments (id, parent_id, body) VALUES (1, NULL, 'root')").ok
+    check execSql(db, "INSERT INTO comments (id, parent_id, body) VALUES (2, 1, 'child')").ok
+    check execSql(db, "INSERT INTO comments (id, parent_id, body) VALUES (3, 1, 'child2')").ok
+    check execSql(db, "DELETE FROM comments WHERE id = 1").ok
+    let sel = execSqlRows(db, "SELECT COUNT(*) FROM comments", @[])
+    check sel.ok
+    check sel.value[0].values[0].int64Val == 0
+    discard closeDb(db)
+
+  test "Self-referencing FK rejects bad column reference":
+    let path = makeTempDb("decentdb_selfref_fk_badcol.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, """CREATE TABLE comments (
+      id INT PRIMARY KEY,
+      parent_id INT NULL REFERENCES comments(nonexistent),
+      body TEXT NOT NULL
+    )""")
+    check not res.ok
     discard closeDb(db)
