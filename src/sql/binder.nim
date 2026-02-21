@@ -33,6 +33,8 @@ proc literalType(expr: Expr): Option[ColumnType] =
     return some(ctFloat64)
   of svString:
     return some(ctText)
+  of svBlob:
+    return some(ctBlob)
   of svParam:
     return none(ColumnType)
 
@@ -45,7 +47,9 @@ proc checkLiteralType(expr: Expr, expected: ColumnType, columnName: string): Res
       (expected == ctInt64 and actual in {ctBool, ctFloat64}) or
       (expected == ctFloat64 and actual in {ctInt64, ctDecimal}) or
       (expected == ctDecimal and actual in {ctFloat64, ctInt64}) or
-      (expected == ctBool and actual == ctInt64)
+      (expected == ctBool and actual == ctInt64) or
+      (expected == ctUuid and actual == ctBlob) or
+      (expected == ctBlob and actual == ctUuid)
     if not compatible:
       return err[Void](ERR_SQL, "Type mismatch for column", columnName)
   okVoid()
@@ -438,6 +442,7 @@ proc inferExprType(catalog: Catalog, map: Table[string, TableMeta], expr: Expr):
     of svFloat: return ctFloat64
     of svBool: return ctBool
     of svString: return ctText
+    of svBlob: return ctBlob
     else: return ctText
   of ekColumn:
     let res = resolveColumn(map, expr.table, expr.name)
@@ -1796,24 +1801,29 @@ proc bindCreateTable(catalog: Catalog, stmt: Statement): Result[Statement] =
         return err[Statement](ERR_SQL, "ON DELETE SET NULL requires nullable child column", col.name)
       if onUpdate == "SET NULL" and col.notNull:
         return err[Statement](ERR_SQL, "ON UPDATE SET NULL requires nullable child column", col.name)
-      let parentRes = catalog.getTable(col.refTable)
-      if not parentRes.ok:
-        return err[Statement](parentRes.err.code, parentRes.err.message, col.refTable)
+      # Self-referencing FK: validate against the columns being created
+      let isSelfRef = col.refTable == stmt.createTableName
+      let parentColumns = if isSelfRef: tableColumns
+        else:
+          let parentRes = catalog.getTable(col.refTable)
+          if not parentRes.ok:
+            return err[Statement](parentRes.err.code, parentRes.err.message, col.refTable)
+          parentRes.value.columns
       var parentHasColumn = false
-      for parentCol in parentRes.value.columns:
+      for parentCol in parentColumns:
         if parentCol.name == col.refColumn:
           parentHasColumn = true
           break
       if not parentHasColumn:
         return err[Statement](ERR_SQL, "Referenced column not found", col.refTable & "." & col.refColumn)
-      let parentIdx = catalog.getIndexForColumn(col.refTable, col.refColumn, ikBtree, requireUnique = true)
       var isInt64Pk = false
-      for parentCol in parentRes.value.columns:
+      for parentCol in parentColumns:
         if parentCol.name == col.refColumn and parentCol.primaryKey and parentCol.kind == ctInt64:
           isInt64Pk = true
           break
 
-      if not isInt64Pk:
+      if not isInt64Pk and not isSelfRef:
+        let parentIdx = catalog.getIndexForColumn(col.refTable, col.refColumn, ikBtree, requireUnique = true)
         if isNone(parentIdx):
           return err[Statement](ERR_SQL, "Referenced column must be indexed uniquely", col.refTable & "." & col.refColumn)
   if primaryCount > 1:

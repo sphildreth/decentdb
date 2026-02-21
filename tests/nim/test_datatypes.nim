@@ -104,6 +104,29 @@ suite "Datatypes - UUID":
     if val.bytes.len > 0: copyMem(addr s[0], unsafeAddr val.bytes[0], val.bytes.len)
     check s == "550e8400-e29b-41d4-a716-446655440000"
 
+  test "uuid from hex blob literal":
+    let dbPath = makeTempDb("test_uuid_hex.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer: discard closeDb(db)
+
+    let c = execSql(db, "CREATE TABLE uuids (id INT PRIMARY KEY, uid UUID NOT NULL)", @[])
+    check c.ok
+
+    let i1 = execSql(db, "INSERT INTO uuids VALUES (1, X'B85B456D9272A0CB2FD0C18E40AD8FC5')", @[])
+    check i1.ok
+
+    let s1 = execSqlRows(db, "SELECT uid FROM uuids WHERE id = 1", @[])
+    check s1.ok
+    check s1.value[0].values[0].kind == vkBlob
+    check s1.value[0].values[0].bytes.len == 16
+    check s1.value[0].values[0].bytes[0] == 0xB8'u8
+
+    # Reject non-16-byte blob for UUID column
+    let i2 = execSql(db, "INSERT INTO uuids VALUES (2, X'DEADBEEF')", @[])
+    check not i2.ok
+
 suite "Datatypes - DECIMAL":
   test "decimal arithmetic":
     let dbPath = makeTempDb("test_decimal.ddb")
@@ -338,6 +361,44 @@ suite "Datatypes - Basic":
     check s1.ok
     check s1.value[0].values[0].kind == vkBlob
     check s1.value[0].values[0].bytes == data
+
+  test "blob hex literal X'...' syntax":
+    let dbPath = makeTempDb("test_blob_hex.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer: discard closeDb(db)
+
+    let c = execSql(db, "CREATE TABLE blobs2 (id INT PRIMARY KEY, b BLOB)", @[])
+    check c.ok
+
+    let i1 = execSql(db, "INSERT INTO blobs2 VALUES (1, X'DEADBEEF')", @[])
+    check i1.ok
+
+    let s1 = execSqlRows(db, "SELECT b FROM blobs2 WHERE id = 1", @[])
+    check s1.ok
+    check s1.value[0].values[0].kind == vkBlob
+    check s1.value[0].values[0].bytes == @[0xDE'u8, 0xAD, 0xBE, 0xEF]
+
+    # Empty blob
+    let i2 = execSql(db, "INSERT INTO blobs2 VALUES (2, X'')", @[])
+    check i2.ok
+
+    let s2 = execSqlRows(db, "SELECT b FROM blobs2 WHERE id = 2", @[])
+    check s2.ok
+    check s2.value[0].values[0].kind == vkBlob
+    check s2.value[0].values[0].bytes.len == 0
+
+    # UUID-like blob (16 bytes)
+    let i3 = execSql(db, "INSERT INTO blobs2 VALUES (3, X'B85B456D9272A0CB2FD0C18E40AD8FC5')", @[])
+    check i3.ok
+
+    let s3 = execSqlRows(db, "SELECT b FROM blobs2 WHERE id = 3", @[])
+    check s3.ok
+    check s3.value[0].values[0].kind == vkBlob
+    check s3.value[0].values[0].bytes.len == 16
+    check s3.value[0].values[0].bytes[0] == 0xB8'u8
+    check s3.value[0].values[0].bytes[15] == 0xC5'u8
 
   test "boolean aliases and casting":
     let dbPath = makeTempDb("test_bool.ddb")

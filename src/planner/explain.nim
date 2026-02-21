@@ -36,6 +36,7 @@ proc renderExpr*(expr: Expr): string =
     of svFloat: $expr.value.floatVal
     of svBool: $expr.value.boolVal
     of svString: "'" & expr.value.strVal.replace("'", "''") & "'"
+    of svBlob: "X'" & expr.value.blobVal.mapIt(it.toHex(2)).join("") & "'"
     of svParam: "$" & $expr.value.paramIndex
   of ekColumn:
     if expr.table.len > 0:

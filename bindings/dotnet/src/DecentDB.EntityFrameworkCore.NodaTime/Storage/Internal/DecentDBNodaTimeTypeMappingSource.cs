@@ -25,7 +25,7 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
         var longMapping = new LongTypeMapping("INTEGER", DbType.Int64);
         var floatMapping = new FloatTypeMapping("REAL", DbType.Single);
         var doubleMapping = new DoubleTypeMapping("REAL", DbType.Double);
-        var decimalMapping = new DecimalTypeMapping("DECIMAL", DbType.Decimal, precision: null, scale: null);
+        var decimalMapping = new DecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
         var stringMapping = new StringTypeMapping("TEXT", DbType.String);
         var blobMapping = new ByteArrayTypeMapping("BLOB", DbType.Binary);
 
@@ -155,6 +155,11 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
         var clrType = Nullable.GetUnderlyingType(mappingInfo.ClrType ?? typeof(object)) ?? mappingInfo.ClrType;
         if (clrType != null && _clrMappings.TryGetValue(clrType, out var clrMapping))
         {
+            if (clrType == typeof(decimal))
+            {
+                return CreateDecimalMapping(mappingInfo, mappingInfo.StoreTypeName);
+            }
+
             return clrMapping;
         }
 
@@ -164,11 +169,64 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
             var normalized = NormalizeStoreTypeName(storeType);
             if (_storeMappings.TryGetValue(normalized, out var storeMapping))
             {
+                if (normalized is "DECIMAL" or "NUMERIC")
+                {
+                    return CreateDecimalMapping(mappingInfo, mappingInfo.StoreTypeName ?? storeType);
+                }
+
                 return storeMapping;
             }
         }
 
         return null;
+    }
+
+    private static DecimalTypeMapping CreateDecimalMapping(
+        in RelationalTypeMappingInfo mappingInfo,
+        string? storeTypeName)
+    {
+        const int defaultPrecision = 18;
+        const int defaultScale = 4;
+
+        var precision = mappingInfo.Precision;
+        var scale = mappingInfo.Scale;
+
+        if (!precision.HasValue && !scale.HasValue && !string.IsNullOrWhiteSpace(storeTypeName))
+        {
+            (precision, scale) = ParsePrecisionScale(storeTypeName);
+        }
+
+        var p = precision ?? defaultPrecision;
+        var s = scale ?? defaultScale;
+
+        return new DecimalTypeMapping($"DECIMAL({p},{s})", DbType.Decimal, precision: p, scale: s);
+    }
+
+    private static (int? precision, int? scale) ParsePrecisionScale(string storeTypeName)
+    {
+        var openParen = storeTypeName.IndexOf('(');
+        var closeParen = storeTypeName.IndexOf(')');
+        if (openParen < 0 || closeParen <= openParen)
+        {
+            return (null, null);
+        }
+
+        var inner = storeTypeName.AsSpan()[(openParen + 1)..closeParen];
+        var commaIdx = inner.IndexOf(',');
+
+        if (commaIdx >= 0
+            && int.TryParse(inner[..commaIdx].Trim(), out var p)
+            && int.TryParse(inner[(commaIdx + 1)..].Trim(), out var s))
+        {
+            return (p, s);
+        }
+
+        if (int.TryParse(inner.Trim(), out var pOnly))
+        {
+            return (pOnly, null);
+        }
+
+        return (null, null);
     }
 
     private static string NormalizeStoreTypeName(string storeTypeName)

@@ -5,6 +5,16 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-02-21
+
+### Added
+- **SQL Engine**: Hex blob literal (`X'DEADBEEF'`) syntax support — new `svBlob` value kind parsed from libpg_query `bsval` nodes, with full support across parser, binder, executor, EXPLAIN output, and storage predicate evaluator.
+
+### Fixed
+- **SQL Engine**: Self-referencing foreign keys — `CREATE TABLE` with a foreign key referencing the same table (e.g., `parent_id REFERENCES self(id)`) now validates against the columns being defined instead of failing with "Table not found".
+- **SQL Engine**: UUID ↔ Blob type coercion — blob literals (e.g., `X'...'` with 16 bytes) are now accepted for UUID columns in INSERT/UPDATE, and vice versa. Previously the binder rejected these with "Type mismatch" despite the runtime already supporting 16-byte blobs as UUIDs.
+- .NET: `DecentDB.EntityFrameworkCore.NodaTime` DECIMAL type mapping now respects precision and scale from EF Core model configuration (e.g., `HasPrecision(18, 6)`). Previously ignored model-specified precision/scale and always emitted `DECIMAL(18,4)`.
+
 ## [1.2.0] - 2026-02-21
 
 ### Added
