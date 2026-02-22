@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **SQL Engine**: Case-insensitive identifier resolution following PostgreSQL semantics — unquoted identifiers (lowercased by the parser) now correctly match tables, columns, and indexes created with quoted identifiers and vice versa. Previously, `SELECT id FROM mytable` would fail if the table was created as `CREATE TABLE "MyTable" ("Id" INTEGER)`. Affects catalog lookups, binder column resolution, INSERT/UPDATE/DELETE column matching, ON CONFLICT target matching, index maintenance during INSERT/UPDATE/DELETE, INSERT...SELECT column mapping, and JOIN column resolution. See ADR-0096.
+- **Shared Library**: Disable Nim's built-in signal handler (`-d:noSignalHandler`) when building the shared library. Nim's SIGSEGV handler conflicts with host runtimes (.NET, JVM) that use signals for GC write barriers and stack probing, causing spurious crashes.
+- **Shared Library**: Use system allocator (`-d:useMalloc`) instead of Nim's thread-local allocator when building the shared library. Fixes heap corruption when host runtimes (e.g., .NET async/await) allocate objects on one thread and free them on another.
+- **Engine**: Evict stale Pager references from threadvar caches (`gAppendCache`, `gReusableBTree`, `gEvalPager`, `gEvalCatalog`) in `closeDb()`. Previously, closed Pager objects accumulated in thread-local caches across database open/close cycles, causing memory leaks under ARC.
 
 ## [1.3.0] - 2026-02-21
 

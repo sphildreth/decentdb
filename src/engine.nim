@@ -4084,6 +4084,12 @@ proc closeDb*(db: Db): Result[Void] =
   if not db.isOpen:
     return okVoid()
   
+  # Evict threadvar cache entries that reference this database's pager,
+  # preventing leaked Pager refs from accumulating across open/close cycles.
+  evictPagerFromAppendCache(db.pager)
+  evictPagerFromReusableBTree(db.pager)
+  evictPagerFromEvalCache(db.pager)
+  
   # Flush any pending trigram deltas before closing (ensure clean shutdown durability)
   # We ignore errors here to prioritize closing, but log them in a real system
   if db.catalog.trigramDeltas.len > 0:

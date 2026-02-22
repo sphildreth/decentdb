@@ -38,6 +38,13 @@ var gEvalContextDepth* {.threadvar.}: int
 var gEvalPager* {.threadvar.}: Pager
 var gEvalCatalog* {.threadvar.}: Catalog
 
+proc evictPagerFromEvalCache*(pager: Pager) =
+  ## Release eval-context caches if they reference the given pager.
+  if gEvalPager == pager:
+    gEvalPager = nil
+  if gEvalCatalog != nil and gEvalCatalog.catalogTree != nil and gEvalCatalog.catalogTree.pager == pager:
+    gEvalCatalog = nil
+
 proc decimalToString(val: int64, scale: uint8): string =
   var s = $val
   if scale == 0: return s

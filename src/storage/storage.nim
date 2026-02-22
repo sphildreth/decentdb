@@ -23,6 +23,11 @@ var gReusableBTree {.threadvar.}: BTree
 # Thread-local reusable record buffer to avoid per-insert allocation
 var gRecordBuf {.threadvar.}: seq[byte]
 
+proc evictPagerFromReusableBTree*(pager: Pager) =
+  ## Release gReusableBTree if it references the given pager.
+  if gReusableBTree != nil and gReusableBTree.pager == pager:
+    gReusableBTree = nil
+
 type StoredRow* = object
   rowid*: uint64
   values*: seq[Value]

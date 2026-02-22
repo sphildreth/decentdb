@@ -48,6 +48,19 @@ var gAppendCache {.threadvar.}: Table[PageId, AppendCacheEntry]
 var gLastCacheRoot {.threadvar.}: PageId
 var gLastCachePtr {.threadvar.}: ptr AppendCacheEntry
 
+proc evictPagerFromAppendCache*(pager: Pager) =
+  ## Remove all append-cache entries belonging to a specific pager.
+  ## Call this when closing a database to prevent leaked Pager refs.
+  if gAppendCache.len == 0:
+    return
+  var toDelete: seq[PageId]
+  for root, entry in gAppendCache:
+    if entry.pager == pager:
+      toDelete.add(root)
+  for root in toDelete:
+    gAppendCache.del(root)
+  gLastCachePtr = nil
+
 proc encodeVarintToBuf*(v: uint64, buf: var array[10, byte]): int {.inline.} =
   ## Encode a varint into a stack-allocated buffer, returning the number of bytes written.
   var x = v

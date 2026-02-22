@@ -11,7 +11,7 @@ requires "zip >= 0.3.1"
 
 
 task build_lib, "Build DecentDB shared library (C API)":
-  exec "nim c --app:lib -d:libpg_query -d:release --mm:arc --threads:on --outdir:build src/c_api.nim"
+  exec "nim c --app:lib -d:libpg_query -d:release --mm:arc --threads:on -d:noSignalHandler -d:useMalloc --outdir:build src/c_api.nim"
 
 task test_bindings_dotnet, "Run .NET binding tests":
   exec "ln -sf libc_api.so build/libdecentdb.so"
