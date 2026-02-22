@@ -1536,7 +1536,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         let colName = nodeString(keyNode)
         var found = false
         for i, col in columns:
-          if col.name == colName:
+          if col.name.toLowerAscii() == colName.toLowerAscii():
             found = true
             columns[i].unique = keys.len == 1  # only mark unique for single-column
             if contype == "CONSTR_PRIMARY":

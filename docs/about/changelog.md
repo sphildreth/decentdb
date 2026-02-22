@@ -5,6 +5,11 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-02-22
+
+### Fixed
+- **SQL Engine**: Case-insensitive identifier resolution following PostgreSQL semantics — unquoted identifiers (lowercased by the parser) now correctly match tables, columns, and indexes created with quoted identifiers and vice versa. Previously, `SELECT id FROM mytable` would fail if the table was created as `CREATE TABLE "MyTable" ("Id" INTEGER)`. Affects catalog lookups, binder column resolution, INSERT/UPDATE/DELETE column matching, ON CONFLICT target matching, index maintenance during INSERT/UPDATE/DELETE, INSERT...SELECT column mapping, and JOIN column resolution. See ADR-0096.
+
 ## [1.3.0] - 2026-02-21
 
 ### Added

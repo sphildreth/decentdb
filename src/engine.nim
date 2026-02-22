@@ -534,13 +534,13 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
           return err[Void](ERR_CONSTRAINT, "UNIQUE constraint failed", table.name & "." & col.name)
   # Check unique indexes (composite and single-column CREATE UNIQUE INDEX)
   for _, idx in catalog.indexes:
-    if idx.table != table.name or not idx.unique:
+    if idx.table.toLowerAscii() != table.name.toLowerAscii() or not idx.unique:
       continue
     # Skip single-column indexes already covered by inline col.unique above
     if idx.columns.len == 1:
       var coveredInline = false
       for col in table.columns:
-        if col.name == idx.columns[0] and col.unique:
+        if col.name.toLowerAscii() == idx.columns[0].toLowerAscii() and col.unique:
           coveredInline = true
           break
       if coveredInline:
@@ -678,7 +678,7 @@ proc findConflictRowidOnTarget(
   for colName in targetCols:
     var idx = -1
     for i, col in table.columns:
-      if col.name == colName:
+      if col.name.toLowerAscii() == colName.toLowerAscii():
         idx = i
         break
     if idx < 0:
@@ -720,7 +720,7 @@ proc findConflictRowidOnTarget(
 
   var matchedIndex: Option[IndexMeta] = none(IndexMeta)
   for _, idx in catalog.indexes:
-    if idx.table == table.name and idx.unique and idx.columns == targetCols:
+    if idx.table.toLowerAscii() == table.name.toLowerAscii() and idx.unique and idx.columns == targetCols:
       matchedIndex = some(idx)
       break
   if isNone(matchedIndex):
@@ -1049,7 +1049,7 @@ proc enforceForeignKeysBatch*(
     let parentTable = parentRes.value
     var parentColIdx = -1
     for i, col in parentTable.columns:
-      if col.name == refKey.refColumn:
+      if col.name.toLowerAscii() == refKey.refColumn.toLowerAscii():
         parentColIdx = i
         break
     if parentColIdx < 0:
@@ -1259,8 +1259,9 @@ proc enforceConstraintsBatch*(
   ok(allFailures)
 
 proc columnIndexInTable(table: TableMeta, columnName: string): int =
+  let norm = columnName.toLowerAscii()
   for i, col in table.columns:
-    if col.name == columnName:
+    if col.name.toLowerAscii() == norm:
       return i
   -1
 
@@ -1650,7 +1651,7 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
       for colName, expr in bound.insertConflictUpdateAssignments:
         var idx = -1
         for i, col in table.columns:
-          if col.name == colName:
+          if col.name.toLowerAscii() == colName.toLowerAscii():
             idx = i
             break
         if idx < 0:
@@ -1793,13 +1794,13 @@ proc execAllInsertRows(db: Db, bound: Statement, params: seq[Value], wantRows: b
 proc buildUpdateWriteProfile(catalog: Catalog, table: TableMeta, assignments: Table[string, Expr]): UpdateWriteProfile =
   var updatedCols = initHashSet[string]()
   for colName, _ in assignments:
-    updatedCols.incl(colName)
+    updatedCols.incl(colName.toLowerAscii())
 
   var hasNotNullOnUpdated = false
   var hasUniqueOnUpdated = false
   var hasForeignKeysOnUpdated = false
   for col in table.columns:
-    if col.name notin updatedCols:
+    if col.name.toLowerAscii() notin updatedCols:
       continue
     if col.notNull:
       hasNotNullOnUpdated = true
@@ -1810,13 +1811,13 @@ proc buildUpdateWriteProfile(catalog: Catalog, table: TableMeta, assignments: Ta
 
   var updatesIndexedColumns = false
   for _, idx in catalog.indexes:
-    if idx.table != table.name:
+    if idx.table.toLowerAscii() != table.name.toLowerAscii():
       continue
     for idxCol in idx.columns:
       if idxCol.startsWith(IndexExpressionPrefix):
         updatesIndexedColumns = true
         break
-      if idxCol in updatedCols:
+      if idxCol.toLowerAscii() in updatedCols:
         updatesIndexedColumns = true
         break
     if updatesIndexedColumns:
@@ -1875,7 +1876,7 @@ proc buildInsertWriteProfile(catalog: Catalog, tableName: string): InsertWritePr
       result.hasTextBlobColumns = true
   # Check for unique indexes (composite and single-column via CREATE UNIQUE INDEX)
   for _, idx in catalog.indexes:
-    if idx.table != tableName:
+    if idx.table.toLowerAscii() != tableName.toLowerAscii():
       continue
     result.hasSecondaryIndexes = true
     if idx.unique:
@@ -1885,7 +1886,7 @@ proc buildInsertWriteProfile(catalog: Catalog, tableName: string): InsertWritePr
         # Single-column unique index: check if already covered by col.unique
         var coveredInline = false
         for col in table.columns:
-          if col.name == idx.columns[0] and col.unique:
+          if col.name.toLowerAscii() == idx.columns[0].toLowerAscii() and col.unique:
             coveredInline = true
             break
         if not coveredInline:
@@ -2202,14 +2203,14 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
         # Build column index for reordering
         var colIndex = initTable[string, int]()
         for ci, col in table.columns:
-          colIndex[col.name] = ci
+          colIndex[col.name.toLowerAscii()] = ci
         for row in selRows.value:
           var vals = newSeq[Value](table.columns.len)
           for vi in 0 ..< vals.len:
             vals[vi] = Value(kind: vkNull)
           for ci, colName in targetCols:
-            if ci < row.values.len and colIndex.hasKey(colName):
-              let idx = colIndex[colName]
+            if ci < row.values.len and colIndex.hasKey(colName.toLowerAscii()):
+              let idx = colIndex[colName.toLowerAscii()]
               let checked = typeCheckValue(table.columns[idx], row.values[ci])
               if not checked.ok:
                 return err[seq[string]](checked.err.code, checked.err.message, checked.err.context)
@@ -2556,7 +2557,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           return err[seq[string]](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
         var toDrop: seq[string] = @[]
         for name, idx in db.catalog.indexes:
-          if idx.table == bound.dropTableName:
+          if idx.table.toLowerAscii() == bound.dropTableName.toLowerAscii():
             toDrop.add(name)
         for idxName in toDrop:
           discard db.catalog.dropIndex(idxName)
@@ -2584,7 +2585,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         for colName in bound.columnNames:
           var found = false
           for i, col in table.columns:
-            if col.name == colName:
+            if col.name.toLowerAscii() == colName.toLowerAscii():
               colIndices.add(i)
               found = true
               break
@@ -2775,14 +2776,14 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           bound.insertColumns
         var colIndex = initTable[string, int]()
         for ci, col in table.columns:
-          colIndex[col.name] = ci
+          colIndex[col.name.toLowerAscii()] = ci
         for row in selRows.value:
           var vals = newSeq[Value](table.columns.len)
           for vi in 0 ..< vals.len:
             vals[vi] = Value(kind: vkNull)
           for ci, colName in targetCols:
-            if ci < row.values.len and colIndex.hasKey(colName):
-              let idx = colIndex[colName]
+            if ci < row.values.len and colIndex.hasKey(colName.toLowerAscii()):
+              let idx = colIndex[colName.toLowerAscii()]
               let checked = typeCheckValue(table.columns[idx], row.values[ci])
               if not checked.ok:
                 return err[seq[string]](checked.err.code, checked.err.message, checked.err.context)
@@ -2847,7 +2848,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           for colName, expr in bound.assignments:
             var idx = -1
             for i, col in table.columns:
-              if col.name == colName:
+              if col.name.toLowerAscii() == colName.toLowerAscii():
                 idx = i
                 break
             if idx >= 0:
@@ -3070,7 +3071,7 @@ proc tryFastPkUpdate(db: Db, bound: Statement, params: seq[Value]): Result[Optio
   for colName, expr in bound.assignments:
     var idx = -1
     for i, col in table.columns:
-      if col.name == colName:
+      if col.name.toLowerAscii() == colName.toLowerAscii():
         idx = i
         break
     if idx >= 0:
@@ -3214,7 +3215,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         return err[int64](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
       var toDrop: seq[string] = @[]
       for name, idx in db.catalog.indexes:
-        if idx.table == bound.dropTableName:
+        if idx.table.toLowerAscii() == bound.dropTableName.toLowerAscii():
           toDrop.add(name)
       for idxName in toDrop:
         discard db.catalog.dropIndex(idxName)
@@ -3246,7 +3247,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       for colName in bound.columnNames:
         var found = false
         for i, col in table.columns:
-          if col.name == colName:
+          if col.name.toLowerAscii() == colName.toLowerAscii():
             colIndices.add(i)
             found = true
             break
@@ -3450,15 +3451,15 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         bound.insertColumns
       var colIndex = initTable[string, int]()
       for ci, col in table.columns:
-        colIndex[col.name] = ci
+        colIndex[col.name.toLowerAscii()] = ci
       affected = 0
       for row in selRows.value:
         var vals = newSeq[Value](table.columns.len)
         for vi in 0 ..< vals.len:
           vals[vi] = Value(kind: vkNull)
         for ci, colName in targetCols:
-          if ci < row.values.len and colIndex.hasKey(colName):
-            let idx = colIndex[colName]
+          if ci < row.values.len and colIndex.hasKey(colName.toLowerAscii()):
+            let idx = colIndex[colName.toLowerAscii()]
             let checked = typeCheckValue(table.columns[idx], row.values[ci])
             if not checked.ok:
               return err[int64](checked.err.code, checked.err.message, checked.err.context)
@@ -3513,7 +3514,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
         for colName, expr in bound.assignments:
           var idx = -1
           for i, col in table.columns:
-            if col.name == colName:
+            if col.name.toLowerAscii() == colName.toLowerAscii():
               idx = i
               break
           if idx >= 0:
@@ -4058,7 +4059,7 @@ proc bulkLoad*(db: Db, tableName: string, rows: seq[seq[Value]], options: BulkLo
 
   if options.disableIndexes:
     for _, idx in db.catalog.indexes:
-      if idx.table == tableName:
+      if idx.table.toLowerAscii() == tableName.toLowerAscii():
         let rebuildRes = rebuildIndex(db.pager, db.catalog, idx)
         if not rebuildRes.ok:
           return rebuildRes

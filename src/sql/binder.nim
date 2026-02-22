@@ -16,6 +16,10 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement]
 proc normalizedName(name: string): string =
   name.toLowerAscii()
 
+proc eqIdent(a, b: string): bool {.inline.} =
+  ## Case-insensitive identifier comparison following PostgreSQL semantics.
+  a.toLowerAscii() == b.toLowerAscii()
+
 proc nullExpr(): Expr =
   Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
 
@@ -400,31 +404,33 @@ proc buildTableMap(catalog: Catalog, fromTable: string, fromAlias: string, joins
     let baseRes = catalog.getTable(fromTable)
     if not baseRes.ok:
       return err[Table[string, TableMeta]](baseRes.err.code, baseRes.err.message, baseRes.err.context)
-    map[fromTable] = baseRes.value
+    map[normalizedName(fromTable)] = baseRes.value
     if fromAlias.len > 0:
-      map[fromAlias] = baseRes.value
+      map[normalizedName(fromAlias)] = baseRes.value
   for join in joins:
     let tableRes = catalog.getTable(join.table)
     if not tableRes.ok:
       return err[Table[string, TableMeta]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
-    map[join.table] = tableRes.value
+    map[normalizedName(join.table)] = tableRes.value
     if join.alias.len > 0:
-      map[join.alias] = tableRes.value
+      map[normalizedName(join.alias)] = tableRes.value
   ok(map)
 
 proc resolveColumn(map: Table[string, TableMeta], table: string, name: string): Result[ColumnType] =
+  let normName = normalizedName(name)
   if table.len > 0:
-    if not map.hasKey(table):
+    let normTable = normalizedName(table)
+    if not map.hasKey(normTable):
       return err[ColumnType](ERR_SQL, "Unknown table", table)
-    let meta = map[table]
+    let meta = map[normTable]
     for col in meta.columns:
-      if col.name == name:
+      if normalizedName(col.name) == normName:
         return ok(col.kind)
     return err[ColumnType](ERR_SQL, "Unknown column", table & "." & name)
   var found: seq[ColumnType] = @[]
   for _, meta in map:
     for col in meta.columns:
-      if col.name == name:
+      if normalizedName(col.name) == normName:
         found.add(col.kind)
   if found.len == 0:
     return err[ColumnType](ERR_SQL, "Unknown column", name)
@@ -1518,9 +1524,9 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
       return err[Statement](ERR_SQL, "Column count mismatch", stmt.insertTable)
     var colSet = initHashSet[string]()
     for col in viewRes.value.columnNames:
-      colSet.incl(col)
+      colSet.incl(normalizedName(col))
     for colName in targetCols:
-      if not colSet.contains(colName):
+      if not colSet.contains(normalizedName(colName)):
         return err[Statement](ERR_SQL, "Unknown column", colName)
     return ok(stmt)
   let tableRes = catalog.getTable(stmt.insertTable)
@@ -1541,9 +1547,9 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     # Validate target columns exist
     var colIndex = initTable[string, int]()
     for i, col in table.columns:
-      colIndex[col.name] = i
+      colIndex[normalizedName(col.name)] = i
     for colName in targetCols:
-      if not colIndex.hasKey(colName):
+      if not colIndex.hasKey(normalizedName(colName)):
         return err[Statement](ERR_SQL, "Unknown column", colName)
     # Validate SELECT column count matches target columns
     if stmt.insertSelectQuery.selectItems.len > 0:
@@ -1569,14 +1575,14 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](ERR_SQL, "Column count mismatch", stmt.insertTable)
   var colIndex = initTable[string, int]()
   for i, col in table.columns:
-    colIndex[col.name] = i
+    colIndex[normalizedName(col.name)] = i
   var ordered: seq[Expr] = newSeq[Expr](table.columns.len)
   for i in 0 ..< ordered.len:
     ordered[i] = nullExpr()
   for i, colName in targetCols:
-    if not colIndex.hasKey(colName):
+    if not colIndex.hasKey(normalizedName(colName)):
       return err[Statement](ERR_SQL, "Unknown column", colName)
-    let idx = colIndex[colName]
+    let idx = colIndex[normalizedName(colName)]
     let expr = stmt.insertValues[i]
     let typeRes = checkLiteralType(expr, table.columns[idx].kind, colName)
     if not typeRes.ok:
@@ -1592,7 +1598,7 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     for i in 0 ..< rowOrdered.len:
       rowOrdered[i] = nullExpr()
     for i, colName in targetCols:
-      let idx = colIndex[colName]
+      let idx = colIndex[normalizedName(colName)]
       let expr = rowVals[i]
       let typeRes = checkLiteralType(expr, table.columns[idx].kind, colName)
       if not typeRes.ok:
@@ -1613,7 +1619,7 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
       if not catalog.indexes.hasKey(conflictTargetConstraint):
         return err[Statement](ERR_SQL, "Unknown ON CONFLICT constraint", conflictTargetConstraint)
       let idx = catalog.indexes[conflictTargetConstraint]
-      if idx.table != stmt.insertTable:
+      if idx.table.toLowerAscii() != stmt.insertTable.toLowerAscii():
         return err[Statement](ERR_SQL, "ON CONFLICT constraint belongs to different table", conflictTargetConstraint)
       if not idx.unique:
         return err[Statement](ERR_SQL, "ON CONFLICT constraint must be unique", conflictTargetConstraint)
@@ -1622,20 +1628,20 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     if conflictTargetCols.len > 0:
       var colSet = initHashSet[string]()
       for col in table.columns:
-        colSet.incl(col.name)
+        colSet.incl(normalizedName(col.name))
       for name in conflictTargetCols:
-        if not colSet.contains(name):
+        if not colSet.contains(normalizedName(name)):
           return err[Statement](ERR_SQL, "Unknown ON CONFLICT target column", name)
 
       var matchedUniqueTarget = false
       if conflictTargetCols.len == 1:
         for col in table.columns:
-          if col.name == conflictTargetCols[0] and (col.primaryKey or col.unique):
+          if eqIdent(col.name, conflictTargetCols[0]) and (col.primaryKey or col.unique):
             matchedUniqueTarget = true
             break
       if not matchedUniqueTarget:
         for _, idx in catalog.indexes:
-          if idx.table == stmt.insertTable and idx.unique and idx.columns == conflictTargetCols:
+          if eqIdent(idx.table, stmt.insertTable) and idx.unique and idx.columns == conflictTargetCols:
             matchedUniqueTarget = true
             break
       if not matchedUniqueTarget:
@@ -1660,7 +1666,7 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
     for colName, expr in stmt.insertConflictUpdateAssignments:
       var colIdx = -1
       for i, col in table.columns:
-        if col.name == colName:
+        if eqIdent(col.name, colName):
           colIdx = i
           break
       if colIdx < 0:
@@ -1720,9 +1726,9 @@ proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
       return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
     var colSet = initHashSet[string]()
     for col in viewRes.value.columnNames:
-      colSet.incl(col)
+      colSet.incl(normalizedName(col))
     for colName, _ in stmt.assignments:
-      if not colSet.contains(colName):
+      if not colSet.contains(normalizedName(colName)):
         return err[Statement](ERR_SQL, "Unknown column", colName)
     return ok(stmt)
   let tableRes = catalog.getTable(stmt.updateTable)
@@ -1732,7 +1738,7 @@ proc bindUpdate(catalog: Catalog, stmt: Statement): Result[Statement] =
   for colName, expr in stmt.assignments:
     var found = false
     for col in table.columns:
-      if col.name == colName:
+      if eqIdent(col.name, colName):
         found = true
         let typeRes = checkLiteralType(expr, col.kind, colName)
         if not typeRes.ok:
@@ -1910,7 +1916,7 @@ proc bindCreateIndex(catalog: Catalog, stmt: Statement): Result[Statement] =
   for colName in stmt.columnNames:
     var found = false
     for col in tableRes.value.columns:
-      if col.name == colName:
+      if eqIdent(col.name, colName):
         found = true
         if stmt.indexKind == sql.ikTrigram and col.kind != ctText:
           return err[Statement](ERR_SQL, "Trigram index only supported on TEXT columns", colName)
@@ -2068,7 +2074,7 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   let table = tableRes.value
   for _, idx in catalog.indexes:
-    if idx.table == stmt.alterTableName and idx.columns.len == 1 and idx.columns[0].startsWith(IndexExpressionPrefix):
+    if idx.table.toLowerAscii() == stmt.alterTableName.toLowerAscii() and idx.columns.len == 1 and idx.columns[0].startsWith(IndexExpressionPrefix):
       return err[Statement](ERR_SQL, "ALTER TABLE on tables with expression indexes is not supported in 0.x", stmt.alterTableName)
   if table.checks.len > 0:
     return err[Statement](ERR_SQL, "ALTER TABLE on tables with CHECK constraints is not supported in 0.x", stmt.alterTableName)
@@ -2077,7 +2083,7 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     case action.kind
     of ataAddColumn:
       for col in table.columns:
-        if col.name == action.columnDef.name:
+        if eqIdent(col.name, action.columnDef.name):
           return err[Statement](ERR_SQL, "Column already exists", action.columnDef.name)
       let validTypes = ["INT", "INT64", "INTEGER", "TEXT", "BLOB", "BOOL", "BOOLEAN", "FLOAT", "FLOAT64", "REAL"]
       var typeValid = false
@@ -2091,7 +2097,7 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
     of ataDropColumn:
       var found = false
       for col in table.columns:
-        if col.name == action.columnName:
+        if eqIdent(col.name, action.columnName):
           found = true
           if col.primaryKey:
             return err[Statement](ERR_SQL, "Cannot drop PRIMARY KEY column", action.columnName)
@@ -2104,9 +2110,9 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
       var oldFound = false
       var newFound = false
       for col in table.columns:
-        if col.name == action.columnName:
+        if eqIdent(col.name, action.columnName):
           oldFound = true
-        if col.name == action.newColumnName:
+        if eqIdent(col.name, action.newColumnName):
           newFound = true
       if not oldFound:
         return err[Statement](ERR_SQL, "Column does not exist", action.columnName)
@@ -2116,7 +2122,7 @@ proc bindAlterTable(catalog: Catalog, stmt: Statement): Result[Statement] =
       var found = false
       var foundCol = Column()
       for col in table.columns:
-        if col.name == action.columnName:
+        if eqIdent(col.name, action.columnName):
           found = true
           foundCol = col
           break

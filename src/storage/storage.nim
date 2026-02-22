@@ -75,7 +75,7 @@ proc isTextBlobIndex*(table: TableMeta, idx: IndexMeta): bool =
   if idx.columns.len != 1:
     return false
   for col in table.columns:
-    if col.name == idx.columns[0]:
+    if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
       return col.kind in {ctText, ctBlob}
   false
 
@@ -140,7 +140,7 @@ proc indexColumnIndices*(table: TableMeta, idx: IndexMeta): seq[int] =
     if colName.startsWith(IndexExpressionPrefix):
       continue
     for i, col in table.columns:
-      if col.name == colName:
+      if col.name.toLowerAscii() == colName.toLowerAscii():
         result.add(i)
         break
 
@@ -238,7 +238,7 @@ proc evalExpressionIndexExpr(table: TableMeta, values: seq[Value], expr: Expr): 
   case expr.kind
   of ekColumn:
     for i, col in table.columns:
-      if col.name == expr.name:
+      if col.name.toLowerAscii() == expr.name.toLowerAscii():
         if i < values.len:
           return ok(values[i])
         return err[Value](ERR_CORRUPTION, "Row column count does not match table metadata", table.name)
@@ -344,7 +344,7 @@ proc evalPredicateValue(table: TableMeta, values: seq[Value], expr: Expr): Value
     of svParam: return Value(kind: vkNull)
   of ekColumn:
     for i, col in table.columns:
-      if col.name == expr.name:
+      if col.name.toLowerAscii() == expr.name.toLowerAscii():
         if i < values.len: return values[i]
         return Value(kind: vkNull)
     return Value(kind: vkNull)
@@ -907,7 +907,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
   var trigramValues: seq[(IndexMeta, Value)]
   if updateIndexes:
     for _, idx in catalog.indexes:
-      if idx.table != tableName:
+      if idx.table.toLowerAscii() != tableName.toLowerAscii():
         continue
       if not shouldIncludeInIndex(tablePtr[], idx, storedValues):
         continue
@@ -919,7 +919,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         var idxValue = Value(kind: vkNull)
         if isTextBlobIndex(tablePtr[], idx) and idx.columns.len == 1:
           for i, col in tablePtr.columns:
-            if col.name == idx.columns[0]:
+            if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
               idxValue = storedValues[i]
               break
         indexKeys.add((idx, keyRes.value, idxValue))
@@ -928,7 +928,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
         if idx.columns.len == 1:
           var valueIndex = -1
           for i, col in tablePtr.columns:
-            if col.name == idx.columns[0]:
+            if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
               valueIndex = i
               break
           if valueIndex >= 0:
@@ -1037,7 +1037,7 @@ proc insertRowInternal(pager: Pager, catalog: Catalog, tableName: string, values
 proc insertRow*(pager: Pager, catalog: Catalog, tableName: string, values: seq[Value]): Result[uint64] =
   var hasIndexes = false
   for _, idx in catalog.indexes:
-    if idx.table == tableName:
+    if idx.table.toLowerAscii() == tableName.toLowerAscii():
       hasIndexes = true
       break
   insertRowInternal(pager, catalog, tableName, values, hasIndexes)
@@ -1122,7 +1122,7 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
 
   var hasIndexes = false
   for _, idx in catalog.indexes:
-    if idx.table == tableName:
+    if idx.table.toLowerAscii() == tableName.toLowerAscii():
       hasIndexes = true
       break
 
@@ -1131,7 +1131,7 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
     if not oldRes.ok:
       return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
     for _, idx in catalog.indexes:
-      if idx.table != tableName:
+      if idx.table.toLowerAscii() != tableName.toLowerAscii():
         continue
       let oldIncluded = shouldIncludeInIndex(table, idx, oldRes.value.values)
       let newIncluded = shouldIncludeInIndex(table, idx, values)
@@ -1146,7 +1146,7 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
             var oldIdxValue = Value(kind: vkNull)
             if textBlob and idx.columns.len == 1:
               for i, col in table.columns:
-                if col.name == idx.columns[0]:
+                if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
                   oldIdxValue = oldRes.value.values[i]
                   break
             let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeIndexEntry(rowid, oldIdxValue, textBlob))
@@ -1159,7 +1159,7 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
             var newIdxValue = Value(kind: vkNull)
             if textBlob and idx.columns.len == 1:
               for i, col in table.columns:
-                if col.name == idx.columns[0]:
+                if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
                   newIdxValue = values[i]
                   break
             let idxInsert = insert(idxTree, newKeyRes.value, encodeIndexEntry(rowid, newIdxValue, textBlob))
@@ -1172,7 +1172,7 @@ proc updateRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
         if idx.columns.len == 1:
           var valueIndex = -1
           for i, col in table.columns:
-            if col.name == idx.columns[0]:
+            if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
               valueIndex = i
               break
           if valueIndex >= 0:
@@ -1206,7 +1206,7 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
   if not oldRes.ok:
     return err[Void](oldRes.err.code, oldRes.err.message, oldRes.err.context)
   for _, idx in catalog.indexes:
-    if idx.table != tableName:
+    if idx.table.toLowerAscii() != tableName.toLowerAscii():
       continue
     if not shouldIncludeInIndex(table, idx, oldRes.value.values):
       continue
@@ -1219,7 +1219,7 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       var oldIdxValue = Value(kind: vkNull)
       if textBlob and idx.columns.len == 1:
         for i, col in table.columns:
-          if col.name == idx.columns[0]:
+          if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
             oldIdxValue = oldRes.value.values[i]
             break
       let delRes = deleteKeyValue(idxTree, oldKeyRes.value, encodeIndexEntry(rowid, oldIdxValue, textBlob))
@@ -1232,7 +1232,7 @@ proc deleteRow*(pager: Pager, catalog: Catalog, tableName: string, rowid: uint64
       if idx.columns.len == 1:
         var valueIndex = -1
         for i, col in table.columns:
-          if col.name == idx.columns[0]:
+          if col.name.toLowerAscii() == idx.columns[0].toLowerAscii():
             valueIndex = i
             break
         if valueIndex >= 0:
@@ -1253,7 +1253,7 @@ proc buildIndexForColumn*(pager: Pager, catalog: Catalog, tableName: string, col
   let table = tableRes.value
   var columnIndex = -1
   for i, col in table.columns:
-    if col.name == columnName:
+    if col.name.toLowerAscii() == columnName.toLowerAscii():
       columnIndex = i
       break
   if columnIndex < 0:
@@ -1291,7 +1291,7 @@ proc buildIndexForColumns*(pager: Pager, catalog: Catalog, tableName: string, co
   for colName in columnNames:
     var found = false
     for i, col in table.columns:
-      if col.name == colName:
+      if col.name.toLowerAscii() == colName.toLowerAscii():
         colIndices.add(i)
         found = true
         break
@@ -1360,7 +1360,7 @@ proc buildTrigramIndexForColumn*(pager: Pager, catalog: Catalog, tableName: stri
   let table = tableRes.value
   var columnIndex = -1
   for i, col in table.columns:
-    if col.name == columnName:
+    if col.name.toLowerAscii() == columnName.toLowerAscii():
       columnIndex = i
       break
   if columnIndex < 0:
@@ -1470,7 +1470,7 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   var idxOpt: Option[IndexMeta] = none(IndexMeta)
   if isExpressionIndexToken(column):
     for _, idx in catalog.indexes:
-      if idx.table == tableName and idx.kind == ikBtree and idx.columns.len == 1 and idx.columns[0] == column:
+      if idx.table.toLowerAscii() == tableName.toLowerAscii() and idx.kind == ikBtree and idx.columns.len == 1 and idx.columns[0].toLowerAscii() == column.toLowerAscii():
         idxOpt = some(idx)
         break
   else:
@@ -1661,7 +1661,7 @@ proc alterColumnTypeInTable(pager: Pager, catalog: Catalog, table: var TableMeta
   let originalTableMeta = table
   var columnIndex = -1
   for i, col in table.columns:
-    if col.name == columnName:
+    if col.name.toLowerAscii() == columnName.toLowerAscii():
       columnIndex = i
       break
   if columnIndex < 0:
@@ -1734,7 +1734,7 @@ proc alterColumnTypeInTable(pager: Pager, catalog: Catalog, table: var TableMeta
   # Rebuild indexes against the rewritten table contents and updated column type.
   updateTableMeta(catalog, table)
   for _, idx in catalog.indexes:
-    if idx.table == table.name:
+    if idx.table.toLowerAscii() == table.name.toLowerAscii():
       let rebuildRes = rebuildIndex(pager, catalog, idx)
       if not rebuildRes.ok:
         updateTableMeta(catalog, originalTableMeta)
@@ -1744,7 +1744,7 @@ proc alterColumnTypeInTable(pager: Pager, catalog: Catalog, table: var TableMeta
 proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, columnName: string): Result[Void] =
   var columnIndex = -1
   for i, col in table.columns:
-    if col.name == columnName:
+    if col.name.toLowerAscii() == columnName.toLowerAscii():
       columnIndex = i
       break
   
@@ -1758,7 +1758,7 @@ proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, c
   
   var indexesToDrop: seq[string] = @[]
   for idxName, idx in catalog.indexes:
-    if idx.table == table.name and idx.columns.len == 1 and idx.columns[0] == columnName:
+    if idx.table.toLowerAscii() == table.name.toLowerAscii() and idx.columns.len == 1 and idx.columns[0].toLowerAscii() == columnName.toLowerAscii():
       indexesToDrop.add(idxName)
   
   for idxName in indexesToDrop:
@@ -1813,7 +1813,7 @@ proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, c
   table.rootPage = newRoot
   
   for idxName, idx in catalog.indexes:
-    if idx.table == table.name:
+    if idx.table.toLowerAscii() == table.name.toLowerAscii():
       let rebuildRes = rebuildIndex(pager, catalog, idx)
       if not rebuildRes.ok:
         return rebuildRes
@@ -1822,7 +1822,7 @@ proc dropColumnFromTable(pager: Pager, catalog: Catalog, table: var TableMeta, c
 
 proc addColumnToTable(pager: Pager, catalog: Catalog, table: var TableMeta, colDef: ColumnDef): Result[Void] =
   for col in table.columns:
-    if col.name == colDef.name:
+    if col.name.toLowerAscii() == colDef.name.toLowerAscii():
       return err[Void](ERR_SQL, "Column already exists", colDef.name)
   
   let colRes = columnFromColumnDef(colDef)
@@ -1877,7 +1877,7 @@ proc addColumnToTable(pager: Pager, catalog: Catalog, table: var TableMeta, colD
   table.rootPage = newRoot
   
   for idxName, idx in catalog.indexes:
-    if idx.table == table.name:
+    if idx.table.toLowerAscii() == table.name.toLowerAscii():
       let rebuildRes = rebuildIndex(pager, catalog, idx)
       if not rebuildRes.ok:
         return rebuildRes
@@ -1887,9 +1887,9 @@ proc addColumnToTable(pager: Pager, catalog: Catalog, table: var TableMeta, colD
 proc renameColumnInTable(pager: Pager, catalog: Catalog, table: var TableMeta, oldName: string, newName: string): Result[Void] =
   var oldIndex = -1
   for i, col in table.columns:
-    if col.name == oldName:
+    if col.name.toLowerAscii() == oldName.toLowerAscii():
       oldIndex = i
-    if col.name == newName:
+    if col.name.toLowerAscii() == newName.toLowerAscii():
       return err[Void](ERR_SQL, "Column already exists", newName)
   if oldIndex < 0:
     return err[Void](ERR_SQL, "Column not found", oldName)

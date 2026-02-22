@@ -1230,7 +1230,7 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
 
     var colIndex = -1
     for i, col in table.columns:
-      if col.name == plan.column:
+      if col.name.toLowerAscii() == plan.column.toLowerAscii():
         colIndex = i
         break
     if colIndex < 0:
@@ -1322,7 +1322,7 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
 
     var colIndex = -1
     for i, col in table.columns:
-      if col.name == colName:
+      if col.name.toLowerAscii() == colName.toLowerAscii():
         colIndex = i
         break
     if colIndex < 0:
@@ -1377,16 +1377,18 @@ proc estimateRowBytes*(row: Row): int =
     result += varintLen(uint64(payloadLen)) + payloadLen
 
 proc columnIndex*(row: Row, table: string, name: string): Result[int] =
+  let normName = name.toLowerAscii()
   if table.len > 0:
-    let key = table & "." & name
+    let key = (table & "." & name).toLowerAscii()
     for i, col in row.columns:
-      if col == key:
+      if col.toLowerAscii() == key:
         return ok(i)
     # Qualified lookup failed (e.g. post-projection columns lack alias prefix);
     # fall through to unqualified matching below.
   var matches: seq[int] = @[]
   for i, col in row.columns:
-    if col == name or col.endsWith("." & name):
+    let normCol = col.toLowerAscii()
+    if normCol == normName or normCol.endsWith("." & normName):
       matches.add(i)
   if matches.len == 1:
     return ok(matches[0])
@@ -2549,7 +2551,7 @@ proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     cols.add(prefix & "." & col.name)
   var valueIndex = -1
   for i, col in table.columns:
-    if col.name == column:
+    if col.name.toLowerAscii() == column.toLowerAscii():
       valueIndex = i
       break
   for rowid in rowIdsRes.value:
@@ -2573,7 +2575,7 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
   let idx = indexOpt.get
   var columnIndex = -1
   for i, col in table.columns:
-    if col.name == column:
+    if col.name.toLowerAscii() == column.toLowerAscii():
       columnIndex = i
       break
   if columnIndex < 0:

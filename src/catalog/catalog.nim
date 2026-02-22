@@ -444,7 +444,7 @@ proc rebuildReverseFkCache(catalog: Catalog) =
     for col in meta.columns:
       if col.refTable.len == 0 or col.refColumn.len == 0:
         continue
-      let key = (col.refTable, col.refColumn)
+      let key = (normalizedObjectName(col.refTable), normalizedObjectName(col.refColumn))
       if not catalog.reverseFkRefs.hasKey(key):
         catalog.reverseFkRefs[key] = @[]
       catalog.reverseFkRefs[key].add(ReferencingChildFk(
@@ -523,11 +523,11 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
           if maxKeyRes.ok:
             if table.nextRowId <= maxKeyRes.value:
                table.nextRowId = maxKeyRes.value + 1
-          catalog.tables[record.table.name] = table
+          catalog.tables[normalizedObjectName(record.table.name)] = table
         of crIndex:
-          catalog.indexes[record.index.name] = record.index
+          catalog.indexes[normalizedObjectName(record.index.name)] = record.index
         of crView:
-          catalog.views[record.view.name] = record.view
+          catalog.views[normalizedObjectName(record.view.name)] = record.view
         of crTrigger:
           catalog.triggers[triggerMetaKey(record.trigger.table, record.trigger.name)] = record.trigger
   rebuildDependentViewsIndex(catalog)
@@ -567,20 +567,20 @@ proc allTrigramDeltas*(catalog: Catalog): seq[((string, uint32), TrigramDelta)] 
 proc updateTableMeta*(catalog: Catalog, table: TableMeta) =
   ## Updates the in-memory metadata for a table without persisting to disk.
   ## Use with caution: changes will be lost on crash if not followed by saveTable eventually.
-  catalog.tables[table.name] = table
+  catalog.tables[normalizedObjectName(table.name)] = table
 
 proc updateTableMetaFast*(catalog: Catalog, tableName: string, nextRowId: uint64, rootPage: PageId) {.inline.} =
   ## Updates only nextRowId and rootPage in the in-memory table metadata.
   ## Avoids copying the entire TableMeta struct when only these fields change.
-  catalog.tables.withValue(tableName, entry):
+  catalog.tables.withValue(normalizedObjectName(tableName), entry):
     entry.nextRowId = nextRowId
     entry.rootPage = rootPage
 
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
   var rebuildFk = true
-  if catalog.tables.hasKey(table.name):
-    rebuildFk = catalog.tables[table.name].columns != table.columns
-  catalog.tables[table.name] = table
+  if catalog.tables.hasKey(normalizedObjectName(table.name)):
+    rebuildFk = catalog.tables[normalizedObjectName(table.name)].columns != table.columns
+  catalog.tables[normalizedObjectName(table.name)] = table
   if rebuildFk:
     rebuildReverseFkCache(catalog)
   let key = uint64(crc32c(stringToBytes("table:" & table.name)))
@@ -604,19 +604,19 @@ proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] 
   okVoid()
 
 proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
-  if not catalog.tables.hasKey(name):
+  if not catalog.tables.hasKey(normalizedObjectName(name)):
     return err[TableMeta](ERR_SQL, "Table not found", name)
-  ok(catalog.tables[name])
+  ok(catalog.tables[normalizedObjectName(name)])
 
 proc getTablePtr*(catalog: Catalog, name: string): ptr TableMeta =
   ## Returns a mutable pointer into the catalog table map. Caller must not
   ## hold this across operations that could rehash catalog.tables.
-  catalog.tables.withValue(name, v):
+  catalog.tables.withValue(normalizedObjectName(name), v):
     return addr v[]
   return nil
 
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
-  catalog.indexes[index.name] = index
+  catalog.indexes[normalizedObjectName(index.name)] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
   let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
@@ -629,7 +629,7 @@ proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   okVoid()
 
 proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
-  catalog.indexes[index.name] = index
+  catalog.indexes[normalizedObjectName(index.name)] = index
   let key = uint64(crc32c(stringToBytes("index:" & index.name)))
   discard delete(catalog.catalogTree, key)
   let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
@@ -643,15 +643,16 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   okVoid()
 
 proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
-  if catalog.views.hasKey(view.name):
+  let normName = normalizedObjectName(view.name)
+  if catalog.views.hasKey(normName):
     return err[Void](ERR_SQL, "View already exists", view.name)
-  catalog.views[view.name] = view
+  catalog.views[normName] = view
   rebuildDependentViewsIndex(catalog)
   let key = uint64(crc32c(stringToBytes("view:" & view.name)))
   let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
-    catalog.views.del(view.name)
+    catalog.views.del(normName)
     rebuildDependentViewsIndex(catalog)
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
@@ -659,7 +660,7 @@ proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
   okVoid()
 
 proc saveViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
-  catalog.views[view.name] = view
+  catalog.views[normalizedObjectName(view.name)] = view
   rebuildDependentViewsIndex(catalog)
   let key = uint64(crc32c(stringToBytes("view:" & view.name)))
   let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
@@ -678,27 +679,30 @@ proc saveViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
   okVoid()
 
 proc getView*(catalog: Catalog, name: string): Result[ViewMeta] =
-  if not catalog.views.hasKey(name):
+  let normName = normalizedObjectName(name)
+  if not catalog.views.hasKey(normName):
     return err[ViewMeta](ERR_SQL, "View not found", name)
-  ok(catalog.views[name])
+  ok(catalog.views[normName])
 
 proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void]
 proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void]
 
 proc dropView*(catalog: Catalog, name: string): Result[Void] =
-  if not catalog.views.hasKey(name):
+  let normName = normalizedObjectName(name)
+  if not catalog.views.hasKey(normName):
     return err[Void](ERR_SQL, "View not found", name)
+  let originalName = catalog.views[normName].name
   var triggerNames: seq[string] = @[]
   for _, trigger in catalog.triggers:
-    if normalizedObjectName(trigger.table) == normalizedObjectName(name):
+    if normalizedObjectName(trigger.table) == normName:
       triggerNames.add(trigger.name)
   for triggerName in triggerNames:
     let dropTrigRes = dropTrigger(catalog, name, triggerName)
     if not dropTrigRes.ok:
       return dropTrigRes
-  catalog.views.del(name)
+  catalog.views.del(normName)
   rebuildDependentViewsIndex(catalog)
-  let key = uint64(crc32c(stringToBytes("view:" & name)))
+  let key = uint64(crc32c(stringToBytes("view:" & originalName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
@@ -707,18 +711,20 @@ proc dropView*(catalog: Catalog, name: string): Result[Void] =
   okVoid()
 
 proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Void] =
-  if not catalog.views.hasKey(oldName):
+  let normOldName = normalizedObjectName(oldName)
+  let normNewName = normalizedObjectName(newName)
+  if not catalog.views.hasKey(normOldName):
     return err[Void](ERR_SQL, "View not found", oldName)
-  if catalog.views.hasKey(newName):
+  if catalog.views.hasKey(normNewName):
     return err[Void](ERR_SQL, "View already exists", newName)
-  var view = catalog.views[oldName]
-  let oldKey = uint64(crc32c(stringToBytes("view:" & oldName)))
+  var view = catalog.views[normOldName]
+  let oldKey = uint64(crc32c(stringToBytes("view:" & view.name)))
   let delRes = delete(catalog.catalogTree, oldKey)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
-  catalog.views.del(oldName)
+  catalog.views.del(normOldName)
   view.name = newName
-  catalog.views[newName] = view
+  catalog.views[normNewName] = view
   var triggerMetas: seq[TriggerMeta] = @[]
   for _, trigger in catalog.triggers:
     if normalizedObjectName(trigger.table) == normalizedObjectName(oldName):
@@ -774,7 +780,7 @@ proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Res
   okVoid()
 
 proc referencingChildren*(catalog: Catalog, tableName: string, columnName: string): seq[ReferencingChildFk] =
-  let key = (tableName, columnName)
+  let key = (normalizedObjectName(tableName), normalizedObjectName(columnName))
   if catalog.reverseFkRefs.hasKey(key):
     return catalog.reverseFkRefs[key]
   @[]
@@ -814,19 +820,21 @@ proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
   result.sort()
 
 proc dropTable*(catalog: Catalog, name: string): Result[Void] =
-  if not catalog.tables.hasKey(name):
+  let normName = normalizedObjectName(name)
+  if not catalog.tables.hasKey(normName):
     return err[Void](ERR_SQL, "Table not found", name)
+  let originalName = catalog.tables[normName].name
   var triggerNames: seq[string] = @[]
   for _, trigger in catalog.triggers:
-    if normalizedObjectName(trigger.table) == normalizedObjectName(name):
+    if normalizedObjectName(trigger.table) == normName:
       triggerNames.add(trigger.name)
   for triggerName in triggerNames:
     let dropTrigRes = dropTrigger(catalog, name, triggerName)
     if not dropTrigRes.ok:
       return dropTrigRes
-  catalog.tables.del(name)
+  catalog.tables.del(normName)
   rebuildReverseFkCache(catalog)
-  let key = uint64(crc32c(stringToBytes("table:" & name)))
+  let key = uint64(crc32c(stringToBytes("table:" & originalName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
@@ -837,10 +845,12 @@ proc dropTable*(catalog: Catalog, name: string): Result[Void] =
   okVoid()
 
 proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
-  if not catalog.indexes.hasKey(name):
+  let normName = normalizedObjectName(name)
+  if not catalog.indexes.hasKey(normName):
     return err[Void](ERR_SQL, "Index not found", name)
-  catalog.indexes.del(name)
-  let key = uint64(crc32c(stringToBytes("index:" & name)))
+  let originalName = catalog.indexes[normName].name
+  catalog.indexes.del(normName)
+  let key = uint64(crc32c(stringToBytes("index:" & originalName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
     return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
@@ -851,16 +861,19 @@ proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
   okVoid()
 
 proc getBtreeIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
+  let normTable = normalizedObjectName(table)
   for _, idx in catalog.indexes:
-    if idx.table == table and idx.columns.len == 1 and idx.columns[0] == column and idx.kind == ikBtree:
+    if normalizedObjectName(idx.table) == normTable and idx.columns.len == 1 and normalizedObjectName(idx.columns[0]) == normalizedObjectName(column) and idx.kind == ikBtree:
       return some(idx)
   none(IndexMeta)
 
 proc getIndexForColumn*(catalog: Catalog, table: string, column: string, kind: IndexKind, requireUnique: bool = false): Option[IndexMeta] =
   ## Returns any single-column index that semantically satisfies the requested signature.
   ## If requireUnique is true, only unique indexes satisfy.
+  let normTable = normalizedObjectName(table)
+  let normColumn = normalizedObjectName(column)
   for _, idx in catalog.indexes:
-    if idx.table != table or idx.columns.len != 1 or idx.columns[0] != column or idx.kind != kind:
+    if normalizedObjectName(idx.table) != normTable or idx.columns.len != 1 or normalizedObjectName(idx.columns[0]) != normColumn or idx.kind != kind:
       continue
     if requireUnique and not idx.unique:
       continue
@@ -868,21 +881,23 @@ proc getIndexForColumn*(catalog: Catalog, table: string, column: string, kind: I
   none(IndexMeta)
 
 proc getTrigramIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
+  let normTable = normalizedObjectName(table)
   for _, idx in catalog.indexes:
-    if idx.table == table and idx.columns.len == 1 and idx.columns[0] == column and idx.kind == ikTrigram:
+    if normalizedObjectName(idx.table) == normTable and idx.columns.len == 1 and normalizedObjectName(idx.columns[0]) == normalizedObjectName(column) and idx.kind == ikTrigram:
       return some(idx)
   none(IndexMeta)
 
 proc getIndexByName*(catalog: Catalog, name: string): Option[IndexMeta] =
-  if catalog.indexes.hasKey(name):
-    return some(catalog.indexes[name])
+  let normName = normalizedObjectName(name)
+  if catalog.indexes.hasKey(normName):
+    return some(catalog.indexes[normName])
   none(IndexMeta)
 
 proc hasTableName*(catalog: Catalog, name: string): bool =
-  catalog.tables.hasKey(name)
+  catalog.tables.hasKey(normalizedObjectName(name))
 
 proc hasViewName*(catalog: Catalog, name: string): bool =
-  catalog.views.hasKey(name)
+  catalog.views.hasKey(normalizedObjectName(name))
 
 proc hasTableOrViewName*(catalog: Catalog, name: string): bool =
-  catalog.tables.hasKey(name) or catalog.views.hasKey(name)
+  catalog.tables.hasKey(normalizedObjectName(name)) or catalog.views.hasKey(normalizedObjectName(name))
