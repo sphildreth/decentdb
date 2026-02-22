@@ -433,7 +433,7 @@ proc evalPredicateValue(table: TableMeta, values: seq[Value], expr: Expr): Value
   else:
     return Value(kind: vkNull)
 
-proc shouldIncludeInIndex(table: TableMeta, idx: IndexMeta, values: seq[Value]): bool =
+proc shouldIncludeInIndex*(table: TableMeta, idx: IndexMeta, values: seq[Value]): bool =
   if idx.predicateSql.len == 0:
     return true
   let predExpr = parsePredicateExpr(idx.predicateSql, idx.table)

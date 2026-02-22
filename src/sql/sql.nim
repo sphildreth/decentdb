@@ -1369,14 +1369,22 @@ proc selectToCanonicalSql(stmt: Statement): string =
   parts.add("SELECT " & selectItems.join(", "))
 
   if stmt.fromTable.len > 0:
-    var fromPart = "FROM " & quoteIdent(stmt.fromTable)
-    if stmt.fromAlias.len > 0:
-      fromPart.add(" " & quoteIdent(stmt.fromAlias))
+    var fromPart: string
+    if stmt.fromSubquery != nil:
+      fromPart = "FROM (" & selectToCanonicalSql(stmt.fromSubquery) & ") " & quoteIdent(stmt.fromAlias)
+    else:
+      fromPart = "FROM " & quoteIdent(stmt.fromTable)
+      if stmt.fromAlias.len > 0:
+        fromPart.add(" " & quoteIdent(stmt.fromAlias))
     parts.add(fromPart)
 
-  for join in stmt.joins:
+  for i, join in stmt.joins:
     let joinKeyword = if join.joinType == jtLeft: "LEFT JOIN " else: "INNER JOIN "
-    var joinPart = joinKeyword & quoteIdent(join.table)
+    var joinPart: string
+    if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
+      joinPart = joinKeyword & "(" & selectToCanonicalSql(stmt.joinSubqueries[i]) & ")"
+    else:
+      joinPart = joinKeyword & quoteIdent(join.table)
     if join.alias.len > 0:
       joinPart.add(" " & quoteIdent(join.alias))
     if join.onExpr != nil:

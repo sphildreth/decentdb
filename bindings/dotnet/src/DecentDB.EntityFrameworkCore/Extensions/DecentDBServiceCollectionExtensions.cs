@@ -36,6 +36,8 @@ public static class DecentDBServiceCollectionExtensions
         builder.TryAdd<IMemberTranslatorProvider, DecentDBMemberTranslatorProvider>();
         builder.TryAdd<IUpdateSqlGenerator, DecentDBUpdateSqlGenerator>();
         builder.TryAdd<IModificationCommandBatchFactory, DecentDBModificationCommandBatchFactory>();
+        builder.TryAdd<IQueryableMethodTranslatingExpressionVisitorFactory,
+            DecentDBQueryableMethodTranslatingExpressionVisitorFactory>();
         builder.TryAddCoreServices();
 
         return serviceCollection;

@@ -536,6 +536,10 @@ proc enforceUnique(catalog: Catalog, pager: Pager, table: TableMeta, values: seq
   for _, idx in catalog.indexes:
     if idx.table.toLowerAscii() != table.name.toLowerAscii() or not idx.unique:
       continue
+    # Skip rows excluded by partial index predicate
+    if idx.predicateSql.len > 0:
+      if not shouldIncludeInIndex(table, idx, values):
+        continue
     # Skip single-column indexes already covered by inline col.unique above
     if idx.columns.len == 1:
       var coveredInline = false
@@ -2594,11 +2598,22 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let rowsRes = scanTable(db.pager, table)
         if not rowsRes.ok:
           return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+        # Build qualified column names for predicate evaluation
+        var qualCols: seq[string] = @[]
+        if bound.indexPredicate != nil:
+          for col in table.columns:
+            qualCols.add(bound.indexTableName & "." & col.name)
         if colIndices.len == 1:
           let colKind = table.columns[colIndices[0]].kind
           var seen: Table[uint64, bool] = initTable[uint64, bool]()
           var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
           for row in rowsRes.value:
+            # Skip rows excluded by partial index predicate
+            if bound.indexPredicate != nil:
+              let evalRow = Row(rowid: row.rowid, columns: qualCols, values: row.values)
+              let predRes = evalExpr(evalRow, bound.indexPredicate, @[])
+              if predRes.ok and not valueToBool(predRes.value):
+                continue
             if row.values[colIndices[0]].kind == vkNull:
               continue
             let key = indexKeyFromValue(row.values[colIndices[0]])
@@ -2618,6 +2633,11 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           # Composite uniqueness check: hash all column values, verify via row comparison
           var seen: Table[uint64, seq[seq[Value]]] = initTable[uint64, seq[seq[Value]]]()
           for row in rowsRes.value:
+            if bound.indexPredicate != nil:
+              let evalRow = Row(rowid: row.rowid, columns: qualCols, values: row.values)
+              let predRes = evalExpr(evalRow, bound.indexPredicate, @[])
+              if predRes.ok and not valueToBool(predRes.value):
+                continue
             var hasNull = false
             var vals: seq[Value] = @[]
             for ci in colIndices:
@@ -3256,11 +3276,20 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       let rowsRes = scanTable(db.pager, table)
       if not rowsRes.ok:
         return err[int64](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
+      var qualCols2: seq[string] = @[]
+      if bound.indexPredicate != nil:
+        for col in table.columns:
+          qualCols2.add(bound.indexTableName & "." & col.name)
       if colIndices.len == 1:
         let colKind = table.columns[colIndices[0]].kind
         var seen: Table[uint64, bool] = initTable[uint64, bool]()
         var seenVals: Table[uint64, seq[string]] = initTable[uint64, seq[string]]()
         for row in rowsRes.value:
+          if bound.indexPredicate != nil:
+            let evalRow = Row(rowid: row.rowid, columns: qualCols2, values: row.values)
+            let predRes = evalExpr(evalRow, bound.indexPredicate, @[])
+            if predRes.ok and not valueToBool(predRes.value):
+              continue
           if row.values[colIndices[0]].kind == vkNull:
             continue
           let key = indexKeyFromValue(row.values[colIndices[0]])
@@ -3279,6 +3308,11 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       else:
         var seen: Table[uint64, seq[seq[Value]]] = initTable[uint64, seq[seq[Value]]]()
         for row in rowsRes.value:
+          if bound.indexPredicate != nil:
+            let evalRow = Row(rowid: row.rowid, columns: qualCols2, values: row.values)
+            let predRes = evalExpr(evalRow, bound.indexPredicate, @[])
+            if predRes.ok and not valueToBool(predRes.value):
+              continue
           var hasNull = false
           var vals: seq[Value] = @[]
           for ci in colIndices:

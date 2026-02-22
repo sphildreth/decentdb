@@ -863,19 +863,22 @@ proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
 proc getBtreeIndexForColumn*(catalog: Catalog, table: string, column: string): Option[IndexMeta] =
   let normTable = normalizedObjectName(table)
   for _, idx in catalog.indexes:
-    if normalizedObjectName(idx.table) == normTable and idx.columns.len == 1 and normalizedObjectName(idx.columns[0]) == normalizedObjectName(column) and idx.kind == ikBtree:
+    if normalizedObjectName(idx.table) == normTable and idx.columns.len == 1 and normalizedObjectName(idx.columns[0]) == normalizedObjectName(column) and idx.kind == ikBtree and idx.predicateSql.len == 0:
       return some(idx)
   none(IndexMeta)
 
 proc getIndexForColumn*(catalog: Catalog, table: string, column: string, kind: IndexKind, requireUnique: bool = false): Option[IndexMeta] =
   ## Returns any single-column index that semantically satisfies the requested signature.
   ## If requireUnique is true, only unique indexes satisfy.
+  ## Partial indexes (with predicateSql) are excluded — they may not cover all rows.
   let normTable = normalizedObjectName(table)
   let normColumn = normalizedObjectName(column)
   for _, idx in catalog.indexes:
     if normalizedObjectName(idx.table) != normTable or idx.columns.len != 1 or normalizedObjectName(idx.columns[0]) != normColumn or idx.kind != kind:
       continue
     if requireUnique and not idx.unique:
+      continue
+    if idx.predicateSql.len > 0:
       continue
     return some(idx)
   none(IndexMeta)

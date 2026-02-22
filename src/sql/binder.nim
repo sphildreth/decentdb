@@ -475,6 +475,9 @@ proc inferExprType(catalog: Catalog, map: Table[string, TableMeta], expr: Expr):
 
 proc subqueryTableMeta(catalog: Catalog, subquery: Statement, alias: string): Result[TableMeta] =
   ## Derive a synthetic TableMeta from a subquery's SELECT items.
+  # For UNION/INTERSECT/EXCEPT, columns are defined by the left operand.
+  if subquery.setOpKind != sokNone and subquery.setOpLeft != nil:
+    return subqueryTableMeta(catalog, subquery.setOpLeft, alias)
   var columns: seq[Column] = @[]
   # Build a table map for the subquery's own sources to resolve column types.
   var innerMap = initTable[string, TableMeta]()
@@ -1490,6 +1493,16 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
         var found = false
         for si in expanded.selectItems:
           if si.alias.len > 0 and si.alias == item.expr.name:
+            # When the aliased expression is an aggregate function, keep the
+            # ORDER BY as a column reference to the alias so the sort
+            # evaluates against the materialized aggregate output row instead
+            # of trying to re-evaluate the aggregate (which would fail).
+            if si.expr != nil and si.expr.kind == ekFunc and
+                si.expr.funcName.toUpperAscii() in [
+                  "COUNT", "SUM", "AVG", "MIN", "MAX",
+                  "GROUP_CONCAT", "STRING_AGG"]:
+              found = true
+              break
             expanded.orderBy[i] = OrderItem(expr: cloneExpr(si.expr), asc: item.asc)
             let aliasRes = bindExpr(map, expanded.orderBy[i].expr)
             if not aliasRes.ok:

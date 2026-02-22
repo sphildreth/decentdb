@@ -31,8 +31,8 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
 
         var dateTimeMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
             new ValueConverter<DateTime, long>(
-                value => new DateTimeOffset(value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime(), TimeSpan.Zero).ToUnixTimeMilliseconds(),
-                value => DateTimeOffset.FromUnixTimeMilliseconds(value).UtcDateTime),
+                value => new DateTimeOffset(value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime(), TimeSpan.Zero).UtcTicks,
+                value => new DateTime(value, DateTimeKind.Utc)),
             comparer: null,
             keyComparer: null,
             elementMapping: null,
@@ -40,8 +40,8 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
 
         var dateTimeOffsetMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
             new ValueConverter<DateTimeOffset, long>(
-                value => value.ToUniversalTime().ToUnixTimeMilliseconds(),
-                value => DateTimeOffset.FromUnixTimeMilliseconds(value)),
+                value => value.UtcTicks,
+                value => new DateTimeOffset(value, TimeSpan.Zero)),
             comparer: null,
             keyComparer: null,
             elementMapping: null,
@@ -85,8 +85,8 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
 
         var instantMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
             new ValueConverter<Instant, long>(
-                value => value.ToUnixTimeMilliseconds(),
-                value => Instant.FromUnixTimeMilliseconds(value)),
+                value => value.ToUnixTimeTicks(),
+                value => Instant.FromUnixTimeTicks(value)),
             comparer: null,
             keyComparer: null,
             elementMapping: null,
@@ -103,8 +103,8 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
 
         var localDateTimeMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
             new ValueConverter<LocalDateTime, long>(
-                value => value.InZoneLeniently(DateTimeZone.Utc).ToInstant().ToUnixTimeMilliseconds(),
-                value => Instant.FromUnixTimeMilliseconds(value).InUtc().LocalDateTime),
+                value => value.InZoneLeniently(DateTimeZone.Utc).ToInstant().ToUnixTimeTicks(),
+                value => Instant.FromUnixTimeTicks(value).InUtc().LocalDateTime),
             comparer: null,
             keyComparer: null,
             elementMapping: null,

@@ -185,7 +185,7 @@ namespace DecentDB.AdoNet
             else if (nonNullableType == typeof(decimal))
             {
                 var type = _statement.ColumnType(ordinal);
-                if (type == 12) 
+                if (type == 12)
                 {
                     boxed = _statement.GetDecimal(ordinal);
                 }

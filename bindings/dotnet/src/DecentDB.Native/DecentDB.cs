@@ -244,7 +244,7 @@ public sealed class PreparedStatement : IDisposable
             var bytes = stackalloc byte[16];
             if (!value.TryWriteBytes(new Span<byte>(bytes, 16)))
                 throw new InvalidOperationException("Failed to write Guid bytes");
-            
+
             var res = DecentDBNativeUnsafe.decentdb_bind_blob(Handle, index1Based, bytes, 16);
             if (res < 0)
             {
@@ -258,7 +258,7 @@ public sealed class PreparedStatement : IDisposable
     {
         // DecentDB currently supports DECIMAL backed by INT64 (approx 18 digits).
         // C# decimal is 96-bit integer + scale. We must check if it fits in 64-bit.
-        
+
         Span<int> bits = stackalloc int[4];
         decimal.GetBits(value, bits);
         int low = bits[0];
@@ -268,22 +268,22 @@ public sealed class PreparedStatement : IDisposable
         int scale = (flags >> 16) & 0xFF;
         bool isNegative = (flags & 0x80000000) != 0;
 
-        if (high != 0) 
+        if (high != 0)
         {
-             throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
+            throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
         }
-        
+
         // Combine Mid and Low
         ulong unscaledU = ((ulong)(uint)mid << 32) | (uint)low;
-        
+
         if (unscaledU > (ulong)long.MaxValue + (ulong)(isNegative ? 1 : 0))
         {
-             throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
+            throw new OverflowException("Value is too large for DecentDB DECIMAL (must fit in 64-bit unscaled integer)");
         }
-        
+
         long unscaled = (long)unscaledU;
         if (isNegative) unscaled = -unscaled;
-        
+
         var res = DecentDBNativeUnsafe.decentdb_bind_decimal(Handle, index1Based, unscaled, scale);
         if (res < 0)
         {
@@ -394,7 +394,7 @@ public sealed class PreparedStatement : IDisposable
         // We can just check != 0.
         return GetInt64(col0Based) != 0;
     }
-    
+
     public Guid GetGuid(int col0Based)
     {
         unsafe
@@ -402,12 +402,12 @@ public sealed class PreparedStatement : IDisposable
             // Try to get as blob first, as UUIDs are stored as blobs
             int len;
             var ptr = (byte*)DecentDBNative.decentdb_column_blob(Handle, col0Based, out len);
-            
+
             if (ptr != null && len == 16)
             {
                 return new Guid(new ReadOnlySpan<byte>(ptr, 16));
             }
-            
+
             // Fallback: check text if blob failed or length mismatch (e.g. legacy text UUIDs?)
             // Although ADR 0091 says text will no longer be accepted for ctUuid, 
             // we might still have text columns that contain UUID strings.
@@ -417,7 +417,7 @@ public sealed class PreparedStatement : IDisposable
                 var s = new string((sbyte*)ptr, 0, len, System.Text.Encoding.UTF8);
                 if (Guid.TryParse(s, out var g)) return g;
             }
-            
+
             return Guid.Empty;
         }
     }
@@ -439,11 +439,11 @@ public sealed class PreparedStatement : IDisposable
         // decimal(int lo, int mid, int hi, bool isNegative, byte scale)
         bool isNegative = unscaled < 0;
         ulong u = isNegative ? (ulong)(-unscaled) : (ulong)unscaled;
-        
+
         int lo = (int)(u & 0xFFFFFFFF);
         int mid = (int)(u >> 32);
         int hi = 0;
-        
+
         return new decimal(lo, mid, hi, isNegative, (byte)scale);
     }
 

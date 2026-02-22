@@ -6,6 +6,8 @@ using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using DecentDB.Native;
 
 namespace DecentDB.AdoNet
@@ -142,6 +144,13 @@ namespace DecentDB.AdoNet
                 _state = ConnectionState.Closed;
                 throw new InvalidOperationException($"Failed to open database: {ex.Message}", ex);
             }
+        }
+
+        public override Task OpenAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Open();
+            return Task.CompletedTask;
         }
 
         protected override DbCommand CreateDbCommand()

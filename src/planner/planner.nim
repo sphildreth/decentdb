@@ -237,6 +237,15 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   proc isRowidPkColumn(colName: string): bool =
     if not tableRes.ok:
       return false
+    # A column is the rowid only when it is the SOLE INT64 primary key.
+    # Composite PKs use a hash-based unique index; individual columns are
+    # NOT rowid aliases even when they are INTEGER PRIMARY KEY.
+    var pkCount = 0
+    for col in tableMeta.columns:
+      if col.primaryKey:
+        inc pkCount
+    if pkCount != 1:
+      return false
     for col in tableMeta.columns:
       if col.name == colName and col.primaryKey and col.kind == ctInt64:
         return true
@@ -493,7 +502,29 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
     base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
     if stmt.orderBy.len > 0:
-      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+      # Rewrite ORDER BY aggregate expressions to column references so the
+      # sort evaluates against materialized aggregate output columns instead
+      # of trying to re-evaluate the aggregate function (which would fail).
+      var rewrittenOrder: seq[OrderItem] = @[]
+      for item in stmt.orderBy:
+        if exprHasAggregate(item.expr):
+          var colName = ""
+          for si in stmt.selectItems:
+            if exprToCanonicalSql(si.expr) == exprToCanonicalSql(item.expr):
+              if si.alias.len > 0:
+                colName = si.alias
+              elif si.expr != nil and si.expr.kind == ekFunc:
+                colName = si.expr.funcName.toLowerAscii()
+              break
+          if colName.len > 0:
+            rewrittenOrder.add(OrderItem(
+              expr: Expr(kind: ekColumn, name: colName, table: ""),
+              asc: item.asc))
+          else:
+            rewrittenOrder.add(item)
+        else:
+          rewrittenOrder.add(item)
+      base = Plan(kind: pkSort, orderBy: rewrittenOrder, left: base)
   else:
     # Place Sort before Project so that ORDER BY sees the original column
     # names (not aliases) and expensive projections (e.g. scalar subqueries)

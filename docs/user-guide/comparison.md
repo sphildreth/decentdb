@@ -49,7 +49,7 @@ DecentDB's current baseline includes:
 - CTEs: non-recursive `WITH ... AS`
 - Window functions: `ROW_NUMBER() OVER (...)`
 - Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
-- Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`
+- Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `JSON_ARRAY_LENGTH`, `JSON_EXTRACT`, `PRINTF`
 - Operators: `+`, `-`, `*`, `/`, `||` (string concatenation)
 - Parameters: positional `$1, $2, ...` (Postgres-style)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output

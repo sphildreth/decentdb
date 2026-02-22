@@ -139,9 +139,33 @@ namespace DecentDB.AdoNet
 
         public override int ExecuteNonQuery()
         {
-            using var reader = ExecuteDbDataReader(CommandBehavior.Default);
-            while (reader.Read()) { }
-            return reader.RecordsAffected;
+            var statements = SqlStatementSplitter.Split(_commandText);
+            if (statements.Count <= 1)
+            {
+                using var reader = ExecuteDbDataReader(CommandBehavior.Default);
+                while (reader.Read()) { }
+                return reader.RecordsAffected;
+            }
+
+            // Multi-statement: execute each individually, sum affected rows
+            var totalRows = 0;
+            var savedText = _commandText;
+            try
+            {
+                foreach (var stmt in statements)
+                {
+                    _commandText = stmt;
+                    using var reader = ExecuteDbDataReader(CommandBehavior.Default);
+                    while (reader.Read()) { }
+                    if (reader.RecordsAffected > 0)
+                        totalRows += reader.RecordsAffected;
+                }
+            }
+            finally
+            {
+                _commandText = savedText;
+            }
+            return totalRows;
         }
 
         public override object? ExecuteScalar()
@@ -156,11 +180,13 @@ namespace DecentDB.AdoNet
 
         public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(ExecuteNonQuery());
         }
 
         public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(ExecuteScalar());
         }
 
@@ -173,6 +199,8 @@ namespace DecentDB.AdoNet
 
             var db = _connection.GetNativeDb();
             var (sql, paramMap) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
+            SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
+            sql = SqlParameterRewriter.StripUpdateDeleteAlias(sql);
 
             var observation = _connection.TryStartSqlObservation(sql, SnapshotParameters(paramMap));
 
@@ -243,6 +271,7 @@ namespace DecentDB.AdoNet
 
         protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             return Task.FromResult(ExecuteDbDataReader(behavior));
         }
 
