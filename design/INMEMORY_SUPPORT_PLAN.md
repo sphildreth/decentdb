@@ -43,7 +43,9 @@ The following files directly access `VfsFile.file` and must be updated to cast t
 **Migration Strategy**: Since `VfsFile` methods receive the file as a parameter, the VFS implementation (OsVfs or MemVfs) will cast the `VfsFile` to its concrete type internally. No changes required in callers.
 
 ### 3.2 Expanding the `Vfs` Interface
-Currently, `engine.nim`, `pager.nim`, and `wal.nim` use `os.getFileInfo`, `os.fileExists`, and `os.removeFile` directly. These must be abstracted into the `Vfs` interface:
+Currently, `engine.nim`, `pager.nim`, and `wal.nim` use `os.getFileInfo`, `os.fileExists`, and `os.removeFile` directly. **Run `grep -r 'os\\.(getFileInfo|fileExists|removeFile|fileSize)' src/` before implementation to confirm all locations.**
+
+These must be abstracted into the `Vfs` interface:
 ```nim
 method getFileSize*(vfs: Vfs, path: string): Result[int64] {.base.}
 method fileExists*(vfs: Vfs, path: string): bool {.base.}
@@ -55,7 +57,7 @@ method removeFile*(vfs: Vfs, path: string): Result[Void] {.base.}
 Create `src/vfs/mem_vfs.nim`:
 ```nim
 type MemVfsFile* = ref object of VfsFile
-  data*: string
+  data*: seq[byte]
 
 type MemVfs* = ref object of Vfs
   files*: Table[string, MemVfsFile]
@@ -83,7 +85,7 @@ type MemVfs* = ref object of Vfs
 In `src/engine.nim`:
 ```nim
 proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
-  let isMemory = path == ":memory:"
+  let isMemory = path.endsWith(":memory:")
   let vfs: Vfs = if isMemory: newMemVfs() else: newOsVfs()
   ...
 ```
@@ -130,7 +132,7 @@ Per `design/adr/README.md`, an ADR is required for decisions that "have meaningf
 ## 5. Testing Strategy
 - Add unit tests for `MemVfs` in `tests/vfs/test_mem_vfs.nim`.
 - Add a test in `tests/test_engine.nim` that opens `:memory:`, creates tables, inserts data, and verifies concurrent readers work.
-- Add a test in `tests/test_engine.nim` that verifies multiple independent `:memory:` databases do not share state.
+- Add a test in `tests/test_engine.nim` that verifies multiple independent `:memory:` databases do not share state.RSS drops via `getrusage` or equivalent
 - Add a test in `tests/test_engine.nim` that verifies transaction rollback works correctly in `:memory:` (insert data, rollback, verify data is gone).
 - Add a test in `tests/test_engine.nim` that verifies memory is released when `Db` is closed (open `:memory:`, insert large data, close, open again, verify memory usage dropped).
 - Run core benchmark smoke tests against `:memory:`.
