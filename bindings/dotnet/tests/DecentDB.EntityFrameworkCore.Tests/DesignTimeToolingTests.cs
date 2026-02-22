@@ -193,12 +193,13 @@ public sealed class DesignTimeToolingTests
     {
         Directory.CreateDirectory(outputDirectory);
 
+        // Prefer build/ output (canonical build dir) over repo root to avoid stale binaries.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
             CopyFirstExisting(
-                Path.Combine(repoRoot, "libdecentdb.so"),
                 Path.Combine(repoRoot, "build", "libdecentdb.so"),
                 Path.Combine(repoRoot, "build", "libc_api.so"),
+                Path.Combine(repoRoot, "libdecentdb.so"),
                 destinationPath: Path.Combine(outputDirectory, "libdecentdb.so"));
             return;
         }
@@ -206,9 +207,9 @@ public sealed class DesignTimeToolingTests
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
             CopyFirstExisting(
-                Path.Combine(repoRoot, "libdecentdb.dylib"),
                 Path.Combine(repoRoot, "build", "libdecentdb.dylib"),
                 Path.Combine(repoRoot, "build", "libc_api.dylib"),
+                Path.Combine(repoRoot, "libdecentdb.dylib"),
                 destinationPath: Path.Combine(outputDirectory, "libdecentdb.dylib"));
             return;
         }
@@ -216,9 +217,9 @@ public sealed class DesignTimeToolingTests
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             CopyFirstExisting(
-                Path.Combine(repoRoot, "decentdb.dll"),
                 Path.Combine(repoRoot, "build", "decentdb.dll"),
                 Path.Combine(repoRoot, "build", "c_api.dll"),
+                Path.Combine(repoRoot, "decentdb.dll"),
                 destinationPath: Path.Combine(outputDirectory, "decentdb.dll"));
         }
     }
