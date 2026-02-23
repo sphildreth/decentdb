@@ -57,6 +57,7 @@ A change is done only when:
 - ✅ CI passes on all target OSes
 
 ## 4. Commit / PR hygiene
+- **NEVER commit directly without presenting the full diff to the user for review first.** Always show `git diff` output and wait for explicit approval before running `git commit`. No exceptions.
 - Use clear commit messages (imperative, scoped).
 - Avoid mixing unrelated refactors with feature work.
 - If you changed any persistent format (db header, page layout, WAL frame format, postings format):

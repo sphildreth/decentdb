@@ -1,4 +1,6 @@
+using DecentDB.EntityFrameworkCore.NodaTime.Query.Internal;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -13,7 +15,10 @@ public sealed class DecentDBNodaTimeOptionsExtension : IDbContextOptionsExtensio
         => _info ??= new ExtensionInfo(this);
 
     public void ApplyServices(IServiceCollection services)
-        => services.Replace(ServiceDescriptor.Singleton<IRelationalTypeMappingSource, DecentDBNodaTimeTypeMappingSource>());
+    {
+        services.Replace(ServiceDescriptor.Singleton<IRelationalTypeMappingSource, DecentDBNodaTimeTypeMappingSource>());
+        services.AddScoped<IMemberTranslatorPlugin, DecentDBNodaTimeMemberTranslatorPlugin>();
+    }
 
     public void Validate(IDbContextOptions options)
     {
@@ -33,7 +38,7 @@ public sealed class DecentDBNodaTimeOptionsExtension : IDbContextOptionsExtensio
             => "using NodaTime ";
 
         public override int GetServiceProviderHashCode()
-            => 1;
+            => typeof(DecentDBNodaTimeMemberTranslatorPlugin).GetHashCode();
 
         public override void PopulateDebugInfo(IDictionary<string, string> debugInfo)
             => debugInfo["DecentDB:NodaTime"] = "1";

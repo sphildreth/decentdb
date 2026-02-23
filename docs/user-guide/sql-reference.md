@@ -321,6 +321,13 @@ Supported scalar functions:
 - `UUID_PARSE`
 - `UUID_TO_STRING`
 
+**JSON:**
+- `JSON_ARRAY_LENGTH(json [, path])` — returns element count of a JSON array
+- `JSON_EXTRACT(json, path)` — extracts a value using JSONPath (`$`, `$[N]`, `$.key`)
+
+**Other:**
+- `PRINTF(format, args...)` — formatted string output (SQLite-compatible)
+
 ```sql
 SELECT COALESCE(nickname, name) FROM users;
 SELECT NULLIF(status, 'active') FROM users;
@@ -335,6 +342,10 @@ SELECT TRIM(name) || '_suffix' FROM users;
 SELECT CAST(id AS TEXT) FROM users;
 SELECT CAST('12.34' AS DECIMAL(10,2));
 SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
+SELECT JSON_ARRAY_LENGTH('["a","b","c"]');  -- Returns 3
+SELECT JSON_EXTRACT('{"name":"Alice"}', '$.name');  -- Returns 'Alice'
+SELECT JSON_EXTRACT('["x","y","z"]', '$[1]');  -- Returns 'y'
+SELECT PRINTF('Hello %s, you are %d', name, age) FROM users;
 ```
 
 ### Common Table Expressions (CTE)
@@ -390,6 +401,8 @@ SELECT AVG(price) FROM products;
 SELECT MIN(created_at), MAX(created_at) FROM users;
 SELECT category, SUM(amount) FROM orders GROUP BY category;
 SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 5;
+SELECT GROUP_CONCAT(name, ', ') FROM users;  -- Concatenate with separator
+SELECT STRING_AGG(name, ', ') FROM users;    -- Alias for GROUP_CONCAT
 ```
 
 ### Window Functions

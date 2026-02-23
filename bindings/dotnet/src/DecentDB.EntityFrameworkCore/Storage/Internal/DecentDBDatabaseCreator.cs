@@ -43,10 +43,41 @@ internal sealed class DecentDBDatabaseCreator : RelationalDatabaseCreator
     }
 
     public override bool HasTables()
-        => Exists();
+    {
+        if (!Exists())
+            return false;
+
+        var dbConnection = Dependencies.Connection.DbConnection;
+        var wasOpen = dbConnection.State == ConnectionState.Open;
+        try
+        {
+            if (!wasOpen)
+                dbConnection.Open();
+
+            if (dbConnection is DecentDBConnection ddbConn)
+            {
+                var json = ddbConn.ListTablesJson();
+                return json != "[]" && json.Length > 2;
+            }
+
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (!wasOpen)
+                dbConnection.Close();
+        }
+    }
 
     public override Task<bool> HasTablesAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult(HasTables());
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(HasTables());
+    }
 
     private void OpenAndCloseConnection()
     {

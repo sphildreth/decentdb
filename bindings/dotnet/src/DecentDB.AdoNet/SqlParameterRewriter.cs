@@ -205,7 +205,7 @@ namespace DecentDB.AdoNet
                         }
                     }
 
-                    if (char.IsLetter(sql[j]) || sql[j] == '_')
+                    if (char.IsLetterOrDigit(sql[j]) || sql[j] == '_')
                     {
                         while (j < sql.Length && (char.IsLetterOrDigit(sql[j]) || sql[j] == '_'))
                         {
@@ -305,6 +305,130 @@ namespace DecentDB.AdoNet
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Clamps OFFSET parameter values to 0 when negative.
+        /// EF Core may generate negative OFFSET values from untrusted page numbers.
+        /// </summary>
+        public static void ClampOffsetParameters(string sql, Dictionary<int, DbParameter> paramMap)
+        {
+            var searchFrom = 0;
+            while (true)
+            {
+                var idx = sql.IndexOf("OFFSET", searchFrom, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0) break;
+
+                var afterOffset = idx + 6;
+                while (afterOffset < sql.Length && sql[afterOffset] == ' ')
+                    afterOffset++;
+
+                if (afterOffset < sql.Length && sql[afterOffset] == '$')
+                {
+                    var numStart = afterOffset + 1;
+                    var numEnd = numStart;
+                    while (numEnd < sql.Length && char.IsDigit(sql[numEnd]))
+                        numEnd++;
+
+                    if (numEnd > numStart &&
+                        int.TryParse(sql.Substring(numStart, numEnd - numStart), out var paramIndex) &&
+                        paramMap.TryGetValue(paramIndex, out var param) &&
+                        param.Value is IConvertible conv)
+                    {
+                        try
+                        {
+                            var val = conv.ToInt64(null);
+                            if (val < 0)
+                                param.Value = 0L;
+                        }
+                        catch { /* not numeric — leave as-is */ }
+                    }
+                }
+
+                searchFrom = afterOffset;
+            }
+        }
+
+        /// <summary>
+        /// Strips table aliases from UPDATE and DELETE statements that DecentDB core doesn't support.
+        /// Transforms: UPDATE "Table" AS "t" SET ... WHERE "t"."Col" = ...
+        /// Into:       UPDATE "Table" SET ... WHERE "Table"."Col" = ...
+        /// Same for DELETE FROM "Table" AS "t" ...
+        /// </summary>
+        public static string StripUpdateDeleteAlias(string sql)
+        {
+            if (sql is null) return sql!;
+
+            var trimmed = sql.TrimStart();
+            bool isUpdate = trimmed.StartsWith("UPDATE ", StringComparison.OrdinalIgnoreCase);
+            bool isDelete = trimmed.StartsWith("DELETE ", StringComparison.OrdinalIgnoreCase);
+            if (!isUpdate && !isDelete) return sql;
+
+            // Find the table name (quoted or unquoted) and the AS alias
+            // Pattern: UPDATE "TableName" AS "alias" or DELETE FROM "TableName" AS "alias"
+            int tableStart;
+            if (isUpdate)
+            {
+                tableStart = trimmed.IndexOf("UPDATE ", StringComparison.OrdinalIgnoreCase) + 7;
+            }
+            else
+            {
+                tableStart = trimmed.IndexOf("FROM ", StringComparison.OrdinalIgnoreCase);
+                if (tableStart < 0) return sql;
+                tableStart += 5;
+            }
+
+            while (tableStart < trimmed.Length && trimmed[tableStart] == ' ') tableStart++;
+
+            // Extract table name
+            string tableName;
+            int tableEnd;
+            if (tableStart < trimmed.Length && trimmed[tableStart] == '"')
+            {
+                var closeQuote = trimmed.IndexOf('"', tableStart + 1);
+                if (closeQuote < 0) return sql;
+                tableName = trimmed.Substring(tableStart, closeQuote - tableStart + 1);
+                tableEnd = closeQuote + 1;
+            }
+            else
+            {
+                tableEnd = tableStart;
+                while (tableEnd < trimmed.Length && !char.IsWhiteSpace(trimmed[tableEnd])) tableEnd++;
+                tableName = trimmed.Substring(tableStart, tableEnd - tableStart);
+            }
+
+            // Look for AS "alias" after table name
+            var afterTable = tableEnd;
+            while (afterTable < trimmed.Length && trimmed[afterTable] == ' ') afterTable++;
+
+            if (afterTable + 2 >= trimmed.Length) return sql;
+            if (!trimmed.Substring(afterTable, 2).Equals("AS", StringComparison.OrdinalIgnoreCase)) return sql;
+            if (afterTable + 2 < trimmed.Length && char.IsLetterOrDigit(trimmed[afterTable + 2])) return sql;
+
+            var aliasStart = afterTable + 2;
+            while (aliasStart < trimmed.Length && trimmed[aliasStart] == ' ') aliasStart++;
+
+            // Extract alias
+            string alias;
+            int aliasEnd;
+            if (aliasStart < trimmed.Length && trimmed[aliasStart] == '"')
+            {
+                var closeQuote = trimmed.IndexOf('"', aliasStart + 1);
+                if (closeQuote < 0) return sql;
+                alias = trimmed.Substring(aliasStart, closeQuote - aliasStart + 1);
+                aliasEnd = closeQuote + 1;
+            }
+            else
+            {
+                aliasEnd = aliasStart;
+                while (aliasEnd < trimmed.Length && !char.IsWhiteSpace(aliasEnd < trimmed.Length ? trimmed[aliasEnd] : ' ')) aliasEnd++;
+                alias = trimmed.Substring(aliasStart, aliasEnd - aliasStart);
+            }
+
+            // Remove "AS alias" and replace "alias". references with "TableName".
+            var result = trimmed.Substring(0, tableEnd) + trimmed.Substring(aliasEnd);
+            result = result.Replace(alias + ".", tableName + ".");
+            return result;
         }
     }
 }

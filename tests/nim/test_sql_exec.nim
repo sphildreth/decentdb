@@ -829,14 +829,10 @@ suite "Planner":
     check execSql(db, "INSERT INTO items VALUES (4, 20)").ok
     check execSql(db, "CREATE INDEX items_val_partial ON items (val) WHERE val IS NOT NULL").ok
 
+    # Partial indexes are excluded from the general query planner (ADR-0100)
+    # so the query falls back to sequential scan. Verify data correctness below.
     let explainRes = execSql(db, "EXPLAIN SELECT id FROM items WHERE val = 10")
     check explainRes.ok
-    var sawIndexSeek = false
-    for line in explainRes.value:
-      if line.contains("IndexSeek("):
-        sawIndexSeek = true
-        break
-    check sawIndexSeek
 
     let q1 = execSql(db, "SELECT id FROM items WHERE val = 10 ORDER BY id")
     check q1.ok

@@ -35,7 +35,7 @@ public sealed class DesignTimeToolingTests
                                                <Nullable>enable</Nullable>
                                              </PropertyGroup>
                                              <ItemGroup>
-                                               <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.0">
+                                               <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.3">
                                                  <PrivateAssets>all</PrivateAssets>
                                                  <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
                                                </PackageReference>
@@ -148,9 +148,12 @@ public sealed class DesignTimeToolingTests
             RedirectStandardError = true
         };
 
+        // Prevent MSBuild node reuse to avoid lock contention with the test host's MSBuild server.
+        psi.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        psi.Environment["DOTNET_CLI_DO_NOT_USE_MSBUILD_SERVER"] = "1";
+
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start dotnet process.");
 
-        // Avoid deadlocks: read stdout/stderr concurrently while the process runs.
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
 
@@ -168,21 +171,35 @@ public sealed class DesignTimeToolingTests
             throw new TimeoutException($"dotnet {arguments} timed out after {DotnetCommandTimeout}.");
         }
 
-        Task.WaitAll(stdoutTask, stderrTask);
-        var output = stdoutTask.Result + stderrTask.Result;
-        return (process.ExitCode, output);
+        // Use a bounded wait for output to prevent hangs from orphaned child processes holding pipes.
+        if (!Task.WaitAll([stdoutTask, stderrTask], TimeSpan.FromSeconds(10)))
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // Best-effort cleanup.
+            }
+        }
+
+        var stdout = stdoutTask.IsCompleted ? stdoutTask.Result : "";
+        var stderr = stderrTask.IsCompleted ? stderrTask.Result : "";
+        return (process.ExitCode, stdout + stderr);
     }
 
     private static void StageNativeLibrary(string repoRoot, string outputDirectory)
     {
         Directory.CreateDirectory(outputDirectory);
 
+        // Prefer build/ output (canonical build dir) over repo root to avoid stale binaries.
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
             CopyFirstExisting(
-                Path.Combine(repoRoot, "libdecentdb.so"),
                 Path.Combine(repoRoot, "build", "libdecentdb.so"),
                 Path.Combine(repoRoot, "build", "libc_api.so"),
+                Path.Combine(repoRoot, "libdecentdb.so"),
                 destinationPath: Path.Combine(outputDirectory, "libdecentdb.so"));
             return;
         }
@@ -190,9 +207,9 @@ public sealed class DesignTimeToolingTests
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
             CopyFirstExisting(
-                Path.Combine(repoRoot, "libdecentdb.dylib"),
                 Path.Combine(repoRoot, "build", "libdecentdb.dylib"),
                 Path.Combine(repoRoot, "build", "libc_api.dylib"),
+                Path.Combine(repoRoot, "libdecentdb.dylib"),
                 destinationPath: Path.Combine(outputDirectory, "libdecentdb.dylib"));
             return;
         }
@@ -200,9 +217,9 @@ public sealed class DesignTimeToolingTests
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             CopyFirstExisting(
-                Path.Combine(repoRoot, "decentdb.dll"),
                 Path.Combine(repoRoot, "build", "decentdb.dll"),
                 Path.Combine(repoRoot, "build", "c_api.dll"),
+                Path.Combine(repoRoot, "decentdb.dll"),
                 destinationPath: Path.Combine(outputDirectory, "decentdb.dll"));
         }
     }

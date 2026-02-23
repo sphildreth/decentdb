@@ -10,6 +10,7 @@ import std/monotimes
 import std/times
 import std/math
 import std/sysrand
+import std/json except `%`
 import ../errors
 import ../sql/sql
 import ../sql/binder
@@ -37,6 +38,13 @@ type RowCursor* = ref object
 var gEvalContextDepth* {.threadvar.}: int
 var gEvalPager* {.threadvar.}: Pager
 var gEvalCatalog* {.threadvar.}: Catalog
+
+proc evictPagerFromEvalCache*(pager: Pager) =
+  ## Release eval-context caches if they reference the given pager.
+  if gEvalPager == pager:
+    gEvalPager = nil
+  if gEvalCatalog != nil and gEvalCatalog.catalogTree != nil and gEvalCatalog.catalogTree.pager == pager:
+    gEvalCatalog = nil
 
 proc decimalToString(val: int64, scale: uint8): string =
   var s = $val
@@ -745,6 +753,23 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
 proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value]
 proc valueToBool*(value: Value): bool
 
+# Value kind classification helpers (used by rowid seek coercion and compareValues)
+proc isIntKind(k: ValueKind): bool {.inline.} =
+  k in {vkInt64, vkInt0, vkInt1}
+
+proc isTextKind(k: ValueKind): bool {.inline.} =
+  k in {vkText, vkTextCompressed, vkTextOverflow, vkTextCompressedOverflow}
+
+proc isBlobKind(k: ValueKind): bool {.inline.} =
+  k in {vkBlob, vkBlobCompressed, vkBlobOverflow, vkBlobCompressedOverflow}
+
+proc getIntVal(v: Value): int64 {.inline.} =
+  case v.kind
+  of vkInt64: v.int64Val
+  of vkInt0: 0'i64
+  of vkInt1: 1'i64
+  else: 0'i64
+
 proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[RowCursor] =
   ## Build a forward-only cursor for a query plan.
   ##
@@ -852,7 +877,15 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:
       return err[RowCursor](valueRes.err.code, valueRes.err.message, valueRes.err.context)
-    if valueRes.value.kind != vkInt64:
+    var seekVal = valueRes.value
+    # SQLite type affinity: coerce text to int for rowid seeks
+    if isTextKind(seekVal.kind):
+      let s = valueToString(seekVal)
+      try:
+        seekVal = Value(kind: vkInt64, int64Val: int64(parseBiggestInt(s)))
+      except ValueError:
+        return err[RowCursor](ERR_SQL, "Rowid seek expects INT64")
+    if seekVal.kind != vkInt64 and seekVal.kind != vkInt0 and seekVal.kind != vkInt1:
       return err[RowCursor](ERR_SQL, "Rowid seek expects INT64")
     let tableRes = catalog.getTable(plan.table)
     if not tableRes.ok:
@@ -862,7 +895,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     var cols: seq[string] = @[]
     for col in table.columns:
       cols.add(prefix & "." & col.name)
-    let targetRowId = cast[uint64](valueRes.value.int64Val)
+    let targetRowId = cast[uint64](getIntVal(seekVal))
     var done = false
     let c = RowCursor(
       columns: cols,
@@ -1230,7 +1263,7 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
 
     var colIndex = -1
     for i, col in table.columns:
-      if col.name == plan.column:
+      if col.name.toLowerAscii() == plan.column.toLowerAscii():
         colIndex = i
         break
     if colIndex < 0:
@@ -1322,7 +1355,7 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
 
     var colIndex = -1
     for i, col in table.columns:
-      if col.name == colName:
+      if col.name.toLowerAscii() == colName.toLowerAscii():
         colIndex = i
         break
     if colIndex < 0:
@@ -1377,22 +1410,34 @@ proc estimateRowBytes*(row: Row): int =
     result += varintLen(uint64(payloadLen)) + payloadLen
 
 proc columnIndex*(row: Row, table: string, name: string): Result[int] =
+  let normName = name.toLowerAscii()
   if table.len > 0:
-    let key = table & "." & name
+    let key = (table & "." & name).toLowerAscii()
     for i, col in row.columns:
-      if col == key:
+      if col.toLowerAscii() == key:
         return ok(i)
-    # Qualified lookup failed (e.g. post-projection columns lack alias prefix);
-    # fall through to unqualified matching below.
+    # Qualified lookup failed — columns may lack this alias prefix. Try
+    # matching only columns that are unqualified or share the same table prefix
+    # to avoid false ambiguity across different tables.
+    var matches: seq[int] = @[]
+    for i, col in row.columns:
+      let normCol = col.toLowerAscii()
+      if normCol == normName:
+        matches.add(i)
+    if matches.len == 1:
+      return ok(matches[0])
+    if matches.len == 0:
+      return err[int](ERR_SQL, "Unknown column", table & "." & name)
+    return err[int](ERR_SQL, "Ambiguous column", name)
   var matches: seq[int] = @[]
   for i, col in row.columns:
-    if col == name or col.endsWith("." & name):
+    let normCol = col.toLowerAscii()
+    if normCol == normName or normCol.endsWith("." & normName):
       matches.add(i)
   if matches.len == 1:
     return ok(matches[0])
   if matches.len == 0:
-    let ctx = if table.len > 0: table & "." & name else: name
-    return err[int](ERR_SQL, "Unknown column", ctx)
+    return err[int](ERR_SQL, "Unknown column", name)
   err[int](ERR_SQL, "Ambiguous column", name)
 
 proc evalLiteral(value: SqlValue): Value =
@@ -1584,25 +1629,97 @@ proc truthOr(left: TruthValue, right: TruthValue): TruthValue =
     return tvUnknown
   tvFalse
 
+proc compareBytes(a, b: Value): int {.inline.} =
+  let lenA = a.bytes.len
+  let lenB = b.bytes.len
+  let minLen = min(lenA, lenB)
+  if minLen > 0:
+    let c = cmpMem(unsafeAddr a.bytes[0], unsafeAddr b.bytes[0], minLen)
+    if c != 0: return c
+  cmp(lenA, lenB)
+
 proc compareValues*(a: Value, b: Value): int =
-  if a.kind != b.kind:
-    return cmp(a.kind, b.kind)
-  case a.kind
-  of vkNull: 0
-  of vkBool: cmp(a.boolVal, b.boolVal)
-  of vkInt64: cmp(a.int64Val, b.int64Val)
-  of vkFloat64: cmp(a.float64Val, b.float64Val)
-  of vkDecimal: compareDecimals(a, b)
-  of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
-    var lenA = a.bytes.len
-    var lenB = b.bytes.len
-    var minLen = min(lenA, lenB)
-    if minLen > 0:
-      let c = cmpMem(unsafeAddr a.bytes[0], unsafeAddr b.bytes[0], minLen)
-      if c != 0: return c
-    return cmp(lenA, lenB)
-  else:
-    0
+  if a.kind == b.kind:
+    case a.kind
+    of vkNull: return 0
+    of vkBool: return cmp(a.boolVal, b.boolVal)
+    of vkBoolTrue, vkBoolFalse: return 0
+    of vkInt64: return cmp(a.int64Val, b.int64Val)
+    of vkInt0, vkInt1: return 0
+    of vkFloat64: return cmp(a.float64Val, b.float64Val)
+    of vkDecimal: return compareDecimals(a, b)
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      return compareBytes(a, b)
+    else: return 0
+
+  # SQLite-compatible type affinity: NULL < INT/REAL < TEXT < BLOB
+  if a.kind == vkNull: return -1
+  if b.kind == vkNull: return 1
+
+  let aIsInt = isIntKind(a.kind)
+  let bIsInt = isIntKind(b.kind)
+  let aIsFloat = a.kind == vkFloat64
+  let bIsFloat = b.kind == vkFloat64
+  let aIsText = isTextKind(a.kind)
+  let bIsText = isTextKind(b.kind)
+  let aIsBlob = isBlobKind(a.kind)
+  let bIsBlob = isBlobKind(b.kind)
+
+  # INT vs INT (different compact kinds, e.g. vkInt0 vs vkInt64)
+  if aIsInt and bIsInt:
+    return cmp(getIntVal(a), getIntVal(b))
+
+  # INT vs FLOAT or FLOAT vs INT — compare as float
+  if aIsInt and bIsFloat:
+    return cmp(float64(getIntVal(a)), b.float64Val)
+  if aIsFloat and bIsInt:
+    return cmp(a.float64Val, float64(getIntVal(b)))
+
+  # INT/FLOAT vs TEXT — try to coerce TEXT to numeric (SQLite affinity)
+  if (aIsInt or aIsFloat) and bIsText:
+    let s = valueToString(b)
+    try:
+      let parsed = parseBiggestInt(s)
+      if aIsInt: return cmp(getIntVal(a), int64(parsed))
+      else: return cmp(a.float64Val, float64(parsed))
+    except ValueError:
+      try:
+        let parsed = parseFloat(s)
+        if aIsInt: return cmp(float64(getIntVal(a)), parsed)
+        else: return cmp(a.float64Val, parsed)
+      except ValueError:
+        return -1  # Non-numeric text: numeric < text
+
+  if aIsText and (bIsInt or bIsFloat):
+    let s = valueToString(a)
+    try:
+      let parsed = parseBiggestInt(s)
+      if bIsInt: return cmp(int64(parsed), getIntVal(b))
+      else: return cmp(float64(parsed), b.float64Val)
+    except ValueError:
+      try:
+        let parsed = parseFloat(s)
+        if bIsInt: return cmp(parsed, float64(getIntVal(b)))
+        else: return cmp(parsed, b.float64Val)
+      except ValueError:
+        return 1  # Non-numeric text: text > numeric
+
+  # TEXT vs TEXT (different sub-kinds like compressed vs uncompressed)
+  if aIsText and bIsText:
+    return compareBytes(a, b)
+
+  # BLOB vs BLOB (different sub-kinds)
+  if aIsBlob and bIsBlob:
+    return compareBytes(a, b)
+
+  # BLOB > everything else; numeric < text (SQLite ordering)
+  if aIsBlob: return 1
+  if bIsBlob: return -1
+  if aIsText: return 1
+  if bIsText: return -1
+
+  # Fallback for bool vs int etc.
+  cmp(ord(a.kind), ord(b.kind))
 
 proc hash*(v: Value): Hash =
   var h: Hash = 0
@@ -2166,6 +2283,109 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return ok(textValue(valueToString(strRes.value).replace(
         valueToString(fromRes.value), valueToString(toRes.value))))
 
+    if name == "JSON_ARRAY_LENGTH":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "JSON_ARRAY_LENGTH requires 1 or 2 arguments")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let jsonText = valueToString(argRes.value)
+      try:
+        var node = parseJson(jsonText)
+        if expr.args.len == 2:
+          let pathRes = evalExpr(row, expr.args[1], params)
+          if not pathRes.ok:
+            return err[Value](pathRes.err.code, pathRes.err.message, pathRes.err.context)
+          if pathRes.value.kind == vkNull:
+            return ok(Value(kind: vkNull))
+          let path = valueToString(pathRes.value)
+          if path == "$":
+            discard
+          elif path.startsWith("$."):
+            for key in path[2..^1].split('.'):
+              if node.kind == JObject and node.hasKey(key):
+                node = node[key]
+              else:
+                return ok(Value(kind: vkNull))
+          else:
+            return ok(Value(kind: vkNull))
+        if node.kind == JArray:
+          return ok(Value(kind: vkInt64, int64Val: int64(node.len)))
+        return ok(Value(kind: vkInt64, int64Val: 0'i64))
+      except JsonParsingError:
+        return ok(Value(kind: vkNull))
+
+    if name == "JSON_EXTRACT":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "JSON_EXTRACT requires exactly 2 arguments")
+      let jsonRes = evalExpr(row, expr.args[0], params)
+      if not jsonRes.ok:
+        return err[Value](jsonRes.err.code, jsonRes.err.message, jsonRes.err.context)
+      if jsonRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let pathRes = evalExpr(row, expr.args[1], params)
+      if not pathRes.ok:
+        return err[Value](pathRes.err.code, pathRes.err.message, pathRes.err.context)
+      if pathRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let jsonText = valueToString(jsonRes.value)
+      let path = valueToString(pathRes.value)
+      try:
+        var node = parseJson(jsonText)
+        if path == "$":
+          discard
+        elif path.startsWith("$"):
+          var segments: seq[string] = @[]
+          var i = 1
+          while i < path.len:
+            if path[i] == '.':
+              inc i
+              var key = ""
+              while i < path.len and path[i] != '.' and path[i] != '[':
+                key.add(path[i])
+                inc i
+              if key.len > 0:
+                segments.add(key)
+            elif path[i] == '[':
+              inc i
+              var idxStr = ""
+              while i < path.len and path[i] != ']':
+                idxStr.add(path[i])
+                inc i
+              if i < path.len: inc i  # skip ']'
+              segments.add("[" & idxStr & "]")
+            else:
+              inc i
+          for seg in segments:
+            if seg.startsWith("[") and seg.endsWith("]"):
+              let idxText = seg[1..^2]
+              try:
+                let idx = parseInt(idxText)
+                if node.kind == JArray and idx >= 0 and idx < node.len:
+                  node = node[idx]
+                else:
+                  return ok(Value(kind: vkNull))
+              except ValueError:
+                return ok(Value(kind: vkNull))
+            else:
+              if node.kind == JObject and node.hasKey(seg):
+                node = node[seg]
+              else:
+                return ok(Value(kind: vkNull))
+        else:
+          return ok(Value(kind: vkNull))
+        case node.kind
+        of JString: return ok(textValue(node.getStr()))
+        of JInt: return ok(Value(kind: vkInt64, int64Val: node.getBiggestInt()))
+        of JFloat: return ok(Value(kind: vkFloat64, float64Val: node.getFloat()))
+        of JBool: return ok(Value(kind: vkInt64, int64Val: if node.getBool(): 1'i64 else: 0'i64))
+        of JNull: return ok(Value(kind: vkNull))
+        of JObject, JArray: return ok(textValue($node))
+      except JsonParsingError:
+        return ok(Value(kind: vkNull))
+
     if name == "PRINTF":
       if expr.args.len < 1:
         return err[Value](ERR_SQL, "PRINTF requires at least a format argument")
@@ -2549,7 +2769,7 @@ proc indexSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: str
     cols.add(prefix & "." & col.name)
   var valueIndex = -1
   for i, col in table.columns:
-    if col.name == column:
+    if col.name.toLowerAscii() == column.toLowerAscii():
       valueIndex = i
       break
   for rowid in rowIdsRes.value:
@@ -2573,7 +2793,7 @@ proc trigramSeekRows(pager: Pager, catalog: Catalog, tableName: string, alias: s
   let idx = indexOpt.get
   var columnIndex = -1
   for i, col in table.columns:
-    if col.name == column:
+    if col.name.toLowerAscii() == column.toLowerAscii():
       columnIndex = i
       break
   if columnIndex < 0:
@@ -3622,7 +3842,14 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:
       return err[seq[Row]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
-    if valueRes.value.kind != vkInt64:
+    var seekVal = valueRes.value
+    if isTextKind(seekVal.kind):
+      let s = valueToString(seekVal)
+      try:
+        seekVal = Value(kind: vkInt64, int64Val: int64(parseBiggestInt(s)))
+      except ValueError:
+        return err[seq[Row]](ERR_SQL, "Rowid seek expects INT64")
+    if seekVal.kind != vkInt64 and seekVal.kind != vkInt0 and seekVal.kind != vkInt1:
       return err[seq[Row]](ERR_SQL, "Rowid seek expects INT64")
     let tableRes = catalog.getTable(plan.table)
     if not tableRes.ok:
@@ -3632,7 +3859,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
     var cols: seq[string] = @[]
     for col in table.columns:
       cols.add(prefix & "." & col.name)
-    let targetRowId = cast[uint64](valueRes.value.int64Val)
+    let targetRowId = cast[uint64](getIntVal(seekVal))
     let readRes = readRowAt(pager, table, targetRowId)
     if not readRes.ok:
       if readRes.err.code == ERR_IO and readRes.err.message == "Key not found":
@@ -3891,6 +4118,41 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         let prefix = if plan.right.alias.len > 0: plan.right.alias else: plan.right.table
         for col in tableRes.value.columns:
           rightColumns.add(prefix & "." & col.name)
+    # For subquery-backed joins with zero rows, derive column names from the
+    # inner plan's projection or underlying table so LEFT JOIN can pad NULLs.
+    if rightColumns.len == 0 and plan.right.kind == pkSubqueryScan:
+      let prefix = if plan.right.alias.len > 0: plan.right.alias
+                   elif plan.right.table.len > 0: plan.right.table
+                   else: ""
+      if prefix.len > 0:
+        var p = plan.right.subPlan
+        while p != nil:
+          if p.kind == pkProject and p.projections.len > 0:
+            for item in p.projections:
+              if item.alias.len > 0:
+                rightColumns.add(prefix & "." & item.alias)
+              elif item.expr != nil and item.expr.kind == ekColumn:
+                rightColumns.add(prefix & "." & item.expr.name)
+              else:
+                rightColumns.add(prefix & ".?column?")
+            break
+          if p.left != nil: p = p.left
+          elif p.subPlan != nil: p = p.subPlan
+          else: break
+      # Last resort: find underlying table scan in the inner plan.
+      if rightColumns.len == 0:
+        var p = plan.right.subPlan
+        while p != nil:
+          if p.kind == pkTableScan and p.table.len > 0:
+            let tableRes = catalog.getTable(p.table)
+            if tableRes.ok:
+              let pfx = if prefix.len > 0: prefix else: p.table
+              for col in tableRes.value.columns:
+                rightColumns.add(pfx & "." & col.name)
+            break
+          if p.left != nil: p = p.left
+          elif p.subPlan != nil: p = p.subPlan
+          else: break
     
     # Pre-compute merged column names once (avoid allocating for each match)
     var mergedColumns: seq[string] = @[]

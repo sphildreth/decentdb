@@ -5,6 +5,32 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-02-22
+
+### Added
+- **SQL Engine**: `json_array_length(json [, path])` scalar function — returns the number of elements in a JSON array. Supports optional JSONPath for nested access. See ADR-0102.
+- **SQL Engine**: `json_extract(json, path)` scalar function — extracts a value from a JSON document using JSONPath notation (`$`, `$[N]`, `$.key`). Returns the appropriate SQL type (TEXT, INT64, FLOAT64, BOOL, NULL). See ADR-0102.
+- .NET: EF Core primitive collection support — `string[]` properties stored as JSON are now fully queryable via LINQ (`.Any()`, `.Count()`, `.Contains()`, `array[index]`, `.Select()`). See ADR-0103.
+- .NET: NodaTime member translation plugin — `Instant.InUtc().Year/Month/Day` and other date part extractions now translate to SQL expressions. See ADR-0101.
+- .NET: `SqlStatementSplitter` for batch SQL execution in ADO.NET layer.
+- .NET: `SqlParameterRewriter` tests covering named, positional, and mixed parameter styles.
+- .NET: Primitive collection tests (11 tests covering Any, Count, Contains, ElementAt, Select, null/empty arrays).
+
+### Fixed
+- **SQL Engine**: Case-insensitive identifier resolution following PostgreSQL semantics — unquoted identifiers (lowercased by the parser) now correctly match tables, columns, and indexes created with quoted identifiers and vice versa. See ADR-0096.
+- **SQL Engine**: SQLite-compatible type affinity in comparisons — TEXT values are coerced to INTEGER/FLOAT for comparison operators and rowid seeks, matching SQLite behavior. See ADR-0099.
+- **SQL Engine**: Partial index query planner exclusion — partial indexes are no longer selected by the general query planner, preventing incorrect results when the query predicate doesn't match the index predicate. See ADR-0100.
+- **SQL Engine**: Composite primary key tables no longer incorrectly use rowid seeks — individual columns in composite PKs are not rowid aliases. See ADR-0104.
+- **SQL Engine**: `ORDER BY` on aggregate aliases (e.g., `ORDER BY "AlbumCount"`) now correctly references the materialized aggregate output instead of re-evaluating the aggregate function. See ADR-0104.
+- **SQL Engine**: `FROM (SELECT ... UNION SELECT ...)` subqueries now correctly derive column metadata from the left operand. See ADR-0104.
+- **SQL Engine**: LEFT JOIN column resolution with subquery returning zero rows — correctly derive column names from inner projection and pad NULLs. See ADR-0098.
+- **SQL Engine**: `IN (SELECT ...)` parameter scanning now correctly finds `$N` references inside subquery SQL text.
+- **Shared Library**: Disable Nim's signal handler (`-d:noSignalHandler`) and use system allocator (`-d:useMalloc`) to prevent conflicts with host runtimes (.NET, JVM). See ADR-0097.
+- **Engine**: Evict stale Pager references from threadvar caches in `closeDb()` to prevent memory leaks under ARC. See ADR-0097.
+- .NET: NodaTime `Instant` type mapping now uses tick-level precision (100ns ticks since Unix epoch) instead of millisecond precision, matching .NET `DateTimeOffset.Ticks` behavior.
+- .NET: EF Core database creator now handles table/index creation failures gracefully during `EnsureCreated()`.
+- .NET: ADO.NET `SqlParameterRewriter` correctly handles parameters in complex subqueries and multi-statement SQL.
+
 ## [1.3.0] - 2026-02-21
 
 ### Added

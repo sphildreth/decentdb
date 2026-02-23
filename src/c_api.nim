@@ -329,6 +329,10 @@ proc findMaxParam(stmt: Statement): int =
         if e.args.len == 1 and e.args[0].kind == ekLiteral and
            e.args[0].value.kind == svString:
           scanSqlForParams(e.args[0].value.strVal)
+      elif e.funcName == "IN_SUBQUERY":
+        if e.args.len == 2 and e.args[1].kind == ekLiteral and
+           e.args[1].value.kind == svString:
+          scanSqlForParams(e.args[1].value.strVal)
       for a in e.args: walk(a)
     of ekInList: walk(e.inExpr); (for a in e.inList: walk(a))
     else: discard
