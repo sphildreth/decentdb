@@ -43,23 +43,31 @@ type connector struct {
 }
 
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
-	// Parse DSN: file:/path/to.ddb?opt=val
-	u, err := url.Parse(c.dsn)
-	if err != nil {
-		return nil, err
-	}
-	path := u.Path
-	if u.Scheme == "file" {
-		// Handle file:/// path
-	} else if u.Scheme == "" && path == "" {
-		path = c.dsn
+	// Parse DSN: file:/path/to.ddb?opt=val or :memory:
+	var path string
+	var rawQuery string
+
+	if c.dsn == ":memory:" {
+		path = ":memory:"
+	} else {
+		u, err := url.Parse(c.dsn)
+		if err != nil {
+			return nil, err
+		}
+		path = u.Path
+		if u.Scheme == "file" {
+			// Handle file:/// path
+		} else if u.Scheme == "" && path == "" {
+			path = c.dsn
+		}
+		rawQuery = u.RawQuery
 	}
 
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	// Options string (simpler for MVP)
-	cOpts := C.CString(u.RawQuery)
+	cOpts := C.CString(rawQuery)
 	defer C.free(unsafe.Pointer(cOpts))
 
 	db := C.decentdb_open(cPath, cOpts)

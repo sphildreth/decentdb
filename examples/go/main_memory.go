@@ -1,31 +1,25 @@
-// Example: Basic DecentDB usage with Go's database/sql interface.
+// Example: DecentDB in-memory database with Go's database/sql interface.
+//
+// Demonstrates using :memory: for ephemeral databases — no files created on disk.
 //
 // Build the native library first:
 //   nim c -d:release --mm:arc --threads:on --app:lib --out:libdecentdb.so src/c_api.nim
 //
 // Then run:
-//   DECENTDB_LIB_PATH=/path/to/libdecentdb.so go run main.go
+//   DECENTDB_LIB_PATH=/path/to/libdecentdb.so go run main_memory.go
 package main
 
 import (
 	"database/sql"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 
 	_ "github.com/sphildreth/decentdb-go"
 )
 
 func main() {
-	// Open a database in a temp directory (creates the file if it doesn't exist).
-	tmpDir, err := os.MkdirTemp("", "decentdb-example-*")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-	dbPath := filepath.Join(tmpDir, "example.ddb")
-	db, err := sql.Open("decentdb", fmt.Sprintf("file:%s", dbPath))
+	// Open an in-memory database — no file is created on disk.
+	db, err := sql.Open("decentdb", ":memory:")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,7 +35,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Insert rows. DecentDB uses Postgres-style $1, $2, ... parameters.
+	// Insert rows.
 	users := []struct {
 		name  string
 		email string
@@ -205,4 +199,7 @@ func main() {
 		}
 	}
 	rows.Close()
+
+	// No cleanup needed — in-memory database is automatically discarded.
+	fmt.Println("\nDone.")
 }

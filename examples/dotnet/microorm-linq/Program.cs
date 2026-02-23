@@ -60,6 +60,7 @@ Console.WriteLine($"\nTotal: {count}, Has adults: {hasAdults}");
 // ── Window Functions (via raw SQL) ──
 Console.WriteLine("\n── Window Functions ──");
 
+await ctx.ExecuteNonQueryAsync("DROP TABLE IF EXISTS scores");
 await ctx.ExecuteNonQueryAsync(@"CREATE TABLE scores (
     id    INTEGER PRIMARY KEY,
     name  TEXT NOT NULL,
