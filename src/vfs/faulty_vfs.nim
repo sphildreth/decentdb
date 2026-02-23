@@ -197,3 +197,12 @@ method mapWritable*(fv: FaultyVfs, file: VfsFile, length: int64): Result[MmapReg
 
 method unmap*(fv: FaultyVfs, region: MmapRegion): Result[Void] =
   err[Void](ERR_INTERNAL, "munmap disabled in FaultyVfs", "")
+
+method getFileSize*(fv: FaultyVfs, path: string): Result[int64] =
+  fv.inner.getFileSize(path)
+
+method fileExists*(fv: FaultyVfs, path: string): bool =
+  fv.inner.fileExists(path)
+
+method removeFile*(fv: FaultyVfs, path: string): Result[Void] =
+  fv.inner.removeFile(path)

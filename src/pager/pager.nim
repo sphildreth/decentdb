@@ -114,12 +114,15 @@ proc newPager*(vfs: Vfs, file: VfsFile, cachePages: int = 1024): Result[Pager] =
   if header.pageSize != DefaultPageSize:
     return err[Pager](ERR_CORRUPTION, "Unsupported page size", "page_id=1")
   let pageSize = int(header.pageSize)
-  let fileInfo = getFileInfo(file.path)
-  if fileInfo.size > 0 and (fileInfo.size mod pageSize) != 0:
+  let fileSizeRes = vfs.getFileSize(file.path)
+  if not fileSizeRes.ok:
+    return err[Pager](fileSizeRes.err.code, fileSizeRes.err.message, fileSizeRes.err.context)
+  let fileSize = fileSizeRes.value
+  if fileSize > 0 and (fileSize mod pageSize) != 0:
     return err[Pager](ERR_CORRUPTION, "File size not aligned to page size", file.path)
-  let count = if fileInfo.size == 0: 0'u32 else: uint32(fileInfo.size div pageSize)
+  let count = if fileSize == 0: 0'u32 else: uint32(fileSize div pageSize)
   let cache = newPageCache(cachePages)
-  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0, preExtendedSize: fileInfo.size)
+  var pager = Pager(vfs: vfs, file: file, header: header, pageSize: pageSize, pageCount: count, cache: cache, overlaySnapshot: 0, preExtendedSize: fileSize)
   pager.overriddenPages = initHashSet[PageId]()
   initLock(pager.lock)
   initLock(pager.overlayLock)

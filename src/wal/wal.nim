@@ -1,4 +1,3 @@
-import os
 import locks
 import tables
 import sets
@@ -297,10 +296,13 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
   let fileRes = vfs.open(path, fmReadWrite, true)
   if not fileRes.ok:
     return err[Wal](fileRes.err.code, fileRes.err.message, fileRes.err.context)
-  let info = getFileInfo(path)
+  let fileSizeRes = vfs.getFileSize(path)
+  if not fileSizeRes.ok:
+    return err[Wal](fileSizeRes.err.code, fileSizeRes.err.message, fileSizeRes.err.context)
+  let fileSize = fileSizeRes.value
   var endOffset = int64(0)
   var headerWalEnd: uint64 = 0
-  if info.size == 0:
+  if fileSize == 0:
     var header = newSeq[byte](WalHeaderSize)
     encodeWalHeader(header, pageSize, 0)
     let writeRes = vfs.write(fileRes.value, 0, header)
@@ -311,7 +313,7 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
       return err[Wal](truncRes.err.code, truncRes.err.message, truncRes.err.context)
     endOffset = WalHeaderSize
   else:
-    if info.size < WalHeaderSize:
+    if fileSize < WalHeaderSize:
       return err[Wal](ERR_CORRUPTION, "WAL header missing", path)
     var header = newSeq[byte](WalHeaderSize)
     let readRes = vfs.read(fileRes.value, 0, header)
@@ -327,8 +329,8 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
       return err[Wal](ERR_CORRUPTION, "WAL page size mismatch", "wal=" & $headerPageSize & " db=" & $pageSize)
     if walEnd != 0 and walEnd < uint64(WalHeaderSize):
       return err[Wal](ERR_CORRUPTION, "Invalid WAL end offset", "wal_end=" & $walEnd)
-    if walEnd > uint64(info.size):
-      return err[Wal](ERR_CORRUPTION, "WAL end exceeds file size", "wal_end=" & $walEnd & " size=" & $info.size)
+    if walEnd > uint64(fileSize):
+      return err[Wal](ERR_CORRUPTION, "WAL end exceeds file size", "wal_end=" & $walEnd & " size=" & $fileSize)
     headerWalEnd = walEnd
     endOffset = max(int64(walEnd), int64(WalHeaderSize))
   
@@ -424,7 +426,11 @@ proc ensureWalMmapCapacity(wal: Wal, requiredEnd: int64): Result[bool] =
   if requiredEnd <= 0:
     return ok(false)
 
-  var fileSize = if wal.mmapLen > 0: int64(wal.mmapLen) else: getFileInfo(wal.path).size
+  let currentSizeRes = wal.vfs.getFileSize(wal.path)
+  if not currentSizeRes.ok:
+    return err[bool](currentSizeRes.err.code, currentSizeRes.err.message, currentSizeRes.err.context)
+  let currentSize = currentSizeRes.value
+  var fileSize = if wal.mmapLen > 0: int64(wal.mmapLen) else: currentSize
   if fileSize < WalHeaderSize:
     fileSize = WalHeaderSize
 

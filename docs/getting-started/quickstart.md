@@ -127,3 +127,21 @@ decentdb stats --db=myapp.ddb
 - Understand [data types](../user-guide/data-types.md)
 - Optimize performance with [indexes](../user-guide/indexes.md)
 - Read the full [API reference](../api/cli-reference.md)
+
+## In-Memory Database
+
+DecentDB supports purely in-memory databases using the `:memory:` connection string:
+
+```nim
+import decentdb/engine
+
+let res = openDb(":memory:")
+if res.ok:
+  let db = res.value
+  # db is entirely in memory
+  discard db.closeDb()
+```
+
+Each call to `openDb(":memory:")` creates a **new, isolated** in-memory database instance. They do not share data, even within the same process. 
+
+Note: `mmap` is not supported for in-memory databases, but due to being backed by memory, read and write speeds are virtually instantaneous. In-memory databases do not persist across restarts and are primarily intended for caching or fast unit testing.

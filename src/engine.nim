@@ -12,6 +12,7 @@ import std/monotimes
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
+import ./vfs/mem_vfs
 import ./pager/db_header
 import ./pager/pager
 import ./catalog/catalog
@@ -102,25 +103,29 @@ proc defaultBulkLoadOptions*(): BulkLoadOptions =
 proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
   ## Open a database file with configurable cache size
   ## cachePages: Number of 4KB pages to cache (default 1024 = 4MB)
-  let vfs = newOsVfs()
+  let vfs: Vfs = if path == ":memory:": newMemVfs() else: newOsVfs()
   let walPath = path & "-wal"
   let res = vfs.open(path, fmReadWrite, true)
   if not res.ok:
     return err[Db](res.err.code, res.err.message, res.err.context)
   let file = res.value
-  let info = getFileInfo(path)
+  let fileSizeRes = vfs.getFileSize(path)
+  if not fileSizeRes.ok:
+    discard vfs.close(file)
+    return err[Db](fileSizeRes.err.code, fileSizeRes.err.message, fileSizeRes.err.context)
+  let initialSize = fileSizeRes.value
   var probe = newSeq[byte](HeaderSize)
   let probeRes = vfs.read(file, 0, probe)
   if not probeRes.ok:
     discard vfs.close(file)
     return err[Db](probeRes.err.code, probeRes.err.message, probeRes.err.context)
   if probeRes.value == 0:
-    if info.size > 0:
+    if initialSize > 0:
       discard vfs.close(file)
       return err[Db](ERR_CORRUPTION, "Header unreadable", "page_id=1")
     # Fresh DB: remove any stale WAL from prior runs
-    if fileExists(walPath):
-      removeFile(walPath)
+    if vfs.fileExists(walPath):
+      discard vfs.removeFile(walPath)
     let header = DbHeader(
       formatVersion: FormatVersion,
       pageSize: DefaultPageSize,
