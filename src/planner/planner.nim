@@ -176,7 +176,7 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     if expr == nil: return false
     case expr.kind
     of ekFunc:
-      if expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+      if expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
         return true
       for arg in expr.args:
         if exprHasAggregate(arg): return true

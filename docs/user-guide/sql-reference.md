@@ -309,12 +309,18 @@ Supported scalar functions:
 - `TRIM`
 - `REPLACE`
 - `SUBSTRING` / `SUBSTR`
+- `INSTR(str, substr)` — returns 1-based position of first occurrence (0 if not found)
+- `CHR(n)` — returns the character for ASCII code point `n`
+- `HEX(val)` — returns uppercase hexadecimal encoding of an integer, text, or blob
 
 **Math:**
 - `ABS`
 - `ROUND`
 - `CEIL` / `CEILING`
 - `FLOOR`
+- `SQRT(x)` — square root (returns FLOAT64; errors on negative input)
+- `POWER(x, y)` / `POW(x, y)` — exponentiation (returns FLOAT64)
+- `MOD(x, y)` — modulo (also available as `x % y` operator)
 
 **UUID:**
 - `GEN_RANDOM_UUID`
@@ -335,6 +341,11 @@ SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name) FROM users;
 SELECT REPLACE(name, 'old', 'new') FROM users;
 SELECT SUBSTRING(name, 1, 3) FROM users;
 SELECT ABS(balance), ROUND(price, 2), CEIL(rating), FLOOR(rating) FROM products;
+SELECT SQRT(area), POWER(base, 2), MOD(total, 10) FROM data;
+SELECT 17 % 5;  -- Modulo operator, returns 2
+SELECT INSTR('hello world', 'world');  -- Returns 7
+SELECT CHR(65);  -- Returns 'A'
+SELECT HEX(255);  -- Returns 'FF'
 SELECT GEN_RANDOM_UUID();
 SELECT UUID_TO_STRING(id) FROM users;
 SELECT CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID);
@@ -399,6 +410,7 @@ SELECT COUNT(email) FROM users;  -- Count non-NULL
 SELECT SUM(amount) FROM orders;
 SELECT AVG(price) FROM products;
 SELECT MIN(created_at), MAX(created_at) FROM users;
+SELECT TOTAL(amount) FROM orders;  -- Like SUM but returns 0.0 for empty sets (never NULL)
 SELECT category, SUM(amount) FROM orders GROUP BY category;
 SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 5;
 SELECT GROUP_CONCAT(name, ', ') FROM users;  -- Concatenate with separator

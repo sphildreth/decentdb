@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engine**: In-memory database support via `:memory:` connection string — each `openDb(":memory:")` creates a new, isolated, ephemeral database backed by `MemVfs`. WAL remains enabled for consistent transaction semantics. See ADR-0105.
 - **Engine**: `saveAs` — export any open database (including `:memory:`) to a new on-disk file. Performs a full checkpoint, then streams pages to the destination via atomic temp-file + rename. Available as a Nim proc, C API function, CLI command, and in all bindings (.NET, Go, Node, Python).
 - **SQL Engine**: Window functions `RANK()`, `DENSE_RANK()`, `LAG()`, and `LEAD()` — extends the existing `ROW_NUMBER()` support with additional SQL:2003 window functions. All support `PARTITION BY` and `ORDER BY` clauses. `LAG`/`LEAD` accept 1–3 arguments (expression, offset, default). See ADR-0106.
+- **SQL Engine**: Math scalar functions `SQRT(x)`, `POWER(x, y)` / `POW(x, y)`, and `MOD(x, y)` — extends numeric function coverage for SQLite parity. All handle INT64, FLOAT64, and DECIMAL inputs; return FLOAT64. NULL propagation follows SQL standard. See issue #37.
+- **SQL Engine**: String scalar functions `INSTR(str, substr)`, `CHR(n)`, and `HEX(val)` — `INSTR` returns 1-based position (0 if not found), `CHR` converts ASCII code point to character (PostgreSQL syntax), `HEX` encodes integers/text/blobs as uppercase hexadecimal. See issue #37.
+- **SQL Engine**: `%` modulo binary operator for INT64, FLOAT64, and DECIMAL types — complements the `MOD()` function with operator syntax (`SELECT 17 % 5`). Division-by-zero returns an error. See issue #37.
+- **SQL Engine**: `TOTAL(expr)` aggregate function — like `SUM` but always returns FLOAT64 and 0.0 for empty sets (never NULL), matching SQLite semantics. See issue #37.
 - **CLI**: `save-as` command — `decentdb save-as --db=:memory: --output=backup.ddb` exports a database snapshot to a new file.
 - **VFS**: `MemVfs` implementation — memory-backed Virtual File System with `seq[byte]` storage, per-file locking, and full VFS interface compliance (no `mmap` support).
 - **VFS**: `getFileSize`, `fileExists`, and `removeFile` methods added to the VFS interface, replacing direct OS calls in the engine, pager, and WAL.
@@ -20,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Go**: `DB.SaveAs(destPath)` method for exporting databases.
 - **Node**: `Database.saveAs(destPath)` method for exporting databases.
 - **Python**: `Connection.save_as(dest_path)` method for exporting databases.
+
+### Changed
+- **SQL Engine**: Expanded CHECK constraint function allowlist — deterministic scalar functions (`ABS`, `ROUND`, `CEIL`, `CEILING`, `FLOOR`, `SQRT`, `POWER`, `POW`, `MOD`, `INSTR`, `CHR`, `CHAR`, `HEX`, `REPLACE`, `SUBSTR`, `SUBSTRING`) are now permitted in CHECK expressions. Previously only `CASE`, `CAST`, `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, and `LIKE_ESCAPE` were allowed.
 
 ### Fixed
 - **VFS**: Double `deinitLock` undefined behavior — `MemVfs.removeFile` no longer calls `deinitLock`; `close()` is the sole owner of lock lifecycle.

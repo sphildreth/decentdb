@@ -603,11 +603,13 @@ proc validateCheckExpr(expr: Expr): Result[Void] =
     return validateCheckExpr(expr.right)
   of ekFunc:
     let fn = expr.funcName.toUpperAscii()
-    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
       return err[Void](ERR_SQL, "CHECK expression cannot use aggregate functions", expr.funcName)
     if fn == "EXISTS" or fn == "SCALAR_SUBQUERY":
       return err[Void](ERR_SQL, "CHECK expression cannot use subqueries")
-    let allowed = ["CASE", "CAST", "COALESCE", "NULLIF", "LENGTH", "LOWER", "UPPER", "TRIM", "LIKE_ESCAPE"]
+    let allowed = ["CASE", "CAST", "COALESCE", "NULLIF", "LENGTH", "LOWER", "UPPER", "TRIM", "LIKE_ESCAPE",
+                    "ABS", "ROUND", "CEIL", "CEILING", "FLOOR", "SQRT", "POWER", "POW", "MOD",
+                    "INSTR", "CHR", "CHAR", "HEX", "REPLACE", "SUBSTR", "SUBSTRING"]
     if fn notin allowed:
       return err[Void](ERR_SQL, "Unsupported function in CHECK expression", expr.funcName)
     for arg in expr.args:
@@ -1528,7 +1530,7 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
             if si.expr != nil and si.expr.kind == ekFunc and
                 si.expr.funcName.toUpperAscii() in [
                   "COUNT", "SUM", "AVG", "MIN", "MAX",
-                  "GROUP_CONCAT", "STRING_AGG"]:
+                  "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
               found = true
               break
             expanded.orderBy[i] = OrderItem(expr: cloneExpr(si.expr), asc: item.asc)

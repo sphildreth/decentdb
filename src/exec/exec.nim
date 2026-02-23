@@ -1921,7 +1921,7 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
       return ok(textValue(valueToString(leftRes.value) & valueToString(rightRes.value)))
-    of "+", "-", "*", "/":
+    of "+", "-", "*", "/", "%":
       if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
 
@@ -1972,6 +1972,14 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
               else:
                   if res >= 0: res.inc else: res.dec
            return ok(Value(kind: vkDecimal, int64Val: res, decimalScale: s))
+         of "%":
+           if v2.int64Val == 0: return err[Value](ERR_SQL, "Division by zero")
+           let s = max(s1, s2)
+           let r1 = scaleDecimal(v1.int64Val, s1, s)
+           let r2 = scaleDecimal(v2.int64Val, s2, s)
+           if not r1.ok: return err[Value](r1.err.code, r1.err.message, r1.err.context)
+           if not r2.ok: return err[Value](r2.err.code, r2.err.message, r2.err.context)
+           return ok(Value(kind: vkDecimal, int64Val: r1.value mod r2.value, decimalScale: s))
          else:
            return err[Value](ERR_SQL, "Unsupported operator", expr.op)
 
@@ -1989,6 +1997,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
           if r == 0.0:
             return err[Value](ERR_SQL, "Division by zero")
           return ok(Value(kind: vkFloat64, float64Val: l / r))
+        of "%":
+          if r == 0.0:
+            return err[Value](ERR_SQL, "Division by zero")
+          return ok(Value(kind: vkFloat64, float64Val: l.mod(r)))
         else:
           return err[Value](ERR_SQL, "Unsupported operator", expr.op)
       else:
@@ -2005,6 +2017,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
           if r == 0:
             return err[Value](ERR_SQL, "Division by zero")
           return ok(Value(kind: vkInt64, int64Val: l div r))
+        of "%":
+          if r == 0:
+            return err[Value](ERR_SQL, "Division by zero")
+          return ok(Value(kind: vkInt64, int64Val: l mod r))
         else:
           return err[Value](ERR_SQL, "Unsupported operator", expr.op)
     of "LIKE", "ILIKE":
@@ -2030,7 +2046,7 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     when defined(decentdbDebugLogging):
       echo "DEBUG ekFunc: " & expr.funcName
     let name = expr.funcName.toUpperAscii()
-    if name in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+    if name in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
       return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
 
     if name == "GEN_RANDOM_UUID":
@@ -2288,6 +2304,64 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
         return ok(Value(kind: vkNull))
       return ok(textValue(valueToString(strRes.value).replace(
         valueToString(fromRes.value), valueToString(toRes.value))))
+
+    if name == "INSTR":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "INSTR requires exactly two arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let subRes = evalExpr(row, expr.args[1], params)
+      if not subRes.ok:
+        return err[Value](subRes.err.code, subRes.err.message, subRes.err.context)
+      if subRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let haystack = valueToString(strRes.value)
+      let needle = valueToString(subRes.value)
+      let pos = haystack.find(needle)
+      # Return 1-based position (0 if not found), matching SQLite/Postgres behavior
+      return ok(Value(kind: vkInt64, int64Val: int64(if pos < 0: 0 else: pos + 1)))
+
+    if name in ["CHR", "CHAR"]:
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, name & " requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      if argRes.value.kind != vkInt64:
+        return err[Value](ERR_SQL, name & " requires integer argument")
+      let code = argRes.value.int64Val
+      if code < 0 or code > 127:
+        return err[Value](ERR_SQL, name & " argument out of ASCII range (0-127)")
+      return ok(textValue($char(code)))
+
+    if name == "HEX":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "HEX requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      case argRes.value.kind
+      of vkInt64:
+        return ok(textValue(argRes.value.int64Val.toHex.strip(trailing = false, chars = {'0'})))
+      of vkBlob:
+        var hexStr = ""
+        for b in argRes.value.bytes:
+          hexStr.add(b.toHex(2))
+        return ok(textValue(hexStr))
+      of vkText:
+        var hexStr = ""
+        for b in argRes.value.bytes:
+          hexStr.add(b.toHex(2))
+        return ok(textValue(hexStr))
+      else:
+        return err[Value](ERR_SQL, "HEX requires integer, text, or blob argument")
 
     if name == "JSON_ARRAY_LENGTH":
       if expr.args.len < 1 or expr.args.len > 2:
@@ -2579,6 +2653,84 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
         return ok(Value(kind: vkFloat64, float64Val: floor(asFloat)))
       else:
         return err[Value](ERR_SQL, "FLOOR requires numeric argument")
+
+    if name == "SQRT":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "SQRT requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var f: float64
+      case argRes.value.kind
+      of vkInt64: f = float64(argRes.value.int64Val)
+      of vkFloat64: f = argRes.value.float64Val
+      of vkDecimal:
+        f = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, "SQRT requires numeric argument")
+      if f < 0.0:
+        return err[Value](ERR_SQL, "SQRT of negative number")
+      return ok(Value(kind: vkFloat64, float64Val: sqrt(f)))
+
+    if name in ["POWER", "POW"]:
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, name & " requires exactly two arguments")
+      let baseRes = evalExpr(row, expr.args[0], params)
+      if not baseRes.ok:
+        return err[Value](baseRes.err.code, baseRes.err.message, baseRes.err.context)
+      let expRes = evalExpr(row, expr.args[1], params)
+      if not expRes.ok:
+        return err[Value](expRes.err.code, expRes.err.message, expRes.err.context)
+      if baseRes.value.kind == vkNull or expRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var b, e: float64
+      case baseRes.value.kind
+      of vkInt64: b = float64(baseRes.value.int64Val)
+      of vkFloat64: b = baseRes.value.float64Val
+      of vkDecimal:
+        b = float64(baseRes.value.int64Val) / pow(10.0, float64(baseRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, name & " requires numeric arguments")
+      case expRes.value.kind
+      of vkInt64: e = float64(expRes.value.int64Val)
+      of vkFloat64: e = expRes.value.float64Val
+      of vkDecimal:
+        e = float64(expRes.value.int64Val) / pow(10.0, float64(expRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, name & " requires numeric arguments")
+      return ok(Value(kind: vkFloat64, float64Val: pow(b, e)))
+
+    if name == "MOD":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "MOD requires exactly two arguments")
+      let aRes = evalExpr(row, expr.args[0], params)
+      if not aRes.ok:
+        return err[Value](aRes.err.code, aRes.err.message, aRes.err.context)
+      let bRes = evalExpr(row, expr.args[1], params)
+      if not bRes.ok:
+        return err[Value](bRes.err.code, bRes.err.message, bRes.err.context)
+      if aRes.value.kind == vkNull or bRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      if aRes.value.kind == vkFloat64 or bRes.value.kind == vkFloat64:
+        var l, r: float64
+        case aRes.value.kind
+        of vkInt64: l = float64(aRes.value.int64Val)
+        of vkFloat64: l = aRes.value.float64Val
+        else: return err[Value](ERR_SQL, "MOD requires numeric arguments")
+        case bRes.value.kind
+        of vkInt64: r = float64(bRes.value.int64Val)
+        of vkFloat64: r = bRes.value.float64Val
+        else: return err[Value](ERR_SQL, "MOD requires numeric arguments")
+        if r == 0.0:
+          return err[Value](ERR_SQL, "Division by zero")
+        return ok(Value(kind: vkFloat64, float64Val: l.mod(r)))
+      if aRes.value.kind == vkInt64 and bRes.value.kind == vkInt64:
+        if bRes.value.int64Val == 0:
+          return err[Value](ERR_SQL, "Division by zero")
+        return ok(Value(kind: vkInt64, int64Val: aRes.value.int64Val mod bRes.value.int64Val))
+      return err[Value](ERR_SQL, "MOD requires numeric arguments")
 
     if name == "LIKE_ESCAPE":
       if expr.args.len != 2:
@@ -3141,7 +3293,7 @@ proc collectAggSpecs(items: seq[SelectItem]): seq[AggSpec] =
     case expr.kind
     of ekFunc:
       let fn = expr.funcName.toUpperAscii()
-      if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+      if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
         let arg = if expr.args.len > 0: expr.args[0] else: nil
         let sep = if expr.args.len > 1: expr.args[1] else: nil
         specs.add(AggSpec(funcName: fn, argExpr: arg, separatorExpr: sep, itemIdx: itemIdx))
@@ -3164,7 +3316,7 @@ proc substituteAggResult(expr: Expr, aggValues: Table[int, Value], aggIdx: var i
   case expr.kind
   of ekFunc:
     let fn = expr.funcName.toUpperAscii()
-    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+    if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
       let val = aggValues.getOrDefault(aggIdx, Value(kind: vkNull))
       aggIdx.inc
       return Expr(kind: ekLiteral, value: valueToSqlLiteral(val))
@@ -3219,7 +3371,7 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
               return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
             let val = evalRes.value
             if val.kind != vkNull:
-              if spec.funcName == "SUM" or spec.funcName == "AVG":
+              if spec.funcName in ["SUM", "AVG", "TOTAL"]:
                 let addVal = if val.kind == vkFloat64: val.float64Val else: float(val.int64Val)
                 states[i].sum += addVal
                 if val.kind == vkFloat64:
@@ -3259,6 +3411,9 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
           aggValues[i] = Value(kind: vkInt64, int64Val: int64(state.sum))
         else:
           aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum)
+      of "TOTAL":
+        # TOTAL always returns float64, 0.0 for empty set (never NULL)
+        aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum)
       of "AVG":
         if not state.initialized:
           aggValues[i] = Value(kind: vkNull)
@@ -3298,7 +3453,7 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
     for item in items:
       let substituted = substituteAggResult(item.expr, aggValues, aggIdx)
       let colName = if item.alias.len > 0: item.alias
-                    elif item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+                    elif item.expr != nil and item.expr.kind == ekFunc and item.expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
                       item.expr.funcName.toLowerAscii()
                     elif item.expr != nil and item.expr.kind == ekColumn:
                       item.expr.name

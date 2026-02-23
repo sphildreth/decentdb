@@ -372,7 +372,12 @@ suite "Binder":
 
     let stmtCheckUnsupportedFn = parseSingle("CREATE TABLE chk_fn (id INT, CHECK (ABS(id) > 0))")
     let bindCheckUnsupportedFn = bindStatement(db.catalog, stmtCheckUnsupportedFn)
-    check not bindCheckUnsupportedFn.ok
+    check bindCheckUnsupportedFn.ok
+
+    # Verify truly unsupported functions are still rejected in CHECK
+    let stmtCheckBadFn = parseSingle("CREATE TABLE chk_fn2 (id INT, CHECK (GEN_RANDOM_UUID() IS NOT NULL))")
+    let bindCheckBadFn = bindStatement(db.catalog, stmtCheckBadFn)
+    check not bindCheckBadFn.ok
 
     discard closeDb(db)
 
