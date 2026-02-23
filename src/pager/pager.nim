@@ -56,6 +56,7 @@ type Pager* = ref object
   rollbackLock*: Lock    # Guards against seeing dirty state during rollback
   rollbackInProgress*: Atomic[bool]  # Fast path check to avoid lock contention
   txnAllocatedPages*: seq[PageId]  # Pages allocated during current transaction (HIGH-003)
+  txnFreedPages*: seq[PageId]      # Pages freed during current transaction (ADR-0057)
   inTransaction*: bool             # Whether a transaction is active (HIGH-003)
   flushHandler*: proc(pageId: PageId, data: string): Result[Void]
   # Optimization: Track dirty page count during transaction to enable single-page fast path
@@ -1087,9 +1088,7 @@ proc allocatePage*(pager: Pager): Result[PageId] =
     return err[PageId](readRes.err.code, readRes.err.message, readRes.err.context)
   if ids.len == 0:
     pager.header.freelistHead = next
-    let headerRes = updateHeader(pager)
-    if not headerRes.ok:
-      return err[PageId](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+    # Header persisted at checkpoint (ADR-0057)
     let res = appendBlankPage(pager)
     if res.ok and pager.inTransaction:
       pager.txnAllocatedPages.add(res.value)
@@ -1102,9 +1101,7 @@ proc allocatePage*(pager: Pager): Result[PageId] =
     return err[PageId](writeRes.err.code, writeRes.err.message, writeRes.err.context)
   if ids.len == 0:
     pager.header.freelistHead = next
-  let headerRes = updateHeader(pager)
-  if not headerRes.ok:
-    return err[PageId](headerRes.err.code, headerRes.err.message, headerRes.err.context)
+  # Header persisted at checkpoint (ADR-0057)
   let pageId = PageId(id)
   if pager.inTransaction:
     pager.txnAllocatedPages.add(pageId)
@@ -1128,7 +1125,10 @@ proc freePage*(pager: Pager, pageId: PageId): Result[Void] =
       let writeRes = writeFreelistPage(pager, headId, next, ids)
       if not writeRes.ok:
         return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-      return updateHeader(pager)
+      # Header persisted at checkpoint (ADR-0057)
+      if pager.inTransaction:
+        pager.txnFreedPages.add(pageId)
+      return okVoid()
   let oldHead = pager.header.freelistHead
   let newListPage = appendBlankPage(pager)
   if not newListPage.ok:
@@ -1139,13 +1139,17 @@ proc freePage*(pager: Pager, pageId: PageId): Result[Void] =
   let writeRes = writeFreelistPage(pager, newHead, oldHead, @[uint32(pageId)])
   if not writeRes.ok:
     return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
-  updateHeader(pager)
+  # Header persisted at checkpoint (ADR-0057)
+  if pager.inTransaction:
+    pager.txnFreedPages.add(pageId)
+  okVoid()
 
 proc beginTxnPageTracking*(pager: Pager) =
   ## Begin tracking page allocations for the current transaction.
   ## Call this when a transaction begins.
   pager.inTransaction = true
   pager.txnAllocatedPages = @[]
+  pager.txnFreedPages = @[]
   pager.txnDirtyCount = 0
   pager.txnDirtyPages.setLen(0)
   pager.txnLastDirtyId = 0
@@ -1155,13 +1159,63 @@ proc endTxnPageTracking*(pager: Pager) =
   ## Call this when a transaction commits (pages become permanent).
   pager.inTransaction = false
   pager.txnAllocatedPages = @[]
+  pager.txnFreedPages = @[]
 
 proc rollbackTxnPageAllocations*(pager: Pager): Result[Void] =
   ## Return all pages allocated during the current transaction to the freelist.
   ## Call this when a transaction rolls back to prevent orphaned pages.
-  if not pager.inTransaction or pager.txnAllocatedPages.len == 0:
+  if not pager.inTransaction or (pager.txnAllocatedPages.len == 0 and pager.txnFreedPages.len == 0):
     endTxnPageTracking(pager)
     return okVoid()
+  
+  # First, undo freed pages — remove them from the freelist (ADR-0057).
+  # We walk the freelist chain and remove any page IDs that were freed in this txn.
+  if pager.txnFreedPages.len > 0:
+    let freedSet = toHashSet(pager.txnFreedPages)
+    var freedCount = uint32(pager.txnFreedPages.len)
+    # Clear txnFreedPages before modifying freelist to avoid re-tracking
+    pager.txnFreedPages = @[]
+    var curHead = pager.header.freelistHead
+    var prevPageId: PageId = 0
+    var prevNext: uint32 = 0
+    var prevIds: seq[uint32] = @[]
+    while curHead != 0:
+      var next: uint32
+      var count: uint32
+      var ids: seq[uint32]
+      let readRes = readFreelistPage(pager, PageId(curHead), next, count, ids)
+      if not readRes.ok:
+        stderr.writeLine("Warning: failed to read freelist page " & $curHead & " during rollback: " & readRes.err.message)
+        break
+      var newIds: seq[uint32] = @[]
+      for id in ids:
+        if PageId(id) notin freedSet:
+          newIds.add(id)
+      if newIds.len != ids.len:
+        if newIds.len == 0 and prevPageId == 0:
+          # Head page is now empty — advance head
+          pager.header.freelistHead = next
+          let writeRes = writeFreelistPage(pager, PageId(curHead), 0, @[])
+          if not writeRes.ok:
+            stderr.writeLine("Warning: failed to clear freelist page during rollback")
+        elif newIds.len == 0 and prevPageId != 0:
+          # Non-head page empty — unlink from chain
+          let writeRes = writeFreelistPage(pager, prevPageId, next, prevIds)
+          if not writeRes.ok:
+            stderr.writeLine("Warning: failed to unlink freelist page during rollback")
+        else:
+          let writeRes = writeFreelistPage(pager, PageId(curHead), next, newIds)
+          if not writeRes.ok:
+            stderr.writeLine("Warning: failed to update freelist page during rollback")
+          prevPageId = PageId(curHead)
+          prevNext = next
+          prevIds = newIds
+      else:
+        prevPageId = PageId(curHead)
+        prevNext = next
+        prevIds = ids
+      curHead = next
+    pager.header.freelistCount = pager.header.freelistCount - freedCount
   
   # Return each allocated page to the freelist
   for pageId in pager.txnAllocatedPages:
@@ -1171,4 +1225,24 @@ proc rollbackTxnPageAllocations*(pager: Pager): Result[Void] =
       stderr.writeLine("Warning: failed to free page " & $pageId & " during rollback: " & freeRes.err.message)
   
   endTxnPageTracking(pager)
+  okVoid()
+
+proc reconstructFreelistHeader*(pager: Pager): Result[Void] =
+  ## Walk the freelist chain starting from freelistHead and rebuild freelistCount.
+  ## Called after WAL recovery to ensure header matches actual freelist state (ADR-0057).
+  if pager.header.freelistHead == 0:
+    pager.header.freelistCount = 0
+    return okVoid()
+  var totalCount: uint32 = 0
+  var curHead = pager.header.freelistHead
+  while curHead != 0:
+    var next: uint32
+    var count: uint32
+    var ids: seq[uint32]
+    let readRes = readFreelistPage(pager, PageId(curHead), next, count, ids)
+    if not readRes.ok:
+      return err[Void](readRes.err.code, "Failed to read freelist page during reconstruction", "page_id=" & $curHead)
+    totalCount += uint32(ids.len)
+    curHead = next
+  pager.header.freelistCount = totalCount
   okVoid()

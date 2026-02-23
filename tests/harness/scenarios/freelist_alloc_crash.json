@@ -1,0 +1,17 @@
+{
+  "name": "freelist_alloc_crash",
+  "description": "Crash during INSERT that allocates pages - committed rows survive, uncommitted do not (ADR-0057)",
+  "db_path": "$TMPDIR/decentdb_freelist_alloc_crash.ddb",
+  "setup_sql": "CREATE TABLE test (id INT PRIMARY KEY, data TEXT); INSERT INTO test VALUES (1, 'committed')",
+  "sql": "INSERT INTO test VALUES (2, 'uncommitted')",
+  "failpoint": {
+    "label": "wal_write_frame",
+    "kind": "error",
+    "count": 1
+  },
+  "verify": {
+    "expect_crash": true,
+    "post_crash_sql": "SELECT id, data FROM test ORDER BY id",
+    "expect_rows": ["1|committed"]
+  }
+}

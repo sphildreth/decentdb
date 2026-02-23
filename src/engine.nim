@@ -261,6 +261,14 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
       pager.header = hRes.value
     else:
       stderr.writeLine("Warning: Failed to decode recovered header: " & hRes.err.message)
+  
+  # Reconstruct freelist header from chain scan (ADR-0057).
+  # After recovery, the header's freelistCount may be stale if a crash occurred
+  # between a freelist mutation and checkpoint.
+  let freelistRes = reconstructFreelistHeader(pager)
+  if not freelistRes.ok:
+    stderr.writeLine("Warning: Failed to reconstruct freelist header: " & freelistRes.err.message)
+
   let txn = beginRead(wal)
   pager.overlaySnapshot = txn.snapshot
   let catalogRes = initCatalog(pager)

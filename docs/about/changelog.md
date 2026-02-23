@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engine**: `getFileSize` error in `openDb` now properly propagated instead of silently returning 0.
 - **WAL**: `getFileSize` error in `ensureWalMmapCapacity` now properly propagated instead of silently returning 0.
 - **WAL**: Removed unused `import os` (all OS operations now go through VFS).
+- **Pager**: Transactional freelist header updates — `allocatePage()` and `freePage()` no longer fsync the DB header mid-transaction. Header is now only persisted at checkpoint, eliminating a crash-safety window where the on-disk header could reflect uncommitted freelist state. Freelist header is reconstructed from the page chain on open. See ADR-0057.
 
 ## [1.4.0] - 2026-02-22
 
