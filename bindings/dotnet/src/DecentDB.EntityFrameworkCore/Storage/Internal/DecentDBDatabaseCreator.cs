@@ -73,8 +73,11 @@ internal sealed class DecentDBDatabaseCreator : RelationalDatabaseCreator
         }
     }
 
-    public override async Task<bool> HasTablesAsync(CancellationToken cancellationToken = default)
-        => HasTables();
+    public override Task<bool> HasTablesAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(HasTables());
+    }
 
     private void OpenAndCloseConnection()
     {

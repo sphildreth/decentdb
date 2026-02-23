@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4.0] - 2026-02-22
 
 ### Added
-- **SQL Engine**: `json_array_length(json [, path])` scalar function — returns the number of elements in a JSON array (or keys in an object). Supports optional JSONPath for nested access. See ADR-0102.
+- **SQL Engine**: `json_array_length(json [, path])` scalar function — returns the number of elements in a JSON array. Supports optional JSONPath for nested access. See ADR-0102.
 - **SQL Engine**: `json_extract(json, path)` scalar function — extracts a value from a JSON document using JSONPath notation (`$`, `$[N]`, `$.key`). Returns the appropriate SQL type (TEXT, INT64, FLOAT64, BOOL, NULL). See ADR-0102.
 - .NET: EF Core primitive collection support — `string[]` properties stored as JSON are now fully queryable via LINQ (`.Any()`, `.Count()`, `.Contains()`, `array[index]`, `.Select()`). See ADR-0103.
 - .NET: NodaTime member translation plugin — `Instant.InUtc().Year/Month/Day` and other date part extractions now translate to SQL expressions. See ADR-0101.

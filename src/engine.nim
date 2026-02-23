@@ -724,9 +724,15 @@ proc findConflictRowidOnTarget(
 
   var matchedIndex: Option[IndexMeta] = none(IndexMeta)
   for _, idx in catalog.indexes:
-    if idx.table.toLowerAscii() == table.name.toLowerAscii() and idx.unique and idx.columns == targetCols:
-      matchedIndex = some(idx)
-      break
+    if idx.table.toLowerAscii() == table.name.toLowerAscii() and idx.unique and idx.columns.len == targetCols.len:
+      var colsMatch = true
+      for i in 0..<idx.columns.len:
+        if idx.columns[i].toLowerAscii() != targetCols[i].toLowerAscii():
+          colsMatch = false
+          break
+      if colsMatch:
+        matchedIndex = some(idx)
+        break
   if isNone(matchedIndex):
     return err[Option[uint64]](ERR_INTERNAL, "Missing UNIQUE index", table.name & "." & targetCols.join(","))
 

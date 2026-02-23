@@ -247,7 +247,7 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     if pkCount != 1:
       return false
     for col in tableMeta.columns:
-      if col.name == colName and col.primaryKey and col.kind == ctInt64:
+      if col.name.toLowerAscii() == colName.toLowerAscii() and col.primaryKey and col.kind == ctInt64:
         return true
     false
 

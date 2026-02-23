@@ -20,6 +20,12 @@ proc eqIdent(a, b: string): bool {.inline.} =
   ## Case-insensitive identifier comparison following PostgreSQL semantics.
   a.toLowerAscii() == b.toLowerAscii()
 
+proc eqIdentSeq(a, b: seq[string]): bool =
+  if a.len != b.len: return false
+  for i in 0..<a.len:
+    if not eqIdent(a[i], b[i]): return false
+  true
+
 proc nullExpr(): Expr =
   Expr(kind: ekLiteral, value: SqlValue(kind: svNull))
 
@@ -1654,7 +1660,7 @@ proc bindInsert(catalog: Catalog, stmt: Statement): Result[Statement] =
             break
       if not matchedUniqueTarget:
         for _, idx in catalog.indexes:
-          if eqIdent(idx.table, stmt.insertTable) and idx.unique and idx.columns == conflictTargetCols:
+          if eqIdent(idx.table, stmt.insertTable) and idx.unique and eqIdentSeq(idx.columns, conflictTargetCols):
             matchedUniqueTarget = true
             break
       if not matchedUniqueTarget:
