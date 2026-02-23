@@ -103,7 +103,7 @@ proc defaultBulkLoadOptions*(): BulkLoadOptions =
 proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
   ## Open a database file with configurable cache size
   ## cachePages: Number of 4KB pages to cache (default 1024 = 4MB)
-  let vfs: Vfs = if path == ":memory:": newMemVfs() else: newOsVfs()
+  let vfs: Vfs = if cmpIgnoreCase(path, ":memory:") == 0: newMemVfs() else: newOsVfs()
   let walPath = path & "-wal"
   let res = vfs.open(path, fmReadWrite, true)
   if not res.ok:

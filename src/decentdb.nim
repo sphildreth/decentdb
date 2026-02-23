@@ -22,7 +22,7 @@ when isMainModule:
      cmdName = "exec",
      doc = "Execute SQL statements or manage database",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "sql": "SQL statement to execute",
        "openClose": "Open and close database without executing SQL (testing mode)",
        "timing": "Show query execution timing in milliseconds",
@@ -56,7 +56,7 @@ when isMainModule:
      cmdName = "list-tables",
      doc = "List all tables in the database",
      help = {
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd'
@@ -66,7 +66,7 @@ when isMainModule:
      doc = "Describe table structure",
      help = {
        "table": "Table name to describe",
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd',
@@ -76,7 +76,7 @@ when isMainModule:
      cmdName = "list-indexes",
      doc = "List all indexes",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "table": "Optional table name to filter indexes"
      },
      short = {
@@ -88,7 +88,7 @@ when isMainModule:
      doc = "Rebuild an index",
      help = {
        "index": "Index name to rebuild",
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd',
@@ -99,7 +99,7 @@ when isMainModule:
      cmdName = "rebuild-indexes",
      doc = "Rebuild all indexes",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "table": "Optional table name to filter indexes"
      },
      short = {
@@ -111,7 +111,7 @@ when isMainModule:
      doc = "Verify index integrity",
      help = {
        "index": "Index name to verify",
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd',
@@ -125,7 +125,7 @@ when isMainModule:
      help = {
        "table": "Table name to import into",
        "input": "Input file path",
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "batchSize": "Number of rows per batch (default: 10000)",
        "format": "Import format: csv or json (default: csv)"
      },
@@ -139,7 +139,7 @@ when isMainModule:
      help = {
        "table": "Table name to export",
        "output": "Output file path",
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "format": "Export format: csv or json (default: csv)"
      },
      short = {
@@ -150,7 +150,7 @@ when isMainModule:
      cmdName = "dump",
      doc = "Dump database as SQL",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "output": "Output SQL file path (optional, defaults to stdout)"
      },
      short = {
@@ -163,7 +163,7 @@ when isMainModule:
      help = {
        "table": "Table name to import into",
        "input": "CSV file path",
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "batchSize": "Rows per batch (default: 10000)",
        "syncInterval": "Batches between fsync when durability is deferred (default: 10)",
        "durability": "Durability mode: full, deferred, none (default: deferred)",
@@ -178,7 +178,7 @@ when isMainModule:
      cmdName = "checkpoint",
      doc = "Force a WAL checkpoint",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "warnings": "Include WAL warnings in output",
        "verbose": "Include verbose diagnostics in output"
      },
@@ -189,7 +189,7 @@ when isMainModule:
      cmdName = "stats",
      doc = "Show basic engine statistics",
      help = {
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd'
@@ -198,7 +198,7 @@ when isMainModule:
      cmdName = "vacuum",
      doc = "Rewrite database into a new file to reclaim space",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "output": "Output database path (required)",
        "overwrite": "Overwrite output if it exists",
        "cachePages": "Number of 4KB pages to cache (default: 1024 = 4MB)",
@@ -211,7 +211,7 @@ when isMainModule:
      cmdName = "info",
      doc = "Display database information",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "schema-summary": "Include schema summary (tables, columns, indexes)"
      },
      short = {
@@ -221,7 +221,7 @@ when isMainModule:
      cmdName = "dump-header",
      doc = "Dump raw database header fields",
      help = {
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd'
@@ -230,7 +230,7 @@ when isMainModule:
      cmdName = "verify-header",
      doc = "Verify database header checksum",
      help = {
-       "db": "Path to database file (required)"
+       "db": "Path to database file, or :memory: for in-memory (required)"
      },
      short = {
        "db": 'd'
@@ -239,7 +239,7 @@ when isMainModule:
      cmdName = "repl",
      doc = "Interactive REPL mode",
      help = {
-       "db": "Path to database file (required)",
+       "db": "Path to database file, or :memory: for in-memory (required)",
        "format": "Output format: json, csv, table (default: table)"
      },
      short = {

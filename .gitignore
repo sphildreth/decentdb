@@ -94,4 +94,7 @@ bindings/dotnet/.idea/
 bindings/dotnet/v
 bindings/dotnet/v
 :memory:*
+:MEMORY:*
 
+src/engine
+src/vfs/os_vfs

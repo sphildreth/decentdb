@@ -5,6 +5,20 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-02-23
+
+### Added
+- **Engine**: In-memory database support via `:memory:` connection string — each `openDb(":memory:")` creates a new, isolated, ephemeral database backed by `MemVfs`. WAL remains enabled for consistent transaction semantics. See ADR-0105.
+- **VFS**: `MemVfs` implementation — memory-backed Virtual File System with `seq[byte]` storage, per-file locking, and full VFS interface compliance (no `mmap` support).
+- **VFS**: `getFileSize`, `fileExists`, and `removeFile` methods added to the VFS interface, replacing direct OS calls in the engine, pager, and WAL.
+- **VFS**: `OsVfsFile` subclass introduced — `VfsFile` refactored from concrete type to base class (`ref object of RootObj`) to support polymorphic VFS file implementations.
+
+### Fixed
+- **VFS**: Double `deinitLock` undefined behavior — `MemVfs.removeFile` no longer calls `deinitLock`; `close()` is the sole owner of lock lifecycle.
+- **Engine**: `getFileSize` error in `openDb` now properly propagated instead of silently returning 0.
+- **WAL**: `getFileSize` error in `ensureWalMmapCapacity` now properly propagated instead of silently returning 0.
+- **WAL**: Removed unused `import os` (all OS operations now go through VFS).
+
 ## [1.4.0] - 2026-02-22
 
 ### Added

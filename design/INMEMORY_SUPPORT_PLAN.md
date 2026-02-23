@@ -107,6 +107,64 @@ The `MemVfs` simulates the filesystem safely, so the WAL will function correctly
 - Changes to `Pager.nim` to write directly to the DB file
 - Testing to ensure Snapshot Isolation still works correctly
 
+### 3.6 "Save As" (Export `:memory:` DB to an on-disk file)
+Provide a way to persist an in-memory database by exporting a **transactionally consistent snapshot** to a new on-disk database file.
+
+#### 3.6.1 Semantics
+- Export produces a **new database file** that can be opened later via normal disk-backed `openDb("/path/to/db.ddb")`.
+- Export captures a **single snapshot** (as of a specific commit boundary).
+- Export does not change the logical contents of the in-memory database; however, it may perform internal checkpointing/truncation work to materialize a clean snapshot.
+
+#### 3.6.2 API sketch
+- `proc saveAs*(db: Db, destPath: string): Result[Void]`
+
+Progress reporting (optional):
+- Bytes-only callback:
+  - `type SaveAsProgressCb* = proc (writtenBytes: int64, totalBytes: int64) {.gcsafe, raises: [].}`
+  - `proc saveAs*(db: Db, destPath: string, onProgress: SaveAsProgressCb = nil): Result[Void]`
+- Phase + bytes callback (preferred for bindings / UX):
+  - `type SaveAsPhase* = enum spAcquireWriterLock, spCheckpoint, spCopy, spFsync, spRename, spDone`
+  - `type SaveAsEventCb* = proc (phase: SaveAsPhase, writtenBytes: int64, totalBytes: int64) {.gcsafe, raises: [].}`
+  - `proc saveAs*(db: Db, destPath: string, onEvent: SaveAsEventCb = nil): Result[Void]`
+
+Bindings can expose an equivalent method name, but should preserve the same snapshot semantics.
+
+Callback contract:
+- Callbacks must be **optional** and **zero-cost when nil**.
+- `totalBytes` refers to the exported main DB file size for the snapshot.
+- For phases without meaningful byte counts, emit `(phase, 0, 0)`.
+- Callbacks must be **non-blocking** and must **not** call back into the same `Db` to avoid deadlocks/reentrancy.
+- Throttle callback frequency during `spCopy` (e.g., at most once every 10-50ms) to avoid overhead on large exports.
+
+Bindings notes:
+- .NET: expose as `IProgress<SaveAsEvent>` or `Action<SaveAsEvent>`; if used from UI contexts, the binding/user must marshal to the UI thread.
+- Node: expose as a callback `(event) => {}`; document that it may be called frequently during copy and must be lightweight.
+- Python: expose as a callable `on_event(phase, written_bytes, total_bytes)`; document threading expectations and callback cost.
+
+#### 3.6.3 Implementation approach (v1: simplest + safest)
+Because v1 keeps WAL enabled for `:memory:`, the simplest robust export is:
+1. **Block the writer** (exclusive DB write lock). Readers may continue if Snapshot Isolation guarantees are preserved.
+2. Force a **checkpoint** so that the main DB file in `MemVfs` contains a complete, consistent snapshot of all committed state.
+3. **Truncate/reset** the WAL so the exported file does not depend on any external WAL file for correctness.
+4. **Stream-copy** the in-memory DB file bytes to a temporary on-disk file `destPath.tmp` (avoid allocating a second full-size buffer).
+5. `fsync` the temp file, `rename()` to `destPath`, then `fsync` the containing directory.
+
+This produces a standalone DB file equivalent to a cleanly checkpointed on-disk database.
+
+#### 3.6.4 Key complications / pitfalls
+- **Consistency point**: copying raw bytes without checkpointing can export an inconsistent mix of pages.
+- **WAL interplay**: if WAL is non-empty at export time, export must either include WAL as an artifact with clearly defined naming/open semantics, or checkpoint + truncate so the result is a single clean DB file.
+- **Header invariants**: ensure header fields (page count, freelist, etc.) reflect the post-checkpoint state, not a mid-checkpoint intermediate.
+- **Destination existence**: define overwrite behavior (prefer error-by-default).
+- **Atomicity**: `rename()` is only atomic within the same filesystem; ensure temp file is created in the same directory as `destPath`.
+- **Lock ordering**: export must not deadlock with ongoing statements/transactions; it should participate in the existing writer lock ordering.
+
+#### 3.6.5 Testing additions
+- Integration: create `:memory:` DB, write data, call `saveAs()`, open `destPath` as a disk DB, verify contents.
+- WAL edge: export while WAL has uncheckpointed frames (export forces checkpoint).
+- Concurrency: long-running reader + periodic writes, export while reader active, verify export succeeds and disk DB is consistent.
+- Failure injection (optional but high value): fail mid-write of `destPath.tmp` and ensure `destPath` is not created or remains valid.
+
 ## 4. Performance and Memory Considerations
 - **Memory Usage**: The memory usage is bounded to `Size of DB in MemVfs` + `Size of WAL in MemVfs` + `Pager Cache Size (default 4MB)`. The WAL file size is bounded by the auto-checkpoint interval (default 64MB). This means the overhead of double-buffering is minimal and perfectly acceptable for an in-memory database.
 - **CPU Overhead**: Reading and writing to `MemVfs` involves `memcpy`, which is extremely fast (microseconds per page).

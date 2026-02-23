@@ -6,15 +6,18 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using NodaTime;
 using DecentDB.EntityFrameworkCore;
-
-var dbPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "music.ddb"));
+using DecentDB.AdoNet;
 
 Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════╗");
-Console.WriteLine("║           DecentDB Entity Framework Core Demo Application                ║");
+Console.WriteLine("║           DecentDB Entity Framework Core In-Memory Demo Application      ║");
 Console.WriteLine("╚══════════════════════════════════════════════════════════════════════════╝");
 Console.WriteLine();
-Console.WriteLine($"Database: {dbPath}");
+Console.WriteLine("Database: :memory:");
 Console.WriteLine();
+
+// Keep one connection open for the lifetime of the in-memory database (same pattern as SQLite).
+using var sharedConnection = new DecentDBConnection("Data Source=:memory:");
+sharedConnection.Open();
 
 // Setup DI
 var services = new ServiceCollection();
@@ -27,7 +30,7 @@ services.AddLogging(builder =>
 
 services.AddDbContextFactory<MusicDbContext>(options =>
 {
-    options.UseDecentDB($"Data Source={dbPath}", x => x.UseNodaTime());
+    options.UseDecentDB(sharedConnection, contextOwnsConnection: false, x => x.UseNodaTime());
     options.UseLazyLoadingProxies();
     options.EnableSensitiveDataLogging(false);
 });
@@ -39,13 +42,6 @@ services.AddScoped<TrackService>();
 services.AddScoped<EventService>();
 
 var serviceProvider = services.BuildServiceProvider();
-
-// Clean start
-if (File.Exists(dbPath))
-{
-    File.Delete(dbPath);
-    Console.WriteLine("Cleaned up existing database.");
-}
 
 // Ensure database and schema are created
 using (var scope = serviceProvider.CreateScope())
@@ -623,11 +619,3 @@ foreach (var es in eventSummaries.Take(3))
 }
 
 Console.WriteLine("\n✓ Demo completed successfully!");
-
-// Cleanup
-Console.WriteLine("\nCleaning up...");
-if (File.Exists(dbPath))
-{
-    File.Delete(dbPath);
-    Console.WriteLine("Database file deleted.");
-}
