@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Engine**: In-memory database support via `:memory:` connection string — each `openDb(":memory:")` creates a new, isolated, ephemeral database backed by `MemVfs`. WAL remains enabled for consistent transaction semantics. See ADR-0105.
 - **Engine**: `saveAs` — export any open database (including `:memory:`) to a new on-disk file. Performs a full checkpoint, then streams pages to the destination via atomic temp-file + rename. Available as a Nim proc, C API function, CLI command, and in all bindings (.NET, Go, Node, Python).
+- **SQL Engine**: Window functions `RANK()`, `DENSE_RANK()`, `LAG()`, and `LEAD()` — extends the existing `ROW_NUMBER()` support with additional SQL:2003 window functions. All support `PARTITION BY` and `ORDER BY` clauses. `LAG`/`LEAD` accept 1–3 arguments (expression, offset, default). See ADR-0106.
 - **CLI**: `save-as` command — `decentdb save-as --db=:memory: --output=backup.ddb` exports a database snapshot to a new file.
 - **VFS**: `MemVfs` implementation — memory-backed Virtual File System with `seq[byte]` storage, per-file locking, and full VFS interface compliance (no `mmap` support).
 - **VFS**: `getFileSize`, `fileExists`, and `removeFile` methods added to the VFS interface, replacing direct OS calls in the engine, pager, and WAL.
@@ -273,7 +274,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Single writer only (no concurrent write transactions)
 - Single process access (no multi-process concurrency)
-- Window functions limited to `ROW_NUMBER()` (no RANK, DENSE_RANK, LAG, LEAD, etc.)
+- Window functions support `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD` but no frame clauses (`ROWS BETWEEN`, `RANGE BETWEEN`) or `NTILE`/`PERCENT_RANK`/`CUME_DIST`
 - Only non-recursive CTEs supported (no `WITH RECURSIVE`)
 - Views are read-only (no `INSERT`/`UPDATE`/`DELETE` targeting a view); parameters are not allowed in view definitions
 - Triggers are intentionally narrow: `AFTER` (tables) and `INSTEAD OF` (views), `FOR EACH ROW` only, and actions must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` (no `NEW`/`OLD`)

@@ -65,6 +65,75 @@ async function main() {
   const { rows: countRows } = db.exec('SELECT count(*) FROM users');
   console.log(`\nTotal users after transaction: ${countRows[0][0]}`);
 
+  // ── Window Functions ──
+  db.exec(`CREATE TABLE scores (
+    id    INTEGER PRIMARY KEY,
+    name  TEXT NOT NULL,
+    dept  TEXT NOT NULL,
+    score INTEGER NOT NULL
+  )`);
+
+  const scores = [
+    ['Alice', 'eng', 95], ['Bob', 'eng', 95],
+    ['Carol', 'eng', 80], ['Dave', 'sales', 90],
+    ['Eve', 'sales', 85],
+  ];
+  for (const [name, dept, score] of scores) {
+    db.exec('INSERT INTO scores (name, dept, score) VALUES ($1, $2, $3)', [name, dept, score]);
+  }
+
+  console.log('\n── Window Functions ──');
+
+  // ROW_NUMBER
+  const rn = db.exec(`
+    SELECT name, dept, score,
+           ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rn
+    FROM scores ORDER BY dept, score DESC`);
+  console.log('\nROW_NUMBER (ranking within department):');
+  for (const [name, dept, score, rnVal] of rn.rows) {
+    console.log(`  ${name.padEnd(6)}  dept=${dept.padEnd(5)}  score=${score}  rn=${rnVal}`);
+  }
+
+  // RANK
+  const rank = db.exec(`
+    SELECT name, score,
+           RANK() OVER (ORDER BY score DESC) AS rank
+    FROM scores ORDER BY score DESC, name`);
+  console.log('\nRANK (with gaps for ties):');
+  for (const [name, score, r] of rank.rows) {
+    console.log(`  ${name.padEnd(6)}  score=${score}  rank=${r}`);
+  }
+
+  // DENSE_RANK
+  const dr = db.exec(`
+    SELECT name, score,
+           DENSE_RANK() OVER (ORDER BY score DESC) AS dr
+    FROM scores ORDER BY score DESC, name`);
+  console.log('\nDENSE_RANK (no gaps):');
+  for (const [name, score, d] of dr.rows) {
+    console.log(`  ${name.padEnd(6)}  score=${score}  dense_rank=${d}`);
+  }
+
+  // LAG
+  const lag = db.exec(`
+    SELECT name, score,
+           LAG(score, 1, 0) OVER (ORDER BY score DESC) AS prev_score
+    FROM scores ORDER BY score DESC`);
+  console.log('\nLAG (previous score):');
+  for (const [name, score, prev] of lag.rows) {
+    console.log(`  ${name.padEnd(6)}  score=${score}  prev_score=${prev}`);
+  }
+
+  // LEAD
+  const lead = db.exec(`
+    SELECT name, score,
+           LEAD(score) OVER (PARTITION BY dept ORDER BY score DESC) AS next_score
+    FROM scores ORDER BY dept, score DESC`);
+  console.log('\nLEAD (next score in dept):');
+  for (const [name, score, next] of lead.rows) {
+    console.log(`  ${name.padEnd(6)}  score=${score}  next_score=${next ?? 'NULL'}`);
+  }
+
   // Schema introspection.
   console.log(`\nTables: ${JSON.stringify(db.listTables())}`);
 

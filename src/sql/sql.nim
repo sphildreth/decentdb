@@ -57,6 +57,8 @@ type Expr* = ref object
     inExpr*: Expr
     inList*: seq[Expr]
   of ekWindowRowNumber:
+    windowFunc*: string           # "ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD"
+    windowArgs*: seq[Expr]        # LAG/LEAD: [expr, offset, default]
     windowPartitions*: seq[Expr]
     windowOrderExprs*: seq[Expr]
     windowOrderAsc*: seq[bool]
@@ -405,10 +407,15 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
 
   let overNode = nodeGet(node, "over")
   if overNode.kind == JObject:
-    if funcName != "ROW_NUMBER":
-      return err[Expr](ERR_SQL, "Only ROW_NUMBER window function is supported in 0.x", funcName)
-    if args.len > 0:
-      return err[Expr](ERR_SQL, "ROW_NUMBER does not take arguments in 0.x")
+    const windowFuncs = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD"]
+    if funcName notin windowFuncs:
+      return err[Expr](ERR_SQL, "Unsupported window function", funcName)
+    if funcName in ["ROW_NUMBER", "RANK", "DENSE_RANK"]:
+      if args.len > 0:
+        return err[Expr](ERR_SQL, funcName & " does not take arguments")
+    elif funcName in ["LAG", "LEAD"]:
+      if args.len < 1 or args.len > 3:
+        return err[Expr](ERR_SQL, funcName & " requires 1 to 3 arguments")
 
     var partitions: seq[Expr] = @[]
     let partitionNode = nodeGet(overNode, "partitionClause")
@@ -436,6 +443,8 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
 
     return ok(Expr(
       kind: ekWindowRowNumber,
+      windowFunc: funcName,
+      windowArgs: args,
       windowPartitions: partitions,
       windowOrderExprs: orderExprs,
       windowOrderAsc: orderAsc
@@ -1292,7 +1301,13 @@ proc exprToCanonicalSql*(expr: Expr): string =
       parts.add(exprToCanonicalSql(item))
     "(" & exprToCanonicalSql(expr.inExpr) & " IN (" & parts.join(", ") & "))"
   of ekWindowRowNumber:
-    var sqlText = "ROW_NUMBER() OVER ("
+    var sqlText = expr.windowFunc & "("
+    if expr.windowFunc in ["LAG", "LEAD"]:
+      var argSql: seq[string] = @[]
+      for a in expr.windowArgs:
+        argSql.add(exprToCanonicalSql(a))
+      sqlText.add(argSql.join(", "))
+    sqlText.add(") OVER (")
     if expr.windowPartitions.len > 0:
       var partSql: seq[string] = @[]
       for p in expr.windowPartitions:

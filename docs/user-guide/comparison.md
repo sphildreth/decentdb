@@ -47,7 +47,7 @@ DecentDB's current baseline includes:
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 - Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
 - CTEs: non-recursive `WITH ... AS`
-- Window functions: `ROW_NUMBER() OVER (...)`
+- Window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()` with `OVER (...)`
 - Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
 - Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `JSON_ARRAY_LENGTH`, `JSON_EXTRACT`, `PRINTF`
 - Operators: `+`, `-`, `*`, `/`, `||` (string concatenation)
@@ -74,7 +74,7 @@ DecentDB has implemented many previously planned baseline features, including:
 - `CHECK` constraints and FK `CASCADE` / `SET NULL` actions
 - Broader `ALTER TABLE` (`ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`)
 - Trigger subsets (`AFTER` row triggers on tables, `INSTEAD OF` row triggers on views)
-- Window subset (`ROW_NUMBER() OVER (...)`)
+- Window functions (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()` with `OVER (...)`)
 - Indexing options (multi-column, partial v0 subset, expression index v0 subset)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 

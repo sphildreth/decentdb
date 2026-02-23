@@ -145,6 +145,8 @@ proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
       referencedTables(part, tablesOut)
     for o in expr.windowOrderExprs:
       referencedTables(o, tablesOut)
+    for a in expr.windowArgs:
+      referencedTables(a, tablesOut)
   else:
     discard
 

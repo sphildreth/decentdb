@@ -816,6 +816,139 @@ suite "Planner":
 
     discard closeDb(db)
 
+  test "RANK window function":
+    let path = makeTempDb("decentdb_sql_window_rank.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE scores (id INT, score INT, team TEXT)").ok
+    check execSql(db, "INSERT INTO scores VALUES (1, 100, 'a')").ok
+    check execSql(db, "INSERT INTO scores VALUES (2, 100, 'a')").ok
+    check execSql(db, "INSERT INTO scores VALUES (3, 90, 'a')").ok
+    check execSql(db, "INSERT INTO scores VALUES (4, 80, 'b')").ok
+    check execSql(db, "INSERT INTO scores VALUES (5, 80, 'b')").ok
+
+    # RANK with ties: equal scores get same rank, next rank skips
+    let rankRes = execSql(db,
+      "SELECT id, RANK() OVER (PARTITION BY team ORDER BY score DESC) AS r FROM scores ORDER BY id")
+    check rankRes.ok
+    check rankRes.value == @["1|1", "2|1", "3|3", "4|1", "5|1"]
+
+    # RANK without partition (global)
+    let globalRes = execSql(db,
+      "SELECT id, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY id")
+    check globalRes.ok
+    check globalRes.value == @["1|1", "2|1", "3|3", "4|4", "5|4"]
+
+    discard closeDb(db)
+
+  test "DENSE_RANK window function":
+    let path = makeTempDb("decentdb_sql_window_dense_rank.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE scores (id INT, score INT)").ok
+    check execSql(db, "INSERT INTO scores VALUES (1, 100)").ok
+    check execSql(db, "INSERT INTO scores VALUES (2, 100)").ok
+    check execSql(db, "INSERT INTO scores VALUES (3, 90)").ok
+    check execSql(db, "INSERT INTO scores VALUES (4, 80)").ok
+
+    # DENSE_RANK: no gaps after ties
+    let denseRes = execSql(db,
+      "SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY id")
+    check denseRes.ok
+    check denseRes.value == @["1|1", "2|1", "3|2", "4|3"]
+
+    discard closeDb(db)
+
+  test "LAG window function":
+    let path = makeTempDb("decentdb_sql_window_lag.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # LAG(val) — default offset 1, default NULL
+    let lagRes = execSql(db,
+      "SELECT id, LAG(val) OVER (PARTITION BY grp ORDER BY id) AS prev FROM events ORDER BY id")
+    check lagRes.ok
+    check lagRes.value == @["1|NULL", "2|10", "3|20", "4|NULL", "5|100"]
+
+    # LAG with offset 2 and default 0
+    let lag2Res = execSql(db,
+      "SELECT id, LAG(val, 2, 0) OVER (ORDER BY id) AS prev2 FROM events ORDER BY id")
+    check lag2Res.ok
+    check lag2Res.value == @["1|0", "2|0", "3|10", "4|20", "5|30"]
+
+    discard closeDb(db)
+
+  test "LEAD window function":
+    let path = makeTempDb("decentdb_sql_window_lead.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+
+    # LEAD(val) — default offset 1, default NULL
+    let leadRes = execSql(db,
+      "SELECT id, LEAD(val) OVER (PARTITION BY grp ORDER BY id) AS nxt FROM events ORDER BY id")
+    check leadRes.ok
+    check leadRes.value == @["1|20", "2|30", "3|NULL", "4|NULL"]
+
+    # LEAD with offset and default
+    let lead2Res = execSql(db,
+      "SELECT id, LEAD(val, 1, -1) OVER (ORDER BY id) AS nxt FROM events ORDER BY id")
+    check lead2Res.ok
+    check lead2Res.value == @["1|20", "2|30", "3|100", "4|-1"]
+
+    discard closeDb(db)
+
+  test "window functions with NULLs and single row":
+    let path = makeTempDb("decentdb_sql_window_edge.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT, val INT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, NULL)").ok
+    check execSql(db, "INSERT INTO t VALUES (2, NULL)").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 10)").ok
+
+    # RANK with NULLs: NULLs compare equal → same rank
+    let rankNull = execSql(db,
+      "SELECT id, RANK() OVER (ORDER BY val) AS r FROM t ORDER BY id")
+    check rankNull.ok
+    check rankNull.value == @["1|1", "2|1", "3|3"]
+
+    # DENSE_RANK with NULLs
+    let denseNull = execSql(db,
+      "SELECT id, DENSE_RANK() OVER (ORDER BY val) AS dr FROM t ORDER BY id")
+    check denseNull.ok
+    check denseNull.value == @["1|1", "2|1", "3|2"]
+
+    # Single row table
+    check execSql(db, "CREATE TABLE single (id INT)").ok
+    check execSql(db, "INSERT INTO single VALUES (1)").ok
+    let singleRow = execSql(db,
+      "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, RANK() OVER (ORDER BY id) AS r FROM single")
+    check singleRow.ok
+    check singleRow.value == @["1|1|1"]
+
+    discard closeDb(db)
+
   test "partial index (IS NOT NULL) maintenance and planning":
     let path = makeTempDb("decentdb_sql_partial_index.db")
     let dbRes = openDb(path)

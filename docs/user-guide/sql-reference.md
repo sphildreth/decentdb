@@ -407,20 +407,46 @@ SELECT STRING_AGG(name, ', ') FROM users;    -- Alias for GROUP_CONCAT
 
 ### Window Functions
 
-Supported window subset:
-- `ROW_NUMBER() OVER (...)`
-- `PARTITION BY` is optional
-- `ORDER BY` inside `OVER (...)` is required in 0.x
+Supported window functions:
+
+- `ROW_NUMBER() OVER (...)` — sequential row numbering within each partition
+- `RANK() OVER (...)` — ranking with gaps for ties (e.g., 1, 1, 3)
+- `DENSE_RANK() OVER (...)` — ranking without gaps (e.g., 1, 1, 2)
+- `LAG(expr [, offset [, default]]) OVER (...)` — access a previous row's value
+- `LEAD(expr [, offset [, default]]) OVER (...)` — access a following row's value
+
+All functions support:
+
+- `PARTITION BY` (optional) — divides rows into groups
+- `ORDER BY` inside `OVER (...)` (required) — determines row ordering within partitions
 
 ```sql
-SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) AS rn
-FROM t
-ORDER BY id;
+-- ROW_NUMBER: sequential numbering
+SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn
+FROM employees ORDER BY dept, id;
+
+-- RANK: ties get same rank, with gaps
+SELECT name, RANK() OVER (ORDER BY score DESC) AS rank
+FROM scores ORDER BY score DESC;
+
+-- DENSE_RANK: ties get same rank, no gaps
+SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS drank
+FROM scores ORDER BY score DESC;
+
+-- LAG: previous row's value (default offset = 1, default value = NULL)
+SELECT name, score, LAG(score, 1, 0) OVER (ORDER BY id) AS prev_score
+FROM scores ORDER BY id;
+
+-- LEAD: next row's value
+SELECT name, LEAD(score) OVER (PARTITION BY dept ORDER BY id) AS next_score
+FROM scores ORDER BY dept, id;
 ```
 
 Current limits:
-- Only `ROW_NUMBER()` is supported.
+
 - Window expressions are supported only in `SELECT` projection items.
+- `ORDER BY` in the outer query cannot reference window function aliases directly; use base column ordering instead.
+- Frame clauses (`ROWS BETWEEN ...`, `RANGE BETWEEN ...`) are not supported.
 
 ### Transactions
 
@@ -540,7 +566,8 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 ## Unsupported Features
 
 Not currently supported:
-- Advanced window functions beyond `ROW_NUMBER()` (for example `RANK`, `DENSE_RANK`, `LAG`, frame clauses)
+- Window frame clauses (`ROWS BETWEEN ...`, `RANGE BETWEEN ...`)
+- Additional window functions (`NTILE`, `PERCENT_RANK`, `CUME_DIST`, `NTH_VALUE`, `FIRST_VALUE`, `LAST_VALUE`)
 - Recursive CTEs (`WITH RECURSIVE`)
 - Stored procedures
 

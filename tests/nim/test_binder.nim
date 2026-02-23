@@ -678,3 +678,48 @@ suite "Binder":
     check not windowInWhere.ok
 
     discard closeDb(db)
+
+  test "bind RANK/DENSE_RANK/LAG/LEAD window constraints":
+    let path = makeTempDb("decentdb_binder_window_extended.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    discard addTable(db, "t", @[Column(name: "id", kind: ctInt64), Column(name: "val", kind: ctInt64), Column(name: "grp", kind: ctText)])
+
+    # Valid RANK
+    let okRank = bindStatement(db.catalog,
+      parseSingle("SELECT RANK() OVER (ORDER BY id) FROM t"))
+    check okRank.ok
+
+    # Valid DENSE_RANK with PARTITION BY
+    let okDense = bindStatement(db.catalog,
+      parseSingle("SELECT DENSE_RANK() OVER (PARTITION BY grp ORDER BY val) FROM t"))
+    check okDense.ok
+
+    # RANK without ORDER BY → fail
+    let rankNoOrder = bindStatement(db.catalog,
+      parseSingle("SELECT RANK() OVER (PARTITION BY grp) FROM t"))
+    check not rankNoOrder.ok
+
+    # Valid LAG with 1 arg
+    let okLag1 = bindStatement(db.catalog,
+      parseSingle("SELECT LAG(val) OVER (ORDER BY id) FROM t"))
+    check okLag1.ok
+
+    # Valid LAG with 3 args
+    let okLag3 = bindStatement(db.catalog,
+      parseSingle("SELECT LAG(val, 2, 0) OVER (ORDER BY id) FROM t"))
+    check okLag3.ok
+
+    # Valid LEAD
+    let okLead = bindStatement(db.catalog,
+      parseSingle("SELECT LEAD(val, 1) OVER (PARTITION BY grp ORDER BY id) FROM t"))
+    check okLead.ok
+
+    # LAG without ORDER BY → fail
+    let lagNoOrder = bindStatement(db.catalog,
+      parseSingle("SELECT LAG(val) OVER (PARTITION BY grp) FROM t"))
+    check not lagNoOrder.ok
+
+    discard closeDb(db)

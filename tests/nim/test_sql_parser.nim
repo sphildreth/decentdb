@@ -113,10 +113,62 @@ suite "SQL Parser":
     check stmt.kind == skSelect
     check stmt.selectItems.len == 2
     check stmt.selectItems[1].expr.kind == ekWindowRowNumber
+    check stmt.selectItems[1].expr.windowFunc == "ROW_NUMBER"
     check stmt.selectItems[1].expr.windowPartitions.len == 1
     check stmt.selectItems[1].expr.windowOrderExprs.len == 1
     check stmt.selectItems[1].expr.windowOrderAsc.len == 1
     check stmt.selectItems[1].expr.windowOrderAsc[0] == false
+
+  test "parse RANK window expression":
+    let stmt = parseSingle(
+      "SELECT RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS r FROM emp"
+    )
+    check stmt.kind == skSelect
+    check stmt.selectItems[0].expr.kind == ekWindowRowNumber
+    check stmt.selectItems[0].expr.windowFunc == "RANK"
+    check stmt.selectItems[0].expr.windowArgs.len == 0
+    check stmt.selectItems[0].expr.windowPartitions.len == 1
+    check stmt.selectItems[0].expr.windowOrderExprs.len == 1
+
+  test "parse DENSE_RANK window expression":
+    let stmt = parseSingle(
+      "SELECT DENSE_RANK() OVER (ORDER BY score) AS dr FROM scores"
+    )
+    check stmt.selectItems[0].expr.windowFunc == "DENSE_RANK"
+    check stmt.selectItems[0].expr.windowArgs.len == 0
+    check stmt.selectItems[0].expr.windowPartitions.len == 0
+    check stmt.selectItems[0].expr.windowOrderExprs.len == 1
+
+  test "parse LAG with 1, 2 and 3 arguments":
+    let stmt1 = parseSingle(
+      "SELECT LAG(val) OVER (ORDER BY id) FROM t"
+    )
+    check stmt1.selectItems[0].expr.windowFunc == "LAG"
+    check stmt1.selectItems[0].expr.windowArgs.len == 1
+
+    let stmt2 = parseSingle(
+      "SELECT LAG(val, 2) OVER (ORDER BY id) FROM t"
+    )
+    check stmt2.selectItems[0].expr.windowFunc == "LAG"
+    check stmt2.selectItems[0].expr.windowArgs.len == 2
+
+    let stmt3 = parseSingle(
+      "SELECT LAG(val, 2, 0) OVER (ORDER BY id) FROM t"
+    )
+    check stmt3.selectItems[0].expr.windowFunc == "LAG"
+    check stmt3.selectItems[0].expr.windowArgs.len == 3
+
+  test "parse LEAD window expression":
+    let stmt = parseSingle(
+      "SELECT LEAD(val, 1, -1) OVER (PARTITION BY grp ORDER BY id) FROM t"
+    )
+    check stmt.selectItems[0].expr.windowFunc == "LEAD"
+    check stmt.selectItems[0].expr.windowArgs.len == 3
+    check stmt.selectItems[0].expr.windowPartitions.len == 1
+
+  test "parse unsupported window function rejects":
+    let res = parseSql("SELECT NTILE(4) OVER (ORDER BY id) FROM t")
+    check not res.ok
 
   test "parse insert/update/delete":
     let ins = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x')")

@@ -67,7 +67,12 @@ proc renderExpr*(expr: Expr): string =
     s.add("))")
     s
   of ekWindowRowNumber:
-    var s = "ROW_NUMBER() OVER ("
+    var s = expr.windowFunc & "("
+    if expr.windowFunc in ["LAG", "LEAD"]:
+      for i, a in expr.windowArgs:
+        if i > 0: s.add(", ")
+        s.add(renderExpr(a))
+    s.add(") OVER (")
     if expr.windowPartitions.len > 0:
       s.add("PARTITION BY ")
       for i, p in expr.windowPartitions:

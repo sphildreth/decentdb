@@ -986,11 +986,17 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     ok(c)
 
   of pkProject:
+    # Window functions (ekWindowRowNumber) require access to all rows for
+    # sorting/partitioning, so they cannot be evaluated in the streaming
+    # cursor path. Fall back to materialized execution via projectRows.
+    let items = plan.projections
+    for item in items:
+      if not item.isStar and item.expr != nil and item.expr.kind == ekWindowRowNumber:
+        return materialize()
     let childRes = openRowCursor(pager, catalog, plan.left, params)
     if not childRes.ok:
       return err[RowCursor](childRes.err.code, childRes.err.message, childRes.err.context)
     let child = childRes.value
-    let items = plan.projections
     if items.len == 0 or (items.len == 1 and items[0].isStar):
       return ok(child)
     var outCols: seq[string] = @[]
@@ -2735,7 +2741,7 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return ok(Value(kind: vkNull))
     return ok(Value(kind: vkBool, boolVal: false))
   of ekWindowRowNumber:
-    return err[Value](ERR_SQL, "ROW_NUMBER window expression must be evaluated in projection context")
+    return err[Value](ERR_SQL, "Window function must be evaluated in projection context")
 
 proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: string): Result[seq[Row]] =
   let tableRes = catalog.getTable(tableName)
@@ -2943,25 +2949,136 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
       cmp(a, b)
     )
 
-    var rowNumbers = newSeq[Value](rows.len)
-    var currentRowNum = 0'i64
-    var prevIdx = -1
-    for pos, rowIdx in sortedIdx:
-      if pos == 0:
-        currentRowNum = 1
-      else:
-        var samePartition = true
-        for i in 0 ..< partitionVals[rowIdx].len:
-          if compareValues(partitionVals[rowIdx][i], partitionVals[prevIdx][i]) != 0:
-            samePartition = false
-            break
-        if samePartition:
-          currentRowNum.inc
-        else:
+    var windowVals = newSeq[Value](rows.len)
+    let wfunc = wexpr.windowFunc
+
+    if wfunc == "ROW_NUMBER":
+      var currentRowNum = 0'i64
+      var prevIdx = -1
+      for pos, rowIdx in sortedIdx:
+        if pos == 0:
           currentRowNum = 1
-      rowNumbers[rowIdx] = Value(kind: vkInt64, int64Val: currentRowNum)
-      prevIdx = rowIdx
-    windowValuesByItem[itemIdx] = rowNumbers
+        else:
+          var samePartition = true
+          for i in 0 ..< partitionVals[rowIdx].len:
+            if compareValues(partitionVals[rowIdx][i], partitionVals[prevIdx][i]) != 0:
+              samePartition = false
+              break
+          if samePartition:
+            currentRowNum.inc
+          else:
+            currentRowNum = 1
+        windowVals[rowIdx] = Value(kind: vkInt64, int64Val: currentRowNum)
+        prevIdx = rowIdx
+
+    elif wfunc == "RANK":
+      var currentRank = 0'i64
+      var rowsInRank = 0'i64
+      var prevIdx = -1
+      for pos, rowIdx in sortedIdx:
+        if pos == 0:
+          currentRank = 1
+          rowsInRank = 1
+        else:
+          var samePartition = true
+          for i in 0 ..< partitionVals[rowIdx].len:
+            if compareValues(partitionVals[rowIdx][i], partitionVals[prevIdx][i]) != 0:
+              samePartition = false
+              break
+          if not samePartition:
+            currentRank = 1
+            rowsInRank = 1
+          else:
+            rowsInRank.inc
+            var sameOrder = true
+            for i in 0 ..< orderVals[rowIdx].len:
+              if compareValues(orderVals[rowIdx][i], orderVals[prevIdx][i]) != 0:
+                sameOrder = false
+                break
+            if not sameOrder:
+              currentRank = currentRank + rowsInRank - 1
+              rowsInRank = 1
+        windowVals[rowIdx] = Value(kind: vkInt64, int64Val: currentRank)
+        prevIdx = rowIdx
+
+    elif wfunc == "DENSE_RANK":
+      var currentRank = 0'i64
+      var prevIdx = -1
+      for pos, rowIdx in sortedIdx:
+        if pos == 0:
+          currentRank = 1
+        else:
+          var samePartition = true
+          for i in 0 ..< partitionVals[rowIdx].len:
+            if compareValues(partitionVals[rowIdx][i], partitionVals[prevIdx][i]) != 0:
+              samePartition = false
+              break
+          if not samePartition:
+            currentRank = 1
+          else:
+            var sameOrder = true
+            for i in 0 ..< orderVals[rowIdx].len:
+              if compareValues(orderVals[rowIdx][i], orderVals[prevIdx][i]) != 0:
+                sameOrder = false
+                break
+            if not sameOrder:
+              currentRank.inc
+        windowVals[rowIdx] = Value(kind: vkInt64, int64Val: currentRank)
+        prevIdx = rowIdx
+
+    elif wfunc in ["LAG", "LEAD"]:
+      let offset = if wexpr.windowArgs.len >= 2 and wexpr.windowArgs[1].kind == ekLiteral:
+        let litVal = wexpr.windowArgs[1].value
+        if litVal.kind == svInt: litVal.intVal.int
+        else: 1
+      else: 1
+      let defaultVal = if wexpr.windowArgs.len >= 3:
+        let defRes = evalExpr(rows[0], wexpr.windowArgs[2], params)
+        if not defRes.ok:
+          return err[seq[Row]](defRes.err.code, defRes.err.message, defRes.err.context)
+        defRes.value
+      else:
+        Value(kind: vkNull)
+
+      # Build partition boundaries in sorted order
+      var partStart = 0
+      for pos in 0 ..< sortedIdx.len:
+        let rowIdx = sortedIdx[pos]
+        var newPartition = pos == 0
+        if not newPartition:
+          let prevRowIdx = sortedIdx[pos - 1]
+          for i in 0 ..< partitionVals[rowIdx].len:
+            if compareValues(partitionVals[rowIdx][i], partitionVals[prevRowIdx][i]) != 0:
+              newPartition = true
+              break
+        if newPartition and pos > 0:
+          # Process previous partition
+          for p in partStart ..< pos:
+            let rIdx = sortedIdx[p]
+            let targetPos = if wfunc == "LAG": p - offset else: p + offset
+            if targetPos >= partStart and targetPos < pos:
+              let targetRowIdx = sortedIdx[targetPos]
+              let valRes = evalExpr(rows[targetRowIdx], wexpr.windowArgs[0], params)
+              if not valRes.ok:
+                return err[seq[Row]](valRes.err.code, valRes.err.message, valRes.err.context)
+              windowVals[rIdx] = valRes.value
+            else:
+              windowVals[rIdx] = defaultVal
+          partStart = pos
+      # Process last partition
+      for p in partStart ..< sortedIdx.len:
+        let rIdx = sortedIdx[p]
+        let targetPos = if wfunc == "LAG": p - offset else: p + offset
+        if targetPos >= partStart and targetPos < sortedIdx.len:
+          let targetRowIdx = sortedIdx[targetPos]
+          let valRes = evalExpr(rows[targetRowIdx], wexpr.windowArgs[0], params)
+          if not valRes.ok:
+            return err[seq[Row]](valRes.err.code, valRes.err.message, valRes.err.context)
+          windowVals[rIdx] = valRes.value
+        else:
+          windowVals[rIdx] = defaultVal
+
+    windowValuesByItem[itemIdx] = windowVals
 
   var resultRows: seq[Row] = @[]
   for rowIdx, row in rows:
@@ -2975,7 +3092,15 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
       elif item.expr != nil and item.expr.kind == ekWindowRowNumber:
         if not windowValuesByItem.hasKey(itemIdx):
           return err[seq[Row]](ERR_INTERNAL, "Window projection state missing")
-        var name = if item.alias.len > 0: item.alias else: "row_number"
+        var name = if item.alias.len > 0: item.alias
+                   else:
+                     case item.expr.windowFunc
+                     of "ROW_NUMBER": "row_number"
+                     of "RANK": "rank"
+                     of "DENSE_RANK": "dense_rank"
+                     of "LAG": "lag"
+                     of "LEAD": "lead"
+                     else: "window"
         cols.add(name)
         vals.add(windowValuesByItem[itemIdx][rowIdx])
       else:

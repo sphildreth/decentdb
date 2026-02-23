@@ -59,6 +59,78 @@ def main():
     count = cursor.fetchone()[0]
     print(f"\nTotal users after transaction: {count}")
 
+    # ── Window Functions ──
+    # Add some scores for window function demos.
+    cursor.execute("""
+        CREATE TABLE scores (
+            id    INTEGER PRIMARY KEY,
+            name  TEXT NOT NULL,
+            dept  TEXT NOT NULL,
+            score INTEGER NOT NULL
+        )
+    """)
+    for name, dept, score in [
+        ("Alice", "eng", 95), ("Bob", "eng", 95),
+        ("Carol", "eng", 80), ("Dave", "sales", 90),
+        ("Eve", "sales", 85),
+    ]:
+        cursor.execute(
+            "INSERT INTO scores (name, dept, score) VALUES (?, ?, ?)",
+            (name, dept, score),
+        )
+
+    print("\n── Window Functions ──")
+
+    # ROW_NUMBER
+    cursor.execute("""
+        SELECT name, dept, score,
+               ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rn
+        FROM scores ORDER BY dept, score DESC
+    """)
+    print("\nROW_NUMBER (ranking within department):")
+    for row in cursor.fetchall():
+        print(f"  {row[0]:6s}  dept={row[1]:5s}  score={row[2]}  rn={row[3]}")
+
+    # RANK (ties get same rank, with gaps)
+    cursor.execute("""
+        SELECT name, score,
+               RANK() OVER (ORDER BY score DESC) AS rank
+        FROM scores ORDER BY score DESC, name
+    """)
+    print("\nRANK (global, with gaps for ties):")
+    for row in cursor.fetchall():
+        print(f"  {row[0]:6s}  score={row[1]}  rank={row[2]}")
+
+    # DENSE_RANK (ties get same rank, no gaps)
+    cursor.execute("""
+        SELECT name, score,
+               DENSE_RANK() OVER (ORDER BY score DESC) AS dense_rank
+        FROM scores ORDER BY score DESC, name
+    """)
+    print("\nDENSE_RANK (no gaps):")
+    for row in cursor.fetchall():
+        print(f"  {row[0]:6s}  score={row[1]}  dense_rank={row[2]}")
+
+    # LAG (previous row's score)
+    cursor.execute("""
+        SELECT name, score,
+               LAG(score, 1, 0) OVER (ORDER BY score DESC) AS prev_score
+        FROM scores ORDER BY score DESC
+    """)
+    print("\nLAG (previous score, default 0):")
+    for row in cursor.fetchall():
+        print(f"  {row[0]:6s}  score={row[1]}  prev_score={row[2]}")
+
+    # LEAD (next row's score)
+    cursor.execute("""
+        SELECT name, score,
+               LEAD(score) OVER (PARTITION BY dept ORDER BY score DESC) AS next_score
+        FROM scores ORDER BY dept, score DESC
+    """)
+    print("\nLEAD (next score in dept, NULL at end):")
+    for row in cursor.fetchall():
+        print(f"  {row[0]:6s}  score={row[1]}  next_score={row[2]}")
+
     # Schema introspection.
     tables = conn.list_tables()
     print(f"\nTables: {tables}")

@@ -97,8 +97,13 @@ proc cloneExpr(expr: Expr): Expr =
     var orderExprs: seq[Expr] = @[]
     for o in expr.windowOrderExprs:
       orderExprs.add(cloneExpr(o))
+    var clonedArgs: seq[Expr] = @[]
+    for a in expr.windowArgs:
+      clonedArgs.add(cloneExpr(a))
     Expr(
       kind: ekWindowRowNumber,
+      windowFunc: expr.windowFunc,
+      windowArgs: clonedArgs,
       windowPartitions: partitions,
       windowOrderExprs: orderExprs,
       windowOrderAsc: expr.windowOrderAsc
@@ -143,8 +148,13 @@ proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
     var orderExprs: seq[Expr] = @[]
     for o in expr.windowOrderExprs:
       orderExprs.add(qualifyInsertConflictExpr(o, tableName))
+    var qualArgs: seq[Expr] = @[]
+    for a in expr.windowArgs:
+      qualArgs.add(qualifyInsertConflictExpr(a, tableName))
     Expr(
       kind: ekWindowRowNumber,
+      windowFunc: expr.windowFunc,
+      windowArgs: qualArgs,
       windowPartitions: partitions,
       windowOrderExprs: orderExprs,
       windowOrderAsc: expr.windowOrderAsc
@@ -563,13 +573,17 @@ proc bindExpr(map: Table[string, TableMeta], expr: Expr): Result[Void] =
       if not partRes.ok:
         return partRes
     if expr.windowOrderExprs.len == 0:
-      return err[Void](ERR_SQL, "ROW_NUMBER window requires ORDER BY in 0.x")
+      return err[Void](ERR_SQL, expr.windowFunc & " window function requires ORDER BY")
     if expr.windowOrderAsc.len != expr.windowOrderExprs.len:
-      return err[Void](ERR_SQL, "ROW_NUMBER window ORDER BY metadata mismatch")
+      return err[Void](ERR_SQL, expr.windowFunc & " window ORDER BY metadata mismatch")
     for o in expr.windowOrderExprs:
       let orderRes = bindExpr(map, o)
       if not orderRes.ok:
         return orderRes
+    for a in expr.windowArgs:
+      let argRes = bindExpr(map, a)
+      if not argRes.ok:
+        return argRes
     okVoid()
   else:
     okVoid()
@@ -856,8 +870,16 @@ proc rewriteExprForViewRef(
       if not orderRes.ok:
         return err[Expr](orderRes.err.code, orderRes.err.message, orderRes.err.context)
       orderExprs.add(orderRes.value)
+    var rewrittenArgs: seq[Expr] = @[]
+    for a in expr.windowArgs:
+      let argRes = rewriteExprForViewRef(a, refTable, refAlias, columnMap, allowUnqualified)
+      if not argRes.ok:
+        return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+      rewrittenArgs.add(argRes.value)
     ok(Expr(
       kind: ekWindowRowNumber,
+      windowFunc: expr.windowFunc,
+      windowArgs: rewrittenArgs,
       windowPartitions: partitions,
       windowOrderExprs: orderExprs,
       windowOrderAsc: expr.windowOrderAsc
@@ -1462,7 +1484,7 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       continue
     if hasWindowInExpr(item.expr):
       if item.expr.kind != ekWindowRowNumber:
-        return err[Statement](ERR_SQL, "Only top-level ROW_NUMBER window expressions are supported in 0.x")
+        return err[Statement](ERR_SQL, "Window functions must be top-level SELECT expressions")
     let res = bindExpr(map, item.expr)
     if not res.ok:
       return err[Statement](res.err.code, res.err.message, res.err.context)
