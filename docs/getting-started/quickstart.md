@@ -142,6 +142,31 @@ if res.ok:
   discard db.closeDb()
 ```
 
-Each call to `openDb(":memory:")` creates a **new, isolated** in-memory database instance. They do not share data, even within the same process. 
+Each call to `openDb(":memory:")` creates a **new, isolated** in-memory database instance. They do not share data, even within the same process. Detection is case-insensitive (`:memory:`, `:MEMORY:`, `:Memory:` all work).
 
 Note: `mmap` is not supported for in-memory databases, but due to being backed by memory, read and write speeds are virtually instantaneous. In-memory databases do not persist across restarts and are primarily intended for caching or fast unit testing.
+
+### Exporting to Disk (SaveAs)
+
+Use `saveAs` to persist an in-memory database to a durable on-disk file:
+
+```nim
+let db = openDb(":memory:").value
+discard execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+discard execSql(db, "INSERT INTO items (id, name) VALUES (1, 'widget')")
+
+let res = saveAs(db, "/tmp/snapshot.ddb")
+assert res.ok
+discard closeDb(db)
+```
+
+`saveAs` works with all bindings:
+
+| Binding | Method |
+|---------|--------|
+| Nim | `saveAs(db, destPath)` |
+| CLI | `decentdb save-as --db=:memory: --output=dest.ddb` |
+| .NET | `connection.SaveAs(destPath)` |
+| Go | `db.SaveAs(destPath)` |
+| Node | `db.saveAs(destPath)` |
+| Python | `conn.save_as(dest_path)` |

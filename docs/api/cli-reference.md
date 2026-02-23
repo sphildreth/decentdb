@@ -4,7 +4,12 @@ The `decentdb` CLI provides all database operations through subcommands.
 
 ## General Usage
 
-Most commands require `--db=<path>`.
+Most commands require `--db=<path>`. Use `:memory:` (case-insensitive) for an ephemeral in-memory database:
+
+```bash
+decentdb exec --db=myapp.ddb --sql="SELECT * FROM users"
+decentdb exec --db=:memory: --sql="SELECT 1 + 1"
+```
 
 Use `--help` on any command for the authoritative, generated help:
 
@@ -200,6 +205,20 @@ Rewrite the database into a new file to reclaim space.
 ```bash
 decentdb vacuum --db=<path> --output=<path> [--overwrite] [--cachePages=<n>] [--cacheMb=<n>]
 ```
+
+### save-as
+
+Export the database to a new on-disk file (snapshot backup). Works with both file-based and `:memory:` databases.
+
+```bash
+decentdb save-as --db=<path> --output=<dest>
+decentdb save-as --db=:memory: --output=/tmp/snapshot.ddb
+```
+
+Options:
+- `--output=<dest>` - Destination file path (required, must not already exist)
+
+The command performs a full WAL checkpoint, then copies all pages to the destination atomically.
 
 ### dump-header
 

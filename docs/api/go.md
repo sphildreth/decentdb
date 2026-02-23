@@ -119,6 +119,38 @@ The driver accepts either:
 
 - A file URL: `file:/path/to.ddb?opt=value`
 - A raw path: `/path/to.ddb`
+- `:memory:` for an ephemeral in-memory database (case-insensitive)
+
+### In-Memory Databases
+
+```go
+// database/sql
+db, _ := sql.Open("decentdb", ":memory:")
+defer db.Close()
+
+// Direct API
+db, _ := decentdb.OpenDirect(":memory:")
+defer db.Close()
+```
+
+Each connection to `:memory:` creates an independent, isolated database. Data is lost when the database is closed.
+
+### SaveAs (Export to Disk)
+
+Export any open database — including `:memory:` — to a new on-disk file:
+
+```go
+db, _ := decentdb.OpenDirect(":memory:")
+db.Exec("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+db.Exec("INSERT INTO items (id, name) VALUES ($1, $2)", 1, "widget")
+
+err := db.SaveAs("/tmp/snapshot.ddb")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+`SaveAs` performs a full checkpoint, then copies all pages atomically. The destination must not already exist.
 
 ## Parameter Style
 
