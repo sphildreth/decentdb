@@ -293,6 +293,24 @@ proc decentdb_checkpoint*(p: pointer): cint {.exportc, cdecl, dynlib.} =
     return -1
   return 0
 
+proc decentdb_save_as*(p: pointer, dest_path_utf8: cstring): cint {.exportc, cdecl, dynlib.} =
+  ## Export the database to a new on-disk file at dest_path_utf8.
+  ## Returns 0 on success, -1 on error.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return -1
+  if dest_path_utf8 == nil:
+    let handle = cast[DbHandle](p)
+    handle.setError(ERR_INTERNAL, "NULL destination path")
+    return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = saveAs(handle.db, $dest_path_utf8)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
+
 proc decentdb_last_error_code*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil:
     return cint(globalLastErrorCode)

@@ -779,3 +779,177 @@ func TestExplainAnalyze(t *testing.T) {
 		t.Errorf("expected 'Actual Time:' in plan output, got: %s", planText)
 	}
 }
+
+func TestSaveAs_ExportsMemoryToDisk(t *testing.T) {
+	db, err := OpenDirect(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDirect(:memory:) failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO items (id, name) VALUES ($1, $2)", 1, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO items (id, name) VALUES ($1, $2)", 2, "beta"); err != nil {
+		t.Fatal(err)
+	}
+
+	destPath := filepath.Join(t.TempDir(), "exported.ddb")
+	if err := db.SaveAs(destPath); err != nil {
+		t.Fatalf("SaveAs failed: %v", err)
+	}
+
+	sqlDB, err := sql.Open("decentdb", fmt.Sprintf("file:%s", destPath))
+	if err != nil {
+		t.Fatalf("failed to reopen: %v", err)
+	}
+	defer sqlDB.Close()
+
+	rows, err := sqlDB.Query("SELECT id, name FROM items ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	type row struct {
+		id   int
+		name string
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.name); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(got))
+	}
+	if got[0].id != 1 || got[0].name != "alpha" {
+		t.Errorf("row 0: expected (1, alpha), got (%d, %s)", got[0].id, got[0].name)
+	}
+	if got[1].id != 2 || got[1].name != "beta" {
+		t.Errorf("row 1: expected (2, beta), got (%d, %s)", got[1].id, got[1].name)
+	}
+}
+
+func TestSaveAs_PreservesSchema(t *testing.T) {
+	db, err := OpenDirect(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDirect(:memory:) failed: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price FLOAT)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE INDEX idx_products_name ON products (name)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO products (id, name, price) VALUES ($1, $2, $3)", 1, "Widget", 9.99); err != nil {
+		t.Fatal(err)
+	}
+
+	destPath := filepath.Join(t.TempDir(), "schema.ddb")
+	if err := db.SaveAs(destPath); err != nil {
+		t.Fatalf("SaveAs failed: %v", err)
+	}
+
+	db2, err := OpenDirect(destPath)
+	if err != nil {
+		t.Fatalf("failed to reopen: %v", err)
+	}
+	defer db2.Close()
+
+	tables, err := db2.ListTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, tbl := range tables {
+		if tbl == "products" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'products' table, got %v", tables)
+	}
+
+	indexes, err := db2.ListIndexes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idxFound := false
+	for _, idx := range indexes {
+		if idx.Name == "idx_products_name" && idx.Table == "products" {
+			idxFound = true
+		}
+	}
+	if !idxFound {
+		t.Errorf("expected idx_products_name index, got %v", indexes)
+	}
+
+	sqlDB, err := sql.Open("decentdb", fmt.Sprintf("file:%s", destPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+
+	var name string
+	var price float64
+	if err := sqlDB.QueryRow("SELECT name, price FROM products WHERE id = 1").Scan(&name, &price); err != nil {
+		t.Fatal(err)
+	}
+	if name != "Widget" || price != 9.99 {
+		t.Errorf("expected (Widget, 9.99), got (%s, %v)", name, price)
+	}
+}
+
+func TestSaveAs_ErrorsIfDestExists(t *testing.T) {
+	db, err := OpenDirect(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDirect(:memory:) failed: %v", err)
+	}
+	defer db.Close()
+
+	destPath := filepath.Join(t.TempDir(), "existing.ddb")
+	if err := os.WriteFile(destPath, []byte("placeholder"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.SaveAs(destPath)
+	if err == nil {
+		t.Fatal("expected error when destination file already exists, got nil")
+	}
+}
+
+func TestSaveAs_EmptyDatabase(t *testing.T) {
+	db, err := OpenDirect(":memory:")
+	if err != nil {
+		t.Fatalf("OpenDirect(:memory:) failed: %v", err)
+	}
+	defer db.Close()
+
+	destPath := filepath.Join(t.TempDir(), "empty.ddb")
+	if err := db.SaveAs(destPath); err != nil {
+		t.Fatalf("SaveAs failed: %v", err)
+	}
+
+	db2, err := OpenDirect(destPath)
+	if err != nil {
+		t.Fatalf("failed to reopen empty database: %v", err)
+	}
+	defer db2.Close()
+
+	tables, err := db2.ListTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 0 {
+		t.Errorf("expected 0 tables in empty db, got %d", len(tables))
+	}
+}

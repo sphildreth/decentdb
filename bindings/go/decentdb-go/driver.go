@@ -133,6 +133,9 @@ func (d *DB) Close() error { return d.c.Close() }
 // Checkpoint flushes the WAL to the main database file.
 func (d *DB) Checkpoint() error { return d.c.Checkpoint() }
 
+// SaveAs exports the database to a new on-disk file at destPath.
+func (d *DB) SaveAs(destPath string) error { return d.c.SaveAs(destPath) }
+
 // ListTables returns the names of all tables.
 func (d *DB) ListTables() ([]string, error) { return d.c.ListTables() }
 
@@ -236,6 +239,21 @@ func (c *conn) Checkpoint() error {
 		return errors.New("connection is closed")
 	}
 	res := C.decentdb_checkpoint(c.db)
+	if res != 0 {
+		msg := C.GoString(C.decentdb_last_error_message(c.db))
+		return &DecentDBError{Code: int(res), Message: msg}
+	}
+	return nil
+}
+
+// SaveAs exports the database to a new on-disk file at destPath.
+func (c *conn) SaveAs(destPath string) error {
+	if c.db == nil {
+		return errors.New("connection is closed")
+	}
+	cPath := C.CString(destPath)
+	defer C.free(unsafe.Pointer(cPath))
+	res := C.decentdb_save_as(c.db, cPath)
 	if res != 0 {
 		msg := C.GoString(C.decentdb_last_error_message(c.db))
 		return &DecentDBError{Code: int(res), Message: msg}

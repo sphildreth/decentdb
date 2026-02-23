@@ -207,6 +207,16 @@ when isMainModule:
      short = {
        "db": 'd'
      }],
+    [decentdb_cli.saveAsCmd,
+     cmdName = "save-as",
+     doc = "Export the database to a new on-disk file (snapshot backup)",
+     help = {
+       "db": "Path to database file, or :memory: for in-memory (required)",
+       "output": "Destination file path (required, must not exist)"
+     },
+     short = {
+       "db": 'd'
+     }],
     [decentdb_cli.infoCmd,
      cmdName = "info",
      doc = "Display database information",

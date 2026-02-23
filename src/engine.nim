@@ -26,6 +26,9 @@ import ./storage/storage
 import ./btree/btree
 import ./wal/wal
 
+when not defined(windows):
+  import posix
+
 when defined(bench_breakdown):
   import ./utils/bench_breakdown
 
@@ -4385,3 +4388,118 @@ proc checkpointDb*(db: Db): Result[uint64] =
     db.catalog.clearTrigramDeltas()
   
   checkpoint(db.wal, db.pager)
+
+# ============================================================================
+# SaveAs — Export database to a new on-disk file
+# ============================================================================
+
+proc saveAs*(db: Db, destPath: string): Result[Void] =
+  ## Export a transactionally-consistent snapshot of this database (in-memory
+  ## or file-based) to a new on-disk file at `destPath`.
+  ##
+  ## The implementation checkpoints the WAL so the main DB file contains all
+  ## committed state, then streams the bytes page-by-page to a temporary file
+  ## which is fsync'd and renamed into place.
+  if not db.isOpen:
+    return err[Void](ERR_INTERNAL, "Database not open")
+  if db.activeWriter != nil:
+    return err[Void](ERR_TRANSACTION, "Cannot saveAs during active transaction")
+  if destPath.len == 0:
+    return err[Void](ERR_IO, "Destination path is empty")
+
+  let absPath = expandTilde(destPath)
+  if fileExists(absPath):
+    return err[Void](ERR_IO, "Destination file already exists", absPath)
+  if fileExists(absPath & "-wal"):
+    return err[Void](ERR_IO, "Destination WAL file already exists", absPath & "-wal")
+
+  # 1. Force checkpoint so the main DB file in the VFS is complete.
+  let ckRes = checkpointDb(db)
+  if not ckRes.ok:
+    return err[Void](ckRes.err.code, ckRes.err.message, ckRes.err.context)
+
+  # 2. Determine the size of the main DB file.
+  let sizeRes = db.vfs.getFileSize(db.path)
+  if not sizeRes.ok:
+    return err[Void](sizeRes.err.code, sizeRes.err.message, sizeRes.err.context)
+  let totalBytes = sizeRes.value
+  if totalBytes <= 0:
+    return err[Void](ERR_IO, "Database file is empty, nothing to export")
+
+  # 3. Create a temporary file in the same directory as destPath for atomic rename.
+  let parentDir = parentDir(absPath)
+  if parentDir.len > 0:
+    try:
+      createDir(parentDir)
+    except OSError:
+      return err[Void](ERR_IO, "Cannot create destination directory", parentDir)
+
+  let tmpPath = absPath & ".tmp"
+  if fileExists(tmpPath):
+    try: removeFile(tmpPath)
+    except OSError: discard
+
+  # 4. Stream-copy the main DB file page-by-page to the temp file.
+  let osVfs = newOsVfs()
+  let openRes = osVfs.open(tmpPath, fmReadWrite, create = true)
+  if not openRes.ok:
+    return err[Void](openRes.err.code, openRes.err.message, openRes.err.context)
+  let dstFile = openRes.value
+
+  let pageSize = int(db.pageSize)
+  var buf = newSeq[byte](pageSize)
+  var offset: int64 = 0
+  while offset < totalBytes:
+    let toRead = min(pageSize, int(totalBytes - offset))
+    if toRead < pageSize:
+      buf.setLen(toRead)
+    let readRes = db.vfs.read(db.file, offset, buf)
+    if not readRes.ok:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](readRes.err.code, readRes.err.message, readRes.err.context)
+    if readRes.value != toRead:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](ERR_IO, "Short read during saveAs", "offset=" & $offset)
+    let writeRes = osVfs.write(dstFile, offset, buf)
+    if not writeRes.ok:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    if writeRes.value != toRead:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](ERR_IO, "Short write during saveAs", "offset=" & $offset)
+    offset += int64(toRead)
+
+  # 5. fsync the written file.
+  let syncRes = osVfs.fsync(dstFile)
+  if not syncRes.ok:
+    discard osVfs.close(dstFile)
+    try: removeFile(tmpPath)
+    except OSError: discard
+    return err[Void](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+  discard osVfs.close(dstFile)
+
+  # 6. Atomic rename tmp → dest.
+  try:
+    moveFile(tmpPath, absPath)
+  except OSError:
+    try: removeFile(tmpPath)
+    except OSError: discard
+    return err[Void](ERR_IO, "Failed to rename temp file to destination", absPath)
+
+  # 7. fsync the parent directory for rename durability (POSIX best-effort).
+  when not defined(windows):
+    if parentDir.len > 0:
+      let fd = posix.open(cstring(parentDir), O_RDONLY)
+      if fd >= 0:
+        discard posix.fsync(fd)
+        discard posix.close(fd)
+
+  okVoid()

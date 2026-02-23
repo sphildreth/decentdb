@@ -118,6 +118,18 @@ namespace DecentDB.AdoNet
         /// </summary>
         internal bool IsInMemory => string.Equals(_dataSource, ":memory:", StringComparison.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// Export the database to a new on-disk file at the specified path.
+        /// The connection must be open and no transaction may be active.
+        /// The destination file must not already exist.
+        /// </summary>
+        public void SaveAs(string destPath)
+        {
+            if (_state != ConnectionState.Open || _db == null)
+                throw new InvalidOperationException("Connection is not open.");
+            _db.SaveAs(destPath);
+        }
+
         public override void Open()
         {
             if (_state == ConnectionState.Open) return;

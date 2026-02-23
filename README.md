@@ -39,7 +39,7 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
 - 📊 **Rich Query Support** - Aggregates, subqueries (FROM, EXISTS, scalar), UPSERT, set operations, and scalar functions (string, math, UUID, JSON)
 - ⚡ **Triggers** - AFTER and INSTEAD OF triggers for complex logic
-- 🧠 **In-Memory Database** - Ephemeral `:memory:` databases for caching and testing
+- 🧠 **In-Memory Database** - Ephemeral `:memory:` databases for caching and testing, with `saveAs` to export snapshots to disk
 - 📦 **Single File Database** - Portable database stored in a single file
 - 🌐 **Cross-Platform** - Runs on Linux, macOS, and Windows
 - 🚀 **Bulk Load Operations** - Optimized high-performance data loading

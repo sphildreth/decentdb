@@ -125,6 +125,10 @@ def load_library():
     # Checkpoint (flush WAL to main database file)
     _lib.decentdb_checkpoint.argtypes = [c_void_p]
     _lib.decentdb_checkpoint.restype = c_int
+
+    # SaveAs (export database to a new on-disk file)
+    _lib.decentdb_save_as.argtypes = [c_void_p, c_char_p]
+    _lib.decentdb_save_as.restype = c_int
     
     # decentdb_open
     _lib.decentdb_open.argtypes = [c_char_p, c_char_p]

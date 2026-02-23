@@ -48,8 +48,7 @@ tests/nim/
 !tests/nim/
 tests/nim/*
 !tests/nim/*.nim
-decentdb
-!bindings/python/decentdb/
+/decentdb
 debug_parser
 decentdb_cli
 decentdb_schema

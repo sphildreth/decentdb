@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Engine**: In-memory database support via `:memory:` connection string — each `openDb(":memory:")` creates a new, isolated, ephemeral database backed by `MemVfs`. WAL remains enabled for consistent transaction semantics. See ADR-0105.
+- **Engine**: `saveAs` — export any open database (including `:memory:`) to a new on-disk file. Performs a full checkpoint, then streams pages to the destination via atomic temp-file + rename. Available as a Nim proc, C API function, CLI command, and in all bindings (.NET, Go, Node, Python).
+- **CLI**: `save-as` command — `decentdb save-as --db=:memory: --output=backup.ddb` exports a database snapshot to a new file.
 - **VFS**: `MemVfs` implementation — memory-backed Virtual File System with `seq[byte]` storage, per-file locking, and full VFS interface compliance (no `mmap` support).
 - **VFS**: `getFileSize`, `fileExists`, and `removeFile` methods added to the VFS interface, replacing direct OS calls in the engine, pager, and WAL.
 - **VFS**: `OsVfsFile` subclass introduced — `VfsFile` refactored from concrete type to base class (`ref object of RootObj`) to support polymorphic VFS file implementations.
+- **C API**: `decentdb_save_as(db, dest_path_utf8)` — export database to on-disk file via FFI.
+- **.NET**: `DecentDBConnection.SaveAs(destPath)` and `DecentDB.Native.DecentDB.SaveAs(destPath)` methods for exporting databases.
+- **Go**: `DB.SaveAs(destPath)` method for exporting databases.
+- **Node**: `Database.saveAs(destPath)` method for exporting databases.
+- **Python**: `Connection.save_as(dest_path)` method for exporting databases.
 
 ### Fixed
 - **VFS**: Double `deinitLock` undefined behavior — `MemVfs.removeFile` no longer calls `deinitLock`; `close()` is the sole owner of lock lifecycle.

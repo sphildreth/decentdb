@@ -861,6 +861,16 @@ class Connection:
         if rc != 0:
             _raise_error(self._db, sql="checkpoint", params=None)
 
+    def save_as(self, dest_path):
+        """Export the database to a new on-disk file at dest_path."""
+        if self._closed:
+            raise ProgrammingError("Connection closed")
+        if isinstance(dest_path, str):
+            dest_path = dest_path.encode("utf-8")
+        rc = self._lib.decentdb_save_as(self._db, dest_path)
+        if rc != 0:
+            _raise_error(self._db, sql="save_as", params=None)
+
     def __enter__(self):
         return self
         

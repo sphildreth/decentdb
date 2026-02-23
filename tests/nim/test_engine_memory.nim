@@ -1,4 +1,6 @@
 import unittest
+import os
+import std/monotimes
 import ../../src/engine
 import ../../src/errors
 
@@ -181,3 +183,179 @@ suite "Engine In-Memory Tests":
     check(selRes.value[2] == "Bob|12")
 
     discard db.closeDb()
+
+  # =========================================================================
+  # SaveAs tests
+  # =========================================================================
+
+  test "saveAs exports :memory: to disk and reopens":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+    require(execSql(db, "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").ok)
+    require(execSql(db, "INSERT INTO t1 (id, name) VALUES (1, 'Alice')").ok)
+    require(execSql(db, "INSERT INTO t1 (id, name) VALUES (2, 'Bob')").ok)
+
+    let destPath = "/tmp/test_saveas_basic_" & $getMonoTime().ticks & ".ddb"
+    let saRes = db.saveAs(destPath)
+    require(saRes.ok)
+    discard db.closeDb()
+
+    # Reopen from disk and verify
+    let db2Res = openDb(destPath)
+    require(db2Res.ok)
+    let db2 = db2Res.value
+    let selRes = execSql(db2, "SELECT name FROM t1 ORDER BY id")
+    require(selRes.ok)
+    check(selRes.value.len == 2)
+    check(selRes.value[0] == "Alice")
+    check(selRes.value[1] == "Bob")
+    discard db2.closeDb()
+
+    try: removeFile(destPath)
+    except: discard
+    try: removeFile(destPath & "-wal")
+    except: discard
+
+  test "saveAs preserves indexes":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+    require(execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, price INT, name TEXT)").ok)
+    require(execSql(db, "CREATE INDEX idx_price ON items (price)").ok)
+    require(execSql(db, "INSERT INTO items (id, price, name) VALUES (1, 100, 'A')").ok)
+    require(execSql(db, "INSERT INTO items (id, price, name) VALUES (2, 200, 'B')").ok)
+    require(execSql(db, "INSERT INTO items (id, price, name) VALUES (3, 100, 'C')").ok)
+
+    let destPath = "/tmp/test_saveas_indexes_" & $getMonoTime().ticks & ".ddb"
+    require(db.saveAs(destPath).ok)
+    discard db.closeDb()
+
+    let db2Res = openDb(destPath)
+    require(db2Res.ok)
+    let db2 = db2Res.value
+    let selRes = execSql(db2, "SELECT name FROM items WHERE price = 100 ORDER BY name")
+    require(selRes.ok)
+    check(selRes.value.len == 2)
+    check(selRes.value[0] == "A")
+    check(selRes.value[1] == "C")
+    discard db2.closeDb()
+
+    try: removeFile(destPath)
+    except: discard
+    try: removeFile(destPath & "-wal")
+    except: discard
+
+  test "saveAs empty database":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+
+    let destPath = "/tmp/test_saveas_empty_" & $getMonoTime().ticks & ".ddb"
+    let saRes = db.saveAs(destPath)
+    require(saRes.ok)
+    discard db.closeDb()
+
+    let db2Res = openDb(destPath)
+    require(db2Res.ok)
+    let db2 = db2Res.value
+    let selRes = execSql(db2, "SELECT id FROM nonexistent")
+    check(not selRes.ok)
+    discard db2.closeDb()
+
+    try: removeFile(destPath)
+    except: discard
+    try: removeFile(destPath & "-wal")
+    except: discard
+
+  test "saveAs errors if dest already exists":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+
+    let destPath = "/tmp/test_saveas_exists_" & $getMonoTime().ticks & ".ddb"
+    writeFile(destPath, "placeholder")
+
+    let saRes = db.saveAs(destPath)
+    check(not saRes.ok)
+    check(saRes.err.code == ERR_IO)
+    discard db.closeDb()
+
+    try: removeFile(destPath)
+    except: discard
+
+  test "saveAs errors during active transaction":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+    require(execSql(db, "CREATE TABLE t1 (id INT PRIMARY KEY)").ok)
+    require(db.beginTransaction().ok)
+    require(execSql(db, "INSERT INTO t1 (id) VALUES (1)").ok)
+
+    let destPath = "/tmp/test_saveas_txn_" & $getMonoTime().ticks & ".ddb"
+    let saRes = db.saveAs(destPath)
+    check(not saRes.ok)
+    check(saRes.err.code == ERR_TRANSACTION)
+
+    require(db.rollbackTransaction().ok)
+    discard db.closeDb()
+
+  test "saveAs after checkpoint":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+    require(execSql(db, "CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT)").ok)
+    for i in 1..50:
+      require(execSql(db, "INSERT INTO t1 (id, v) VALUES (" & $i & ", 'row" & $i & "')").ok)
+
+    require(db.checkpointDb().ok)
+
+    let destPath = "/tmp/test_saveas_postckpt_" & $getMonoTime().ticks & ".ddb"
+    require(db.saveAs(destPath).ok)
+    discard db.closeDb()
+
+    let db2Res = openDb(destPath)
+    require(db2Res.ok)
+    let db2 = db2Res.value
+    let selRes = execSql(db2, "SELECT v FROM t1 WHERE id = 25")
+    require(selRes.ok)
+    check(selRes.value[0] == "row25")
+    let cntRes = execSql(db2, "SELECT id FROM t1")
+    require(cntRes.ok)
+    check(cntRes.value.len == 50)
+    discard db2.closeDb()
+
+    try: removeFile(destPath)
+    except: discard
+    try: removeFile(destPath & "-wal")
+    except: discard
+
+  test "saveAs with multiple tables and foreign keys":
+    let dbRes = openDb(":memory:")
+    require(dbRes.ok)
+    let db = dbRes.value
+    require(execSql(db, "CREATE TABLE authors (id INT PRIMARY KEY, name TEXT NOT NULL)").ok)
+    require(execSql(db, "CREATE TABLE books (id INT PRIMARY KEY, title TEXT, author_id INT REFERENCES authors(id))").ok)
+    require(execSql(db, "INSERT INTO authors (id, name) VALUES (1, 'Tolkien')").ok)
+    require(execSql(db, "INSERT INTO authors (id, name) VALUES (2, 'Asimov')").ok)
+    require(execSql(db, "INSERT INTO books (id, title, author_id) VALUES (10, 'The Hobbit', 1)").ok)
+    require(execSql(db, "INSERT INTO books (id, title, author_id) VALUES (11, 'Foundation', 2)").ok)
+
+    let destPath = "/tmp/test_saveas_fk_" & $getMonoTime().ticks & ".ddb"
+    require(db.saveAs(destPath).ok)
+    discard db.closeDb()
+
+    let db2Res = openDb(destPath)
+    require(db2Res.ok)
+    let db2 = db2Res.value
+    let selRes = execSql(db2, "SELECT b.title, a.name FROM books b INNER JOIN authors a ON a.id = b.author_id ORDER BY b.id")
+    require(selRes.ok)
+    check(selRes.value.len == 2)
+    check(selRes.value[0] == "The Hobbit|Tolkien")
+    check(selRes.value[1] == "Foundation|Asimov")
+    discard db2.closeDb()
+
+    try: removeFile(destPath)
+    except: discard
+    try: removeFile(destPath & "-wal")
+    except: discard

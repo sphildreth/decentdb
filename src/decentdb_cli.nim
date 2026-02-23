@@ -1897,10 +1897,36 @@ proc repl*(db: string = "", format: string = "table"): int =
   discard closeDb(database)
   return 0
 
+proc saveAsCmd*(db: string = "", output: string = ""): int =
+  ## Export the database to a new on-disk file (snapshot backup).
+  let dbPath = resolveDbPath(db)
+  if dbPath.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  if output.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --output argument"))
+    return 1
+
+  let openRes = openDb(dbPath)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  let saRes = saveAs(database, output)
+  discard closeDb(database)
+  if not saRes.ok:
+    echo resultJson(false, saRes.err)
+    return 1
+
+  echo resultJson(true, rows = @["Saved to " & output])
+  return 0
+
 proc completion*(shell: string = "bash"): int =
   ## Emit basic shell completion script
   let normalized = shell.strip().toLowerAscii()
-  let commands = "exec list-tables describe list-indexes rebuild-index rebuild-indexes verify-index import export dump bulk-load checkpoint stats info vacuum dump-header verify-header repl completion"
+  let commands = "exec list-tables describe list-indexes rebuild-index rebuild-indexes verify-index import export dump bulk-load checkpoint stats info vacuum save-as dump-header verify-header repl completion"
   if normalized == "zsh":
     echo "#compdef decentdb"
     echo "_decentdb() {"

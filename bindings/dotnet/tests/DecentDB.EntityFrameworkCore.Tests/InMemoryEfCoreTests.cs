@@ -1,6 +1,7 @@
 using System;
 using System.ComponentModel.DataAnnotations;
 using System.Data;
+using System.IO;
 using System.Linq;
 using DecentDB.AdoNet;
 using DecentDB.EntityFrameworkCore;
@@ -241,5 +242,83 @@ public sealed class InMemoryEfCoreTests : IDisposable
         // The database creator reports tables exist.
         var creator = context.GetService<Microsoft.EntityFrameworkCore.Storage.IRelationalDatabaseCreator>();
         Assert.True(creator.HasTables());
+    }
+
+    // =========================================================================
+    // SaveAs tests
+    // =========================================================================
+
+    [Fact]
+    public void SaveAs_EfCoreMemory_ReopensAsFileBacked()
+    {
+        var destPath = Path.Combine(Path.GetTempPath(), $"test_ef_saveas_{Guid.NewGuid():N}.ddb");
+        try
+        {
+            // Create and populate via EF Core on shared in-memory connection
+            using (var context = new SimpleDbContext(CreateOptions<SimpleDbContext>()))
+            {
+                context.Database.EnsureCreated();
+                context.Items.Add(new SimpleItem { Id = 1, Name = "Widget", Value = 42 });
+                context.Items.Add(new SimpleItem { Id = 2, Name = "Gadget", Value = 99 });
+                context.SaveChanges();
+
+                // Verify via EF LINQ while context is alive
+                Assert.Equal(2, context.Items.Count());
+            }
+
+            // SaveAs via the shared connection
+            _connection.SaveAs(destPath);
+
+            // Reopen as file-backed and verify via EF Core context
+            using var conn2 = new DecentDBConnection($"Data Source={destPath}");
+            conn2.Open();
+            var opts2 = new DbContextOptionsBuilder<SimpleDbContext>()
+                .UseDecentDB(conn2, contextOwnsConnection: false)
+                .Options;
+            using var ctx2 = new SimpleDbContext(opts2);
+            var items = ctx2.Items.OrderBy(i => i.Id).ToList();
+            Assert.Equal(2, items.Count);
+            Assert.Equal("Widget", items[0].Name);
+            Assert.Equal("Gadget", items[1].Name);
+        }
+        finally
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+            if (File.Exists(destPath + "-wal")) File.Delete(destPath + "-wal");
+        }
+    }
+
+    [Fact]
+    public void SaveAs_EfCoreMemory_ReopensAsEfCore()
+    {
+        var destPath = Path.Combine(Path.GetTempPath(), $"test_ef_saveas_ef_{Guid.NewGuid():N}.ddb");
+        try
+        {
+            using (var context = new SimpleDbContext(CreateOptions<SimpleDbContext>()))
+            {
+                context.Database.EnsureCreated();
+                context.Items.Add(new SimpleItem { Id = 1, Name = "A", Value = 10 });
+                context.Items.Add(new SimpleItem { Id = 2, Name = "B", Value = 20 });
+                context.Items.Add(new SimpleItem { Id = 3, Name = "C", Value = 30 });
+                context.SaveChanges();
+            }
+
+            _connection.SaveAs(destPath);
+
+            // Reopen as file-backed EF Core context
+            var fileOptions = new DbContextOptionsBuilder<SimpleDbContext>();
+            fileOptions.UseDecentDB($"Data Source={destPath}");
+            using var ctx2 = new SimpleDbContext(fileOptions.Options);
+            var items = ctx2.Items.OrderBy(x => x.Id).ToList();
+            Assert.Equal(3, items.Count);
+            Assert.Equal("A", items[0].Name);
+            Assert.Equal(20, items[1].Value);
+            Assert.Equal("C", items[2].Name);
+        }
+        finally
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+            if (File.Exists(destPath + "-wal")) File.Delete(destPath + "-wal");
+        }
     }
 }

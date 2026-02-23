@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.IO;
 using Xunit;
 using DecentDB.AdoNet;
 
@@ -391,5 +392,155 @@ public class InMemoryTests
         cmd.CommandText = "SELECT 1";
         var result = cmd.ExecuteScalar();
         Assert.Equal(1L, result);
+    }
+
+    // =========================================================================
+    // SaveAs tests
+    // =========================================================================
+
+    [Fact]
+    public void SaveAs_ExportsMemoryToDisk_AndReopens()
+    {
+        var destPath = Path.Combine(Path.GetTempPath(), $"test_saveas_{Guid.NewGuid():N}.ddb");
+        try
+        {
+            using (var conn = new DecentDBConnection(MemoryConnectionString))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "INSERT INTO items (id, name) VALUES (1, 'Alpha')";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "INSERT INTO items (id, name) VALUES (2, 'Beta')";
+                cmd.ExecuteNonQuery();
+
+                conn.SaveAs(destPath);
+            }
+
+            // Reopen from disk
+            using (var conn2 = new DecentDBConnection($"Data Source={destPath}"))
+            {
+                conn2.Open();
+                using var cmd2 = conn2.CreateCommand();
+                cmd2.CommandText = "SELECT name FROM items ORDER BY id";
+                using var reader = cmd2.ExecuteReader();
+                Assert.True(reader.Read());
+                Assert.Equal("Alpha", reader.GetString(0));
+                Assert.True(reader.Read());
+                Assert.Equal("Beta", reader.GetString(0));
+                Assert.False(reader.Read());
+            }
+        }
+        finally
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+            if (File.Exists(destPath + "-wal")) File.Delete(destPath + "-wal");
+        }
+    }
+
+    [Fact]
+    public void SaveAs_PreservesSchema_Indexes_ForeignKeys()
+    {
+        var destPath = Path.Combine(Path.GetTempPath(), $"test_saveas_schema_{Guid.NewGuid():N}.ddb");
+        try
+        {
+            using (var conn = new DecentDBConnection(MemoryConnectionString))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL)";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER REFERENCES authors(id))";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "CREATE INDEX idx_books_author ON books (author_id)";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "INSERT INTO authors (id, name) VALUES (1, 'Tolkien')";
+                cmd.ExecuteNonQuery();
+                cmd.CommandText = "INSERT INTO books (id, title, author_id) VALUES (10, 'The Hobbit', 1)";
+                cmd.ExecuteNonQuery();
+
+                conn.SaveAs(destPath);
+            }
+
+            using (var conn2 = new DecentDBConnection($"Data Source={destPath}"))
+            {
+                conn2.Open();
+                using var cmd2 = conn2.CreateCommand();
+                cmd2.CommandText = "SELECT b.title, a.name FROM books b INNER JOIN authors a ON a.id = b.author_id";
+                using var reader = cmd2.ExecuteReader();
+                Assert.True(reader.Read());
+                Assert.Equal("The Hobbit", reader.GetString(0));
+                Assert.Equal("Tolkien", reader.GetString(1));
+            }
+        }
+        finally
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+            if (File.Exists(destPath + "-wal")) File.Delete(destPath + "-wal");
+        }
+    }
+
+    [Fact]
+    public void SaveAs_ErrorsIfDestExists()
+    {
+        var destPath = Path.Combine(Path.GetTempPath(), $"test_saveas_exists_{Guid.NewGuid():N}.ddb");
+        File.WriteAllText(destPath, "placeholder");
+        try
+        {
+            using var conn = new DecentDBConnection(MemoryConnectionString);
+            conn.Open();
+            Assert.Throws<DecentDB.Native.DecentDBException>(() => conn.SaveAs(destPath));
+        }
+        finally
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+        }
+    }
+
+    [Fact]
+    public void SaveAs_ErrorsWhenConnectionClosed()
+    {
+        using var conn = new DecentDBConnection(MemoryConnectionString);
+        Assert.Throws<InvalidOperationException>(() => conn.SaveAs("/tmp/should_not_exist.ddb"));
+    }
+
+    [Fact]
+    public void SaveAs_ManyRows_Verified()
+    {
+        var destPath = Path.Combine(Path.GetTempPath(), $"test_saveas_many_{Guid.NewGuid():N}.ddb");
+        try
+        {
+            using (var conn = new DecentDBConnection(MemoryConnectionString))
+            {
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT)";
+                cmd.ExecuteNonQuery();
+                for (int i = 1; i <= 500; i++)
+                {
+                    cmd.CommandText = $"INSERT INTO data (id, val) VALUES ({i}, 'row{i}')";
+                    cmd.ExecuteNonQuery();
+                }
+                conn.SaveAs(destPath);
+            }
+
+            using (var conn2 = new DecentDBConnection($"Data Source={destPath}"))
+            {
+                conn2.Open();
+                using var cmd2 = conn2.CreateCommand();
+                cmd2.CommandText = "SELECT COUNT(*) FROM data";
+                var count = (long)cmd2.ExecuteScalar()!;
+                Assert.Equal(500, count);
+
+                cmd2.CommandText = "SELECT val FROM data WHERE id = 250";
+                Assert.Equal("row250", cmd2.ExecuteScalar());
+            }
+        }
+        finally
+        {
+            if (File.Exists(destPath)) File.Delete(destPath);
+            if (File.Exists(destPath + "-wal")) File.Delete(destPath + "-wal");
+        }
     }
 }
