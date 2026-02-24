@@ -868,6 +868,50 @@ proc snapshotDirtyPages*(pager: Pager): seq[(PageId, string)] =
         result.add((entry.id, entry.data))
     release(shard.lock)
 
+proc rollbackToSnapshot*(pager: Pager, snapshot: seq[(PageId, string)]) =
+  ## Restore pager dirty-page state to a savepoint snapshot.
+  ## Pages in the snapshot are written back. Pages dirtied after the snapshot
+  ## are evicted from cache so they will be re-read from disk.
+  let cache = pager.cache
+  var snapshotIds: seq[PageId] = @[]
+  for entry in snapshot:
+    snapshotIds.add(entry[0])
+  # 1. Restore pages from snapshot
+  for entry in snapshot:
+    let (pageId, data) = entry
+    let shard = shardFor(cache, pageId)
+    acquire(shard.lock)
+    if shard.pages.hasKey(pageId):
+      let ce = shard.pages[pageId]
+      acquire(ce.lock)
+      ce.data = data
+      ce.dirty = true
+      ce.aux = nil
+      release(ce.lock)
+    release(shard.lock)
+  # 2. Clean up pages dirtied after the savepoint (not in snapshot)
+  for pageId in pager.txnDirtyPages:
+    var found = false
+    for sid in snapshotIds:
+      if sid == pageId:
+        found = true
+        break
+    if not found:
+      let shard = shardFor(cache, pageId)
+      acquire(shard.lock)
+      if shard.pages.hasKey(pageId):
+        let ce = shard.pages[pageId]
+        acquire(ce.lock)
+        ce.dirty = false
+        ce.aux = nil
+        release(ce.lock)
+      release(shard.lock)
+  # 3. Reset txnDirtyPages to snapshot state
+  pager.txnDirtyPages = snapshotIds
+  pager.txnDirtyCount = snapshotIds.len
+  if snapshotIds.len > 0:
+    pager.txnLastDirtyId = snapshotIds[^1]
+
 proc collectDirtyPageRefs*(pager: Pager): seq[(PageId, pointer, int)] =
   ## Collect references to dirty page data without copying.
   ## Uses txnDirtyPages list for O(n) lookup instead of O(shards*pages) scan.

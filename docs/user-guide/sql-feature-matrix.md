@@ -18,9 +18,9 @@ This document provides a comprehensive matrix of SQL features, comparing support
 | DROP VIEW | ✅ | ✅ | ✅ |
 | CREATE TRIGGER | ✅ | ✅ | ✅ |
 | DROP TRIGGER | ✅ | ✅ | ✅ |
-| CREATE TEMP TABLE | ❌ | ✅ | ✅ |
-| CREATE TEMP VIEW | ❌ | ✅ | ✅ |
-| Generated columns (STORED) | ❌ | ✅ | ✅ |
+| CREATE TEMP TABLE | ✅ | ✅ | ✅ |
+| CREATE TEMP VIEW | ✅ | ✅ | ✅ |
+| Generated columns (STORED) | ✅ | ✅ | ✅ |
 | Table-level FOREIGN KEY | ✅ | ✅ | ✅ |
 
 ### Examples
@@ -72,10 +72,10 @@ ON CONFLICT (id) DO NOTHING;
 |---------|----------|--------|------------|
 | INNER JOIN | ✅ | ✅ | ✅ |
 | LEFT JOIN | ✅ | ✅ | ✅ |
-| RIGHT JOIN | ❌ (explicit error) | ✅ | ✅ |
-| FULL OUTER JOIN | ❌ (explicit error) | ✅ | ✅ |
-| CROSS JOIN | ❌ | ✅ | ✅ |
-| NATURAL JOIN | ❌ | ✅ | ✅ |
+| RIGHT JOIN | ✅ (rewritten as LEFT JOIN) | ✅ | ✅ |
+| FULL OUTER JOIN | ✅ | ✅ | ✅ |
+| CROSS JOIN | ✅ | ✅ | ✅ |
+| NATURAL JOIN | ✅ | ✅ | ✅ |
 
 ### Examples
 
@@ -97,9 +97,9 @@ SELECT * FROM users u LEFT JOIN orders o ON u.id = o.user_id;
 | GROUP BY | ✅ | ✅ | ✅ |
 | HAVING | ✅ | ✅ | ✅ |
 | DISTINCT | ✅ | ✅ | ✅ |
-| DISTINCT ON | ❌ | ❌ | ✅ |
+| DISTINCT ON | ✅ | ❌ | ✅ |
 | LIMIT ALL | ✅ | ✅ | ✅ |
-| OFFSET with FETCH | ❌ | ✅ | ✅ |
+| OFFSET with FETCH | ✅ | ✅ | ✅ |
 
 ### Examples
 
@@ -230,8 +230,8 @@ FROM employees;
 | json_array() | ✅ | ✅ | ✅ |
 | -> | ✅ | ✅ | ✅ |
 | ->> | ✅ | ✅ | ✅ |
-| json_each() | ❌ | ✅ | ❌ |
-| json_tree() | ❌ | ✅ | ❌ |
+| json_each() | ✅ | ✅ | ❌ |
+| json_tree() | ✅ | ✅ | ❌ |
 
 ### Examples
 
@@ -273,9 +273,9 @@ SELECT '{"a":1}'->>'a', json_extract('{"a":1}', '$.a'), json_valid('{"a":1}');
 | BEGIN IMMEDIATE | ✅ (treated as BEGIN) | ✅ | ❌ |
 | COMMIT | ✅ | ✅ | ✅ |
 | ROLLBACK | ✅ | ✅ | ✅ |
-| SAVEPOINT | ❌ | ✅ | ✅ |
-| RELEASE SAVEPOINT | ❌ | ✅ | ✅ |
-| ROLLBACK TO SAVEPOINT | ❌ | ✅ | ✅ |
+| SAVEPOINT | ✅ | ✅ | ✅ |
+| RELEASE SAVEPOINT | ✅ | ✅ | ✅ |
+| ROLLBACK TO SAVEPOINT | ✅ | ✅ | ✅ |
 
 ## Data Types
 
@@ -303,7 +303,7 @@ SELECT '{"a":1}'->>'a', json_extract('{"a":1}', '$.a'), json_valid('{"a":1}');
 | NOT NULL | ✅ | ✅ | ✅ |
 | UNIQUE | ✅ | ✅ | ✅ |
 | CHECK | ✅ | ✅ | ✅ |
-| DEFAULT | ❌ (parsed, not enforced) | ✅ | ✅ |
+| DEFAULT | ✅ | ✅ | ✅ |
 
 ## Set Operations
 

@@ -40,6 +40,8 @@ type Column* = object
   refOnUpdate*: string
   decPrecision*: uint8
   decScale*: uint8
+  defaultExpr*: string  ## SQL text of the DEFAULT expression (empty = no default)
+  generatedExpr*: string  ## SQL text of GENERATED ALWAYS AS expr STORED (empty = not generated)
 
 type CheckConstraint* = object
   name*: string
@@ -210,6 +212,13 @@ proc encodeColumns(columns: seq[Column]): seq[byte] =
       flags.add("ref=" & col.refTable & "." & col.refColumn)
       flags.add("refdel=" & fkActionToCode(col.refOnDelete))
       flags.add("refupd=" & fkActionToCode(col.refOnUpdate))
+    if col.defaultExpr.len > 0:
+      # Percent-encode special delimiters to avoid conflicts with column encoding format
+      var encoded = col.defaultExpr.replace("%", "%25").replace(";", "%3B").replace(":", "%3A").replace(",", "%2C")
+      flags.add("default=" & encoded)
+    if col.generatedExpr.len > 0:
+      var encoded = col.generatedExpr.replace("%", "%25").replace(";", "%3B").replace(":", "%3A").replace(",", "%2C")
+      flags.add("gen=" & encoded)
     let flagPart = if flags.len > 0: ":" & flags.join(",") else: ""
     let typeText =
       if col.kind == ctDecimal:
@@ -260,6 +269,12 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
                 col.refOnDelete = fkActionFromCode(flag[7 .. ^1])
               elif flag.startsWith("refupd="):
                 col.refOnUpdate = fkActionFromCode(flag[7 .. ^1])
+              elif flag.startsWith("default="):
+                var encoded = flag[8 .. ^1]
+                col.defaultExpr = encoded.replace("%2C", ",").replace("%3A", ":").replace("%3B", ";").replace("%25", "%")
+              elif flag.startsWith("gen="):
+                var encoded = flag[4 .. ^1]
+                col.generatedExpr = encoded.replace("%2C", ",").replace("%3A", ":").replace("%3B", ";").replace("%25", "%")
         if col.refTable.len > 0 and col.refColumn.len > 0:
           if col.refOnDelete.len == 0:
             col.refOnDelete = "NO ACTION"
@@ -605,6 +620,11 @@ proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] 
   
   okVoid()
 
+proc registerTempTable*(catalog: Catalog, table: TableMeta) =
+  ## Add a table to the in-memory catalog only (not persisted).
+  catalog.tables[normalizedObjectName(table.name)] = table
+  rebuildReverseFkCache(catalog)
+
 proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
   if not catalog.tables.hasKey(normalizedObjectName(name)):
     return err[TableMeta](ERR_SQL, "Table not found", name)
@@ -660,6 +680,11 @@ proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
+
+proc registerTempView*(catalog: Catalog, view: ViewMeta) =
+  ## Add a view to the in-memory catalog only (not persisted).
+  catalog.views[normalizedObjectName(view.name)] = view
+  rebuildDependentViewsIndex(catalog)
 
 proc saveViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
   catalog.views[normalizedObjectName(view.name)] = view

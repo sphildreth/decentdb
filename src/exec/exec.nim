@@ -1079,7 +1079,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
-  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetIntersectAll, pkSetExcept, pkSetExceptAll, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement, pkSubqueryScan, pkLiteralRows:
+  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetIntersectAll, pkSetExcept, pkSetExceptAll, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement, pkSubqueryScan, pkLiteralRows, pkTvfScan:
     materialize()
 
 proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
@@ -4951,6 +4951,83 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         vals.add(val)
       rows.add(makeRow(cols, vals, 0))
     return ok(rows)
+  of pkTvfScan:
+    let prefix = if plan.alias.len > 0: plan.alias else: plan.table
+    if plan.tvfArgs.len == 0:
+      return err[seq[Row]](ERR_SQL, "Table-valued function requires an argument", plan.tvfFunc)
+    let argRes = evalExpr(makeRow(@[], @[], 0), plan.tvfArgs[0], params)
+    if not argRes.ok:
+      return err[seq[Row]](argRes.err.code, argRes.err.message, argRes.err.context)
+    let argVal = argRes.value
+    if argVal.kind == vkNull:
+      return ok(newSeq[Row]())  # NULL input → empty result
+    if argVal.kind notin {vkText, vkTextOverflow, vkTextCompressed, vkTextCompressedOverflow}:
+      return err[seq[Row]](ERR_SQL, "Table-valued function argument must be a string", plan.tvfFunc)
+    let jsonStr = valueToString(argVal)
+    var jsonNode: JsonNode
+    try:
+      jsonNode = parseJson(jsonStr)
+    except JsonParsingError:
+      return err[seq[Row]](ERR_SQL, "Invalid JSON", jsonStr)
+    var rows: seq[Row] = @[]
+    case plan.tvfFunc
+    of "json_each":
+      case jsonNode.kind
+      of JObject:
+        for key, val in jsonNode.pairs:
+          let typeName = case val.kind
+            of JNull: "null"
+            of JBool: "boolean"
+            of JInt, JFloat: "number"
+            of JString: "string"
+            of JObject: "object"
+            of JArray: "array"
+          rows.add(makeRow(
+            @[prefix & ".key", prefix & ".value", prefix & ".type"],
+            @[textValue(key), textValue($val), textValue(typeName)],
+            0))
+      of JArray:
+        for i in 0..<jsonNode.len:
+          let val = jsonNode[i]
+          let typeName = case val.kind
+            of JNull: "null"
+            of JBool: "boolean"
+            of JInt, JFloat: "number"
+            of JString: "string"
+            of JObject: "object"
+            of JArray: "array"
+          rows.add(makeRow(
+            @[prefix & ".key", prefix & ".value", prefix & ".type"],
+            @[textValue($i), textValue($val), textValue(typeName)],
+            0))
+      else:
+        return err[seq[Row]](ERR_SQL, "json_each requires a JSON object or array")
+    of "json_tree":
+      proc walkTree(node: JsonNode, path: string, key: string, rows: var seq[Row]) =
+        let typeName = case node.kind
+          of JNull: "null"
+          of JBool: "boolean"
+          of JInt, JFloat: "number"
+          of JString: "string"
+          of JObject: "object"
+          of JArray: "array"
+        rows.add(makeRow(
+          @[prefix & ".key", prefix & ".value", prefix & ".type", prefix & ".path"],
+          @[textValue(key), textValue($node), textValue(typeName), textValue(path)],
+          0))
+        case node.kind
+        of JObject:
+          for k, v in jsonNode.pairs:
+            walkTree(v, path & "." & k, k, rows)
+        of JArray:
+          for i in 0..<node.len:
+            walkTree(node[i], path & "[" & $i & "]", $i, rows)
+        else:
+          discard
+      walkTree(jsonNode, "$", "", rows)
+    else:
+      return err[seq[Row]](ERR_SQL, "Unknown table-valued function", plan.tvfFunc)
+    return ok(rows)
   of pkUnionDistinct:
     let leftRes = execPlan(pager, catalog, plan.left, params)
     if not leftRes.ok:
@@ -5389,14 +5466,15 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           rightJoinColIdx = -1
           leftJoinColIdx = -1
     
-    if plan.joinType == jtRight:
-      return err[seq[Row]](ERR_SQL, "RIGHT JOIN is not supported; use LEFT JOIN with reversed table order")
+    # For FULL OUTER JOIN, track which right rows were matched
+    var matchedRightIdxs: seq[bool]
     if plan.joinType == jtFull:
-      return err[seq[Row]](ERR_SQL, "FULL OUTER JOIN is not supported")
+      matchedRightIdxs = newSeq[bool](cachedRight.len)
 
     for lrow in leftRes.value:
       var matched = false
       var rightRows: seq[Row] = @[]
+      var rightRowIdxs: seq[int] = @[]  # cachedRight indices for FULL JOIN tracking
       if plan.right.kind == pkIndexSeek:
         let valueRes = evalExpr(lrow, plan.right.valueExpr, params)
         if not valueRes.ok:
@@ -5412,6 +5490,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           if hashJoinKeySupported(leftVal) and rightHashTable.hasKey(leftVal):
             for idx in rightHashTable[leftVal]:
               rightRows.add(cachedRight[idx])
+              rightRowIdxs.add(idx)
       else:
         # Non-correlated right side: reuse cached rows.
         # Correlated right side is handled above via pkIndexSeek.
@@ -5421,7 +5500,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         # Update merged columns if we didn't have right columns before
         if mergedColumns.len == 0:
           mergedColumns = lrow.columns & rightColumns
-      for rrow in rightRows:
+      for rrowIdx, rrow in rightRows:
         # Reuse pre-computed merged column names
         let cols = if mergedColumns.len > 0: mergedColumns else: lrow.columns & rrow.columns
         # Optimize: Pre-allocate seq and copy instead of concatenation
@@ -5432,10 +5511,20 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           mergedValues[lrow.values.len + i] = rrow.values[i]
         
         var merged = Row(columns: cols, values: mergedValues)
-        if skipJoinPredicate or (useHashJoin and rightJoinColIdx >= 0 and leftJoinColIdx >= 0):
+        if plan.joinOn == nil:
+          # CROSS JOIN / implicit comma-join: no predicate → Cartesian product
+          matched = true
+          resultRows.add(merged)
+          if plan.joinType == jtFull:
+            let cachedIdx = if rightRowIdxs.len > 0: rightRowIdxs[rrowIdx] else: rrowIdx
+            matchedRightIdxs[cachedIdx] = true
+        elif skipJoinPredicate or (useHashJoin and rightJoinColIdx >= 0 and leftJoinColIdx >= 0):
           # Hash join already filtered by equality, no need to re-evaluate predicate
           matched = true
           resultRows.add(merged)
+          if plan.joinType == jtFull:
+            let cachedIdx = if rightRowIdxs.len > 0: rightRowIdxs[rrowIdx] else: rrowIdx
+            matchedRightIdxs[cachedIdx] = true
         else:
           let predRes = evalExpr(merged, plan.joinOn, params)
           if not predRes.ok:
@@ -5443,7 +5532,10 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           if valueToBool(predRes.value):
             matched = true
             resultRows.add(merged)
-      if plan.joinType == jtLeft and not matched:
+            if plan.joinType == jtFull:
+              let cachedIdx = if rightRowIdxs.len > 0: rightRowIdxs[rrowIdx] else: rrowIdx
+              matchedRightIdxs[cachedIdx] = true
+      if (plan.joinType == jtLeft or plan.joinType == jtFull) and not matched:
         var nullVals: seq[Value] = @[]
         for _ in rightColumns:
           nullVals.add(Value(kind: vkNull))
@@ -5455,6 +5547,22 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           mergedValues[lrow.values.len + i] = nullVals[i]
         let merged = Row(columns: cols, values: mergedValues)
         resultRows.add(merged)
+    # FULL OUTER JOIN: append unmatched right rows with NULL left columns
+    if plan.joinType == jtFull:
+      let leftColumns = if leftRes.value.len > 0: leftRes.value[0].columns else: @[]
+      for ridx, rrow in cachedRight:
+        if not matchedRightIdxs[ridx]:
+          var nullVals = newSeq[Value](leftColumns.len)
+          for i in 0 ..< leftColumns.len:
+            nullVals[i] = Value(kind: vkNull)
+          let cols = if mergedColumns.len > 0: mergedColumns else: leftColumns & rrow.columns
+          var mergedValues = newSeq[Value](nullVals.len + rrow.values.len)
+          for i in 0 ..< nullVals.len:
+            mergedValues[i] = nullVals[i]
+          for i in 0 ..< rrow.values.len:
+            mergedValues[nullVals.len + i] = rrow.values[i]
+          let merged = Row(columns: cols, values: mergedValues)
+          resultRows.add(merged)
     ok(resultRows)
   of pkSort:
     let inputRes = execPlan(pager, catalog, plan.left, params)

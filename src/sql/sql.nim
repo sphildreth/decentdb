@@ -81,6 +81,8 @@ type ColumnDef* = object
   refColumn*: string
   refOnDelete*: string
   refOnUpdate*: string
+  defaultExpr*: Expr
+  generatedExpr*: Expr  ## GENERATED ALWAYS AS (expr) STORED
 
 type CheckConstraintDef* = object
   name*: string
@@ -113,6 +115,7 @@ type JoinClause* = object
   table*: string
   alias*: string
   onExpr*: Expr
+  isNatural*: bool
 
 type SelectItem* = object
   expr*: Expr
@@ -182,6 +185,9 @@ type StatementKind* = enum
   skBegin
   skCommit
   skRollback
+  skSavepoint
+  skReleaseSavepoint
+  skRollbackToSavepoint
   skExplain
 
 type Statement* = ref object
@@ -194,6 +200,7 @@ type Statement* = ref object
     columns*: seq[ColumnDef]
     createChecks*: seq[CheckConstraintDef]
     foreignKeys*: seq[ForeignKeyConstraintDef]
+    createTableIsTemp*: bool
   of skCreateIndex:
     indexName*: string
     indexTableName*: string
@@ -224,6 +231,7 @@ type Statement* = ref object
     createViewColumns*: seq[string]
     createViewSqlText*: string
     createViewQuery*: Statement
+    createViewIsTemp*: bool
   of skDropView:
     dropViewName*: string
     dropViewIfExists*: bool
@@ -257,6 +265,8 @@ type Statement* = ref object
     fromTable*: string
     fromAlias*: string
     fromSubquery*: Statement
+    fromTvfFunc*: string           # Table-valued function name (e.g. "json_each")
+    fromTvfArgs*: seq[Expr]        # TVF argument expressions
     joins*: seq[JoinClause]
     joinSubqueries*: seq[Statement]
     whereExpr*: Expr
@@ -267,6 +277,7 @@ type Statement* = ref object
     limitParam*: int
     offset*: int
     offsetParam*: int
+    distinctOnExprs*: seq[Expr]
   of skUpdate:
     updateTable*: string
     assignments*: Table[string, Expr]
@@ -280,6 +291,12 @@ type Statement* = ref object
     discard
   of skRollback:
     discard
+  of skSavepoint:
+    savepointName*: string
+  of skReleaseSavepoint:
+    releaseSavepointName*: string
+  of skRollbackToSavepoint:
+    rollbackToSavepointName*: string
 
 type SqlAst* = ref object
   statements*: seq[Statement]
@@ -869,7 +886,8 @@ proc parseRangeSubselect(node: JsonNode): Result[(Statement, string)] =
   ok((stmtRes.value, alias))
 
 proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string, joins: var seq[JoinClause],
-                   fromSubquery: var Statement, joinSubqueries: var seq[Statement]): Result[Void] =
+                   fromSubquery: var Statement, joinSubqueries: var seq[Statement],
+                   tvfFunc: var string, tvfArgs: var seq[Expr]): Result[Void] =
   if nodeHas(node, "RangeVar") or nodeHas(node, "relname"):
     let rvRes = parseRangeVar(node)
     if not rvRes.ok:
@@ -893,9 +911,42 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
       joins.add(JoinClause(joinType: jtInner, table: subRes.value[1], alias: subRes.value[1], onExpr: nil))
       joinSubqueries.add(subRes.value[0])
     return okVoid()
+  if nodeHas(node, "RangeFunction"):
+    let rf = node["RangeFunction"]
+    let funcs = nodeGet(rf, "functions")
+    if funcs.kind == JArray and funcs.len > 0:
+      let listNode = funcs[0]
+      let items = nodeGet(nodeGet(listNode, "List"), "items")
+      if items.kind == JArray and items.len > 0:
+        let fc = items[0]
+        if nodeHas(fc, "FuncCall"):
+          let funcCall = fc["FuncCall"]
+          let fnNames = nodeGet(funcCall, "funcname")
+          if fnNames.kind == JArray and fnNames.len > 0:
+            tvfFunc = nodeString(fnNames[^1]).toLowerAscii
+          let args = nodeGet(funcCall, "args")
+          if args.kind == JArray:
+            for arg in args:
+              let exprRes = parseExprNode(arg)
+              if not exprRes.ok:
+                return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+              tvfArgs.add(exprRes.value)
+    let alias = nodeGet(rf, "alias")
+    if alias.kind == JObject:
+      let aliasName = nodeGet(alias, "aliasname").getStr
+      if aliasName.len > 0:
+        baseAlias = aliasName
+        baseTable = aliasName
+      else:
+        baseTable = tvfFunc
+        baseAlias = tvfFunc
+    else:
+      baseTable = tvfFunc
+      baseAlias = tvfFunc
+    return okVoid()
   if nodeHas(node, "JoinExpr"):
     let join = node["JoinExpr"]
-    let leftRes = parseFromItem(join["larg"], baseTable, baseAlias, joins, fromSubquery, joinSubqueries)
+    let leftRes = parseFromItem(join["larg"], baseTable, baseAlias, joins, fromSubquery, joinSubqueries, tvfFunc, tvfArgs)
     if not leftRes.ok:
       return err[Void](leftRes.err.code, leftRes.err.message, leftRes.err.context)
     var rightTable = ""
@@ -930,8 +981,9 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
       let onRes = parseExprNode(join["quals"])
       if onRes.ok:
         onExpr = onRes.value
+    let isNatural = nodeHas(join, "isNatural") and join["isNatural"].kind == JBool and join["isNatural"].getBool
     if rightTable.len > 0:
-      joins.add(JoinClause(joinType: joinKind, table: rightTable, alias: rightAlias, onExpr: onExpr))
+      joins.add(JoinClause(joinType: joinKind, table: rightTable, alias: rightAlias, onExpr: onExpr, isNatural: isNatural))
       joinSubqueries.add(rightSubquery)
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
@@ -1056,12 +1108,14 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
   var fromTable = ""
   var fromAlias = ""
   var fromSubquery: Statement = nil
+  var fromTvfFunc = ""
+  var fromTvfArgs: seq[Expr] = @[]
   var joins: seq[JoinClause] = @[]
   var joinSubqueries: seq[Statement] = @[]
   let fromClause = nodeGet(node, "fromClause")
   if fromClause.kind == JArray and fromClause.len > 0:
     for item in fromClause:
-      let res = parseFromItem(item, fromTable, fromAlias, joins, fromSubquery, joinSubqueries)
+      let res = parseFromItem(item, fromTable, fromAlias, joins, fromSubquery, joinSubqueries, fromTvfFunc, fromTvfArgs)
       if not res.ok:
         return err[Statement](res.err.code, res.err.message, res.err.context)
   var whereExpr: Expr = nil
@@ -1119,6 +1173,20 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       offsetParam = offsetRes.value.index
     else:
       return err[Statement](ERR_SQL, "OFFSET must be an integer literal or $N parameter")
+  # Parse DISTINCT ON (expr, ...) — note: regular SELECT DISTINCT is a separate clause
+  var distinctOnExprs: seq[Expr] = @[]
+  let distinctClause = nodeGet(node, "distinctClause")
+  if distinctClause.kind == JArray and distinctClause.len > 0:
+    for dnode in distinctClause:
+      # libpg_query: DISTINCT ON uses expression nodes directly (not SortBy wrappers)
+      if nodeHas(dnode, "SortBy"):
+        let exprRes = parseExprNode(dnode["SortBy"]["node"])
+        if exprRes.ok:
+          distinctOnExprs.add(exprRes.value)
+      else:
+        let exprRes = parseExprNode(dnode)
+        if exprRes.ok:
+          distinctOnExprs.add(exprRes.value)
   ok(Statement(
     kind: skSelect,
     cteNames: cteNames,
@@ -1132,6 +1200,8 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     fromTable: fromTable,
     fromAlias: fromAlias,
     fromSubquery: fromSubquery,
+    fromTvfFunc: fromTvfFunc,
+    fromTvfArgs: fromTvfArgs,
     joins: joins,
     joinSubqueries: joinSubqueries,
     whereExpr: whereExpr,
@@ -1141,7 +1211,8 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     limit: limit,
     limitParam: limitParam,
     offset: offset,
-    offsetParam: offsetParam
+    offsetParam: offsetParam,
+    distinctOnExprs: distinctOnExprs
   ))
 
 proc parseInsertStmt(node: JsonNode): Result[Statement] =
@@ -1562,6 +1633,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let isTemp = nodeGet(rel, "relpersistence").getStr == "t"
   var columns: seq[ColumnDef] = @[]
   var checks: seq[CheckConstraintDef] = @[]
   var foreignKeys: seq[ForeignKeyConstraintDef] = @[]
@@ -1645,6 +1717,16 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
                   name: nodeGet(constraint, "conname").getStr,
                   expr: exprRes.value
                 ))
+              of "CONSTR_DEFAULT":
+                let rawExpr = nodeGet(constraint, "raw_expr")
+                let exprRes = parseExprNode(rawExpr)
+                if exprRes.ok:
+                  def.defaultExpr = exprRes.value
+              of "CONSTR_GENERATED":
+                let rawExpr = nodeGet(constraint, "raw_expr")
+                let exprRes = parseExprNode(rawExpr)
+                if exprRes.ok:
+                  def.generatedExpr = exprRes.value
               else:
                 discard
         columns.add(def)
@@ -1713,7 +1795,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         name: nodeGet(constraint, "conname").getStr,
         expr: exprRes.value
       ))
-  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks, foreignKeys: foreignKeys))
+  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks, foreignKeys: foreignKeys, createTableIsTemp: isTemp))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let idxName = nodeGet(node, "idxname").getStr
@@ -1766,8 +1848,7 @@ proc parseViewStmt(node: JsonNode): Result[Statement] =
   let viewName = viewRes.value[0]
 
   let persistence = nodeStringOr(nodeGet(node, "view"), "relpersistence", "p")
-  if persistence != "p":
-    return err[Statement](ERR_SQL, "TEMP/TEMPORARY VIEW not supported")
+  let isTemp = persistence == "t"
 
   let checkOption = nodeStringOr(node, "withCheckOption", "NO_CHECK_OPTION")
   if checkOption != "NO_CHECK_OPTION":
@@ -1796,7 +1877,8 @@ proc parseViewStmt(node: JsonNode): Result[Statement] =
     createViewOrReplace: replace,
     createViewColumns: aliases,
     createViewSqlText: selectToCanonicalSql(queryRes.value),
-    createViewQuery: queryRes.value
+    createViewQuery: queryRes.value,
+    createViewIsTemp: isTemp
   ))
 
 proc parseDropStmt(node: JsonNode): Result[Statement] =
@@ -1925,9 +2007,21 @@ proc parseTransactionStmt(node: JsonNode): Result[Statement] =
   if kindStr == "TRANS_STMT_COMMIT":
     kind = skCommit
   elif kindStr == "TRANS_STMT_ROLLBACK":
+    let spName = nodeGet(node, "savepoint_name").getStr
+    if spName.len > 0:
+      return ok(Statement(kind: skRollbackToSavepoint, rollbackToSavepointName: spName))
     kind = skRollback
+  elif kindStr == "TRANS_STMT_ROLLBACK_TO":
+    let spName = nodeGet(node, "savepoint_name").getStr
+    return ok(Statement(kind: skRollbackToSavepoint, rollbackToSavepointName: spName))
   elif kindStr == "TRANS_STMT_START" or kindStr == "TRANS_STMT_BEGIN":
     kind = skBegin
+  elif kindStr == "TRANS_STMT_SAVEPOINT":
+    let name = nodeGet(node, "savepoint_name").getStr
+    return ok(Statement(kind: skSavepoint, savepointName: name))
+  elif kindStr == "TRANS_STMT_RELEASE":
+    let name = nodeGet(node, "savepoint_name").getStr
+    return ok(Statement(kind: skReleaseSavepoint, releaseSavepointName: name))
   else:
     return err[Statement](ERR_SQL, "Unsupported transaction statement", kindStr)
   ok(Statement(kind: kind))
@@ -2340,3 +2434,12 @@ proc parseSql*(sql: string): Result[SqlAst] =
         return err[SqlAst](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
       statements.add(stmtRes.value)
   ok(SqlAst(statements: statements))
+
+proc parseSqlExpr*(sql: string): Result[Expr] =
+  ## Parse a standalone SQL expression by wrapping it in a SELECT statement.
+  let wrapRes = parseSql("SELECT " & sql)
+  if not wrapRes.ok:
+    return err[Expr](wrapRes.err.code, wrapRes.err.message, wrapRes.err.context)
+  if wrapRes.value.statements.len > 0 and wrapRes.value.statements[0].selectItems.len > 0:
+    return ok(wrapRes.value.statements[0].selectItems[0].expr)
+  err[Expr](ERR_SQL, "Failed to parse expression", sql)

@@ -142,6 +142,9 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
     of pkLiteralRows:
       line.add("LiteralRows(table=" & p.table & " alias=" & p.alias & " rows=" & $p.rows.len & ")")
       lines.add(line)
+    of pkTvfScan:
+      line.add("TvfScan(func=" & p.tvfFunc & " alias=" & p.alias & ")")
+      lines.add(line)
     of pkUnionDistinct:
       line.add("UnionDistinct")
       lines.add(line)

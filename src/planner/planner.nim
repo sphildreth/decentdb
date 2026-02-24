@@ -29,6 +29,7 @@ type PlanKind* = enum
   pkSort
   pkAggregate
   pkLimit
+  pkTvfScan
 
 type Plan* = ref object
   kind*: PlanKind
@@ -54,6 +55,8 @@ type Plan* = ref object
   groupBy*: seq[Expr]
   having*: Expr
   rows*: seq[seq[(string, Value)]]  # for pkLiteralRows: pre-materialized rows
+  tvfFunc*: string                   # for pkTvfScan: function name
+  tvfArgs*: seq[Expr]                # for pkTvfScan: argument expressions
 
 proc isSimpleEquality(expr: Expr, table: string, columnOut: var string, valueOut: var Expr): bool =
   if expr == nil or expr.kind != ekBinary or expr.op != "=":
@@ -159,6 +162,17 @@ proc refs(expr: Expr): HashSet[string] =
   result = initHashSet[string]()
   referencedTables(expr, result)
 
+proc makeJoinPlan(joinType: JoinType, joinOn: Expr, left, right: Plan): Plan =
+  ## Construct a join plan, rewriting RIGHT JOIN as LEFT JOIN with swapped operands.
+  ## For FULL OUTER JOIN, disable index seek since we need all right rows.
+  if joinType == jtRight:
+    Plan(kind: pkJoin, joinType: jtLeft, joinOn: joinOn, left: right, right: left)
+  elif joinType == jtFull and right.kind == pkIndexSeek:
+    let fallback = Plan(kind: pkTableScan, table: right.table, alias: right.alias)
+    Plan(kind: pkJoin, joinType: jtFull, joinOn: joinOn, left: left, right: fallback)
+  else:
+    Plan(kind: pkJoin, joinType: joinType, joinOn: joinOn, left: left, right: right)
+
 proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[string, seq[seq[(string, Value)]]] = initTable[string, seq[seq[(string, Value)]]]()): Plan =
   if stmt.setOpKind == sokUnionAll:
     let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
@@ -235,10 +249,26 @@ proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[strin
         rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
       else:
         rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
-      base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+      base = makeJoinPlan(join.joinType, join.onExpr, base, rightPlan)
       if join.alias.len > 0:
         available.incl(join.alias)
       available.incl(join.table)
+    if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
+      base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+    else:
+      base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+    if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+      base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
+    return base
+
+  # When the FROM source is a table-valued function.
+  if stmt.fromTvfFunc.len > 0:
+    base = Plan(kind: pkTvfScan, table: stmt.fromTable, alias: stmt.fromAlias, tvfFunc: stmt.fromTvfFunc, tvfArgs: stmt.fromTvfArgs)
+    for c in conjuncts:
+      base = Plan(kind: pkFilter, predicate: c, left: base)
+    conjuncts = @[]
     if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
       base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
     else:
@@ -267,7 +297,7 @@ proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[strin
         rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
       else:
         rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
-      base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+      base = makeJoinPlan(join.joinType, join.onExpr, base, rightPlan)
       if join.alias.len > 0:
         available.incl(join.alias)
       available.incl(join.table)
@@ -542,7 +572,7 @@ proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[strin
             rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
         if rightPlan == nil:
           rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
-    base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+    base = makeJoinPlan(join.joinType, join.onExpr, base, rightPlan)
     if join.alias.len > 0:
       available.incl(join.alias)
     available.incl(join.table)

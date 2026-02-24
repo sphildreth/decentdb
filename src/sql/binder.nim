@@ -172,7 +172,7 @@ proc cloneSelectItem(item: SelectItem): SelectItem =
   SelectItem(expr: cloneExpr(item.expr), alias: item.alias, isStar: item.isStar)
 
 proc cloneJoin(join: JoinClause): JoinClause =
-  JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: cloneExpr(join.onExpr))
+  JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: cloneExpr(join.onExpr), isNatural: join.isNatural)
 
 proc cloneOrderItem(item: OrderItem): OrderItem =
   OrderItem(expr: cloneExpr(item.expr), asc: item.asc)
@@ -230,6 +230,8 @@ proc cloneSelectStatement(stmt: Statement): Statement =
     fromTable: stmt.fromTable,
     fromAlias: stmt.fromAlias,
     fromSubquery: clonedFromSubquery,
+    fromTvfFunc: stmt.fromTvfFunc,
+    fromTvfArgs: stmt.fromTvfArgs,
     joins: joins,
     joinSubqueries: clonedJoinSubqueries,
     whereExpr: cloneExpr(stmt.whereExpr),
@@ -239,7 +241,8 @@ proc cloneSelectStatement(stmt: Statement): Statement =
     limit: stmt.limit,
     limitParam: stmt.limitParam,
     offset: stmt.offset,
-    offsetParam: stmt.offsetParam
+    offsetParam: stmt.offsetParam,
+    distinctOnExprs: stmt.distinctOnExprs.mapIt(cloneExpr(it))
   )
 
 proc countExprNodes(expr: Expr): int
@@ -423,9 +426,33 @@ proc hasParamsInDmlStatement(stmt: Statement): bool =
   else:
     false
 
-proc buildTableMap(catalog: Catalog, fromTable: string, fromAlias: string, joins: seq[JoinClause]): Result[Table[string, TableMeta]] =
+proc buildTableMap(catalog: Catalog, fromTable: string, fromAlias: string, joins: seq[JoinClause],
+                   tvfFunc: string = ""): Result[Table[string, TableMeta]] =
   var map = initTable[string, TableMeta]()
-  if fromTable.len > 0:
+  if tvfFunc.len > 0:
+    # Table-valued function: provide synthetic column schema
+    var cols: seq[Column] = @[]
+    case tvfFunc
+    of "json_each":
+      cols = @[
+        Column(name: "key", kind: ctText),
+        Column(name: "value", kind: ctText),
+        Column(name: "type", kind: ctText)
+      ]
+    of "json_tree":
+      cols = @[
+        Column(name: "key", kind: ctText),
+        Column(name: "value", kind: ctText),
+        Column(name: "type", kind: ctText),
+        Column(name: "path", kind: ctText)
+      ]
+    else:
+      return err[Table[string, TableMeta]](ERR_SQL, "Unknown table-valued function", tvfFunc)
+    let meta = TableMeta(columns: cols)
+    if fromAlias.len > 0:
+      map[normalizedName(fromAlias)] = meta
+    map[normalizedName(fromTable)] = meta
+  elif fromTable.len > 0:
     let baseRes = catalog.getTable(fromTable)
     if not baseRes.ok:
       return err[Table[string, TableMeta]](baseRes.err.code, baseRes.err.message, baseRes.err.context)
@@ -648,7 +675,7 @@ proc directSelectDependencies(stmt: Statement): seq[string] =
   for name in stmt.cteNames:
     cteNames.incl(normalizedName(name))
   var seen = initHashSet[string]()
-  if stmt.fromTable.len > 0 and stmt.fromSubquery == nil and normalizedName(stmt.fromTable) notin cteNames:
+  if stmt.fromTable.len > 0 and stmt.fromSubquery == nil and stmt.fromTvfFunc.len == 0 and normalizedName(stmt.fromTable) notin cteNames:
     seen.incl(normalizedName(stmt.fromTable))
   if stmt.fromSubquery != nil:
     for dep in directSelectDependencies(stmt.fromSubquery):
@@ -963,7 +990,7 @@ proc rewriteAllExpressions(
       let onRes = rewriteExprForViewRef(join.onExpr, refTable, refAlias, columnMap, allowUnqualified)
       if not onRes.ok:
         return err[Void](onRes.err.code, onRes.err.message, onRes.err.context)
-      rewrittenJoins.add(JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: onRes.value))
+      rewrittenJoins.add(JoinClause(joinType: join.joinType, table: join.table, alias: join.alias, onExpr: onRes.value, isNatural: join.isNatural))
     target.joins = rewrittenJoins
 
     var rewrittenGroupBy: seq[Expr] = @[]
@@ -1530,7 +1557,7 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       cteJoinIndices.add(i)
       continue
     realJoins.add(join)
-  var mapRes = buildTableMap(catalog, mapFromTable, mapFromAlias, realJoins)
+  var mapRes = buildTableMap(catalog, mapFromTable, mapFromAlias, realJoins, stmt.fromTvfFunc)
   if not mapRes.ok:
     return err[Statement](mapRes.err.code, mapRes.err.message, mapRes.err.context)
   var map = mapRes.value
@@ -1579,6 +1606,37 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       map[join.table] = metaRes.value
       if join.alias.len > 0:
         map[join.alias] = metaRes.value
+  # Resolve NATURAL JOINs: synthesize ON clause from shared column names
+  for i in 0 ..< expanded.joins.len:
+    if not expanded.joins[i].isNatural:
+      continue
+    let join = expanded.joins[i]
+    # Determine the "left" table: the base table or the preceding join's table
+    let leftName = if i == 0:
+      (if expanded.fromAlias.len > 0: expanded.fromAlias else: expanded.fromTable)
+    else:
+      let prev = expanded.joins[i - 1]
+      if prev.alias.len > 0: prev.alias else: prev.table
+    let rightName = if join.alias.len > 0: join.alias else: join.table
+    let leftKey = normalizedName(leftName)
+    let rightKey = normalizedName(rightName)
+    if not map.hasKey(leftKey) or not map.hasKey(rightKey):
+      return err[Statement](ERR_SQL, "NATURAL JOIN requires both tables to be resolvable")
+    let leftMeta = map[leftKey]
+    let rightMeta = map[rightKey]
+    var onExpr: Expr = nil
+    for lcol in leftMeta.columns:
+      for rcol in rightMeta.columns:
+        if normalizedName(lcol.name) == normalizedName(rcol.name):
+          let eq = Expr(kind: ekBinary, op: "=",
+            left: Expr(kind: ekColumn, table: leftName, name: lcol.name),
+            right: Expr(kind: ekColumn, table: rightName, name: rcol.name))
+          onExpr = andExpr(onExpr, eq)
+          break
+    if onExpr == nil:
+      return err[Statement](ERR_SQL, "NATURAL JOIN found no common columns between " & leftName & " and " & rightName)
+    expanded.joins[i].onExpr = onExpr
+    expanded.joins[i].isNatural = false
   for item in expanded.selectItems:
     if item.isStar:
       continue
@@ -2163,7 +2221,8 @@ proc bindCreateView(catalog: Catalog, stmt: Statement): Result[Statement] =
     createViewOrReplace: stmt.createViewOrReplace,
     createViewColumns: colRes.value,
     createViewSqlText: stmt.createViewSqlText,
-    createViewQuery: cloneSelectStatement(stmt.createViewQuery)
+    createViewQuery: cloneSelectStatement(stmt.createViewQuery),
+    createViewIsTemp: stmt.createViewIsTemp
   )
 
   if stmt.createViewOrReplace and exists:
@@ -2379,7 +2438,7 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     bindAlterView(catalog, stmt)
   of skAlterTable:
     bindAlterTable(catalog, stmt)
-  of skBegin, skCommit, skRollback:
+  of skBegin, skCommit, skRollback, skSavepoint, skReleaseSavepoint, skRollbackToSavepoint:
     ok(stmt)
   of skExplain:
     let innerRes = bindStatement(catalog, stmt.explainInner)

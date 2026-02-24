@@ -68,7 +68,7 @@ SQLite and DuckDB generally include all of the above, plus substantial additiona
 | Non-materialized views (`CREATE VIEW ... AS SELECT ...`) | Yes; read-only views | Yes | Yes |
 | `CREATE OR REPLACE VIEW` | Yes | Not supported as a single statement | Yes |
 | Updatable views | Limited: via narrow `INSTEAD OF` trigger subset (`decentdb_exec_sql('<single DML>')`, no `NEW`/`OLD`) | Via `INSTEAD OF` triggers | Limited / generally not the default |
-| `TEMP` views | No | Yes | Yes |
+| `TEMP` views | Yes (session-scoped, not persisted) | Yes | Yes |
 
 ### SQL roadmap
 
@@ -83,9 +83,14 @@ DecentDB has implemented many previously planned baseline features, including:
 - Date/time functions (`NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`)
 - Math functions (`SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`)
 - String functions (`LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`, `INSTR`)
-- JSON functions (`JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`)
+- JSON functions (`JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`, `json_each()`, `json_tree()`)
 - Indexing options (multi-column, partial v0 subset, expression index v0 subset)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
+- Join types (`INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`, `NATURAL`)
+- `DISTINCT ON`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`)
+- `DEFAULT` and generated columns (STORED)
+- `CREATE TEMP TABLE` / `CREATE TEMP VIEW` (session-scoped)
+- `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
 
 For remaining roadmap and deferred capabilities, use:
 - [DecentDB SQL Enhancements Plan](../../design/SQL_ENHANCEMENTS_PLAN.md)
