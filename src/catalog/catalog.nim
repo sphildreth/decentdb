@@ -130,6 +130,8 @@ proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
     ok(ColumnTypeSpec(kind: ctFloat64))
   of "TEXT", "VARCHAR", "CHARACTER VARYING":
     ok(ColumnTypeSpec(kind: ctText))
+  of "DATE", "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP WITH TIME ZONE", "DATETIME":
+    ok(ColumnTypeSpec(kind: ctText))
   of "BLOB":
     ok(ColumnTypeSpec(kind: ctBlob))
   of "UUID":

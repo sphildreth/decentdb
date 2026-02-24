@@ -139,6 +139,9 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       line.add("SubqueryScan(alias=" & p.alias & ")")
       lines.add(line)
       traverse(p.subPlan, depth + 1)
+    of pkLiteralRows:
+      line.add("LiteralRows(table=" & p.table & " alias=" & p.alias & " rows=" & $p.rows.len & ")")
+      lines.add(line)
     of pkUnionDistinct:
       line.add("UnionDistinct")
       lines.add(line)

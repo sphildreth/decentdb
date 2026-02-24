@@ -82,7 +82,7 @@ proc cloneExpr(expr: Expr): Expr =
     var args: seq[Expr] = @[]
     for arg in expr.args:
       args.add(cloneExpr(arg))
-    Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar)
+    Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar, isDistinct: expr.isDistinct)
   of ekParam:
     Expr(kind: ekParam, index: expr.index)
   of ekInList:
@@ -137,7 +137,7 @@ proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
     var args: seq[Expr] = @[]
     for arg in expr.args:
       args.add(qualifyInsertConflictExpr(arg, tableName))
-    Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar)
+    Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar, isDistinct: expr.isDistinct)
   of ekParam:
     Expr(kind: ekParam, index: expr.index)
   of ekInList:
@@ -222,6 +222,7 @@ proc cloneSelectStatement(stmt: Statement): Statement =
     cteNames: stmt.cteNames,
     cteColumns: stmt.cteColumns,
     cteQueries: cteQueries,
+    cteRecursive: stmt.cteRecursive,
     setOpKind: stmt.setOpKind,
     setOpLeft: setLeft,
     setOpRight: setRight,
@@ -855,7 +856,7 @@ proc rewriteExprForViewRef(
       if not argRes.ok:
         return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
       args.add(argRes.value)
-    ok(Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar))
+    ok(Expr(kind: ekFunc, funcName: expr.funcName, args: args, isStar: expr.isStar, isDistinct: expr.isDistinct))
   of ekInList:
     let inExprRes = rewriteExprForViewRef(expr.inExpr, refTable, refAlias, columnMap, allowUnqualified)
     if not inExprRes.ok:
@@ -1044,9 +1045,23 @@ proc expandSelectCteRefs(
   ctes: Table[string, ExpandedCte]
 ): Result[Statement] =
   var expanded = cloneSelectStatement(stmt)
-  expanded.cteNames = @[]
-  expanded.cteColumns = @[]
-  expanded.cteQueries = @[]
+  # Preserve recursive CTE definitions; only clear non-recursive CTEs
+  # that are being inlined here.
+  var keepNames: seq[string] = @[]
+  var keepCols: seq[seq[string]] = @[]
+  var keepQueries: seq[Statement] = @[]
+  var keepRecursive: seq[bool] = @[]
+  for i, cteName in expanded.cteNames:
+    let isRec = i < expanded.cteRecursive.len and expanded.cteRecursive[i]
+    if isRec:
+      keepNames.add(cteName)
+      keepCols.add(if i < expanded.cteColumns.len: expanded.cteColumns[i] else: @[])
+      keepQueries.add(if i < expanded.cteQueries.len: expanded.cteQueries[i] else: nil)
+      keepRecursive.add(true)
+  expanded.cteNames = keepNames
+  expanded.cteColumns = keepCols
+  expanded.cteQueries = keepQueries
+  expanded.cteRecursive = keepRecursive
 
   if expanded.fromTable.len > 0 and ctes.hasKey(normalizedName(expanded.fromTable)):
     let onlySource = expanded.joins.len == 0
@@ -1181,6 +1196,7 @@ proc expandSelectCtes(
     return err[Statement](ERR_SQL, "CTE expansion depth exceeded", "max_depth=" & $MaxViewExpansionDepth)
 
   var expandedCtes = initTable[string, ExpandedCte]()
+  var hasRecursiveCte = false
   for i, cteName in stmt.cteNames:
     if i >= stmt.cteQueries.len:
       return err[Statement](ERR_SQL, "CTE query must be SELECT", cteName)
@@ -1190,6 +1206,14 @@ proc expandSelectCtes(
     let key = normalizedName(cteName)
     if expandedCtes.hasKey(key):
       return err[Statement](ERR_SQL, "Duplicate CTE name", cteName)
+
+    # Recursive CTEs are not expanded at bind time — they are kept
+    # for executor-time iterative evaluation (see ADR-0107).
+    let isRecursive = i < stmt.cteRecursive.len and stmt.cteRecursive[i]
+    if isRecursive:
+      hasRecursiveCte = true
+      continue
+
     for existing in stack:
       if normalizedName(existing) == key:
         return err[Statement](ERR_SQL, "Circular CTE reference", cteName)
@@ -1213,9 +1237,29 @@ proc expandSelectCtes(
 
     expandedCtes[key] = ExpandedCte(query: viewRes.value, columnNames: colRes.value)
   var outer = cloneSelectStatement(stmt)
-  outer.cteNames = @[]
-  outer.cteColumns = @[]
-  outer.cteQueries = @[]
+  if hasRecursiveCte:
+    # Keep recursive CTE definitions for executor-time evaluation;
+    # only clear non-recursive CTEs that were already expanded.
+    var keepNames: seq[string] = @[]
+    var keepCols: seq[seq[string]] = @[]
+    var keepQueries: seq[Statement] = @[]
+    var keepRecursive: seq[bool] = @[]
+    for i, cteName in stmt.cteNames:
+      let isRec = i < stmt.cteRecursive.len and stmt.cteRecursive[i]
+      if isRec:
+        keepNames.add(cteName)
+        keepCols.add(if i < stmt.cteColumns.len: stmt.cteColumns[i] else: @[])
+        keepQueries.add(stmt.cteQueries[i])
+        keepRecursive.add(true)
+    outer.cteNames = keepNames
+    outer.cteColumns = keepCols
+    outer.cteQueries = keepQueries
+    outer.cteRecursive = keepRecursive
+  else:
+    outer.cteNames = @[]
+    outer.cteColumns = @[]
+    outer.cteQueries = @[]
+    outer.cteRecursive = @[]
   let outerInlineRes = expandSelectCteRefs(catalog, outer, expandedCtes)
   if not outerInlineRes.ok:
     return err[Statement](outerInlineRes.err.code, outerInlineRes.err.message, outerInlineRes.err.context)
@@ -1410,6 +1454,7 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       cteNames: @[],
       cteColumns: @[],
       cteQueries: @[],
+      cteRecursive: @[],
       setOpKind: stmt.setOpKind,
       setOpLeft: leftRes.value,
       setOpRight: rightRes.value,
@@ -1456,15 +1501,33 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
       boundJoinSubqueries.add(nil)
   expanded.joinSubqueries = boundJoinSubqueries
 
-  # When FROM is a subquery, pass empty fromTable so buildTableMap only resolves
-  # real join tables (the subquery alias is added below).
-  let mapFromTable = if expanded.fromSubquery != nil: "" else: expanded.fromTable
-  let mapFromAlias = if expanded.fromSubquery != nil: "" else: expanded.fromAlias
-  # Filter out joins backed by subqueries so buildTableMap doesn't try to look
-  # them up in the catalog.
+  # Check if fromTable references a recursive CTE.
+  var fromIsRecursiveCte = false
+  var recursiveCteIdx = -1
+  for i, cteName in expanded.cteNames:
+    if i < expanded.cteRecursive.len and expanded.cteRecursive[i] and
+       normalizedName(cteName) == normalizedName(expanded.fromTable):
+      fromIsRecursiveCte = true
+      recursiveCteIdx = i
+      break
+
+  # When FROM is a subquery or recursive CTE, pass empty fromTable so
+  # buildTableMap only resolves real join tables.
+  let mapFromTable = if expanded.fromSubquery != nil or fromIsRecursiveCte: "" else: expanded.fromTable
+  let mapFromAlias = if expanded.fromSubquery != nil or fromIsRecursiveCte: "" else: expanded.fromAlias
+  # Filter out joins backed by subqueries or recursive CTEs so buildTableMap
+  # doesn't try to look them up in the catalog.
+  var recursiveCteNames: seq[string] = @[]
+  for i, cteName in expanded.cteNames:
+    if i < expanded.cteRecursive.len and expanded.cteRecursive[i]:
+      recursiveCteNames.add(normalizedName(cteName))
   var realJoins: seq[JoinClause] = @[]
+  var cteJoinIndices: seq[int] = @[]
   for i, join in expanded.joins:
     if i < expanded.joinSubqueries.len and expanded.joinSubqueries[i] != nil:
+      continue
+    if normalizedName(join.table) in recursiveCteNames:
+      cteJoinIndices.add(i)
       continue
     realJoins.add(join)
   var mapRes = buildTableMap(catalog, mapFromTable, mapFromAlias, realJoins)
@@ -1480,6 +1543,33 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
     map[expanded.fromTable] = metaRes.value
     if expanded.fromAlias.len > 0:
       map[expanded.fromAlias] = metaRes.value
+  # Add synthetic table metadata for recursive CTE sources.
+  if fromIsRecursiveCte and recursiveCteIdx >= 0:
+    let cteCols = if recursiveCteIdx < expanded.cteColumns.len: expanded.cteColumns[recursiveCteIdx] else: @[]
+    var cols: seq[Column] = @[]
+    for colName in cteCols:
+      cols.add(Column(name: colName, kind: ctText, primaryKey: false))
+    let synMeta = TableMeta(name: expanded.fromTable, columns: cols)
+    let key = normalizedName(expanded.fromTable)
+    map[key] = synMeta
+    if expanded.fromAlias.len > 0:
+      map[normalizedName(expanded.fromAlias)] = synMeta
+  # Add synthetic table metadata for recursive CTE join sources.
+  for jIdx in cteJoinIndices:
+    let join = expanded.joins[jIdx]
+    let joinCteName = normalizedName(join.table)
+    # Find the matching CTE index to get column names.
+    for ci, cteName in expanded.cteNames:
+      if normalizedName(cteName) == joinCteName and ci < expanded.cteRecursive.len and expanded.cteRecursive[ci]:
+        let cteCols = if ci < expanded.cteColumns.len: expanded.cteColumns[ci] else: @[]
+        var cols: seq[Column] = @[]
+        for colName in cteCols:
+          cols.add(Column(name: colName, kind: ctText, primaryKey: false))
+        let synMeta = TableMeta(name: join.table, columns: cols)
+        map[normalizedName(join.table)] = synMeta
+        if join.alias.len > 0:
+          map[normalizedName(join.alias)] = synMeta
+        break
   for i, sq in expanded.joinSubqueries:
     if sq != nil and i < expanded.joins.len:
       let join = expanded.joins[i]

@@ -1840,3 +1840,81 @@ suite "Planner":
       check r.ok
       check splitRow(r.value[0])[0] == "a"
     discard closeDb(db)
+
+  test "WITH RECURSIVE counting 1..5":
+    let path = makeTempDb("decentdb_recursive_cte.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, """
+      WITH RECURSIVE cnt(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM cnt WHERE x < 5
+      )
+      SELECT x FROM cnt
+    """)
+    check res.ok
+    check res.value.len == 5
+    check splitRow(res.value[0])[0] == "1"
+    check splitRow(res.value[1])[0] == "2"
+    check splitRow(res.value[2])[0] == "3"
+    check splitRow(res.value[3])[0] == "4"
+    check splitRow(res.value[4])[0] == "5"
+    discard closeDb(db)
+
+  test "WITH RECURSIVE tree traversal":
+    let path = makeTempDb("decentdb_recursive_tree.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE tree (id INT64 PRIMARY KEY, parent_id INT64, name TEXT)")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (1, 0, 'root')")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (2, 1, 'child1')")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (3, 1, 'child2')")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (4, 2, 'grandchild1')")
+    let res = execSql(db, """
+      WITH RECURSIVE descendants(id, name, depth) AS (
+        SELECT id, name, 0 FROM tree WHERE id = 1
+        UNION ALL
+        SELECT t.id, t.name, d.depth + 1
+        FROM tree t
+        INNER JOIN descendants d ON t.parent_id = d.id
+      )
+      SELECT id, name, depth FROM descendants ORDER BY id
+    """)
+    check res.ok
+    check res.value.len == 4
+    let row0 = splitRow(res.value[0])
+    check row0[0] == "1"
+    check row0[1] == "root"
+    check row0[2] == "0"
+    let row3 = splitRow(res.value[3])
+    check row3[0] == "4"
+    check row3[1] == "grandchild1"
+    check row3[2] == "2"
+    discard closeDb(db)
+
+  test "DATE and TIMESTAMP column types accepted":
+    let path = makeTempDb("decentdb_date_types.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let createRes = execSql(db, """
+      CREATE TABLE events (
+        id INT64 PRIMARY KEY,
+        event_date DATE,
+        event_ts TIMESTAMP,
+        created_at DATETIME
+      )
+    """)
+    check createRes.ok
+    let insRes = execSql(db, "INSERT INTO events (id, event_date, event_ts, created_at) VALUES (1, '2025-06-15', '2025-06-15 10:30:00', '2025-06-15 10:30:00')")
+    check insRes.ok
+    let selRes = execSql(db, "SELECT event_date, event_ts FROM events WHERE id = 1")
+    check selRes.ok
+    check selRes.value.len == 1
+    let row = splitRow(selRes.value[0])
+    check row[0] == "2025-06-15"
+    check row[1] == "2025-06-15 10:30:00"
+    discard closeDb(db)

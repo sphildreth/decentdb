@@ -79,9 +79,9 @@ Fills remaining gaps in the scalar function surface area. All are pure function 
 
 Extends the aggregate function infrastructure to support DISTINCT modifiers and additional aggregate forms.
 
-- [x] **AVG(DISTINCT expr)** — Average of distinct non-NULL values. Requires adding a `isDistinct` flag to `AggSpec` in `exec.nim`, collecting a `HashSet[Value]` per group during accumulation, and using the distinct set for final computation. Also applies to `SUM(DISTINCT ...)` and `COUNT(DISTINCT ...)`. **Parser support added**, execution pending libpg_query `agg_distinct` flag exposure.
-- [x] **SUM(DISTINCT expr)** — Sum of distinct non-NULL values. Same infrastructure as `AVG(DISTINCT ...)`. **Parser support added**.
-- [x] **COUNT(DISTINCT expr)** — Count of distinct non-NULL values. Same infrastructure. **Parser support added**.
+- [x] **AVG(DISTINCT expr)** — Average of distinct non-NULL values. `isDistinct` flag propagated through parser, binder (5 fix sites), and executor. Uses `distinctValues: seq[Value]` per-group accumulation. End-to-end tested.
+- [x] **SUM(DISTINCT expr)** — Sum of distinct non-NULL values. Same infrastructure as `AVG(DISTINCT ...)`. End-to-end tested.
+- [x] **COUNT(DISTINCT expr)** — Count of distinct non-NULL values. Same infrastructure. End-to-end tested.
 - [x] **Parser support for DISTINCT in aggregates** — libpg_query parses `AGG(DISTINCT expr)` with an `agg_distinct` flag on `FuncCall` nodes. Need to propagate this flag through `parseFuncCall` in `sql.nim` into the `Expr` AST (add `isDistinct*: bool` to the `ekFunc` variant), then through the binder to the aggregate evaluation. **Parser/binder support added** but libpg_query doesn't expose the flag in an accessible format.
 
 ---
@@ -97,7 +97,7 @@ Extends JSON support beyond the current `JSON_ARRAY_LENGTH` and `JSON_EXTRACT` t
 - [x] **json_type(json [, path])** — Returns the type of a JSON value as TEXT (`'null'`, `'true'`, `'false'`, `'integer'`, `'real'`, `'text'`, `'array'`, `'object'`). Simple scalar function.
 - [x] **json_valid(json)** — Returns 1 if the argument is well-formed JSON, 0 otherwise. Simple scalar function using `try/except` on `parseJson`.
 - [x] **json_object(key1, val1, key2, val2, ...)** — Creates a JSON object from key-value pairs. Scalar function.
-- [x] **json_array(val1, val2, ...)** — Creates a JSON array from values. Scalar function.
+- [x] **json_array(val1, val2, ...)** — Creates a JSON array from values. Scalar function. Parser handles `JsonArrayConstructor` node (PostgreSQL 16+ SQL/JSON standard syntax) and maps to existing `JSON_ARRAY` handler in exec.nim. Tested with integer, string, and empty arrays.
 
 ---
 
@@ -113,7 +113,7 @@ Addresses missing query-level SQL features. Some require parser changes (libpg_q
 
 ### Recursive CTEs
 
-- [ ] **WITH RECURSIVE** — Currently explicitly rejected in `sql.nim` with `"WITH RECURSIVE is not supported in 0.x"`. Implementation requires: (a) parsing the `RECURSIVE` flag in `parseWithClause`, (b) detecting the recursive self-reference in the CTE body, (c) implementing iterative fixpoint evaluation in the executor (seed with the non-recursive term, then repeatedly evaluate the recursive term until no new rows are produced). **Significant implementation effort.** The planner needs a new plan node type (e.g., `pkRecursiveCte`). **Requires an ADR** for the execution strategy and termination guarantees. **Status: Not implemented - requires ADR**
+- [x] **WITH RECURSIVE** — Implemented with iterative fixpoint evaluation per ADR-0107. Parser accepts `RECURSIVE` flag, binder preserves recursive CTEs for executor-time evaluation, planner supports `pkLiteralRows` plan node for materialized CTE rows. Supports simple counting CTEs and tree/graph traversals with JOIN. Iteration limit: 1000. Tested with counting and tree traversal tests.
 
 ### Set Operation Enhancements
 
@@ -175,7 +175,7 @@ The acceptance criteria require a maintained, test-backed feature matrix.
 | Work Item | Requires ADR? | Reason |
 |-----------|--------------|--------|
 | Date/time functions | Maybe | Only if new data types are introduced |
-| WITH RECURSIVE | Yes | New execution strategy, termination guarantees |
+| WITH RECURSIVE | Yes | ADR-0107: iterative fixpoint execution strategy |
 | SAVEPOINT / ROLLBACK TO | Yes | WAL integration, undo capability |
 | Deferred FK constraints | Yes | Deferred constraint checking design |
 | CREATE TEMP TABLE/VIEW | Maybe | Temp catalog namespace design |

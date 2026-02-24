@@ -74,7 +74,7 @@ ON CONFLICT (id) DO NOTHING;
 | LEFT JOIN | ✅ | ✅ | ✅ |
 | RIGHT JOIN | ❌ (explicit error) | ✅ | ✅ |
 | FULL OUTER JOIN | ❌ (explicit error) | ✅ | ✅ |
-| CROSS JOIN | ✅ | ✅ | ✅ |
+| CROSS JOIN | ❌ | ✅ | ✅ |
 | NATURAL JOIN | ❌ | ✅ | ✅ |
 
 ### Examples
@@ -124,9 +124,9 @@ SELECT user_id, COUNT(*) as order_count FROM orders GROUP BY user_id HAVING COUN
 | GROUP_CONCAT | ✅ | ✅ | ✅ |
 | STRING_AGG | ✅ | ❌ | ✅ |
 | TOTAL | ✅ | ✅ | ❌ |
-| COUNT(DISTINCT) | ❌ | ✅ | ✅ |
-| SUM(DISTINCT) | ❌ | ✅ | ✅ |
-| AVG(DISTINCT) | ❌ | ✅ | ✅ |
+| COUNT(DISTINCT) | ✅ | ✅ | ✅ |
+| SUM(DISTINCT) | ✅ | ✅ | ✅ |
+| AVG(DISTINCT) | ✅ | ✅ | ✅ |
 
 ### Examples
 
@@ -227,7 +227,7 @@ FROM employees;
 | json_type() | ✅ | ✅ | ✅ |
 | json_valid() | ✅ | ✅ | ✅ |
 | json_object() | ✅ | ✅ | ✅ |
-| json_array() | ❌ (parser limitation) | ✅ | ✅ |
+| json_array() | ✅ | ✅ | ✅ |
 | -> | ✅ | ✅ | ✅ |
 | ->> | ✅ | ✅ | ✅ |
 | json_each() | ❌ | ✅ | ❌ |
@@ -291,8 +291,8 @@ SELECT '{"a":1}'->>'a', json_extract('{"a":1}', '$.a'), json_valid('{"a":1}');
 | BOOLEAN | ✅ | ✅ | ✅ |
 | UUID | ✅ | ❌ | ✅ |
 | DECIMAL/NUMERIC | ✅ | ✅ | ✅ |
-| DATE | ❌ (TEXT) | ✅ | ✅ |
-| TIMESTAMP | ❌ (TEXT) | ✅ | ✅ |
+| DATE | ✅ (TEXT storage, ISO format) | ✅ | ✅ |
+| TIMESTAMP | ✅ (TEXT storage, ISO format) | ✅ | ✅ |
 
 ## Constraints
 
@@ -303,7 +303,7 @@ SELECT '{"a":1}'->>'a', json_extract('{"a":1}', '$.a'), json_valid('{"a":1}');
 | NOT NULL | ✅ | ✅ | ✅ |
 | UNIQUE | ✅ | ✅ | ✅ |
 | CHECK | ✅ | ✅ | ✅ |
-| DEFAULT | ✅ | ✅ | ✅ |
+| DEFAULT | ❌ (parsed, not enforced) | ✅ | ✅ |
 
 ## Set Operations
 
@@ -321,5 +321,5 @@ SELECT '{"a":1}'->>'a', json_extract('{"a":1}', '$.a'), json_valid('{"a":1}');
 | Feature | DecentDB | SQLite | PostgreSQL |
 |---------|----------|--------|------------|
 | WITH ... AS | ✅ | ✅ | ✅ |
-| WITH RECURSIVE | ❌ | ✅ | ✅ |
+| WITH RECURSIVE | ✅ | ✅ | ✅ |
 | Multiple CTEs | ✅ | ✅ | ✅ |

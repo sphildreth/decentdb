@@ -26,9 +26,14 @@ suite "SQL Parser":
     check stmt.cteColumns[1] == @["x"]
     check stmt.fromTable == "filt"
 
-  test "reject WITH RECURSIVE in v0":
+  test "parse WITH RECURSIVE":
     let astRes = parseSql("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t")
-    check not astRes.ok
+    check astRes.ok
+    let stmt = astRes.value.statements[0]
+    check stmt.cteNames.len == 1
+    check stmt.cteNames[0] == "t"
+    check stmt.cteRecursive.len == 1
+    check stmt.cteRecursive[0] == true
 
   test "parse set operations":
     let unionAll = parseSingle("SELECT id FROM a UNION ALL SELECT id FROM b")

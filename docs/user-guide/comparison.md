@@ -46,13 +46,13 @@ DecentDB's current baseline includes:
 - Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`, `HAVING`, `DISTINCT`
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `STRING_AGG`
 - Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`
-- CTEs: non-recursive `WITH ... AS`
+- CTEs: `WITH ... AS` (recursive and non-recursive)
 - Window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()` with `OVER (...)`
 - Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
 - Math functions: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`
 - String functions: `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
 - Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
-- JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `->`, `->>`
+- JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`
 - Other functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `PRINTF`
 - Operators: `+`, `-`, `*`, `/`, `%` (modulo), `||` (string concatenation)
 - Transaction control: `BEGIN`, `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` (treated as `BEGIN`), `COMMIT`, `ROLLBACK`
@@ -75,7 +75,7 @@ SQLite and DuckDB generally include all of the above, plus substantial additiona
 DecentDB has implemented many previously planned baseline features, including:
 - Richer expression support (`IS NULL`, `CASE`, `CAST`, `BETWEEN`, `IN`, `EXISTS`, `LIKE ... ESCAPE`, `||`, core scalar functions)
 - UPSERT and DML conveniences (`INSERT ... ON CONFLICT DO NOTHING/DO UPDATE`, `INSERT ... RETURNING`)
-- Non-recursive CTEs, set operations (`UNION ALL`, `UNION`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`)
+- Recursive and non-recursive CTEs, set operations (`UNION ALL`, `UNION`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`)
 - `CHECK` constraints, FK `CASCADE` / `SET NULL` actions, table-level FOREIGN KEY constraints
 - Broader `ALTER TABLE` (`ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`)
 - Trigger subsets (`AFTER` row triggers on tables, `INSTEAD OF` row triggers on views)
@@ -83,7 +83,7 @@ DecentDB has implemented many previously planned baseline features, including:
 - Date/time functions (`NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`)
 - Math functions (`SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`)
 - String functions (`LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`, `INSTR`)
-- JSON functions (`JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `->`, `->>`)
+- JSON functions (`JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`)
 - Indexing options (multi-column, partial v0 subset, expression index v0 subset)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 
@@ -141,4 +141,4 @@ SQLite's mechanism for querying multiple database files simultaneously. Not supp
 
 ### Recursive CTEs
 
-`WITH RECURSIVE` is not currently supported. This requires significant implementation work and may be added in a future version.
+`WITH RECURSIVE` is supported for iterative fixpoint queries (counting, tree/graph traversal). Recursive CTEs require `UNION ALL` between anchor and recursive terms. Iteration limit: 1000.

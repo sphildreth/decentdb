@@ -2,6 +2,7 @@ import options
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
+import ../record/record
 import sets
 import strutils
 import tables
@@ -14,6 +15,7 @@ type PlanKind* = enum
   pkIndexSeek
   pkTrigramSeek
   pkSubqueryScan
+  pkLiteralRows
   pkUnionDistinct
   pkSetUnionDistinct
   pkSetIntersect
@@ -51,6 +53,7 @@ type Plan* = ref object
   offsetParam*: int
   groupBy*: seq[Expr]
   having*: Expr
+  rows*: seq[seq[(string, Value)]]  # for pkLiteralRows: pre-materialized rows
 
 proc isSimpleEquality(expr: Expr, table: string, columnOut: var string, valueOut: var Expr): bool =
   if expr == nil or expr.kind != ekBinary or expr.op != "=":
@@ -156,30 +159,30 @@ proc refs(expr: Expr): HashSet[string] =
   result = initHashSet[string]()
   referencedTables(expr, result)
 
-proc planSelect(catalog: Catalog, stmt: Statement): Plan =
+proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[string, seq[seq[(string, Value)]]] = initTable[string, seq[seq[(string, Value)]]]()): Plan =
   if stmt.setOpKind == sokUnionAll:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkAppend, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokUnion:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetUnionDistinct, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokIntersect:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetIntersect, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokIntersectAll:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetIntersectAll, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokExcept:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetExcept, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokExceptAll:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetExceptAll, left: leftPlan, right: rightPlan)
 
   proc exprHasAggregate(expr: Expr): bool =
@@ -214,7 +217,7 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
 
   # When the FROM source is a subquery, recursively plan it and use as base.
   if stmt.fromSubquery != nil:
-    let innerPlan = planSelect(catalog, stmt.fromSubquery)
+    let innerPlan = planSelect(catalog, stmt.fromSubquery, materializedCtes)
     base = Plan(kind: pkSubqueryScan, subPlan: innerPlan, table: stmt.fromTable, alias: stmt.fromAlias)
     # Apply WHERE filters.
     for c in conjuncts:
@@ -228,7 +231,39 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     for i, join in stmt.joins:
       var rightPlan: Plan = nil
       if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
-        let joinInner = planSelect(catalog, stmt.joinSubqueries[i])
+        let joinInner = planSelect(catalog, stmt.joinSubqueries[i], materializedCtes)
+        rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
+      else:
+        rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
+      base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+      if join.alias.len > 0:
+        available.incl(join.alias)
+      available.incl(join.table)
+    if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
+      base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+    else:
+      base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+    if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+      base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
+    return base
+
+  # When the FROM source is a materialized recursive CTE, use pre-computed rows.
+  let cteKey = stmt.fromTable.toLowerAscii()
+  if materializedCtes.hasKey(cteKey):
+    base = Plan(kind: pkLiteralRows, table: stmt.fromTable, alias: stmt.fromAlias, rows: materializedCtes[cteKey])
+    for c in conjuncts:
+      base = Plan(kind: pkFilter, predicate: c, left: base)
+    conjuncts = @[]
+    var available = initHashSet[string]()
+    if stmt.fromAlias.len > 0:
+      available.incl(stmt.fromAlias)
+    available.incl(stmt.fromTable)
+    for i, join in stmt.joins:
+      var rightPlan: Plan = nil
+      if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
+        let joinInner = planSelect(catalog, stmt.joinSubqueries[i], materializedCtes)
         rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
       else:
         rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
@@ -491,17 +526,22 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
   for i, join in stmt.joins:
     var rightPlan: Plan = nil
     if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
-      let joinInner = planSelect(catalog, stmt.joinSubqueries[i])
+      let joinInner = planSelect(catalog, stmt.joinSubqueries[i], materializedCtes)
       rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
     else:
-      var joinIdxCol = ""
-      var joinIdxVal: Expr = nil
-      if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
-        let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
-        if isSome(idxOpt):
-          rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
-      if rightPlan == nil:
-        rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
+      # Check if the join table is a materialized recursive CTE.
+      let joinCteKey = join.table.toLowerAscii()
+      if materializedCtes.hasKey(joinCteKey):
+        rightPlan = Plan(kind: pkLiteralRows, table: join.table, alias: join.alias, rows: materializedCtes[joinCteKey])
+      else:
+        var joinIdxCol = ""
+        var joinIdxVal: Expr = nil
+        if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
+          let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
+          if isSome(idxOpt):
+            rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
+        if rightPlan == nil:
+          rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
     base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
     if join.alias.len > 0:
       available.incl(join.alias)
@@ -551,4 +591,9 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
 proc plan*(catalog: Catalog, stmt: Statement): Result[Plan] =
   if stmt.kind == skSelect:
     return ok(planSelect(catalog, stmt))
+  ok(Plan(kind: pkStatement, stmt: stmt))
+
+proc plan*(catalog: Catalog, stmt: Statement, materializedCtes: Table[string, seq[seq[(string, Value)]]]): Result[Plan] =
+  if stmt.kind == skSelect:
+    return ok(planSelect(catalog, stmt, materializedCtes))
   ok(Plan(kind: pkStatement, stmt: stmt))

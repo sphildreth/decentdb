@@ -429,15 +429,62 @@ suite "Scalar & Aggregate Functions (issue #37)":
     check splitRow(res.value[0])[0] == "olleh"
     discard closeDb(db)
 
-  # Note: DISTINCT aggregates require libpg_query to expose the agg_distinct flag
-  # Currently libpg_query doesn't expose this flag in an accessible format
-  # Parser/binder support is added but execution won't work until this is resolved
+  # ── DISTINCT aggregates ──────────────────────────────────
 
-  # test "COUNT(DISTINCT) returns unique count":  # TODO: enable when libpg_query exposes agg_distinct
-  # test "AVG(DISTINCT) computes average of unique values":
-  # test "SUM(DISTINCT) computes sum of unique values":
-  # test "COUNT(DISTINCT) with NULL":
-  # test "COUNT(DISTINCT) on empty set":
+  test "COUNT(DISTINCT) returns unique count":
+    let db = openDb(makeTempDb("test_count_distinct.ddb")).value
+    discard execSql(db, "CREATE TABLE td (id INTEGER PRIMARY KEY, val INTEGER)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (1, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (2, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (3, 20)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (4, 20)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (5, 30)")
+    let res = execSql(db, "SELECT COUNT(DISTINCT val) FROM td")
+    check res.ok
+    check res.value == @["3"]
+    discard closeDb(db)
+
+  test "SUM(DISTINCT) returns sum of unique values":
+    let db = openDb(makeTempDb("test_sum_distinct.ddb")).value
+    discard execSql(db, "CREATE TABLE td (id INTEGER PRIMARY KEY, val INTEGER)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (1, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (2, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (3, 20)")
+    let res = execSql(db, "SELECT SUM(DISTINCT val) FROM td")
+    check res.ok
+    check res.value == @["30"]
+    discard closeDb(db)
+
+  test "AVG(DISTINCT) returns average of unique values":
+    let db = openDb(makeTempDb("test_avg_distinct.ddb")).value
+    discard execSql(db, "CREATE TABLE td (id INTEGER PRIMARY KEY, val INTEGER)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (1, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (2, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (3, 20)")
+    let res = execSql(db, "SELECT AVG(DISTINCT val) FROM td")
+    check res.ok
+    check res.value == @["15.0"]
+    discard closeDb(db)
+
+  test "COUNT(DISTINCT) with NULLs excludes NULLs":
+    let db = openDb(makeTempDb("test_count_distinct_null.ddb")).value
+    discard execSql(db, "CREATE TABLE td (id INTEGER PRIMARY KEY, val INTEGER)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (1, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (2, NULL)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (3, 10)")
+    discard execSql(db, "INSERT INTO td (id, val) VALUES (4, NULL)")
+    let res = execSql(db, "SELECT COUNT(DISTINCT val) FROM td")
+    check res.ok
+    check res.value == @["1"]
+    discard closeDb(db)
+
+  test "COUNT(DISTINCT) on empty set returns 0":
+    let db = openDb(makeTempDb("test_count_distinct_empty.ddb")).value
+    discard execSql(db, "CREATE TABLE td (id INTEGER PRIMARY KEY, val INTEGER)")
+    let res = execSql(db, "SELECT COUNT(DISTINCT val) FROM td")
+    check res.ok
+    check res.value == @["0"]
+    discard closeDb(db)
 
   # ── LOG two-argument form ────────────────────────────────
 
@@ -525,18 +572,22 @@ suite "Scalar & Aggregate Functions (issue #37)":
     discard closeDb(db)
 
   test "json_array creates JSON array":
-    # Note: JSON_ARRAY() is parsed by libpg_query as JsonArrayConstructor
-    # (SQL/JSON standard syntax) rather than a regular FuncCall.
-    # DecentDB does not yet handle this node type, so JSON_ARRAY is not
-    # usable via SQL. This test documents the current behavior.
     let db = openDb(makeTempDb("test_json_array.ddb")).value
     let res = execSql(db, "SELECT JSON_ARRAY(1, 2, 3)")
-    # Currently fails because the parser doesn't handle JsonArrayConstructor
-    check not res.ok
+    check res.ok
+    check res.value == @["[1,2,3]"]
     discard closeDb(db)
 
   test "json_array with NULL":
     let db = openDb(makeTempDb("test_json_array_null.ddb")).value
     let res = execSql(db, "SELECT JSON_ARRAY(1, NULL, 3)")
-    check not res.ok
+    check res.ok
+    check res.value == @["[1,null,3]"]
+    discard closeDb(db)
+
+  test "json_array empty":
+    let db = openDb(makeTempDb("test_json_array_empty.ddb")).value
+    let res = execSql(db, "SELECT JSON_ARRAY()")
+    check res.ok
+    check res.value == @["[]"]
     discard closeDb(db)

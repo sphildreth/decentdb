@@ -249,6 +249,7 @@ type Statement* = ref object
     cteNames*: seq[string]
     cteColumns*: seq[seq[string]]
     cteQueries*: seq[Statement]
+    cteRecursive*: seq[bool]  # per-CTE recursive flag (WITH RECURSIVE)
     setOpKind*: SetOpKind
     setOpLeft*: Statement
     setOpRight*: Statement
@@ -784,6 +785,21 @@ proc parseExtract(node: JsonNode): Result[Expr] =
     return err[Expr](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
   ok(Expr(kind: ekExtract, extractField: fieldStr, extractSource: sourceRes.value))
 
+proc parseJsonArrayConstructor(node: JsonNode): Result[Expr] =
+  var args: seq[Expr] = @[]
+  let exprsNode = nodeGet(node, "exprs")
+  if exprsNode.kind == JArray:
+    for item in exprsNode:
+      # Each element is a JsonValueExpr with a raw_expr inside
+      var rawNode = item
+      if nodeHas(item, "JsonValueExpr"):
+        rawNode = nodeGet(item["JsonValueExpr"], "raw_expr")
+      let argRes = parseExprNode(rawNode)
+      if not argRes.ok:
+        return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+      args.add(argRes.value)
+  ok(Expr(kind: ekFunc, funcName: "JSON_ARRAY", args: args, isStar: false))
+
 proc parseExprNode(node: JsonNode): Result[Expr] =
   if node.kind == JObject:
     if nodeHas(node, "A_Const"):
@@ -812,6 +828,8 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseSqlValueFunction(node["SQLValueFunction"])
     if nodeHas(node, "Extract"):
       return parseExtract(node["Extract"])
+    if nodeHas(node, "JsonArrayConstructor"):
+      return parseJsonArrayConstructor(node["JsonArrayConstructor"])
   err[Expr](ERR_SQL, "Unsupported expression node: " & $node)
 
 proc unwrapRangeVar(node: JsonNode): JsonNode =
@@ -918,24 +936,24 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
 
-proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq[Statement])] =
+proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq[Statement], seq[bool])] =
   var cteNames: seq[string] = @[]
   var cteColumns: seq[seq[string]] = @[]
   var cteQueries: seq[Statement] = @[]
+  var cteRecursiveFlags: seq[bool] = @[]
   if node.kind != JObject:
-    return ok((cteNames, cteColumns, cteQueries))
-  if nodeHas(node, "recursive") and node["recursive"].kind == JBool and node["recursive"].getBool:
-    return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "WITH RECURSIVE is not supported in 0.x")
+    return ok((cteNames, cteColumns, cteQueries, cteRecursiveFlags))
+  let isRecursive = nodeHas(node, "recursive") and node["recursive"].kind == JBool and node["recursive"].getBool
   let cteNodes = nodeGet(node, "ctes")
   if cteNodes.kind != JArray:
-    return ok((cteNames, cteColumns, cteQueries))
+    return ok((cteNames, cteColumns, cteQueries, cteRecursiveFlags))
   for entry in cteNodes:
     if not nodeHas(entry, "CommonTableExpr"):
       continue
     let cteNode = entry["CommonTableExpr"]
     let cteName = nodeGet(cteNode, "ctename").getStr
     if cteName.len == 0:
-      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE name is required")
+      return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](ERR_SQL, "CTE name is required")
 
     var columns: seq[string] = @[]
     let aliasCols = nodeGet(cteNode, "aliascolnames")
@@ -943,24 +961,26 @@ proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq
       for colNode in aliasCols:
         let colName = nodeString(colNode)
         if colName.len == 0:
-          return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "Invalid CTE column name", cteName)
+          return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](ERR_SQL, "Invalid CTE column name", cteName)
         columns.add(colName)
 
     let queryRes = parseStatementNode(nodeGet(cteNode, "ctequery"))
     if not queryRes.ok:
-      return err[(seq[string], seq[seq[string]], seq[Statement])](queryRes.err.code, queryRes.err.message, queryRes.err.context)
+      return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](queryRes.err.code, queryRes.err.message, queryRes.err.context)
     if queryRes.value.kind != skSelect:
-      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE query must be SELECT", cteName)
+      return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](ERR_SQL, "CTE query must be SELECT", cteName)
 
     cteNames.add(cteName)
     cteColumns.add(columns)
     cteQueries.add(queryRes.value)
-  ok((cteNames, cteColumns, cteQueries))
+    cteRecursiveFlags.add(isRecursive)
+  ok((cteNames, cteColumns, cteQueries, cteRecursiveFlags))
 
 proc parseSelectStmt(node: JsonNode): Result[Statement] =
   var cteNames: seq[string] = @[]
   var cteColumns: seq[seq[string]] = @[]
   var cteQueries: seq[Statement] = @[]
+  var cteRecursiveFlags: seq[bool] = @[]
   if nodeHas(node, "withClause"):
     let cteRes = parseWithClause(node["withClause"])
     if not cteRes.ok:
@@ -968,6 +988,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     cteNames = cteRes.value[0]
     cteColumns = cteRes.value[1]
     cteQueries = cteRes.value[2]
+    cteRecursiveFlags = cteRes.value[3]
 
   let setOp = nodeStringOr(node, "op", "SETOP_NONE")
   if setOp != "SETOP_NONE":
@@ -995,6 +1016,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       cteNames: cteNames,
       cteColumns: cteColumns,
       cteQueries: cteQueries,
+      cteRecursive: cteRecursiveFlags,
       setOpKind: parsedSetOpKind,
       setOpLeft: leftRes.value,
       setOpRight: rightRes.value,
@@ -1102,6 +1124,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     cteNames: cteNames,
     cteColumns: cteColumns,
     cteQueries: cteQueries,
+    cteRecursive: cteRecursiveFlags,
     setOpKind: sokNone,
     setOpLeft: nil,
     setOpRight: nil,
@@ -2200,6 +2223,7 @@ proc parseSql*(sql: string): Result[SqlAst] =
       cteNames: @[],
       cteColumns: @[],
       cteQueries: @[],
+      cteRecursive: @[],
       setOpKind: sokNone,
       setOpLeft: nil,
       setOpRight: nil,

@@ -1079,7 +1079,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
-  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetIntersectAll, pkSetExcept, pkSetExceptAll, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement, pkSubqueryScan:
+  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetIntersectAll, pkSetExcept, pkSetExceptAll, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement, pkSubqueryScan, pkLiteralRows:
     materialize()
 
 proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
@@ -1858,7 +1858,7 @@ proc substituteCorrelatedExpr(expr: Expr, innerTables: seq[string], row: Row): E
     var newArgs: seq[Expr] = @[]
     for a in expr.args:
       newArgs.add(substituteCorrelatedExpr(a, innerTables, row))
-    return Expr(kind: ekFunc, funcName: expr.funcName, args: newArgs, isStar: expr.isStar)
+    return Expr(kind: ekFunc, funcName: expr.funcName, args: newArgs, isStar: expr.isStar, isDistinct: expr.isDistinct)
   of ekInList:
     var newList: seq[Expr] = @[]
     for item in expr.inList:
@@ -1906,6 +1906,7 @@ proc substituteCorrelatedStmt(stmt: Statement, innerTables: seq[string], row: Ro
     cteNames: stmt.cteNames,
     cteColumns: stmt.cteColumns,
     cteQueries: stmt.cteQueries,
+    cteRecursive: stmt.cteRecursive,
     setOpKind: stmt.setOpKind,
     setOpLeft: stmt.setOpLeft,
     setOpRight: stmt.setOpRight,
@@ -4060,7 +4061,7 @@ proc substituteAggResult(expr: Expr, aggValues: Table[int, Value], aggIdx: var i
     var newArgs: seq[Expr] = @[]
     for a in expr.args:
       newArgs.add(substituteAggResult(a, aggValues, aggIdx))
-    return Expr(kind: ekFunc, funcName: expr.funcName, args: newArgs, isStar: expr.isStar)
+    return Expr(kind: ekFunc, funcName: expr.funcName, args: newArgs, isStar: expr.isStar, isDistinct: expr.isDistinct)
   of ekBinary:
     return Expr(kind: ekBinary, op: expr.op,
       left: substituteAggResult(expr.left, aggValues, aggIdx),
@@ -4938,6 +4939,17 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         let baseName = if dotIdx >= 0: colName[dotIdx + 1 .. ^1] else: colName
         cols[i] = prefix & "." & baseName
       rows.add(makeRow(cols, r.values, r.rowid))
+    return ok(rows)
+  of pkLiteralRows:
+    let prefix = if plan.alias.len > 0: plan.alias else: plan.table
+    var rows: seq[Row] = @[]
+    for rowData in plan.rows:
+      var cols: seq[string] = @[]
+      var vals: seq[Value] = @[]
+      for (colName, val) in rowData:
+        cols.add(prefix & "." & colName)
+        vals.add(val)
+      rows.add(makeRow(cols, vals, 0))
     return ok(rows)
   of pkUnionDistinct:
     let leftRes = execPlan(pager, catalog, plan.left, params)

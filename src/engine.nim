@@ -2058,6 +2058,94 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
 # Forward declaration
 proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil, updateProfile: UpdateWriteProfile = UpdateWriteProfile()): Result[int64]
 
+const MaxRecursiveCteIterations = 1000
+
+proc materializeRecursiveCtes(
+  pager: Pager,
+  catalog: Catalog,
+  bound: Statement,
+  params: seq[Value]
+): Result[Table[string, seq[seq[(string, Value)]]]] =
+  ## Execute any recursive CTEs on the bound statement and return
+  ## materialized row data keyed by lowercased CTE name.
+  var cteData = initTable[string, seq[seq[(string, Value)]]]()
+  for i, isRec in bound.cteRecursive:
+    if not isRec:
+      continue
+    let cteName = bound.cteNames[i]
+    let cteColumns = if i < bound.cteColumns.len: bound.cteColumns[i] else: @[]
+    let cteQuery = bound.cteQueries[i]
+    if cteQuery == nil or cteQuery.setOpKind != sokUnionAll:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        ERR_SQL, "WITH RECURSIVE requires UNION ALL", cteName)
+    let anchor = cteQuery.setOpLeft
+    let recursive = cteQuery.setOpRight
+    if anchor == nil or recursive == nil:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        ERR_SQL, "WITH RECURSIVE requires anchor and recursive terms", cteName)
+
+    # Execute anchor term.
+    let anchorPlan = plan(catalog, anchor, cteData)
+    if not anchorPlan.ok:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        anchorPlan.err.code, anchorPlan.err.message, anchorPlan.err.context)
+    let anchorRes = execPlan(pager, catalog, anchorPlan.value, params)
+    if not anchorRes.ok:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        anchorRes.err.code, anchorRes.err.message, anchorRes.err.context)
+
+    # Convert anchor rows into (colName, value) pairs.
+    var allRows: seq[seq[(string, Value)]] = @[]
+    for row in anchorRes.value:
+      var rowData: seq[(string, Value)] = @[]
+      for ci, col in row.columns:
+        # Use CTE-declared column names if provided, else strip prefix.
+        let baseName =
+          if ci < cteColumns.len: cteColumns[ci]
+          else:
+            let dotIdx = col.find('.')
+            if dotIdx >= 0: col[dotIdx + 1 .. ^1] else: col
+        rowData.add((baseName, row.values[ci]))
+      allRows.add(rowData)
+
+    # Iterative fixpoint: execute recursive term until no new rows.
+    var workingRows = allRows
+    var iteration = 0
+    while workingRows.len > 0 and iteration < MaxRecursiveCteIterations:
+      iteration.inc
+      # Make current working rows available under the CTE name.
+      let cteKey = cteName.toLowerAscii()
+      cteData[cteKey] = workingRows
+
+      let recPlan = plan(catalog, recursive, cteData)
+      if not recPlan.ok:
+        return err[Table[string, seq[seq[(string, Value)]]]](
+          recPlan.err.code, recPlan.err.message, recPlan.err.context)
+      let recRes = execPlan(pager, catalog, recPlan.value, params)
+      if not recRes.ok:
+        return err[Table[string, seq[seq[(string, Value)]]]](
+          recRes.err.code, recRes.err.message, recRes.err.context)
+
+      var newRows: seq[seq[(string, Value)]] = @[]
+      for row in recRes.value:
+        var rowData: seq[(string, Value)] = @[]
+        for ci, col in row.columns:
+          let baseName =
+            if ci < cteColumns.len: cteColumns[ci]
+            else:
+              let dotIdx = col.find('.')
+              if dotIdx >= 0: col[dotIdx + 1 .. ^1] else: col
+          rowData.add((baseName, row.values[ci]))
+        newRows.add(rowData)
+
+      for r in newRows:
+        allRows.add(r)
+      workingRows = newRows
+
+    # Store the complete materialized CTE under its name.
+    cteData[cteName.toLowerAscii()] = allRows
+  ok(cteData)
+
 const MaxTriggerExecutionDepth = 16
 var gTriggerExecutionDepth {.threadvar.}: int
 
@@ -2354,10 +2442,23 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       boundStatements.add(bindRes.value)
     for bound in boundStatements:
       if bound.kind == skSelect:
-        let planRes = plan(db.catalog, bound)
-        if not planRes.ok:
-          return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
-        cachedPlans.add(planRes.value)
+        # Materialize any recursive CTEs before planning.
+        var hasRecCte = false
+        for r in bound.cteRecursive:
+          if r: hasRecCte = true; break
+        if hasRecCte:
+          let cteRes = materializeRecursiveCtes(db.pager, db.catalog, bound, params)
+          if not cteRes.ok:
+            return err[seq[string]](cteRes.err.code, cteRes.err.message, cteRes.err.context)
+          let planRes = plan(db.catalog, bound, cteRes.value)
+          if not planRes.ok:
+            return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+          cachedPlans.add(planRes.value)
+        else:
+          let planRes = plan(db.catalog, bound)
+          if not planRes.ok:
+            return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+          cachedPlans.add(planRes.value)
       elif bound.kind == skExplain:
         # For EXPLAIN, we plan the inner statement if it is a SELECT.
         # If it's not a SELECT, we'll error at execution time, so we store nil here.
@@ -2370,7 +2471,14 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           cachedPlans.add(nil)
       else:
         cachedPlans.add(nil)
-    rememberSqlCache(sqlText, boundStatements, cachedPlans)
+    # Skip caching for recursive CTE queries (materialized data is baked into plan).
+    var hasAnyCteRecursive = false
+    for bound in boundStatements:
+      if bound.kind == skSelect:
+        for r in bound.cteRecursive:
+          if r: hasAnyCteRecursive = true; break
+    if not hasAnyCteRecursive:
+      rememberSqlCache(sqlText, boundStatements, cachedPlans)
     let t1 = getMonoTime()
     if sqlText.contains("count(*)"):
       stderr.writeLine("Plan: " & $((t1 - t0).inNanoseconds.float / 1000.0) & "us")
