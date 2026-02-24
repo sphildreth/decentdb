@@ -15,6 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL Engine**: String scalar functions `INSTR(str, substr)`, `CHR(n)`, and `HEX(val)` — `INSTR` returns 1-based position (0 if not found), `CHR` converts ASCII code point to character (PostgreSQL syntax), `HEX` encodes integers/text/blobs as uppercase hexadecimal. See issue #37.
 - **SQL Engine**: `%` modulo binary operator for INT64, FLOAT64, and DECIMAL types — complements the `MOD()` function with operator syntax (`SELECT 17 % 5`). Division-by-zero returns an error. See issue #37.
 - **SQL Engine**: `TOTAL(expr)` aggregate function — like `SUM` but always returns FLOAT64 and 0.0 for empty sets (never NULL), matching SQLite semantics. See issue #37.
+- **SQL Engine**: `DISTINCT` aggregate modifier — `COUNT(DISTINCT expr)`, `SUM(DISTINCT expr)`, and `AVG(DISTINCT expr)` now de-duplicate values per group before aggregating. NULL values are excluded. See issue #37.
+- **SQL Engine**: Window functions `FIRST_VALUE(expr)`, `LAST_VALUE(expr)`, and `NTH_VALUE(expr, n)` — extends window function coverage with value-access functions over ordered partitions. See issue #37.
+- **SQL Engine**: `json_array(...)` scalar function — constructs a JSON array from arguments. See issue #37.
+- **SQL Engine**: `json_each(json)` and `json_tree(json)` table-valued functions — `json_each` iterates top-level keys/values of a JSON object or array; `json_tree` recursively walks nested structures. Returns rows with `key`, `value`, `type` (and `path` for `json_tree`). See ADR-0111.
+- **SQL Engine**: `WITH RECURSIVE` common table expressions — supports recursive CTEs for hierarchical queries (tree traversal, graph walks, series generation). See ADR-0107.
+- **SQL Engine**: `RIGHT JOIN` (via LEFT JOIN rewrite), `FULL OUTER JOIN`, `CROSS JOIN`, and `NATURAL JOIN` support. See issue #37.
+- **SQL Engine**: `DISTINCT ON (expr, ...)` — keeps only the first row per distinct group, ordered by the specified expressions. PostgreSQL-compatible syntax. See issue #37.
+- **SQL Engine**: `DEFAULT` column constraint — columns with `DEFAULT` values are automatically populated when omitted from `INSERT` statements. See issue #37.
+- **SQL Engine**: Generated columns (`STORED`) — columns defined with `GENERATED ALWAYS AS (expr) STORED` are computed on INSERT/UPDATE and persisted. See ADR-0108.
+- **SQL Engine**: `CREATE TEMP TABLE` and `CREATE TEMP VIEW` — session-scoped temporary objects that are not persisted to disk. See ADR-0109.
+- **SQL Engine**: `SAVEPOINT name` / `RELEASE SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` — nested transaction control with page-level snapshot rollback. See ADR-0110.
+- **SQL Engine**: `OFFSET n ROWS FETCH FIRST n ROWS ONLY` (SQL:2008 syntax) as an alias for `LIMIT`/`OFFSET`. See issue #37.
+- **SQL Engine**: `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` accepted as synonyms for `BEGIN`. See issue #37.
+- **SQL Engine**: `DATE` and `TIMESTAMP` column type keywords accepted in DDL (mapped to TEXT storage). See issue #37.
 - **CLI**: `save-as` command — `decentdb save-as --db=:memory: --output=backup.ddb` exports a database snapshot to a new file.
 - **VFS**: `MemVfs` implementation — memory-backed Virtual File System with `seq[byte]` storage, per-file locking, and full VFS interface compliance (no `mmap` support).
 - **VFS**: `getFileSize`, `fileExists`, and `removeFile` methods added to the VFS interface, replacing direct OS calls in the engine, pager, and WAL.

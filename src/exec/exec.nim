@@ -1493,7 +1493,7 @@ proc strftimeFormat(input: string, format: string): string =
       return ""
     dt = dtRes.value
   
-  var result = ""
+  var fmtResult = ""
   var i = 0
   while i < format.len:
     case format[i]
@@ -1502,30 +1502,30 @@ proc strftimeFormat(input: string, format: string): string =
         inc i
         case format[i]
         of 'Y':
-          result.add(dt.format("yyyy"))
+          fmtResult.add(dt.format("yyyy"))
         of 'm':
-          result.add(dt.format("MM"))
+          fmtResult.add(dt.format("MM"))
         of 'd':
-          result.add(dt.format("dd"))
+          fmtResult.add(dt.format("dd"))
         of 'H':
-          result.add(dt.format("HH"))
+          fmtResult.add(dt.format("HH"))
         of 'M':
-          result.add(dt.format("mm"))
+          fmtResult.add(dt.format("mm"))
         of 'S':
-          result.add(dt.format("ss"))
+          fmtResult.add(dt.format("ss"))
         of 'w':
-          result.add($ord(dt.weekday))
+          fmtResult.add($ord(dt.weekday))
         of '%':
-          result.add("%")
+          fmtResult.add("%")
         else:
-          result.add("%")
-          result.add(format[i])
+          fmtResult.add("%")
+          fmtResult.add(format[i])
       else:
-        result.add("%")
+        fmtResult.add("%")
     else:
-      result.add(format[i])
+      fmtResult.add(format[i])
     inc i
-  result
+  fmtResult
 
 proc normalizeLikeEscapePattern(pattern: string, escapeText: string): Result[string] =
   var escapeChar = '\0'
@@ -2234,10 +2234,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
         return ok(Value(kind: vkNull))
       let formatStr = valueToString(formatRes.value)
       let valueStr = valueToString(valueRes.value)
-      let result = strftimeFormat(valueStr, formatStr)
-      if result.len == 0:
+      let fmtOut = strftimeFormat(valueStr, formatStr)
+      if fmtOut.len == 0:
         return err[Value](ERR_SQL, "Invalid strftime arguments")
-      return ok(textValue(result))
+      return ok(textValue(fmtOut))
 
     if name == "GEN_RANDOM_UUID":
       if expr.args.len != 0: return err[Value](ERR_SQL, "GEN_RANDOM_UUID takes no arguments")
@@ -2959,17 +2959,17 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
           if fill.len == 0: fill = " "
       if text.len >= targetLen:
         return ok(textValue(text[0 ..< targetLen]))
-      var result = ""
+      var padded = ""
       var remaining = targetLen - text.len
       while remaining > 0:
         if remaining >= fill.len:
-          result.add(fill)
+          padded.add(fill)
           remaining -= fill.len
         else:
-          result.add(fill[0 ..< remaining])
+          padded.add(fill[0 ..< remaining])
           remaining = 0
-      result.add(text)
-      return ok(textValue(result))
+      padded.add(text)
+      return ok(textValue(padded))
 
     if name == "RPAD":
       if expr.args.len < 2 or expr.args.len > 3:
@@ -3001,16 +3001,16 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
           if fill.len == 0: fill = " "
       if text.len >= targetLen:
         return ok(textValue(text[0 ..< targetLen]))
-      var result = text
+      var padded = text
       var remaining = targetLen - text.len
       while remaining > 0:
         if remaining >= fill.len:
-          result.add(fill)
+          padded.add(fill)
           remaining -= fill.len
         else:
-          result.add(fill[0 ..< remaining])
+          padded.add(fill[0 ..< remaining])
           remaining = 0
-      return ok(textValue(result))
+      return ok(textValue(padded))
 
     if name == "REPEAT":
       if expr.args.len != 2:
@@ -3032,10 +3032,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       else: return err[Value](ERR_SQL, "REPEAT requires numeric second argument")
       if n < 0: n = 0
       let text = valueToString(strRes.value)
-      var result = ""
+      var repeated = ""
       for i in 0 ..< n:
-        result.add(text)
-      return ok(textValue(result))
+        repeated.add(text)
+      return ok(textValue(repeated))
 
     if name == "REVERSE":
       if expr.args.len != 1:
@@ -3046,10 +3046,10 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if strRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
       let text = valueToString(strRes.value)
-      var result = ""
+      var reversed = ""
       for i in countdown(text.len - 1, 0):
-        result.add(text[i])
-      return ok(textValue(result))
+        reversed.add(text[i])
+      return ok(textValue(reversed))
 
     if name == "ABS":
       if expr.args.len != 1:

@@ -32,13 +32,14 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
-- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs, CTEs, subqueries, window functions, and rich types (UUID, DECIMAL)
+- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, DATE, TIMESTAMP)
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
 - 🔄 **Foreign Key Constraints** - Automatic indexing and referential integrity enforcement
-- 📊 **Rich Query Support** - Aggregates, subqueries (FROM, EXISTS, scalar), UPSERT, set operations, and scalar functions (string, math, UUID, JSON)
+- 📊 **Rich Query Support** - Aggregates (including DISTINCT), subqueries (FROM, EXISTS, scalar), UPSERT, set operations, generated columns, and scalar functions (string, math, UUID, JSON)
 - ⚡ **Triggers** - AFTER and INSTEAD OF triggers for complex logic
+- 💾 **Savepoints** - Nested transaction control with SAVEPOINT, RELEASE, and ROLLBACK TO
 - 🧠 **In-Memory Database** - Ephemeral `:memory:` databases for caching and testing, with `saveAs` to export snapshots to disk
 - 📦 **Single File Database** - Portable database stored in a single file
 - 🌐 **Cross-Platform** - Runs on Linux, macOS, and Windows
@@ -47,6 +48,7 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - 📁 **Import/Export Tools** - CSV and JSON data import/export capabilities
 - 🧩 **Parameterized Queries** - Safe parameter binding to prevent SQL injection
 - 🧾 **Transaction Support** - BEGIN, COMMIT, ROLLBACK for atomic operations
+- 📋 **Temporary Objects** - Session-scoped TEMP tables and views
 - 🏗️ **EF Core Provider** - Full Entity Framework Core integration with LINQ translation, migrations, and NodaTime support
 
 ## Languages/Toolkits/SDKs

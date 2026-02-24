@@ -568,7 +568,7 @@ Console.WriteLine($"\nDatabase Statistics:");
 Console.WriteLine($"  Artists: {artistCount}");
 Console.WriteLine($"  Albums: {albumCount}");
 Console.WriteLine($"  Tracks: {trackCount}");
-Console.WriteLine($"  Average Album Duration: {TimeSpan.FromSeconds(avgDuration):mm\\:ss}");
+Console.WriteLine($"  Average Album Duration: {(avgDuration > 0 && avgDuration < 1e9 ? TimeSpan.FromSeconds(avgDuration).ToString(@"mm\:ss") : "N/A")}");
 Console.WriteLine($"  Total Track Plays: {totalPlayCount:N0}");
 Console.WriteLine($"  Distinct Countries: {distinctCountries.Count}");
 Console.WriteLine($"  Distinct Genres: {distinctGenres.Count}");
