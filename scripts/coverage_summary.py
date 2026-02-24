@@ -53,8 +53,9 @@ def parse_gcov_file(path: Path) -> dict[int, tuple[bool, bool]]:
         if count == "#####":
             covered = False
         else:
+            # Strip trailing '*' (partial-branch marker) before parsing.
             try:
-                covered = int(count) > 0
+                covered = int(count.rstrip("*")) > 0
             except ValueError:
                 covered = False
         prev = lines.get(line_no)

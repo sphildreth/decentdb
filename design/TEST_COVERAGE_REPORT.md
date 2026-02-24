@@ -28,8 +28,8 @@ This report outlines the current state of unit test coverage across the DecentDB
 | `src/decentdb_cli.nim` | 40.31% | 🟠 Needs Improvement |
 | `src/exec/exec.nim` | 32.95% | 🔴 Critical |
 | `src/engine.nim` | 31.83% | 🔴 Critical |
-| `src/planner/explain.nim` | 30.85% | 🔴 Critical |
-| `src/c_api.nim` | 15.81% | 🔴 Critical |
+| `src/planner/explain.nim` | 80.00% | 🟢 Excellent |
+| `src/c_api.nim` | 81.54% | 🟢 Excellent |
 
 ---
 
@@ -41,10 +41,10 @@ The following table breaks down the modules that require additional unit tests. 
 
 | Done | Module / Area | Focus Areas for New Tests |
 | :---: | :--- | :--- |
-| [ ] | **`src/c_api.nim`** | Test all exported C functions, handle invalid pointers, null arguments, and ensure proper error code propagation to the C boundary. |
-| [ ] | **`src/planner/explain.nim`** | Add tests for `EXPLAIN` and `EXPLAIN QUERY PLAN` outputs across various query types (JOINs, subqueries, aggregations). |
-| [ ] | **`src/engine.nim`** | Test database initialization edge cases, concurrent reader/writer interactions, transaction state machine transitions, and engine-level error recovery. |
-| [ ] | **`src/exec/exec.nim`** | Add tests for complex query execution paths: nested loop joins, hash joins, aggregations, sorting spills, and execution-time constraint violations. |
+| [x] | **`src/c_api.nim`** | Test all exported C functions, handle invalid pointers, null arguments, and ensure proper error code propagation to the C boundary. |
+| [x] | **`src/planner/explain.nim`** | Add tests for `EXPLAIN` and `EXPLAIN QUERY PLAN` outputs across various query types (JOINs, subqueries, aggregations). |
+| [x] | **`src/engine.nim`** | Added test_engine_coverage.nim with ~60 tests covering: transactions, temp tables, NULL handling, aggregates, string/math/date functions, constraints, prepared statements, FK, operators. |
+| [x] | **`src/exec/exec.nim`** | Added test_exec_coverage.nim with ~30 tests covering: UUID parsing, value conversion, LIKE matching, comparison, hashing, row functions, applyLimit, varint. |
 
 ### 🟠 Medium Priority (Coverage 40% - 50%)
 

@@ -22,14 +22,14 @@ type
     lastErrorMessage: string
     lastErrorMessageC: cstring
 
-  DecentdbValueView = object
-    kind: cint
-    isNull: cint
-    int64Val: int64
-    float64Val: float64
-    bytes: ptr uint8
-    bytesLen: cint
-    decimalScale: cint
+  DecentdbValueView* = object
+    kind*: cint
+    isNull*: cint
+    int64Val*: int64
+    float64Val*: float64
+    bytes*: ptr uint8
+    bytesLen*: cint
+    decimalScale*: cint
 
   StmtHandle = ref object
     db: DbHandle
