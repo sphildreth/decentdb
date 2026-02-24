@@ -1,10 +1,16 @@
 import unittest
 import os
 import strutils
+import tables
+import options
 import engine
 import errors
 import c_api
 import record/record
+import planner/explain
+import planner/planner
+import sql/sql
+import catalog/catalog
 
 proc makeTempDb(name: string): string =
   let normalizedName =
@@ -335,4 +341,126 @@ suite "EXPLAIN Statement":
     check "Actual Rows: 2" in planText
     check "Actual Time:" in planText
     discard decentdb_close(h)
+
+  test "Direct renderExpr coverage":
+    check renderExpr(nil) == "<nil>"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svNull))) == "NULL"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 42))) == "42"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svFloat, floatVal: 3.14))) == "3.14"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svBool, boolVal: true))) == "true"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "foo'bar"))) == "'foo''bar'"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svBlob, blobVal: @[byte 0xDE, 0xAD, 0xBE, 0xEF]))) == "X'DEADBEEF'"
+    check renderExpr(Expr(kind: ekLiteral, value: SqlValue(kind: svParam, paramIndex: 1))) == "$1"
+    check renderExpr(Expr(kind: ekColumn, table: "t1", name: "c1")) == "t1.c1"
+    check renderExpr(Expr(kind: ekColumn, table: "", name: "c1")) == "c1"
+    check renderExpr(Expr(kind: ekBinary, op: "+", left: Expr(kind: ekColumn, name: "a"), right: Expr(kind: ekColumn, name: "b"))) == "(a + b)"
+    check renderExpr(Expr(kind: ekUnary, unOp: "NOT", expr: Expr(kind: ekColumn, name: "a"))) == "(NOT a)"
+    check renderExpr(Expr(kind: ekFunc, funcName: "COUNT", isStar: true)) == "COUNT(*)"
+    check renderExpr(Expr(kind: ekFunc, funcName: "COALESCE", args: @[Expr(kind: ekColumn, name: "a"), Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 0))], isStar: false)) == "COALESCE(a, 0)"
+    check renderExpr(Expr(kind: ekParam, index: 2)) == "$2"
+    check renderExpr(Expr(kind: ekInList, inExpr: Expr(kind: ekColumn, name: "a"), inList: @[Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)), Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 2))])) == "(a IN (1, 2))"
+    
+    let winExpr = Expr(kind: ekWindowRowNumber, windowFunc: "LAG", windowArgs: @[Expr(kind: ekColumn, name: "a")], windowPartitions: @[Expr(kind: ekColumn, name: "p")], windowOrderExprs: @[Expr(kind: ekColumn, name: "o")], windowOrderAsc: @[false])
+    check renderExpr(winExpr) == "LAG(a) OVER (PARTITION BY p ORDER BY o DESC)"
+    
+    let winExpr2 = Expr(kind: ekWindowRowNumber, windowFunc: "ROW_NUMBER", windowArgs: @[], windowPartitions: @[], windowOrderExprs: @[Expr(kind: ekColumn, name: "o")])
+    check renderExpr(winExpr2) == "ROW_NUMBER() OVER (ORDER BY o ASC)"
+
+    check renderExpr(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_TIMESTAMP")) == "CURRENT_TIMESTAMP"
+    check renderExpr(Expr(kind: ekExtract, extractField: "YEAR", extractSource: Expr(kind: ekColumn, name: "d"))) == "EXTRACT(YEAR FROM d)"
+
+  test "Direct explainPlanLines coverage":
+    let cat = Catalog()
+    cat.indexes = initTable[string, IndexMeta]()
+    
+    # Create an index for pkIndexSeek that starts with expr:
+    cat.indexes["idx1"] = IndexMeta(name: "idx1", table: "t1", kind: ikBtree, columns: @["expr:(a + 1)"])
+    
+    # Make a dummy plan to trigger all the lines
+    let p = Plan(kind: pkAppend,
+      left: Plan(kind: pkUnionDistinct,
+        left: Plan(kind: pkSetUnionDistinct,
+          left: Plan(kind: pkSetIntersect,
+            left: Plan(kind: pkSetIntersectAll,
+              left: Plan(kind: pkSetExcept, left: Plan(kind: pkOneRow), right: nil),
+              right: Plan(kind: pkSetExceptAll, left: Plan(kind: pkOneRow), right: nil)
+            ),
+            right: nil
+          ),
+          right: nil
+        ),
+        right: nil
+      ),
+      right: Plan(kind: pkSubqueryScan, alias: "sub",
+        subPlan: Plan(kind: pkLiteralRows, table: "t2", alias: "t2a", rows: @[])
+      )
+    )
+    discard explainPlanLines(cat, p)
+
+    let p2 = Plan(kind: pkFilter, predicate: Expr(kind: ekColumn, name: "a"),
+      left: Plan(kind: pkProject, projections: @[SelectItem(isStar: true), SelectItem(expr: Expr(kind: ekColumn, name: "b"), alias: "b2")],
+        left: Plan(kind: pkJoin, joinType: jtLeft, joinOn: Expr(kind: ekColumn, name: "a"),
+          left: Plan(kind: pkSort, orderBy: @[OrderItem(expr: Expr(kind: ekColumn, name: "a"), asc: true), OrderItem(expr: Expr(kind: ekColumn, name: "b"), asc: false)],
+            left: Plan(kind: pkAggregate, groupBy: @[Expr(kind: ekColumn, name: "a")], having: Expr(kind: ekColumn, name: "b"), projections: @[SelectItem(isStar: true)],
+              left: Plan(kind: pkLimit, limitParam: 1, offsetParam: 2,
+                left: Plan(kind: pkStatement, stmt: Statement(kind: skBegin))
+              )
+            )
+          ),
+          right: Plan(kind: pkTvfScan, tvfFunc: "generate_series", alias: "g")
+        )
+      )
+    )
+    discard explainPlanLines(cat, p2)
+
+    let p3 = Plan(kind: pkRowidSeek, table: "t", alias: "a", column: "id", valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)))
+    discard explainPlanLines(cat, p3)
+
+    let p4 = Plan(kind: pkIndexSeek, table: "t1", column: "expr:(a + 1)", valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)))
+    discard explainPlanLines(cat, p4)
+
+    let p4_miss = Plan(kind: pkIndexSeek, table: "t1", column: "expr:(a + 2)", valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)))
+    discard explainPlanLines(cat, p4_miss)
+
+    cat.indexes["idx2"] = IndexMeta(name: "idx2", table: "t1", kind: ikBtree, columns: @["normal_col"])
+    let p5 = Plan(kind: pkIndexSeek, table: "t1", column: "normal_col", valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)))
+    discard explainPlanLines(cat, p5)
+
+    let p5_miss = Plan(kind: pkIndexSeek, table: "t1", column: "missing_col", valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)))
+    discard explainPlanLines(cat, p5_miss)
+
+    cat.indexes["idx3"] = IndexMeta(name: "idx3", table: "t1", kind: ikTrigram, columns: @["txt_col"])
+    let p5_b = Plan(kind: pkTrigramSeek, table: "t1", column: "txt_col", likeExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "%abc%")), likeInsensitive: false)
+    discard explainPlanLines(cat, p5_b)
+
+    let p5_b_miss = Plan(kind: pkTrigramSeek, table: "t1", column: "missing_txt", likeExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svString, strVal: "%abc%")), likeInsensitive: true)
+    discard explainPlanLines(cat, p5_b_miss)
+
+    let p6 = Plan(kind: pkLimit, limit: 10, offset: 5, left: nil)
+    discard explainPlanLines(cat, p6)
+
+    let p7 = Plan(kind: pkJoin, joinType: jtInner, joinOn: Expr(kind: ekColumn, name: "a"), left: nil, right: nil)
+    discard explainPlanLines(cat, p7)
+
+    let p8 = Plan(kind: pkTableScan, table: "t1", alias: "t", left: nil)
+    discard explainPlanLines(cat, p8)
+
+    let p9 = Plan(kind: pkProject, projections: @[SelectItem(isStar: true)], left: nil)
+    discard explainPlanLines(cat, p9)
+
+    let p10 = Plan(kind: pkAggregate, groupBy: @[Expr(kind: ekColumn, name: "a"), Expr(kind: ekColumn, name: "b")], having: nil, projections: @[], left: nil)
+    discard explainPlanLines(cat, p10)
+
+    let p11 = Plan(kind: pkSort, orderBy: @[OrderItem(expr: Expr(kind: ekColumn, name: "a"), asc: true)], left: nil)
+    discard explainPlanLines(cat, p11)
+
+    let p12 = Plan(kind: pkLiteralRows, table: "t2", alias: "t2a", rows: @[@[("a", Value(kind: vkInt64, int64Val: 1))]])
+    discard explainPlanLines(cat, p12)
+
+    let p13 = Plan(kind: pkRowidSeek, table: "t", alias: "", column: "id", valueExpr: Expr(kind: ekLiteral, value: SqlValue(kind: svInt, intVal: 1)))
+    discard explainPlanLines(cat, p13)
+
+    let metrics = PlanMetrics(actualRows: 100, actualTimeMs: 12.345)
+    let p14 = Plan(kind: pkOneRow)
+    discard explainAnalyzePlanLines(cat, p14, metrics)
 

@@ -24,6 +24,7 @@ It captures:
 - Use DBeaver’s ER diagrams to visualize schema relationships.
 - Browse basic metadata (tables, columns, indexes) using standard JDBC metadata APIs.
 - Keep the first version minimal and robust.
+- **Ultimate Goal:** Upstream the integration to the official DBeaver repository so DecentDB is listed as a supported "Embedded" database on `dbeaver.com` and works out-of-the-box.
 
 ### Non-goals (initially)
 
@@ -162,6 +163,8 @@ This is the same model used by SQLite JDBC, DuckDB JDBC, and H2. The user does n
 **JDBC driver + DBeaver extension (first-class experience)**
 
 Ship a DBeaver plugin that pre-registers the driver and provides a DecentDB-specific SQL dialect. This makes DecentDB appear as a first-class database type in DBeaver's UI.
+
+*Long-term:* To achieve official listing on `dbeaver.com`, this plugin will eventually be submitted as a Pull Request to the upstream `dbeaver/dbeaver` repository, and the JDBC driver will be published to Maven Central.
 
 ---
 
@@ -792,6 +795,13 @@ Deliverable: Users can download and install the driver with clear documentation.
 - Value handlers for special types (UUID/BLOB)
 - Better error classification (unique constraint violations, FK violations)
 
+### Stage 6: Upstream to DBeaver (Official Support)
+
+To get DecentDB officially listed on `dbeaver.com` as a supported embedded database:
+- Publish the `decentdb-jdbc` driver to Maven Central (DBeaver requires this to auto-download drivers).
+- Submit a Pull Request to the `dbeaver/dbeaver` GitHub repository containing the `org.jkiss.dbeaver.ext.decentdb` plugin.
+- Work with DBeaver maintainers to get the PR merged. Once merged, DecentDB will be available out-of-the-box in all new DBeaver installations.
+
 ---
 
 ## 9) Testing plan
@@ -848,13 +858,12 @@ decentdb-jdbc-{version}.jar
 ├── com/decentdb/jdbc/*.class
 ├── META-INF/services/java.sql.Driver
 └── native/
-    ├── linux-x86_64/libdecentdb_jni.so
-    ├── macos-universal/libdecentdb_jni.dylib
-    └── windows-x86_64/decentdb_jni.dll
-```
+    ├── linux-x86_64/libdecentdb_jni.so for early access.
+   - Users download the JAR or extension ZIP directly from the releases page.
+   - Versioned releases with release notes.
 
-### 10.2 Distribution channels
-
+2. **Maven Central**: Required for official DBeaver support.
+   - DBeaver's driver manager dynamically downloads drivers using Maven coordinates. We *must* publish `com.decentdb:decentdb-jdbc` to Maven Central before we can upstream the plugin to DBeaver.
 1. **GitHub Releases**: Primary distribution point
    - Users download the JAR directly from the releases page
    - Versioned releases with release notes

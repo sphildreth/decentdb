@@ -97,3 +97,4 @@ bindings/dotnet/v
 
 src/engine
 src/vfs/os_vfs
+*.gcov
