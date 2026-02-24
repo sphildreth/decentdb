@@ -285,6 +285,8 @@ proc evalExpressionIndexExpr(table: TableMeta, values: seq[Value], expr: Expr): 
         return err[Value](ERR_SQL, "Expression index CAST target not supported in 0.x", expr.args[1].value.strVal)
       return castExpressionValue(argRes.value, targetRes.value.kind)
     err[Value](ERR_SQL, "Unsupported expression index function", fn)
+  of ekSqlValueFunction, ekExtract:
+    err[Value](ERR_SQL, "Unsupported expression index expression")
   else:
     err[Value](ERR_SQL, "Unsupported expression index expression")
 

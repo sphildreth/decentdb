@@ -32,6 +32,8 @@ type ExprKind* = enum
   ekParam
   ekInList
   ekWindowRowNumber
+  ekSqlValueFunction
+  ekExtract
 
 type Expr* = ref object
   case kind*: ExprKind
@@ -51,6 +53,7 @@ type Expr* = ref object
     funcName*: string
     args*: seq[Expr]
     isStar*: bool
+    isDistinct*: bool  # true for COUNT(DISTINCT x), AVG(DISTINCT x), etc.
   of ekParam:
     index*: int
   of ekInList:
@@ -62,6 +65,11 @@ type Expr* = ref object
     windowPartitions*: seq[Expr]
     windowOrderExprs*: seq[Expr]
     windowOrderAsc*: seq[bool]
+  of ekSqlValueFunction:
+    sqlValueFunc*: string         # "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "NOW"
+  of ekExtract:
+    extractField*: string         # "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"
+    extractSource*: Expr          # The source expression to extract from
 
 type ColumnDef* = object
   name*: string
@@ -78,6 +86,14 @@ type CheckConstraintDef* = object
   name*: string
   expr*: Expr
 
+type ForeignKeyConstraintDef* = object
+  name*: string
+  columns*: seq[string]
+  refTable*: string
+  refColumns*: seq[string]
+  refOnDelete*: string
+  refOnUpdate*: string
+
 type SqlIndexKind* = enum
   ikBtree
   ikTrigram
@@ -89,6 +105,8 @@ type OrderItem* = object
 type JoinType* = enum
   jtInner
   jtLeft
+  jtRight
+  jtFull
 
 type JoinClause* = object
   joinType*: JoinType
@@ -125,7 +143,9 @@ type SetOpKind* = enum
   sokUnionAll
   sokUnion
   sokIntersect
+  sokIntersectAll
   sokExcept
+  sokExceptAll
 
 const TriggerEventInsertMask* = 4
 const TriggerEventDeleteMask* = 8
@@ -173,6 +193,7 @@ type Statement* = ref object
     createTableName*: string
     columns*: seq[ColumnDef]
     createChecks*: seq[CheckConstraintDef]
+    foreignKeys*: seq[ForeignKeyConstraintDef]
   of skCreateIndex:
     indexName*: string
     indexTableName*: string
@@ -396,6 +417,17 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
     funcName = nodeString(nameParts[^1]).toUpperAscii()
   if funcName == "BTRIM":
     funcName = "TRIM"
+  if funcName == "EXTRACT":
+    if nodeHas(node, "args") and node["args"].kind == JArray and node["args"].len >= 2:
+      let fieldNode = node["args"][0]
+      let sourceNode = node["args"][1]
+      var fieldStr = ""
+      if nodeHas(fieldNode, "A_Const"):
+        fieldStr = nodeString(fieldNode["A_Const"]["sval"]).toUpperAscii()
+      let sourceRes = parseExprNode(sourceNode)
+      if not sourceRes.ok:
+        return err[Expr](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+      return ok(Expr(kind: ekExtract, extractField: fieldStr, extractSource: sourceRes.value))
   let argsNode = nodeGet(node, "args")
   var args: seq[Expr] = @[]
   if argsNode.kind == JArray:
@@ -407,7 +439,7 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
 
   let overNode = nodeGet(node, "over")
   if overNode.kind == JObject:
-    const windowFuncs = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD"]
+    const windowFuncs = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"]
     if funcName notin windowFuncs:
       return err[Expr](ERR_SQL, "Unsupported window function", funcName)
     if funcName in ["ROW_NUMBER", "RANK", "DENSE_RANK"]:
@@ -416,6 +448,12 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
     elif funcName in ["LAG", "LEAD"]:
       if args.len < 1 or args.len > 3:
         return err[Expr](ERR_SQL, funcName & " requires 1 to 3 arguments")
+    elif funcName in ["FIRST_VALUE", "LAST_VALUE"]:
+      if args.len != 1:
+        return err[Expr](ERR_SQL, funcName & " requires exactly 1 argument")
+    elif funcName == "NTH_VALUE":
+      if args.len != 2:
+        return err[Expr](ERR_SQL, "NTH_VALUE requires exactly 2 arguments")
 
     var partitions: seq[Expr] = @[]
     let partitionNode = nodeGet(overNode, "partitionClause")
@@ -450,7 +488,8 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
       windowOrderAsc: orderAsc
     ))
   let isStar = nodeHas(node, "agg_star") and node["agg_star"].getBool
-  ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar))
+  let isDistinct = nodeHas(node, "agg_distinct") and node["agg_distinct"].getBool
+  ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar, isDistinct: isDistinct))
 
 proc parseListItems(node: JsonNode): seq[JsonNode] =
   if node.kind == JArray:
@@ -722,6 +761,29 @@ proc parseNullTest(node: JsonNode): Result[Expr] =
     op = "IS NOT"
   ok(Expr(kind: ekBinary, op: op, left: argRes.value, right: Expr(kind: ekLiteral, value: SqlValue(kind: svNull))))
 
+proc parseSqlValueFunction(node: JsonNode): Result[Expr] =
+  let op = nodeStringOr(node, "op", "")
+  case op
+  of "SVFOP_CURRENT_TIMESTAMP":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_TIMESTAMP"))
+  of "SVFOP_CURRENT_DATE":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_DATE"))
+  of "SVFOP_CURRENT_TIME":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_TIME"))
+  of "SVFOP_NOW":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "NOW"))
+  else:
+    err[Expr](ERR_SQL, "Unsupported SQL value function", op)
+
+proc parseExtract(node: JsonNode): Result[Expr] =
+  let fieldNode = nodeGet(node, "field")
+  let fieldStr = nodeString(fieldNode).toUpperAscii()
+  let argNode = nodeGet(node, "arg")
+  let sourceRes = parseExprNode(argNode)
+  if not sourceRes.ok:
+    return err[Expr](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+  ok(Expr(kind: ekExtract, extractField: fieldStr, extractSource: sourceRes.value))
+
 proc parseExprNode(node: JsonNode): Result[Expr] =
   if node.kind == JObject:
     if nodeHas(node, "A_Const"):
@@ -746,6 +808,10 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseTypeCast(node["TypeCast"])
     if nodeHas(node, "NullTest"):
       return parseNullTest(node["NullTest"])
+    if nodeHas(node, "SQLValueFunction"):
+      return parseSqlValueFunction(node["SQLValueFunction"])
+    if nodeHas(node, "Extract"):
+      return parseExtract(node["Extract"])
   err[Expr](ERR_SQL, "Unsupported expression node: " & $node)
 
 proc unwrapRangeVar(node: JsonNode): JsonNode =
@@ -831,7 +897,16 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
           rightTable = rvRes.value[0]
           rightAlias = rvRes.value[1]
     let joinKindStr = if nodeHas(join, "jointype"): join["jointype"].getStr else: ""
-    let joinKind = if joinKindStr == "JOIN_LEFT": jtLeft else: jtInner
+    var joinKind: JoinType
+    case joinKindStr
+    of "JOIN_LEFT":
+      joinKind = jtLeft
+    of "JOIN_RIGHT":
+      joinKind = jtRight
+    of "JOIN_FULL":
+      joinKind = jtFull
+    else:
+      joinKind = jtInner
     var onExpr: Expr = nil
     if nodeHas(join, "quals"):
       let onRes = parseExprNode(join["quals"])
@@ -902,13 +977,9 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     of "SETOP_UNION":
       parsedSetOpKind = (if isAll: sokUnionAll else: sokUnion)
     of "SETOP_INTERSECT":
-      if isAll:
-        return err[Statement](ERR_SQL, "INTERSECT ALL is not supported in 0.x")
-      parsedSetOpKind = sokIntersect
+      parsedSetOpKind = (if isAll: sokIntersectAll else: sokIntersect)
     of "SETOP_EXCEPT":
-      if isAll:
-        return err[Statement](ERR_SQL, "EXCEPT ALL is not supported in 0.x")
-      parsedSetOpKind = sokExcept
+      parsedSetOpKind = (if isAll: sokExceptAll else: sokExcept)
     else:
       return err[Statement](ERR_SQL, "Set operation not supported in 0.x", setOp)
     if nodeHas(node, "sortClause") or nodeHas(node, "limitCount") or nodeHas(node, "limitOffset"):
@@ -1323,6 +1394,10 @@ proc exprToCanonicalSql*(expr: Expr): string =
       sqlText.add("ORDER BY " & orderSql.join(", "))
     sqlText.add(")")
     sqlText
+  of ekSqlValueFunction:
+    expr.sqlValueFunc
+  of ekExtract:
+    "EXTRACT(" & expr.extractField & " FROM " & exprToCanonicalSql(expr.extractSource) & ")"
 
 proc parseStandaloneExpr*(exprSql: string): Result[Expr] =
   let sqlText = "SELECT " & exprSql
@@ -1364,7 +1439,9 @@ proc selectToCanonicalSql(stmt: Statement): string =
         of sokUnionAll: " UNION ALL "
         of sokUnion: " UNION "
         of sokIntersect: " INTERSECT "
+        of sokIntersectAll: " INTERSECT ALL "
         of sokExcept: " EXCEPT "
+        of sokExceptAll: " EXCEPT ALL "
         else: " UNION ALL "
       parts.add(selectToCanonicalSql(stmt.setOpLeft) & opText & selectToCanonicalSql(stmt.setOpRight))
       return parts.join(" ")
@@ -1464,6 +1541,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
   var columns: seq[ColumnDef] = @[]
   var checks: seq[CheckConstraintDef] = @[]
+  var foreignKeys: seq[ForeignKeyConstraintDef] = @[]
   var tableConstraints: seq[JsonNode] = @[]
   let elts = nodeGet(node, "tableElts")
   if elts.kind == JArray:
@@ -1569,7 +1647,40 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         if not found:
           return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
     elif contype == "CONSTR_FOREIGN":
-      return err[Statement](ERR_SQL, "Table-level foreign keys not supported")
+      # Parse table-level foreign key constraint
+      var fkCols: seq[string] = @[]
+      let fkColsNode = nodeGet(constraint, "fk_attrs")
+      if fkColsNode.kind == JArray:
+        for colNode in fkColsNode:
+          fkCols.add(nodeString(colNode))
+      var refCols: seq[string] = @[]
+      let refColsNode = nodeGet(constraint, "pk_attrs")
+      if refColsNode.kind == JArray:
+        for colNode in refColsNode:
+          refCols.add(nodeString(colNode))
+      var refTableName = ""
+      if nodeHas(constraint, "pktable"):
+        let pkRes = parseRangeVar(constraint["pktable"])
+        if pkRes.ok:
+          refTableName = pkRes.value[0]
+      let delActionRes = parseFkActionCode(nodeGet(constraint, "fk_del_action").getStr)
+      if not delActionRes.ok:
+        return err[Statement](delActionRes.err.code, delActionRes.err.message, delActionRes.err.context)
+      let updActionRes = parseFkActionCode(nodeGet(constraint, "fk_upd_action").getStr)
+      if not updActionRes.ok:
+        return err[Statement](updActionRes.err.code, updActionRes.err.message, updActionRes.err.context)
+      if fkCols.len == 0 or refTableName.len == 0 or refCols.len == 0:
+        return err[Statement](ERR_SQL, "Invalid table-level foreign key constraint")
+      if fkCols.len != refCols.len:
+        return err[Statement](ERR_SQL, "Foreign key column count must match referenced column count")
+      foreignKeys.add(ForeignKeyConstraintDef(
+        name: nodeGet(constraint, "conname").getStr,
+        columns: fkCols,
+        refTable: refTableName,
+        refColumns: refCols,
+        refOnDelete: delActionRes.value,
+        refOnUpdate: updActionRes.value
+      ))
     elif contype == "CONSTR_CHECK":
       let rawExpr = nodeGet(constraint, "raw_expr")
       let exprRes = parseExprNode(rawExpr)
@@ -1579,7 +1690,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         name: nodeGet(constraint, "conname").getStr,
         expr: exprRes.value
       ))
-  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks))
+  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks, foreignKeys: foreignKeys))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let idxName = nodeGet(node, "idxname").getStr

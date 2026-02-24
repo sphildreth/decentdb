@@ -1079,7 +1079,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     )
     ok(c)
 
-  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetExcept, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement, pkSubqueryScan:
+  of pkTrigramSeek, pkUnionDistinct, pkSetUnionDistinct, pkSetIntersect, pkSetIntersectAll, pkSetExcept, pkSetExceptAll, pkAppend, pkJoin, pkSort, pkAggregate, pkStatement, pkSubqueryScan:
     materialize()
 
 proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): Result[Option[int64]] =
@@ -1466,6 +1466,66 @@ proc textValue(text: string): Value =
   for ch in text:
     bytes.add(byte(ch))
   Value(kind: vkText, bytes: bytes)
+
+proc tryParseDatetime(input: string): Result[DateTime] =
+  let formats = [
+    "yyyy-MM-dd HH:mm:ss",
+    "yyyy-MM-dd",
+    "HH:mm:ss",
+    "yyyy-MM-dd'T'HH:mm:ss",
+  ]
+  for fmt in formats:
+    try:
+      let dt = parse(input, fmt)
+      return ok(dt)
+    except ValueError:
+      discard
+  err[DateTime](ERR_SQL, "Cannot parse datetime", input)
+
+proc strftimeFormat(input: string, format: string): string =
+  var dt: DateTime
+  let inputLower = input.toLowerAscii()
+  if inputLower == "now":
+    dt = now()
+  else:
+    let dtRes = tryParseDatetime(input)
+    if not dtRes.ok:
+      return ""
+    dt = dtRes.value
+  
+  var result = ""
+  var i = 0
+  while i < format.len:
+    case format[i]
+    of '%':
+      if i + 1 < format.len:
+        inc i
+        case format[i]
+        of 'Y':
+          result.add(dt.format("yyyy"))
+        of 'm':
+          result.add(dt.format("MM"))
+        of 'd':
+          result.add(dt.format("dd"))
+        of 'H':
+          result.add(dt.format("HH"))
+        of 'M':
+          result.add(dt.format("mm"))
+        of 'S':
+          result.add(dt.format("ss"))
+        of 'w':
+          result.add($ord(dt.weekday))
+        of '%':
+          result.add("%")
+        else:
+          result.add("%")
+          result.add(format[i])
+      else:
+        result.add("%")
+    else:
+      result.add(format[i])
+    inc i
+  result
 
 proc normalizeLikeEscapePattern(pattern: string, escapeText: string): Result[string] =
   var escapeChar = '\0'
@@ -2032,6 +2092,64 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if not likeRes.ok:
         return err[Value](likeRes.err.code, likeRes.err.message, likeRes.err.context)
       return ok(Value(kind: vkBool, boolVal: likeRes.value))
+    of "->":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let jsonStr = valueToString(leftRes.value)
+      let pathStr = valueToString(rightRes.value)
+      try:
+        let node = parseJson(jsonStr)
+        var currentNode = node
+        if pathStr.startsWith("$"):
+          var segments = pathStr[1..^1].split(".")
+          for seg in segments:
+            if currentNode.kind == JObject and currentNode.hasKey(seg):
+              currentNode = currentNode[seg]
+            else:
+              return ok(Value(kind: vkNull))
+        else:
+          if currentNode.kind == JObject and currentNode.hasKey(pathStr):
+            currentNode = currentNode[pathStr]
+          else:
+            return ok(Value(kind: vkNull))
+        return ok(textValue($currentNode))
+      except JsonParsingError:
+        return ok(Value(kind: vkNull))
+    of "->>":
+      if leftRes.value.kind == vkNull or rightRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let jsonStr = valueToString(leftRes.value)
+      let pathStr = valueToString(rightRes.value)
+      try:
+        let node = parseJson(jsonStr)
+        var currentNode = node
+        if pathStr.startsWith("$"):
+          var segments = pathStr[1..^1].split(".")
+          for seg in segments:
+            if currentNode.kind == JObject and currentNode.hasKey(seg):
+              currentNode = currentNode[seg]
+            else:
+              return ok(Value(kind: vkNull))
+        else:
+          if currentNode.kind == JObject and currentNode.hasKey(pathStr):
+            currentNode = currentNode[pathStr]
+          else:
+            return ok(Value(kind: vkNull))
+        case currentNode.kind
+        of JString:
+          return ok(textValue(currentNode.getStr))
+        of JInt:
+          return ok(textValue($currentNode.getInt))
+        of JFloat:
+          return ok(textValue($currentNode.getFloat))
+        of JBool:
+          return ok(textValue(if currentNode.getBool: "true" else: "false"))
+        of JNull:
+          return ok(textValue("null"))
+        else:
+          return ok(textValue($currentNode))
+      except JsonParsingError:
+        return ok(Value(kind: vkNull))
     of "IS":
        if rightRes.value.kind == vkNull:
          return ok(Value(kind: vkBool, boolVal: leftRes.value.kind == vkNull))
@@ -2048,6 +2166,77 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     let name = expr.funcName.toUpperAscii()
     if name in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
       return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
+
+    if name in ["NOW", "CURRENT_TIMESTAMP"]:
+      let now = now()
+      let formatted = now.format("yyyy-MM-dd HH:mm:ss")
+      return ok(textValue(formatted))
+
+    if name == "CURRENT_DATE":
+      let now = now()
+      let formatted = now.format("yyyy-MM-dd")
+      return ok(textValue(formatted))
+
+    if name == "CURRENT_TIME":
+      let now = now()
+      let formatted = now.format("HH:mm:ss")
+      return ok(textValue(formatted))
+
+    if name == "DATE":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "date requires 1 or 2 arguments")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok: return argRes
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let inputStr = valueToString(argRes.value).toLowerAscii()
+      var dt: DateTime
+      if inputStr == "now":
+        dt = now()
+      else:
+        let dtRes = tryParseDatetime(inputStr)
+        if not dtRes.ok:
+          return err[Value](ERR_SQL, "Invalid date value", inputStr)
+        dt = dtRes.value
+      let formatted = dt.format("yyyy-MM-dd")
+      return ok(textValue(formatted))
+
+    if name == "DATETIME":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "datetime requires 1 or 2 arguments")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok: return argRes
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let inputStr = valueToString(argRes.value).toLowerAscii()
+      var dt: DateTime
+      if inputStr == "now":
+        dt = now()
+      else:
+        let dtRes = tryParseDatetime(inputStr)
+        if not dtRes.ok:
+          return err[Value](ERR_SQL, "Invalid datetime value", inputStr)
+        dt = dtRes.value
+      let formatted = dt.format("yyyy-MM-dd HH:mm:ss")
+      return ok(textValue(formatted))
+
+    if name == "STRFTIME":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "strftime requires exactly 2 arguments")
+      let formatRes = evalExpr(row, expr.args[0], params)
+      if not formatRes.ok: return formatRes
+      if formatRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let valueRes = evalExpr(row, expr.args[1], params)
+      if not valueRes.ok: return valueRes
+      if valueRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let formatStr = valueToString(formatRes.value)
+      let valueStr = valueToString(valueRes.value)
+      let result = strftimeFormat(valueStr, formatStr)
+      if result.len == 0:
+        return err[Value](ERR_SQL, "Invalid strftime arguments")
+      return ok(textValue(result))
 
     if name == "GEN_RANDOM_UUID":
       if expr.args.len != 0: return err[Value](ERR_SQL, "GEN_RANDOM_UUID takes no arguments")
@@ -2466,6 +2655,92 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       except JsonParsingError:
         return ok(Value(kind: vkNull))
 
+    if name == "JSON_TYPE":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "json_type requires 1 or 2 arguments")
+      let jsonRes = evalExpr(row, expr.args[0], params)
+      if not jsonRes.ok:
+        return err[Value](jsonRes.err.code, jsonRes.err.message, jsonRes.err.context)
+      if jsonRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let jsonText = valueToString(jsonRes.value)
+      try:
+        var node = parseJson(jsonText)
+        if expr.args.len == 2:
+          let pathRes = evalExpr(row, expr.args[1], params)
+          if pathRes.value.kind == vkNull:
+            return ok(Value(kind: vkNull))
+          let path = valueToString(pathRes.value)
+          if path.startsWith("$"):
+            var segments = path[1..^1].split(".")
+            for seg in segments:
+              if node.kind == JObject and node.hasKey(seg):
+                node = node[seg]
+              else:
+                return ok(textValue("null"))
+        case node.kind
+        of JNull: return ok(textValue("null"))
+        of JBool: return ok(textValue("boolean"))
+        of JInt: return ok(textValue("integer"))
+        of JFloat: return ok(textValue("real"))
+        of JString: return ok(textValue("text"))
+        of JArray: return ok(textValue("array"))
+        of JObject: return ok(textValue("object"))
+      except JsonParsingError:
+        return ok(Value(kind: vkNull))
+
+    if name == "JSON_VALID":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "json_valid requires exactly 1 argument")
+      let jsonRes = evalExpr(row, expr.args[0], params)
+      if not jsonRes.ok:
+        return err[Value](jsonRes.err.code, jsonRes.err.message, jsonRes.err.context)
+      if jsonRes.value.kind == vkNull:
+        return ok(Value(kind: vkInt64, int64Val: 0))
+      let jsonText = valueToString(jsonRes.value)
+      try:
+        discard parseJson(jsonText)
+        return ok(Value(kind: vkInt64, int64Val: 1))
+      except JsonParsingError:
+        return ok(Value(kind: vkInt64, int64Val: 0))
+
+    if name == "JSON_OBJECT":
+      if expr.args.len mod 2 != 0:
+        return err[Value](ERR_SQL, "json_object requires even number of arguments")
+      var obj = newJObject()
+      var i = 0
+      while i < expr.args.len:
+        let keyRes = evalExpr(row, expr.args[i], params)
+        let valRes = evalExpr(row, expr.args[i + 1], params)
+        if keyRes.value.kind == vkNull or valRes.value.kind == vkNull:
+          return ok(Value(kind: vkNull))
+        let key = valueToString(keyRes.value)
+        let val = valueToString(valRes.value)
+        try:
+          obj[key] = newJString(val)
+        except JsonParsingError:
+          return ok(Value(kind: vkNull))
+        i += 2
+      return ok(textValue($obj))
+
+    if name == "JSON_ARRAY":
+      var arr = newJArray()
+      for arg in expr.args:
+        let res = evalExpr(row, arg, params)
+        if not res.ok:
+          return err[Value](res.err.code, res.err.message, res.err.context)
+        if res.value.kind == vkNull:
+          arr.add(newJNull())
+        elif res.value.kind == vkInt64:
+          arr.add(%* res.value.int64Val)
+        elif res.value.kind == vkFloat64:
+          arr.add(%* res.value.float64Val)
+        elif res.value.kind == vkBool:
+          arr.add(%* res.value.boolVal)
+        else:
+          arr.add(%* valueToString(res.value))
+      return ok(textValue($arr))
+
     if name == "PRINTF":
       if expr.args.len < 1:
         return err[Value](ERR_SQL, "PRINTF requires at least a format argument")
@@ -2558,6 +2833,222 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
         return ok(textValue(text[startIdx ..< endIdx]))
       else:
         return ok(textValue(text[startIdx ..< text.len]))
+
+    if name == "LTRIM":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "LTRIM requires 1 or 2 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var text = valueToString(strRes.value)
+      if expr.args.len == 2:
+        let charsRes = evalExpr(row, expr.args[1], params)
+        if not charsRes.ok:
+          return err[Value](charsRes.err.code, charsRes.err.message, charsRes.err.context)
+        if charsRes.value.kind != vkNull:
+          let chars = valueToString(charsRes.value)
+          var charSet: set[char] = {}
+          for c in chars:
+            charSet.incl(c)
+          text = text.strip(leading = true, chars = charSet)
+      else:
+        text = text.strip(leading = true)
+      return ok(textValue(text))
+
+    if name == "RTRIM":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "RTRIM requires 1 or 2 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var text = valueToString(strRes.value)
+      if expr.args.len == 2:
+        let charsRes = evalExpr(row, expr.args[1], params)
+        if not charsRes.ok:
+          return err[Value](charsRes.err.code, charsRes.err.message, charsRes.err.context)
+        if charsRes.value.kind != vkNull:
+          let chars = valueToString(charsRes.value)
+          var charSet: set[char] = {}
+          for c in chars:
+            charSet.incl(c)
+          text = text.strip(trailing = true, chars = charSet)
+      else:
+        text = text.strip(trailing = true)
+      return ok(textValue(text))
+
+    if name == "LEFT":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "LEFT requires exactly 2 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let nRes = evalExpr(row, expr.args[1], params)
+      if not nRes.ok:
+        return err[Value](nRes.err.code, nRes.err.message, nRes.err.context)
+      if nRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let text = valueToString(strRes.value)
+      var n = 0
+      case nRes.value.kind
+      of vkInt64: n = int(nRes.value.int64Val)
+      of vkFloat64: n = int(nRes.value.float64Val)
+      else: return err[Value](ERR_SQL, "LEFT requires numeric second argument")
+      if n < 0: n = text.len + n
+      if n <= 0: return ok(textValue(""))
+      if n >= text.len: return ok(textValue(text))
+      return ok(textValue(text[0 ..< n]))
+
+    if name == "RIGHT":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "RIGHT requires exactly 2 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let nRes = evalExpr(row, expr.args[1], params)
+      if not nRes.ok:
+        return err[Value](nRes.err.code, nRes.err.message, nRes.err.context)
+      if nRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let text = valueToString(strRes.value)
+      var n = 0
+      case nRes.value.kind
+      of vkInt64: n = int(nRes.value.int64Val)
+      of vkFloat64: n = int(nRes.value.float64Val)
+      else: return err[Value](ERR_SQL, "RIGHT requires numeric second argument")
+      if n < 0: n = text.len + n
+      if n <= 0: return ok(textValue(""))
+      if n >= text.len: return ok(textValue(text))
+      return ok(textValue(text[text.len - n ..< text.len]))
+
+    if name == "LPAD":
+      if expr.args.len < 2 or expr.args.len > 3:
+        return err[Value](ERR_SQL, "LPAD requires 2 or 3 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      let lenRes = evalExpr(row, expr.args[1], params)
+      if not lenRes.ok:
+        return err[Value](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+      if lenRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var targetLen = 0
+      case lenRes.value.kind
+      of vkInt64: targetLen = int(lenRes.value.int64Val)
+      of vkFloat64: targetLen = int(lenRes.value.float64Val)
+      else: return err[Value](ERR_SQL, "LPAD requires numeric second argument")
+      if targetLen < 0: targetLen = 0
+      var text = ""
+      if strRes.value.kind != vkNull:
+        text = valueToString(strRes.value)
+      var fill = " "
+      if expr.args.len == 3:
+        let fillRes = evalExpr(row, expr.args[2], params)
+        if not fillRes.ok:
+          return err[Value](fillRes.err.code, fillRes.err.message, fillRes.err.context)
+        if fillRes.value.kind != vkNull:
+          fill = valueToString(fillRes.value)
+          if fill.len == 0: fill = " "
+      if text.len >= targetLen:
+        return ok(textValue(text[0 ..< targetLen]))
+      var result = ""
+      var remaining = targetLen - text.len
+      while remaining > 0:
+        if remaining >= fill.len:
+          result.add(fill)
+          remaining -= fill.len
+        else:
+          result.add(fill[0 ..< remaining])
+          remaining = 0
+      result.add(text)
+      return ok(textValue(result))
+
+    if name == "RPAD":
+      if expr.args.len < 2 or expr.args.len > 3:
+        return err[Value](ERR_SQL, "RPAD requires 2 or 3 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      let lenRes = evalExpr(row, expr.args[1], params)
+      if not lenRes.ok:
+        return err[Value](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+      if lenRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var targetLen = 0
+      case lenRes.value.kind
+      of vkInt64: targetLen = int(lenRes.value.int64Val)
+      of vkFloat64: targetLen = int(lenRes.value.float64Val)
+      else: return err[Value](ERR_SQL, "RPAD requires numeric second argument")
+      if targetLen < 0: targetLen = 0
+      var text = ""
+      if strRes.value.kind != vkNull:
+        text = valueToString(strRes.value)
+      var fill = " "
+      if expr.args.len == 3:
+        let fillRes = evalExpr(row, expr.args[2], params)
+        if not fillRes.ok:
+          return err[Value](fillRes.err.code, fillRes.err.message, fillRes.err.context)
+        if fillRes.value.kind != vkNull:
+          fill = valueToString(fillRes.value)
+          if fill.len == 0: fill = " "
+      if text.len >= targetLen:
+        return ok(textValue(text[0 ..< targetLen]))
+      var result = text
+      var remaining = targetLen - text.len
+      while remaining > 0:
+        if remaining >= fill.len:
+          result.add(fill)
+          remaining -= fill.len
+        else:
+          result.add(fill[0 ..< remaining])
+          remaining = 0
+      return ok(textValue(result))
+
+    if name == "REPEAT":
+      if expr.args.len != 2:
+        return err[Value](ERR_SQL, "REPEAT requires exactly 2 arguments")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let nRes = evalExpr(row, expr.args[1], params)
+      if not nRes.ok:
+        return err[Value](nRes.err.code, nRes.err.message, nRes.err.context)
+      if nRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var n = 0
+      case nRes.value.kind
+      of vkInt64: n = int(nRes.value.int64Val)
+      of vkFloat64: n = int(nRes.value.float64Val)
+      else: return err[Value](ERR_SQL, "REPEAT requires numeric second argument")
+      if n < 0: n = 0
+      let text = valueToString(strRes.value)
+      var result = ""
+      for i in 0 ..< n:
+        result.add(text)
+      return ok(textValue(result))
+
+    if name == "REVERSE":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "REVERSE requires exactly one argument")
+      let strRes = evalExpr(row, expr.args[0], params)
+      if not strRes.ok:
+        return err[Value](strRes.err.code, strRes.err.message, strRes.err.context)
+      if strRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      let text = valueToString(strRes.value)
+      var result = ""
+      for i in countdown(text.len - 1, 0):
+        result.add(text[i])
+      return ok(textValue(result))
 
     if name == "ABS":
       if expr.args.len != 1:
@@ -2673,6 +3164,131 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if f < 0.0:
         return err[Value](ERR_SQL, "SQRT of negative number")
       return ok(Value(kind: vkFloat64, float64Val: sqrt(f)))
+
+    if name == "SIGN":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "SIGN requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var f: float64
+      case argRes.value.kind
+      of vkInt64:
+        let v = argRes.value.int64Val
+        if v > 0: return ok(Value(kind: vkInt64, int64Val: 1))
+        if v < 0: return ok(Value(kind: vkInt64, int64Val: -1))
+        return ok(Value(kind: vkInt64, int64Val: 0))
+      of vkFloat64:
+        f = argRes.value.float64Val
+      of vkDecimal:
+        f = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, "SIGN requires numeric argument")
+      if f > 0.0: return ok(Value(kind: vkInt64, int64Val: 1))
+      if f < 0.0: return ok(Value(kind: vkInt64, int64Val: -1))
+      return ok(Value(kind: vkInt64, int64Val: 0))
+
+    if name == "LN":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "LN requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var f: float64
+      case argRes.value.kind
+      of vkInt64: f = float64(argRes.value.int64Val)
+      of vkFloat64: f = argRes.value.float64Val
+      of vkDecimal:
+        f = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, "LN requires numeric argument")
+      if f <= 0.0:
+        return err[Value](ERR_SQL, "LN argument must be positive")
+      return ok(Value(kind: vkFloat64, float64Val: ln(f)))
+
+    if name == "LOG" or name == "LOG10":
+      if expr.args.len < 1 or expr.args.len > 2:
+        return err[Value](ERR_SQL, "LOG requires one or two arguments")
+      if expr.args.len == 2:
+        # LOG(base, x) — logarithm of x with given base
+        let baseRes = evalExpr(row, expr.args[0], params)
+        if not baseRes.ok:
+          return err[Value](baseRes.err.code, baseRes.err.message, baseRes.err.context)
+        let argRes = evalExpr(row, expr.args[1], params)
+        if not argRes.ok:
+          return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+        if baseRes.value.kind == vkNull or argRes.value.kind == vkNull:
+          return ok(Value(kind: vkNull))
+        var b, f: float64
+        case baseRes.value.kind
+        of vkInt64: b = float64(baseRes.value.int64Val)
+        of vkFloat64: b = baseRes.value.float64Val
+        of vkDecimal:
+          b = float64(baseRes.value.int64Val) / pow(10.0, float64(baseRes.value.decimalScale))
+        else:
+          return err[Value](ERR_SQL, "LOG base must be numeric")
+        case argRes.value.kind
+        of vkInt64: f = float64(argRes.value.int64Val)
+        of vkFloat64: f = argRes.value.float64Val
+        of vkDecimal:
+          f = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+        else:
+          return err[Value](ERR_SQL, "LOG argument must be numeric")
+        if b <= 0.0 or b == 1.0:
+          return err[Value](ERR_SQL, "LOG base must be positive and not equal to 1")
+        if f <= 0.0:
+          return err[Value](ERR_SQL, "LOG argument must be positive")
+        return ok(Value(kind: vkFloat64, float64Val: ln(f) / ln(b)))
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var f: float64
+      case argRes.value.kind
+      of vkInt64: f = float64(argRes.value.int64Val)
+      of vkFloat64: f = argRes.value.float64Val
+      of vkDecimal:
+        f = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, "LOG requires numeric argument")
+      if f <= 0.0:
+        return err[Value](ERR_SQL, "LOG argument must be positive")
+      return ok(Value(kind: vkFloat64, float64Val: log10(f)))
+
+    if name == "EXP":
+      if expr.args.len != 1:
+        return err[Value](ERR_SQL, "EXP requires exactly one argument")
+      let argRes = evalExpr(row, expr.args[0], params)
+      if not argRes.ok:
+        return err[Value](argRes.err.code, argRes.err.message, argRes.err.context)
+      if argRes.value.kind == vkNull:
+        return ok(Value(kind: vkNull))
+      var f: float64
+      case argRes.value.kind
+      of vkInt64: f = float64(argRes.value.int64Val)
+      of vkFloat64: f = argRes.value.float64Val
+      of vkDecimal:
+        f = float64(argRes.value.int64Val) / pow(10.0, float64(argRes.value.decimalScale))
+      else:
+        return err[Value](ERR_SQL, "EXP requires numeric argument")
+      return ok(Value(kind: vkFloat64, float64Val: exp(f)))
+
+    if name == "RANDOM":
+      if expr.args.len != 0:
+        return err[Value](ERR_SQL, "RANDOM takes no arguments")
+      var bytes = newSeq[byte](8)
+      if not urandom(bytes):
+        return err[Value](ERR_IO, "Failed to generate random number")
+      var ull: uint64 = 0
+      for i, b in bytes:
+        ull = (ull shl 8) or uint64(b)
+      let f = float64(ull) / float64(uint64.high)
+      return ok(Value(kind: vkFloat64, float64Val: f))
 
     if name in ["POWER", "POW"]:
       if expr.args.len != 2:
@@ -2894,6 +3510,51 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     return ok(Value(kind: vkBool, boolVal: false))
   of ekWindowRowNumber:
     return err[Value](ERR_SQL, "Window function must be evaluated in projection context")
+  of ekSqlValueFunction:
+    let funcName = expr.sqlValueFunc.toUpperAscii()
+    let now = now()
+    case funcName
+    of "NOW", "CURRENT_TIMESTAMP":
+      let dt = now
+      let formatted = dt.format("yyyy-MM-dd HH:mm:ss")
+      return ok(textValue(formatted))
+    of "CURRENT_DATE":
+      let dt = now
+      let formatted = dt.format("yyyy-MM-dd")
+      return ok(textValue(formatted))
+    of "CURRENT_TIME":
+      let dt = now
+      let formatted = dt.format("HH:mm:ss")
+      return ok(textValue(formatted))
+    else:
+      return err[Value](ERR_SQL, "Unsupported SQL value function", funcName)
+  of ekExtract:
+    let sourceRes = evalExpr(row, expr.extractSource, params)
+    if not sourceRes.ok:
+      return err[Value](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+    if sourceRes.value.kind == vkNull:
+      return ok(Value(kind: vkNull))
+    let inputStr = valueToString(sourceRes.value)
+    let field = expr.extractField.toUpperAscii()
+    let dtRes = tryParseDatetime(inputStr)
+    if not dtRes.ok:
+      return err[Value](ERR_SQL, "Invalid datetime for EXTRACT", inputStr)
+    let dt = dtRes.value
+    case field
+    of "YEAR":
+      return ok(Value(kind: vkInt64, int64Val: dt.year.int64))
+    of "MONTH":
+      return ok(Value(kind: vkInt64, int64Val: dt.month.int64))
+    of "DAY":
+      return ok(Value(kind: vkInt64, int64Val: dt.monthday.int64))
+    of "HOUR":
+      return ok(Value(kind: vkInt64, int64Val: dt.hour.int64))
+    of "MINUTE":
+      return ok(Value(kind: vkInt64, int64Val: dt.minute.int64))
+    of "SECOND":
+      return ok(Value(kind: vkInt64, int64Val: dt.second.int64))
+    else:
+      return err[Value](ERR_SQL, "Unsupported EXTRACT field", field)
 
 proc tableScanRows(pager: Pager, catalog: Catalog, tableName: string, alias: string): Result[seq[Row]] =
   let tableRes = catalog.getTable(tableName)
@@ -3230,6 +3891,77 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
         else:
           windowVals[rIdx] = defaultVal
 
+    elif wfunc == "FIRST_VALUE":
+      if wexpr.windowArgs.len != 1:
+        return err[seq[Row]](ERR_SQL, "FIRST_VALUE requires exactly 1 argument")
+      var partStart = 0
+      for pos in 0 ..< sortedIdx.len:
+        let rowIdx = sortedIdx[pos]
+        var newPartition = pos == 0
+        if not newPartition:
+          let prevRowIdx = sortedIdx[pos - 1]
+          for i in 0 ..< partitionVals[rowIdx].len:
+            if compareValues(partitionVals[rowIdx][i], partitionVals[prevRowIdx][i]) != 0:
+              newPartition = true
+              break
+        if newPartition:
+          partStart = pos
+        let firstRowIdx = sortedIdx[partStart]
+        let valRes = evalExpr(rows[firstRowIdx], wexpr.windowArgs[0], params)
+        if not valRes.ok:
+          return err[seq[Row]](valRes.err.code, valRes.err.message, valRes.err.context)
+        windowVals[rowIdx] = valRes.value
+
+    elif wfunc == "LAST_VALUE":
+      if wexpr.windowArgs.len != 1:
+        return err[seq[Row]](ERR_SQL, "LAST_VALUE requires exactly 1 argument")
+      # LAST_VALUE with default frame RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      # At each row, get the last value from partition start to current position
+      for pos in 0 ..< sortedIdx.len:
+        let rowIdx = sortedIdx[pos]
+        # Get the value at current position
+        let valRes = evalExpr(rows[rowIdx], wexpr.windowArgs[0], params)
+        if not valRes.ok:
+          return err[seq[Row]](valRes.err.code, valRes.err.message, valRes.err.context)
+        windowVals[rowIdx] = valRes.value
+
+    elif wfunc == "NTH_VALUE":
+      if wexpr.windowArgs.len != 2:
+        return err[seq[Row]](ERR_SQL, "NTH_VALUE requires exactly 2 arguments")
+      let nthLit = wexpr.windowArgs[1]
+      if nthLit.kind != ekLiteral or nthLit.value.kind != svInt:
+        return err[seq[Row]](ERR_SQL, "NTH_VALUE second argument must be an integer")
+      let nth = nthLit.value.intVal.int
+      if nth < 1:
+        return err[seq[Row]](ERR_SQL, "NTH_VALUE argument must be positive")
+      # NTH_VALUE - get nth value in the window frame (default: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+      # Frame is from partition start to current position (pos)
+      for pos in 0 ..< sortedIdx.len:
+        let rowIdx = sortedIdx[pos]
+        # Find partition start
+        var partStart = pos
+        for p in countdown(pos - 1, 0, 1):
+          var samePartition = true
+          for i in 0 ..< partitionVals[sortedIdx[pos]].len:
+            if compareValues(partitionVals[sortedIdx[p]][i], partitionVals[sortedIdx[pos]][i]) != 0:
+              samePartition = false
+              break
+          if samePartition:
+            partStart = p
+          else:
+            break
+        # Target position from partition start
+        let targetPos = partStart + nth - 1
+        # Check if target is within the window frame (partition start to current position)
+        if targetPos >= partStart and targetPos <= pos:
+          let targetRowIdx = sortedIdx[targetPos]
+          let valRes = evalExpr(rows[targetRowIdx], wexpr.windowArgs[0], params)
+          if not valRes.ok:
+            return err[seq[Row]](valRes.err.code, valRes.err.message, valRes.err.context)
+          windowVals[rowIdx] = valRes.value
+        else:
+          windowVals[rowIdx] = Value(kind: vkNull)
+
     windowValuesByItem[itemIdx] = windowVals
 
   var resultRows: seq[Row] = @[]
@@ -3252,6 +3984,9 @@ proc projectRows*(rows: seq[Row], items: seq[SelectItem], params: seq[Value]): R
                      of "DENSE_RANK": "dense_rank"
                      of "LAG": "lag"
                      of "LEAD": "lead"
+                     of "FIRST_VALUE": "first_value"
+                     of "LAST_VALUE": "last_value"
+                     of "NTH_VALUE": "nth_value"
                      else: "window"
         cols.add(name)
         vals.add(windowValuesByItem[itemIdx][rowIdx])
@@ -3277,6 +4012,7 @@ type AggState = object
   max: Value
   initialized: bool
   concatValues: seq[string]  # accumulated values for GROUP_CONCAT/STRING_AGG
+  distinctValues: seq[Value]  # accumulated distinct values for DISTINCT aggregates
 
 type AggSpec = object
   ## Describes one aggregate sub-expression found in the SELECT list.
@@ -3284,6 +4020,7 @@ type AggSpec = object
   argExpr: Expr  # nil for COUNT(*)
   separatorExpr: Expr  # second arg for GROUP_CONCAT/STRING_AGG
   itemIdx: int   # which SelectItem this belongs to
+  isDistinct: bool  # true for COUNT(DISTINCT x), etc.
 
 proc collectAggSpecs(items: seq[SelectItem]): seq[AggSpec] =
   ## Recursively find all aggregate function calls in select items.
@@ -3296,7 +4033,7 @@ proc collectAggSpecs(items: seq[SelectItem]): seq[AggSpec] =
       if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
         let arg = if expr.args.len > 0: expr.args[0] else: nil
         let sep = if expr.args.len > 1: expr.args[1] else: nil
-        specs.add(AggSpec(funcName: fn, argExpr: arg, separatorExpr: sep, itemIdx: itemIdx))
+        specs.add(AggSpec(funcName: fn, argExpr: arg, separatorExpr: sep, itemIdx: itemIdx, isDistinct: expr.isDistinct))
         return  # don't recurse into aggregate args
       for a in expr.args:
         walk(a, itemIdx)
@@ -3363,7 +4100,6 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
     
     groups.withValue(keyParts, states) do:
       for i, spec in aggSpecs:
-        states[i].count.inc
         if spec.funcName != "COUNT":
           if spec.argExpr != nil:
             let evalRes = evalExpr(row, spec.argExpr, params)
@@ -3371,6 +4107,17 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
               return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
             let val = evalRes.value
             if val.kind != vkNull:
+              # Handle DISTINCT: check if value already seen
+              var isNewDistinct = true
+              if spec.isDistinct:
+                for dval in states[i].distinctValues:
+                  if compareValues(dval, val) == 0:
+                    isNewDistinct = false
+                    break
+                if isNewDistinct:
+                  states[i].distinctValues.add(val)
+              if spec.isDistinct and not isNewDistinct:
+                continue  # Skip duplicate values for DISTINCT aggregates
               if spec.funcName in ["SUM", "AVG", "TOTAL"]:
                 let addVal = if val.kind == vkFloat64: val.float64Val else: float(val.int64Val)
                 states[i].sum += addVal
@@ -3385,6 +4132,24 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
               if spec.funcName in ["GROUP_CONCAT", "STRING_AGG"]:
                 states[i].concatValues.add(valueToString(val))
               states[i].initialized = true
+        else:
+          # COUNT - handle DISTINCT separately
+          if spec.argExpr != nil and spec.isDistinct:
+            let evalRes = evalExpr(row, spec.argExpr, params)
+            if not evalRes.ok:
+              return err[seq[Row]](evalRes.err.code, evalRes.err.message, evalRes.err.context)
+            let val = evalRes.value
+            if val.kind != vkNull:
+              var isNewDistinct = true
+              for dval in states[i].distinctValues:
+                if compareValues(dval, val) == 0:
+                  isNewDistinct = false
+                  break
+              if isNewDistinct:
+                states[i].distinctValues.add(val)
+                states[i].count.inc
+          else:
+            states[i].count.inc
 
   
   if rows.len == 0 and groupBy.len == 0:
@@ -3403,7 +4168,8 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
       let state = states[i]
       case spec.funcName
       of "COUNT":
-        aggValues[i] = Value(kind: vkInt64, int64Val: state.count)
+        let cnt = if spec.isDistinct: state.distinctValues.len else: state.count
+        aggValues[i] = Value(kind: vkInt64, int64Val: cnt)
       of "SUM":
         if not state.initialized:
           aggValues[i] = Value(kind: vkNull)
@@ -3418,7 +4184,8 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
         if not state.initialized:
           aggValues[i] = Value(kind: vkNull)
         else:
-          aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum / float(state.count))
+          let cnt = if spec.isDistinct: state.distinctValues.len else: state.count
+          aggValues[i] = Value(kind: vkFloat64, float64Val: state.sum / float(cnt))
       of "MIN":
         if not state.initialized:
           aggValues[i] = Value(kind: vkNull)
@@ -4257,6 +5024,56 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
         emitted.incl(row.values)
         outRows.add(row)
     return ok(outRows)
+  of pkSetIntersectAll:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "INTERSECT ALL requires matching column counts")
+    # INTERSECT ALL: emit min(count_left, count_right) for each row
+    var leftCounts = initTable[seq[Value], int]()
+    for leftRow in leftRes.value:
+      leftCounts[leftRow.values] = leftCounts.getOrDefault(leftRow.values, 0) + 1
+    var rightCounts = initTable[seq[Value], int]()
+    for rightRow in rightRes.value:
+      rightCounts[rightRow.values] = rightCounts.getOrDefault(rightRow.values, 0) + 1
+    var outRows: seq[Row] = @[]
+    for leftRow in leftRes.value:
+      let lcnt = leftCounts.getOrDefault(leftRow.values, 0)
+      let rcnt = rightCounts.getOrDefault(leftRow.values, 0)
+      if lcnt > 0 and rcnt > 0:
+        outRows.add(leftRow)
+        leftCounts[leftRow.values] = lcnt - 1
+    return ok(outRows)
+  of pkSetExceptAll:
+    let leftRes = execPlan(pager, catalog, plan.left, params)
+    if not leftRes.ok:
+      return err[seq[Row]](leftRes.err.code, leftRes.err.message, leftRes.err.context)
+    let rightRes = execPlan(pager, catalog, plan.right, params)
+    if not rightRes.ok:
+      return err[seq[Row]](rightRes.err.code, rightRes.err.message, rightRes.err.context)
+    if leftRes.value.len > 0 and rightRes.value.len > 0:
+      if leftRes.value[0].values.len != rightRes.value[0].values.len:
+        return err[seq[Row]](ERR_SQL, "EXCEPT ALL requires matching column counts")
+    # EXCEPT ALL: emit count_left - count_right for each row
+    var leftCounts = initTable[seq[Value], int]()
+    for leftRow in leftRes.value:
+      leftCounts[leftRow.values] = leftCounts.getOrDefault(leftRow.values, 0) + 1
+    var rightCounts = initTable[seq[Value], int]()
+    for rightRow in rightRes.value:
+      rightCounts[rightRow.values] = rightCounts.getOrDefault(rightRow.values, 0) + 1
+    var outRows: seq[Row] = @[]
+    for leftRow in leftRes.value:
+      let lcnt = leftCounts.getOrDefault(leftRow.values, 0)
+      let rcnt = rightCounts.getOrDefault(leftRow.values, 0)
+      if lcnt > rcnt:
+        outRows.add(leftRow)
+        leftCounts[leftRow.values] = lcnt - 1
+    return ok(outRows)
   of pkAppend:
     let leftRes = execPlan(pager, catalog, plan.left, params)
     if not leftRes.ok:
@@ -4560,6 +5377,11 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
           rightJoinColIdx = -1
           leftJoinColIdx = -1
     
+    if plan.joinType == jtRight:
+      return err[seq[Row]](ERR_SQL, "RIGHT JOIN is not supported; use LEFT JOIN with reversed table order")
+    if plan.joinType == jtFull:
+      return err[seq[Row]](ERR_SQL, "FULL OUTER JOIN is not supported")
+
     for lrow in leftRes.value:
       var matched = false
       var rightRows: seq[Row] = @[]

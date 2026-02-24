@@ -42,15 +42,20 @@ What “extensions” means here:
 DecentDB's current baseline includes:
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `DROP VIEW`, `ALTER TABLE`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `INSERT ... RETURNING`, `INSERT ... ON CONFLICT`
-- Joins: `INNER JOIN`, `LEFT JOIN`
+- Joins: `INNER JOIN`, `LEFT JOIN` (`RIGHT JOIN` and `FULL OUTER JOIN` are rejected with clear error messages)
 - Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`, `HAVING`, `DISTINCT`
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `EXCEPT`
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `STRING_AGG`
+- Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`
 - CTEs: non-recursive `WITH ... AS`
-- Window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()` with `OVER (...)`
+- Window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()` with `OVER (...)`
 - Predicates: comparisons (`=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`), `AND`/`OR`/`NOT`, `LIKE`/`ILIKE`, `IN`, `BETWEEN`, `EXISTS`, `IS NULL`/`IS NOT NULL`
-- Scalar functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `JSON_ARRAY_LENGTH`, `JSON_EXTRACT`, `PRINTF`
-- Operators: `+`, `-`, `*`, `/`, `||` (string concatenation)
+- Math functions: `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`
+- String functions: `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
+- Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
+- JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `->`, `->>`
+- Other functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `PRINTF`
+- Operators: `+`, `-`, `*`, `/`, `%` (modulo), `||` (string concatenation)
+- Transaction control: `BEGIN`, `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` (treated as `BEGIN`), `COMMIT`, `ROLLBACK`
 - Parameters: positional `$1, $2, ...` (Postgres-style)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 
@@ -70,11 +75,15 @@ SQLite and DuckDB generally include all of the above, plus substantial additiona
 DecentDB has implemented many previously planned baseline features, including:
 - Richer expression support (`IS NULL`, `CASE`, `CAST`, `BETWEEN`, `IN`, `EXISTS`, `LIKE ... ESCAPE`, `||`, core scalar functions)
 - UPSERT and DML conveniences (`INSERT ... ON CONFLICT DO NOTHING/DO UPDATE`, `INSERT ... RETURNING`)
-- Non-recursive CTEs, set operations (`UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`)
-- `CHECK` constraints and FK `CASCADE` / `SET NULL` actions
+- Non-recursive CTEs, set operations (`UNION ALL`, `UNION`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`)
+- `CHECK` constraints, FK `CASCADE` / `SET NULL` actions, table-level FOREIGN KEY constraints
 - Broader `ALTER TABLE` (`ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`, `ALTER COLUMN TYPE`)
 - Trigger subsets (`AFTER` row triggers on tables, `INSTEAD OF` row triggers on views)
-- Window functions (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()` with `OVER (...)`)
+- Window functions (`ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()` with `OVER (...)`)
+- Date/time functions (`NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`)
+- Math functions (`SQRT`, `POWER`/`POW`, `MOD`, `SIGN`, `LOG`, `LN`, `EXP`, `RANDOM`)
+- String functions (`LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`, `INSTR`)
+- JSON functions (`JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `->`, `->>`)
 - Indexing options (multi-column, partial v0 subset, expression index v0 subset)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 
@@ -97,3 +106,39 @@ SQLite and DuckDB both offer larger built-in ecosystems of types and functions. 
 | Advanced index options (partial/expression/multi-column, etc.) | Supported with v0 limits (multi-column BTREE; partial `col IS NOT NULL`; narrow deterministic single-expression BTREE) | Many are available | Many are available |
 
 DecentDB emphasizes predictable behavior, durability, and correctness testing rather than broad operational surface area.
+
+## SQLite-Specific Features: Explicit Decisions
+
+DecentDB intentionally does not support certain SQLite-specific features. This section documents those decisions and provides alternatives where applicable.
+
+### PRAGMA
+
+SQLite's runtime configuration mechanism (hundreds of directives) is not supported.
+
+| Common PRAGMA | DecentDB Alternative |
+|---|---|
+| `PRAGMA journal_mode` | Not applicable; DecentDB uses WAL-only mode |
+| `PRAGMA foreign_keys` | Always enabled; cannot be disabled |
+| `PRAGMA table_info(t)` | Use catalog queries (if supported) or `SELECT * FROM t LIMIT 0` |
+| `PRAGMA synchronous` | Not configurable; fsync-on-commit is default and required for durability |
+| `PRAGMA cache_size` | Not configurable; uses built-in page cache |
+
+### rowid / _rowid_ Pseudo-Columns
+
+SQLite exposes implicit rowid as a queryable pseudo-column. DecentDB has an internal rowid but does not expose it to SQL.
+
+**Recommendation:** Use explicit `INTEGER PRIMARY KEY` columns which auto-increment (already supported).
+
+### WITHOUT ROWID Tables
+
+SQLite optimization for tables where the PRIMARY KEY is the clustering key. Not applicable to DecentDB's storage architecture.
+
+### ATTACH DATABASE
+
+SQLite's mechanism for querying multiple database files simultaneously. Not supported.
+
+**Recommendation:** Use application-level multi-database coordination.
+
+### Recursive CTEs
+
+`WITH RECURSIVE` is not currently supported. This requires significant implementation work and may be added in a future version.

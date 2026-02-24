@@ -17,7 +17,9 @@ type PlanKind* = enum
   pkUnionDistinct
   pkSetUnionDistinct
   pkSetIntersect
+  pkSetIntersectAll
   pkSetExcept
+  pkSetExceptAll
   pkAppend
   pkFilter
   pkProject
@@ -167,10 +169,18 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     let leftPlan = planSelect(catalog, stmt.setOpLeft)
     let rightPlan = planSelect(catalog, stmt.setOpRight)
     return Plan(kind: pkSetIntersect, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokIntersectAll:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetIntersectAll, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokExcept:
     let leftPlan = planSelect(catalog, stmt.setOpLeft)
     let rightPlan = planSelect(catalog, stmt.setOpRight)
     return Plan(kind: pkSetExcept, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokExceptAll:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft)
+    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    return Plan(kind: pkSetExceptAll, left: leftPlan, right: rightPlan)
 
   proc exprHasAggregate(expr: Expr): bool =
     if expr == nil: return false

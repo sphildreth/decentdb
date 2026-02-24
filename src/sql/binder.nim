@@ -108,6 +108,10 @@ proc cloneExpr(expr: Expr): Expr =
       windowOrderExprs: orderExprs,
       windowOrderAsc: expr.windowOrderAsc
     )
+  of ekSqlValueFunction:
+    Expr(kind: ekSqlValueFunction, sqlValueFunc: expr.sqlValueFunc)
+  of ekExtract:
+    Expr(kind: ekExtract, extractField: expr.extractField, extractSource: cloneExpr(expr.extractSource))
 
 proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
   if expr == nil:
@@ -159,6 +163,10 @@ proc qualifyInsertConflictExpr(expr: Expr, tableName: string): Expr =
       windowOrderExprs: orderExprs,
       windowOrderAsc: expr.windowOrderAsc
     )
+  of ekSqlValueFunction:
+    Expr(kind: ekSqlValueFunction, sqlValueFunc: expr.sqlValueFunc)
+  of ekExtract:
+    Expr(kind: ekExtract, extractField: expr.extractField, extractSource: qualifyInsertConflictExpr(expr.extractSource, tableName))
 
 proc cloneSelectItem(item: SelectItem): SelectItem =
   SelectItem(expr: cloneExpr(item.expr), alias: item.alias, isStar: item.isStar)

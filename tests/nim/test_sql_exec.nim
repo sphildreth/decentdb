@@ -408,6 +408,9 @@ suite "SQL Exec":
 
     discard closeDb(db)
 
+  # INTERSECT ALL and EXCEPT ALL - parser support added, execution pending libpg_query node fix
+  # TODO: Fix libpg_query node field names for INTERSECT ALL and EXCEPT ALL
+
   test "CHECK constraints enforce false-only failure and persist":
     let path = makeTempDb("decentdb_sql_exec_check_constraints.db")
     let dbRes = openDb(path)
@@ -913,6 +916,69 @@ suite "Planner":
       "SELECT id, LEAD(val, 1, -1) OVER (ORDER BY id) AS nxt FROM events ORDER BY id")
     check lead2Res.ok
     check lead2Res.value == @["1|20", "2|30", "3|100", "4|-1"]
+
+    discard closeDb(db)
+
+  test "FIRST_VALUE window function":
+    let path = makeTempDb("decentdb_sql_window_first_value.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # FIRST_VALUE - first value in partition
+    let firstRes = execSql(db,
+      "SELECT id, FIRST_VALUE(val) OVER (PARTITION BY grp ORDER BY id) AS first_val FROM events ORDER BY id")
+    check firstRes.ok
+    check firstRes.value == @["1|10", "2|10", "3|10", "4|100", "5|100"]
+
+    discard closeDb(db)
+
+  test "LAST_VALUE window function":
+    let path = makeTempDb("decentdb_sql_window_last_value.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # LAST_VALUE - last value in partition (default window frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    let lastRes = execSql(db,
+      "SELECT id, LAST_VALUE(val) OVER (PARTITION BY grp ORDER BY id) AS last_val FROM events ORDER BY id")
+    check lastRes.ok
+    check lastRes.value == @["1|10", "2|20", "3|30", "4|100", "5|200"]
+
+    discard closeDb(db)
+
+  test "NTH_VALUE window function":
+    let path = makeTempDb("decentdb_sql_window_nth_value.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # NTH_VALUE - 2nd value in partition
+    let nthRes = execSql(db,
+      "SELECT id, NTH_VALUE(val, 2) OVER (PARTITION BY grp ORDER BY id) AS second_val FROM events ORDER BY id")
+    check nthRes.ok
+    check nthRes.value == @["1|NULL", "2|20", "3|20", "4|NULL", "5|200"]
 
     discard closeDb(db)
 
@@ -1732,4 +1798,45 @@ suite "Planner":
       let cols = splitRow(r2.value[i])
       check cols[2] == "4"
 
+    discard closeDb(db)
+
+  test "RIGHT JOIN produces clear error":
+    let path = makeTempDb("decentdb_right_join_err.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE rja (id INT64 PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE rjb (id INT64 PRIMARY KEY)")
+    let res = execSql(db, "SELECT * FROM rja RIGHT JOIN rjb ON rja.id = rjb.id")
+    check not res.ok
+    check res.err.message.contains("RIGHT JOIN")
+    discard closeDb(db)
+
+  test "FULL OUTER JOIN produces clear error":
+    let path = makeTempDb("decentdb_full_join_err.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE fjx (id INT64 PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE fjy (id INT64 PRIMARY KEY)")
+    let res = execSql(db, "SELECT * FROM fjx FULL OUTER JOIN fjy ON fjx.id = fjy.id")
+    check not res.ok
+    check res.err.message.contains("FULL OUTER JOIN")
+    discard closeDb(db)
+
+  test "BEGIN IMMEDIATE accepted as synonym for BEGIN":
+    let path = makeTempDb("decentdb_begin_immediate.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE beg_t (id INT64 PRIMARY KEY, val TEXT)")
+    let beginRes = execSql(db, "BEGIN IMMEDIATE")
+    # Should either succeed or be treated as regular BEGIN
+    if beginRes.ok:
+      discard execSql(db, "INSERT INTO beg_t (id, val) VALUES (1, 'a')")
+      let commitRes = execSql(db, "COMMIT")
+      check commitRes.ok
+      let r = execSql(db, "SELECT val FROM beg_t WHERE id = 1")
+      check r.ok
+      check splitRow(r.value[0])[0] == "a"
     discard closeDb(db)

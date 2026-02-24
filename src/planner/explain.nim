@@ -89,6 +89,10 @@ proc renderExpr*(expr: Expr): string =
         s.add(if asc: " ASC" else: " DESC")
     s.add(")")
     s
+  of ekSqlValueFunction:
+    expr.sqlValueFunc
+  of ekExtract:
+    "EXTRACT(" & expr.extractField & " FROM " & renderExpr(expr.extractSource) & ")"
 
 proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
   var lines: seq[string] = @[]
@@ -155,8 +159,18 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       lines.add(line)
       traverse(p.left, depth + 1)
       traverse(p.right, depth + 1)
+    of pkSetIntersectAll:
+      line.add("SetIntersectAll")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
     of pkSetExcept:
       line.add("SetExcept")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetExceptAll:
+      line.add("SetExceptAll")
       lines.add(line)
       traverse(p.left, depth + 1)
       traverse(p.right, depth + 1)
