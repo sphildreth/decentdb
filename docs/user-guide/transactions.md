@@ -8,7 +8,11 @@ DecentDB supports ACID transactions with full durability guarantees.
 
 ```sql
 BEGIN;
+BEGIN IMMEDIATE;   -- Accepted as synonym for BEGIN
+BEGIN EXCLUSIVE;   -- Accepted as synonym for BEGIN
 ```
+
+DecentDB is a single-writer engine, so `BEGIN`, `BEGIN IMMEDIATE`, and `BEGIN EXCLUSIVE` all behave identically.
 
 ### Committing a Transaction
 
@@ -25,6 +29,10 @@ ROLLBACK;
 ```
 
 All changes since BEGIN are discarded.
+
+### Auto-Commit
+
+Individual write statements (`INSERT`, `UPDATE`, `DELETE`, DDL) executed outside an explicit `BEGIN`/`COMMIT` block are automatically wrapped in their own transaction. If the statement succeeds, it is committed; if it fails, it is rolled back.
 
 ## ACID Properties
 
@@ -105,6 +113,75 @@ Use bulk load API for large imports:
 decentdb bulk-load --db=my.ddb --table=users --input=users.csv --durability=deferred
 ```
 
+## Savepoints
+
+Savepoints allow you to create named checkpoints within a transaction. You can roll back to a savepoint without discarding the entire transaction. See [ADR-0110](../../design/adr/0110-savepoints.md).
+
+### Creating a Savepoint
+
+```sql
+SAVEPOINT name;
+```
+
+Captures a snapshot of the current transaction state (catalog metadata and dirty pages).
+
+### Releasing a Savepoint
+
+```sql
+RELEASE SAVEPOINT name;
+```
+
+Discards the named savepoint from the stack. Changes made since the savepoint **remain** part of the current transaction — `RELEASE` does not commit or roll back anything.
+
+### Rolling Back to a Savepoint
+
+```sql
+ROLLBACK TO SAVEPOINT name;
+```
+
+Restores the transaction state to what it was when the savepoint was created:
+
+- All data changes made after the savepoint are undone
+- Catalog changes (DDL) after the savepoint are reverted
+- The savepoint itself remains active — you can roll back to it again
+
+### Example
+
+```sql
+BEGIN;
+INSERT INTO users VALUES (1, 'Alice');
+
+SAVEPOINT sp1;
+INSERT INTO users VALUES (2, 'Bob');
+
+SAVEPOINT sp2;
+INSERT INTO users VALUES (3, 'Carol');
+
+-- Undo Carol's insert, keep Alice and Bob
+ROLLBACK TO SAVEPOINT sp2;
+
+-- Discard sp1 (Alice and Bob remain)
+RELEASE SAVEPOINT sp1;
+
+COMMIT;
+-- Result: users contains Alice (1) and Bob (2)
+```
+
+### Savepoint Nesting
+
+Savepoints can be nested. Rolling back to an outer savepoint also discards all inner savepoints created after it:
+
+```sql
+BEGIN;
+SAVEPOINT a;
+  INSERT INTO t VALUES (1);
+  SAVEPOINT b;
+    INSERT INTO t VALUES (2);
+  ROLLBACK TO SAVEPOINT a;
+  -- Both inserts are undone; savepoint b is gone
+COMMIT;
+```
+
 ## Best Practices
 
 ### Keep Transactions Short
@@ -159,7 +236,7 @@ decentdb info --db=my.ddb
 
 ## Limitations
 
-- No SAVEPOINT support (nested transactions)
 - No distributed transactions
 - Single writer only (no concurrent write transactions)
 - Foreign keys enforced at statement time, not commit time
+- Savepoints are only supported within explicit `BEGIN`/`COMMIT` blocks

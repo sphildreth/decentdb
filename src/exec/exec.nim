@@ -4132,6 +4132,7 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
                   states[i].max = val
               if spec.funcName in ["GROUP_CONCAT", "STRING_AGG"]:
                 states[i].concatValues.add(valueToString(val))
+              states[i].count.inc
               states[i].initialized = true
         else:
           # COUNT - handle DISTINCT separately

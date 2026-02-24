@@ -2,7 +2,7 @@
 
 This page summarizes high-level feature differences between **DecentDB**, **SQLite**, and **DuckDB**.
 
-## Versions (as of 2026-02-06)
+## Versions (as of 2026-02-24)
 
 This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
@@ -17,6 +17,8 @@ DecentDB is intentionally scoped around:
 - **SQL goal:** a practical, Postgres-like subset for common application queries
 
 SQLite and DuckDB are used as behavioral baselines for many SQL features, but DecentDB does **not** aim to be a drop-in replacement for either.
+
+> **See also:** [SQL Feature Matrix](sql-feature-matrix.md) for a concise per-feature support grid comparing DecentDB, SQLite, and DuckDB.
 
 ## Quick summary
 
@@ -40,11 +42,11 @@ What “extensions” means here:
 ## SQL surface area
 
 DecentDB's current baseline includes:
-- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `DROP VIEW`, `ALTER TABLE`, `ALTER VIEW ... RENAME TO ...`
+- DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `CREATE VIEW`, `CREATE TEMP TABLE`, `CREATE TEMP VIEW`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `DROP VIEW`, `ALTER TABLE`, `ALTER VIEW ... RENAME TO ...`
 - DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `INSERT ... RETURNING`, `INSERT ... ON CONFLICT`
-- Joins: `INNER JOIN`, `LEFT JOIN` (`RIGHT JOIN` and `FULL OUTER JOIN` are rejected with clear error messages)
-- Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`, `HAVING`, `DISTINCT`
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `STRING_AGG`
+- Joins: `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN`
+- Clauses: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, `GROUP BY`, `HAVING`, `DISTINCT`, `DISTINCT ON`
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `TOTAL`, `GROUP_CONCAT`, `STRING_AGG` (with `DISTINCT` modifier)
 - Set operations: `UNION`, `UNION ALL`, `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`
 - CTEs: `WITH ... AS` (recursive and non-recursive)
 - Window functions: `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTH_VALUE()` with `OVER (...)`
@@ -53,9 +55,11 @@ DecentDB's current baseline includes:
 - String functions: `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTRING`/`SUBSTR`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
 - Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
 - JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`
+- Table-valued functions: `json_each()`, `json_tree()`
+- Generated columns: `GENERATED ALWAYS AS (expr) STORED`
 - Other functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `PRINTF`
 - Operators: `+`, `-`, `*`, `/`, `%` (modulo), `||` (string concatenation)
-- Transaction control: `BEGIN`, `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` (treated as `BEGIN`), `COMMIT`, `ROLLBACK`
+- Transaction control: `BEGIN`, `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` (treated as `BEGIN`), `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`
 - Parameters: positional `$1, $2, ...` (Postgres-style)
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 
@@ -97,10 +101,10 @@ For remaining roadmap and deferred capabilities, use:
 
 ## Data types and functions
 
-DecentDB’s baseline types are intentionally small:
-- `NULL`, `INT64`, `BOOL`, `FLOAT64`, `TEXT` (UTF-8), `BLOB`, `UUID`, `DECIMAL(p,s)` / `NUMERIC(p,s)`
+DecentDB’s baseline types cover the most common application needs:
+- `NULL`, `INT64`, `BOOL`, `FLOAT64`, `TEXT` (UTF-8), `BLOB`, `UUID`, `DECIMAL(p,s)` / `NUMERIC(p,s)`, `DATE`, `TIMESTAMP`
 
-SQLite and DuckDB both offer larger built-in ecosystems of types and functions. DuckDB, in particular, has many analytics-oriented types and functions (dates/times, decimals, nested types, extensive math/statistics), while SQLite’s strength is portability, flexibility, and a long list of optional extensions.
+SQLite and DuckDB both offer larger built-in ecosystems of types and functions. DuckDB, in particular, has many analytics-oriented types and functions (nested types, extensive math/statistics), while SQLite’s strength is portability, flexibility, and a long list of optional extensions.
 
 ## Indexing and search
 

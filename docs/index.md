@@ -8,11 +8,14 @@ DecentDB is an embedded, single-machine relational database engine focused on **
 
 - **ACID Transactions** — Full durability with WAL-based persistence and snapshot isolation
 - **Single Writer + Many Readers** — Optimized for read-heavy workloads
-- **PostgreSQL-Compatible SQL** — JOINs, CTEs, window functions, aggregates, upsert, RETURNING
-- **Rich Data Types** — INT64, FLOAT64, TEXT, BLOB, BOOL, DECIMAL, UUID
+- **PostgreSQL-Compatible SQL** — JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), window functions, aggregates (with DISTINCT), upsert, RETURNING, savepoints
+- **Rich Data Types** — INT64, FLOAT64, TEXT, BLOB, BOOL, DECIMAL, UUID, DATE, TIMESTAMP
 - **Full-Text Substring Search** — Trigram inverted index for `LIKE '%pattern%'` queries
 - **Auto-Increment Primary Keys** — `INTEGER PRIMARY KEY` columns auto-assign IDs
 - **Foreign Keys** — Referential integrity with CASCADE, SET NULL, RESTRICT
+- **Generated Columns** — `GENERATED ALWAYS AS (expr) STORED` for computed values
+- **Temporary Objects** — Session-scoped TEMP tables and views
+- **JSON Support** — Scalar functions, table-valued functions (`json_each`, `json_tree`)
 - **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md)
 - **Cross-Platform** — Linux, macOS, Windows
 

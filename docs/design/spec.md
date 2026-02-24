@@ -295,15 +295,26 @@ Alternative:
     - optional `WHERE` on `DO UPDATE`
     - expression scope: target table columns and `EXCLUDED.col`
     - unqualified columns in `DO UPDATE` expressions bind to target table
-- Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)` with `GROUP BY` and `HAVING`
-- Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`
+- Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`, `TOTAL(col)`, `GROUP_CONCAT(col, sep)`, `STRING_AGG(col, sep)` with `GROUP BY` and `HAVING`
+  - `DISTINCT` aggregate modifier: `COUNT(DISTINCT col)`, `SUM(DISTINCT col)`, `AVG(DISTINCT col)`
+- Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTR`/`SUBSTRING`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`/`CHAR`, `HEX`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SIGN`, `SQRT`, `POWER`/`POW`, `MOD`, `LN`, `LOG`/`LOG10`, `EXP`, `RANDOM`, `PRINTF`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `JSON_TYPE`, `JSON_VALID`, `JSON_OBJECT`, `JSON_ARRAY`
+- Date/time functions: `NOW`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `DATE()`, `DATETIME()`, `STRFTIME()`, `EXTRACT()`
+- Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`
 - Expression forms: searched/simple `CASE`, `CAST(expr AS type)` (narrow matrix)
-- Common Table Expressions (CTE): non-recursive `WITH ...` for `SELECT`
+- Common Table Expressions (CTE): non-recursive `WITH ...` and `WITH RECURSIVE` for `SELECT`
   - CTE names resolve in declaration order and can shadow catalog objects in the statement scope
-  - v0 CTE body restrictions: `GROUP BY`/`HAVING`, `ORDER BY`, and `LIMIT/OFFSET` inside CTE bodies are not supported
+  - Recursive CTEs limited to 1000 iterations per invocation (see ADR-0107)
 - Set operations: `UNION ALL`, `UNION`, `INTERSECT`, `EXCEPT`
-- Joins: `LEFT JOIN`, `INNER JOIN` on equality predicates
+- Joins: `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN` (rewritten as LEFT), `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN` on equality predicates
 - Filters: basic comparisons, boolean ops, `BETWEEN`, `IN (...)`, `EXISTS (SELECT ...)` (non-correlated), `LIKE`/`ILIKE` (with `ESCAPE`), string concatenation (`||`)
+- `DISTINCT ON (expr, ...)` — keeps first row per distinct group
+- Table-valued functions: `json_each(json)`, `json_tree(json)` in FROM clause (see ADR-0111)
+- Generated columns: `GENERATED ALWAYS AS (expr) STORED` (see ADR-0108)
+- Temporary objects: `CREATE TEMP TABLE`, `CREATE TEMP VIEW` — session-scoped, not persisted (see ADR-0109)
+- Savepoints: `SAVEPOINT name`, `RELEASE SAVEPOINT name`, `ROLLBACK TO SAVEPOINT name` (see ADR-0110)
+- `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` accepted as synonyms for `BEGIN`
+- `OFFSET n ROWS FETCH FIRST n ROWS ONLY` (SQL:2008 syntax for LIMIT/OFFSET)
+- `DATE` and `TIMESTAMP` column type keywords (mapped to TEXT storage)
 - CHECK constraints in `CREATE TABLE` (column-level and table-level)
 - Partial index subset: `CREATE INDEX ... WHERE <indexed_column> IS NOT NULL` for single-column BTREE indexes
 - Expression index subset: `CREATE INDEX ... ((<expr>))` for single-expression BTREE indexes
@@ -319,11 +330,12 @@ Alternative:
   - Predicate results in `WHERE`: only `TRUE` keeps a row; both `FALSE` and `NULL` filter out
 - Ordering: `ORDER BY` (multi-column), `LIMIT`, `OFFSET`
 - Explicitly unsupported in 0.x baseline:
-  - `WITH RECURSIVE`
   - `INTERSECT ALL`, `EXCEPT ALL`
   - targetless `INSERT ... ON CONFLICT DO UPDATE ...` (without conflict target)
   - `UPDATE ... RETURNING`
   - `DELETE ... RETURNING`
+  - Window frame clauses (`ROWS BETWEEN ...`, `RANGE BETWEEN ...`)
+  - Additional window functions: `NTILE`, `PERCENT_RANK`, `CUME_DIST`
   - Partial indexes beyond the v0 subset (`UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, arbitrary predicates)
   - Expression indexes beyond the v0 subset (multi-expression keys, unsupported functions/operators, `UNIQUE`, or partial forms)
 

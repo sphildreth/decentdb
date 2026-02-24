@@ -116,6 +116,32 @@ CREATE TABLE example (
 );
 ```
 
+### DATE
+
+Date value stored as TEXT in ISO 8601 format (`YYYY-MM-DD`).
+
+```sql
+CREATE TABLE events (
+    id INT PRIMARY KEY,
+    event_date DATE
+);
+INSERT INTO events VALUES (1, '2026-02-24');
+```
+
+### TIMESTAMP
+
+Date and time value stored as TEXT in ISO 8601 format (`YYYY-MM-DD HH:MM:SS`).
+
+```sql
+CREATE TABLE logs (
+    id INT PRIMARY KEY,
+    created_at TIMESTAMP
+);
+INSERT INTO logs VALUES (1, '2026-02-24 17:30:00');
+```
+
+**Note:** `DATE` and `TIMESTAMP` are stored as TEXT internally. Use the date/time scalar functions (`NOW()`, `CURRENT_TIMESTAMP`, `EXTRACT()`, `STRFTIME()`) for date arithmetic and formatting.
+
 ### NULL
 
 Represents missing or unknown values.
@@ -145,6 +171,8 @@ All columns can contain NULL unless marked NOT NULL.
 | NUMERIC | DECIMAL |
 | DECIMAL | DECIMAL |
 | UUID | UUID |
+| DATE | TEXT (ISO 8601) |
+| TIMESTAMP | TEXT (ISO 8601) |
 
 ## Type Conversion
 

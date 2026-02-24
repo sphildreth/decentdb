@@ -11,9 +11,7 @@ It captures:
 - What we would likely need to build on the DecentDB side (the gating factor)
 - A staged approach so we can get something working quickly and iterate
 
-> Key takeaway: **DBeaver is primarily JDBC-centric.** The simplest path is to provide a **JDBC driver** for DecentDB (even a thin one), then either:
-> 1) rely on DBeaver’s “Generic” JDBC support with a manually added driver, or
-> 2) ship a small DBeaver extension that pre-registers the driver/provider and a DecentDB SQL dialect.
+> Key takeaway: **DBeaver is primarily JDBC-centric.** The path forward is to provide a **JDBC driver** for DecentDB and ship a DBeaver extension that pre-registers the driver/provider and a DecentDB SQL dialect.
 
 ---
 
@@ -23,14 +21,15 @@ It captures:
 
 - Connect to a DecentDB database from DBeaver.
 - Execute SQL queries and view results.
+- Use DBeaver’s ER diagrams to visualize schema relationships.
 - Browse basic metadata (tables, columns, indexes) using standard JDBC metadata APIs.
 - Keep the first version minimal and robust.
 
 ### Non-goals (initially)
 
-- Implementing every DBeaver feature (ER diagrams, advanced DDL editors, custom explain plans, etc.).
+- Implementing every DBeaver feature (advanced DDL editors, custom explain plans, etc.).
 - Multi-process server mode or a network protocol, unless we later decide it’s necessary and create an ADR.
-- Rewriting DecentDB’s SQL dialect to “match PostgreSQL” for UI convenience.
+- Pretending to be PostgreSQL “just for UI convenience” (e.g., misreporting `DatabaseMetaData.getDatabaseProductName()` as PostgreSQL, relying on PostgreSQL-specific system catalogs, or enabling PostgreSQL-only feature flags that DecentDB doesn’t actually support).
 
 ---
 
@@ -117,6 +116,7 @@ For DBeaver to be usable, the driver should provide:
 - `Connection`, `PreparedStatement`, `Statement`, `ResultSet`
 - Metadata:
   - `DatabaseMetaData.getTables`, `getColumns`, `getPrimaryKeys`, `getIndexInfo`, etc.
+  - For ER diagrams specifically: `DatabaseMetaData.getImportedKeys`, `getExportedKeys`, and/or `getCrossReference`
 
 DBeaver can tolerate imperfect metadata (many real-world drivers have quirks), but missing basics will hurt the UX.
 
@@ -130,78 +130,68 @@ This repository’s North Star and constraints emphasize:
 
 This influences how we should expose it to Java:
 
-- **Embedded JDBC** (Java loads native library and talks in-process) aligns with “single process” semantics.
+- **In-process JDBC** (Java loads native library via JNI) aligns with "single process" semantics - the database engine runs inside the DBeaver process.
 - “Client-server over TCP” mode is a bigger step with more surface area (auth, protocol stability, concurrency semantics) and would almost certainly need an ADR.
 
 ---
 
-## 4) Integration options (recommended path first)
+## 4) Integration approach: JDBC driver (in-process)
 
-### Option A (recommended): Provide an embedded JDBC driver + minimal DBeaver extension
+DecentDB will provide a **JDBC driver** that works with DBeaver's standard JDBC support. This is the most straightforward path since DBeaver is Java-centric and JDBC is its primary database connectivity model.
 
-**What you ship:**
+### What "in-process" means
 
-- A DecentDB JDBC driver JAR
-- A small DBeaver plugin that:
-  - registers a provider + driver (so users don’t manually configure)
-  - registers a `DecentDBSQLDialect`
-  - optionally provides a “file database handler” for `.ddb` files (nice-to-have)
+The JDBC driver is a standalone JAR file that users download and add to DBeaver. When DBeaver connects to a DecentDB database:
 
-**Pros**
+1. DBeaver loads the JDBC driver JAR
+2. The driver loads a native library (JNI) that contains the DecentDB engine
+3. The database runs **in the same process as DBeaver** - no separate server
 
-- Best DBeaver UX (DecentDB appears as a first-class database type)
-- Keeps the driver and dialect “discoverable” and defaulted
-- Compatible with DBeaver’s normal workflows
+This is the same model used by SQLite JDBC, DuckDB JDBC, and H2. The user does not need to run a separate DecentDB server or have the `decentdb_cli` installed.
 
-**Cons**
+**The JDBC driver is a separate artifact from the DecentDB CLI.** Users download the JAR from GitHub releases and use it directly in DBeaver.
 
-- Requires writing and maintaining a JDBC driver
-- If the driver is JNI-backed, it requires careful packaging per OS/arch
+### Why JDBC (not ODBC or bespoke provider)
 
-### Option B (fastest initial): Provide only a JDBC driver; no DBeaver plugin
+- **JDBC is DBeaver's native path**: Most DBeaver database integrations use JDBC
+- **ODBC requires bridges**: DBeaver's ODBC support varies by edition and often involves JDBC bridges anyway
+- **Bespoke providers are rare**: Most DBeaver internals assume JDBC-like behavior; custom providers add maintenance burden without significant benefit
 
-**What the user does:**
+### Delivery
 
-- In DBeaver: Database → Driver Manager → New
-- Add the DecentDB JDBC driver JAR
-- Specify:
-  - driver class
-  - URL template
+**JDBC driver + DBeaver extension (first-class experience)**
 
-**Pros**
-
-- No DBeaver plugin development upfront
-- Great for early testing and iteration
-
-**Cons**
-
-- Worse UX: manual driver setup
-- No DecentDB-specific defaults (dialect, keywords, behavior flags)
-
-### Option C: Use ODBC (only if we already have an ODBC story)
-
-If DecentDB had an ODBC driver, we could evaluate DBeaver’s ODBC support.
-
-**Caution:** ODBC is not the “default path” in DBeaver compared to JDBC. Depending on the distribution (Community vs. Enterprise) and available extensions, this can mean:
-
-- An ODBC-to-JDBC bridge layer
-- Extra native dependencies
-
-This is likely **not** the simplest path unless DecentDB already ships a strong ODBC driver.
-
-### Option D: Build a DecentDB server + JDBC network driver (big change)
-
-This is a larger architectural investment. It would touch concurrency semantics, durability behavior under network clients, authentication, and protocol stability.
-
-Per repo process, this almost certainly requires an ADR before implementation.
+Ship a DBeaver plugin that pre-registers the driver and provides a DecentDB-specific SQL dialect. This makes DecentDB appear as a first-class database type in DBeaver's UI.
 
 ---
 
-## 5) What the minimal DBeaver plugin looks like
+## 5) Existing C API metadata functions (prerequisite for JDBC)
+
+The DecentDB C API already exposes metadata via JSON-returning functions that the JDBC driver can leverage:
+
+| C API Function | Returns | JDBC Mapping |
+|---|---|---|
+| `decentdb_list_tables_json` | `["table1", "table2", ...]` | `DatabaseMetaData.getTables()` |
+| `decentdb_get_table_columns_json` | `[{name, type, not_null, unique, primary_key, ref_table, ref_column, ...}]` | `DatabaseMetaData.getColumns()`, `getPrimaryKeys()`, `getImportedKeys()` |
+| `decentdb_list_indexes_json` | `[{name, table, columns, unique, kind}]` | `DatabaseMetaData.getIndexInfo()` |
+
+**Implementation approach for JDBC driver:**
+
+1. Call these C API functions via JNI
+2. Parse the JSON responses
+3. Construct JDBC-compliant `ResultSet` objects with the required column schemas
+
+This avoids the need for SQL-based metadata queries (e.g., `information_schema`) in the initial implementation. The JSON format is stable and already used by other language bindings.
+
+*Note on performance:* Parsing large JSON strings in Java for every metadata query could become a bottleneck for databases with massive schemas. A future optimization could involve exposing a more direct, tabular C API for metadata if JSON parsing overhead becomes an issue.
+
+---
+
+## 6) What the minimal DBeaver plugin looks like
 
 This section describes the plugin “shape” you would create in a separate repository (or in a dedicated integration repo).
 
-### 5.1 Modules
+### 6.1 Modules
 
 DBeaver often splits database support into:
 
@@ -210,7 +200,7 @@ DBeaver often splits database support into:
 
 For a minimal DecentDB integration, you can start with just the **model** plugin.
 
-### 5.2 Provider + driver registration (`plugin.xml`)
+### 6.2 Provider + driver registration (`plugin.xml`)
 
 You contribute to:
 
@@ -225,7 +215,7 @@ and declare:
 
 **Important:** the URL and driver class must match what your JDBC driver actually supports.
 
-### 5.3 SQL dialect registration (`plugin.xml`)
+### 6.3 SQL dialect registration (`plugin.xml`)
 
 You contribute to:
 
@@ -233,18 +223,20 @@ You contribute to:
 
 and implement:
 
-- `DecentDBSQLDialect extends GenericSQLDialect` (most likely)
+- `DecentDBSQLDialect extends PostgreDialect` (or similar base class)
 
-At minimum, this dialect would:
+Because DecentDB uses `libpg_query` and aims for PostgreSQL dialect compatibility, the dialect implementation can be extremely thin. It should inherit from DBeaver's existing PostgreSQL dialect to get all the benefits of PostgreSQL syntax highlighting, keyword autocomplete, and identifier quoting for free.
 
-- set a name and id (e.g., `super("DecentDB", "decentdb")`)
-- define identifier quoting if it differs from defaults
-- define feature flags (ALTER TABLE support, multi-value insert mode, etc.)
-- add DecentDB keywords to improve editor UX
+The primary reason to have a *custom* dialect class (even if it just inherits from PostgreSQL) rather than just telling DBeaver "this is PostgreSQL" is to **disable features DecentDB doesn't support**. 
 
-This can start tiny and grow as DecentDB’s SQL surface is clarified.
+For example, you would use this class to:
+- Disable UI elements for PostgreSQL-specific features (like Tablespaces, Roles, or advanced partitioning).
+- Prevent DBeaver from trying to query `pg_catalog` tables that DecentDB doesn't implement.
+- Override specific feature flags (e.g., `supportsAlterTable()`) if DecentDB's subset differs from full PostgreSQL.
 
-### 5.4 Minimal `plugin.xml` skeleton (copy/paste starting point)
+This keeps DBeaver’s view of capabilities honest, preventing the UI from making incorrect assumptions and throwing errors when users click things.
+
+### 6.4 Minimal `plugin.xml` skeleton (copy/paste starting point)
 
 Below is an intentionally small `plugin.xml` sketch showing the shape you need.
 
@@ -298,22 +290,37 @@ Notes:
 </plugin>
 ```
 
-### 5.5 What *not* to do in the first plugin
+### 6.5 What *not* to do in the first plugin
 
-- Don’t fork DBeaver or add large UI flows.
-- Don’t implement a custom DBeaver “native” provider unless you have a strong reason.
-- Don’t over-customize metadata/DDL generation in the plugin until the JDBC driver is solid.
+- Don't fork DBeaver or add large UI flows.
+- Don't implement a custom DBeaver "native" provider unless you have a strong reason.
+- Don't over-customize metadata/DDL generation in the plugin until the JDBC driver is solid.
 
 ---
 
-## 6) What the minimal JDBC driver looks like (DecentDB side)
+## 7) What the minimal JDBC driver looks like (DecentDB side)
 
-This repository already has multiple language bindings and a C API build output directory, which suggests a plausible JNI-backed JDBC driver design:
+This repository already has multiple language bindings (`bindings/dotnet`, `bindings/go`, `bindings/node`, `bindings/python`) and a C API build output directory, which suggests a plausible JNI-backed JDBC driver design:
 
 - Java: implement `java.sql.*` interfaces
 - Native: call into DecentDB C API (or a dedicated stable native ABI for JDBC)
 
-### 6.1 Driver architecture sketch
+**Leveraging existing bindings experience:**
+
+The existing bindings provide patterns that can inform the JDBC driver design:
+
+| Binding | Relevant Lessons |
+|---------|------------------|
+| .NET (`bindings/dotnet`) | Handle lifecycle, type mapping, metadata API patterns |
+| Python (`bindings/python`) | JSON metadata parsing from C API, error mapping |
+| Go (`bindings/go`) | CGO patterns similar to JNI concerns |
+
+The JDBC driver should follow similar patterns for:
+- Native handle ownership and cleanup
+- Type conversion between native and managed code
+- Error propagation
+
+### 7.1 Driver architecture sketch
 
 - `DecentDBDriver` (`java.sql.Driver`):
   - Parse `jdbc:decentdb:` URL
@@ -336,7 +343,7 @@ This repository already has multiple language bindings and a C API build output 
 - `DecentDBDatabaseMetaData`:
   - Use DecentDB’s catalog tables or built-in metadata to implement JDBC metadata queries
 
-### 6.2 Where JDBC gets tricky
+### 7.2 Where JDBC gets tricky
 
 - Type mapping: DecentDB types → JDBC types (`java.sql.Types`)
 - NULL semantics
@@ -349,24 +356,24 @@ For correctness, we should be explicit:
 - Which JDBC isolation levels map to DecentDB behavior (and which are rejected)
 - Whether the driver is thread-safe per connection
 
-### 6.3 Implementation blueprint: embedded JDBC driver (JNI-backed)
+### 7.3 Implementation blueprint: JDBC driver (JNI-backed, in-process)
 
 This section is intentionally written as an **implementation checklist** for a coding agent.
 
 Assumption for this blueprint:
 
-- The driver is **embedded**: Java loads a native library (JNI) that calls into the DecentDB native engine (likely via the existing C API or a dedicated stable ABI).
+- The driver runs **in-process**: Java loads a native library (JNI) that calls into the DecentDB native engine (likely via the existing C API or a dedicated stable ABI). The database engine runs inside the DBeaver process.
 
 If you later do a client/server mode, you’d implement the same Java classes but the native calls become network calls.
 
-#### 6.3.1 Project layout (suggested)
+#### 7.3.1 Project layout (suggested)
 
-Keep the JDBC driver in its own repo or its own top-level folder so its Java build toolchain doesn’t leak into the Nim core.
+Keep the JDBC driver in the `bindings/` directory to maintain consistency with other language bindings, ensuring its Java build toolchain doesn’t leak into the Nim core.
 
 Suggested structure:
 
 ```
-decentdb-jdbc/
+bindings/java/
   driver/
     src/main/java/com/decentdb/jdbc/
       DecentDBDriver.java
@@ -390,7 +397,7 @@ decentdb-jdbc/
     build/...
 ```
 
-#### 6.3.2 JDBC URL + properties
+#### 7.3.2 JDBC URL + properties
 
 Pick a canonical URL format early; DBeaver needs a stable sample URL.
 
@@ -411,7 +418,7 @@ If an option is unknown, prefer:
 - ignore with a warning (for forwards compatibility), or
 - reject with a clear `SQLException` if it could lead to surprising behavior.
 
-#### 6.3.3 JNI library loading strategy (must be explicit)
+#### 7.3.3 JNI library loading strategy (must be explicit)
 
 You need a deterministic way to load the native library when the driver first connects.
 
@@ -444,7 +451,7 @@ Also:
 - Ensure extraction is safe under concurrency (file locks / atomic rename).
 - Include driver version in the extracted filename to avoid mismatched binaries.
 
-#### 6.3.4 Native handle ownership (define this early)
+#### 7.3.4 Native handle ownership (define this early)
 
 For each native pointer/handle exposed to Java, define:
 
@@ -464,7 +471,7 @@ Use `Cleaner` or `finalize()`-free patterns:
 - Prefer `java.lang.ref.Cleaner` to free native resources if user forgets to close.
 - Still implement `close()` everywhere and make it idempotent.
 
-#### 6.3.5 Concurrency model mapping (Java ↔ DecentDB)
+#### 7.3.5 Concurrency model mapping (Java ↔ DecentDB)
 
 DecentDB’s model is “one writer, many readers” within a single process.
 
@@ -481,7 +488,7 @@ DBeaver may open:
 
 So correctness matters more than maximizing intra-connection parallelism.
 
-#### 6.3.6 Minimal class-by-class checklist
+#### 7.3.6 Minimal class-by-class checklist
 
 Below is a “do these methods first” guide. The idea is: implement a narrow but correct subset and throw `SQLFeatureNotSupportedException` for the rest.
 
@@ -567,13 +574,17 @@ Implement at least:
 - `getColumns(catalog, schemaPattern, tableNamePattern, columnNamePattern)`
 - `getPrimaryKeys(catalog, schema, table)`
 - `getIndexInfo(catalog, schema, table, unique, approximate)`
+- For ER diagrams (relationships):
+  - `getImportedKeys(catalog, schema, table)`
+  - `getExportedKeys(catalog, schema, table)`
+  - `getCrossReference(primaryCatalog, primarySchema, primaryTable, foreignCatalog, foreignSchema, foreignTable)`
 
 You can initially throw for:
 
 - procedures/functions metadata
 - advanced referential metadata, unless you already expose it
 
-#### 6.3.7 Metadata result set schemas (what to return)
+#### 7.3.7 Metadata result set schemas (what to return)
 
 The JDBC spec defines the columns each `DatabaseMetaData.*` method must return. DBeaver assumes those columns exist.
 
@@ -595,10 +606,14 @@ At minimum, ensure these columns exist:
 - `getColumns`: `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `COLUMN_NAME`, `DATA_TYPE`, `TYPE_NAME`, `COLUMN_SIZE`, `DECIMAL_DIGITS`, `NULLABLE`, `ORDINAL_POSITION`
 - `getPrimaryKeys`: `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `COLUMN_NAME`, `KEY_SEQ`, `PK_NAME`
 - `getIndexInfo`: `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `NON_UNIQUE`, `INDEX_NAME`, `ORDINAL_POSITION`, `COLUMN_NAME`
+- `getImportedKeys` / `getExportedKeys` / `getCrossReference`:
+  - `PKTABLE_CAT`, `PKTABLE_SCHEM`, `PKTABLE_NAME`, `PKCOLUMN_NAME`
+  - `FKTABLE_CAT`, `FKTABLE_SCHEM`, `FKTABLE_NAME`, `FKCOLUMN_NAME`
+  - `KEY_SEQ`, `UPDATE_RULE`, `DELETE_RULE`, `FK_NAME`, `PK_NAME`, `DEFERRABILITY`
 
 If you omit required columns, DBeaver’s navigator and editors tend to misbehave in confusing ways.
 
-#### 6.3.8 Type mapping (DecentDB → JDBC)
+#### 7.3.8 Type mapping (DecentDB → JDBC)
 
 Implement one central mapping function:
 
@@ -625,21 +640,26 @@ A pragmatic starter mapping (adjust to DecentDB reality):
 
 Decide what `getObject()` returns for each type and keep it consistent.
 
-#### 6.3.9 Transactions + isolation mapping
+#### 7.3.9 Transactions + isolation mapping
 
 JDBC requires you to report supported isolation levels.
 
+**Reference:** ADR-0023 defines DecentDB's isolation model as Snapshot Isolation.
+
 Implementation guidance that keeps you honest:
 
-- Implement `getTransactionIsolation()` to return the closest level to DecentDB snapshot isolation.
-- In `setTransactionIsolation(level)`, accept only levels you truly support and throw `SQLFeatureNotSupportedException` otherwise.
+- Implement `getTransactionIsolation()` to return `Connection.TRANSACTION_REPEATABLE_READ` (the closest JDBC equivalent to snapshot isolation).
+- In `setTransactionIsolation(level)`:
+  - Accept `TRANSACTION_REPEATABLE_READ` and `TRANSACTION_READ_COMMITTED` (both map to snapshot isolation, which provides stronger guarantees than read committed)
+  - Throw `SQLFeatureNotSupportedException` for `TRANSACTION_SERIALIZABLE` (snapshot isolation does not prevent write skews)
+  - Throw `SQLFeatureNotSupportedException` for `TRANSACTION_READ_UNCOMMITTED` (dirty reads are not allowed)
 - Ensure `setAutoCommit(true/false)` has correct semantics:
   - If `autoCommit=true`, each statement is its own transaction.
   - If `autoCommit=false`, statements execute within a transaction until `commit/rollback`.
 
 If DecentDB has explicit BEGIN/COMMIT/ROLLBACK behavior, map directly.
 
-#### 6.3.10 Error mapping (native → `SQLException`)
+#### 7.3.10 Error mapping (native → `SQLException`)
 
 DBeaver inspects `SQLException` fields.
 
@@ -656,7 +676,7 @@ At minimum:
 
 Even if not perfect, consistent SQLState improves how DBeaver categorizes errors.
 
-#### 6.3.11 “Enough for DBeaver” smoke test script
+#### 7.3.11 "Enough for DBeaver" smoke test script
 
 When the driver is wired into DBeaver, these should work:
 
@@ -667,11 +687,11 @@ When the driver is wired into DBeaver, these should work:
 
 Use this as the first end-to-end milestone.
 
-### 6.4 Implementation blueprint: DBeaver extension that ships the driver
+### 7.4 Implementation blueprint: DBeaver extension that ships the driver
 
 This is what a coding agent should implement once the JDBC driver exists.
 
-#### 6.4.1 Plugin modules
+#### 7.4.1 Plugin modules
 
 Minimal:
 
@@ -681,7 +701,7 @@ Optional later:
 
 - `com.decentdb.dbeaver.ui` (connection wizard, file handler)
 
-#### 6.4.2 Model plugin contents
+#### 7.4.2 Model plugin contents
 
 - `plugin.xml` with:
   - provider + driver declaration
@@ -692,7 +712,7 @@ Optional later:
 
 In most cases you do *not* need custom Java code for the provider if you can use `GenericDataSourceProvider`.
 
-#### 6.4.3 Optional: custom `DataSource` class (only if needed)
+#### 7.4.3 Optional: custom `DataSource` class (only if needed)
 
 Only add a custom `GenericDataSource` subclass if you must override behavior, e.g.:
 
@@ -702,7 +722,7 @@ Only add a custom `GenericDataSource` subclass if you must override behavior, e.
 
 Start without it. Every extra class here becomes ongoing maintenance.
 
-#### 6.4.4 Optional: “file database handler” for `.ddb`
+#### 7.4.4 Optional: "file database handler" for `.ddb`
 
 If DecentDB is file-based, a UI plugin can allow:
 
@@ -712,7 +732,7 @@ DBeaver patterns exist for file handlers (e.g., SQLite/DuckDB). Implement this o
 
 ---
 
-## 7) Staged implementation plan
+## 8) Staged implementation plan
 
 ### Stage 0: Implementation prerequisites
 
@@ -733,17 +753,18 @@ At this stage, skip fancy metadata: DBeaver can still run SQL queries even if th
 
 Deliverable: DBeaver can open a connection and run queries.
 
-### Stage 2: Basic metadata (tables/columns)
+### Stage 2: ER-diagram-ready metadata (tables/columns/keys)
 
-Implement enough `DatabaseMetaData` to populate DBeaver’s navigator:
+Implement enough `DatabaseMetaData` to populate DBeaver’s navigator and ER diagrams:
 
 - schemas/catalogs (even if “fake” / single schema)
 - tables/views
 - columns
 - primary keys
 - indexes
+- foreign keys (relationships)
 
-Deliverable: DBeaver shows tables and columns.
+Deliverable: DBeaver shows tables/columns and ER diagrams show relationships.
 
 ### Stage 3: Package as a DBeaver extension
 
@@ -753,7 +774,19 @@ Deliverable: DBeaver shows tables and columns.
 
 Deliverable: Users can select “DecentDB” in DBeaver without manual driver setup.
 
-### Stage 4: UX polish (optional)
+### Stage 4: Documentation and packaging
+
+- Create user documentation at `docs/user-guide/dbeaver.md`:
+  - Installation instructions (with screenshots)
+  - Connection URL format and options
+  - Supported SQL features in DBeaver context
+  - Known limitations and troubleshooting
+- Package driver JAR with embedded native libraries
+- Publish to GitHub releases
+
+Deliverable: Users can download and install the driver with clear documentation.
+
+### Stage 5: UX polish (optional)
 
 - Better dialect behavior
 - Value handlers for special types (UUID/BLOB)
@@ -761,7 +794,7 @@ Deliverable: Users can select “DecentDB” in DBeaver without manual driver se
 
 ---
 
-## 8) Testing plan
+## 9) Testing plan
 
 ### JDBC driver testing (must-have)
 
@@ -775,6 +808,7 @@ Deliverable: Users can select “DecentDB” in DBeaver without manual driver se
   - run DDL + DML
   - verify commit/rollback semantics
   - verify concurrent reads while writing (within one process)
+  - verify `DatabaseMetaData` foreign key metadata matches created constraints
 
 ### DBeaver plugin testing
 
@@ -782,43 +816,128 @@ Deliverable: Users can select “DecentDB” in DBeaver without manual driver se
   - connection wizard works
   - query editor works
   - navigator populates
+  - ER diagram renders tables + relationships correctly
 
 - Optional automated UI tests are likely overkill initially.
 
 ---
 
-## 9) Packaging and distribution notes
+## 10) Packaging, distribution, and user installation
 
-If the JDBC driver uses JNI/native libraries:
+### 10.1 Driver packaging
 
-- We need a distribution plan per OS/arch (Linux/macOS/Windows; x86_64/arm64).
-- DBeaver plugin bundling can include driver JARs; native libs may need special handling.
+The JDBC driver will be distributed as a single JAR file containing:
 
-A practical approach is:
+- Java classes implementing `java.sql.*` interfaces
+- Native libraries for supported platforms (embedded in JAR, extracted at runtime)
 
-- first get it working on Linux (developer workflow)
-- then expand to other platforms
+**Supported platforms (initial):**
+
+| Platform | Architecture | Native library |
+|----------|--------------|----------------|
+| Linux | x86_64 | `libdecentdb_jni.so` |
+| macOS | Universal (x86_64 + arm64) | `libdecentdb_jni.dylib` |
+| Windows | x86_64 | `decentdb_jni.dll` |
+
+*Note: On macOS, it is standard practice to compile a single "Universal Binary" (fat binary) that contains both architectures to simplify distribution and JNI extraction logic.*
+
+**JAR structure:**
+
+```
+decentdb-jdbc-{version}.jar
+├── com/decentdb/jdbc/*.class
+├── META-INF/services/java.sql.Driver
+└── native/
+    ├── linux-x86_64/libdecentdb_jni.so
+    ├── macos-universal/libdecentdb_jni.dylib
+    └── windows-x86_64/decentdb_jni.dll
+```
+
+### 10.2 Distribution channels
+
+1. **GitHub Releases**: Primary distribution point
+   - Users download the JAR directly from the releases page
+   - Versioned releases with release notes
+
+2. **Maven Central** (future): For build tool integration
+   - Allows users to add as dependency in Maven/Gradle projects
+   - Not required for DBeaver usage
+
+### 10.3 User installation in DBeaver
+
+Once a DBeaver extension is available:
+
+1. Download the extension ZIP from GitHub releases
+2. In DBeaver: **Help → Install New Software**
+3. Add the extension archive as a local update site
+4. Restart DBeaver
+5. DecentDB appears as a first-class database type in the connection wizard
+
+### 10.4 Documentation requirements
+
+A user-facing documentation page must be created at `docs/user-guide/dbeaver.md` covering:
+
+- Supported DBeaver versions
+- Supported platforms and Java versions
+- Step-by-step installation instructions (with screenshots)
+- Connection URL format and options
+- Supported SQL features in DBeaver context
+- Known limitations
+- Troubleshooting common issues
 
 ---
 
-## 10) Open questions (to resolve early)
+## 11) Risks and mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| JNI native library compatibility across JVM versions | Driver crashes or fails to load | Test against LTS Java versions (8, 11, 17, 21); use stable JNI practices; document supported JVM versions |
+| DBeaver internal API changes | Plugin breaks on DBeaver updates | Target stable extension points; avoid internal APIs; test against multiple DBeaver versions |
+| Testing matrix complexity (OS × arch × DBeaver × JVM) | QA burden grows quickly | Prioritize Linux x86_64 + DBeaver latest + Java 17 as primary combo; expand incrementally |
+| Native library extraction conflicts | Multiple driver versions conflict in temp directory | Include version in extracted filename; use atomic rename for extraction |
+| Connection pooling assumptions | DBeaver may pool connections; driver may not be pool-safe | Document whether driver is pool-safe; implement `isValid()` for connection health checks. Explicitly state how multiple `Connection` objects in the same JVM share the underlying DecentDB environment handle and interact with the "one writer" lock. |
+| BLOB/large value handling | DBeaver data viewer may fail on large values | Implement streaming for BLOBs; set reasonable fetch size limits |
+
+---
+
+## 12) Resolved Architectural Decisions
 
 1) **Does DecentDB already have a JDBC driver** (even experimental) or must we build it?
+   
+   > **Answer:** No JDBC driver exists yet. Must be built from scratch using the existing C API as the foundation.
+
 2) What should the **JDBC URL format** be?
    - `jdbc:decentdb:/path/to/db.ddb`?
    - `jdbc:decentdb:file:/path/to/db.ddb`?
    - Any query parameters for options (read-only, pragmas, etc.)?
+   
+   > **Recommendation:** Use `jdbc:decentdb:/path/to/db.ddb` as the canonical format. Support query parameters for options like `readOnly=true`. This matches common embedded database patterns (SQLite, DuckDB).
+
 3) How does DecentDB expose metadata today?
    - information_schema-like tables?
    - `SHOW` commands?
    - internal catalog tables?
+   
+   > **Answer:** DecentDB exposes metadata via C API functions that return JSON (see Section 5):
+   > - `decentdb_list_tables_json`
+   > - `decentdb_get_table_columns_json`
+   > - `decentdb_list_indexes_json`
+   > 
+   > The JDBC driver should call these via JNI and parse the JSON responses.
+
 4) How should JDBC isolation levels map to DecentDB snapshot isolation?
+   
+   > **Answer:** Per ADR-0023, DecentDB implements Snapshot Isolation. The JDBC driver should:
+   > - Report `Connection.TRANSACTION_REPEATABLE_READ` as the default isolation level (closest JDBC equivalent to snapshot isolation)
+   > - Accept `TRANSACTION_READ_COMMITTED` and map it to the same underlying behavior (snapshot isolation provides stronger guarantees)
+   > - Reject `TRANSACTION_SERIALIZABLE` with `SQLFeatureNotSupportedException` (snapshot isolation does not prevent write skews)
+   > - Reject `TRANSACTION_READ_UNCOMMITTED` with `SQLFeatureNotSupportedException` (dirty reads not allowed)
 
 ---
 
-## 11) Suggested next concrete step
+## 13) Suggested next concrete step
 
 Before writing any DBeaver plugin code, confirm the DecentDB connectivity story:
 
 - If we can define a JDBC URL + driver class today (even a stub), we can prototype DBeaver integration immediately.
-- If not, the immediate work is: build a minimal embedded JDBC driver (or at least a proof-of-concept wrapper around the existing C API).
+- If not, the immediate work is: build a minimal JDBC driver (or at least a proof-of-concept wrapper around the existing C API).

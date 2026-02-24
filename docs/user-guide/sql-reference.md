@@ -34,6 +34,16 @@ Constraints:
 - `CHECK (expression)` — row-level validation; the expression must evaluate to `TRUE` or `NULL` (only `FALSE` is a violation).
 - `DEFAULT value` — default value used when column is omitted from INSERT.
 - `REFERENCES table(column)` — foreign key constraint (see [Foreign Keys](#foreign-keys)).
+- `GENERATED ALWAYS AS (expr) STORED` — computed column persisted on INSERT/UPDATE (see [Generated Columns](#generated-columns)).
+
+### CREATE TEMP TABLE / CREATE TEMP VIEW
+
+```sql
+CREATE TEMP TABLE temp_results (id INT, value TEXT);
+CREATE TEMP VIEW temp_summary AS SELECT category, COUNT(*) AS cnt FROM products GROUP BY category;
+```
+
+Session-scoped temporary objects that are not persisted to disk. They are visible only to the connection that created them and are dropped when the connection closes. See [ADR-0109](../../design/adr/0109-temporary-tables-views.md).
 
 ### CREATE INDEX
 
@@ -247,8 +257,10 @@ Notes:
 SELECT * FROM table_name;
 SELECT col1, col2 FROM table_name WHERE condition;
 SELECT DISTINCT col1 FROM table_name;
+SELECT DISTINCT ON (category) category, name FROM products ORDER BY category, price;
 SELECT * FROM table_name ORDER BY col1 ASC, col2 DESC;
 SELECT * FROM table_name LIMIT 10 OFFSET 20;
+SELECT * FROM table_name OFFSET 20 ROWS FETCH FIRST 10 ROWS ONLY;  -- SQL:2008 syntax
 SELECT id FROM a UNION ALL SELECT id FROM b;
 ```
 
@@ -307,10 +319,18 @@ Supported scalar functions:
 - `LOWER`
 - `UPPER`
 - `TRIM`
+- `LTRIM(str [, chars])` — remove leading characters (default: whitespace)
+- `RTRIM(str [, chars])` — remove trailing characters (default: whitespace)
 - `REPLACE`
 - `SUBSTRING` / `SUBSTR`
 - `INSTR(str, substr)` — returns 1-based position of first occurrence (0 if not found)
-- `CHR(n)` — returns the character for ASCII code point `n`
+- `LEFT(str, n)` — first `n` characters
+- `RIGHT(str, n)` — last `n` characters
+- `LPAD(str, len [, fill])` — pad left to `len` with `fill` (default: space)
+- `RPAD(str, len [, fill])` — pad right to `len` with `fill` (default: space)
+- `REPEAT(str, n)` — repeat string `n` times
+- `REVERSE(str)` — reverse a string
+- `CHR(n)` / `CHAR(n)` — returns the character for ASCII code point `n`
 - `HEX(val)` — returns uppercase hexadecimal encoding of an integer, text, or blob
 
 **Math:**
@@ -318,9 +338,14 @@ Supported scalar functions:
 - `ROUND`
 - `CEIL` / `CEILING`
 - `FLOOR`
+- `SIGN(x)` — returns -1, 0, or 1
 - `SQRT(x)` — square root (returns FLOAT64; errors on negative input)
 - `POWER(x, y)` / `POW(x, y)` — exponentiation (returns FLOAT64)
 - `MOD(x, y)` — modulo (also available as `x % y` operator)
+- `LN(x)` — natural logarithm
+- `LOG(x)` / `LOG10(x)` — base-10 logarithm; `LOG(base, x)` for custom base
+- `EXP(x)` — exponential (e^x)
+- `RANDOM()` — random float in [0, 1)
 
 **UUID:**
 - `GEN_RANDOM_UUID`
@@ -330,6 +355,19 @@ Supported scalar functions:
 **JSON:**
 - `JSON_ARRAY_LENGTH(json [, path])` — returns element count of a JSON array
 - `JSON_EXTRACT(json, path)` — extracts a value using JSONPath (`$`, `$[N]`, `$.key`)
+- `JSON_TYPE(json)` — returns the type as a string (`null`, `boolean`, `integer`, `real`, `text`, `array`, `object`)
+- `JSON_VALID(json)` — returns 1 if valid JSON, 0 otherwise
+- `JSON_OBJECT(key1, val1, ...)` — creates a JSON object from key-value pairs
+- `JSON_ARRAY(val1, val2, ...)` — creates a JSON array from arguments
+
+**Date/Time:**
+- `NOW()` / `CURRENT_TIMESTAMP` — current date and time as ISO 8601 TEXT
+- `CURRENT_DATE` — current date as `YYYY-MM-DD` TEXT
+- `CURRENT_TIME` — current time as `HH:MM:SS` TEXT
+- `DATE(value)` — parse/normalize a date string
+- `DATETIME(value)` — parse/normalize a datetime string
+- `STRFTIME(format, value)` — format a datetime using `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%w`
+- `EXTRACT(field FROM value)` — extract `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND` from a datetime string
 
 **Other:**
 - `PRINTF(format, args...)` — formatted string output (SQLite-compatible)
@@ -340,8 +378,14 @@ SELECT NULLIF(status, 'active') FROM users;
 SELECT LENGTH(name), LOWER(name), UPPER(name), TRIM(name) FROM users;
 SELECT REPLACE(name, 'old', 'new') FROM users;
 SELECT SUBSTRING(name, 1, 3) FROM users;
+SELECT LEFT(name, 3), RIGHT(name, 3) FROM users;
+SELECT LPAD(code, 5, '0'), RPAD(name, 20) FROM items;
+SELECT REPEAT('*', 5);  -- Returns '*****'
+SELECT REVERSE('hello');  -- Returns 'olleh'
 SELECT ABS(balance), ROUND(price, 2), CEIL(rating), FLOOR(rating) FROM products;
 SELECT SQRT(area), POWER(base, 2), MOD(total, 10) FROM data;
+SELECT LN(x), LOG(x), EXP(x), SIGN(x) FROM data;
+SELECT RANDOM();  -- Random float in [0, 1)
 SELECT 17 % 5;  -- Modulo operator, returns 2
 SELECT INSTR('hello world', 'world');  -- Returns 7
 SELECT CHR(65);  -- Returns 'A'
@@ -355,20 +399,23 @@ SELECT CAST('12.34' AS DECIMAL(10,2));
 SELECT CASE WHEN active THEN 'on' ELSE 'off' END FROM users;
 SELECT JSON_ARRAY_LENGTH('["a","b","c"]');  -- Returns 3
 SELECT JSON_EXTRACT('{"name":"Alice"}', '$.name');  -- Returns 'Alice'
-SELECT JSON_EXTRACT('["x","y","z"]', '$[1]');  -- Returns 'y'
+SELECT JSON_TYPE('{"a":1}');  -- Returns 'object'
+SELECT JSON_VALID('not json');  -- Returns 0
+SELECT JSON_OBJECT('name', 'Alice', 'age', 30);
+SELECT JSON_ARRAY(1, 'two', 3.0);
+SELECT NOW(), CURRENT_DATE, CURRENT_TIME;
+SELECT EXTRACT(YEAR FROM '2026-02-24');  -- Returns 2026
+SELECT STRFTIME('%Y-%m-%d', CURRENT_TIMESTAMP);
 SELECT PRINTF('Hello %s, you are %d', name, age) FROM users;
 ```
 
 ### Common Table Expressions (CTE)
 
-Supported CTE subset:
+Supported:
 - Non-recursive `WITH ...` on `SELECT`
+- `WITH RECURSIVE` for hierarchical queries (tree traversal, series generation). See [ADR-0107](../../design/adr/0107-recursive-cte-execution.md).
 - Multiple CTEs in declaration order (`a`, then `b` may reference `a`)
 - Optional CTE output column list (`WITH cte(col1, ...) AS (...)`)
-
-Current limits:
-- `WITH RECURSIVE` is not supported
-- CTE bodies cannot contain `GROUP BY`/`HAVING`, `ORDER BY`, or `LIMIT/OFFSET` in 0.x
 
 ```sql
 WITH recent AS (
@@ -378,7 +425,27 @@ SELECT name FROM recent ORDER BY id;
 
 WITH a AS (SELECT id FROM users), b(x) AS (SELECT id FROM a WHERE id > 1)
 SELECT x FROM b ORDER BY x;
+
+-- Recursive CTE: generate numbers 1..5
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 5
+)
+SELECT x FROM cnt;
+
+-- Recursive CTE: tree traversal
+WITH RECURSIVE tree(id, name, lvl) AS (
+  SELECT id, name, 0 FROM categories WHERE parent_id IS NULL
+  UNION ALL
+  SELECT c.id, c.name, t.lvl + 1
+  FROM categories c JOIN tree t ON c.parent_id = t.id
+)
+SELECT * FROM tree;
 ```
+
+Current limits:
+- Recursive CTE iteration limit: 1000 rows (prevents infinite loops)
 
 ### Set Operations
 
@@ -400,6 +467,18 @@ SELECT * FROM users JOIN orders ON users.id = orders.user_id;
 
 -- Left join
 SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;
+
+-- Right join (rewritten internally as LEFT JOIN with swapped operands)
+SELECT * FROM orders RIGHT JOIN users ON users.id = orders.user_id;
+
+-- Full outer join
+SELECT * FROM users FULL OUTER JOIN orders ON users.id = orders.user_id;
+
+-- Cross join (Cartesian product)
+SELECT * FROM colors CROSS JOIN sizes;
+
+-- Natural join (matches on shared column names)
+SELECT * FROM employees NATURAL JOIN departments;
 ```
 
 ### Aggregate Functions
@@ -415,6 +494,11 @@ SELECT category, SUM(amount) FROM orders GROUP BY category;
 SELECT category, COUNT(*) FROM orders GROUP BY category HAVING COUNT(*) > 5;
 SELECT GROUP_CONCAT(name, ', ') FROM users;  -- Concatenate with separator
 SELECT STRING_AGG(name, ', ') FROM users;    -- Alias for GROUP_CONCAT
+
+-- DISTINCT aggregates: de-duplicate values before aggregating
+SELECT COUNT(DISTINCT category) FROM products;
+SELECT SUM(DISTINCT amount) FROM orders;
+SELECT AVG(DISTINCT score) FROM results;
 ```
 
 ### Window Functions
@@ -426,6 +510,9 @@ Supported window functions:
 - `DENSE_RANK() OVER (...)` — ranking without gaps (e.g., 1, 1, 2)
 - `LAG(expr [, offset [, default]]) OVER (...)` — access a previous row's value
 - `LEAD(expr [, offset [, default]]) OVER (...)` — access a following row's value
+- `FIRST_VALUE(expr) OVER (...)` — first value in the partition
+- `LAST_VALUE(expr) OVER (...)` — last value in the partition
+- `NTH_VALUE(expr, n) OVER (...)` — nth value in the partition (1-based)
 
 All functions support:
 
@@ -452,6 +539,13 @@ FROM scores ORDER BY id;
 -- LEAD: next row's value
 SELECT name, LEAD(score) OVER (PARTITION BY dept ORDER BY id) AS next_score
 FROM scores ORDER BY dept, id;
+
+-- FIRST_VALUE / LAST_VALUE / NTH_VALUE
+SELECT name,
+  FIRST_VALUE(score) OVER (PARTITION BY dept ORDER BY id) AS first,
+  LAST_VALUE(score) OVER (PARTITION BY dept ORDER BY id) AS last,
+  NTH_VALUE(score, 2) OVER (PARTITION BY dept ORDER BY id) AS second
+FROM scores ORDER BY dept, id;
 ```
 
 Current limits:
@@ -464,14 +558,18 @@ Current limits:
 
 ```sql
 BEGIN;
--- ... your operations ...
+BEGIN IMMEDIATE;   -- Synonym for BEGIN (single-writer engine)
+BEGIN EXCLUSIVE;   -- Synonym for BEGIN (single-writer engine)
 COMMIT;
-
--- Or rollback
-BEGIN;
--- ... your operations ...
 ROLLBACK;
+
+-- Savepoints (within a transaction)
+SAVEPOINT name;
+RELEASE SAVEPOINT name;
+ROLLBACK TO SAVEPOINT name;
 ```
+
+For details, see [Transactions](transactions.md).
 
 ### Explain
 
@@ -489,6 +587,48 @@ EXPLAIN ANALYZE SELECT * FROM users WHERE id = 1;
 
 Executes the query and produces the execution plan annotated with actual row counts
 and execution time. The parenthesized form `EXPLAIN (ANALYZE) ...` is also supported.
+
+### Table-Valued Functions
+
+Table-valued functions appear in the `FROM` clause and return a set of rows. See [ADR-0111](../../design/adr/0111-table-valued-functions.md).
+
+**`json_each(json)`** — iterates top-level key/value pairs of a JSON object or array.
+
+Returns columns: `key` (TEXT), `value` (TEXT), `type` (TEXT).
+
+```sql
+-- Iterate a JSON object
+SELECT key, value, type FROM json_each('{"name":"Alice","age":30}');
+-- Returns: name|Alice|string, age|30|number
+
+-- Iterate a JSON array
+SELECT key, value, type FROM json_each('[10, 20, 30]');
+-- Returns: 0|10|number, 1|20|number, 2|30|number
+```
+
+**`json_tree(json)`** — recursively walks a nested JSON structure.
+
+Returns columns: `key` (TEXT), `value` (TEXT), `type` (TEXT), `path` (TEXT).
+
+```sql
+SELECT key, value, type, path FROM json_tree('{"a":{"b":1},"c":[2,3]}');
+```
+
+### Generated Columns
+
+Columns defined with `GENERATED ALWAYS AS (expr) STORED` are computed on every INSERT and UPDATE and persisted to disk. See [ADR-0108](../../design/adr/0108-generated-columns-stored.md).
+
+```sql
+CREATE TABLE products (
+    id INT PRIMARY KEY,
+    price REAL,
+    qty INT,
+    total REAL GENERATED ALWAYS AS (price * qty) STORED
+);
+
+INSERT INTO products (id, price, qty) VALUES (1, 9.99, 3);
+SELECT total FROM products WHERE id = 1;  -- Returns 29.97
+```
 
 ## Constraints
 
@@ -579,8 +719,9 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users WHERE id = \$1" --params=in
 
 Not currently supported:
 - Window frame clauses (`ROWS BETWEEN ...`, `RANGE BETWEEN ...`)
-- Additional window functions (`NTILE`, `PERCENT_RANK`, `CUME_DIST`, `NTH_VALUE`, `FIRST_VALUE`, `LAST_VALUE`)
-- Recursive CTEs (`WITH RECURSIVE`)
+- Additional window functions (`NTILE`, `PERCENT_RANK`, `CUME_DIST`)
+- `INTERSECT ALL`, `EXCEPT ALL`
 - Stored procedures
+- Distributed transactions
 
 See [Known Limitations](../about/changelog.md#known-limitations) for details.

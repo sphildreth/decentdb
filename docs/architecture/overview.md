@@ -58,7 +58,7 @@ DecentDB is designed with a modular architecture emphasizing correctness, perfor
 ### Execution Engine (`exec/`)
 
 - Iterator-based (Volcano) model
-- Operators: Scan, Filter, Project, Join, Sort, Limit, Aggregate, Window
+- Operators: Scan, Filter, Project, Join, Sort, Limit, Aggregate, Window, TvfScan (table-valued functions)
 - Expression evaluation
 - Row materialization
 

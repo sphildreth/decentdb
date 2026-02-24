@@ -80,7 +80,7 @@ The project emphasizes **testing and correctness from day 1**, using a **Python-
 - Full PostgreSQL semantics, system catalogs, extensions, or wire protocol
 - Advanced query optimizer (cost-based, statistics-driven)
 - Full-text ranking, stemming, language analyzers (beyond trigram index)
-- Advanced ALTER TABLE operations (RENAME COLUMN, MODIFY COLUMN, ADD CONSTRAINT)
+- `ALTER TABLE ... ADD CONSTRAINT` (constraints must be declared at table creation)
 - Replication / clustering
 - Encrypted storage (future optional)
 
