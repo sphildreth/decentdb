@@ -140,6 +140,46 @@ suite "EXPLAIN Statement":
 
     discard closeDb(db)
 
+  test "Join reordering respects ON dependencies":
+    let path = makeTempDb("decentdb_explain_join_reorder_deps.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE a (id INT)").ok
+    check execSql(db, "CREATE TABLE b (id INT, a_id INT)").ok
+    check execSql(db, "CREATE TABLE c (id INT, b_id INT)").ok
+
+    check execSql(db, "INSERT INTO a VALUES (1)").ok
+    # Make b appear larger than c to tempt naive cardinality-based reordering.
+    for i in 1 .. 200:
+      check execSql(db, "INSERT INTO b VALUES (" & $i & ", 1)").ok
+    check execSql(db, "INSERT INTO c VALUES (1, 1)").ok
+
+    # Stats should not be required for dependency correctness, but keep them fresh.
+    check execSql(db, "ANALYZE a").ok
+    check execSql(db, "ANALYZE b").ok
+    check execSql(db, "ANALYZE c").ok
+
+    let res = execSql(db, "EXPLAIN SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id")
+    check res.ok
+    let lines = res.value
+    # In a left-deep tree (with Project at the root), the only depth-2 access
+    # node is the last joined table (right child of the outer Join).
+    var depth2Access: seq[string] = @[]
+    for ln in lines:
+      if ln.startsWith("    TableScan(table=") or ln.startsWith("    IndexSeek(table="):
+        depth2Access.add(ln)
+    check depth2Access.len == 1
+    check "(table=c" in depth2Access[0]
+
+    # Also verify the query executes (a bad reorder used to fail at runtime).
+    let rows = execSql(db, "SELECT a.id, b.id, c.id FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id")
+    check rows.ok
+    check rows.value.len == 1
+
+    discard closeDb(db)
+
   test "AND (OR ...) distributes into UnionDistinct when indexable":
     let path = makeTempDb("decentdb_explain_and_or_union.db")
     let dbRes = openDb(path)

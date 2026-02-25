@@ -107,10 +107,16 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       line.add("OneRow")
       lines.add(line)
     of pkTableScan:
-      line.add("TableScan(table=" & p.table & " alias=" & p.alias & ")")
+      line.add("TableScan(table=" & p.table & " alias=" & p.alias)
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkRowidSeek:
-      line.add("RowidSeek(table=" & p.table & " alias=" & p.alias & " column=" & p.column & " value=" & renderExpr(p.valueExpr) & ")")
+      line.add("RowidSeek(table=" & p.table & " alias=" & p.alias & " column=" & p.column & " value=" & renderExpr(p.valueExpr))
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkIndexSeek:
       var idxName = "?"
@@ -128,12 +134,18 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
           p.column[IndexExpressionPrefix.len .. ^1]
         else:
           p.column
-      line.add("IndexSeek(table=" & p.table & " column=" & colDisplay & " value=" & renderExpr(p.valueExpr) & " index=" & idxName & ")")
+      line.add("IndexSeek(table=" & p.table & " column=" & colDisplay & " value=" & renderExpr(p.valueExpr) & " index=" & idxName)
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkTrigramSeek:
       let idxOpt = catalog.getTrigramIndexForColumn(p.table, p.column)
       let idxName = if idxOpt.isSome: idxOpt.get.name else: "?"
-      line.add("TrigramSeek(table=" & p.table & " column=" & p.column & " pattern=" & renderExpr(p.likeExpr) & " insensitive=" & $p.likeInsensitive & " index=" & idxName & ")")
+      line.add("TrigramSeek(table=" & p.table & " column=" & p.column & " pattern=" & renderExpr(p.likeExpr) & " insensitive=" & $p.likeInsensitive & " index=" & idxName)
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkSubqueryScan:
       line.add("SubqueryScan(alias=" & p.alias & ")")
@@ -224,5 +236,7 @@ proc explainAnalyzePlanLines*(catalog: Catalog, plan: Plan, metrics: PlanMetrics
   ## Render EXPLAIN ANALYZE output: plan lines followed by actual execution metrics.
   result = explainPlanLines(catalog, plan)
   result.add("---")
+  if plan != nil and plan.estRows > 0:
+    result.add("Estimated Rows: " & $plan.estRows)
   result.add("Actual Rows: " & $metrics.actualRows)
   result.add("Actual Time: " & formatFloat(metrics.actualTimeMs, ffDecimal, 3) & " ms")

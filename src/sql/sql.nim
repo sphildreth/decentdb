@@ -189,6 +189,7 @@ type StatementKind* = enum
   skReleaseSavepoint
   skRollbackToSavepoint
   skExplain
+  skAnalyze
 
 type Statement* = ref object
   case kind*: StatementKind
@@ -297,6 +298,8 @@ type Statement* = ref object
     releaseSavepointName*: string
   of skRollbackToSavepoint:
     rollbackToSavepointName*: string
+  of skAnalyze:
+    analyzeTable*: string  ## empty string = analyze all tables
 
 type SqlAst* = ref object
   statements*: seq[Statement]
@@ -2137,9 +2140,31 @@ proc parseExplainStmt(node: JsonNode): Result[Statement] =
   
   ok(Statement(kind: skExplain, explainInner: innerRes.value, explainAnalyze: analyze))
 
+proc parseVacuumStmt(node: JsonNode): Result[Statement] =
+  ## pg_query emits ANALYZE tableName as a VacuumStmt with is_vacuumcmd=false.
+  ## Bare ANALYZE (no table) also maps here with an empty rels list.
+  let isVacuum = nodeHas(node, "is_vacuumcmd") and node["is_vacuumcmd"].getBool(false)
+  if isVacuum:
+    return err[Statement](ERR_SQL, "VACUUM not supported")
+  # Extract optional table name from rels list.
+  var tableName = ""
+  if nodeHas(node, "rels") and node["rels"].kind == JArray and node["rels"].len > 0:
+    let rel = node["rels"][0]
+    # libpg_query wraps the relation in a VacuumRelation node.
+    var relNode = rel
+    if nodeHas(rel, "VacuumRelation"):
+      relNode = rel["VacuumRelation"]
+    if nodeHas(relNode, "relation"):
+      let rn = relNode["relation"]
+      let inner = if nodeHas(rn, "RangeVar"): rn["RangeVar"] else: rn
+      tableName = nodeString(nodeGet(inner, "relname"))
+  ok(Statement(kind: skAnalyze, analyzeTable: tableName))
+
 proc parseStatementNode(node: JsonNode): Result[Statement] =
   if nodeHas(node, "ExplainStmt"):
     return parseExplainStmt(node["ExplainStmt"])
+  if nodeHas(node, "VacuumStmt"):
+    return parseVacuumStmt(node["VacuumStmt"])
   if nodeHas(node, "SelectStmt"):
     return parseSelectStmt(node["SelectStmt"])
   if nodeHas(node, "InsertStmt"):

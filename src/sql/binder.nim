@@ -2445,3 +2445,7 @@ proc bindStatement*(catalog: Catalog, stmt: Statement): Result[Statement] =
     if not innerRes.ok:
       return err[Statement](innerRes.err.code, innerRes.err.message, innerRes.err.context)
     ok(Statement(kind: skExplain, explainInner: innerRes.value, explainAnalyze: stmt.explainAnalyze))
+  of skAnalyze:
+    if stmt.analyzeTable.len > 0 and not catalog.hasTableName(stmt.analyzeTable):
+      return err[Statement](ERR_SQL, "Table not found", stmt.analyzeTable)
+    ok(stmt)

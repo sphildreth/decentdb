@@ -2492,6 +2492,9 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
     of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skAlterTable:
        # DDL invalidates prepared statements anyway
        return execSql(db, prepared.sql, params)
+    of skAnalyze:
+       # ANALYZE is never cached as a prepared statement; fall back to execSql.
+       return execSql(db, prepared.sql, params)
 
   ok(output)
 
@@ -2722,7 +2725,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       output.add(parts.join("|"))
     ok(output)
   for i, bound in boundStatements:
-    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
+    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete, skAnalyze}
     # stderr.writeLine("execSql: i=" & $i & " kind=" & $bound.kind & " isWrite=" & $isWrite)
     # stderr.writeLine("execSql: autoCommit=" & $autoCommit)
     var autoCommit = false
@@ -3153,6 +3156,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0)
         if not multiRes.ok:
           return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+        addRowCountDelta(db.catalog, bound.insertTable, multiRes.value.totalAffected)
         let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
         if not triggerRes.ok:
           return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
@@ -3276,6 +3280,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
           if not delRes.ok:
             return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
+        addRowCountDelta(db.catalog, bound.deleteTable, -int64(deletions.len))
         let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, int64(deletions.len))
         if not triggerRes.ok:
           return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
@@ -3358,6 +3363,58 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           break
       if not found:
         return err[seq[string]](ERR_SQL, "SAVEPOINT not found", bound.rollbackToSavepointName)
+    of skAnalyze:
+      # ANALYZE must not be called inside an explicit multi-statement transaction.
+      if not autoCommit:
+        return err[seq[string]](ERR_SQL, "ANALYZE cannot run inside an explicit transaction")
+      # Determine which tables to analyze.
+      var tableNames: seq[string] = @[]
+      if bound.analyzeTable.len > 0:
+        tableNames.add(bound.analyzeTable)
+      else:
+        for normName in db.catalog.tables.keys:
+          tableNames.add(normName)
+      for tname in tableNames:
+        let normName = tname.toLowerAscii()
+        let tableRes = db.catalog.getTable(normName)
+        if not tableRes.ok:
+          continue
+        let tableMeta = tableRes.value
+        # Count rows by scanning the table B+Tree.
+        var rowCount: int64 = 0
+        let tableTree = newBTree(db.pager, tableMeta.rootPage)
+        let cursorRes = openCursor(tableTree)
+        if cursorRes.ok:
+          let cursor = cursorRes.value
+          while true:
+            let nextRes = cursorNext(cursor)
+            if not nextRes.ok: break
+            inc rowCount
+        let saveStatsRes = db.catalog.saveTableStats(normName, TableStats(rowCount: rowCount))
+        if not saveStatsRes.ok:
+          return err[seq[string]](saveStatsRes.err.code, saveStatsRes.err.message, saveStatsRes.err.context)
+        # Count index entries and distinct keys for all B+Tree indexes on this table.
+        for _, idx in db.catalog.indexes:
+          if idx.table.toLowerAscii() != normName or idx.kind != ikBtree:
+            continue
+          var entryCount: int64 = 0
+          var distinctKeyCount: int64 = 0
+          var lastKey: uint64 = uint64.high
+          let idxTree = newBTree(db.pager, idx.rootPage)
+          let idxCursorRes = openCursor(idxTree)
+          if idxCursorRes.ok:
+            let idxCursor = idxCursorRes.value
+            while true:
+              let nextRes = cursorNext(idxCursor)
+              if not nextRes.ok: break
+              inc entryCount
+              let key = nextRes.value[0]
+              if key != lastKey:
+                inc distinctKeyCount
+                lastKey = key
+          let saveIdxRes = db.catalog.saveIndexStats(idx.name.toLowerAscii(), IndexStats(entryCount: entryCount, distinctKeyCount: distinctKeyCount))
+          if not saveIdxRes.ok:
+            return err[seq[string]](saveIdxRes.err.code, saveIdxRes.err.message, saveIdxRes.err.context)
     if autoCommit:
       let commitRes = commitTransaction(db)
       if not commitRes.ok:
@@ -4762,6 +4819,9 @@ proc commitTransaction*(db: Db): Result[Void] =
   
   # End page allocation tracking (pages are now permanent) (HIGH-003)
   endTxnPageTracking(db.pager)
+
+  # Apply incremental row-count deltas to persisted stats.
+  discard applyRowCountDeltas(db.catalog)
   
   okVoid()
 
@@ -4800,6 +4860,7 @@ proc rollbackTransaction*(db: Db): Result[Void] =
     stderr.writeLine("Warning: failed to return some allocated pages to freelist during rollback")
 
   db.catalog.clearTrigramDeltas()
+  discardRowCountDeltas(db.catalog)
 
   release(db.pager.rollbackLock)
 

@@ -276,6 +276,20 @@ UPDATE table_name SET col1 = val1 WHERE condition;
 DELETE FROM table_name WHERE condition;
 ```
 
+### ANALYZE
+
+Collects table and index statistics used by the query planner (row counts and index key cardinality).
+
+```sql
+ANALYZE;
+ANALYZE table_name;
+```
+
+Notes:
+- `ANALYZE table_name` computes statistics for a single table.
+- `ANALYZE` (no table) analyzes all tables.
+- `ANALYZE` is a write operation and is currently rejected inside an explicit transaction (`BEGIN`/`COMMIT`).
+
 ## Query Features
 
 ### WHERE Clause

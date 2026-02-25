@@ -175,6 +175,9 @@ decentdb checkpoint --db ./my.ddb
 # View database statistics
 decentdb stats --db ./my.ddb
 
+# Collect planner statistics (row counts / index cardinality)
+decentdb exec --db ./my.ddb --sql "ANALYZE"
+
 # Rebuild an index
 decentdb rebuild-index --index users_name_idx --db ./my.ddb
 ```

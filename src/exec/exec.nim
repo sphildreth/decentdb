@@ -5414,39 +5414,43 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
 
     if useHashJoin:
       let info = hashJoinInfo.get
-      # Determine which side of the equality refers to which table
-      # Left side of predicate could be from left or right table
-      let leftPrefix = if plan.left.alias.len > 0: plan.left.alias else: plan.left.table
+      # Determine which side of the equality refers to the right input.
       let rightPrefix = if plan.right.alias.len > 0: plan.right.alias else: plan.right.table
-      
+
+      proc matchesRight(tableName: string): bool =
+        tableName.len > 0 and (tableName == rightPrefix or tableName == plan.right.table)
+
       var rColName, lColName: string
       var rColTable, lColTable: string
-      
-      # Check if first column matches right table
-      if info.leftColTable == rightPrefix or info.leftColTable == plan.right.table or 
-         (info.leftColTable.len == 0 and info.rightColTable == leftPrefix):
+
+      if matchesRight(info.leftColTable) and not matchesRight(info.rightColTable):
         rColTable = info.leftColTable
         rColName = info.leftColName
         lColTable = info.rightColTable
         lColName = info.rightColName
-      else:
-        lColTable = info.leftColTable
-        lColName = info.leftColName
+      elif matchesRight(info.rightColTable) and not matchesRight(info.leftColTable):
         rColTable = info.rightColTable
         rColName = info.rightColName
-      
-      # Find index of join column on each side using the known scan prefixes.
-      let rightColKey = rightPrefix & "." & rColName
-      for i, col in cachedRight[0].columns:
-        if col == rightColKey or col.endsWith("." & rColName):
-          rightJoinColIdx = i
-          break
+        lColTable = info.leftColTable
+        lColName = info.leftColName
+      else:
+        # Can't reliably map the join predicate to left/right.
+        rColTable = ""
+        lColTable = ""
 
-      let leftColKey = leftPrefix & "." & lColName
-      for i, col in leftRes.value[0].columns:
-        if col == leftColKey or col.endsWith("." & lColName):
-          leftJoinColIdx = i
-          break
+      proc tryFindColIdx(row: Row, tableCandidates: openArray[string], colName: string): int =
+        for t in tableCandidates:
+          if t.len == 0:
+            continue
+          let idxRes = columnIndex(row, t, colName)
+          if idxRes.ok:
+            return idxRes.value
+        -1
+
+      if rColTable.len > 0 and lColTable.len > 0:
+        rightJoinColIdx = tryFindColIdx(cachedRight[0], [rColTable, rightPrefix, plan.right.table], rColName)
+        # NOTE: plan.left might be a join, so plan.left.table/alias may be empty.
+        leftJoinColIdx = tryFindColIdx(leftRes.value[0], [lColTable], lColName)
 
       # Build hash table if we found the columns and the key kind is supported.
       if rightJoinColIdx >= 0 and leftJoinColIdx >= 0:
