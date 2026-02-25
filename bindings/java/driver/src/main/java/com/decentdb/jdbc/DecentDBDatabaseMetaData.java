@@ -613,7 +613,75 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
                 String typeName = col.getString("type");
                 int jdbcType = TypeMapping.jdbcTypeFromName(typeName);
+                // DBeaver displays TYPE_NAME in the UI. Our catalog exposes canonical
+                // internal names (INT64/FLOAT64/BOOL); normalize them to common SQL
+                // names for a more familiar experience.
+                String displayTypeName;
+                if (typeName == null) {
+                    displayTypeName = "OTHER";
+                } else {
+                    switch (typeName.toUpperCase().trim()) {
+                        case "INT64":
+                            displayTypeName = "INTEGER";
+                            break;
+                        case "FLOAT64":
+                            displayTypeName = "REAL";
+                            break;
+                        case "BOOL":
+                            displayTypeName = "BOOLEAN";
+                            break;
+                        default:
+                            displayTypeName = typeName;
+                            break;
+                    }
+                }
                 boolean notNull = col.optBoolean("not_null", false);
+
+                int columnSize;
+                int decimalDigits;
+                int radix;
+                switch (jdbcType) {
+                    case Types.BIGINT:
+                        columnSize = 19;
+                        decimalDigits = 0;
+                        radix = 10;
+                        break;
+                    case Types.INTEGER:
+                        columnSize = 10;
+                        decimalDigits = 0;
+                        radix = 10;
+                        break;
+                    case Types.BOOLEAN:
+                        columnSize = 1;
+                        decimalDigits = 0;
+                        radix = 10;
+                        break;
+                    case Types.DOUBLE:
+                        columnSize = 15;
+                        decimalDigits = 0;
+                        radix = 10;
+                        break;
+                    case Types.DECIMAL:
+                        columnSize = 18;
+                        decimalDigits = 0;
+                        radix = 10;
+                        break;
+                    case Types.BINARY:
+                        columnSize = typeName != null && typeName.equalsIgnoreCase("UUID") ? 16 : 0;
+                        decimalDigits = 0;
+                        radix = 0;
+                        break;
+                    case Types.VARCHAR:
+                        columnSize = 0;
+                        decimalDigits = 0;
+                        radix = 0;
+                        break;
+                    default:
+                        columnSize = 0;
+                        decimalDigits = 0;
+                        radix = 0;
+                        break;
+                }
 
                 rows.add(new Object[]{
                     null,                          // TABLE_CAT
@@ -621,17 +689,17 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
                     tbl,                           // TABLE_NAME
                     colName,                       // COLUMN_NAME
                     jdbcType,                      // DATA_TYPE
-                    typeName,                      // TYPE_NAME
-                    255,                           // COLUMN_SIZE
+                    displayTypeName,               // TYPE_NAME
+                    columnSize,                    // COLUMN_SIZE
                     null,                          // BUFFER_LENGTH
-                    0,                             // DECIMAL_DIGITS
-                    10,                            // NUM_PREC_RADIX
+                    decimalDigits,                 // DECIMAL_DIGITS
+                    radix,                         // NUM_PREC_RADIX
                     notNull ? DatabaseMetaData.columnNoNulls : DatabaseMetaData.columnNullable, // NULLABLE
                     "",                            // REMARKS
                     null,                          // COLUMN_DEF
                     null,                          // SQL_DATA_TYPE
                     null,                          // SQL_DATETIME_SUB
-                    255,                           // CHAR_OCTET_LENGTH
+                    columnSize,                    // CHAR_OCTET_LENGTH
                     ci + 1,                        // ORDINAL_POSITION (1-based)
                     notNull ? "NO" : "YES",        // IS_NULLABLE
                     null, null, null,              // SCOPE_CATALOG, SCOPE_SCHEMA, SCOPE_TABLE
@@ -880,15 +948,16 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public ResultSet getTypeInfo() throws SQLException {
+        // Keep this aligned with DecentDB's canonical catalog type names
+        // (see src/catalog/catalog.nim columnTypeToText).
         List<Object[]> rows = Arrays.asList(
-            typeRow("INTEGER", Types.BIGINT, 19, false),
-            typeRow("REAL",    Types.DOUBLE, 15, false),
-            typeRow("DECIMAL", Types.DECIMAL, 38, false),
+            typeRow("INT64",   Types.BIGINT, 19, false),
+            typeRow("BOOL",    Types.BOOLEAN, 1, false),
+            typeRow("FLOAT64", Types.DOUBLE, 15, false),
+            typeRow("DECIMAL", Types.DECIMAL, 18, false),
             typeRow("TEXT",    Types.VARCHAR, 0, true),
-            typeRow("BOOLEAN", Types.BOOLEAN, 1, false),
             typeRow("BLOB",    Types.BINARY, 0, false),
-            typeRow("DATE",    Types.DATE, 10, true),
-            typeRow("TIMESTAMP", Types.TIMESTAMP, 26, true)
+            typeRow("UUID",    Types.BINARY, 16, false)
         );
         return buildResultSet(new String[]{
             "TYPE_NAME","DATA_TYPE","PRECISION","LITERAL_PREFIX","LITERAL_SUFFIX",

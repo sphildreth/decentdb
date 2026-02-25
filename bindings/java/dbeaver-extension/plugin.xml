@@ -18,13 +18,14 @@
             inheritProviderProperties="true"
             dialect="decentdb"
             label="DecentDB"
-            icon="icons/decentdb_icon.png">
+            icon="icons/decentdb_icon_16.png"
+            iconBig="icons/decentdb_icon_big.png">
 
             <drivers managable="true">
                 <driver
                     id="decentdb_jdbc"
                     label="DecentDB"
-                    icon="icons/decentdb_icon.png"
+                    icon="icons/decentdb_icon_16.png"
                     iconBig="icons/decentdb_icon_big.png"
                     class="com.decentdb.jdbc.DecentDBDriver"
                     sampleURL="jdbc:decentdb:{file}"
@@ -64,7 +65,7 @@
             class="org.jkiss.dbeaver.ext.generic.model.GenericSQLDialect"
             label="DecentDB"
             description="DecentDB SQL dialect"
-            icon="icons/decentdb_icon.png"
+            icon="icons/decentdb_icon_16.png"
             />
     </extension>
 

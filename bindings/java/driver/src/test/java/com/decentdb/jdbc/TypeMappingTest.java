@@ -16,6 +16,7 @@ class TypeMappingTest {
     void integerType() {
         assertEquals(Types.BIGINT, TypeMapping.jdbcTypeFromName("INTEGER"));
         assertEquals(Types.BIGINT, TypeMapping.jdbcTypeFromName("INT"));
+        assertEquals(Types.BIGINT, TypeMapping.jdbcTypeFromName("INT64"));
         assertEquals(Types.BIGINT, TypeMapping.jdbcTypeFromName("BIGINT"));
     }
 
@@ -59,7 +60,7 @@ class TypeMappingTest {
 
     @Test
     void unknownType() {
-        assertEquals(Types.OTHER, TypeMapping.jdbcTypeFromName("UUID"));
+        assertEquals(Types.BINARY, TypeMapping.jdbcTypeFromName("UUID"));
         assertEquals(Types.OTHER, TypeMapping.jdbcTypeFromName("JSON"));
         assertEquals(Types.OTHER, TypeMapping.jdbcTypeFromName("UNKNOWN_TYPE"));
         assertEquals(Types.OTHER, TypeMapping.jdbcTypeFromName(null));

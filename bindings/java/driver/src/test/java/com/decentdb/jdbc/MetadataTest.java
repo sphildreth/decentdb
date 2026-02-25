@@ -141,8 +141,16 @@ class MetadataTest {
             boolean foundDeptId = false, foundDeptName = false;
             while (rs.next()) {
                 String col = rs.getString("COLUMN_NAME");
-                if ("dept_id".equalsIgnoreCase(col)) foundDeptId = true;
-                if ("dept_name".equalsIgnoreCase(col)) foundDeptName = true;
+                if ("dept_id".equalsIgnoreCase(col)) {
+                    foundDeptId = true;
+                    assertEquals(Types.BIGINT, rs.getInt("DATA_TYPE"));
+                    assertEquals("INTEGER", rs.getString("TYPE_NAME"));
+                }
+                if ("dept_name".equalsIgnoreCase(col)) {
+                    foundDeptName = true;
+                    assertEquals(Types.VARCHAR, rs.getInt("DATA_TYPE"));
+                    assertEquals("TEXT", rs.getString("TYPE_NAME"));
+                }
                 count++;
                 // Verify required JDBC columns are present
                 assertNotNull(rs.getString("TABLE_NAME"));
@@ -287,7 +295,18 @@ class MetadataTest {
         assumeNative();
         DatabaseMetaData meta = connection.getMetaData();
         try (ResultSet rs = meta.getTypeInfo()) {
-            assertTrue(rs.next(), "Should return at least one type");
+            java.util.Map<String, Integer> byName = new java.util.HashMap<>();
+            while (rs.next()) {
+                byName.put(rs.getString("TYPE_NAME"), rs.getInt("DATA_TYPE"));
+            }
+
+            assertEquals(Types.BIGINT, byName.get("INT64"));
+            assertEquals(Types.BOOLEAN, byName.get("BOOL"));
+            assertEquals(Types.DOUBLE, byName.get("FLOAT64"));
+            assertEquals(Types.DECIMAL, byName.get("DECIMAL"));
+            assertEquals(Types.VARCHAR, byName.get("TEXT"));
+            assertEquals(Types.BINARY, byName.get("BLOB"));
+            assertEquals(Types.BINARY, byName.get("UUID"));
         }
     }
 

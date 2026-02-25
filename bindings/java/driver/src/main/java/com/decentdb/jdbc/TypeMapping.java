@@ -18,6 +18,7 @@ final class TypeMapping {
         switch (typeName.toUpperCase().trim()) {
             case "INTEGER":
             case "INT":
+            case "INT64":
             case "BIGINT":
             case "INT8":
                 return Types.BIGINT;
@@ -25,6 +26,7 @@ final class TypeMapping {
             case "INT4":
             case "INT2":
                 return Types.INTEGER;
+            case "FLOAT64":
             case "REAL":
             case "DOUBLE":
             case "DOUBLE PRECISION":
@@ -42,6 +44,8 @@ final class TypeMapping {
                 return Types.VARCHAR;
             case "BOOLEAN":
             case "BOOL":
+            case "BOOL_TRUE":
+            case "BOOL_FALSE":
                 return Types.BOOLEAN;
             case "BLOB":
             case "BYTEA":
@@ -54,7 +58,8 @@ final class TypeMapping {
             case "TIMESTAMPTZ":
                 return Types.TIMESTAMP;
             case "UUID":
-                return Types.OTHER;
+                // Stored as 16-byte blob at rest.
+                return Types.BINARY;
             case "JSON":
             case "JSONB":
                 return Types.OTHER;
