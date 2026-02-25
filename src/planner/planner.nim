@@ -575,7 +575,7 @@ proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[strin
   var effectiveJoins = stmt.joins  # may be replaced with reordered version
   var effectiveJoinSubqueries = stmt.joinSubqueries
   block joinReorderBlock:
-    if stmt.joins.len == 0 or stmt.joins.len + 1 > joinReorderMaxTables:
+    if stmt.joins.len == 0:
       break joinReorderBlock
     # Only reorder if all joins are inner joins with no subquery sources.
     var allInner = true
@@ -671,19 +671,8 @@ proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[strin
       if j.alias.len > 0:
         deps[i].excl(j.alias)
 
-    # DP over subsets of joins: dpCost[mask] is the cheapest estimated cost so far.
     let fullMask = (1 shl n) - 1
-    var dpCost = newSeq[float64](1 shl n)
-    var dpRows = newSeq[int64](1 shl n)
-    var prevMask = newSeq[int](1 shl n)
-    var chosenJoinIdx = newSeq[int](1 shl n)
-    for m in 0 .. fullMask:
-      dpCost[m] = Inf
-      prevMask[m] = -1
-      chosenJoinIdx[m] = -1
-      dpRows[m] = 0
-    dpCost[0] = 0.0
-    dpRows[0] = tableEst(stmt.fromTable)
+    let doDp = (stmt.joins.len + 1) <= joinReorderMaxTables
 
     proc buildAvailable(mask: int): HashSet[string] =
       result = initHashSet[string]()
@@ -715,44 +704,92 @@ proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[strin
             return seekProbeCost(trows)
       scanCost(trows)
 
-    for mask in 0 .. fullMask:
-      if dpCost[mask] == Inf:
-        continue
-      let avail = buildAvailable(mask)
-      for i in 0 ..< n:
-        if (mask and (1 shl i)) != 0:
-          continue
-        if not (deps[i] <= avail):
-          continue
-        let j = stmt.joins[i]
-        let probe = joinProbeCost(j, avail)
-        let outerRows = max(1'i64, dpRows[mask])
-        let newCost = dpCost[mask] + float64(outerRows) * probe
-        let rightRows = tableEst(j.table)
-        let newRowsF = min(float64(high(int64)), float64(outerRows) * float64(rightRows) * dpJoinSel)
-        let newRows = max(1'i64, int64(newRowsF))
-        let newMask = mask or (1 shl i)
-        if newCost < dpCost[newMask]:
-          dpCost[newMask] = newCost
-          dpRows[newMask] = newRows
-          prevMask[newMask] = mask
-          chosenJoinIdx[newMask] = i
-
-    if dpCost[fullMask] == Inf:
-      break joinReorderBlock
-
-    # Reconstruct best join order.
     var orderIdxs: seq[int] = @[]
-    var m = fullMask
-    while m != 0:
-      let jIdx = chosenJoinIdx[m]
-      if jIdx < 0:
-        break
-      orderIdxs.add(jIdx)
-      m = prevMask[m]
-    orderIdxs.reverse()
-    if orderIdxs.len != n:
-      break joinReorderBlock
+
+    if doDp:
+      # DP over subsets of joins: dpCost[mask] is the cheapest estimated cost so far.
+      var dpCost = newSeq[float64](1 shl n)
+      var dpRows = newSeq[int64](1 shl n)
+      var prevMask = newSeq[int](1 shl n)
+      var chosenJoinIdx = newSeq[int](1 shl n)
+      for m in 0 .. fullMask:
+        dpCost[m] = Inf
+        prevMask[m] = -1
+        chosenJoinIdx[m] = -1
+        dpRows[m] = 0
+      dpCost[0] = 0.0
+      dpRows[0] = tableEst(stmt.fromTable)
+
+      for mask in 0 .. fullMask:
+        if dpCost[mask] == Inf:
+          continue
+        let avail = buildAvailable(mask)
+        for i in 0 ..< n:
+          if (mask and (1 shl i)) != 0:
+            continue
+          if not (deps[i] <= avail):
+            continue
+          let j = stmt.joins[i]
+          let probe = joinProbeCost(j, avail)
+          let outerRows = max(1'i64, dpRows[mask])
+          let newCost = dpCost[mask] + float64(outerRows) * probe
+          let rightRows = tableEst(j.table)
+          let newRowsF = min(float64(high(int64)), float64(outerRows) * float64(rightRows) * dpJoinSel)
+          let newRows = max(1'i64, int64(newRowsF))
+          let newMask = mask or (1 shl i)
+          if newCost < dpCost[newMask]:
+            dpCost[newMask] = newCost
+            dpRows[newMask] = newRows
+            prevMask[newMask] = mask
+            chosenJoinIdx[newMask] = i
+
+      if dpCost[fullMask] == Inf:
+        break joinReorderBlock
+
+      # Reconstruct best join order.
+      var m = fullMask
+      while m != 0:
+        let jIdx = chosenJoinIdx[m]
+        if jIdx < 0:
+          break
+        orderIdxs.add(jIdx)
+        m = prevMask[m]
+      orderIdxs.reverse()
+      if orderIdxs.len != n:
+        break joinReorderBlock
+    else:
+      # Greedy fallback: repeatedly pick the next legal join with the lowest
+      # incremental estimated cost. This is not exhaustive, but avoids O(2^n).
+      var mask = 0
+      var outerRows = max(1'i64, tableEst(stmt.fromTable))
+      while mask != fullMask:
+        let avail = buildAvailable(mask)
+        var bestIdx = -1
+        var bestDelta = Inf
+        var bestNewRows: int64 = outerRows
+        for i in 0 ..< n:
+          if (mask and (1 shl i)) != 0:
+            continue
+          if not (deps[i] <= avail):
+            continue
+          let j = stmt.joins[i]
+          let probe = joinProbeCost(j, avail)
+          let delta = float64(outerRows) * probe
+          if delta < bestDelta:
+            bestDelta = delta
+            bestIdx = i
+            let rightRows = tableEst(j.table)
+            let newRowsF = min(float64(high(int64)), float64(outerRows) * float64(rightRows) * dpJoinSel)
+            bestNewRows = max(1'i64, int64(newRowsF))
+        if bestIdx < 0:
+          # No legal next join — keep original join order.
+          break joinReorderBlock
+        orderIdxs.add(bestIdx)
+        mask = mask or (1 shl bestIdx)
+        outerRows = bestNewRows
+
+      if orderIdxs.len != n:
+        break joinReorderBlock
 
     var reordered: seq[JoinClause] = @[]
     var reorderedSubqueries: seq[Statement] = @[]
