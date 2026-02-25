@@ -1,11 +1,13 @@
 # Workplan: Cost-based query optimizer with statistics collection (Issue #24)
 
+**Agent coding prompt:** See `design/ISSUE_24_AGENT_PROMPT.md`.
+
 ## Overview
 This document outlines the implementation plan for introducing a cost-based query optimizer with statistics collection to DecentDB, as described in [Issue #24](https://github.com/sphildreth/decentdb/issues/24).
 
 ## Phase 0: Design and Architecture
-- **Task 0.1: Draft ADR 0038**
-  - Detail the design for the cost-based query optimizer.
+- **Task 0.1: Update/Supersede ADR 0038**
+  - Update `design/adr/0038-cost-based-optimization-deferred.md` (or supersede it with a new ADR) with the implementation-ready design for cost-based optimization.
   - Define the catalog schema changes for storing statistics (row counts, index cardinality).
   - Define the format versioning strategy and backward compatibility plan.
   - Define the cost model formulas and selectivity estimation logic.
@@ -14,7 +16,7 @@ This document outlines the implementation plan for introducing a cost-based quer
 
 ## Phase 1: Statistics Collection & Maintenance
 - **Task 1.1: Catalog Updates for Statistics**
-  - Update `src/storage/catalog.nim` to support storing and retrieving table row counts and index cardinalities.
+  - Update `src/catalog/catalog.nim` to support storing and retrieving table row counts and index cardinalities.
   - Handle format versioning to ensure backward compatibility for existing databases (no database format breakage for users who never run `ANALYZE`).
 - **Task 1.2: Implement `ANALYZE` Command**
   - Add SQL parser support for the `ANALYZE` command.
