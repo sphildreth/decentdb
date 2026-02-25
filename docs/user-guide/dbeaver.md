@@ -12,7 +12,7 @@ For JDBC driver details (URL format, properties, isolation mapping), see: [JDBC 
 
 | Component | Supported |
 |---|---|
-| DBeaver | 23.x, 24.x (tested with latest Community Edition as of 2025) |
+| DBeaver | 23.x+ (tested with Community Edition 25.3.x) |
 | Java | 17 LTS, 21 LTS (must be Java 17+ at runtime) |
 | Platforms | Linux x86\_64, macOS x86\_64/arm64, Windows x86\_64 |
 
@@ -55,13 +55,11 @@ For JDBC driver details (URL format, properties, isolation mapping), see: [JDBC 
 
 6. Click **OK** to save the driver.
 
-### Option B — DBeaver plugin (available; packaging in progress)
+### Option B — DBeaver plugin (first-class database type)
 
-The DecentDB DBeaver extension code lives in `bindings/java/dbeaver-extension/` and registers DecentDB as a first-class database type.
+The DecentDB DBeaver extension code lives in `bindings/java/dbeaver-extension/` and registers DecentDB as a first-class database type inside DBeaver.
 
-What’s still in progress (tracked in [issue #38](https://github.com/sphildreth/decentdb/issues/38)) is publishing a **turnkey packaged install** (e.g., a release artifact / update site) that bundles the JDBC driver and native libraries.
-
-If you want to use the plugin today, build it from source and install it as a local plugin:
+If you want to use the plugin today, build it from source:
 
 ```bash
 # From the repo root
@@ -69,7 +67,49 @@ cd bindings/java
 JAVA_HOME=<jdk17> ./gradlew :dbeaver-extension:jar
 ```
 
-Then copy the built plugin jar from `bindings/java/dbeaver-extension/build/libs/` into your DBeaver installation’s `plugins/` directory and restart DBeaver.
+#### Install location
+
+You must install into the **application** plugins directory (not your workspace).
+
+- Official DBeaver packages (tarball/Windows/macOS): typically `<DBeaver install>/plugins/`
+- Arch/Manjaro `extra/dbeaver`: `/usr/lib/dbeaver/plugins/`
+
+#### Install (official DBeaver packages)
+
+Copy the built jar from `bindings/java/dbeaver-extension/build/libs/` into DBeaver’s `plugins/` directory, then restart DBeaver.
+
+#### Install (Arch/Manjaro `extra/dbeaver`)
+
+Arch’s DBeaver packaging uses Equinox “simpleconfigurator”, which means **dropping a jar into `plugins/` is not sufficient**.
+You also need to add the bundle to `bundles.info` and start DBeaver once with `-clean`.
+
+1. Copy the jar into the app plugin directory:
+
+    # From the DecentDB repo root
+    VERSION=1.5.0
+
+    sudo install -Dm644 \
+      bindings/java/dbeaver-extension/build/libs/dbeaver-extension-${VERSION}.jar \
+      /usr/lib/dbeaver/plugins/org.jkiss.dbeaver.ext.decentdb_${VERSION}.jar
+
+2. Add it to the bundle list:
+
+    BUNDLES_INFO=/usr/lib/dbeaver/configuration/org.eclipse.equinox.simpleconfigurator/bundles.info
+
+    # Use an existing bundle to copy its (startLevel, autoStart) fields.
+    # This prints e.g. "4,false" on many installs.
+    START_FIELDS=$(grep -m1 '^org\.jkiss\.dbeaver\.ext\.generic,' "$BUNDLES_INFO" | cut -d, -f4-5)
+
+    # Append DecentDB bundle entry if it isn't already present.
+    if ! grep -qi '^org\.jkiss\.dbeaver\.ext\.decentdb,' "$BUNDLES_INFO"; then
+      echo "org.jkiss.dbeaver.ext.decentdb,${VERSION},plugins/org.jkiss.dbeaver.ext.decentdb_${VERSION}.jar,${START_FIELDS}" | sudo tee -a "$BUNDLES_INFO" >/dev/null
+    fi
+
+3. Start DBeaver once with `-clean` (forces it to rebuild its bundle cache):
+
+    dbeaver -clean -consoleLog
+
+After that, DecentDB should show up under **New Connection → Embedded**.
 
 ---
 

@@ -20,27 +20,58 @@ BUILD_DIR = $(shell realpath ../../../build 2>/dev/null || echo ../../../build)
 OS := $(shell uname -s)
 ARCH := $(shell uname -m)
 
+IS_WINDOWS := 0
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(OS)))
+    IS_WINDOWS := 1
+endif
+
 ifeq ($(OS),Darwin)
     LIB_EXT = dylib
     SHARED_FLAGS = -dynamiclib
     OS_INCLUDES = -I$(JAVA_HOME)/include/darwin
     PLATFORM_FLAGS = -undefined dynamic_lookup
+    RPATH_FLAGS = -Wl,-rpath,@loader_path -Wl,-rpath,$(DECENTDB_LIB_DIR)
 else ifeq ($(OS),Linux)
     LIB_EXT = so
     SHARED_FLAGS = -shared -fPIC
     OS_INCLUDES = -I$(JAVA_HOME)/include/linux
     PLATFORM_FLAGS =
+    RPATH_FLAGS = -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(DECENTDB_LIB_DIR)
+else ifeq ($(IS_WINDOWS),1)
+    LIB_EXT = dll
+    SHARED_FLAGS = -shared
+    OS_INCLUDES = -I$(JAVA_HOME)/include/win32
+    PLATFORM_FLAGS = -Wl,--enable-auto-import
+    RPATH_FLAGS =
 else
     $(error Unsupported OS: $(OS))
 endif
 
 CC = gcc
-CFLAGS = -O2 -fPIC -Wall \
+CFLAGS = -O2 -Wall \
     -I$(JAVA_HOME)/include \
     $(OS_INCLUDES) \
     -I.
 
-OUTPUT_LIB = $(BUILD_DIR)/libdecentdb_jni.$(LIB_EXT)
+ifeq ($(IS_WINDOWS),1)
+    OUTPUT_LIB = $(BUILD_DIR)/decentdb_jni.$(LIB_EXT)
+else
+    OUTPUT_LIB = $(BUILD_DIR)/libdecentdb_jni.$(LIB_EXT)
+endif
+
+ifeq ($(IS_WINDOWS),1)
+    # build_lib produces build/decentdb.dll on Windows.
+    # Nim (mingw) typically also produces build/libdecentdb.dll.a (import lib).
+    ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libdecentdb.dll.a))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libdecentdb.dll.a
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.lib))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.lib
+    else
+        DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -ldecentdb
+    endif
+else
+    DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
+endif
 
 .PHONY: all clean
 
@@ -50,9 +81,8 @@ $(OUTPUT_LIB): decentdb_jni.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) $(PLATFORM_FLAGS) \
 	    -o $@ \
 	    decentdb_jni.c \
-	    -L$(DECENTDB_LIB_DIR) -lc_api \
-	    -Wl,-rpath,'$$ORIGIN' \
-	    -Wl,-rpath,$(DECENTDB_LIB_DIR)
+        $(DECENTDB_LINK_FLAGS) \
+        $(RPATH_FLAGS)
 	@echo "Built: $@"
 
 $(BUILD_DIR):

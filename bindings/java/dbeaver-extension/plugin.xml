@@ -14,42 +14,38 @@
             class="org.jkiss.dbeaver.ext.generic.GenericDataSourceProvider"
             description="DecentDB embedded database"
             id="decentdb"
-            label="DecentDB">
-
-            <tree
-                path="decentdb"
-                label="DecentDB Data Source"
-                icon="icons/decentdb.png"
-                description="DecentDB database">
-                <folder type="org.jkiss.dbeaver.ext.generic.model.GenericTable"
-                    label="Tables"
-                    icon="#folder_table"
-                    description="Tables"/>
-                <folder type="org.jkiss.dbeaver.ext.generic.model.GenericView"
-                    label="Views"
-                    icon="#folder_view"
-                    description="Views"/>
-                <folder type="org.jkiss.dbeaver.ext.generic.model.GenericIndex"
-                    label="Indexes"
-                    icon="#folder_index"
-                    description="Indexes"/>
-            </tree>
+            parent="generic"
+            inheritProviderProperties="true"
+            dialect="decentdb"
+            label="DecentDB"
+            icon="icons/decentdb_icon.png">
 
             <drivers managable="true">
                 <driver
                     id="decentdb_jdbc"
                     label="DecentDB"
+                    icon="icons/decentdb_icon.png"
+                    iconBig="icons/decentdb_icon_big.png"
                     class="com.decentdb.jdbc.DecentDBDriver"
                     sampleURL="jdbc:decentdb:{file}"
+                    supportedConfigurationTypes="MANUAL,URL"
                     defaultPort=""
                     description="DecentDB JDBC Driver (in-process, JNI-backed)"
                     webURL="https://decentdb.org"
                     propertiesURL="https://decentdb.org/api/jdbc/"
                     supportsDriverProperties="true"
                     anonymous="true"
-                    customEndpointDefaults="true"
                     embedded="true"
-                    singleConnection="true">
+                    singleConnection="true"
+                    categories="sql,embedded"
+                    dialect="decentdb">
+
+                    <!--
+                        DBeaver loads JDBC drivers via a separate driver classloader.
+                        Add this bundle jar to that classpath so the driver class (and embedded deps)
+                        are resolvable without any manual “add jar” step.
+                    -->
+                    <file type="jar" path="bundle:/org.jkiss.dbeaver.ext.decentdb"/>
 
                     <!-- Default connection properties -->
                     <property name="readOnly" value="false"/>
@@ -68,6 +64,7 @@
             class="org.jkiss.dbeaver.ext.generic.model.GenericSQLDialect"
             label="DecentDB"
             description="DecentDB SQL dialect"
+            icon="icons/decentdb_icon.png"
             />
     </extension>
 
