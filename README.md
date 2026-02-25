@@ -50,13 +50,16 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - 🧾 **Transaction Support** - BEGIN, COMMIT, ROLLBACK for atomic operations
 - 📋 **Temporary Objects** - Session-scoped TEMP tables and views
 - 🏗️ **EF Core Provider** - Full Entity Framework Core integration with LINQ translation, migrations, and NodaTime support
+- 🔌 **DBeaver Support** - Connect to `.ddb` files from DBeaver via the in-process JNI-backed JDBC driver; browse tables, run queries, and render ER diagrams. See the [DBeaver guide](docs/user-guide/dbeaver.md).
 
 ## Languages/Toolkits/SDKs
 
 | Language | Toolkit | Description | Documentation |
 |---|---|---|---|
 | C# | ADO.NET + Dapper + MicroOrm (LINQ) + EF Core | Embedded ADO.NET provider, LINQ Micro-ORM, and EF Core integration with DbContext, migrations, and NodaTime support | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
+| Java | JDBC (JNI-backed, in-process) | JDBC driver for connecting to `.ddb` files from Java and tools like DBeaver | [decentdb.org/api/jdbc](https://decentdb.org/api/jdbc/) |
 | Go | `database/sql` driver | Embedded `database/sql` driver with `$N` positional parameters | [decentdb.org/api/go](https://decentdb.org/api/go/) |
+| Nim | Native Nim API | Native embedded API for Nim applications | [decentdb.org/api/nim-api](https://decentdb.org/api/nim-api/) |
 | Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
 | Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 

@@ -4852,6 +4852,13 @@ proc rollbackTransaction*(db: Db): Result[Void] =
   # Evict dirty pages immediately while holding rollback lock
   if dirtyPages.len > 0:
     rollbackCacheLocked(db.pager)
+    # Invalidate B+tree append-cache entries for this pager.
+    # After eviction, any cached CacheEntry with dirty=true is an orphaned
+    # (evicted) entry. Future inserts via tryAppend would write to the orphaned
+    # entry (not in the live cache), causing txnDirtyCount to not increment and
+    # the subsequent COMMIT to flush 0 pages. Clearing the cache forces a fresh
+    # pinPage on the next insert.
+    evictPagerFromAppendCache(db.pager)
 
   # Return allocated pages to freelist (HIGH-003)
   let freeRes = rollbackTxnPageAllocations(db.pager)

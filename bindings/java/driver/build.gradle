@@ -1,0 +1,66 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'com.decentdb'
+version = '1.5.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.1'
+    testImplementation 'org.junit.jupiter:junit-jupiter-params:5.10.1'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.1'
+    // JSON parsing for metadata (minimal, uses only stdlib)
+    implementation 'org.json:json:20231013'
+}
+
+test {
+    useJUnitPlatform()
+    // Native library path for integration tests
+    def nativeLibDir = project.findProperty('nativeLibDir') ?:
+        "${rootProject.projectDir}/../../build"
+    systemProperty 'decentdb.native.lib.dir', nativeLibDir
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
+}
+
+jar {
+    manifest {
+        attributes(
+            'Implementation-Title': 'DecentDB JDBC Driver',
+            'Implementation-Version': version,
+            'Main-Class': 'com.decentdb.jdbc.DecentDBDriver'
+        )
+    }
+
+    // Include native libraries if pre-built.
+    // NativeLibLoader expects resources under: /native/<os>-<arch>/
+    def os = System.getProperty('os.name', '').toLowerCase()
+    def arch = System.getProperty('os.arch', '').toLowerCase()
+    def osDir = os.contains('win') ? 'windows' : (os.contains('mac') || os.contains('darwin') ? 'darwin' : 'linux')
+    def archDir = (arch == 'amd64' || arch == 'x86_64') ? 'x86_64' : ((arch == 'aarch64' || arch == 'arm64') ? 'aarch64' : arch)
+    def nativeDir = "native/${osDir}-${archDir}"
+
+    from("${rootProject.projectDir}/../../build") {
+        into nativeDir
+        include 'libdecentdb_jni.so'
+        include 'libdecentdb_jni.dylib'
+        include 'decentdb_jni.dll'
+
+        // Core DecentDB C API library name varies by OS/build.
+        include 'libc_api.so'
+        include 'libc_api.dylib'
+        include 'libc_api.dll'
+        include 'c_api.dll'
+        include 'decentdb.dll'
+    }
+}
