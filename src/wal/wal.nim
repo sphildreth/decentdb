@@ -192,7 +192,7 @@ proc payloadSizeFor(frameType: WalFrameType, pageSize: uint32): int =
   of wfCheckpoint:
     8
 
-proc encodeFrameInto(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): int =
+proc encodeFrameInto*(dest: var seq[byte], offset: int, frameType: WalFrameType, pageId: uint32, payload: openArray[byte]): int =
   let needed = HeaderSize + payload.len + TrailerSize
   if dest.len < offset + needed:
     dest.setLen(max(dest.len * 2, offset + needed))

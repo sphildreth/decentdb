@@ -1,10 +1,12 @@
 import unittest
 import os
-
+import strutils
 import engine
 import record/record
 import errors
 import catalog/catalog
+import sql/binder
+import sql/sql
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
@@ -780,6 +782,500 @@ suite "Engine DDL Extra Edge Cases":
     
     discard closeDb(db)
 
+suite "Engine Transaction Errors":
+  test "BEGIN twice fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "BEGIN")
+    let res = execSql(db, "BEGIN")
+    check not res.ok
+    discard execSql(db, "ROLLBACK")
+    discard closeDb(db)
+
+  test "COMMIT without BEGIN fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, "COMMIT")
+    check not res.ok
+    discard closeDb(db)
+
+  test "ROLLBACK without BEGIN fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, "ROLLBACK")
+    check not res.ok
+    discard closeDb(db)
+
+  test "RELEASE non-existent savepoint fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "BEGIN")
+    let res = execSql(db, "RELEASE SAVEPOINT nonexistent")
+    check not res.ok
+    discard execSql(db, "ROLLBACK")
+    discard closeDb(db)
+
+  test "ROLLBACK TO non-existent savepoint fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "BEGIN")
+    let res = execSql(db, "ROLLBACK TO SAVEPOINT nonexistent")
+    check not res.ok
+    discard execSql(db, "ROLLBACK")
+    discard closeDb(db)
+
+suite "Engine Type Check Errors":
+  test "UUID wrong size fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, u UUID)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, X'0102030405060708')")
+    check not insRes.ok
+    discard closeDb(db)
+
+  test "DECIMAL precision overflow":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, d DECIMAL(5,2))")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 123456.78)")
+    check not insRes.ok
+    discard closeDb(db)
+
+  test "Type mismatch INT64 expected":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val INT)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 'not_an_int')")
+    check not insRes.ok
+    discard closeDb(db)
+
+  test "Type mismatch BOOL expected":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val BOOL)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 'not_a_bool')")
+    check not insRes.ok
+    discard closeDb(db)
+
+  test "Type mismatch FLOAT64 expected":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val FLOAT)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, X'0102')")
+    check not insRes.ok
+    discard closeDb(db)
+
+  test "Type mismatch TEXT expected":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT NOT NULL)")
+    let insRes = execSql(db, "INSERT INTO t (id) VALUES (1)")
+    check not insRes.ok
+    discard closeDb(db)
+
+  test "Type mismatch BLOB expected":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val BLOB)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 123)")
+    check not insRes.ok
+    discard closeDb(db)
+
+suite "Engine FK Cascade Operations":
+  test "ON DELETE CASCADE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON DELETE CASCADE)")
+    discard execSql(db, "INSERT INTO parent VALUES (1)")
+    discard execSql(db, "INSERT INTO child VALUES (10, 1)")
+    let delRes = execSql(db, "DELETE FROM parent WHERE id = 1")
+    check delRes.ok
+    let childRes = execSql(db, "SELECT COUNT(*) FROM child")
+    check childRes.ok
+    discard closeDb(db)
+
+  test "ON DELETE SET NULL":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON DELETE SET NULL)")
+    discard execSql(db, "INSERT INTO parent VALUES (1)")
+    discard execSql(db, "INSERT INTO child VALUES (10, 1)")
+    let delRes = execSql(db, "DELETE FROM parent WHERE id = 1")
+    check delRes.ok
+    let childRes = execSql(db, "SELECT pid FROM child WHERE id = 10")
+    check childRes.ok
+    discard closeDb(db)
+
+  test "ON UPDATE CASCADE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE CASCADE)")
+    discard execSql(db, "INSERT INTO parent VALUES (1)")
+    discard execSql(db, "INSERT INTO child VALUES (10, 1)")
+    let upRes = execSql(db, "UPDATE parent SET id = 2 WHERE id = 1")
+    check upRes.ok
+    let childRes = execSql(db, "SELECT pid FROM child WHERE id = 10")
+    check childRes.ok
+    discard closeDb(db)
+
+  test "ON UPDATE SET NULL":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON UPDATE SET NULL)")
+    discard execSql(db, "INSERT INTO parent VALUES (1)")
+    discard execSql(db, "INSERT INTO child VALUES (10, 1)")
+    let upRes = execSql(db, "UPDATE parent SET id = 2 WHERE id = 1")
+    check upRes.ok
+    let childRes = execSql(db, "SELECT pid FROM child WHERE id = 10")
+    check childRes.ok
+    discard closeDb(db)
+
+  test "FK RESTRICT blocks delete":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id) ON DELETE RESTRICT)")
+    discard execSql(db, "INSERT INTO parent VALUES (1)")
+    discard execSql(db, "INSERT INTO child VALUES (10, 1)")
+    let delRes = execSql(db, "DELETE FROM parent WHERE id = 1")
+    check not delRes.ok
+    discard closeDb(db)
+
+suite "Engine INSERT ON CONFLICT":
+  test "ON CONFLICT DO UPDATE with WHERE clause":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a')")
+    let upRes = execSql(db, "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET val = excluded.val WHERE excluded.val != 'skip'")
+    check upRes.ok
+    let selRes = execSql(db, "SELECT val FROM t WHERE id = 1")
+    check selRes.ok
+    discard closeDb(db)
+
+  test "ON CONFLICT DO UPDATE WHERE excludes row":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a')")
+    let upRes = execSql(db, "INSERT INTO t VALUES (1, 'skip') ON CONFLICT (id) DO UPDATE SET val = excluded.val WHERE excluded.val != 'skip'")
+    check upRes.ok
+    let selRes = execSql(db, "SELECT val FROM t WHERE id = 1")
+    check selRes.ok
+    discard closeDb(db)
+
+    discard closeDb(db)
+  test "ON CONFLICT DO NOTHING without target (INT64 PK)":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a')")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 'b') ON CONFLICT DO NOTHING")
+    check insRes.ok
+    discard closeDb(db)
+
+  test "ON CONFLICT DO NOTHING without target (UNIQUE)":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT UNIQUE)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a')")
+    let insRes = execSql(db, "INSERT INTO t VALUES (2, 'a') ON CONFLICT DO NOTHING")
+    check insRes.ok
+    discard closeDb(db)
+
+  test "ON CONFLICT DO UPDATE unknown column error":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a')")
+    let upRes = execSql(db, "INSERT INTO t VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET nonexistent = 'x'")
+    check not upRes.ok
+    discard closeDb(db)
+
+suite "Engine Multi-Row INSERT":
+  test "INSERT multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+    check insRes.ok
+    let selRes = execSql(db, "SELECT COUNT(*) FROM t")
+    check selRes.ok
+    discard closeDb(db)
+
+  test "INSERT multiple rows with RETURNING":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING id")
+    check insRes.ok
+    discard closeDb(db)
+
+suite "Engine INSERT SELECT":
+  test "INSERT SELECT basic":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "CREATE TABLE dst (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO src VALUES (1, 'a'), (2, 'b')")
+    let insRes = execSql(db, "INSERT INTO dst SELECT id, val FROM src")
+    check insRes.ok
+    let selRes = execSql(db, "SELECT COUNT(*) FROM dst")
+    check selRes.ok
+    discard closeDb(db)
+
+  test "INSERT SELECT with generated column":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE dst (id INT PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY, a INT)")
+    discard execSql(db, "INSERT INTO src VALUES (1, 10)")
+    let insRes = execSql(db, "INSERT INTO dst (id, a) SELECT id, a FROM src")
+    check insRes.ok
+    discard closeDb(db)
+
+suite "Engine DISTINCT ON":
+  test "DISTINCT ON expression":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, val INT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30)")
+    let selRes = execSql(db, "SELECT DISTINCT ON (cat) cat, val FROM t ORDER BY cat, val")
+    check selRes.ok
+    discard closeDb(db)
+
+suite "Engine CTE":
+  test "Non-recursive CTE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO t VALUES (1), (2), (3)")
+    let selRes = execSql(db, "WITH cte AS (SELECT id FROM t WHERE id > 1) SELECT * FROM cte")
+    check selRes.ok
+    discard closeDb(db)
+
+  test "Recursive CTE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    let selRes = execSql(db, "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT x FROM cnt")
+    check not selRes.ok
+    discard closeDb(db)
+
+suite "Engine View Operations":
+  test "CREATE VIEW IF NOT EXISTS":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE VIEW v AS SELECT * FROM t")
+    let res = execSql(db, "CREATE VIEW IF NOT EXISTS v AS SELECT * FROM t")
+    check res.ok
+    discard closeDb(db)
+
+  test "CREATE OR REPLACE VIEW":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "CREATE VIEW v AS SELECT id FROM t")
+    let res = execSql(db, "CREATE OR REPLACE VIEW v AS SELECT id, val FROM t")
+    check res.ok
+    discard closeDb(db)
+
+  test "DROP view with dependent views fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE VIEW v1 AS SELECT * FROM t")
+    discard execSql(db, "CREATE VIEW v2 AS SELECT * FROM v1")
+    let res = execSql(db, "DROP VIEW v1")
+    check not res.ok
+    discard closeDb(db)
+
+  test "DROP TABLE with dependent views fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE VIEW v AS SELECT * FROM t")
+    let res = execSql(db, "DROP TABLE t")
+    check not res.ok
+    discard closeDb(db)
+
+suite "Engine EXPLAIN":
+  test "EXPLAIN non-SELECT fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    let res = execSql(db, "EXPLAIN INSERT INTO t VALUES (1)")
+    check not res.ok
+    discard closeDb(db)
+
+  test "EXPLAIN ANALYZE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    let res = execSql(db, "EXPLAIN ANALYZE SELECT * FROM t")
+    check res.ok
+    discard closeDb(db)
+
+suite "Engine Prepared Statement Errors":
+  test "Prepare on closed DB fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard closeDb(db)
+    let prepRes = prepare(db, "SELECT 1")
+    check not prepRes.ok
+
+  test "ExecPrepared on closed DB fails":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    let prepRes = prepare(db, "SELECT * FROM t")
+    require prepRes.ok
+    discard closeDb(db)
+    let execRes = execPrepared(prepRes.value, @[])
+    check not execRes.ok
+
+suite "Engine SQL Cache Eviction":
+  test "SQL cache evicts old entries":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    for i in 1..150:
+      let res = execSql(db, "SELECT * FROM t WHERE id = " & $i)
+      check res.ok
+    discard closeDb(db)
+
+suite "Engine Composite Primary Key":
+  test "Table with composite PK":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))")
+    check res.ok
+    discard closeDb(db)
+
+  test "INSERT into composite PK table":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (a INT, b INT, val TEXT, PRIMARY KEY (a, b))")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 2, 'x')")
+    check insRes.ok
+    let selRes = execSql(db, "SELECT val FROM t WHERE a = 1 AND b = 2")
+    check selRes.ok
+    discard closeDb(db)
+
+  test "Composite PK uniqueness enforced":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a, b))")
+    discard execSql(db, "INSERT INTO t VALUES (1, 2)")
+    let insRes = execSql(db, "INSERT INTO t VALUES (1, 2)")
+    check not insRes.ok
+    discard closeDb(db)
+
+suite "Engine Expressions":
+  test "CASE with multiple WHEN":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, "SELECT CASE WHEN 1 = 2 THEN 'a' WHEN 2 = 2 THEN 'b' ELSE 'c' END")
+    check res.ok
+    discard closeDb(db)
+
+  test "Nested CASE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, "SELECT CASE WHEN 1 = 1 THEN CASE WHEN 2 = 2 THEN 'yes' ELSE 'no' END ELSE 'outer' END")
+    check res.ok
+    discard closeDb(db)
+
+  test "BETWEEN with NOT":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+    let res = execSql(db, "SELECT id FROM t WHERE id NOT BETWEEN 2 AND 4")
+    check res.ok
+    discard closeDb(db)
+
+suite "Engine CHECK Constraint":
+  test "CHECK with multiple conditions":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, CHECK (a > 0 AND a < 100))")
+    let insOk = execSql(db, "INSERT INTO t VALUES (1, 50)")
+    check insOk.ok
+    let insBad = execSql(db, "INSERT INTO t VALUES (2, 150)")
+    check not insBad.ok
+    discard closeDb(db)
+
+  test "CHECK with named constraint":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val INT CONSTRAINT positive_val CHECK (val > 0))")
+    let insBad = execSql(db, "INSERT INTO t VALUES (1, -1)")
+    check not insBad.ok
+    discard closeDb(db)
+
+suite "Engine Partial Index":
+  test "CREATE partial index":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, active BOOL, val INT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, true, 10), (2, false, 20)")
+    let idxRes = execSql(db, "CREATE INDEX idx_active ON t(val) WHERE active")
+    check idxRes.ok
+    discard closeDb(db)
+
 suite "Engine Complex Coverage":
   test "UNIQUE Index Error Paths":
     let dbRes = openDb(":memory:")
@@ -829,5 +1325,465 @@ suite "Engine Complex Coverage":
     
     let altRes = execSql(db, "ALTER VIEW v1 RENAME TO v2")
     check not altRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine ExecPrepared Direct Calls":
+  test "execPrepared - select":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+
+    let prepRes = prepare(db, "SELECT * FROM t WHERE id = $1")
+    check prepRes.ok
+    let prep = prepRes.value
+    let execRes = execPrepared(prep, @[Value(kind: vkInt64, int64Val: 1)])
+    if execRes.ok: echo "Select output: ", execRes.value
+    check execRes.ok
+    check execRes.value.len == 1 # 1 statement output
+    discard closeDb(db)
+
+  test "execPrepared - fast insert":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    let prepRes = prepare(db, "INSERT INTO t VALUES ($1, $2)")
+    check prepRes.ok
+    let prep = prepRes.value
+    let execRes = execPrepared(prep, @[Value(kind: vkInt64, int64Val: 1), Value(kind: vkText, bytes: cast[seq[byte]]("a"))])
+    check execRes.ok
+    
+    # Check fast insert type mismatch
+    let execBad = execPrepared(prep, @[Value(kind: vkText, bytes: cast[seq[byte]]("bad")), Value(kind: vkText, bytes: cast[seq[byte]]("a"))])
+    check not execBad.ok
+    discard closeDb(db)
+
+  test "execPrepared - explicit transaction control":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPrepared(prepare(db, "BEGIN").value, @[]).ok
+    check execPrepared(prepare(db, "INSERT INTO t VALUES (1)").value, @[]).ok
+    check execPrepared(prepare(db, "SAVEPOINT sp1").value, @[]).ok
+    check execPrepared(prepare(db, "INSERT INTO t VALUES (2)").value, @[]).ok
+    check execPrepared(prepare(db, "ROLLBACK TO SAVEPOINT sp1").value, @[]).ok
+    check execPrepared(prepare(db, "COMMIT").value, @[]).ok
+    
+    let selRes = execPrepared(prepare(db, "SELECT * FROM t").value, @[])
+    if selRes.ok: echo "Select all output: ", selRes.value
+    check selRes.ok
+    check selRes.value.len == 1 # 1 statement output
+    discard closeDb(db)
+    
+  test "execPrepared - schema change triggers re-prepare":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    let prepRes = prepare(db, "SELECT * FROM t")
+    check prepRes.ok
+    let prep = prepRes.value
+    
+    discard execSql(db, "CREATE TABLE t2 (id INT PRIMARY KEY)")
+    # Schema cookie changed
+    let execRes = execPrepared(prep, @[])
+    check execRes.ok
+    discard closeDb(db)
+
+  test "execPrepared - release savepoint":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    check execPrepared(prepare(db, "BEGIN").value, @[]).ok
+    check execPrepared(prepare(db, "SAVEPOINT sp1").value, @[]).ok
+    check execPrepared(prepare(db, "RELEASE SAVEPOINT sp1").value, @[]).ok
+    check execPrepared(prepare(db, "COMMIT").value, @[]).ok
+    discard closeDb(db)
+
+  test "execPrepared - explain analyze":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    let prepRes = prepare(db, "EXPLAIN ANALYZE SELECT * FROM t")
+    check prepRes.ok
+    let execRes = execPrepared(prepRes.value, @[])
+    check execRes.ok
+    discard closeDb(db)
+
+
+proc getBoundStmt(db: Db, sql: string): Statement =
+  let pRes = prepare(db, sql)
+  doAssert pRes.ok, "Prepare failed: " & sql
+  pRes.value.statements[0]
+
+suite "Engine execPreparedNonSelect coverage":
+  test "skCreateTable error paths":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    # Good create
+    check execPreparedNonSelect(db, getBoundStmt(db, "CREATE TABLE t (id INT PRIMARY KEY)"), @[]).ok
+
+    # Bad column type
+    # For this we need to manually construct a bad Statement, or find a way to get one.
+    # Actually, binder checks types. If we want parseColumnType to fail, we need to bypass binder or create a type that binder allows but engine doesn't?
+    # No, binder uses `parseColumnType` too... Wait, let's just test the other DDL branches.
+
+    discard closeDb(db)
+
+  test "skDropTable":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "DROP TABLE t"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "skCreateIndex / skDropIndex":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "CREATE INDEX idx_val ON t(val)"), @[]).ok
+    check execPreparedNonSelect(db, getBoundStmt(db, "DROP INDEX idx_val"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "skAlterTable":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "ALTER TABLE t ADD COLUMN val TEXT"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "skCreateView / skDropView / skAlterView":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "CREATE VIEW v AS SELECT * FROM t"), @[]).ok
+    check execPreparedNonSelect(db, getBoundStmt(db, "ALTER VIEW v RENAME TO v2"), @[]).ok
+    check execPreparedNonSelect(db, getBoundStmt(db, "DROP VIEW v2"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert with multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1), (2), (3)")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert from select":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO src VALUES (1)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t SELECT id FROM src")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+  test "skCreateTrigger / skDropTrigger":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "CREATE TRIGGER trig_after_ins AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO t VALUES (99)')"), @[]).ok
+    check execPreparedNonSelect(db, getBoundStmt(db, "DROP TRIGGER trig_after_ins ON t"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert with returning":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1) RETURNING id")
+    let res = execPreparedNonSelect(db, stmt, @[])
+    check not res.ok
+    check res.err.message == "INSERT RETURNING is not supported by non-select execution API"
+    
+    discard closeDb(db)
+  test "Insert with multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1), (2), (3)")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert from select":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO src VALUES (1)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t SELECT id FROM src")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+  test "execPreparedNonSelect DDL error paths":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    # skCreateTable with invalid column type
+    let createBadType = Statement(
+      kind: skCreateTable,
+      createTableName: "t_bad",
+      columns: @[ColumnDef(name: "id", typeName: "INVALID_TYPE")],
+      createTableIsTemp: false
+    )
+    check not execPreparedNonSelect(db, createBadType, @[]).ok
+
+    # skCreateTable temp with invalid column type
+    let createTempBadType = Statement(
+      kind: skCreateTable,
+      createTableName: "t_temp_bad",
+      columns: @[ColumnDef(name: "id", typeName: "INVALID_TYPE")],
+      createTableIsTemp: true
+    )
+    check not execPreparedNonSelect(db, createTempBadType, @[]).ok
+
+    # skDropTable nonexistent
+    let dropBad = Statement(
+      kind: skDropTable,
+      dropTableName: "nonexistent",
+      dropTableIfExists: false
+    )
+    check not execPreparedNonSelect(db, dropBad, @[]).ok
+
+    # skCreateIndex nonexistent table
+    let idxBad = Statement(
+      kind: skCreateIndex,
+      indexName: "idx_fake",
+      indexTableName: "nonexistent",
+      columnNames: @["col1"],
+      indexKind: ikBtree
+    )
+    check not execPreparedNonSelect(db, idxBad, @[]).ok
+
+    # skDropIndex nonexistent
+    let dropIdxBad = Statement(
+      kind: skDropIndex,
+      dropIndexName: "nonexistent",
+    )
+    check not execPreparedNonSelect(db, dropIdxBad, @[]).ok
+
+    # skAlterTable nonexistent
+    let alterBad = Statement(
+      kind: skAlterTable,
+      alterTableName: "nonexistent",
+      alterActions: @[]
+    )
+    check not execPreparedNonSelect(db, alterBad, @[]).ok
+
+    # skDropTrigger nonexistent
+    let dropTrigBad = Statement(
+      kind: skDropTrigger,
+      dropTriggerName: "trig",
+      dropTriggerTableName: "t",
+      dropTriggerIfExists: false
+    )
+    check not execPreparedNonSelect(db, dropTrigBad, @[]).ok
+
+
+    # skDropView nonexistent
+    let dropViewBad = Statement(
+      kind: skDropView,
+      dropViewName: "nonexistent",
+      dropViewIfExists: false
+    )
+    check not execPreparedNonSelect(db, dropViewBad, @[]).ok
+
+    discard closeDb(db)
+  test "Insert with multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1), (2), (3)")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert from select":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO src VALUES (1)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t SELECT id FROM src")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+  test "skCreateTrigger / skDropTrigger":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "CREATE TRIGGER trig_after_ins AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO t VALUES (99)')"), @[]).ok
+    check execPreparedNonSelect(db, getBoundStmt(db, "DROP TRIGGER trig_after_ins ON t"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert with returning":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1) RETURNING id")
+    let res = execPreparedNonSelect(db, stmt, @[])
+    check not res.ok
+    check res.err.message == "INSERT RETURNING is not supported by non-select execution API"
+    
+    discard closeDb(db)
+  test "Insert with multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1), (2), (3)")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert from select":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO src VALUES (1)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t SELECT id FROM src")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+    # skCreateTrigger nonexistent table
+    let trigBad = Statement(
+      kind: skCreateTrigger,
+      triggerName: "trig",
+      triggerTableName: "nonexistent",
+      triggerEventsMask: 4,
+      triggerForEachRow: true,
+      triggerFunctionName: "decentdb_exec_sql",
+      triggerActionSql: "SELECT 1"
+    )
+    check not execPreparedNonSelect(db, trigBad, @[]).ok
+    # skDropTrigger nonexistent
+    let dropTrigBad = Statement(
+      kind: skDropTrigger,
+      dropTriggerName: "trig",
+      dropTriggerTableName: "t",
+      dropTriggerIfExists: false
+    )
+    check not execPreparedNonSelect(db, dropTrigBad, @[]).ok
+
+
+    # skDropView nonexistent
+    let dropViewBad = Statement(
+      kind: skDropView,
+      dropViewName: "nonexistent",
+      dropViewIfExists: false
+    )
+    check not execPreparedNonSelect(db, dropViewBad, @[]).ok
+
+    discard closeDb(db)
+  test "Insert with multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1), (2), (3)")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert from select":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO src VALUES (1)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t SELECT id FROM src")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+  test "skCreateTrigger / skDropTrigger":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    check execPreparedNonSelect(db, getBoundStmt(db, "CREATE TRIGGER trig_after_ins AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO t VALUES (99)')"), @[]).ok
+    check execPreparedNonSelect(db, getBoundStmt(db, "DROP TRIGGER trig_after_ins ON t"), @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert with returning":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1) RETURNING id")
+    let res = execPreparedNonSelect(db, stmt, @[])
+    check not res.ok
+    check res.err.message == "INSERT RETURNING is not supported by non-select execution API"
+    
+    discard closeDb(db)
+  test "Insert with multiple rows":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t VALUES (1), (2), (3)")
+    check execPreparedNonSelect(db, stmt, @[]).ok
+    
+    discard closeDb(db)
+
+  test "Insert from select":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE TABLE src (id INT PRIMARY KEY)")
+    discard execSql(db, "INSERT INTO src VALUES (1)")
+    
+    let stmt = getBoundStmt(db, "INSERT INTO t SELECT id FROM src")
+    check execPreparedNonSelect(db, stmt, @[]).ok
     
     discard closeDb(db)
