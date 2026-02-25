@@ -603,3 +603,231 @@ suite "Engine Operators":
     check res.ok
     
     discard closeDb(db)
+
+suite "Engine UPDATE and DELETE":
+  test "UPDATE statement":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+    
+    let updateRes = execSql(db, "UPDATE t SET val = 'c' WHERE id = 1")
+    check updateRes.ok
+    
+    let selectRes = execSql(db, "SELECT val FROM t WHERE id = 1")
+    check selectRes.ok
+    
+    discard closeDb(db)
+
+  test "DELETE statement":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+    
+    let deleteRes = execSql(db, "DELETE FROM t WHERE id = 1")
+    check deleteRes.ok
+    
+    let selectRes = execSql(db, "SELECT * FROM t")
+    check selectRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine Views":
+  test "CREATE and DROP VIEW":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+    
+    let createRes = execSql(db, "CREATE VIEW v AS SELECT id, val FROM t WHERE id = 1")
+    check createRes.ok
+    
+    let selectRes = execSql(db, "SELECT * FROM v")
+    check selectRes.ok
+    
+    let dropRes = execSql(db, "DROP VIEW v")
+    check dropRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine Triggers":
+  test "CREATE and TRIGGER execution":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "CREATE TABLE t2 (id INT PRIMARY KEY, log_val TEXT)")
+    
+    let createRes = execSql(db, "CREATE TRIGGER trig_after_insert AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO t2 VALUES (42, ''trigger_log'')')")
+    if not createRes.ok: echo "Trigger Create Err: ", createRes.err.message, " ctx: ", createRes.err.context
+    check createRes.ok
+    
+    let insertRes = execSql(db, "INSERT INTO t1 VALUES (1, 'logged')")
+    if not insertRes.ok: echo "Trigger Insert Err: ", insertRes.err.message, " ctx: ", insertRes.err.context
+    check insertRes.ok
+    
+    let selectT2 = execSql(db, "SELECT * FROM t2")
+    check selectT2.ok
+    
+    let dropRes = execSql(db, "DROP TRIGGER trig_after_insert ON t1")
+    check dropRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine Temp Views and Instead Triggers":
+  test "CREATE TEMP VIEW and INSTEAD OF trigger":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    # base table
+    discard execSql(db, "CREATE TABLE base (id INT PRIMARY KEY, val TEXT)")
+    
+    # temp view
+    let vRes = execSql(db, "CREATE TEMP VIEW tv AS SELECT * FROM base")
+    check vRes.ok
+    
+    # instead of trigger
+    let trigRes = execSql(db, "CREATE TRIGGER t_instead INSTEAD OF INSERT ON tv FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO base VALUES (42, ''from_trigger'')')")
+    check trigRes.ok
+    
+    # trigger it
+    let insertRes = execSql(db, "INSERT INTO tv VALUES (1, 'ignored')")
+    check insertRes.ok
+    
+    let selectRes = execSql(db, "SELECT * FROM base")
+    check selectRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine DDL":
+  test "DROP TABLE":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    
+    let dropRes = execSql(db, "DROP TABLE t")
+    if not dropRes.ok: echo "Drop Err: ", dropRes.err.message, " ctx: ", dropRes.err.context
+    check dropRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine Transactions Extended":
+  test "SAVEPOINT RELEASE":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "BEGIN")
+    discard execSql(db, "SAVEPOINT sp1")
+    check execSql(db, "RELEASE SAVEPOINT sp1").ok
+    check execSql(db, "COMMIT").ok
+    discard closeDb(db)
+
+suite "Engine Foreign Keys Constraints and Cascades":
+  test "ON DELETE and ON UPDATE actions":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    # parent table
+    discard execSql(db, "CREATE TABLE parent (id INT PRIMARY KEY, val TEXT)")
+    
+    # child table with cascade
+    discard execSql(db, "CREATE TABLE child (id INT PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE)")
+    
+    discard execSql(db, "INSERT INTO parent VALUES (1, 'p1')")
+    discard execSql(db, "INSERT INTO child VALUES (10, 1)")
+    
+    let childSel1 = execSql(db, "SELECT * FROM child")
+    check childSel1.ok
+    
+    # update cascade (though ON UPDATE action isn't fully supported in some engines, let's see if it executes without error or raises the right error)
+    let upRes = execSql(db, "UPDATE parent SET id = 2 WHERE id = 1")
+    # If unsupported, ok might be false, which is fine, we just want to execute the path
+    discard upRes
+    
+    # delete cascade
+    let delRes = execSql(db, "DELETE FROM parent WHERE id = 1 OR id = 2")
+    check delRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine DDL Extra Edge Cases":
+  test "DROP IF EXISTS":
+    let dbRes = openDb(":memory:")
+    require dbRes.ok
+    let db = dbRes.value
+
+    let dropTableRes = execSql(db, "DROP TABLE IF EXISTS t_nonexistent")
+    check dropTableRes.ok
+    
+    let dropViewRes = execSql(db, "DROP VIEW IF EXISTS v_nonexistent")
+    check dropViewRes.ok
+
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    let dropTrigRes = execSql(db, "DROP TRIGGER IF EXISTS trig_nonexistent ON t")
+    check dropTrigRes.ok
+    
+    discard closeDb(db)
+
+suite "Engine Complex Coverage":
+  test "UNIQUE Index Error Paths":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO t VALUES (1, 'a'), (2, 'a')")
+    let idxRes = execSql(db, "CREATE UNIQUE INDEX idx_t_val ON t(val)")
+    check not idxRes.ok
+    
+    discard execSql(db, "CREATE TABLE t2 (id INT PRIMARY KEY, val1 INT, val2 INT)")
+    discard execSql(db, "INSERT INTO t2 VALUES (1, 10, 20), (2, 10, 20)")
+    let idxRes2 = execSql(db, "CREATE UNIQUE INDEX idx_t2_vals ON t2(val1, val2)")
+    check not idxRes2.ok
+    discard closeDb(db)
+
+  test "Generated Columns":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)").ok
+    
+    let ins1 = execSql(db, "INSERT INTO t (id, a) VALUES (1, 10)")
+    if not ins1.ok: echo "GenInsErr: ", ins1.err.message
+    check ins1.ok
+    
+    let up1 = execSql(db, "UPDATE t SET a = 20 WHERE id = 1")
+    if not up1.ok: echo "GenUpErr: ", up1.err.message
+    check up1.ok
+    
+    check execSql(db, "CREATE TABLE src (id INT PRIMARY KEY, a INT)").ok
+    check execSql(db, "INSERT INTO src VALUES (2, 5)").ok
+    
+    let ins2 = execSql(db, "INSERT INTO t (id, a) SELECT id, a FROM src")
+    if not ins2.ok: echo "GenSelErr: ", ins2.err.message
+    check ins2.ok
+    
+    let rowsRes = execSql(db, "SELECT * FROM t")
+    if not rowsRes.ok: echo "SelErr: ", rowsRes.err.message
+    check rowsRes.ok
+    discard closeDb(db)
+
+  test "View Errors":
+    let dbRes = openDb(":memory:")
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE t (id INT PRIMARY KEY)")
+    discard execSql(db, "CREATE VIEW v1 AS SELECT * FROM t")
+    discard execSql(db, "CREATE VIEW v2 AS SELECT * FROM t")
+    
+    let altRes = execSql(db, "ALTER VIEW v1 RENAME TO v2")
+    check not altRes.ok
+    
+    discard closeDb(db)
