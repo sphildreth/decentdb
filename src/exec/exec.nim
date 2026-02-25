@@ -5138,6 +5138,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       if lcnt > 0 and rcnt > 0:
         outRows.add(leftRow)
         leftCounts[leftRow.values] = lcnt - 1
+        rightCounts[leftRow.values] = rcnt - 1
     return ok(outRows)
   of pkSetExceptAll:
     let leftRes = execPlan(pager, catalog, plan.left, params)

@@ -1464,7 +1464,7 @@ proc bindSelect(catalog: Catalog, stmt: Statement): Result[Statement] =
   if stmt.setOpKind != sokNone:
     if stmt.cteNames.len > 0:
       return err[Statement](ERR_SQL, "WITH with set operations is not supported in 0.x")
-    if stmt.setOpKind notin {sokUnionAll, sokUnion, sokIntersect, sokExcept}:
+    if stmt.setOpKind notin {sokUnionAll, sokUnion, sokIntersect, sokIntersectAll, sokExcept, sokExceptAll}:
       return err[Statement](ERR_SQL, "Set operation not supported in 0.x")
     if stmt.setOpLeft == nil or stmt.setOpRight == nil:
       return err[Statement](ERR_SQL, "Set operation requires both sides")
