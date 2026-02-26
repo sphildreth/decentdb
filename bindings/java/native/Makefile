@@ -14,8 +14,8 @@
 # Output: build/libdecentdb_jni.so (Linux), build/libdecentdb_jni.dylib (macOS)
 
 JAVA_HOME ?= $(shell java -XshowSettings:all -version 2>&1 | grep "java.home" | awk '{print $$3}')
-DECENTDB_LIB_DIR ?= $(shell realpath ../../../build 2>/dev/null || echo ../../../build)
-BUILD_DIR = $(shell realpath ../../../build 2>/dev/null || echo ../../../build)
+DECENTDB_LIB_DIR ?= $(shell p=$$(realpath ../../../build 2>/dev/null || echo ../../../build); cygpath -m "$$p" 2>/dev/null || echo "$$p")
+BUILD_DIR = $(shell p=$$(realpath ../../../build 2>/dev/null || echo ../../../build); cygpath -m "$$p" 2>/dev/null || echo "$$p")
 
 OS := $(shell uname -s)
 ARCH := $(shell uname -m)
