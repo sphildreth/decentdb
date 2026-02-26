@@ -18,8 +18,12 @@ nav:
     - Indexes: user-guide/indexes.md
     - Performance Tuning: user-guide/performance.md
     - Comparison (SQLite/DuckDB): user-guide/comparison.md
+    - Tools:
+      - DBeaver Integration: user-guide/dbeaver.md
+      - JDBC Driver (Java): api/jdbc.md
   - API Reference:
     - Nim API: api/nim-api.md
+    - JDBC Driver (Java): api/jdbc.md
     - CLI Reference: api/cli-reference.md
     - Error Codes: api/error-codes.md
     - Configuration: api/configuration.md

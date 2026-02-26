@@ -43,23 +43,31 @@ type connector struct {
 }
 
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
-	// Parse DSN: file:/path/to.ddb?opt=val
-	u, err := url.Parse(c.dsn)
-	if err != nil {
-		return nil, err
-	}
-	path := u.Path
-	if u.Scheme == "file" {
-		// Handle file:/// path
-	} else if u.Scheme == "" && path == "" {
-		path = c.dsn
+	// Parse DSN: file:/path/to.ddb?opt=val or :memory:
+	var path string
+	var rawQuery string
+
+	if c.dsn == ":memory:" {
+		path = ":memory:"
+	} else {
+		u, err := url.Parse(c.dsn)
+		if err != nil {
+			return nil, err
+		}
+		path = u.Path
+		if u.Scheme == "file" {
+			// Handle file:/// path
+		} else if u.Scheme == "" && path == "" {
+			path = c.dsn
+		}
+		rawQuery = u.RawQuery
 	}
 
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	// Options string (simpler for MVP)
-	cOpts := C.CString(u.RawQuery)
+	cOpts := C.CString(rawQuery)
 	defer C.free(unsafe.Pointer(cOpts))
 
 	db := C.decentdb_open(cPath, cOpts)
@@ -132,6 +140,9 @@ func (d *DB) Close() error { return d.c.Close() }
 
 // Checkpoint flushes the WAL to the main database file.
 func (d *DB) Checkpoint() error { return d.c.Checkpoint() }
+
+// SaveAs exports the database to a new on-disk file at destPath.
+func (d *DB) SaveAs(destPath string) error { return d.c.SaveAs(destPath) }
 
 // ListTables returns the names of all tables.
 func (d *DB) ListTables() ([]string, error) { return d.c.ListTables() }
@@ -236,6 +247,21 @@ func (c *conn) Checkpoint() error {
 		return errors.New("connection is closed")
 	}
 	res := C.decentdb_checkpoint(c.db)
+	if res != 0 {
+		msg := C.GoString(C.decentdb_last_error_message(c.db))
+		return &DecentDBError{Code: int(res), Message: msg}
+	}
+	return nil
+}
+
+// SaveAs exports the database to a new on-disk file at destPath.
+func (c *conn) SaveAs(destPath string) error {
+	if c.db == nil {
+		return errors.New("connection is closed")
+	}
+	cPath := C.CString(destPath)
+	defer C.free(unsafe.Pointer(cPath))
+	res := C.decentdb_save_as(c.db, cPath)
 	if res != 0 {
 		msg := C.GoString(C.decentdb_last_error_message(c.db))
 		return &DecentDBError{Code: int(res), Message: msg}
@@ -444,9 +470,9 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 				res = C.decentdb_bind_blob(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.int(len(v)))
 			}
 		case time.Time:
-			// Epoch ms UTC
-			ms := v.UnixNano() / 1e6
-			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(ms))
+			// Microseconds since Unix epoch UTC
+			micros := v.UnixNano() / 1e3
+			res = C.decentdb_bind_datetime(s.stmt, idx, C.int64_t(micros))
 		case Decimal:
 			res = C.decentdb_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.int(v.Scale))
 		default:
@@ -569,6 +595,9 @@ func (r *rows) Next(dest []driver.Value) error {
 				Unscaled: int64(v.int64_val),
 				Scale:    int(v.decimal_scale),
 			}
+		case 17: // vkDateTime: microseconds since Unix epoch UTC
+			micros := int64(v.int64_val)
+			dest[i] = time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
 		default:
 			dest[i] = nil
 		}

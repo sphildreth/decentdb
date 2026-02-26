@@ -84,13 +84,13 @@ public sealed class TypeMappingTests : IDisposable
     }
 
     [Fact]
-    public void DateTimeAndDateTimeOffset_AreUnixEpochMilliseconds()
+    public void DateTimeAndDateTimeOffset_RoundTrip()
     {
         using var conn = new DecentDBConnection($"Data Source={_dbPath}");
         conn.Open();
 
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, dt INTEGER, dto INTEGER)";
+        cmd.CommandText = "CREATE TABLE t (id INTEGER PRIMARY KEY, dt TIMESTAMP, dto TIMESTAMP)";
         cmd.ExecuteNonQuery();
 
         var dt = new DateTime(2024, 01, 02, 03, 04, 05, DateTimeKind.Utc);

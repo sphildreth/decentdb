@@ -20,6 +20,7 @@ import ./record/record
 import ./storage/storage
 import ./wal/wal
 import ./vfs/os_vfs
+import ./utils/datetime
 
 # Helper to convert JSON to Result for consistent output format
 proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): JsonNode =
@@ -379,6 +380,12 @@ proc csvCellToValue(cellValue: string, col: Column): Value =
       Value(kind: vkBlob, bytes: res.value)
     else:
       Value(kind: vkNull)
+  of ctDateTime:
+    let res = parseDatetimeMicros(cellValue.strip())
+    if res.ok:
+      Value(kind: vkDateTime, int64Val: res.value)
+    else:
+      Value(kind: vkNull)
 
 proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]] =
   var parser: CsvParser
@@ -506,6 +513,17 @@ proc jsonToValue(node: JsonNode, col: Column): Value =
         Value(kind: vkBlob, bytes: res.value)
       else:
         Value(kind: vkNull)
+    else:
+      Value(kind: vkNull)
+  of ctDateTime:
+    if node.kind == JString:
+      let res = parseDatetimeMicros(node.getStr().strip())
+      if res.ok:
+        Value(kind: vkDateTime, int64Val: res.value)
+      else:
+        Value(kind: vkNull)
+    elif node.kind == JInt:
+      Value(kind: vkDateTime, int64Val: node.getBiggestInt())
     else:
       Value(kind: vkNull)
 
@@ -831,6 +849,28 @@ proc schemaListTables*(db: string = ""): int =
   echo resultJson(true, rows = tables)
   return 0
 
+proc schemaListViews*(db: string = ""): int =
+  ## List all views in the database
+  let dbPath = resolveDbPath(db)
+  if dbPath.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  let openRes = openDb(dbPath)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  var views: seq[string] = @[]
+  
+  for viewName, _ in database.catalog.views:
+    views.add(viewName)
+  
+  discard closeDb(database)
+  echo resultJson(true, rows = views)
+  return 0
+
 proc schemaDescribe*(table: string, db: string = ""): int =
   ## Show table structure (columns, types, constraints)
   let dbPath = resolveDbPath(db)
@@ -867,6 +907,7 @@ proc schemaDescribe*(table: string, db: string = ""): int =
       of ctBlob: "BLOB"
       of ctDecimal: "DECIMAL"
       of ctUuid: "UUID"
+      of ctDateTime: "TIMESTAMP"
     
     let notNull = if col.notNull: "YES" else: "NO"
     let primaryKey = if col.primaryKey: "YES" else: "NO"
@@ -1252,6 +1293,7 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         of ctBlob: "BLOB"
         of ctDecimal: "DECIMAL"
         of ctUuid: "UUID"
+        of ctDateTime: "TIMESTAMP"
       
       colDef &= typeName
       
@@ -1897,10 +1939,36 @@ proc repl*(db: string = "", format: string = "table"): int =
   discard closeDb(database)
   return 0
 
+proc saveAsCmd*(db: string = "", output: string = ""): int =
+  ## Export the database to a new on-disk file (snapshot backup).
+  let dbPath = resolveDbPath(db)
+  if dbPath.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  if output.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --output argument"))
+    return 1
+
+  let openRes = openDb(dbPath)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  let saRes = saveAs(database, output)
+  discard closeDb(database)
+  if not saRes.ok:
+    echo resultJson(false, saRes.err)
+    return 1
+
+  echo resultJson(true, rows = @["Saved to " & output])
+  return 0
+
 proc completion*(shell: string = "bash"): int =
   ## Emit basic shell completion script
   let normalized = shell.strip().toLowerAscii()
-  let commands = "exec list-tables describe list-indexes rebuild-index rebuild-indexes verify-index import export dump bulk-load checkpoint stats info vacuum dump-header verify-header repl completion"
+  let commands = "bulk-load checkpoint completion describe dump dump-header exec export import info list-indexes list-tables list-views rebuild-index rebuild-indexes repl save-as stats vacuum verify-header verify-index"
   if normalized == "zsh":
     echo "#compdef decentdb"
     echo "_decentdb() {"

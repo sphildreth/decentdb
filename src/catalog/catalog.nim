@@ -18,6 +18,7 @@ type ColumnType* = enum
   ctBlob
   ctDecimal
   ctUuid
+  ctDateTime
 
 type ColumnTypeSpec* = object
   kind*: ColumnType
@@ -40,6 +41,8 @@ type Column* = object
   refOnUpdate*: string
   decPrecision*: uint8
   decScale*: uint8
+  defaultExpr*: string  ## SQL text of the DEFAULT expression (empty = no default)
+  generatedExpr*: string  ## SQL text of GENERATED ALWAYS AS expr STORED (empty = not generated)
 
 type CheckConstraint* = object
   name*: string
@@ -83,6 +86,13 @@ type TrigramDelta* = ref object
   adds*: HashSet[uint64]
   removes*: HashSet[uint64]
 
+type TableStats* = object
+  rowCount*: int64
+
+type IndexStats* = object
+  entryCount*: int64
+  distinctKeyCount*: int64
+
 type Catalog* = ref object
   tables*: Table[string, TableMeta]
   indexes*: Table[string, IndexMeta]
@@ -94,12 +104,17 @@ type Catalog* = ref object
   triggerEventMaskByTable*: Table[string, int]
   catalogTree*: BTree
   trigramDeltas*: Table[(string, uint32), TrigramDelta]
+  tableStats*: Table[string, TableStats]
+  indexStats*: Table[string, IndexStats]
+  rowCountDeltas*: Table[string, int64]
 
 type CatalogRecordKind = enum
   crTable
   crIndex
   crView
   crTrigger
+  crTableStats
+  crIndexStats
 
 type CatalogRecord = object
   kind: CatalogRecordKind
@@ -107,6 +122,10 @@ type CatalogRecord = object
   index: IndexMeta
   view: ViewMeta
   trigger: TriggerMeta
+  tableStats: TableStats
+  tableStatsName: string
+  indexStats: IndexStats
+  indexStatsName: string
 
 proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
   let raw = text.strip()
@@ -130,6 +149,8 @@ proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
     ok(ColumnTypeSpec(kind: ctFloat64))
   of "TEXT", "VARCHAR", "CHARACTER VARYING":
     ok(ColumnTypeSpec(kind: ctText))
+  of "DATE", "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP WITH TIME ZONE", "DATETIME":
+    ok(ColumnTypeSpec(kind: ctDateTime))
   of "BLOB":
     ok(ColumnTypeSpec(kind: ctBlob))
   of "UUID":
@@ -169,6 +190,7 @@ proc columnTypeToText*(kind: ColumnType): string =
   of ctBlob: "BLOB"
   of ctDecimal: "DECIMAL"
   of ctUuid: "UUID"
+  of ctDateTime: "TIMESTAMP"
 
 proc normalizeFkAction(action: string): string =
   let upper = action.strip().toUpperAscii()
@@ -208,6 +230,13 @@ proc encodeColumns(columns: seq[Column]): seq[byte] =
       flags.add("ref=" & col.refTable & "." & col.refColumn)
       flags.add("refdel=" & fkActionToCode(col.refOnDelete))
       flags.add("refupd=" & fkActionToCode(col.refOnUpdate))
+    if col.defaultExpr.len > 0:
+      # Percent-encode special delimiters to avoid conflicts with column encoding format
+      var encoded = col.defaultExpr.replace("%", "%25").replace(";", "%3B").replace(":", "%3A").replace(",", "%2C")
+      flags.add("default=" & encoded)
+    if col.generatedExpr.len > 0:
+      var encoded = col.generatedExpr.replace("%", "%25").replace(";", "%3B").replace(":", "%3A").replace(",", "%2C")
+      flags.add("gen=" & encoded)
     let flagPart = if flags.len > 0: ":" & flags.join(",") else: ""
     let typeText =
       if col.kind == ctDecimal:
@@ -258,6 +287,12 @@ proc decodeColumns(bytes: seq[byte]): seq[Column] =
                 col.refOnDelete = fkActionFromCode(flag[7 .. ^1])
               elif flag.startsWith("refupd="):
                 col.refOnUpdate = fkActionFromCode(flag[7 .. ^1])
+              elif flag.startsWith("default="):
+                var encoded = flag[8 .. ^1]
+                col.defaultExpr = encoded.replace("%2C", ",").replace("%3A", ":").replace("%3B", ";").replace("%25", "%")
+              elif flag.startsWith("gen="):
+                var encoded = flag[4 .. ^1]
+                col.generatedExpr = encoded.replace("%2C", ",").replace("%3A", ":").replace("%3B", ";").replace("%25", "%")
         if col.refTable.len > 0 and col.refColumn.len > 0:
           if col.refOnDelete.len == 0:
             col.refOnDelete = "NO ACTION"
@@ -352,19 +387,42 @@ proc makeTriggerRecord(name: string, tableName: string, eventsMask: int, actionS
   ]
   encodeRecord(values)
 
+proc makeTableStatsRecord(normName: string, rowCount: int64): seq[byte] =
+  let values = @[
+    Value(kind: vkText, bytes: stringToBytes("stats:table")),
+    Value(kind: vkText, bytes: stringToBytes(normName)),
+    Value(kind: vkInt64, int64Val: rowCount)
+  ]
+  encodeRecord(values)
+
+proc makeIndexStatsRecord(normName: string, entryCount: int64, distinctKeyCount: int64): seq[byte] =
+  let values = @[
+    Value(kind: vkText, bytes: stringToBytes("stats:index")),
+    Value(kind: vkText, bytes: stringToBytes(normName)),
+    Value(kind: vkInt64, int64Val: entryCount),
+    Value(kind: vkInt64, int64Val: distinctKeyCount)
+  ]
+  encodeRecord(values)
+
 proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
   let decoded = decodeRecord(data)
   if not decoded.ok:
     return err[CatalogRecord](decoded.err.code, decoded.err.message, decoded.err.context)
   let values = decoded.value
-  if values.len < 4:
+  if values.len < 1:
+    return err[CatalogRecord](ERR_CORRUPTION, "Empty catalog record")
+  # Detect old compact format (4 values: name, rootPage, nextRowId, columns).
+  # Only treat as compact if the first field is not a known type discriminator.
+  if values.len == 4 and values[0].kind == vkText:
+    let firstStr = bytesToString(values[0].bytes).toLowerAscii()
+    if firstStr notin ["table", "index", "view", "trigger", "stats:table", "stats:index"]:
+      let name = bytesToString(values[0].bytes)
+      let rootPage = PageId(values[1].int64Val)
+      let nextRowId = uint64(values[2].int64Val)
+      let columns = decodeColumns(values[3].bytes)
+      return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns, checks: @[])))
+  if values.len < 2:
     return err[CatalogRecord](ERR_CORRUPTION, "Catalog record too short")
-  if values.len == 4:
-    let name = bytesToString(values[0].bytes)
-    let rootPage = PageId(values[1].int64Val)
-    let nextRowId = uint64(values[2].int64Val)
-    let columns = decodeColumns(values[3].bytes)
-    return ok(CatalogRecord(kind: crTable, table: TableMeta(name: name, rootPage: rootPage, nextRowId: nextRowId, columns: columns, checks: @[])))
   let recordType = bytesToString(values[0].bytes).toLowerAscii()
   if recordType == "table":
     let name = bytesToString(values[1].bytes)
@@ -429,6 +487,20 @@ proc parseCatalogRecord(data: seq[byte]): Result[CatalogRecord] =
     let eventsMask = int(values[3].int64Val)
     let actionSql = bytesToString(values[4].bytes)
     return ok(CatalogRecord(kind: crTrigger, trigger: TriggerMeta(name: name, table: tableName, eventsMask: eventsMask, actionSql: actionSql)))
+  if recordType == "stats:table":
+    if values.len < 3:
+      return err[CatalogRecord](ERR_CORRUPTION, "Table stats record too short")
+    let name = bytesToString(values[1].bytes)
+    let rowCount = values[2].int64Val
+    return ok(CatalogRecord(kind: crTableStats, tableStats: TableStats(rowCount: rowCount), tableStatsName: name))
+  if recordType == "stats:index":
+    if values.len < 4:
+      return err[CatalogRecord](ERR_CORRUPTION, "Index stats record too short")
+    let name = bytesToString(values[1].bytes)
+    let entryCount = values[2].int64Val
+    let distinctKeyCount = values[3].int64Val
+    return ok(CatalogRecord(kind: crIndexStats, indexStats: IndexStats(entryCount: entryCount, distinctKeyCount: distinctKeyCount), indexStatsName: name))
+  # Unknown record types are silently skipped (forward compatibility).
   err[CatalogRecord](ERR_CORRUPTION, "Unknown catalog record type", recordType)
 
 proc normalizedObjectName(name: string): string =
@@ -502,7 +574,10 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
     tablesWithReferencingChildren: initHashSet[string](),
     triggerEventMaskByTable: initTable[string, int](),
     catalogTree: tree,
-    trigramDeltas: initTable[(string, uint32), TrigramDelta]()
+    trigramDeltas: initTable[(string, uint32), TrigramDelta](),
+    tableStats: initTable[string, TableStats](),
+    indexStats: initTable[string, IndexStats](),
+    rowCountDeltas: initTable[string, int64]()
   )
   let cursorRes = openCursor(tree)
   if cursorRes.ok:
@@ -530,6 +605,10 @@ proc initCatalog*(pager: Pager): Result[Catalog] =
           catalog.views[normalizedObjectName(record.view.name)] = record.view
         of crTrigger:
           catalog.triggers[triggerMetaKey(record.trigger.table, record.trigger.name)] = record.trigger
+        of crTableStats:
+          catalog.tableStats[record.tableStatsName] = record.tableStats
+        of crIndexStats:
+          catalog.indexStats[record.indexStatsName] = record.indexStats
   rebuildDependentViewsIndex(catalog)
   rebuildReverseFkCache(catalog)
   rebuildTriggerCache(catalog)
@@ -603,6 +682,11 @@ proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] 
   
   okVoid()
 
+proc registerTempTable*(catalog: Catalog, table: TableMeta) =
+  ## Add a table to the in-memory catalog only (not persisted).
+  catalog.tables[normalizedObjectName(table.name)] = table
+  rebuildReverseFkCache(catalog)
+
 proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
   if not catalog.tables.hasKey(normalizedObjectName(name)):
     return err[TableMeta](ERR_SQL, "Table not found", name)
@@ -658,6 +742,11 @@ proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
+
+proc registerTempView*(catalog: Catalog, view: ViewMeta) =
+  ## Add a view to the in-memory catalog only (not persisted).
+  catalog.views[normalizedObjectName(view.name)] = view
+  rebuildDependentViewsIndex(catalog)
 
 proc saveViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
   catalog.views[normalizedObjectName(view.name)] = view
@@ -904,3 +993,83 @@ proc hasViewName*(catalog: Catalog, name: string): bool =
 
 proc hasTableOrViewName*(catalog: Catalog, name: string): bool =
   catalog.tables.hasKey(normalizedObjectName(name)) or catalog.views.hasKey(normalizedObjectName(name))
+
+# ---------------------------------------------------------------------------
+# Statistics: table and index stats persistence
+# ---------------------------------------------------------------------------
+
+proc getTableStats*(catalog: Catalog, tableName: string): Option[TableStats] =
+  let normName = normalizedObjectName(tableName)
+  if catalog.tableStats.hasKey(normName):
+    return some(catalog.tableStats[normName])
+  none(TableStats)
+
+proc getIndexStats*(catalog: Catalog, indexName: string): Option[IndexStats] =
+  let normName = normalizedObjectName(indexName)
+  if catalog.indexStats.hasKey(normName):
+    return some(catalog.indexStats[normName])
+  none(IndexStats)
+
+proc saveTableStats*(catalog: Catalog, tableName: string, stats: TableStats): Result[Void] =
+  let normName = normalizedObjectName(tableName)
+  catalog.tableStats[normName] = stats
+  let key = uint64(crc32c(stringToBytes("stats:table:" & normName)))
+  let record = makeTableStatsRecord(normName, stats.rowCount)
+  # Try update first; insert if not found.
+  let updateRes = update(catalog.catalogTree, key, record)
+  if updateRes.ok:
+    if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+      catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+    return okVoid()
+  if updateRes.err.message != "Key not found":
+    return err[Void](updateRes.err.code, updateRes.err.message, updateRes.err.context)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc saveIndexStats*(catalog: Catalog, indexName: string, stats: IndexStats): Result[Void] =
+  let normName = normalizedObjectName(indexName)
+  catalog.indexStats[normName] = stats
+  let key = uint64(crc32c(stringToBytes("stats:index:" & normName)))
+  let record = makeIndexStatsRecord(normName, stats.entryCount, stats.distinctKeyCount)
+  let updateRes = update(catalog.catalogTree, key, record)
+  if updateRes.ok:
+    if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+      catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+    return okVoid()
+  if updateRes.err.message != "Key not found":
+    return err[Void](updateRes.err.code, updateRes.err.message, updateRes.err.context)
+  let insertRes = insert(catalog.catalogTree, key, record)
+  if not insertRes.ok:
+    return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
+  if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
+    catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
+  okVoid()
+
+proc applyRowCountDeltas*(catalog: Catalog): Result[Void] =
+  ## Apply pending incremental row-count deltas to persisted table stats.
+  ## Called at commit time; clears deltas afterward.
+  for normName, delta in catalog.rowCountDeltas:
+    if delta == 0:
+      continue
+    if catalog.tableStats.hasKey(normName):
+      var stats = catalog.tableStats[normName]
+      stats.rowCount = max(0, stats.rowCount + delta)
+      let saveRes = saveTableStats(catalog, normName, stats)
+      if not saveRes.ok:
+        return saveRes
+  catalog.rowCountDeltas.clear()
+  okVoid()
+
+proc discardRowCountDeltas*(catalog: Catalog) =
+  ## Discard pending incremental row-count deltas on rollback.
+  catalog.rowCountDeltas.clear()
+
+proc addRowCountDelta*(catalog: Catalog, tableName: string, delta: int64) =
+  ## Record a row-count change for commit-time application.
+  let normName = normalizedObjectName(tableName)
+  let current = if catalog.rowCountDeltas.hasKey(normName): catalog.rowCountDeltas[normName] else: 0'i64
+  catalog.rowCountDeltas[normName] = current + delta

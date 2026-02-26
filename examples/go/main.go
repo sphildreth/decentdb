@@ -11,13 +11,21 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 
 	_ "github.com/sphildreth/decentdb-go"
 )
 
 func main() {
-	// Open a database (creates the file if it doesn't exist).
-	db, err := sql.Open("decentdb", "file:example.ddb")
+	// Open a database in a temp directory (creates the file if it doesn't exist).
+	tmpDir, err := os.MkdirTemp("", "decentdb-example-*")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+	dbPath := filepath.Join(tmpDir, "example.ddb")
+	db, err := sql.Open("decentdb", fmt.Sprintf("file:%s", dbPath))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -87,4 +95,114 @@ func main() {
 	var count int64
 	db.QueryRow("SELECT count(*) FROM users").Scan(&count)
 	fmt.Printf("\nTotal users after transaction: %d\n", count)
+
+	// ── Window Functions ──
+	db.Exec(`CREATE TABLE scores (
+		id    INTEGER PRIMARY KEY,
+		name  TEXT NOT NULL,
+		dept  TEXT NOT NULL,
+		score INTEGER NOT NULL
+	)`)
+	for _, s := range []struct {
+		name, dept string
+		score      int
+	}{
+		{"Alice", "eng", 95}, {"Bob", "eng", 95},
+		{"Carol", "eng", 80}, {"Dave", "sales", 90},
+		{"Eve", "sales", 85},
+	} {
+		db.Exec("INSERT INTO scores (name, dept, score) VALUES ($1, $2, $3)", s.name, s.dept, s.score)
+	}
+
+	fmt.Println("\n── Window Functions ──")
+
+	// ROW_NUMBER
+	rows, err = db.Query(`
+		SELECT name, dept, score,
+		       ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) AS rn
+		FROM scores ORDER BY dept, score DESC`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\nROW_NUMBER (ranking within department):")
+	for rows.Next() {
+		var n, d string
+		var s, rn int64
+		rows.Scan(&n, &d, &s, &rn)
+		fmt.Printf("  %-6s  dept=%-5s  score=%d  rn=%d\n", n, d, s, rn)
+	}
+	rows.Close()
+
+	// RANK
+	rows, err = db.Query(`
+		SELECT name, score,
+		       RANK() OVER (ORDER BY score DESC) AS rank
+		FROM scores ORDER BY score DESC, name`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\nRANK (with gaps for ties):")
+	for rows.Next() {
+		var n string
+		var s, r int64
+		rows.Scan(&n, &s, &r)
+		fmt.Printf("  %-6s  score=%d  rank=%d\n", n, s, r)
+	}
+	rows.Close()
+
+	// DENSE_RANK
+	rows, err = db.Query(`
+		SELECT name, score,
+		       DENSE_RANK() OVER (ORDER BY score DESC) AS dr
+		FROM scores ORDER BY score DESC, name`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\nDENSE_RANK (no gaps):")
+	for rows.Next() {
+		var n string
+		var s, dr int64
+		rows.Scan(&n, &s, &dr)
+		fmt.Printf("  %-6s  score=%d  dense_rank=%d\n", n, s, dr)
+	}
+	rows.Close()
+
+	// LAG
+	rows, err = db.Query(`
+		SELECT name, score,
+		       LAG(score, 1, 0) OVER (ORDER BY score DESC) AS prev_score
+		FROM scores ORDER BY score DESC`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\nLAG (previous score):")
+	for rows.Next() {
+		var n string
+		var s, prev int64
+		rows.Scan(&n, &s, &prev)
+		fmt.Printf("  %-6s  score=%d  prev_score=%d\n", n, s, prev)
+	}
+	rows.Close()
+
+	// LEAD
+	rows, err = db.Query(`
+		SELECT name, score,
+		       LEAD(score) OVER (PARTITION BY dept ORDER BY score DESC) AS next_score
+		FROM scores ORDER BY dept, score DESC`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("\nLEAD (next score in dept):")
+	for rows.Next() {
+		var n string
+		var s int64
+		var next sql.NullInt64
+		rows.Scan(&n, &s, &next)
+		if next.Valid {
+			fmt.Printf("  %-6s  score=%d  next_score=%d\n", n, s, next.Int64)
+		} else {
+			fmt.Printf("  %-6s  score=%d  next_score=NULL\n", n, s)
+		}
+	}
+	rows.Close()
 }

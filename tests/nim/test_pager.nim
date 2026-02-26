@@ -1,5 +1,6 @@
 import unittest
 import os
+import strutils
 import engine
 import pager/pager
 import pager/db_header
@@ -129,16 +130,13 @@ suite "Pager":
     let p2 = p2Res.value
     discard p2
     check freePage(pager, p1).ok
-    let headerRes = readHeader(db.vfs, db.file)
-    check headerRes.ok
-    check headerRes.value.freelistCount == 1
+    # Header is updated in-memory; not fsynced until checkpoint (ADR-0057)
+    check pager.header.freelistCount == 1
     let p3Res = allocatePage(pager)
     check p3Res.ok
     let p3 = p3Res.value
     check p3 == p1
-    let headerRes2 = readHeader(db.vfs, db.file)
-    check headerRes2.ok
-    check headerRes2.value.freelistCount == 0
+    check pager.header.freelistCount == 0
     discard closePager(pager)
     discard closeDb(db)
 
@@ -206,9 +204,8 @@ suite "Pager":
     for p in pages:
       check freePage(pager, p).ok
       
-    # Verify freelist count in header
-    let header = readHeader(db.vfs, db.file).value
-    check header.freelistCount == uint32(limit)
+    # Verify freelist count in-memory header (not fsynced until checkpoint, ADR-0057)
+    check pager.header.freelistCount == uint32(limit)
     
     # Verify we can re-allocate them (LIFO order usually)
     for i in 0 ..< limit:
@@ -243,3 +240,135 @@ suite "Pager":
     let dbRes2 = openDb(path)
     check not dbRes2.ok
     check dbRes2.err.code == ERR_CORRUPTION
+
+  test "freelist header not fsynced during transaction (ADR-0057)":
+    let path = makeTempDb("decentdb_pager_no_header_fsync.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 64)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    
+    # Read on-disk header before any freelist ops
+    let hBefore = readHeader(db.vfs, db.file)
+    check hBefore.ok
+    let diskCountBefore = hBefore.value.freelistCount
+    
+    # Allocate and free some pages
+    let p1 = allocatePage(pager).value
+    let p2 = allocatePage(pager).value
+    check freePage(pager, p1).ok
+    check freePage(pager, p2).ok
+    
+    # In-memory header should reflect changes
+    check pager.header.freelistCount == diskCountBefore + 2
+    
+    # On-disk header should be unchanged (no fsync)
+    let hAfter = readHeader(db.vfs, db.file)
+    check hAfter.ok
+    check hAfter.value.freelistCount == diskCountBefore
+    
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "reconstructFreelistHeader rebuilds count from chain":
+    let path = makeTempDb("decentdb_pager_reconstruct.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 64)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    
+    # Allocate pages, then free them to build a freelist
+    var pages: seq[PageId] = @[]
+    for i in 0 ..< 10:
+      pages.add(allocatePage(pager).value)
+    for p in pages:
+      check freePage(pager, p).ok
+    
+    check pager.header.freelistCount == 10
+    
+    # Corrupt the in-memory count
+    pager.header.freelistCount = 999
+    
+    # Reconstruct should fix it
+    let res = reconstructFreelistHeader(pager)
+    check res.ok
+    check pager.header.freelistCount == 10
+    
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "reconstructFreelistHeader handles empty freelist":
+    let path = makeTempDb("decentdb_pager_reconstruct_empty.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 64)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    
+    check pager.header.freelistHead == 0
+    let res = reconstructFreelistHeader(pager)
+    check res.ok
+    check pager.header.freelistCount == 0
+    
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "txnFreedPages tracked and rolled back (ADR-0057)":
+    let path = makeTempDb("decentdb_pager_freed_rollback.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 64)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    
+    # Allocate pages outside a transaction
+    let p1 = allocatePage(pager).value
+    let p2 = allocatePage(pager).value
+    let p3 = allocatePage(pager).value
+    
+    # Begin tracking and free pages
+    beginTxnPageTracking(pager)
+    check freePage(pager, p1).ok
+    check freePage(pager, p2).ok
+    
+    # Verify tracking
+    check pager.txnFreedPages.len == 2
+    check pager.header.freelistCount == 2
+    
+    # Rollback — freed pages should be removed from freelist
+    let rbRes = rollbackTxnPageAllocations(pager)
+    check rbRes.ok
+    check pager.header.freelistCount == 0
+    check pager.txnFreedPages.len == 0
+    
+    discard p3
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "freelist reconstruction on reopen produces correct count":
+    # Verify that openDb calls reconstructFreelistHeader and gets the right count.
+    # We test this by opening a DB, verifying reconstruction runs (freelistCount == 0
+    # for a fresh DB), then closing and reopening to confirm idempotency.
+    let path = makeTempDb("decentdb_pager_reopen_reconstruct.db")
+    block:
+      let dbRes = openDb(path)
+      check dbRes.ok
+      let db = dbRes.value
+      # Fresh DB should have no freelist
+      check db.pager.header.freelistCount == 0
+      check db.pager.header.freelistHead == 0
+      discard closeDb(db)
+    block:
+      # Reopen — reconstruction should confirm empty freelist
+      let dbRes = openDb(path)
+      check dbRes.ok
+      let db = dbRes.value
+      check db.pager.header.freelistCount == 0
+      check db.pager.header.freelistHead == 0
+      discard closeDb(db)

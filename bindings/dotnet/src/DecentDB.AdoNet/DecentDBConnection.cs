@@ -113,6 +113,23 @@ namespace DecentDB.AdoNet
             }
         }
 
+        /// <summary>
+        /// Returns true when the data source represents an in-memory database (":memory:").
+        /// </summary>
+        internal bool IsInMemory => string.Equals(_dataSource, ":memory:", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Export the database to a new on-disk file at the specified path.
+        /// The connection must be open and no transaction may be active.
+        /// The destination file must not already exist.
+        /// </summary>
+        public void SaveAs(string destPath)
+        {
+            if (_state != ConnectionState.Open || _db == null)
+                throw new InvalidOperationException("Connection is not open.");
+            _db.SaveAs(destPath);
+        }
+
         public override void Open()
         {
             if (_state == ConnectionState.Open) return;
@@ -123,15 +140,18 @@ namespace DecentDB.AdoNet
                 throw new InvalidOperationException("Data Source is required");
             }
 
-            if (!Path.IsPathRooted(path))
+            if (!IsInMemory)
             {
-                path = Path.Combine(Environment.CurrentDirectory, path);
-            }
+                if (!Path.IsPathRooted(path))
+                {
+                    path = Path.Combine(Environment.CurrentDirectory, path);
+                }
 
-            var directory = Path.GetDirectoryName(path);
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-            {
-                Directory.CreateDirectory(directory);
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
             }
 
             try

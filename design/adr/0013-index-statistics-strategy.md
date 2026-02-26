@@ -1,6 +1,6 @@
 # Index Statistics Strategy
 **Date:** 2026-01-28
-**Status:** Accepted
+**Status:** Superseded by ADR-0112 (incremental maintenance now implemented)
 
 ### Decision
 Use heuristic-based selectivity estimates for the 0.x baseline, defer full statistics collection.

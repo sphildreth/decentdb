@@ -84,6 +84,33 @@ db.exec('COMMIT');
 db.checkpoint();  // flush WAL to main database file
 ```
 
+### In-Memory Databases
+
+Use `:memory:` for an ephemeral in-memory database (case-insensitive):
+
+```javascript
+const db = new Database({ path: ':memory:' });
+db.exec('CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT)');
+db.exec("INSERT INTO cache (key, val) VALUES ($1, $2)", ['k1', 'hello']);
+// Data is lost when the database is closed
+db.close();
+```
+
+### SaveAs (Export to Disk)
+
+Export any open database — including `:memory:` — to a new on-disk file:
+
+```javascript
+const db = new Database({ path: ':memory:' });
+db.exec('CREATE TABLE items (id INT PRIMARY KEY, name TEXT)');
+db.exec('INSERT INTO items (id, name) VALUES ($1, $2)', [1, 'widget']);
+
+db.saveAs('/tmp/snapshot.ddb');
+db.close();
+```
+
+`saveAs` performs a full checkpoint, then copies all pages atomically. The destination must not already exist.
+
 ### Schema Introspection
 
 ```javascript

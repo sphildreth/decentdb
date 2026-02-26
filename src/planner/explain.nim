@@ -67,7 +67,12 @@ proc renderExpr*(expr: Expr): string =
     s.add("))")
     s
   of ekWindowRowNumber:
-    var s = "ROW_NUMBER() OVER ("
+    var s = expr.windowFunc & "("
+    if expr.windowFunc in ["LAG", "LEAD"]:
+      for i, a in expr.windowArgs:
+        if i > 0: s.add(", ")
+        s.add(renderExpr(a))
+    s.add(") OVER (")
     if expr.windowPartitions.len > 0:
       s.add("PARTITION BY ")
       for i, p in expr.windowPartitions:
@@ -84,6 +89,10 @@ proc renderExpr*(expr: Expr): string =
         s.add(if asc: " ASC" else: " DESC")
     s.add(")")
     s
+  of ekSqlValueFunction:
+    expr.sqlValueFunc
+  of ekExtract:
+    "EXTRACT(" & expr.extractField & " FROM " & renderExpr(expr.extractSource) & ")"
 
 proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
   var lines: seq[string] = @[]
@@ -98,10 +107,16 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       line.add("OneRow")
       lines.add(line)
     of pkTableScan:
-      line.add("TableScan(table=" & p.table & " alias=" & p.alias & ")")
+      line.add("TableScan(table=" & p.table & " alias=" & p.alias)
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkRowidSeek:
-      line.add("RowidSeek(table=" & p.table & " alias=" & p.alias & " column=" & p.column & " value=" & renderExpr(p.valueExpr) & ")")
+      line.add("RowidSeek(table=" & p.table & " alias=" & p.alias & " column=" & p.column & " value=" & renderExpr(p.valueExpr))
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkIndexSeek:
       var idxName = "?"
@@ -119,17 +134,29 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
           p.column[IndexExpressionPrefix.len .. ^1]
         else:
           p.column
-      line.add("IndexSeek(table=" & p.table & " column=" & colDisplay & " value=" & renderExpr(p.valueExpr) & " index=" & idxName & ")")
+      line.add("IndexSeek(table=" & p.table & " column=" & colDisplay & " value=" & renderExpr(p.valueExpr) & " index=" & idxName)
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkTrigramSeek:
       let idxOpt = catalog.getTrigramIndexForColumn(p.table, p.column)
       let idxName = if idxOpt.isSome: idxOpt.get.name else: "?"
-      line.add("TrigramSeek(table=" & p.table & " column=" & p.column & " pattern=" & renderExpr(p.likeExpr) & " insensitive=" & $p.likeInsensitive & " index=" & idxName & ")")
+      line.add("TrigramSeek(table=" & p.table & " column=" & p.column & " pattern=" & renderExpr(p.likeExpr) & " insensitive=" & $p.likeInsensitive & " index=" & idxName)
+      if p.estRows > 0:
+        line.add(" estRows=" & $p.estRows)
+      line.add(")")
       lines.add(line)
     of pkSubqueryScan:
       line.add("SubqueryScan(alias=" & p.alias & ")")
       lines.add(line)
       traverse(p.subPlan, depth + 1)
+    of pkLiteralRows:
+      line.add("LiteralRows(table=" & p.table & " alias=" & p.alias & " rows=" & $p.rows.len & ")")
+      lines.add(line)
+    of pkTvfScan:
+      line.add("TvfScan(func=" & p.tvfFunc & " alias=" & p.alias & ")")
+      lines.add(line)
     of pkUnionDistinct:
       line.add("UnionDistinct")
       lines.add(line)
@@ -150,8 +177,18 @@ proc explainPlanLines*(catalog: Catalog, plan: Plan): seq[string] =
       lines.add(line)
       traverse(p.left, depth + 1)
       traverse(p.right, depth + 1)
+    of pkSetIntersectAll:
+      line.add("SetIntersectAll")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
     of pkSetExcept:
       line.add("SetExcept")
+      lines.add(line)
+      traverse(p.left, depth + 1)
+      traverse(p.right, depth + 1)
+    of pkSetExceptAll:
+      line.add("SetExceptAll")
       lines.add(line)
       traverse(p.left, depth + 1)
       traverse(p.right, depth + 1)
@@ -199,5 +236,7 @@ proc explainAnalyzePlanLines*(catalog: Catalog, plan: Plan, metrics: PlanMetrics
   ## Render EXPLAIN ANALYZE output: plan lines followed by actual execution metrics.
   result = explainPlanLines(catalog, plan)
   result.add("---")
+  if plan != nil and plan.estRows > 0:
+    result.add("Estimated Rows: " & $plan.estRows)
   result.add("Actual Rows: " & $metrics.actualRows)
   result.add("Actual Time: " & formatFloat(metrics.actualTimeMs, ffDecimal, 3) & " ms")

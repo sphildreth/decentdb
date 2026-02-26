@@ -101,6 +101,34 @@ for idx in indexes:
 conn.checkpoint()  # flush WAL to main database file
 ```
 
+### In-Memory Databases
+
+Use `:memory:` for an ephemeral in-memory database (case-insensitive):
+
+```python
+conn = decentdb.connect(":memory:")
+conn.execute("CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT)")
+conn.execute("INSERT INTO cache (key, val) VALUES ($1, $2)", ["k1", "hello"])
+conn.commit()
+# Data is lost when the connection is closed
+```
+
+### SaveAs (Export to Disk)
+
+Export any open database — including `:memory:` — to a new on-disk file:
+
+```python
+conn = decentdb.connect(":memory:")
+conn.execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+conn.execute("INSERT INTO items (id, name) VALUES ($1, $2)", [1, "widget"])
+conn.commit()
+
+conn.save_as("/tmp/snapshot.ddb")
+conn.close()
+```
+
+`save_as` performs a full checkpoint, then copies all pages atomically. The destination must not already exist.
+
 ## SQLAlchemy Usage
 
 ```python

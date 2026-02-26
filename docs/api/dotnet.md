@@ -209,6 +209,47 @@ using var conn = new DecentDBConnection("Data Source=./sample.ddb");
 conn.Open();
 ```
 
+### In-Memory Databases
+
+Use `Data Source=:memory:` for an ephemeral in-memory database (case-insensitive):
+
+```csharp
+using var conn = new DecentDBConnection("Data Source=:memory:");
+conn.Open();
+
+using var cmd = conn.CreateCommand();
+cmd.CommandText = "CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT)";
+cmd.ExecuteNonQuery();
+// Data is lost when the connection is closed/disposed
+```
+
+With EF Core:
+
+```csharp
+// Share a single open connection for the lifetime of the context
+var conn = new DecentDBConnection("Data Source=:memory:");
+conn.Open();
+
+services.AddDbContextFactory<AppDbContext>(options =>
+    options.UseDecentDB(conn, contextOwnsConnection: false));
+```
+
+### SaveAs (Export to Disk)
+
+Export any open database — including `:memory:` — to a new on-disk file:
+
+```csharp
+using var conn = new DecentDBConnection("Data Source=:memory:");
+conn.Open();
+
+// ... create schema and populate data ...
+
+conn.SaveAs("/tmp/snapshot.ddb");
+// The file now contains a durable copy of the in-memory database
+```
+
+`SaveAs` performs a full checkpoint, then copies all pages atomically. The destination must not already exist.
+
 ### Connection String Builder
 
 ```csharp

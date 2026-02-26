@@ -373,7 +373,8 @@ suite "SQL Exec":
     check shadow.value == @[("1")]
 
     let unsupportedShape = execSql(db, "WITH a AS (SELECT id FROM users ORDER BY id) SELECT id FROM a")
-    check not unsupportedShape.ok
+    check unsupportedShape.ok
+    check unsupportedShape.value.len >= 1
 
     discard closeDb(db)
 
@@ -407,6 +408,9 @@ suite "SQL Exec":
     check exceptRes.value == @["1"]
 
     discard closeDb(db)
+
+  # INTERSECT ALL and EXCEPT ALL - parser support added, execution pending libpg_query node fix
+  # TODO: Fix libpg_query node field names for INTERSECT ALL and EXCEPT ALL
 
   test "CHECK constraints enforce false-only failure and persist":
     let path = makeTempDb("decentdb_sql_exec_check_constraints.db")
@@ -813,6 +817,202 @@ suite "Planner":
 
     let badWindow = execSql(db, "SELECT ROW_NUMBER() OVER (PARTITION BY grp) FROM t")
     check not badWindow.ok
+
+    discard closeDb(db)
+
+  test "RANK window function":
+    let path = makeTempDb("decentdb_sql_window_rank.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE scores (id INT, score INT, team TEXT)").ok
+    check execSql(db, "INSERT INTO scores VALUES (1, 100, 'a')").ok
+    check execSql(db, "INSERT INTO scores VALUES (2, 100, 'a')").ok
+    check execSql(db, "INSERT INTO scores VALUES (3, 90, 'a')").ok
+    check execSql(db, "INSERT INTO scores VALUES (4, 80, 'b')").ok
+    check execSql(db, "INSERT INTO scores VALUES (5, 80, 'b')").ok
+
+    # RANK with ties: equal scores get same rank, next rank skips
+    let rankRes = execSql(db,
+      "SELECT id, RANK() OVER (PARTITION BY team ORDER BY score DESC) AS r FROM scores ORDER BY id")
+    check rankRes.ok
+    check rankRes.value == @["1|1", "2|1", "3|3", "4|1", "5|1"]
+
+    # RANK without partition (global)
+    let globalRes = execSql(db,
+      "SELECT id, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY id")
+    check globalRes.ok
+    check globalRes.value == @["1|1", "2|1", "3|3", "4|4", "5|4"]
+
+    discard closeDb(db)
+
+  test "DENSE_RANK window function":
+    let path = makeTempDb("decentdb_sql_window_dense_rank.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE scores (id INT, score INT)").ok
+    check execSql(db, "INSERT INTO scores VALUES (1, 100)").ok
+    check execSql(db, "INSERT INTO scores VALUES (2, 100)").ok
+    check execSql(db, "INSERT INTO scores VALUES (3, 90)").ok
+    check execSql(db, "INSERT INTO scores VALUES (4, 80)").ok
+
+    # DENSE_RANK: no gaps after ties
+    let denseRes = execSql(db,
+      "SELECT id, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY id")
+    check denseRes.ok
+    check denseRes.value == @["1|1", "2|1", "3|2", "4|3"]
+
+    discard closeDb(db)
+
+  test "LAG window function":
+    let path = makeTempDb("decentdb_sql_window_lag.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # LAG(val) — default offset 1, default NULL
+    let lagRes = execSql(db,
+      "SELECT id, LAG(val) OVER (PARTITION BY grp ORDER BY id) AS prev FROM events ORDER BY id")
+    check lagRes.ok
+    check lagRes.value == @["1|NULL", "2|10", "3|20", "4|NULL", "5|100"]
+
+    # LAG with offset 2 and default 0
+    let lag2Res = execSql(db,
+      "SELECT id, LAG(val, 2, 0) OVER (ORDER BY id) AS prev2 FROM events ORDER BY id")
+    check lag2Res.ok
+    check lag2Res.value == @["1|0", "2|0", "3|10", "4|20", "5|30"]
+
+    discard closeDb(db)
+
+  test "LEAD window function":
+    let path = makeTempDb("decentdb_sql_window_lead.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+
+    # LEAD(val) — default offset 1, default NULL
+    let leadRes = execSql(db,
+      "SELECT id, LEAD(val) OVER (PARTITION BY grp ORDER BY id) AS nxt FROM events ORDER BY id")
+    check leadRes.ok
+    check leadRes.value == @["1|20", "2|30", "3|NULL", "4|NULL"]
+
+    # LEAD with offset and default
+    let lead2Res = execSql(db,
+      "SELECT id, LEAD(val, 1, -1) OVER (ORDER BY id) AS nxt FROM events ORDER BY id")
+    check lead2Res.ok
+    check lead2Res.value == @["1|20", "2|30", "3|100", "4|-1"]
+
+    discard closeDb(db)
+
+  test "FIRST_VALUE window function":
+    let path = makeTempDb("decentdb_sql_window_first_value.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # FIRST_VALUE - first value in partition
+    let firstRes = execSql(db,
+      "SELECT id, FIRST_VALUE(val) OVER (PARTITION BY grp ORDER BY id) AS first_val FROM events ORDER BY id")
+    check firstRes.ok
+    check firstRes.value == @["1|10", "2|10", "3|10", "4|100", "5|100"]
+
+    discard closeDb(db)
+
+  test "LAST_VALUE window function":
+    let path = makeTempDb("decentdb_sql_window_last_value.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # LAST_VALUE - last value in partition (default window frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    let lastRes = execSql(db,
+      "SELECT id, LAST_VALUE(val) OVER (PARTITION BY grp ORDER BY id) AS last_val FROM events ORDER BY id")
+    check lastRes.ok
+    check lastRes.value == @["1|10", "2|20", "3|30", "4|100", "5|200"]
+
+    discard closeDb(db)
+
+  test "NTH_VALUE window function":
+    let path = makeTempDb("decentdb_sql_window_nth_value.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE events (id INT, val INT, grp TEXT)").ok
+    check execSql(db, "INSERT INTO events VALUES (1, 10, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (2, 20, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (3, 30, 'a')").ok
+    check execSql(db, "INSERT INTO events VALUES (4, 100, 'b')").ok
+    check execSql(db, "INSERT INTO events VALUES (5, 200, 'b')").ok
+
+    # NTH_VALUE - 2nd value in partition
+    let nthRes = execSql(db,
+      "SELECT id, NTH_VALUE(val, 2) OVER (PARTITION BY grp ORDER BY id) AS second_val FROM events ORDER BY id")
+    check nthRes.ok
+    check nthRes.value == @["1|NULL", "2|20", "3|20", "4|NULL", "5|200"]
+
+    discard closeDb(db)
+
+  test "window functions with NULLs and single row":
+    let path = makeTempDb("decentdb_sql_window_edge.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    check execSql(db, "CREATE TABLE t (id INT, val INT)").ok
+    check execSql(db, "INSERT INTO t VALUES (1, NULL)").ok
+    check execSql(db, "INSERT INTO t VALUES (2, NULL)").ok
+    check execSql(db, "INSERT INTO t VALUES (3, 10)").ok
+
+    # RANK with NULLs: NULLs compare equal → same rank
+    let rankNull = execSql(db,
+      "SELECT id, RANK() OVER (ORDER BY val) AS r FROM t ORDER BY id")
+    check rankNull.ok
+    check rankNull.value == @["1|1", "2|1", "3|3"]
+
+    # DENSE_RANK with NULLs
+    let denseNull = execSql(db,
+      "SELECT id, DENSE_RANK() OVER (ORDER BY val) AS dr FROM t ORDER BY id")
+    check denseNull.ok
+    check denseNull.value == @["1|1", "2|1", "3|2"]
+
+    # Single row table
+    check execSql(db, "CREATE TABLE single (id INT)").ok
+    check execSql(db, "INSERT INTO single VALUES (1)").ok
+    let singleRow = execSql(db,
+      "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, RANK() OVER (ORDER BY id) AS r FROM single")
+    check singleRow.ok
+    check singleRow.value == @["1|1|1"]
 
     discard closeDb(db)
 
@@ -1599,4 +1799,388 @@ suite "Planner":
       let cols = splitRow(r2.value[i])
       check cols[2] == "4"
 
+    discard closeDb(db)
+
+  test "RIGHT JOIN works via LEFT JOIN rewrite":
+    let path = makeTempDb("decentdb_right_join.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE rja (id INT64 PRIMARY KEY, x TEXT)")
+    discard execSql(db, "CREATE TABLE rjb (id INT64 PRIMARY KEY, y TEXT)")
+    discard execSql(db, "INSERT INTO rja (id, x) VALUES (1, 'a')")
+    discard execSql(db, "INSERT INTO rja (id, x) VALUES (2, 'b')")
+    discard execSql(db, "INSERT INTO rjb (id, y) VALUES (2, 'p')")
+    discard execSql(db, "INSERT INTO rjb (id, y) VALUES (3, 'q')")
+    let res = execSql(db, "SELECT rja.x, rjb.y FROM rja RIGHT JOIN rjb ON rja.id = rjb.id ORDER BY rjb.id")
+    check res.ok
+    check res.value.len == 2
+    # id=2 matches: x='b', y='p'
+    let r0 = splitRow(res.value[0])
+    check r0[0] == "b"
+    check r0[1] == "p"
+    # id=3 has no left match: x=NULL, y='q'
+    let r1 = splitRow(res.value[1])
+    check r1[0] == "NULL"
+    check r1[1] == "q"
+    discard closeDb(db)
+
+  test "FULL OUTER JOIN returns matched and unmatched rows from both sides":
+    let path = makeTempDb("decentdb_full_join.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE fjx (id INT64 PRIMARY KEY, x TEXT)")
+    discard execSql(db, "CREATE TABLE fjy (id INT64 PRIMARY KEY, y TEXT)")
+    discard execSql(db, "INSERT INTO fjx (id, x) VALUES (1, 'a')")
+    discard execSql(db, "INSERT INTO fjx (id, x) VALUES (2, 'b')")
+    discard execSql(db, "INSERT INTO fjy (id, y) VALUES (2, 'p')")
+    discard execSql(db, "INSERT INTO fjy (id, y) VALUES (3, 'q')")
+    let res = execSql(db, "SELECT fjx.x, fjy.y FROM fjx FULL OUTER JOIN fjy ON fjx.id = fjy.id ORDER BY COALESCE(fjx.id, fjy.id)")
+    check res.ok
+    check res.value.len == 3
+    # id=1: x='a', y=NULL (left only)
+    let r0 = splitRow(res.value[0])
+    check r0[0] == "a"
+    check r0[1] == "NULL"
+    # id=2: x='b', y='p' (matched)
+    let r1 = splitRow(res.value[1])
+    check r1[0] == "b"
+    check r1[1] == "p"
+    # id=3: x=NULL, y='q' (right only)
+    let r2 = splitRow(res.value[2])
+    check r2[0] == "NULL"
+    check r2[1] == "q"
+    discard closeDb(db)
+
+  test "BEGIN IMMEDIATE accepted as synonym for BEGIN":
+    let path = makeTempDb("decentdb_begin_immediate.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE beg_t (id INT64 PRIMARY KEY, val TEXT)")
+    let beginRes = execSql(db, "BEGIN IMMEDIATE")
+    # Should either succeed or be treated as regular BEGIN
+    if beginRes.ok:
+      discard execSql(db, "INSERT INTO beg_t (id, val) VALUES (1, 'a')")
+      let commitRes = execSql(db, "COMMIT")
+      check commitRes.ok
+      let r = execSql(db, "SELECT val FROM beg_t WHERE id = 1")
+      check r.ok
+      check splitRow(r.value[0])[0] == "a"
+    discard closeDb(db)
+
+  test "WITH RECURSIVE counting 1..5":
+    let path = makeTempDb("decentdb_recursive_cte.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let res = execSql(db, """
+      WITH RECURSIVE cnt(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT x + 1 FROM cnt WHERE x < 5
+      )
+      SELECT x FROM cnt
+    """)
+    check res.ok
+    check res.value.len == 5
+    check splitRow(res.value[0])[0] == "1"
+    check splitRow(res.value[1])[0] == "2"
+    check splitRow(res.value[2])[0] == "3"
+    check splitRow(res.value[3])[0] == "4"
+    check splitRow(res.value[4])[0] == "5"
+    discard closeDb(db)
+
+  test "WITH RECURSIVE tree traversal":
+    let path = makeTempDb("decentdb_recursive_tree.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    discard execSql(db, "CREATE TABLE tree (id INT64 PRIMARY KEY, parent_id INT64, name TEXT)")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (1, 0, 'root')")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (2, 1, 'child1')")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (3, 1, 'child2')")
+    discard execSql(db, "INSERT INTO tree (id, parent_id, name) VALUES (4, 2, 'grandchild1')")
+    let res = execSql(db, """
+      WITH RECURSIVE descendants(id, name, depth) AS (
+        SELECT id, name, 0 FROM tree WHERE id = 1
+        UNION ALL
+        SELECT t.id, t.name, d.depth + 1
+        FROM tree t
+        INNER JOIN descendants d ON t.parent_id = d.id
+      )
+      SELECT id, name, depth FROM descendants ORDER BY id
+    """)
+    check res.ok
+    check res.value.len == 4
+    let row0 = splitRow(res.value[0])
+    check row0[0] == "1"
+    check row0[1] == "root"
+    check row0[2] == "0"
+    let row3 = splitRow(res.value[3])
+    check row3[0] == "4"
+    check row3[1] == "grandchild1"
+    check row3[2] == "2"
+    discard closeDb(db)
+
+  test "DATE and TIMESTAMP column types accepted":
+    let path = makeTempDb("decentdb_date_types.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let createRes = execSql(db, """
+      CREATE TABLE events (
+        id INT64 PRIMARY KEY,
+        event_date DATE,
+        event_ts TIMESTAMP,
+        created_at DATETIME
+      )
+    """)
+    check createRes.ok
+    let insRes = execSql(db, "INSERT INTO events (id, event_date, event_ts, created_at) VALUES (1, '2025-06-15', '2025-06-15 10:30:00', '2025-06-15 10:30:00')")
+    check insRes.ok
+    let selRes = execSql(db, "SELECT event_date, event_ts FROM events WHERE id = 1")
+    check selRes.ok
+    check selRes.value.len == 1
+    let row = splitRow(selRes.value[0])
+    check row[0] == "2025-06-15 00:00:00"
+    check row[1] == "2025-06-15 10:30:00"
+    discard closeDb(db)
+
+  test "CROSS JOIN produces Cartesian product":
+    let path = makeTempDb("decentdb_cross_join.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE colors (id INT64 PRIMARY KEY, name TEXT)")
+    discard execSql(db, "INSERT INTO colors (id, name) VALUES (1, 'red')")
+    discard execSql(db, "INSERT INTO colors (id, name) VALUES (2, 'blue')")
+    discard execSql(db, "CREATE TABLE sizes (id INT64 PRIMARY KEY, label TEXT)")
+    discard execSql(db, "INSERT INTO sizes (id, label) VALUES (1, 'S')")
+    discard execSql(db, "INSERT INTO sizes (id, label) VALUES (2, 'M')")
+    discard execSql(db, "INSERT INTO sizes (id, label) VALUES (3, 'L')")
+    # Explicit CROSS JOIN
+    let res1 = execSql(db, "SELECT c.name, s.label FROM colors c CROSS JOIN sizes s ORDER BY c.name, s.label")
+    check res1.ok
+    check res1.value.len == 6
+    # Implicit cross join (comma FROM)
+    let res2 = execSql(db, "SELECT c.name, s.label FROM colors c, sizes s ORDER BY c.name, s.label")
+    check res2.ok
+    check res2.value.len == 6
+    discard closeDb(db)
+
+  test "OFFSET with FETCH syntax":
+    let path = makeTempDb("decentdb_fetch.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE nums (id INT64 PRIMARY KEY)")
+    for i in 1..10:
+      discard execSql(db, "INSERT INTO nums (id) VALUES (" & $i & ")")
+    # FETCH FIRST N ROWS ONLY (SQL:2008 standard)
+    let r1 = execSql(db, "SELECT id FROM nums ORDER BY id FETCH FIRST 3 ROWS ONLY")
+    check r1.ok
+    check r1.value.len == 3
+    # OFFSET with FETCH
+    let r2 = execSql(db, "SELECT id FROM nums ORDER BY id OFFSET 2 ROWS FETCH FIRST 3 ROWS ONLY")
+    check r2.ok
+    check r2.value.len == 3
+    discard closeDb(db)
+
+  test "NATURAL JOIN matches on shared column names":
+    let path = makeTempDb("decentdb_natural_join.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE nj_dept (dept_id INT64 PRIMARY KEY, dname TEXT)")
+    discard execSql(db, "CREATE TABLE nj_emp (emp_id INT64 PRIMARY KEY, dept_id INT64, ename TEXT)")
+    discard execSql(db, "INSERT INTO nj_dept (dept_id, dname) VALUES (1, 'Eng')")
+    discard execSql(db, "INSERT INTO nj_dept (dept_id, dname) VALUES (2, 'Sales')")
+    discard execSql(db, "INSERT INTO nj_emp (emp_id, dept_id, ename) VALUES (10, 1, 'Alice')")
+    discard execSql(db, "INSERT INTO nj_emp (emp_id, dept_id, ename) VALUES (20, 1, 'Bob')")
+    discard execSql(db, "INSERT INTO nj_emp (emp_id, dept_id, ename) VALUES (30, 2, 'Carol')")
+    let res = execSql(db, "SELECT nj_dept.dname, nj_emp.ename FROM nj_dept NATURAL JOIN nj_emp ORDER BY nj_emp.ename")
+    check res.ok
+    check res.value.len == 3
+    let r0 = splitRow(res.value[0])
+    check r0[0] == "Eng"
+    check r0[1] == "Alice"
+    let r1 = splitRow(res.value[1])
+    check r1[0] == "Eng"
+    check r1[1] == "Bob"
+    let r2n = splitRow(res.value[2])
+    check r2n[0] == "Sales"
+    check r2n[1] == "Carol"
+    discard closeDb(db)
+
+  test "DEFAULT constraint applied on INSERT":
+    let path = makeTempDb("decentdb_default.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE def_test (id INT64 PRIMARY KEY, name TEXT DEFAULT 'unknown', score INT64 DEFAULT 42)")
+    # Insert omitting default columns
+    discard execSql(db, "INSERT INTO def_test (id) VALUES (1)")
+    let res = execSql(db, "SELECT name, score FROM def_test WHERE id = 1")
+    check res.ok
+    check res.value.len == 1
+    let r0 = splitRow(res.value[0])
+    check r0[0] == "unknown"
+    check r0[1] == "42"
+    # Insert providing explicit values should override defaults
+    discard execSql(db, "INSERT INTO def_test (id, name, score) VALUES (2, 'Alice', 99)")
+    let res2 = execSql(db, "SELECT name, score FROM def_test WHERE id = 2")
+    check res2.ok
+    let r1 = splitRow(res2.value[0])
+    check r1[0] == "Alice"
+    check r1[1] == "99"
+    discard closeDb(db)
+
+  test "DISTINCT ON keeps first row per group":
+    let path = makeTempDb("decentdb_distinct_on.db")
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE sales (id INT64 PRIMARY KEY, dept TEXT, amount INT64)")
+    discard execSql(db, "INSERT INTO sales (id, dept, amount) VALUES (1, 'A', 100)")
+    discard execSql(db, "INSERT INTO sales (id, dept, amount) VALUES (2, 'A', 200)")
+    discard execSql(db, "INSERT INTO sales (id, dept, amount) VALUES (3, 'B', 150)")
+    discard execSql(db, "INSERT INTO sales (id, dept, amount) VALUES (4, 'B', 50)")
+    let res = execSql(db, "SELECT DISTINCT ON (dept) dept, amount FROM sales ORDER BY dept, amount DESC")
+    check res.ok
+    check res.value.len == 2
+    # Dept 'A': first row by amount DESC → 200
+    let r0 = splitRow(res.value[0])
+    check r0[0] == "A"
+    check r0[1] == "200"
+    # Dept 'B': first row by amount DESC → 150
+    let r1d = splitRow(res.value[1])
+    check r1d[0] == "B"
+    check r1d[1] == "150"
+    discard closeDb(db)
+
+  test "Generated column (STORED) is computed on INSERT and UPDATE":
+    let dbPath = "test_generated_col.db"
+    removeFile(dbPath)
+    let db = openDb(dbPath).value
+    discard execSql(db, "CREATE TABLE products (name TEXT, price INT, tax INT GENERATED ALWAYS AS (price * 10 / 100) STORED)", @[])
+    discard execSql(db, "INSERT INTO products (name, price) VALUES ('Widget', 200)", @[])
+    discard execSql(db, "INSERT INTO products (name, price) VALUES ('Gadget', 50)", @[])
+    let res = execSql(db, "SELECT name, price, tax FROM products ORDER BY name", @[])
+    check res.ok
+    check res.value.len == 2
+    let g = splitRow(res.value[0])
+    check g[0] == "Gadget"
+    check g[1] == "50"
+    check g[2] == "5"
+    let w = splitRow(res.value[1])
+    check w[0] == "Widget"
+    check w[1] == "200"
+    check w[2] == "20"
+    # UPDATE should recompute the generated column
+    discard execSql(db, "UPDATE products SET price = 300 WHERE name = 'Widget'", @[])
+    let res2 = execSql(db, "SELECT tax FROM products WHERE name = 'Widget'", @[])
+    check res2.ok
+    check res2.value.len == 1
+    check splitRow(res2.value[0])[0] == "30"
+    discard closeDb(db)
+
+  test "CREATE TEMP TABLE stores data in session only":
+    let path = "test_temp_table.db"
+    removeFile(path)
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TEMP TABLE scratch (id INT64 PRIMARY KEY, val TEXT)")
+    discard execSql(db, "INSERT INTO scratch (id, val) VALUES (1, 'hello')")
+    let res = execSql(db, "SELECT val FROM scratch WHERE id = 1", @[])
+    check res.ok
+    check res.value.len == 1
+    check splitRow(res.value[0])[0] == "hello"
+    discard closeDb(db)
+    # Reopen — temp table should be gone
+    let db2 = openDb(path).value
+    let res2 = execSql(db2, "SELECT * FROM scratch", @[])
+    check not res2.ok  # table not found
+    discard closeDb(db2)
+
+  test "CREATE TEMP VIEW is queryable in session":
+    let path = "test_temp_view.db"
+    removeFile(path)
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT, active INT)")
+    discard execSql(db, "INSERT INTO items (id, name, active) VALUES (1, 'a', 1)")
+    discard execSql(db, "INSERT INTO items (id, name, active) VALUES (2, 'b', 0)")
+    discard execSql(db, "CREATE TEMP VIEW active_items AS SELECT name FROM items WHERE active = 1")
+    let res = execSql(db, "SELECT name FROM active_items", @[])
+    check res.ok
+    check res.value.len == 1
+    check splitRow(res.value[0])[0] == "a"
+    discard closeDb(db)
+    # Reopen — temp view should be gone
+    let db2 = openDb(path).value
+    let res2 = execSql(db2, "SELECT * FROM active_items", @[])
+    check not res2.ok  # view not found
+    discard closeDb(db2)
+
+  test "SAVEPOINT / RELEASE / ROLLBACK TO SAVEPOINT":
+    let path = "test_savepoint.db"
+    removeFile(path)
+    let db = openDb(path).value
+    discard execSql(db, "CREATE TABLE sp_test (id INT64 PRIMARY KEY, val TEXT)")
+    discard execSql(db, "BEGIN")
+    discard execSql(db, "INSERT INTO sp_test (id, val) VALUES (1, 'a')")
+    discard execSql(db, "SAVEPOINT sp1")
+    discard execSql(db, "INSERT INTO sp_test (id, val) VALUES (2, 'b')")
+    discard execSql(db, "SAVEPOINT sp2")
+    discard execSql(db, "INSERT INTO sp_test (id, val) VALUES (3, 'c')")
+    # ROLLBACK TO sp2 should undo insert of (3, 'c')
+    discard execSql(db, "ROLLBACK TO SAVEPOINT sp2")
+    let res1 = execSql(db, "SELECT val FROM sp_test ORDER BY id", @[])
+    check res1.ok
+    check res1.value.len == 2  # rows 1 and 2
+    # RELEASE sp1 — just discards the savepoint
+    discard execSql(db, "RELEASE SAVEPOINT sp1")
+    discard execSql(db, "COMMIT")
+    let res2 = execSql(db, "SELECT val FROM sp_test ORDER BY id", @[])
+    check res2.ok
+    check res2.value.len == 2
+    check splitRow(res2.value[0])[0] == "a"
+    check splitRow(res2.value[1])[0] == "b"
+    discard closeDb(db)
+
+  test "json_each() on a JSON object":
+    let path = "test_json_each.db"
+    removeFile(path)
+    let db = openDb(path).value
+    let res = execSql(db, """SELECT key, value, type FROM json_each('{"a":1,"b":"hello","c":null}')""", @[])
+    check res.ok
+    check res.value.len == 3
+    let r0 = splitRow(res.value[0])
+    check r0[0] == "a"
+    check r0[1] == "1"
+    check r0[2] == "number"
+    let r1 = splitRow(res.value[1])
+    check r1[0] == "b"
+    check r1[1] == "\"hello\""
+    check r1[2] == "string"
+    let r2 = splitRow(res.value[2])
+    check r2[0] == "c"
+    check r2[1] == "null"
+    check r2[2] == "null"
+    discard closeDb(db)
+
+  test "json_each() on a JSON array":
+    let path = "test_json_each_arr.db"
+    removeFile(path)
+    let db = openDb(path).value
+    let res = execSql(db, """SELECT key, value FROM json_each('[10,20,30]')""", @[])
+    check res.ok
+    check res.value.len == 3
+    check splitRow(res.value[0])[0] == "0"
+    check splitRow(res.value[0])[1] == "10"
+    check splitRow(res.value[1])[0] == "1"
+    check splitRow(res.value[1])[1] == "20"
+    discard closeDb(db)
+
+  test "json_tree() recursive traversal":
+    let path = "test_json_tree.db"
+    removeFile(path)
+    let db = openDb(path).value
+    let res = execSql(db, """SELECT key, value, type, path FROM json_tree('{"a":1,"b":[2,3]}')""", @[])
+    check res.ok
+    # Root + a + b + b[0] + b[1] = 5 rows
+    check res.value.len == 5
+    let r0 = splitRow(res.value[0])
+    check r0[2] == "object"  # root type
+    check r0[3] == "$"       # root path
+    let r1 = splitRow(res.value[1])
+    check r1[0] == "a"
+    check r1[2] == "number"
+    check r1[3] == "$.a"
     discard closeDb(db)

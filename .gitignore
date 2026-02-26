@@ -48,8 +48,7 @@ tests/nim/
 !tests/nim/
 tests/nim/*
 !tests/nim/*.nim
-decentdb
-!bindings/python/decentdb/
+/decentdb
 debug_parser
 decentdb_cli
 decentdb_schema
@@ -77,6 +76,16 @@ coverage/
 config.gypi
 test_pk_fk.ddb-wal
 
+# Java / Gradle (bindings/java)
+bindings/java/**/.gradle/
+bindings/java/**/build/
+bindings/java/**/out/
+bindings/java/**/.classpath
+bindings/java/**/.project
+bindings/java/**/.settings/
+hs_err_pid*.log
+*.class
+
 # Local review/action-plan notes (do not commit)
 design/reviews/ACTION-PLAN.md
 
@@ -94,4 +103,10 @@ bindings/dotnet/.idea/
 bindings/dotnet/v
 bindings/dotnet/v
 :memory:*
+:MEMORY:*
 
+src/engine
+src/vfs/os_vfs
+*.gcov
+stdout
+examples/java/json-20231013.jar

@@ -125,6 +125,10 @@ def load_library():
     # Checkpoint (flush WAL to main database file)
     _lib.decentdb_checkpoint.argtypes = [c_void_p]
     _lib.decentdb_checkpoint.restype = c_int
+
+    # SaveAs (export database to a new on-disk file)
+    _lib.decentdb_save_as.argtypes = [c_void_p, c_char_p]
+    _lib.decentdb_save_as.restype = c_int
     
     # decentdb_open
     _lib.decentdb_open.argtypes = [c_char_p, c_char_p]
@@ -174,6 +178,9 @@ def load_library():
     _lib.decentdb_bind_decimal.argtypes = [c_void_p, c_int, c_int64, c_int]
     _lib.decentdb_bind_decimal.restype = c_int
 
+    _lib.decentdb_bind_datetime.argtypes = [c_void_p, c_int, c_int64]
+    _lib.decentdb_bind_datetime.restype = c_int
+
     _lib.decentdb_bind_text.argtypes = [c_void_p, c_int, c_char_p, c_int]
     _lib.decentdb_bind_text.restype = c_int
 
@@ -209,6 +216,9 @@ def load_library():
 
     _lib.decentdb_column_decimal_unscaled.argtypes = [c_void_p, c_int]
     _lib.decentdb_column_decimal_unscaled.restype = c_int64
+
+    _lib.decentdb_column_datetime.argtypes = [c_void_p, c_int]
+    _lib.decentdb_column_datetime.restype = c_int64
 
     _lib.decentdb_column_text.argtypes = [c_void_p, c_int, POINTER(c_int)]
     _lib.decentdb_column_text.restype = c_char_p

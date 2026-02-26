@@ -5,6 +5,72 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-02-26
+
+### Added
+- **SQL Engine**: Views with GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, and DISTINCT ON — view and CTE bodies that aggregate, sort, or limit rows are now expanded as derived tables (subqueries in FROM) instead of being rejected. See ADR-0113.
+- **Demo Database**: Comprehensive `make_demo_db` script now showcases all supported features including DEFAULT values, FK actions (SET NULL, CASCADE), UNIQUE INDEX, INSERT RETURNING, ON CONFLICT, auto-increment, 12 views (aggregates, window functions, CTEs, CASE, COALESCE, JSON operators, subqueries, UNION ALL, LIKE/ILIKE), INSTEAD OF trigger, and ANALYZE.
+- **Engine**: In-memory database support via `:memory:` connection string — each `openDb(":memory:")` creates a new, isolated, ephemeral database backed by `MemVfs`. WAL remains enabled for consistent transaction semantics. See ADR-0105.
+- **Engine**: `saveAs` — export any open database (including `:memory:`) to a new on-disk file. Performs a full checkpoint, then streams pages to the destination via atomic temp-file + rename. Available as a Nim proc, C API function, CLI command, and in all bindings (.NET, Go, Node, Python).
+- **SQL Engine**: Window functions `RANK()`, `DENSE_RANK()`, `LAG()`, and `LEAD()` — extends the existing `ROW_NUMBER()` support with additional SQL:2003 window functions. All support `PARTITION BY` and `ORDER BY` clauses. `LAG`/`LEAD` accept 1–3 arguments (expression, offset, default). See ADR-0106.
+- **SQL Engine**: Math scalar functions `SQRT(x)`, `POWER(x, y)` / `POW(x, y)`, and `MOD(x, y)` — extends numeric function coverage for SQLite parity. All handle INT64, FLOAT64, and DECIMAL inputs; return FLOAT64. NULL propagation follows SQL standard. See issue #37.
+- **SQL Engine**: String scalar functions `INSTR(str, substr)`, `CHR(n)`, and `HEX(val)` — `INSTR` returns 1-based position (0 if not found), `CHR` converts ASCII code point to character (PostgreSQL syntax), `HEX` encodes integers/text/blobs as uppercase hexadecimal. See issue #37.
+- **SQL Engine**: `%` modulo binary operator for INT64, FLOAT64, and DECIMAL types — complements the `MOD()` function with operator syntax (`SELECT 17 % 5`). Division-by-zero returns an error. See issue #37.
+- **SQL Engine**: `TOTAL(expr)` aggregate function — like `SUM` but always returns FLOAT64 and 0.0 for empty sets (never NULL), matching SQLite semantics. See issue #37.
+- **SQL Engine**: `DISTINCT` aggregate modifier — `COUNT(DISTINCT expr)`, `SUM(DISTINCT expr)`, and `AVG(DISTINCT expr)` now de-duplicate values per group before aggregating. NULL values are excluded. See issue #37.
+- **SQL Engine**: Window functions `FIRST_VALUE(expr)`, `LAST_VALUE(expr)`, and `NTH_VALUE(expr, n)` — extends window function coverage with value-access functions over ordered partitions. See issue #37.
+- **SQL Engine**: `json_array(...)` scalar function — constructs a JSON array from arguments. See issue #37.
+- **SQL Engine**: `json_each(json)` and `json_tree(json)` table-valued functions — `json_each` iterates top-level keys/values of a JSON object or array; `json_tree` recursively walks nested structures. Returns rows with `key`, `value`, `type` (and `path` for `json_tree`). See ADR-0111.
+- **SQL Engine**: `WITH RECURSIVE` common table expressions — supports recursive CTEs for hierarchical queries (tree traversal, graph walks, series generation). See ADR-0107.
+- **SQL Engine**: `RIGHT JOIN` (via LEFT JOIN rewrite), `FULL OUTER JOIN`, `CROSS JOIN`, and `NATURAL JOIN` support. See issue #37.
+- **SQL Engine**: `DISTINCT ON (expr, ...)` — keeps only the first row per distinct group, ordered by the specified expressions. PostgreSQL-compatible syntax. See issue #37.
+- **SQL Engine**: `DEFAULT` column constraint — columns with `DEFAULT` values are automatically populated when omitted from `INSERT` statements. See issue #37.
+- **SQL Engine**: Generated columns (`STORED`) — columns defined with `GENERATED ALWAYS AS (expr) STORED` are computed on INSERT/UPDATE and persisted. See ADR-0108.
+- **SQL Engine**: `CREATE TEMP TABLE` and `CREATE TEMP VIEW` — session-scoped temporary objects that are not persisted to disk. See ADR-0109.
+- **SQL Engine**: `SAVEPOINT name` / `RELEASE SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name` — nested transaction control with page-level snapshot rollback. See ADR-0110.
+- **SQL Engine**: `OFFSET n ROWS FETCH FIRST n ROWS ONLY` (SQL:2008 syntax) as an alias for `LIMIT`/`OFFSET`. See issue #37.
+- **SQL Engine**: `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE` accepted as synonyms for `BEGIN`. See issue #37.
+- **SQL Engine**: `DATE` and `TIMESTAMP` column type keywords accepted in DDL (mapped to TEXT storage). See issue #37.
+- **CLI**: `save-as` command — `decentdb save-as --db=:memory: --output=backup.ddb` exports a database snapshot to a new file.
+- **VFS**: `MemVfs` implementation — memory-backed Virtual File System with `seq[byte]` storage, per-file locking, and full VFS interface compliance (no `mmap` support).
+- **VFS**: `getFileSize`, `fileExists`, and `removeFile` methods added to the VFS interface, replacing direct OS calls in the engine, pager, and WAL.
+- **VFS**: `OsVfsFile` subclass introduced — `VfsFile` refactored from concrete type to base class (`ref object of RootObj`) to support polymorphic VFS file implementations.
+- **C API**: `decentdb_save_as(db, dest_path_utf8)` — export database to on-disk file via FFI.
+- **.NET**: `DecentDBConnection.SaveAs(destPath)` and `DecentDB.Native.DecentDB.SaveAs(destPath)` methods for exporting databases.
+- **Go**: `DB.SaveAs(destPath)` method for exporting databases.
+- **Node**: `Database.saveAs(destPath)` method for exporting databases.
+- **Python**: `Connection.save_as(dest_path)` method for exporting databases.
+- **Native TIMESTAMP Type**: `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, and `DATETIME` column keywords now map to a native `ctDateTime` / `vkDateTime` type (ordinal 17) stored as **microseconds since Unix epoch UTC** (int64, zigzag-varint encoded). Previously these keywords were silently treated as TEXT. See ADR-0114.
+  - `ORDER BY` on TIMESTAMP columns is now chronologically correct.
+  - `EXTRACT(YEAR/MONTH/DAY/HOUR/MINUTE/SECOND FROM col)` operates natively without string re-parsing.
+  - `NOW()` / `CURRENT_TIMESTAMP` return a native `vkDateTime` value.
+  - `CAST(value AS TIMESTAMP)` converts ISO-8601 strings and int64 microseconds.
+  - String literals are auto-coerced on INSERT into TIMESTAMP columns.
+- **C API**: `decentdb_bind_datetime(stmt, col, micros_utc)` — bind a TIMESTAMP parameter as microseconds since Unix epoch UTC.
+- **C API**: `decentdb_column_datetime(stmt, col)` — read a TIMESTAMP column as microseconds since Unix epoch UTC.
+- **Python binding**: `datetime.datetime` parameters are now bound natively via `decentdb_bind_datetime`; TIMESTAMP columns are returned as `datetime.datetime` (UTC-aware).
+- **Go binding**: `time.Time` parameters are bound as microseconds via `decentdb_bind_datetime`; TIMESTAMP columns are returned as `time.Time` (UTC).
+- **Node.js binding**: TIMESTAMP columns (kind=17) are returned as milliseconds since epoch (wrap in `new Date(val)` if needed).
+- **.NET binding**: `DateTime` / `DateTimeOffset` parameters use microseconds and `TIMESTAMP` store type (was milliseconds + `INT64`); TIMESTAMP columns read via `decentdb_column_datetime`.
+- **Java JDBC**: `KIND_DATETIME = 17` constant; `bindDatetime` / `colDatetime` JNI bridge; `getTimestamp()` reads TIMESTAMP columns natively; `TypeMapping` maps `KIND_DATETIME` → `Types.TIMESTAMP`.
+- **Example**: `examples/python/example_datetime.py` — end-to-end DateTime demo.
+
+### Changed
+- **SQL Engine**: Expanded CHECK constraint function allowlist — deterministic scalar functions (`ABS`, `ROUND`, `CEIL`, `CEILING`, `FLOOR`, `SQRT`, `POWER`, `POW`, `MOD`, `INSTR`, `CHR`, `CHAR`, `HEX`, `REPLACE`, `SUBSTR`, `SUBSTRING`) are now permitted in CHECK expressions. Previously only `CASE`, `CAST`, `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, and `LIKE_ESCAPE` were allowed.
+- **SQL Engine**: `NOW()` / `CURRENT_TIMESTAMP` return `vkDateTime` instead of `vkText`.
+- **SQL Engine**: `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `DATETIME` column type keywords now create native TIMESTAMP columns instead of TEXT columns.
+
+### Fixed
+- **VFS**: Double `deinitLock` undefined behavior — `MemVfs.removeFile` no longer calls `deinitLock`; `close()` is the sole owner of lock lifecycle.
+- **Engine**: `getFileSize` error in `openDb` now properly propagated instead of silently returning 0.
+- **WAL**: `getFileSize` error in `ensureWalMmapCapacity` now properly propagated instead of silently returning 0.
+- **WAL**: Removed unused `import os` (all OS operations now go through VFS).
+- **Pager**: Transactional freelist header updates — `allocatePage()` and `freePage()` no longer fsync the DB header mid-transaction. Header is now only persisted at checkpoint, eliminating a crash-safety window where the on-disk header could reflect uncommitted freelist state. Freelist header is reconstructed from the page chain on open. See ADR-0057.
+- **B-tree**: Stale page cache `aux` index — cached `InternalNodeIndex` was only invalidated on first dirty transition; subsequent writes to already-dirty pages left stale navigation data causing `find()` to follow wrong child pointers when multiple B-trees were modified in the same transaction. Manifested as false FK constraint failures during interleaved multi-table inserts.
+- **SQL Engine**: HAVING aggregate evaluation — aggregate functions in HAVING expressions now have their results substituted before evaluation, fixing "aggregate not allowed in scalar context" errors.
+- **SQL Engine**: View expansion for complex views — views with GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET are now wrapped as derived tables instead of being rejected at bind time.
+
+
 ## [1.4.0] - 2026-02-22
 
 ### Added
@@ -31,6 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - .NET: EF Core database creator now handles table/index creation failures gracefully during `EnsureCreated()`.
 - .NET: ADO.NET `SqlParameterRewriter` correctly handles parameters in complex subqueries and multi-statement SQL.
 
+
 ## [1.3.0] - 2026-02-21
 
 ### Added
@@ -40,6 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL Engine**: Self-referencing foreign keys — `CREATE TABLE` with a foreign key referencing the same table (e.g., `parent_id REFERENCES self(id)`) now validates against the columns being defined instead of failing with "Table not found".
 - **SQL Engine**: UUID ↔ Blob type coercion — blob literals (e.g., `X'...'` with 16 bytes) are now accepted for UUID columns in INSERT/UPDATE, and vice versa. Previously the binder rejected these with "Type mismatch" despite the runtime already supporting 16-byte blobs as UUIDs.
 - .NET: `DecentDB.EntityFrameworkCore.NodaTime` DECIMAL type mapping now respects precision and scale from EF Core model configuration (e.g., `HasPrecision(18, 6)`). Previously ignored model-specified precision/scale and always emitted `DECIMAL(18,4)`.
+
 
 ## [1.2.0] - 2026-02-21
 
@@ -64,6 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL Engine**: `GROUP_CONCAT`/`STRING_AGG` now correctly recognized by the query planner as aggregate functions, preventing "evaluated elsewhere" errors when used without `GROUP BY`.
 - .NET: EF Core `DecentDBTypeMappingSource` now respects precision and scale from model configuration for DECIMAL columns, instead of always using `DECIMAL(18,4)`.
 
+
 ## [1.1.3] - 2026-02-18
 
 ### Fixed
@@ -71,6 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Build: Linux and macOS CI steps now use the `libpg_query.a` static archive instead of `sudo make install`, matching the Windows build and ensuring the shared library is self-contained.
+
 
 ## [1.1.2] - 2026-02-15
 
@@ -84,6 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **SQL Engine**: Scalar subquery deferral past Sort+Limit — queries with correlated scalar subqueries in the SELECT list (e.g. `SELECT ..., (SELECT COUNT(*) ...) ... ORDER BY ... LIMIT N`) now defer subquery evaluation until after sorting and limiting, yielding up to **14× speedup** on large tables.
 - .NET: 15 comprehensive EF Core CRUD tests covering all 17 CLR data types (bool, byte, short, int, long, float, double, decimal, string, byte[], DateTime, DateTimeOffset, DateOnly, TimeOnly, TimeSpan, Guid, enum), nullable variant lifecycle, edge-case values, SQLite-imported schema with type coercion, async operations, bulk delete, pagination with correlated COUNT subquery, and ChangeTracker.Clear recovery.
+
 
 ## [1.1.1] - 2026-02-15
 
@@ -100,6 +171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - .NET: Updated `EntityFrameworkDemo` example NuGet dependencies to latest versions.
+
 
 ## [1.1.0] - 2026-02-14
 
@@ -126,15 +198,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL Engine**: Resolved `ResultShadowed` warning in `exec.nim` aggregate path.
 - .NET: EF Core lazy loading proxy support (opt-in via `UseLazyLoadingProxies()`).
 
+
 ## [1.0.2] - 2026-02-11
 
 ### Changed
 - NuGet package now publishes to both GitHub Packages and NuGet.org
 
+
 ## [1.0.1] - 2026-02-11
 
 ### Fixed
 - .NET: NuGet package packing now places managed assemblies under `lib/net10.0/` so nuget.org correctly reports supported frameworks.
+
 
 ## [1.0.0] - 2026-02-10
 
@@ -154,6 +229,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Composite primary key support in SQLite import tool
 - CI workflow for automated testing
 - Benchmarking support for Firebird in embedded database comparison
+
 
 ## [0.1.0] - 2026-02-07
 
@@ -182,6 +258,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Go**: `database/sql` driver, `OpenDirect` API with Checkpoint, ListTables, GetTableColumns, ListIndexes, Decimal type.
   - **Python**: DB-API 2.0, SQLAlchemy dialect, checkpoint, list_indexes, import tools.
   - **Node.js**: N-API addon with Database/Statement classes, async iteration, checkpoint, schema introspection, Knex integration.
+
 
 ## [0.0.1] - 2026-01-30
 
@@ -252,7 +329,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Single writer only (no concurrent write transactions)
 - Single process access (no multi-process concurrency)
-- Window functions limited to `ROW_NUMBER()` (no RANK, DENSE_RANK, LAG, LEAD, etc.)
+- Window functions support `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD` but no frame clauses (`ROWS BETWEEN`, `RANGE BETWEEN`) or `NTILE`/`PERCENT_RANK`/`CUME_DIST`
 - Only non-recursive CTEs supported (no `WITH RECURSIVE`)
 - Views are read-only (no `INSERT`/`UPDATE`/`DELETE` targeting a view); parameters are not allowed in view definitions
 - Triggers are intentionally narrow: `AFTER` (tables) and `INSTEAD OF` (views), `FOR EACH ROW` only, and actions must be `EXECUTE FUNCTION decentdb_exec_sql('<single DML SQL>')` (no `NEW`/`OLD`)

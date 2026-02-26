@@ -1,0 +1,4 @@
+rootProject.name = 'decentdb-java'
+
+include 'driver'
+include 'dbeaver-extension'

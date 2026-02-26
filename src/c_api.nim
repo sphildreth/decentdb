@@ -22,14 +22,14 @@ type
     lastErrorMessage: string
     lastErrorMessageC: cstring
 
-  DecentdbValueView = object
-    kind: cint
-    isNull: cint
-    int64Val: int64
-    float64Val: float64
-    bytes: ptr uint8
-    bytesLen: cint
-    decimalScale: cint
+  DecentdbValueView* = object
+    kind*: cint
+    isNull*: cint
+    int64Val*: int64
+    float64Val*: float64
+    bytes*: ptr uint8
+    bytesLen*: cint
+    decimalScale*: cint
 
   StmtHandle = ref object
     db: DbHandle
@@ -103,6 +103,50 @@ proc decentdb_list_tables_json*(p: pointer, out_len: ptr cint): cstring {.export
   clearGlobalError()
   return allocSharedCString(payload, out_len)
 
+proc decentdb_list_views_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of view names, e.g. ["v1","v2"].
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var names: seq[string] = @[]
+  for name in dbh.db.catalog.views.keys:
+    names.add(name)
+  names.sort(system.cmp)
+
+  var arr = newJArray()
+  for name in names:
+    arr.add(%name)
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
+proc decentdb_get_view_ddl*(p: pointer, view_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns the SQL text for a view.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  if view_utf8 == nil:
+    let dbh = cast[DbHandle](p)
+    dbh.setError(ERR_INTERNAL, "NULL view name")
+    return nil
+
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+  let viewName = $view_utf8
+
+  if dbh.db.catalog.views.hasKey(viewName):
+    let v = dbh.db.catalog.views[viewName]
+    let payload = v.sqlText
+    return allocSharedCString(payload, out_len)
+  else:
+    dbh.setError(ERR_SQL, "View not found: " & viewName)
+    return nil
+
 proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
   ## Returns a JSON array of column metadata objects for a given table.
   ## Caller must free returned pointer with `decentdb_free`.
@@ -117,27 +161,38 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
   let dbh = cast[DbHandle](p)
   dbh.clearError()
   let tableName = $table_utf8
-  if not dbh.db.catalog.tables.hasKey(tableName):
-    dbh.setError(ERR_SQL, "Table not found: " & tableName)
-    return nil
-
-  let t = dbh.db.catalog.tables[tableName]
   var arr = newJArray()
-  for col in t.columns:
-    var obj = newJObject()
-    obj["name"] = %col.name
-    obj["type"] = %columnTypeToText(col.kind)
-    obj["not_null"] = %col.notNull
-    obj["unique"] = %col.unique
-    obj["primary_key"] = %col.primaryKey
-    if col.refTable.len > 0:
-      obj["ref_table"] = %col.refTable
-    if col.refColumn.len > 0:
-      obj["ref_column"] = %col.refColumn
-    if col.refTable.len > 0 and col.refColumn.len > 0:
-      obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
-      obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
-    arr.add(obj)
+
+  if dbh.db.catalog.tables.hasKey(tableName):
+    let t = dbh.db.catalog.tables[tableName]
+    for col in t.columns:
+      var obj = newJObject()
+      obj["name"] = %col.name
+      obj["type"] = %columnTypeToText(col.kind)
+      obj["not_null"] = %col.notNull
+      obj["unique"] = %col.unique
+      obj["primary_key"] = %col.primaryKey
+      if col.refTable.len > 0:
+        obj["ref_table"] = %col.refTable
+      if col.refColumn.len > 0:
+        obj["ref_column"] = %col.refColumn
+      if col.refTable.len > 0 and col.refColumn.len > 0:
+        obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
+        obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
+      arr.add(obj)
+  elif dbh.db.catalog.views.hasKey(tableName):
+    let v = dbh.db.catalog.views[tableName]
+    for cname in v.columnNames:
+      var obj = newJObject()
+      obj["name"] = %cname
+      obj["type"] = %"ANY"
+      obj["not_null"] = %false
+      obj["unique"] = %false
+      obj["primary_key"] = %false
+      arr.add(obj)
+  else:
+    dbh.setError(ERR_SQL, "Table or View not found: " & tableName)
+    return nil
 
   let payload = $arr
   clearGlobalError()
@@ -293,6 +348,24 @@ proc decentdb_checkpoint*(p: pointer): cint {.exportc, cdecl, dynlib.} =
     return -1
   return 0
 
+proc decentdb_save_as*(p: pointer, dest_path_utf8: cstring): cint {.exportc, cdecl, dynlib.} =
+  ## Export the database to a new on-disk file at dest_path_utf8.
+  ## Returns 0 on success, -1 on error.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return -1
+  if dest_path_utf8 == nil:
+    let handle = cast[DbHandle](p)
+    handle.setError(ERR_INTERNAL, "NULL destination path")
+    return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = saveAs(handle.db, $dest_path_utf8)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
+
 proc decentdb_last_error_code*(p: pointer): cint {.exportc, cdecl, dynlib.} =
   if p == nil:
     return cint(globalLastErrorCode)
@@ -428,14 +501,30 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
       if tableRes.ok:
         for col in tableRes.value.columns:
           colNames.add(col.name)
+      elif db_handle.db.catalog.views.hasKey(bound.fromTable):
+        let v = db_handle.db.catalog.views[bound.fromTable]
+        for cname in v.columnNames:
+          colNames.add(cname)
     else:
       for item in bound.selectItems:
-        var name = if item.alias.len > 0: item.alias else: ""
-        if name.len == 0 and item.expr != nil and item.expr.kind == ekColumn:
-          name = item.expr.name
-        if name.len == 0:
-          name = "column" & $colNames.len
-        colNames.add(name)
+        if item.isStar:
+          # Star in a multi-item select – resolve from table or view
+          if bound.fromTable.len > 0:
+            let tableRes = db_handle.db.catalog.getTable(bound.fromTable)
+            if tableRes.ok:
+              for col in tableRes.value.columns:
+                colNames.add(col.name)
+            elif db_handle.db.catalog.views.hasKey(bound.fromTable):
+              let v = db_handle.db.catalog.views[bound.fromTable]
+              for cname in v.columnNames:
+                colNames.add(cname)
+        else:
+          var name = if item.alias.len > 0: item.alias else: ""
+          if name.len == 0 and item.expr != nil and item.expr.kind == ekColumn:
+            name = item.expr.name
+          if name.len == 0:
+            name = "column" & $colNames.len
+          colNames.add(name)
 
   if bound.kind == skExplain:
     if bound.explainInner.kind != skSelect:
@@ -815,6 +904,27 @@ proc decentdb_column_blob*(p: pointer, col: cint, out_len: ptr cint): ptr uint8 
     return cast[ptr uint8](unsafeAddr h.currentValues[col].bytes[0])
   return nil
 
+proc decentdb_column_datetime*(p: pointer, col: cint): int64 {.exportc, cdecl, dynlib.} =
+  ## Returns the column value as microseconds since Unix epoch UTC.
+  ## Returns 0 if the column is NULL, not a TIMESTAMP, or out of range.
+  let h = cast[StmtHandle](p)
+  if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return 0
+  let val = h.currentValues[col]
+  if val.kind == vkDateTime: return val.int64Val
+  if val.kind == vkInt64: return val.int64Val
+  return 0
+
+proc decentdb_bind_datetime*(p: pointer, col: cint, micros: int64): cint {.exportc, cdecl, dynlib.} =
+  ## Bind a TIMESTAMP parameter as microseconds since Unix epoch UTC.
+  let h = cast[StmtHandle](p)
+  if h == nil: return -1
+  let idx = int(col) - 1
+  if idx < 0: return -1
+  while h.params.len <= idx:
+    h.params.add(Value(kind: vkNull))
+  h.params[idx] = Value(kind: vkDateTime, int64Val: micros)
+  return 0
+
 proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_count: ptr cint): cint {.exportc, cdecl, dynlib.} =
   if p == nil: return -1
   let h = cast[StmtHandle](p)
@@ -831,6 +941,8 @@ proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_c
     if v.kind == vkNull:
       view.isNull = 1
     elif v.kind == vkInt64:
+      view.int64Val = v.int64Val
+    elif v.kind == vkDateTime:
       view.int64Val = v.int64Val
     elif v.kind == vkBool:
       view.int64Val = if v.boolVal: 1 else: 0

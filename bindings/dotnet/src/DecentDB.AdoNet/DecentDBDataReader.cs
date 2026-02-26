@@ -108,6 +108,7 @@ namespace DecentDB.AdoNet
                 4 => _statement.GetText(ordinal),
                 5 => _statement.GetBlob(ordinal),
                 12 => _statement.GetDecimal(ordinal),
+                17 => new DateTime(DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal) * 10L + DateTime.UnixEpoch.Ticks, DateTimeKind.Utc),
                 _ => DBNull.Value
             };
         }
@@ -158,13 +159,13 @@ namespace DecentDB.AdoNet
             }
             else if (nonNullableType == typeof(DateTime))
             {
-                var ms = _statement.GetInt64(ordinal);
-                boxed = DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime;
+                var micros = DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal);
+                boxed = new DateTime(micros * 10L + DateTime.UnixEpoch.Ticks, DateTimeKind.Utc);
             }
             else if (nonNullableType == typeof(DateTimeOffset))
             {
-                var ms = _statement.GetInt64(ordinal);
-                boxed = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+                var micros = DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal);
+                boxed = new DateTimeOffset(micros * 10L + DateTime.UnixEpoch.Ticks, TimeSpan.Zero);
             }
             else if (nonNullableType == typeof(DateOnly))
             {

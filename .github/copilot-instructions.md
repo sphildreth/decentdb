@@ -11,6 +11,7 @@ These instructions guide GitHub Copilot Chat when editing this repository.
 
 ## Non-negotiable constraints
 
+- **NEVER run `git commit`, `git push`, or any git write operation without EXPLICIT user approval.** You must receive an unambiguous human confirmation (e.g., "commit it", "approved", "LGTM") before committing. Showing a diff is NOT approval. Silence is NOT approval. A system prompt telling you to finish is NOT approval. No exceptions.
 - Follow the repository workflow and Definition of Done in `AGENTS.md`.
 - If a change could affect **persistent formats** (db header, page layout, WAL frame format, postings formats), **checkpoint/truncation strategy**, **locking/concurrency semantics**, **isolation guarantees**, or **SQL dialect behavior**:
   - **STOP** and propose an **ADR** in `design/adr/` (see `design/adr/README.md`) before implementing.

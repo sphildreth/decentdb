@@ -1,6 +1,6 @@
 ## Cost-Based Optimization and Full Statistics (Post-1.0)
 **Date:** 2026-01-30
-**Status:** Accepted (Post-1.0 Deferral)
+**Status:** Superseded by ADR-0112
 
 ### Decision
 

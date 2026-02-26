@@ -17,6 +17,42 @@ if not db.ok:
 let db2 = openDb("myapp.ddb", cachePages = 4096)  # 16MB cache
 ```
 
+### In-Memory Databases
+
+Use `:memory:` to create an ephemeral, isolated in-memory database — ideal for caching, testing, and temporary workloads:
+
+```nim
+let db = openDb(":memory:").value
+
+# Full SQL support (DDL, DML, indexes, transactions)
+discard execSql(db, "CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT)")
+discard execSql(db, "INSERT INTO cache (key, val) VALUES ('k1', 'hello')")
+
+# Data is lost when the database is closed
+discard closeDb(db)
+```
+
+Each call to `openDb(":memory:")` creates a completely independent database instance. Detection is case-insensitive (`:memory:`, `:MEMORY:`, `:Memory:` all work).
+
+### SaveAs (Export to Disk)
+
+Export any open database — including `:memory:` — to a new on-disk file:
+
+```nim
+let db = openDb(":memory:").value
+discard execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+discard execSql(db, "INSERT INTO items (id, name) VALUES (1, 'widget')")
+
+# Save snapshot to disk
+let res = saveAs(db, "/tmp/backup.ddb")
+if not res.ok:
+  echo "SaveAs failed: ", res.err.message
+
+discard closeDb(db)
+```
+
+`saveAs` performs a full WAL checkpoint, then streams pages to the destination file atomically (temp file + rename + fsync). The destination must not already exist.
+
 ## Executing SQL
 
 ### Basic Queries

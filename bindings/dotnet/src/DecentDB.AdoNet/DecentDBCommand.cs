@@ -342,14 +342,14 @@ namespace DecentDB.AdoNet
             {
                 var dt = (DateTime)value;
                 var utc = dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime();
-                var ms = new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeMilliseconds();
-                stmt.BindInt64(index1Based, ms);
+                var micros = (utc.Ticks - DateTime.UnixEpoch.Ticks) / 10L;
+                stmt.BindDatetime(index1Based, micros);
             }
             else if (type == typeof(DateTimeOffset))
             {
                 var dto = ((DateTimeOffset)value).ToUniversalTime();
-                var ms = dto.ToUnixTimeMilliseconds();
-                stmt.BindInt64(index1Based, ms);
+                var micros = (dto.UtcTicks - DateTime.UnixEpoch.Ticks) / 10L;
+                stmt.BindDatetime(index1Based, micros);
             }
             else if (type == typeof(TimeSpan))
             {

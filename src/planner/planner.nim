@@ -1,7 +1,10 @@
 import options
+import math
+import algorithm
 import ../errors
 import ../sql/sql
 import ../catalog/catalog
+import ../record/record
 import sets
 import strutils
 import tables
@@ -14,10 +17,13 @@ type PlanKind* = enum
   pkIndexSeek
   pkTrigramSeek
   pkSubqueryScan
+  pkLiteralRows
   pkUnionDistinct
   pkSetUnionDistinct
   pkSetIntersect
+  pkSetIntersectAll
   pkSetExcept
+  pkSetExceptAll
   pkAppend
   pkFilter
   pkProject
@@ -25,6 +31,7 @@ type PlanKind* = enum
   pkSort
   pkAggregate
   pkLimit
+  pkTvfScan
 
 type Plan* = ref object
   kind*: PlanKind
@@ -49,6 +56,11 @@ type Plan* = ref object
   offsetParam*: int
   groupBy*: seq[Expr]
   having*: Expr
+  rows*: seq[seq[(string, Value)]]  # for pkLiteralRows: pre-materialized rows
+  tvfFunc*: string                   # for pkTvfScan: function name
+  tvfArgs*: seq[Expr]                # for pkTvfScan: argument expressions
+  estRows*: int64                    # estimated output cardinality (0 = unknown)
+  estCost*: float64                  # estimated relative cost (0.0 = unknown)
 
 proc isSimpleEquality(expr: Expr, table: string, columnOut: var string, valueOut: var Expr): bool =
   if expr == nil or expr.kind != ekBinary or expr.op != "=":
@@ -145,6 +157,8 @@ proc referencedTables(expr: Expr, tablesOut: var HashSet[string]) =
       referencedTables(part, tablesOut)
     for o in expr.windowOrderExprs:
       referencedTables(o, tablesOut)
+    for a in expr.windowArgs:
+      referencedTables(a, tablesOut)
   else:
     discard
 
@@ -152,29 +166,66 @@ proc refs(expr: Expr): HashSet[string] =
   result = initHashSet[string]()
   referencedTables(expr, result)
 
-proc planSelect(catalog: Catalog, stmt: Statement): Plan =
+proc seekCheaperThanScan(catalog: Catalog, tableName: string, idxName: string): bool =
+  ## Return true if an index seek is estimated cheaper than a full table scan.
+  ## When stats are absent, default to seeking (preserves prior heuristic).
+  let tableStatsOpt = catalog.getTableStats(tableName)
+  if tableStatsOpt.isNone:
+    return true
+  let tableRows = max(1, tableStatsOpt.get.rowCount)
+  let scanCost = float64(max(1, (tableRows + 99) div 100))
+  let idxStatsOpt = catalog.getIndexStats(idxName)
+  let sel =
+    if idxStatsOpt.isSome and idxStatsOpt.get.distinctKeyCount > 0:
+      1.0 / float64(idxStatsOpt.get.distinctKeyCount)
+    else:
+      0.10  # heuristic
+  let seekRows = float64(tableRows) * sel
+  let seekCost = 1.0 + ln(float64(max(1, tableRows))) / ln(2.0) + seekRows / 100.0
+  seekCost < scanCost
+
+proc makeJoinPlan(joinType: JoinType, joinOn: Expr, left, right: Plan): Plan =
+  ## Construct a join plan, rewriting RIGHT JOIN as LEFT JOIN with swapped operands.
+  ## For FULL OUTER JOIN, disable index seek since we need all right rows.
+  if joinType == jtRight:
+    Plan(kind: pkJoin, joinType: jtLeft, joinOn: joinOn, left: right, right: left)
+  elif joinType == jtFull and right.kind == pkIndexSeek:
+    let fallback = Plan(kind: pkTableScan, table: right.table, alias: right.alias)
+    Plan(kind: pkJoin, joinType: jtFull, joinOn: joinOn, left: left, right: fallback)
+  else:
+    Plan(kind: pkJoin, joinType: joinType, joinOn: joinOn, left: left, right: right)
+
+proc planSelect(catalog: Catalog, stmt: Statement, materializedCtes: Table[string, seq[seq[(string, Value)]]] = initTable[string, seq[seq[(string, Value)]]]()): Plan =
   if stmt.setOpKind == sokUnionAll:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkAppend, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokUnion:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetUnionDistinct, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokIntersect:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetIntersect, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokIntersectAll:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
+    return Plan(kind: pkSetIntersectAll, left: leftPlan, right: rightPlan)
   if stmt.setOpKind == sokExcept:
-    let leftPlan = planSelect(catalog, stmt.setOpLeft)
-    let rightPlan = planSelect(catalog, stmt.setOpRight)
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
     return Plan(kind: pkSetExcept, left: leftPlan, right: rightPlan)
+  if stmt.setOpKind == sokExceptAll:
+    let leftPlan = planSelect(catalog, stmt.setOpLeft, materializedCtes)
+    let rightPlan = planSelect(catalog, stmt.setOpRight, materializedCtes)
+    return Plan(kind: pkSetExceptAll, left: leftPlan, right: rightPlan)
 
   proc exprHasAggregate(expr: Expr): bool =
     if expr == nil: return false
     case expr.kind
     of ekFunc:
-      if expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG"]:
+      if expr.funcName.toUpperAscii() in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
         return true
       for arg in expr.args:
         if exprHasAggregate(arg): return true
@@ -202,7 +253,7 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
 
   # When the FROM source is a subquery, recursively plan it and use as base.
   if stmt.fromSubquery != nil:
-    let innerPlan = planSelect(catalog, stmt.fromSubquery)
+    let innerPlan = planSelect(catalog, stmt.fromSubquery, materializedCtes)
     base = Plan(kind: pkSubqueryScan, subPlan: innerPlan, table: stmt.fromTable, alias: stmt.fromAlias)
     # Apply WHERE filters.
     for c in conjuncts:
@@ -216,11 +267,59 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     for i, join in stmt.joins:
       var rightPlan: Plan = nil
       if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
-        let joinInner = planSelect(catalog, stmt.joinSubqueries[i])
+        let joinInner = planSelect(catalog, stmt.joinSubqueries[i], materializedCtes)
         rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
       else:
         rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
-      base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+      base = makeJoinPlan(join.joinType, join.onExpr, base, rightPlan)
+      if join.alias.len > 0:
+        available.incl(join.alias)
+      available.incl(join.table)
+    if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
+      base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+    else:
+      base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+    if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+      base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
+    return base
+
+  # When the FROM source is a table-valued function.
+  if stmt.fromTvfFunc.len > 0:
+    base = Plan(kind: pkTvfScan, table: stmt.fromTable, alias: stmt.fromAlias, tvfFunc: stmt.fromTvfFunc, tvfArgs: stmt.fromTvfArgs)
+    for c in conjuncts:
+      base = Plan(kind: pkFilter, predicate: c, left: base)
+    conjuncts = @[]
+    if stmt.groupBy.len > 0 or hasAggregate(stmt.selectItems):
+      base = Plan(kind: pkAggregate, groupBy: stmt.groupBy, having: stmt.havingExpr, projections: stmt.selectItems, left: base)
+    else:
+      base = Plan(kind: pkProject, projections: stmt.selectItems, left: base)
+    if stmt.orderBy.len > 0:
+      base = Plan(kind: pkSort, orderBy: stmt.orderBy, left: base)
+    if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
+      base = Plan(kind: pkLimit, limit: stmt.limit, limitParam: stmt.limitParam, offset: stmt.offset, offsetParam: stmt.offsetParam, left: base)
+    return base
+
+  # When the FROM source is a materialized recursive CTE, use pre-computed rows.
+  let cteKey = stmt.fromTable.toLowerAscii()
+  if materializedCtes.hasKey(cteKey):
+    base = Plan(kind: pkLiteralRows, table: stmt.fromTable, alias: stmt.fromAlias, rows: materializedCtes[cteKey])
+    for c in conjuncts:
+      base = Plan(kind: pkFilter, predicate: c, left: base)
+    conjuncts = @[]
+    var available = initHashSet[string]()
+    if stmt.fromAlias.len > 0:
+      available.incl(stmt.fromAlias)
+    available.incl(stmt.fromTable)
+    for i, join in stmt.joins:
+      var rightPlan: Plan = nil
+      if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
+        let joinInner = planSelect(catalog, stmt.joinSubqueries[i], materializedCtes)
+        rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
+      else:
+        rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
+      base = makeJoinPlan(join.joinType, join.onExpr, base, rightPlan)
       if join.alias.len > 0:
         available.incl(join.alias)
       available.incl(join.table)
@@ -265,9 +364,10 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
           break
         let idxOpt = catalog.getBtreeIndexForColumn(stmt.fromTable, idxColumn)
         if isSome(idxOpt):
-          partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
-          accessIdx = i
-          break
+          if seekCheaperThanScan(catalog, stmt.fromTable, idxOpt.get.name):
+            partBase = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+            accessIdx = i
+            break
       if c != nil and c.kind == ekBinary and c.op == "=":
         let leftSql = normalizeIndexExprSql(exprToCanonicalSql(c.left), stmt.fromTable, stmt.fromAlias)
         let rightSql = normalizeIndexExprSql(exprToCanonicalSql(c.right), stmt.fromTable, stmt.fromAlias)
@@ -407,9 +507,10 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         break
       let idxOpt = catalog.getBtreeIndexForColumn(stmt.fromTable, idxColumn)
       if isSome(idxOpt):
-        base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
-        accessConjunctIdx = i
-        break
+        if seekCheaperThanScan(catalog, stmt.fromTable, idxOpt.get.name):
+          base = Plan(kind: pkIndexSeek, table: stmt.fromTable, alias: stmt.fromAlias, column: idxColumn, valueExpr: idxValue)
+          accessConjunctIdx = i
+          break
     if c != nil and c.kind == ekBinary and c.op == "=":
       let leftSql = normalizeIndexExprSql(exprToCanonicalSql(c.left), stmt.fromTable, stmt.fromAlias)
       let rightSql = normalizeIndexExprSql(exprToCanonicalSql(c.right), stmt.fromTable, stmt.fromAlias)
@@ -462,6 +563,245 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
     available.incl(stmt.fromAlias)
   available.incl(stmt.fromTable)
 
+  # Join reordering: for queries with only inner joins and all base table sources,
+  # choose a left-deep join order by dynamic programming over join permutations.
+  #
+  # IMPORTANT: we only consider join orders where each JOIN's ON predicate references
+  # tables that are already available at that point (plus the join table itself).
+  # This preserves semantics for ON predicates that reference previously-joined tables.
+  # LEFT/FULL/RIGHT joins are never reordered to preserve NULL semantics.
+  # Restricted to ≤ 6 tables total (FROM + joins) to bound the permutation search.
+  const joinReorderMaxTables = 6
+  var effectiveJoins = stmt.joins  # may be replaced with reordered version
+  var effectiveJoinSubqueries = stmt.joinSubqueries
+  block joinReorderBlock:
+    if stmt.joins.len == 0:
+      break joinReorderBlock
+    # Only reorder if all joins are inner joins with no subquery sources.
+    var allInner = true
+    for j in stmt.joins:
+      if j.joinType != jtInner:
+        allInner = false
+        break
+    if not allInner:
+      break joinReorderBlock
+    for j in stmt.joins:
+      if j.isNatural:
+        break joinReorderBlock
+    var hasSubquery = false
+    for k in 0 ..< stmt.joins.len:
+      if k < stmt.joinSubqueries.len and stmt.joinSubqueries[k] != nil:
+        hasSubquery = true
+        break
+    if hasSubquery:
+      break joinReorderBlock
+    # Also skip if any join source is a recursive CTE materialized table.
+    var hasCte = false
+    for j in stmt.joins:
+      if materializedCtes.hasKey(j.table.toLowerAscii()):
+        hasCte = true
+        break
+    if hasCte:
+      break joinReorderBlock
+
+    proc exprHasUnqualifiedColumn(expr: Expr): bool =
+      if expr == nil:
+        return false
+      case expr.kind
+      of ekColumn:
+        return expr.table.len == 0
+      of ekBinary:
+        return exprHasUnqualifiedColumn(expr.left) or exprHasUnqualifiedColumn(expr.right)
+      of ekUnary:
+        return exprHasUnqualifiedColumn(expr.expr)
+      of ekFunc:
+        for a in expr.args:
+          if exprHasUnqualifiedColumn(a):
+            return true
+        return false
+      of ekInList:
+        if exprHasUnqualifiedColumn(expr.inExpr):
+          return true
+        for item in expr.inList:
+          if exprHasUnqualifiedColumn(item):
+            return true
+        return false
+      of ekWindowRowNumber:
+        for part in expr.windowPartitions:
+          if exprHasUnqualifiedColumn(part):
+            return true
+        for o in expr.windowOrderExprs:
+          if exprHasUnqualifiedColumn(o):
+            return true
+        for a in expr.windowArgs:
+          if exprHasUnqualifiedColumn(a):
+            return true
+        return false
+      else:
+        return false
+
+    # Be conservative: skip reordering if any ON predicate uses unqualified columns.
+    for j in stmt.joins:
+      if exprHasUnqualifiedColumn(j.onExpr):
+        break joinReorderBlock
+
+    proc tableEst(tname: string): int64 =
+      let st = catalog.getTableStats(tname)
+      if st.isSome: max(1, st.get.rowCount) else: 1000'i64
+
+    const dpRowsPerPage = 100
+    const dpJoinSel = 0.10
+
+    proc scanCost(rows: int64): float64 =
+      float64(max(1, (rows + dpRowsPerPage - 1) div dpRowsPerPage))
+
+    proc seekProbeCost(tableRows: int64): float64 =
+      1.0 + ln(float64(max(1, tableRows))) / ln(2.0)
+
+    let fromKey = if stmt.fromAlias.len > 0: stmt.fromAlias else: stmt.fromTable
+    let n = stmt.joins.len
+
+    # Precompute ON dependencies for each join clause.
+    var deps: seq[HashSet[string]] = newSeq[HashSet[string]](n)
+    for i, j in stmt.joins:
+      deps[i] = refs(j.onExpr)
+      # ON clauses may refer to the join table via either table name or alias.
+      if j.table.len > 0:
+        deps[i].excl(j.table)
+      if j.alias.len > 0:
+        deps[i].excl(j.alias)
+
+    let fullMask = (1 shl n) - 1
+    let doDp = (stmt.joins.len + 1) <= joinReorderMaxTables
+
+    proc buildAvailable(mask: int): HashSet[string] =
+      result = initHashSet[string]()
+      if stmt.fromTable.len > 0:
+        result.incl(stmt.fromTable)
+      if stmt.fromAlias.len > 0:
+        result.incl(stmt.fromAlias)
+      result.incl(fromKey)
+      for i in 0 ..< n:
+        if (mask and (1 shl i)) != 0:
+          let j = stmt.joins[i]
+          if j.table.len > 0:
+            result.incl(j.table)
+          if j.alias.len > 0:
+            result.incl(j.alias)
+
+    proc joinProbeCost(join: JoinClause, avail: HashSet[string]): float64 =
+      ## Estimate per-outer-row cost of probing the right side.
+      let trows = tableEst(join.table)
+      var col = ""
+      var valExpr: Expr = nil
+      if join.onExpr != nil and isSimpleEqualityFor(join.onExpr, join.table, join.alias, col, valExpr):
+        # Only treat as a correlated seek if the value expression depends only
+        # on already-available tables.
+        let r = refs(valExpr)
+        if (r <= avail) and (not r.contains(join.table)) and (join.alias.len == 0 or not r.contains(join.alias)):
+          let idxOpt = catalog.getBtreeIndexForColumn(join.table, col)
+          if idxOpt.isSome and seekCheaperThanScan(catalog, join.table, idxOpt.get.name):
+            return seekProbeCost(trows)
+      scanCost(trows)
+
+    var orderIdxs: seq[int] = @[]
+
+    if doDp:
+      # DP over subsets of joins: dpCost[mask] is the cheapest estimated cost so far.
+      var dpCost = newSeq[float64](1 shl n)
+      var dpRows = newSeq[int64](1 shl n)
+      var prevMask = newSeq[int](1 shl n)
+      var chosenJoinIdx = newSeq[int](1 shl n)
+      for m in 0 .. fullMask:
+        dpCost[m] = Inf
+        prevMask[m] = -1
+        chosenJoinIdx[m] = -1
+        dpRows[m] = 0
+      dpCost[0] = 0.0
+      dpRows[0] = tableEst(stmt.fromTable)
+
+      for mask in 0 .. fullMask:
+        if dpCost[mask] == Inf:
+          continue
+        let avail = buildAvailable(mask)
+        for i in 0 ..< n:
+          if (mask and (1 shl i)) != 0:
+            continue
+          if not (deps[i] <= avail):
+            continue
+          let j = stmt.joins[i]
+          let probe = joinProbeCost(j, avail)
+          let outerRows = max(1'i64, dpRows[mask])
+          let newCost = dpCost[mask] + float64(outerRows) * probe
+          let rightRows = tableEst(j.table)
+          let newRowsF = min(float64(high(int64)), float64(outerRows) * float64(rightRows) * dpJoinSel)
+          let newRows = max(1'i64, int64(newRowsF))
+          let newMask = mask or (1 shl i)
+          if newCost < dpCost[newMask]:
+            dpCost[newMask] = newCost
+            dpRows[newMask] = newRows
+            prevMask[newMask] = mask
+            chosenJoinIdx[newMask] = i
+
+      if dpCost[fullMask] == Inf:
+        break joinReorderBlock
+
+      # Reconstruct best join order.
+      var m = fullMask
+      while m != 0:
+        let jIdx = chosenJoinIdx[m]
+        if jIdx < 0:
+          break
+        orderIdxs.add(jIdx)
+        m = prevMask[m]
+      orderIdxs.reverse()
+      if orderIdxs.len != n:
+        break joinReorderBlock
+    else:
+      # Greedy fallback: repeatedly pick the next legal join with the lowest
+      # incremental estimated cost. This is not exhaustive, but avoids O(2^n).
+      var mask = 0
+      var outerRows = max(1'i64, tableEst(stmt.fromTable))
+      while mask != fullMask:
+        let avail = buildAvailable(mask)
+        var bestIdx = -1
+        var bestDelta = Inf
+        var bestNewRows: int64 = outerRows
+        for i in 0 ..< n:
+          if (mask and (1 shl i)) != 0:
+            continue
+          if not (deps[i] <= avail):
+            continue
+          let j = stmt.joins[i]
+          let probe = joinProbeCost(j, avail)
+          let delta = float64(outerRows) * probe
+          if delta < bestDelta:
+            bestDelta = delta
+            bestIdx = i
+            let rightRows = tableEst(j.table)
+            let newRowsF = min(float64(high(int64)), float64(outerRows) * float64(rightRows) * dpJoinSel)
+            bestNewRows = max(1'i64, int64(newRowsF))
+        if bestIdx < 0:
+          # No legal next join — keep original join order.
+          break joinReorderBlock
+        orderIdxs.add(bestIdx)
+        mask = mask or (1 shl bestIdx)
+        outerRows = bestNewRows
+
+      if orderIdxs.len != n:
+        break joinReorderBlock
+
+    var reordered: seq[JoinClause] = @[]
+    var reorderedSubqueries: seq[Statement] = @[]
+    for jIdx in orderIdxs:
+      reordered.add(stmt.joins[jIdx])
+      if jIdx < stmt.joinSubqueries.len:
+        reorderedSubqueries.add(stmt.joinSubqueries[jIdx])
+      else:
+        reorderedSubqueries.add(nil)
+    effectiveJoins = reordered
+    effectiveJoinSubqueries = reorderedSubqueries
+
   proc applyEligible() =
     var remaining: seq[Expr] = @[]
     for c in conjuncts:
@@ -476,21 +816,26 @@ proc planSelect(catalog: Catalog, stmt: Statement): Plan =
         remaining.add(c)
     conjuncts = remaining
   applyEligible()
-  for i, join in stmt.joins:
+  for i, join in effectiveJoins:
     var rightPlan: Plan = nil
-    if i < stmt.joinSubqueries.len and stmt.joinSubqueries[i] != nil:
-      let joinInner = planSelect(catalog, stmt.joinSubqueries[i])
+    if i < effectiveJoinSubqueries.len and effectiveJoinSubqueries[i] != nil:
+      let joinInner = planSelect(catalog, effectiveJoinSubqueries[i], materializedCtes)
       rightPlan = Plan(kind: pkSubqueryScan, subPlan: joinInner, table: join.table, alias: join.alias)
     else:
-      var joinIdxCol = ""
-      var joinIdxVal: Expr = nil
-      if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
-        let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
-        if isSome(idxOpt):
-          rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
-      if rightPlan == nil:
-        rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
-    base = Plan(kind: pkJoin, joinType: join.joinType, joinOn: join.onExpr, left: base, right: rightPlan)
+      # Check if the join table is a materialized recursive CTE.
+      let joinCteKey = join.table.toLowerAscii()
+      if materializedCtes.hasKey(joinCteKey):
+        rightPlan = Plan(kind: pkLiteralRows, table: join.table, alias: join.alias, rows: materializedCtes[joinCteKey])
+      else:
+        var joinIdxCol = ""
+        var joinIdxVal: Expr = nil
+        if isSimpleEqualityFor(join.onExpr, join.table, join.alias, joinIdxCol, joinIdxVal):
+          let idxOpt = catalog.getBtreeIndexForColumn(join.table, joinIdxCol)
+          if isSome(idxOpt):
+            rightPlan = Plan(kind: pkIndexSeek, table: join.table, alias: join.alias, column: joinIdxCol, valueExpr: joinIdxVal)
+        if rightPlan == nil:
+          rightPlan = Plan(kind: pkTableScan, table: join.table, alias: join.alias)
+    base = makeJoinPlan(join.joinType, join.onExpr, base, rightPlan)
     if join.alias.len > 0:
       available.incl(join.alias)
     available.incl(join.table)
@@ -540,3 +885,173 @@ proc plan*(catalog: Catalog, stmt: Statement): Result[Plan] =
   if stmt.kind == skSelect:
     return ok(planSelect(catalog, stmt))
   ok(Plan(kind: pkStatement, stmt: stmt))
+
+proc plan*(catalog: Catalog, stmt: Statement, materializedCtes: Table[string, seq[seq[(string, Value)]]]): Result[Plan] =
+  if stmt.kind == skSelect:
+    return ok(planSelect(catalog, stmt, materializedCtes))
+  ok(Plan(kind: pkStatement, stmt: stmt))
+
+# ---------------------------------------------------------------------------
+# Cost annotation pass
+# ---------------------------------------------------------------------------
+# Selectivity heuristics (when stats not available or predicate unanalyzed)
+const selEqualityHeuristic = 0.10
+const selRangeHeuristic = 0.30
+const selLikeHeuristic = 0.05
+const rowsPerPage = 100
+const heuristicRowCount: int64 = 1000
+
+proc estimateSelectivity(catalog: Catalog, table: string, predicate: Expr): float64 =
+  ## Return a selectivity estimate for a predicate on `table`.
+  if predicate == nil:
+    return 1.0
+  case predicate.kind
+  of ekBinary:
+    let op = predicate.op.toUpperAscii()
+    if op == "AND":
+      let l = estimateSelectivity(catalog, table, predicate.left)
+      let r = estimateSelectivity(catalog, table, predicate.right)
+      return l * r
+    if op == "OR":
+      let l = estimateSelectivity(catalog, table, predicate.left)
+      let r = estimateSelectivity(catalog, table, predicate.right)
+      return l + r - l * r
+    if op == "=":
+      # Try to find an index for selectivity via distinct key count.
+      var colName = ""
+
+      if predicate.left.kind == ekColumn:
+        colName = predicate.left.name
+      elif predicate.right.kind == ekColumn:
+        colName = predicate.right.name
+      if colName.len > 0:
+        let idxOpt = catalog.getBtreeIndexForColumn(table, colName)
+        if idxOpt.isSome:
+          let statsOpt = catalog.getIndexStats(idxOpt.get.name)
+          if statsOpt.isSome and statsOpt.get.distinctKeyCount > 0:
+            return 1.0 / float64(statsOpt.get.distinctKeyCount)
+      return selEqualityHeuristic
+    if op in [">", "<", ">=", "<="]:
+      return selRangeHeuristic
+    if op in ["LIKE", "ILIKE"]:
+      return selLikeHeuristic
+    return 1.0
+  else:
+    return 1.0
+
+proc annotatePlan*(catalog: Catalog, p: Plan): void =
+  ## Fill in estRows and estCost fields for each plan node bottom-up.
+  if p == nil:
+    return
+  # Recurse into children first.
+  annotatePlan(catalog, p.left)
+  annotatePlan(catalog, p.right)
+  annotatePlan(catalog, p.subPlan)
+
+  case p.kind
+  of pkOneRow:
+    p.estRows = 1
+    p.estCost = 1.0
+  of pkTableScan:
+    let statsOpt = catalog.getTableStats(p.table)
+    p.estRows = if statsOpt.isSome: max(1, statsOpt.get.rowCount) else: heuristicRowCount
+    p.estCost = float64(max(1, (p.estRows + rowsPerPage - 1) div rowsPerPage))
+  of pkRowidSeek:
+    p.estRows = 1
+    let tableRows = block:
+      let st = catalog.getTableStats(p.table)
+      if st.isSome: max(1, st.get.rowCount) else: heuristicRowCount
+    p.estCost = 1.0 + float64(max(1, tableRows)).ln() / float64(2).ln()
+  of pkIndexSeek:
+    let tableRowsOpt = catalog.getTableStats(p.table)
+    let tableRows = if tableRowsOpt.isSome: max(1, tableRowsOpt.get.rowCount) else: heuristicRowCount
+    let sel = block:
+      let col = p.column
+      let idxOpt = catalog.getBtreeIndexForColumn(p.table, col)
+      if idxOpt.isSome:
+        let statsOpt = catalog.getIndexStats(idxOpt.get.name)
+        if statsOpt.isSome and statsOpt.get.distinctKeyCount > 0:
+          1.0 / float64(statsOpt.get.distinctKeyCount)
+        else:
+          selEqualityHeuristic
+      else:
+        selEqualityHeuristic
+    p.estRows = max(1, int64(float64(tableRows) * sel))
+    p.estCost = 1.0 + float64(max(1, tableRows)).ln() / float64(2).ln()
+  of pkTrigramSeek:
+    p.estRows = 10  # conservative estimate for trigram seek
+    p.estCost = 10.0
+  of pkFilter:
+    let inputRows = if p.left != nil: p.left.estRows else: heuristicRowCount
+    let inputCost = if p.left != nil: p.left.estCost else: 0.0
+    let sel = estimateSelectivity(catalog, p.left.table, p.predicate)
+    p.estRows = max(1, int64(float64(inputRows) * sel))
+    p.estCost = inputCost
+  of pkProject:
+    p.estRows = if p.left != nil: p.left.estRows else: 1
+    p.estCost = if p.left != nil: p.left.estCost else: 0.0
+  of pkJoin:
+    let leftRows = if p.left != nil: p.left.estRows else: heuristicRowCount
+    let rightRows = if p.right != nil: p.right.estRows else: heuristicRowCount
+    let leftCost = if p.left != nil: p.left.estCost else: 0.0
+    let rightCost = if p.right != nil: p.right.estCost else: 0.0
+    p.estRows = max(1, int64(float64(leftRows) * float64(rightRows) * selEqualityHeuristic))
+    p.estCost = leftCost + float64(leftRows) * rightCost
+  of pkSort:
+    let inputRows = if p.left != nil: p.left.estRows else: 1
+    let inputCost = if p.left != nil: p.left.estCost else: 0.0
+    p.estRows = inputRows
+    let sortFactor = float64(max(inputRows, 2)).ln() / float64(2).ln() / 100.0
+    p.estCost = inputCost + float64(inputRows) * sortFactor
+  of pkAggregate:
+    p.estRows = max(1, if p.left != nil: p.left.estRows div 10 else: 1)
+    p.estCost = if p.left != nil: p.left.estCost else: 0.0
+  of pkLimit:
+    let inputRows = if p.left != nil: p.left.estRows else: heuristicRowCount
+    let inputCost = if p.left != nil: p.left.estCost else: 0.0
+    let limitRows = if p.limit >= 0: int64(p.limit) else: inputRows
+    p.estRows = min(limitRows, inputRows)
+    p.estCost = if inputRows > 0: inputCost * float64(p.estRows) / float64(inputRows) else: inputCost
+  of pkSubqueryScan:
+    p.estRows = if p.subPlan != nil: p.subPlan.estRows else: heuristicRowCount
+    p.estCost = if p.subPlan != nil: p.subPlan.estCost else: 0.0
+  of pkLiteralRows:
+    p.estRows = int64(p.rows.len)
+    p.estCost = float64(p.rows.len) / float64(rowsPerPage)
+  of pkUnionDistinct, pkSetUnionDistinct:
+    let l = if p.left != nil: p.left.estRows else: 0
+    let r = if p.right != nil: p.right.estRows else: 0
+    p.estRows = l + r
+    p.estCost = (if p.left != nil: p.left.estCost else: 0.0) + (if p.right != nil: p.right.estCost else: 0.0)
+  of pkAppend:
+    let l = if p.left != nil: p.left.estRows else: 0
+    let r = if p.right != nil: p.right.estRows else: 0
+    p.estRows = l + r
+    p.estCost = (if p.left != nil: p.left.estCost else: 0.0) + (if p.right != nil: p.right.estCost else: 0.0)
+  of pkSetIntersect, pkSetIntersectAll:
+    let l = if p.left != nil: p.left.estRows else: 0
+    p.estRows = max(1, l div 2)
+    p.estCost = (if p.left != nil: p.left.estCost else: 0.0) + (if p.right != nil: p.right.estCost else: 0.0)
+  of pkSetExcept, pkSetExceptAll:
+    let l = if p.left != nil: p.left.estRows else: 0
+    p.estRows = max(1, l div 2)
+    p.estCost = (if p.left != nil: p.left.estCost else: 0.0) + (if p.right != nil: p.right.estCost else: 0.0)
+  of pkTvfScan:
+    p.estRows = heuristicRowCount
+    p.estCost = float64(heuristicRowCount div rowsPerPage)
+  of pkStatement:
+    p.estRows = 0
+    p.estCost = 0.0
+
+proc planWithStats*(catalog: Catalog, stmt: Statement): Result[Plan] =
+  ## Plan a statement and annotate the tree with cost estimates.
+  let res = plan(catalog, stmt)
+  if res.ok:
+    annotatePlan(catalog, res.value)
+  res
+
+proc planWithStats*(catalog: Catalog, stmt: Statement, materializedCtes: Table[string, seq[seq[(string, Value)]]]): Result[Plan] =
+  let res = plan(catalog, stmt, materializedCtes)
+  if res.ok:
+    annotatePlan(catalog, res.value)
+  res

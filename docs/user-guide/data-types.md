@@ -116,6 +116,38 @@ CREATE TABLE example (
 );
 ```
 
+### TIMESTAMP / DATE / DATETIME / TIMESTAMPTZ
+
+Date and time value stored natively as microseconds since Unix epoch UTC.
+
+Accepts ISO 8601 string literals on INSERT; values are read back as formatted strings
+(`YYYY-MM-DD HH:MM:SS[.ffffff]`).
+
+All of the following type names are equivalent and map to the native TIMESTAMP type:
+`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `DATETIME`.
+
+```sql
+CREATE TABLE events (
+    id         INT PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event_date DATE
+);
+
+-- Insert using string literal
+INSERT INTO events (id, event_date) VALUES (1, '2026-02-24');
+INSERT INTO events (id, created_at) VALUES (2, '2026-02-24 17:30:00');
+
+-- Insert using NOW()
+INSERT INTO events (id, created_at) VALUES (3, NOW());
+
+-- Query with EXTRACT
+SELECT EXTRACT(YEAR FROM created_at) FROM events;
+```
+
+**Storage:** TIMESTAMP columns are stored as int64 microseconds since Unix epoch UTC,
+identical to PostgreSQL's internal timestamp format. String literals are parsed on INSERT
+and converted transparently.
+
 ### NULL
 
 Represents missing or unknown values.
@@ -145,6 +177,10 @@ All columns can contain NULL unless marked NOT NULL.
 | NUMERIC | DECIMAL |
 | DECIMAL | DECIMAL |
 | UUID | UUID |
+| DATE | TIMESTAMP (native datetime) |
+| TIMESTAMP | TIMESTAMP (native datetime) |
+| TIMESTAMPTZ | TIMESTAMP (native datetime) |
+| DATETIME | TIMESTAMP (native datetime) |
 
 ## Type Conversion
 
@@ -166,6 +202,7 @@ SELECT CAST(price AS INT) FROM products;
 | FLOAT64 | 8 bytes | Never |
 | DECIMAL | 8 bytes (int64) | Never |
 | UUID | 16 bytes | Never |
+| TIMESTAMP | 8 bytes (int64 µs) | Never |
 | TEXT | Variable, up to 512 bytes | > 512 bytes |
 | BLOB | Variable, up to 512 bytes | > 512 bytes |
 | NULL | 0 bytes | Never |

@@ -86,6 +86,29 @@ public sealed class DecentDB : IDisposable
         }
     }
 
+    /// <summary>
+    /// Export the database to a new on-disk file at the specified path.
+    /// The destination file must not already exist.
+    /// </summary>
+    public void SaveAs(string destPath)
+    {
+        var pathBytes = Encoding.UTF8.GetBytes(destPath + "\0");
+        var pathPtr = Marshal.AllocHGlobal(pathBytes.Length);
+        try
+        {
+            Marshal.Copy(pathBytes, 0, pathPtr, pathBytes.Length);
+            var res = DecentDBNative.decentdb_save_as(Handle, pathPtr);
+            if (res != 0)
+            {
+                throw new DecentDBException(res, LastErrorMessage, "SaveAs");
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pathPtr);
+        }
+    }
+
     internal IntPtr GetDbHandle() => Handle;
 
     /// <summary>
@@ -250,6 +273,16 @@ public sealed class PreparedStatement : IDisposable
             {
                 throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
             }
+        }
+        return this;
+    }
+
+    public PreparedStatement BindDatetime(int index1Based, long microsUtc)
+    {
+        var res = DecentDBNativeUnsafe.decentdb_bind_datetime(Handle, index1Based, microsUtc);
+        if (res < 0)
+        {
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
         }
         return this;
     }

@@ -149,6 +149,9 @@ public static class DecentDBNative
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_checkpoint")]
     public static extern int decentdb_checkpoint(IntPtr db);
 
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_save_as")]
+    public static extern int decentdb_save_as(IntPtr db, IntPtr destPathUtf8);
+
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_last_error_code")]
     public static extern int decentdb_last_error_code(IntPtr db);
 
@@ -230,6 +233,12 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_blob")]
     public static extern int decentdb_bind_blob(IntPtr stmt, int index1Based, byte* data, int byteLen);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_datetime")]
+    public static extern int decentdb_bind_datetime(IntPtr stmt, int index1Based, long microsUtc);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_datetime")]
+    public static extern long decentdb_column_datetime(IntPtr stmt, int col0Based);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_name")]
     public static extern byte* decentdb_column_name(IntPtr stmt, int col0Based);

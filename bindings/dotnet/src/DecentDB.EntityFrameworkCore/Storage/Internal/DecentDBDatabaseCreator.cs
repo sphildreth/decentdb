@@ -11,15 +11,19 @@ internal sealed class DecentDBDatabaseCreator : RelationalDatabaseCreator
     {
     }
 
+    private bool IsInMemory
+        => Dependencies.Connection.DbConnection is DecentDBConnection { IsInMemory: true };
+
     public override bool Exists()
-        => File.Exists(GetDatabasePath());
+        => IsInMemory || File.Exists(GetDatabasePath());
 
     public override Task<bool> ExistsAsync(CancellationToken cancellationToken = default)
         => Task.FromResult(Exists());
 
     public override void Create()
     {
-        EnsureDirectoryExists();
+        if (!IsInMemory)
+            EnsureDirectoryExists();
         OpenAndCloseConnection();
     }
 
@@ -31,6 +35,9 @@ internal sealed class DecentDBDatabaseCreator : RelationalDatabaseCreator
 
     public override void Delete()
     {
+        if (IsInMemory)
+            return;
+
         var path = GetDatabasePath();
         TryDelete(path);
         TryDelete(path + "-wal");
@@ -44,7 +51,7 @@ internal sealed class DecentDBDatabaseCreator : RelationalDatabaseCreator
 
     public override bool HasTables()
     {
-        if (!Exists())
+        if (!IsInMemory && !Exists())
             return false;
 
         var dbConnection = Dependencies.Connection.DbConnection;

@@ -2,9 +2,8 @@ import locks
 import atomics
 import ../errors
 
-type VfsFile* = ref object
+type VfsFile* = ref object of RootObj
   path*: string
-  file*: File
   lock*: Lock
   bufferedDirty*: Atomic[bool]
 
@@ -40,6 +39,15 @@ method truncate*(vfs: Vfs, file: VfsFile, size: int64): Result[Void] {.base.} =
 
 method close*(vfs: Vfs, file: VfsFile): Result[Void] {.base.} =
   err[Void](ERR_INTERNAL, "VFS.close not implemented", file.path)
+
+method getFileSize*(vfs: Vfs, path: string): Result[int64] {.base.} =
+  err[int64](ERR_INTERNAL, "VFS.getFileSize not implemented", path)
+
+method fileExists*(vfs: Vfs, path: string): bool {.base.} =
+  false
+
+method removeFile*(vfs: Vfs, path: string): Result[Void] {.base.} =
+  err[Void](ERR_INTERNAL, "VFS.removeFile not implemented", path)
 
 method mapWritable*(vfs: Vfs, file: VfsFile, length: int64): Result[MmapRegion] {.base.} =
   err[MmapRegion](ERR_INTERNAL, "VFS.mapWritable not implemented", file.path)

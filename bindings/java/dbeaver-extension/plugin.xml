@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.4"?>
+<plugin>
+
+    <!--
+        DecentDB DBeaver Extension
+        Registers DecentDB as a first-class database type in DBeaver.
+        Provider ID: decentdb
+        Driver ID:   decentdb_jdbc
+    -->
+
+    <extension point="org.jkiss.dbeaver.dataSourceProvider">
+        <datasource
+            class="org.jkiss.dbeaver.ext.generic.GenericDataSourceProvider"
+            description="DecentDB embedded database"
+            id="decentdb"
+            parent="generic"
+            inheritProviderProperties="true"
+            dialect="decentdb"
+            label="DecentDB"
+            icon="icons/decentdb_icon_16.png"
+            iconBig="icons/decentdb_icon_big.png">
+
+            <!-- Use our custom meta model so we can override getViewDDL() etc. -->
+            <parameter name="meta-model" value="decentdb"/>
+
+            <drivers managable="true">
+                <driver
+                    id="decentdb_jdbc"
+                    label="DecentDB"
+                    icon="icons/decentdb_icon_16.png"
+                    iconBig="icons/decentdb_icon_big.png"
+                    class="com.decentdb.jdbc.DecentDBDriver"
+                    sampleURL="jdbc:decentdb:{file}"
+                    supportedConfigurationTypes="MANUAL,URL"
+                    defaultPort=""
+                    description="DecentDB JDBC Driver (in-process, JNI-backed)"
+                    webURL="https://decentdb.org"
+                    propertiesURL="https://decentdb.org/api/jdbc/"
+                    supportsDriverProperties="true"
+                    anonymous="true"
+                    embedded="true"
+                    singleConnection="true"
+                    categories="sql,embedded"
+                    dialect="decentdb">
+
+                    <!--
+                        DBeaver loads JDBC drivers via a separate driver classloader.
+                        Add this bundle jar to that classpath so the driver class (and embedded deps)
+                        are resolvable without any manual "add jar" step.
+                    -->
+                    <file type="jar" path="bundle:/org.jkiss.dbeaver.ext.decentdb"/>
+
+                    <!-- Default connection properties -->
+                    <property name="readOnly" value="false"/>
+
+                </driver>
+            </drivers>
+
+        </datasource>
+    </extension>
+
+    <!-- SQL Dialect -->
+    <extension point="org.jkiss.dbeaver.sqlDialect">
+        <dialect
+            id="decentdb"
+            parent="generic"
+            class="org.jkiss.dbeaver.ext.generic.model.GenericSQLDialect"
+            label="DecentDB"
+            description="DecentDB SQL dialect"
+            icon="icons/decentdb_icon_16.png"
+            />
+    </extension>
+
+    <!-- File handler: lets users open .ddb files directly in DBeaver -->
+    <extension point="org.jkiss.dbeaver.databaseEditorContributor">
+    </extension>
+    <!-- Register our custom meta model with the generic meta model registry -->
+    <extension point="org.jkiss.dbeaver.generic.meta">
+        <meta id="decentdb" class="org.jkiss.dbeaver.ext.decentdb.model.DecentDBMetaModel"
+              driverClass="com.decentdb.jdbc.DecentDBDriver"/>
+    </extension>
+
+</plugin>

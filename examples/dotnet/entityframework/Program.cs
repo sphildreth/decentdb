@@ -6,15 +6,18 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using NodaTime;
 using DecentDB.EntityFrameworkCore;
-
-var dbPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "music.ddb"));
+using DecentDB.AdoNet;
 
 Console.WriteLine("╔══════════════════════════════════════════════════════════════════════════╗");
-Console.WriteLine("║           DecentDB Entity Framework Core Demo Application                ║");
+Console.WriteLine("║           DecentDB Entity Framework Core In-Memory Demo Application      ║");
 Console.WriteLine("╚══════════════════════════════════════════════════════════════════════════╝");
 Console.WriteLine();
-Console.WriteLine($"Database: {dbPath}");
+Console.WriteLine("Database: :memory:");
 Console.WriteLine();
+
+// Keep one connection open for the lifetime of the in-memory database (same pattern as SQLite).
+using var sharedConnection = new DecentDBConnection("Data Source=:memory:");
+sharedConnection.Open();
 
 // Setup DI
 var services = new ServiceCollection();
@@ -27,7 +30,7 @@ services.AddLogging(builder =>
 
 services.AddDbContextFactory<MusicDbContext>(options =>
 {
-    options.UseDecentDB($"Data Source={dbPath}", x => x.UseNodaTime());
+    options.UseDecentDB(sharedConnection, contextOwnsConnection: false, x => x.UseNodaTime());
     options.UseLazyLoadingProxies();
     options.EnableSensitiveDataLogging(false);
 });
@@ -39,13 +42,6 @@ services.AddScoped<TrackService>();
 services.AddScoped<EventService>();
 
 var serviceProvider = services.BuildServiceProvider();
-
-// Clean start
-if (File.Exists(dbPath))
-{
-    File.Delete(dbPath);
-    Console.WriteLine("Cleaned up existing database.");
-}
 
 // Ensure database and schema are created
 using (var scope = serviceProvider.CreateScope())
@@ -523,6 +519,43 @@ var eventCities = await metrics.MeasureAsync(
     async () => await eventService.GetDistinctCitiesAsync()
 );
 
+// ── Showcase: Window Functions (via raw SQL on the shared connection) ──
+Console.WriteLine("\n--- Window Functions (Raw SQL) ---");
+
+using (var wfCmd = sharedConnection.CreateCommand())
+{
+    wfCmd.CommandText = @"
+        SELECT a.name, a.genre,
+               ROW_NUMBER() OVER (ORDER BY a.name) AS rn,
+               RANK()       OVER (ORDER BY a.genre) AS genre_rank,
+               DENSE_RANK() OVER (ORDER BY a.genre) AS genre_drank
+        FROM artists a ORDER BY a.name LIMIT 10";
+    using var reader = wfCmd.ExecuteReader();
+    Console.WriteLine("\nROW_NUMBER / RANK / DENSE_RANK on Artists (first 10):");
+    Console.WriteLine($"  {"Name",-20} {"Genre",-10} {"RN",3}  {"Rank",4}  {"DRank",5}");
+    while (reader.Read())
+    {
+        Console.WriteLine($"  {reader.GetString(0),-20} {reader.GetString(1),-10} {reader.GetInt64(2),3}  {reader.GetInt64(3),4}  {reader.GetInt64(4),5}");
+    }
+}
+
+using (var lagCmd = sharedConnection.CreateCommand())
+{
+    lagCmd.CommandText = @"
+        SELECT t.title, t.play_count,
+               LAG(t.play_count, 1, 0)  OVER (ORDER BY t.play_count DESC) AS prev_plays,
+               LEAD(t.play_count)       OVER (ORDER BY t.play_count DESC) AS next_plays
+        FROM tracks t ORDER BY t.play_count DESC LIMIT 10";
+    using var reader = lagCmd.ExecuteReader();
+    Console.WriteLine("\nLAG / LEAD on Tracks by PlayCount (top 10):");
+    Console.WriteLine($"  {"Title",-30} {"Plays",6}  {"Prev",6}  {"Next",6}");
+    while (reader.Read())
+    {
+        var next = reader.IsDBNull(3) ? "NULL" : reader.GetInt64(3).ToString();
+        Console.WriteLine($"  {reader.GetString(0),-30} {reader.GetInt64(1),6}  {reader.GetInt64(2),6}  {next,6}");
+    }
+}
+
 // Print performance report
 metrics.PrintReport();
 
@@ -535,7 +568,7 @@ Console.WriteLine($"\nDatabase Statistics:");
 Console.WriteLine($"  Artists: {artistCount}");
 Console.WriteLine($"  Albums: {albumCount}");
 Console.WriteLine($"  Tracks: {trackCount}");
-Console.WriteLine($"  Average Album Duration: {TimeSpan.FromSeconds(avgDuration):mm\\:ss}");
+Console.WriteLine($"  Average Album Duration: {(avgDuration > 0 && avgDuration < 1e9 ? TimeSpan.FromSeconds(avgDuration).ToString(@"mm\:ss") : "N/A")}");
 Console.WriteLine($"  Total Track Plays: {totalPlayCount:N0}");
 Console.WriteLine($"  Distinct Countries: {distinctCountries.Count}");
 Console.WriteLine($"  Distinct Genres: {distinctGenres.Count}");
@@ -623,11 +656,3 @@ foreach (var es in eventSummaries.Take(3))
 }
 
 Console.WriteLine("\n✓ Demo completed successfully!");
-
-// Cleanup
-Console.WriteLine("\nCleaning up...");
-if (File.Exists(dbPath))
-{
-    File.Delete(dbPath);
-    Console.WriteLine("Database file deleted.");
-}

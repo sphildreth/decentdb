@@ -465,6 +465,176 @@ suite "Datatypes - Basic":
     for i in 0..3:
       check s1.value[0].values[i].float64Val == val
 
+suite "Datatypes - DateTime":
+  test "create timestamp column and insert ISO string":
+    let dbPath = makeTempDb("test_dt_basic.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    let c = execSql(db, "CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP)", @[])
+    check c.ok
+
+    let i = execSql(db, "INSERT INTO events VALUES (1, '2024-06-15 12:30:00')", @[])
+    check i.ok
+
+    let r = execSqlRows(db, "SELECT ts FROM events WHERE id = 1", @[])
+    check r.ok
+    check r.value.len == 1
+    let val = r.value[0].values[0]
+    check val.kind == vkDateTime
+    # 2024-06-15 12:30:00 UTC in microseconds
+    check val.int64Val > 0
+
+  test "NOW() returns vkDateTime":
+    let dbPath = makeTempDb("test_dt_now.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    setupDummy(db)
+    let r = execSqlRows(db, "SELECT NOW() FROM dummy", @[])
+    check r.ok
+    check r.value.len == 1
+    let val = r.value[0].values[0]
+    check val.kind == vkDateTime
+    check val.int64Val > 0
+
+  test "bind vkDateTime parameter":
+    let dbPath = makeTempDb("test_dt_bind.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    let c = execSql(db, "CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP)", @[])
+    check c.ok
+
+    let micros = 1718454600_000000i64  # 2024-06-15 12:30:00 UTC
+    let tsVal = Value(kind: vkDateTime, int64Val: micros)
+    let i = execSql(db, "INSERT INTO ev VALUES (1, $1)", @[tsVal])
+    check i.ok
+
+    let r = execSqlRows(db, "SELECT ts FROM ev WHERE id = 1", @[])
+    check r.ok
+    let got = r.value[0].values[0]
+    check got.kind == vkDateTime
+    check got.int64Val == micros
+
+  test "CAST text to TIMESTAMP":
+    let dbPath = makeTempDb("test_dt_cast.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    setupDummy(db)
+    let r = execSqlRows(db, "SELECT CAST('2024-01-01 00:00:00' AS TIMESTAMP) FROM dummy", @[])
+    check r.ok
+    check r.value[0].values[0].kind == vkDateTime
+
+  test "EXTRACT from TIMESTAMP":
+    let dbPath = makeTempDb("test_dt_extract.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    let c = execSql(db, "CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP)", @[])
+    check c.ok
+    let i = execSql(db, "INSERT INTO ev VALUES (1, '2024-06-15 12:30:45')", @[])
+    check i.ok
+
+    let r = execSqlRows(db, "SELECT EXTRACT(YEAR FROM ts), EXTRACT(MONTH FROM ts), EXTRACT(DAY FROM ts), EXTRACT(HOUR FROM ts), EXTRACT(MINUTE FROM ts), EXTRACT(SECOND FROM ts) FROM ev", @[])
+    check r.ok
+    let row = r.value[0].values
+    check row[0].int64Val == 2024
+    check row[1].int64Val == 6
+    check row[2].int64Val == 15
+    check row[3].int64Val == 12
+    check row[4].int64Val == 30
+    check row[5].int64Val == 45
+
+  test "ORDER BY TIMESTAMP":
+    let dbPath = makeTempDb("test_dt_order.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    let c = execSql(db, "CREATE TABLE ev (id INT PRIMARY KEY, ts TIMESTAMP)", @[])
+    check c.ok
+    discard execSql(db, "INSERT INTO ev VALUES (1, '2024-03-01 00:00:00')", @[])
+    discard execSql(db, "INSERT INTO ev VALUES (2, '2023-01-01 00:00:00')", @[])
+    discard execSql(db, "INSERT INTO ev VALUES (3, '2025-12-31 23:59:59')", @[])
+
+    let r = execSqlRows(db, "SELECT id FROM ev ORDER BY ts ASC", @[])
+    check r.ok
+    check r.value.len == 3
+    check r.value[0].values[0].int64Val == 2
+    check r.value[1].values[0].int64Val == 1
+    check r.value[2].values[0].int64Val == 3
+
+  test "DATE and DATETIME type aliases":
+    let dbPath = makeTempDb("test_dt_aliases.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    let c = execSql(db, "CREATE TABLE ev (d DATE, dt DATETIME, ts TIMESTAMPTZ)", @[])
+    check c.ok
+
+    let i = execSql(db, "INSERT INTO ev VALUES ('2024-06-15', '2024-06-15 10:00:00', '2024-06-15 10:00:00')", @[])
+    check i.ok
+
+    let r = execSqlRows(db, "SELECT d, dt, ts FROM ev", @[])
+    check r.ok
+    let row = r.value[0].values
+    check row[0].kind == vkDateTime
+    check row[1].kind == vkDateTime
+    check row[2].kind == vkDateTime
+
+  test "CURRENT_TIMESTAMP returns vkDateTime":
+    let dbPath = makeTempDb("test_dt_current.ddb")
+    let dbRes = openDb(dbPath)
+    require dbRes.ok
+    let db = dbRes.value
+    defer:
+      discard closeDb(db)
+      removeFile(dbPath)
+      if fileExists(dbPath & "-wal"): removeFile(dbPath & "-wal")
+
+    setupDummy(db)
+    let r = execSqlRows(db, "SELECT CURRENT_TIMESTAMP FROM dummy", @[])
+    check r.ok
+    let val = r.value[0].values[0]
+    check val.kind == vkDateTime
+    check val.int64Val > 0
+
 
 
 

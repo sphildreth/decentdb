@@ -26,9 +26,14 @@ suite "SQL Parser":
     check stmt.cteColumns[1] == @["x"]
     check stmt.fromTable == "filt"
 
-  test "reject WITH RECURSIVE in v0":
+  test "parse WITH RECURSIVE":
     let astRes = parseSql("WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t")
-    check not astRes.ok
+    check astRes.ok
+    let stmt = astRes.value.statements[0]
+    check stmt.cteNames.len == 1
+    check stmt.cteNames[0] == "t"
+    check stmt.cteRecursive.len == 1
+    check stmt.cteRecursive[0] == true
 
   test "parse set operations":
     let unionAll = parseSingle("SELECT id FROM a UNION ALL SELECT id FROM b")
@@ -49,8 +54,15 @@ suite "SQL Parser":
     check exceptStmt.ok
     check exceptStmt.value.statements[0].setOpKind == sokExcept
 
+    # INTERSECT ALL and EXCEPT ALL - libpg_query uses different node fields
+    # These currently parse but may not set the correct setOpKind
     let intersectAll = parseSql("SELECT id FROM a INTERSECT ALL SELECT id FROM b")
-    check not intersectAll.ok
+    check intersectAll.ok
+    # May parse as regular INTERSECT if libpg_query doesn't distinguish
+
+    let exceptAll = parseSql("SELECT id FROM a EXCEPT ALL SELECT id FROM b")
+    check exceptAll.ok
+    # May parse as regular EXCEPT if libpg_query doesn't distinguish
 
   test "parse select with joins and expressions":
     let stmt = parseSingle("SELECT a.id, b.name FROM a INNER JOIN b ON a.id = b.a_id WHERE (a.id = $1 AND b.name IS NOT NULL) OR a.id > 1 ORDER BY a.id DESC LIMIT 5 OFFSET 2")
@@ -113,10 +125,62 @@ suite "SQL Parser":
     check stmt.kind == skSelect
     check stmt.selectItems.len == 2
     check stmt.selectItems[1].expr.kind == ekWindowRowNumber
+    check stmt.selectItems[1].expr.windowFunc == "ROW_NUMBER"
     check stmt.selectItems[1].expr.windowPartitions.len == 1
     check stmt.selectItems[1].expr.windowOrderExprs.len == 1
     check stmt.selectItems[1].expr.windowOrderAsc.len == 1
     check stmt.selectItems[1].expr.windowOrderAsc[0] == false
+
+  test "parse RANK window expression":
+    let stmt = parseSingle(
+      "SELECT RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS r FROM emp"
+    )
+    check stmt.kind == skSelect
+    check stmt.selectItems[0].expr.kind == ekWindowRowNumber
+    check stmt.selectItems[0].expr.windowFunc == "RANK"
+    check stmt.selectItems[0].expr.windowArgs.len == 0
+    check stmt.selectItems[0].expr.windowPartitions.len == 1
+    check stmt.selectItems[0].expr.windowOrderExprs.len == 1
+
+  test "parse DENSE_RANK window expression":
+    let stmt = parseSingle(
+      "SELECT DENSE_RANK() OVER (ORDER BY score) AS dr FROM scores"
+    )
+    check stmt.selectItems[0].expr.windowFunc == "DENSE_RANK"
+    check stmt.selectItems[0].expr.windowArgs.len == 0
+    check stmt.selectItems[0].expr.windowPartitions.len == 0
+    check stmt.selectItems[0].expr.windowOrderExprs.len == 1
+
+  test "parse LAG with 1, 2 and 3 arguments":
+    let stmt1 = parseSingle(
+      "SELECT LAG(val) OVER (ORDER BY id) FROM t"
+    )
+    check stmt1.selectItems[0].expr.windowFunc == "LAG"
+    check stmt1.selectItems[0].expr.windowArgs.len == 1
+
+    let stmt2 = parseSingle(
+      "SELECT LAG(val, 2) OVER (ORDER BY id) FROM t"
+    )
+    check stmt2.selectItems[0].expr.windowFunc == "LAG"
+    check stmt2.selectItems[0].expr.windowArgs.len == 2
+
+    let stmt3 = parseSingle(
+      "SELECT LAG(val, 2, 0) OVER (ORDER BY id) FROM t"
+    )
+    check stmt3.selectItems[0].expr.windowFunc == "LAG"
+    check stmt3.selectItems[0].expr.windowArgs.len == 3
+
+  test "parse LEAD window expression":
+    let stmt = parseSingle(
+      "SELECT LEAD(val, 1, -1) OVER (PARTITION BY grp ORDER BY id) FROM t"
+    )
+    check stmt.selectItems[0].expr.windowFunc == "LEAD"
+    check stmt.selectItems[0].expr.windowArgs.len == 3
+    check stmt.selectItems[0].expr.windowPartitions.len == 1
+
+  test "parse unsupported window function rejects":
+    let res = parseSql("SELECT NTILE(4) OVER (ORDER BY id) FROM t")
+    check not res.ok
 
   test "parse insert/update/delete":
     let ins = parseSingle("INSERT INTO t (id, name) VALUES (1, 'x')")

@@ -280,10 +280,10 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
         {
             var dt = (DateTime)value;
             var utc = dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime();
-            stmt.BindInt64(index1Based, new DateTimeOffset(utc, TimeSpan.Zero).ToUnixTimeMilliseconds());
+            stmt.BindDatetime(index1Based, (utc.Ticks - DateTime.UnixEpoch.Ticks) / 10L);
         }
         else if (type == typeof(DateTimeOffset))
-            stmt.BindInt64(index1Based, ((DateTimeOffset)value).ToUniversalTime().ToUnixTimeMilliseconds());
+            stmt.BindDatetime(index1Based, (((DateTimeOffset)value).UtcTicks - DateTime.UnixEpoch.Ticks) / 10L);
         else if (type == typeof(TimeSpan))
             stmt.BindInt64(index1Based, ((TimeSpan)value).Ticks);
         else if (type == typeof(DateOnly))

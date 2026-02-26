@@ -1,0 +1,15 @@
+{
+  "name": "decentdb-native",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DecentDB Node.js native addon (N-API) + thin JS wrapper",
+  "main": "index.js",
+  "gypfile": true,
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.1.0"
+  }
+}

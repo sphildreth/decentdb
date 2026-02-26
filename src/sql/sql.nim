@@ -32,6 +32,8 @@ type ExprKind* = enum
   ekParam
   ekInList
   ekWindowRowNumber
+  ekSqlValueFunction
+  ekExtract
 
 type Expr* = ref object
   case kind*: ExprKind
@@ -51,15 +53,23 @@ type Expr* = ref object
     funcName*: string
     args*: seq[Expr]
     isStar*: bool
+    isDistinct*: bool  # true for COUNT(DISTINCT x), AVG(DISTINCT x), etc.
   of ekParam:
     index*: int
   of ekInList:
     inExpr*: Expr
     inList*: seq[Expr]
   of ekWindowRowNumber:
+    windowFunc*: string           # "ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD"
+    windowArgs*: seq[Expr]        # LAG/LEAD: [expr, offset, default]
     windowPartitions*: seq[Expr]
     windowOrderExprs*: seq[Expr]
     windowOrderAsc*: seq[bool]
+  of ekSqlValueFunction:
+    sqlValueFunc*: string         # "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "NOW"
+  of ekExtract:
+    extractField*: string         # "YEAR", "MONTH", "DAY", "HOUR", "MINUTE", "SECOND"
+    extractSource*: Expr          # The source expression to extract from
 
 type ColumnDef* = object
   name*: string
@@ -71,10 +81,20 @@ type ColumnDef* = object
   refColumn*: string
   refOnDelete*: string
   refOnUpdate*: string
+  defaultExpr*: Expr
+  generatedExpr*: Expr  ## GENERATED ALWAYS AS (expr) STORED
 
 type CheckConstraintDef* = object
   name*: string
   expr*: Expr
+
+type ForeignKeyConstraintDef* = object
+  name*: string
+  columns*: seq[string]
+  refTable*: string
+  refColumns*: seq[string]
+  refOnDelete*: string
+  refOnUpdate*: string
 
 type SqlIndexKind* = enum
   ikBtree
@@ -87,12 +107,15 @@ type OrderItem* = object
 type JoinType* = enum
   jtInner
   jtLeft
+  jtRight
+  jtFull
 
 type JoinClause* = object
   joinType*: JoinType
   table*: string
   alias*: string
   onExpr*: Expr
+  isNatural*: bool
 
 type SelectItem* = object
   expr*: Expr
@@ -123,7 +146,9 @@ type SetOpKind* = enum
   sokUnionAll
   sokUnion
   sokIntersect
+  sokIntersectAll
   sokExcept
+  sokExceptAll
 
 const TriggerEventInsertMask* = 4
 const TriggerEventDeleteMask* = 8
@@ -160,7 +185,11 @@ type StatementKind* = enum
   skBegin
   skCommit
   skRollback
+  skSavepoint
+  skReleaseSavepoint
+  skRollbackToSavepoint
   skExplain
+  skAnalyze
 
 type Statement* = ref object
   case kind*: StatementKind
@@ -171,6 +200,8 @@ type Statement* = ref object
     createTableName*: string
     columns*: seq[ColumnDef]
     createChecks*: seq[CheckConstraintDef]
+    foreignKeys*: seq[ForeignKeyConstraintDef]
+    createTableIsTemp*: bool
   of skCreateIndex:
     indexName*: string
     indexTableName*: string
@@ -201,6 +232,7 @@ type Statement* = ref object
     createViewColumns*: seq[string]
     createViewSqlText*: string
     createViewQuery*: Statement
+    createViewIsTemp*: bool
   of skDropView:
     dropViewName*: string
     dropViewIfExists*: bool
@@ -226,6 +258,7 @@ type Statement* = ref object
     cteNames*: seq[string]
     cteColumns*: seq[seq[string]]
     cteQueries*: seq[Statement]
+    cteRecursive*: seq[bool]  # per-CTE recursive flag (WITH RECURSIVE)
     setOpKind*: SetOpKind
     setOpLeft*: Statement
     setOpRight*: Statement
@@ -233,6 +266,8 @@ type Statement* = ref object
     fromTable*: string
     fromAlias*: string
     fromSubquery*: Statement
+    fromTvfFunc*: string           # Table-valued function name (e.g. "json_each")
+    fromTvfArgs*: seq[Expr]        # TVF argument expressions
     joins*: seq[JoinClause]
     joinSubqueries*: seq[Statement]
     whereExpr*: Expr
@@ -243,6 +278,7 @@ type Statement* = ref object
     limitParam*: int
     offset*: int
     offsetParam*: int
+    distinctOnExprs*: seq[Expr]
   of skUpdate:
     updateTable*: string
     assignments*: Table[string, Expr]
@@ -256,6 +292,14 @@ type Statement* = ref object
     discard
   of skRollback:
     discard
+  of skSavepoint:
+    savepointName*: string
+  of skReleaseSavepoint:
+    releaseSavepointName*: string
+  of skRollbackToSavepoint:
+    rollbackToSavepointName*: string
+  of skAnalyze:
+    analyzeTable*: string  ## empty string = analyze all tables
 
 type SqlAst* = ref object
   statements*: seq[Statement]
@@ -394,6 +438,17 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
     funcName = nodeString(nameParts[^1]).toUpperAscii()
   if funcName == "BTRIM":
     funcName = "TRIM"
+  if funcName == "EXTRACT":
+    if nodeHas(node, "args") and node["args"].kind == JArray and node["args"].len >= 2:
+      let fieldNode = node["args"][0]
+      let sourceNode = node["args"][1]
+      var fieldStr = ""
+      if nodeHas(fieldNode, "A_Const"):
+        fieldStr = nodeString(fieldNode["A_Const"]["sval"]).toUpperAscii()
+      let sourceRes = parseExprNode(sourceNode)
+      if not sourceRes.ok:
+        return err[Expr](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+      return ok(Expr(kind: ekExtract, extractField: fieldStr, extractSource: sourceRes.value))
   let argsNode = nodeGet(node, "args")
   var args: seq[Expr] = @[]
   if argsNode.kind == JArray:
@@ -405,10 +460,21 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
 
   let overNode = nodeGet(node, "over")
   if overNode.kind == JObject:
-    if funcName != "ROW_NUMBER":
-      return err[Expr](ERR_SQL, "Only ROW_NUMBER window function is supported in 0.x", funcName)
-    if args.len > 0:
-      return err[Expr](ERR_SQL, "ROW_NUMBER does not take arguments in 0.x")
+    const windowFuncs = ["ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE"]
+    if funcName notin windowFuncs:
+      return err[Expr](ERR_SQL, "Unsupported window function", funcName)
+    if funcName in ["ROW_NUMBER", "RANK", "DENSE_RANK"]:
+      if args.len > 0:
+        return err[Expr](ERR_SQL, funcName & " does not take arguments")
+    elif funcName in ["LAG", "LEAD"]:
+      if args.len < 1 or args.len > 3:
+        return err[Expr](ERR_SQL, funcName & " requires 1 to 3 arguments")
+    elif funcName in ["FIRST_VALUE", "LAST_VALUE"]:
+      if args.len != 1:
+        return err[Expr](ERR_SQL, funcName & " requires exactly 1 argument")
+    elif funcName == "NTH_VALUE":
+      if args.len != 2:
+        return err[Expr](ERR_SQL, "NTH_VALUE requires exactly 2 arguments")
 
     var partitions: seq[Expr] = @[]
     let partitionNode = nodeGet(overNode, "partitionClause")
@@ -436,12 +502,15 @@ proc parseFuncCall(node: JsonNode): Result[Expr] =
 
     return ok(Expr(
       kind: ekWindowRowNumber,
+      windowFunc: funcName,
+      windowArgs: args,
       windowPartitions: partitions,
       windowOrderExprs: orderExprs,
       windowOrderAsc: orderAsc
     ))
   let isStar = nodeHas(node, "agg_star") and node["agg_star"].getBool
-  ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar))
+  let isDistinct = nodeHas(node, "agg_distinct") and node["agg_distinct"].getBool
+  ok(Expr(kind: ekFunc, funcName: funcName, args: args, isStar: isStar, isDistinct: isDistinct))
 
 proc parseListItems(node: JsonNode): seq[JsonNode] =
   if node.kind == JArray:
@@ -713,6 +782,44 @@ proc parseNullTest(node: JsonNode): Result[Expr] =
     op = "IS NOT"
   ok(Expr(kind: ekBinary, op: op, left: argRes.value, right: Expr(kind: ekLiteral, value: SqlValue(kind: svNull))))
 
+proc parseSqlValueFunction(node: JsonNode): Result[Expr] =
+  let op = nodeStringOr(node, "op", "")
+  case op
+  of "SVFOP_CURRENT_TIMESTAMP":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_TIMESTAMP"))
+  of "SVFOP_CURRENT_DATE":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_DATE"))
+  of "SVFOP_CURRENT_TIME":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "CURRENT_TIME"))
+  of "SVFOP_NOW":
+    ok(Expr(kind: ekSqlValueFunction, sqlValueFunc: "NOW"))
+  else:
+    err[Expr](ERR_SQL, "Unsupported SQL value function", op)
+
+proc parseExtract(node: JsonNode): Result[Expr] =
+  let fieldNode = nodeGet(node, "field")
+  let fieldStr = nodeString(fieldNode).toUpperAscii()
+  let argNode = nodeGet(node, "arg")
+  let sourceRes = parseExprNode(argNode)
+  if not sourceRes.ok:
+    return err[Expr](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
+  ok(Expr(kind: ekExtract, extractField: fieldStr, extractSource: sourceRes.value))
+
+proc parseJsonArrayConstructor(node: JsonNode): Result[Expr] =
+  var args: seq[Expr] = @[]
+  let exprsNode = nodeGet(node, "exprs")
+  if exprsNode.kind == JArray:
+    for item in exprsNode:
+      # Each element is a JsonValueExpr with a raw_expr inside
+      var rawNode = item
+      if nodeHas(item, "JsonValueExpr"):
+        rawNode = nodeGet(item["JsonValueExpr"], "raw_expr")
+      let argRes = parseExprNode(rawNode)
+      if not argRes.ok:
+        return err[Expr](argRes.err.code, argRes.err.message, argRes.err.context)
+      args.add(argRes.value)
+  ok(Expr(kind: ekFunc, funcName: "JSON_ARRAY", args: args, isStar: false))
+
 proc parseExprNode(node: JsonNode): Result[Expr] =
   if node.kind == JObject:
     if nodeHas(node, "A_Const"):
@@ -737,6 +844,12 @@ proc parseExprNode(node: JsonNode): Result[Expr] =
       return parseTypeCast(node["TypeCast"])
     if nodeHas(node, "NullTest"):
       return parseNullTest(node["NullTest"])
+    if nodeHas(node, "SQLValueFunction"):
+      return parseSqlValueFunction(node["SQLValueFunction"])
+    if nodeHas(node, "Extract"):
+      return parseExtract(node["Extract"])
+    if nodeHas(node, "JsonArrayConstructor"):
+      return parseJsonArrayConstructor(node["JsonArrayConstructor"])
   err[Expr](ERR_SQL, "Unsupported expression node: " & $node)
 
 proc unwrapRangeVar(node: JsonNode): JsonNode =
@@ -776,7 +889,8 @@ proc parseRangeSubselect(node: JsonNode): Result[(Statement, string)] =
   ok((stmtRes.value, alias))
 
 proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string, joins: var seq[JoinClause],
-                   fromSubquery: var Statement, joinSubqueries: var seq[Statement]): Result[Void] =
+                   fromSubquery: var Statement, joinSubqueries: var seq[Statement],
+                   tvfFunc: var string, tvfArgs: var seq[Expr]): Result[Void] =
   if nodeHas(node, "RangeVar") or nodeHas(node, "relname"):
     let rvRes = parseRangeVar(node)
     if not rvRes.ok:
@@ -800,9 +914,42 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
       joins.add(JoinClause(joinType: jtInner, table: subRes.value[1], alias: subRes.value[1], onExpr: nil))
       joinSubqueries.add(subRes.value[0])
     return okVoid()
+  if nodeHas(node, "RangeFunction"):
+    let rf = node["RangeFunction"]
+    let funcs = nodeGet(rf, "functions")
+    if funcs.kind == JArray and funcs.len > 0:
+      let listNode = funcs[0]
+      let items = nodeGet(nodeGet(listNode, "List"), "items")
+      if items.kind == JArray and items.len > 0:
+        let fc = items[0]
+        if nodeHas(fc, "FuncCall"):
+          let funcCall = fc["FuncCall"]
+          let fnNames = nodeGet(funcCall, "funcname")
+          if fnNames.kind == JArray and fnNames.len > 0:
+            tvfFunc = nodeString(fnNames[^1]).toLowerAscii
+          let args = nodeGet(funcCall, "args")
+          if args.kind == JArray:
+            for arg in args:
+              let exprRes = parseExprNode(arg)
+              if not exprRes.ok:
+                return err[Void](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+              tvfArgs.add(exprRes.value)
+    let alias = nodeGet(rf, "alias")
+    if alias.kind == JObject:
+      let aliasName = nodeGet(alias, "aliasname").getStr
+      if aliasName.len > 0:
+        baseAlias = aliasName
+        baseTable = aliasName
+      else:
+        baseTable = tvfFunc
+        baseAlias = tvfFunc
+    else:
+      baseTable = tvfFunc
+      baseAlias = tvfFunc
+    return okVoid()
   if nodeHas(node, "JoinExpr"):
     let join = node["JoinExpr"]
-    let leftRes = parseFromItem(join["larg"], baseTable, baseAlias, joins, fromSubquery, joinSubqueries)
+    let leftRes = parseFromItem(join["larg"], baseTable, baseAlias, joins, fromSubquery, joinSubqueries, tvfFunc, tvfArgs)
     if not leftRes.ok:
       return err[Void](leftRes.err.code, leftRes.err.message, leftRes.err.context)
     var rightTable = ""
@@ -822,36 +969,46 @@ proc parseFromItem(node: JsonNode, baseTable: var string, baseAlias: var string,
           rightTable = rvRes.value[0]
           rightAlias = rvRes.value[1]
     let joinKindStr = if nodeHas(join, "jointype"): join["jointype"].getStr else: ""
-    let joinKind = if joinKindStr == "JOIN_LEFT": jtLeft else: jtInner
+    var joinKind: JoinType
+    case joinKindStr
+    of "JOIN_LEFT":
+      joinKind = jtLeft
+    of "JOIN_RIGHT":
+      joinKind = jtRight
+    of "JOIN_FULL":
+      joinKind = jtFull
+    else:
+      joinKind = jtInner
     var onExpr: Expr = nil
     if nodeHas(join, "quals"):
       let onRes = parseExprNode(join["quals"])
       if onRes.ok:
         onExpr = onRes.value
+    let isNatural = nodeHas(join, "isNatural") and join["isNatural"].kind == JBool and join["isNatural"].getBool
     if rightTable.len > 0:
-      joins.add(JoinClause(joinType: joinKind, table: rightTable, alias: rightAlias, onExpr: onExpr))
+      joins.add(JoinClause(joinType: joinKind, table: rightTable, alias: rightAlias, onExpr: onExpr, isNatural: isNatural))
       joinSubqueries.add(rightSubquery)
     return okVoid()
   err[Void](ERR_SQL, "Unsupported FROM item")
 
-proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq[Statement])] =
+proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq[Statement], seq[bool])] =
   var cteNames: seq[string] = @[]
   var cteColumns: seq[seq[string]] = @[]
   var cteQueries: seq[Statement] = @[]
+  var cteRecursiveFlags: seq[bool] = @[]
   if node.kind != JObject:
-    return ok((cteNames, cteColumns, cteQueries))
-  if nodeHas(node, "recursive") and node["recursive"].kind == JBool and node["recursive"].getBool:
-    return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "WITH RECURSIVE is not supported in 0.x")
+    return ok((cteNames, cteColumns, cteQueries, cteRecursiveFlags))
+  let isRecursive = nodeHas(node, "recursive") and node["recursive"].kind == JBool and node["recursive"].getBool
   let cteNodes = nodeGet(node, "ctes")
   if cteNodes.kind != JArray:
-    return ok((cteNames, cteColumns, cteQueries))
+    return ok((cteNames, cteColumns, cteQueries, cteRecursiveFlags))
   for entry in cteNodes:
     if not nodeHas(entry, "CommonTableExpr"):
       continue
     let cteNode = entry["CommonTableExpr"]
     let cteName = nodeGet(cteNode, "ctename").getStr
     if cteName.len == 0:
-      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE name is required")
+      return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](ERR_SQL, "CTE name is required")
 
     var columns: seq[string] = @[]
     let aliasCols = nodeGet(cteNode, "aliascolnames")
@@ -859,24 +1016,26 @@ proc parseWithClause(node: JsonNode): Result[(seq[string], seq[seq[string]], seq
       for colNode in aliasCols:
         let colName = nodeString(colNode)
         if colName.len == 0:
-          return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "Invalid CTE column name", cteName)
+          return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](ERR_SQL, "Invalid CTE column name", cteName)
         columns.add(colName)
 
     let queryRes = parseStatementNode(nodeGet(cteNode, "ctequery"))
     if not queryRes.ok:
-      return err[(seq[string], seq[seq[string]], seq[Statement])](queryRes.err.code, queryRes.err.message, queryRes.err.context)
+      return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](queryRes.err.code, queryRes.err.message, queryRes.err.context)
     if queryRes.value.kind != skSelect:
-      return err[(seq[string], seq[seq[string]], seq[Statement])](ERR_SQL, "CTE query must be SELECT", cteName)
+      return err[(seq[string], seq[seq[string]], seq[Statement], seq[bool])](ERR_SQL, "CTE query must be SELECT", cteName)
 
     cteNames.add(cteName)
     cteColumns.add(columns)
     cteQueries.add(queryRes.value)
-  ok((cteNames, cteColumns, cteQueries))
+    cteRecursiveFlags.add(isRecursive)
+  ok((cteNames, cteColumns, cteQueries, cteRecursiveFlags))
 
 proc parseSelectStmt(node: JsonNode): Result[Statement] =
   var cteNames: seq[string] = @[]
   var cteColumns: seq[seq[string]] = @[]
   var cteQueries: seq[Statement] = @[]
+  var cteRecursiveFlags: seq[bool] = @[]
   if nodeHas(node, "withClause"):
     let cteRes = parseWithClause(node["withClause"])
     if not cteRes.ok:
@@ -884,6 +1043,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     cteNames = cteRes.value[0]
     cteColumns = cteRes.value[1]
     cteQueries = cteRes.value[2]
+    cteRecursiveFlags = cteRes.value[3]
 
   let setOp = nodeStringOr(node, "op", "SETOP_NONE")
   if setOp != "SETOP_NONE":
@@ -893,13 +1053,9 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     of "SETOP_UNION":
       parsedSetOpKind = (if isAll: sokUnionAll else: sokUnion)
     of "SETOP_INTERSECT":
-      if isAll:
-        return err[Statement](ERR_SQL, "INTERSECT ALL is not supported in 0.x")
-      parsedSetOpKind = sokIntersect
+      parsedSetOpKind = (if isAll: sokIntersectAll else: sokIntersect)
     of "SETOP_EXCEPT":
-      if isAll:
-        return err[Statement](ERR_SQL, "EXCEPT ALL is not supported in 0.x")
-      parsedSetOpKind = sokExcept
+      parsedSetOpKind = (if isAll: sokExceptAll else: sokExcept)
     else:
       return err[Statement](ERR_SQL, "Set operation not supported in 0.x", setOp)
     if nodeHas(node, "sortClause") or nodeHas(node, "limitCount") or nodeHas(node, "limitOffset"):
@@ -915,6 +1071,7 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       cteNames: cteNames,
       cteColumns: cteColumns,
       cteQueries: cteQueries,
+      cteRecursive: cteRecursiveFlags,
       setOpKind: parsedSetOpKind,
       setOpLeft: leftRes.value,
       setOpRight: rightRes.value,
@@ -954,12 +1111,14 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
   var fromTable = ""
   var fromAlias = ""
   var fromSubquery: Statement = nil
+  var fromTvfFunc = ""
+  var fromTvfArgs: seq[Expr] = @[]
   var joins: seq[JoinClause] = @[]
   var joinSubqueries: seq[Statement] = @[]
   let fromClause = nodeGet(node, "fromClause")
   if fromClause.kind == JArray and fromClause.len > 0:
     for item in fromClause:
-      let res = parseFromItem(item, fromTable, fromAlias, joins, fromSubquery, joinSubqueries)
+      let res = parseFromItem(item, fromTable, fromAlias, joins, fromSubquery, joinSubqueries, fromTvfFunc, fromTvfArgs)
       if not res.ok:
         return err[Statement](res.err.code, res.err.message, res.err.context)
   var whereExpr: Expr = nil
@@ -1017,11 +1176,26 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
       offsetParam = offsetRes.value.index
     else:
       return err[Statement](ERR_SQL, "OFFSET must be an integer literal or $N parameter")
+  # Parse DISTINCT ON (expr, ...) — note: regular SELECT DISTINCT is a separate clause
+  var distinctOnExprs: seq[Expr] = @[]
+  let distinctClause = nodeGet(node, "distinctClause")
+  if distinctClause.kind == JArray and distinctClause.len > 0:
+    for dnode in distinctClause:
+      # libpg_query: DISTINCT ON uses expression nodes directly (not SortBy wrappers)
+      if nodeHas(dnode, "SortBy"):
+        let exprRes = parseExprNode(dnode["SortBy"]["node"])
+        if exprRes.ok:
+          distinctOnExprs.add(exprRes.value)
+      else:
+        let exprRes = parseExprNode(dnode)
+        if exprRes.ok:
+          distinctOnExprs.add(exprRes.value)
   ok(Statement(
     kind: skSelect,
     cteNames: cteNames,
     cteColumns: cteColumns,
     cteQueries: cteQueries,
+    cteRecursive: cteRecursiveFlags,
     setOpKind: sokNone,
     setOpLeft: nil,
     setOpRight: nil,
@@ -1029,6 +1203,8 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     fromTable: fromTable,
     fromAlias: fromAlias,
     fromSubquery: fromSubquery,
+    fromTvfFunc: fromTvfFunc,
+    fromTvfArgs: fromTvfArgs,
     joins: joins,
     joinSubqueries: joinSubqueries,
     whereExpr: whereExpr,
@@ -1038,7 +1214,8 @@ proc parseSelectStmt(node: JsonNode): Result[Statement] =
     limit: limit,
     limitParam: limitParam,
     offset: offset,
-    offsetParam: offsetParam
+    offsetParam: offsetParam,
+    distinctOnExprs: distinctOnExprs
   ))
 
 proc parseInsertStmt(node: JsonNode): Result[Statement] =
@@ -1292,7 +1469,13 @@ proc exprToCanonicalSql*(expr: Expr): string =
       parts.add(exprToCanonicalSql(item))
     "(" & exprToCanonicalSql(expr.inExpr) & " IN (" & parts.join(", ") & "))"
   of ekWindowRowNumber:
-    var sqlText = "ROW_NUMBER() OVER ("
+    var sqlText = expr.windowFunc & "("
+    if expr.windowFunc in ["LAG", "LEAD"]:
+      var argSql: seq[string] = @[]
+      for a in expr.windowArgs:
+        argSql.add(exprToCanonicalSql(a))
+      sqlText.add(argSql.join(", "))
+    sqlText.add(") OVER (")
     if expr.windowPartitions.len > 0:
       var partSql: seq[string] = @[]
       for p in expr.windowPartitions:
@@ -1308,6 +1491,10 @@ proc exprToCanonicalSql*(expr: Expr): string =
       sqlText.add("ORDER BY " & orderSql.join(", "))
     sqlText.add(")")
     sqlText
+  of ekSqlValueFunction:
+    expr.sqlValueFunc
+  of ekExtract:
+    "EXTRACT(" & expr.extractField & " FROM " & exprToCanonicalSql(expr.extractSource) & ")"
 
 proc parseStandaloneExpr*(exprSql: string): Result[Expr] =
   let sqlText = "SELECT " & exprSql
@@ -1349,7 +1536,9 @@ proc selectToCanonicalSql(stmt: Statement): string =
         of sokUnionAll: " UNION ALL "
         of sokUnion: " UNION "
         of sokIntersect: " INTERSECT "
+        of sokIntersectAll: " INTERSECT ALL "
         of sokExcept: " EXCEPT "
+        of sokExceptAll: " EXCEPT ALL "
         else: " UNION ALL "
       parts.add(selectToCanonicalSql(stmt.setOpLeft) & opText & selectToCanonicalSql(stmt.setOpRight))
       return parts.join(" ")
@@ -1447,8 +1636,10 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
   let tableRes = parseRangeVar(rel)
   if not tableRes.ok:
     return err[Statement](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+  let isTemp = nodeGet(rel, "relpersistence").getStr == "t"
   var columns: seq[ColumnDef] = @[]
   var checks: seq[CheckConstraintDef] = @[]
+  var foreignKeys: seq[ForeignKeyConstraintDef] = @[]
   var tableConstraints: seq[JsonNode] = @[]
   let elts = nodeGet(node, "tableElts")
   if elts.kind == JArray:
@@ -1529,6 +1720,16 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
                   name: nodeGet(constraint, "conname").getStr,
                   expr: exprRes.value
                 ))
+              of "CONSTR_DEFAULT":
+                let rawExpr = nodeGet(constraint, "raw_expr")
+                let exprRes = parseExprNode(rawExpr)
+                if exprRes.ok:
+                  def.defaultExpr = exprRes.value
+              of "CONSTR_GENERATED":
+                let rawExpr = nodeGet(constraint, "raw_expr")
+                let exprRes = parseExprNode(rawExpr)
+                if exprRes.ok:
+                  def.generatedExpr = exprRes.value
               else:
                 discard
         columns.add(def)
@@ -1554,7 +1755,40 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         if not found:
           return err[Statement](ERR_SQL, "Constraint refers to unknown column", colName)
     elif contype == "CONSTR_FOREIGN":
-      return err[Statement](ERR_SQL, "Table-level foreign keys not supported")
+      # Parse table-level foreign key constraint
+      var fkCols: seq[string] = @[]
+      let fkColsNode = nodeGet(constraint, "fk_attrs")
+      if fkColsNode.kind == JArray:
+        for colNode in fkColsNode:
+          fkCols.add(nodeString(colNode))
+      var refCols: seq[string] = @[]
+      let refColsNode = nodeGet(constraint, "pk_attrs")
+      if refColsNode.kind == JArray:
+        for colNode in refColsNode:
+          refCols.add(nodeString(colNode))
+      var refTableName = ""
+      if nodeHas(constraint, "pktable"):
+        let pkRes = parseRangeVar(constraint["pktable"])
+        if pkRes.ok:
+          refTableName = pkRes.value[0]
+      let delActionRes = parseFkActionCode(nodeGet(constraint, "fk_del_action").getStr)
+      if not delActionRes.ok:
+        return err[Statement](delActionRes.err.code, delActionRes.err.message, delActionRes.err.context)
+      let updActionRes = parseFkActionCode(nodeGet(constraint, "fk_upd_action").getStr)
+      if not updActionRes.ok:
+        return err[Statement](updActionRes.err.code, updActionRes.err.message, updActionRes.err.context)
+      if fkCols.len == 0 or refTableName.len == 0 or refCols.len == 0:
+        return err[Statement](ERR_SQL, "Invalid table-level foreign key constraint")
+      if fkCols.len != refCols.len:
+        return err[Statement](ERR_SQL, "Foreign key column count must match referenced column count")
+      foreignKeys.add(ForeignKeyConstraintDef(
+        name: nodeGet(constraint, "conname").getStr,
+        columns: fkCols,
+        refTable: refTableName,
+        refColumns: refCols,
+        refOnDelete: delActionRes.value,
+        refOnUpdate: updActionRes.value
+      ))
     elif contype == "CONSTR_CHECK":
       let rawExpr = nodeGet(constraint, "raw_expr")
       let exprRes = parseExprNode(rawExpr)
@@ -1564,7 +1798,7 @@ proc parseCreateStmt(node: JsonNode): Result[Statement] =
         name: nodeGet(constraint, "conname").getStr,
         expr: exprRes.value
       ))
-  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks))
+  ok(Statement(kind: skCreateTable, createTableName: tableRes.value[0], columns: columns, createChecks: checks, foreignKeys: foreignKeys, createTableIsTemp: isTemp))
 
 proc parseIndexStmt(node: JsonNode): Result[Statement] =
   let idxName = nodeGet(node, "idxname").getStr
@@ -1617,8 +1851,7 @@ proc parseViewStmt(node: JsonNode): Result[Statement] =
   let viewName = viewRes.value[0]
 
   let persistence = nodeStringOr(nodeGet(node, "view"), "relpersistence", "p")
-  if persistence != "p":
-    return err[Statement](ERR_SQL, "TEMP/TEMPORARY VIEW not supported")
+  let isTemp = persistence == "t"
 
   let checkOption = nodeStringOr(node, "withCheckOption", "NO_CHECK_OPTION")
   if checkOption != "NO_CHECK_OPTION":
@@ -1647,7 +1880,8 @@ proc parseViewStmt(node: JsonNode): Result[Statement] =
     createViewOrReplace: replace,
     createViewColumns: aliases,
     createViewSqlText: selectToCanonicalSql(queryRes.value),
-    createViewQuery: queryRes.value
+    createViewQuery: queryRes.value,
+    createViewIsTemp: isTemp
   ))
 
 proc parseDropStmt(node: JsonNode): Result[Statement] =
@@ -1776,9 +2010,21 @@ proc parseTransactionStmt(node: JsonNode): Result[Statement] =
   if kindStr == "TRANS_STMT_COMMIT":
     kind = skCommit
   elif kindStr == "TRANS_STMT_ROLLBACK":
+    let spName = nodeGet(node, "savepoint_name").getStr
+    if spName.len > 0:
+      return ok(Statement(kind: skRollbackToSavepoint, rollbackToSavepointName: spName))
     kind = skRollback
+  elif kindStr == "TRANS_STMT_ROLLBACK_TO":
+    let spName = nodeGet(node, "savepoint_name").getStr
+    return ok(Statement(kind: skRollbackToSavepoint, rollbackToSavepointName: spName))
   elif kindStr == "TRANS_STMT_START" or kindStr == "TRANS_STMT_BEGIN":
     kind = skBegin
+  elif kindStr == "TRANS_STMT_SAVEPOINT":
+    let name = nodeGet(node, "savepoint_name").getStr
+    return ok(Statement(kind: skSavepoint, savepointName: name))
+  elif kindStr == "TRANS_STMT_RELEASE":
+    let name = nodeGet(node, "savepoint_name").getStr
+    return ok(Statement(kind: skReleaseSavepoint, releaseSavepointName: name))
   else:
     return err[Statement](ERR_SQL, "Unsupported transaction statement", kindStr)
   ok(Statement(kind: kind))
@@ -1894,9 +2140,31 @@ proc parseExplainStmt(node: JsonNode): Result[Statement] =
   
   ok(Statement(kind: skExplain, explainInner: innerRes.value, explainAnalyze: analyze))
 
+proc parseVacuumStmt(node: JsonNode): Result[Statement] =
+  ## pg_query emits ANALYZE tableName as a VacuumStmt with is_vacuumcmd=false.
+  ## Bare ANALYZE (no table) also maps here with an empty rels list.
+  let isVacuum = nodeHas(node, "is_vacuumcmd") and node["is_vacuumcmd"].getBool(false)
+  if isVacuum:
+    return err[Statement](ERR_SQL, "VACUUM not supported")
+  # Extract optional table name from rels list.
+  var tableName = ""
+  if nodeHas(node, "rels") and node["rels"].kind == JArray and node["rels"].len > 0:
+    let rel = node["rels"][0]
+    # libpg_query wraps the relation in a VacuumRelation node.
+    var relNode = rel
+    if nodeHas(rel, "VacuumRelation"):
+      relNode = rel["VacuumRelation"]
+    if nodeHas(relNode, "relation"):
+      let rn = relNode["relation"]
+      let inner = if nodeHas(rn, "RangeVar"): rn["RangeVar"] else: rn
+      tableName = nodeString(nodeGet(inner, "relname"))
+  ok(Statement(kind: skAnalyze, analyzeTable: tableName))
+
 proc parseStatementNode(node: JsonNode): Result[Statement] =
   if nodeHas(node, "ExplainStmt"):
     return parseExplainStmt(node["ExplainStmt"])
+  if nodeHas(node, "VacuumStmt"):
+    return parseVacuumStmt(node["VacuumStmt"])
   if nodeHas(node, "SelectStmt"):
     return parseSelectStmt(node["SelectStmt"])
   if nodeHas(node, "InsertStmt"):
@@ -2074,6 +2342,7 @@ proc parseSql*(sql: string): Result[SqlAst] =
       cteNames: @[],
       cteColumns: @[],
       cteQueries: @[],
+      cteRecursive: @[],
       setOpKind: sokNone,
       setOpLeft: nil,
       setOpRight: nil,
@@ -2190,3 +2459,12 @@ proc parseSql*(sql: string): Result[SqlAst] =
         return err[SqlAst](stmtRes.err.code, stmtRes.err.message, stmtRes.err.context)
       statements.add(stmtRes.value)
   ok(SqlAst(statements: statements))
+
+proc parseSqlExpr*(sql: string): Result[Expr] =
+  ## Parse a standalone SQL expression by wrapping it in a SELECT statement.
+  let wrapRes = parseSql("SELECT " & sql)
+  if not wrapRes.ok:
+    return err[Expr](wrapRes.err.code, wrapRes.err.message, wrapRes.err.context)
+  if wrapRes.value.statements.len > 0 and wrapRes.value.statements[0].selectItems.len > 0:
+    return ok(wrapRes.value.statements[0].selectItems[0].expr)
+  err[Expr](ERR_SQL, "Failed to parse expression", sql)

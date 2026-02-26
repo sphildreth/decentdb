@@ -246,6 +246,15 @@ decentdb exec --db=dev.ddb --sql="..." --cacheMb=32
 PRAGMA wal_sync_mode = NORMAL;
 ```
 
+### In-Memory (Caching/Testing)
+
+```bash
+# Ephemeral in-memory database — no disk I/O
+decentdb exec --db=:memory: --sql="CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT)"
+```
+
+In-memory databases ignore `wal_sync_mode` (no fsync needed) and use the default page cache. Use `save-as` to persist a snapshot to disk when needed.
+
 ### Production Server
 
 ```bash

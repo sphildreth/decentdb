@@ -1,0 +1,71 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'org.jkiss.dbeaver.ext'
+version = '1.5.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Embed the DecentDB JDBC driver + its runtime deps into this bundle.
+    implementation project(':driver')
+
+    // DBeaver OSGi bundles – compile-only (provided at runtime by the DBeaver platform).
+    def pluginDir = new File('/usr/lib/dbeaver/plugins')
+    if (pluginDir.exists()) {
+        def jars = pluginDir.listFiles().findAll { f ->
+            f.name.endsWith('.jar') && (
+                f.name.startsWith('org.jkiss.dbeaver.model_') ||
+                f.name.startsWith('org.jkiss.dbeaver.model.jdbc_') ||
+                f.name.startsWith('org.jkiss.dbeaver.model.sql_') ||
+                f.name.startsWith('org.jkiss.dbeaver.ext.generic_') ||
+                f.name.startsWith('org.jkiss.utils_')
+            )
+        }
+        compileOnly files(jars)
+    }
+}
+
+jar {
+    dependsOn ':driver:jar'
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    manifest {
+        attributes(
+            'Bundle-SymbolicName': 'org.jkiss.dbeaver.ext.decentdb;singleton:=true',
+            'Bundle-Version': version,
+            'Bundle-Name': 'DecentDB DBeaver Extension',
+            'Bundle-Vendor': 'DecentDB Contributors',
+            'Require-Bundle': 'org.jkiss.dbeaver.model,org.jkiss.dbeaver.model.jdbc,org.jkiss.dbeaver.ext.generic',
+            'Bundle-ManifestVersion': '2',
+            'Bundle-RequiredExecutionEnvironment': 'JavaSE-21',
+            'Export-Package': 'org.jkiss.dbeaver.ext.decentdb.model',
+            'Bundle-ClassPath': '.',
+            'Bundle-ActivationPolicy': 'lazy',
+            'Import-Package': 'org.jkiss.code'
+        )
+    }
+
+    // DBeaver expects plugin.xml at the bundle root.
+    from('plugin.xml')
+
+    // Bundle UI icons referenced by plugin.xml.
+    from('icons') {
+        into 'icons'
+    }
+
+    // Produce a single drop-in bundle jar by unpacking runtime classpath jars.
+    // This embeds the JDBC driver, org.json, and native resources.
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+}

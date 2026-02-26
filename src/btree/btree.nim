@@ -1500,9 +1500,9 @@ proc tryAppendToCachedRightmostLeaf(tree: BTree, key: uint64, value: openArray[b
     if not entry.dirty:
       entry.data = cloneString(entry.data)
       entry.dirty = true
-      entry.aux = nil
       tree.pager.txnDirtyCount.inc
       tree.pager.txnDirtyPages.add(entry.id)
+    entry.aux = nil
     tree.pager.txnLastDirtyId = entry.id
 
     when defined(btree_trace):

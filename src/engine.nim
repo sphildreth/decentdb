@@ -12,6 +12,7 @@ import std/monotimes
 import ./errors
 import ./vfs/types
 import ./vfs/os_vfs
+import ./vfs/mem_vfs
 import ./pager/db_header
 import ./pager/pager
 import ./catalog/catalog
@@ -22,11 +23,25 @@ import ./planner/explain
 import ./exec/exec
 import ./record/record
 import ./storage/storage
+import ./utils/datetime
 import ./btree/btree
 import ./wal/wal
 
+when not defined(windows):
+  import posix
+
 when defined(bench_breakdown):
   import ./utils/bench_breakdown
+
+type TempTable* = object
+  meta*: TableMeta
+  rows*: seq[seq[Value]]
+  nextRowId*: uint64
+
+type TempView* = object
+  name*: string
+  sqlText*: string
+  columns*: seq[string]
 
 type Db* = ref object
   path*: string
@@ -44,6 +59,9 @@ type Db* = ref object
   cachePages*: int                   # Cache size for diagnostics
   sqlCache*: Table[string, tuple[schemaCookie: uint32, statements: seq[Statement], plans: seq[Plan]]]
   sqlCacheOrder*: seq[string]
+  tempTables*: Table[string, TempTable]
+  tempViews*: Table[string, TempView]
+  savepointStack*: seq[tuple[name: string, catalogSnapshot: seq[(string, TableMeta)], viewSnapshot: seq[(string, ViewMeta)], dirtyPageSnapshot: seq[(PageId, string)]]]
 
 type UpdateWriteProfile* = object
   hasUpdateTriggers*: bool
@@ -102,25 +120,29 @@ proc defaultBulkLoadOptions*(): BulkLoadOptions =
 proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
   ## Open a database file with configurable cache size
   ## cachePages: Number of 4KB pages to cache (default 1024 = 4MB)
-  let vfs = newOsVfs()
+  let vfs: Vfs = if cmpIgnoreCase(path, ":memory:") == 0: newMemVfs() else: newOsVfs()
   let walPath = path & "-wal"
   let res = vfs.open(path, fmReadWrite, true)
   if not res.ok:
     return err[Db](res.err.code, res.err.message, res.err.context)
   let file = res.value
-  let info = getFileInfo(path)
+  let fileSizeRes = vfs.getFileSize(path)
+  if not fileSizeRes.ok:
+    discard vfs.close(file)
+    return err[Db](fileSizeRes.err.code, fileSizeRes.err.message, fileSizeRes.err.context)
+  let initialSize = fileSizeRes.value
   var probe = newSeq[byte](HeaderSize)
   let probeRes = vfs.read(file, 0, probe)
   if not probeRes.ok:
     discard vfs.close(file)
     return err[Db](probeRes.err.code, probeRes.err.message, probeRes.err.context)
   if probeRes.value == 0:
-    if info.size > 0:
+    if initialSize > 0:
       discard vfs.close(file)
       return err[Db](ERR_CORRUPTION, "Header unreadable", "page_id=1")
     # Fresh DB: remove any stale WAL from prior runs
-    if fileExists(walPath):
-      removeFile(walPath)
+    if vfs.fileExists(walPath):
+      discard vfs.removeFile(walPath)
     let header = DbHeader(
       formatVersion: FormatVersion,
       pageSize: DefaultPageSize,
@@ -253,6 +275,14 @@ proc openDb*(path: string, cachePages: int = 1024): Result[Db] =
       pager.header = hRes.value
     else:
       stderr.writeLine("Warning: Failed to decode recovered header: " & hRes.err.message)
+  
+  # Reconstruct freelist header from chain scan (ADR-0057).
+  # After recovery, the header's freelistCount may be stale if a crash occurred
+  # between a freelist mutation and checkpoint.
+  let freelistRes = reconstructFreelistHeader(pager)
+  if not freelistRes.ok:
+    stderr.writeLine("Warning: Failed to reconstruct freelist header: " & freelistRes.err.message)
+
   let txn = beginRead(wal)
   pager.overlaySnapshot = txn.snapshot
   let catalogRes = initCatalog(pager)
@@ -412,6 +442,19 @@ proc typeCheckValue(col: Column, value: Value): Result[Value] =
        if value.bytes.len == 16: return ok(value)
        return err[Value](ERR_CONSTRAINT, "UUID must be 16 bytes")
     return err[Value](ERR_SQL, "Type mismatch: expected UUID")
+  of ctDateTime:
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkDateTime: return ok(value)
+    if value.kind == vkInt64:
+      return ok(Value(kind: vkDateTime, int64Val: value.int64Val))
+    if value.kind in {vkText, vkBlob}:
+      let s = valueToString(value).strip()
+      if s.toLowerAscii() == "now":
+        return ok(Value(kind: vkDateTime, int64Val: datetimeToMicros(now().utc())))
+      let res = parseDatetimeMicros(s)
+      if not res.ok: return err[Value](ERR_SQL, "Type mismatch: invalid datetime string", s)
+      return ok(Value(kind: vkDateTime, int64Val: res.value))
+    return err[Value](ERR_SQL, "Type mismatch: expected TIMESTAMP")
 
 proc typeCheckFast(col: Column, value: Value): bool {.inline.} =
   ## Returns true if value trivially matches the column type (no conversion needed).
@@ -425,6 +468,7 @@ proc typeCheckFast(col: Column, value: Value): bool {.inline.} =
   of ctBlob: value.kind == vkBlob
   of ctDecimal: value.kind == vkDecimal and value.decimalScale == col.decScale
   of ctUuid: value.kind == vkBlob and value.bytes.len == 16
+  of ctDateTime: value.kind == vkDateTime
 
 proc valuesEqual(a: Value, b: Value): bool =
   if a.kind == vkNull and b.kind == vkNull:
@@ -1565,6 +1609,35 @@ proc execInsertStatement(db: Db, bound: Statement, params: seq[Value], wantRow: 
     valuesPtr = addr gInsertValues
   template values: untyped = valuesPtr[]
 
+  # Apply DEFAULT values for NULL columns that have a default expression
+  for i, col in table.columns:
+    if i < values.len and values[i].kind == vkNull and col.defaultExpr.len > 0:
+      let exprRes = parseSqlExpr(col.defaultExpr)
+      if exprRes.ok:
+        let valRes = evalExpr(Row(), exprRes.value, @[])
+        if valRes.ok:
+          values[i] = valueFromSql(valRes.value)
+
+  # Evaluate GENERATED ALWAYS AS columns
+  block:
+    var hasGenerated = false
+    for col in table.columns:
+      if col.generatedExpr.len > 0:
+        hasGenerated = true
+        break
+    if hasGenerated:
+      var rowCols: seq[string] = @[]
+      for col in table.columns:
+        rowCols.add(table.name & "." & col.name)
+      let row = makeRow(rowCols, values)
+      for i, col in table.columns:
+        if col.generatedExpr.len > 0 and i < values.len:
+          let exprRes = parseStandaloneExpr(col.generatedExpr)
+          if exprRes.ok:
+            let valRes = evalExpr(row, exprRes.value, @[])
+            if valRes.ok:
+              values[i] = valueFromSql(valRes.value)
+
   when defined(bench_breakdown):
     let t1 = getMonoTime()
     for i, col in table.columns:
@@ -2042,6 +2115,94 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]]
 # Forward declaration
 proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: Plan = nil, updateProfile: UpdateWriteProfile = UpdateWriteProfile()): Result[int64]
 
+const MaxRecursiveCteIterations = 1000
+
+proc materializeRecursiveCtes(
+  pager: Pager,
+  catalog: Catalog,
+  bound: Statement,
+  params: seq[Value]
+): Result[Table[string, seq[seq[(string, Value)]]]] =
+  ## Execute any recursive CTEs on the bound statement and return
+  ## materialized row data keyed by lowercased CTE name.
+  var cteData = initTable[string, seq[seq[(string, Value)]]]()
+  for i, isRec in bound.cteRecursive:
+    if not isRec:
+      continue
+    let cteName = bound.cteNames[i]
+    let cteColumns = if i < bound.cteColumns.len: bound.cteColumns[i] else: @[]
+    let cteQuery = bound.cteQueries[i]
+    if cteQuery == nil or cteQuery.setOpKind != sokUnionAll:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        ERR_SQL, "WITH RECURSIVE requires UNION ALL", cteName)
+    let anchor = cteQuery.setOpLeft
+    let recursive = cteQuery.setOpRight
+    if anchor == nil or recursive == nil:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        ERR_SQL, "WITH RECURSIVE requires anchor and recursive terms", cteName)
+
+    # Execute anchor term.
+    let anchorPlan = plan(catalog, anchor, cteData)
+    if not anchorPlan.ok:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        anchorPlan.err.code, anchorPlan.err.message, anchorPlan.err.context)
+    let anchorRes = execPlan(pager, catalog, anchorPlan.value, params)
+    if not anchorRes.ok:
+      return err[Table[string, seq[seq[(string, Value)]]]](
+        anchorRes.err.code, anchorRes.err.message, anchorRes.err.context)
+
+    # Convert anchor rows into (colName, value) pairs.
+    var allRows: seq[seq[(string, Value)]] = @[]
+    for row in anchorRes.value:
+      var rowData: seq[(string, Value)] = @[]
+      for ci, col in row.columns:
+        # Use CTE-declared column names if provided, else strip prefix.
+        let baseName =
+          if ci < cteColumns.len: cteColumns[ci]
+          else:
+            let dotIdx = col.find('.')
+            if dotIdx >= 0: col[dotIdx + 1 .. ^1] else: col
+        rowData.add((baseName, row.values[ci]))
+      allRows.add(rowData)
+
+    # Iterative fixpoint: execute recursive term until no new rows.
+    var workingRows = allRows
+    var iteration = 0
+    while workingRows.len > 0 and iteration < MaxRecursiveCteIterations:
+      iteration.inc
+      # Make current working rows available under the CTE name.
+      let cteKey = cteName.toLowerAscii()
+      cteData[cteKey] = workingRows
+
+      let recPlan = plan(catalog, recursive, cteData)
+      if not recPlan.ok:
+        return err[Table[string, seq[seq[(string, Value)]]]](
+          recPlan.err.code, recPlan.err.message, recPlan.err.context)
+      let recRes = execPlan(pager, catalog, recPlan.value, params)
+      if not recRes.ok:
+        return err[Table[string, seq[seq[(string, Value)]]]](
+          recRes.err.code, recRes.err.message, recRes.err.context)
+
+      var newRows: seq[seq[(string, Value)]] = @[]
+      for row in recRes.value:
+        var rowData: seq[(string, Value)] = @[]
+        for ci, col in row.columns:
+          let baseName =
+            if ci < cteColumns.len: cteColumns[ci]
+            else:
+              let dotIdx = col.find('.')
+              if dotIdx >= 0: col[dotIdx + 1 .. ^1] else: col
+          rowData.add((baseName, row.values[ci]))
+        newRows.add(rowData)
+
+      for r in newRows:
+        allRows.add(r)
+      workingRows = newRows
+
+    # Store the complete materialized CTE under its name.
+    cteData[cteName.toLowerAscii()] = allRows
+  ok(cteData)
+
 const MaxTriggerExecutionDepth = 16
 var gTriggerExecutionDepth {.threadvar.}: int
 
@@ -2153,6 +2314,41 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
     of skRollback:
       let res = rollbackTransaction(db)
       if not res.ok: return err[seq[string]](res.err.code, res.err.message, res.err.context)
+    of skSavepoint:
+      var snap: seq[(string, TableMeta)] = @[]
+      for k, v in db.catalog.tables:
+        snap.add((k, v))
+      var viewSnap: seq[(string, ViewMeta)] = @[]
+      for k, v in db.catalog.views:
+        viewSnap.add((k, v))
+      db.savepointStack.add((name: bound.savepointName, catalogSnapshot: snap, viewSnapshot: viewSnap, dirtyPageSnapshot: snapshotDirtyPages(db.pager)))
+    of skReleaseSavepoint:
+      var found = false
+      for j in countdown(db.savepointStack.high, 0):
+        if db.savepointStack[j].name.toLowerAscii() == bound.releaseSavepointName.toLowerAscii():
+          db.savepointStack.delete(j)
+          found = true
+          break
+      if not found:
+        return err[seq[string]](ERR_SQL, "SAVEPOINT not found", bound.releaseSavepointName)
+    of skRollbackToSavepoint:
+      var found = false
+      for j in countdown(db.savepointStack.high, 0):
+        if db.savepointStack[j].name.toLowerAscii() == bound.rollbackToSavepointName.toLowerAscii():
+          let snap = db.savepointStack[j]
+          db.catalog.tables.clear()
+          for entry in snap.catalogSnapshot:
+            db.catalog.tables[entry[0]] = entry[1]
+          db.catalog.views.clear()
+          for entry in snap.viewSnapshot:
+            db.catalog.views[entry[0]] = entry[1]
+          rollbackToSnapshot(db.pager, snap.dirtyPageSnapshot)
+          # Remove savepoints created after this one
+          db.savepointStack.setLen(j + 1)
+          found = true
+          break
+      if not found:
+        return err[seq[string]](ERR_SQL, "SAVEPOINT not found", bound.rollbackToSavepointName)
     of skExplain:
       if bound.explainAnalyze:
         let t0 = getMonoTime()
@@ -2225,6 +2421,31 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
               if not checked.ok:
                 return err[seq[string]](checked.err.code, checked.err.message, checked.err.context)
               vals[idx] = checked.value
+          # Apply defaults for omitted columns
+          for di, dcol in table.columns:
+            if vals[di].kind == vkNull and dcol.defaultExpr.len > 0:
+              let dExprRes = parseSqlExpr(dcol.defaultExpr)
+              if dExprRes.ok:
+                let dValRes = evalExpr(Row(), dExprRes.value, @[])
+                if dValRes.ok:
+                  vals[di] = valueFromSql(dValRes.value)
+          # Evaluate generated columns
+          block:
+            var hasGen = false
+            for gcol in table.columns:
+              if gcol.generatedExpr.len > 0: hasGen = true; break
+            if hasGen:
+              var genCols: seq[string] = @[]
+              for gcol in table.columns:
+                genCols.add(table.name & "." & gcol.name)
+              let genRow = makeRow(genCols, vals)
+              for gi, gcol in table.columns:
+                if gcol.generatedExpr.len > 0:
+                  let genExprRes = parseStandaloneExpr(gcol.generatedExpr)
+                  if genExprRes.ok:
+                    let genValRes = evalExpr(genRow, genExprRes.value, @[])
+                    if genValRes.ok:
+                      vals[gi] = valueFromSql(genValRes.value)
           let insRes = insertRow(db.pager, db.catalog, bound.insertTable, vals)
           if not insRes.ok:
             return err[seq[string]](insRes.err.code, insRes.err.message, insRes.err.context)
@@ -2286,6 +2507,9 @@ proc execPrepared*(prepared: Prepared, params: seq[Value]): Result[seq[string]] 
     of skCreateTable, skDropTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skAlterTable:
        # DDL invalidates prepared statements anyway
        return execSql(db, prepared.sql, params)
+    of skAnalyze:
+       # ANALYZE is never cached as a prepared statement; fall back to execSql.
+       return execSql(db, prepared.sql, params)
 
   ok(output)
 
@@ -2338,10 +2562,23 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       boundStatements.add(bindRes.value)
     for bound in boundStatements:
       if bound.kind == skSelect:
-        let planRes = plan(db.catalog, bound)
-        if not planRes.ok:
-          return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
-        cachedPlans.add(planRes.value)
+        # Materialize any recursive CTEs before planning.
+        var hasRecCte = false
+        for r in bound.cteRecursive:
+          if r: hasRecCte = true; break
+        if hasRecCte:
+          let cteRes = materializeRecursiveCtes(db.pager, db.catalog, bound, params)
+          if not cteRes.ok:
+            return err[seq[string]](cteRes.err.code, cteRes.err.message, cteRes.err.context)
+          let planRes = plan(db.catalog, bound, cteRes.value)
+          if not planRes.ok:
+            return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+          cachedPlans.add(planRes.value)
+        else:
+          let planRes = plan(db.catalog, bound)
+          if not planRes.ok:
+            return err[seq[string]](planRes.err.code, planRes.err.message, planRes.err.context)
+          cachedPlans.add(planRes.value)
       elif bound.kind == skExplain:
         # For EXPLAIN, we plan the inner statement if it is a SELECT.
         # If it's not a SELECT, we'll error at execution time, so we store nil here.
@@ -2354,7 +2591,14 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           cachedPlans.add(nil)
       else:
         cachedPlans.add(nil)
-    rememberSqlCache(sqlText, boundStatements, cachedPlans)
+    # Skip caching for recursive CTE queries (materialized data is baked into plan).
+    var hasAnyCteRecursive = false
+    for bound in boundStatements:
+      if bound.kind == skSelect:
+        for r in bound.cteRecursive:
+          if r: hasAnyCteRecursive = true; break
+    if not hasAnyCteRecursive:
+      rememberSqlCache(sqlText, boundStatements, cachedPlans)
     let t1 = getMonoTime()
     if sqlText.contains("count(*)"):
       stderr.writeLine("Plan: " & $((t1 - t0).inNanoseconds.float / 1000.0) & "us")
@@ -2431,7 +2675,24 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         stderr.writeLine("Exec(NoWAL): " & $((t3 - t2).inNanoseconds.float / 1000.0) & "us")
       if not rowsRes.ok:
         return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-      for row in rowsRes.value:
+      var resultRows = rowsRes.value
+      # Apply DISTINCT ON filtering
+      if bound.distinctOnExprs.len > 0:
+        var seen = initHashSet[seq[Value]]()
+        var filtered: seq[Row] = @[]
+        for row in resultRows:
+          var key: seq[Value] = @[]
+          for expr in bound.distinctOnExprs:
+            let valRes = evalExpr(row, expr, params)
+            if valRes.ok:
+              key.add(valRes.value)
+            else:
+              key.add(Value(kind: vkNull))
+          if not seen.contains(key):
+            seen.incl(key)
+            filtered.add(row)
+        resultRows = filtered
+      for row in resultRows:
         var parts: seq[string] = @[]
         for value in row.values:
           parts.add(valueToString(value))
@@ -2455,15 +2716,33 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       stderr.writeLine("Exec(WAL): " & $((t3 - t2).inNanoseconds.float / 1000.0) & "us")
     if not rowsRes.ok:
       return err[seq[string]](rowsRes.err.code, rowsRes.err.message, rowsRes.err.context)
-    for row in rowsRes.value:
+    var resultRows = rowsRes.value
+    # Apply DISTINCT ON filtering
+    if bound.distinctOnExprs.len > 0:
+      var seen = initHashSet[seq[Value]]()
+      var filtered: seq[Row] = @[]
+      for row in resultRows:
+        var key: seq[Value] = @[]
+        for expr in bound.distinctOnExprs:
+          let valRes = evalExpr(row, expr, params)
+          if valRes.ok:
+            key.add(valRes.value)
+          else:
+            key.add(Value(kind: vkNull))
+        if not seen.contains(key):
+          seen.incl(key)
+          filtered.add(row)
+      resultRows = filtered
+    for row in resultRows:
       var parts: seq[string] = @[]
       for value in row.values:
         parts.add(valueToString(value))
       output.add(parts.join("|"))
     ok(output)
   for i, bound in boundStatements:
-    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete}
+    let isWrite = bound.kind in {skCreateTable, skDropTable, skAlterTable, skCreateIndex, skDropIndex, skCreateTrigger, skDropTrigger, skCreateView, skDropView, skAlterView, skInsert, skUpdate, skDelete, skAnalyze}
     # stderr.writeLine("execSql: i=" & $i & " kind=" & $bound.kind & " isWrite=" & $isWrite)
+    # stderr.writeLine("execSql: autoCommit=" & $autoCommit)
     var autoCommit = false
     if isWrite and db.activeWriter == nil and db.wal != nil:
       let beginRes = beginTransaction(db)
@@ -2477,87 +2756,110 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         discard rollbackTransaction(db)
     case bound.kind
     of skCreateTable:
-      let rootRes = initTableRoot(db.pager)
-      if not rootRes.ok:
-        return err[seq[string]](rootRes.err.code, rootRes.err.message, rootRes.err.context)
-      var columns: seq[Column] = @[]
-      for col in bound.columns:
-        let typeRes = parseColumnType(col.typeName)
-        if not typeRes.ok:
-          return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-        let spec = typeRes.value
-        columns.add(Column(
-          name: col.name,
-          kind: spec.kind,
-          notNull: col.notNull,
-          unique: col.unique,
-          primaryKey: col.primaryKey,
-          refTable: col.refTable,
-          refColumn: col.refColumn,
-          refOnDelete: col.refOnDelete,
-          refOnUpdate: col.refOnUpdate,
-          decPrecision: spec.decPrecision,
-          decScale: spec.decScale
-        ))
-      var checks: seq[catalog.CheckConstraint] = @[]
-      for checkDef in bound.createChecks:
-        checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
-      let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
-      let saveRes = db.catalog.saveTable(db.pager, meta)
-      if not saveRes.ok:
-        return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-      # Collect PK columns for composite PK detection
-      var pkCols: seq[string] = @[]
-      for col in columns:
-        if col.primaryKey:
-          pkCols.add(col.name)
-      if pkCols.len > 1:
-        # Composite PK: single-INT64 optimization doesn't apply; create composite unique index
-        let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
-        let idxRootRes = initTableRoot(db.pager)
-        if not idxRootRes.ok:
-          return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-        let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
-        if not buildRes.ok:
-          return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-        let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-        let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-        if not idxSaveRes.ok:
-          return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-      for col in columns:
-        if col.primaryKey or col.unique:
-          if col.primaryKey and pkCols.len > 1:
-            continue  # handled by composite index above
-          if col.primaryKey and col.kind == ctInt64:
-            continue
-          let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
-          if isNone(db.catalog.getIndexForColumn(meta.name, col.name, catalog.ikBtree, requireUnique = true)):
-            let idxRootRes = initTableRoot(db.pager)
-            if not idxRootRes.ok:
-              return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-            if not buildRes.ok:
-              return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-            if not idxSaveRes.ok:
-              return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-        if col.refTable.len > 0 and col.refColumn.len > 0:
-          if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
-            let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
-            let idxRootRes = initTableRoot(db.pager)
-            if not idxRootRes.ok:
-              return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-            if not buildRes.ok:
-              return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
-            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-            if not idxSaveRes.ok:
-              return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if bound.createTableIsTemp:
+        var columns: seq[Column] = @[]
+        for col in bound.columns:
+          let typeRes = parseColumnType(col.typeName)
+          if not typeRes.ok:
+            return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+          let spec = typeRes.value
+          columns.add(Column(
+            name: col.name, kind: spec.kind, notNull: col.notNull, unique: col.unique,
+            primaryKey: col.primaryKey, refTable: "", refColumn: "",
+            decPrecision: spec.decPrecision, decScale: spec.decScale,
+            defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
+            generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
+          ))
+        let rootRes = initTableRoot(db.pager)
+        if not rootRes.ok:
+          return err[seq[string]](rootRes.err.code, rootRes.err.message, rootRes.err.context)
+        let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
+        db.catalog.registerTempTable(meta)
+        db.tempTables[bound.createTableName.toLowerAscii()] = TempTable(meta: meta, rows: @[], nextRowId: 1)
+      else:
+        let rootRes = initTableRoot(db.pager)
+        if not rootRes.ok:
+          return err[seq[string]](rootRes.err.code, rootRes.err.message, rootRes.err.context)
+        var columns: seq[Column] = @[]
+        for col in bound.columns:
+          let typeRes = parseColumnType(col.typeName)
+          if not typeRes.ok:
+            return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+          let spec = typeRes.value
+          columns.add(Column(
+            name: col.name,
+            kind: spec.kind,
+            notNull: col.notNull,
+            unique: col.unique,
+            primaryKey: col.primaryKey,
+            refTable: col.refTable,
+            refColumn: col.refColumn,
+            refOnDelete: col.refOnDelete,
+            refOnUpdate: col.refOnUpdate,
+            decPrecision: spec.decPrecision,
+            decScale: spec.decScale,
+            defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
+            generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
+          ))
+        var checks: seq[catalog.CheckConstraint] = @[]
+        for checkDef in bound.createChecks:
+          checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
+        let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
+        let saveRes = db.catalog.saveTable(db.pager, meta)
+        if not saveRes.ok:
+          return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+        # Collect PK columns for composite PK detection
+        var pkCols: seq[string] = @[]
+        for col in columns:
+          if col.primaryKey:
+            pkCols.add(col.name)
+        if pkCols.len > 1:
+          # Composite PK: single-INT64 optimization doesn't apply; create composite unique index
+          let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
+          let idxRootRes = initTableRoot(db.pager)
+          if not idxRootRes.ok:
+            return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+          let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
+          if not buildRes.ok:
+            return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+          let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+          let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+          if not idxSaveRes.ok:
+            return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+        for col in columns:
+          if col.primaryKey or col.unique:
+            if col.primaryKey and pkCols.len > 1:
+              continue  # handled by composite index above
+            if col.primaryKey and col.kind == ctInt64:
+              continue
+            let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
+            if isNone(db.catalog.getIndexForColumn(meta.name, col.name, catalog.ikBtree, requireUnique = true)):
+              let idxRootRes = initTableRoot(db.pager)
+              if not idxRootRes.ok:
+                return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+              let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+              if not buildRes.ok:
+                return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+              let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+              let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+              if not idxSaveRes.ok:
+                return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+          if col.refTable.len > 0 and col.refColumn.len > 0:
+            if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
+              let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
+              let idxRootRes = initTableRoot(db.pager)
+              if not idxRootRes.ok:
+                return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+              let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+              if not buildRes.ok:
+                return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+              let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
+              let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+              if not idxSaveRes.ok:
+                return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropTable:
       if bound.dropTableIfExists and bound.dropTableName notin db.catalog.tables:
         discard  # IF EXISTS: silently skip
@@ -2736,26 +3038,41 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       if not bumpRes.ok:
         return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skCreateView:
-      let dependencies = viewDependencies(bound.createViewQuery)
-      let viewMeta = ViewMeta(
-        name: bound.createViewName,
-        sqlText: bound.createViewSqlText,
-        columnNames: bound.createViewColumns,
-        dependencies: dependencies
-      )
-      if bound.createViewIfNotExists and db.catalog.hasViewName(bound.createViewName):
-        discard
-      elif bound.createViewOrReplace and db.catalog.hasViewName(bound.createViewName):
-        let saveRes = db.catalog.saveViewMeta(viewMeta)
-        if not saveRes.ok:
-          return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+      if bound.createViewIsTemp:
+        let dependencies = viewDependencies(bound.createViewQuery)
+        let viewMeta = ViewMeta(
+          name: bound.createViewName,
+          sqlText: bound.createViewSqlText,
+          columnNames: bound.createViewColumns,
+          dependencies: dependencies
+        )
+        db.catalog.registerTempView(viewMeta)
+        db.tempViews[bound.createViewName.toLowerAscii()] = TempView(
+          name: bound.createViewName,
+          sqlText: bound.createViewSqlText,
+          columns: bound.createViewColumns
+        )
       else:
-        let createRes = db.catalog.createViewMeta(viewMeta)
-        if not createRes.ok:
-          return err[seq[string]](createRes.err.code, createRes.err.message, createRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+        let dependencies = viewDependencies(bound.createViewQuery)
+        let viewMeta = ViewMeta(
+          name: bound.createViewName,
+          sqlText: bound.createViewSqlText,
+          columnNames: bound.createViewColumns,
+          dependencies: dependencies
+        )
+        if bound.createViewIfNotExists and db.catalog.hasViewName(bound.createViewName):
+          discard
+        elif bound.createViewOrReplace and db.catalog.hasViewName(bound.createViewName):
+          let saveRes = db.catalog.saveViewMeta(viewMeta)
+          if not saveRes.ok:
+            return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+        else:
+          let createRes = db.catalog.createViewMeta(viewMeta)
+          if not createRes.ok:
+            return err[seq[string]](createRes.err.code, createRes.err.message, createRes.err.context)
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropView:
       if not db.catalog.hasViewName(bound.dropViewName):
         if bound.dropViewIfExists:
@@ -2814,6 +3131,31 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
               if not checked.ok:
                 return err[seq[string]](checked.err.code, checked.err.message, checked.err.context)
               vals[idx] = checked.value
+          # Apply defaults for omitted columns
+          for di, dcol in table.columns:
+            if vals[di].kind == vkNull and dcol.defaultExpr.len > 0:
+              let dExprRes = parseSqlExpr(dcol.defaultExpr)
+              if dExprRes.ok:
+                let dValRes = evalExpr(Row(), dExprRes.value, @[])
+                if dValRes.ok:
+                  vals[di] = valueFromSql(dValRes.value)
+          # Evaluate generated columns
+          block:
+            var hasGen = false
+            for gcol in table.columns:
+              if gcol.generatedExpr.len > 0: hasGen = true; break
+            if hasGen:
+              var genCols: seq[string] = @[]
+              for gcol in table.columns:
+                genCols.add(table.name & "." & gcol.name)
+              let genRow = makeRow(genCols, vals)
+              for gi, gcol in table.columns:
+                if gcol.generatedExpr.len > 0:
+                  let genExprRes = parseStandaloneExpr(gcol.generatedExpr)
+                  if genExprRes.ok:
+                    let genValRes = evalExpr(genRow, genExprRes.value, @[])
+                    if genValRes.ok:
+                      vals[gi] = valueFromSql(genValRes.value)
           let insRes = insertRow(db.pager, db.catalog, bound.insertTable, vals)
           if not insRes.ok:
             return err[seq[string]](insRes.err.code, insRes.err.message, insRes.err.context)
@@ -2829,6 +3171,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let multiRes = execAllInsertRows(db, bound, params, wantRows = bound.insertReturning.len > 0)
         if not multiRes.ok:
           return err[seq[string]](multiRes.err.code, multiRes.err.message, multiRes.err.context)
+        addRowCountDelta(db.catalog, bound.insertTable, multiRes.value.totalAffected)
         let triggerRes = executeAfterTriggers(db, bound.insertTable, TriggerEventInsertMask, multiRes.value.totalAffected)
         if not triggerRes.ok:
           return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
@@ -2885,6 +3228,15 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
               if not typeRes.ok:
                 return err[seq[string]](typeRes.err.code, typeRes.err.message, colName)
               newValues[idx] = typeRes.value
+          # Recompute generated columns after assignments
+          for gi, gcol in table.columns:
+            if gcol.generatedExpr.len > 0:
+              let genRow = makeRow(cols, newValues)
+              let genExprRes = parseStandaloneExpr(gcol.generatedExpr)
+              if genExprRes.ok:
+                let genValRes = evalExpr(genRow, genExprRes.value, @[])
+                if genValRes.ok:
+                  newValues[gi] = valueFromSql(genValRes.value)
           updates.add((stored.rowid, stored.values, newValues))
         for entry in updates:
           let notNullRes = enforceNotNull(table, entry[2])
@@ -2943,6 +3295,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
           let delRes = deleteRow(db.pager, db.catalog, bound.deleteTable, row.rowid)
           if not delRes.ok:
             return err[seq[string]](delRes.err.code, delRes.err.message, delRes.err.context)
+        addRowCountDelta(db.catalog, bound.deleteTable, -int64(deletions.len))
         let triggerRes = executeAfterTriggers(db, bound.deleteTable, TriggerEventDeleteMask, int64(deletions.len))
         if not triggerRes.ok:
           return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
@@ -2991,6 +3344,92 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
       let rollbackRes = rollbackTransaction(db)
       if not rollbackRes.ok:
         return err[seq[string]](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
+    of skSavepoint:
+      var snap: seq[(string, TableMeta)] = @[]
+      for k, v in db.catalog.tables:
+        snap.add((k, v))
+      var viewSnap: seq[(string, ViewMeta)] = @[]
+      for k, v in db.catalog.views:
+        viewSnap.add((k, v))
+      db.savepointStack.add((name: bound.savepointName, catalogSnapshot: snap, viewSnapshot: viewSnap, dirtyPageSnapshot: snapshotDirtyPages(db.pager)))
+    of skReleaseSavepoint:
+      var found = false
+      for j in countdown(db.savepointStack.high, 0):
+        if db.savepointStack[j].name.toLowerAscii() == bound.releaseSavepointName.toLowerAscii():
+          db.savepointStack.delete(j)
+          found = true
+          break
+      if not found:
+        return err[seq[string]](ERR_SQL, "SAVEPOINT not found", bound.releaseSavepointName)
+    of skRollbackToSavepoint:
+      var found = false
+      for j in countdown(db.savepointStack.high, 0):
+        if db.savepointStack[j].name.toLowerAscii() == bound.rollbackToSavepointName.toLowerAscii():
+          let snap = db.savepointStack[j]
+          db.catalog.tables.clear()
+          for entry in snap.catalogSnapshot:
+            db.catalog.tables[entry[0]] = entry[1]
+          db.catalog.views.clear()
+          for entry in snap.viewSnapshot:
+            db.catalog.views[entry[0]] = entry[1]
+          rollbackToSnapshot(db.pager, snap.dirtyPageSnapshot)
+          db.savepointStack.setLen(j + 1)
+          found = true
+          break
+      if not found:
+        return err[seq[string]](ERR_SQL, "SAVEPOINT not found", bound.rollbackToSavepointName)
+    of skAnalyze:
+      # ANALYZE must not be called inside an explicit multi-statement transaction.
+      if not autoCommit:
+        return err[seq[string]](ERR_SQL, "ANALYZE cannot run inside an explicit transaction")
+      # Determine which tables to analyze.
+      var tableNames: seq[string] = @[]
+      if bound.analyzeTable.len > 0:
+        tableNames.add(bound.analyzeTable)
+      else:
+        for normName in db.catalog.tables.keys:
+          tableNames.add(normName)
+      for tname in tableNames:
+        let normName = tname.toLowerAscii()
+        let tableRes = db.catalog.getTable(normName)
+        if not tableRes.ok:
+          continue
+        let tableMeta = tableRes.value
+        # Count rows by scanning the table B+Tree.
+        var rowCount: int64 = 0
+        let tableTree = newBTree(db.pager, tableMeta.rootPage)
+        let cursorRes = openCursor(tableTree)
+        if cursorRes.ok:
+          let cursor = cursorRes.value
+          while true:
+            let nextRes = cursorNext(cursor)
+            if not nextRes.ok: break
+            inc rowCount
+        let saveStatsRes = db.catalog.saveTableStats(normName, TableStats(rowCount: rowCount))
+        if not saveStatsRes.ok:
+          return err[seq[string]](saveStatsRes.err.code, saveStatsRes.err.message, saveStatsRes.err.context)
+        # Count index entries and distinct keys for all B+Tree indexes on this table.
+        for _, idx in db.catalog.indexes:
+          if idx.table.toLowerAscii() != normName or idx.kind != ikBtree:
+            continue
+          var entryCount: int64 = 0
+          var distinctKeyCount: int64 = 0
+          var lastKey: uint64 = uint64.high
+          let idxTree = newBTree(db.pager, idx.rootPage)
+          let idxCursorRes = openCursor(idxTree)
+          if idxCursorRes.ok:
+            let idxCursor = idxCursorRes.value
+            while true:
+              let nextRes = cursorNext(idxCursor)
+              if not nextRes.ok: break
+              inc entryCount
+              let key = nextRes.value[0]
+              if key != lastKey:
+                inc distinctKeyCount
+                lastKey = key
+          let saveIdxRes = db.catalog.saveIndexStats(idx.name.toLowerAscii(), IndexStats(entryCount: entryCount, distinctKeyCount: distinctKeyCount))
+          if not saveIdxRes.ok:
+            return err[seq[string]](saveIdxRes.err.code, saveIdxRes.err.message, saveIdxRes.err.context)
     if autoCommit:
       let commitRes = commitTransaction(db)
       if not commitRes.ok:
@@ -3151,85 +3590,105 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   var affected: int64 = 0
   case bound.kind
   of skCreateTable:
-    let rootRes = initTableRoot(db.pager)
-    if not rootRes.ok:
-      return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
-    var columns: seq[Column] = @[]
-    for col in bound.columns:
-      let typeRes = parseColumnType(col.typeName)
-      if not typeRes.ok:
-        return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-      let spec = typeRes.value
-      columns.add(Column(
-        name: col.name,
-        kind: spec.kind,
-        notNull: col.notNull,
-        unique: col.unique,
-        primaryKey: col.primaryKey,
-        refTable: col.refTable,
-        refColumn: col.refColumn,
-        refOnDelete: col.refOnDelete,
-        refOnUpdate: col.refOnUpdate,
-        decPrecision: spec.decPrecision,
-        decScale: spec.decScale
-      ))
-    var checks: seq[catalog.CheckConstraint] = @[]
-    for checkDef in bound.createChecks:
-      checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
-    let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
-    let saveRes = db.catalog.saveTable(db.pager, meta)
-    if not saveRes.ok:
-      return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-    var pkCols: seq[string] = @[]
-    for col in columns:
-      if col.primaryKey:
-        pkCols.add(col.name)
-    if pkCols.len > 1:
-      let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
-      let idxRootRes = initTableRoot(db.pager)
-      if not idxRootRes.ok:
-        return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-      let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
-      if not buildRes.ok:
-        return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-      let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-      let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-      if not idxSaveRes.ok:
-        return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-    for col in columns:
-      if col.primaryKey or col.unique:
-        if col.primaryKey and pkCols.len > 1:
-          continue
-        if col.primaryKey and col.kind == ctInt64:
-          continue
-        let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
-        if isNone(db.catalog.getIndexByName(idxName)):
-          let idxRootRes = initTableRoot(db.pager)
-          if not idxRootRes.ok:
-            return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-          let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-          if not buildRes.ok:
-            return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-          let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-          let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-          if not idxSaveRes.ok:
-            return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-      if col.refTable.len > 0 and col.refColumn.len > 0:
-        if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
-          let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
-          let idxRootRes = initTableRoot(db.pager)
-          if not idxRootRes.ok:
-            return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-          let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-          if not buildRes.ok:
-            return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-          let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
-          let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-          if not idxSaveRes.ok:
-            return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    if bound.createTableIsTemp:
+      var columns: seq[Column] = @[]
+      for col in bound.columns:
+        let typeRes = parseColumnType(col.typeName)
+        if not typeRes.ok:
+          return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+        let spec = typeRes.value
+        columns.add(Column(
+          name: col.name, kind: spec.kind, notNull: col.notNull, unique: col.unique,
+          primaryKey: col.primaryKey, refTable: "", refColumn: "",
+          decPrecision: spec.decPrecision, decScale: spec.decScale,
+          defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
+          generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
+        ))
+      let meta = TableMeta(name: bound.createTableName, rootPage: 0, nextRowId: 1, columns: columns)
+      db.catalog.registerTempTable(meta)
+      db.tempTables[bound.createTableName.toLowerAscii()] = TempTable(meta: meta, rows: @[], nextRowId: 1)
+    else:
+      let rootRes = initTableRoot(db.pager)
+      if not rootRes.ok:
+        return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
+      var columns: seq[Column] = @[]
+      for col in bound.columns:
+        let typeRes = parseColumnType(col.typeName)
+        if not typeRes.ok:
+          return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+        let spec = typeRes.value
+        columns.add(Column(
+          name: col.name,
+          kind: spec.kind,
+          notNull: col.notNull,
+          unique: col.unique,
+          primaryKey: col.primaryKey,
+          refTable: col.refTable,
+          refColumn: col.refColumn,
+          refOnDelete: col.refOnDelete,
+          refOnUpdate: col.refOnUpdate,
+          decPrecision: spec.decPrecision,
+          decScale: spec.decScale,
+          defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
+          generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
+        ))
+      var checks: seq[catalog.CheckConstraint] = @[]
+      for checkDef in bound.createChecks:
+        checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
+      let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
+      let saveRes = db.catalog.saveTable(db.pager, meta)
+      if not saveRes.ok:
+        return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+      var pkCols: seq[string] = @[]
+      for col in columns:
+        if col.primaryKey:
+          pkCols.add(col.name)
+      if pkCols.len > 1:
+        let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
+        let idxRootRes = initTableRoot(db.pager)
+        if not idxRootRes.ok:
+          return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+        let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
+        if not buildRes.ok:
+          return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+        let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+        if not idxSaveRes.ok:
+          return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+      for col in columns:
+        if col.primaryKey or col.unique:
+          if col.primaryKey and pkCols.len > 1:
+            continue
+          if col.primaryKey and col.kind == ctInt64:
+            continue
+          let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
+          if isNone(db.catalog.getIndexByName(idxName)):
+            let idxRootRes = initTableRoot(db.pager)
+            if not idxRootRes.ok:
+              return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+            if not buildRes.ok:
+              return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
+            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+            if not idxSaveRes.ok:
+              return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+        if col.refTable.len > 0 and col.refColumn.len > 0:
+          if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
+            let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
+            let idxRootRes = initTableRoot(db.pager)
+            if not idxRootRes.ok:
+              return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+            if not buildRes.ok:
+              return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
+            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
+            if not idxSaveRes.ok:
+              return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skDropTable:
@@ -3419,27 +3878,42 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 0
 
   of skCreateView:
-    let dependencies = viewDependencies(bound.createViewQuery)
-    let viewMeta = ViewMeta(
-      name: bound.createViewName,
-      sqlText: bound.createViewSqlText,
-      columnNames: bound.createViewColumns,
-      dependencies: dependencies
-    )
-    if bound.createViewIfNotExists and db.catalog.hasViewName(bound.createViewName):
-      discard
-    elif bound.createViewOrReplace and db.catalog.hasViewName(bound.createViewName):
-      let saveRes = db.catalog.saveViewMeta(viewMeta)
-      if not saveRes.ok:
-        return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+    if bound.createViewIsTemp:
+      let dependencies = viewDependencies(bound.createViewQuery)
+      let viewMeta = ViewMeta(
+        name: bound.createViewName,
+        sqlText: bound.createViewSqlText,
+        columnNames: bound.createViewColumns,
+        dependencies: dependencies
+      )
+      db.catalog.registerTempView(viewMeta)
+      db.tempViews[bound.createViewName.toLowerAscii()] = TempView(
+        name: bound.createViewName,
+        sqlText: bound.createViewSqlText,
+        columns: bound.createViewColumns
+      )
     else:
-      let createRes = db.catalog.createViewMeta(viewMeta)
-      if not createRes.ok:
-        return err[int64](createRes.err.code, createRes.err.message, createRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
-    affected = 0
+      let dependencies = viewDependencies(bound.createViewQuery)
+      let viewMeta = ViewMeta(
+        name: bound.createViewName,
+        sqlText: bound.createViewSqlText,
+        columnNames: bound.createViewColumns,
+        dependencies: dependencies
+      )
+      if bound.createViewIfNotExists and db.catalog.hasViewName(bound.createViewName):
+        discard
+      elif bound.createViewOrReplace and db.catalog.hasViewName(bound.createViewName):
+        let saveRes = db.catalog.saveViewMeta(viewMeta)
+        if not saveRes.ok:
+          return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
+      else:
+        let createRes = db.catalog.createViewMeta(viewMeta)
+        if not createRes.ok:
+          return err[int64](createRes.err.code, createRes.err.message, createRes.err.context)
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      affected = 0
 
   of skDropView:
     if not db.catalog.hasViewName(bound.dropViewName):
@@ -3504,6 +3978,31 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
             if not checked.ok:
               return err[int64](checked.err.code, checked.err.message, checked.err.context)
             vals[idx] = checked.value
+        # Apply defaults for omitted columns
+        for di, dcol in table.columns:
+          if vals[di].kind == vkNull and dcol.defaultExpr.len > 0:
+            let dExprRes = parseSqlExpr(dcol.defaultExpr)
+            if dExprRes.ok:
+              let dValRes = evalExpr(Row(), dExprRes.value, @[])
+              if dValRes.ok:
+                vals[di] = valueFromSql(dValRes.value)
+        # Evaluate generated columns
+        block:
+          var hasGen = false
+          for gcol in table.columns:
+            if gcol.generatedExpr.len > 0: hasGen = true; break
+          if hasGen:
+            var genCols: seq[string] = @[]
+            for gcol in table.columns:
+              genCols.add(table.name & "." & gcol.name)
+            let genRow = makeRow(genCols, vals)
+            for gi, gcol in table.columns:
+              if gcol.generatedExpr.len > 0:
+                let genExprRes = parseStandaloneExpr(gcol.generatedExpr)
+                if genExprRes.ok:
+                  let genValRes = evalExpr(genRow, genExprRes.value, @[])
+                  if genValRes.ok:
+                    vals[gi] = valueFromSql(genValRes.value)
         let insRes = insertRow(db.pager, db.catalog, bound.insertTable, vals)
         if not insRes.ok:
           return err[int64](insRes.err.code, insRes.err.message, insRes.err.context)
@@ -3586,6 +4085,15 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
             if not typeRes.ok:
               return err[int64](typeRes.err.code, typeRes.err.message, colName)
             newValues[idx] = typeRes.value
+          # Recompute generated columns after assignments
+          for gi, gcol in table.columns:
+            if gcol.generatedExpr.len > 0:
+              let genRow = makeRow(cols, newValues)
+              let genExprRes = parseStandaloneExpr(gcol.generatedExpr)
+              if genExprRes.ok:
+                let genValRes = evalExpr(genRow, genExprRes.value, @[])
+                if genValRes.ok:
+                  newValues[gi] = valueFromSql(genValRes.value)
           updates.add((row.rowid, row.values, newValues))
 
         if not updateProfile.isSimpleUpdate:
@@ -3674,6 +4182,46 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     let rollbackRes = rollbackTransaction(db)
     if not rollbackRes.ok:
       return err[int64](rollbackRes.err.code, rollbackRes.err.message, rollbackRes.err.context)
+    affected = 0
+
+  of skSavepoint:
+    var snap: seq[(string, TableMeta)] = @[]
+    for k, v in db.catalog.tables:
+      snap.add((k, v))
+    var viewSnap: seq[(string, ViewMeta)] = @[]
+    for k, v in db.catalog.views:
+      viewSnap.add((k, v))
+    db.savepointStack.add((name: bound.savepointName, catalogSnapshot: snap, viewSnapshot: viewSnap, dirtyPageSnapshot: snapshotDirtyPages(db.pager)))
+    affected = 0
+
+  of skReleaseSavepoint:
+    var found = false
+    for j in countdown(db.savepointStack.high, 0):
+      if db.savepointStack[j].name.toLowerAscii() == bound.releaseSavepointName.toLowerAscii():
+        db.savepointStack.delete(j)
+        found = true
+        break
+    if not found:
+      return err[int64](ERR_SQL, "SAVEPOINT not found", bound.releaseSavepointName)
+    affected = 0
+
+  of skRollbackToSavepoint:
+    var found = false
+    for j in countdown(db.savepointStack.high, 0):
+      if db.savepointStack[j].name.toLowerAscii() == bound.rollbackToSavepointName.toLowerAscii():
+        let snap = db.savepointStack[j]
+        db.catalog.tables.clear()
+        for entry in snap.catalogSnapshot:
+          db.catalog.tables[entry[0]] = entry[1]
+        db.catalog.views.clear()
+        for entry in snap.viewSnapshot:
+          db.catalog.views[entry[0]] = entry[1]
+        rollbackToSnapshot(db.pager, snap.dirtyPageSnapshot)
+        db.savepointStack.setLen(j + 1)
+        found = true
+        break
+    if not found:
+      return err[int64](ERR_SQL, "SAVEPOINT not found", bound.rollbackToSavepointName)
     affected = 0
 
   else:
@@ -4286,6 +4834,9 @@ proc commitTransaction*(db: Db): Result[Void] =
   
   # End page allocation tracking (pages are now permanent) (HIGH-003)
   endTxnPageTracking(db.pager)
+
+  # Apply incremental row-count deltas to persisted stats.
+  discard applyRowCountDeltas(db.catalog)
   
   okVoid()
 
@@ -4316,6 +4867,13 @@ proc rollbackTransaction*(db: Db): Result[Void] =
   # Evict dirty pages immediately while holding rollback lock
   if dirtyPages.len > 0:
     rollbackCacheLocked(db.pager)
+    # Invalidate B+tree append-cache entries for this pager.
+    # After eviction, any cached CacheEntry with dirty=true is an orphaned
+    # (evicted) entry. Future inserts via tryAppend would write to the orphaned
+    # entry (not in the live cache), causing txnDirtyCount to not increment and
+    # the subsequent COMMIT to flush 0 pages. Clearing the cache forces a fresh
+    # pinPage on the next insert.
+    evictPagerFromAppendCache(db.pager)
 
   # Return allocated pages to freelist (HIGH-003)
   let freeRes = rollbackTxnPageAllocations(db.pager)
@@ -4324,6 +4882,7 @@ proc rollbackTransaction*(db: Db): Result[Void] =
     stderr.writeLine("Warning: failed to return some allocated pages to freelist during rollback")
 
   db.catalog.clearTrigramDeltas()
+  discardRowCountDeltas(db.catalog)
 
   release(db.pager.rollbackLock)
 
@@ -4380,3 +4939,118 @@ proc checkpointDb*(db: Db): Result[uint64] =
     db.catalog.clearTrigramDeltas()
   
   checkpoint(db.wal, db.pager)
+
+# ============================================================================
+# SaveAs — Export database to a new on-disk file
+# ============================================================================
+
+proc saveAs*(db: Db, destPath: string): Result[Void] =
+  ## Export a transactionally-consistent snapshot of this database (in-memory
+  ## or file-based) to a new on-disk file at `destPath`.
+  ##
+  ## The implementation checkpoints the WAL so the main DB file contains all
+  ## committed state, then streams the bytes page-by-page to a temporary file
+  ## which is fsync'd and renamed into place.
+  if not db.isOpen:
+    return err[Void](ERR_INTERNAL, "Database not open")
+  if db.activeWriter != nil:
+    return err[Void](ERR_TRANSACTION, "Cannot saveAs during active transaction")
+  if destPath.len == 0:
+    return err[Void](ERR_IO, "Destination path is empty")
+
+  let absPath = expandTilde(destPath)
+  if fileExists(absPath):
+    return err[Void](ERR_IO, "Destination file already exists", absPath)
+  if fileExists(absPath & "-wal"):
+    return err[Void](ERR_IO, "Destination WAL file already exists", absPath & "-wal")
+
+  # 1. Force checkpoint so the main DB file in the VFS is complete.
+  let ckRes = checkpointDb(db)
+  if not ckRes.ok:
+    return err[Void](ckRes.err.code, ckRes.err.message, ckRes.err.context)
+
+  # 2. Determine the size of the main DB file.
+  let sizeRes = db.vfs.getFileSize(db.path)
+  if not sizeRes.ok:
+    return err[Void](sizeRes.err.code, sizeRes.err.message, sizeRes.err.context)
+  let totalBytes = sizeRes.value
+  if totalBytes <= 0:
+    return err[Void](ERR_IO, "Database file is empty, nothing to export")
+
+  # 3. Create a temporary file in the same directory as destPath for atomic rename.
+  let parentDir = parentDir(absPath)
+  if parentDir.len > 0:
+    try:
+      createDir(parentDir)
+    except OSError:
+      return err[Void](ERR_IO, "Cannot create destination directory", parentDir)
+
+  let tmpPath = absPath & ".tmp"
+  if fileExists(tmpPath):
+    try: removeFile(tmpPath)
+    except OSError: discard
+
+  # 4. Stream-copy the main DB file page-by-page to the temp file.
+  let osVfs = newOsVfs()
+  let openRes = osVfs.open(tmpPath, fmReadWrite, create = true)
+  if not openRes.ok:
+    return err[Void](openRes.err.code, openRes.err.message, openRes.err.context)
+  let dstFile = openRes.value
+
+  let pageSize = int(db.pageSize)
+  var buf = newSeq[byte](pageSize)
+  var offset: int64 = 0
+  while offset < totalBytes:
+    let toRead = min(pageSize, int(totalBytes - offset))
+    if toRead < pageSize:
+      buf.setLen(toRead)
+    let readRes = db.vfs.read(db.file, offset, buf)
+    if not readRes.ok:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](readRes.err.code, readRes.err.message, readRes.err.context)
+    if readRes.value != toRead:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](ERR_IO, "Short read during saveAs", "offset=" & $offset)
+    let writeRes = osVfs.write(dstFile, offset, buf)
+    if not writeRes.ok:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](writeRes.err.code, writeRes.err.message, writeRes.err.context)
+    if writeRes.value != toRead:
+      discard osVfs.close(dstFile)
+      try: removeFile(tmpPath)
+      except OSError: discard
+      return err[Void](ERR_IO, "Short write during saveAs", "offset=" & $offset)
+    offset += int64(toRead)
+
+  # 5. fsync the written file.
+  let syncRes = osVfs.fsync(dstFile)
+  if not syncRes.ok:
+    discard osVfs.close(dstFile)
+    try: removeFile(tmpPath)
+    except OSError: discard
+    return err[Void](syncRes.err.code, syncRes.err.message, syncRes.err.context)
+  discard osVfs.close(dstFile)
+
+  # 6. Atomic rename tmp → dest.
+  try:
+    moveFile(tmpPath, absPath)
+  except OSError:
+    try: removeFile(tmpPath)
+    except OSError: discard
+    return err[Void](ERR_IO, "Failed to rename temp file to destination", absPath)
+
+  # 7. fsync the parent directory for rename durability (POSIX best-effort).
+  when not defined(windows):
+    if parentDir.len > 0:
+      let fd = posix.open(cstring(parentDir), O_RDONLY)
+      if fd >= 0:
+        discard posix.fsync(fd)
+        discard posix.close(fd)
+
+  okVoid()

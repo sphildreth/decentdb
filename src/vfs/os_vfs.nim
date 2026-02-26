@@ -8,6 +8,9 @@ when defined(windows):
 else:
   import posix
 
+type OsVfsFile* = ref object of VfsFile
+  file*: File
+
 type OsVfs* = ref object of Vfs
 
 proc newOsVfs*(): OsVfs =
@@ -32,7 +35,7 @@ proc flushBufferedWritesIfNeeded(file: VfsFile): Result[Void] =
   withFileLock(file):
     if file.bufferedDirty.load(moAcquire):
       try:
-        flushFile(file.file)
+        flushFile(OsVfsFile(file).file)
       except IOError, OSError:
         return err[Void](ERR_IO, "Flush failed", file.path)
       file.bufferedDirty.store(false, moRelease)
@@ -61,10 +64,10 @@ method open*(vfs: OsVfs, path: string, mode: FileMode, create: bool): Result[Vfs
         return err[VfsFile](ERR_IO, "Failed to open file", path)
   except OSError:
     return err[VfsFile](ERR_IO, "Failed to open file", path)
-  let vf = VfsFile(path: path, file: f)
+  let vf = OsVfsFile(path: path, file: f)
   initLock(vf.lock)
   vf.bufferedDirty.store(false, moRelaxed)
-  ok(vf)
+  ok(VfsFile(vf))
 
 method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte]): Result[int] =
   ## Read without lock - pread is thread-safe and position-independent.
@@ -77,11 +80,11 @@ method read*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var openArray[byte])
     when defined(windows):
       # Windows stdio file handles don't support POSIX pread; serialize with a per-file lock.
       withFileLock(file):
-        setFilePos(file.file, offset)
-        let bytesRead = file.file.readBuffer(addr buf[0], buf.len)
+        setFilePos(OsVfsFile(file).file, offset)
+        let bytesRead = OsVfsFile(file).file.readBuffer(addr buf[0], buf.len)
         return ok(bytesRead)
     else:
-      let fd = cast[cint](file.file.getFileHandle())
+      let fd = cast[cint](OsVfsFile(file).file.getFileHandle())
       let res = pread(fd, addr buf[0], buf.len, offset.Off)
       if res < 0:
         return err[int](ERR_IO, "Read failed", file.path)
@@ -100,11 +103,11 @@ method readStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: var string): Resu
     when defined(windows):
       # Windows stdio file handles don't support POSIX pread; serialize with a per-file lock.
       withFileLock(file):
-        setFilePos(file.file, offset)
-        let bytesRead = file.file.readBuffer(addr buf[0], buf.len)
+        setFilePos(OsVfsFile(file).file, offset)
+        let bytesRead = OsVfsFile(file).file.readBuffer(addr buf[0], buf.len)
         return ok(bytesRead)
     else:
-      let fd = cast[cint](file.file.getFileHandle())
+      let fd = cast[cint](OsVfsFile(file).file.getFileHandle())
       let res = pread(fd, addr buf[0], buf.len, offset.Off)
       if res < 0:
         return err[int](ERR_IO, "Read failed", file.path)
@@ -119,8 +122,8 @@ method write*(vfs: OsVfs, file: VfsFile, offset: int64, buf: openArray[byte]): R
       if buf.len == 0:
         bytesWritten = 0
       else:
-        setFilePos(file.file, offset)
-        bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
+        setFilePos(OsVfsFile(file).file, offset)
+        bytesWritten = OsVfsFile(file).file.writeBuffer(unsafeAddr buf[0], buf.len)
         file.bufferedDirty.store(true, moRelease)
     except IOError, OSError:
       return err[int](ERR_IO, "Write failed", file.path)
@@ -135,8 +138,8 @@ method writeStr*(vfs: OsVfs, file: VfsFile, offset: int64, buf: string): Result[
       if buf.len == 0:
         bytesWritten = 0
       else:
-        setFilePos(file.file, offset)
-        bytesWritten = file.file.writeBuffer(unsafeAddr buf[0], buf.len)
+        setFilePos(OsVfsFile(file).file, offset)
+        bytesWritten = OsVfsFile(file).file.writeBuffer(unsafeAddr buf[0], buf.len)
         file.bufferedDirty.store(true, moRelease)
     except IOError, OSError:
       return err[int](ERR_IO, "Write failed", file.path)
@@ -152,12 +155,12 @@ method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
   # Correctness relies on the caller (WAL writer) serializing writes/fsyncs via wal.lock.
   try:
     # First flush stdio buffers to ensure all data is in kernel buffers
-    flushFile(file.file)
+    flushFile(OsVfsFile(file).file)
     file.bufferedDirty.store(false, moRelease)
     
     when defined(windows):
       # Windows: Use FlushFileBuffers for OS-level sync
-      let handle = winlean.get_osfhandle(cint(file.file.getFileHandle()))
+      let handle = winlean.get_osfhandle(cint(OsVfsFile(file).file.getFileHandle()))
       if handle == INVALID_HANDLE_VALUE:
         return err[Void](ERR_IO, "Invalid file handle for fsync", file.path)
       if winlean.flushFileBuffers(handle) == 0:
@@ -165,7 +168,7 @@ method fsync*(vfs: OsVfs, file: VfsFile): Result[Void] =
     else:
       # POSIX: Use fdatasync for data-only sync (faster than fsync)
       # Falls back to fsync on platforms where fdatasync is unavailable
-      let fd = cint(file.file.getFileHandle())
+      let fd = cint(OsVfsFile(file).file.getFileHandle())
       when defined(macosx) or defined(ios):
         # macOS/iOS don't have fdatasync, use fsync instead
         if fsync(fd) != 0:
@@ -184,15 +187,15 @@ method truncate*(vfs: OsVfs, file: VfsFile, size: int64): Result[Void] =
   withFileLock(file):
     try:
       if file.bufferedDirty.load(moAcquire):
-        flushFile(file.file)
+        flushFile(OsVfsFile(file).file)
         file.bufferedDirty.store(false, moRelease)
       when defined(windows):
-        setFilePos(file.file, size)
-        let handle = winlean.get_osfhandle(cint(file.file.getFileHandle()))
+        setFilePos(OsVfsFile(file).file, size)
+        let handle = winlean.get_osfhandle(cint(OsVfsFile(file).file.getFileHandle()))
         if setEndOfFile(handle) == 0:
           return err[Void](ERR_IO, "Truncate failed", file.path)
       else:
-        let fd = cast[cint](file.file.getFileHandle())
+        let fd = cast[cint](OsVfsFile(file).file.getFileHandle())
         if ftruncate(fd, size.Off) == -1:
           return err[Void](ERR_IO, "Truncate failed", file.path)
     except OSError:
@@ -203,9 +206,9 @@ method close*(vfs: OsVfs, file: VfsFile): Result[Void] =
   withFileLock(file):
     try:
       if file.bufferedDirty.load(moAcquire):
-        flushFile(file.file)
+        flushFile(OsVfsFile(file).file)
         file.bufferedDirty.store(false, moRelease)
-      close(file.file)
+      close(OsVfsFile(file).file)
     except OSError:
       return err[Void](ERR_IO, "Close failed", file.path)
   deinitLock(file.lock)
@@ -218,7 +221,7 @@ method mapWritable*(vfs: OsVfs, file: VfsFile, length: int64): Result[MmapRegion
     if length <= 0:
       return err[MmapRegion](ERR_INTERNAL, "Invalid mmap length", file.path)
     try:
-      let fd = cast[cint](file.file.getFileHandle())
+      let fd = cast[cint](OsVfsFile(file).file.getFileHandle())
       let region = mmap(nil, int(length), cint(PROT_READ or PROT_WRITE), cint(MAP_SHARED), fd, 0.Off)
       if region == MAP_FAILED:
         return err[MmapRegion](ERR_IO, "mmap failed: " & $strerror(errno), file.path)
@@ -238,3 +241,19 @@ method unmap*(vfs: OsVfs, region: MmapRegion): Result[Void] =
     except OSError:
       return err[Void](ERR_IO, "munmap failed")
     okVoid()
+
+method getFileSize*(vfs: OsVfs, path: string): Result[int64] =
+  try:
+    ok(os.getFileInfo(path).size)
+  except OSError:
+    err[int64](ERR_IO, "getFileSize failed", path)
+
+method fileExists*(vfs: OsVfs, path: string): bool =
+  os.fileExists(path)
+
+method removeFile*(vfs: OsVfs, path: string): Result[Void] =
+  try:
+    os.removeFile(path)
+    okVoid()
+  except OSError:
+    err[Void](ERR_IO, "removeFile failed", path)
