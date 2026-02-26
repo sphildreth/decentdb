@@ -212,6 +212,12 @@ let textVal = Value(kind: vkText, bytes: toBytes("Hello"))
 
 # Blob
 let blobVal = Value(kind: vkBlob, bytes: toBytes("\x00\x01\x02"))
+
+# TIMESTAMP (native datetime): int64 microseconds since Unix epoch UTC
+let tsVal = Value(kind: vkDateTime, int64Val: 1735689600'i64 * 1_000_000)  # 2025-01-01T00:00:00 (UTC)
+
+# DECIMAL (scaled integer)
+let decVal = Value(kind: vkDecimal, int64Val: 12345, decimalScale: 2)  # 123.45
 ```
 
 ### Converting Values to Strings
@@ -220,9 +226,12 @@ let blobVal = Value(kind: vkBlob, bytes: toBytes("\x00\x01\x02"))
 proc valueToString(v: Value): string =
   case v.kind
   of vkNull: "NULL"
-  of vkInt64: $v.int64Val
+  of vkInt64, vkDateTime: $v.int64Val
   of vkFloat64: $v.float64Val
   of vkBool: if v.boolVal: "true" else: "false"
+  of vkDecimal:
+    # Value = int64Val * 10^-decimalScale
+    $v.int64Val & "e-" & $v.decimalScale
   of vkText, vkBlob:
     result = ""
     for b in v.bytes:

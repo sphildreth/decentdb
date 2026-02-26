@@ -67,7 +67,7 @@ DecentDB is designed with a modular architecture emphasizing correctness, perfor
 - Table operations (scan, insert, update, delete)
 - Index operations (seek, range scan)
 - Constraint enforcement (PK, FK, UNIQUE, NOT NULL, CHECK)
-- Auto-increment for INTEGER PRIMARY KEY columns
+- Auto-assigned IDs for a single INT64 PRIMARY KEY when omitted
 - Trigram index management
 - Bulk load operations
 
@@ -283,4 +283,4 @@ DecentDB exposes a C API (`src/c_api.nim`) with 35+ functions for use by languag
 | [Python](../api/python.md) | DB-API 2.0 + SQLAlchemy | ctypes loading |
 | [Node.js](../api/node.md) | N-API addon + Knex | Dynamic loading |
 
-All bindings support: schema introspection (list tables, columns, indexes), checkpoint, all data types, and auto-increment INTEGER PRIMARY KEY.
+All bindings support: schema introspection (list tables, columns, indexes), checkpoint, all data types, and auto-assigned IDs for a single INT64 primary key when omitted from INSERT.

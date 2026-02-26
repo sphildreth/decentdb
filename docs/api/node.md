@@ -28,7 +28,7 @@ const { Database } = require('decentdb');
 const db = new Database({ path: '/tmp/sample.ddb' });
 
 // DDL
-db.exec('CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT)');
+db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)');
 
 // INSERT with auto-increment (omit id column)
 db.exec('INSERT INTO users (name, email) VALUES ($1, $2)', ['Alice', 'alice@example.com']);
@@ -78,6 +78,21 @@ db.exec('COMMIT');
 | `Buffer` / `Uint8Array` | BLOB |
 | `{ unscaled: bigint, scale: number }` | DECIMAL |
 
+### TIMESTAMP values
+
+TIMESTAMP columns are stored as microseconds since Unix epoch (UTC). When reading results, the addon returns TIMESTAMP values as a number (milliseconds since epoch); wrap with `new Date(ms)`.
+
+To bind a TIMESTAMP parameter, pass a `bigint` microsecond value:
+
+```javascript
+db.exec('CREATE TABLE events (id INTEGER PRIMARY KEY, occurred_at TIMESTAMP)');
+const micros = BigInt(Date.now()) * 1000n;
+db.exec('INSERT INTO events (occurred_at) VALUES ($1)', [micros]);
+
+const { rows } = db.exec('SELECT occurred_at FROM events');
+console.log(new Date(rows[0][0]).toISOString());
+```
+
 ### Checkpoint
 
 ```javascript
@@ -102,7 +117,7 @@ Export any open database — including `:memory:` — to a new on-disk file:
 
 ```javascript
 const db = new Database({ path: ':memory:' });
-db.exec('CREATE TABLE items (id INT PRIMARY KEY, name TEXT)');
+db.exec('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)');
 db.exec('INSERT INTO items (id, name) VALUES ($1, $2)', [1, 'widget']);
 
 db.saveAs('/tmp/snapshot.ddb');

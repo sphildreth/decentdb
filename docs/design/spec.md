@@ -634,33 +634,33 @@ Define error categories:
 ---
 
 ## 16. Configuration system
-### 16.1 Configuration options
+
+Status: partially implemented in the current engine.
+
+### 16.1 Configuration options (current)
+
 Database-level configuration (set at open time):
-- `page_size`: 4096, 8192, or 16384 (default: 4096)
-- `cache_size_mb`: Maximum page cache size in MB (default: 4MB)
-- `wal_sync_mode`: `FULL` (fsync), `NORMAL` (fdatasync), `TESTING_ONLY_UNSAFE_NOSYNC` (requires compile flag)
-- `checkpoint_timeout_sec`: Max wait for readers before forced checkpoint (default: 30)
-- `trigram_postings_threshold`: Max postings before requiring additional filters (default: 100000)
-- `temp_dir`: Directory for temporary sort files (default: system temp)
+- `page_size`: fixed at 4096 bytes (opening any other size currently returns `ERR_CORRUPTION`)
+- `cachePages` / `cacheMb`: page cache capacity (CLI: `--cachePages` / `--cacheMb`; Nim: `openDb(..., cachePages = ...)`)
 
-**Safety Note:** `TESTING_ONLY_UNSAFE_NOSYNC` requires the engine to be compiled with `-d:allowUnsafeSyncMode` flag. This mode provides no durability guarantees and must never be used in production.
+### 16.2 Runtime configuration (current)
 
-### 16.2 Runtime configuration
-Some options can be changed at runtime:
-- `trigram_postings_threshold`: adjust based on workload
-- `checkpoint_threshold_mb`: adjust for write-heavy workloads
+- Checkpoint/reader management can be changed via `setCheckpointConfig(wal, ...)` (defaults are set in `openDb`).
+- Durability for normal transactions is fsync-on-commit and is not currently configurable via SQL; for ingestion tradeoffs use bulk load durability modes.
 
-### 16.3 Configuration API
+### 16.3 Configuration API (current)
+
 ```nim
-# Open database with configuration
-db = open("dbfile", config{
-  page_size: 8192,
-  cache_size_mb: 16,
-  wal_sync_mode: FULL
-})
+import decentdb/engine
+import decentdb/wal/wal
 
-# Change runtime configuration
-db.set_config("trigram_postings_threshold", 50000)
+let db = openDb("dbfile", cachePages = 4096).value
+setCheckpointConfig(db.wal,
+  everyBytes = 64 * 1024 * 1024,
+  everyMs = 0,
+  readerWarnMs = 60 * 1000,
+  readerTimeoutMs = 300 * 1000,
+  forceTruncateOnTimeout = true)
 ```
 
 ---

@@ -13,6 +13,7 @@ nav:
     - First Steps: getting-started/first-steps.md
   - User Guide:
     - SQL Reference: user-guide/sql-reference.md
+    - SQL Feature Matrix: user-guide/sql-feature-matrix.md
     - Data Types: user-guide/data-types.md
     - Transactions: user-guide/transactions.md
     - Indexes: user-guide/indexes.md
@@ -20,7 +21,6 @@ nav:
     - Comparison (SQLite/DuckDB): user-guide/comparison.md
     - Tools:
       - DBeaver Integration: user-guide/dbeaver.md
-      - JDBC Driver (Java): api/jdbc.md
   - API Reference:
     - Nim API: api/nim-api.md
     - JDBC Driver (Java): api/jdbc.md
@@ -30,6 +30,7 @@ nav:
     - Language Bindings:
       - .NET (C#): api/dotnet.md
       - Go: api/go.md
+      - JDBC Driver (Java): api/jdbc.md      
       - Node.js: api/node.md
       - Python: api/python.md
   - Architecture:
@@ -41,6 +42,9 @@ nav:
   - Development:
     - Building from Source: development/building.md
     - Testing: development/testing.md
+    - Documentation Site (MkDocs): README.md
+    - Release process: development/releases.md
+    - GitHub Releases: https://github.com/sphildreth/decentdb/releases
     - Import Tools: development/import-tools.md
     - SQLite Import Notes: development/sqlite-import-notes.md
     - Contributing: development/contributing.md
@@ -55,6 +59,8 @@ nav:
 
 theme:
   name: material
+  logo: assets/logo.png
+  favicon: assets/favicon.png
   palette:
     - scheme: default
       primary: indigo

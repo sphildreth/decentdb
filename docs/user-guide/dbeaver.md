@@ -125,7 +125,8 @@ After that, DecentDB should show up under **New Connection → Embedded**.
    | Property | Default | Description |
    |---|---|---|
    | `readOnly` | `false` | Open the database in read-only mode |
-   | `busyTimeoutMs` | `5000` | Milliseconds to wait when the database is locked by another writer |
+   | `busyTimeoutMs` | `0` | Milliseconds to wait when the database is locked by another writer |
+   | `cachePages` | `0` | Page cache size (0 = engine default) |
 
 4. Leave the **Username** and **Password** fields empty.
 5. Click **Test Connection**, then **Finish**.
@@ -136,6 +137,8 @@ After that, DecentDB should show up under **New Connection → Embedded**.
 jdbc:decentdb:/home/alice/data/shop.ddb
 jdbc:decentdb:/home/alice/data/shop.ddb?readOnly=true
 jdbc:decentdb:/home/alice/data/shop.ddb?busyTimeoutMs=10000
+jdbc:decentdb:/home/alice/data/shop.ddb?cachePages=2048
+jdbc:decentdb::memory:
 ```
 
 ---
@@ -231,5 +234,5 @@ SQLException: database is locked
 ### DBeaver shows no tables after connecting
 
 - Refresh the Database Navigator (right-click connection → *Refresh*).
-- Confirm you connected to the correct `.ddb` file and that the file contains tables
-  (run `SELECT * FROM sqlite_master` or the DecentDB equivalent in a SQL console).
+- Confirm you connected to the correct `.ddb` file and that the file contains tables.
+  From a terminal you can sanity-check with `decentdb list-tables --db=/path/to/mydb.ddb`.

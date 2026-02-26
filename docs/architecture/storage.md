@@ -330,4 +330,4 @@ decentdb info --db=my.ddb
 
 - [B+Tree Details](btree.md) - Node structure, splits
 - [WAL & Recovery](wal.md) - Durability, checkpoints
-- [Configuration](../../api/configuration.md) - Cache settings
+- [Configuration](../api/configuration.md) - Cache settings

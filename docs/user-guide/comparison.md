@@ -8,7 +8,7 @@ This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB is currently at **v1.1**. This document describes the current feature set and constraints; details may change as DecentDB continues to evolve.
+DecentDB is currently at **v1.6.0**. This document describes the current feature set and constraints; details may change as DecentDB continues to evolve.
 
 DecentDB is intentionally scoped around:
 - **Priority #1:** durable ACID writes (WAL-based)
@@ -96,8 +96,9 @@ DecentDB has implemented many previously planned baseline features, including:
 - `CREATE TEMP TABLE` / `CREATE TEMP VIEW` (session-scoped)
 - `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
 
-For remaining roadmap and deferred capabilities, use:
-- [DecentDB SQL Enhancements Plan](../../design/SQL_ENHANCEMENTS_PLAN.md)
+For remaining roadmap and deferred capabilities, see:
+- [Road to RTM](../design/road-to-rtm.md)
+- [ADRs](../design/adr.md)
 
 ## Data types and functions
 
@@ -128,15 +129,15 @@ SQLite's runtime configuration mechanism (hundreds of directives) is not support
 |---|---|
 | `PRAGMA journal_mode` | Not applicable; DecentDB uses WAL-only mode |
 | `PRAGMA foreign_keys` | Always enabled; cannot be disabled |
-| `PRAGMA table_info(t)` | Use catalog queries (if supported) or `SELECT * FROM t LIMIT 0` |
-| `PRAGMA synchronous` | Not configurable; fsync-on-commit is default and required for durability |
-| `PRAGMA cache_size` | Not configurable; uses built-in page cache |
+| `PRAGMA table_info(t)` | Use `decentdb describe --db=... --table=t` |
+| `PRAGMA synchronous` | Not configurable; commits are durable by default (fsync-on-commit). Use `bulk-load --durability=...` for ingestion tradeoffs |
+| `PRAGMA cache_size` | Configure cache at open: CLI `--cachePages/--cacheMb`, Nim `openDb(..., cachePages=...)` |
 
 ### rowid / _rowid_ Pseudo-Columns
 
 SQLite exposes implicit rowid as a queryable pseudo-column. DecentDB has an internal rowid but does not expose it to SQL.
 
-**Recommendation:** Use explicit `INTEGER PRIMARY KEY` columns which auto-increment (already supported).
+**Recommendation:** Use an explicit INT64 primary key (e.g. `id INT PRIMARY KEY`). If the table has a single INT64 primary key column, omitting the value on INSERT will auto-assign an ID.
 
 ### WITHOUT ROWID Tables
 

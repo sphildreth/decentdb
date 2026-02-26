@@ -43,7 +43,7 @@ decentdb exec --db=corrupted.ddb --sql="SELECT 1"
 
 **Resolution:**
 - Restore from backup
-- Use `PRAGMA integrity_check`
+- Verify on-disk structure with `decentdb verify-header` and `decentdb verify-index`
 - Contact support if reproducible
 
 ### ERR_CONSTRAINT (Constraint Violation)
@@ -259,8 +259,12 @@ ERR_SQL: Type mismatch for column: age
 If database is corrupted:
 
 ```bash
-# Check integrity
-decentdb exec --db=my.ddb --sql="PRAGMA integrity_check"
+# Verify on-disk structure
+decentdb verify-header --db=my.ddb
+
+# If you suspect a specific index is corrupted:
+decentdb list-indexes --db=my.ddb
+decentdb verify-index --db=my.ddb --index=idx_users_name
 
 # Export and reimport if needed
 decentdb export --db=my.ddb --table=users --output=users.csv

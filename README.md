@@ -24,16 +24,16 @@
                                                              
 ```
                                                   
-ACID first. Everything else… eventually.
+DecentDB is an embedded relational database engine built with Nim, focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
 
-DecentDB is a embedded relational database engine focused on **durable writes**, **fast reads**, and **predictable correctness**. It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation. DecentDB provides a PostgreSQL-like SQL interface with ACID transactions, efficient B+Tree storage, and concurrent read access. It is not intended to be the best embedded database engine, but not terrible, a decent better than some engine.
+It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation, implementing a PostgreSQL-like SQL dialect (via libpg_query) on top of a fixed-page B+Tree storage engine and a write-ahead log (WAL) for durability.
 
 ## Features
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
 - 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
-- 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds UTC; correct `ORDER BY`, `EXTRACT`, and native bind/read in all bindings
+- 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds since Unix epoch (UTC); correct `ORDER BY` and `EXTRACT(YEAR|MONTH|DAY|HOUR|MINUTE|SECOND FROM ...)`, with native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing
@@ -41,8 +41,8 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 - 📊 **Rich Query Support** - Aggregates (including DISTINCT), subqueries (FROM, EXISTS, scalar), UPSERT, set operations, generated columns, and scalar functions (string, math, UUID, JSON)
 - ⚡ **Triggers** - AFTER and INSTEAD OF triggers for complex logic
 - 💾 **Savepoints** - Nested transaction control with SAVEPOINT, RELEASE, and ROLLBACK TO
-- 🧠 **In-Memory Database** - Ephemeral `:memory:` databases for caching and testing, with `saveAs` to export snapshots to disk
-- 📦 **Single File Database** - Portable database stored in a single file
+- 🧠 **In-Memory Database** - Ephemeral `:memory:` databases for caching and testing, with `save-as` (CLI) / `saveAs` (embedded API) to snapshot to disk
+- 📦 **Single-file DB + WAL sidecar** - Primary `.ddb` file with a `-wal` sidecar log for durability
 - 🌐 **Cross-Platform** - Runs on Linux, macOS, and Windows
 - 🚀 **Bulk Load Operations** - Optimized high-performance data loading
 - 🛠️ **Rich CLI Tool** - Unified command-line interface for all database operations
@@ -86,17 +86,11 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 **Regenerate**
 ```bash
-# Run full benchmark pipeline (all engines, aggregate, chart)
+# Run full benchmark pipeline (run + aggregate + chart)
 nimble bench_embedded_pipeline
 
-# Or run individual steps:
-nimble bench_embedded_sample    # Run all engines
-nimble bench_embedded_aggregate  # Aggregate results
-nimble bench_embedded_chart     # Generate chart
-
-# Run specific engines only:
-./build/run_benchmarks /tmp/bench_out --engines=decentdb,sqlite
-./build/run_benchmarks /tmp/bench_out --engines=all
+# Or generate just the chart from existing results:
+nimble bench_embedded_chart
 ```
 
 ## Quick Start
@@ -104,21 +98,24 @@ nimble bench_embedded_chart     # Generate chart
 ### Prerequisites
 
 - [Nim](https://nim-lang.org) (includes `nim` + `nimble`)
-- Python 3
 - libpg_query (C library + headers)
+- Python 3 (optional; for test harness)
 
-### Installation
+### Build from source
 
 ```bash
 nimble build
+# Optionally: install into ~/.nimble/bin
+nimble install
 ```
 
 ### Create a Database
 
 ```bash
 # Create and query a database
-decentdb exec --db ./my.ddb --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
-decentdb exec --db ./my.ddb --sql "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')"
+# Note: DecentDB auto-assigns an id when you omit a single INT64 PRIMARY KEY column on INSERT.
+decentdb exec --db ./my.ddb --sql "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)"
+decentdb exec --db ./my.ddb --sql "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com') RETURNING id"
 decentdb exec --db ./my.ddb --sql "SELECT * FROM users"
 ```
 
@@ -138,16 +135,16 @@ decentdb exec --db ./my.ddb --sql "CREATE TABLE orders (
     id INT PRIMARY KEY,
     user_id INT REFERENCES users(id),
     amount FLOAT64,
-    created_at INT
+    created_at TIMESTAMP
 )"
 
 # Insert data
-decentdb exec --db ./my.ddb --sql "INSERT INTO orders VALUES (1, 1, 99.99, 1704067200)"
+decentdb exec --db ./my.ddb --sql "INSERT INTO orders VALUES (1, 1, 99.99, TIMESTAMP '2025-01-01 00:00:00')"
 
 # Query with JOINs
-decentdb exec --db ./my.ddb --sql "SELECT u.name, SUM(o.amount) 
-    FROM users u 
-    JOIN orders o ON u.id = o.user_id 
+decentdb exec --db ./my.ddb --sql "SELECT u.name, SUM(o.amount) AS total
+    FROM users u
+    JOIN orders o ON u.id = o.user_id
     GROUP BY u.name"
 
 # Text search with trigram index
@@ -183,7 +180,10 @@ decentdb stats --db ./my.ddb
 decentdb exec --db ./my.ddb --sql "ANALYZE"
 
 # Rebuild an index
-decentdb rebuild-index --index users_name_idx --db ./my.ddb
+decentdb rebuild-index --index idx_users_name --db ./my.ddb
+
+# Rebuild all indexes
+decentdb rebuild-indexes --db ./my.ddb
 ```
 
 ## CLI Reference
@@ -196,7 +196,10 @@ Common commands:
 - `import` / `export` - Data transfer
 - `bulk-load` - High-performance data loading
 - `checkpoint` - WAL maintenance
+- `save-as` - Snapshot backup to a new on-disk file
 - `list-tables` / `describe` - Schema introspection
+- `rebuild-index` / `rebuild-indexes` - Index maintenance
+- `dump` - Export database as SQL
 
 ## Documentation
 

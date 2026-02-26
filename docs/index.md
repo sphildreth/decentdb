@@ -11,19 +11,19 @@ DecentDB is an embedded, single-machine relational database engine focused on **
 - **PostgreSQL-Compatible SQL** — JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), window functions, aggregates (with DISTINCT), upsert, RETURNING, savepoints
 - **Rich Data Types** — INT64, FLOAT64, TEXT, BLOB, BOOL, DECIMAL, UUID, DATE, TIMESTAMP
 - **Full-Text Substring Search** — Trigram inverted index for `LIKE '%pattern%'` queries
-- **Auto-Increment Primary Keys** — `INTEGER PRIMARY KEY` columns auto-assign IDs
+- **Auto-Assigned Primary Keys** — If a table has a single INT64 primary key column, omitting the value on INSERT will auto-assign an ID (INT/INTEGER/INT64/BIGINT are synonyms)
 - **Foreign Keys** — Referential integrity with CASCADE, SET NULL, RESTRICT
 - **Generated Columns** — `GENERATED ALWAYS AS (expr) STORED` for computed values
 - **Temporary Objects** — Session-scoped TEMP tables and views
 - **JSON Support** — Scalar functions, table-valued functions (`json_each`, `json_tree`)
-- **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md)
+- **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md), [JDBC](api/jdbc.md)
 - **Cross-Platform** — Linux, macOS, Windows
 
 ## Releases
 
 Releases are driven by Git tags and published via GitHub Actions:
 
-- Engine binaries (GitHub Releases): `docs/development/releases.md`
+- Engine binaries (GitHub Releases): [Releases](development/releases.md)
 - NuGet packages (`.NET 10`): `DecentDB.AdoNet`, `DecentDB.MicroOrm`, `DecentDB.EntityFrameworkCore`, `DecentDB.EntityFrameworkCore.Design`, `DecentDB.EntityFrameworkCore.NodaTime`
 
 ## Quick Start
@@ -33,9 +33,10 @@ Releases are driven by Git tags and published via GitHub Actions:
 nimble install decentdb
 
 # Create a database
-decentdb exec --db=mydb.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"
+# Note: auto-increment works for a single INT64 PRIMARY KEY column (spelling INT/INTEGER/INT64 doesn’t matter).
+decentdb exec --db=mydb.ddb --sql="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
 
-# Insert data
+# Insert data (id auto-assigned)
 decentdb exec --db=mydb.ddb --sql="INSERT INTO users (name) VALUES ('Alice')"
 
 # Query
@@ -44,10 +45,14 @@ decentdb exec --db=mydb.ddb --sql="SELECT * FROM users"
 
 ## Use Cases
 
-- **Music Library Apps** - Fast queries across artists, albums, tracks
-- **Embedded Applications** - Local data storage with SQL interface
-- **Analytics & Reporting** - Aggregate functions and GROUP BY support
-- **Search-Heavy Workloads** - Trigram indexes for text search
+- **Offline-first desktop app** — local relational cache for a UI-heavy app (fast reads, durable writes), with `saveAs` for backups/migration.
+- **Music library / media server** — trigram indexes for fast search across artist/album/track names and JSON metadata.
+- **IoT / edge device data logger** — append-only event table with native `TIMESTAMP`, periodic checkpoints, and snapshot exports.
+- **Game tools / editors** — temporary tables/views for import pipelines and fast iteration, with savepoints for “undo” style workflows.
+- **Embedded analytics & reporting** — `GROUP BY`/HAVING + window functions for dashboards on a single machine.
+- **Config/state store for services** — ACID transactions + foreign keys for consistent config + relational integrity.
+- **ETL staging / ingestion** — bulk-load CSV + generated columns for derived values and normalized search keys.
+- **Search-heavy workloads** — `%pattern%` queries accelerated by trigram indexes when you need substring matching.
 
 ## Performance
 

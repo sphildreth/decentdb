@@ -43,45 +43,34 @@ decentdb exec --db=small.ddb --sql="SELECT 1" --cachePages=1024
 decentdb exec --db=large.ddb --sql="SELECT 1" --cacheMb=256
 ```
 
-## WAL Configuration
+## Durability and Checkpointing
 
-The Write-Ahead Log (WAL) ensures durability.
+DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by default for durable ACID writes.
 
-### Sync Mode
+### Durability
 
-Controls how often data is synced to disk.
+There is currently no SQL-level `PRAGMA` to change durability for normal DML (`INSERT`/`UPDATE`/`DELETE`). For high-throughput ingestion, use bulk-load durability modes instead:
 
-**Modes:**
-- **FULL** (default): fsync on every commit. Maximum durability, slowest.
-- **NORMAL**: fdatasync on commit. Good balance.
-- **OFF** (testing only): No fsync. Fastest, unsafe.
+- CLI: `decentdb bulk-load --durability=full|deferred|none` (default: `deferred`)
+- Nim: `BulkLoadOptions.durability = dmFull|dmDeferred|dmNone`
 
-```sql
-PRAGMA wal_sync_mode = FULL;
-PRAGMA wal_sync_mode = NORMAL;
+### Checkpointing
+
+- Manual checkpoint: `decentdb checkpoint --db=my.ddb`
+- The engine configures sensible defaults at open (see `setCheckpointConfig` in the WAL module).
+
+From the CLI you can override checkpoint/reader behavior for a single `exec` invocation:
+
+```bash
+decentdb exec --db=my.ddb \
+  --checkpointBytes=67108864 \
+  --readerWarnMs=60000 \
+  --readerTimeoutMs=300000 \
+  --forceTruncateOnTimeout \
+  --sql="SELECT 1"
 ```
 
-### Checkpoint Threshold
-
-When to automatically checkpoint the WAL:
-
-```sql
--- Checkpoint when WAL reaches 10MB
-PRAGMA checkpoint_threshold = 10000000;
-```
-
-Default: 1MB
-
-### Checkpoint Timeout
-
-Maximum time to wait for readers before forcing checkpoint:
-
-```sql
--- Wait up to 60 seconds for readers
-PRAGMA checkpoint_timeout = 60;
-```
-
-Default: 30 seconds
+Note: if you pass *any* of the checkpoint/reader flags, the CLI overrides the engine defaults for that process (unset values become `0` / `false`).
 
 ## Bulk Load Configuration
 
@@ -103,21 +92,12 @@ opts.disableIndexes = true
 opts.checkpointOnComplete = true
 
 -- Durability mode
-opts.durability = dmDeferred  -- dmFull, dmNormal, dmNone
+opts.durability = dmDeferred  -- dmFull, dmDeferred, dmNone
 ```
 
 ## Page Size
 
-Set at database creation (cannot be changed):
-
-Valid sizes: 2048, 4096, 8192, 16384 bytes
-
-Default: 4096 bytes
-
-**Considerations:**
-- Smaller pages (2KB): Less memory usage, more I/O
-- Larger pages (16KB): Better for large rows, less I/O
-- 4KB is optimal for most workloads
+DecentDB currently uses a fixed 4096-byte page size (this is part of the on-disk format).
 
 ## Runtime Configuration
 
@@ -138,23 +118,18 @@ decentdb info --db=my.ddb --schema-summary
 # - (optional) Schema summary (tables, columns, indexes)
 ```
 
-### PRAGMA Commands
+### Checkpoint/Reader Settings (CLI)
 
-```sql
--- Get setting
-PRAGMA wal_sync_mode;
+DecentDB does not support SQLite-style `PRAGMA` statements.
 
--- Set setting
-PRAGMA wal_sync_mode = NORMAL;
-```
+To override checkpoint/reader settings for a single `exec` invocation, use:
+- `--checkpointBytes`
+- `--checkpointMs`
+- `--readerWarnMs`
+- `--readerTimeoutMs`
+- `--forceTruncateOnTimeout`
 
-Available PRAGMAs:
-- `wal_sync_mode` - Durability level
-- `checkpoint_threshold` - Auto-checkpoint size
-- `checkpoint_timeout` - Reader timeout
-- `stats` - Database statistics
-- `integrity_check` - Verify database
-
+For embedded Nim usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
 ## Configuration File
 
 Create `~/.decentdb/config` for default settings:
@@ -163,11 +138,9 @@ Create `~/.decentdb/config` for default settings:
 # Default database path
 db = ~/myapp.ddb
 
-# Default cache size
+# Default cache size (either key is supported)
 cacheMb = 64
-
-# Default output format
-format = json
+# cachePages = 16384
 ```
 
 Settings are overridden by command-line options.
@@ -197,16 +170,7 @@ opts.checkpointOnComplete = true
 ```bash
 # Balanced settings
 decentdb exec --db=my.ddb --sql="..." --cacheMb=64
-
-# Normal durability
-PRAGMA wal_sync_mode = NORMAL;
 ```
-
-## Environment Variables
-
-- `DECENTDB_CACHE_MB` - Default cache size in MB
-- `DECENTDB_WAL_SYNC` - Default WAL sync mode
-- `DECENTDB_FORMAT` - Default output format
 
 ## Best Practices
 
@@ -241,9 +205,7 @@ decentdb exec --db=embedded.ddb --sql="..." --cachePages=256  # 1MB
 ### Development/Testing
 
 ```bash
-# Fast but less safe
 decentdb exec --db=dev.ddb --sql="..." --cacheMb=32
-PRAGMA wal_sync_mode = NORMAL;
 ```
 
 ### In-Memory (Caching/Testing)
@@ -253,15 +215,18 @@ PRAGMA wal_sync_mode = NORMAL;
 decentdb exec --db=:memory: --sql="CREATE TABLE cache (key TEXT PRIMARY KEY, val TEXT)"
 ```
 
-In-memory databases ignore `wal_sync_mode` (no fsync needed) and use the default page cache. Use `save-as` to persist a snapshot to disk when needed.
+In-memory databases are fully transactional, but do not write to disk. Use `save-as` to persist a snapshot to disk when needed.
 
 ### Production Server
 
 ```bash
-# Safe and fast
+# Larger cache (durability is fsync-on-commit by default)
 decentdb exec --db=prod.ddb --sql="..." --cacheMb=256
-PRAGMA wal_sync_mode = FULL;
-PRAGMA checkpoint_threshold = 10000000;  # 10MB
+
+# Optional: explicitly set checkpoint/reader policy for this invocation
+# (see note above about overriding defaults)
+decentdb exec --db=prod.ddb --sql="SELECT 1" --cacheMb=256 \
+  --checkpointBytes=67108864 --readerWarnMs=60000 --readerTimeoutMs=300000 --forceTruncateOnTimeout
 ```
 
 ### Bulk Data Import

@@ -95,8 +95,8 @@ EF Core provider type mappings with the existing ADO.NET/MicroOrm conventions:
 | `Guid` | `UUID` | 16-byte blob UUID (see ADR-0091) |
 | `string` | `TEXT` | UTF-8 text |
 | `byte[]` | `BLOB` | binary blob |
-| `DateTime` | `INTEGER` | Unix epoch milliseconds (UTC) |
-| `DateTimeOffset` | `INTEGER` | Unix epoch milliseconds (UTC) |
+| `DateTime` | `TIMESTAMP` | microseconds since Unix epoch (UTC) |
+| `DateTimeOffset` | `TIMESTAMP` | microseconds since Unix epoch (UTC) |
 | `DateOnly` | `INTEGER` | day offset from Unix epoch day |
 | `TimeOnly` | `INTEGER` | ticks since midnight |
 | `TimeSpan` | `INTEGER` | ticks |
@@ -171,9 +171,11 @@ options.UseDecentDB("Data Source=./app.ddb", decent => decent.UseNodaTime());
 
 Supported NodaTime types in the extension package:
 
-- `Instant` -> `INTEGER` (Unix epoch milliseconds)
+- `Instant` -> `INTEGER` (Unix epoch ticks / 100ns)
 - `LocalDate` -> `INTEGER` (day offset from Unix epoch day)
-- `LocalDateTime` -> `INTEGER` (UTC epoch milliseconds via UTC zone conversion)
+- `LocalDateTime` -> `INTEGER` (Unix epoch ticks / 100ns, interpreted in UTC)
+
+Note: the NodaTime extension replaces the EF Core type mapping source; when enabled, `DateTime` and `DateTimeOffset` are stored as `INTEGER` (`UtcTicks`) rather than `TIMESTAMP`.
 
 ## Assemblies
 
@@ -196,7 +198,7 @@ If you need a RID not shipped by the NuGet package or you're working in this rep
 nimble build_lib
 ```
 
-This produces `build/libc_api.so` (Linux), `build/libc_api.dylib` (macOS), or `build/decentdb.dll` (Windows).
+This produces `build/libc_api.so` (Linux), `build/libc_api.dylib` (macOS), or `build/c_api.dll` (Windows).
 
 ## ADO.NET Usage
 
@@ -277,7 +279,7 @@ conn.Open();
 using var cmd = conn.CreateCommand();
 
 // DDL
-cmd.CommandText = "CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)";
+cmd.CommandText = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)";
 cmd.ExecuteNonQuery();
 
 // INSERT with auto-increment (omit id column)

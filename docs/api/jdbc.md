@@ -30,7 +30,8 @@ jdbc:decentdb:/absolute/path/to/db.ddb
 Optional query parameters:
 
 - `readOnly=true|false` (default: `false`)
-- `busyTimeoutMs=<int>` (default: `5000`)
+- `busyTimeoutMs=<int>` (default: `0`)
+- `cachePages=<int>` (default: `0`, meaning “engine default”)
 
 Examples:
 
@@ -38,7 +39,16 @@ Examples:
 jdbc:decentdb:/home/alice/data/shop.ddb
 jdbc:decentdb:/home/alice/data/shop.ddb?readOnly=true
 jdbc:decentdb:/home/alice/data/shop.ddb?busyTimeoutMs=10000
+jdbc:decentdb:/home/alice/data/shop.ddb?cachePages=2048
 ```
+
+In-memory databases:
+
+```
+jdbc:decentdb::memory:
+```
+
+Each JDBC connection opened with `:memory:` is an independent in-memory database (it is not shared across connections).
 
 ---
 
@@ -84,6 +94,15 @@ public class Main {
   }
 }
 ```
+
+---
+
+## TIMESTAMP mapping
+
+DecentDB stores `TIMESTAMP` as **microseconds since Unix epoch (UTC)**.
+
+- Binding: `PreparedStatement#setTimestamp(...)` binds a `java.sql.Timestamp` as microseconds since epoch.
+- Reading: `ResultSet#getTimestamp(...)` returns a `java.sql.Timestamp` reconstructed from the stored microseconds.
 
 ---
 

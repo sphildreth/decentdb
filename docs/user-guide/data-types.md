@@ -12,13 +12,13 @@ Range: -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807
 
 ```sql
 CREATE TABLE example (
-    id INT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     count INTEGER,
     big_number INT64
 );
 ```
 
-`INTEGER PRIMARY KEY` columns support auto-increment: if the column is omitted from an `INSERT` statement, DecentDB automatically assigns the next sequential ID. Explicit values are also accepted.
+A single INT64 `PRIMARY KEY` column supports auto-increment: if the column is omitted from an `INSERT` statement, DecentDB automatically assigns the next sequential ID. (`INT`, `INTEGER`, and `INT64` are synonyms here.) Explicit values are also accepted.
 
 ```sql
 INSERT INTO example (count) VALUES (42);       -- id auto-assigned

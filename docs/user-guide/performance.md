@@ -25,11 +25,11 @@ Recommendations:
 
 Always define primary keys. DecentDB automatically creates an index.
 
-`INTEGER PRIMARY KEY` columns support auto-increment — omit the column from INSERT and DecentDB assigns the next sequential ID.
+A single INT64 `PRIMARY KEY` column supports auto-assignment — omit the column from INSERT and DecentDB assigns the next sequential ID (`INT`/`INTEGER`/`INT64`/`BIGINT` are synonyms here).
 
 ```sql
 CREATE TABLE users (
-    id INT PRIMARY KEY,  -- Automatically indexed, auto-incremented
+    id INT PRIMARY KEY,  -- Automatically indexed, auto-assigned when omitted
     name TEXT
 );
 
@@ -48,8 +48,8 @@ Foreign keys are automatically indexed for efficient joins.
 
 ```sql
 CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    user_id INT REFERENCES users(id)  -- Auto-indexed
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id)  -- Auto-indexed
 );
 ```
 
@@ -156,23 +156,25 @@ Checkpoints write WAL data to the main database file:
 # Manual checkpoint
 decentdb checkpoint --db=my.ddb
 
-# Configure auto-checkpoint thresholds
-decentdb exec --db=my.ddb --sql="PRAGMA checkpoint_threshold=10000000"  # 10MB
+# (Optional) Override checkpoint policy for this exec invocation
+# Note: if you pass any checkpoint/reader flag, exec overrides the engine defaults.
+decentdb exec --db=my.ddb --checkpointBytes=10000000 --sql="SELECT 1"
 ```
 
 ### Durability vs Performance
 
 Trade-off between safety and speed:
 
-```sql
--- Full durability (default): fsync on every commit
-PRAGMA wal_sync_mode = FULL;
+DecentDB commits are durable (fsync-on-commit) by default.
 
--- Normal: fdatasync (faster, still safe)
-PRAGMA wal_sync_mode = NORMAL;
+For higher throughput ingestion, use bulk load durability modes:
 
--- Testing only: no fsync
-PRAGMA wal_sync_mode = OFF;
+```bash
+# Default bulk-load mode (good throughput, still durable)
+decentdb bulk-load --db=my.ddb --table=logs --input=logs.csv --durability=deferred
+
+# Fastest (unsafe): may lose recent batches on crash
+decentdb bulk-load --db=my.ddb --table=logs --input=logs.csv --durability=none
 ```
 
 ## Monitoring
@@ -199,7 +201,7 @@ Over time, indexes may become fragmented. Rebuild them:
 decentdb rebuild-index --db=my.ddb --index=idx_users_name
 
 # Or rebuild all indexes
-decentdb exec --db=my.ddb --sql="PRAGMA rebuild_all_indexes"
+decentdb rebuild-indexes --db=my.ddb
 ```
 
 ## Common Bottlenecks
