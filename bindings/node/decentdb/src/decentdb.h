@@ -76,6 +76,10 @@ int decentdb_bind_decimal(decentdb_stmt* stmt, int index_1_based, int64_t unscal
 int64_t decentdb_column_decimal_unscaled(decentdb_stmt* stmt, int col_0_based);
 int decentdb_column_decimal_scale(decentdb_stmt* stmt, int col_0_based);
 
+// DateTime support: microseconds since Unix epoch UTC (TIMESTAMP columns)
+int decentdb_bind_datetime(decentdb_stmt* stmt, int index_1_based, int64_t micros_utc);
+int64_t decentdb_column_datetime(decentdb_stmt* stmt, int col_0_based);
+
 // Convenience API for high-overhead FFI layers (e.g. Python/ctypes):
 // reset + clear bindings + bind params (from value_view array) + step once + row_view.
 // Returns 0 on success, -1 on error. `out_has_row` is set to 1 if a row is available.

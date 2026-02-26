@@ -288,6 +288,7 @@ public sealed class PreparedStatement : IDisposable
     }
 
     public PreparedStatement BindDecimal(int index1Based, decimal value)
+    {
         // DecentDB currently supports DECIMAL backed by INT64 (approx 18 digits).
         // C# decimal is 96-bit integer + scale. We must check if it fits in 64-bit.
 

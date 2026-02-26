@@ -103,7 +103,7 @@ public class EdgeCaseTests : IDisposable
         conn.Open();
 
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE TABLE test_datetime (id INTEGER PRIMARY KEY, dt_value INT64)";
+        cmd.CommandText = "CREATE TABLE test_datetime (id INTEGER PRIMARY KEY, dt_value TIMESTAMP)";
         cmd.ExecuteNonQuery();
 
         var now = DateTime.Now;
