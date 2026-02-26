@@ -1940,7 +1940,7 @@ suite "Planner":
     check selRes.ok
     check selRes.value.len == 1
     let row = splitRow(selRes.value[0])
-    check row[0] == "2025-06-15"
+    check row[0] == "2025-06-15 00:00:00"
     check row[1] == "2025-06-15 10:30:00"
     discard closeDb(db)
 

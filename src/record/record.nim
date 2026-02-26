@@ -22,6 +22,8 @@ type ValueKind* = enum
   vkBoolTrue
   vkInt0
   vkInt1
+  # Native datetime: int64 microseconds since Unix epoch UTC (zigzag-varint encoded)
+  vkDateTime
 
 type Value* = object
   kind*: ValueKind
@@ -190,6 +192,9 @@ proc encodeValue*(value: Value): seq[byte] =
     else:
       kind = vkInt64
       payload = encodeVarint(zigzagEncode(value.int64Val))
+  of vkDateTime:
+    kind = vkDateTime
+    payload = encodeVarint(zigzagEncode(value.int64Val))
   of vkFloat64:
     payload = newSeq[byte](8)
     writeU64LE(payload, 0, cast[uint64](value.float64Val))
@@ -275,6 +280,12 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
     if not vRes.ok:
       return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
     value.int64Val = zigzagDecode(vRes.value)
+  of vkDateTime:
+    var pOffset = 0
+    let vRes = decodeVarint(payload, pOffset)
+    if not vRes.ok:
+      return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
+    value.int64Val = zigzagDecode(vRes.value)
   ok(value)
 
 proc encodeRecord*(values: seq[Value]): seq[byte] =
@@ -350,6 +361,8 @@ proc encodeRecord*(values: seq[Value]): seq[byte] =
       payloadLen = 8
     of vkDecimal:
       payloadLen = 1 + varintLen(zigzagEncode(value.int64Val))
+    of vkDateTime:
+      payloadLen = varintLen(zigzagEncode(value.int64Val))
     totalLen += 1 + varintLen(uint64(payloadLen)) + payloadLen
 
   result = newSeq[byte](totalLen)
@@ -389,6 +402,8 @@ proc encodeRecord*(values: seq[Value]): seq[byte] =
       payloadLen = 8
     of vkDecimal:
       payloadLen = 1 + varintLen(zigzagEncode(value.int64Val))
+    of vkDateTime:
+      payloadLen = varintLen(zigzagEncode(value.int64Val))
 
     result[offset] = byte(kind)
     inc offset
@@ -402,6 +417,8 @@ proc encodeRecord*(values: seq[Value]): seq[byte] =
       # payloadLen is 0, so the kind byte is exactly two bytes behind `offset`.
       result[offset - 2] = byte(if value.boolVal: vkBoolTrue else: vkBoolFalse)
     of vkInt64:
+      putVarint(result, offset, zigzagEncode(value.int64Val))
+    of vkDateTime:
       putVarint(result, offset, zigzagEncode(value.int64Val))
     of vkFloat64:
       putU64LE(result, offset, cast[uint64](value.float64Val))
@@ -479,6 +496,8 @@ proc encodeRecordTo*(values: openArray[Value], dst: var seq[byte]): int =
       payloadLen = 8
     of vkDecimal:
       payloadLen = 1 + varintLen(zigzagEncode(value.int64Val))
+    of vkDateTime:
+      payloadLen = varintLen(zigzagEncode(value.int64Val))
     totalLen += 1 + varintLen(uint64(payloadLen)) + payloadLen
 
   if dst.len < totalLen:
@@ -520,6 +539,8 @@ proc encodeRecordTo*(values: openArray[Value], dst: var seq[byte]): int =
       payloadLen = 8
     of vkDecimal:
       payloadLen = 1 + varintLen(zigzagEncode(value.int64Val))
+    of vkDateTime:
+      payloadLen = varintLen(zigzagEncode(value.int64Val))
 
     dst[offset] = byte(kind)
     inc offset
@@ -531,6 +552,8 @@ proc encodeRecordTo*(values: openArray[Value], dst: var seq[byte]): int =
     of vkBool:
       dst[offset - 2] = byte(if value.boolVal: vkBoolTrue else: vkBoolFalse)
     of vkInt64:
+      putVarintBuf(dst, offset, zigzagEncode(value.int64Val))
+    of vkDateTime:
       putVarintBuf(dst, offset, zigzagEncode(value.int64Val))
     of vkFloat64:
       putU64LEBuf(dst, offset, cast[uint64](value.float64Val))

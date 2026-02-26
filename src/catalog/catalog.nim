@@ -18,6 +18,7 @@ type ColumnType* = enum
   ctBlob
   ctDecimal
   ctUuid
+  ctDateTime
 
 type ColumnTypeSpec* = object
   kind*: ColumnType
@@ -149,7 +150,7 @@ proc parseColumnType*(text: string): Result[ColumnTypeSpec] =
   of "TEXT", "VARCHAR", "CHARACTER VARYING":
     ok(ColumnTypeSpec(kind: ctText))
   of "DATE", "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP WITH TIME ZONE", "DATETIME":
-    ok(ColumnTypeSpec(kind: ctText))
+    ok(ColumnTypeSpec(kind: ctDateTime))
   of "BLOB":
     ok(ColumnTypeSpec(kind: ctBlob))
   of "UUID":
@@ -189,6 +190,7 @@ proc columnTypeToText*(kind: ColumnType): string =
   of ctBlob: "BLOB"
   of ctDecimal: "DECIMAL"
   of ctUuid: "UUID"
+  of ctDateTime: "TIMESTAMP"
 
 proc normalizeFkAction(action: string): string =
   let upper = action.strip().toUpperAscii()

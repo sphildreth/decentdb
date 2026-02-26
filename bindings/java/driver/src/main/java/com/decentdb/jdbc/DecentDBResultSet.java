@@ -138,6 +138,15 @@ public class DecentDBResultSet implements ResultSet {
             return DecentDBNative.colInt64(stmtHandle, columnIndex - 1) != 0 ? "true" : "false";
         } else if (k == DecentDBNative.KIND_DECIMAL) {
             return getDecimal(columnIndex).toPlainString();
+        } else if (k == DecentDBNative.KIND_DATETIME) {
+            // Format as ISO-8601 string
+            long micros = DecentDBNative.colDatetime(stmtHandle, columnIndex - 1);
+            long epochMicros = micros;
+            long secs = epochMicros / 1_000_000L;
+            int us = (int)(epochMicros % 1_000_000L);
+            if (us < 0) { secs--; us += 1_000_000; }
+            java.time.Instant inst = java.time.Instant.ofEpochSecond(secs, us * 1000L);
+            return inst.atOffset(java.time.ZoneOffset.UTC).format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
         }
         return DecentDBNative.colText(stmtHandle, columnIndex - 1);
     }
@@ -312,6 +321,17 @@ public class DecentDBResultSet implements ResultSet {
 
     @Override
     public Timestamp getTimestamp(int columnIndex) throws SQLException {
+        checkOpen();
+        if (isNull(columnIndex)) return null;
+        int k = kind(columnIndex);
+        if (k == DecentDBNative.KIND_DATETIME) {
+            long micros = DecentDBNative.colDatetime(stmtHandle, columnIndex - 1);
+            long ms = micros / 1000L;
+            int ns = (int)((micros % 1000L) * 1000L);
+            Timestamp ts = new Timestamp(ms);
+            ts.setNanos(ns >= 0 ? ns : ns + 1_000_000_000);
+            return ts;
+        }
         String s = getString(columnIndex);
         if (s == null) return null;
         try { return Timestamp.valueOf(s.trim()); } catch (IllegalArgumentException e) { return null; }
@@ -332,6 +352,7 @@ public class DecentDBResultSet implements ResultSet {
                 return bytes;
             }
             case DecentDBNative.KIND_DECIMAL: return getBigDecimal(columnIndex);
+            case DecentDBNative.KIND_DATETIME: return getTimestamp(columnIndex);
             default: return getString(columnIndex);
         }
     }

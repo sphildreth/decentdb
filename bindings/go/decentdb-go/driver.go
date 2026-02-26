@@ -470,9 +470,9 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 				res = C.decentdb_bind_blob(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.int(len(v)))
 			}
 		case time.Time:
-			// Epoch ms UTC
-			ms := v.UnixNano() / 1e6
-			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(ms))
+			// Microseconds since Unix epoch UTC
+			micros := v.UnixNano() / 1e3
+			res = C.decentdb_bind_datetime(s.stmt, idx, C.int64_t(micros))
 		case Decimal:
 			res = C.decentdb_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.int(v.Scale))
 		default:
@@ -595,6 +595,9 @@ func (r *rows) Next(dest []driver.Value) error {
 				Unscaled: int64(v.int64_val),
 				Scale:    int(v.decimal_scale),
 			}
+		case 17: // vkDateTime: microseconds since Unix epoch UTC
+			micros := int64(v.int64_val)
+			dest[i] = time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
 		default:
 			dest[i] = nil
 		}

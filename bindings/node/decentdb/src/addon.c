@@ -649,6 +649,19 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
           cell = obj;
           break;
         }
+        case 17: { // vkDateTime: microseconds since epoch → JS Date (milliseconds)
+          double ms = (double)v->int64_val / 1000.0;
+          napi_value msv;
+          st = napi_create_double(env, ms, &msv);
+          assert(st == napi_ok);
+          napi_value date_ctor;
+          st = napi_get_global(env, &date_ctor);
+          assert(st == napi_ok);
+          // Return as ISO string for simplicity (Date constructor is async-unsafe in N-API)
+          // Format: expose as a plain number (ms since epoch); callers wrap in new Date(val)
+          cell = msv;
+          break;
+        }
         default: {
           // Unknown kind: surface as null to avoid UB.
           st = napi_get_null(env, &cell);

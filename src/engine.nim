@@ -23,6 +23,7 @@ import ./planner/explain
 import ./exec/exec
 import ./record/record
 import ./storage/storage
+import ./utils/datetime
 import ./btree/btree
 import ./wal/wal
 
@@ -441,6 +442,19 @@ proc typeCheckValue(col: Column, value: Value): Result[Value] =
        if value.bytes.len == 16: return ok(value)
        return err[Value](ERR_CONSTRAINT, "UUID must be 16 bytes")
     return err[Value](ERR_SQL, "Type mismatch: expected UUID")
+  of ctDateTime:
+    if value.kind == vkNull: return ok(value)
+    if value.kind == vkDateTime: return ok(value)
+    if value.kind == vkInt64:
+      return ok(Value(kind: vkDateTime, int64Val: value.int64Val))
+    if value.kind in {vkText, vkBlob}:
+      let s = valueToString(value).strip()
+      if s.toLowerAscii() == "now":
+        return ok(Value(kind: vkDateTime, int64Val: datetimeToMicros(now().utc())))
+      let res = parseDatetimeMicros(s)
+      if not res.ok: return err[Value](ERR_SQL, "Type mismatch: invalid datetime string", s)
+      return ok(Value(kind: vkDateTime, int64Val: res.value))
+    return err[Value](ERR_SQL, "Type mismatch: expected TIMESTAMP")
 
 proc typeCheckFast(col: Column, value: Value): bool {.inline.} =
   ## Returns true if value trivially matches the column type (no conversion needed).
@@ -454,6 +468,7 @@ proc typeCheckFast(col: Column, value: Value): bool {.inline.} =
   of ctBlob: value.kind == vkBlob
   of ctDecimal: value.kind == vkDecimal and value.decimalScale == col.decScale
   of ctUuid: value.kind == vkBlob and value.bytes.len == 16
+  of ctDateTime: value.kind == vkDateTime
 
 proc valuesEqual(a: Value, b: Value): bool =
   if a.kind == vkNull and b.kind == vkNull:

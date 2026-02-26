@@ -11,6 +11,7 @@ import ../catalog/catalog
 import ../search/search
 import ../sql/sql
 import sets
+import ../utils/datetime
 
 when defined(bench_breakdown):
   import std/monotimes
@@ -1596,6 +1597,8 @@ proc valueToStringForAlter(value: Value): string =
     $value.int64Val
   of vkFloat64:
     $value.float64Val
+  of vkDateTime:
+    formatDatetimeMicros(value.int64Val)
   of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
     var s = ""
     for b in value.bytes:
@@ -1659,6 +1662,18 @@ proc convertValueForAlter(value: Value, targetKind: ColumnType): Result[Value] =
       if s in ["false", "f", "0"]:
         return ok(Value(kind: vkBool, boolVal: false))
       return err[Value](ERR_SQL, "Invalid type conversion text-to-bool value", s)
+    else:
+      return err[Value](ERR_SQL, "Unsupported type conversion source type")
+  of ctDateTime:
+    case value.kind
+    of vkDateTime: return ok(value)
+    of vkInt64: return ok(Value(kind: vkDateTime, int64Val: value.int64Val))
+    of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
+      let s = valueToStringForAlter(value).strip()
+      let res = parseDatetimeMicros(s)
+      if not res.ok:
+        return err[Value](ERR_SQL, "Invalid type conversion text-to-datetime value", s)
+      return ok(Value(kind: vkDateTime, int64Val: res.value))
     else:
       return err[Value](ERR_SQL, "Unsupported type conversion source type")
   else:

@@ -32,7 +32,8 @@ DecentDB is a embedded relational database engine focused on **durable writes**,
 
 - 🔒 **ACID Transactions** - Write-ahead logging with crash-safe recovery
 - 🌳 **B+Tree Storage** - Efficient tables and secondary indexes with page caching
-- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, DATE, TIMESTAMP)
+- 🐘 **PostgreSQL-like SQL** - Familiar DDL/DML syntax with JOINs (INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL), CTEs (including WITH RECURSIVE), subqueries, window functions, and rich types (UUID, DECIMAL, native TIMESTAMP)
+- 🕒 **Native TIMESTAMP Type** - DATE/TIMESTAMP columns stored as int64 microseconds UTC; correct `ORDER BY`, `EXTRACT`, and native bind/read in all bindings
 - 👥 **Concurrent Reads** - Snapshot isolation allows multiple readers with one writer
 - 🔎 **Trigram Index** - Fast text search for `LIKE '%pattern%'` queries
 - 🧪 **Comprehensive Testing** - Unit tests, property tests, crash injection, and differential testing

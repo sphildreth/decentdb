@@ -277,8 +277,17 @@ public sealed class PreparedStatement : IDisposable
         return this;
     }
 
-    public PreparedStatement BindDecimal(int index1Based, decimal value)
+    public PreparedStatement BindDatetime(int index1Based, long microsUtc)
     {
+        var res = DecentDBNativeUnsafe.decentdb_bind_datetime(Handle, index1Based, microsUtc);
+        if (res < 0)
+        {
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+        }
+        return this;
+    }
+
+    public PreparedStatement BindDecimal(int index1Based, decimal value)
         // DecentDB currently supports DECIMAL backed by INT64 (approx 18 digits).
         // C# decimal is 96-bit integer + scale. We must check if it fits in 64-bit.
 

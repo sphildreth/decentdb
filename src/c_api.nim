@@ -501,14 +501,30 @@ proc decentdb_prepare*(p: pointer, sql_text: cstring, out_stmt: ptr pointer): ci
       if tableRes.ok:
         for col in tableRes.value.columns:
           colNames.add(col.name)
+      elif db_handle.db.catalog.views.hasKey(bound.fromTable):
+        let v = db_handle.db.catalog.views[bound.fromTable]
+        for cname in v.columnNames:
+          colNames.add(cname)
     else:
       for item in bound.selectItems:
-        var name = if item.alias.len > 0: item.alias else: ""
-        if name.len == 0 and item.expr != nil and item.expr.kind == ekColumn:
-          name = item.expr.name
-        if name.len == 0:
-          name = "column" & $colNames.len
-        colNames.add(name)
+        if item.isStar:
+          # Star in a multi-item select – resolve from table or view
+          if bound.fromTable.len > 0:
+            let tableRes = db_handle.db.catalog.getTable(bound.fromTable)
+            if tableRes.ok:
+              for col in tableRes.value.columns:
+                colNames.add(col.name)
+            elif db_handle.db.catalog.views.hasKey(bound.fromTable):
+              let v = db_handle.db.catalog.views[bound.fromTable]
+              for cname in v.columnNames:
+                colNames.add(cname)
+        else:
+          var name = if item.alias.len > 0: item.alias else: ""
+          if name.len == 0 and item.expr != nil and item.expr.kind == ekColumn:
+            name = item.expr.name
+          if name.len == 0:
+            name = "column" & $colNames.len
+          colNames.add(name)
 
   if bound.kind == skExplain:
     if bound.explainInner.kind != skSelect:
@@ -888,6 +904,27 @@ proc decentdb_column_blob*(p: pointer, col: cint, out_len: ptr cint): ptr uint8 
     return cast[ptr uint8](unsafeAddr h.currentValues[col].bytes[0])
   return nil
 
+proc decentdb_column_datetime*(p: pointer, col: cint): int64 {.exportc, cdecl, dynlib.} =
+  ## Returns the column value as microseconds since Unix epoch UTC.
+  ## Returns 0 if the column is NULL, not a TIMESTAMP, or out of range.
+  let h = cast[StmtHandle](p)
+  if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return 0
+  let val = h.currentValues[col]
+  if val.kind == vkDateTime: return val.int64Val
+  if val.kind == vkInt64: return val.int64Val
+  return 0
+
+proc decentdb_bind_datetime*(p: pointer, col: cint, micros: int64): cint {.exportc, cdecl, dynlib.} =
+  ## Bind a TIMESTAMP parameter as microseconds since Unix epoch UTC.
+  let h = cast[StmtHandle](p)
+  if h == nil: return -1
+  let idx = int(col) - 1
+  if idx < 0: return -1
+  while h.params.len <= idx:
+    h.params.add(Value(kind: vkNull))
+  h.params[idx] = Value(kind: vkDateTime, int64Val: micros)
+  return 0
+
 proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_count: ptr cint): cint {.exportc, cdecl, dynlib.} =
   if p == nil: return -1
   let h = cast[StmtHandle](p)
@@ -904,6 +941,8 @@ proc decentdb_row_view*(p: pointer, out_values: ptr ptr DecentdbValueView, out_c
     if v.kind == vkNull:
       view.isNull = 1
     elif v.kind == vkInt64:
+      view.int64Val = v.int64Val
+    elif v.kind == vkDateTime:
       view.int64Val = v.int64Val
     elif v.kind == vkBool:
       view.int64Val = if v.boolVal: 1 else: 0

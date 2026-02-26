@@ -85,6 +85,7 @@ final class TypeMapping {
             case DecentDBNative.KIND_BOOL_TRUE:
                 return Types.BOOLEAN;
             case DecentDBNative.KIND_DECIMAL: return Types.DECIMAL;
+            case DecentDBNative.KIND_DATETIME: return Types.TIMESTAMP;
             case DecentDBNative.KIND_NULL:    return Types.NULL;
             default:                          return Types.OTHER;
         }

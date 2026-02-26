@@ -149,6 +149,16 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
             } else if (v instanceof byte[]) {
                 int rc = DecentDBNative.bindBlob(stmtHandle, col, (byte[]) v);
                 if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+            } else if (v instanceof java.sql.Timestamp) {
+                java.sql.Timestamp ts = (java.sql.Timestamp) v;
+                long micros = ts.getTime() * 1000L + ts.getNanos() / 1000L % 1000L;
+                int rc = DecentDBNative.bindDatetime(stmtHandle, col, micros);
+                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+            } else if (v instanceof java.sql.Date) {
+                java.sql.Date d = (java.sql.Date) v;
+                long micros = d.getTime() * 1000L;
+                int rc = DecentDBNative.bindDatetime(stmtHandle, col, micros);
+                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
             } else {
                 // Fallback: convert to string
                 int rc = DecentDBNative.bindText(stmtHandle, col, v.toString());
@@ -228,7 +238,7 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
     @Override
     public void setDate(int parameterIndex, Date x) throws SQLException {
         checkParamIndex(parameterIndex);
-        params[parameterIndex - 1] = x != null ? x.toString() : NullPlaceholder.INSTANCE;
+        params[parameterIndex - 1] = x != null ? x : NullPlaceholder.INSTANCE;
     }
 
     @Override
@@ -240,7 +250,7 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
     @Override
     public void setTimestamp(int parameterIndex, Timestamp x) throws SQLException {
         checkParamIndex(parameterIndex);
-        params[parameterIndex - 1] = x != null ? x.toString() : NullPlaceholder.INSTANCE;
+        params[parameterIndex - 1] = x != null ? x : NullPlaceholder.INSTANCE;
     }
 
     @Override

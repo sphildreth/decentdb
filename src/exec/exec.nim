@@ -22,6 +22,7 @@ import ../storage/storage
 import ../planner/planner
 import ../search/search
 import ../btree/btree
+import ../utils/datetime
 
 type Row* = object
   rowid*: uint64
@@ -155,6 +156,7 @@ proc valueToString*(value: Value): string =
   of vkInt64: $value.int64Val
   of vkFloat64: $value.float64Val
   of vkDecimal: decimalToString(value.int64Val, value.decimalScale)
+  of vkDateTime: formatDatetimeMicros(value.int64Val)
   of vkText, vkBlob:
     let n = value.bytes.len
     var s = newString(n)
@@ -1404,7 +1406,7 @@ proc estimateRowBytes*(row: Row): int =
       payloadLen = 0
     of vkBool:
       payloadLen = 1
-    of vkInt64, vkFloat64:
+    of vkInt64, vkFloat64, vkDateTime:
       payloadLen = 8
     of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
       payloadLen = value.bytes.len
@@ -1468,19 +1470,12 @@ proc textValue(text: string): Value =
   Value(kind: vkText, bytes: bytes)
 
 proc tryParseDatetime(input: string): Result[DateTime] =
-  let formats = [
-    "yyyy-MM-dd HH:mm:ss",
-    "yyyy-MM-dd",
-    "HH:mm:ss",
-    "yyyy-MM-dd'T'HH:mm:ss",
-  ]
-  for fmt in formats:
-    try:
-      let dt = parse(input, fmt)
-      return ok(dt)
-    except ValueError:
-      discard
-  err[DateTime](ERR_SQL, "Cannot parse datetime", input)
+  ## Legacy helper used by STRFTIME, DATE(), DATETIME() functions.
+  ## Delegates to parseDatetimeMicros and converts back to DateTime.
+  let res = parseDatetimeMicros(input)
+  if not res.ok:
+    return err[DateTime](res.err.code, res.err.message, res.err.context)
+  ok(microsToDatetime(res.value))
 
 proc strftimeFormat(input: string, format: string): string =
   var dt: DateTime
@@ -1714,9 +1709,22 @@ proc compareValues*(a: Value, b: Value): int =
     of vkInt0, vkInt1: return 0
     of vkFloat64: return cmp(a.float64Val, b.float64Val)
     of vkDecimal: return compareDecimals(a, b)
+    of vkDateTime: return cmp(a.int64Val, b.int64Val)
     of vkText, vkBlob, vkTextCompressed, vkBlobCompressed:
       return compareBytes(a, b)
     else: return 0
+
+  # vkDateTime vs vkText: parse the text and compare as microseconds
+  if a.kind == vkDateTime and isTextKind(b.kind):
+    let s = valueToString(b)
+    let res = parseDatetimeMicros(s)
+    if res.ok: return cmp(a.int64Val, res.value)
+    return -1  # unparseable text sorts before datetime
+  if isTextKind(a.kind) and b.kind == vkDateTime:
+    let s = valueToString(a)
+    let res = parseDatetimeMicros(s)
+    if res.ok: return cmp(res.value, b.int64Val)
+    return 1
 
   # SQLite-compatible type affinity: NULL < INT/REAL < TEXT < BLOB
   if a.kind == vkNull: return -1
@@ -1794,6 +1802,7 @@ proc hash*(v: Value): Hash =
   of vkNull, vkBoolFalse, vkBoolTrue, vkInt0, vkInt1: discard
   of vkBool: h = h !& hash(v.boolVal)
   of vkInt64: h = h !& hash(v.int64Val)
+  of vkDateTime: h = h !& hash(v.int64Val)
   of vkFloat64: h = h !& hash(v.float64Val)
   of vkDecimal:
     h = h !& hash(v.int64Val)
@@ -1815,6 +1824,7 @@ proc valueToSqlLiteral(v: Value): SqlValue =
   of vkInt1: SqlValue(kind: svInt, intVal: 1)
   of vkFloat64: SqlValue(kind: svFloat, floatVal: v.float64Val)
   of vkDecimal: SqlValue(kind: svString, strVal: valueToString(v))
+  of vkDateTime: SqlValue(kind: svString, strVal: formatDatetimeMicros(v.int64Val))
   of vkText, vkTextOverflow, vkTextCompressed, vkTextCompressedOverflow:
     SqlValue(kind: svString, strVal: valueToString(v))
   of vkBlob, vkBlobOverflow, vkBlobCompressed, vkBlobCompressedOverflow:
@@ -2169,9 +2179,8 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return err[Value](ERR_SQL, "Aggregate functions evaluated elsewhere")
 
     if name in ["NOW", "CURRENT_TIMESTAMP"]:
-      let now = now()
-      let formatted = now.format("yyyy-MM-dd HH:mm:ss")
-      return ok(textValue(formatted))
+      let nowDt = now().utc()
+      return ok(Value(kind: vkDateTime, int64Val: datetimeToMicros(nowDt)))
 
     if name == "CURRENT_DATE":
       let now = now()
@@ -2190,15 +2199,18 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if not argRes.ok: return argRes
       if argRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
-      let inputStr = valueToString(argRes.value).toLowerAscii()
-      var dt: DateTime
-      if inputStr == "now":
-        dt = now()
-      else:
-        let dtRes = tryParseDatetime(inputStr)
-        if not dtRes.ok:
-          return err[Value](ERR_SQL, "Invalid date value", inputStr)
-        dt = dtRes.value
+      let dt =
+        if argRes.value.kind == vkDateTime:
+          microsToDatetime(argRes.value.int64Val)
+        else:
+          let inputStr = valueToString(argRes.value).toLowerAscii()
+          if inputStr == "now":
+            now().utc()
+          else:
+            let dtRes = tryParseDatetime(inputStr)
+            if not dtRes.ok:
+              return err[Value](ERR_SQL, "Invalid date value", inputStr)
+            dtRes.value
       let formatted = dt.format("yyyy-MM-dd")
       return ok(textValue(formatted))
 
@@ -2209,15 +2221,18 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if not argRes.ok: return argRes
       if argRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
-      let inputStr = valueToString(argRes.value).toLowerAscii()
-      var dt: DateTime
-      if inputStr == "now":
-        dt = now()
-      else:
-        let dtRes = tryParseDatetime(inputStr)
-        if not dtRes.ok:
-          return err[Value](ERR_SQL, "Invalid datetime value", inputStr)
-        dt = dtRes.value
+      let dt =
+        if argRes.value.kind == vkDateTime:
+          microsToDatetime(argRes.value.int64Val)
+        else:
+          let inputStr = valueToString(argRes.value).toLowerAscii()
+          if inputStr == "now":
+            now().utc()
+          else:
+            let dtRes = tryParseDatetime(inputStr)
+            if not dtRes.ok:
+              return err[Value](ERR_SQL, "Invalid datetime value", inputStr)
+            dtRes.value
       let formatted = dt.format("yyyy-MM-dd HH:mm:ss")
       return ok(textValue(formatted))
 
@@ -2233,7 +2248,11 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       if valueRes.value.kind == vkNull:
         return ok(Value(kind: vkNull))
       let formatStr = valueToString(formatRes.value)
-      let valueStr = valueToString(valueRes.value)
+      let valueStr =
+        if valueRes.value.kind == vkDateTime:
+          formatDatetimeMicros(valueRes.value.int64Val)
+        else:
+          valueToString(valueRes.value)
       let fmtOut = strftimeFormat(valueStr, formatStr)
       if fmtOut.len == 0:
         return err[Value](ERR_SQL, "Invalid strftime arguments")
@@ -2399,6 +2418,21 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
          if valRes.value.kind == vkBlob and valRes.value.bytes.len == 16:
             return ok(textValue(uuidToString(valRes.value.bytes)))
          return ok(textValue(valueToString(valRes.value)))
+
+      of ctDateTime:
+         case valRes.value.kind
+         of vkDateTime: return ok(valRes.value)
+         of vkInt64:
+           return ok(Value(kind: vkDateTime, int64Val: valRes.value.int64Val))
+         of vkText:
+           let s = valueToString(valRes.value).strip()
+           if s.toLowerAscii() == "now":
+             return ok(Value(kind: vkDateTime, int64Val: datetimeToMicros(now().utc())))
+           let res = parseDatetimeMicros(s)
+           if not res.ok: return err[Value](res.err.code, res.err.message)
+           return ok(Value(kind: vkDateTime, int64Val: res.value))
+         else:
+           return err[Value](ERR_SQL, "Cannot cast to TIMESTAMP", $valRes.value.kind)
       else:
          return err[Value](ERR_SQL, "Unsupported CAST target")
 
@@ -3513,19 +3547,15 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
     return err[Value](ERR_SQL, "Window function must be evaluated in projection context")
   of ekSqlValueFunction:
     let funcName = expr.sqlValueFunc.toUpperAscii()
-    let now = now()
+    let nowDt = now().utc()
     case funcName
     of "NOW", "CURRENT_TIMESTAMP":
-      let dt = now
-      let formatted = dt.format("yyyy-MM-dd HH:mm:ss")
-      return ok(textValue(formatted))
+      return ok(Value(kind: vkDateTime, int64Val: datetimeToMicros(nowDt)))
     of "CURRENT_DATE":
-      let dt = now
-      let formatted = dt.format("yyyy-MM-dd")
+      let formatted = nowDt.format("yyyy-MM-dd")
       return ok(textValue(formatted))
     of "CURRENT_TIME":
-      let dt = now
-      let formatted = dt.format("HH:mm:ss")
+      let formatted = nowDt.format("HH:mm:ss")
       return ok(textValue(formatted))
     else:
       return err[Value](ERR_SQL, "Unsupported SQL value function", funcName)
@@ -3535,12 +3565,16 @@ proc evalExpr*(row: Row, expr: Expr, params: seq[Value]): Result[Value] =
       return err[Value](sourceRes.err.code, sourceRes.err.message, sourceRes.err.context)
     if sourceRes.value.kind == vkNull:
       return ok(Value(kind: vkNull))
-    let inputStr = valueToString(sourceRes.value)
     let field = expr.extractField.toUpperAscii()
-    let dtRes = tryParseDatetime(inputStr)
-    if not dtRes.ok:
-      return err[Value](ERR_SQL, "Invalid datetime for EXTRACT", inputStr)
-    let dt = dtRes.value
+    let dt =
+      if sourceRes.value.kind == vkDateTime:
+        microsToDatetime(sourceRes.value.int64Val)
+      else:
+        let inputStr = valueToString(sourceRes.value)
+        let dtRes = tryParseDatetime(inputStr)
+        if not dtRes.ok:
+          return err[Value](ERR_SQL, "Invalid datetime for EXTRACT", inputStr)
+        dtRes.value
     case field
     of "YEAR":
       return ok(Value(kind: vkInt64, int64Val: dt.year.int64))
@@ -5433,7 +5467,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
       case v.kind
       of vkNull, vkBool, vkInt64, vkDecimal, vkText, vkBlob, vkTextCompressed, vkBlobCompressed,
          vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow,
-         vkBoolFalse, vkBoolTrue, vkInt0, vkInt1:
+         vkBoolFalse, vkBoolTrue, vkInt0, vkInt1, vkDateTime:
         # Overflow values have additional state (overflowPage/overflowLen) and may not compare
         # equal to their materialized counterpart; keep them out of hash join for correctness.
         v.overflowLen == 0'u32 and v.overflowPage == PageId(0)

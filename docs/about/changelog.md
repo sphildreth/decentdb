@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.5.0] - 2026-02-27
+## [1.5.0] - 2026-02-26
 
 ### Added
 - **SQL Engine**: Views with GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, and DISTINCT ON — view and CTE bodies that aggregate, sort, or limit rows are now expanded as derived tables (subqueries in FROM) instead of being rejected. See ADR-0113.
@@ -40,9 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Go**: `DB.SaveAs(destPath)` method for exporting databases.
 - **Node**: `Database.saveAs(destPath)` method for exporting databases.
 - **Python**: `Connection.save_as(dest_path)` method for exporting databases.
+- **Native TIMESTAMP Type**: `DATE`, `TIMESTAMP`, `TIMESTAMPTZ`, and `DATETIME` column keywords now map to a native `ctDateTime` / `vkDateTime` type (ordinal 17) stored as **microseconds since Unix epoch UTC** (int64, zigzag-varint encoded). Previously these keywords were silently treated as TEXT. See ADR-0114.
+  - `ORDER BY` on TIMESTAMP columns is now chronologically correct.
+  - `EXTRACT(YEAR/MONTH/DAY/HOUR/MINUTE/SECOND FROM col)` operates natively without string re-parsing.
+  - `NOW()` / `CURRENT_TIMESTAMP` return a native `vkDateTime` value.
+  - `CAST(value AS TIMESTAMP)` converts ISO-8601 strings and int64 microseconds.
+  - String literals are auto-coerced on INSERT into TIMESTAMP columns.
+- **C API**: `decentdb_bind_datetime(stmt, col, micros_utc)` — bind a TIMESTAMP parameter as microseconds since Unix epoch UTC.
+- **C API**: `decentdb_column_datetime(stmt, col)` — read a TIMESTAMP column as microseconds since Unix epoch UTC.
+- **Python binding**: `datetime.datetime` parameters are now bound natively via `decentdb_bind_datetime`; TIMESTAMP columns are returned as `datetime.datetime` (UTC-aware).
+- **Go binding**: `time.Time` parameters are bound as microseconds via `decentdb_bind_datetime`; TIMESTAMP columns are returned as `time.Time` (UTC).
+- **Node.js binding**: TIMESTAMP columns (kind=17) are returned as milliseconds since epoch (wrap in `new Date(val)` if needed).
+- **.NET binding**: `DateTime` / `DateTimeOffset` parameters use microseconds and `TIMESTAMP` store type (was milliseconds + `INT64`); TIMESTAMP columns read via `decentdb_column_datetime`.
+- **Java JDBC**: `KIND_DATETIME = 17` constant; `bindDatetime` / `colDatetime` JNI bridge; `getTimestamp()` reads TIMESTAMP columns natively; `TypeMapping` maps `KIND_DATETIME` → `Types.TIMESTAMP`.
+- **Example**: `examples/python/example_datetime.py` — end-to-end DateTime demo.
 
 ### Changed
 - **SQL Engine**: Expanded CHECK constraint function allowlist — deterministic scalar functions (`ABS`, `ROUND`, `CEIL`, `CEILING`, `FLOOR`, `SQRT`, `POWER`, `POW`, `MOD`, `INSTR`, `CHR`, `CHAR`, `HEX`, `REPLACE`, `SUBSTR`, `SUBSTRING`) are now permitted in CHECK expressions. Previously only `CASE`, `CAST`, `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, and `LIKE_ESCAPE` were allowed.
+- **SQL Engine**: `NOW()` / `CURRENT_TIMESTAMP` return `vkDateTime` instead of `vkText`.
+- **SQL Engine**: `DATE` / `TIMESTAMP` / `TIMESTAMPTZ` / `DATETIME` column type keywords now create native TIMESTAMP columns instead of TEXT columns.
 
 ### Fixed
 - **VFS**: Double `deinitLock` undefined behavior — `MemVfs.removeFile` no longer calls `deinitLock`; `close()` is the sole owner of lock lifecycle.

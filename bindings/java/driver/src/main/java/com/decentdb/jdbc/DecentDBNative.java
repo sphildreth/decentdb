@@ -62,6 +62,8 @@ final class DecentDBNative {
     static native int bindFloat64(long stmtHandle, int col, double value);
     static native int bindText(long stmtHandle, int col, String value);
     static native int bindBlob(long stmtHandle, int col, byte[] value);
+    /** Binds a TIMESTAMP parameter as microseconds since Unix epoch UTC. */
+    static native int bindDatetime(long stmtHandle, int col, long microsUtc);
 
     // ---- Column access (0-based index) --------------------------------
 
@@ -90,6 +92,9 @@ final class DecentDBNative {
 
     /** Returns unscaled integer value for DECIMAL columns. */
     static native long colDecimalUnscaled(long stmtHandle, int index);
+
+    /** Returns column value as microseconds since Unix epoch UTC for TIMESTAMP columns. */
+    static native long colDatetime(long stmtHandle, int index);
 
     // ---- Metadata (return JSON strings) --------------------------------
 
@@ -121,6 +126,7 @@ final class DecentDBNative {
     static final int KIND_BOOL_TRUE  = 14;
     static final int KIND_INT0       = 15;
     static final int KIND_INT1       = 16;
+    static final int KIND_DATETIME   = 17;
 
     // ---- Error code constants (must match src/errors.nim + c_api.nim) --
     static final int ERR_OK          = 0;

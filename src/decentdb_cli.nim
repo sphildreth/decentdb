@@ -20,6 +20,7 @@ import ./record/record
 import ./storage/storage
 import ./wal/wal
 import ./vfs/os_vfs
+import ./utils/datetime
 
 # Helper to convert JSON to Result for consistent output format
 proc resultJson(ok: bool, err: DbError = DbError(), rows: seq[string] = @[]): JsonNode =
@@ -379,6 +380,12 @@ proc csvCellToValue(cellValue: string, col: Column): Value =
       Value(kind: vkBlob, bytes: res.value)
     else:
       Value(kind: vkNull)
+  of ctDateTime:
+    let res = parseDatetimeMicros(cellValue.strip())
+    if res.ok:
+      Value(kind: vkDateTime, int64Val: res.value)
+    else:
+      Value(kind: vkNull)
 
 proc readCsvRows(tableMeta: TableMeta, csvFile: string): Result[seq[seq[Value]]] =
   var parser: CsvParser
@@ -506,6 +513,17 @@ proc jsonToValue(node: JsonNode, col: Column): Value =
         Value(kind: vkBlob, bytes: res.value)
       else:
         Value(kind: vkNull)
+    else:
+      Value(kind: vkNull)
+  of ctDateTime:
+    if node.kind == JString:
+      let res = parseDatetimeMicros(node.getStr().strip())
+      if res.ok:
+        Value(kind: vkDateTime, int64Val: res.value)
+      else:
+        Value(kind: vkNull)
+    elif node.kind == JInt:
+      Value(kind: vkDateTime, int64Val: node.getBiggestInt())
     else:
       Value(kind: vkNull)
 
@@ -889,6 +907,7 @@ proc schemaDescribe*(table: string, db: string = ""): int =
       of ctBlob: "BLOB"
       of ctDecimal: "DECIMAL"
       of ctUuid: "UUID"
+      of ctDateTime: "TIMESTAMP"
     
     let notNull = if col.notNull: "YES" else: "NO"
     let primaryKey = if col.primaryKey: "YES" else: "NO"
@@ -1274,6 +1293,7 @@ proc dumpSql*(db: string = "", output: string = ""): int =
         of ctBlob: "BLOB"
         of ctDecimal: "DECIMAL"
         of ctUuid: "UUID"
+        of ctDateTime: "TIMESTAMP"
       
       colDef &= typeName
       

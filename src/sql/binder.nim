@@ -59,7 +59,8 @@ proc checkLiteralType(expr: Expr, expected: ColumnType, columnName: string): Res
       (expected == ctDecimal and actual in {ctFloat64, ctInt64}) or
       (expected == ctBool and actual == ctInt64) or
       (expected == ctUuid and actual == ctBlob) or
-      (expected == ctBlob and actual == ctUuid)
+      (expected == ctBlob and actual == ctUuid) or
+      (expected == ctDateTime and actual in {ctText, ctInt64})
     if not compatible:
       return err[Void](ERR_SQL, "Type mismatch for column", columnName)
   okVoid()

@@ -415,6 +415,18 @@ class Cursor:
                 ArrayType = ctypes.c_uint8 * 16
                 b_arr = ArrayType.from_buffer_copy(b)
                 res = self._lib.decentdb_bind_blob(self._stmt, idx, b_arr, 16)
+            elif isinstance(param, datetime.datetime):
+                # Bind as microseconds since Unix epoch UTC
+                epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+                aware = param if param.tzinfo is not None else param.replace(tzinfo=datetime.timezone.utc)
+                micros = int((aware - epoch).total_seconds() * 1_000_000)
+                res = self._lib.decentdb_bind_datetime(self._stmt, idx, micros)
+            elif isinstance(param, datetime.date):
+                # Bind date-only as microseconds for midnight UTC of that date
+                epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+                dt = datetime.datetime(param.year, param.month, param.day, tzinfo=datetime.timezone.utc)
+                micros = int((dt - epoch).total_seconds() * 1_000_000)
+                res = self._lib.decentdb_bind_datetime(self._stmt, idx, micros)
             else:
                 # Try string conversion for unknown types (e.g. Date)
                 s = str(param)
@@ -565,6 +577,10 @@ class Cursor:
                     scale = v.decimalScale
                     val = v.int64Val
                     row[i] = decimal.Decimal(val) / (decimal.Decimal(10) ** scale)
+                elif k == 17: # vkDateTime
+                    micros = int(v.int64Val)
+                    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+                    row[i] = epoch + datetime.timedelta(microseconds=micros)
                 else:
                     return self._get_row_slow()
             self._pending_select_params = None
@@ -648,6 +664,10 @@ class Cursor:
                     scale = v.decimalScale
                     val = v.int64Val
                     row[i] = decimal.Decimal(val) / (decimal.Decimal(10) ** scale)
+                elif k == 17: # vkDateTime
+                    micros = int(v.int64Val)
+                    epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+                    row[i] = epoch + datetime.timedelta(microseconds=micros)
                 else:
                     # Unknown kinds should not occur in normalized result rows.
                     # Fall back to slow path for correctness.
@@ -692,6 +712,10 @@ class Cursor:
                 scale = self._lib.decentdb_column_decimal_scale(self._stmt, i)
                 val = self._lib.decentdb_column_decimal_unscaled(self._stmt, i)
                 row.append(decimal.Decimal(val) / (decimal.Decimal(10) ** scale))
+            elif kind == 17: # vkDateTime
+                micros = self._lib.decentdb_column_datetime(self._stmt, i)
+                epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+                row.append(epoch + datetime.timedelta(microseconds=micros))
             else:
                 row.append(None)
         return tuple(row)

@@ -26,20 +26,22 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         var decimalMapping = new DecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
         var stringMapping = new StringTypeMapping("TEXT", DbType.String);
         var blobMapping = new ByteArrayTypeMapping("BLOB", DbType.Binary);
+        var timestampStorageMapping = new LongTypeMapping("TIMESTAMP", DbType.Int64);
 
-        var dateTimeMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
+        // DateTime/DateTimeOffset stored as microseconds since Unix epoch UTC in TIMESTAMP columns.
+        var dateTimeMapping = (RelationalTypeMapping)timestampStorageMapping.WithComposedConverter(
             new ValueConverter<DateTime, long>(
-                value => new DateTimeOffset(value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime(), TimeSpan.Zero).ToUnixTimeMilliseconds(),
-                value => DateTimeOffset.FromUnixTimeMilliseconds(value).UtcDateTime),
+                value => (value.ToUniversalTime().Ticks - DateTime.UnixEpoch.Ticks) / 10L,
+                value => new DateTime(value * 10L + DateTime.UnixEpoch.Ticks, DateTimeKind.Utc)),
             comparer: null,
             keyComparer: null,
             elementMapping: null,
             jsonValueReaderWriter: null);
 
-        var dateTimeOffsetMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
+        var dateTimeOffsetMapping = (RelationalTypeMapping)timestampStorageMapping.WithComposedConverter(
             new ValueConverter<DateTimeOffset, long>(
-                value => value.ToUniversalTime().ToUnixTimeMilliseconds(),
-                value => DateTimeOffset.FromUnixTimeMilliseconds(value)),
+                value => (value.UtcTicks - DateTime.UnixEpoch.Ticks) / 10L,
+                value => new DateTimeOffset(value * 10L + DateTime.UnixEpoch.Ticks, TimeSpan.Zero)),
             comparer: null,
             keyComparer: null,
             elementMapping: null,
@@ -120,7 +122,11 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
             ["BLOB"] = blobMapping,
             ["UUID"] = guidMapping,
             ["DECIMAL"] = decimalMapping,
-            ["NUMERIC"] = decimalMapping
+            ["NUMERIC"] = decimalMapping,
+            ["TIMESTAMP"] = dateTimeMapping,
+            ["TIMESTAMPTZ"] = dateTimeMapping,
+            ["DATE"] = dateTimeMapping,
+            ["DATETIME"] = dateTimeMapping
         };
     }
 

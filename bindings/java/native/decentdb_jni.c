@@ -81,6 +81,7 @@ extern int         decentdb_bind_int64(void *stmt, int col, int64_t val);
 extern int         decentdb_bind_float64(void *stmt, int col, double val);
 extern int         decentdb_bind_text(void *stmt, int col, const char *utf8, int byte_len);
 extern int         decentdb_bind_blob(void *stmt, int col, const uint8_t *data, int byte_len);
+extern int         decentdb_bind_datetime(void *stmt, int col, int64_t micros_utc);
 
 extern int         decentdb_column_count(void *stmt);
 extern const char *decentdb_column_name(void *stmt, int col);
@@ -90,6 +91,7 @@ extern int64_t     decentdb_column_int64(void *stmt, int col);
 extern double      decentdb_column_float64(void *stmt, int col);
 extern int         decentdb_column_decimal_scale(void *stmt, int col);
 extern int64_t     decentdb_column_decimal_unscaled(void *stmt, int col);
+extern int64_t     decentdb_column_datetime(void *stmt, int col);
 extern const char *decentdb_column_text(void *stmt, int col, int *out_len);
 extern const uint8_t *decentdb_column_blob(void *stmt, int col, int *out_len);
 
@@ -253,6 +255,13 @@ Java_com_decentdb_jdbc_DecentDBNative_bindBlob(JNIEnv *env, jclass cls, jlong s,
     return (jint)rc;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_bindDatetime(JNIEnv *env, jclass cls, jlong s, jint col, jlong micros_utc)
+{
+    if (s == 0) return -1;
+    return (jint)decentdb_bind_datetime((void *)(uintptr_t)s, (int)col, (int64_t)micros_utc);
+}
+
 /* ---- Column access ----------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
@@ -340,6 +349,13 @@ Java_com_decentdb_jdbc_DecentDBNative_colDecimalUnscaled(JNIEnv *env, jclass cls
 {
     if (s == 0) return 0;
     return (jlong)decentdb_column_decimal_unscaled((void *)(uintptr_t)s, (int)index);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_colDatetime(JNIEnv *env, jclass cls, jlong s, jint index)
+{
+    if (s == 0) return 0;
+    return (jlong)decentdb_column_datetime((void *)(uintptr_t)s, (int)index);
 }
 
 /* ---- Metadata (JSON) --------------------------------------------------- */

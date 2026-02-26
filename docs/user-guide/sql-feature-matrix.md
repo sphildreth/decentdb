@@ -513,8 +513,8 @@ COMMIT;  -- only X is committed
 | BOOLEAN | ✅ | ✅ | ✅ | ✅ |
 | UUID | ✅ | ❌ | ✅ | ✅ |
 | DECIMAL/NUMERIC | ✅ | ✅ | ✅ | ✅ |
-| DATE | ✅ (TEXT storage, ISO format) | ✅ | ✅ | ✅ (native) |
-| TIMESTAMP | ✅ (TEXT storage, ISO format) | ✅ | ✅ | ✅ (native) |
+| DATE | ✅ (native int64 µs UTC) | ✅ | ✅ | ✅ (native) |
+| TIMESTAMP | ✅ (native int64 µs UTC) | ✅ | ✅ | ✅ (native) |
 
 ### Examples
 

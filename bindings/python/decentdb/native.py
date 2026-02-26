@@ -178,6 +178,9 @@ def load_library():
     _lib.decentdb_bind_decimal.argtypes = [c_void_p, c_int, c_int64, c_int]
     _lib.decentdb_bind_decimal.restype = c_int
 
+    _lib.decentdb_bind_datetime.argtypes = [c_void_p, c_int, c_int64]
+    _lib.decentdb_bind_datetime.restype = c_int
+
     _lib.decentdb_bind_text.argtypes = [c_void_p, c_int, c_char_p, c_int]
     _lib.decentdb_bind_text.restype = c_int
 
@@ -213,6 +216,9 @@ def load_library():
 
     _lib.decentdb_column_decimal_unscaled.argtypes = [c_void_p, c_int]
     _lib.decentdb_column_decimal_unscaled.restype = c_int64
+
+    _lib.decentdb_column_datetime.argtypes = [c_void_p, c_int]
+    _lib.decentdb_column_datetime.restype = c_int64
 
     _lib.decentdb_column_text.argtypes = [c_void_p, c_int, POINTER(c_int)]
     _lib.decentdb_column_text.restype = c_char_p

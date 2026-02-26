@@ -97,13 +97,13 @@ public class DecentDBStatement implements Statement {
             if (rc < 0) {
                 Errors.checkResult(connection.getDbHandle(), rc);
             }
-            if (rc == 1) {
-                // row available - this is a query
+            if (rc == 1 || isReadStatement(sql)) {
+                // It is a read query, return a ResultSet even if exhausted (rc == 0).
                 currentResultSet = new DecentDBResultSet(this, stmtHandle, connection.getDbHandle(), rc);
                 updateCount = -1;
                 return true;
             } else {
-                // no rows - DML/DDL
+                // no rows and not a read statement - DML/DDL
                 updateCount = DecentDBNative.stmtRowsAffected(stmtHandle);
                 finalizeStmt();
                 return false;

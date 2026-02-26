@@ -376,13 +376,14 @@ Supported scalar functions:
 - `JSON_ARRAY(val1, val2, ...)` — creates a JSON array from arguments
 
 **Date/Time:**
-- `NOW()` / `CURRENT_TIMESTAMP` — current date and time as ISO 8601 TEXT
+- `NOW()` / `CURRENT_TIMESTAMP` — current date and time as a native TIMESTAMP value
 - `CURRENT_DATE` — current date as `YYYY-MM-DD` TEXT
 - `CURRENT_TIME` — current time as `HH:MM:SS` TEXT
 - `DATE(value)` — parse/normalize a date string
 - `DATETIME(value)` — parse/normalize a datetime string
 - `STRFTIME(format, value)` — format a datetime using `%Y`, `%m`, `%d`, `%H`, `%M`, `%S`, `%w`
-- `EXTRACT(field FROM value)` — extract `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND` from a datetime string
+- `EXTRACT(field FROM value)` — extract `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND` from a TIMESTAMP column or datetime string
+- `CAST(value AS TIMESTAMP)` — convert an ISO 8601 string or int64 microseconds to a native TIMESTAMP
 
 **Other:**
 - `PRINTF(format, args...)` — formatted string output (SQLite-compatible)
