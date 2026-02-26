@@ -523,24 +523,48 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         connection.checkOpen();
         long dbHandle = connection.getDbHandle();
 
-        String json = DecentDBNative.metaListTables(dbHandle);
         List<Object[]> rows = new ArrayList<>();
 
         boolean includeTable = types == null || Arrays.asList(types).contains("TABLE");
-        if (json != null && includeTable) {
-            JSONArray arr = new JSONArray(json);
-            for (int i = 0; i < arr.length(); i++) {
-                String tbl = arr.getString(i);
-                if (tableNamePattern != null && !tableNamePattern.equals("%") &&
-                    !tbl.equalsIgnoreCase(tableNamePattern)) continue;
-                rows.add(new Object[]{
-                    null,   // TABLE_CAT
-                    null,   // TABLE_SCHEM
-                    tbl,    // TABLE_NAME
-                    "TABLE", // TABLE_TYPE
-                    "",     // REMARKS
-                    null, null, null, null, null  // TYPE_CAT, TYPE_SCHEM, TYPE_NAME, SELF_REFERENCING_COL_NAME, REF_GENERATION
-                });
+        boolean includeView = types == null || Arrays.asList(types).contains("VIEW");
+
+        if (includeTable) {
+            String json = DecentDBNative.metaListTables(dbHandle);
+            if (json != null) {
+                JSONArray arr = new JSONArray(json);
+                for (int i = 0; i < arr.length(); i++) {
+                    String tbl = arr.getString(i);
+                    if (tableNamePattern != null && !tableNamePattern.equals("%") &&
+                        !tbl.equalsIgnoreCase(tableNamePattern)) continue;
+                    rows.add(new Object[]{
+                        null,   // TABLE_CAT
+                        null,   // TABLE_SCHEM
+                        tbl,    // TABLE_NAME
+                        "TABLE", // TABLE_TYPE
+                        "",     // REMARKS
+                        null, null, null, null, null  // TYPE_CAT, TYPE_SCHEM, TYPE_NAME, SELF_REFERENCING_COL_NAME, REF_GENERATION
+                    });
+                }
+            }
+        }
+
+        if (includeView) {
+            String json = DecentDBNative.metaListViews(dbHandle);
+            if (json != null) {
+                JSONArray arr = new JSONArray(json);
+                for (int i = 0; i < arr.length(); i++) {
+                    String tbl = arr.getString(i);
+                    if (tableNamePattern != null && !tableNamePattern.equals("%") &&
+                        !tbl.equalsIgnoreCase(tableNamePattern)) continue;
+                    rows.add(new Object[]{
+                        null,   // TABLE_CAT
+                        null,   // TABLE_SCHEM
+                        tbl,    // TABLE_NAME
+                        "VIEW",  // TABLE_TYPE
+                        "",     // REMARKS
+                        null, null, null, null, null  // TYPE_CAT, TYPE_SCHEM, TYPE_NAME, SELF_REFERENCING_COL_NAME, REF_GENERATION
+                    });
+                }
             }
         }
 
@@ -570,7 +594,7 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
     public ResultSet getTableTypes() throws SQLException {
         return buildResultSet(
             new String[]{"TABLE_TYPE"},
-            Collections.singletonList(new Object[]{"TABLE"})
+            Arrays.asList(new Object[]{"TABLE"}, new Object[]{"VIEW"})
         );
     }
 
@@ -592,12 +616,21 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
         List<Object[]> rows = new ArrayList<>();
 
+        List<String> allTablesAndViews = new ArrayList<>();
         String tablesJson = DecentDBNative.metaListTables(dbHandle);
-        if (tablesJson == null) return emptyResultSet(COLUMN_COLUMNS);
+        if (tablesJson != null) {
+            JSONArray arr = new JSONArray(tablesJson);
+            for (int i = 0; i < arr.length(); i++) allTablesAndViews.add(arr.getString(i));
+        }
+        String viewsJson = DecentDBNative.metaListViews(dbHandle);
+        if (viewsJson != null) {
+            JSONArray arr = new JSONArray(viewsJson);
+            for (int i = 0; i < arr.length(); i++) allTablesAndViews.add(arr.getString(i));
+        }
 
-        JSONArray tables = new JSONArray(tablesJson);
-        for (int ti = 0; ti < tables.length(); ti++) {
-            String tbl = tables.getString(ti);
+        if (allTablesAndViews.isEmpty()) return emptyResultSet(COLUMN_COLUMNS);
+
+        for (String tbl : allTablesAndViews) {
             if (tableNamePattern != null && !tableNamePattern.equals("%") &&
                 !tbl.equalsIgnoreCase(tableNamePattern)) continue;
 
@@ -782,9 +815,11 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
                 String refTable = col.optString("ref_table", "");
                 String refColumn = col.optString("ref_column", "");
                 if (!refTable.isEmpty() && !refColumn.isEmpty()) {
-                    rows.add(buildFkRow(refTable, refColumn, table, col.getString("name"),
-                        seq++, col.optString("ref_on_update", "NO ACTION"),
-                        col.optString("ref_on_delete", "NO ACTION"), null));
+                    String colName = col.getString("name");
+                    String fkName = table + "_" + colName + "_fkey";
+                    rows.add(buildFkRow(refTable, refColumn, table, colName,
+                        1, col.optString("ref_on_update", "NO ACTION"),
+                        col.optString("ref_on_delete", "NO ACTION"), fkName));
                 }
             }
         }
@@ -822,9 +857,11 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
                     String refTable = col.optString("ref_table", "");
                     if (refTable.equalsIgnoreCase(table)) {
                         String refColumn = col.optString("ref_column", "");
-                        rows.add(buildFkRow(table, refColumn, fkTable, col.getString("name"),
-                            seq++, col.optString("ref_on_update", "NO ACTION"),
-                            col.optString("ref_on_delete", "NO ACTION"), null));
+                        String fkColName = col.getString("name");
+                        String fkName = fkTable + "_" + fkColName + "_fkey";
+                        rows.add(buildFkRow(table, refColumn, fkTable, fkColName,
+                            1, col.optString("ref_on_update", "NO ACTION"),
+                            col.optString("ref_on_delete", "NO ACTION"), fkName));
                     }
                 }
             }
@@ -852,9 +889,11 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
                 String refTable = col.optString("ref_table", "");
                 if (refTable.equalsIgnoreCase(parentTable)) {
                     String refColumn = col.optString("ref_column", "");
-                    rows.add(buildFkRow(parentTable, refColumn, foreignTable, col.getString("name"),
-                        seq++, col.optString("ref_on_update", "NO ACTION"),
-                        col.optString("ref_on_delete", "NO ACTION"), null));
+                    String colName = col.getString("name");
+                    String fkName = foreignTable + "_" + colName + "_fkey";
+                    rows.add(buildFkRow(parentTable, refColumn, foreignTable, colName,
+                        1, col.optString("ref_on_update", "NO ACTION"),
+                        col.optString("ref_on_delete", "NO ACTION"), fkName));
                 }
             }
         }
@@ -1065,11 +1104,11 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
     // ---- Helpers -------------------------------------------------------
 
-    private static ResultSet emptyResultSet(String... columns) {
+    static ResultSet emptyResultSet(String... columns) {
         return buildResultSet(columns, Collections.emptyList());
     }
 
-    private static ResultSet buildResultSet(String[] columns, List<Object[]> rows) {
+    static ResultSet buildResultSet(String[] columns, List<Object[]> rows) {
         return new InMemoryResultSet(columns, rows);
     }
 

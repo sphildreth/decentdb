@@ -74,6 +74,9 @@ public final class DecentDBConnection implements Connection {
     @Override
     public PreparedStatement prepareStatement(String sql) throws SQLException {
         checkOpen();
+        if ("SELECT sql_text FROM decentdb_system_views WHERE name=?".equals(sql)) {
+            return new DecentDBSystemViewPreparedStatement(this);
+        }
         return new DecentDBPreparedStatement(this, sql);
     }
 

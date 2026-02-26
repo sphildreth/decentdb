@@ -96,6 +96,12 @@ final class DecentDBNative {
     /** Returns JSON array of table names: ["t1","t2",...]. */
     static native String metaListTables(long dbHandle);
 
+    /** Returns JSON array of view names: ["v1","v2",...]. */
+    static native String metaListViews(long dbHandle);
+
+    /** Returns view DDL string, or null if view not found. */
+    static native String metaGetViewDDL(long dbHandle, String viewName);
+
     /** Returns JSON array of column metadata objects for a table. */
     static native String metaGetTableColumns(long dbHandle, String tableName);
 

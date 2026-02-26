@@ -94,6 +94,8 @@ extern const char *decentdb_column_text(void *stmt, int col, int *out_len);
 extern const uint8_t *decentdb_column_blob(void *stmt, int col, int *out_len);
 
 extern const char *decentdb_list_tables_json(void *db, int *out_len);
+extern const char *decentdb_list_views_json(void *db, int *out_len);
+extern const char *decentdb_get_view_ddl(void *db, const char *view, int *out_len);
 extern const char *decentdb_get_table_columns_json(void *db, const char *table, int *out_len);
 extern const char *decentdb_list_indexes_json(void *db, int *out_len);
 
@@ -351,6 +353,36 @@ Java_com_decentdb_jdbc_DecentDBNative_metaListTables(JNIEnv *env, jclass cls, jl
     if (json == NULL) return NULL;
     jstring result = (*env)->NewStringUTF(env, json);
     decentdb_free((void *)json);
+    return result;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_metaListViews(JNIEnv *env, jclass cls, jlong dbHandle)
+{
+    if (dbHandle == 0) return NULL;
+    int out_len = 0;
+    const char *json = decentdb_list_views_json((void *)(uintptr_t)dbHandle, &out_len);
+    if (json == NULL) return NULL;
+    jstring result = (*env)->NewStringUTF(env, json);
+    decentdb_free((void *)json);
+    return result;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_decentdb_jdbc_DecentDBNative_metaGetViewDDL(JNIEnv *env, jclass cls,
+    jlong dbHandle, jstring jview)
+{
+    if (dbHandle == 0 || jview == NULL) return NULL;
+    char *view = jstring_to_cstr(env, jview);
+    if (view == NULL) return NULL;
+
+    int out_len = 0;
+    const char *ddl = decentdb_get_view_ddl((void *)(uintptr_t)dbHandle, view, &out_len);
+    free(view);
+
+    if (ddl == NULL) return NULL;
+    jstring result = (*env)->NewStringUTF(env, ddl);
+    decentdb_free((void *)ddl);
     return result;
 }
 

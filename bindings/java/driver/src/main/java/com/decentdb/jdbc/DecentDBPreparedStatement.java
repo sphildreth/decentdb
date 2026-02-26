@@ -15,7 +15,7 @@ import java.util.Calendar;
  *
  * Not thread-safe. Do not share across threads.
  */
-public final class DecentDBPreparedStatement extends DecentDBStatement implements PreparedStatement {
+public class DecentDBPreparedStatement extends DecentDBStatement implements PreparedStatement {
 
     private final String sql;
     private Object[] params;

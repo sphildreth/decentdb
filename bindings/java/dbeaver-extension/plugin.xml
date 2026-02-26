@@ -50,6 +50,7 @@
 
                     <!-- Default connection properties -->
                     <property name="readOnly" value="false"/>
+                    <property name="queryGetViewDefinition" value="SELECT sql_text FROM decentdb_system_views WHERE name=?"/>
 
                 </driver>
             </drivers>

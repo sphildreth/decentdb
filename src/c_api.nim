@@ -103,6 +103,50 @@ proc decentdb_list_tables_json*(p: pointer, out_len: ptr cint): cstring {.export
   clearGlobalError()
   return allocSharedCString(payload, out_len)
 
+proc decentdb_list_views_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of view names, e.g. ["v1","v2"].
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var names: seq[string] = @[]
+  for name in dbh.db.catalog.views.keys:
+    names.add(name)
+  names.sort(system.cmp)
+
+  var arr = newJArray()
+  for name in names:
+    arr.add(%name)
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
+proc decentdb_get_view_ddl*(p: pointer, view_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns the SQL text for a view.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  if view_utf8 == nil:
+    let dbh = cast[DbHandle](p)
+    dbh.setError(ERR_INTERNAL, "NULL view name")
+    return nil
+
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+  let viewName = $view_utf8
+
+  if dbh.db.catalog.views.hasKey(viewName):
+    let v = dbh.db.catalog.views[viewName]
+    let payload = v.sqlText
+    return allocSharedCString(payload, out_len)
+  else:
+    dbh.setError(ERR_SQL, "View not found: " & viewName)
+    return nil
+
 proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
   ## Returns a JSON array of column metadata objects for a given table.
   ## Caller must free returned pointer with `decentdb_free`.
@@ -117,27 +161,38 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
   let dbh = cast[DbHandle](p)
   dbh.clearError()
   let tableName = $table_utf8
-  if not dbh.db.catalog.tables.hasKey(tableName):
-    dbh.setError(ERR_SQL, "Table not found: " & tableName)
-    return nil
-
-  let t = dbh.db.catalog.tables[tableName]
   var arr = newJArray()
-  for col in t.columns:
-    var obj = newJObject()
-    obj["name"] = %col.name
-    obj["type"] = %columnTypeToText(col.kind)
-    obj["not_null"] = %col.notNull
-    obj["unique"] = %col.unique
-    obj["primary_key"] = %col.primaryKey
-    if col.refTable.len > 0:
-      obj["ref_table"] = %col.refTable
-    if col.refColumn.len > 0:
-      obj["ref_column"] = %col.refColumn
-    if col.refTable.len > 0 and col.refColumn.len > 0:
-      obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
-      obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
-    arr.add(obj)
+
+  if dbh.db.catalog.tables.hasKey(tableName):
+    let t = dbh.db.catalog.tables[tableName]
+    for col in t.columns:
+      var obj = newJObject()
+      obj["name"] = %col.name
+      obj["type"] = %columnTypeToText(col.kind)
+      obj["not_null"] = %col.notNull
+      obj["unique"] = %col.unique
+      obj["primary_key"] = %col.primaryKey
+      if col.refTable.len > 0:
+        obj["ref_table"] = %col.refTable
+      if col.refColumn.len > 0:
+        obj["ref_column"] = %col.refColumn
+      if col.refTable.len > 0 and col.refColumn.len > 0:
+        obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
+        obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
+      arr.add(obj)
+  elif dbh.db.catalog.views.hasKey(tableName):
+    let v = dbh.db.catalog.views[tableName]
+    for cname in v.columnNames:
+      var obj = newJObject()
+      obj["name"] = %cname
+      obj["type"] = %"ANY"
+      obj["not_null"] = %false
+      obj["unique"] = %false
+      obj["primary_key"] = %false
+      arr.add(obj)
+  else:
+    dbh.setError(ERR_SQL, "Table or View not found: " & tableName)
+    return nil
 
   let payload = $arr
   clearGlobalError()
