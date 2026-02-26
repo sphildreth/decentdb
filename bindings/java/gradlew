@@ -108,7 +108,7 @@ if "$cygwin" || "$msys" ; then
     JAVACMD=$( cygpath --unix "$JAVACMD" )
 fi
 
-DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+DEFAULT_JVM_OPTS='-Xmx64m -Xms64m'
 
 # shellcheck disable=SC2086
 exec "$JAVACMD" \
