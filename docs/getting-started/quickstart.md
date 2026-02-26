@@ -6,7 +6,8 @@ This guide will get you up and running with DecentDB in 5 minutes.
 
 ```bash
 # Create a database file (automatically created on first access)
-decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT)"
+# Note: auto-increment works for a single INT64 PRIMARY KEY column (spelling INT/INTEGER/INT64 doesn’t matter).
+decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)"
 ```
 
 ## Insert Data

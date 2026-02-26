@@ -89,29 +89,17 @@ DecentDB enforces single writer semantics:
 - No deadlocks possible
 - Readers see stable snapshots
 
-## Durability Modes
+## Durability
 
-Durability is configured via the `--wal-sync-mode` option at startup or in the configuration file.
+By default, DecentDB commits are durable: a successful `COMMIT` is persisted via the WAL before the command returns.
 
-### Full (Default)
+For bulk ingestion you can trade durability for throughput using `bulk-load --durability=<full|deferred|none>`:
 
-- fsync on every commit
-- Maximum durability
-- Slower performance
+- `full`: fsync each batch (safest, slowest)
+- `deferred` (default): fsync every `--syncInterval` batches
+- `none`: no fsync (fastest; unsafe on crash/power loss)
 
-### Normal
-
-- fdatasync on commit
-- Good balance of safety and speed
-- Recommended for most applications
-
-### Deferred (Bulk Operations)
-
-Use bulk load API for large imports:
-
-```bash
-decentdb bulk-load --db=my.ddb --table=users --input=users.csv --durability=deferred
-```
+This setting applies to `bulk-load`; regular SQL writes use the default durable commit behavior.
 
 ## Savepoints
 
@@ -217,12 +205,15 @@ UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 
 ### Handle Errors with Rollback
 
-When using the CLI `exec` command with a multi-statement string, if an error occurs, the transaction is automatically rolled back if `BEGIN` was used.
+`BEGIN`/`COMMIT` works normally: if a statement fails and you `ROLLBACK`, all changes in the transaction are discarded.
+
+Notes for the CLI:
+- `decentdb exec --sql` may contain multiple statements separated by `;` and they run on a single connection.
+- All statements are **parsed/bound up front** against the schema at the start of the call. That means `CREATE TABLE ...; INSERT INTO that_table ...;` in the same `--sql` will fail with “table not found”. Run schema changes as separate `exec` calls or use `decentdb repl`.
 
 ```bash
-# The entire string is executed as one session.
-# If INSERT fails, the transaction is rolled back (or fails to commit).
-decentdb exec --db=my.ddb --sql="BEGIN; INSERT INTO users VALUES (1, 'Alice'); COMMIT"
+# Assuming users table already exists:
+decentdb exec --db=my.ddb --sql="BEGIN; INSERT INTO users (name) VALUES ('Alice'); COMMIT"
 ```
 
 ## Transaction State
@@ -240,3 +231,4 @@ decentdb info --db=my.ddb
 - Single writer only (no concurrent write transactions)
 - Foreign keys enforced at statement time, not commit time
 - Savepoints are only supported within explicit `BEGIN`/`COMMIT` blocks
+- Multi-statement `exec` strings are bound against the starting schema (DDL in the same string doesn't affect later statements)

@@ -19,7 +19,7 @@ CREATE TABLE table_name (
 Example:
 ```sql
 CREATE TABLE users (
-    id INT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     email TEXT UNIQUE,
     created_at INT,
@@ -28,7 +28,7 @@ CREATE TABLE users (
 ```
 
 Constraints:
-- `PRIMARY KEY` — enforces uniqueness. `INTEGER PRIMARY KEY` columns are implicitly `NOT NULL` and support auto-increment when omitted from INSERT statements.
+- `PRIMARY KEY` — enforces uniqueness and implies `NOT NULL`. If a table has a single INT64 primary key column, omitting it on INSERT will auto-assign the next sequential ID (`INT`/`INTEGER`/`INT64`/`BIGINT` are synonyms here).
 - `NOT NULL` — rejects NULL values.
 - `UNIQUE` — enforces uniqueness via a secondary index.
 - `CHECK (expression)` — row-level validation; the expression must evaluate to `TRUE` or `NULL` (only `FALSE` is a violation).
@@ -57,21 +57,20 @@ CREATE INDEX index_name ON table_name USING trigram(column_name);
 -- Unique index
 CREATE UNIQUE INDEX index_name ON table_name(column_name);
 
--- Partial index (v0 subset)
+-- Partial/filtered index (BTREE only)
 CREATE INDEX index_name ON table_name(column_name) WHERE column_name IS NOT NULL;
 
--- Expression index (v0 subset)
+-- Expression index (BTREE only; single expression)
 CREATE INDEX index_name ON table_name((LOWER(column_name)));
 ```
 
 Notes:
-- Partial indexes are currently limited to single-column BTREE indexes with predicate form `column IS NOT NULL`.
-- `UNIQUE` partial indexes, trigram partial indexes, multi-column partial indexes, and arbitrary partial predicates are not supported in 0.x.
-- Expression indexes are currently limited to single-expression BTREE indexes with deterministic expressions:
+- Partial/filtered indexes are supported for BTREE indexes with arbitrary predicates (including multi-column and `UNIQUE`). Partial trigram indexes are not supported.
+- Expression indexes are currently limited to **a single** deterministic expression:
   - column reference
   - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
   - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
-- `UNIQUE` expression indexes, partial expression indexes, and multi-expression index keys are not supported in 0.x.
+- `UNIQUE` expression indexes, partial expression indexes, and multi-expression index keys are not supported.
 
 ### DROP TABLE / DROP INDEX
 
@@ -234,7 +233,7 @@ INSERT INTO table_name (...) VALUES (...) RETURNING col1, col2;
 ```
 
 Notes:
-- `INTEGER PRIMARY KEY` columns support auto-increment. If the column is omitted from the INSERT column list, DecentDB automatically assigns the next sequential ID:
+- A single INT64 `PRIMARY KEY` column supports auto-assignment. If the column is omitted from the INSERT column list, DecentDB automatically assigns the next sequential ID:
   ```sql
   CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
   INSERT INTO users (name) VALUES ('Alice');  -- id auto-assigned as 1

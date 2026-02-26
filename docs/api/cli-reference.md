@@ -83,22 +83,31 @@ decentdb dump-header --db=<path>
 Execute SQL statements.
 
 ```bash
-decentdb exec --db=<path> --sql=<statement> [options]
+decentdb exec --db=<path> --sql=<sql> [options]
 ```
 
+Notes:
+- `--sql` may contain multiple `;`-separated statements.
+- Statements are **parsed/bound up front** against the starting schema. DDL followed by dependent statements in the same `--sql` string can fail; use separate `exec` calls or `decentdb repl`.
+
 Options:
-- `--sql=<statement>` - SQL statement to execute
+- `--sql=<sql>` - SQL to execute
 - `--params=<type:value>` - Bind parameters (repeatable, positional). Examples: `int:1`, `text:Alice`, `null`
-- `--timing` - Include `elapsed_ms` in JSON output
-- `--format=<json|csv|table>` - Output format (default: json). Note: `--timing/--warnings/--verbose` currently require `--format=json`
+- `--openClose` - Open and close the database without executing SQL (testing mode)
+- `--timing` - Include a detailed `timing` object in JSON output (JSON output always includes `elapsed_ms`)
+- `--format=<json|csv|table>` - Output format (default: json). Note: `--timing/--warnings/--verbose/--noRows` currently require `--format=json`
+- `--noRows` - Execute a single `SELECT` and discard result rows (returns the row count)
 - `--cachePages=<n>` - Cache size in 4KB pages (default: 1024)
 - `--cacheMb=<n>` - Cache size in megabytes (overrides `--cachePages` if non-zero)
+- `--heartbeatMs=<n>` - Print periodic progress to stderr while a long query is running
 
 Diagnostics and management flags:
-- `--checkpoint` - Force a WAL checkpoint (after SQL execution if `--sql` is also provided)
+- `--checkpoint` - Force a WAL checkpoint (with `--sql`: after execution; without: checkpoint and exit)
 - `--dbInfo` - Print database info and exit
 - `--readerCount` - Print active reader count and exit
 - `--longReaders=<ms>` - Print readers older than this threshold and exit
+- `--warnings` - Include WAL warnings in output
+- `--verbose` - Include verbose diagnostics (LSN, readers, cache) in output
 
 WAL tuning/testing flags:
 - `--checkpointBytes=<n>` - Auto-checkpoint when WAL reaches N bytes
@@ -115,7 +124,10 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users"
 decentdb exec --db=my.ddb --sql="INSERT INTO users VALUES (\$1, \$2)" --params=int:1 --params=text:Alice
 decentdb exec --db=my.ddb --sql="SELECT * FROM users" --format=table
 
-# Execute SQL and immediately checkpoint to main DB (ensures data is persisted)
+# Assuming schema already exists, execute multiple statements in one call:
+decentdb exec --db=my.ddb --sql="BEGIN; INSERT INTO users (name) VALUES ('Alice'); COMMIT"
+
+# Execute SQL and immediately checkpoint to the main DB file
 decentdb exec --db=my.ddb --sql="CREATE INDEX ix_name ON users(name)" --checkpoint
 ```
 
@@ -268,6 +280,8 @@ decentdb verify-index --db=<path> --index=<name>
 
 ### JSON (default)
 
+JSON output is intended for machine consumption. It always includes `elapsed_ms`.
+
 ```json
 {
   "ok": true,
@@ -275,7 +289,8 @@ decentdb verify-index --db=<path> --index=<name>
   "rows": [
     "1|Alice|alice@example.com",
     "2|Bob|bob@example.com"
-  ]
+  ],
+  "elapsed_ms": 0.3216
 }
 ```
 
@@ -286,25 +301,27 @@ When `--checkpoint` is used with `--sql`, the response includes the checkpoint L
   "ok": true,
   "error": null,
   "rows": [],
+  "elapsed_ms": 0.4682,
   "checkpoint_lsn": 550651
 }
 ```
 
 ### CSV
 
+CSV output is a simple rendering of row values (no header row):
+
 ```
-id,name,email
 1,Alice,alice@example.com
 2,Bob,bob@example.com
 ```
 
 ### Table
 
+Table output is a simple rendering of row values (no header row):
+
 ```
-id | name  | email
----|-------|------------------
-1  | Alice | alice@example.com
-2  | Bob   | bob@example.com
+1 | Alice | alice@example.com
+2 | Bob | bob@example.com
 ```
 
 ## Error Handling
@@ -319,7 +336,8 @@ When a command fails, the exit code is non-zero and output contains error detail
     "message": "Table not found",
     "context": "users"
   },
-  "rows": []
+  "rows": [],
+  "elapsed_ms": 0.3594
 }
 ```
 

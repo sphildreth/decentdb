@@ -33,7 +33,7 @@ import decentdb
 conn = decentdb.connect("/path/to/database.ddb")
 
 # DDL
-conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT)")
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)")
 conn.commit()
 
 # INSERT with auto-increment (omit id column)
@@ -78,6 +78,22 @@ with decentdb.connect("/path/to/database.ddb") as conn:
     # auto-commits on exit, auto-rollbacks on exception
 ```
 
+### TIMESTAMP / datetime
+
+The DB-API driver binds `datetime.datetime` to `TIMESTAMP` as **microseconds since Unix epoch (UTC)**. Naive datetimes are treated as UTC.
+
+```python
+import datetime
+
+conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, occurred_at TIMESTAMP NOT NULL)")
+now = datetime.datetime.now(datetime.timezone.utc)
+conn.execute("INSERT INTO events (occurred_at) VALUES ($1)", [now])
+conn.commit()
+
+(occurred_at,) = conn.execute("SELECT occurred_at FROM events").fetchone()
+print(occurred_at)  # timezone-aware datetime (UTC)
+```
+
 ### Schema Introspection
 
 ```python
@@ -119,7 +135,7 @@ Export any open database — including `:memory:` — to a new on-disk file:
 
 ```python
 conn = decentdb.connect(":memory:")
-conn.execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
 conn.execute("INSERT INTO items (id, name) VALUES ($1, $2)", [1, "widget"])
 conn.commit()
 
@@ -137,7 +153,7 @@ from sqlalchemy import create_engine, text
 engine = create_engine("decentdb+pysql:////path/to/database.ddb")
 
 with engine.connect() as conn:
-    conn.execute(text("CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name TEXT)"))
+    conn.execute(text("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)"))
     conn.execute(text("INSERT INTO users (name) VALUES ('Alice')"))  # id auto-assigned
     conn.commit()
 

@@ -277,29 +277,28 @@ For very large databases, archived WAL segments could be:
 
 ## Configuration
 
-### Checkpoint Threshold
+DecentDB does not support SQLite-style `PRAGMA` statements. Checkpointing and reader timeouts are configured via API/CLI flags.
 
-```sql
--- Checkpoint when WAL reaches 10MB
-PRAGMA checkpoint_threshold = 10000000;
+### Checkpointing
+
+```bash
+# Manual checkpoint
+decentdb checkpoint --db=my.ddb
+
+# Or checkpoint after a specific exec
+decentdb exec --db=my.ddb --sql="CREATE INDEX ..." --checkpoint
+
+# Optional: override checkpoint/reader policy for this exec invocation
+# (note: passing any of these flags overrides the engine defaults)
+decentdb exec --db=my.ddb --sql="SELECT 1" \
+  --checkpointBytes=67108864 --readerWarnMs=60000 --readerTimeoutMs=300000 --forceTruncateOnTimeout
 ```
 
-### Checkpoint Timeout
+For embedded Nim usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
 
-```sql
--- Wait up to 60 seconds for readers
-PRAGMA checkpoint_timeout = 60;
-```
+### Durability
 
-### Sync Mode
-
-```sql
--- Maximum durability
-PRAGMA wal_sync_mode = FULL;
-
--- Balanced (recommended)
-PRAGMA wal_sync_mode = NORMAL;
-```
+Commits are durable (fsync-on-commit) by default. For bulk ingestion, use `bulk-load --durability=full|deferred|none`.
 
 ## Best Practices
 
@@ -322,10 +321,10 @@ PRAGMA wal_sync_mode = NORMAL;
    - Set up alerts if WAL > 100MB
    - Indicates reader or checkpoint issue
 
-5. **Use appropriate durability mode**
-   - FULL: Critical data, slowest
-   - NORMAL: Good balance
-   - DEFERRED: Bulk loads only
+5. **Use bulk-load durability intentionally**
+   - `deferred` (default): batch fsync for higher throughput
+   - `full`: fsync more aggressively
+   - `none` (unsafe): fastest, may lose recent batches on crash
 
 6. **Checkpoint after DDL operations**
    - Use `--checkpoint` with CREATE INDEX to persist immediately
@@ -349,7 +348,7 @@ decentdb info --db=my.ddb
 **Solution:**
 - Close idle connections
 - Reduce transaction duration
-- Force checkpoint: `PRAGMA checkpoint;`
+- Force checkpoint: `decentdb checkpoint --db=...` (or `decentdb exec --checkpoint ...` for a checkpoint after specific SQL)
 
 ### Slow Recovery
 
@@ -357,15 +356,18 @@ decentdb info --db=my.ddb
 
 **Solution:**
 - Checkpoint more frequently
-- Lower checkpoint_threshold
-- Monitor with: `PRAGMA stats;`
+- Checkpoint more frequently (e.g. schedule `decentdb checkpoint`) or use a smaller `--checkpointBytes` policy in long-running embedded usage
+- Monitor with: `decentdb stats --db=...`
 
 ### Corruption After Crash
 
 **Check:**
 ```bash
-# Verify integrity
-decentdb exec --db=my.ddb --sql="PRAGMA integrity_check"
+# Verify on-disk structure
+decentdb verify-header --db=my.ddb
+
+# Verify an index (repeat per index as needed)
+decentdb verify-index --db=my.ddb --index=idx_users_name
 ```
 
 **If corrupted:**
@@ -376,5 +378,5 @@ decentdb exec --db=my.ddb --sql="PRAGMA integrity_check"
 ## Further Reading
 
 - [Storage Engine](storage.md) - Page format
-- [Configuration](../../api/configuration.md) - WAL settings
-- [Transactions](../../user-guide/transactions.md) - ACID details
+- [Configuration](../api/configuration.md) - WAL settings
+- [Transactions](../user-guide/transactions.md) - ACID details

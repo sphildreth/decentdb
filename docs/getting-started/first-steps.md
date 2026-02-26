@@ -8,7 +8,8 @@ DecentDB databases are single files, making them easy to manage:
 
 ```bash
 # The database file is created automatically when you run your first command
-decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INT PRIMARY KEY, name TEXT)"
+# Note: auto-increment works for a single INT64 PRIMARY KEY column (spelling INT/INTEGER/INT64 doesn’t matter).
+decentdb exec --db=myapp.ddb --sql="CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
 ```
 
 ## Basic Operations
@@ -58,10 +59,11 @@ decentdb exec --db=myapp.ddb --sql="DELETE FROM users WHERE id = 3"
 
 ```bash
 # Create tables with foreign keys
-decentdb exec --db=myapp.ddb --sql="CREATE TABLE artists (id INT PRIMARY KEY, name TEXT)"
-decentdb exec --db=myapp.ddb --sql="CREATE TABLE albums (id INT PRIMARY KEY, artist_id INT REFERENCES artists(id) ON DELETE CASCADE, title TEXT)"
+decentdb exec --db=myapp.ddb --sql="CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT)"
+decentdb exec --db=myapp.ddb --sql="CREATE TABLE albums (id INTEGER PRIMARY KEY, artist_id INTEGER REFERENCES artists(id) ON DELETE CASCADE, title TEXT)"
 
 # Insert related data
+# (the first inserted artist will have id = 1)
 decentdb exec --db=myapp.ddb --sql="INSERT INTO artists (name) VALUES ('The Beatles')"
 decentdb exec --db=myapp.ddb --sql="INSERT INTO albums (artist_id, title) VALUES (1, 'Abbey Road')"
 ```
@@ -97,18 +99,30 @@ decentdb exec --db=myapp.ddb --sql="SELECT * FROM users WHERE name LIKE '%lic%'"
 
 ## Transactions
 
-Group multiple operations into atomic transactions:
+Group multiple operations into atomic transactions.
+
+`decentdb exec --sql` can contain multiple `;`-separated statements (they run on a single connection). However, all statements are **parsed/bound up front** against the schema at the start of the call, so DDL followed by dependent statements in the same `--sql` string can fail (e.g. `CREATE TABLE ...; INSERT INTO that_table ...;`). For schema changes + dependent statements, use separate `exec` calls or the REPL.
+
+Example (table already exists):
 
 ```bash
-# Begin transaction
-decentdb exec --db=myapp.ddb --sql="BEGIN"
+decentdb exec --db=myapp.ddb --sql="BEGIN; INSERT INTO users (name) VALUES ('Dave'); INSERT INTO users (name) VALUES ('Eve'); COMMIT;"
+```
 
-# Multiple operations
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name) VALUES ('Dave')"
-decentdb exec --db=myapp.ddb --sql="INSERT INTO users (name) VALUES ('Eve')"
+For interactive transactions (and for DDL followed by dependent statements), use `decentdb repl`:
 
-# Commit (or ROLLBACK to cancel)
-decentdb exec --db=myapp.ddb --sql="COMMIT"
+```bash
+decentdb repl --db=myapp.ddb
+```
+
+Then in the REPL:
+
+```sql
+BEGIN;
+INSERT INTO users (name) VALUES ('Dave');
+INSERT INTO users (name) VALUES ('Eve');
+COMMIT;
+-- or ROLLBACK;
 ```
 
 ## Schema Management

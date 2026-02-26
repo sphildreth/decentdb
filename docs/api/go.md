@@ -30,7 +30,7 @@ func main() {
   }
   defer db.Close()
 
-  db.Exec("CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT)")
+  db.Exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)")
 
   // Auto-increment: omit id column
   db.Exec("INSERT INTO users (name, email) VALUES ($1, $2)", "Alice", "alice@example.com")
@@ -54,6 +54,20 @@ func main() {
 tx, _ := db.Begin()
 tx.Exec("INSERT INTO users (name) VALUES ($1)", "Carol")
 tx.Commit()  // or tx.Rollback()
+```
+
+### TIMESTAMP / time.Time
+
+`time.Time` parameters are bound as `TIMESTAMP` values (microseconds since Unix epoch, UTC). Returned values scan into `time.Time` in UTC.
+
+```go
+import "time"
+
+db.Exec("CREATE TABLE events (id INTEGER PRIMARY KEY, occurred_at TIMESTAMP)")
+db.Exec("INSERT INTO events (occurred_at) VALUES ($1)", time.Now().UTC())
+
+var t time.Time
+db.QueryRow("SELECT occurred_at FROM events LIMIT 1").Scan(&t)
 ```
 
 ### Decimal Type
@@ -83,7 +97,7 @@ import decentdb "github.com/sphildreth/decentdb-go"
 db, _ := decentdb.OpenDirect("/tmp/sample.ddb")
 defer db.Close()
 
-db.Exec("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+db.Exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
 db.Exec("INSERT INTO items (name) VALUES ($1)", "Widget")
 ```
 
@@ -141,7 +155,7 @@ Export any open database — including `:memory:` — to a new on-disk file:
 
 ```go
 db, _ := decentdb.OpenDirect(":memory:")
-db.Exec("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
+db.Exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
 db.Exec("INSERT INTO items (id, name) VALUES ($1, $2)", 1, "widget")
 
 err := db.SaveAs("/tmp/snapshot.ddb")

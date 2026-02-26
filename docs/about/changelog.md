@@ -245,7 +245,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Triggers (`CREATE TRIGGER`, `DROP TRIGGER`): `AFTER` row triggers on tables and `INSTEAD OF` row triggers on views, with a constrained action surface.
   - `INSERT ... RETURNING` for retrieving auto-assigned values.
   - `INSERT ... ON CONFLICT DO NOTHING` and `INSERT ... ON CONFLICT DO UPDATE` (upsert).
-  - `INTEGER PRIMARY KEY` auto-increment: columns auto-assign sequential IDs when omitted from INSERT.
+  - Single INT64 `PRIMARY KEY` auto-assignment: IDs auto-assign sequentially when omitted from INSERT (`INT`/`INTEGER`/`INT64`/`BIGINT` are synonyms).
   - `<>` operator (alias for `!=`).
   - `EXPLAIN ANALYZE` for query plan output with actual execution metrics (row counts, timing).
 - **C API**:

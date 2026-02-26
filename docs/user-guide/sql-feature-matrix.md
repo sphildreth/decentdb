@@ -560,7 +560,7 @@ INSERT INTO events (event_date, created_at) VALUES ('2024-03-15', '2024-03-15 14
 ### Examples
 
 ```sql
--- PRIMARY KEY (auto-increment with INTEGER PRIMARY KEY)
+-- PRIMARY KEY (auto-assignment with a single INT64 PRIMARY KEY; INT/INTEGER/INT64 are aliases)
 CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
 
 -- FOREIGN KEY with actions

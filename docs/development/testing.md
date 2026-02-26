@@ -387,4 +387,4 @@ When changing behavior:
 
 - [Building from Source](building.md)
 - [Contributing](contributing.md)
-- [Architecture Overview](../../architecture/overview.md)
+- [Architecture Overview](../architecture/overview.md)

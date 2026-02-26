@@ -38,14 +38,14 @@ DecentDB creates indexes automatically for:
 ```sql
 -- This creates an automatic unique index on id
 CREATE TABLE users (
-    id INT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     email TEXT UNIQUE
 );
 
 -- This creates an automatic index on user_id
 CREATE TABLE orders (
-    id INT PRIMARY KEY,
-    user_id INT REFERENCES users(id)
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id)
 );
 ```
 
@@ -58,7 +58,7 @@ Create an index that only includes rows meeting a condition.
 CREATE INDEX idx_users_active ON users(id) WHERE status IS NOT NULL;
 ```
 
-**Note:** v0 partial indexes only support `IS NOT NULL` predicates.
+**Note:** Partial/filtered indexes are supported for BTREE indexes with arbitrary predicates. Partial trigram indexes are not supported.
 
 ## Expression Indexes
 
@@ -69,7 +69,7 @@ Index the result of a function or expression.
 CREATE INDEX idx_users_lower_name ON users((LOWER(name)));
 ```
 
-**Note:** v0 expression indexes support single expressions with deterministic functions (`LOWER`, `UPPER`, `TRIM`, `LENGTH`, `CAST`).
+**Note:** Expression indexes are supported for BTREE indexes but are currently limited to a single deterministic expression (e.g. `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `CAST`). `UNIQUE` expression indexes are not supported.
 
 ## Trigram Indexes
 
