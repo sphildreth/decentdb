@@ -5,6 +5,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 import java.io.File;
 import java.sql.*;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -247,6 +248,52 @@ class IntegrationTest {
             assertEquals(java.sql.Types.BIGINT, meta.getColumnType(1));
             assertEquals(java.sql.Types.VARCHAR, meta.getColumnType(2));
         }
+    }
+
+    // ---- UUID formatting / BLOB display -----------------------------------
+
+    @Test
+    @Order(40)
+    void uuidBlobFormatsAsUuidString() throws Exception {
+        assumeNative();
+
+        UUID u = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff");
+        byte[] bytes = uuidToBytes(u);
+
+        try (Statement s = connection.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS uuid_test (id INTEGER PRIMARY KEY, u UUID NOT NULL)");
+            s.execute("DELETE FROM uuid_test");
+        }
+
+        try (PreparedStatement ps = connection.prepareStatement(
+                "INSERT INTO uuid_test (id, u) VALUES ($1, $2)")) {
+            ps.setLong(1, 1);
+            ps.setBytes(2, bytes);
+            assertEquals(1, ps.executeUpdate());
+        }
+
+        try (Statement s = connection.createStatement();
+             ResultSet rs = s.executeQuery("SELECT u FROM uuid_test WHERE id = 1")) {
+            assertTrue(rs.next());
+            assertEquals(u.toString(), rs.getString(1));
+            Object obj = rs.getObject(1);
+            assertTrue(obj instanceof UUID, "Expected getObject() to return UUID for 16-byte UUID blob");
+            assertEquals(u, obj);
+            assertArrayEquals(bytes, rs.getBytes(1));
+        }
+    }
+
+    private static byte[] uuidToBytes(UUID u) {
+        long msb = u.getMostSignificantBits();
+        long lsb = u.getLeastSignificantBits();
+        byte[] out = new byte[16];
+        for (int i = 0; i < 8; i++) {
+            out[i] = (byte) (msb >>> (56 - (i * 8)));
+        }
+        for (int i = 0; i < 8; i++) {
+            out[8 + i] = (byte) (lsb >>> (56 - (i * 8)));
+        }
+        return out;
     }
 
     // ---- Transaction semantics -------------------------------------------

@@ -123,6 +123,11 @@ public class DecentDBResultSet implements ResultSet {
         int k = kind(columnIndex);
         if (k == DecentDBNative.KIND_TEXT) {
             return DecentDBNative.colText(stmtHandle, columnIndex - 1);
+        } else if (k == DecentDBNative.KIND_BLOB) {
+            byte[] bytes = DecentDBNative.colBlob(stmtHandle, columnIndex - 1);
+            if (bytes == null) return null;
+            if (isUuidBytes(bytes)) return uuidToString(bytes);
+            return bytesToHex(bytes);
         } else if (k == DecentDBNative.KIND_INT64
                 || k == DecentDBNative.KIND_INT0 || k == DecentDBNative.KIND_INT1) {
             return Long.toString(DecentDBNative.colInt64(stmtHandle, columnIndex - 1));
@@ -135,6 +140,51 @@ public class DecentDBResultSet implements ResultSet {
             return getDecimal(columnIndex).toPlainString();
         }
         return DecentDBNative.colText(stmtHandle, columnIndex - 1);
+    }
+
+    private static boolean isUuidBytes(byte[] bytes) {
+        return bytes.length == 16;
+    }
+
+    private static UUID uuidFromBytes(byte[] bytes) {
+        long msb = 0;
+        long lsb = 0;
+        for (int i = 0; i < 8; i++) {
+            msb = (msb << 8) | (bytes[i] & 0xffL);
+        }
+        for (int i = 8; i < 16; i++) {
+            lsb = (lsb << 8) | (bytes[i] & 0xffL);
+        }
+        return new UUID(msb, lsb);
+    }
+
+    private static String uuidToString(byte[] bytes) {
+        final char[] hex = "0123456789abcdef".toCharArray();
+        char[] out = new char[36];
+        int o = 0;
+        for (int i = 0; i < 16; i++) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) {
+                out[o++] = '-';
+            }
+            int b = bytes[i] & 0xff;
+            out[o++] = hex[b >>> 4];
+            out[o++] = hex[b & 0x0f];
+        }
+        return new String(out);
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        final char[] hex = "0123456789abcdef".toCharArray();
+        char[] out = new char[2 + bytes.length * 2];
+        out[0] = '0';
+        out[1] = 'x';
+        int o = 2;
+        for (byte aByte : bytes) {
+            int b = aByte & 0xff;
+            out[o++] = hex[b >>> 4];
+            out[o++] = hex[b & 0x0f];
+        }
+        return new String(out);
     }
 
     @Override
@@ -276,7 +326,11 @@ public class DecentDBResultSet implements ResultSet {
             case DecentDBNative.KIND_INT64: return getLong(columnIndex);
             case DecentDBNative.KIND_FLOAT64: return getDouble(columnIndex);
             case DecentDBNative.KIND_BOOL: return getBoolean(columnIndex);
-            case DecentDBNative.KIND_BLOB: return getBytes(columnIndex);
+            case DecentDBNative.KIND_BLOB: {
+                byte[] bytes = getBytes(columnIndex);
+                if (bytes != null && isUuidBytes(bytes)) return uuidFromBytes(bytes);
+                return bytes;
+            }
             case DecentDBNative.KIND_DECIMAL: return getBigDecimal(columnIndex);
             default: return getString(columnIndex);
         }
