@@ -19,16 +19,15 @@ quadrantChart
     quadrant-2 Quick Wins
     quadrant-3 Low Priority
     quadrant-4 Nice to Have
-    "Rich Types (JSONB/UUID)": [0.35, 0.85]
+    "Rich Types (JSONB)": [0.35, 0.85]
     "Built-in CDC (Reactive)": [0.45, 0.80]
-    "Online DDL (ALTER TABLE)": [0.40, 0.65]
     "MVCC (Concurrent Writes)": [0.90, 0.95]
     "Native Vector Index (HNSW)": [0.75, 0.70]
     "Transparent Encryption (TDE)": [0.65, 0.60]
 ```
 
 ### The Strategy
-*   **Start with Quadrant 2 (Top Left - Quick Wins):** **Rich Types (JSONB/UUID)** and **Built-in CDC**. These provide massive bragging rights against SQLite with relatively manageable changes to the current storage and WAL engines.
+*   **Start with Quadrant 2 (Top Left - Quick Wins):** **Rich Types (JSONB)** and **Built-in CDC**. These provide massive bragging rights against SQLite with relatively manageable changes to the current storage and WAL engines.
 *   **The Ultimate Goal (Top Right - High Value, Complex):** **MVCC**. This requires a rewrite of the transaction and locking mechanisms, but it completely changes the category of applications DecentDB can support.
 
 ---
@@ -66,19 +65,19 @@ sequenceDiagram
 
 ---
 
-## 2. First-Class Native "Rich" Types (JSONB, UUID, DateTime)
+## 2. First-Class Native "Rich" Types (JSONB, DateTime)
 
 ### The SQLite Pain Point
 SQLite uses "Flexible Typing" (Manifest Typing), meaning any column can store any data type regardless of its declaration (though `STRICT` tables help). Crucially, SQLite lacks native, optimized storage for modern application data:
-*   **UUIDs:** Stored as bulky 36-character strings or hard-to-query BLOBs.
 *   **Dates/Times:** Stored as strings or reals, requiring constant function parsing on every query (`strftime()`).
 *   **JSON:** Stored as plain text. Querying JSON requires parsing the string at runtime for *every* row evaluated.
 
 ### The DecentDB Win
 DecentDB can introduce strict typing by default with **native binary representations** of rich types:
-*   `UUID`: Stored as a highly optimized 16-byte packed structure. Native indexing makes filtering by UUID lightning fast.
 *   `DateTime`: Stored as an integer epoch with integrated time-zone awareness.
 *   `JSONB`: Binary JSON (like PostgreSQL). Queries traverse the binary structure directly without parsing strings, making JSON indexing and querying orders of magnitude faster than SQLite.
+
+*(Note: Native `UUID` support has already been implemented as a highly optimized 16-byte packed structure!)*
 
 ```mermaid
 block-beta
@@ -138,31 +137,6 @@ If you need an encrypted database on iOS, Android, or desktop (to comply with HI
 
 ### The DecentDB Win
 Built-in **Page-Level AES-256-GCM Encryption**. Since DecentDB controls the Pager, we can intercept page flushes and reads. The developer simply executes `PRAGMA encryption_key = 'super_secret';` upon connection. The engine transparently encrypts data at rest, including the WAL and temporary files, with zero external build dependencies.
-
----
-
-## 6. Fully Featured Online DDL (The `ALTER TABLE` Fix)
-
-### The SQLite Pain Point
-SQLite's `ALTER TABLE` is historically crippled. While recent versions added `DROP COLUMN`, changing a column's type, modifying a constraint, or reordering columns still requires the infamous "12-step table copy dance" (Create new table, move data, drop old, rename new). This locks the database and takes O(N) time.
-
-### The DecentDB Win
-Implement **Metadata-Only Schema Migrations**. By versioning the schema and using lazy evaluation, DecentDB can support instantly dropping columns, altering types, and modifying constraints without rewriting the underlying B-Tree pages until they are naturally touched by future updates.
-
-```mermaid
-graph LR
-    subgraph SQLite ["SQLite DDL: Change Column Type"]
-        A1["CREATE new_table"] --> A2["INSERT INTO new_table SELECT * FROM old"]
-        A2 --> A3["DROP old_table"]
-        A3 --> A4["ALTER TABLE rename"]
-        A2 -.->|Blocks all writes & reads| A4
-    end
-
-    subgraph DecentDB ["DecentDB DDL: Change Column Type"]
-        B1["UPDATE Catalog Metadata"] --> B2["Done in O(1)"]
-        B1 -.->|Lazy coercion on read/write| B2
-    end
-```
 
 ---
 
