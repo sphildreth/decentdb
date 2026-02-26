@@ -32,8 +32,8 @@ public sealed class TypeMappingTests : IDisposable
         Assert.Equal("BLOB", GetMapping<byte[]>(mappingSource).StoreType);
         Assert.Equal("DECIMAL(18,4)", GetMapping<decimal>(mappingSource).StoreType);
         Assert.Equal("UUID", GetMapping<Guid>(mappingSource).StoreType);
-        Assert.Equal("INTEGER", GetMapping<DateTime>(mappingSource).StoreType);
-        Assert.Equal("INTEGER", GetMapping<DateTimeOffset>(mappingSource).StoreType);
+        Assert.Equal("TIMESTAMP", GetMapping<DateTime>(mappingSource).StoreType);
+        Assert.Equal("TIMESTAMP", GetMapping<DateTimeOffset>(mappingSource).StoreType);
         Assert.Equal("INTEGER", GetMapping<DateOnly>(mappingSource).StoreType);
         Assert.Equal("INTEGER", GetMapping<TimeOnly>(mappingSource).StoreType);
         Assert.Equal("INTEGER", GetMapping<TimeSpan>(mappingSource).StoreType);
@@ -82,8 +82,8 @@ public sealed class TypeMappingTests : IDisposable
         var decProvider = decimalMapping.Converter?.ConvertToProvider(dec) ?? dec;
 
         var epochDay = DateOnly.FromDateTime(DateTime.UnixEpoch).DayNumber;
-        Assert.Equal(new DateTimeOffset(dateTime, TimeSpan.Zero).ToUnixTimeMilliseconds(), dtProvider);
-        Assert.Equal(dateTimeOffset.ToUnixTimeMilliseconds(), dtoProvider);
+        Assert.Equal((long)(new DateTimeOffset(dateTime, TimeSpan.Zero) - DateTimeOffset.UnixEpoch).TotalMicroseconds, dtProvider);
+        Assert.Equal((long)(dateTimeOffset - DateTimeOffset.UnixEpoch).TotalMicroseconds, dtoProvider);
         Assert.Equal(dateOnly.DayNumber - epochDay, dProvider);
         Assert.Equal(timeOnly.Ticks, tProvider);
         Assert.Equal(timeSpan.Ticks, tsProvider);
