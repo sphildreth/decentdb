@@ -6,8 +6,8 @@ group = 'org.jkiss.dbeaver.ext'
 version = '1.5.0'
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 repositories {
@@ -17,6 +17,21 @@ repositories {
 dependencies {
     // Embed the DecentDB JDBC driver + its runtime deps into this bundle.
     implementation project(':driver')
+
+    // DBeaver OSGi bundles – compile-only (provided at runtime by the DBeaver platform).
+    def pluginDir = new File('/usr/lib/dbeaver/plugins')
+    if (pluginDir.exists()) {
+        def jars = pluginDir.listFiles().findAll { f ->
+            f.name.endsWith('.jar') && (
+                f.name.startsWith('org.jkiss.dbeaver.model_') ||
+                f.name.startsWith('org.jkiss.dbeaver.model.jdbc_') ||
+                f.name.startsWith('org.jkiss.dbeaver.model.sql_') ||
+                f.name.startsWith('org.jkiss.dbeaver.ext.generic_') ||
+                f.name.startsWith('org.jkiss.utils_')
+            )
+        }
+        compileOnly files(jars)
+    }
 }
 
 jar {
@@ -30,9 +45,13 @@ jar {
             'Bundle-Version': version,
             'Bundle-Name': 'DecentDB DBeaver Extension',
             'Bundle-Vendor': 'DecentDB Contributors',
-            'Require-Bundle': 'org.jkiss.dbeaver.model,org.jkiss.dbeaver.ext.generic',
+            'Require-Bundle': 'org.jkiss.dbeaver.model,org.jkiss.dbeaver.model.jdbc,org.jkiss.dbeaver.ext.generic',
             'Bundle-ManifestVersion': '2',
-            'Bundle-RequiredExecutionEnvironment': 'JavaSE-17'
+            'Bundle-RequiredExecutionEnvironment': 'JavaSE-21',
+            'Export-Package': 'org.jkiss.dbeaver.ext.decentdb.model',
+            'Bundle-ClassPath': '.',
+            'Bundle-ActivationPolicy': 'lazy',
+            'Import-Package': 'org.jkiss.code'
         )
     }
 

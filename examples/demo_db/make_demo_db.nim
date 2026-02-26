@@ -12,7 +12,7 @@ proc usage(): string =
 make_demo_db.nim
 
 Creates a demo DecentDB database file with a schema and seed data covering:
-- Types: INTEGER/INT64, REAL/FLOAT64, BOOL, DECIMAL, TEXT, BLOB, UUID, DATE/TIMESTAMP (stored as TEXT)
+- Types: INTEGER/INT64, REAL/FLOAT64, BOOL, DECIMAL, TEXT, BLOB, UUID, DATE/TIMESTAMP (native int64 µs UTC)
 - Constraints: PRIMARY KEY, UNIQUE, NOT NULL, CHECK, DEFAULT, FOREIGN KEY (CASCADE/SET NULL/ON UPDATE CASCADE)
 - Indexes: BTREE (composite), expression index, partial index, trigram index, UNIQUE INDEX
 - Generated columns (STORED), views (12 showcase views), triggers (AFTER + INSTEAD OF)
@@ -545,7 +545,7 @@ when isMainModule:
         MOD(COALESCE(d.int64_val, 0), 7) AS mod_val,
         UUID_TO_STRING(d.uuid_val) AS uuid_str,
         EXTRACT(YEAR FROM d.ts_val) AS ts_year,
-        STRFTIME('%Y-%m-%d', COALESCE(d.ts_val, '2026-01-01 00:00:00')) AS ts_formatted,
+        STRFTIME('%Y-%m-%d', COALESCE(d.ts_val, CAST('2026-01-01 00:00:00' AS TIMESTAMP))) AS ts_formatted,
         JSON_EXTRACT(d.json_val, '$.kind') AS json_kind,
         JSON_ARRAY_LENGTH(JSON_EXTRACT(d.json_val, '$.tags')) AS json_tags_count,
         JSON_TYPE(d.json_val) AS json_type_val,

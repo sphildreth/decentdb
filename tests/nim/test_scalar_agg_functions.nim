@@ -239,7 +239,7 @@ suite "Scalar & Aggregate Functions (issue #37)":
     let res = execSql(db, "SELECT NOW()")
     check res.ok
     let row = splitRow(res.value[0])
-    check row[0].len == 19  # YYYY-MM-DD HH:MM:SS
+    check row[0].len == 26  # YYYY-MM-DD HH:MM:SS.ffffff
     check row[0][4] == '-'
     check row[0][7] == '-'
     check row[0][10] == ' '
@@ -251,7 +251,7 @@ suite "Scalar & Aggregate Functions (issue #37)":
     let res = execSql(db, "SELECT CURRENT_TIMESTAMP")
     check res.ok
     let row = splitRow(res.value[0])
-    check row[0].len == 19
+    check row[0].len == 26  # YYYY-MM-DD HH:MM:SS.ffffff
     check row[0][4] == '-'
     discard closeDb(db)
 

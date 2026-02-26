@@ -21,6 +21,9 @@
             icon="icons/decentdb_icon_16.png"
             iconBig="icons/decentdb_icon_big.png">
 
+            <!-- Use our custom meta model so we can override getViewDDL() etc. -->
+            <parameter name="meta-model" value="decentdb"/>
+
             <drivers managable="true">
                 <driver
                     id="decentdb_jdbc"
@@ -44,13 +47,12 @@
                     <!--
                         DBeaver loads JDBC drivers via a separate driver classloader.
                         Add this bundle jar to that classpath so the driver class (and embedded deps)
-                        are resolvable without any manual “add jar” step.
+                        are resolvable without any manual "add jar" step.
                     -->
                     <file type="jar" path="bundle:/org.jkiss.dbeaver.ext.decentdb"/>
 
                     <!-- Default connection properties -->
                     <property name="readOnly" value="false"/>
-                    <property name="queryGetViewDefinition" value="SELECT sql_text FROM decentdb_system_views WHERE name=?"/>
 
                 </driver>
             </drivers>
@@ -72,6 +74,11 @@
 
     <!-- File handler: lets users open .ddb files directly in DBeaver -->
     <extension point="org.jkiss.dbeaver.databaseEditorContributor">
+    </extension>
+    <!-- Register our custom meta model with the generic meta model registry -->
+    <extension point="org.jkiss.dbeaver.generic.meta">
+        <meta id="decentdb" class="org.jkiss.dbeaver.ext.decentdb.model.DecentDBMetaModel"
+              driverClass="com.decentdb.jdbc.DecentDBDriver"/>
     </extension>
 
 </plugin>
