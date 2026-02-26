@@ -178,6 +178,7 @@ DROP VIEW active_users_v1;
 
 **Notes:**
 - View definitions must be a pure `SELECT` statement.
+- Views may include GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, and DISTINCT ON — these are expanded as derived tables at query time.
 - Views are read-only unless you define `INSTEAD OF` triggers for DML.
 - Parameters (`$1`, etc.) are not allowed in view definitions.
 - Dropping or renaming a view is `RESTRICT`ed when dependent views exist.

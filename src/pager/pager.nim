@@ -731,9 +731,9 @@ proc acquirePageRw*(pager: Pager, pageId: PageId): Result[PageHandle] =
   if not entry.dirty:
     entry.data = cloneString(entry.data)
     entry.dirty = true
-    entry.aux = nil
     pager.txnDirtyCount.inc
     pager.txnDirtyPages.add(pageId)
+  entry.aux = nil
   pager.txnLastDirtyId = pageId
 
   ok(PageHandle(pager: pager, entry: entry, pinned: true))
@@ -759,9 +759,9 @@ proc upgradeToRw*(handle: var PageHandle): Result[Void] =
         echo "upgradeToRw(", entry.id, "): cloneString keyCount=", cnt, " pinCount=", entry.pinCount
     entry.data = cloneString(entry.data)
     entry.dirty = true
-    entry.aux = nil
     pager.txnDirtyCount.inc
     pager.txnDirtyPages.add(entry.id)
+  entry.aux = nil
   pager.txnLastDirtyId = entry.id
   okVoid()
 
@@ -1114,8 +1114,7 @@ proc writeFreelistPage(pager: Pager, pageId: PageId, next: uint32, ids: seq[uint
     writeU32LE(buf, offset, id)
   writePage(pager, pageId, buf)
 
-proc updateHeader(pager: Pager): Result[Void] =
-  writeHeader(pager.vfs, pager.file, pager.header)
+
 
 proc allocatePage*(pager: Pager): Result[PageId] =
   if pager.header.freelistCount == 0 or pager.header.freelistHead == 0:

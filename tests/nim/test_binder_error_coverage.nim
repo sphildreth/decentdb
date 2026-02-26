@@ -9,51 +9,62 @@ import strutils
 import engine
 
 suite "View definition validation errors":
-  test "VIEW with GROUP BY fails when queried":
+  test "VIEW with GROUP BY succeeds when queried (subquery wrap)":
     let db = openDb(":memory:").value
     defer: discard closeDb(db)
     check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)").ok
     check execSql(db, "INSERT INTO t VALUES (1, 'A', 10)").ok
-    # Creation succeeds, but using view with GROUP BY fails
-    check execSql(db, "CREATE VIEW gv AS SELECT cat, COUNT(*) FROM t GROUP BY cat").ok
+    check execSql(db, "INSERT INTO t VALUES (2, 'B', 20)").ok
+    check execSql(db, "CREATE VIEW gv AS SELECT cat, COUNT(*) AS cnt FROM t GROUP BY cat").ok
     let r = execSql(db, "SELECT * FROM gv")
-    check not r.ok
+    check r.ok
+    check r.value.len == 2
 
-  test "VIEW with ORDER BY fails when queried":
+  test "VIEW with ORDER BY succeeds when queried (subquery wrap)":
     let db = openDb(":memory:").value
     defer: discard closeDb(db)
     check execSql(db, "CREATE TABLE t2 (id INT PRIMARY KEY, v INT)").ok
     check execSql(db, "INSERT INTO t2 VALUES (1, 5)").ok
+    check execSql(db, "INSERT INTO t2 VALUES (2, 3)").ok
     check execSql(db, "CREATE VIEW ov AS SELECT id, v FROM t2 ORDER BY v").ok
     let r = execSql(db, "SELECT * FROM ov")
-    check not r.ok
+    check r.ok
+    check r.value.len == 2
+    check r.value[0] == "2|3"
 
-  test "VIEW with LIMIT fails when queried":
+  test "VIEW with LIMIT succeeds when queried (subquery wrap)":
     let db = openDb(":memory:").value
     defer: discard closeDb(db)
     check execSql(db, "CREATE TABLE t3 (id INT PRIMARY KEY, v INT)").ok
     check execSql(db, "INSERT INTO t3 VALUES (1, 5)").ok
-    check execSql(db, "CREATE VIEW lv AS SELECT id FROM t3 LIMIT 10").ok
+    check execSql(db, "INSERT INTO t3 VALUES (2, 3)").ok
+    check execSql(db, "CREATE VIEW lv AS SELECT id FROM t3 LIMIT 1").ok
     let r = execSql(db, "SELECT * FROM lv")
-    check not r.ok
+    check r.ok
+    check r.value.len == 1
 
-  test "VIEW with OFFSET fails when queried":
+  test "VIEW with OFFSET succeeds when queried (subquery wrap)":
     let db = openDb(":memory:").value
     defer: discard closeDb(db)
     check execSql(db, "CREATE TABLE t4 (id INT PRIMARY KEY, v INT)").ok
     check execSql(db, "INSERT INTO t4 VALUES (1, 5)").ok
-    check execSql(db, "CREATE VIEW ov2 AS SELECT id FROM t4 LIMIT 5 OFFSET 2").ok
+    check execSql(db, "INSERT INTO t4 VALUES (2, 3)").ok
+    check execSql(db, "CREATE VIEW ov2 AS SELECT id FROM t4 LIMIT 5 OFFSET 1").ok
     let r = execSql(db, "SELECT * FROM ov2")
-    check not r.ok
+    check r.ok
+    check r.value.len == 1
 
-  test "VIEW with HAVING fails when queried":
+  test "VIEW with HAVING succeeds when queried (subquery wrap)":
     let db = openDb(":memory:").value
     defer: discard closeDb(db)
     check execSql(db, "CREATE TABLE t5 (id INT PRIMARY KEY, cat TEXT, v INT)").ok
     check execSql(db, "INSERT INTO t5 VALUES (1, 'A', 10), (2, 'A', 20)").ok
-    check execSql(db, "CREATE VIEW hv AS SELECT cat, COUNT(*) FROM t5 GROUP BY cat HAVING COUNT(*) > 1").ok
+    check execSql(db, "INSERT INTO t5 VALUES (3, 'B', 30)").ok
+    check execSql(db, "CREATE VIEW hv AS SELECT cat, COUNT(*) AS cnt FROM t5 GROUP BY cat HAVING COUNT(*) > 1").ok
     let r = execSql(db, "SELECT * FROM hv")
-    check not r.ok
+    check r.ok
+    check r.value.len == 1
+    check r.value[0].contains("A")
 
 suite "CTE and view binding validation":
   test "SELECT * with JOIN on CTE is not supported":

@@ -919,7 +919,7 @@ proc estimateSelectivity(catalog: Catalog, table: string, predicate: Expr): floa
     if op == "=":
       # Try to find an index for selectivity via distinct key count.
       var colName = ""
-      var valExpr: Expr = nil
+
       if predicate.left.kind == ekColumn:
         colName = predicate.left.name
       elif predicate.right.kind == ekColumn:

@@ -373,7 +373,8 @@ suite "SQL Exec":
     check shadow.value == @[("1")]
 
     let unsupportedShape = execSql(db, "WITH a AS (SELECT id FROM users ORDER BY id) SELECT id FROM a")
-    check not unsupportedShape.ok
+    check unsupportedShape.ok
+    check unsupportedShape.value.len >= 1
 
     discard closeDb(db)
 

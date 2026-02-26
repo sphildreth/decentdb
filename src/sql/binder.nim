@@ -746,14 +746,18 @@ proc parseViewSelect(view: ViewMeta): Result[Statement] =
     return err[Statement](ERR_SQL, "View definition must be SELECT", view.name)
   ok(stmt)
 
-proc ensureExpandableViewShape(viewName: string, stmt: Statement): Result[Void] =
+proc needsSubqueryWrap(stmt: Statement): bool =
+  ## Returns true when a view/CTE body cannot be merge-inlined and must
+  ## be wrapped as a derived table (subquery in FROM).
   if stmt.groupBy.len > 0 or stmt.havingExpr != nil:
-    return err[Void](ERR_SQL, "Views with GROUP BY/HAVING are not supported in 0.x", viewName)
+    return true
   if stmt.orderBy.len > 0:
-    return err[Void](ERR_SQL, "Views with ORDER BY are not supported in 0.x", viewName)
+    return true
   if stmt.limit >= 0 or stmt.limitParam > 0 or stmt.offset >= 0 or stmt.offsetParam > 0:
-    return err[Void](ERR_SQL, "Views with LIMIT/OFFSET are not supported in 0.x", viewName)
-  okVoid()
+    return true
+  if stmt.distinctOnExprs.len > 0:
+    return true
+  false
 
 proc buildViewOutputExprs(catalog: Catalog, stmt: Statement): Result[seq[Expr]] =
   if stmt.setOpKind != sokNone:
@@ -1100,62 +1104,67 @@ proc expandSelectCteRefs(
     let refAlias = expanded.fromAlias
     let cteDef = ctes[normalizedName(refTable)]
 
-    # Build column map for rewriting CTE alias references (e.g. b(x) → users.id)
-    var columnMap: Table[string, Expr]
-    var hasColumnMap = false
-    if cteDef.query.setOpKind == sokNone:
-      let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
-      if not columnMapRes.ok:
-        return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
-      columnMap = columnMapRes.value
-      hasColumnMap = true
+    if needsSubqueryWrap(cteDef.query):
+      # CTE body has GROUP BY/ORDER BY/LIMIT/HAVING/DISTINCT ON
+      # — wrap as derived table instead of merge-inlining.
+      let alias = if refAlias.len > 0: refAlias else: refTable
+      expanded.fromSubquery = cloneSelectStatement(cteDef.query)
+      expanded.fromTable = alias
+      expanded.fromAlias = alias
+    else:
+      # Build column map for rewriting CTE alias references (e.g. b(x) → users.id)
+      var columnMap: Table[string, Expr]
+      var hasColumnMap = false
+      if cteDef.query.setOpKind == sokNone:
+        let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
+        if not columnMapRes.ok:
+          return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+        columnMap = columnMapRes.value
+        hasColumnMap = true
 
-    var skipRewrite = false
-    if singleSourceStar and hasColumnMap:
-      # Optimization for single source star on simple query: replace star with explicit columns
-      var items: seq[SelectItem] = @[]
-      for item in expanded.selectItems:
-        if item.isStar:
-          for colName in cteDef.columnNames:
-            let key = normalizedName(colName)
-            if columnMap.hasKey(key):
-              items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
-        else:
+      var skipRewrite = false
+      if singleSourceStar and hasColumnMap:
+        var items: seq[SelectItem] = @[]
+        for item in expanded.selectItems:
+          if item.isStar:
+            for colName in cteDef.columnNames:
+              let key = normalizedName(colName)
+              if columnMap.hasKey(key):
+                items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
+          else:
+            let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
+            if not exprRes.ok:
+               return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+            items.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
+        expanded.selectItems = items
+        skipRewrite = true
+
+      let originalOrderBy = expanded.orderBy
+      let originalLimit = expanded.limit
+      let originalLimitParam = expanded.limitParam
+      let originalOffset = expanded.offset
+      let originalOffsetParam = expanded.offsetParam
+      
+      let pushedRes = pushDownQuery(catalog, expanded, cteDef.query, refTable, refAlias, cteDef.columnNames, onlySource, skipRewrite)
+      if not pushedRes.ok:
+        return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
+      expanded = pushedRes.value
+      
+      var restoredOrderBy = originalOrderBy
+      if hasColumnMap and restoredOrderBy.len > 0:
+        var rewrittenOrder: seq[OrderItem] = @[]
+        for item in restoredOrderBy:
           let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
           if not exprRes.ok:
-             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-          items.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
-      expanded.selectItems = items
-      skipRewrite = true
+            return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+          rewrittenOrder.add(OrderItem(expr: exprRes.value, asc: item.asc))
+        restoredOrderBy = rewrittenOrder
 
-    let originalOrderBy = expanded.orderBy
-    let originalLimit = expanded.limit
-    let originalLimitParam = expanded.limitParam
-    let originalOffset = expanded.offset
-    let originalOffsetParam = expanded.offsetParam
-    
-    let pushedRes = pushDownQuery(catalog, expanded, cteDef.query, refTable, refAlias, cteDef.columnNames, onlySource, skipRewrite)
-    if not pushedRes.ok:
-      return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
-    expanded = pushedRes.value
-    
-    # Restore outer query's ordering/limit, rewriting through column map
-    # so CTE alias references (e.g. ORDER BY x) resolve to underlying columns
-    var restoredOrderBy = originalOrderBy
-    if hasColumnMap and restoredOrderBy.len > 0:
-      var rewrittenOrder: seq[OrderItem] = @[]
-      for item in restoredOrderBy:
-        let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
-        if not exprRes.ok:
-          return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-        rewrittenOrder.add(OrderItem(expr: exprRes.value, asc: item.asc))
-      restoredOrderBy = rewrittenOrder
-
-    expanded.orderBy = restoredOrderBy
-    expanded.limit = originalLimit
-    expanded.limitParam = originalLimitParam
-    expanded.offset = originalOffset
-    expanded.offsetParam = originalOffsetParam
+      expanded.orderBy = restoredOrderBy
+      expanded.limit = originalLimit
+      expanded.limitParam = originalLimitParam
+      expanded.offset = originalOffset
+      expanded.offsetParam = originalOffsetParam
 
   var joinIdx = 0
   while joinIdx < expanded.joins.len:
@@ -1166,45 +1175,55 @@ proc expandSelectCteRefs(
       let refTable = expanded.joins[joinIdx].table
       let refAlias = expanded.joins[joinIdx].alias
       let cteDef = ctes[normalizedName(refTable)]
-      
-      if cteDef.query.setOpKind != sokNone:
-         return err[Statement](ERR_SQL, "Joining with SetOp CTE not supported in 0.x")
 
-      let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
-      if not columnMapRes.ok:
-        return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
-      let columnMap = columnMapRes.value
+      if needsSubqueryWrap(cteDef.query):
+        # Wrap complex CTE as a join subquery.
+        let alias = if refAlias.len > 0: refAlias else: refTable
+        var baseJoin = expanded.joins[joinIdx]
+        baseJoin.table = alias
+        baseJoin.alias = alias
+        while expanded.joinSubqueries.len <= joinIdx:
+          expanded.joinSubqueries.add(nil)
+        expanded.joinSubqueries[joinIdx] = cloneSelectStatement(cteDef.query)
+        expanded.joins[joinIdx] = baseJoin
+      else:
+        if cteDef.query.setOpKind != sokNone:
+          return err[Statement](ERR_SQL, "Joining with SetOp CTE not supported in 0.x")
+        let columnMapRes = outputExprMapForColumns(catalog, cteDef.query, cteDef.columnNames, refTable)
+        if not columnMapRes.ok:
+          return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+        let columnMap = columnMapRes.value
 
-      let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, false)
-      if not rewriteRes.ok:
-        return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
+        let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, false)
+        if not rewriteRes.ok:
+          return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
 
-      let cteQuery = cloneSelectStatement(cteDef.query)
-      var baseJoin = expanded.joins[joinIdx]
-      baseJoin.table = cteQuery.fromTable
-      baseJoin.alias = cteQuery.fromAlias
-      baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(cteQuery.whereExpr))
+        let cteQuery = cloneSelectStatement(cteDef.query)
+        var baseJoin = expanded.joins[joinIdx]
+        baseJoin.table = cteQuery.fromTable
+        baseJoin.alias = cteQuery.fromAlias
+        baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(cteQuery.whereExpr))
 
-      var newJoins: seq[JoinClause] = @[]
-      var newJoinSubqueries: seq[Statement] = @[]
-      for i, join in expanded.joins:
-        if i == joinIdx:
-          newJoins.add(baseJoin)
-          if i < expanded.joinSubqueries.len:
-            newJoinSubqueries.add(expanded.joinSubqueries[i])
+        var newJoins: seq[JoinClause] = @[]
+        var newJoinSubqueries: seq[Statement] = @[]
+        for i, join in expanded.joins:
+          if i == joinIdx:
+            newJoins.add(baseJoin)
+            if i < expanded.joinSubqueries.len:
+              newJoinSubqueries.add(expanded.joinSubqueries[i])
+            else:
+              newJoinSubqueries.add(nil)
+            for extra in cteQuery.joins:
+              newJoins.add(extra)
+              newJoinSubqueries.add(nil)
           else:
-            newJoinSubqueries.add(nil)
-          for extra in cteQuery.joins:
-            newJoins.add(extra)
-            newJoinSubqueries.add(nil)
-        else:
-          newJoins.add(join)
-          if i < expanded.joinSubqueries.len:
-            newJoinSubqueries.add(expanded.joinSubqueries[i])
-          else:
-            newJoinSubqueries.add(nil)
-      expanded.joins = newJoins
-      expanded.joinSubqueries = newJoinSubqueries
+            newJoins.add(join)
+            if i < expanded.joinSubqueries.len:
+              newJoinSubqueries.add(expanded.joinSubqueries[i])
+            else:
+              newJoinSubqueries.add(nil)
+        expanded.joins = newJoins
+        expanded.joinSubqueries = newJoinSubqueries
     joinIdx.inc
 
 
@@ -1254,9 +1273,6 @@ proc expandSelectCtes(
     let viewRes = expandSelectViews(catalog, inlineRes.value, depth + 1, stack & @[cteName])
     if not viewRes.ok:
       return err[Statement](viewRes.err.code, viewRes.err.message, viewRes.err.context)
-    let shapeRes = ensureExpandableViewShape(cteName, viewRes.value)
-    if not shapeRes.ok:
-      return err[Statement](shapeRes.err.code, shapeRes.err.message, shapeRes.err.context)
     let cols = if i < stmt.cteColumns.len: stmt.cteColumns[i] else: @[]
     let colRes = resolveViewOutputColumnNames(catalog, cteName, cols, viewRes.value)
     if not colRes.ok:
@@ -1328,9 +1344,6 @@ proc expandSelectViews(
     let parsedRes = parseViewSelect(viewRes.value)
     if not parsedRes.ok:
       return err[(ViewMeta, Statement)](parsedRes.err.code, parsedRes.err.message, parsedRes.err.context)
-    let shapeRes = ensureExpandableViewShape(viewRes.value.name, parsedRes.value)
-    if not shapeRes.ok:
-      return err[(ViewMeta, Statement)](shapeRes.err.code, shapeRes.err.message, shapeRes.err.context)
     let nextRes = expandSelectSources(catalog, parsedRes.value, depth + 1, stack & @[refTable])
     if not nextRes.ok:
       return err[(ViewMeta, Statement)](nextRes.err.code, nextRes.err.message, nextRes.err.context)
@@ -1351,54 +1364,52 @@ proc expandSelectViews(
     let refTable = expanded.fromTable
     let refAlias = expanded.fromAlias
 
-    var skipRewrite = false
-    if singleSourceStar and viewExpanded.setOpKind == sokNone:
-      # Optimization: expand star using the view's output columns (from Left if SetOp? No, only if None for now)
-      # Actually, for SetOp, we can also expand star if we trust viewMeta.columnNames
-      # But let's stick to safe path.
-      let columnMapRes = outputExprMapForColumns(catalog, viewExpanded, viewMeta.columnNames, refTable)
-      if not columnMapRes.ok:
-         return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
-      let columnMap = columnMapRes.value
-      
-      var items: seq[SelectItem] = @[]
-      for item in expanded.selectItems:
-        if item.isStar:
-          for colName in viewMeta.columnNames:
-            let key = normalizedName(colName)
-            if columnMap.hasKey(key):
-              items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
-        else:
-          let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
-          if not exprRes.ok:
-             return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
-          items.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
-      expanded.selectItems = items
-      skipRewrite = true
-
-    let originalOrderBy = expanded.orderBy
-    let originalLimit = expanded.limit
-    let originalLimitParam = expanded.limitParam
-    let originalOffset = expanded.offset
-    let originalOffsetParam = expanded.offsetParam
-    
-    let pushedRes = pushDownQuery(catalog, expanded, viewExpanded, refTable, refAlias, viewMeta.columnNames, onlySource, skipRewrite)
-    if not pushedRes.ok:
-      return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
-    expanded = pushedRes.value
-    
-    if expanded.setOpKind != sokNone:
-        expanded.orderBy = originalOrderBy
-        expanded.limit = originalLimit
-        expanded.limitParam = originalLimitParam
-        expanded.offset = originalOffset
-        expanded.offsetParam = originalOffsetParam
+    if needsSubqueryWrap(viewExpanded) or viewExpanded.setOpKind != sokNone:
+      # View body has GROUP BY/ORDER BY/LIMIT/HAVING/DISTINCT ON or set ops
+      # — cannot merge-inline.  Wrap as a derived table (subquery in FROM).
+      let alias = if refAlias.len > 0: refAlias else: refTable
+      expanded.fromSubquery = cloneSelectStatement(viewExpanded)
+      expanded.fromTable = alias
+      expanded.fromAlias = alias
     else:
-        expanded.orderBy = originalOrderBy
-        expanded.limit = originalLimit
-        expanded.limitParam = originalLimitParam
-        expanded.offset = originalOffset
-        expanded.offsetParam = originalOffsetParam
+      var skipRewrite = false
+      if singleSourceStar and viewExpanded.setOpKind == sokNone:
+        let columnMapRes = outputExprMapForColumns(catalog, viewExpanded, viewMeta.columnNames, refTable)
+        if not columnMapRes.ok:
+           return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+        let columnMap = columnMapRes.value
+        
+        var items: seq[SelectItem] = @[]
+        for item in expanded.selectItems:
+          if item.isStar:
+            for colName in viewMeta.columnNames:
+              let key = normalizedName(colName)
+              if columnMap.hasKey(key):
+                items.add(SelectItem(expr: cloneExpr(columnMap[key]), alias: colName, isStar: false))
+          else:
+            let exprRes = rewriteExprForViewRef(item.expr, refTable, refAlias, columnMap, onlySource)
+            if not exprRes.ok:
+               return err[Statement](exprRes.err.code, exprRes.err.message, exprRes.err.context)
+            items.add(SelectItem(expr: exprRes.value, alias: item.alias, isStar: false))
+        expanded.selectItems = items
+        skipRewrite = true
+
+      let originalOrderBy = expanded.orderBy
+      let originalLimit = expanded.limit
+      let originalLimitParam = expanded.limitParam
+      let originalOffset = expanded.offset
+      let originalOffsetParam = expanded.offsetParam
+      
+      let pushedRes = pushDownQuery(catalog, expanded, viewExpanded, refTable, refAlias, viewMeta.columnNames, onlySource, skipRewrite)
+      if not pushedRes.ok:
+        return err[Statement](pushedRes.err.code, pushedRes.err.message, pushedRes.err.context)
+      expanded = pushedRes.value
+      
+      expanded.orderBy = originalOrderBy
+      expanded.limit = originalLimit
+      expanded.limitParam = originalLimitParam
+      expanded.offset = originalOffset
+      expanded.offsetParam = originalOffsetParam
 
   var joinIdx = 0
   while joinIdx < expanded.joins.len:
@@ -1414,44 +1425,54 @@ proc expandSelectViews(
       let viewExpanded = sourceRes.value[1]
       let viewMeta = sourceRes.value[0]
 
-      if viewExpanded.setOpKind != sokNone:
-          return err[Statement](ERR_SQL, "Joining with SetOp view not supported in 0.x")
+      if needsSubqueryWrap(viewExpanded) or viewExpanded.setOpKind != sokNone:
+        # Wrap complex view as a join subquery.
+        let alias = if refAlias.len > 0: refAlias else: refTable
+        var baseJoin = expanded.joins[joinIdx]
+        baseJoin.table = alias
+        baseJoin.alias = alias
 
-      let columnMapRes = outputExprMapForColumns(catalog, viewExpanded, viewMeta.columnNames, refTable)
-      if not columnMapRes.ok:
-         return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
-      let columnMap = columnMapRes.value
+        # Ensure joinSubqueries is long enough.
+        while expanded.joinSubqueries.len <= joinIdx:
+          expanded.joinSubqueries.add(nil)
+        expanded.joinSubqueries[joinIdx] = cloneSelectStatement(viewExpanded)
+        expanded.joins[joinIdx] = baseJoin
+      else:
+        let columnMapRes = outputExprMapForColumns(catalog, viewExpanded, viewMeta.columnNames, refTable)
+        if not columnMapRes.ok:
+           return err[Statement](columnMapRes.err.code, columnMapRes.err.message, columnMapRes.err.context)
+        let columnMap = columnMapRes.value
 
-      let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, false)
-      if not rewriteRes.ok:
-        return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
+        let rewriteRes = rewriteAllExpressions(expanded, refTable, refAlias, columnMap, false)
+        if not rewriteRes.ok:
+          return err[Statement](rewriteRes.err.code, rewriteRes.err.message, rewriteRes.err.context)
 
-      let viewQuery = cloneSelectStatement(viewExpanded)
-      var baseJoin = expanded.joins[joinIdx]
-      baseJoin.table = viewQuery.fromTable
-      baseJoin.alias = viewQuery.fromAlias
-      baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(viewQuery.whereExpr))
+        let viewQuery = cloneSelectStatement(viewExpanded)
+        var baseJoin = expanded.joins[joinIdx]
+        baseJoin.table = viewQuery.fromTable
+        baseJoin.alias = viewQuery.fromAlias
+        baseJoin.onExpr = andExpr(baseJoin.onExpr, cloneExpr(viewQuery.whereExpr))
 
-      var newJoins: seq[JoinClause] = @[]
-      var newJoinSubqueries: seq[Statement] = @[]
-      for i, join in expanded.joins:
-        if i == joinIdx:
-          newJoins.add(baseJoin)
-          if i < expanded.joinSubqueries.len:
-            newJoinSubqueries.add(expanded.joinSubqueries[i])
+        var newJoins: seq[JoinClause] = @[]
+        var newJoinSubqueries: seq[Statement] = @[]
+        for i, join in expanded.joins:
+          if i == joinIdx:
+            newJoins.add(baseJoin)
+            if i < expanded.joinSubqueries.len:
+              newJoinSubqueries.add(expanded.joinSubqueries[i])
+            else:
+              newJoinSubqueries.add(nil)
+            for extra in viewQuery.joins:
+              newJoins.add(extra)
+              newJoinSubqueries.add(nil)
           else:
-            newJoinSubqueries.add(nil)
-          for extra in viewQuery.joins:
-            newJoins.add(extra)
-            newJoinSubqueries.add(nil)
-        else:
-          newJoins.add(join)
-          if i < expanded.joinSubqueries.len:
-            newJoinSubqueries.add(expanded.joinSubqueries[i])
-          else:
-            newJoinSubqueries.add(nil)
-      expanded.joins = newJoins
-      expanded.joinSubqueries = newJoinSubqueries
+            newJoins.add(join)
+            if i < expanded.joinSubqueries.len:
+              newJoinSubqueries.add(expanded.joinSubqueries[i])
+            else:
+              newJoinSubqueries.add(nil)
+        expanded.joins = newJoins
+        expanded.joinSubqueries = newJoinSubqueries
     joinIdx.inc
 
   let nodeCount = countSelectNodes(expanded)

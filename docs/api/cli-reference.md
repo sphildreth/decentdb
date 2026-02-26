@@ -20,6 +20,64 @@ decentdb <command> --help
 
 ## Commands
 
+### bulk-load
+
+Bulk load data from CSV (high-throughput ingest).
+
+```bash
+decentdb bulk-load --db=<path> --table=<name> --input=<path> [options]
+```
+
+Options:
+- `--batchSize=<n>` - Rows per batch (default: 10000)
+- `--syncInterval=<n>` - Batches between fsync when durability is deferred (default: 10)
+- `--durability=<full|deferred|none>` - Durability mode (default: deferred)
+- `--disableIndexes` - Disable indexes during load (default: true)
+- `--noCheckpoint` - Skip checkpoint after load completes
+
+### checkpoint
+
+Force WAL checkpoint.
+
+```bash
+decentdb checkpoint --db=<path> [--warnings] [--verbose]
+```
+
+### completion
+
+Emit a basic shell completion script.
+
+```bash
+decentdb completion [--shell=bash|zsh]
+```
+
+### describe
+
+Show table structure.
+
+```bash
+decentdb describe --db=<path> --table=<name>
+```
+
+Options:
+- `--table=<name>` - Table name to describe
+
+### dump
+
+Dump the database as SQL statements.
+
+```bash
+decentdb dump --db=<path> [--output=<path>]
+```
+
+### dump-header
+
+Dump raw database header fields and checksum status.
+
+```bash
+decentdb dump-header --db=<path>
+```
+
 ### exec
 
 Execute SQL statements.
@@ -61,24 +119,45 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM users" --format=table
 decentdb exec --db=my.ddb --sql="CREATE INDEX ix_name ON users(name)" --checkpoint
 ```
 
-### list-tables
+### export
 
-List all tables in the database.
-
-```bash
-decentdb list-tables --db=<path>
-```
-
-### describe
-
-Show table structure.
+Export table to CSV.
 
 ```bash
-decentdb describe --db=<path> --table=<name>
+decentdb export --db=<path> --table=<name> --output=<path> [options]
 ```
 
 Options:
-- `--table=<name>` - Table name to describe
+- `--table=<name>` - Table name to export
+- `--output=<path>` - Output file path
+- `--format=<csv|json>` - Output format (default: csv)
+
+### import
+
+Import data from CSV or JSON.
+
+```bash
+decentdb import --db=<path> --table=<name> --input=<path> [options]
+```
+
+Options:
+- `--table=<name>` - Target table
+- `--input=<path>` - Input file path
+- `--format=<csv|json>` - Input format (default: csv)
+- `--batchSize=<n>` - Rows per batch (default: 10000)
+
+### info
+
+Show detailed database information (configured settings and schema).
+
+```bash
+decentdb info --db=<path> [--schema-summary]
+```
+
+Options:
+- `--schema-summary` - Include schema summary (tables, columns, indexes)
+
+Use `info` to inspect static database configuration (like format version and page size) or get a high-level summary of the database schema layout.
 
 ### list-indexes
 
@@ -90,6 +169,22 @@ decentdb list-indexes --db=<path> [--table=<name>]
 
 Options:
 - `--table=<name>` - Filter by table (optional)
+
+### list-tables
+
+List all tables in the database.
+
+```bash
+decentdb list-tables --db=<path>
+```
+
+### list-views
+
+List all views in the database.
+
+```bash
+decentdb list-views --db=<path>
+```
 
 ### rebuild-index
 
@@ -113,97 +208,12 @@ decentdb rebuild-indexes --db=<path> [--table=<name>]
 Options:
 - `--table=<name>` - Filter indexes by table (optional)
 
-### verify-index
+### repl
 
-Verify index integrity.
-
-```bash
-decentdb verify-index --db=<path> --index=<name>
-```
-
-### import
-
-Import data from CSV or JSON.
+Interactive Read-Eval-Print Loop (REPL) mode.
 
 ```bash
-decentdb import --db=<path> --table=<name> --input=<path> [options]
-```
-
-Options:
-- `--table=<name>` - Target table
-- `--input=<path>` - Input file path
-- `--format=<csv|json>` - Input format (default: csv)
-- `--batchSize=<n>` - Rows per batch (default: 10000)
-
-### export
-
-Export table to CSV.
-
-```bash
-decentdb export --db=<path> --table=<name> --output=<path> [options]
-```
-
-Options:
-- `--table=<name>` - Table name to export
-- `--output=<path>` - Output file path
-- `--format=<csv|json>` - Output format (default: csv)
-
-### dump
-
-Dump the database as SQL statements.
-
-```bash
-decentdb dump --db=<path> [--output=<path>]
-```
-
-### bulk-load
-
-Bulk load data from CSV (high-throughput ingest).
-
-```bash
-decentdb bulk-load --db=<path> --table=<name> --input=<path> [options]
-```
-
-Options:
-- `--batchSize=<n>` - Rows per batch (default: 10000)
-- `--syncInterval=<n>` - Batches between fsync when durability is deferred (default: 10)
-- `--durability=<full|deferred|none>` - Durability mode (default: deferred)
-- `--disableIndexes` - Disable indexes during load (default: true)
-- `--noCheckpoint` - Skip checkpoint after load completes
-
-### checkpoint
-
-Force WAL checkpoint.
-
-```bash
-decentdb checkpoint --db=<path> [--warnings] [--verbose]
-```
-
-### stats
-
-Show database statistics.
-
-```bash
-decentdb stats --db=<path>
-```
-
-### info
-
-Show detailed database information.
-
-```bash
-decentdb info --db=<path> [--schema-summary]
-```
-
-Options:
-- `--schema-summary` - Include schema summary (tables, columns, indexes)
-
-### vacuum
-
-Rewrite the database into a new file to reclaim space.
-
-```bash
-decentdb vacuum --db=<path> --output=<path> [--overwrite] [--cachePages=<n>] [--cacheMb=<n>]
+decentdb repl --db=<path> [--format=<json|csv|table>]
 ```
 
 ### save-as
@@ -220,12 +230,22 @@ Options:
 
 The command performs a full WAL checkpoint, then copies all pages to the destination atomically.
 
-### dump-header
+### stats
 
-Dump raw database header fields and checksum status.
+Show runtime database statistics (current memory usage and physical size).
 
 ```bash
-decentdb dump-header --db=<path>
+decentdb stats --db=<path>
+```
+
+Use `stats` to monitor the current memory usage of the database engine (how full the cache is) or check the physical page layout size of the database file on disk.
+
+### vacuum
+
+Rewrite the database into a new file to reclaim space.
+
+```bash
+decentdb vacuum --db=<path> --output=<path> [--overwrite] [--cachePages=<n>] [--cacheMb=<n>]
 ```
 
 ### verify-header
@@ -236,20 +256,12 @@ Verify database header magic and checksum.
 decentdb verify-header --db=<path>
 ```
 
-### repl
+### verify-index
 
-Interactive REPL mode.
-
-```bash
-decentdb repl --db=<path> [--format=<json|csv|table>]
-```
-
-### completion
-
-Emit a basic shell completion script.
+Verify index integrity.
 
 ```bash
-decentdb completion [--shell=bash|zsh]
+decentdb verify-index --db=<path> --index=<name>
 ```
 
 ## Output Formats

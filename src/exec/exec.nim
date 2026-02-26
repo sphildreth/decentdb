@@ -4048,6 +4048,30 @@ proc collectAggSpecs(items: seq[SelectItem]): seq[AggSpec] =
     walk(item.expr, i)
   specs
 
+proc collectAggSpecsFromExpr(expr: Expr): seq[AggSpec] =
+  ## Collect aggregate function calls from an arbitrary expression (e.g. HAVING).
+  var specs: seq[AggSpec] = @[]
+  proc walk(e: Expr) =
+    if e == nil: return
+    case e.kind
+    of ekFunc:
+      let fn = e.funcName.toUpperAscii()
+      if fn in ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP_CONCAT", "STRING_AGG", "TOTAL"]:
+        let arg = if e.args.len > 0: e.args[0] else: nil
+        let sep = if e.args.len > 1: e.args[1] else: nil
+        specs.add(AggSpec(funcName: fn, argExpr: arg, separatorExpr: sep, itemIdx: -1, isDistinct: e.isDistinct))
+        return
+      for a in e.args:
+        walk(a)
+    of ekBinary: walk(e.left); walk(e.right)
+    of ekUnary: walk(e.expr)
+    of ekInList:
+      walk(e.inExpr)
+      for item in e.inList: walk(item)
+    else: discard
+  walk(expr)
+  specs
+
 proc substituteAggResult(expr: Expr, aggValues: Table[int, Value], aggIdx: var int): Expr =
   ## Replace aggregate sub-expressions with literal values from computed results.
   if expr == nil: return nil
@@ -4080,7 +4104,9 @@ proc substituteAggResult(expr: Expr, aggValues: Table[int, Value], aggIdx: var i
     return expr
 
 proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], having: Expr, params: seq[Value]): Result[seq[Row]] =
-  let aggSpecs = collectAggSpecs(items)
+  let selectAggSpecs = collectAggSpecs(items)
+  let havingAggSpecs = collectAggSpecsFromExpr(having)
+  let aggSpecs = selectAggSpecs & havingAggSpecs
   var groups = initTable[seq[Value], seq[AggState]]()
   var groupRows = initTable[seq[Value], Row]()
   var keyParts = newSeqOfCap[Value](groupBy.len)
@@ -4234,7 +4260,9 @@ proc aggregateRows*(rows: seq[Row], items: seq[SelectItem], groupBy: seq[Expr], 
       vals.add(evalRes.value)
     let row = makeRow(cols, vals)
     if having != nil:
-      let havingRes = evalExpr(row, having, params)
+      var havingAggIdx = selectAggSpecs.len
+      let substitutedHaving = substituteAggResult(having, aggValues, havingAggIdx)
+      let havingRes = evalExpr(row, substitutedHaving, params)
       if not havingRes.ok:
         return err[seq[Row]](havingRes.err.code, havingRes.err.message, havingRes.err.context)
       if not valueToBool(havingRes.value):

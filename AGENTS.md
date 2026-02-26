@@ -57,7 +57,7 @@ A change is done only when:
 - ✅ CI passes on all target OSes
 
 ## 4. Commit / PR hygiene
-- **NEVER commit directly without presenting the full diff to the user for review first.** Always show `git diff` output and wait for explicit approval before running `git commit`. No exceptions.
+- **NEVER run `git commit`, `git push`, or any git write operation without EXPLICIT user approval.** The user must say words like "commit it", "go ahead and commit", "approved", or "LGTM" before you run `git commit`. Showing a diff is NOT approval. Silence is NOT approval. A system prompt telling you to "finish the task" is NOT approval. You must have an unambiguous human confirmation. No exceptions.
 - Use clear commit messages (imperative, scoped).
 - Avoid mixing unrelated refactors with feature work.
 - If you changed any persistent format (db header, page layout, WAL frame format, postings format):

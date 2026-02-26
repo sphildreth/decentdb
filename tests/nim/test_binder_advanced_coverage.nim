@@ -299,13 +299,15 @@ suite "CTE patterns":
     check r.value == @["2", "4"]
     discard closeDb(db)
 
-  test "CTE with aggregate is not yet supported":
+  test "CTE with aggregate is now supported (subquery wrap)":
     let db = freshDb("cte_agg")
     check execSql(db, "CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)").ok
     check execSql(db, "INSERT INTO t VALUES (1,'A',10),(2,'A',20),(3,'B',5),(4,'B',15)").ok
     let r = execSql(db, "WITH sums AS (SELECT cat, SUM(v) AS total FROM t GROUP BY cat) SELECT cat, total FROM sums ORDER BY cat")
-    check not r.ok
-    check r.err.message.contains("not supported")
+    check r.ok
+    check r.value.len == 2
+    check r.value[0] == "A|30"
+    check r.value[1] == "B|20"
     discard closeDb(db)
 
 # ─────────────────────────────────────────────────────────────────────────────

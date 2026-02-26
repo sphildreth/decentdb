@@ -80,11 +80,11 @@ suite "Binder":
     )
     check not forwardRef.ok
 
-    let badShape = bindStatement(
+    let orderCte = bindStatement(
       db.catalog,
       parseSingle("WITH a AS (SELECT id FROM users ORDER BY id) SELECT id FROM a")
     )
-    check not badShape.ok
+    check orderCte.ok
 
     discard closeDb(db)
 

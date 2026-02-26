@@ -831,6 +831,28 @@ proc schemaListTables*(db: string = ""): int =
   echo resultJson(true, rows = tables)
   return 0
 
+proc schemaListViews*(db: string = ""): int =
+  ## List all views in the database
+  let dbPath = resolveDbPath(db)
+  if dbPath.len == 0:
+    echo resultJson(false, DbError(code: ERR_IO, message: "Missing --db argument"))
+    return 1
+
+  let openRes = openDb(dbPath)
+  if not openRes.ok:
+    echo resultJson(false, openRes.err)
+    return 1
+
+  let database = openRes.value
+  var views: seq[string] = @[]
+  
+  for viewName, _ in database.catalog.views:
+    views.add(viewName)
+  
+  discard closeDb(database)
+  echo resultJson(true, rows = views)
+  return 0
+
 proc schemaDescribe*(table: string, db: string = ""): int =
   ## Show table structure (columns, types, constraints)
   let dbPath = resolveDbPath(db)
@@ -1926,7 +1948,7 @@ proc saveAsCmd*(db: string = "", output: string = ""): int =
 proc completion*(shell: string = "bash"): int =
   ## Emit basic shell completion script
   let normalized = shell.strip().toLowerAscii()
-  let commands = "exec list-tables describe list-indexes rebuild-index rebuild-indexes verify-index import export dump bulk-load checkpoint stats info vacuum save-as dump-header verify-header repl completion"
+  let commands = "bulk-load checkpoint completion describe dump dump-header exec export import info list-indexes list-tables list-views rebuild-index rebuild-indexes repl save-as stats vacuum verify-header verify-index"
   if normalized == "zsh":
     echo "#compdef decentdb"
     echo "_decentdb() {"
