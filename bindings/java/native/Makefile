@@ -60,14 +60,18 @@ else
 endif
 
 ifeq ($(IS_WINDOWS),1)
-    # build_lib produces build/decentdb.dll on Windows.
-    # Nim (mingw) typically also produces build/libdecentdb.dll.a (import lib).
+    # build_lib produces build/c_api.dll on Windows.
+    # Nim (mingw) may also produce build/libc_api.dll.a (import lib).
     ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libdecentdb.dll.a))
         DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libdecentdb.dll.a
     else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.lib))
         DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.lib
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libc_api.dll.a))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libc_api.dll.a
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/c_api.dll))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/c_api.dll
     else
-        DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -ldecentdb
+        DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
     endif
 else
     DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
