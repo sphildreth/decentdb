@@ -29,6 +29,7 @@ nav:
     - Configuration: api/configuration.md
     - Language Bindings:
       - .NET (C#): api/dotnet.md
+      - Dart/Flutter: api/dart.md
       - Go: api/go.md
       - JDBC Driver (Java): api/jdbc.md      
       - Node.js: api/node.md
