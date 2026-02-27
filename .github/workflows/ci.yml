@@ -138,3 +138,15 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/build
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/build:/usr/local/lib:/opt/homebrew/lib
         run: dotnet test bindings/dotnet/tests/DecentDB.EntityFrameworkCore.Tests/DecentDB.EntityFrameworkCore.Tests.csproj --configuration Release --verbosity minimal
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Run Dart binding tests
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/build:/usr/local/lib:/opt/homebrew/lib
+        run: bash bindings/dart/scripts/run_tests.sh

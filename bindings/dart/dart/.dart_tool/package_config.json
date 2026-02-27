@@ -296,8 +296,7 @@
       "languageVersion": "3.0"
     }
   ],
-  "generated": "2026-02-27T15:26:42.317638Z",
   "generator": "pub",
-  "generatorVersion": "3.7.0",
+  "generatorVersion": "3.10.1",
   "pubCache": "file:///home/steven/.pub-cache"
 }

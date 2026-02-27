@@ -48,6 +48,7 @@ task test_bindings, "Run all binding tests":
   exec "nimble test_bindings_go"
   exec "nimble test_bindings_node"
   exec "nimble test_bindings_python"
+  exec "nimble test_bindings_dart"
 
 task test, "Run Nim + Python unit tests + Bindings":
   exec "nimble test_nim"
