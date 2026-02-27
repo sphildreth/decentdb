@@ -1,0 +1,33 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "decentdb",
+      "rootUri": "../../../dart",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
+    },
+    {
+      "name": "ffi",
+      "rootUri": "file:///home/steven/.pub-cache/hosted/pub.dev/ffi-2.2.0",
+      "packageUri": "lib/",
+      "languageVersion": "3.7"
+    },
+    {
+      "name": "path",
+      "rootUri": "file:///home/steven/.pub-cache/hosted/pub.dev/path-1.9.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.4"
+    },
+    {
+      "name": "decentdb_console_example",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
+    }
+  ],
+  "generated": "2026-02-27T15:29:45.072749Z",
+  "generator": "pub",
+  "generatorVersion": "3.7.0",
+  "pubCache": "file:///home/steven/.pub-cache"
+}

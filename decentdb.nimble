@@ -38,6 +38,10 @@ task test_bindings_python, "Run Python binding tests":
   withDir "bindings/python":
     exec "pytest"
 
+task test_bindings_dart, "Run Dart binding tests":
+  exec "nimble build_lib"
+  exec "bash bindings/dart/scripts/run_tests.sh"
+
 task test_bindings, "Run all binding tests":
   exec "nimble build_lib"
   exec "nimble test_bindings_dotnet"
