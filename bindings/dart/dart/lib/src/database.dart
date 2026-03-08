@@ -1,5 +1,4 @@
 import 'dart:ffi';
-import 'dart:io' show Platform;
 
 import 'package:ffi/ffi.dart';
 
@@ -76,7 +75,8 @@ class Database {
     String? libraryPath,
     NativeBindings? bindings,
   }) {
-    final b = bindings ??
+    final b =
+        bindings ??
         NativeBindings.load(libraryPath ?? NativeBindings.defaultLibraryName());
 
     final pathPtr = path.toNativeUtf8();
@@ -87,7 +87,9 @@ class Database {
         // Error on a null handle; check global error.
         final errCode = b.lastErrorCode(nullptr);
         final msgPtr = b.lastErrorMessage(nullptr);
-        final msg = msgPtr == nullptr ? 'Failed to open database' : msgPtr.toDartString();
+        final msg = msgPtr == nullptr
+            ? 'Failed to open database'
+            : msgPtr.toDartString();
         throw DecentDbException(ErrorCode.fromCode(errCode), msg);
       }
       return Database._(b, dbPtr);
@@ -98,10 +100,7 @@ class Database {
   }
 
   /// Open an in-memory database (no persistence).
-  static Database memory({
-    String? libraryPath,
-    NativeBindings? bindings,
-  }) {
+  static Database memory({String? libraryPath, NativeBindings? bindings}) {
     return open(':memory:', libraryPath: libraryPath, bindings: bindings);
   }
 

@@ -304,14 +304,19 @@ void _dbWorker(SendPort sendPort) {
 ### Cancellation
 
 DecentDB does not currently support mid-query interruption. To cancel a
-long-running query:
+long-running query when using isolates:
 
-1. Call `stmt.dispose()` from a different isolate (this finalizes the native
-   statement handle and releases the read transaction).
-2. The original isolate's next `step()` call will throw.
-
-This is best-effort; the engine may complete the current page of work before
-the cancellation takes effect.
+1. Run all `Database` and `Statement` objects in a dedicated database isolate
+   (as shown in the isolate example above).
+2. When you start a long-running query, assign it an ID and track the
+   corresponding `Statement` in that database isolate.
+3. From another isolate, send a cancellation message (including the query ID)
+   to the database isolate via `SendPort`.
+4. In the database isolate, handle the cancellation message by locating the
+   tracked `Statement` and calling `stmt.dispose()` there. The statement must
+   only be disposed from the isolate that owns it.
+5. The next `step()`/`execute()` on that statement will throw, and the read
+   transaction will be released.
 
 ## ABI Versioning
 

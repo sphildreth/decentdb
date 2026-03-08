@@ -28,7 +28,6 @@
 ///   // Process commands from main isolate...
 /// }
 /// ```
-library;
 
 import 'dart:io';
 
@@ -48,7 +47,9 @@ void main() {
   print('DecentDB ${db.engineVersion}');
 
   // Create sample data
-  db.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, done BOOLEAN)');
+  db.execute(
+    'CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, done BOOLEAN)',
+  );
   db.execute("INSERT INTO tasks VALUES (1, 'Build Gridlock UI', false)");
   db.execute("INSERT INTO tasks VALUES (2, 'Integrate DecentDB', true)");
   db.execute("INSERT INTO tasks VALUES (3, 'Ship v1.0', false)");

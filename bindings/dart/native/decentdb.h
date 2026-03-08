@@ -72,8 +72,10 @@ int decentdb_step(decentdb_stmt* stmt);
 int decentdb_column_count(decentdb_stmt* stmt);
 const char* decentdb_column_name(decentdb_stmt* stmt, int col_0_based);
 
-// Column type codes: 0=NULL, 1=INT64, 2=BOOL, 3=FLOAT64, 4=TEXT, 5=BLOB,
-//                    6=DECIMAL, 7=DATETIME
+// Column type codes use the underlying ValueKind ordinals.
+// Common logical codes: 0=NULL, 1=INT64, 2=BOOL, 3=FLOAT64, 4=TEXT, 5=BLOB,
+//                       12=DECIMAL, 17=DATETIME.
+// TEXT/BLOB values may also report overflow/compressed ValueKind codes.
 int decentdb_column_type(decentdb_stmt* stmt, int col_0_based);
 
 // --------------------------------------------------------------------------

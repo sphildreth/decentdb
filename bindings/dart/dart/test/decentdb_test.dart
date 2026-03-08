@@ -20,8 +20,10 @@ String findNativeLib() {
     if (candidateDll.existsSync()) return candidateDll.path;
     dir = dir.parent;
   }
-  throw StateError('Cannot find DecentDB native library. '
-      'Set DECENTDB_NATIVE_LIB or run from the repo root after `nimble build_lib`.');
+  throw StateError(
+    'Cannot find DecentDB native library. '
+    'Set DECENTDB_NATIVE_LIB or run from the repo root after `nimble build_lib`.',
+  );
 }
 
 void main() {
@@ -73,7 +75,9 @@ void main() {
 
   group('DDL', () {
     test('CREATE TABLE', () {
-      db.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)');
+      db.execute(
+        'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)',
+      );
       final tables = db.schema.listTables();
       expect(tables, contains('users'));
     });
@@ -96,7 +100,8 @@ void main() {
   group('DML', () {
     setUp(() {
       db.execute(
-          'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score FLOAT)');
+        'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score FLOAT)',
+      );
     });
 
     test('INSERT and SELECT', () {
@@ -113,7 +118,9 @@ void main() {
       db.execute("INSERT INTO users VALUES (1, 'Alice', 95.5)");
       db.execute("INSERT INTO users VALUES (2, 'Bob', 87.3)");
       final affected = db.executeWithParams(
-          'UPDATE users SET score = \$1 WHERE id = \$2', [100.0, 1]);
+        'UPDATE users SET score = \$1 WHERE id = \$2',
+        [100.0, 1],
+      );
       expect(affected, 1);
     });
 
@@ -128,7 +135,8 @@ void main() {
   group('Prepared statements', () {
     setUp(() {
       db.execute(
-          'CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)');
+        'CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)',
+      );
     });
 
     test('bind and execute with reuse', () {
@@ -161,6 +169,26 @@ void main() {
 
       final rows = db.query('SELECT name FROM items WHERE id = 1');
       expect(rows[0]['name'], 'test');
+    });
+
+    test('query resets before re-executing', () {
+      db.execute("INSERT INTO items VALUES (1, 'one', true)");
+      db.execute("INSERT INTO items VALUES (2, 'two', false)");
+
+      final stmt = db.prepare(
+        'SELECT id FROM items WHERE active = \$1 ORDER BY id',
+      );
+      try {
+        stmt.bindBool(1, true);
+
+        final first = stmt.query();
+        final second = stmt.query();
+
+        expect(first.map((row) => row['id']).toList(), [1]);
+        expect(second.map((row) => row['id']).toList(), [1]);
+      } finally {
+        stmt.dispose();
+      }
     });
 
     test('bind NULL', () {
@@ -332,6 +360,13 @@ void main() {
       expect(ddl, isNotNull);
       expect(ddl!, contains('SELECT'));
     });
+
+    test('getViewDdl throws for missing view', () {
+      expect(
+        () => db.schema.getViewDdl('missing_view'),
+        throwsA(isA<DecentDbException>()),
+      );
+    });
   });
 
   group('Data types', () {
@@ -369,6 +404,59 @@ void main() {
       stmt.dispose();
       final rows = db.query('SELECT val FROM t');
       expect(rows[0]['val'], data);
+    });
+
+    test('decimal types', () {
+      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val DECIMAL(10,2))');
+      final insert = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
+      try {
+        insert.bindInt64(1, 1);
+        insert.bindDecimal(2, 12345, 2);
+        insert.execute();
+      } finally {
+        insert.dispose();
+      }
+
+      final stmt = db.prepare('SELECT val FROM t');
+      try {
+        final rows = stmt.query();
+        final decimal = rows[0]['val'] as ({int unscaled, int scale});
+        expect(decimal.unscaled, 12345);
+        expect(decimal.scale, 2);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('datetime types', () {
+      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TIMESTAMP)');
+      final expected = DateTime.utc(2024, 1, 2, 3, 4, 5, 678, 901);
+      final insert = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
+      try {
+        insert.bindInt64(1, 1);
+        insert.bindDateTime(2, expected);
+        insert.execute();
+      } finally {
+        insert.dispose();
+      }
+
+      final stmt = db.prepare('SELECT val FROM t');
+      try {
+        final rows = stmt.query();
+        expect(rows[0]['val'], expected);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('compact bool and integer result kinds', () {
+      final rows = db.query(
+        'SELECT TRUE AS t, FALSE AS f, 1 AS one, 0 AS zero',
+      );
+      expect(rows[0]['t'], isTrue);
+      expect(rows[0]['f'], isFalse);
+      expect(rows[0]['one'], 1);
+      expect(rows[0]['zero'], 0);
     });
 
     test('boolean types', () {

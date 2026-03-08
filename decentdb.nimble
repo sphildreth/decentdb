@@ -40,7 +40,11 @@ task test_bindings_python, "Run Python binding tests":
 
 task test_bindings_dart, "Run Dart binding tests":
   exec "nimble build_lib"
-  exec "bash bindings/dart/scripts/run_tests.sh"
+  when defined(windows):
+    echo "Dart binding tests currently require a POSIX shell (bash). Please run this task from an environment that provides bash (e.g., WSL or Git Bash)."
+    quit(1)
+  else:
+    exec "bash bindings/dart/scripts/run_tests.sh"
 
 task test_bindings, "Run all binding tests":
   exec "nimble build_lib"

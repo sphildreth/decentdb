@@ -128,10 +128,7 @@ class Statement {
     _checkNotDisposed();
     final utf8 = value.toNativeUtf8();
     try {
-      final byteLen = value.codeUnits.length; // UTF-8 byte length
-      // Calculate actual UTF-8 byte length
-      final actualLen = utf8.length;
-      _checkResult(_bindings.bindText(_stmtPtr!, index, utf8, actualLen));
+      _checkResult(_bindings.bindText(_stmtPtr!, index, utf8, utf8.length));
     } finally {
       calloc.free(utf8);
     }
@@ -168,7 +165,8 @@ class Statement {
   void bindDateTime(int index, DateTime value) {
     _checkNotDisposed();
     _checkResult(
-        _bindings.bindDateTime(_stmtPtr!, index, value.microsecondsSinceEpoch));
+      _bindings.bindDateTime(_stmtPtr!, index, value.microsecondsSinceEpoch),
+    );
   }
 
   /// Bind a dynamic value to parameter at [index] (1-based).
@@ -259,10 +257,13 @@ class Statement {
       switch (type) {
         case ColumnType.vkInt64:
           values[i] = _bindings.columnInt64(_stmtPtr!, i);
+          break;
         case ColumnType.vkBool:
           values[i] = _bindings.columnInt64(_stmtPtr!, i) != 0;
+          break;
         case ColumnType.vkFloat64:
           values[i] = _bindings.columnFloat64(_stmtPtr!, i);
+          break;
         case ColumnType.vkText:
           final lenPtr = calloc<Int32>();
           try {
@@ -276,6 +277,7 @@ class Statement {
           } finally {
             calloc.free(lenPtr);
           }
+          break;
         case ColumnType.vkBlob:
           final lenPtr = calloc<Int32>();
           try {
@@ -289,15 +291,19 @@ class Statement {
           } finally {
             calloc.free(lenPtr);
           }
+          break;
         case ColumnType.vkDecimal:
           final unscaled = _bindings.columnDecimalUnscaled(_stmtPtr!, i);
           final scale = _bindings.columnDecimalScale(_stmtPtr!, i);
           values[i] = (unscaled: unscaled, scale: scale);
+          break;
         case ColumnType.vkDateTime:
           final micros = _bindings.columnDateTime(_stmtPtr!, i);
           values[i] = DateTime.fromMicrosecondsSinceEpoch(micros, isUtc: true);
+          break;
         case ColumnType.vkNull:
           values[i] = null;
+          break;
       }
     }
     return Row(names, values);
@@ -312,6 +318,7 @@ class Statement {
   /// Resets the statement first. For large results, prefer [queryCursor].
   List<Row> query() {
     _checkNotDisposed();
+    reset();
     final rows = <Row>[];
     while (step()) {
       rows.add(readRow());

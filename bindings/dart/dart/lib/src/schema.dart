@@ -29,7 +29,8 @@ class Schema {
 
   /// Helper: call a native JSON function, parse, free the buffer.
   String _callJsonFunc(
-      Pointer<Utf8> Function(Pointer<DecentdbDb>, Pointer<Int32>) fn) {
+    Pointer<Utf8> Function(Pointer<DecentdbDb>, Pointer<Int32>) fn,
+  ) {
     final lenPtr = calloc<Int32>();
     try {
       final ptr = fn(_dbPtr, lenPtr);
@@ -94,7 +95,10 @@ class Schema {
     final lenPtr = calloc<Int32>();
     try {
       final ptr = _bindings.getViewDdl(_dbPtr, namePtr, lenPtr);
-      if (ptr == nullptr) return null;
+      if (ptr == nullptr) {
+        _throwIfError();
+        return null;
+      }
       final len = lenPtr.value;
       final result = ptr.toDartString(length: len);
       _bindings.free(ptr.cast<Void>());

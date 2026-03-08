@@ -1,6 +1,8 @@
-/// DecentDB value type codes returned by `decentdb_column_type()`.
+/// DecentDB logical value types returned by the Dart binding.
 ///
-/// These match the Nim `ValueKind` enum values.
+/// `decentdb_column_type()` exposes raw Nim `ValueKind` ordinals. `fromCode()`
+/// normalizes storage-specific variants (for example overflow/compressed
+/// text/blob kinds and compact bool/int encodings) to these logical types.
 enum ColumnType {
   /// NULL value.
   vkNull(0),
@@ -21,19 +23,49 @@ enum ColumnType {
   vkBlob(5),
 
   /// Fixed-point decimal (unscaled int64 + scale).
-  vkDecimal(6),
+  vkDecimal(12),
 
   /// Timestamp as microseconds since Unix epoch UTC.
-  vkDateTime(7);
+  vkDateTime(17);
 
   final int code;
   const ColumnType(this.code);
 
   static ColumnType fromCode(int code) {
-    for (final t in values) {
-      if (t.code == code) return t;
+    switch (code) {
+      case 0:
+        return vkNull;
+      case 1:
+      case 15:
+      case 16:
+        return vkInt64;
+      case 2:
+      case 13:
+      case 14:
+        return vkBool;
+      case 3:
+        return vkFloat64;
+      case 4:
+      case 6:
+      case 8:
+      case 10:
+        return vkText;
+      case 5:
+      case 7:
+      case 9:
+      case 11:
+        return vkBlob;
+      case 12:
+        return vkDecimal;
+      case 17:
+        return vkDateTime;
+      default:
+        throw ArgumentError.value(
+          code,
+          'code',
+          'Unknown DecentDB column type code',
+        );
     }
-    return vkNull;
   }
 }
 
@@ -99,7 +131,8 @@ class ColumnInfo {
   }
 
   @override
-  String toString() => 'ColumnInfo($name $type${notNull ? " NOT NULL" : ""}'
+  String toString() =>
+      'ColumnInfo($name $type${notNull ? " NOT NULL" : ""}'
       '${primaryKey ? " PK" : ""}${unique ? " UNIQUE" : ""})';
 }
 
@@ -130,6 +163,7 @@ class IndexInfo {
   }
 
   @override
-  String toString() => 'IndexInfo($name on $table(${columns.join(", ")}) $kind'
+  String toString() =>
+      'IndexInfo($name on $table(${columns.join(", ")}) $kind'
       '${unique ? " UNIQUE" : ""})';
 }

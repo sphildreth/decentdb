@@ -896,7 +896,11 @@ proc decentdb_column_int64*(p: pointer, col: cint): int64 {.exportc, cdecl, dynl
   if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return 0
   let val = h.currentValues[col]
   if val.kind == vkInt64: return val.int64Val
+  if val.kind == vkInt0: return 0
+  if val.kind == vkInt1: return 1
   if val.kind == vkBool: return if val.boolVal: 1 else: 0
+  if val.kind == vkBoolFalse: return 0
+  if val.kind == vkBoolTrue: return 1
   if val.kind == vkFloat64: return int64(val.float64Val)
   if val.kind == vkDecimal:
     # Truncate
@@ -911,7 +915,11 @@ proc decentdb_column_float64*(p: pointer, col: cint): float64 {.exportc, cdecl, 
   let val = h.currentValues[col]
   if val.kind == vkFloat64: return val.float64Val
   if val.kind == vkInt64: return float64(val.int64Val)
+  if val.kind == vkInt0: return 0.0
+  if val.kind == vkInt1: return 1.0
   if val.kind == vkBool: return if val.boolVal: 1.0 else: 0.0
+  if val.kind == vkBoolFalse: return 0.0
+  if val.kind == vkBoolTrue: return 1.0
   if val.kind == vkDecimal:
     # Best effort conversion to float
     var f = float64(val.int64Val)

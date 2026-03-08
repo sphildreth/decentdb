@@ -110,4 +110,6 @@ src/vfs/os_vfs
 *.gcov
 stdout
 examples/java/json-20231013.jar
-bindings/dart/dart/.dart_tool/test/incremental_kernel.Ly9AZGFydD0zLjA=
+
+# Dart / Flutter
+**/.dart_tool/
