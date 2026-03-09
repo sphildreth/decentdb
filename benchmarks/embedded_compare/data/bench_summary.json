@@ -1,16 +1,16 @@
 {
   "engines": {
     "DecentDB": {
-      "commit_p95_ms": 3.016505,
-      "insert_rows_per_sec": 1133915.409910421,
-      "join_p95_ms": 0.382297,
-      "read_p95_ms": 0.001252
+      "commit_p95_ms": 3.008335,
+      "insert_rows_per_sec": 1115075.825156111,
+      "join_p95_ms": 0.377939,
+      "read_p95_ms": 0.001282
     },
     "DuckDB": {
-      "commit_p95_ms": 12.058724,
-      "insert_rows_per_sec": 10929.46342892242,
-      "join_p95_ms": 1.770415,
-      "read_p95_ms": 0.20257
+      "commit_p95_ms": 12.062628,
+      "insert_rows_per_sec": 10765.98937827488,
+      "join_p95_ms": 1.596005,
+      "read_p95_ms": 0.193573
     },
     "H2": {
       "read_p95_ms": 0.01785111746
@@ -20,17 +20,17 @@
       "read_p95_ms": 0.018636946209999998
     },
     "SQLite": {
-      "commit_p95_ms": 3.002548,
-      "insert_rows_per_sec": 1108401.684770561,
-      "join_p95_ms": 0.403418,
-      "read_p95_ms": 0.001954
+      "commit_p95_ms": 3.017263,
+      "insert_rows_per_sec": 1106561.912138984,
+      "join_p95_ms": 0.380053,
+      "read_p95_ms": 0.002255
     }
   },
   "metadata": {
     "durability_profile": "safe",
     "machine": "batman (AMD Ryzen 9 3900X 12-Core Processor)",
     "notes": "Generated from raw benchmark outputs in benchmarks/embedded_compare/raw/sample; merged extra engines from benchmarks/python_embedded_compare/out/results_merged.json",
-    "run_id": "20260227_153500",
+    "run_id": "20260309_001140",
     "units": {
       "commit_p95_ms": "ms (lower is better)",
       "insert_rows_per_sec": "rows/sec (higher is better)",
