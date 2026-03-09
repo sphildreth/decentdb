@@ -105,6 +105,20 @@ jobs:
       - name: Pin libpg_query linker path
         shell: bash
         run: |
+          set -euo pipefail
+          repo_root="$PWD"
+          target_lib="$repo_root/build/lib/libpg_query.a"
+
+          if [ ! -f "$target_lib" ]; then
+            if [ ! -f /tmp/libpg_query/libpg_query.a ] && [ -d /tmp/libpg_query ]; then
+              make -C /tmp/libpg_query
+            fi
+            mkdir -p "$repo_root/build/lib"
+            cp /tmp/libpg_query/libpg_query.a "$target_lib"
+          fi
+
+          test -f "$target_lib"
+
           python - <<'PY'
           from pathlib import Path
 
@@ -124,6 +138,8 @@ jobs:
 
           cfg.write_text("\n".join(lines) + "\n")
           PY
+
+          ls -l "$target_lib"
 
       - name: Build
         run: nimble build -d:release
