@@ -23,7 +23,7 @@ dependencies {
 }
 
 test {
-    // useJUnitPlatform()
+    useJUnitPlatform()
     // Native library path for integration tests
     def nativeLibDir = project.findProperty('nativeLibDir') ?:
         "${rootProject.projectDir}/../../build"

@@ -1,5 +1,4 @@
 import ../src/engine
-import strutils
 
 # Open in-memory database with 52 tables (mimicking Melodee schema)
 let res = openDb(":memory:")

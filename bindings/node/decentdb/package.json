@@ -6,7 +6,7 @@
   "main": "index.js",
   "gypfile": true,
   "scripts": {
-    "build": "node-gyp rebuild",
+    "build": "node --no-deprecation ./node_modules/node-gyp/bin/node-gyp.js rebuild",
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {

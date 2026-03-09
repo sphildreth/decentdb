@@ -1,13 +1,10 @@
 import unittest
 import os
-import options
-import sets
 
 import engine
 import catalog/catalog
 import record/record
 import storage/storage
-import search/search
 import pager/pager
 import btree/btree
 import errors
@@ -194,6 +191,45 @@ suite "Storage Comprehensive":
     check result.ok
     check count == 1
     
+    discard closeDb(db)
+
+  test "scanTableEach decodes overflow-backed rows":
+    let path = makeTempDb("decentdb_scan_table_each_overflow.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let table = createTable(db, "test", @[
+      Column(name: "id", kind: ctInt64),
+      Column(name: "payload", kind: ctBlob)
+    ])
+
+    var blob = newSeq[byte](db.pager.pageSize)
+    var s: uint32 = 0x12345678'u32
+    for i in 0 ..< blob.len:
+      s = s * 1103515245'u32 + 12345'u32
+      blob[i] = byte((s shr 24) and 0xFF'u32)
+
+    let insertRes = insertRow(db.pager, db.catalog, "test", @[
+      Value(kind: vkInt64, int64Val: 7),
+      Value(kind: vkBlob, bytes: blob)
+    ])
+    check insertRes.ok
+
+    var seen = false
+    let result = scanTableEach(db.pager, table, proc(row: StoredRow): Result[Void] =
+      seen = true
+      check row.rowid == insertRes.value
+      check row.values.len == 2
+      check row.values[0].int64Val == 7
+      check row.values[1].kind == vkBlob
+      check row.values[1].bytes.len == blob.len
+      check row.values[1].bytes[0] == blob[0]
+      check row.values[1].bytes[^1] == blob[^1]
+      okVoid()
+    )
+    check result.ok
+    check seen
+
     discard closeDb(db)
 
   test "insertRow with wrong column count":

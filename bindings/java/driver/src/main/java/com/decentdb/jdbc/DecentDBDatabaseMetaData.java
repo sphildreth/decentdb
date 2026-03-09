@@ -19,6 +19,7 @@ import java.util.*;
  * Metadata is fetched via the DecentDB C API JSON functions and parsed here.
  * This avoids any SQL-based metadata queries (no information_schema needed).
  */
+@SuppressWarnings("deprecation")
 public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
     private final DecentDBConnection connection;

@@ -5,6 +5,12 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Engine**: Table scans and index seek hot paths now decode records directly from page-backed views and use lower-allocation B-tree cursors where possible, reducing scan overhead without changing on-disk formats.
+- **Engine**: `COUNT(*)` fast-path index seeks no longer emit unconditional hot-path timing output, removing benchmark noise from point-read and join benchmark runs.
+
 ## [1.6.0] - 2026-02-27
 
 ### Added

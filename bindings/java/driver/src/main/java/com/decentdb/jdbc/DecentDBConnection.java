@@ -32,6 +32,32 @@ public final class DecentDBConnection implements Connection {
     private static final Cleaner CLEANER = Cleaner.create();
     private static final Logger LOG = Logger.getLogger(DecentDBConnection.class.getName());
 
+    private static final class NativeDbCleanup implements Runnable {
+        private volatile long handle;
+        private volatile boolean closedExplicitly = false;
+
+        NativeDbCleanup(long handle) {
+            this.handle = handle;
+        }
+
+        @Override
+        public void run() {
+            long h = handle;
+            handle = 0;
+            if (h != 0) {
+                if (!closedExplicitly) {
+                    LOG.warning("DecentDBConnection was garbage-collected without being closed; closing native handle.");
+                }
+                DecentDBNative.dbClose(h);
+            }
+        }
+
+        void closeExplicitly() {
+            closedExplicitly = true;
+            run();
+        }
+    }
+
     final ReentrantLock connectionLock = new ReentrantLock();
     private volatile long dbHandle;
     private volatile boolean closed = false;
@@ -40,20 +66,15 @@ public final class DecentDBConnection implements Connection {
     private final String url;
     private boolean inTransaction = false;
 
+    private final NativeDbCleanup cleanupState;
     private final Cleaner.Cleanable cleanable;
 
     DecentDBConnection(long dbHandle, String url, boolean readOnly) {
         this.dbHandle = dbHandle;
         this.url = url;
         this.readOnly = readOnly;
-        // Safety net: close native handle if GC collects this object before close()
-        long handle = dbHandle;
-        this.cleanable = CLEANER.register(this, () -> {
-            if (handle != 0) {
-                LOG.warning("DecentDBConnection was garbage-collected without being closed; closing native handle.");
-                DecentDBNative.dbClose(handle);
-            }
-        });
+        this.cleanupState = new NativeDbCleanup(dbHandle);
+        this.cleanable = CLEANER.register(this, cleanupState);
     }
 
     long getDbHandle() throws SQLException {
@@ -169,7 +190,8 @@ public final class DecentDBConnection implements Connection {
             }
             closed = true;
             dbHandle = 0;
-            cleanable.clean(); // triggers lambda: dbClose(original handle)
+            cleanupState.closeExplicitly();
+            cleanable.clean();
         } finally {
             connectionLock.unlock();
         }

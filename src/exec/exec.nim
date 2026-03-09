@@ -697,10 +697,7 @@ proc matchLikeInRecordStr(pager: Pager, recordPage: string, recordStart: int, re
           return ok(bytesEndsWithInStr(recordPage, offset, length, needleBytes))
         return ok(false)
       else:
-        var recordBytes = newSeq[byte](recordLen)
-        if recordLen > 0:
-          copyMem(addr recordBytes[0], unsafeAddr recordPage[recordStart], recordLen)
-        let decoded = decodeRecordWithOverflow(pager, recordBytes)
+        let decoded = decodeRecordWithOverflow(pager, recordPage, recordStart, recordLen)
         if not decoded.ok:
           return err[bool](decoded.err.code, decoded.err.message, decoded.err.context)
         if colIndex >= decoded.value.len:
@@ -850,7 +847,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
       return err[RowCursor](tableRes.err.code, tableRes.err.message, tableRes.err.context)
     let table = tableRes.value
     let tree = newBTree(pager, table.rootPage)
-    let cursorRes = openCursor(tree)
+    let cursorRes = openCursorStream(tree)
     if not cursorRes.ok:
       return err[RowCursor](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
     let btCursor = cursorRes.value
@@ -862,13 +859,13 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
       columns: cols,
       nextFn: proc(): Result[Option[Row]] =
         while true:
-          let nextRes = cursorNext(btCursor)
+          let nextRes = cursorNextStream(btCursor)
           if not nextRes.ok:
             return ok(none(Row))
-          let (rowid, valueBytes, overflow) = nextRes.value
-          if valueBytes.len == 0 and overflow == 0'u32:
+          let (rowid, leafPage, valueOffset, valueLen, overflow) = nextRes.value
+          if valueLen == 0 and overflow == 0'u32:
             continue
-          let decoded = decodeRecordWithOverflow(pager, valueBytes)
+          let decoded = decodeRecordWithOverflow(pager, leafPage, valueOffset, valueLen, PageId(overflow))
           if not decoded.ok:
             return err[Option[Row]](decoded.err.code, decoded.err.message, decoded.err.context)
           return ok(some(makeRow(cols, decoded.value, rowid)))
@@ -931,7 +928,7 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
     let needle = indexKeyFromValue(valueRes.value)
     let needleBytes = if textBlob and valueRes.value.kind in {vkText, vkBlob}: valueRes.value.bytes else: @[]
     let idxTree = newBTree(pager, idx.rootPage)
-    let idxCursorRes = openCursorAt(idxTree, needle)
+    let idxCursorRes = openCursorViewAt(idxTree, needle)
     if not idxCursorRes.ok:
       return err[RowCursor](idxCursorRes.err.code, idxCursorRes.err.message, idxCursorRes.err.context)
     let idxCursor = idxCursorRes.value
@@ -943,17 +940,17 @@ proc openRowCursor*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Valu
       columns: cols,
       nextFn: proc(): Result[Option[Row]] =
         while true:
-          let nextRes = cursorNext(idxCursor)
+          let nextRes = cursorNextView(idxCursor)
           if not nextRes.ok:
             return ok(none(Row))
           if nextRes.value[0] < needle:
             continue
           if nextRes.value[0] > needle:
             return ok(none(Row))
-          let entryRes = decodeIndexEntry(nextRes.value[1], textBlob)
+          let entryRes = decodeIndexEntryView(nextRes.value[1], nextRes.value[2], nextRes.value[3], textBlob, needleBytes)
           if not entryRes.ok:
             continue
-          if textBlob and entryRes.value.valueBytes != needleBytes:
+          if not entryRes.value.matches:
             continue
           let readRes = readRowAt(pager, table, entryRes.value.rowid)
           if not readRes.ok:
@@ -1191,7 +1188,6 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
     return ok(some(count))
 
   of pkIndexSeek:
-    let tA = getMonoTime()
     let valueRes = evalExpr(Row(), plan.valueExpr, params)
     if not valueRes.ok:
       return err[Option[int64]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
@@ -1209,16 +1205,14 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
       return ok(none(int64))
     let needle = indexKeyFromValue(valueRes.value)
     let needleBytes = if textBlob and valueRes.value.kind in {vkText, vkBlob}: valueRes.value.bytes else: @[]
-    let tB = getMonoTime()
     let idxTree = newBTree(pager, idx.rootPage)
-    let idxCursorRes = openCursorAt(idxTree, needle)
-    let tC = getMonoTime()
+    let idxCursorRes = openCursorViewAt(idxTree, needle)
     if not idxCursorRes.ok:
       return err[Option[int64]](idxCursorRes.err.code, idxCursorRes.err.message, idxCursorRes.err.context)
     let idxCursor = idxCursorRes.value
     var count: int64 = 0
     while true:
-      let nextRes = cursorNext(idxCursor)
+      let nextRes = cursorNextView(idxCursor)
       if not nextRes.ok:
         break
       let key = nextRes.value[0]
@@ -1226,15 +1220,11 @@ proc tryCountNoRowsFast*(pager: Pager, catalog: Catalog, plan: Plan, params: seq
         continue
       if key > needle:
         break
-      if textBlob:
-        let entryRes = decodeIndexEntry(nextRes.value[1], true)
-        if entryRes.ok and entryRes.value.valueBytes == needleBytes:
-          count.inc
-      else:
+      let entryRes = decodeIndexEntryView(nextRes.value[1], nextRes.value[2], nextRes.value[3], textBlob, needleBytes)
+      if not entryRes.ok:
+        return err[Option[int64]](entryRes.err.code, entryRes.err.message, entryRes.err.context)
+      if entryRes.value.matches:
         count.inc
-    let tD = getMonoTime()
-    if (tD - tA).inNanoseconds > 1000:
-       stderr.writeLine("Seek: Eval=" & $((tB - tA).inNanoseconds) & "ns Open=" & $((tC - tB).inNanoseconds) & "ns Scan=" & $((tD - tC).inNanoseconds) & "ns")
     return ok(some(count))
 
   of pkRowidSeek:
@@ -5314,10 +5304,7 @@ proc execPlan*(pager: Pager, catalog: Catalog, plan: Plan, params: seq[Value]): 
                   return err[seq[Row]](mRes.err.code, mRes.err.message, mRes.err.context)
                 if not mRes.value:
                   continue
-                var recordBytes = newSeq[byte](valueLen)
-                if valueLen > 0:
-                  copyMem(addr recordBytes[0], unsafeAddr leafPage[valueOffset], valueLen)
-                let decoded = decodeRecordWithOverflow(pager, recordBytes)
+                let decoded = decodeRecordWithOverflow(pager, leafPage, valueOffset, valueLen)
                 if not decoded.ok:
                   return err[seq[Row]](decoded.err.code, decoded.err.message, decoded.err.context)
                 outRows.add(makeRow(cols, decoded.value, rowid))

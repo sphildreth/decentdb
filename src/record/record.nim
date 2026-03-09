@@ -125,6 +125,26 @@ proc decodeVarintFast*(data: string, offset: var int, valOut: var uint64): bool 
       return false
   return false
 
+proc decodeVarintBoundedStr(data: string, offset: var int, endPos: int): Result[uint64] {.inline.} =
+  ## Decode a varint from a bounded region inside a string-backed page view.
+  var shift = 0
+  var value: uint64 = 0
+  while offset < endPos:
+    let b = byte(data[offset])
+    offset.inc
+    value = value or (uint64(b and 0x7F) shl shift)
+    if (b and 0x80) == 0:
+      return ok(value)
+    shift += 7
+    if shift > 63:
+      return err[uint64](ERR_CORRUPTION, "Varint overflow")
+  err[uint64](ERR_CORRUPTION, "Unexpected end of varint")
+
+proc copyBytesFromString(data: string, payloadStart: int, payloadLen: int): seq[byte] {.inline.} =
+  result = newSeq[byte](payloadLen)
+  if payloadLen > 0:
+    copyMem(addr result[0], unsafeAddr data[payloadStart], payloadLen)
+
 proc compressData(data: seq[byte]): seq[byte] =
   if data.len == 0: return @[]
   var s = newString(data.len)
@@ -283,6 +303,86 @@ proc decodeValue*(data: openArray[byte], offset: var int): Result[Value] =
   of vkDateTime:
     var pOffset = 0
     let vRes = decodeVarint(payload, pOffset)
+    if not vRes.ok:
+      return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
+    value.int64Val = zigzagDecode(vRes.value)
+  ok(value)
+
+proc decodeValueSlice(data: string, offset: var int, endPos: int): Result[Value] =
+  if offset >= endPos:
+    return err[Value](ERR_CORRUPTION, "Unexpected end of record")
+  let kindValue = int(byte(data[offset]))
+  if kindValue < 0 or kindValue > ord(high(ValueKind)):
+    return err[Value](ERR_CORRUPTION, "Unknown value kind")
+  let kind = ValueKind(kindValue)
+  offset.inc
+
+  let lenRes = decodeVarintBoundedStr(data, offset, endPos)
+  if not lenRes.ok:
+    return err[Value](lenRes.err.code, lenRes.err.message, lenRes.err.context)
+  let length = int(lenRes.value)
+  if offset + length > endPos:
+    return err[Value](ERR_CORRUPTION, "Record field length out of bounds")
+
+  let payloadStart = offset
+  let payloadEnd = payloadStart + length
+  offset = payloadEnd
+
+  var value = Value(kind: kind)
+  case kind
+  of vkNull:
+    discard
+  of vkBoolFalse:
+    value.kind = vkBool
+    value.boolVal = false
+  of vkBoolTrue:
+    value.kind = vkBool
+    value.boolVal = true
+  of vkInt0:
+    value.kind = vkInt64
+    value.int64Val = 0
+  of vkInt1:
+    value.kind = vkInt64
+    value.int64Val = 1
+  of vkBool:
+    if length != 1:
+      return err[Value](ERR_CORRUPTION, "Invalid BOOL length")
+    value.boolVal = byte(data[payloadStart]) != 0
+  of vkInt64:
+    var pOffset = payloadStart
+    let vRes = decodeVarintBoundedStr(data, pOffset, payloadEnd)
+    if not vRes.ok:
+      return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
+    value.int64Val = zigzagDecode(vRes.value)
+  of vkFloat64:
+    if length != 8:
+      return err[Value](ERR_CORRUPTION, "Invalid FLOAT64 length")
+    value.float64Val = cast[float64](readU64LE(data, payloadStart))
+  of vkText, vkBlob:
+    value.bytes = copyBytesFromString(data, payloadStart, length)
+  of vkTextCompressed, vkBlobCompressed:
+    let decompRes = decompressData(copyBytesFromString(data, payloadStart, length))
+    if not decompRes.ok:
+      return err[Value](decompRes.err.code, decompRes.err.message, decompRes.err.context)
+    value.bytes = decompRes.value
+    value.kind = if kind == vkTextCompressed: vkText else: vkBlob
+  of vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow:
+    if length != 8:
+      return err[Value](ERR_CORRUPTION, "Invalid overflow pointer length")
+    value.overflowPage = PageId(readU32LE(data, payloadStart))
+    value.overflowLen = readU32LE(data, payloadStart + 4)
+  of vkDecimal:
+    if length < 2:
+      return err[Value](ERR_CORRUPTION, "Invalid DECIMAL length")
+    value.decimalScale = uint8(byte(data[payloadStart]))
+    var pOffset = payloadStart + 1
+    let vRes = decodeVarintBoundedStr(data, pOffset, payloadEnd)
+    if not vRes.ok:
+      return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
+    value.int64Val = zigzagDecode(vRes.value)
+  of vkDateTime:
+    var pOffset = payloadStart
+    let vRes = decodeVarintBoundedStr(data, pOffset, payloadEnd)
     if not vRes.ok:
       return err[Value](vRes.err.code, vRes.err.message, vRes.err.context)
     value.int64Val = zigzagDecode(vRes.value)
@@ -586,6 +686,27 @@ proc decodeRecord*(data: openArray[byte]): Result[seq[Value]] =
     values.add(valueRes.value)
   ok(values)
 
+proc decodeRecord*(data: string, start: int = 0, len: int = -1): Result[seq[Value]] =
+  let endPos =
+    if len < 0:
+      data.len
+    else:
+      start + len
+  if start < 0 or endPos < start or endPos > data.len:
+    return err[seq[Value]](ERR_CORRUPTION, "Record view out of bounds")
+  var offset = start
+  let countRes = decodeVarintBoundedStr(data, offset, endPos)
+  if not countRes.ok:
+    return err[seq[Value]](countRes.err.code, countRes.err.message, countRes.err.context)
+  let count = int(countRes.value)
+  var values = newSeqOfCap[Value](count)
+  for _ in 0 ..< count:
+    let valueRes = decodeValueSlice(data, offset, endPos)
+    if not valueRes.ok:
+      return err[seq[Value]](valueRes.err.code, valueRes.err.message, valueRes.err.context)
+    values.add(valueRes.value)
+  ok(values)
+
 proc writeOverflowChain*(pager: Pager, data: openArray[byte]): Result[PageId] =
   if data.len == 0:
     return ok(PageId(0))
@@ -698,6 +819,34 @@ proc decodeRecordWithOverflow*(pager: Pager, data: openArray[byte]): Result[seq[
         return err[seq[Value]](readRes.err.code, readRes.err.message, readRes.err.context)
       values[i].bytes = readRes.value
       
+      if values[i].kind in {vkTextCompressedOverflow, vkBlobCompressedOverflow}:
+        let decompRes = decompressData(values[i].bytes)
+        if not decompRes.ok:
+          return err[seq[Value]](decompRes.err.code, decompRes.err.message, decompRes.err.context)
+        values[i].bytes = decompRes.value
+        values[i].kind = if values[i].kind == vkTextCompressedOverflow: vkText else: vkBlob
+      else:
+        values[i].kind = if values[i].kind == vkTextOverflow: vkText else: vkBlob
+  ok(values)
+
+proc decodeRecordWithOverflow*(pager: Pager, data: string, start: int, len: int, overflowRoot: PageId = PageId(0)): Result[seq[Value]] =
+  if overflowRoot != PageId(0):
+    let readRes = readOverflowChainAll(pager, overflowRoot)
+    if not readRes.ok:
+      return err[seq[Value]](readRes.err.code, readRes.err.message, readRes.err.context)
+    return decodeRecordWithOverflow(pager, readRes.value)
+
+  let decoded = decodeRecord(data, start, len)
+  if not decoded.ok:
+    return decoded
+  var values = decoded.value
+  for i in 0 ..< values.len:
+    if values[i].kind in {vkTextOverflow, vkBlobOverflow, vkTextCompressedOverflow, vkBlobCompressedOverflow}:
+      let readRes = readOverflowChain(pager, values[i].overflowPage, values[i].overflowLen)
+      if not readRes.ok:
+        return err[seq[Value]](readRes.err.code, readRes.err.message, readRes.err.context)
+      values[i].bytes = readRes.value
+
       if values[i].kind in {vkTextCompressedOverflow, vkBlobCompressedOverflow}:
         let decompRes = decompressData(values[i].bytes)
         if not decompRes.ok:

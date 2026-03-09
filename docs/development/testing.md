@@ -31,10 +31,17 @@ nimble test
 ```
 
 Runs:
-- All Nim unit tests (30+ test files)
+- All Nim unit tests
 - Python harness tests
+- Binding test suites wired through `nimble test_bindings` (`.NET`, Go, Node.js, Python, Dart)
+- Java JDBC tests remain separate: `nimble test_bindings_java`
 
-Takes ~2-3 minutes.
+If you want only the core engine checks without binding prerequisites:
+
+```bash
+nimble test_nim
+nimble test_py
+```
 
 ### Nim Tests Only
 

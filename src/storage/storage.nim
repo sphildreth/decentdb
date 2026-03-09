@@ -122,6 +122,34 @@ proc decodeIndexEntry*(data: openArray[byte], isTextBlob: bool): Result[tuple[ro
       return err[tuple[rowid: uint64, valueBytes: seq[byte]]](ERR_CORRUPTION, "Index rowid payload too short")
     ok((rowid: readU64LE(data, 0), valueBytes: newSeq[byte]()))
 
+proc decodeIndexEntryView*(data: string, valueOffset: int, valueLen: int, isTextBlob: bool, needleBytes: openArray[byte] = []): Result[tuple[rowid: uint64, matches: bool]] =
+  ## Decode an index entry from a string-backed page view without copying payload bytes.
+  if valueOffset < 0 or valueLen < 0 or valueOffset + valueLen > data.len:
+    return err[tuple[rowid: uint64, matches: bool]](ERR_CORRUPTION, "Index entry view out of bounds")
+
+  if isTextBlob:
+    var offset = valueOffset
+    var inlineLen: uint64 = 0
+    if not decodeVarintFast(data, offset, inlineLen):
+      return err[tuple[rowid: uint64, matches: bool]](ERR_CORRUPTION, "Invalid index value length")
+    let valueBytesLen = int(inlineLen)
+    let rowidOffset = offset + valueBytesLen
+    if rowidOffset + 8 > valueOffset + valueLen:
+      return err[tuple[rowid: uint64, matches: bool]](ERR_CORRUPTION, "Index entry too short for TEXT/BLOB")
+    var matches = needleBytes.len == 0
+    if needleBytes.len > 0:
+      matches = valueBytesLen == needleBytes.len
+      if matches:
+        for i in 0 ..< valueBytesLen:
+          if byte(data[offset + i]) != needleBytes[i]:
+            matches = false
+            break
+    return ok((rowid: readU64LE(data, rowidOffset), matches: matches))
+
+  if valueLen < 8:
+    return err[tuple[rowid: uint64, matches: bool]](ERR_CORRUPTION, "Index rowid payload too short")
+  ok((rowid: readU64LE(data, valueOffset), matches: true))
+
 proc compositeIndexKey*(values: seq[Value], columnIndices: seq[int]): uint64 =
   ## Hash multiple column values into a single uint64 key for composite indexes.
   if columnIndices.len == 1:
@@ -794,44 +822,42 @@ proc readRowAt*(pager: Pager, table: TableMeta, rowid: uint64): Result[StoredRow
 
 proc scanTable*(pager: Pager, table: TableMeta): Result[seq[StoredRow]] =
   let tree = newBTree(pager, table.rootPage)
-  let cursorRes = openCursor(tree)
+  let cursorRes = openCursorStream(tree)
   if not cursorRes.ok:
     return err[seq[StoredRow]](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   var rows: seq[StoredRow] = @[]
   while true:
-    let nextRes = cursorNext(cursor)
+    let nextRes = cursorNextStream(cursor)
     if not nextRes.ok:
       break
-    let valueBytes = nextRes.value[1]
-    let overflow = nextRes.value[2]
-    if valueBytes.len == 0 and overflow == 0'u32:
+    let (rowid, leafPage, valueOffset, valueLen, overflow) = nextRes.value
+    if valueLen == 0 and overflow == 0'u32:
       continue
-    let decoded = decodeRecordWithOverflow(pager, valueBytes)
+    let decoded = decodeRecordWithOverflow(pager, leafPage, valueOffset, valueLen, PageId(overflow))
     if not decoded.ok:
       return err[seq[StoredRow]](decoded.err.code, decoded.err.message, decoded.err.context)
-    rows.add(StoredRow(rowid: nextRes.value[0], values: decoded.value))
+    rows.add(StoredRow(rowid: rowid, values: decoded.value))
   ok(rows)
 
 proc scanTableEach*(pager: Pager, table: TableMeta, body: proc(row: StoredRow): Result[Void]): Result[Void] =
   ## Iterate all rows in a table without materializing them into memory.
   let tree = newBTree(pager, table.rootPage)
-  let cursorRes = openCursor(tree)
+  let cursorRes = openCursorStream(tree)
   if not cursorRes.ok:
     return err[Void](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   while true:
-    let nextRes = cursorNext(cursor)
+    let nextRes = cursorNextStream(cursor)
     if not nextRes.ok:
       break
-    let valueBytes = nextRes.value[1]
-    let overflow = nextRes.value[2]
-    if valueBytes.len == 0 and overflow == 0'u32:
+    let (rowid, leafPage, valueOffset, valueLen, overflow) = nextRes.value
+    if valueLen == 0 and overflow == 0'u32:
       continue
-    let decoded = decodeRecordWithOverflow(pager, valueBytes)
+    let decoded = decodeRecordWithOverflow(pager, leafPage, valueOffset, valueLen, PageId(overflow))
     if not decoded.ok:
       return err[Void](decoded.err.code, decoded.err.message, decoded.err.context)
-    let cbRes = body(StoredRow(rowid: nextRes.value[0], values: decoded.value))
+    let cbRes = body(StoredRow(rowid: rowid, values: decoded.value))
     if not cbRes.ok:
       return cbRes
   okVoid()
@@ -1489,14 +1515,14 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
   let textBlob = isTextBlobIndex(table, idx)
   let idxTree = newBTree(pager, idx.rootPage)
   let needle = indexKeyFromValue(value)
-  let cursorRes = openCursorAt(idxTree, needle)
+  let cursorRes = openCursorViewAt(idxTree, needle)
   if not cursorRes.ok:
     return err[seq[uint64]](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   var matches: seq[uint64] = @[]
   let needleBytes = if textBlob and value.kind in {vkText, vkBlob}: value.bytes else: @[]
   while true:
-    let nextRes = cursorNext(cursor)
+    let nextRes = cursorNextView(cursor)
     if not nextRes.ok:
       if nextRes.err.code == ERR_IO and nextRes.err.message == "Cursor exhausted":
         break
@@ -1505,24 +1531,21 @@ proc indexSeek*(pager: Pager, catalog: Catalog, tableName: string, column: strin
       continue
     if nextRes.value[0] > needle:
       break
-    if nextRes.value[0] == needle:
-      let entryRes = decodeIndexEntry(nextRes.value[1], textBlob)
-      if entryRes.ok:
-        if textBlob:
-          if entryRes.value.valueBytes == needleBytes:
-            matches.add(entryRes.value.rowid)
-        else:
-          matches.add(entryRes.value.rowid)
+    let entryRes = decodeIndexEntryView(nextRes.value[1], nextRes.value[2], nextRes.value[3], textBlob, needleBytes)
+    if not entryRes.ok:
+      return err[seq[uint64]](entryRes.err.code, entryRes.err.message, entryRes.err.context)
+    if entryRes.value.matches:
+      matches.add(entryRes.value.rowid)
   ok(matches)
 
 proc indexHasAnyKey*(pager: Pager, index: IndexMeta, key: uint64): Result[bool] =
   let idxTree = newBTree(pager, index.rootPage)
-  let cursorRes = openCursorAt(idxTree, key)
+  let cursorRes = openCursorViewAt(idxTree, key)
   if not cursorRes.ok:
     return err[bool](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   while true:
-    let nextRes = cursorNext(cursor)
+    let nextRes = cursorNextView(cursor)
     if not nextRes.ok:
       break
     if nextRes.value[0] < key:
@@ -1535,27 +1558,23 @@ proc indexHasAnyKey*(pager: Pager, index: IndexMeta, key: uint64): Result[bool] 
 
 proc indexHasOtherRowid*(pager: Pager, index: IndexMeta, key: uint64, rowid: uint64, isTextBlob: bool = false, valueBytes: seq[byte] = @[]): Result[bool] =
   let idxTree = newBTree(pager, index.rootPage)
-  let cursorRes = openCursorAt(idxTree, key)
+  let cursorRes = openCursorViewAt(idxTree, key)
   if not cursorRes.ok:
     return err[bool](cursorRes.err.code, cursorRes.err.message, cursorRes.err.context)
   let cursor = cursorRes.value
   while true:
-    let nextRes = cursorNext(cursor)
+    let nextRes = cursorNextView(cursor)
     if not nextRes.ok:
       break
     if nextRes.value[0] < key:
       continue
     if nextRes.value[0] > key:
       break
-    if nextRes.value[0] == key:
-      let entryRes = decodeIndexEntry(nextRes.value[1], isTextBlob)
-      if entryRes.ok:
-        if isTextBlob:
-          if entryRes.value.valueBytes == valueBytes and entryRes.value.rowid != rowid:
-            return ok(true)
-        else:
-          if entryRes.value.rowid != rowid:
-            return ok(true)
+    let entryRes = decodeIndexEntryView(nextRes.value[1], nextRes.value[2], nextRes.value[3], isTextBlob, valueBytes)
+    if not entryRes.ok:
+      return err[bool](entryRes.err.code, entryRes.err.message, entryRes.err.context)
+    if entryRes.value.matches and entryRes.value.rowid != rowid:
+      return ok(true)
   ok(false)
 
 # ALTER TABLE implementation

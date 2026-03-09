@@ -225,8 +225,14 @@ DecentDB is organized into focused modules:
 ## Development
 
 ```bash
-# Run tests
+# Run the main test suite (engine + harness + .NET/Go/Node/Python/Dart bindings)
 nimble test
+
+# Run Java JDBC binding tests
+nimble test_bindings_java
+
+# Run only the core engine tests
+nimble test_nim
 
 # Run benchmarks
 nimble bench

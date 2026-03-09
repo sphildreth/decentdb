@@ -867,6 +867,84 @@ proc find*(tree: BTree, key: uint64): Result[(uint64, seq[byte], uint32)] =
     return err[(uint64, seq[byte], uint32)](valueRes.err.code, valueRes.err.message, valueRes.err.context)
   ok((foundKey, valueRes.value, foundOverflow))
 
+proc findView*(tree: BTree, key: uint64): Result[(uint64, string, int, int, uint32)] =
+  ## Find a key without copying inline payload bytes.
+  ##
+  ## Returns `(key, leafPage, valueOffset, valueLen, overflowRoot)`.
+  let leafRes = findLeaf(tree, key)
+  if not leafRes.ok:
+    return err[(uint64, string, int, int, uint32)](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  let leafId = leafRes.value
+
+  var foundKey: uint64 = 0
+  var foundPage = ""
+  var foundOffset = 0
+  var foundLen = 0
+  var foundOverflow: uint32 = 0
+  var found = false
+
+  let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
+    if page.len < 8:
+      return err[Void](ERR_CORRUPTION, "Page too small")
+    if byte(page[0]) != PageTypeLeaf:
+      return err[Void](ERR_CORRUPTION, "Not a leaf page")
+    let deltaEncoded = byte(page[1]) == PageFlagDeltaKeys
+    let count = int(readU16LE(page, 2))
+    var offset = 8
+    var prevKey: uint64 = 0
+
+    for _ in 0 ..< count:
+      if offset >= page.len:
+        return err[Void](ERR_CORRUPTION, "Leaf cell out of bounds")
+
+      var k: uint64
+      if not decodeVarintFast(page, offset, k):
+        return err[Void](ERR_CORRUPTION, "Invalid key varint")
+      if deltaEncoded:
+        k = prevKey + k
+        prevKey = k
+
+      var ctrl: uint64
+      if not decodeVarintFast(page, offset, ctrl):
+        return err[Void](ERR_CORRUPTION, "Invalid control varint")
+
+      let isOverflow = (ctrl and 1) != 0
+      let val = uint32(ctrl shr 1)
+      let valueOffset = offset
+      var valueLen = 0
+      var overflow = 0'u32
+
+      if isOverflow:
+        overflow = val
+      else:
+        valueLen = int(val)
+        if valueOffset + valueLen > page.len:
+          return err[Void](ERR_CORRUPTION, "Leaf value out of bounds")
+
+      if k == key:
+        if valueLen == 0 and overflow == 0'u32:
+          return err[Void](ERR_IO, "Key not found")
+        foundKey = k
+        foundPage = page
+        foundOffset = valueOffset
+        foundLen = valueLen
+        foundOverflow = overflow
+        found = true
+        return okVoid()
+
+      offset = valueOffset + valueLen
+      if k > key:
+        return okVoid()
+
+    okVoid()
+  )
+
+  if not pageRes.ok:
+    return err[(uint64, string, int, int, uint32)](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  if not found:
+    return err[(uint64, string, int, int, uint32)](ERR_IO, "Key not found")
+  ok((foundKey, foundPage, foundOffset, foundLen, foundOverflow))
+
 proc containsKey*(tree: BTree, key: uint64): Result[bool] =
   ## Return true if `key` exists in the tree.
   ##
@@ -991,6 +1069,41 @@ proc openCursorAt*(tree: BTree, startKey: uint64): Result[BTreeCursor] =
     return err[BTreeCursor](pageRes.err.code, pageRes.err.message, pageRes.err.context)
   let idx = lowerBound(keys, startKey)
   let cursor = BTreeCursor(tree: tree, leaf: leafId, index: idx, keys: keys, values: values, overflows: overflows, nextLeaf: nextLeaf)
+  ok(cursor)
+
+proc openCursorViewAt*(tree: BTree, startKey: uint64): Result[BTreeCursorView] =
+  let leafRes = findLeafLeftmost(tree, startKey)
+  if not leafRes.ok:
+    return err[BTreeCursorView](leafRes.err.code, leafRes.err.message, leafRes.err.context)
+  let leafId = leafRes.value
+  var keys: seq[uint64] = @[]
+  var valueOffsets: seq[int] = @[]
+  var valueLens: seq[int] = @[]
+  var overflows: seq[uint32] = @[]
+  var nextLeaf: PageId = 0
+  var leafPage = ""
+  let pageRes = tree.pager.withPageRo(leafId, proc(page: string): Result[Void] =
+    leafPage = page
+    let parsed = readLeafCellsView(page)
+    if not parsed.ok:
+      return err[Void](parsed.err.code, parsed.err.message, parsed.err.context)
+    (keys, valueOffsets, valueLens, overflows, nextLeaf) = parsed.value
+    okVoid()
+  )
+  if not pageRes.ok:
+    return err[BTreeCursorView](pageRes.err.code, pageRes.err.message, pageRes.err.context)
+  let idx = lowerBound(keys, startKey)
+  let cursor = BTreeCursorView(
+    tree: tree,
+    leaf: leafId,
+    index: idx,
+    keys: keys,
+    valueOffsets: valueOffsets,
+    valueLens: valueLens,
+    overflows: overflows,
+    nextLeaf: nextLeaf,
+    leafPage: leafPage
+  )
   ok(cursor)
 
 proc openCursorView*(tree: BTree): Result[BTreeCursorView] =
