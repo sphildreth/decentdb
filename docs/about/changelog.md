@@ -5,7 +5,8 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+
+## [1.6.1] - 2026-03-09
 
 ### Changed
 - **Engine**: Table scans and index seek hot paths now decode records directly from page-backed views and use lower-allocation B-tree cursors where possible, reducing scan overhead without changing on-disk formats.
@@ -16,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Dart/Flutter Binding**: New Dart FFI package (`decentdb`) for Flutter desktop apps (Linux, macOS, Windows). High-level idiomatic API with `Database`, `Statement`, `Schema`, cursor paging, transactions, and full schema introspection. See ADR-0115.
 - **C API**: `decentdb_abi_version()` — returns the ABI version number for compatibility checking at load time.
-- **C API**: `decentdb_engine_version()` — returns the engine version string (e.g. "1.6.0").
+- **C API**: `decentdb_engine_version()` — returns the engine version string (e.g. "1.6.1").
 - **C API**: `decentdb_begin()`, `decentdb_commit()`, `decentdb_rollback()` — native transaction control functions, avoiding the overhead of prepare+step for transaction management.
 - **Dart**: Console example with paging, schema introspection, and EXPLAIN output.
 - **Dart**: Flutter desktop integration example with library bundling guidance.

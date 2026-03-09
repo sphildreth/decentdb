@@ -34,14 +34,14 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
     public String getDatabaseProductName() { return "DecentDB"; }
 
     @Override
-    public String getDatabaseProductVersion() { return "1.5.0"; }
+    public String getDatabaseProductVersion() { return DecentDBDriver.DRIVER_VERSION; }
 
     @Override
     public String getDriverName() { return "DecentDB JDBC Driver"; }
 
     @Override
     public String getDriverVersion() {
-        return DecentDBDriver.DRIVER_MAJOR_VERSION + "." + DecentDBDriver.DRIVER_MINOR_VERSION;
+        return DecentDBDriver.DRIVER_VERSION;
     }
 
     @Override
@@ -54,7 +54,7 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
     public int getDatabaseMajorVersion() { return 1; }
 
     @Override
-    public int getDatabaseMinorVersion() { return 5; }
+    public int getDatabaseMinorVersion() { return DecentDBDriver.DRIVER_MINOR_VERSION; }
 
     @Override
     public int getJDBCMajorVersion() { return 4; }

@@ -1,6 +1,6 @@
 name: decentdb
 description: Dart FFI bindings for DecentDB – an embedded ACID database engine.
-version: 0.1.0
+version: 1.6.1
 repository: https://github.com/nicholasgasior/decentdb
 homepage: https://github.com/nicholasgasior/decentdb/tree/main/bindings/dart
 

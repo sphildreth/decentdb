@@ -20,7 +20,7 @@ public final class NativeLibLoader {
     private static final AtomicBoolean loaded = new AtomicBoolean(false);
     static volatile Throwable loadError = null;
 
-    private static final String VERSION = "1.5.0";
+    private static final String VERSION = DecentDBDriver.DRIVER_VERSION;
 
     private NativeLibLoader() {}
 

@@ -226,7 +226,7 @@ Include:
 
 Example:
 ```
-**Version:** 0.0.1
+**Version:** 1.6.1
 **OS:** Ubuntu 22.04
 
 **Steps:**

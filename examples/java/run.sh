@@ -1,7 +1,7 @@
 #!/bin/bash
 set -eo pipefail
 
-DRIVER_JAR="../../bindings/java/driver/build/libs/driver-1.5.0.jar"
+DRIVER_JAR="../../bindings/java/driver/build/libs/driver-1.6.1.jar"
 
 echo "Building driver JAR..."
 pushd ../../bindings/java

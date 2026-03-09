@@ -404,5 +404,5 @@ See the [VFS module](../architecture/storage.md) for details.
 
 ## API Stability
 
-DecentDB is currently pre-1.0 (starting at 0.0.1). Until 1.0.0, APIs may change, including breaking changes.
-Once 1.0.0 is released, we will follow Semantic Versioning for API compatibility.
+DecentDB is on the stable `1.x` line and follows Semantic Versioning for public API compatibility.
+Patch releases may include fixes and internal performance work; minor releases may add backward-compatible features.
