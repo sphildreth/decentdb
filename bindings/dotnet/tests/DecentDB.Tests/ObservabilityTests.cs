@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using DecentDB.AdoNet;
 using Xunit;
 
@@ -5,6 +6,7 @@ namespace DecentDB.Tests
 {
     public class ObservabilityTests : IDisposable
     {
+        private static readonly object TraceSync = new();
         private readonly string _dbPath;
         private readonly DecentDBConnection _connection;
 
@@ -43,6 +45,54 @@ namespace DecentDB.Tests
 
             Assert.True(eventFired);
             Assert.Contains("CREATE TABLE test", capturedSql);
+        }
+
+        [Fact]
+        public void TestDebugTraceRedactsSqlText()
+        {
+            var dbPath = Path.Combine(Path.GetTempPath(), $"decentdb_obs_trace_{Guid.NewGuid()}.ddb");
+            try
+            {
+                using var conn = new DecentDBConnection($"Data Source={dbPath};Logging=1;LogLevel=Debug");
+                conn.Open();
+
+                using var writer = new StringWriter();
+                using var listener = new TextWriterTraceListener(writer);
+
+                lock (TraceSync)
+                {
+                    Trace.Listeners.Add(listener);
+                    try
+                    {
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = "SELECT 'salary=123456'";
+                        var result = cmd.ExecuteScalar();
+
+                        listener.Flush();
+                        var traceOutput = writer.ToString();
+
+                        Assert.Equal("salary=123456", result);
+                        Assert.Contains("DecentDB SQL executing: SELECT statement", traceOutput);
+                        Assert.Contains("DecentDB SQL executed (ok)", traceOutput);
+                        Assert.DoesNotContain("salary=123456", traceOutput);
+                    }
+                    finally
+                    {
+                        Trace.Listeners.Remove(listener);
+                    }
+                }
+            }
+            finally
+            {
+                if (File.Exists(dbPath))
+                {
+                    File.Delete(dbPath);
+                }
+                if (File.Exists(dbPath + "-wal"))
+                {
+                    File.Delete(dbPath + "-wal");
+                }
+            }
         }
     }
 }

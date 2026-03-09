@@ -199,6 +199,29 @@ namespace DecentDB.AdoNet
 
         internal int DefaultCommandTimeoutSeconds => _defaultCommandTimeoutSeconds;
 
+        private static string DescribeSqlForTrace(string sql)
+        {
+            if (string.IsNullOrWhiteSpace(sql))
+            {
+                return "statement <empty>";
+            }
+
+            var trimmed = sql.TrimStart();
+            var tokenEnd = 0;
+            while (tokenEnd < trimmed.Length)
+            {
+                var ch = trimmed[tokenEnd];
+                if (char.IsWhiteSpace(ch) || ch == '(')
+                {
+                    break;
+                }
+                tokenEnd++;
+            }
+
+            var verb = tokenEnd > 0 ? trimmed.Substring(0, tokenEnd).ToUpperInvariant() : "STATEMENT";
+            return $"{verb} statement ({sql.Length} chars)";
+        }
+
         internal SqlObservation? TryStartSqlObservation(string sql, IReadOnlyList<SqlParameterValue> parameters)
         {
             // Zero-cost when disabled: one predictable branch, no allocations.
@@ -211,7 +234,7 @@ namespace DecentDB.AdoNet
 
             if (_loggingEnabled && _logLevel <= SqlLogLevel.Debug)
             {
-                Trace.WriteLine($"DecentDB SQL executing: {sql}");
+                Trace.WriteLine($"DecentDB SQL executing: {DescribeSqlForTrace(sql)}");
             }
 
             _sqlExecuting?.Invoke(this, new SqlExecutingEventArgs(sql, parameters, obs.Timestamp));
@@ -225,7 +248,7 @@ namespace DecentDB.AdoNet
             if (_loggingEnabled && _logLevel <= SqlLogLevel.Debug)
             {
                 var status = exception == null ? "ok" : "error";
-                Trace.WriteLine($"DecentDB SQL executed ({status}) in {duration.TotalMilliseconds:F3}ms: {obs.Sql}");
+                Trace.WriteLine($"DecentDB SQL executed ({status}) in {duration.TotalMilliseconds:F3}ms: {DescribeSqlForTrace(obs.Sql)}");
             }
 
             _sqlExecuted?.Invoke(this, new SqlExecutedEventArgs(obs.Sql, obs.Parameters, obs.Timestamp, duration, rowsAffected, exception));

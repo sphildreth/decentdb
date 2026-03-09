@@ -10,6 +10,6 @@
     "test": "node --test test/*.test.js"
   },
   "devDependencies": {
-    "node-gyp": "^10.1.0"
+    "node-gyp": "^12.2.0"
   }
 }

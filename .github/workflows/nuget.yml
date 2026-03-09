@@ -67,6 +67,45 @@ jobs:
       - name: Install dependencies
         run: nimble setup -y
 
+      - name: Pin libpg_query linker path
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$PWD"
+          target_lib="$repo_root/build/lib/libpg_query.a"
+
+          if [ ! -f "$target_lib" ]; then
+            if [ ! -f /tmp/libpg_query/libpg_query.a ] && [ -d /tmp/libpg_query ]; then
+              make -C /tmp/libpg_query
+            fi
+            mkdir -p "$repo_root/build/lib"
+            cp /tmp/libpg_query/libpg_query.a "$target_lib"
+          fi
+
+          test -f "$target_lib"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          cfg = Path("nim.cfg")
+          abs_lib = (Path.cwd() / "build" / "lib" / "libpg_query.a").as_posix()
+          lines = cfg.read_text().splitlines()
+
+          replaced = False
+          for i, line in enumerate(lines):
+            if line.startswith('--passL:"') and 'libpg_query.a' in line:
+              lines[i] = f'--passL:"{abs_lib}"'
+              replaced = True
+              break
+
+          if not replaced:
+            lines.append(f'--passL:"{abs_lib}"')
+
+          cfg.write_text("\n".join(lines) + "\n")
+          PY
+
+          ls -l "$target_lib"
+
       - name: Build native library (C API)
         run: nimble build_lib
 

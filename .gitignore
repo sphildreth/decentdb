@@ -110,3 +110,6 @@ src/vfs/os_vfs
 *.gcov
 stdout
 examples/java/json-20231013.jar
+
+# Dart / Flutter
+**/.dart_tool/

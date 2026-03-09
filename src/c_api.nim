@@ -14,6 +14,19 @@ import planner/planner
 import exec/exec
 import engine
 import wal/wal
+import version
+
+const AbiVersion* = 1
+
+proc decentdb_abi_version*(): cint {.exportc, cdecl, dynlib.} =
+  ## Returns the C ABI version number. Callers should check this at load time
+  ## and fail fast if it doesn't match the expected version.
+  return cint(AbiVersion)
+
+proc decentdb_engine_version*(): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns the DecentDB engine version string (e.g. "1.6.0").
+  ## The returned pointer is a static string; do NOT free it.
+  return cstring(DecentDBVersion)
 
 type
   DbHandle = ref object
@@ -377,6 +390,45 @@ proc decentdb_last_error_message*(p: pointer): cstring {.exportc, cdecl, dynlib.
     return globalLastErrorMessageC
   let handle = cast[DbHandle](p)
   return handle.lastErrorMessageC
+
+proc decentdb_begin*(p: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Begin an explicit transaction. Returns 0 on success, -1 on error.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = beginTransaction(handle.db)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
+
+proc decentdb_commit*(p: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Commit the active transaction. Returns 0 on success, -1 on error.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = commitTransaction(handle.db)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
+
+proc decentdb_rollback*(p: pointer): cint {.exportc, cdecl, dynlib.} =
+  ## Rollback the active transaction. Returns 0 on success, -1 on error.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return -1
+  let handle = cast[DbHandle](p)
+  handle.clearError()
+  let res = rollbackTransaction(handle.db)
+  if not res.ok:
+    handle.setError(res.err.code, res.err.message)
+    return -1
+  return 0
 
 proc findMaxParam(stmt: Statement): int =
   var maxIdx = 0
@@ -844,7 +896,11 @@ proc decentdb_column_int64*(p: pointer, col: cint): int64 {.exportc, cdecl, dynl
   if not h.hasRow or col < 0 or col >= cint(h.currentValues.len): return 0
   let val = h.currentValues[col]
   if val.kind == vkInt64: return val.int64Val
+  if val.kind == vkInt0: return 0
+  if val.kind == vkInt1: return 1
   if val.kind == vkBool: return if val.boolVal: 1 else: 0
+  if val.kind == vkBoolFalse: return 0
+  if val.kind == vkBoolTrue: return 1
   if val.kind == vkFloat64: return int64(val.float64Val)
   if val.kind == vkDecimal:
     # Truncate
@@ -859,7 +915,11 @@ proc decentdb_column_float64*(p: pointer, col: cint): float64 {.exportc, cdecl, 
   let val = h.currentValues[col]
   if val.kind == vkFloat64: return val.float64Val
   if val.kind == vkInt64: return float64(val.int64Val)
+  if val.kind == vkInt0: return 0.0
+  if val.kind == vkInt1: return 1.0
   if val.kind == vkBool: return if val.boolVal: 1.0 else: 0.0
+  if val.kind == vkBoolFalse: return 0.0
+  if val.kind == vkBoolTrue: return 1.0
   if val.kind == vkDecimal:
     # Best effort conversion to float
     var f = float64(val.int64Val)
