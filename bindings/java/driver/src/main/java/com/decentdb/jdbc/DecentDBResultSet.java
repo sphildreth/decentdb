@@ -17,6 +17,7 @@ import java.util.*;
  * The first step has already been executed by the owning Statement before this
  * ResultSet is created. {@link #next()} advances to the next row.
  */
+@SuppressWarnings("deprecation")
 public class DecentDBResultSet implements ResultSet {
 
     private final DecentDBStatement owningStatement;

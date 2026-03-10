@@ -136,6 +136,15 @@ nimble test
 This runs:
 - All Nim unit tests
 - Python harness tests
+- Binding test suites wired through `nimble test_bindings` (`.NET`, Go, Node.js, Python, Dart)
+- Java JDBC tests remain separate: `nimble test_bindings_java`
+
+If you only want the engine test suite without binding prerequisites, run:
+
+```bash
+nimble test_nim
+nimble test_py
+```
 
 ### Nim Tests Only
 
@@ -332,8 +341,8 @@ Before creating a release:
 4. [ ] Documentation built
 5. [ ] Binaries built for all platforms
 6. [ ] Version bumped (e.g. `1.0.2` -> `1.1.0`) and changelog updated
-7. [ ] Git tag created: `git tag -a v1.6.0 -m "DecentDB 1.6.0"`
-8. [ ] Tag pushed: `git push origin v1.6.0`
+7. [ ] Git tag created: `git tag -a v1.6.1 -m "DecentDB 1.6.1"`
+8. [ ] Tag pushed: `git push origin v1.6.1`
 
 ## Next Steps
 

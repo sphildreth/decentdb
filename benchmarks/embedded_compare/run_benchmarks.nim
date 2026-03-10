@@ -13,7 +13,6 @@ import algorithm
 import ../../src/engine
 import ../../src/record/record
 import ../../src/errors
-import ../../src/vfs/vfs
 import ../../src/version
 when defined(bench_breakdown):
   import ../../src/wal/wal
@@ -310,7 +309,7 @@ proc runDecentDBInsert(outputDir: string) =
   let commitRes = execSql(db, "COMMIT")
   if not commitRes.ok:
     raise newException(IOError, "DecentDB insert benchmark COMMIT failed: " & commitRes.err.message)
-  let commitNs = inNanoseconds(getMonoTime() - commitStart)
+  discard inNanoseconds(getMonoTime() - commitStart)
   
   let duration = secondsBetween(start, getMonoTime())
   let opsPerSec = float(iterations) / duration

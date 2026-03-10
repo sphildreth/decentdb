@@ -14,7 +14,7 @@ extern "C" {
 // Returns the ABI version number. Callers should check at load time.
 int decentdb_abi_version(void);
 
-// Returns the engine version string (e.g. "1.6.0"). Static; do NOT free.
+// Returns the engine version string (e.g. "1.6.1"). Static; do NOT free.
 const char* decentdb_engine_version(void);
 
 // --------------------------------------------------------------------------

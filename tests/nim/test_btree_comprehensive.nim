@@ -5,7 +5,6 @@ import pager/pager
 import btree/btree
 import pager/db_header
 import errors
-import record/record
 
 proc makeTempDb(name: string): string =
   let path = getTempDir() / (if name.len >= 3 and name[name.len - 3 .. ^1] == ".db": name[0 .. ^4] & ".ddb" else: name)
@@ -79,6 +78,45 @@ suite "BTree Comprehensive":
     for i in 1 .. 100:
       let cursorRes = openCursorAt(tree, uint64(i))
       check cursorRes.ok
+
+    discard closePager(pager)
+    discard closeDb(db)
+
+  test "openCursorViewAt returns leaf views from the requested start key":
+    let path = makeTempDb("decentdb_btree_cursorviewat.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+    let pagerRes = newPager(db.vfs, db.file, cachePages = 16)
+    check pagerRes.ok
+    let pager = pagerRes.value
+    let rootRes = allocatePage(pager)
+    check rootRes.ok
+    let root = rootRes.value
+    var rootBuf = newString(pager.pageSize)
+    rootBuf[0] = char(PageTypeLeaf)
+    writeU32LE(rootBuf, 4, 0)
+    check writePage(pager, root, rootBuf).ok
+    let tree = newBTree(pager, root)
+
+    for i in 1 .. 32:
+      check insert(tree, uint64(i * 10), @[byte(i)]).ok
+
+    let cursorRes = openCursorViewAt(tree, 155)
+    check cursorRes.ok
+    let cursor = cursorRes.value
+
+    let firstRes = cursorNextView(cursor)
+    check firstRes.ok
+    check firstRes.value[0] == 160'u64
+    check firstRes.value[3] == 1
+    check byte(firstRes.value[1][firstRes.value[2]]) == byte(16)
+
+    let secondRes = cursorNextView(cursor)
+    check secondRes.ok
+    check secondRes.value[0] == 170'u64
+    check secondRes.value[3] == 1
+    check byte(secondRes.value[1][secondRes.value[2]]) == byte(17)
 
     discard closePager(pager)
     discard closeDb(db)

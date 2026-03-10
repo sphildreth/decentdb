@@ -1,6 +1,5 @@
 import unittest
 import os
-import strutils
 
 import engine
 import pager/pager
@@ -125,6 +124,25 @@ suite "Record Comprehensive":
     let data = @[byte(1), byte(vkInt64), byte(8), byte(0), byte(0)]  # Says 8 bytes but only has 2 after header
     let result = decodeRecord(data)
     check not result.ok
+
+  test "decodeRecord from string view matches seq decode":
+    let values = @[
+      Value(kind: vkInt64, int64Val: 123),
+      Value(kind: vkText, bytes: @[byte('v'), byte('i'), byte('e'), byte('w')]),
+      Value(kind: vkBool, boolVal: true)
+    ]
+    let encoded = encodeRecord(values)
+    var page = newString(encoded.len + 8)
+    for i, b in encoded:
+      page[4 + i] = char(b)
+
+    let decoded = decodeRecord(page, 4, encoded.len)
+    check decoded.ok
+    check decoded.value.len == values.len
+    check decoded.value[0].int64Val == 123
+    check decoded.value[1].bytes == @[byte('v'), byte('i'), byte('e'), byte('w')]
+    check decoded.value[2].kind == vkBool
+    check decoded.value[2].boolVal
 
   test "writeOverflowChain with empty data":
     let path = makeTempDb("decentdb_write_overflow_empty.db")

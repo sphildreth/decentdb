@@ -1,5 +1,4 @@
 import ../src/c_api
-import strutils
 
 proc exec(p: pointer, sql: string) =
   var stmt: pointer
