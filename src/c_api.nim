@@ -845,7 +845,36 @@ proc decentdb_step*(p: pointer): cint {.exportc, cdecl, dynlib.} =
         gEvalCatalog = nil
 
     if h.cursor == nil:
-      let curRes = openRowCursor(db.pager, db.catalog, h.plan, h.params)
+      var executionPlan = h.plan
+      if executionPlan == nil:
+        let planRes = planner.plan(db.catalog, h.statement)
+        if not planRes.ok:
+          h.db.setError(planRes.err.code, planRes.err.message)
+          return -1
+        executionPlan = planRes.value
+
+      var hasRecursiveCte = false
+      for isRecursive in h.statement.cteRecursive:
+        if isRecursive:
+          hasRecursiveCte = true
+          break
+      if hasRecursiveCte:
+        let cteRes = materializeRecursiveCtes(
+          db.pager,
+          db.catalog,
+          h.statement,
+          h.params,
+        )
+        if not cteRes.ok:
+          h.db.setError(cteRes.err.code, cteRes.err.message)
+          return -1
+        let planRes = planner.plan(db.catalog, h.statement, cteRes.value)
+        if not planRes.ok:
+          h.db.setError(planRes.err.code, planRes.err.message)
+          return -1
+        executionPlan = planRes.value
+
+      let curRes = openRowCursor(db.pager, db.catalog, executionPlan, h.params)
       if not curRes.ok:
         h.db.setError(curRes.err.code, curRes.err.message)
         return -1

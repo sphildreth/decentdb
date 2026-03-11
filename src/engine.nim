@@ -2117,7 +2117,7 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
 
 const MaxRecursiveCteIterations = 1000
 
-proc materializeRecursiveCtes(
+proc materializeRecursiveCtes*(
   pager: Pager,
   catalog: Catalog,
   bound: Statement,
@@ -3591,6 +3591,9 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   case bound.kind
   of skCreateTable:
     if bound.createTableIsTemp:
+      let rootRes = initTableRoot(db.pager)
+      if not rootRes.ok:
+        return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
       var columns: seq[Column] = @[]
       for col in bound.columns:
         let typeRes = parseColumnType(col.typeName)
@@ -3604,7 +3607,12 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
           defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
           generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
         ))
-      let meta = TableMeta(name: bound.createTableName, rootPage: 0, nextRowId: 1, columns: columns)
+      let meta = TableMeta(
+        name: bound.createTableName,
+        rootPage: rootRes.value,
+        nextRowId: 1,
+        columns: columns,
+      )
       db.catalog.registerTempTable(meta)
       db.tempTables[bound.createTableName.toLowerAscii()] = TempTable(meta: meta, rows: @[], nextRowId: 1)
     else:

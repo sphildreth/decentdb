@@ -553,6 +553,24 @@ suite "C API: step":
     decentdb_finalize(stmt)
     check decentdb_close(h) == 0
 
+  test "step WITH RECURSIVE SELECT yields rows then 0":
+    let h = openFresh("capi_step_recursive_cte.ddb")
+    var stmt: pointer = nil
+    check decentdb_prepare(h, """
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 5
+)
+SELECT x FROM cnt ORDER BY x
+""".cstring, addr stmt) == 0
+    for expected in 1'i64 .. 5'i64:
+      check decentdb_step(stmt) == 1
+      check decentdb_column_int64(stmt, 0) == expected
+    check decentdb_step(stmt) == 0
+    decentdb_finalize(stmt)
+    check decentdb_close(h) == 0
+
   test "step INSERT RETURNING yields rows":
     let h = openFresh("capi_step_returning.ddb")
     execDDL(h, "CREATE TABLE t (id INT, name TEXT)")
@@ -569,6 +587,43 @@ suite "C API: step":
 
   test "rows_affected with nil returns 0":
     check decentdb_rows_affected(nil) == 0
+
+  test "prepared TEMP TABLE insert and select work within one connection":
+    let path = makeTempDb("capi_temp_table.ddb")
+    let h = decentdb_open(path.cstring, nil)
+    check h != nil
+    execDDL(h, "CREATE TEMP TABLE scratch (id INT64 PRIMARY KEY, val TEXT)")
+
+    var ins: pointer = nil
+    check decentdb_prepare(
+      h,
+      "INSERT INTO scratch (id, val) VALUES (1, 'hello')".cstring,
+      addr ins,
+    ) == 0
+    check decentdb_step(ins) == 0
+    check decentdb_rows_affected(ins) == 1
+    decentdb_finalize(ins)
+
+    var sel: pointer = nil
+    check decentdb_prepare(
+      h,
+      "SELECT val FROM scratch WHERE id = 1".cstring,
+      addr sel,
+    ) == 0
+    check decentdb_step(sel) == 1
+    var textLen: cint = 0
+    let textPtr = decentdb_column_text(sel, 0, addr textLen)
+    check textPtr != nil
+    check ($textPtr)[0 ..< int(textLen)] == "hello"
+    check decentdb_step(sel) == 0
+    decentdb_finalize(sel)
+    check decentdb_close(h) == 0
+
+    let h2 = decentdb_open(path.cstring, nil)
+    check h2 != nil
+    var missing: pointer = nil
+    check decentdb_prepare(h2, "SELECT * FROM scratch".cstring, addr missing) != 0
+    check decentdb_close(h2) == 0
 
 # ---------------------------------------------------------------------------
 # Suite: column accessors
