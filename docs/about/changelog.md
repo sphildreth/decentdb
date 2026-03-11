@@ -5,6 +5,14 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-03-11
+
+### Added
+- **C API / Dart Binding**: Richer schema introspection surface for downstream tools. Added canonical table DDL retrieval (`decentdb_get_table_ddl` / `Schema.getTableDdl()`), detailed table/view listing APIs with `ddl` and `temporary` metadata, trigger listing metadata, table-level CHECK metadata, and richer column metadata including defaults, generated stored expressions, and FK actions. See ADR-0116.
+- **C API**: Prepared `WITH RECURSIVE` SELECT statements now execute correctly through `decentdb_step()` by materializing recursive CTEs before planning and opening the row cursor.
+
+### Fixed
+- **Engine / C API**: Prepared `CREATE TEMP TABLE` statements now allocate a real temp table root page, allowing inserts and selects against temp tables to work correctly within the creating connection while staying session-scoped.
 
 ## [1.6.1] - 2026-03-09
 

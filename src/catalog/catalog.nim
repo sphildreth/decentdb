@@ -5,6 +5,7 @@ import algorithm
 import strutils
 import json
 import ../errors
+import ../sql/sql
 import ../record/record
 import ../pager/pager
 import ../pager/db_header
@@ -54,18 +55,21 @@ type TableMeta* = object
   nextRowId*: uint64
   columns*: seq[Column]
   checks*: seq[CheckConstraint]
+  temporary*: bool
 
 type ViewMeta* = object
   name*: string
   sqlText*: string
   columnNames*: seq[string]
   dependencies*: seq[string]
+  temporary*: bool
 
 type TriggerMeta* = object
   name*: string
   table*: string
   eventsMask*: int
   actionSql*: string
+  temporary*: bool
 
 type ReferencingChildFk* = object
   tableName*: string
@@ -81,6 +85,7 @@ type IndexMeta* = object
   kind*: IndexKind
   unique*: bool
   predicateSql*: string
+  temporary*: bool
 
 type TrigramDelta* = ref object
   adds*: HashSet[uint64]
@@ -215,6 +220,120 @@ proc fkActionFromCode(code: string): string =
   of "c": "CASCADE"
   of "n": "SET NULL"
   else: "NO ACTION"
+
+proc quoteSqlStringLiteral(text: string): string =
+  "'" & text.replace("'", "''") & "'"
+
+proc columnTypeSql*(col: Column): string =
+  if col.kind == ctDecimal and col.decPrecision > 0:
+    return "DECIMAL(" & $col.decPrecision & "," & $col.decScale & ")"
+  columnTypeToText(col.kind)
+
+proc quotedIdentList(names: openArray[string]): string =
+  var parts: seq[string] = @[]
+  for name in names:
+    parts.add(quoteIdent(name))
+  parts.join(", ")
+
+proc indexKeySql(name: string): string =
+  if name.startsWith(IndexExpressionPrefix):
+    return name[IndexExpressionPrefix.len .. ^1]
+  quoteIdent(name)
+
+proc tableCheckSql(checkDef: CheckConstraint): string =
+  if checkDef.name.len > 0:
+    return "CONSTRAINT " & quoteIdent(checkDef.name) & " CHECK " & checkDef.exprSql
+  "CHECK " & checkDef.exprSql
+
+proc tableColumnSql(col: Column, inlinePrimaryKey: bool): string =
+  var parts: seq[string] = @[quoteIdent(col.name), columnTypeSql(col)]
+  if col.notNull:
+    parts.add("NOT NULL")
+  if col.unique:
+    parts.add("UNIQUE")
+  if inlinePrimaryKey:
+    parts.add("PRIMARY KEY")
+  if col.defaultExpr.len > 0:
+    parts.add("DEFAULT " & col.defaultExpr)
+  if col.generatedExpr.len > 0:
+    parts.add("GENERATED ALWAYS AS (" & col.generatedExpr & ") STORED")
+  if col.refTable.len > 0 and col.refColumn.len > 0:
+    parts.add("REFERENCES " & quoteIdent(col.refTable) & "(" & quoteIdent(col.refColumn) & ")")
+    parts.add("ON DELETE " & normalizeFkAction(col.refOnDelete))
+    parts.add("ON UPDATE " & normalizeFkAction(col.refOnUpdate))
+  parts.join(" ")
+
+proc tableDdl*(table: TableMeta): string =
+  var parts: seq[string] = @[]
+  var pkCols: seq[string] = @[]
+  for col in table.columns:
+    if col.primaryKey:
+      pkCols.add(col.name)
+  let inlinePk = pkCols.len == 1
+  for col in table.columns:
+    parts.add(tableColumnSql(col, inlinePk and col.primaryKey))
+  if pkCols.len > 1:
+    parts.add("PRIMARY KEY (" & quotedIdentList(pkCols) & ")")
+  for checkDef in table.checks:
+    parts.add(tableCheckSql(checkDef))
+  let createPrefix = if table.temporary: "CREATE TEMP TABLE " else: "CREATE TABLE "
+  createPrefix & quoteIdent(table.name) & " (" & parts.join(", ") & ")"
+
+proc viewDdl*(view: ViewMeta): string =
+  let createPrefix = if view.temporary: "CREATE TEMP VIEW " else: "CREATE VIEW "
+  createPrefix & quoteIdent(view.name) & " AS " & view.sqlText
+
+proc indexDdl*(index: IndexMeta): string =
+  var columnsSql: seq[string] = @[]
+  for colName in index.columns:
+    columnsSql.add(indexKeySql(colName))
+  let createPrefix = if index.unique: "CREATE UNIQUE INDEX " else: "CREATE INDEX "
+  var sqlText = createPrefix & quoteIdent(index.name) & " ON " & quoteIdent(index.table)
+  if index.kind == ikTrigram:
+    sqlText.add(" USING trigram")
+  sqlText.add(" (" & columnsSql.join(", ") & ")")
+  if index.predicateSql.len > 0:
+    sqlText.add(" WHERE " & index.predicateSql)
+  sqlText
+
+proc triggerTimingName*(eventsMask: int): string =
+  if (eventsMask and TriggerTimingInsteadMask) != 0:
+    return "instead_of"
+  "after"
+
+proc triggerTimingSql(eventsMask: int): string =
+  if (eventsMask and TriggerTimingInsteadMask) != 0:
+    return "INSTEAD OF"
+  "AFTER"
+
+proc triggerEventNames*(eventsMask: int): seq[string] =
+  if (eventsMask and TriggerEventInsertMask) != 0:
+    result.add("insert")
+  if (eventsMask and TriggerEventUpdateMask) != 0:
+    result.add("update")
+  if (eventsMask and TriggerEventDeleteMask) != 0:
+    result.add("delete")
+  if (eventsMask and TriggerEventTruncateMask) != 0:
+    result.add("truncate")
+
+proc triggerEventSql(eventsMask: int): string =
+  var parts: seq[string] = @[]
+  for name in triggerEventNames(eventsMask):
+    parts.add(name.toUpperAscii())
+  parts.join(" OR ")
+
+proc triggerTargetKindName*(eventsMask: int): string =
+  if (eventsMask and TriggerTimingInsteadMask) != 0:
+    return "view"
+  "table"
+
+proc triggerDdl*(trigger: TriggerMeta): string =
+  var sqlText = "CREATE TRIGGER " & quoteIdent(trigger.name) & " " &
+    triggerTimingSql(trigger.eventsMask) & " " & triggerEventSql(trigger.eventsMask) &
+    " ON " & quoteIdent(trigger.table) &
+    " FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql(" &
+    quoteSqlStringLiteral(trigger.actionSql) & ")"
+  sqlText
 
 proc encodeColumns(columns: seq[Column]): seq[byte] =
   var parts: seq[string] = @[]
@@ -656,14 +775,16 @@ proc updateTableMetaFast*(catalog: Catalog, tableName: string, nextRowId: uint64
     entry.rootPage = rootPage
 
 proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] =
+  var storedTable = table
+  storedTable.temporary = false
   var rebuildFk = true
   if catalog.tables.hasKey(normalizedObjectName(table.name)):
-    rebuildFk = catalog.tables[normalizedObjectName(table.name)].columns != table.columns
-  catalog.tables[normalizedObjectName(table.name)] = table
+    rebuildFk = catalog.tables[normalizedObjectName(table.name)].columns != storedTable.columns
+  catalog.tables[normalizedObjectName(storedTable.name)] = storedTable
   if rebuildFk:
     rebuildReverseFkCache(catalog)
-  let key = uint64(crc32c(stringToBytes("table:" & table.name)))
-  let record = makeTableRecord(table.name, table.rootPage, table.nextRowId, table.columns, table.checks)
+  let key = uint64(crc32c(stringToBytes("table:" & storedTable.name)))
+  let record = makeTableRecord(storedTable.name, storedTable.rootPage, storedTable.nextRowId, storedTable.columns, storedTable.checks)
   
   let updateRes = update(catalog.catalogTree, key, record)
   if updateRes.ok:
@@ -684,7 +805,9 @@ proc saveTable*(catalog: Catalog, pager: Pager, table: TableMeta): Result[Void] 
 
 proc registerTempTable*(catalog: Catalog, table: TableMeta) =
   ## Add a table to the in-memory catalog only (not persisted).
-  catalog.tables[normalizedObjectName(table.name)] = table
+  var tempTable = table
+  tempTable.temporary = true
+  catalog.tables[normalizedObjectName(tempTable.name)] = tempTable
   rebuildReverseFkCache(catalog)
 
 proc getTable*(catalog: Catalog, name: string): Result[TableMeta] =
@@ -700,11 +823,14 @@ proc getTablePtr*(catalog: Catalog, name: string): ptr TableMeta =
   return nil
 
 proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
-  catalog.indexes[normalizedObjectName(index.name)] = index
-  let key = uint64(crc32c(stringToBytes("index:" & index.name)))
-  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
+  var storedIndex = index
+  storedIndex.temporary = false
+  catalog.indexes[normalizedObjectName(storedIndex.name)] = storedIndex
+  let key = uint64(crc32c(stringToBytes("index:" & storedIndex.name)))
+  let record = makeIndexRecord(storedIndex.name, storedIndex.table, storedIndex.columns, storedIndex.rootPage, storedIndex.kind, storedIndex.unique, storedIndex.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
+    catalog.indexes.del(normalizedObjectName(storedIndex.name))
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
   
   if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
@@ -713,10 +839,12 @@ proc createIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
   okVoid()
 
 proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
-  catalog.indexes[normalizedObjectName(index.name)] = index
-  let key = uint64(crc32c(stringToBytes("index:" & index.name)))
+  var storedIndex = index
+  storedIndex.temporary = false
+  catalog.indexes[normalizedObjectName(storedIndex.name)] = storedIndex
+  let key = uint64(crc32c(stringToBytes("index:" & storedIndex.name)))
   discard delete(catalog.catalogTree, key)
-  let record = makeIndexRecord(index.name, index.table, index.columns, index.rootPage, index.kind, index.unique, index.predicateSql)
+  let record = makeIndexRecord(storedIndex.name, storedIndex.table, storedIndex.columns, storedIndex.rootPage, storedIndex.kind, storedIndex.unique, storedIndex.predicateSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     return err[Void](insertRes.err.code, insertRes.err.message, insertRes.err.context)
@@ -726,14 +854,22 @@ proc saveIndexMeta*(catalog: Catalog, index: IndexMeta): Result[Void] =
 
   okVoid()
 
+proc registerTempIndex*(catalog: Catalog, index: IndexMeta) =
+  ## Add an index to the in-memory catalog only (not persisted).
+  var tempIndex = index
+  tempIndex.temporary = true
+  catalog.indexes[normalizedObjectName(tempIndex.name)] = tempIndex
+
 proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
-  let normName = normalizedObjectName(view.name)
+  var storedView = view
+  storedView.temporary = false
+  let normName = normalizedObjectName(storedView.name)
   if catalog.views.hasKey(normName):
-    return err[Void](ERR_SQL, "View already exists", view.name)
-  catalog.views[normName] = view
+    return err[Void](ERR_SQL, "View already exists", storedView.name)
+  catalog.views[normName] = storedView
   rebuildDependentViewsIndex(catalog)
-  let key = uint64(crc32c(stringToBytes("view:" & view.name)))
-  let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
+  let key = uint64(crc32c(stringToBytes("view:" & storedView.name)))
+  let record = makeViewRecord(storedView.name, storedView.sqlText, storedView.columnNames, storedView.dependencies)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     catalog.views.del(normName)
@@ -745,14 +881,18 @@ proc createViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
 
 proc registerTempView*(catalog: Catalog, view: ViewMeta) =
   ## Add a view to the in-memory catalog only (not persisted).
-  catalog.views[normalizedObjectName(view.name)] = view
+  var tempView = view
+  tempView.temporary = true
+  catalog.views[normalizedObjectName(tempView.name)] = tempView
   rebuildDependentViewsIndex(catalog)
 
 proc saveViewMeta*(catalog: Catalog, view: ViewMeta): Result[Void] =
-  catalog.views[normalizedObjectName(view.name)] = view
+  var storedView = view
+  storedView.temporary = false
+  catalog.views[normalizedObjectName(storedView.name)] = storedView
   rebuildDependentViewsIndex(catalog)
-  let key = uint64(crc32c(stringToBytes("view:" & view.name)))
-  let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
+  let key = uint64(crc32c(stringToBytes("view:" & storedView.name)))
+  let record = makeViewRecord(storedView.name, storedView.sqlText, storedView.columnNames, storedView.dependencies)
   let updateRes = update(catalog.catalogTree, key, record)
   if updateRes.ok:
     if catalog.catalogTree.root != catalog.catalogTree.pager.header.rootCatalog:
@@ -774,13 +914,16 @@ proc getView*(catalog: Catalog, name: string): Result[ViewMeta] =
   ok(catalog.views[normName])
 
 proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void]
+proc registerTempTrigger*(catalog: Catalog, trigger: TriggerMeta)
 proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void]
 
 proc dropView*(catalog: Catalog, name: string): Result[Void] =
   let normName = normalizedObjectName(name)
   if not catalog.views.hasKey(normName):
     return err[Void](ERR_SQL, "View not found", name)
-  let originalName = catalog.views[normName].name
+  let view = catalog.views[normName]
+  let originalName = view.name
+  let isTemporary = view.temporary
   var triggerNames: seq[string] = @[]
   for _, trigger in catalog.triggers:
     if normalizedObjectName(trigger.table) == normName:
@@ -791,6 +934,8 @@ proc dropView*(catalog: Catalog, name: string): Result[Void] =
       return dropTrigRes
   catalog.views.del(normName)
   rebuildDependentViewsIndex(catalog)
+  if isTemporary:
+    return okVoid()
   let key = uint64(crc32c(stringToBytes("view:" & originalName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
@@ -807,10 +952,11 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
   if catalog.views.hasKey(normNewName):
     return err[Void](ERR_SQL, "View already exists", newName)
   var view = catalog.views[normOldName]
-  let oldKey = uint64(crc32c(stringToBytes("view:" & view.name)))
-  let delRes = delete(catalog.catalogTree, oldKey)
-  if not delRes.ok:
-    return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
+  if not view.temporary:
+    let oldKey = uint64(crc32c(stringToBytes("view:" & view.name)))
+    let delRes = delete(catalog.catalogTree, oldKey)
+    if not delRes.ok:
+      return err[Void](delRes.err.code, delRes.err.message, delRes.err.context)
   catalog.views.del(normOldName)
   view.name = newName
   catalog.views[normNewName] = view
@@ -825,10 +971,15 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
   for trigger in triggerMetas:
     var renamed = trigger
     renamed.table = newName
-    let createTrigRes = createTriggerMeta(catalog, renamed)
-    if not createTrigRes.ok:
-      return createTrigRes
+    if renamed.temporary:
+      registerTempTrigger(catalog, renamed)
+    else:
+      let createTrigRes = createTriggerMeta(catalog, renamed)
+      if not createTrigRes.ok:
+        return createTrigRes
   rebuildDependentViewsIndex(catalog)
+  if view.temporary:
+    return okVoid()
   let newKey = uint64(crc32c(stringToBytes("view:" & newName)))
   let record = makeViewRecord(view.name, view.sqlText, view.columnNames, view.dependencies)
   let insertRes = insert(catalog.catalogTree, newKey, record)
@@ -839,12 +990,14 @@ proc renameView*(catalog: Catalog, oldName: string, newName: string): Result[Voi
   okVoid()
 
 proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void] =
-  let keyName = triggerMetaKey(trigger.table, trigger.name)
+  var storedTrigger = trigger
+  storedTrigger.temporary = false
+  let keyName = triggerMetaKey(storedTrigger.table, storedTrigger.name)
   if catalog.triggers.hasKey(keyName):
-    return err[Void](ERR_SQL, "Trigger already exists", trigger.table & "." & trigger.name)
-  catalog.triggers[keyName] = trigger
-  let key = uint64(crc32c(stringToBytes("trigger:" & trigger.table & ":" & trigger.name)))
-  let record = makeTriggerRecord(trigger.name, trigger.table, trigger.eventsMask, trigger.actionSql)
+    return err[Void](ERR_SQL, "Trigger already exists", storedTrigger.table & "." & storedTrigger.name)
+  catalog.triggers[keyName] = storedTrigger
+  let key = uint64(crc32c(stringToBytes("trigger:" & storedTrigger.table & ":" & storedTrigger.name)))
+  let record = makeTriggerRecord(storedTrigger.name, storedTrigger.table, storedTrigger.eventsMask, storedTrigger.actionSql)
   let insertRes = insert(catalog.catalogTree, key, record)
   if not insertRes.ok:
     catalog.triggers.del(keyName)
@@ -854,11 +1007,22 @@ proc createTriggerMeta*(catalog: Catalog, trigger: TriggerMeta): Result[Void] =
     catalog.catalogTree.pager.header.rootCatalog = catalog.catalogTree.root
   okVoid()
 
+proc registerTempTrigger*(catalog: Catalog, trigger: TriggerMeta) =
+  ## Add a trigger to the in-memory catalog only (not persisted).
+  var tempTrigger = trigger
+  tempTrigger.temporary = true
+  catalog.triggers[triggerMetaKey(tempTrigger.table, tempTrigger.name)] = tempTrigger
+  rebuildTriggerCache(catalog)
+
 proc dropTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[Void] =
   let keyName = triggerMetaKey(tableName, triggerName)
   if not catalog.triggers.hasKey(keyName):
     return err[Void](ERR_SQL, "Trigger not found", tableName & "." & triggerName)
+  let trigger = catalog.triggers[keyName]
   catalog.triggers.del(keyName)
+  if trigger.temporary:
+    rebuildTriggerCache(catalog)
+    return okVoid()
   let key = uint64(crc32c(stringToBytes("trigger:" & tableName & ":" & triggerName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
@@ -888,6 +1052,12 @@ proc hasTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int = 
 proc hasTrigger*(catalog: Catalog, tableName: string, triggerName: string): bool =
   catalog.triggers.hasKey(triggerMetaKey(tableName, triggerName))
 
+proc getTrigger*(catalog: Catalog, tableName: string, triggerName: string): Result[TriggerMeta] =
+  let keyName = triggerMetaKey(tableName, triggerName)
+  if not catalog.triggers.hasKey(keyName):
+    return err[TriggerMeta](ERR_SQL, "Trigger not found", tableName & "." & triggerName)
+  ok(catalog.triggers[keyName])
+
 proc listTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int = 0): seq[TriggerMeta] =
   if not catalog.hasTriggersForTable(tableName, eventMask):
     return @[]
@@ -899,6 +1069,14 @@ proc listTriggersForTable*(catalog: Catalog, tableName: string, eventMask: int =
       continue
     result.add(trigger)
   result.sort(proc(a, b: TriggerMeta): int = cmp(a.name, b.name))
+
+proc listTriggers*(catalog: Catalog): seq[TriggerMeta] =
+  for _, trigger in catalog.triggers:
+    result.add(trigger)
+  result.sort(proc(a, b: TriggerMeta): int =
+    let tableCmp = cmp(a.table, b.table)
+    if tableCmp != 0: tableCmp else: cmp(a.name, b.name)
+  )
 
 proc listDependentViews*(catalog: Catalog, objectName: string): seq[string] =
   let key = normalizedObjectName(objectName)
@@ -912,7 +1090,9 @@ proc dropTable*(catalog: Catalog, name: string): Result[Void] =
   let normName = normalizedObjectName(name)
   if not catalog.tables.hasKey(normName):
     return err[Void](ERR_SQL, "Table not found", name)
-  let originalName = catalog.tables[normName].name
+  let table = catalog.tables[normName]
+  let originalName = table.name
+  let isTemporary = table.temporary
   var triggerNames: seq[string] = @[]
   for _, trigger in catalog.triggers:
     if normalizedObjectName(trigger.table) == normName:
@@ -923,6 +1103,8 @@ proc dropTable*(catalog: Catalog, name: string): Result[Void] =
       return dropTrigRes
   catalog.tables.del(normName)
   rebuildReverseFkCache(catalog)
+  if isTemporary:
+    return okVoid()
   let key = uint64(crc32c(stringToBytes("table:" & originalName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:
@@ -937,8 +1119,11 @@ proc dropIndex*(catalog: Catalog, name: string): Result[Void] =
   let normName = normalizedObjectName(name)
   if not catalog.indexes.hasKey(normName):
     return err[Void](ERR_SQL, "Index not found", name)
-  let originalName = catalog.indexes[normName].name
+  let index = catalog.indexes[normName]
+  let originalName = index.name
   catalog.indexes.del(normName)
+  if index.temporary:
+    return okVoid()
   let key = uint64(crc32c(stringToBytes("index:" & originalName)))
   let delRes = delete(catalog.catalogTree, key)
   if not delRes.ok:

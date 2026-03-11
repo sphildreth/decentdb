@@ -211,9 +211,19 @@ typedef _ListTablesJsonC = Pointer<Utf8> Function(
 typedef _ListTablesJsonDart = Pointer<Utf8> Function(
     Pointer<DecentdbDb> db, Pointer<Int32> outLen);
 
+typedef _ListTablesInfoJsonC = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Int32> outLen);
+typedef _ListTablesInfoJsonDart = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Int32> outLen);
+
 typedef _GetTableColumnsJsonC = Pointer<Utf8> Function(
     Pointer<DecentdbDb> db, Pointer<Utf8> table, Pointer<Int32> outLen);
 typedef _GetTableColumnsJsonDart = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Utf8> table, Pointer<Int32> outLen);
+
+typedef _GetTableDdlC = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Utf8> table, Pointer<Int32> outLen);
+typedef _GetTableDdlDart = Pointer<Utf8> Function(
     Pointer<DecentdbDb> db, Pointer<Utf8> table, Pointer<Int32> outLen);
 
 typedef _ListIndexesJsonC = Pointer<Utf8> Function(
@@ -226,10 +236,20 @@ typedef _ListViewsJsonC = Pointer<Utf8> Function(
 typedef _ListViewsJsonDart = Pointer<Utf8> Function(
     Pointer<DecentdbDb> db, Pointer<Int32> outLen);
 
+typedef _ListViewsInfoJsonC = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Int32> outLen);
+typedef _ListViewsInfoJsonDart = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Int32> outLen);
+
 typedef _GetViewDdlC = Pointer<Utf8> Function(
     Pointer<DecentdbDb> db, Pointer<Utf8> view, Pointer<Int32> outLen);
 typedef _GetViewDdlDart = Pointer<Utf8> Function(
     Pointer<DecentdbDb> db, Pointer<Utf8> view, Pointer<Int32> outLen);
+
+typedef _ListTriggersJsonC = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Int32> outLen);
+typedef _ListTriggersJsonDart = Pointer<Utf8> Function(
+    Pointer<DecentdbDb> db, Pointer<Int32> outLen);
 
 // ---------------------------------------------------------------------------
 // Native bindings holder
@@ -302,10 +322,14 @@ class NativeBindings {
 
   // Schema
   late final _ListTablesJsonDart listTablesJson;
+  late final _ListTablesInfoJsonDart listTablesInfoJson;
   late final _GetTableColumnsJsonDart getTableColumnsJson;
+  late final _GetTableDdlDart getTableDdl;
   late final _ListIndexesJsonDart listIndexesJson;
   late final _ListViewsJsonDart listViewsJson;
+  late final _ListViewsInfoJsonDart listViewsInfoJson;
   late final _GetViewDdlDart getViewDdl;
+  late final _ListTriggersJsonDart listTriggersJson;
 
   NativeBindings._(this._lib) {
     abiVersion =
@@ -386,14 +410,22 @@ class NativeBindings {
 
     listTablesJson =
         _lib.lookupFunction<_ListTablesJsonC, _ListTablesJsonDart>('decentdb_list_tables_json');
+    listTablesInfoJson =
+        _lib.lookupFunction<_ListTablesInfoJsonC, _ListTablesInfoJsonDart>('decentdb_list_tables_info_json');
     getTableColumnsJson =
         _lib.lookupFunction<_GetTableColumnsJsonC, _GetTableColumnsJsonDart>('decentdb_get_table_columns_json');
+    getTableDdl =
+        _lib.lookupFunction<_GetTableDdlC, _GetTableDdlDart>('decentdb_get_table_ddl');
     listIndexesJson =
         _lib.lookupFunction<_ListIndexesJsonC, _ListIndexesJsonDart>('decentdb_list_indexes_json');
     listViewsJson =
         _lib.lookupFunction<_ListViewsJsonC, _ListViewsJsonDart>('decentdb_list_views_json');
+    listViewsInfoJson =
+        _lib.lookupFunction<_ListViewsInfoJsonC, _ListViewsInfoJsonDart>('decentdb_list_views_info_json');
     getViewDdl =
         _lib.lookupFunction<_GetViewDdlC, _GetViewDdlDart>('decentdb_get_view_ddl');
+    listTriggersJson =
+        _lib.lookupFunction<_ListTriggersJsonC, _ListTriggersJsonDart>('decentdb_list_triggers_json');
   }
 
   /// Load the native library from [path] and resolve all function symbols.

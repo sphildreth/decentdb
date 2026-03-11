@@ -305,16 +305,32 @@ void main() {
 
   group('Schema introspection', () {
     setUp(() {
+      db.execute('CREATE TABLE parents (id INTEGER PRIMARY KEY)');
+      db.execute('INSERT INTO parents VALUES (1)');
       db.execute('''
         CREATE TABLE users (
           id INTEGER PRIMARY KEY,
-          name TEXT NOT NULL,
+          parent_id INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE ON UPDATE RESTRICT,
+          name TEXT NOT NULL DEFAULT 'anon',
           email TEXT UNIQUE,
-          score FLOAT
+          score INTEGER,
+          score_x2 INTEGER GENERATED ALWAYS AS (score * 2) STORED,
+          CONSTRAINT score_nonneg CHECK (score >= 0)
         )
       ''');
       db.execute('CREATE INDEX idx_users_name ON users (name)');
       db.execute('CREATE VIEW user_names AS SELECT id, name FROM users');
+      db.execute('CREATE TEMP TABLE scratch (id INTEGER DEFAULT 7)');
+      db.execute('CREATE TEMP VIEW temp_user_names AS SELECT name FROM users');
+      db.execute('CREATE TABLE audit_log (msg TEXT)');
+      db.execute(
+        "CREATE TRIGGER users_aiu AFTER INSERT OR UPDATE ON users FOR EACH ROW "
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log VALUES (''changed'')')",
+      );
+      db.execute(
+        "CREATE TRIGGER temp_user_names_ins INSTEAD OF INSERT ON temp_user_names FOR EACH ROW "
+        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO users(id, parent_id, name, email, score) VALUES (999, 1, ''Temp'', NULL, 0)')",
+      );
     });
 
     test('listTables', () {
@@ -324,16 +340,28 @@ void main() {
 
     test('getTableColumns', () {
       final cols = db.schema.getTableColumns('users');
-      expect(cols.length, 4);
+      expect(cols.length, 6);
 
       final idCol = cols.firstWhere((c) => c.name == 'id');
       expect(idCol.primaryKey, isTrue);
 
+      final parentCol = cols.firstWhere((c) => c.name == 'parent_id');
+      expect(parentCol.notNull, isTrue);
+      expect(parentCol.refTable, 'parents');
+      expect(parentCol.refColumn, 'id');
+      expect(parentCol.refOnDelete, 'CASCADE');
+      expect(parentCol.refOnUpdate, 'RESTRICT');
+
       final nameCol = cols.firstWhere((c) => c.name == 'name');
       expect(nameCol.notNull, isTrue);
+      expect(nameCol.defaultExpr, "'anon'");
 
       final emailCol = cols.firstWhere((c) => c.name == 'email');
       expect(emailCol.unique, isTrue);
+
+      final generatedCol = cols.firstWhere((c) => c.name == 'score_x2');
+      expect(generatedCol.generatedExpr, '("score" * 2)');
+      expect(generatedCol.generatedStored, isTrue);
     });
 
     test('getTableColumns for views', () {
@@ -348,17 +376,93 @@ void main() {
       expect(idx.table, 'users');
       expect(idx.columns, ['name']);
       expect(idx.kind, 'btree');
+      expect(idx.temporary, isFalse);
+      expect(idx.ddl, contains('CREATE INDEX'));
     });
 
     test('listViews', () {
       final views = db.schema.listViews();
       expect(views, contains('user_names'));
+      expect(views, contains('temp_user_names'));
+    });
+
+    test('listTablesInfo', () {
+      final tables = db.schema.listTablesInfo();
+
+      final users = tables.firstWhere((t) => t.name == 'users');
+      expect(users.temporary, isFalse);
+      expect(users.ddl, contains('CREATE TABLE'));
+      expect(users.ddl, contains('GENERATED ALWAYS AS'));
+      expect(users.ddl, contains('"score" * 2'));
+      expect(users.ddl, contains('ON DELETE CASCADE ON UPDATE RESTRICT'));
+      expect(users.checks, hasLength(1));
+      expect(users.checks.single.name, 'score_nonneg');
+      expect(users.checks.single.exprSql, '("score" >= 0)');
+
+      final scratch = tables.firstWhere((t) => t.name == 'scratch');
+      expect(scratch.temporary, isTrue);
+      expect(scratch.ddl, startsWith('CREATE TEMP TABLE'));
+    });
+
+    test('getTableDdl', () {
+      final ddl = db.schema.getTableDdl('users');
+      expect(ddl, isNotNull);
+      expect(ddl!, startsWith('CREATE TABLE'));
+      expect(ddl, contains('"parent_id" INT64 NOT NULL'));
+      expect(ddl, contains('DEFAULT \'anon\''));
+      expect(ddl, contains('GENERATED ALWAYS AS'));
+      expect(ddl, contains('"score" * 2'));
+      expect(ddl, contains('CONSTRAINT "score_nonneg" CHECK ("score" >= 0)'));
+    });
+
+    test('getTableDdl throws for missing table', () {
+      expect(
+        () => db.schema.getTableDdl('missing_table'),
+        throwsA(isA<DecentDbException>()),
+      );
     });
 
     test('getViewDdl', () {
       final ddl = db.schema.getViewDdl('user_names');
       expect(ddl, isNotNull);
       expect(ddl!, contains('SELECT'));
+    });
+
+    test('listViewsInfo', () {
+      final views = db.schema.listViewsInfo();
+
+      final userNames = views.firstWhere((v) => v.name == 'user_names');
+      expect(userNames.temporary, isFalse);
+      expect(userNames.sqlText, contains('SELECT'));
+      expect(userNames.ddl, startsWith('CREATE VIEW'));
+      expect(userNames.columnNames, ['id', 'name']);
+      expect(userNames.dependencies, contains('users'));
+
+      final tempUserNames = views.firstWhere((v) => v.name == 'temp_user_names');
+      expect(tempUserNames.temporary, isTrue);
+      expect(tempUserNames.ddl, startsWith('CREATE TEMP VIEW'));
+    });
+
+    test('listTriggers', () {
+      final triggers = db.schema.listTriggers();
+
+      final usersTrigger = triggers.firstWhere((t) => t.name == 'users_aiu');
+      expect(usersTrigger.targetName, 'users');
+      expect(usersTrigger.targetKind, 'table');
+      expect(usersTrigger.timing, 'after');
+      expect(usersTrigger.events, ['insert', 'update']);
+      expect(usersTrigger.actionSql, contains('changed'));
+      expect(usersTrigger.ddl, contains('AFTER INSERT OR UPDATE'));
+      expect(usersTrigger.temporary, isFalse);
+
+      final tempViewTrigger =
+          triggers.firstWhere((t) => t.name == 'temp_user_names_ins');
+      expect(tempViewTrigger.targetName, 'temp_user_names');
+      expect(tempViewTrigger.targetKind, 'view');
+      expect(tempViewTrigger.timing, 'instead_of');
+      expect(tempViewTrigger.events, ['insert']);
+      expect(tempViewTrigger.ddl, contains('INSTEAD OF INSERT'));
+      expect(tempViewTrigger.temporary, isTrue);
     });
 
     test('getViewDdl throws for missing view', () {

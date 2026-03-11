@@ -1,5 +1,6 @@
 import unittest
 import os
+import strutils
 
 import engine
 import options
@@ -255,5 +256,100 @@ suite "Catalog":
 
     check db.catalog.dropTrigger("t", "trg_update").ok
     check not db.catalog.hasTriggersForTable("t")
+
+    discard closeDb(db)
+
+  test "table ddl reconstruction includes temp defaults generated checks and fk actions":
+    let meta = TableMeta(
+      name: "child",
+      rootPage: PageId(1),
+      nextRowId: 1,
+      temporary: true,
+      columns: @[
+        Column(name: "id", kind: ctInt64, primaryKey: true),
+        Column(
+          name: "parent_id",
+          kind: ctInt64,
+          notNull: true,
+          refTable: "parent",
+          refColumn: "id",
+          refOnDelete: "CASCADE",
+          refOnUpdate: "RESTRICT"
+        ),
+        Column(
+          name: "amount",
+          kind: ctDecimal,
+          decPrecision: 10,
+          decScale: 2,
+          defaultExpr: "42.50"
+        ),
+        Column(
+          name: "double_amount",
+          kind: ctDecimal,
+          decPrecision: 10,
+          decScale: 2,
+          generatedExpr: "amount * 2"
+        )
+      ],
+      checks: @[CheckConstraint(name: "amount_nonneg", exprSql: "(amount >= 0)")]
+    )
+
+    let ddl = tableDdl(meta)
+    check ddl.contains("CREATE TEMP TABLE")
+    check ddl.contains("\"parent_id\" INT64 NOT NULL REFERENCES \"parent\"(\"id\") ON DELETE CASCADE ON UPDATE RESTRICT")
+    check ddl.contains("\"amount\" DECIMAL(10,2) DEFAULT 42.50")
+    check ddl.contains("\"double_amount\" DECIMAL(10,2) GENERATED ALWAYS AS (amount * 2) STORED")
+    check ddl.contains("CONSTRAINT \"amount_nonneg\" CHECK (amount >= 0)")
+
+  test "temporary registrations mark schema metadata and reconstruct trigger ddl":
+    let path = makeTempDb("decentdb_catalog_temp_meta.db")
+    let dbRes = openDb(path)
+    check dbRes.ok
+    let db = dbRes.value
+
+    db.catalog.registerTempTable(TableMeta(
+      name: "scratch",
+      rootPage: PageId(1),
+      nextRowId: 1,
+      columns: @[Column(name: "id", kind: ctInt64, primaryKey: true)]
+    ))
+    db.catalog.registerTempView(ViewMeta(
+      name: "scratch_view",
+      sqlText: "SELECT \"id\" FROM \"scratch\"",
+      columnNames: @["id"],
+      dependencies: @["scratch"]
+    ))
+    db.catalog.registerTempIndex(IndexMeta(
+      name: "scratch_id_idx",
+      table: "scratch",
+      columns: @["id"],
+      rootPage: PageId(2),
+      kind: ikBtree,
+      unique: true
+    ))
+    db.catalog.registerTempTrigger(TriggerMeta(
+      name: "scratch_view_ins",
+      table: "scratch_view",
+      eventsMask: TriggerTimingInsteadMask or TriggerEventInsertMask,
+      actionSql: "INSERT INTO scratch VALUES (1)"
+    ))
+
+    let tableRes = db.catalog.getTable("scratch")
+    check tableRes.ok
+    check tableRes.value.temporary
+
+    let viewRes = db.catalog.getView("scratch_view")
+    check viewRes.ok
+    check viewRes.value.temporary
+    check viewDdl(viewRes.value).contains("CREATE TEMP VIEW")
+
+    let idxRes = db.catalog.getIndexByName("scratch_id_idx")
+    check isSome(idxRes)
+    check idxRes.get.temporary
+
+    let trigRes = db.catalog.getTrigger("scratch_view", "scratch_view_ins")
+    check trigRes.ok
+    check trigRes.value.temporary
+    check triggerDdl(trigRes.value).contains("INSTEAD OF INSERT")
 
     discard closeDb(db)

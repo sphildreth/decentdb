@@ -372,6 +372,146 @@ proc viewDependencies(stmt: Statement): seq[string] =
   for dep in seen:
     result.add(dep)
 
+proc buildTableColumns(bound: Statement): Result[seq[Column]] =
+  var columns: seq[Column] = @[]
+  for col in bound.columns:
+    let typeRes = parseColumnType(col.typeName)
+    if not typeRes.ok:
+      return err[seq[Column]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
+    let spec = typeRes.value
+    columns.add(Column(
+      name: col.name,
+      kind: spec.kind,
+      notNull: col.notNull,
+      unique: col.unique,
+      primaryKey: col.primaryKey,
+      refTable: col.refTable,
+      refColumn: col.refColumn,
+      refOnDelete: col.refOnDelete,
+      refOnUpdate: col.refOnUpdate,
+      decPrecision: spec.decPrecision,
+      decScale: spec.decScale,
+      defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
+      generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
+    ))
+  ok(columns)
+
+proc buildTableChecks(bound: Statement): seq[catalog.CheckConstraint] =
+  for checkDef in bound.createChecks:
+    result.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
+
+proc buildTableMeta(bound: Statement, rootPage: PageId, temporary: bool): Result[TableMeta] =
+  let columnsRes = buildTableColumns(bound)
+  if not columnsRes.ok:
+    return err[TableMeta](columnsRes.err.code, columnsRes.err.message, columnsRes.err.context)
+  ok(TableMeta(
+    name: bound.createTableName,
+    rootPage: rootPage,
+    nextRowId: 1,
+    columns: columnsRes.value,
+    checks: buildTableChecks(bound),
+    temporary: temporary
+  ))
+
+proc storeIndexMeta(db: Db, idxMeta: IndexMeta, temporary: bool): Result[Void] =
+  if temporary:
+    db.catalog.registerTempIndex(idxMeta)
+    return okVoid()
+  db.catalog.createIndexMeta(idxMeta)
+
+proc createConstraintIndexes(db: Db, meta: TableMeta): Result[Void] =
+  let temporary = meta.temporary
+  var pkCols: seq[string] = @[]
+  for col in meta.columns:
+    if col.primaryKey:
+      pkCols.add(col.name)
+  if pkCols.len > 1:
+    let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
+    let idxRootRes = initTableRoot(db.pager)
+    if not idxRootRes.ok:
+      return err[Void](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+    let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
+    if not buildRes.ok:
+      return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+    let idxMeta = IndexMeta(
+      name: idxName,
+      table: meta.name,
+      columns: pkCols,
+      rootPage: buildRes.value,
+      kind: catalog.ikBtree,
+      unique: true,
+      temporary: temporary
+    )
+    let idxSaveRes = storeIndexMeta(db, idxMeta, temporary)
+    if not idxSaveRes.ok:
+      return err[Void](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+  for col in meta.columns:
+    if col.primaryKey or col.unique:
+      if col.primaryKey and pkCols.len > 1:
+        continue
+      if col.primaryKey and col.kind == ctInt64:
+        continue
+      let idxName =
+        if col.primaryKey:
+          "pk_" & meta.name & "_" & col.name & "_idx"
+        else:
+          "uniq_" & meta.name & "_" & col.name & "_idx"
+      if isNone(db.catalog.getIndexForColumn(meta.name, col.name, catalog.ikBtree, requireUnique = true)):
+        let idxRootRes = initTableRoot(db.pager)
+        if not idxRootRes.ok:
+          return err[Void](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+        let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+        if not buildRes.ok:
+          return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        let idxMeta = IndexMeta(
+          name: idxName,
+          table: meta.name,
+          columns: @[col.name],
+          rootPage: buildRes.value,
+          kind: catalog.ikBtree,
+          unique: true,
+          temporary: temporary
+        )
+        let idxSaveRes = storeIndexMeta(db, idxMeta, temporary)
+        if not idxSaveRes.ok:
+          return err[Void](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+    if col.refTable.len > 0 and col.refColumn.len > 0:
+      if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
+        let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
+        let idxRootRes = initTableRoot(db.pager)
+        if not idxRootRes.ok:
+          return err[Void](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
+        let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
+        if not buildRes.ok:
+          return err[Void](buildRes.err.code, buildRes.err.message, buildRes.err.context)
+        let idxMeta = IndexMeta(
+          name: idxName,
+          table: meta.name,
+          columns: @[col.name],
+          rootPage: buildRes.value,
+          kind: catalog.ikBtree,
+          unique: false,
+          temporary: temporary
+        )
+        let idxSaveRes = storeIndexMeta(db, idxMeta, temporary)
+        if not idxSaveRes.ok:
+          return err[Void](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+  okVoid()
+
+proc isTemporaryTable(catalog: Catalog, tableName: string): bool =
+  let tableRes = catalog.getTable(tableName)
+  tableRes.ok and tableRes.value.temporary
+
+proc isTemporaryView(catalog: Catalog, viewName: string): bool =
+  let viewRes = catalog.getView(viewName)
+  viewRes.ok and viewRes.value.temporary
+
+proc storeTriggerMeta(db: Db, triggerMeta: TriggerMeta, temporary: bool): Result[Void] =
+  if temporary:
+    db.catalog.registerTempTrigger(triggerMeta)
+    return okVoid()
+  db.catalog.createTriggerMeta(triggerMeta)
+
 proc valueFromSql(value: Value): Value =
   value
 
@@ -2756,114 +2896,36 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         discard rollbackTransaction(db)
     case bound.kind
     of skCreateTable:
+      let rootRes = initTableRoot(db.pager)
+      if not rootRes.ok:
+        return err[seq[string]](rootRes.err.code, rootRes.err.message, rootRes.err.context)
+      let metaRes = buildTableMeta(bound, rootRes.value, bound.createTableIsTemp)
+      if not metaRes.ok:
+        return err[seq[string]](metaRes.err.code, metaRes.err.message, metaRes.err.context)
+      let meta = metaRes.value
       if bound.createTableIsTemp:
-        var columns: seq[Column] = @[]
-        for col in bound.columns:
-          let typeRes = parseColumnType(col.typeName)
-          if not typeRes.ok:
-            return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-          let spec = typeRes.value
-          columns.add(Column(
-            name: col.name, kind: spec.kind, notNull: col.notNull, unique: col.unique,
-            primaryKey: col.primaryKey, refTable: "", refColumn: "",
-            decPrecision: spec.decPrecision, decScale: spec.decScale,
-            defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
-            generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
-          ))
-        let rootRes = initTableRoot(db.pager)
-        if not rootRes.ok:
-          return err[seq[string]](rootRes.err.code, rootRes.err.message, rootRes.err.context)
-        let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns)
         db.catalog.registerTempTable(meta)
         db.tempTables[bound.createTableName.toLowerAscii()] = TempTable(meta: meta, rows: @[], nextRowId: 1)
       else:
-        let rootRes = initTableRoot(db.pager)
-        if not rootRes.ok:
-          return err[seq[string]](rootRes.err.code, rootRes.err.message, rootRes.err.context)
-        var columns: seq[Column] = @[]
-        for col in bound.columns:
-          let typeRes = parseColumnType(col.typeName)
-          if not typeRes.ok:
-            return err[seq[string]](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-          let spec = typeRes.value
-          columns.add(Column(
-            name: col.name,
-            kind: spec.kind,
-            notNull: col.notNull,
-            unique: col.unique,
-            primaryKey: col.primaryKey,
-            refTable: col.refTable,
-            refColumn: col.refColumn,
-            refOnDelete: col.refOnDelete,
-            refOnUpdate: col.refOnUpdate,
-            decPrecision: spec.decPrecision,
-            decScale: spec.decScale,
-            defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
-            generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
-          ))
-        var checks: seq[catalog.CheckConstraint] = @[]
-        for checkDef in bound.createChecks:
-          checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
-        let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
         let saveRes = db.catalog.saveTable(db.pager, meta)
         if not saveRes.ok:
           return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-        # Collect PK columns for composite PK detection
-        var pkCols: seq[string] = @[]
-        for col in columns:
-          if col.primaryKey:
-            pkCols.add(col.name)
-        if pkCols.len > 1:
-          # Composite PK: single-INT64 optimization doesn't apply; create composite unique index
-          let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
-          let idxRootRes = initTableRoot(db.pager)
-          if not idxRootRes.ok:
-            return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-          let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
-          if not buildRes.ok:
-            return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-          let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-          let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-          if not idxSaveRes.ok:
-            return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-        for col in columns:
-          if col.primaryKey or col.unique:
-            if col.primaryKey and pkCols.len > 1:
-              continue  # handled by composite index above
-            if col.primaryKey and col.kind == ctInt64:
-              continue
-            let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
-            if isNone(db.catalog.getIndexForColumn(meta.name, col.name, catalog.ikBtree, requireUnique = true)):
-              let idxRootRes = initTableRoot(db.pager)
-              if not idxRootRes.ok:
-                return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-              let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-              if not buildRes.ok:
-                return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-              let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-              let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-              if not idxSaveRes.ok:
-                return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-          if col.refTable.len > 0 and col.refColumn.len > 0:
-            if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
-              let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
-              let idxRootRes = initTableRoot(db.pager)
-              if not idxRootRes.ok:
-                return err[seq[string]](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-              let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-              if not buildRes.ok:
-                return err[seq[string]](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-              let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
-              let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-              if not idxSaveRes.ok:
-                return err[seq[string]](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+      let idxRes = createConstraintIndexes(db, meta)
+      if not idxRes.ok:
+        return err[seq[string]](idxRes.err.code, idxRes.err.message, idxRes.err.context)
+      if not bound.createTableIsTemp:
         let bumpRes = schemaBump(db)
         if not bumpRes.ok:
           return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropTable:
-      if bound.dropTableIfExists and bound.dropTableName notin db.catalog.tables:
-        discard  # IF EXISTS: silently skip
+      let tableRes = db.catalog.getTable(bound.dropTableName)
+      if not tableRes.ok:
+        if bound.dropTableIfExists:
+          discard
+        else:
+          return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       else:
+        let isTemporary = tableRes.value.temporary
         let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
         if dependentViews.len > 0:
           return err[seq[string]](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
@@ -2876,22 +2938,26 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         let dropRes = db.catalog.dropTable(bound.dropTableName)
         if not dropRes.ok:
           return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-        let bumpRes = schemaBump(db)
-        if not bumpRes.ok:
-          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+        if isTemporary:
+          db.tempTables.del(bound.dropTableName.toLowerAscii())
+        else:
+          let bumpRes = schemaBump(db)
+          if not bumpRes.ok:
+            return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skAlterTable:
       let alterRes = alterTable(db.pager, db.catalog, bound.alterTableName, bound.alterActions)
       if not alterRes.ok:
         return err[seq[string]](alterRes.err.code, alterRes.err.message, alterRes.err.context)
     of skCreateIndex:
+      let tableRes = db.catalog.getTable(bound.indexTableName)
+      if not tableRes.ok:
+        return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+      let indexIsTemp = tableRes.value.temporary
       let indexRootRes = initTableRoot(db.pager)
       if not indexRootRes.ok:
         return err[seq[string]](indexRootRes.err.code, indexRootRes.err.message, indexRootRes.err.context)
       let predicateSql = if bound.indexPredicate != nil: exprToCanonicalSql(bound.indexPredicate) else: ""
       if bound.unique:
-        let tableRes = db.catalog.getTable(bound.indexTableName)
-        if not tableRes.ok:
-          return err[seq[string]](tableRes.err.code, tableRes.err.message, tableRes.err.context)
         let table = tableRes.value
         var colIndices: seq[int] = @[]
         for colName in bound.columnNames:
@@ -2998,45 +3064,58 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         rootPage: finalRoot,
         kind: idxKind,
         unique: bound.unique,
-        predicateSql: predicateSql
+        predicateSql: predicateSql,
+        temporary: indexIsTemp
       )
-      let saveRes = db.catalog.createIndexMeta(idxMeta)
+      let saveRes = storeIndexMeta(db, idxMeta, indexIsTemp)
       if not saveRes.ok:
         return err[seq[string]](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if not indexIsTemp:
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skCreateTrigger:
+      let triggerIsTemp =
+        if (bound.triggerEventsMask and TriggerTimingInsteadMask) != 0:
+          db.catalog.isTemporaryView(bound.triggerTableName)
+        else:
+          db.catalog.isTemporaryTable(bound.triggerTableName)
       let triggerMeta = TriggerMeta(
         name: bound.triggerName,
         table: bound.triggerTableName,
         eventsMask: bound.triggerEventsMask,
-        actionSql: bound.triggerActionSql
+        actionSql: bound.triggerActionSql,
+        temporary: triggerIsTemp
       )
-      let createRes = db.catalog.createTriggerMeta(triggerMeta)
+      let createRes = storeTriggerMeta(db, triggerMeta, triggerIsTemp)
       if not createRes.ok:
         return err[seq[string]](createRes.err.code, createRes.err.message, createRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if not triggerIsTemp:
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropTrigger:
-      if not db.catalog.hasTrigger(bound.dropTriggerTableName, bound.dropTriggerName):
+      let triggerRes = db.catalog.getTrigger(bound.dropTriggerTableName, bound.dropTriggerName)
+      if not triggerRes.ok:
         if not bound.dropTriggerIfExists:
-          return err[seq[string]](ERR_SQL, "Trigger not found", bound.dropTriggerTableName & "." & bound.dropTriggerName)
+          return err[seq[string]](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
       else:
         let dropRes = db.catalog.dropTrigger(bound.dropTriggerTableName, bound.dropTriggerName)
         if not dropRes.ok:
           return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+        if not triggerRes.value.temporary:
+          let bumpRes = schemaBump(db)
+          if not bumpRes.ok:
+            return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropIndex:
+      let idxOpt = db.catalog.getIndexByName(bound.dropIndexName)
       let dropRes = db.catalog.dropIndex(bound.dropIndexName)
       if not dropRes.ok:
         return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if idxOpt.isSome and not idxOpt.get.temporary:
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skCreateView:
       if bound.createViewIsTemp:
         let dependencies = viewDependencies(bound.createViewQuery)
@@ -3074,21 +3153,26 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value]): Result[seq[string]] 
         if not bumpRes.ok:
           return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skDropView:
-      if not db.catalog.hasViewName(bound.dropViewName):
+      let viewRes = db.catalog.getView(bound.dropViewName)
+      if not viewRes.ok:
         if bound.dropViewIfExists:
           discard
         else:
-          return err[seq[string]](ERR_SQL, "View not found", bound.dropViewName)
+          return err[seq[string]](viewRes.err.code, viewRes.err.message, viewRes.err.context)
       else:
+        let isTemporary = viewRes.value.temporary
         let dependentViews = db.catalog.listDependentViews(bound.dropViewName)
         if dependentViews.len > 0:
           return err[seq[string]](ERR_SQL, "Cannot drop view with dependent views", bound.dropViewName)
         let dropRes = db.catalog.dropView(bound.dropViewName)
         if not dropRes.ok:
           return err[seq[string]](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+        if isTemporary:
+          db.tempViews.del(bound.dropViewName.toLowerAscii())
+        else:
+          let bumpRes = schemaBump(db)
+          if not bumpRes.ok:
+            return err[seq[string]](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     of skAlterView:
       let dependentViews = db.catalog.listDependentViews(bound.alterViewName)
       if dependentViews.len > 0:
@@ -3590,119 +3674,38 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
   var affected: int64 = 0
   case bound.kind
   of skCreateTable:
+    let rootRes = initTableRoot(db.pager)
+    if not rootRes.ok:
+      return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
+    let metaRes = buildTableMeta(bound, rootRes.value, bound.createTableIsTemp)
+    if not metaRes.ok:
+      return err[int64](metaRes.err.code, metaRes.err.message, metaRes.err.context)
+    let meta = metaRes.value
     if bound.createTableIsTemp:
-      let rootRes = initTableRoot(db.pager)
-      if not rootRes.ok:
-        return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
-      var columns: seq[Column] = @[]
-      for col in bound.columns:
-        let typeRes = parseColumnType(col.typeName)
-        if not typeRes.ok:
-          return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-        let spec = typeRes.value
-        columns.add(Column(
-          name: col.name, kind: spec.kind, notNull: col.notNull, unique: col.unique,
-          primaryKey: col.primaryKey, refTable: "", refColumn: "",
-          decPrecision: spec.decPrecision, decScale: spec.decScale,
-          defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
-          generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
-        ))
-      let meta = TableMeta(
-        name: bound.createTableName,
-        rootPage: rootRes.value,
-        nextRowId: 1,
-        columns: columns,
-      )
       db.catalog.registerTempTable(meta)
       db.tempTables[bound.createTableName.toLowerAscii()] = TempTable(meta: meta, rows: @[], nextRowId: 1)
     else:
-      let rootRes = initTableRoot(db.pager)
-      if not rootRes.ok:
-        return err[int64](rootRes.err.code, rootRes.err.message, rootRes.err.context)
-      var columns: seq[Column] = @[]
-      for col in bound.columns:
-        let typeRes = parseColumnType(col.typeName)
-        if not typeRes.ok:
-          return err[int64](typeRes.err.code, typeRes.err.message, typeRes.err.context)
-        let spec = typeRes.value
-        columns.add(Column(
-          name: col.name,
-          kind: spec.kind,
-          notNull: col.notNull,
-          unique: col.unique,
-          primaryKey: col.primaryKey,
-          refTable: col.refTable,
-          refColumn: col.refColumn,
-          refOnDelete: col.refOnDelete,
-          refOnUpdate: col.refOnUpdate,
-          decPrecision: spec.decPrecision,
-          decScale: spec.decScale,
-          defaultExpr: if col.defaultExpr != nil: exprToCanonicalSql(col.defaultExpr) else: "",
-          generatedExpr: if col.generatedExpr != nil: exprToCanonicalSql(col.generatedExpr) else: ""
-        ))
-      var checks: seq[catalog.CheckConstraint] = @[]
-      for checkDef in bound.createChecks:
-        checks.add(catalog.CheckConstraint(name: checkDef.name, exprSql: exprToCanonicalSql(checkDef.expr)))
-      let meta = TableMeta(name: bound.createTableName, rootPage: rootRes.value, nextRowId: 1, columns: columns, checks: checks)
       let saveRes = db.catalog.saveTable(db.pager, meta)
       if not saveRes.ok:
         return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-      var pkCols: seq[string] = @[]
-      for col in columns:
-        if col.primaryKey:
-          pkCols.add(col.name)
-      if pkCols.len > 1:
-        let idxName = "pk_" & meta.name & "_" & pkCols.join("_") & "_idx"
-        let idxRootRes = initTableRoot(db.pager)
-        if not idxRootRes.ok:
-          return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-        let buildRes = buildIndexForColumns(db.pager, db.catalog, meta.name, pkCols, idxRootRes.value)
-        if not buildRes.ok:
-          return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-        let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: pkCols, rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-        let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-        if not idxSaveRes.ok:
-          return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-      for col in columns:
-        if col.primaryKey or col.unique:
-          if col.primaryKey and pkCols.len > 1:
-            continue
-          if col.primaryKey and col.kind == ctInt64:
-            continue
-          let idxName = if col.primaryKey: "pk_" & meta.name & "_" & col.name & "_idx" else: "uniq_" & meta.name & "_" & col.name & "_idx"
-          if isNone(db.catalog.getIndexByName(idxName)):
-            let idxRootRes = initTableRoot(db.pager)
-            if not idxRootRes.ok:
-              return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-            if not buildRes.ok:
-              return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: true)
-            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-            if not idxSaveRes.ok:
-              return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
-        if col.refTable.len > 0 and col.refColumn.len > 0:
-          if isNone(db.catalog.getBtreeIndexForColumn(meta.name, col.name)):
-            let idxName = "fk_" & meta.name & "_" & col.name & "_idx"
-            let idxRootRes = initTableRoot(db.pager)
-            if not idxRootRes.ok:
-              return err[int64](idxRootRes.err.code, idxRootRes.err.message, idxRootRes.err.context)
-            let buildRes = buildIndexForColumn(db.pager, db.catalog, meta.name, col.name, idxRootRes.value)
-            if not buildRes.ok:
-              return err[int64](buildRes.err.code, buildRes.err.message, buildRes.err.context)
-            let idxMeta = IndexMeta(name: idxName, table: meta.name, columns: @[col.name], rootPage: buildRes.value, kind: catalog.ikBtree, unique: false)
-            let idxSaveRes = db.catalog.createIndexMeta(idxMeta)
-            if not idxSaveRes.ok:
-              return err[int64](idxSaveRes.err.code, idxSaveRes.err.message, idxSaveRes.err.context)
+    let idxRes = createConstraintIndexes(db, meta)
+    if not idxRes.ok:
+      return err[int64](idxRes.err.code, idxRes.err.message, idxRes.err.context)
+    if not bound.createTableIsTemp:
       let bumpRes = schemaBump(db)
       if not bumpRes.ok:
         return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skDropTable:
-    if bound.dropTableIfExists and bound.dropTableName notin db.catalog.tables:
-      discard  # IF EXISTS: silently skip
+    let tableRes = db.catalog.getTable(bound.dropTableName)
+    if not tableRes.ok:
+      if bound.dropTableIfExists:
+        discard
+      else:
+        return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
     else:
+      let isTemporary = tableRes.value.temporary
       let dependentViews = db.catalog.listDependentViews(bound.dropTableName)
       if dependentViews.len > 0:
         return err[int64](ERR_SQL, "Cannot drop table with dependent views", bound.dropTableName)
@@ -3715,9 +3718,12 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       let dropRes = db.catalog.dropTable(bound.dropTableName)
       if not dropRes.ok:
         return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-      let bumpRes = schemaBump(db)
-      if not bumpRes.ok:
-        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if isTemporary:
+        db.tempTables.del(bound.dropTableName.toLowerAscii())
+      else:
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skAlterTable:
@@ -3727,14 +3733,15 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
     affected = 0
 
   of skCreateIndex:
+    let tableRes = db.catalog.getTable(bound.indexTableName)
+    if not tableRes.ok:
+      return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
+    let indexIsTemp = tableRes.value.temporary
     let indexRootRes = initTableRoot(db.pager)
     if not indexRootRes.ok:
       return err[int64](indexRootRes.err.code, indexRootRes.err.message, indexRootRes.err.context)
     let predicateSql = if bound.indexPredicate != nil: exprToCanonicalSql(bound.indexPredicate) else: ""
     if bound.unique:
-      let tableRes = db.catalog.getTable(bound.indexTableName)
-      if not tableRes.ok:
-        return err[int64](tableRes.err.code, tableRes.err.message, tableRes.err.context)
       let table = tableRes.value
       var colIndices: seq[int] = @[]
       for colName in bound.columnNames:
@@ -3838,51 +3845,64 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       rootPage: finalRoot,
       kind: idxKind,
       unique: bound.unique,
-      predicateSql: predicateSql
+      predicateSql: predicateSql,
+      temporary: indexIsTemp
     )
-    let saveRes = db.catalog.createIndexMeta(idxMeta)
+    let saveRes = storeIndexMeta(db, idxMeta, indexIsTemp)
     if not saveRes.ok:
       return err[int64](saveRes.err.code, saveRes.err.message, saveRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    if not indexIsTemp:
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skDropIndex:
+    let idxOpt = db.catalog.getIndexByName(bound.dropIndexName)
     let dropRes = db.catalog.dropIndex(bound.dropIndexName)
     if not dropRes.ok:
       return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    if idxOpt.isSome and not idxOpt.get.temporary:
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skCreateTrigger:
+    let triggerIsTemp =
+      if (bound.triggerEventsMask and TriggerTimingInsteadMask) != 0:
+        db.catalog.isTemporaryView(bound.triggerTableName)
+      else:
+        db.catalog.isTemporaryTable(bound.triggerTableName)
     let triggerMeta = TriggerMeta(
       name: bound.triggerName,
       table: bound.triggerTableName,
       eventsMask: bound.triggerEventsMask,
-      actionSql: bound.triggerActionSql
+      actionSql: bound.triggerActionSql,
+      temporary: triggerIsTemp
     )
-    let createRes = db.catalog.createTriggerMeta(triggerMeta)
+    let createRes = storeTriggerMeta(db, triggerMeta, triggerIsTemp)
     if not createRes.ok:
       return err[int64](createRes.err.code, createRes.err.message, createRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+    if not triggerIsTemp:
+      let bumpRes = schemaBump(db)
+      if not bumpRes.ok:
+        return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skDropTrigger:
-    if not db.catalog.hasTrigger(bound.dropTriggerTableName, bound.dropTriggerName):
+    let triggerRes = db.catalog.getTrigger(bound.dropTriggerTableName, bound.dropTriggerName)
+    if not triggerRes.ok:
       if not bound.dropTriggerIfExists:
-        return err[int64](ERR_SQL, "Trigger not found", bound.dropTriggerTableName & "." & bound.dropTriggerName)
+        return err[int64](triggerRes.err.code, triggerRes.err.message, triggerRes.err.context)
     else:
       let dropRes = db.catalog.dropTrigger(bound.dropTriggerTableName, bound.dropTriggerName)
       if not dropRes.ok:
         return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if not triggerRes.value.temporary:
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skCreateView:
@@ -3924,19 +3944,24 @@ proc execPreparedNonSelect*(db: Db, bound: Statement, params: seq[Value], plan: 
       affected = 0
 
   of skDropView:
-    if not db.catalog.hasViewName(bound.dropViewName):
+    let viewRes = db.catalog.getView(bound.dropViewName)
+    if not viewRes.ok:
       if not bound.dropViewIfExists:
-        return err[int64](ERR_SQL, "View not found", bound.dropViewName)
+        return err[int64](viewRes.err.code, viewRes.err.message, viewRes.err.context)
     else:
+      let isTemporary = viewRes.value.temporary
       let dependentViews = db.catalog.listDependentViews(bound.dropViewName)
       if dependentViews.len > 0:
         return err[int64](ERR_SQL, "Cannot drop view with dependent views", bound.dropViewName)
       let dropRes = db.catalog.dropView(bound.dropViewName)
       if not dropRes.ok:
         return err[int64](dropRes.err.code, dropRes.err.message, dropRes.err.context)
-    let bumpRes = schemaBump(db)
-    if not bumpRes.ok:
-      return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
+      if isTemporary:
+        db.tempViews.del(bound.dropViewName.toLowerAscii())
+      else:
+        let bumpRes = schemaBump(db)
+        if not bumpRes.ok:
+          return err[int64](bumpRes.err.code, bumpRes.err.message, bumpRes.err.context)
     affected = 0
 
   of skAlterView:

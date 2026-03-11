@@ -5,6 +5,7 @@
 import unittest
 import os
 import strutils
+import json
 import c_api
 import record/record
 
@@ -35,6 +36,11 @@ proc execDDL(h: pointer, sql: string) =
   let rc2 = decentdb_step(stmt)
   doAssert rc2 == 0, "step failed for: " & sql
   decentdb_finalize(stmt)
+
+proc takeCString(p: cstring, outLen: cint): string =
+  result = newString(int(outLen))
+  if outLen > 0:
+    copyMem(addr result[0], p, int(outLen))
 
 # ---------------------------------------------------------------------------
 # Suite: open / close
@@ -1046,6 +1052,88 @@ suite "C API: JSON metadata":
     decentdb_free(p)
     check decentdb_close(h) == 0
 
+  test "list_tables_info_json exposes temp ddl checks and richer column metadata":
+    let h = openFresh("capi_json_tables_info.ddb")
+    execDDL(h, "CREATE TABLE parent (id INT PRIMARY KEY)")
+    execDDL(h,
+      "CREATE TABLE users (" &
+      "id INT PRIMARY KEY, " &
+      "parent_id INT NOT NULL REFERENCES parent(id) ON DELETE CASCADE ON UPDATE RESTRICT, " &
+      "name TEXT DEFAULT 'anon', " &
+      "score INT, " &
+      "score_x2 INT GENERATED ALWAYS AS (score * 2) STORED, " &
+      "CONSTRAINT score_nonneg CHECK (score >= 0))"
+    )
+    execDDL(h, "CREATE TEMP TABLE scratch (id INT DEFAULT 7)")
+
+    var outLen: cint = 0
+    let p = decentdb_list_tables_info_json(h, addr outLen)
+    check p != nil
+    let arr = parseJson(takeCString(p, outLen))
+    decentdb_free(p)
+
+    var usersNode: JsonNode = nil
+    var scratchNode: JsonNode = nil
+    for item in arr:
+      case item["name"].getStr
+      of "users": usersNode = item
+      of "scratch": scratchNode = item
+      else: discard
+
+    check usersNode != nil
+    check scratchNode != nil
+    check usersNode["temporary"].getBool == false
+    check usersNode["ddl"].getStr.contains("CREATE TABLE")
+    check usersNode["ddl"].getStr.contains("GENERATED ALWAYS AS")
+    check usersNode["ddl"].getStr.contains("\"score\" * 2")
+    check usersNode["ddl"].getStr.contains("ON DELETE CASCADE ON UPDATE RESTRICT")
+    check usersNode["checks"][0]["name"].getStr == "score_nonneg"
+    check usersNode["checks"][0]["expr_sql"].getStr == "(\"score\" >= 0)"
+
+    var parentIdNode: JsonNode = nil
+    var nameNode: JsonNode = nil
+    var generatedNode: JsonNode = nil
+    for col in usersNode["columns"]:
+      case col["name"].getStr
+      of "parent_id": parentIdNode = col
+      of "name": nameNode = col
+      of "score_x2": generatedNode = col
+      else: discard
+
+    check parentIdNode != nil
+    check parentIdNode["ref_table"].getStr == "parent"
+    check parentIdNode["ref_on_delete"].getStr == "CASCADE"
+    check parentIdNode["ref_on_update"].getStr == "RESTRICT"
+
+    check nameNode != nil
+    check nameNode["default_expr"].getStr == "'anon'"
+
+    check generatedNode != nil
+    check generatedNode["generated_expr"].getStr == "(\"score\" * 2)"
+    check generatedNode["generated_stored"].getBool
+
+    check scratchNode["temporary"].getBool
+    check scratchNode["ddl"].getStr.contains("CREATE TEMP TABLE")
+
+    check decentdb_close(h) == 0
+
+  test "get_table_ddl returns canonical create table sql":
+    let h = openFresh("capi_json_table_ddl.ddb")
+    execDDL(h, "CREATE TABLE t (id INT PRIMARY KEY, score INT DEFAULT 1, doubled INT GENERATED ALWAYS AS (score * 2) STORED)")
+
+    var outLen: cint = 0
+    let p = decentdb_get_table_ddl(h, "t".cstring, addr outLen)
+    check p != nil
+    let ddl = takeCString(p, outLen)
+    decentdb_free(p)
+
+    check ddl.startsWith("CREATE TABLE")
+    check ddl.contains("\"score\" INT64 DEFAULT 1")
+    check ddl.contains("\"doubled\" INT64 GENERATED ALWAYS AS")
+    check ddl.contains("\"score\" * 2")
+
+    check decentdb_close(h) == 0
+
   test "get_table_columns_json with nil handle returns nil":
     let p = decentdb_get_table_columns_json(nil, "t".cstring, nil)
     check p == nil
@@ -1091,6 +1179,34 @@ suite "C API: JSON metadata":
     decentdb_free(p)
     check decentdb_close(h) == 0
 
+  test "get_table_columns_json includes defaults and generated metadata":
+    let h = openFresh("capi_json_cols_generated.ddb")
+    execDDL(h, "CREATE TABLE t (id INT PRIMARY KEY, score INT DEFAULT 5, doubled INT GENERATED ALWAYS AS (score * 2) STORED)")
+
+    var outLen: cint = 0
+    let p = decentdb_get_table_columns_json(h, "t".cstring, addr outLen)
+    check p != nil
+    let cols = parseJson(takeCString(p, outLen))
+    decentdb_free(p)
+
+    var scoreNode: JsonNode = nil
+    var doubledNode: JsonNode = nil
+    for col in cols:
+      case col["name"].getStr
+      of "score": scoreNode = col
+      of "doubled": doubledNode = col
+      else: discard
+
+    check scoreNode != nil
+    check scoreNode["default_expr"].getStr == "5"
+    check scoreNode["generated_stored"].getBool == false
+
+    check doubledNode != nil
+    check doubledNode["generated_expr"].getStr == "(\"score\" * 2)"
+    check doubledNode["generated_stored"].getBool
+
+    check decentdb_close(h) == 0
+
   test "list_indexes_json with nil returns nil and sets global error":
     let p = decentdb_list_indexes_json(nil, nil)
     check p == nil
@@ -1134,6 +1250,77 @@ suite "C API: JSON metadata":
     check "ix_name" in s
     check "trigram" in s
     decentdb_free(p)
+    check decentdb_close(h) == 0
+
+  test "list_views_info_json exposes temp and ddl metadata":
+    let h = openFresh("capi_json_views_info.ddb")
+    execDDL(h, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    execDDL(h, "CREATE VIEW user_names AS SELECT id, name FROM users")
+    execDDL(h, "CREATE TEMP VIEW temp_user_names AS SELECT name FROM users")
+
+    var outLen: cint = 0
+    let p = decentdb_list_views_info_json(h, addr outLen)
+    check p != nil
+    let arr = parseJson(takeCString(p, outLen))
+    decentdb_free(p)
+
+    var viewNode: JsonNode = nil
+    var tempNode: JsonNode = nil
+    for item in arr:
+      case item["name"].getStr
+      of "user_names": viewNode = item
+      of "temp_user_names": tempNode = item
+      else: discard
+
+    check viewNode != nil
+    check tempNode != nil
+    check viewNode["temporary"].getBool == false
+    check viewNode["sql_text"].getStr.contains("SELECT")
+    check viewNode["ddl"].getStr.startsWith("CREATE VIEW")
+    check tempNode["temporary"].getBool
+    check tempNode["ddl"].getStr.startsWith("CREATE TEMP VIEW")
+
+    check decentdb_close(h) == 0
+
+  test "list_triggers_json exposes trigger metadata and ddl":
+    let h = openFresh("capi_json_triggers.ddb")
+    execDDL(h, "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+    execDDL(h, "CREATE TABLE audit (msg TEXT)")
+    execDDL(h, "CREATE VIEW user_view AS SELECT id, name FROM users")
+    execDDL(h, "CREATE TRIGGER users_aiu AFTER INSERT OR UPDATE ON users FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit VALUES (''row_changed'')')")
+    execDDL(h, "CREATE TRIGGER user_view_ins INSTEAD OF INSERT ON user_view FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO users VALUES (1, ''via_view'')')")
+
+    var outLen: cint = 0
+    let p = decentdb_list_triggers_json(h, addr outLen)
+    check p != nil
+    let arr = parseJson(takeCString(p, outLen))
+    decentdb_free(p)
+
+    var tableTrig: JsonNode = nil
+    var viewTrig: JsonNode = nil
+    for item in arr:
+      case item["name"].getStr
+      of "users_aiu": tableTrig = item
+      of "user_view_ins": viewTrig = item
+      else: discard
+
+    check tableTrig != nil
+    check tableTrig["target_name"].getStr == "users"
+    check tableTrig["target_kind"].getStr == "table"
+    check tableTrig["timing"].getStr == "after"
+    check tableTrig["events_mask"].getInt > 0
+    check tableTrig["events"][0].getStr == "insert"
+    check tableTrig["events"][1].getStr == "update"
+    check tableTrig["action_sql"].getStr.contains("row_changed")
+    check tableTrig["ddl"].getStr.contains("AFTER INSERT OR UPDATE")
+
+    check viewTrig != nil
+    check viewTrig["target_name"].getStr == "user_view"
+    check viewTrig["target_kind"].getStr == "view"
+    check viewTrig["timing"].getStr == "instead_of"
+    check viewTrig["events"][0].getStr == "insert"
+    check viewTrig["ddl"].getStr.contains("INSTEAD OF INSERT")
+
     check decentdb_close(h) == 0
 
 # ---------------------------------------------------------------------------

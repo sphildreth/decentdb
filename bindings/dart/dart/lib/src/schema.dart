@@ -47,32 +47,59 @@ class Schema {
     }
   }
 
+  String _callStringByName(
+    String name,
+    Pointer<Utf8> Function(
+      Pointer<DecentdbDb>,
+      Pointer<Utf8>,
+      Pointer<Int32>,
+    )
+    fn,
+  ) {
+    final namePtr = name.toNativeUtf8();
+    final lenPtr = calloc<Int32>();
+    try {
+      final ptr = fn(_dbPtr, namePtr, lenPtr);
+      if (ptr == nullptr) {
+        _throwIfError();
+        return '';
+      }
+      final len = lenPtr.value;
+      final result = ptr.toDartString(length: len);
+      _bindings.free(ptr.cast<Void>());
+      return result;
+    } finally {
+      calloc.free(namePtr);
+      calloc.free(lenPtr);
+    }
+  }
+
   /// List all table names in the database.
   List<String> listTables() {
     final json = _callJsonFunc(_bindings.listTablesJson);
     return (jsonDecode(json) as List).cast<String>();
   }
 
+  /// List detailed metadata for all tables.
+  List<TableInfo> listTablesInfo() {
+    final json = _callJsonFunc(_bindings.listTablesInfoJson);
+    return (jsonDecode(json) as List)
+        .map((e) => TableInfo.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
   /// Get column metadata for a table or view.
   List<ColumnInfo> getTableColumns(String tableName) {
-    final namePtr = tableName.toNativeUtf8();
-    final lenPtr = calloc<Int32>();
-    try {
-      final ptr = _bindings.getTableColumnsJson(_dbPtr, namePtr, lenPtr);
-      if (ptr == nullptr) {
-        _throwIfError();
-        return [];
-      }
-      final len = lenPtr.value;
-      final json = ptr.toDartString(length: len);
-      _bindings.free(ptr.cast<Void>());
-      return (jsonDecode(json) as List)
-          .map((e) => ColumnInfo.fromJson(e as Map<String, dynamic>))
-          .toList();
-    } finally {
-      calloc.free(namePtr);
-      calloc.free(lenPtr);
-    }
+    final json = _callStringByName(tableName, _bindings.getTableColumnsJson);
+    return (jsonDecode(json) as List)
+        .map((e) => ColumnInfo.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Get canonical CREATE TABLE DDL for a table.
+  String? getTableDdl(String tableName) {
+    final result = _callStringByName(tableName, _bindings.getTableDdl);
+    return result.isEmpty ? null : result;
   }
 
   /// List all indexes in the database.
@@ -89,23 +116,25 @@ class Schema {
     return (jsonDecode(json) as List).cast<String>();
   }
 
-  /// Get the SQL text (DDL) for a view.
+  /// List detailed metadata for all views.
+  List<ViewInfo> listViewsInfo() {
+    final json = _callJsonFunc(_bindings.listViewsInfoJson);
+    return (jsonDecode(json) as List)
+        .map((e) => ViewInfo.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Get the canonical SELECT body for a view.
   String? getViewDdl(String viewName) {
-    final namePtr = viewName.toNativeUtf8();
-    final lenPtr = calloc<Int32>();
-    try {
-      final ptr = _bindings.getViewDdl(_dbPtr, namePtr, lenPtr);
-      if (ptr == nullptr) {
-        _throwIfError();
-        return null;
-      }
-      final len = lenPtr.value;
-      final result = ptr.toDartString(length: len);
-      _bindings.free(ptr.cast<Void>());
-      return result;
-    } finally {
-      calloc.free(namePtr);
-      calloc.free(lenPtr);
-    }
+    final result = _callStringByName(viewName, _bindings.getViewDdl);
+    return result.isEmpty ? null : result;
+  }
+
+  /// List detailed metadata for all triggers.
+  List<TriggerInfo> listTriggers() {
+    final json = _callJsonFunc(_bindings.listTriggersJson);
+    return (jsonDecode(json) as List)
+        .map((e) => TriggerInfo.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
 }
