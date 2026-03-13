@@ -7,7 +7,7 @@ packages:
       path: "../../dart"
       relative: true
     source: path
-    version: "1.6.1"
+    version: "1.7.0"
   ffi:
     dependency: transitive
     description:

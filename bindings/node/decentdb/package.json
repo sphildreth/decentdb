@@ -1,6 +1,6 @@
 {
   "name": "decentdb-native",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "private": true,
   "description": "DecentDB Node.js native addon (N-API) + thin JS wrapper",
   "main": "index.js",

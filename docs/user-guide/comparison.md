@@ -8,7 +8,7 @@ This comparison was written against:
 - SQLite `3.51.2` (sqlite3 CLI)
 - DuckDB `v1.4.3` (duckdb CLI)
 
-DecentDB is currently at **v1.6.1**. This document describes the current feature set and constraints; details may change as DecentDB continues to evolve.
+DecentDB is currently at **v1.7.0**. This document describes the current feature set and constraints; details may change as DecentDB continues to evolve.
 
 DecentDB is intentionally scoped around:
 - **Priority #1:** durable ACID writes (WAL-based)

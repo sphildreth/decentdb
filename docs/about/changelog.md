@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.0] - [unreleased]
+## [1.7.0] - 2026-03-13
 
 ### Added
 - **C API / Dart Binding**: Richer schema introspection surface for downstream tools. Added canonical table DDL retrieval (`decentdb_get_table_ddl` / `Schema.getTableDdl()`), detailed table/view listing APIs with `ddl` and `temporary` metadata, trigger listing metadata, table-level CHECK metadata, and richer column metadata including defaults, generated stored expressions, and FK actions. See ADR-0116.
@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Dart/Flutter Binding**: New Dart FFI package (`decentdb`) for Flutter desktop apps (Linux, macOS, Windows). High-level idiomatic API with `Database`, `Statement`, `Schema`, cursor paging, transactions, and full schema introspection. See ADR-0115.
 - **C API**: `decentdb_abi_version()` — returns the ABI version number for compatibility checking at load time.
-- **C API**: `decentdb_engine_version()` — returns the engine version string (e.g. "1.6.1").
+- **C API**: `decentdb_engine_version()` — returns the engine version string (e.g. "1.7.0").
 - **C API**: `decentdb_begin()`, `decentdb_commit()`, `decentdb_rollback()` — native transaction control functions, avoiding the overhead of prepare+step for transaction management.
 - **Dart**: Console example with paging, schema introspection, and EXPLAIN output.
 - **Dart**: Flutter desktop integration example with library bundling guidance.

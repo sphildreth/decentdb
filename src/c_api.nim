@@ -24,7 +24,7 @@ proc decentdb_abi_version*(): cint {.exportc, cdecl, dynlib.} =
   return cint(AbiVersion)
 
 proc decentdb_engine_version*(): cstring {.exportc, cdecl, dynlib.} =
-  ## Returns the DecentDB engine version string (e.g. "1.6.1").
+  ## Returns the DecentDB engine version string (e.g. "1.7.0").
   ## The returned pointer is a static string; do NOT free it.
   return cstring(DecentDBVersion)
 
