@@ -66,12 +66,13 @@ It targets a single process with **one writer** and **many concurrent readers** 
 | Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 
 ## Tools
-**[MehSQL](https://github.com/sphildreth/mehsql)** - Native cross platform DecentDB SQL Query tool.
+**[Decent Bench](https://github.com/sphildreth/decent-bench)** - Native cross platform DecentDB Bench SQL tool.
 
 ## Performance (at a glance)
 
 <p align="center">
-    <img src="benchmarks/embedded_compare/assets/decentdb-speedup.png" alt="Decent performance..." width="75%" />
+    <img src="benchmarks/embedded_compare/assets/decentdb-speedup.png" alt="Decent performance..." width="65%" />
+    <img src="benchmarks/embedded_compare/assets/decentdb-radar.png" alt="Decent radar compare..." width="65%" />
 </p>
 
 **How this chart is produced**
