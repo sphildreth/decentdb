@@ -86,7 +86,7 @@ You also need to add the bundle to `bundles.info` and start DBeaver once with `-
 1. Copy the jar into the app plugin directory:
 
     # From the DecentDB repo root
-    VERSION=1.6.1
+    VERSION=1.7.0
 
     sudo install -Dm644 \
       bindings/java/dbeaver-extension/build/libs/dbeaver-extension-${VERSION}.jar \

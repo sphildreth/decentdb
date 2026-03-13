@@ -104,7 +104,7 @@ class Database {
     return open(':memory:', libraryPath: libraryPath, bindings: bindings);
   }
 
-  /// The engine version string (e.g. "1.6.1").
+  /// The engine version string (e.g. "1.7.0").
   String get engineVersion {
     final ptr = _bindings.engineVersion();
     return ptr == nullptr ? 'unknown' : ptr.toDartString();

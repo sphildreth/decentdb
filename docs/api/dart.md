@@ -92,11 +92,25 @@ db.transaction(() {
 ```dart
 // Tables
 List<String> tables = db.schema.listTables();
+List<TableInfo> tableInfos = db.schema.listTablesInfo();
+String? tableDdl = db.schema.getTableDdl('users');
 
 // Column metadata
 List<ColumnInfo> cols = db.schema.getTableColumns('users');
 for (final col in cols) {
   print('${col.name} ${col.type} notNull=${col.notNull} pk=${col.primaryKey}');
+  print('  default=${col.defaultExpr} generated=${col.generatedExpr}');
+  if (col.refTable != null) {
+    print('  FK -> ${col.refTable}.${col.refColumn}');
+  }
+}
+
+for (final table in tableInfos) {
+  print('${table.name} temp=${table.temporary}');
+  print(table.ddl);
+  for (final check in table.checks) {
+    print('  CHECK ${check.name}: ${check.exprSql}');
+  }
 }
 
 // Indexes
@@ -104,8 +118,19 @@ List<IndexInfo> indexes = db.schema.listIndexes();
 
 // Views
 List<String> views = db.schema.listViews();
-String? ddl = db.schema.getViewDdl('my_view');
+List<ViewInfo> viewInfos = db.schema.listViewsInfo();
+String? viewSql = db.schema.getViewDdl('my_view'); // canonical SELECT body
+
+// Triggers
+List<TriggerInfo> triggers = db.schema.listTriggers();
+for (final trigger in triggers) {
+  print('${trigger.name} ${trigger.timing} ${trigger.events.join("|")} '
+      'on ${trigger.targetKind} ${trigger.targetName}');
+  print(trigger.ddl);
+}
 ```
+
+`ColumnInfo` includes default expressions, generated-column metadata, and FK action details. `TableInfo`, `ViewInfo`, and `TriggerInfo` expose canonical DDL plus temporary-object metadata.
 
 ## Supported Types
 

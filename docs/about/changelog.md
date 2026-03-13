@@ -5,6 +5,21 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-03-13
+
+### Added
+- **C API / Dart Binding**: Richer schema introspection surface for downstream tools. Added canonical table DDL retrieval (`decentdb_get_table_ddl` / `Schema.getTableDdl()`), detailed table/view listing APIs with `ddl` and `temporary` metadata, trigger listing metadata, table-level CHECK metadata, and richer column metadata including defaults, generated stored expressions, and FK actions. See ADR-0116.
+- **C API**: Prepared `WITH RECURSIVE` SELECT statements now execute correctly through `decentdb_step()` by materializing recursive CTEs before planning and opening the row cursor.
+
+### Changed
+- **Engine**: Lock-free WAL index check optimization. Fast path for page reads directly skips `wal.indexLock` acquisition by atomically checking if any pages are currently uncheckpointed. Reduces read p95 latency by ~20%.
+- **Engine**: B-tree Internal and Leaf indexes are now zero-allocation `object` sequences rather than `ref object` sequences to significantly improve memory access locality and avoid allocations during navigation and searching.
+- **Engine**: Inner workings of `hash join` now directly index off the cached right row list.
+- **Engine**: Eliminated closure overhead inside hot `insert` path inside `btree.nim`.
+- **Benchmarking**: Changed `nimble bench` and `bench_compare` tests to correctly build the engine with `-d:release --opt:speed` optimizations applied.
+
+### Fixed
+- **Engine / C API**: Prepared `CREATE TEMP TABLE` statements now allocate a real temp table root page, allowing inserts and selects against temp tables to work correctly within the creating connection while staying session-scoped.
 
 ## [1.6.1] - 2026-03-09
 
@@ -17,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Dart/Flutter Binding**: New Dart FFI package (`decentdb`) for Flutter desktop apps (Linux, macOS, Windows). High-level idiomatic API with `Database`, `Statement`, `Schema`, cursor paging, transactions, and full schema introspection. See ADR-0115.
 - **C API**: `decentdb_abi_version()` — returns the ABI version number for compatibility checking at load time.
-- **C API**: `decentdb_engine_version()` — returns the engine version string (e.g. "1.6.1").
+- **C API**: `decentdb_engine_version()` — returns the engine version string (e.g. "1.7.0").
 - **C API**: `decentdb_begin()`, `decentdb_commit()`, `decentdb_rollback()` — native transaction control functions, avoiding the overhead of prepare+step for transaction management.
 - **Dart**: Console example with paging, schema introspection, and EXPLAIN output.
 - **Dart**: Flutter desktop integration example with library bundling guidance.

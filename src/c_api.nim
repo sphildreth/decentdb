@@ -24,7 +24,7 @@ proc decentdb_abi_version*(): cint {.exportc, cdecl, dynlib.} =
   return cint(AbiVersion)
 
 proc decentdb_engine_version*(): cstring {.exportc, cdecl, dynlib.} =
-  ## Returns the DecentDB engine version string (e.g. "1.6.1").
+  ## Returns the DecentDB engine version string (e.g. "1.7.0").
   ## The returned pointer is a static string; do NOT free it.
   return cstring(DecentDBVersion)
 
@@ -95,6 +95,109 @@ proc decentdb_free*(p: pointer) {.exportc, cdecl, dynlib.} =
   if p != nil:
     deallocShared(p)
 
+proc columnInfoJson(col: Column): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %col.name
+  obj["type"] = %columnTypeSql(col)
+  obj["not_null"] = %col.notNull
+  obj["unique"] = %col.unique
+  obj["primary_key"] = %col.primaryKey
+  if col.refTable.len > 0:
+    obj["ref_table"] = %col.refTable
+  if col.refColumn.len > 0:
+    obj["ref_column"] = %col.refColumn
+  if col.refTable.len > 0 and col.refColumn.len > 0:
+    obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
+    obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
+  if col.defaultExpr.len > 0:
+    obj["default_expr"] = %col.defaultExpr
+  if col.generatedExpr.len > 0:
+    obj["generated_expr"] = %col.generatedExpr
+    obj["generated_stored"] = %true
+  else:
+    obj["generated_stored"] = %false
+  obj
+
+proc viewColumnInfoJson(name: string): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %name
+  obj["type"] = %"ANY"
+  obj["not_null"] = %false
+  obj["unique"] = %false
+  obj["primary_key"] = %false
+  obj["generated_stored"] = %false
+  obj
+
+proc checkInfoJson(checkDef: catalog.CheckConstraint): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %checkDef.name
+  obj["expr_sql"] = %checkDef.exprSql
+  obj
+
+proc indexInfoJson(idx: IndexMeta): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %idx.name
+  obj["table"] = %idx.table
+  var cols = newJArray()
+  for c in idx.columns:
+    cols.add(%c)
+  obj["columns"] = cols
+  obj["unique"] = %idx.unique
+  obj["kind"] = %(if idx.kind == ikBtree: "btree" else: "trigram")
+  obj["temporary"] = %idx.temporary
+  obj["ddl"] = %indexDdl(idx)
+  if idx.predicateSql.len > 0:
+    obj["predicate_sql"] = %idx.predicateSql
+  obj
+
+proc tableInfoJson(table: TableMeta): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %table.name
+  obj["temporary"] = %table.temporary
+  obj["ddl"] = %tableDdl(table)
+  var columns = newJArray()
+  for col in table.columns:
+    columns.add(columnInfoJson(col))
+  obj["columns"] = columns
+  var checks = newJArray()
+  for checkDef in table.checks:
+    checks.add(checkInfoJson(checkDef))
+  obj["checks"] = checks
+  obj
+
+proc viewInfoJson(view: ViewMeta): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %view.name
+  obj["temporary"] = %view.temporary
+  obj["sql_text"] = %view.sqlText
+  obj["ddl"] = %viewDdl(view)
+  var columnNames = newJArray()
+  for name in view.columnNames:
+    columnNames.add(%name)
+  obj["column_names"] = columnNames
+  var dependencies = newJArray()
+  for dep in view.dependencies:
+    dependencies.add(%dep)
+  obj["dependencies"] = dependencies
+  obj
+
+proc triggerInfoJson(trigger: TriggerMeta): JsonNode =
+  var obj = newJObject()
+  obj["name"] = %trigger.name
+  obj["target_name"] = %trigger.table
+  obj["target_kind"] = %triggerTargetKindName(trigger.eventsMask)
+  obj["timing"] = %triggerTimingName(trigger.eventsMask)
+  obj["events_mask"] = %trigger.eventsMask
+  obj["for_each_row"] = %true
+  obj["temporary"] = %trigger.temporary
+  obj["action_sql"] = %trigger.actionSql
+  obj["ddl"] = %triggerDdl(trigger)
+  var events = newJArray()
+  for name in triggerEventNames(trigger.eventsMask):
+    events.add(%name)
+  obj["events"] = events
+  obj
+
 proc decentdb_list_tables_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
   ## Returns a JSON array of table names, e.g. ["users","items"].
   ## Caller must free returned pointer with `decentdb_free`.
@@ -105,13 +208,34 @@ proc decentdb_list_tables_json*(p: pointer, out_len: ptr cint): cstring {.export
   dbh.clearError()
 
   var names: seq[string] = @[]
-  for name in dbh.db.catalog.tables.keys:
-    names.add(name)
+  for _, table in dbh.db.catalog.tables:
+    names.add(table.name)
   names.sort(system.cmp)
 
   var arr = newJArray()
   for name in names:
     arr.add(%name)
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
+proc decentdb_list_tables_info_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of detailed table metadata objects.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var tables: seq[TableMeta] = @[]
+  for _, table in dbh.db.catalog.tables:
+    tables.add(table)
+  tables.sort(proc(a, b: TableMeta): int = cmp(a.name, b.name))
+
+  var arr = newJArray()
+  for table in tables:
+    arr.add(tableInfoJson(table))
   let payload = $arr
   clearGlobalError()
   return allocSharedCString(payload, out_len)
@@ -126,8 +250,8 @@ proc decentdb_list_views_json*(p: pointer, out_len: ptr cint): cstring {.exportc
   dbh.clearError()
 
   var names: seq[string] = @[]
-  for name in dbh.db.catalog.views.keys:
-    names.add(name)
+  for _, view in dbh.db.catalog.views:
+    names.add(view.name)
   names.sort(system.cmp)
 
   var arr = newJArray()
@@ -137,8 +261,29 @@ proc decentdb_list_views_json*(p: pointer, out_len: ptr cint): cstring {.exportc
   clearGlobalError()
   return allocSharedCString(payload, out_len)
 
+proc decentdb_list_views_info_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of detailed view metadata objects.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var views: seq[ViewMeta] = @[]
+  for _, view in dbh.db.catalog.views:
+    views.add(view)
+  views.sort(proc(a, b: ViewMeta): int = cmp(a.name, b.name))
+
+  var arr = newJArray()
+  for view in views:
+    arr.add(viewInfoJson(view))
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
 proc decentdb_get_view_ddl*(p: pointer, view_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
-  ## Returns the SQL text for a view.
+  ## Returns the canonical SELECT body for a view.
   ## Caller must free returned pointer with `decentdb_free`.
   if p == nil:
     setGlobalError(ERR_INTERNAL, "NULL db handle")
@@ -152,16 +297,36 @@ proc decentdb_get_view_ddl*(p: pointer, view_utf8: cstring, out_len: ptr cint): 
   dbh.clearError()
   let viewName = $view_utf8
 
-  if dbh.db.catalog.views.hasKey(viewName):
-    let v = dbh.db.catalog.views[viewName]
-    let payload = v.sqlText
-    return allocSharedCString(payload, out_len)
+  let viewRes = dbh.db.catalog.getView(viewName)
+  if viewRes.ok:
+    return allocSharedCString(viewRes.value.sqlText, out_len)
   else:
-    dbh.setError(ERR_SQL, "View not found: " & viewName)
+    dbh.setError(viewRes.err.code, viewRes.err.message & ": " & viewName)
+    return nil
+
+proc decentdb_get_table_ddl*(p: pointer, table_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns the canonical CREATE TABLE DDL for a table.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
+    return nil
+  if table_utf8 == nil:
+    let dbh = cast[DbHandle](p)
+    dbh.setError(ERR_INTERNAL, "NULL table name")
+    return nil
+
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+  let tableName = $table_utf8
+  let tableRes = dbh.db.catalog.getTable(tableName)
+  if tableRes.ok:
+    return allocSharedCString(tableDdl(tableRes.value), out_len)
+  else:
+    dbh.setError(tableRes.err.code, tableRes.err.message & ": " & tableName)
     return nil
 
 proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
-  ## Returns a JSON array of column metadata objects for a given table.
+  ## Returns a JSON array of column metadata objects for a given table or view.
   ## Caller must free returned pointer with `decentdb_free`.
   if p == nil:
     setGlobalError(ERR_INTERNAL, "NULL db handle")
@@ -176,36 +341,35 @@ proc decentdb_get_table_columns_json*(p: pointer, table_utf8: cstring, out_len: 
   let tableName = $table_utf8
   var arr = newJArray()
 
-  if dbh.db.catalog.tables.hasKey(tableName):
-    let t = dbh.db.catalog.tables[tableName]
-    for col in t.columns:
-      var obj = newJObject()
-      obj["name"] = %col.name
-      obj["type"] = %columnTypeToText(col.kind)
-      obj["not_null"] = %col.notNull
-      obj["unique"] = %col.unique
-      obj["primary_key"] = %col.primaryKey
-      if col.refTable.len > 0:
-        obj["ref_table"] = %col.refTable
-      if col.refColumn.len > 0:
-        obj["ref_column"] = %col.refColumn
-      if col.refTable.len > 0 and col.refColumn.len > 0:
-        obj["ref_on_delete"] = %(if col.refOnDelete.len > 0: col.refOnDelete else: "NO ACTION")
-        obj["ref_on_update"] = %(if col.refOnUpdate.len > 0: col.refOnUpdate else: "NO ACTION")
-      arr.add(obj)
-  elif dbh.db.catalog.views.hasKey(tableName):
-    let v = dbh.db.catalog.views[tableName]
-    for cname in v.columnNames:
-      var obj = newJObject()
-      obj["name"] = %cname
-      obj["type"] = %"ANY"
-      obj["not_null"] = %false
-      obj["unique"] = %false
-      obj["primary_key"] = %false
-      arr.add(obj)
+  let tableRes = dbh.db.catalog.getTable(tableName)
+  if tableRes.ok:
+    for col in tableRes.value.columns:
+      arr.add(columnInfoJson(col))
   else:
-    dbh.setError(ERR_SQL, "Table or View not found: " & tableName)
+    let viewRes = dbh.db.catalog.getView(tableName)
+    if viewRes.ok:
+      for cname in viewRes.value.columnNames:
+        arr.add(viewColumnInfoJson(cname))
+    else:
+      dbh.setError(ERR_SQL, "Table or View not found: " & tableName)
+      return nil
+
+  let payload = $arr
+  clearGlobalError()
+  return allocSharedCString(payload, out_len)
+
+proc decentdb_list_triggers_json*(p: pointer, out_len: ptr cint): cstring {.exportc, cdecl, dynlib.} =
+  ## Returns a JSON array of trigger metadata objects.
+  ## Caller must free returned pointer with `decentdb_free`.
+  if p == nil:
+    setGlobalError(ERR_INTERNAL, "NULL db handle")
     return nil
+  let dbh = cast[DbHandle](p)
+  dbh.clearError()
+
+  var arr = newJArray()
+  for trigger in dbh.db.catalog.listTriggers():
+    arr.add(triggerInfoJson(trigger))
 
   let payload = $arr
   clearGlobalError()
@@ -220,18 +384,14 @@ proc decentdb_list_indexes_json*(p: pointer, out_len: ptr cint): cstring {.expor
   let dbh = cast[DbHandle](p)
   dbh.clearError()
 
+  var indexes: seq[IndexMeta] = @[]
+  for _, idx in dbh.db.catalog.indexes:
+    indexes.add(idx)
+  indexes.sort(proc(a, b: IndexMeta): int = cmp(a.name, b.name))
+
   var arr = newJArray()
-  for name, idx in dbh.db.catalog.indexes:
-    var obj = newJObject()
-    obj["name"] = %idx.name
-    obj["table"] = %idx.table
-    var cols = newJArray()
-    for c in idx.columns:
-      cols.add(%c)
-    obj["columns"] = cols
-    obj["unique"] = %idx.unique
-    obj["kind"] = %(if idx.kind == ikBtree: "btree" else: "trigram")
-    arr.add(obj)
+  for idx in indexes:
+    arr.add(indexInfoJson(idx))
 
   let payload = $arr
   clearGlobalError()
@@ -845,7 +1005,36 @@ proc decentdb_step*(p: pointer): cint {.exportc, cdecl, dynlib.} =
         gEvalCatalog = nil
 
     if h.cursor == nil:
-      let curRes = openRowCursor(db.pager, db.catalog, h.plan, h.params)
+      var executionPlan = h.plan
+      if executionPlan == nil:
+        let planRes = planner.plan(db.catalog, h.statement)
+        if not planRes.ok:
+          h.db.setError(planRes.err.code, planRes.err.message)
+          return -1
+        executionPlan = planRes.value
+
+      var hasRecursiveCte = false
+      for isRecursive in h.statement.cteRecursive:
+        if isRecursive:
+          hasRecursiveCte = true
+          break
+      if hasRecursiveCte:
+        let cteRes = materializeRecursiveCtes(
+          db.pager,
+          db.catalog,
+          h.statement,
+          h.params,
+        )
+        if not cteRes.ok:
+          h.db.setError(cteRes.err.code, cteRes.err.message)
+          return -1
+        let planRes = planner.plan(db.catalog, h.statement, cteRes.value)
+        if not planRes.ok:
+          h.db.setError(planRes.err.code, planRes.err.message)
+          return -1
+        executionPlan = planRes.value
+
+      let curRes = openRowCursor(db.pager, db.catalog, executionPlan, h.params)
       if not curRes.ok:
         h.db.setError(curRes.err.code, curRes.err.message)
         return -1

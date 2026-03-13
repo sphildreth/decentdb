@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decentdb"
-version = "1.6.1"
+version = "1.7.0"
 description = "Python DB-API 2.0 driver and SQLAlchemy dialect for DecentDB"
 readme = "README.md"
 authors = [

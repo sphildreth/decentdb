@@ -90,6 +90,7 @@ type
     warnings*: seq[string]
     # Memory tracking for WAL index
     indexMemoryBytes*: int64
+    hasIndex*: Atomic[bool]
     checkpointMemoryThreshold*: int64  # Trigger checkpoint when index exceeds this
     # Optimization: Reusable buffer for frame encoding to avoid allocations
     frameBuffer*: seq[byte]
@@ -359,6 +360,7 @@ proc newWal*(vfs: Vfs, path: string, pageSize: uint32 = DefaultPageSize): Result
     totalReadersAborted: 0,
     totalWarningsIssued: 0
   )
+  wal.hasIndex.store(false, moRelaxed)
   initLock(wal.lock)
   initLock(wal.indexLock)
   initLock(wal.readerLock)
@@ -834,6 +836,7 @@ proc checkpoint*(wal: Wal, pager: Pager): Result[uint64] =
     acquire(wal.lock)
     acquire(wal.indexLock)
     wal.index.clear()
+    wal.hasIndex.store(false, moRelease)
     wal.dirtySinceCheckpoint.clear()
     release(wal.indexLock)
     wal.endOffset = WalHeaderSize
@@ -925,6 +928,7 @@ proc recover*(wal: Wal): Result[Void] =
   ## Processes all frames to rebuild the index and validate invariants.
   ## Checkpoint frames are tracked to establish the safe recovery point.
   wal.index.clear()
+  wal.hasIndex.store(false, moRelease)
   wal.dirtySinceCheckpoint.clear()
   var pending: seq[(PageId, uint64, int64)] = @[]
   var lastCommit: uint64 = 0
@@ -958,6 +962,8 @@ proc recover*(wal: Wal): Result[Void] =
     of wfCommit:
       commitCount.inc
       var commitMeta: seq[(PageId, WalIndexEntry)] = @[]
+      if pending.len > 0:
+        wal.hasIndex.store(true, moRelease)
       for entry in pending:
         if not wal.index.hasKey(entry[0]):
           wal.index[entry[0]] = @[]
@@ -1124,6 +1130,9 @@ proc findBestEntryBinarySearch(entries: seq[WalIndexEntry], snapshot: uint64): O
   some((lsn: best.lsn, offset: best.offset))
 
 proc getPageAtOrBefore*(wal: Wal, pageId: PageId, snapshot: uint64): Option[seq[byte]] =
+  if not wal.hasIndex.load(moAcquire):
+    return none(seq[byte])
+  
   acquire(wal.indexLock)
   defer:
     release(wal.indexLock)
@@ -1439,6 +1448,9 @@ proc commit*(writer: WalWriter): Result[uint64] =
     let indexStart = getMonoTime()
   acquire(writer.wal.indexLock)
   
+  if writer.flushed.len > 0 or writer.pageMeta.len > 0:
+    writer.wal.hasIndex.store(true, moRelease)
+
   # Add flushed pages to index first
   for pageId, entry in writer.flushed:
     if not writer.wal.index.hasKey(pageId):

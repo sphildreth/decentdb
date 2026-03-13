@@ -99,6 +99,9 @@ class ColumnInfo {
   final bool notNull;
   final bool unique;
   final bool primaryKey;
+  final String? defaultExpr;
+  final String? generatedExpr;
+  final bool generatedStored;
   final String? refTable;
   final String? refColumn;
   final String? refOnDelete;
@@ -110,6 +113,9 @@ class ColumnInfo {
     required this.notNull,
     required this.unique,
     required this.primaryKey,
+    this.defaultExpr,
+    this.generatedExpr,
+    this.generatedStored = false,
     this.refTable,
     this.refColumn,
     this.refOnDelete,
@@ -123,6 +129,9 @@ class ColumnInfo {
       notNull: json['not_null'] as bool? ?? false,
       unique: json['unique'] as bool? ?? false,
       primaryKey: json['primary_key'] as bool? ?? false,
+      defaultExpr: json['default_expr'] as String?,
+      generatedExpr: json['generated_expr'] as String?,
+      generatedStored: json['generated_stored'] as bool? ?? false,
       refTable: json['ref_table'] as String?,
       refColumn: json['ref_column'] as String?,
       refOnDelete: json['ref_on_delete'] as String?,
@@ -133,7 +142,8 @@ class ColumnInfo {
   @override
   String toString() =>
       'ColumnInfo($name $type${notNull ? " NOT NULL" : ""}'
-      '${primaryKey ? " PK" : ""}${unique ? " UNIQUE" : ""})';
+      '${primaryKey ? " PK" : ""}${unique ? " UNIQUE" : ""}'
+      '${generatedStored ? " GENERATED" : ""})';
 }
 
 /// Metadata for an index.
@@ -143,6 +153,9 @@ class IndexInfo {
   final List<String> columns;
   final bool unique;
   final String kind;
+  final bool temporary;
+  final String? predicateSql;
+  final String? ddl;
 
   const IndexInfo({
     required this.name,
@@ -150,6 +163,9 @@ class IndexInfo {
     required this.columns,
     required this.unique,
     required this.kind,
+    this.temporary = false,
+    this.predicateSql,
+    this.ddl,
   });
 
   factory IndexInfo.fromJson(Map<String, dynamic> json) {
@@ -159,11 +175,149 @@ class IndexInfo {
       columns: (json['columns'] as List).cast<String>(),
       unique: json['unique'] as bool? ?? false,
       kind: json['kind'] as String? ?? 'btree',
+      temporary: json['temporary'] as bool? ?? false,
+      predicateSql: json['predicate_sql'] as String?,
+      ddl: json['ddl'] as String?,
     );
   }
 
   @override
   String toString() =>
       'IndexInfo($name on $table(${columns.join(", ")}) $kind'
-      '${unique ? " UNIQUE" : ""})';
+      '${unique ? " UNIQUE" : ""}${temporary ? " TEMP" : ""})';
+}
+
+/// Metadata for a table-level CHECK constraint.
+class CheckConstraintInfo {
+  final String name;
+  final String exprSql;
+
+  const CheckConstraintInfo({
+    required this.name,
+    required this.exprSql,
+  });
+
+  factory CheckConstraintInfo.fromJson(Map<String, dynamic> json) {
+    return CheckConstraintInfo(
+      name: json['name'] as String? ?? '',
+      exprSql: json['expr_sql'] as String,
+    );
+  }
+
+  @override
+  String toString() =>
+      name.isEmpty ? 'CHECK ($exprSql)' : 'CHECK $name ($exprSql)';
+}
+
+/// Detailed metadata for a table.
+class TableInfo {
+  final String name;
+  final bool temporary;
+  final String ddl;
+  final List<ColumnInfo> columns;
+  final List<CheckConstraintInfo> checks;
+
+  const TableInfo({
+    required this.name,
+    required this.temporary,
+    required this.ddl,
+    required this.columns,
+    required this.checks,
+  });
+
+  factory TableInfo.fromJson(Map<String, dynamic> json) {
+    return TableInfo(
+      name: json['name'] as String,
+      temporary: json['temporary'] as bool? ?? false,
+      ddl: json['ddl'] as String,
+      columns: (json['columns'] as List? ?? const [])
+          .map((e) => ColumnInfo.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      checks: (json['checks'] as List? ?? const [])
+          .map((e) => CheckConstraintInfo.fromJson(e as Map<String, dynamic>))
+          .toList(),
+    );
+  }
+
+  @override
+  String toString() => 'TableInfo($name${temporary ? " TEMP" : ""})';
+}
+
+/// Detailed metadata for a view.
+class ViewInfo {
+  final String name;
+  final bool temporary;
+  final String sqlText;
+  final String ddl;
+  final List<String> columnNames;
+  final List<String> dependencies;
+
+  const ViewInfo({
+    required this.name,
+    required this.temporary,
+    required this.sqlText,
+    required this.ddl,
+    required this.columnNames,
+    required this.dependencies,
+  });
+
+  factory ViewInfo.fromJson(Map<String, dynamic> json) {
+    return ViewInfo(
+      name: json['name'] as String,
+      temporary: json['temporary'] as bool? ?? false,
+      sqlText: json['sql_text'] as String,
+      ddl: json['ddl'] as String,
+      columnNames: (json['column_names'] as List? ?? const []).cast<String>(),
+      dependencies: (json['dependencies'] as List? ?? const []).cast<String>(),
+    );
+  }
+
+  @override
+  String toString() => 'ViewInfo($name${temporary ? " TEMP" : ""})';
+}
+
+/// Detailed metadata for a trigger.
+class TriggerInfo {
+  final String name;
+  final String targetName;
+  final String targetKind;
+  final String timing;
+  final List<String> events;
+  final int eventsMask;
+  final bool forEachRow;
+  final bool temporary;
+  final String actionSql;
+  final String ddl;
+
+  const TriggerInfo({
+    required this.name,
+    required this.targetName,
+    required this.targetKind,
+    required this.timing,
+    required this.events,
+    required this.eventsMask,
+    required this.forEachRow,
+    required this.temporary,
+    required this.actionSql,
+    required this.ddl,
+  });
+
+  factory TriggerInfo.fromJson(Map<String, dynamic> json) {
+    return TriggerInfo(
+      name: json['name'] as String,
+      targetName: json['target_name'] as String,
+      targetKind: json['target_kind'] as String,
+      timing: json['timing'] as String,
+      events: (json['events'] as List? ?? const []).cast<String>(),
+      eventsMask: json['events_mask'] as int? ?? 0,
+      forEachRow: json['for_each_row'] as bool? ?? true,
+      temporary: json['temporary'] as bool? ?? false,
+      actionSql: json['action_sql'] as String,
+      ddl: json['ddl'] as String,
+    );
+  }
+
+  @override
+  String toString() =>
+      'TriggerInfo($name ${timing.toUpperCase()} ${events.join("|")} ON $targetName)';
 }

@@ -1,4 +1,4 @@
-version       = "1.6.1"
+version       = "1.7.0"
 author        = "DecentDB contributors"
 description   = "DecentDB engine"
 license       = "Apache-2.0"
@@ -118,10 +118,10 @@ task lint, "Static checks for Nim + Python":
   exec "python -m compileall tests/harness"
 
 task bench, "Run microbenchmarks":
-  exec "nim c -r tests/bench/bench.nim -- tests/bench/results.json"
+  exec "nim c -d:release --opt:speed -r tests/bench/bench.nim -- tests/bench/results.json"
 
 task bench_compare, "Run microbenchmarks and compare to baseline":
-  exec "nim c -r tests/bench/bench.nim -- tests/bench/results.json"
+  exec "nim c -d:release --opt:speed -r tests/bench/bench.nim -- tests/bench/results.json"
   exec "python tests/bench/compare_bench.py tests/bench/results.json tests/bench/baseline.json tests/bench/thresholds.json"
 
 task bench_large, "Run large/concurrency benchmarks (may be slow)":
