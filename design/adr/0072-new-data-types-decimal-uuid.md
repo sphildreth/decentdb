@@ -43,7 +43,7 @@ Implementation constraint (v1): DECIMAL precision is limited to what fits in sig
 
 ### References
 
-- Catalog type parsing: `parseColumnType()` in src/catalog/catalog.nim
-- Record encoding: src/record/record.nim
+- Catalog type parsing: `parseColumnType()` in src/catalog/catalog.rs
+- Record encoding: src/record/record.rs
 - Error handling strategy: design/adr/0010-error-handling-strategy.md
 - Snapshot isolation constraints: design/adr/0023-isolation-level-specification.md

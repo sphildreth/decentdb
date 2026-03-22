@@ -108,16 +108,16 @@ Python Application
           ↓
       DecentDB.Native (ctypes/cffi or CPython extension)
           ↓
-      DecentDB (Nim engine, direct file I/O)
+      DecentDB (Rust engine, direct file I/O)
 ```
 
 ---
 
-## Phase 1: Native C API (Nim)
+## Phase 1: Native C API (Rust)
 
 ### Requirements
 
-Expose a C-compatible API from the Nim DecentDB engine suitable for Python bindings.
+Expose a C-compatible API from the Rust DecentDB engine suitable for Python bindings.
 
 **Performance-first SELECT requirement:** Provide a forward-only, streaming cursor API so the Python driver can implement DB-API cursor iteration without materializing whole result sets.
 
@@ -186,7 +186,7 @@ int decentdb_fetch_batch(
 
 2. **Row view API**: one call returns a pointer to a row structure describing all columns.
 
-Either approach should preserve the “borrowed view” lifetime model and allow the Python driver to decode values with minimal crossings.
+Either approach should preserve the “borrowed view” lifetime model and allow the Python driver to decode values with mirustal crossings.
 
 ### FFI Ownership + Lifetime Rules
 
@@ -203,7 +203,7 @@ Either approach should preserve the “borrowed view” lifetime model and allow
 
 Implement a DB-API 2.0 compatible driver (PEP 249) usable by SQLAlchemy.
 
-Minimum surface:
+Mirustum surface:
 - `connect(...) -> Connection`
 - `Connection.cursor() -> Cursor`
 - `Cursor.execute(sql, params=None)`
@@ -403,7 +403,7 @@ Parameters (illustrative):
 
 3. **Fast decoding**
    - decode TEXT via `PyUnicode_DecodeUTF8` (C-extension) or `bytes.decode('utf-8')` with buffer reuse
-   - minimize intermediate allocations
+   - mirustize intermediate allocations
 
 4. **Row materialization control**
    - provide tuple rows for Core queries

@@ -14,7 +14,7 @@ Use an atomic reader reference counter with epoch-based cleanup to coordinate ch
 ### Mechanism
 
 #### 1. Atomic Reader Counter
-```nim
+```rust
 type CheckpointState = object
   active_readers: AtomicU32   # Number of active read transactions
   checkpoint_epoch: AtomicU64  # Monotonically increasing epoch
@@ -22,7 +22,7 @@ type CheckpointState = object
 ```
 
 #### 2. Reader Lifecycle
-```nim
+```rust
 proc begin_read_txn(db: Database): ReadTransaction =
   # Increment counter atomically
   db.checkpoint_state.active_readers.fetch_add(1, Ordering.SeqCst)
@@ -40,7 +40,7 @@ proc end_read_txn(txn: ReadTransaction) =
 ```
 
 #### 3. Checkpoint Protocol
-```nim
+```rust
 proc checkpoint(db: Database) =
   # 1. Set pending flag (blocks new write transactions)
   db.checkpoint_state.checkpoint_pending.store(true, Ordering.SeqCst)

@@ -20,7 +20,7 @@ Common patterns affected:
 
 ## Decision
 
-Add SQLite-compatible type affinity coercion to `compareValues` in `src/exec/exec.nim`. The rules are:
+Add SQLite-compatible type affinity coercion to `compareValues` in `src/exec/exec.rs`. The rules are:
 
 1. **INTEGER vs TEXT**: Try to parse the TEXT as an integer. If successful, compare as integers. Otherwise, INTEGER < TEXT.
 2. **FLOAT64 vs TEXT**: Try to parse the TEXT as a float. If successful, compare as floats. Otherwise, FLOAT64 < TEXT.

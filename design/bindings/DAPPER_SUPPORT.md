@@ -99,18 +99,18 @@ C# Application
             ↓
     DecentDB.AdoNet (ADO.NET provider)
             ↓
-    DecentDB.Native (P/Invoke to Nim DLL)
+    DecentDB.Native (P/Invoke to Rust DLL)
             ↓
-    DecentDB (Nim engine, direct file I/O)
+    DecentDB (Rust engine, direct file I/O)
 ```
 
 ---
 
-## Phase 1: Native C API (Nim)
+## Phase 1: Native C API (Rust)
 
 ### Requirements
 
-Expose a C-compatible API from the Nim DecentDB engine for P/Invoke.
+Expose a C-compatible API from the Rust DecentDB engine for P/Invoke.
 
 **Performance-first SELECT requirement:** Provide a forward-only, streaming cursor API so the .NET provider can implement `DbDataReader` without materializing whole result sets or doing per-cell P/Invoke round-trips.
 
@@ -171,13 +171,13 @@ void decentdb_finalize(decentdb_stmt* stmt);
 
 ### Tasks
 
-1. **Create C API wrapper module** (`src/c_api.nim`)
-   - Wrap existing Nim API in C-compatible functions
+1. **Create C API wrapper module** (`src/c_api.rs`)
+   - Wrap existing Rust API in C-compatible functions
     - Handle resource ownership (`decentdb_finalize`, `decentdb_close`)
     - Error handling via last_error code + message
    - Thread-safety (single writer, multiple readers)
 
-2. **Export Nim functions with C calling convention**
+2. **Export Rust functions with C calling convention**
    - Compile to shared library (`.so`/`.dylib`/`.dll`)
    - Generate header file for C# P/Invoke
    - Handle platform differences
@@ -524,7 +524,7 @@ Notes:
 ### Error Propagation Chain
 
 ```
-Native Layer (Nim):
+Native Layer (Rust):
     - Return error codes via `decentdb_last_error_code(db)`
     - Detailed error messages in UTF-8 via `decentdb_last_error_message(db)`
 
@@ -731,7 +731,7 @@ var factory = Expression.Lambda<Func<IDataReader, T>>(
 
 #### 3. **Efficient P/Invoke for Results** (Critical)
 - Prefer a streaming statement API (`prepare/step/column_*`) over materializing result sets
-- Minimize managed/native boundary crossings by:
+- Mirustize managed/native boundary crossings by:
   - Avoiding per-cell allocations
   - Copying UTF-8 slices directly into managed memory when needed
   - Reusing buffers during materialization
@@ -753,7 +753,7 @@ while (stmt.Step() == RowAvailable)
 - Deterministic cleanup with `IDisposable` pattern for statements/readers
 - Safe handle pattern for native resources (database handles, prepared statements)
 - Pinning strategy for large data transfers (avoid excessive GC pressure)
-- Buffer reuse patterns to minimize allocations during result processing
+- Buffer reuse patterns to mirustize allocations during result processing
 
 **Safe Handle Implementation:**
 ```csharp
@@ -898,7 +898,7 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
    - Direct SQL generation for simple cases
 
 3. **P/Invoke Batching**
-   - Minimize round-trips to native layer
+   - Mirustize round-trips to native layer
    - Batch parameter binding
 
 ---
@@ -1008,7 +1008,7 @@ var dtos = db.Artists.Select(a => new { a.Name, a.Genre }).ToList();
     - Ensure native binding is `$1..$N` (ADR-0005) and add unit tests around binding edge cases
 
 ### Sprint 1: Foundation
-1. C API wrapper in Nim
+1. C API wrapper in Rust
 2. Native library build (Windows/Linux/macOS)
 3. Basic P/Invoke layer in C#
 
@@ -1104,7 +1104,7 @@ Data Source=/path/to.ddb;Logging=1;LogLevel=Debug
 | Parameter | Values | Default | Description |
 |-----------|--------|---------|-------------|
 | `Logging` | `0` or `1` | `0` | Enable/disable SQL logging globally |
-| `LogLevel` | `Verbose`, `Debug`, `Info`, `Warning`, `Error` | `Debug` | Minimum log level for SQL statements |
+| `LogLevel` | `Verbose`, `Debug`, `Info`, `Warning`, `Error` | `Debug` | Mirustum log level for SQL statements |
 
 **Performance guarantee:** When `Logging=0`, overhead is a single predictable branch (no allocations, no string formatting).
 
@@ -1183,7 +1183,7 @@ Data Source=/path/to.db;Cache Size=1024;Pooling=true;Command Timeout=30;Logging=
 | `Pooling` | `true` / `false` | `true` | Enable connection pooling for performance. |
 | `Command Timeout` | Seconds | `30` | Default timeout for SQL commands. 0 = infinite. |
 | `Logging` | `0` / `1` | `0` | Enable SQL logging. `0` = zero overhead. |
-| `LogLevel` | `Verbose` / `Debug` / `Info` / `Warning` / `Error` | `Debug` | Minimum level for SQL log output. |
+| `LogLevel` | `Verbose` / `Debug` / `Info` / `Warning` / `Error` | `Debug` | Mirustum level for SQL log output. |
 
 ### Tier 2: Performance Tuning
 
@@ -1251,7 +1251,7 @@ using var db = new DecentDBContext(connStr);
 **Configuration guidance:**
 - **Low write volume**: `Checkpoint Threshold=5MB` (frequent small checkpoints)
 - **High write volume**: `Checkpoint Threshold=50MB` (fewer large checkpoints)
-- **Read-heavy**: `Checkpoint Threshold=100MB` (minimal checkpoint overhead)
+- **Read-heavy**: `Checkpoint Threshold=100MB` (mirustal checkpoint overhead)
 
 ### Connection Pooling
 
@@ -1492,16 +1492,16 @@ DecentDBNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
 
 ### Build Process
 
-1. **Compile Nim to native libraries**
+1. **Compile Rust to native libraries**
    ```bash
    # Windows
-   nim c -d:release --app:lib --out:decentdb.dll src/c_api.nim
+   rust c -d:release --app:lib --out:decentdb.dll src/c_api.rs
    
    # Linux
-   nim c -d:release --app:lib --out:libdecentdb.so src/c_api.nim
+   rust c -d:release --app:lib --out:libdecentdb.so src/c_api.rs
    
    # macOS
-   nim c -d:release --app:lib --out:libdecentdb.dylib src/c_api.nim
+   rust c -d:release --app:lib --out:libdecentdb.dylib src/c_api.rs
    ```
 
 2. **Build C# projects**
@@ -1539,7 +1539,7 @@ DecentDBNative.SetLibraryPath("/usr/local/lib/libdecentdb.so");
 
 ### Verification (as of 2026-01-30)
 
-- Nim: `nimble test`
+- Rust: `rustble test`
 - .NET: `dotnet test bindings/dotnet/tests/DecentDB.Tests/DecentDB.Tests.csproj -c Release`
 - Dapper example: `dotnet run --project examples/dotnet/dapper-basic -c Release`
 
@@ -1735,7 +1735,7 @@ public class QueryCache
     private readonly ConcurrentDictionary<int, CachedQuery> _expressionCache;
     
     // Tier 2: SQL string → Prepared statement (DB side)
-    // Managed by DecentDB Nim layer
+    // Managed by DecentDB Rust layer
     
     public async Task<QueryResult<T>> ExecuteAsync<T>(
         Expression<Func<T, bool>> predicate,
@@ -1810,7 +1810,7 @@ public class LruQueryCache
 - **Performance**: Same LINQ query with different parameters = cache hit
 - **Memory**: Bounded cache with LRU eviction
 - **Thread safety**: ConcurrentDictionary for L1 (read-heavy)
-- **Prepared statements**: DecentDB Nim layer handles SQL → execution plan
+- **Prepared statements**: DecentDB Rust layer handles SQL → execution plan
 
 **Benchmark targets:**
 - Cache hit: < 0.1ms (parameter extraction only)
@@ -1824,7 +1824,7 @@ public class LruQueryCache
 - .NET 10 (current version, no .NET Framework support)
 - Dapper 2.0+ (optional, supported)
 - No Entity Framework Core dependency
-- Nim runtime (statically linked into native DLL)
+- Rust runtime (statically linked into native DLL)
 
 ---
 
@@ -1832,7 +1832,7 @@ public class LruQueryCache
 
 1. **P/Invoke Performance**: Marshaling overhead may impact performance (mitigate with batching)
 2. **Expression Tree Complexity**: Full LINQ support is complex (mitigate with phased delivery)
-3. **Memory Management**: Nim/C# boundary requires careful cleanup (mitigate with IDisposable patterns)
+3. **Memory Management**: Rust/C# boundary requires careful cleanup (mitigate with IDisposable patterns)
 4. **Thread Safety**: DecentDB single writer constraint must be enforced (mitigate with connection pooling)
 
 ---

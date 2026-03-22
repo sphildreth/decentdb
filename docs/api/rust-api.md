@@ -1,10 +1,10 @@
-# Nim API Reference
+# Rust API Reference
 
-DecentDB's native Nim API for embedded applications.
+DecentDB's native Rust API for embedded applications.
 
 ## Opening a Database
 
-```nim
+```rust
 import decentdb/engine
 
 # Open with default cache (1024 pages = 4MB)
@@ -21,7 +21,7 @@ let db2 = openDb("myapp.ddb", cachePages = 4096)  # 16MB cache
 
 Use `:memory:` to create an ephemeral, isolated in-memory database — ideal for caching, testing, and temporary workloads:
 
-```nim
+```rust
 let db = openDb(":memory:").value
 
 # Full SQL support (DDL, DML, indexes, transactions)
@@ -38,7 +38,7 @@ Each call to `openDb(":memory:")` creates a completely independent database inst
 
 Export any open database — including `:memory:` — to a new on-disk file:
 
-```nim
+```rust
 let db = openDb(":memory:").value
 discard execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
 discard execSql(db, "INSERT INTO items (id, name) VALUES (1, 'widget')")
@@ -57,7 +57,7 @@ discard closeDb(db)
 
 ### Basic Queries
 
-```nim
+```rust
 import decentdb/engine
 import decentdb/record/record
 
@@ -79,7 +79,7 @@ let insertRes2 = execSql(db, "INSERT INTO users VALUES (10, 'Bob')")
 
 ### With Parameters
 
-```nim
+```rust
 # Use positional parameters $1, $2, etc.
 let params = @[
   Value(kind: vkInt64, int64Val: 2),
@@ -91,7 +91,7 @@ let res = execSql(db, "INSERT INTO users VALUES ($1, $2)", params)
 
 ### Query Results
 
-```nim
+```rust
 # SELECT returns rows as strings
 let selectRes = execSql(db, "SELECT * FROM users")
 if selectRes.ok:
@@ -103,7 +103,7 @@ if selectRes.ok:
 
 Use `INSERT ... RETURNING` to get auto-assigned values back:
 
-```nim
+```rust
 let res = execSql(db, "INSERT INTO users (name) VALUES ('Alice') RETURNING id, name")
 if res.ok:
   echo res.value[0]  # "1|Alice"
@@ -111,7 +111,7 @@ if res.ok:
 
 ### Upsert (ON CONFLICT)
 
-```nim
+```rust
 # Insert or update on conflict
 discard execSql(db, """
   INSERT INTO users (id, name) VALUES (1, 'Alice')
@@ -129,7 +129,7 @@ discard execSql(db, """
 
 ### Manual Transaction Control
 
-```nim
+```rust
 # Begin transaction
 let beginRes = execSql(db, "BEGIN")
 if not beginRes.ok:
@@ -152,7 +152,7 @@ else:
 
 For high-performance data import:
 
-```nim
+```rust
 import decentdb/engine
 
 let db = openDb("myapp.ddb").value
@@ -187,7 +187,7 @@ else:
 
 ### Creating Values
 
-```nim
+```rust
 import decentdb/record/record
 
 # NULL
@@ -222,7 +222,7 @@ let decVal = Value(kind: vkDecimal, int64Val: 12345, decimalScale: 2)  # 123.45
 
 ### Converting Values to Strings
 
-```nim
+```rust
 proc valueToString(v: Value): string =
   case v.kind
   of vkNull: "NULL"
@@ -242,7 +242,7 @@ proc valueToString(v: Value): string =
 
 All operations return a `Result[T]` type:
 
-```nim
+```rust
 type Result[T] = object
   ok: bool
   value: T          # Only valid if ok == true
@@ -256,7 +256,7 @@ type DbError = object
 
 ### Checking Results
 
-```nim
+```rust
 let res = execSql(db, "SELECT * FROM nonexistent")
 if not res.ok:
   case res.err.code
@@ -274,7 +274,7 @@ if not res.ok:
 
 ### Database Properties
 
-```nim
+```rust
 let db = openDb("myapp.ddb").value
 
 echo "Path: ", db.path
@@ -286,7 +286,7 @@ echo "Schema cookie: ", db.schemaCookie
 
 ### Getting Table Information
 
-```nim
+```rust
 let tableRes = db.catalog.getTable("users")
 if tableRes.ok:
   let table = tableRes.value
@@ -300,7 +300,7 @@ if tableRes.ok:
 
 Always close the database when done:
 
-```nim
+```rust
 let closeRes = closeDb(db)
 if not closeRes.ok:
   echo "Error closing: ", closeRes.err.message
@@ -308,7 +308,7 @@ if not closeRes.ok:
 
 ## Complete Example
 
-```nim
+```rust
 import decentdb/engine
 import decentdb/record/record
 import os
@@ -361,7 +361,7 @@ main()
 
 For low-level operations:
 
-```nim
+```rust
 import decentdb/pager/pager
 
 # Read a page directly
@@ -375,7 +375,7 @@ if pageRes.ok:
 
 Implement your own virtual file system:
 
-```nim
+```rust
 import decentdb/vfs/types
 
 type MyVfs = ref object of Vfs

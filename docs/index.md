@@ -1,5 +1,7 @@
 # DecentDB
 
+> ⚠️ **NOTICE:** DecentDB is currently undergoing a complete rewrite from Nim to Rust. This documentation reflects the target 1.0 architecture and API of the Rust engine.
+
 **Durable. Fast. Embedded.**
 
 DecentDB is an embedded, single-machine relational database engine focused on **durable ACID writes** and **fast reads**.
@@ -30,7 +32,7 @@ Releases are driven by Git tags and published via GitHub Actions:
 
 ```bash
 # Install DecentDB
-nimble install decentdb
+cargo install --path ./cli decentdb
 
 # Create a database
 # Note: auto-increment works for a single INT64 PRIMARY KEY column (spelling INT/INTEGER/INT64 doesn’t matter).

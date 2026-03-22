@@ -1,12 +1,14 @@
 # DecentDB
 
+> ⚠️ **NOTICE:** DecentDB is currently undergoing a complete rewrite from Nim to Rust. This repository is in a pre-alpha state and serves as the workspace for the Rust rewrite. For the previous Nim version, see [decentdb-nim](https://github.com/sphildreth/decentdb-nim).
+
 <p align="center">
     <img src="graphics/logo.png" alt="DecentDB logo" width="220" />
 </p>
 
 <p align="center">
-    <a href="https://nim-lang.org">
-        <img src="https://img.shields.io/badge/language-Nim-2d9cdb" alt="Language: Nim" />
+    <a href="https://rust-lang.org">
+        <img src="https://img.shields.io/badge/language-Rust-orange" alt="Language: Rust" />
     </a>
     <a href="LICENSE">
         <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0" />
@@ -24,7 +26,7 @@
                                                              
 ```
                                                   
-DecentDB is an embedded relational database engine built with Nim, focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
+DecentDB is an embedded relational database engine built with Rust (Rewrite in progress), focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
 
 It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation, implementing a PostgreSQL-like SQL dialect (via libpg_query) on top of a fixed-page B+Tree storage engine and a write-ahead log (WAL) for durability.
 

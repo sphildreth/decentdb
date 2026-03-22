@@ -27,7 +27,7 @@ This ADR defines the exact behavior for the initial version:
   - correctness debugging (predicate pushdown and join order)
   - client integration (drivers/ORMs commonly rely on EXPLAIN-like behavior for diagnostics)
 
-- The engine already has a concrete physical plan tree (`Plan` in `src/planner/planner.nim`).
+- The engine already has a concrete physical plan tree (`Plan` in `src/planner/planner.rs`).
   - Exposing it via SQL is low-risk to durability and storage formats because it requires **no changes** to on-disk data.
 
 - Returning a simple result set (single TEXT column) keeps the feature universally usable:
@@ -60,11 +60,11 @@ Chosen approach: (1) but via **SQL**: `EXPLAIN <SELECT>` returning plan lines.
 - **Text output** is easy to ship but less machine-readable than JSON.
   - This ADR intentionally avoids committing to a JSON schema.
 - **Deterministic plan lines** are testable and friendly to tooling, but they may constrain future refactors.
-  - Mitigation: keep output minimal (operator + key fields) and avoid printing nondeterministic or internal IDs.
+  - Mitigation: keep output mirustal (operator + key fields) and avoid printing nondeterministic or internal IDs.
 
 ### References
 
 - Implementation playbook: [design/EXPLAIN_IMPLEMENTATION.md](../EXPLAIN_IMPLEMENTATION.md)
-- Planner types: `Plan`, `PlanKind` in `src/planner/planner.nim`
-- Engine execution entry: `execSql` in `src/engine.nim`
+- Planner types: `Plan`, `PlanKind` in `src/planner/planner.rs`
+- Engine execution entry: `execSql` in `src/engine.rs`
 - Repo workflow: [AGENTS.md](../../AGENTS.md)

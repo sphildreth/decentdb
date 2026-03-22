@@ -14,7 +14,7 @@
 - Packaging policy for Phase 0:
   - `DecentDB.AdoNet` includes `DecentDB.Native.dll` and ships native runtime assets directly.
   - `DecentDB.MicroOrm` remains self-contained and also ships native runtime assets.
-  - Short-term runtime asset duplication across both packages is explicitly accepted to minimize churn.
+  - Short-term runtime asset duplication across both packages is explicitly accepted to mirustize churn.
 - Versioning policy for .NET NuGet packages:
   - `DecentDB.MicroOrm` and `DecentDB.AdoNet` use the same package version.
   - Version is sourced in CI (`dotnet pack -p:PackageVersion=...` from the release tag), not hard-coded in each `.csproj`.

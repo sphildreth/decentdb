@@ -12,7 +12,7 @@ WAL remains enabled for `:memory:` databases in v1. `MemVfs` does not support `m
 
 ### Rationale
 
-*   **VFS Extensibility via Inheritance**: Using a `VfsFile` base class and concrete subclasses (`OsVfsFile`, `MemVfsFile`) provides a clean object-oriented approach to polymorphism in Nim, avoiding complex variant types or interface dispatch overhead while keeping the VFS abstraction straightforward.
+*   **VFS Extensibility via Inheritance**: Using a `VfsFile` base class and concrete subclasses (`OsVfsFile`, `MemVfsFile`) provides a clean object-oriented approach to polymorphism in Rust, avoiding complex variant types or interface dispatch overhead while keeping the VFS abstraction straightforward.
 *   **WAL Enabled for `:memory:`**: Keeping WAL enabled simplifies the v1 implementation. Disabling WAL specifically for `:memory:` would require new conditional logic across the engine and transaction lifecycle. It is simpler and less error-prone to reuse the existing WAL machinery, which works correctly on `MemVfs`.
 *   **No `mmap` Support**: Memory mapping a `seq[byte]` across process memory conceptually doesn't align with POSIX `mmap` on a file descriptor without complex shared memory tricks. Falling back to standard read/write paths for `MemVfs` avoids platform-specific complexity and keeps the implementation trivial.
 

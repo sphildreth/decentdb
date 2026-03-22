@@ -28,7 +28,7 @@ GitHub Releases include native Linux `arm64` artifacts for 64-bit Raspberry Pi O
 1. **Build the driver jar and native library** (or download a release):
    ```bash
    # From the repo root
-   nimble build_lib                          # builds build/libc_api.so
+   cargo build_lib                          # builds build/libc_api.so
    cd bindings/java/native && make           # builds build/libdecentdb_jni.so
    cd ../.. && JAVA_HOME=<jdk17> ./gradlew :driver:jar   # builds driver/build/libs/decentdb-jdbc-*.jar
    ```

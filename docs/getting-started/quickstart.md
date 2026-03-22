@@ -133,7 +133,7 @@ decentdb stats --db=myapp.ddb
 
 DecentDB supports purely in-memory databases using the `:memory:` connection string:
 
-```nim
+```rust
 import decentdb/engine
 
 let res = openDb(":memory:")
@@ -151,7 +151,7 @@ Note: `mmap` is not supported for in-memory databases, but due to being backed b
 
 Use `saveAs` to persist an in-memory database to a durable on-disk file:
 
-```nim
+```rust
 let db = openDb(":memory:").value
 discard execSql(db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
 discard execSql(db, "INSERT INTO items (id, name) VALUES (1, 'widget')")
@@ -165,7 +165,7 @@ discard closeDb(db)
 
 | Binding | Method |
 |---------|--------|
-| Nim | `saveAs(db, destPath)` |
+| Rust | `saveAs(db, destPath)` |
 | CLI | `decentdb save-as --db=:memory: --output=dest.ddb` |
 | .NET | `connection.SaveAs(destPath)` |
 | Go | `db.SaveAs(destPath)` |

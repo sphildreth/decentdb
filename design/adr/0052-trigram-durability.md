@@ -70,8 +70,8 @@ This is a **breaking change** to user-visible durability semantics:
 
 ## Implementation Plan
 
-1. Modify `commitTransaction` in `src/engine.nim` to skip `flushTrigramDeltas`
-2. Modify `checkpointDb` in `src/engine.nim` to call `flushTrigramDeltas` before checkpoint
+1. Modify `commitTransaction` in `src/engine.rs` to skip `flushTrigramDeltas`
+2. Modify `checkpointDb` in `src/engine.rs` to call `flushTrigramDeltas` before checkpoint
 3. Add trigram rebuild capability to recovery (future work)
 4. Update documentation (SPEC.md) with new durability semantics
 

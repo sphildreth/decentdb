@@ -27,7 +27,7 @@ The current checkpointing mechanism has a critical flaw: if a reader holds a sna
 2. **Timeout Policy**: Configurable timeout (default: 300 seconds) after which long-running readers receive warnings and eventually get terminated
 
 3. **Checkpoint Logic Enhancement**:
-   ```nim
+   ```rust
    # Enhanced checkpoint protocol
    safe_truncate_lsn = min(active_readers_snapshot_lsn)
    

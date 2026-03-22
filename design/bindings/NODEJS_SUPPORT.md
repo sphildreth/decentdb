@@ -76,18 +76,18 @@ Node Application
           ↓
       DecentDB.Native (N-API → C ABI)
           ↓
-      DecentDB (Nim engine, direct file I/O)
+      DecentDB (Rust engine, direct file I/O)
 ```
 
 Key principle: **all language/toolkit bindings should reuse a single, stable native ABI** so fixes and performance work benefit every ecosystem.
 
 ---
 
-## Phase 1: Native ABI (Nim C API)
+## Phase 1: Native ABI (Rust C API)
 
 ### Requirements
 
-The Node addon should call into DecentDB through the existing C ABI (see `src/c_api.nim`). This keeps the addon small and avoids duplicating engine logic.
+The Node addon should call into DecentDB through the existing C ABI (see `src/c_api.rs`). This keeps the addon small and avoids duplicating engine logic.
 
 **Performance-first SELECT requirement:** Provide a forward-only, streaming statement API.
 
@@ -170,9 +170,9 @@ The repository now contains an initial scaffold for Node support:
 - `bindings/node/decentdb/`: N-API addon + thin JS wrapper
   - `bindings/node/decentdb/src/addon.c`: N-API module (C)
   - `bindings/node/decentdb/src/native_lib.c`: runtime `dlopen`/`dlsym` loader for `libdecentdb.*`
-  - `bindings/node/decentdb/index.js`: minimal `Database` + `Statement` wrapper
+  - `bindings/node/decentdb/index.js`: mirustal `Database` + `Statement` wrapper
 - `bindings/node/knex-decentdb/`: Knex client scaffold
-  - `bindings/node/knex-decentdb/src/client.js`: minimal custom Knex client
+  - `bindings/node/knex-decentdb/src/client.js`: mirustal custom Knex client
   - `bindings/node/knex-decentdb/src/positionBindings.js`: `?` → `$N` placeholder rewrite helper
 
 ### Proposed JS API (Goal State)
@@ -279,6 +279,6 @@ const rows = await db("artists")
 
 ## Open Questions
 
-1. Should the Node addon link directly against the engine, or `dlopen` a shared `libdecentdb` built from Nim?
+1. Should the Node addon link directly against the engine, or `dlopen` a shared `libdecentdb` built from Rust?
 2. The C ABI already exposes `decentdb_row_view` (row-view performance extension). Should Node prefer this exclusively, or also add a batch-fetch API for `all()`/buffered streaming?
-3. What is the minimal Knex feature set we promise for 1.0.0 (schema building, migrations, pooling, etc.)?
+3. What is the mirustal Knex feature set we promise for 1.0.0 (schema building, migrations, pooling, etc.)?

@@ -195,7 +195,7 @@ The NuGet packages include these assemblies:
 If you need a RID not shipped by the NuGet package or you're working in this repo:
 
 ```bash
-nimble build_lib
+cargo build_lib
 ```
 
 This produces `build/libc_api.so` (Linux), `build/libc_api.dylib` (macOS), or `build/c_api.dll` (Windows).

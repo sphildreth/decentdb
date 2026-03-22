@@ -6,7 +6,7 @@ Instructions for building DecentDB from source code.
 
 ### Required
 
-- **Nim** >= 1.6.0
+- **Rust** >= 1.6.0
 - **libpg_query** (PostgreSQL parser library)
 - **git** (for cloning)
 
@@ -15,40 +15,40 @@ Instructions for building DecentDB from source code.
 - **Python** >= 3.8 (for test harness)
 - **libpg_query development headers** (for building)
 
-## Installing Nim
+## Installing Rust
 
-### Using choosenim (Recommended)
+### Using rustup (Recommended)
 
 ```bash
-curl https://nim-lang.org/choosenim/init.sh -sSf | sh
+curl https://sh.rustup.rs -sSf | sh
 ```
 
 Or on Windows:
 ```powershell
-. (Invoke-WebRequest -Uri https://nim-lang.org/choosenim/init.ps1 -UseBasicParsing).Content
+. (Invoke-WebRequest -Uri https://win.rustup.rs -UseBasicParsing).Content
 ```
 
 ### Using Package Manager
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt-get install nim
+sudo apt-get install rustc cargo
 ```
 
 **macOS:**
 ```bash
-brew install nim
+brew install rust
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S nim
+sudo pacman -S rust cargo
 ```
 
 ### Verify Installation
 
 ```bash
-nim --version
+rustc --version
 # Should show >= 1.6.0
 ```
 
@@ -96,7 +96,7 @@ cd decentdb
 ### Standard Build
 
 ```bash
-nimble build
+cargo build
 ```
 
 This creates the `decentdb` executable.
@@ -106,7 +106,7 @@ This creates the `decentdb` executable.
 Optimized for performance:
 
 ```bash
-nimble build -d:release
+cargo build -d:release
 ```
 
 ### Debug Build
@@ -114,7 +114,7 @@ nimble build -d:release
 With debug symbols and assertions:
 
 ```bash
-nimble build -d:debug
+cargo build -d:debug
 ```
 
 ### Static Build
@@ -122,7 +122,7 @@ nimble build -d:debug
 Self-contained binary (Linux only):
 
 ```bash
-nimble build --passL:"-static" --passL:"-lpg_query -lstdc++"
+cargo build --passL:"-static" --passL:"-lpg_query -lstdc++"
 ```
 
 ## Running Tests
@@ -130,38 +130,38 @@ nimble build --passL:"-static" --passL:"-lpg_query -lstdc++"
 ### All Tests
 
 ```bash
-nimble test
+cargo test
 ```
 
 This runs:
-- All Nim unit tests
+- All Rust unit tests
 - Python harness tests
-- Binding test suites wired through `nimble test_bindings` (`.NET`, Go, Node.js, Python, Dart)
-- Java JDBC tests remain separate: `nimble test_bindings_java`
+- Binding test suites wired through `cargo test_bindings` (`.NET`, Go, Node.js, Python, Dart)
+- Java JDBC tests remain separate: `cargo test_bindings_java`
 
 If you only want the engine test suite without binding prerequisites, run:
 
 ```bash
-nimble test_nim
-nimble test_py
+cargo test_nim
+cargo test_py
 ```
 
-### Nim Tests Only
+### Rust Tests Only
 
 ```bash
-nimble test_nim
+cargo test_nim
 ```
 
 ### Python Tests Only
 
 ```bash
-nimble test_py
+cargo test_py
 ```
 
 ### Specific Test
 
 ```bash
-nim c -r tests/nim/test_wal.nim
+nim c -r tests/nim/test_wal.rs
 ```
 
 ## Installation
@@ -169,10 +169,10 @@ nim c -r tests/nim/test_wal.nim
 ### Local Install
 
 ```bash
-nimble install
+cargo install --path ./cli
 ```
 
-Installs to `~/.nimble/bin/`
+Installs to `~/.rsble/bin/`
 
 ### System Install
 
@@ -193,10 +193,10 @@ For active development with fast rebuilds:
 
 ```bash
 # Compile without optimization
-nim c -d:development src/decentdb.nim
+nim c -d:development src/decentdb.rs
 
 # Or use the debug task
-nimble build -d:debug
+cargo build -d:debug
 ```
 
 ## Cross-Compilation
@@ -206,7 +206,7 @@ nimble build -d:debug
 Requires mingw-w64:
 
 ```bash
-nim c -d:release --os:windows --cpu:amd64 src/decentdb.nim
+nim c -d:release --os:windows --cpu:amd64 src/decentdb.rs
 ```
 
 ### macOS from Linux
@@ -216,7 +216,7 @@ Requires macOS SDK (complex setup).
 ### ARM64 from x64
 
 ```bash
-nim c -d:release --cpu:arm64 src/decentdb.nim
+nim c -d:release --cpu:arm64 src/decentdb.rs
 ```
 
 GitHub Releases also publish a native Linux arm64 archive,
@@ -242,7 +242,7 @@ export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
 export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
 # Rebuild
-nimble build
+cargo build
 ```
 
 ### "nim not found"
@@ -254,11 +254,11 @@ bash: nim: command not found
 
 **Solution:**
 ```bash
-# Add nimble bin to PATH
-export PATH=$HOME/.nimble/bin:$PATH
+# Add cargo bin to PATH
+export PATH=$HOME/.rsble/bin:$PATH
 
-# Or reinstall choosenim
-curl https://nim-lang.org/choosenim/init.sh -sSf | sh
+# Or reinstall rustup
+curl https://sh.rustup.rs -sSf | sh
 ```
 
 ### Tests Fail
@@ -269,7 +269,7 @@ Some tests fail after build.
 **Solution:**
 ```bash
 # Run specific test for details
-nim c -r tests/nim/test_wal.nim
+nim c -r tests/nim/test_wal.rs
 
 # Check Python tests separately
 python -m unittest -v tests/harness/test_runner.py
@@ -283,10 +283,10 @@ Build takes too long.
 **Solution:**
 ```bash
 # Use release flags (faster compilation)
-nimble build -d:release
+cargo build -d:release
 
 # Or parallel compilation
-nim c --parallelBuild:4 src/decentdb.nim
+nim c --parallelBuild:4 src/decentdb.rs
 ```
 
 ## IDE Setup
@@ -294,13 +294,13 @@ nim c --parallelBuild:4 src/decentdb.nim
 ### VS Code
 
 Install extensions:
-- **Nim** (by kosz78) - Syntax highlighting, compilation
+- **Rust** (by kosz78) - Syntax highlighting, compilation
 - **nim-lsp** - Language server support
 
 Configuration:
 ```json
 {
-  "nim.buildCommand": "nimble build",
+  "nim.buildCommand": "cargo build",
   "nim.runOutput": "./decentdb"
 }
 ```
@@ -313,7 +313,7 @@ Using nimlsp:
 :CocInstall coc-nim
 
 " With native LSP
-lua require'lspconfig'.nimls.setup{}
+lua require'lspconfig'.rsls.setup{}
 ```
 
 ### Emacs
@@ -340,7 +340,7 @@ See `.github/workflows/` for details.
 Before creating a release:
 
 1. [ ] All tests pass
-2. [ ] Version updated in `decentdb.nimble`
+2. [ ] Version updated in `decentdb.rsble`
 3. [ ] CHANGELOG.md updated
 4. [ ] Documentation built
 5. [ ] Binaries built for all release platforms (Linux x64, Linux arm64/Raspberry Pi, macOS, Windows)
@@ -352,4 +352,4 @@ Before creating a release:
 
 - [Run Tests](testing.md)
 - [Contribute](contributing.md)
-- [API Reference](../api/nim-api.md)
+- [API Reference](../api/rust-api.md)

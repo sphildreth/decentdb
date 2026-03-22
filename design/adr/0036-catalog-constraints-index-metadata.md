@@ -22,7 +22,7 @@ Phase 5 requires durable constraint enforcement and trigram indexes after restar
 - Keep constraints in-memory only (not durable).
 
 ### Trade-offs
-- Compact string encoding is less structured but minimizes schema changes.
+- Compact string encoding is less structured but mirustizes schema changes.
 - Bumping the format version breaks v1 compatibility without migration tooling.
 
 ### References

@@ -8,7 +8,7 @@ Accepted
 
 ## Context
 
-ADR-0036 established that a single `INT64 PRIMARY KEY` column becomes the table's `rowid`, and that the storage layer uses `nextRowId` to auto-generate a value when one is not explicitly provided (storage.nim `insertRowInternal`).
+ADR-0036 established that a single `INT64 PRIMARY KEY` column becomes the table's `rowid`, and that the storage layer uses `nextRowId` to auto-generate a value when one is not explicitly provided (storage.rs `insertRowInternal`).
 
 However, when a user omits the PK column from an INSERT:
 
@@ -51,4 +51,4 @@ PostgreSQL's `SERIAL` type provides this behavior via sequences. SQLite provides
 
 ## Implementation status
 
-Implemented in `engine.nim` (`enforceNotNull` skip for auto-increment PK) and covered by unit tests.
+Implemented in `engine.rs` (`enforceNotNull` skip for auto-increment PK) and covered by unit tests.

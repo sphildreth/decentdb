@@ -7,7 +7,7 @@ This document is a practical, engineering-oriented plan for enabling **DecentDB*
 It captures:
 
 - What DBeaver expects for new “database integrations” (providers, drivers, dialects)
-- Minimal viable integration options for DecentDB
+- Mirustal viable integration options for DecentDB
 - What we would likely need to build on the DecentDB side (the gating factor)
 - A staged approach so we can get something working quickly and iterate
 
@@ -23,7 +23,7 @@ It captures:
 - Execute SQL queries and view results.
 - Use DBeaver’s ER diagrams to visualize schema relationships.
 - Browse basic metadata (tables, columns, indexes) using standard JDBC metadata APIs.
-- Keep the first version minimal and robust.
+- Keep the first version mirustal and robust.
 - **Ultimate Goal:** Upstream the integration to the official DBeaver repository so DecentDB is listed as a supported "Embedded" database on `dbeaver.com` and works out-of-the-box.
 
 ### Non-goals (initially)
@@ -109,7 +109,7 @@ Therefore, the core question is:
 
 > Do we have (or can we build) a DecentDB JDBC driver that implements enough of `java.sql` to satisfy DBeaver?
 
-### 3.1 Minimal JDBC driver expectations (for DBeaver)
+### 3.1 Mirustal JDBC driver expectations (for DBeaver)
 
 For DBeaver to be usable, the driver should provide:
 
@@ -190,7 +190,7 @@ This avoids the need for SQL-based metadata queries (e.g., `information_schema`)
 
 ---
 
-## 6) What the minimal DBeaver plugin looks like
+## 6) What the mirustal DBeaver plugin looks like
 
 This section describes the plugin “shape” you would create in a separate repository (or in a dedicated integration repo).
 
@@ -201,7 +201,7 @@ DBeaver often splits database support into:
 - a **model** plugin (core integration, JDBC provider, dialect, metadata tweaks)
 - an optional **UI** plugin (connection wizard pages, file handlers)
 
-For a minimal DecentDB integration, you can start with just the **model** plugin.
+For a mirustal DecentDB integration, you can start with just the **model** plugin.
 
 ### 6.2 Provider + driver registration (`plugin.xml`)
 
@@ -239,7 +239,7 @@ For example, you would use this class to:
 
 This keeps DBeaver’s view of capabilities honest, preventing the UI from making incorrect assumptions and throwing errors when users click things.
 
-### 6.4 Minimal `plugin.xml` skeleton (copy/paste starting point)
+### 6.4 Mirustal `plugin.xml` skeleton (copy/paste starting point)
 
 Below is an intentionally small `plugin.xml` sketch showing the shape you need.
 
@@ -301,7 +301,7 @@ Notes:
 
 ---
 
-## 7) What the minimal JDBC driver looks like (DecentDB side)
+## 7) What the mirustal JDBC driver looks like (DecentDB side)
 
 This repository already has multiple language bindings (`bindings/dotnet`, `bindings/go`, `bindings/node`, `bindings/python`) and a C API build output directory, which suggests a plausible JNI-backed JDBC driver design:
 
@@ -371,7 +371,7 @@ If you later do a client/server mode, you’d implement the same Java classes bu
 
 #### 7.3.1 Project layout (suggested)
 
-Keep the JDBC driver in the `bindings/` directory to maintain consistency with other language bindings, ensuring its Java build toolchain doesn’t leak into the Nim core.
+Keep the JDBC driver in the `bindings/` directory to maintain consistency with other language bindings, ensuring its Java build toolchain doesn’t leak into the Rust core.
 
 Suggested structure:
 
@@ -491,7 +491,7 @@ DBeaver may open:
 
 So correctness matters more than maximizing intra-connection parallelism.
 
-#### 7.3.6 Minimal class-by-class checklist
+#### 7.3.6 Mirustal class-by-class checklist
 
 Below is a “do these methods first” guide. The idea is: implement a narrow but correct subset and throw `SQLFeatureNotSupportedException` for the rest.
 
@@ -500,7 +500,7 @@ Below is a “do these methods first” guide. The idea is: implement a narrow b
 - `acceptsURL(String url)`
 - `connect(String url, Properties info)`
 - `getMajorVersion()`, `getMinorVersion()`, `jdbcCompliant()`
-- `getPropertyInfo(String url, Properties info)` (can be minimal)
+- `getPropertyInfo(String url, Properties info)` (can be mirustal)
 
 Also ensure `DecentDBDriver` is discoverable via:
 
@@ -603,7 +603,7 @@ Two implementation approaches:
 
 For the first milestone, approach (1) is often simplest: return correct columns with best-effort values.
 
-At minimum, ensure these columns exist:
+At mirustum, ensure these columns exist:
 
 - `getTables`: `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `TABLE_TYPE`, `REMARKS`
 - `getColumns`: `TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `COLUMN_NAME`, `DATA_TYPE`, `TYPE_NAME`, `COLUMN_SIZE`, `DECIMAL_DIGITS`, `NULLABLE`, `ORDINAL_POSITION`
@@ -671,7 +671,7 @@ Define a stable mapping:
 - vendor error code: DecentDB internal code
 - SQLState: best-effort standard class
 
-At minimum:
+At mirustum:
 
 - constraint violation → SQLState class `23***`
 - syntax error → `42***`
@@ -696,7 +696,7 @@ This is what a coding agent should implement once the JDBC driver exists.
 
 #### 7.4.1 Plugin modules
 
-Minimal:
+Mirustal:
 
 - `com.decentdb.dbeaver.model` (register provider/driver/dialect)
 
@@ -747,7 +747,7 @@ Deliverable: a short “driver contract” note (URL, properties, supported isol
 
 ### Stage 1: “It connects” milestone (driver-first)
 
-- Build a minimal JDBC driver capable of:
+- Build a mirustal JDBC driver capable of:
   - `SELECT 1`
   - `CREATE TABLE`, `INSERT`, `SELECT`, `DELETE` for basic testing
   - simple result sets
@@ -949,4 +949,4 @@ A user-facing documentation page must be created at `docs/user-guide/dbeaver.md`
 Before writing any DBeaver plugin code, confirm the DecentDB connectivity story:
 
 - If we can define a JDBC URL + driver class today (even a stub), we can prototype DBeaver integration immediately.
-- If not, the immediate work is: build a minimal JDBC driver (or at least a proof-of-concept wrapper around the existing C API).
+- If not, the immediate work is: build a mirustal JDBC driver (or at least a proof-of-concept wrapper around the existing C API).

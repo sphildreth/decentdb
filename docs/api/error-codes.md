@@ -156,9 +156,9 @@ Fields:
 - `message`: Human-readable description
 - `context`: Additional context (table name, column name, etc.)
 
-## Nim API Error Handling
+## Rust API Error Handling
 
-```nim
+```rust
 import decentdb/engine
 
 let res = execSql(db, "SELECT * FROM users")

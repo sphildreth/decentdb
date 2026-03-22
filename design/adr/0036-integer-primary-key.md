@@ -62,7 +62,7 @@ For such tables:
 - **Faster Inserts:** Only one B+Tree to update.
 
 ### Negative
-- **Complexity:** `storage.nim` must now be aware of the schema's PK definition to determine the `rowid`.
+- **Complexity:** `storage.rs` must now be aware of the schema's PK definition to determine the `rowid`.
 - **Updates:** Updating a Primary Key is expensive (requires moving the row in the B+Tree), whereas updating a non-PK column is in-place (or overflow).
 
 ## Implementation status

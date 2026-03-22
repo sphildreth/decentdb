@@ -5,7 +5,7 @@
 
 ## Context
 
-The Gridlock project needs a Dart/Flutter desktop binding for DecentDB. DecentDB already exposes a stable C ABI (`src/c_api.nim`) used by Go, Python, .NET, Java, and Node.js bindings.
+The Gridlock project needs a Dart/Flutter desktop binding for DecentDB. DecentDB already exposes a stable C ABI (`src/c_api.rs`) used by Go, Python, .NET, Java, and Node.js bindings.
 
 ## Decisions
 

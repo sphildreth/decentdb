@@ -22,7 +22,7 @@ Dapper and other ADO.NET consumers expect predictable parameter and result type 
 - Map enums to INT64 via underlying numeric value.
 
 ## Consequences
-- **Pros**: Fast comparisons and range queries for time types; predictable behavior across platforms; minimal storage types.
+- **Pros**: Fast comparisons and range queries for time types; predictable behavior across platforms; mirustal storage types.
 - **Cons**: `decimal` is not natively numeric; inspecting temporal values in raw SQL is less human-friendly.
 
 ## References

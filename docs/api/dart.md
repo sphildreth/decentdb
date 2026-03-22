@@ -5,7 +5,7 @@ DecentDB provides Dart FFI bindings for Flutter desktop apps under `bindings/dar
 ## Build the native library
 
 ```bash
-nimble build_lib
+cargo build_lib
 ```
 
 On Linux this produces `build/libc_api.so`, on macOS `build/libc_api.dylib`, on Windows `build/c_api.dll`.
@@ -234,7 +234,7 @@ void dbWorker(SendPort sendPort) {
 ## Running Tests
 
 ```bash
-nimble build_lib
+cargo build_lib
 bindings/dart/scripts/run_tests.sh
 ```
 

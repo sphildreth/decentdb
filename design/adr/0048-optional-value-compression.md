@@ -18,7 +18,7 @@ However, compression adds CPU overhead and a dependency.
 
 We will implement **storage-internal transparent compression** for `TEXT` and `BLOB` values.
 
-1.  **Algorithm:** **Zlib (Deflate)** via Nim's standard `zip/zlib`.
+1.  **Algorithm:** **Zlib (Deflate)** via Rust's standard `zip/zlib`.
     *   *Reasoning:* Available without adding new dependencies; good size/CPU tradeoff for the 0.x baseline.
 
 2.  **Storage Format:**
@@ -28,10 +28,10 @@ We will implement **storage-internal transparent compression** for `TEXT` and `B
         *   `vkTextCompressedOverflow = 10`
         *   `vkBlobCompressedOverflow = 11`
     *   The payload for these kinds is the raw compressed bytes.
-    *   The engine (in `record.nim`) automatically decompresses when decoding.
+    *   The engine (in `record.rs`) automatically decompresses when decoding.
 
 3.  **Compression Policy:**
-    *   Compression is applied **opportunistically** during `encodeRecord` (or `normalizeValues` in `storage.nim` which handles overflow).
+    *   Compression is applied **opportunistically** during `encodeRecord` (or `normalizeValues` in `storage.rs` which handles overflow).
     *   **Threshold:** Only compress if value length > `COMPRESSION_THRESHOLD` (e.g. 128 bytes) AND compression saves at least X% (e.g. 10% or 20 bytes).
     *   This prevents negative compression for small strings.
 
@@ -47,9 +47,9 @@ We will implement **storage-internal transparent compression** for `TEXT` and `B
 
 ### Record Format Changes
 
-`src/record/record.nim`:
+`src/record/record.rs`:
 
-```nim
+```rust
 type ValueKind* = enum
   ...
   vkTextCompressed = 8
@@ -58,7 +58,7 @@ type ValueKind* = enum
 
 ### Write Path (`encodeValue` / `normalizeValues`)
 
-In `src/storage/storage.nim`, `normalizeValues` may opportunistically compress `vkText`/`vkBlob` values.
+In `src/storage/storage.rs`, `normalizeValues` may opportunistically compress `vkText`/`vkBlob` values.
 
 - If compression is beneficial and the compressed bytes can be stored inline, the value kind becomes `vkTextCompressed` / `vkBlobCompressed`.
 - If compression is beneficial but the compressed bytes must be stored in an overflow chain, the value kind becomes `vkTextCompressedOverflow` / `vkBlobCompressedOverflow`.
@@ -86,7 +86,7 @@ This ensures higher layers (SQL engine) only see `vkText` / `vkBlob`.
 
 ## Implementation status
 
-Implemented using Nim's standard `zip/zlib` and covered by unit tests ("Value Compression"). Compression is applied opportunistically during storage normalization and is transparent to higher layers (decoded values are exposed as normal `vkText`/`vkBlob`).
+Implemented using Rust's standard `zip/zlib` and covered by unit tests ("Value Compression"). Compression is applied opportunistically during storage normalization and is transparent to higher layers (decoded values are exposed as normal `vkText`/`vkBlob`).
 
 ## References
 

@@ -131,7 +131,7 @@ SQLite's runtime configuration mechanism (hundreds of directives) is not support
 | `PRAGMA foreign_keys` | Always enabled; cannot be disabled |
 | `PRAGMA table_info(t)` | Use `decentdb describe --db=... --table=t` |
 | `PRAGMA synchronous` | Not configurable; commits are durable by default (fsync-on-commit). Use `bulk-load --durability=...` for ingestion tradeoffs |
-| `PRAGMA cache_size` | Configure cache at open: CLI `--cachePages/--cacheMb`, Nim `openDb(..., cachePages=...)` |
+| `PRAGMA cache_size` | Configure cache at open: CLI `--cachePages/--cacheMb`, Rust `openDb(..., cachePages=...)` |
 
 ### rowid / _rowid_ Pseudo-Columns
 

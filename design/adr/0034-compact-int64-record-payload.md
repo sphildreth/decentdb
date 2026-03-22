@@ -20,7 +20,7 @@ We will change the payload encoding for `vkInt64` to use **ZigZag encoding** fol
 The `vkInt64` payload will no longer be a fixed 8 bytes. Instead, it will be a variable-length sequence of bytes:
 
 1.  **ZigZag Encode**: Map the signed `int64` to an unsigned `uint64`. This ensures that small negative numbers (e.g., -1) map to small unsigned integers, allowing efficient varint encoding.
-    ```nim
+    ```rust
     func zigzag(n: int64): uint64 =
       (cast[uint64](n) shl 1) xor cast[uint64](n shr 63)
     ```

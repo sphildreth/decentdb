@@ -26,7 +26,7 @@ Database engines must manage memory carefully to prevent leaks and ensure predic
 - **Query Context Pool**: Temporary allocations for query execution
 
 #### Memory Limits
-```nim
+```rust
 # Configuration options
 const DEFAULT_MAX_MEMORY = 256.MB
 const DEFAULT_PAGE_CACHE_SIZE = 100.MB
@@ -43,7 +43,7 @@ proc checkMemoryUsage(): bool =
 #### Leak Detection
 - Track all major allocations with tags
 - Periodic scanning for unreleased memory
-- Integration with Nim's garbage collector for hybrid approach
+- Integration with Rust's garbage collector for hybrid approach
 - Logging and reporting of memory usage patterns
 
 #### Resource Cleanup

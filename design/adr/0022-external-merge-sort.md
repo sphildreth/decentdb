@@ -21,7 +21,7 @@ We will implement **External Merge Sort** in the `Exec` layer.
 1.  **Phase 1: Run Generation (Buffering)**
     *   The `Sort` operator consumes input rows into an in-memory buffer (`sort_buffer_size`, default 16MB).
     *   When the buffer is full:
-        1.  Sort the buffer in-memory (using Nim's native `algorithm.sort`).
+        1.  Sort the buffer in-memory (using Rust's native `algorithm.sort`).
         2.  Serialize the sorted rows to a strictly temporary file (managed by a `TempFile` abstraction).
         3.  Clear the buffer and continue.
     *   Keep a list of `Run` objects (file path, row count).
@@ -47,4 +47,4 @@ We will implement **External Merge Sort** in the `Exec` layer.
 *   **Complexity**: Significantly higher complexity in `Exec` module (state machine, I/O management, heap).
 *   **Robustness**: The database can now sort datasets well beyond RAM limits.
 *   **Performance**: Queries spilling to disk will be much slower (I/O bound).
-*   **Resource Management**: Strict cleanup of temporary files is required (RAII pattern or equivalent in Nim).
+*   **Resource Management**: Strict cleanup of temporary files is required (RAII pattern or equivalent in Rust).

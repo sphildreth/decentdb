@@ -9,7 +9,7 @@ DecentDB's Node.js integrations live under `bindings/node/`:
 
 ```bash
 # Build the native C library
-nimble build_lib
+cargo build_lib
 
 # Build the Node addon
 cd bindings/node/decentdb

@@ -50,4 +50,4 @@ Implement distinct set-operation semantics in 0.x for `UNION`, `INTERSECT`, and 
 ### References
 
 - Roadmap: `design/SQL_ENHANCEMENTS_PLAN.md` (Section 5.4, open question on DISTINCT semantics)
-- Planner/exec internals: `src/planner/planner.nim`, `src/exec/exec.nim`
+- Planner/exec internals: `src/planner/planner.rs`, `src/exec/exec.rs`

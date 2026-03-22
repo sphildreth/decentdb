@@ -34,7 +34,7 @@ DecentDB uses the following open source components:
 - **Source:** https://github.com/pganalyze/libpg_query
 - **Purpose:** PostgreSQL query parser
 
-### Nim Standard Library
+### Rust Standard Library
 
 - **License:** MIT
 - **Source:** https://nim-lang.org/

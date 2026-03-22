@@ -59,4 +59,4 @@ Add initial UPSERT support for `INSERT ... ON CONFLICT ... DO NOTHING` with stri
 ### References
 
 - SQL enhancements roadmap: `design/SQL_ENHANCEMENTS_PLAN.md` (Section 5.2)
-- Existing uniqueness/index metadata behavior: `src/engine.nim`, `src/catalog/catalog.nim`
+- Existing uniqueness/index metadata behavior: `src/engine.rs`, `src/catalog/catalog.rs`

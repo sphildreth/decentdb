@@ -9,12 +9,12 @@ ADR 0072 introduced `DECIMAL(p,s)` and `UUID` types. This ADR clarifies the impl
 ## Decisions
 
 ### 1. Runtime Type Enforcement
-`typeCheckValue` in `src/engine.nim` currently performs loose checks. It will be updated to:
+`typeCheckValue` in `src/engine.rs` currently performs loose checks. It will be updated to:
 - **UUID**: Enforce `vkBlob` with length exactly 16 bytes. `vkText` will no longer be accepted for `ctUuid` columns (breaking change for any pre-existing UUID data stored as Text, though none is expected in production yet).
 - **DECIMAL**: Enforce `vkDecimal`. Validate that `value.decimalScale` matches the column's defined scale. Validate that the unscaled integer fits within precision constraints.
 
 ### 2. Built-in Functions
-The following functions will be implemented in `evalExpr` (`src/exec/exec.nim`):
+The following functions will be implemented in `evalExpr` (`src/exec/exec.rs`):
 - `GEN_RANDOM_UUID()`: Returns a 16-byte `vkBlob` (UUID v4). Uses `std/sysrand`.
 - `UUID_PARSE(text)`: Parses canonical UUID string to `vkBlob`.
 - `UUID_TO_STRING(uuid)`: Converts 16-byte `vkBlob` to canonical UUID string.

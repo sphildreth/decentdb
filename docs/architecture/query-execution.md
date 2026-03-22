@@ -4,10 +4,10 @@ This page describes the path from SQL text to results in DecentDB.
 
 ## End-to-end pipeline
 
-1. **Parse** (`src/sql/sql.nim`): SQL text → AST (via `libpg_query`) → internal `Statement`s.
-2. **Bind** (`src/sql/binder.nim`): resolve names against the catalog, validate types, and produce bound statements.
-3. **Plan** (`src/planner/planner.nim`): choose access paths and build a `Plan` tree.
-4. **Execute** (`src/engine.nim`, `src/exec/exec.nim`): run the plan and format results.
+1. **Parse** (`src/sql/sql.rs`): SQL text → AST (via `libpg_query`) → internal `Statement`s.
+2. **Bind** (`src/sql/binder.rs`): resolve names against the catalog, validate types, and produce bound statements.
+3. **Plan** (`src/planner/planner.rs`): choose access paths and build a `Plan` tree.
+4. **Execute** (`src/engine.rs`, `src/exec/exec.rs`): run the plan and format results.
 
 ## Multi-statement execution (important)
 
@@ -41,4 +41,4 @@ DecentDB uses snapshot isolation:
 
 ## EXPLAIN
 
-`EXPLAIN` is supported and uses `src/planner/explain.nim` to render a human-readable plan tree.
+`EXPLAIN` is supported and uses `src/planner/explain.rs` to render a human-readable plan tree.

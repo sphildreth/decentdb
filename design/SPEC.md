@@ -6,7 +6,7 @@
 
 ## 1. Overview
 This document defines the baseline engineering design for DecentDB:
-- Embedded DB engine in **Nim**
+- Embedded DB engine in **Rust**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
 - ACID via **WAL-based** design
 - Storage: **paged file + B+Trees**, with **trigram inverted index** for search
@@ -17,7 +17,7 @@ Current scope (1.0): single process, multi-threaded readers, single writer.
 ---
 
 ## 2. Module architecture
-### 2.1 Engine modules (Nim)
+### 2.1 Engine modules (Rust)
 1. **vfs/**
   - OS file I/O abstraction: open/read/write/fsync/lock (intra-process lock only)
    - “Faulty VFS” hooks for tests (partial writes, dropped fsync, crash points)
@@ -322,7 +322,7 @@ DecentDB implements **Snapshot Isolation (SI)** as the default and only isolatio
 - Normalize parse trees into DecentDB’s internal AST immediately.
 
 Alternative:
-- Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
+- Use Rust-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
 ### 6.2 Supported SQL subset (1.0 baseline)
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `CREATE TRIGGER`, `DROP TABLE`, `DROP INDEX`, `DROP TRIGGER`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
@@ -528,13 +528,13 @@ For contains predicates:
 
 ## 10. Testing strategy (critical)
 ### 10.1 Test layers
-1. **Pure unit tests (Nim)**
+1. **Pure unit tests (Rust)**
    - Pager read/write, freelist correctness
    - WAL frame encoding, checksum verification
    - B+Tree invariants (ordering, search correctness, cursor iteration)
    - Trigram generation and postings encode/decode
 
-2. **Property tests (Nim + Python)**
+2. **Property tests (Rust + Python)**
    - Random sequences of operations preserve invariants
    - “index results == scan results”
    - “FK never violated” under random mutations
@@ -591,7 +591,7 @@ Track:
 ## 12. Future compatibility: Npgsql / PostgreSQL wire protocol
 Not planned for 1.0. If pursued:
 - Implement pgwire subset as a server endpoint
-- Add minimal catalog responses for clients
+- Add mirustal catalog responses for clients
 - Maintain dialect compatibility with libpg_query parser
 
 ---
@@ -704,7 +704,7 @@ Some options can be changed at runtime:
 - `checkpoint_threshold_mb`: adjust for write-heavy workloads
 
 ### 16.3 Configuration API
-```nim
+```rust
 # Open database with configuration
 db = open("dbfile", config{
   page_size: 8192,

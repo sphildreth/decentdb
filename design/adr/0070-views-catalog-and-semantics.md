@@ -65,7 +65,7 @@ These decisions keep ACID durability and schema safety as the primary goal:
 - DDL enforces strict dependency correctness,
 - read performance for non-view queries remains unchanged because expansion is binder-only.
 
-Name-based dependencies plus `RESTRICT` rename minimize persistent-format complexity for 0.x while preventing silent schema drift.
+Name-based dependencies plus `RESTRICT` rename mirustize persistent-format complexity for 0.x while preventing silent schema drift.
 
 ### Alternatives Considered
 

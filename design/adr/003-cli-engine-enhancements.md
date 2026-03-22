@@ -20,21 +20,21 @@ Currently, these features are either hardcoded (cache), not exposed (WAL), or st
 ### Current Limitations
 
 **1. Cache Size Hardcoded:**
-```nim
-# engine.nim:109
+```rust
+# engine.rs:109
 let pagerRes = newPager(vfs, file, cachePages = 64)  # Hardcoded!
 ```
 
 **2. WAL Not Exposed:**
-```nim
+```rust
 type Db* = ref object
   # ... fields ...
   # No WAL reference! WAL is created/destroyed per operation
 ```
 
 **3. Transaction Stubs:**
-```nim
-# engine.nim:494-511
+```rust
+# engine.rs:494-511
 of skBegin, skCommit, skRollback:
   discard  # Not implemented!
 ```
@@ -48,7 +48,7 @@ We will enhance the `Db` object and `openDb` API to support:
 ### 1. Configurable Cache Size
 
 **API Changes:**
-```nim
+```rust
 proc openDb*(path: string, cachePages: int = 64): Result[Db]
 ```
 
@@ -66,7 +66,7 @@ proc openDb*(path: string, cachePages: int = 64): Result[Db]
 ### 2. WAL Handle Exposure
 
 **API Changes:**
-```nim
+```rust
 type Db* = ref object
   # ... existing fields ...
   wal*: Wal              # Add WAL reference
@@ -88,7 +88,7 @@ proc getWal*(db: Db): Wal  # Accessor for checkpoint operations
 ### 3. Transaction State Management
 
 **API Changes:**
-```nim
+```rust
 proc beginTransaction*(db: Db): Result[Void]
 proc commitTransaction*(db: Db): Result[Void]
 proc rollbackTransaction*(db: Db): Result[Void]
@@ -180,7 +180,7 @@ proc execSql*(db: Db, sqlText: string, params: seq[Value] = @[]): Result[seq[str
 
 ### Unit Tests
 
-```nim
+```rust
 # Test cache configuration
 test "openDb with custom cache size":
   let db = openDb("test.db", cachePages = 256)

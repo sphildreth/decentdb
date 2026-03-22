@@ -6,7 +6,7 @@
 
 Implement `WITH RECURSIVE` using **iterative fixpoint evaluation in the executor**, reusing the existing CTE inline expansion model for the non-recursive (anchor) term and adding a new execution loop for the recursive term.
 
-1. **Parsing** — Remove the `WITH RECURSIVE` rejection in `sql.nim`. Add a `recursive: bool` flag to the `Statement` type for `skSelect`, propagated from `parseWithClause`.
+1. **Parsing** — Remove the `WITH RECURSIVE` rejection in `sql.rs`. Add a `recursive: bool` flag to the `Statement` type for `skSelect`, propagated from `parseWithClause`.
 
 2. **Binding** — For recursive CTEs, skip the standard inline expansion. Instead, preserve the CTE definition for executor-time evaluation. The recursive CTE query body must be a `UNION ALL` (or `UNION`) of exactly two branches: the **anchor** (non-self-referencing) and the **recursive** (self-referencing) term.
 

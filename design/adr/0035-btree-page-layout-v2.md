@@ -10,7 +10,7 @@ The prior B+Tree page layout used fixed-width headers for both leaf and internal
 -   **Leaf Cells**: 16 bytes overhead (`key` u64 + `value_len` u32 + `overflow` u32).
 -   **Internal Cells**: 12 bytes overhead (`key` u64 + `child` u32).
 
-This structure is simple but wasteful, especially for tables with small keys and values (e.g., specific mapping tables or narrow rows). SQLite and other engines use variable-length encodings to minimize this overhead.
+This structure is simple but wasteful, especially for tables with small keys and values (e.g., specific mapping tables or narrow rows). SQLite and other engines use variable-length encodings to mirustize this overhead.
 
 ## Decision
 

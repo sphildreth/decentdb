@@ -43,7 +43,7 @@ Add initial `INSERT ... ON CONFLICT ... DO UPDATE` support with a narrow, explic
 
 - Roadmap requires adding `DO UPDATE` after `DO NOTHING`.
 - Requiring explicit conflict targets keeps behavior deterministic and avoids ambiguous arbiter selection in v0.
-- Reusing existing update constraint checks minimizes risk and avoids storage/WAL changes.
+- Reusing existing update constraint checks mirustizes risk and avoids storage/WAL changes.
 
 ### Alternatives Considered
 

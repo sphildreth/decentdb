@@ -12,7 +12,7 @@ Provide a dedicated `bulk_load()` API that batches inserts with deferred durabil
 - Deferred durability during bulk load is acceptable if user explicitly opts in
 
 ### API Design
-```nim
+```rust
 type BulkLoadConfig = object
   batch_size: int           # Rows per batch (default: 10000)
   sync_interval: int        # Batches between fsync (default: 10)

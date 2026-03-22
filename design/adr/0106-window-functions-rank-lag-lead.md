@@ -17,7 +17,7 @@ Constraints carried forward from ADR-0086:
 - Window frame clauses (`ROWS BETWEEN ...`, `RANGE BETWEEN ...`) are out of scope.
 
 Implementation approach:
-- Add `windowFunc` (string) and `windowArgs` (seq[Expr]) fields to the existing `ekWindowRowNumber` Expr variant rather than creating new ExprKind values, to minimise diff.
+- Add `windowFunc` (string) and `windowArgs` (seq[Expr]) fields to the existing `ekWindowRowNumber` Expr variant rather than creating new ExprKind values, to mirustise diff.
 - RANK/DENSE_RANK reuse the same partition-sort buffer as ROW_NUMBER with different counter logic.
 - LAG/LEAD perform O(1) index lookups on the sorted partition buffer.
 

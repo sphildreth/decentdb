@@ -294,7 +294,7 @@ decentdb exec --db=my.ddb --sql="SELECT 1" \
   --checkpointBytes=67108864 --readerWarnMs=60000 --readerTimeoutMs=300000 --forceTruncateOnTimeout
 ```
 
-For embedded Nim usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
+For embedded Rust usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
 
 ### Durability
 

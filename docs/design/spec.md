@@ -6,7 +6,7 @@
 
 ## 1. Overview
 This document defines the baseline engineering design for DecentDB:
-- Embedded DB engine in **Nim**
+- Embedded DB engine in **Rust**
 - Strong correctness via **Python-driven testing harness** + unit/property/crash tests
 - ACID via **WAL-based** design
 - Storage: **paged file + B+Trees**, with **trigram inverted index** for search
@@ -17,7 +17,7 @@ Current scope (0.x, pre-1.0): single process, multi-threaded readers, single wri
 ---
 
 ## 2. Module architecture
-### 2.1 Engine modules (Nim)
+### 2.1 Engine modules (Rust)
 1. **vfs/**
   - OS file I/O abstraction: open/read/write/fsync/lock (intra-process lock only)
    - “Faulty VFS” hooks for tests (partial writes, dropped fsync, crash points)
@@ -275,7 +275,7 @@ Multi-process locking is out of scope for 0.x.
 - Normalize parse trees into DecentDB’s internal AST immediately.
 
 Alternative:
-- Use Nim-native `parsesql` for faster iteration, then migrate to libpg_query later.
+- Use Rust-native `parsesql` for faster iteration, then migrate to libpg_query later.
 
 ### 6.2 Supported SQL subset (0.x baseline)
 - DDL: `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `CREATE VIEW`, `DROP VIEW`, `ALTER VIEW ... RENAME TO ...`
@@ -475,13 +475,13 @@ For contains predicates:
 
 ## 10. Testing strategy (critical)
 ### 10.1 Test layers
-1. **Pure unit tests (Nim)**
+1. **Pure unit tests (Rust)**
    - Pager read/write, freelist correctness
    - WAL frame encoding, checksum verification
    - B+Tree invariants (ordering, search correctness, cursor iteration)
    - Trigram generation and postings encode/decode
 
-2. **Property tests (Nim + Python)**
+2. **Property tests (Rust + Python)**
    - Random sequences of operations preserve invariants
    - “index results == scan results”
    - “FK never violated” under random mutations
@@ -641,7 +641,7 @@ Status: partially implemented in the current engine.
 
 Database-level configuration (set at open time):
 - `page_size`: fixed at 4096 bytes (opening any other size currently returns `ERR_CORRUPTION`)
-- `cachePages` / `cacheMb`: page cache capacity (CLI: `--cachePages` / `--cacheMb`; Nim: `openDb(..., cachePages = ...)`)
+- `cachePages` / `cacheMb`: page cache capacity (CLI: `--cachePages` / `--cacheMb`; Rust: `openDb(..., cachePages = ...)`)
 
 ### 16.2 Runtime configuration (current)
 
@@ -650,7 +650,7 @@ Database-level configuration (set at open time):
 
 ### 16.3 Configuration API (current)
 
-```nim
+```rust
 import decentdb/engine
 import decentdb/wal/wal
 

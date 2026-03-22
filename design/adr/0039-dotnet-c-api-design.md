@@ -10,7 +10,7 @@ DecentDB needs to be callable from .NET (ADO.NET provider + Micro-ORM) without a
 - safe with explicit ownership and lifetimes
 
 ## Decision
-- Expose a C ABI from the Nim engine and bind it from .NET via P/Invoke.
+- Expose a C ABI from the Rust engine and bind it from .NET via P/Invoke.
 - Use opaque handles for database and prepared statement lifetimes.
 - Implement streaming reads via `prepare/bind/step/column_*` to back `DbDataReader` without materializing full result sets.
 - Error reporting uses numeric error codes plus a UTF-8 message accessible via `decentdb_last_error_code` / `decentdb_last_error_message`.
@@ -23,5 +23,5 @@ DecentDB needs to be callable from .NET (ADO.NET provider + Micro-ORM) without a
 - design/adr/0010-error-handling-strategy.md
 - design/adr/0011-memory-management-strategy.md
 - design/DAPPER_SUPPORT.md (Phase 1 / Phase 2)
-- src/c_api.nim
+- src/c_api.rs
 - bindings/dotnet/src/DecentDB.Native/NativeMethods.cs

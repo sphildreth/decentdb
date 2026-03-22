@@ -70,4 +70,4 @@ When multi-reader support is added:
 - `design/adr/0018-checkpointing-reader-count-mechanism.md` - Reader management during checkpoint
 - `design/adr/0004-wal-checkpoint-strategy.md` - Checkpoint ordering guarantees
 - CRIT-004 (rollback cache atomicity) - Related rollback locking
-- `src/pager/pager.nim` - Freelist implementation (`allocatePage`, `freePage`)
+- `src/pager/pager.rs` - Freelist implementation (`allocatePage`, `freePage`)

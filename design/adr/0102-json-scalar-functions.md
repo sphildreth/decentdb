@@ -17,9 +17,9 @@ These scalar functions must exist in the DecentDB SQL engine for the rewritten q
 
 ## Decision
 
-Add `json_array_length(text [, path])` and `json_extract(text, path)` as built-in scalar functions in `exec.nim`. These functions:
+Add `json_array_length(text [, path])` and `json_extract(text, path)` as built-in scalar functions in `exec.rs`. These functions:
 
-- Parse JSON using Nim's `std/json` module
+- Parse JSON using Rust's `std/json` module
 - Support JSONPath-style `$` root and `$[N]` array index notation
 - Return NULL for NULL inputs (SQL NULL propagation)
 - Return NULL for invalid JSON (no runtime errors for malformed data)
@@ -31,6 +31,6 @@ These are general-purpose SQL functions useful beyond EF Core — any SQL user c
 ## Consequences
 
 - Two new scalar functions available to all DecentDB users via SQL
-- Depends on `std/json` (Nim stdlib — no new external dependency)
+- Depends on `std/json` (Rust stdlib — no new external dependency)
 - JSON parsing occurs at query time per row; no pre-built JSON indexes
 - Enables the EF Core provider to handle primitive collection patterns without core table-valued function support

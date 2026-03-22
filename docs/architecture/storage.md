@@ -72,7 +72,7 @@ Row values are encoded as a small self-describing record:
       [payload_bytes]
 ```
 
-This is defined in `src/record/record.nim` and ADR 0030.
+This is defined in `src/record/record.rs` and ADR 0030.
 
 **Value kinds (payload encoding):**
 - NULL: empty payload
@@ -211,7 +211,7 @@ The pager maintains an in-memory cache of recently used pages.
 
 ### Cache Configuration
 
-```nim
+```rust
 # Default: 1024 pages = 4MB
 let db = openDb("my.ddb", cachePages = 4096)  # 16MB
 ```

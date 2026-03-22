@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Fixed caching memory leak in repeated `prepare()` loops with parameters.
   - Reduced memory fragmentation overhead in B-tree splits.
   - Fixed `Db` object reference cycle leak during `closeDb()` under ARC management.
-- **Tests**: Expanded test suite with comprehensive memory leak regression tests (`test_engine_memory_leak_queries.nim`) and concurrency tests (`test_engine_isolation.nim`).
+- **Tests**: Expanded test suite with comprehensive memory leak regression tests (`test_engine_memory_leak_queries.rs`) and concurrency tests (`test_engine_isolation.rs`).
 
 ## [1.8.0] - 2026-03-19
 
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Tests**: Added 7 cross-connection visibility tests in Python bindings covering insert, update, delete, threaded, multi-commit, cross-pager page allocation, and threaded page allocation+free scenarios.
 
 ### Fixed
-- **Engine**: Fixed `expandFilename` crash when `evictSharedWal` was called on a non-existent file path. `realpath()` returns NULL for missing files, causing an unhandled Nim `OSError` that corrupted runtime state through the C API boundary. Added `safeCanonicalPath` fallback to `absolutePath`.
+- **Engine**: Fixed `expandFilename` crash when `evictSharedWal` was called on a non-existent file path. `realpath()` returns NULL for missing files, causing an unhandled Rust `OSError` that corrupted runtime state through the C API boundary. Added `safeCanonicalPath` fallback to `absolutePath`.
 - **Engine**: Fixed cross-pager `pageCount` divergence in shared WAL mode. When Connection A allocated new pages and committed, Connection B's pager rejected those page IDs in `freePage`/`ensurePageId` because B's `pageCount` (derived from file size at open time) was stale. The `effectivePageCount` proc now checks the shared WAL `maxPageCount` atomic.
 
 ## [1.7.5] - 2026-03-19
@@ -43,8 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engine**: `closeDb` now clears the SQL cache, savepoint stack, and temporary table/view maps to release memory sooner.
 
 ### Changed
-- **Build**: Added `--mm:arc` to `nim.cfg` so all Nim compilations (including tests) use the same memory management as the production shared library. This ensures ARC-specific bugs (e.g. reference cycles) are caught during development rather than only in release builds.
-- **Tests**: Added `nimble test_arc` task with dedicated ARC lifecycle tests (`test_arc_lifecycle.nim`) and a Python regression test (`test_open_close_leak.py`) that verifies RSS stays bounded across 500 open/close cycles.
+- **Build**: Added `--mm:arc` to `nim.cfg` so all Rust compilations (including tests) use the same memory management as the production shared library. This ensures ARC-specific bugs (e.g. reference cycles) are caught during development rather than only in release builds.
+- **Tests**: Added `cargo test_arc` task with dedicated ARC lifecycle tests (`test_arc_lifecycle.rs`) and a Python regression test (`test_open_close_leak.py`) that verifies RSS stays bounded across 500 open/close cycles.
 
 ## [1.7.3] - 2026-03-18
 
@@ -81,8 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engine**: Lock-free WAL index check optimization. Fast path for page reads directly skips `wal.indexLock` acquisition by atomically checking if any pages are currently uncheckpointed. Reduces read p95 latency by ~20%.
 - **Engine**: B-tree Internal and Leaf indexes are now zero-allocation `object` sequences rather than `ref object` sequences to significantly improve memory access locality and avoid allocations during navigation and searching.
 - **Engine**: Inner workings of `hash join` now directly index off the cached right row list.
-- **Engine**: Eliminated closure overhead inside hot `insert` path inside `btree.nim`.
-- **Benchmarking**: Changed `nimble bench` and `bench_compare` tests to correctly build the engine with `-d:release --opt:speed` optimizations applied.
+- **Engine**: Eliminated closure overhead inside hot `insert` path inside `btree.rs`.
+- **Benchmarking**: Changed `cargo bench` and `bench_compare` tests to correctly build the engine with `-d:release --opt:speed` optimizations applied.
 
 ### Fixed
 - **Engine / C API**: Prepared `CREATE TEMP TABLE` statements now allocate a real temp table root page, allowing inserts and selects against temp tables to work correctly within the creating connection while staying session-scoped.
@@ -110,7 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL Engine**: Views with GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET, and DISTINCT ON — view and CTE bodies that aggregate, sort, or limit rows are now expanded as derived tables (subqueries in FROM) instead of being rejected. See ADR-0113.
 - **Demo Database**: Comprehensive `make_demo_db` script now showcases all supported features including DEFAULT values, FK actions (SET NULL, CASCADE), UNIQUE INDEX, INSERT RETURNING, ON CONFLICT, auto-increment, 12 views (aggregates, window functions, CTEs, CASE, COALESCE, JSON operators, subqueries, UNION ALL, LIKE/ILIKE), INSTEAD OF trigger, and ANALYZE.
 - **Engine**: In-memory database support via `:memory:` connection string — each `openDb(":memory:")` creates a new, isolated, ephemeral database backed by `MemVfs`. WAL remains enabled for consistent transaction semantics. See ADR-0105.
-- **Engine**: `saveAs` — export any open database (including `:memory:`) to a new on-disk file. Performs a full checkpoint, then streams pages to the destination via atomic temp-file + rename. Available as a Nim proc, C API function, CLI command, and in all bindings (.NET, Go, Node, Python).
+- **Engine**: `saveAs` — export any open database (including `:memory:`) to a new on-disk file. Performs a full checkpoint, then streams pages to the destination via atomic temp-file + rename. Available as a Rust proc, C API function, CLI command, and in all bindings (.NET, Go, Node, Python).
 - **SQL Engine**: Window functions `RANK()`, `DENSE_RANK()`, `LAG()`, and `LEAD()` — extends the existing `ROW_NUMBER()` support with additional SQL:2003 window functions. All support `PARTITION BY` and `ORDER BY` clauses. `LAG`/`LEAD` accept 1–3 arguments (expression, offset, default). See ADR-0106.
 - **SQL Engine**: Math scalar functions `SQRT(x)`, `POWER(x, y)` / `POW(x, y)`, and `MOD(x, y)` — extends numeric function coverage for SQLite parity. All handle INT64, FLOAT64, and DECIMAL inputs; return FLOAT64. NULL propagation follows SQL standard. See issue #37.
 - **SQL Engine**: String scalar functions `INSTR(str, substr)`, `CHR(n)`, and `HEX(val)` — `INSTR` returns 1-based position (0 if not found), `CHR` converts ASCII code point to character (PostgreSQL syntax), `HEX` encodes integers/text/blobs as uppercase hexadecimal. See issue #37.
@@ -190,7 +190,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQL Engine**: `FROM (SELECT ... UNION SELECT ...)` subqueries now correctly derive column metadata from the left operand. See ADR-0104.
 - **SQL Engine**: LEFT JOIN column resolution with subquery returning zero rows — correctly derive column names from inner projection and pad NULLs. See ADR-0098.
 - **SQL Engine**: `IN (SELECT ...)` parameter scanning now correctly finds `$N` references inside subquery SQL text.
-- **Shared Library**: Disable Nim's signal handler (`-d:noSignalHandler`) and use system allocator (`-d:useMalloc`) to prevent conflicts with host runtimes (.NET, JVM). See ADR-0097.
+- **Shared Library**: Disable Rust's signal handler (`-d:noSignalHandler`) and use system allocator (`-d:useMalloc`) to prevent conflicts with host runtimes (.NET, JVM). See ADR-0097.
 - **Engine**: Evict stale Pager references from threadvar caches in `closeDb()` to prevent memory leaks under ARC. See ADR-0097.
 - .NET: NodaTime `Instant` type mapping now uses tick-level precision (100ns ticks since Unix epoch) instead of millisecond precision, matching .NET `DateTimeOffset.Ticks` behavior.
 - .NET: EF Core database creator now handles table/index creation failures gracefully during `EnsureCreated()`.
@@ -294,7 +294,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **SQL Engine**: `findMaxParam()` in C API now scans `EXISTS`/`SCALAR_SUBQUERY` literal SQL text for `$N` parameter references.
-- **SQL Engine**: Resolved `ResultShadowed` warning in `exec.nim` aggregate path.
+- **SQL Engine**: Resolved `ResultShadowed` warning in `exec.rs` aggregate path.
 - .NET: EF Core lazy loading proxy support (opt-in via `UseLazyLoadingProxies()`).
 
 
@@ -374,7 +374,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive CLI with SQL execution and maintenance commands
 - Complete test suite (unit, property, crash-injection, differential)
 - Performance benchmarks (7 benchmarks covering all key operations)
-- Nim API for embedded applications
+- Rust API for embedded applications
 - Cross-platform support (Linux, macOS, Windows)
 - Full documentation site with MkDocs
 
@@ -413,12 +413,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Page cache with LRU eviction
 - External merge sort for large ORDER BY operations
 - Comprehensive error handling with specific error codes
-- Memory-safe Nim implementation
+- Memory-safe Rust implementation
 - Extensive test coverage (>90% core modules)
 
 ### Documentation
 - Complete user guide with SQL reference
-- Nim API documentation
+- Rust API documentation
 - CLI reference
 - Architecture documentation
 - Design documents (PRD, SPEC, ADRs)

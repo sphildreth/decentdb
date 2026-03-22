@@ -63,18 +63,18 @@ Go Application
           ↓
       decentdb-go (database/sql driver)
           ↓
-      DecentDB.Native (cgo binding to Nim C API)
+      DecentDB.Native (cgo binding to Rust C API)
           ↓
-      DecentDB (Nim engine, direct file I/O)
+      DecentDB (Rust engine, direct file I/O)
 ```
 
 ---
 
-## Phase 1: Native C API (Nim)
+## Phase 1: Native C API (Rust)
 
 ### Requirements
 
-Expose a C-compatible API from the Nim DecentDB engine suitable for `cgo`.
+Expose a C-compatible API from the Rust DecentDB engine suitable for `cgo`.
 
 **Performance-first SELECT requirement:** Provide a forward-only, streaming statement API.
 
@@ -190,7 +190,7 @@ Use cgo to call into the native C ABI.
 
 Performance requirement:
 - avoid per-column cgo calls in hot loops
-- decode into `driver.Value` with minimal allocations
+- decode into `driver.Value` with mirustal allocations
 
 Implementation approach:
 - On `Rows.Next`, use the row-view/batch native API (Phase 1 extension) when available.
@@ -382,7 +382,7 @@ Exact options must match DecentDB engine option parsing.
    - `database/sql` already caches prepared statements per connection in some patterns, but drivers often benefit from explicit reuse
    - cache by SQL string + parameter shape
 
-3. **Fast decoding + minimal allocations**
+3. **Fast decoding + mirustal allocations**
    - reuse buffers for TEXT/BLOB decoding
    - return `[]byte` as copy (safe) or `RawBytes`-like semantics only if lifetime is explicit (dangerous)
 
@@ -497,7 +497,7 @@ Create an ADR before implementing:
 
 1. Should the Go driver target pure cgo with dynamic library loading, or link a static library for simpler distribution?
 2. Do we want to support named parameters at the Go driver layer (not required for sqlc) or keep `$N` only for correctness/performance?
-3. What is the minimal native batch-fetch ABI that meaningfully reduces cgo overhead without complicating pointer lifetimes?
+3. What is the mirustal native batch-fetch ABI that meaningfully reduces cgo overhead without complicating pointer lifetimes?
 
 ---
 

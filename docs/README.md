@@ -57,7 +57,7 @@ To use decentdb.org as the custom domain:
 - `index.md` - Home page
 - `getting-started/` - Installation and quick start guides
 - `user-guide/` - SQL reference, data types, performance tuning
-- `api/` - API documentation (Nim API, CLI reference)
+- `api/` - API documentation (Rust API, CLI reference)
 - `architecture/` - Technical documentation
 - `development/` - Building, testing, contributing
 - `design/` - Design documents (PRD, SPEC, ADRs)

@@ -40,13 +40,13 @@ A native datetime type enables:
   catalog and decode as `vkDateTime`.
 - `NOW()` / `CURRENT_TIMESTAMP` now return `vkDateTime` instead of `vkText`.
   Callers that previously expected `vkText` will need updating (the test in
-  `test_sql_exec.nim` checking the DATE column format was updated accordingly).
+  `test_sql_exec.rs` checking the DATE column format was updated accordingly).
 
 ### Shared Utilities
 
 Datetime conversion helpers (`datetimeToMicros`, `microsToDatetime`,
-`formatDatetimeMicros`, `parseDatetimeMicros`) live in `src/utils/datetime.nim`
-to avoid a circular dependency between `exec.nim` and `storage.nim`.
+`formatDatetimeMicros`, `parseDatetimeMicros`) live in `src/utils/datetime.rs`
+to avoid a circular dependency between `exec.rs` and `storage.rs`.
 
 ### C API Surface
 

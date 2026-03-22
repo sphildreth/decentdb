@@ -33,15 +33,15 @@ cd decentdb
 ### Set Up Development Environment
 
 ```bash
-# Install Nim (see Building guide)
+# Install Rust (see Building guide)
 # Install dependencies
-nimble install
+cargo install --path ./cli
 
 # Build the project
-nimble build
+cargo build
 
 # Run tests
-nimble test
+cargo test
 ```
 
 ## Development Workflow
@@ -64,13 +64,13 @@ git checkout -b fix/bug-description
 
 ```bash
 # Run all tests
-nimble test
+cargo test
 
 # Run specific test
-nim c -r tests/nim/test_your_feature.nim
+nim c -r tests/nim/test_your_feature.rs
 
 # Build with strict checks
-nimble build
+cargo build
 ```
 
 ### 4. Commit
@@ -110,11 +110,11 @@ Then open a PR on GitHub with:
 
 ## Code Guidelines
 
-### Nim Style
+### Rust Style
 
 Follow [NEP-1](https://nim-lang.org/docs/nep1.html):
 
-```nim
+```rust
 # Good
 proc calculateTotal(items: seq[Item]): int64 =
   result = 0
@@ -137,7 +137,7 @@ Key points:
 
 Always check results:
 
-```nim
+```rust
 let res = someOperation()
 if not res.ok:
   return err[Type](res.err.code, res.err.message)
@@ -149,7 +149,7 @@ Never ignore errors in production code.
 
 Every change needs tests:
 
-```nim
+```rust
 suite "My Feature":
   test "basic functionality":
     let res = myFeature()
@@ -166,7 +166,7 @@ suite "My Feature":
 
 Document public APIs:
 
-```nim
+```rust
 ## Calculate page utilization percentage
 ## 
 ## Returns 0.0-100.0 representing percentage of page space used
@@ -252,7 +252,7 @@ Include:
 
 1. **Ensure tests pass**
    ```bash
-   nimble test
+   cargo test
    ```
 
 2. **Update documentation**
@@ -279,7 +279,7 @@ Include:
 
 - **Correctness:** Does it work? Are edge cases handled?
 - **Tests:** Are there tests? Do they cover edge cases?
-- **Style:** Does it follow Nim conventions?
+- **Style:** Does it follow Rust conventions?
 - **Documentation:** Is it documented?
 - **Performance:** Any obvious issues?
 
@@ -295,7 +295,7 @@ Include:
 
 ### Recommended Setup
 
-- VS Code with Nim extension
+- VS Code with Rust extension
 - Or Vim/Neovim with nimlsp
 - Git with GPG signing
 - GitHub CLI (optional)
@@ -304,13 +304,13 @@ Include:
 
 ```bash
 # Format code
-nimpretty src/*.nim
+nimpretty src/*.rs
 
 # Check for issues
-nim check src/decentdb.nim
+nim check src/decentdb.rs
 
 # Profile build
-nim c -d:release --profiler:on src/decentdb.nim
+nim c -d:release --profiler:on src/decentdb.rs
 
 # Memory check
 valgrind --leak-check=full ./decentdb ...

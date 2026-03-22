@@ -1,6 +1,6 @@
 # B+Tree
 
-DecentDB stores tables and secondary indexes in a page-based B+Tree implementation (`src/btree/btree.nim`) backed by the pager (`src/pager/`).
+DecentDB stores tables and secondary indexes in a page-based B+Tree implementation (`src/btree/btree.rs`) backed by the pager (`src/pager/`).
 
 At this layer, the tree is a mapping:
 

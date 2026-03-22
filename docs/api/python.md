@@ -16,7 +16,7 @@ python -m pip install -e bindings/python
 The Python bindings load the DecentDB C API via `ctypes`.
 
 ```bash
-nimble build_lib
+cargo build_lib
 ```
 
 The loader finds `build/libc_api.so` automatically when running from the repo. To force an explicit path:

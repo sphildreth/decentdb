@@ -274,7 +274,7 @@ Add to execution engine:
 
 ## C API and Language Bindings
 
-DecentDB exposes a C API (`src/c_api.nim`) with 35+ functions for use by language bindings:
+DecentDB exposes a C API (`src/c_api.rs`) with 35+ functions for use by language bindings:
 
 | Binding | Interface | Notes |
 |---------|-----------|-------|

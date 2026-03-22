@@ -16,7 +16,7 @@ DecentDB has comprehensive testing at multiple levels.
 
 ```
 tests/
-├── nim/           # Nim unit tests
+├── nim/           # Rust unit tests
 ├── harness/       # Python test framework
 ├── bench/         # Performance benchmarks
 └── data/          # Test datasets
@@ -27,37 +27,37 @@ tests/
 ### All Tests
 
 ```bash
-nimble test
+cargo test
 ```
 
 Runs:
-- All Nim unit tests
+- All Rust unit tests
 - Python harness tests
-- Binding test suites wired through `nimble test_bindings` (`.NET`, Go, Node.js, Python, Dart)
-- Java JDBC tests remain separate: `nimble test_bindings_java`
+- Binding test suites wired through `cargo test_bindings` (`.NET`, Go, Node.js, Python, Dart)
+- Java JDBC tests remain separate: `cargo test_bindings_java`
 
 If you want only the core engine checks without binding prerequisites:
 
 ```bash
-nimble test_nim
-nimble test_py
+cargo test_nim
+cargo test_py
 ```
 
-### Nim Tests Only
+### Rust Tests Only
 
 ```bash
-nimble test_nim
+cargo test_nim
 ```
 
 Or individual test:
 ```bash
-nim c -r tests/nim/test_wal.nim
+nim c -r tests/nim/test_wal.rs
 ```
 
 ### Python Tests Only
 
 ```bash
-nimble test_py
+cargo test_py
 ```
 
 Or directly:
@@ -69,13 +69,13 @@ python -m unittest tests/harness/test_runner.py
 
 ```bash
 # WAL tests
-nim c -r tests/nim/test_wal.nim
+nim c -r tests/nim/test_wal.rs
 
 # BTree tests
-nim c -r tests/nim/test_btree.nim
+nim c -r tests/nim/test_btree.rs
 
 # SQL tests
-nim c -r tests/nim/test_sql_parser.nim
+nim c -r tests/nim/test_sql_parser.rs
 ```
 
 ### Open/Insert/Select/Close Soak Test
@@ -83,7 +83,7 @@ nim c -r tests/nim/test_sql_parser.nim
 Use the soak runner when you need very long lifecycle loops to watch for memory growth:
 
 ```bash
-nimble build_lib
+cargo build_lib
 python scripts/soak_open_insert_select_close.py \
   --batches 20 \
   --iterations-per-batch 500 \
@@ -123,8 +123,8 @@ Notes:
 
 Test individual functions and modules.
 
-**Example** (from `test_btree.nim`):
-```nim
+**Example** (from `test_btree.rs`):
+```rust
 test "insert split update delete":
   let tree = newBTree(pager, rootPage)
   
@@ -150,10 +150,10 @@ test "insert split update delete":
 
 DecentDB uses invariant-style tests, and some tests include randomized loops to exercise edge cases.
 
-There is not currently a dedicated `tests/nim/test_property.nim` suite; if/when property testing is split out, it should follow the same `tests/nim/test_*.nim` naming convention so `nimble test` picks it up.
+There is not currently a dedicated `tests/nim/test_property.rs` suite; if/when property testing is split out, it should follow the same `tests/nim/test_*.rs` naming convention so `cargo test` picks it up.
 
 **Example** (illustrative):
-```nim
+```rust
 test "index results == scan results":
   for i in 0..<100:
     let query = generateRandomQuery()
@@ -167,7 +167,7 @@ test "index results == scan results":
 Simulate failures to verify recovery.
 
 **Using FaultyVFS**:
-```nim
+```rust
 test "torn write ignored on recovery":
   let vfs = newFaultyVfs()
   vfs.addRule(FaultRule(
@@ -207,10 +207,10 @@ Track performance over time.
 
 ```bash
 # Run benchmarks
-nimble bench
+cargo bench
 
 # Compare to baseline
-nimble bench_compare
+cargo bench_compare
 ```
 
 ## Test Data
@@ -254,9 +254,9 @@ python tests/data/generate_unicode.py
 
 ### New Unit Test
 
-Create `tests/nim/test_feature.nim`:
+Create `tests/nim/test_feature.rs`:
 
-```nim
+```rust
 import unittest
 import ../src/engine
 import ../src/record/record
@@ -316,8 +316,8 @@ DifferentialTest(
 ### Measuring Coverage
 
 ```bash
-# Nim coverage (requires gcov)
-nimble coverage_nim
+# Rust coverage (requires gcov)
+cargo coverage_nim
 
 # Python coverage
 pip install coverage
@@ -347,17 +347,17 @@ Tests run automatically on:
 
 ## Debugging Test Failures
 
-### Nim Tests
+### Rust Tests
 
 ```bash
 # Run with verbose output
-nim c -r tests/nim/test_wal.nim --verbose
+nim c -r tests/nim/test_wal.rs --verbose
 
 # Run specific test
-nim c -r tests/nim/test_wal.nim --run="specific test name"
+nim c -r tests/nim/test_wal.rs --run="specific test name"
 
 # Debug build
-nim c -d:debug -r tests/nim/test_wal.nim
+nim c -d:debug -r tests/nim/test_wal.rs
 ```
 
 ### Python Tests

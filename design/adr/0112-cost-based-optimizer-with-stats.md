@@ -30,7 +30,7 @@ Two new catalog record types are introduced alongside the existing `table`, `ind
 
 ### 1.2 Encoded format
 
-Records use the existing `encodeRecord` / `decodeRecord` machinery from `record.nim`. Fields are positional:
+Records use the existing `encodeRecord` / `decodeRecord` machinery from `record.rs`. Fields are positional:
 
 **`stats:table`** (3 fields):
 1. `vkText` — `"stats:table"`
@@ -53,7 +53,7 @@ Records use the existing `encodeRecord` / `decodeRecord` machinery from `record.
 
 `parseCatalogRecord` is extended with two new arms:
 
-```nim
+```rust
 if recordType == "stats:table":
   # fields: [tag, name, rowCount]
   ...
@@ -68,7 +68,7 @@ Unknown record types are silently skipped (no error) so that future additions do
 
 `Catalog` gains two new fields:
 
-```nim
+```rust
 tableStats*: Table[string, TableStats]
 indexStats*: Table[string, IndexStats]
 ```
@@ -81,7 +81,7 @@ These are populated at open time from `parseCatalogRecord` and updated by `ANALY
 
 ### 2.1 SQL syntax
 
-Minimum supported forms:
+Mirustum supported forms:
 
 ```sql
 ANALYZE tableName   -- analyze one table and all its indexes
@@ -92,11 +92,11 @@ ANALYZE             -- analyze all user tables and their indexes
 
 ### 2.2 Parser
 
-libpg_query parses `ANALYZE tableName` as a `VacuumStmt` JSON node with `is_vacuumcmd = false`. A `parseVacuumStmt` proc is added to `sql.nim` that detects this and emits `skAnalyze`. Bare `ANALYZE` (no table) is also supported.
+libpg_query parses `ANALYZE tableName` as a `VacuumStmt` JSON node with `is_vacuumcmd = false`. A `parseVacuumStmt` proc is added to `sql.rs` that detects this and emits `skAnalyze`. Bare `ANALYZE` (no table) is also supported.
 
 ### 2.3 New `StatementKind`
 
-```nim
+```rust
 skAnalyze
 ```
 
@@ -118,7 +118,7 @@ Stats computation is O(n) in table/index size. No background work; `ANALYZE` is 
 
 ### 3.1 Per-transaction deltas
 
-The `Catalog` gains a `rowCountDeltas: Table[string, int64]` field (normalized table name → delta). DML execution in `exec.nim` increments or decrements this per committed row change.
+The `Catalog` gains a `rowCountDeltas: Table[string, int64]` field (normalized table name → delta). DML execution in `exec.rs` increments or decrements this per committed row change.
 
 ### 3.2 Commit semantics
 
@@ -140,7 +140,7 @@ Row-count deltas are applied at the in-memory level immediately on commit. Persi
 
 `Plan` gains two fields:
 
-```nim
+```rust
 estRows*: int64    # estimated output cardinality (0 = unknown / not estimated)
 estCost*: float64  # estimated relative cost (0.0 = not estimated)
 ```
@@ -202,12 +202,12 @@ Only **inner joins** are reordered. `LEFT JOIN` / `FULL OUTER JOIN` chains are n
 
 ### 6.2 Algorithm
 
-- For N ≤ 6 inner joins: exhaustive left-deep DP (Selinger-style). Enumerate all orderings of the N join tables; for each ordering compute total estimated join cost and pick the minimum.
+- For N ≤ 6 inner joins: exhaustive left-deep DP (Selinger-style). Enumerate all orderings of the N join tables; for each ordering compute total estimated join cost and pick the mirustum.
 - For N > 6: greedy heuristic — order tables by estimated cardinality ascending (smallest-first).
 
 ### 6.3 Implementation location
 
-Added to `planSelect` in `planner.nim` after all inner join tables are collected, before building the join tree.
+Added to `planSelect` in `planner.rs` after all inner join tables are collected, before building the join tree.
 
 ### 6.4 Constraint preservation
 
@@ -236,7 +236,7 @@ Actual Time: 3.241 ms
 
 ## 8. Validation Plan
 
-- Unit tests: `tests/nim/test_analyze_stats.nim`
+- Unit tests: `tests/rust/test_analyze_stats.rs`
   - ANALYZE parse/bind/execute
   - Stats persisted and reloaded after DB reopen
   - Empty table → rowCount=0

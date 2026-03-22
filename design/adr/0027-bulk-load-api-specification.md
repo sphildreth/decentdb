@@ -13,7 +13,7 @@ The bulk load functionality was mentioned in the PRD but lacked detailed specifi
 ### API Design
 
 #### Function Signature
-```nim
+```rust
 proc bulkLoad*(db: Database, tableName: string, data: seq[Row], options: BulkLoadOptions): BulkLoadResult
 
 type BulkLoadOptions = object

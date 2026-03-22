@@ -46,7 +46,7 @@ Offset  Size  Field
 - **No checksum**: Unacceptable for production database
 
 ### Trade-offs
-- **Pros**: Detects corruption early, hardware-accelerated, minimal overhead
+- **Pros**: Detects corruption early, hardware-accelerated, mirustal overhead
 - **Cons**: Adds 4 bytes to header, requires checksum calculation on every header update
 
 ### References

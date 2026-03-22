@@ -252,4 +252,4 @@ These Python import tools provide convenience and compatibility but may be slowe
 
 For maximum performance with large datasets, consider:
 1. Using the native `decentdb bulk-load` command for CSV data
-2. Writing a custom Nim importer using the C API directly
+2. Writing a custom Rust importer using the C API directly

@@ -31,11 +31,11 @@ Normalize identifier comparisons to case-insensitive at the **comparison point**
 
 | Module | Change | Hot path? |
 |--------|--------|-----------|
-| `catalog.nim` | Map keys (tables, views, indexes) normalized via `normalizedObjectName()` | Once per statement |
-| `binder.nim` | `resolveColumn()` pre-normalizes lookup name, compares via `normalizedName()` | Once per column ref per statement |
-| `binder.nim` | DDL/conflict column matching uses `eqIdent()` helper | DDL only (infrequent) |
-| `engine.nim` | `columnIndexInTable()` pre-normalizes lookup name | Per column lookup in execution |
-| `sql.nim` | CREATE TABLE constraint column matching lowercased | DDL only |
+| `catalog.rs` | Map keys (tables, views, indexes) normalized via `normalizedObjectName()` | Once per statement |
+| `binder.rs` | `resolveColumn()` pre-normalizes lookup name, compares via `normalizedName()` | Once per column ref per statement |
+| `binder.rs` | DDL/conflict column matching uses `eqIdent()` helper | DDL only (infrequent) |
+| `engine.rs` | `columnIndexInTable()` pre-normalizes lookup name | Per column lookup in execution |
+| `sql.rs` | CREATE TABLE constraint column matching lowercased | DDL only |
 
 ### Performance impact
 

@@ -32,7 +32,7 @@ Cost-based optimization and full statistics collection are **deferred until post
 
 When cost-based optimization is implemented:
 
-1. **Minimal Statistics:** Start with table-level stats only:
+1. **Mirustal Statistics:** Start with table-level stats only:
    - Row count
    - Approximate distinct count (HyperLogLog)
    - Min/max values per column

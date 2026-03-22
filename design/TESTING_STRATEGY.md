@@ -11,7 +11,7 @@ This document expands the testing requirements from PRD/SPEC into an actionable 
 - **Faults are features**: we intentionally simulate partial writes, dropped fsync, and crashes.
 
 ## 2. Test pyramid
-### 2.1 Fast unit tests (Nim)
+### 2.1 Fast unit tests (Rust)
 Runs on every PR.
 - pager:
   - page read/write roundtrip
@@ -96,7 +96,7 @@ For supported subset only.
   - Assert all handles closed after each test
   - Use OS-level tools (lsof, handle.exe) in CI
 - Memory leaks:
-  - Use Nim's memory tracking (--gc:arc --gc:stats)
+  - Use Rust tools like Valgrind or Miri for leak detection
   - Run tests with leak detection enabled
   - Assert no memory growth across repeated operations
   - Test long-running operations for gradual memory accumulation
@@ -138,7 +138,7 @@ For supported subset only.
    - Used for: Performance benchmarks, FK constraint testing
 
 ## 3. Faulty VFS design (must-have)
-Implement a test-only VFS layer in Nim that can be toggled on.
+Implement a test-only VFS layer in Rust that can be toggled on.
 Capabilities:
 - partial write injection: write only first N bytes
 - error injection on read/write/fsync
@@ -164,10 +164,10 @@ Scenario DSL (example):
 
 ## 5. Coverage and CI
 - Coverage target: set a baseline early and raise gradually.
-- Coverage reporting (Nim unit tests):
-  - Run `nimble coverage_nim`.
+- Coverage reporting (Rust unit tests):
+  - Run `cargo tarpaulin` or `cargo llvm-cov`.
   - Output: `build/coverage/summary.txt` and `build/coverage/summary.json`.
-  - Notes: coverage is collected via `gcov` on Nim's C backend; treat the numbers as a trend signal for test completeness.
+  - Notes: coverage is collected via LLVM; treat the numbers as a trend signal for test completeness.
 - CI:
   - PR: unit + small property suite on all OSes
   - nightly: extended crash suite + long property runs + fuzz (if adopted)

@@ -6,7 +6,7 @@ DecentDB can be configured at database creation and runtime.
 
 Configuration is set when opening the database:
 
-```nim
+```rust
 import decentdb/engine
 
 # With default settings
@@ -22,7 +22,7 @@ The page cache keeps frequently accessed pages in memory.
 
 **Configuration:**
 - CLI: `--cachePages=<n>` or `--cacheMb=<n>`
-- Nim API: `openDb(path, cachePages = n)`
+- Rust API: `openDb(path, cachePages = n)`
 - Default: 1024 pages (4MB with 4KB pages)
 
 **Recommendations:**
@@ -52,7 +52,7 @@ DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by def
 There is currently no SQL-level `PRAGMA` to change durability for normal DML (`INSERT`/`UPDATE`/`DELETE`). For high-throughput ingestion, use bulk-load durability modes instead:
 
 - CLI: `decentdb bulk-load --durability=full|deferred|none` (default: `deferred`)
-- Nim: `BulkLoadOptions.durability = dmFull|dmDeferred|dmNone`
+- Rust: `BulkLoadOptions.durability = dmFull|dmDeferred|dmNone`
 
 ### Checkpointing
 
@@ -76,7 +76,7 @@ Note: if you pass *any* of the checkpoint/reader flags, the CLI overrides the en
 
 Configure bulk loading behavior:
 
-```nim
+```rust
 var opts = defaultBulkLoadOptions()
 
 -- Rows per batch
@@ -129,7 +129,7 @@ To override checkpoint/reader settings for a single `exec` invocation, use:
 - `--readerTimeoutMs`
 - `--forceTruncateOnTimeout`
 
-For embedded Nim usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
+For embedded Rust usage, call `setCheckpointConfig(db.wal, ...)` after opening the database.
 ## Configuration File
 
 Create `~/.decentdb/config` for default settings:
@@ -158,7 +158,7 @@ decentdb exec --db=my.ddb --sql="SELECT * FROM large_table" --cacheMb=256
 
 ### For Write-Heavy Workloads
 
-```nim
+```rust
 var opts = defaultBulkLoadOptions()
 opts.durability = dmDeferred
 opts.disableIndexes = true
@@ -231,7 +231,7 @@ decentdb exec --db=prod.ddb --sql="SELECT 1" --cacheMb=256 \
 
 ### Bulk Data Import
 
-```nim
+```rust
 var opts = defaultBulkLoadOptions()
 opts.batchSize = 50000
 opts.syncInterval = 5

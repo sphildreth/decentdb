@@ -5,7 +5,7 @@ DecentDB provides a Go `database/sql` driver and a direct API under `bindings/go
 ## Build the native library
 
 ```bash
-nimble build_lib
+cargo build_lib
 ```
 
 On Linux this produces `build/libc_api.so`.

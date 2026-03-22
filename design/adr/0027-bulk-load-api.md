@@ -8,12 +8,12 @@ DecentDB needs a dedicated bulk load path to ingest large datasets efficiently (
 - Snapshot isolation for readers
 - WAL-based durability by default (fsync on commit)
 
-The engine already exposes a Nim-level `bulkLoad(db, tableName, rows, options, wal)` entry point (`src/engine.nim`), but the behavior and durability modes must be explicitly defined.
+The engine already exposes a Rust-level `bulkLoad(db, tableName, rows, options, wal)` entry point (`src/engine.rs`), but the behavior and durability modes must be explicitly defined.
 
 ## Decision
 Define `bulkLoad` as a batch-oriented loader with explicit durability modes and optional index build specialization.
 
-### API surface (Nim)
+### API surface (Rust)
 `bulkLoad(db, tableName, rows, options = defaultBulkLoadOptions(), wal = db.wal)`
 
 `BulkLoadOptions`:

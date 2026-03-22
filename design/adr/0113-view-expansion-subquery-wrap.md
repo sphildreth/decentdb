@@ -8,7 +8,7 @@ Views and CTEs whose body contains GROUP BY, HAVING, ORDER BY, LIMIT/OFFSET,
 or DISTINCT ON are now expanded as **derived tables** (subqueries in FROM)
 rather than being merge-inlined into the outer query.
 
-Previously, `expandSelectViews` in `binder.nim` used `pushDownQuery()` to
+Previously, `expandSelectViews` in `binder.rs` used `pushDownQuery()` to
 merge-inline all view bodies.  This merge strategy cannot preserve result-set
 semantics for views that aggregate, sort, or limit rows.  The binder rejected
 such views at bind time with an error.
@@ -31,7 +31,7 @@ in HAVING hit the scalar evaluator and failed.
   significant usability gap.
 - Derived tables (subqueries in FROM) were already fully supported by the
   executor and planner.  Wrapping complex views as derived tables reuses
-  existing infrastructure with minimal new code.
+  existing infrastructure with mirustal new code.
 - The merge-inline path is preserved for simple views (no GROUP BY, ORDER BY,
   etc.) where it produces better plans by avoiding a subquery boundary.
 
@@ -50,7 +50,7 @@ in HAVING hit the scalar evaluator and failed.
 
 - **Pro**: Views with GROUP BY, HAVING, ORDER BY, LIMIT, and DISTINCT ON now
   work correctly when queried.
-- **Pro**: Minimal code change — adds a predicate and wrapping logic; does not
+- **Pro**: Mirustal code change — adds a predicate and wrapping logic; does not
   alter the existing merge path.
 - **Con**: Complex views wrapped as subqueries may inhibit certain optimizer
   rewrites (e.g., predicate pushdown into the view body).  This is acceptable
@@ -62,5 +62,5 @@ in HAVING hit the scalar evaluator and failed.
 
 ### References
 
-- `src/sql/binder.nim` — `needsSubqueryWrap`, `expandSelectViews`, `expandSelectCteRefs`
-- `src/exec/exec.nim` — `collectAggSpecsFromExpr`, `aggregateRows` (HAVING fix)
+- `src/sql/binder.rs` — `needsSubqueryWrap`, `expandSelectViews`, `expandSelectCteRefs`
+- `src/exec/exec.rs` — `collectAggSpecsFromExpr`, `aggregateRows` (HAVING fix)

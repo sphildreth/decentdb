@@ -11,11 +11,11 @@ Adopt `libpg_query` via FFI as the SQL parser from the start of Phase 4 and beyo
 - Avoids a later parser migration that would impact tests and planner/exec logic.
 
 ### Alternatives Considered
-- Nim-native parser for the Phase 4 subset (rejected).
+- Rust-native parser for the Phase 4 subset (rejected).
 
 ### Trade-offs
 - Adds a C dependency that must be available at build time.
-- Requires an FFI layer and parse-tree normalization in Nim.
+- Requires an FFI layer and parse-tree normalization in Rust.
 
 ### References
 - `design/SPEC.md` §6.1 (parser choice)

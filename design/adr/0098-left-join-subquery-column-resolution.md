@@ -4,7 +4,7 @@
 
 ### Decision
 
-Fix two related bugs in `exec.nim` that caused incorrect column resolution when a LEFT JOIN's right side is a subquery that returns zero matching rows:
+Fix two related bugs in `exec.rs` that caused incorrect column resolution when a LEFT JOIN's right side is a subquery that returns zero matching rows:
 
 1. **`columnIndex` qualified lookup:** When a qualified column reference (`table.column`) fails the direct lookup, do not fall through to unqualified matching across all tables. Instead, attempt unqualified matching only against columns with no table prefix, preventing false "Ambiguous column" errors.
 

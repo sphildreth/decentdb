@@ -6,7 +6,7 @@
 Store large TEXT/BLOB payloads in a chained sequence of overflow pages. Each page begins with a 4-byte next pointer and 4-byte data length.
 
 ### Rationale
-- Minimal header overhead
+- Mirustal header overhead
 - Works with single-page reads and simple chaining
 
 ### Alternatives Considered

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Nim compiler (>= 1.6.0)
+- Rust compiler (>= 1.6.0)
 - libpg_query (for SQL parsing)
 
 ## GitHub release binaries
@@ -19,9 +19,9 @@ Each archive contains the DecentDB CLI plus the native C API library. Extract th
 
 ## From Source
 
-### 1. Install Nim
+### 1. Install Rust
 
-Follow the official [Nim installation guide](https://nim-lang.org/install.html).
+Follow the official [Rust installation guide](https://nim-lang.org/install.html).
 
 ### 2. Clone the Repository
 
@@ -33,7 +33,7 @@ cd decentdb
 ### 3. Build DecentDB
 
 ```bash
-nimble build
+cargo build
 ```
 
 This creates the `decentdb` executable in the project root.
@@ -41,7 +41,7 @@ This creates the `decentdb` executable in the project root.
 ### 4. Run Tests
 
 ```bash
-nimble test
+cargo test
 ```
 
 ## Docker (Optional)
@@ -55,7 +55,7 @@ If Docker support is needed, either add a `Dockerfile` (and wire it into CI) or 
 To install system-wide:
 
 ```bash
-nimble install
+cargo install --path ./cli
 ```
 
 Or copy the binary manually:
@@ -77,7 +77,7 @@ You should see the help output with available commands.
 To use DecentDB from other languages, build the shared C API library:
 
 ```bash
-nimble build_lib
+cargo build_lib
 ```
 
 This produces `build/libc_api.so` (Linux), `build/libc_api.dylib` (macOS), or `build/c_api.dll` (Windows).

@@ -278,7 +278,7 @@ Hard requirements:
     - `path_cardinality`
 - **Document distributions**: Distributions must be explicitly documented and kept stable unless intentionally revised:
     - Orders `status` distribution (e.g., 70% `paid`, 20% `shipped`, 8% `cancelled`, 2% `refunded`).
-    - `total_cents` distribution (e.g., log-normal-ish or bounded skew; at minimum specify min/max and skew intent).
+    - `total_cents` distribution (e.g., log-normal-ish or bounded skew; at mirustum specify min/max and skew intent).
     - Events `bytes` distribution and null-rate for `referrer`.
     - `created_at` / `ts` ranges and whether they are uniform vs bursty.
 - **Referential integrity**: Generated `orders.customer_id` must always reference an existing customer.
@@ -676,7 +676,7 @@ Also required:
 
 ### Challenge 2: DecentDB Integration
 - May require custom Python bindings or API access
-- Mitigation: Develop HTTP/gRPC interface or Nim-to-Python bindings
+- Mitigation: Develop HTTP/gRPC interface or Rust-to-Python bindings
 
 ### Challenge 3: Performance Overhead
 - Python may introduce some overhead compared to native implementations
