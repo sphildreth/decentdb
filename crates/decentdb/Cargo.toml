@@ -1,0 +1,16 @@
+[package]
+name = "decentdb"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.5"
+insta = { version = "1.39", features = ["json"] }
+
+[lib]
+crate-type = ["rlib", "cdylib"]

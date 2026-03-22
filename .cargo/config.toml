@@ -1,0 +1,11 @@
+[alias]
+# Use nextest by default for CI and local dev
+t = "nextest run"
+test-all = "nextest run --all-features"
+
+# Code coverage shortcuts
+cov = "llvm-cov nextest --html"
+cov-ci = "llvm-cov nextest --lcov --output-path lcov.info"
+
+# Formatting and linting
+lint = "clippy --all-targets --all-features -- -D warnings"

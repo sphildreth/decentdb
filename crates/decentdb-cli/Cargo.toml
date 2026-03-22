@@ -1,0 +1,11 @@
+[package]
+name = "decentdb-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+decentdb = { path = "../decentdb" }
+clap.workspace = true
+anyhow.workspace = true

@@ -144,9 +144,9 @@ INSERT INTO events (id, created_at) VALUES (3, NOW());
 SELECT EXTRACT(YEAR FROM created_at) FROM events;
 ```
 
-**Storage:** TIMESTAMP columns are stored as int64 microseconds since Unix epoch UTC,
-identical to PostgreSQL's internal timestamp format. String literals are parsed on INSERT
-and converted transparently.
+**Storage:** TIMESTAMP columns are backed by int64 microseconds since Unix epoch UTC.
+To minimize disk footprint and align with SQLite's size, they use Varint encoding (1 to 9 bytes).
+String literals are parsed on INSERT and converted transparently.
 
 ### NULL
 
@@ -197,15 +197,15 @@ SELECT CAST(price AS INT) FROM products;
 
 | Type | Inline Size | Overflow |
 |------|-------------|----------|
-| INT64 | 8 bytes | Never |
+| INT64 | 1 to 9 bytes (Varint) | Never |
 | BOOL | 1 byte | Never |
 | FLOAT64 | 8 bytes | Never |
-| DECIMAL | 8 bytes (int64) | Never |
+| DECIMAL | 1 to 9 bytes (Varint) | Never |
 | UUID | 16 bytes | Never |
-| TIMESTAMP | 8 bytes (int64 µs) | Never |
+| TIMESTAMP | 1 to 9 bytes (Varint) | Never |
 | TEXT | Variable, up to 512 bytes | > 512 bytes |
 | BLOB | Variable, up to 512 bytes | > 512 bytes |
-| NULL | 0 bytes | Never |
+| NULL | 0 payload bytes (1-byte tag)| Never |
 
 ### Compression
 

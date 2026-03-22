@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/decentdb",       # Core database engine
+    "crates/decentdb-cli",   # CLI application
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Steven Hildreth"]
+license = "Apache-2.0"
+repository = "https://github.com/sphildreth/decentdb"
+
+[workspace.dependencies]
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
