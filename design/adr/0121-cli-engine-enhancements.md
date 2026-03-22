@@ -1,4 +1,4 @@
-# ADR 003: CLI Engine Enhancements for Performance Tuning and Transaction Control
+# ADR 0121: CLI Engine Enhancements for Performance Tuning and Transaction Control
 
 **Status:** Accepted  
 **Date:** 2026-01-28  
