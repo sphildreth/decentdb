@@ -1,0 +1,221 @@
+# Data Types
+
+DecentDB supports the following SQL data types.
+
+## Supported Types
+
+### INTEGER / INT / INT64
+
+64-bit signed integer.
+
+Range: -9,223,372,036,854,775,808 to 9,223,372,036,854,775,807
+
+```sql
+CREATE TABLE example (
+    id INTEGER PRIMARY KEY,
+    count INTEGER,
+    big_number INT64
+);
+```
+
+A single INT64 `PRIMARY KEY` column supports auto-increment: if the column is omitted from an `INSERT` statement, DecentDB automatically assigns the next sequential ID. (`INT`, `INTEGER`, and `INT64` are synonyms here.) Explicit values are also accepted.
+
+```sql
+INSERT INTO example (count) VALUES (42);       -- id auto-assigned
+INSERT INTO example VALUES (100, 7, 999);      -- explicit id = 100
+```
+
+### TEXT
+
+Variable-length UTF-8 string.
+
+Stored with overflow pages for large values (> 512 bytes inline).
+
+```sql
+CREATE TABLE example (
+    name TEXT,
+    description TEXT
+);
+```
+
+### VARCHAR / CHARACTER VARYING
+
+Variable-length UTF-8 string (alias for TEXT).
+
+DecentDB treats VARCHAR and CHARACTER VARYING as equivalent to TEXT, ignoring any specified length constraints.
+
+```sql
+CREATE TABLE example (
+    name VARCHAR(255),        -- Same as TEXT
+    description VARCHAR,      -- Same as TEXT
+    title CHARACTER VARYING(100)  -- Same as TEXT
+);
+```
+
+### BLOB
+
+Binary large object.
+
+Stored with overflow pages for large values.
+
+```sql
+CREATE TABLE example (
+    data BLOB,
+    image BLOB
+);
+```
+
+### BOOLEAN / BOOL
+
+True/false value.
+
+```sql
+CREATE TABLE example (
+    active BOOLEAN,
+    verified BOOL
+);
+```
+
+### FLOAT / FLOAT64 / REAL
+
+64-bit IEEE 754 floating point number.
+
+```sql
+CREATE TABLE example (
+    price FLOAT,
+    measurement FLOAT64,
+    score REAL
+);
+```
+
+### DECIMAL / NUMERIC
+
+Fixed-point number with user-specified precision and scale.
+
+Suitable for financial calculations where exactness is required.
+
+Range: Precision up to 18 digits (constrained by int64 backing storage).
+
+```sql
+CREATE TABLE example (
+    balance DECIMAL(10,2),    -- 10 total digits, 2 decimal places
+    rate NUMERIC(5,4)         -- 5 total digits, 4 decimal places
+);
+```
+
+### UUID
+
+16-byte Universally Unique Identifier.
+
+Stored efficiently as 16-byte binary data.
+
+```sql
+CREATE TABLE example (
+    id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
+    ref_id UUID
+);
+```
+
+### TIMESTAMP / DATE / DATETIME / TIMESTAMPTZ
+
+Date and time value stored natively as microseconds since Unix epoch UTC.
+
+Accepts ISO 8601 string literals on INSERT; values are read back as formatted strings
+(`YYYY-MM-DD HH:MM:SS[.ffffff]`).
+
+All of the following type names are equivalent and map to the native TIMESTAMP type:
+`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `DATETIME`.
+
+```sql
+CREATE TABLE events (
+    id         INT PRIMARY KEY,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event_date DATE
+);
+
+-- Insert using string literal
+INSERT INTO events (id, event_date) VALUES (1, '2026-02-24');
+INSERT INTO events (id, created_at) VALUES (2, '2026-02-24 17:30:00');
+
+-- Insert using NOW()
+INSERT INTO events (id, created_at) VALUES (3, NOW());
+
+-- Query with EXTRACT
+SELECT EXTRACT(YEAR FROM created_at) FROM events;
+```
+
+**Storage:** TIMESTAMP columns are stored as int64 microseconds since Unix epoch UTC,
+identical to PostgreSQL's internal timestamp format. String literals are parsed on INSERT
+and converted transparently.
+
+### NULL
+
+Represents missing or unknown values.
+
+All columns can contain NULL unless marked NOT NULL.
+
+## Type Aliases
+
+| Alias | Maps To |
+|-------|---------|
+| INTEGER | INT64 |
+| INT | INT64 |
+| BIGINT | INT64 |
+| SERIAL | INT64 (auto-increment) |
+| TEXT | TEXT |
+| VARCHAR | TEXT |
+| CHARACTER VARYING | TEXT |
+| CHAR | TEXT |
+| BLOB | BLOB |
+| BYTEA | BLOB |
+| BOOLEAN | BOOL |
+| BOOL | BOOL |
+| FLOAT | FLOAT64 |
+| REAL | FLOAT64 |
+| DOUBLE | FLOAT64 |
+| DOUBLE PRECISION | FLOAT64 |
+| NUMERIC | DECIMAL |
+| DECIMAL | DECIMAL |
+| UUID | UUID |
+| DATE | TIMESTAMP (native datetime) |
+| TIMESTAMP | TIMESTAMP (native datetime) |
+| TIMESTAMPTZ | TIMESTAMP (native datetime) |
+| DATETIME | TIMESTAMP (native datetime) |
+
+## Type Conversion
+
+Implicit conversions happen automatically when safe:
+- INT → FLOAT (for comparisons)
+- Any type can become NULL
+
+Explicit conversion uses CAST:
+```sql
+SELECT CAST(price AS INT) FROM products;
+```
+
+## Storage Details
+
+| Type | Inline Size | Overflow |
+|------|-------------|----------|
+| INT64 | 8 bytes | Never |
+| BOOL | 1 byte | Never |
+| FLOAT64 | 8 bytes | Never |
+| DECIMAL | 8 bytes (int64) | Never |
+| UUID | 16 bytes | Never |
+| TIMESTAMP | 8 bytes (int64 µs) | Never |
+| TEXT | Variable, up to 512 bytes | > 512 bytes |
+| BLOB | Variable, up to 512 bytes | > 512 bytes |
+| NULL | 0 bytes | Never |
+
+### Compression
+
+TEXT and BLOB values are automatically compressed with zlib when stored on overflow pages. This is transparent to the application — values are decompressed on read.
+
+## Best Practices
+
+1. Use INT for primary keys and counters (auto-incremented when omitted from INSERT)
+2. Use TEXT for names, descriptions, JSON
+3. Use BLOB for binary data, images
+4. Use BOOL for flags and states
+5. Use FLOAT for measurements and prices
+6. Avoid storing large BLOBs if possible (consider file storage with path in DB)
