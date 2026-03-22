@@ -1,7 +1,7 @@
 # Road to Rust: DecentDB 1.0 Implementation Plan
 **Date:** 2026-03-22
 **Status:** Active Execution
-**Current Active Slice:** `Slice 0.1: Workspace Guardrails & Module Skeleton`
+**Current Active Slice:** `Slice 1.1: VFS Core, Fault Injection, and MemVfs`
 
 This document is the execution plan for the Rust rewrite. It is derived from:
 - `design/PRD.md`
@@ -27,12 +27,12 @@ Coding agents MUST implement only the current active slice unless the user expli
 
 ## Slice Map / Status
 
-- [ ] **Phase 0: Execution Guardrails & Bootstrap**
-  - [ ] **Slice 0.1: Workspace Guardrails & Module Skeleton** **(ACTIVE)**
-  - [ ] **Slice 0.2: Error Taxonomy & Config Surface**
-  - [ ] **Slice 0.3: Database Bootstrap & Header Validation**
+- [x] **Phase 0: Execution Guardrails & Bootstrap**
+  - [x] **Slice 0.1: Workspace Guardrails & Module Skeleton**
+  - [x] **Slice 0.2: Error Taxonomy & Config Surface**
+  - [x] **Slice 0.3: Database Bootstrap & Header Validation**
 - [ ] **Phase 1: Storage Foundation**
-  - [ ] **Slice 1.1: VFS Core, Fault Injection, and MemVfs**
+  - [ ] **Slice 1.1: VFS Core, Fault Injection, and MemVfs** **(ACTIVE)**
   - [ ] **Slice 1.2: Pager, Page Cache, and Freelist**
   - [ ] **Slice 1.3: WAL Core and Shared WAL Registry**
   - [ ] **Slice 1.4: Recovery, Reader Registry, and Checkpointing**
@@ -157,7 +157,7 @@ Coding agents MUST implement only the current active slice unless the user expli
 **Directives for Agents:**
 - Implement the 128-byte main DB header exactly as described in `design/SPEC.md`.
 - Use:
-  - `DB_FORMAT_VERSION = 4`
+  - `DB_FORMAT_VERSION = 8`
   - `WAL_HEADER_VERSION = 1`
   - default page size `4096`
 - Implement CRC-32C locally in `storage/checksum.rs`. Do not add a checksum dependency in this slice.
