@@ -95,6 +95,11 @@ impl<S: PageStore> Btree<S> {
         BtreeCursor::seek_backward(&self.store, self.root_page_id, key)
     }
 
+    #[must_use]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     fn rebuild_pages(&mut self) -> Result<()> {
         for head_page_id in self.overflow_heads.drain(..) {
             free_overflow(&mut self.store, head_page_id)?;

@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::config::WalSyncMode;
-use crate::error::Result;
+use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
 use crate::vfs::write_all_at;
 
@@ -27,6 +27,71 @@ pub(crate) fn commit_pages(
         .expect("wal write lock should not be poisoned");
 
     let mut offset = wal.latest_snapshot();
+    if offset == 0 {
+        offset = WAL_HEADER_SIZE;
+    }
+
+    let mut committed = Vec::new();
+    for (page_id, payload) in pages {
+        let frame = WalFrame::page(*page_id, payload.clone());
+        let bytes = frame.encode(wal.inner.page_size)?;
+        write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
+        offset += bytes.len() as u64;
+        committed.push((
+            *page_id,
+            WalVersion {
+                lsn: offset,
+                data: payload.clone(),
+            },
+        ));
+    }
+
+    let commit = WalFrame::commit();
+    let commit_bytes = commit.encode(wal.inner.page_size)?;
+    write_all_at(wal.inner.file.as_ref(), offset, &commit_bytes)?;
+    offset += commit_bytes.len() as u64;
+
+    recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
+    sync_for_mode(wal.inner.sync_mode, wal)?;
+
+    {
+        let mut index = wal
+            .inner
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
+        for (page_id, version) in committed {
+            index.add_version(page_id, version);
+        }
+    }
+
+    wal.inner
+        .max_page_count
+        .fetch_max(max_page_count, Ordering::AcqRel);
+    wal.inner.wal_end_lsn.store(offset, Ordering::Release);
+    Ok(offset)
+}
+
+pub(crate) fn commit_pages_if_latest(
+    wal: &WalHandle,
+    pages: &[(PageId, Vec<u8>)],
+    max_page_count: u32,
+    expected_latest_lsn: u64,
+) -> Result<u64> {
+    let _writer_guard = wal
+        .inner
+        .write_lock
+        .lock()
+        .expect("wal write lock should not be poisoned");
+
+    let latest = wal.latest_snapshot();
+    if latest != expected_latest_lsn {
+        return Err(DbError::transaction(format!(
+            "transaction conflict: WAL advanced from {expected_latest_lsn} to {latest}"
+        )));
+    }
+
+    let mut offset = latest;
     if offset == 0 {
         offset = WAL_HEADER_SIZE;
     }

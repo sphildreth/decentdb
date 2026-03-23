@@ -149,6 +149,11 @@ impl TrigramIndex {
         Ok(())
     }
 
+    #[must_use]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.postings_tree.entry_count() + self.pending.values().map(Vec::len).sum::<usize>()
+    }
+
     pub(crate) fn query_candidates(
         &self,
         pattern: &str,

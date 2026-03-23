@@ -1,0 +1,680 @@
+//! Stable C ABI for DecentDB.
+
+use std::cell::RefCell;
+use std::ffi::{c_char, CStr, CString};
+use std::panic::{self, AssertUnwindSafe};
+use std::ptr;
+
+use crate::error::{DbError, DbErrorCode, Result};
+use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
+
+const DDB_OK: u32 = 0;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DdbValueTag {
+    Null = 0,
+    Int64 = 1,
+    Float64 = 2,
+    Bool = 3,
+    Text = 4,
+    Blob = 5,
+    Decimal = 6,
+    Uuid = 7,
+    TimestampMicros = 8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DdbValue {
+    pub tag: u32,
+    pub bool_value: u8,
+    pub reserved0: [u8; 7],
+    pub int64_value: i64,
+    pub float64_value: f64,
+    pub decimal_scaled: i64,
+    pub decimal_scale: u8,
+    pub reserved1: [u8; 7],
+    pub data: *mut u8,
+    pub len: usize,
+    pub uuid_bytes: [u8; 16],
+    pub timestamp_micros: i64,
+}
+
+impl Default for DdbValue {
+    fn default() -> Self {
+        Self {
+            tag: DdbValueTag::Null as u32,
+            bool_value: 0,
+            reserved0: [0; 7],
+            int64_value: 0,
+            float64_value: 0.0,
+            decimal_scaled: 0,
+            decimal_scale: 0,
+            reserved1: [0; 7],
+            data: ptr::null_mut(),
+            len: 0,
+            uuid_bytes: [0; 16],
+            timestamp_micros: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct DbHandle {
+    db: Db,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct ResultHandle {
+    result: QueryResult,
+}
+
+thread_local! {
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+fn ffi_boundary<F>(op: F) -> u32
+where
+    F: FnOnce() -> Result<()>,
+{
+    clear_last_error();
+    match panic::catch_unwind(AssertUnwindSafe(op)) {
+        Ok(Ok(())) => DDB_OK,
+        Ok(Err(error)) => {
+            set_last_error(error.to_string());
+            error.numeric_code()
+        }
+        Err(payload) => {
+            set_last_error(panic_payload_message(payload));
+            DbErrorCode::Panic.as_u32()
+        }
+    }
+}
+
+fn ffi_cstr_boundary<F>(op: F) -> *const c_char
+where
+    F: FnOnce() -> *const c_char,
+{
+    match panic::catch_unwind(AssertUnwindSafe(op)) {
+        Ok(value) => value,
+        Err(payload) => {
+            set_last_error(panic_payload_message(payload));
+            ptr::null()
+        }
+    }
+}
+
+fn clear_last_error() {
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+fn set_last_error(message: String) {
+    let sanitized = message.replace('\0', " ");
+    let cstring = CString::new(sanitized).unwrap_or_else(|_| CString::new("invalid error").expect("literal"));
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = Some(cstring);
+    });
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        format!("panic: {message}")
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        format!("panic: {message}")
+    } else {
+        "panic: non-string payload".to_string()
+    }
+}
+
+fn out_ptr<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T> {
+    if ptr.is_null() {
+        return Err(DbError::internal(format!("{name} must not be null")));
+    }
+    // SAFETY: null was checked above and the caller owns the out-parameter storage.
+    Ok(unsafe { &mut *ptr })
+}
+
+fn ref_ptr<'a, T>(ptr: *const T, name: &str) -> Result<&'a T> {
+    if ptr.is_null() {
+        return Err(DbError::internal(format!("{name} must not be null")));
+    }
+    // SAFETY: null was checked above and the caller promises the pointer is valid for reads.
+    Ok(unsafe { &*ptr })
+}
+
+fn handle_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T> {
+    ref_ptr(ptr, name)
+}
+
+fn c_string_arg<'a>(ptr: *const c_char, name: &str) -> Result<&'a CStr> {
+    if ptr.is_null() {
+        return Err(DbError::internal(format!("{name} must not be null")));
+    }
+    // SAFETY: null was checked above and the caller must pass a valid NUL-terminated string.
+    Ok(unsafe { CStr::from_ptr(ptr) })
+}
+
+fn utf8_arg(ptr: *const c_char, name: &str) -> Result<String> {
+    c_string_arg(ptr, name)?
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|error| DbError::sql(format!("{name} is not valid UTF-8: {error}")))
+}
+
+fn params_slice<'a>(params: *const DdbValue, params_len: usize) -> Result<&'a [DdbValue]> {
+    if params.is_null() {
+        if params_len == 0 {
+            return Ok(&[]);
+        }
+        return Err(DbError::internal(
+            "params pointer must not be null when params_len > 0",
+        ));
+    }
+    // SAFETY: the caller provides a contiguous array of `params_len` values.
+    Ok(unsafe { std::slice::from_raw_parts(params, params_len) })
+}
+
+fn value_from_ffi(value: &DdbValue) -> Result<Value> {
+    match value.tag {
+        x if x == DdbValueTag::Null as u32 => Ok(Value::Null),
+        x if x == DdbValueTag::Int64 as u32 => Ok(Value::Int64(value.int64_value)),
+        x if x == DdbValueTag::Float64 as u32 => Ok(Value::Float64(value.float64_value)),
+        x if x == DdbValueTag::Bool as u32 => Ok(Value::Bool(value.bool_value != 0)),
+        x if x == DdbValueTag::Text as u32 => {
+            let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+            Ok(Value::Text(text.to_string()))
+        }
+        x if x == DdbValueTag::Blob as u32 => {
+            let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
+            Ok(Value::Blob(bytes.to_vec()))
+        }
+        x if x == DdbValueTag::Decimal as u32 => Ok(Value::Decimal {
+            scaled: value.decimal_scaled,
+            scale: value.decimal_scale,
+        }),
+        x if x == DdbValueTag::Uuid as u32 => Ok(Value::Uuid(value.uuid_bytes)),
+        x if x == DdbValueTag::TimestampMicros as u32 => {
+            Ok(Value::TimestampMicros(value.timestamp_micros))
+        }
+        other => Err(DbError::sql(format!("unsupported DDB value tag {other}"))),
+    }
+}
+
+fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if data.is_null() {
+        return Err(DbError::internal("buffer pointer must not be null when len > 0"));
+    }
+    // SAFETY: the caller provides a contiguous buffer of `len` bytes.
+    Ok(unsafe { std::slice::from_raw_parts(data, len) })
+}
+
+fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
+    ddb_value_reset(out);
+    match value {
+        Value::Null => out.tag = DdbValueTag::Null as u32,
+        Value::Int64(inner) => {
+            out.tag = DdbValueTag::Int64 as u32;
+            out.int64_value = *inner;
+        }
+        Value::Float64(inner) => {
+            out.tag = DdbValueTag::Float64 as u32;
+            out.float64_value = *inner;
+        }
+        Value::Bool(inner) => {
+            out.tag = DdbValueTag::Bool as u32;
+            out.bool_value = u8::from(*inner);
+        }
+        Value::Text(inner) => {
+            out.tag = DdbValueTag::Text as u32;
+            out.data = owned_bytes(inner.as_bytes().to_vec());
+            out.len = inner.len();
+        }
+        Value::Blob(inner) => {
+            out.tag = DdbValueTag::Blob as u32;
+            out.data = owned_bytes(inner.clone());
+            out.len = inner.len();
+        }
+        Value::Decimal { scaled, scale } => {
+            out.tag = DdbValueTag::Decimal as u32;
+            out.decimal_scaled = *scaled;
+            out.decimal_scale = *scale;
+        }
+        Value::Uuid(inner) => {
+            out.tag = DdbValueTag::Uuid as u32;
+            out.uuid_bytes = *inner;
+        }
+        Value::TimestampMicros(inner) => {
+            out.tag = DdbValueTag::TimestampMicros as u32;
+            out.timestamp_micros = *inner;
+        }
+    }
+}
+
+fn owned_bytes(bytes: Vec<u8>) -> *mut u8 {
+    if bytes.is_empty() {
+        return ptr::null_mut();
+    }
+    let len = bytes.len();
+    let boxed = bytes.into_boxed_slice();
+    let raw = Box::into_raw(boxed);
+    let raw_u8 = raw.cast::<u8>();
+    debug_assert!(!raw_u8.is_null() || len == 0);
+    raw_u8
+}
+
+fn free_owned_bytes(data: *mut u8, len: usize) {
+    if data.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: `data` was allocated from `owned_bytes` with exactly `len` bytes.
+    unsafe {
+        let slice = ptr::slice_from_raw_parts_mut(data, len);
+        drop(Box::from_raw(slice));
+    }
+}
+
+fn ddb_value_reset(value: &mut DdbValue) {
+    *value = DdbValue::default();
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_version() -> *const c_char {
+    static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
+    ffi_cstr_boundary(|| VERSION.as_ptr().cast())
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_last_error_message() -> *const c_char {
+    ffi_cstr_boundary(|| {
+        LAST_ERROR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(ptr::null(), |value| value.as_ptr())
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_value_init(value: *mut DdbValue) -> u32 {
+    ffi_boundary(|| {
+        *out_ptr(value, "value")? = DdbValue::default();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_value_dispose(value: *mut DdbValue) -> u32 {
+    ffi_boundary(|| {
+        let value = out_ptr(value, "value")?;
+        if matches!(
+            value.tag,
+            x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
+        ) {
+            free_owned_bytes(value.data, value.len);
+        }
+        ddb_value_reset(value);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_string_free(value: *mut *mut c_char) -> u32 {
+    ffi_boundary(|| {
+        let value = out_ptr(value, "value")?;
+        if (*value).is_null() {
+            return Ok(());
+        }
+        // SAFETY: pointer was created by `CString::into_raw` in this module.
+        unsafe {
+            drop(CString::from_raw(*value));
+        }
+        *value = ptr::null_mut();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_create(path: *const c_char, out_db: *mut *mut DbHandle) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        let handle = Box::new(DbHandle {
+            db: Db::create(path, DbConfig::default())?,
+        });
+        *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_open(path: *const c_char, out_db: *mut *mut DbHandle) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        let handle = Box::new(DbHandle {
+            db: Db::open(path, DbConfig::default())?,
+        });
+        *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_open_or_create(
+    path: *const c_char,
+    out_db: *mut *mut DbHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        let handle = Box::new(DbHandle {
+            db: Db::open_or_create(path, DbConfig::default())?,
+        });
+        *out_ptr(out_db, "out_db")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_free(db: *mut *mut DbHandle) -> u32 {
+    ffi_boundary(|| {
+        let db = out_ptr(db, "db")?;
+        if (*db).is_null() {
+            return Ok(());
+        }
+        // SAFETY: pointer was created by `Box::into_raw` in this module.
+        unsafe {
+            drop(Box::from_raw(*db));
+        }
+        *db = ptr::null_mut();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_execute(
+    db: *mut DbHandle,
+    sql: *const c_char,
+    params: *const DdbValue,
+    params_len: usize,
+    out_result: *mut *mut ResultHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let sql = utf8_arg(sql, "sql")?;
+        let rust_params = params_slice(params, params_len)?
+            .iter()
+            .map(value_from_ffi)
+            .collect::<Result<Vec<_>>>()?;
+        let result = db.db.execute_with_params(&sql, &rust_params)?;
+        *out_ptr(out_result, "out_result")? = Box::into_raw(Box::new(ResultHandle { result }));
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_checkpoint(db: *mut DbHandle) -> u32 {
+    ffi_boundary(|| handle_ref(db, "db")?.db.checkpoint())
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_begin_transaction(db: *mut DbHandle) -> u32 {
+    ffi_boundary(|| handle_ref(db, "db")?.db.begin_transaction())
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_commit_transaction(
+    db: *mut DbHandle,
+    out_lsn: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let lsn = handle_ref(db, "db")?.db.commit_transaction()?;
+        *out_ptr(out_lsn, "out_lsn")? = lsn;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_rollback_transaction(db: *mut DbHandle) -> u32 {
+    ffi_boundary(|| handle_ref(db, "db")?.db.rollback_transaction())
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_in_transaction(db: *mut DbHandle, out_flag: *mut u8) -> u32 {
+    ffi_boundary(|| {
+        *out_ptr(out_flag, "out_flag")? = u8::from(handle_ref(db, "db")?.db.in_transaction()?);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_save_as(
+    db: *mut DbHandle,
+    dest_path: *const c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let dest = utf8_arg(dest_path, "dest_path")?;
+        handle_ref(db, "db")?.db.save_as(dest)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_evict_shared_wal(path: *const c_char) -> u32 {
+    ffi_boundary(|| {
+        let path = utf8_arg(path, "path")?;
+        evict_shared_wal(path)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_result_free(result: *mut *mut ResultHandle) -> u32 {
+    ffi_boundary(|| {
+        let result = out_ptr(result, "result")?;
+        if (*result).is_null() {
+            return Ok(());
+        }
+        // SAFETY: pointer was created by `Box::into_raw` in this module.
+        unsafe {
+            drop(Box::from_raw(*result));
+        }
+        *result = ptr::null_mut();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_result_row_count(result: *mut ResultHandle, out_rows: *mut usize) -> u32 {
+    ffi_boundary(|| {
+        *out_ptr(out_rows, "out_rows")? = handle_ref(result, "result")?.result.rows().len();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_result_column_count(
+    result: *mut ResultHandle,
+    out_columns: *mut usize,
+) -> u32 {
+    ffi_boundary(|| {
+        *out_ptr(out_columns, "out_columns")? = handle_ref(result, "result")?.result.columns().len();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_result_affected_rows(
+    result: *mut ResultHandle,
+    out_rows: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        *out_ptr(out_rows, "out_rows")? = handle_ref(result, "result")?.result.affected_rows();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_result_column_name_copy(
+    result: *mut ResultHandle,
+    column_index: usize,
+    out_name: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let result = handle_ref(result, "result")?;
+        let column = result
+            .result
+            .columns()
+            .get(column_index)
+            .ok_or_else(|| DbError::sql(format!("column index {column_index} is out of bounds")))?;
+        let cstring = CString::new(column.as_str())
+            .map_err(|_| DbError::internal("column name contains an interior NUL"))?;
+        *out_ptr(out_name, "out_name")? = cstring.into_raw();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_result_value_copy(
+    result: *mut ResultHandle,
+    row_index: usize,
+    column_index: usize,
+    out_value: *mut DdbValue,
+) -> u32 {
+    ffi_boundary(|| {
+        let result = handle_ref(result, "result")?;
+        let row = result
+            .result
+            .rows()
+            .get(row_index)
+            .ok_or_else(|| DbError::sql(format!("row index {row_index} is out of bounds")))?;
+        let value = row
+            .values()
+            .get(column_index)
+            .ok_or_else(|| DbError::sql(format!("column index {column_index} is out of bounds")))?;
+        fill_ffi_value(out_ptr(out_value, "out_value")?, value);
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type ExecuteFn = extern "C" fn(
+        *mut DbHandle,
+        *const c_char,
+        *const DdbValue,
+        usize,
+        *mut *mut ResultHandle,
+    ) -> u32;
+
+    #[test]
+    fn abi_shape_matches_expected_layout() {
+        let _execute: ExecuteFn = ddb_db_execute;
+        assert_eq!(std::mem::size_of::<DdbValue>(), 88);
+        assert_eq!(std::mem::align_of::<DdbValue>(), 8);
+    }
+
+    #[test]
+    fn ffi_boundary_converts_panics_into_panic_error_code() {
+        let code = ffi_boundary(|| -> Result<()> { panic!("boom") });
+        assert_eq!(code, DbErrorCode::Panic.as_u32());
+        let message = LAST_ERROR.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .expect("panic message")
+                .to_str()
+                .expect("utf8")
+                .to_string()
+        });
+        assert!(message.contains("boom"));
+    }
+
+    #[test]
+    fn result_and_handle_free_are_idempotent_when_callers_null_out_pointers() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(
+            ddb_db_open_or_create(path.as_ptr(), &mut db),
+            DDB_OK,
+            "open_or_create failed: {:?}",
+            unsafe { CStr::from_ptr(ddb_last_error_message()) }
+        );
+
+        let sql = CString::new("SELECT 1").expect("sql");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_roundtrip_executes_and_copies_values() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)").expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let params = [
+            DdbValue {
+                tag: DdbValueTag::Int64 as u32,
+                int64_value: 1,
+                ..DdbValue::default()
+            },
+            DdbValue {
+                tag: DdbValueTag::Text as u32,
+                data: b"Ada".as_ptr().cast_mut(),
+                len: 3,
+                ..DdbValue::default()
+            },
+        ];
+        let insert = CString::new("INSERT INTO items (id, name) VALUES ($1, $2)").expect("insert");
+        assert_eq!(
+            ddb_db_execute(db, insert.as_ptr(), params.as_ptr(), params.len(), &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let select = CString::new("SELECT id, name FROM items").expect("select");
+        assert_eq!(
+            ddb_db_execute(db, select.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+
+        let mut columns = 0;
+        let mut rows = 0;
+        assert_eq!(ddb_result_column_count(result, &mut columns), DDB_OK);
+        assert_eq!(ddb_result_row_count(result, &mut rows), DDB_OK);
+        assert_eq!(columns, 2);
+        assert_eq!(rows, 1);
+
+        let mut copied = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 1, &mut copied), DDB_OK);
+        let text = std::str::from_utf8(unsafe {
+            std::slice::from_raw_parts(copied.data.cast_const(), copied.len)
+        })
+        .expect("text");
+        assert_eq!(text, "Ada");
+        assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+}

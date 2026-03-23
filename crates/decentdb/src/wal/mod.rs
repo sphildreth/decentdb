@@ -52,12 +52,25 @@ impl WalHandle {
         shared::acquire(vfs, db_path, page_size, sync_mode)
     }
 
+    pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
+        shared::evict(vfs, db_path)
+    }
+
     pub(crate) fn commit_pages(
         &self,
         pages: &[(PageId, Vec<u8>)],
         max_page_count: u32,
     ) -> Result<u64> {
         writer::commit_pages(self, pages, max_page_count)
+    }
+
+    pub(crate) fn commit_pages_if_latest(
+        &self,
+        pages: &[(PageId, Vec<u8>)],
+        max_page_count: u32,
+        expected_latest_lsn: u64,
+    ) -> Result<u64> {
+        writer::commit_pages_if_latest(self, pages, max_page_count, expected_latest_lsn)
     }
 
     pub(crate) fn checkpoint(&self, pager: &PagerHandle, timeout_sec: u64) -> Result<()> {

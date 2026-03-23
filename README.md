@@ -63,7 +63,6 @@ It targets a single process with **one writer** and **many concurrent readers** 
 | Dart | Dart FFI (Flutter desktop) | Embedded FFI binding for Flutter desktop apps with cursor paging and schema introspection | [decentdb.org/api/dart](https://decentdb.org/api/dart/) |
 | Java | JDBC (JNI-backed, in-process) | JDBC driver for connecting to `.ddb` files from Java and tools like DBeaver | [decentdb.org/api/jdbc](https://decentdb.org/api/jdbc/) |
 | Go | `database/sql` driver | Embedded `database/sql` driver with `$N` positional parameters | [decentdb.org/api/go](https://decentdb.org/api/go/) |
-| Nim | Native Nim API | Native embedded API for Nim applications | [decentdb.org/api/nim-api](https://decentdb.org/api/nim-api/) |
 | Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
 | Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 

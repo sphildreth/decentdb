@@ -94,3 +94,16 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<SharedWalInner>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<SharedWalInner>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
+    if vfs.is_memory() {
+        return Ok(());
+    }
+
+    let canonical_path = vfs.canonicalize_path(db_path)?;
+    registry()
+        .lock()
+        .expect("shared wal registry lock should not be poisoned")
+        .remove(&canonical_path);
+    Ok(())
+}

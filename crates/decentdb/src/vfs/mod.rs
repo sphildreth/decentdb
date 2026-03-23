@@ -60,7 +60,7 @@ pub(crate) struct VfsHandle {
 
 impl VfsHandle {
     pub(crate) fn for_path(path: &Path) -> Self {
-        if path == Path::new(":memory:") {
+        if is_memory_path(path) {
             Self {
                 inner: Arc::new(MemVfs::default()),
             }
@@ -91,6 +91,12 @@ impl VfsHandle {
     pub(crate) fn is_memory(&self) -> bool {
         self.inner.is_memory()
     }
+}
+
+pub(crate) fn is_memory_path(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(":memory:")
 }
 
 pub(crate) fn read_exact_at(file: &dyn VfsFile, offset: u64, buf: &mut [u8]) -> Result<()> {
