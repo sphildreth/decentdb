@@ -1,4 +1,7 @@
 //! Shared WAL acquisition keyed by canonical database path.
+//!
+//! Implements:
+//! - design/adr/0117-shared-wal-registry.md
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

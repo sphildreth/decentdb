@@ -362,7 +362,7 @@ fn classify_write(kind: FileKind, offset: u64, buf: &[u8]) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
 
@@ -370,8 +370,14 @@ mod tests {
         clear_failpoints, failpoint_logs, install_failpoint, FailAction, Failpoint, FaultyVfs,
     };
 
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn partial_write_and_dropped_sync_are_reproducible() {
+        let _guard = test_lock().lock().expect("test lock");
         clear_failpoints().expect("clear failpoints");
         install_failpoint(Failpoint {
             label: "db.write_page".to_string(),
@@ -410,6 +416,7 @@ mod tests {
 
     #[test]
     fn failpoint_hits_are_logged_in_order() {
+        let _guard = test_lock().lock().expect("test lock");
         clear_failpoints().expect("clear failpoints");
         install_failpoint(Failpoint {
             label: "db.read".to_string(),

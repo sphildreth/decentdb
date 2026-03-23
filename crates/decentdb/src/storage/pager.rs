@@ -1,4 +1,7 @@
 //! Pager and direct main-database page access.
+//!
+//! Implements:
+//! - design/adr/0001-page-size.md
 
 use std::sync::{Arc, Mutex};
 

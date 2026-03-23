@@ -1,7 +1,7 @@
 # Road to Rust: DecentDB 1.0 Implementation Plan
 **Date:** 2026-03-22
 **Status:** Active Execution
-**Current Active Slice:** `Slice 2.1: Value and Record Encoding`
+**Current Active Slice:** `Slice 3.1: Catalog and Schema Bootstrap`
 
 This document is the execution plan for the Rust rewrite. It is derived from:
 - `design/PRD.md`
@@ -37,12 +37,12 @@ Coding agents MUST implement only the current active slice unless the user expli
   - [x] **Slice 1.3: WAL Core and Shared WAL Registry**
   - [x] **Slice 1.4: Recovery, Reader Registry, and Checkpointing**
   - [x] **Slice 1.5: Python Crash Harness and Storage Failure CI**
-- [ ] **Phase 2: Data Structures and Indexes**
-  - [ ] **Slice 2.1: Value and Record Encoding** **(ACTIVE)**
-  - [ ] **Slice 2.2: Comparable Index Key Encoding**
-  - [ ] **Slice 2.3: B+Tree Read Path**
-  - [ ] **Slice 2.4: B+Tree Write Path and Overflow Pages**
-  - [ ] **Slice 2.5: Trigram Storage, Query Support, and Rebuild Fallback**
+- [x] **Phase 2: Data Structures and Indexes**
+  - [x] **Slice 2.1: Value and Record Encoding**
+  - [x] **Slice 2.2: Comparable Index Key Encoding**
+  - [x] **Slice 2.3: B+Tree Read Path**
+  - [x] **Slice 2.4: B+Tree Write Path and Overflow Pages**
+  - [x] **Slice 2.5: Trigram Storage, Query Support, and Rebuild Fallback**
 - [ ] **Phase 3: Relational Core**
   - [ ] **Slice 3.1: Catalog and Schema Bootstrap**
   - [ ] **Slice 3.2: `libpg_query` Integration and AST Normalization**

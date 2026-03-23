@@ -1,4 +1,8 @@
 //! Reader-aware checkpoint copyback and WAL pruning.
+//!
+//! Implements:
+//! - design/adr/0004-wal-checkpoint-strategy.md
+//! - design/adr/0056-wal-index-pruning-on-checkpoint.md
 
 use std::sync::atomic::Ordering;
 

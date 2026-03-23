@@ -10,7 +10,7 @@ DecentDB uses a page-based storage model where all data is stored in fixed-size 
 
 Default: **4096 bytes (4KB)**
 
-Valid sizes: 2048, 4096, 8192, 16384 bytes
+Valid sizes: 4096, 8192, 16384 bytes
 
 Set at database creation and cannot be changed.
 
@@ -72,17 +72,25 @@ Row values are encoded as a small self-describing record:
       [payload_bytes]
 ```
 
-This is defined in `src/record/record.rs` and ADR 0030.
+This is implemented in:
+- `crates/decentdb/src/record/value.rs`
+- `crates/decentdb/src/record/row.rs`
+- `crates/decentdb/src/record/key.rs`
 
 **Value kinds (payload encoding):**
 - NULL: empty payload
 - BOOL: 1 byte (0/1)
 - INT64: ZigZag + varint-encoded `uint64` (compact for small signed ints)
 - FLOAT64: 8 bytes (IEEE 754, little-endian)
+- DECIMAL: `[scale: u8][scaled_int: ZigZag + varint]`
+- UUID: 16 raw bytes
+- TIMESTAMP: ZigZag + varint microseconds since Unix epoch UTC
 - TEXT/BLOB: raw bytes
-- TEXT/BLOB overflow pointers: 8-byte payload containing `[overflow_page_id u32][overflow_len u32]`
+- TEXT/BLOB overflow pointers: 9-byte payload containing `[flags u8][overflow_page_id u32][overflow_len u32]`
 
-Some builds may also store opportunistically-compressed TEXT/BLOB payloads and transparently decompress on decode.
+Row encoding is intentionally **not** lexicographically comparable. Secondary index ordering uses the separate comparable encoding in `crates/decentdb/src/record/key.rs`.
+
+Large TEXT/BLOB payloads may be compressed with the pure-Rust zlib-compatible wrapper in `crates/decentdb/src/record/compression.rs` before they are written to overflow pages. Decode transparently restores the logical value bytes.
 
 ### Overflow Handling
 
@@ -96,6 +104,7 @@ DecentDB uses overflow pages in two places:
 Large `TEXT`/`BLOB` payloads may be stored as an overflow chain. In that case, the record stores a small overflow pointer payload:
 
 ```
+[flags: 1 byte]
 [overflow_page_id: 4 bytes]
 [overflow_len: 4 bytes]
 ```
@@ -112,7 +121,7 @@ For record value overflow, `overflow_len` is the total length of the logical val
 
 #### B+Tree value overflow
 
-If the *entire encoded record* does not fit inline in a leaf cell, the leaf cell can store an overflow page id and the record bytes are stored out-of-line as an overflow chain.
+If the *entire encoded value* does not fit inline in a leaf cell, the leaf cell can store an overflow page id and the bytes are stored out-of-line as an overflow chain.
 
 ## B+Tree Structure
 

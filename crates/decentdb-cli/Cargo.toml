@@ -9,3 +9,7 @@ license.workspace = true
 decentdb = { path = "../decentdb" }
 clap.workspace = true
 anyhow.workspace = true
+
+[[bin]]
+name = "decentdb"
+path = "src/main.rs"

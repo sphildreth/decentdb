@@ -1,1 +1,7 @@
-//! B+Tree table and secondary-index storage.
+#![allow(dead_code)]
+//! B+Tree storage primitives for table payloads and postings lists.
+
+pub(crate) mod cursor;
+pub(crate) mod page;
+pub(crate) mod read;
+pub(crate) mod write;

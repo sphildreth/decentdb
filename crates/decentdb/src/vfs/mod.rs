@@ -1,4 +1,8 @@
 //! Virtual filesystem abstractions for database and WAL I/O.
+//!
+//! Implements:
+//! - design/adr/0119-rust-vfs-pread-pwrite.md
+//! - design/adr/0105-in-memory-vfs.md
 
 pub(crate) mod faulty;
 pub(crate) mod mem;

@@ -1,4 +1,10 @@
 //! WAL header and frame encoding for the v8 layout.
+//!
+//! Implements:
+//! - design/adr/0064-wal-frame-checksum-removal.md
+//! - design/adr/0065-wal-frame-lsn-removal.md
+//! - design/adr/0066-wal-frame-payload-length-removal.md
+//! - design/adr/0068-wal-header-end-offset.md
 
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;

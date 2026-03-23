@@ -1,13 +1,22 @@
 # B+Tree
 
-DecentDB stores tables and secondary indexes in a page-based B+Tree implementation (`src/btree/btree.rs`) backed by the pager (`src/pager/`).
+DecentDB stores table payloads and postings blobs in a page-based B+Tree implementation in:
+
+- `crates/decentdb/src/btree/page.rs`
+- `crates/decentdb/src/btree/read.rs`
+- `crates/decentdb/src/btree/cursor.rs`
+- `crates/decentdb/src/btree/write.rs`
 
 At this layer, the tree is a mapping:
 
 - **key**: `uint64`
-- **value**: `seq[byte]` (inline payload or an overflow chain)
+- **value**: opaque bytes (inline payload or an overflow chain)
 
-Higher layers (catalog/storage) define how keys/values are encoded for tables vs indexes.
+Higher layers define how those bytes are produced:
+
+- table rows use `crates/decentdb/src/record/row.rs`
+- typed comparable index-key bytes live in `crates/decentdb/src/record/key.rs`
+- trigram postings blobs use `crates/decentdb/src/search/postings.rs`
 
 ## Page types and common header
 
@@ -61,17 +70,11 @@ When reading, the B+Tree materializes the full value by reading the overflow cha
 Leaf pages are linked, so cursors can:
 
 - seek to a key and iterate forward
-- perform range scans
-- stream full scans without materializing per-leaf arrays (`BTreeCursorStream`)
-
-## Fast paths and caching
-
-To keep inserts and point-lookups fast, the implementation includes:
-
-- a thread-local append cache for monotonic key inserts (tracks the last leaf and last key)
-- optional per-page decoded indexes cached in the pager’s `CacheEntry.aux` to avoid repeatedly decoding internal/leaf cell headers
+- iterate backward by re-seeking the predecessor key when needed
+- perform range scans across leaf boundaries
 
 ## Where it’s used
 
 - **Tables**: key is the rowid, value is the encoded row.
-- **BTREE secondary indexes**: key is a `uint64` sort key derived from the indexed value/expression; the value encodes the rowid (and for some TEXT/BLOB indexes may also embed bytes used for post-verification).
+- **Trigram postings**: key is the packed trigram token; value is the delta-encoded postings blob.
+- **Comparable secondary-index encodings**: implemented in `record/key.rs` and consumed by later relational slices.

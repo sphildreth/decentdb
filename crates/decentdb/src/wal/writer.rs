@@ -1,4 +1,7 @@
 //! WAL append and durability logic.
+//!
+//! Implements:
+//! - design/adr/0003-snapshot-lsn-atomicity.md
 
 use std::sync::atomic::Ordering;
 

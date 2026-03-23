@@ -1,4 +1,9 @@
 //! Active-reader tracking for snapshot retention and checkpoint coordination.
+//!
+//! Implements:
+//! - design/adr/0018-checkpointing-reader-count-mechanism.md
+//! - design/adr/0019-wal-retention-for-active-readers.md
+//! - design/adr/0024-wal-growth-prevention-long-readers.md
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

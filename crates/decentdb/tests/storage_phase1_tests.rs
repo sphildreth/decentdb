@@ -1,14 +1,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use decentdb::{Db, DbConfig};
 
 static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
+fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[test]
 fn shared_wal_cross_connection_visibility_is_immediate() {
+    let _guard = test_lock().lock().expect("test lock");
     let path = unique_db_path("shared-wal");
     let config = DbConfig::default();
 
@@ -29,6 +36,7 @@ fn shared_wal_cross_connection_visibility_is_immediate() {
 
 #[test]
 fn failed_commit_does_not_publish_uncommitted_pages_after_reopen() {
+    let _guard = test_lock().lock().expect("test lock");
     let path = unique_db_path("failed-commit");
     let config = DbConfig::default();
     let db = Db::create(&path, config.clone()).expect("create database");
@@ -56,6 +64,7 @@ fn failed_commit_does_not_publish_uncommitted_pages_after_reopen() {
 
 #[test]
 fn checkpoint_truncates_wal_without_readers_and_preserves_data() {
+    let _guard = test_lock().lock().expect("test lock");
     let path = unique_db_path("checkpoint-truncate");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
 
@@ -80,6 +89,7 @@ fn checkpoint_truncates_wal_without_readers_and_preserves_data() {
 
 #[test]
 fn checkpoint_defers_truncation_when_snapshot_is_held_and_prunes_index() {
+    let _guard = test_lock().lock().expect("test lock");
     let path = unique_db_path("checkpoint-reader");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
 
