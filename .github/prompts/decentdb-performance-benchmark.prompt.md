@@ -19,9 +19,31 @@ Start by reading the benchmark contract and current numbers:
 - [.github/copilot-instructions.md](../copilot-instructions.md)
 
 Current native benchmark snapshot to beat:
-- DecentDB: `read_p95_ms=0.048`, `join_p95_ms=0.013`, `commit_p95_ms=4.078`, `insert_rows_per_sec=423635.53`, `db_size_mb=0.492`
-- DuckDB: `read_p95_ms=0.154`, `join_p95_ms=0.333`, `commit_p95_ms=3.053`, `insert_rows_per_sec=7120.40`, `db_size_mb=3.262`
-- SQLite: `read_p95_ms=0.002`, `join_p95_ms=0.002`, `commit_p95_ms=3.022`, `insert_rows_per_sec=1752322.90`, `db_size_mb=1.832`
+- DecentDB: `read_p95_ms=0.045`, `join_p95_ms=0.009`, `commit_p95_ms=4.068`, `insert_rows_per_sec=520253.03`, `db_size_mb=0.492`
+- DuckDB: `read_p95_ms=0.143`, `join_p95_ms=0.327`, `commit_p95_ms=3.040`, `insert_rows_per_sec=7375.14`, `db_size_mb=3.262`
+- SQLite: `read_p95_ms=0.002`, `join_p95_ms=0.002`, `commit_p95_ms=3.008`, `insert_rows_per_sec=1849972.90`, `db_size_mb=1.832`
+
+Important benchmark interpretation notes:
+- This harness is a `single_thread_prepared_statement_oltp` profile, not a bulk-ingest benchmark.
+- The JSON field `commit_p95_ms` measures `prepared_single_row_auto_commit_insert_p95`, not a bare standalone `COMMIT`.
+- SQLite is intentionally self-verified at runtime for fairness: `journal_mode=WAL`, `synchronous=FULL`, and `wal_autocheckpoint=0`.
+- Treat `data/bench_summary.json` as the artifact baseline, but rerun before drawing strong conclusions: recent audited reruns have shown DecentDB insert throughput varying in roughly the low-`500k` to mid-`500k` rows/sec range.
+
+Already-landed wins and dead ends:
+- The old `O(N^2)` behavior from rebuilding all indexes after each mutation has already been removed from the hot insert path. Inserts now maintain runtime BTREE indexes incrementally or rebuild only when stale.
+- Repeated SQL reparsing is no longer the primary bottleneck: DecentDB has a bounded parsed-statement cache plus public prepared statements, and the benchmark uses prepared execution for DecentDB and SQLite.
+- Join numbers are real now, not placeholder values. DecentDB already has a narrow indexed inner-join fast path and currently wins that benchmark category comfortably. Do not regress this just to chase insert throughput.
+- Phase 0 persistence already moved from a single whole-runtime blob to a manifest plus per-table overflow payloads. This removed the worst whole-database rewrite cliff, but it did not eliminate the deeper storage-architecture limit.
+- A public `SqlTransaction` API exists, but using it directly in the audited insert benchmark was slower than the existing prepared statement + explicit `BEGIN`/`COMMIT` path. Do not assume it is the faster benchmark path without remeasuring.
+- Runtime BTREEs now specialize common single-column non-null `INT64` keys to typed `i64` maps, which produced a meaningful recent insert-throughput improvement. Avoid redoing that work under a different name.
+
+Current DecentDB performance hurdles / issues / concerns:
+- The biggest remaining write-path limit is still structural: DecentDB remains in a Phase 0/early Phase 1 hybrid where tables live in in-memory `TableData` structures and persistence still rewrites encoded table payload blobs plus a manifest, rather than updating page-resident table BTREEs directly.
+- Insert throughput is still roughly `3.5x` behind SQLite on the audited explicit-transaction workload (`~520k` vs `~1.85M` rows/sec). Parser overhead and join execution are no longer the dominant suspects; executor/storage hot-path work is.
+- Auto-commit insert p95 remains noticeably behind SQLite (`~4.07 ms` vs `~3.01 ms`) even after the manifest persistence improvement. Suspects include encoded table-payload rewrite cost, WAL/page-store copy churn, and remaining commit-path bookkeeping.
+- Point-read p95 is still far slower than SQLite in relative terms (`~0.045 ms` vs `~0.002 ms`), even though the absolute number is already small. Likely causes are executor/materialization overhead and the fact that runtime indexes/tables are still not backed by the final page-resident layout.
+- File size and join latency are current DecentDB strengths in this harness. Performance work should preserve those advantages unless a regression is clearly justified and documented.
+- Because this environment may be shared and benchmark artifacts can change between runs, verify the current worktree and rerun the benchmark you are comparing against before claiming an improvement.
 
 Primary objective:
 - Improve DecentDB so the measured benchmark deltas move toward category-leading results, with special attention to the metrics where DecentDB is still behind the collected competitors.
@@ -60,6 +82,7 @@ Optimization priorities:
 - Preserve or improve DecentDB's strong join latency and file-size advantages.
 - Prefer algorithmic or layout improvements over superficial micro-optimizations.
 - Treat allocator churn, unnecessary copies, sync frequency, hot-path branching, cache misses, page layout inefficiencies, and avoidable serialization work as prime suspects.
+- Highest-value remaining architectural target: `phase1-table-btree-persistence` — move table persistence off manifest-managed row blobs and onto page-backed table BTREE ownership, building on `crates/decentdb/src/btree/table.rs` and `design/adr/0123-phase1-table-btree-foundation.md`.
 
 Validation requirements:
 - Run `cargo clippy` on the affected crate if your change touches Rust code.
