@@ -16,7 +16,7 @@ struct ChildRef {
     page_id: PageId,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Btree<S: PageStore> {
     store: S,
     root_page_id: Option<PageId>,

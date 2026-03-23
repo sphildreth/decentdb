@@ -975,7 +975,7 @@ impl Db {
                     .execute_statement(statement, params, self.inner.config.page_size);
             }
             let mut working = state.runtime.clone();
-            working.rebuild_indexes(self.inner.config.page_size)?;
+            working.rebuild_stale_indexes(self.inner.config.page_size)?;
             let result =
                 working.execute_statement(statement, params, self.inner.config.page_size)?;
             state.runtime = working;
@@ -989,9 +989,60 @@ impl Db {
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        if matches!(
+            statement,
+            crate::sql::ast::Statement::Insert(insert)
+                if self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| DbError::internal("engine runtime lock poisoned"))?
+                    .can_execute_insert_in_place(insert)
+        ) {
+            return self.execute_autocommit_insert_in_place(statement, params);
+        }
         let mut working = self.engine_snapshot()?;
         let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
         self.persist_runtime(working)?;
+        Ok(result)
+    }
+
+    fn execute_autocommit_insert_in_place(
+        &self,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let result = match runtime.execute_statement(statement, params, self.inner.config.page_size) {
+            Ok(result) => result,
+            Err(error) => {
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        self.begin_write()?;
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        self.inner.catalog.replace(runtime.catalog.clone())?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
         Ok(result)
     }
 
@@ -1002,7 +1053,7 @@ impl Db {
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         let mut snapshot = runtime.clone();
-        snapshot.rebuild_indexes(self.inner.config.page_size)?;
+        snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
         Ok(snapshot)
     }
 
@@ -1073,8 +1124,20 @@ impl Db {
         };
 
         let mut snapshot = state.runtime.clone();
-        snapshot.rebuild_indexes(self.inner.config.page_size)?;
+        snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
         Ok(Some(snapshot))
+    }
+
+    fn restore_runtime_from_storage(&self, runtime: &mut EngineRuntime) -> Result<()> {
+        let schema_cookie = self.current_schema_cookie()?;
+        let restored =
+            EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
+        self.inner.catalog.replace(restored.catalog.clone())?;
+        *runtime = restored;
+        self.inner
+            .last_runtime_lsn
+            .store(self.inner.wal.latest_snapshot(), Ordering::Release);
+        Ok(())
     }
 
     fn refresh_engine_from_storage(&self) -> Result<()> {

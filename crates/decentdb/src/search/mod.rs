@@ -29,7 +29,7 @@ pub(crate) enum TrigramQueryResult {
     Capped(Vec<u64>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TrigramIndex {
     postings_tree: Btree<InMemoryPageStore>,
     pending: BTreeMap<u32, Vec<PendingOp>>,

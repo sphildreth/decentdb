@@ -49,7 +49,7 @@ pub(crate) struct TableData {
     pub(crate) rows: Vec<StoredRow>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum RuntimeIndex {
     Btree { keys: BTreeMap<Vec<u8>, Vec<i64>> },
     Trigram { index: TrigramIndex },
@@ -69,21 +69,11 @@ pub(super) enum PendingIndexInsert {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: CatalogState,
     pub(crate) tables: BTreeMap<String, TableData>,
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
-}
-
-impl Clone for EngineRuntime {
-    fn clone(&self) -> Self {
-        Self {
-            catalog: self.catalog.clone(),
-            tables: self.tables.clone(),
-            indexes: BTreeMap::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2735,6 +2725,64 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
                 _ => unreachable!(),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::search::TrigramQueryResult;
+    use crate::sql::parser::parse_sql_statement;
+
+    use super::{EngineRuntime, RuntimeIndex};
+
+    const PAGE_SIZE: u32 = 4096;
+
+    #[test]
+    fn runtime_clone_preserves_btree_and_trigram_indexes() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT, body TEXT)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX docs_body_trgm_idx ON docs USING gin (body)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email, body) VALUES (1, 'a@example.com', 'alphabet soup')",
+        );
+
+        let cloned = runtime.clone();
+
+        let RuntimeIndex::Btree { keys } = cloned
+            .indexes
+            .get("docs_email_idx")
+            .expect("email index should be cloned")
+        else {
+            panic!("expected BTREE runtime index");
+        };
+        assert!(!keys.is_empty(), "btree entries should be preserved");
+
+        let RuntimeIndex::Trigram { index } = cloned
+            .indexes
+            .get("docs_body_trgm_idx")
+            .expect("trigram index should be cloned")
+        else {
+            panic!("expected trigram runtime index");
+        };
+        assert_eq!(
+            index.query_candidates("alpha", false).expect("query cloned index"),
+            TrigramQueryResult::Candidates(vec![1])
+        );
+    }
+
+    fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
+        let statement = parse_sql_statement(sql).expect("parse SQL");
+        runtime
+            .execute_statement(&statement, &[], PAGE_SIZE)
+            .expect("execute SQL");
     }
 }
 
