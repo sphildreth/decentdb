@@ -6,9 +6,11 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
 use crate::error::{DbError, DbErrorCode, Result};
+use crate::metadata::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, TriggerInfo, ViewInfo};
 use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
 
 const DDB_OK: u32 = 0;
+const DDB_ABI_VERSION: u32 = 1;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,6 +132,12 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
     } else {
         "panic: non-string payload".to_string()
     }
+}
+
+fn cstring_from_string(value: String) -> Result<*mut c_char> {
+    CString::new(value)
+        .map(CString::into_raw)
+        .map_err(|_| DbError::internal("string contains an interior NUL"))
 }
 
 fn out_ptr<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T> {
@@ -289,6 +297,142 @@ fn free_owned_bytes(data: *mut u8, len: usize) {
 
 fn ddb_value_reset(value: &mut DdbValue) {
     *value = DdbValue::default();
+}
+
+fn json_escape(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn json_string(value: &str) -> String {
+    format!("\"{}\"", json_escape(value))
+}
+
+fn json_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn json_optional_string(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_string(), json_string)
+}
+
+fn json_string_list(values: &[String]) -> String {
+    let joined = values
+        .iter()
+        .map(|value| json_string(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{joined}]")
+}
+
+fn foreign_key_json(info: &ForeignKeyInfo) -> String {
+    format!(
+        "{{\"name\":{},\"columns\":{},\"referenced_table\":{},\"referenced_columns\":{},\"on_delete\":{},\"on_update\":{}}}",
+        json_optional_string(info.name.as_deref()),
+        json_string_list(&info.columns),
+        json_string(&info.referenced_table),
+        json_string_list(&info.referenced_columns),
+        json_string(&info.on_delete),
+        json_string(&info.on_update),
+    )
+}
+
+fn column_json(info: &ColumnInfo) -> String {
+    let checks = json_string_list(&info.checks);
+    let foreign_key = info
+        .foreign_key
+        .as_ref()
+        .map_or_else(|| "null".to_string(), foreign_key_json);
+    format!(
+        "{{\"name\":{},\"column_type\":{},\"nullable\":{},\"default_sql\":{},\"primary_key\":{},\"unique\":{},\"auto_increment\":{},\"checks\":{},\"foreign_key\":{}}}",
+        json_string(&info.name),
+        json_string(&info.column_type),
+        json_bool(info.nullable),
+        json_optional_string(info.default_sql.as_deref()),
+        json_bool(info.primary_key),
+        json_bool(info.unique),
+        json_bool(info.auto_increment),
+        checks,
+        foreign_key,
+    )
+}
+
+fn table_json(info: &TableInfo) -> String {
+    let columns = info
+        .columns
+        .iter()
+        .map(column_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let checks = json_string_list(&info.checks);
+    let foreign_keys = info
+        .foreign_keys
+        .iter()
+        .map(foreign_key_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"name\":{},\"columns\":[{}],\"checks\":{},\"foreign_keys\":[{}],\"primary_key_columns\":{},\"row_count\":{}}}",
+        json_string(&info.name),
+        columns,
+        checks,
+        foreign_keys,
+        json_string_list(&info.primary_key_columns),
+        info.row_count,
+    )
+}
+
+fn index_json(info: &IndexInfo) -> String {
+    format!(
+        "{{\"name\":{},\"table_name\":{},\"kind\":{},\"unique\":{},\"columns\":{},\"predicate_sql\":{},\"fresh\":{}}}",
+        json_string(&info.name),
+        json_string(&info.table_name),
+        json_string(&info.kind),
+        json_bool(info.unique),
+        json_string_list(&info.columns),
+        json_optional_string(info.predicate_sql.as_deref()),
+        json_bool(info.fresh),
+    )
+}
+
+fn view_json(info: &ViewInfo) -> String {
+    format!(
+        "{{\"name\":{},\"sql_text\":{},\"column_names\":{},\"dependencies\":{}}}",
+        json_string(&info.name),
+        json_string(&info.sql_text),
+        json_string_list(&info.column_names),
+        json_string_list(&info.dependencies),
+    )
+}
+
+fn trigger_json(info: &TriggerInfo) -> String {
+    format!(
+        "{{\"name\":{},\"target_name\":{},\"kind\":{},\"event\":{},\"on_view\":{},\"action_sql\":{}}}",
+        json_string(&info.name),
+        json_string(&info.target_name),
+        json_string(&info.kind),
+        json_string(&info.event),
+        json_bool(info.on_view),
+        json_string(&info.action_sql),
+    )
+}
+
+fn json_list<T>(items: &[T], render: impl Fn(&T) -> String) -> String {
+    let body = items.iter().map(render).collect::<Vec<_>>().join(",");
+    format!("[{body}]")
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_abi_version() -> u32 {
+    DDB_ABI_VERSION
 }
 
 #[no_mangle]
@@ -461,6 +605,87 @@ pub extern "C" fn ddb_db_save_as(db: *mut DbHandle, dest_path: *const c_char) ->
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_db_list_tables_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
+    ffi_boundary(|| {
+        let tables = handle_ref(db, "db")?.db.list_tables()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&tables, table_json))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_describe_table_json(
+    db: *mut DbHandle,
+    name: *const c_char,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let table = handle_ref(db, "db")?
+            .db
+            .describe_table(&utf8_arg(name, "name")?)?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(table_json(&table))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_get_table_ddl(
+    db: *mut DbHandle,
+    name: *const c_char,
+    out_ddl: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let ddl = handle_ref(db, "db")?
+            .db
+            .table_ddl(&utf8_arg(name, "name")?)?;
+        *out_ptr(out_ddl, "out_ddl")? = cstring_from_string(ddl)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_list_indexes_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
+    ffi_boundary(|| {
+        let indexes = handle_ref(db, "db")?.db.list_indexes()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&indexes, index_json))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_list_views_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
+    ffi_boundary(|| {
+        let views = handle_ref(db, "db")?.db.list_views()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&views, view_json))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_get_view_ddl(
+    db: *mut DbHandle,
+    name: *const c_char,
+    out_ddl: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let ddl = handle_ref(db, "db")?
+            .db
+            .view_ddl(&utf8_arg(name, "name")?)?;
+        *out_ptr(out_ddl, "out_ddl")? = cstring_from_string(ddl)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_list_triggers_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
+    ffi_boundary(|| {
+        let triggers = handle_ref(db, "db")?.db.list_triggers()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&triggers, trigger_json))?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_evict_shared_wal(path: *const c_char) -> u32 {
     ffi_boundary(|| {
         let path = utf8_arg(path, "path")?;
@@ -574,6 +799,11 @@ mod tests {
     }
 
     #[test]
+    fn abi_version_is_stable() {
+        assert_eq!(ddb_abi_version(), DDB_ABI_VERSION);
+    }
+
+    #[test]
     fn ffi_boundary_converts_panics_into_panic_error_code() {
         let code = ffi_boundary(|| -> Result<()> { panic!("boom") });
         assert_eq!(code, DbErrorCode::Panic.as_u32());
@@ -674,6 +904,94 @@ mod tests {
         assert_eq!(text, "Ada");
         assert_eq!(ddb_value_dispose(&mut copied), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn metadata_json_helpers_return_current_catalog_state() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let mut result = ptr::null_mut();
+        for sql in [
+            "CREATE TABLE parent (id INT64 PRIMARY KEY)",
+            "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 REFERENCES parent(id) ON DELETE CASCADE)",
+            "CREATE INDEX idx_child_parent ON child (parent_id)",
+            "CREATE VIEW child_ids AS SELECT id, parent_id FROM child",
+            "CREATE TABLE audit_log (msg TEXT)",
+            "CREATE TRIGGER child_ai AFTER INSERT ON child FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log VALUES (''changed'')')",
+            "INSERT INTO parent VALUES (1)",
+            "INSERT INTO child VALUES (1, 1)",
+        ] {
+            let sql = CString::new(sql).expect("sql");
+            assert_eq!(ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result), DDB_OK);
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+
+        fn take_json(slot: &mut *mut c_char) -> String {
+            let raw = *slot;
+            assert!(!raw.is_null(), "json pointer should be populated");
+            let value = unsafe { CStr::from_ptr(raw) }
+                .to_str()
+                .expect("utf8")
+                .to_string();
+            assert_eq!(ddb_string_free(slot), DDB_OK);
+            value
+        }
+
+        let mut tables_json = ptr::null_mut();
+        assert_eq!(ddb_db_list_tables_json(db, &mut tables_json), DDB_OK);
+        let tables_json = take_json(&mut tables_json);
+        assert!(tables_json.contains("\"name\":\"child\""));
+        assert!(tables_json.contains("\"row_count\":1"));
+
+        let child_name = CString::new("child").expect("name");
+        let mut describe_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_describe_table_json(db, child_name.as_ptr(), &mut describe_json),
+            DDB_OK
+        );
+        let describe_json = take_json(&mut describe_json);
+        assert!(describe_json.contains("\"primary_key\":true"));
+        assert!(describe_json.contains("\"referenced_table\":\"parent\""));
+        assert!(describe_json.contains("\"on_delete\":\"CASCADE\""));
+
+        let mut table_ddl = ptr::null_mut();
+        assert_eq!(
+            ddb_db_get_table_ddl(db, child_name.as_ptr(), &mut table_ddl),
+            DDB_OK
+        );
+        let table_ddl = take_json(&mut table_ddl);
+        assert!(table_ddl.contains("CREATE TABLE \"child\""));
+
+        let mut indexes_json = ptr::null_mut();
+        assert_eq!(ddb_db_list_indexes_json(db, &mut indexes_json), DDB_OK);
+        let indexes_json = take_json(&mut indexes_json);
+        assert!(indexes_json.contains("\"name\":\"idx_child_parent\""));
+        assert!(indexes_json.contains("\"kind\":\"btree\""));
+
+        let mut views_json = ptr::null_mut();
+        assert_eq!(ddb_db_list_views_json(db, &mut views_json), DDB_OK);
+        let views_json = take_json(&mut views_json);
+        assert!(views_json.contains("\"name\":\"child_ids\""));
+        assert!(views_json.contains("\"dependencies\":[\"child\"]"));
+
+        let view_name = CString::new("child_ids").expect("view");
+        let mut view_ddl = ptr::null_mut();
+        assert_eq!(
+            ddb_db_get_view_ddl(db, view_name.as_ptr(), &mut view_ddl),
+            DDB_OK
+        );
+        let view_ddl = take_json(&mut view_ddl);
+        assert!(view_ddl.contains("CREATE VIEW \"child_ids\""));
+
+        let mut triggers_json = ptr::null_mut();
+        assert_eq!(ddb_db_list_triggers_json(db, &mut triggers_json), DDB_OK);
+        let triggers_json = take_json(&mut triggers_json);
+        assert!(triggers_json.contains("\"name\":\"child_ai\""));
+        assert!(triggers_json.contains("\"target_name\":\"child\""));
+
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
 }

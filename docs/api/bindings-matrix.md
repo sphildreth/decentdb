@@ -1,16 +1,22 @@
 # Binding Compatibility Matrix
 
-| Binding surface | Scope in Rust Phase 4 | Source of truth |
+| Binding surface | Current Rust-rewrite scope | Source of truth |
 |---|---|---|
-| C ABI | Stable handle-based core surface | `include/decentdb.h`, `crates/decentdb/src/c_api.rs` |
-| Python | Validation suite over C ABI | `tests/bindings/python/test_ffi.py` |
-| .NET | Validation suite over C ABI | `tests/bindings/dotnet/Smoke/` |
-| Go | Release smoke | `tests/bindings/go/smoke.go` |
-| Java | Release smoke | `tests/bindings/java/Smoke.java` |
-| Node | Release smoke | `tests/bindings/node/` |
-| Dart | Release smoke | `tests/bindings/dart/` |
+| C ABI | Stable handle/result core surface | `include/decentdb.h`, `crates/decentdb/src/c_api.rs` |
+| Python | Validation suite over the C ABI | `tests/bindings/python/test_ffi.py` |
+| .NET | Validation suite over the C ABI | `tests/bindings/dotnet/Smoke/` |
+| Go | Release smoke over the C ABI | `tests/bindings/go/smoke.go` |
+| Java | Release smoke over the C ABI | `tests/bindings/java/Smoke.java` |
+| Node | Release smoke over the C ABI | `tests/bindings/node/` |
+| Dart smoke | Release smoke over the C ABI | `tests/bindings/dart/` |
+| Dart package | In-tree packaged wrapper validated against the C ABI | `bindings/dart/dart/`, `bindings/dart/dart/test/` |
 
-All non-C bindings in the Rust rewrite currently validate the C ABI directly. Higher-level packaged language APIs remain post-Phase-4 work.
+The Rust rewrite still treats the C ABI as the authoritative native surface.
+Language-specific packages either validate that ABI directly or layer tested,
+idiomatic wrappers on top of it.
 
-Packaged language integrations will live under `bindings/` as they are ported.
-`tests/bindings/` remains the validation and smoke-test layer.
+For Dart specifically, there are now two checked layers:
+
+- `tests/bindings/dart/` for the narrow release smoke path
+- `bindings/dart/dart/` for the packaged `Database` / `Statement` / `Schema`
+  wrapper

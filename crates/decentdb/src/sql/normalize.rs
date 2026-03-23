@@ -1198,7 +1198,8 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
         return Ok(Expr::Aggregate {
             name,
             args,
-            star: call.agg_star, distinct: call.agg_distinct,
+            star: call.agg_star,
+            distinct: call.agg_distinct,
         });
     }
 

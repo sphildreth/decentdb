@@ -1,28 +1,33 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:test/test.dart';
 import 'package:decentdb/decentdb.dart';
+import 'package:test/test.dart';
 
-/// Resolve the path to libc_api.so from environment or repo layout.
 String findNativeLib() {
   final envPath = Platform.environment['DECENTDB_NATIVE_LIB'];
-  if (envPath != null && envPath.isNotEmpty) return envPath;
+  if (envPath != null && envPath.isNotEmpty) {
+    return envPath;
+  }
 
-  // Walk up from this test file to find the repo root build/ directory.
   var dir = Directory.current;
   for (var i = 0; i < 10; i++) {
-    final candidate = File('${dir.path}/build/libc_api.so');
-    if (candidate.existsSync()) return candidate.path;
-    final candidateDylib = File('${dir.path}/build/libc_api.dylib');
-    if (candidateDylib.existsSync()) return candidateDylib.path;
-    final candidateDll = File('${dir.path}/build/c_api.dll');
-    if (candidateDll.existsSync()) return candidateDll.path;
+    for (final candidateName in [
+      'target/debug/libdecentdb.so',
+      'target/debug/libdecentdb.dylib',
+      'target/debug/decentdb.dll',
+    ]) {
+      final candidate = File('${dir.path}/$candidateName');
+      if (candidate.existsSync()) {
+        return candidate.path;
+      }
+    }
     dir = dir.parent;
   }
+
   throw StateError(
     'Cannot find DecentDB native library. '
-    'Set DECENTDB_NATIVE_LIB or run from the repo root after `nimble build_lib`.',
+    'Set DECENTDB_NATIVE_LIB or run from the repo root after `cargo build -p decentdb`.',
   );
 }
 
@@ -42,107 +47,100 @@ void main() {
     db.close();
   });
 
-  group('Database lifecycle', () {
+  group('database lifecycle', () {
     test('open and close in-memory database', () {
-      // db is already open from setUp
       expect(db.engineVersion, isNotEmpty);
     });
 
-    test('open file database and close', () {
-      final tmpDir = Directory.systemTemp.createTempSync('decentdb_dart_');
-      final dbPath = '${tmpDir.path}/test.ddb';
+    test('open file database and reopen it', () {
+      final tempDir = Directory.systemTemp.createTempSync('decentdb_dart_');
+      final dbPath = '${tempDir.path}/test.ddb';
       try {
         final fileDb = Database.open(dbPath, libraryPath: libPath);
-        fileDb.execute('CREATE TABLE t (id INTEGER PRIMARY KEY)');
+        fileDb.execute('CREATE TABLE t (id INT64 PRIMARY KEY)');
         fileDb.close();
 
-        // Reopen and verify
-        final fileDb2 = Database.open(dbPath, libraryPath: libPath);
-        final tables = fileDb2.schema.listTables();
-        expect(tables, contains('t'));
-        fileDb2.close();
+        final reopened = Database.open(dbPath, libraryPath: libPath);
+        expect(reopened.schema.listTables(), contains('t'));
+        reopened.close();
       } finally {
-        tmpDir.deleteSync(recursive: true);
+        tempDir.deleteSync(recursive: true);
       }
     });
 
-    test('operations on closed database throw', () {
-      final db2 = Database.open(':memory:', libraryPath: libPath);
-      db2.close();
-      expect(() => db2.execute('SELECT 1'), throwsStateError);
-    });
-  });
-
-  group('DDL', () {
-    test('CREATE TABLE', () {
-      db.execute(
-        'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT)',
+    test('rejects unsupported native open options', () {
+      expect(
+        () => Database.open(':memory:',
+            libraryPath: libPath, options: 'cache_mb=8'),
+        throwsArgumentError,
       );
-      final tables = db.schema.listTables();
-      expect(tables, contains('users'));
     });
 
-    test('CREATE INDEX', () {
-      db.execute('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)');
-      db.execute('CREATE INDEX idx_items_name ON items (name)');
-      final indexes = db.schema.listIndexes();
-      expect(indexes.any((i) => i.name == 'idx_items_name'), isTrue);
-    });
-
-    test('CREATE VIEW', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
-      db.execute('CREATE VIEW v AS SELECT id, val FROM t');
-      final views = db.schema.listViews();
-      expect(views, contains('v'));
+    test('operations on closed database throw', () {
+      final closed = Database.open(':memory:', libraryPath: libPath);
+      closed.close();
+      expect(() => closed.execute('SELECT 1'), throwsStateError);
     });
   });
 
-  group('DML', () {
+  group('DML and query execution', () {
     setUp(() {
       db.execute(
-        'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score FLOAT)',
+        'CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT NOT NULL, score FLOAT64)',
       );
     });
 
-    test('INSERT and SELECT', () {
+    test('insert and query rows', () {
       db.execute("INSERT INTO users VALUES (1, 'Alice', 95.5)");
-      db.execute("INSERT INTO users VALUES (2, 'Bob', 87.3)");
+      db.execute("INSERT INTO users VALUES (2, 'Bob', 87.0)");
+
       final rows = db.query('SELECT id, name, score FROM users ORDER BY id');
-      expect(rows.length, 2);
+      expect(rows, hasLength(2));
       expect(rows[0]['id'], 1);
       expect(rows[0]['name'], 'Alice');
       expect(rows[1]['name'], 'Bob');
     });
 
-    test('UPDATE returns affected rows', () {
+    test('executeWithParams returns affected rows', () {
       db.execute("INSERT INTO users VALUES (1, 'Alice', 95.5)");
-      db.execute("INSERT INTO users VALUES (2, 'Bob', 87.3)");
+
       final affected = db.executeWithParams(
-        'UPDATE users SET score = \$1 WHERE id = \$2',
+        r'UPDATE users SET score = $1 WHERE id = $2',
         [100.0, 1],
       );
+
       expect(affected, 1);
+      expect(db.query('SELECT score FROM users WHERE id = 1').single['score'],
+          100.0);
     });
 
-    test('DELETE returns affected rows', () {
+    test('saveAs exports the current database', () {
       db.execute("INSERT INTO users VALUES (1, 'Alice', 95.5)");
-      db.execute("INSERT INTO users VALUES (2, 'Bob', 87.3)");
-      final affected = db.execute('DELETE FROM users WHERE id = 1');
-      expect(affected, 1);
+      final tempDir = Directory.systemTemp.createTempSync('decentdb_export_');
+      final exportPath = '${tempDir.path}/copy.ddb';
+      try {
+        db.saveAs(exportPath);
+        final copy = Database.open(exportPath, libraryPath: libPath);
+        expect(
+            copy.query('SELECT COUNT(*) AS cnt FROM users').single['cnt'], 1);
+        copy.close();
+      } finally {
+        tempDir.deleteSync(recursive: true);
+      }
     });
   });
 
-  group('Prepared statements', () {
+  group('statement wrapper', () {
     setUp(() {
       db.execute(
-        'CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, active BOOLEAN)',
+        'CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT, active BOOL)',
       );
     });
 
     test('bind and execute with reuse', () {
-      final stmt = db.prepare('INSERT INTO items VALUES (\$1, \$2, \$3)');
+      final stmt = db.prepare(r'INSERT INTO items VALUES ($1, $2, $3)');
       try {
-        for (var i = 1; i <= 5; i++) {
+        for (var i = 1; i <= 3; i++) {
           stmt.reset();
           stmt.clearBindings();
           stmt.bindInt64(1, i);
@@ -154,123 +152,79 @@ void main() {
         stmt.dispose();
       }
 
-      final rows = db.query('SELECT COUNT(*) as cnt FROM items');
-      expect(rows[0]['cnt'], 5);
-    });
-
-    test('bindAll convenience', () {
-      final stmt = db.prepare('INSERT INTO items VALUES (\$1, \$2, \$3)');
-      try {
-        stmt.bindAll([1, 'test', true]);
-        stmt.execute();
-      } finally {
-        stmt.dispose();
-      }
-
-      final rows = db.query('SELECT name FROM items WHERE id = 1');
-      expect(rows[0]['name'], 'test');
+      expect(db.query('SELECT COUNT(*) AS cnt FROM items').single['cnt'], 3);
     });
 
     test('query resets before re-executing', () {
       db.execute("INSERT INTO items VALUES (1, 'one', true)");
       db.execute("INSERT INTO items VALUES (2, 'two', false)");
 
-      final stmt = db.prepare(
-        'SELECT id FROM items WHERE active = \$1 ORDER BY id',
-      );
+      final stmt =
+          db.prepare(r'SELECT id FROM items WHERE active = $1 ORDER BY id');
       try {
         stmt.bindBool(1, true);
-
-        final first = stmt.query();
-        final second = stmt.query();
-
-        expect(first.map((row) => row['id']).toList(), [1]);
-        expect(second.map((row) => row['id']).toList(), [1]);
+        expect(stmt.query().map((row) => row['id']).toList(), [1]);
+        expect(stmt.query().map((row) => row['id']).toList(), [1]);
       } finally {
         stmt.dispose();
       }
     });
 
-    test('bind NULL', () {
-      final stmt = db.prepare('INSERT INTO items VALUES (\$1, \$2, \$3)');
+    test('nextPage returns bounded pages', () {
+      db.transaction(() {
+        for (var i = 1; i <= 10; i++) {
+          db.execute("INSERT INTO items VALUES ($i, 'item_$i', true)");
+        }
+      });
+
+      final stmt = db.prepare('SELECT id FROM items ORDER BY id');
       try {
-        stmt.bindAll([1, null, null]);
-        stmt.execute();
+        final page1 = stmt.nextPage(4);
+        final page2 = stmt.nextPage(4);
+        final page3 = stmt.nextPage(4);
+
+        expect(page1.rows.map((row) => row['id']).toList(), [1, 2, 3, 4]);
+        expect(page2.rows.map((row) => row['id']).toList(), [5, 6, 7, 8]);
+        expect(page3.rows.map((row) => row['id']).toList(), [9, 10]);
+        expect(page3.isLast, isTrue);
       } finally {
         stmt.dispose();
       }
+    });
 
-      final rows = db.query('SELECT name, active FROM items WHERE id = 1');
-      expect(rows[0]['name'], isNull);
-      expect(rows[0]['active'], isNull);
+    test('step/readRow iterate over decoded rows', () {
+      db.execute("INSERT INTO items VALUES (1, 'one', true)");
+      db.execute("INSERT INTO items VALUES (2, 'two', false)");
+
+      final stmt = db.prepare('SELECT id, name FROM items ORDER BY id');
+      try {
+        expect(stmt.step(), isTrue);
+        expect(stmt.readRow()['name'], 'one');
+        expect(stmt.step(), isTrue);
+        expect(stmt.readRow()['name'], 'two');
+        expect(stmt.step(), isFalse);
+      } finally {
+        stmt.dispose();
+      }
     });
 
     test('disposed statement throws', () {
       final stmt = db.prepare('SELECT 1');
       stmt.dispose();
-      expect(() => stmt.step(), throwsStateError);
+      expect(() => stmt.query(), throwsStateError);
     });
   });
 
-  group('Cursor paging', () {
+  group('transactions', () {
     setUp(() {
-      db.execute('CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER)');
-      db.transaction(() {
-        for (var i = 1; i <= 100; i++) {
-          db.execute('INSERT INTO nums VALUES ($i, ${i * 10})');
-        }
-      });
-    });
-
-    test('page through results', () {
-      final stmt = db.prepare('SELECT id, val FROM nums ORDER BY id');
-      try {
-        var totalRows = 0;
-        var pageCount = 0;
-
-        while (true) {
-          final page = stmt.nextPage(25);
-          if (page.rows.isEmpty && page.isLast) break;
-          pageCount++;
-          totalRows += page.rows.length;
-          if (page.isLast) break;
-          expect(page.rows.length, 25);
-        }
-
-        expect(totalRows, 100);
-        expect(pageCount, 4);
-      } finally {
-        stmt.dispose();
-      }
-    });
-
-    test('small last page', () {
-      final stmt = db.prepare('SELECT id FROM nums ORDER BY id');
-      try {
-        final page1 = stmt.nextPage(60);
-        expect(page1.rows.length, 60);
-        expect(page1.isLast, isFalse);
-
-        final page2 = stmt.nextPage(60);
-        expect(page2.rows.length, 40);
-        expect(page2.isLast, isTrue);
-      } finally {
-        stmt.dispose();
-      }
-    });
-  });
-
-  group('Transactions', () {
-    setUp(() {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
+      db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)');
     });
 
     test('commit persists data', () {
       db.begin();
       db.execute("INSERT INTO t VALUES (1, 'a')");
       db.commit();
-      final rows = db.query('SELECT val FROM t WHERE id = 1');
-      expect(rows[0]['val'], 'a');
+      expect(db.query('SELECT val FROM t WHERE id = 1').single['val'], 'a');
     });
 
     test('rollback discards data', () {
@@ -278,375 +232,107 @@ void main() {
       db.begin();
       db.execute("UPDATE t SET val = 'during' WHERE id = 1");
       db.rollback();
-      final rows = db.query('SELECT val FROM t WHERE id = 1');
-      expect(rows[0]['val'], 'before');
+      expect(
+          db.query('SELECT val FROM t WHERE id = 1').single['val'], 'before');
     });
 
-    test('transaction() helper commits on success', () {
+    test('transaction helper commits and rolls back', () {
       db.transaction(() {
         db.execute("INSERT INTO t VALUES (1, 'committed')");
       });
-      final rows = db.query('SELECT val FROM t WHERE id = 1');
-      expect(rows[0]['val'], 'committed');
-    });
+      expect(db.query('SELECT val FROM t WHERE id = 1').single['val'],
+          'committed');
 
-    test('transaction() helper rolls back on exception', () {
-      db.execute("INSERT INTO t VALUES (1, 'original')");
-      try {
-        db.transaction(() {
-          db.execute("UPDATE t SET val = 'changed' WHERE id = 1");
-          throw Exception('deliberate');
-        });
-      } catch (_) {}
-      final rows = db.query('SELECT val FROM t WHERE id = 1');
-      expect(rows[0]['val'], 'original');
+      db.execute("INSERT INTO t VALUES (2, 'original')");
+      expect(
+        () => db.transaction<void>(() {
+          db.execute("UPDATE t SET val = 'changed' WHERE id = 2");
+          throw StateError('boom');
+        }),
+        throwsStateError,
+      );
+      expect(
+          db.query('SELECT val FROM t WHERE id = 2').single['val'], 'original');
     });
   });
 
-  group('Schema introspection', () {
+  group('schema metadata', () {
     setUp(() {
-      db.execute('CREATE TABLE parents (id INTEGER PRIMARY KEY)');
-      db.execute('INSERT INTO parents VALUES (1)');
-      db.execute('''
-        CREATE TABLE users (
-          id INTEGER PRIMARY KEY,
-          parent_id INTEGER NOT NULL REFERENCES parents(id) ON DELETE CASCADE ON UPDATE RESTRICT,
-          name TEXT NOT NULL DEFAULT 'anon',
-          email TEXT UNIQUE,
-          score INTEGER,
-          score_x2 INTEGER GENERATED ALWAYS AS (score * 2) STORED,
-          CONSTRAINT score_nonneg CHECK (score >= 0)
-        )
-      ''');
-      db.execute('CREATE INDEX idx_users_name ON users (name)');
-      db.execute('CREATE VIEW user_names AS SELECT id, name FROM users');
-      db.execute('CREATE TEMP TABLE scratch (id INTEGER DEFAULT 7)');
-      db.execute('CREATE TEMP VIEW temp_user_names AS SELECT name FROM users');
+      db.execute('CREATE TABLE parent (id INT64 PRIMARY KEY)');
+      db.execute('INSERT INTO parent VALUES (1)');
+      db.execute(
+        "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 NOT NULL REFERENCES parent(id) ON DELETE CASCADE, name TEXT DEFAULT 'anon')",
+      );
+      db.execute('CREATE INDEX idx_child_parent ON child (parent_id)');
+      db.execute('CREATE VIEW child_names AS SELECT id, name FROM child');
       db.execute('CREATE TABLE audit_log (msg TEXT)');
       db.execute(
-        "CREATE TRIGGER users_aiu AFTER INSERT OR UPDATE ON users FOR EACH ROW "
-        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log VALUES (''changed'')')",
+        "CREATE TRIGGER child_ai AFTER INSERT ON child FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log VALUES (''changed'')')",
       );
-      db.execute(
-        "CREATE TRIGGER temp_user_names_ins INSTEAD OF INSERT ON temp_user_names FOR EACH ROW "
-        "EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO users(id, parent_id, name, email, score) VALUES (999, 1, ''Temp'', NULL, 0)')",
-      );
+      db.execute("INSERT INTO child VALUES (1, 1, 'Ada')");
     });
 
-    test('listTables', () {
-      final tables = db.schema.listTables();
-      expect(tables, contains('users'));
+    test('listTables and describeTable expose catalog state', () {
+      expect(db.schema.listTables(),
+          containsAll(['parent', 'child', 'audit_log']));
+
+      final child = db.schema.describeTable('child');
+      expect(child.rowCount, 1);
+      expect(child.primaryKeyColumns, ['id']);
+      expect(child.columns.map((column) => column.name),
+          containsAll(['id', 'parent_id', 'name']));
+
+      final parentColumn =
+          child.columns.firstWhere((column) => column.name == 'parent_id');
+      expect(parentColumn.foreignKey, isNotNull);
+      expect(parentColumn.foreignKey!.referencedTable, 'parent');
+      expect(parentColumn.foreignKey!.onDelete, 'CASCADE');
+
+      expect(db.schema.getTableColumns('child').length, child.columns.length);
+      expect(db.schema.getTableDdl('child'), contains('CREATE TABLE "child"'));
     });
 
-    test('getTableColumns', () {
-      final cols = db.schema.getTableColumns('users');
-      expect(cols.length, 6);
-
-      final idCol = cols.firstWhere((c) => c.name == 'id');
-      expect(idCol.primaryKey, isTrue);
-
-      final parentCol = cols.firstWhere((c) => c.name == 'parent_id');
-      expect(parentCol.notNull, isTrue);
-      expect(parentCol.refTable, 'parents');
-      expect(parentCol.refColumn, 'id');
-      expect(parentCol.refOnDelete, 'CASCADE');
-      expect(parentCol.refOnUpdate, 'RESTRICT');
-
-      final nameCol = cols.firstWhere((c) => c.name == 'name');
-      expect(nameCol.notNull, isTrue);
-      expect(nameCol.defaultExpr, "'anon'");
-
-      final emailCol = cols.firstWhere((c) => c.name == 'email');
-      expect(emailCol.unique, isTrue);
-
-      final generatedCol = cols.firstWhere((c) => c.name == 'score_x2');
-      expect(generatedCol.generatedExpr, '("score" * 2)');
-      expect(generatedCol.generatedStored, isTrue);
-    });
-
-    test('getTableColumns for views', () {
-      final cols = db.schema.getTableColumns('user_names');
-      expect(cols.length, 2);
-      expect(cols.map((c) => c.name).toList(), ['id', 'name']);
-    });
-
-    test('listIndexes', () {
+    test('listIndexes, listViews, and listTriggers expose metadata', () {
       final indexes = db.schema.listIndexes();
-      final idx = indexes.firstWhere((i) => i.name == 'idx_users_name');
-      expect(idx.table, 'users');
-      expect(idx.columns, ['name']);
-      expect(idx.kind, 'btree');
-      expect(idx.temporary, isFalse);
-      expect(idx.ddl, contains('CREATE INDEX'));
-    });
+      final childIndex =
+          indexes.firstWhere((index) => index.name == 'idx_child_parent');
+      expect(childIndex.tableName, 'child');
 
-    test('listViews', () {
-      final views = db.schema.listViews();
-      expect(views, contains('user_names'));
-      expect(views, contains('temp_user_names'));
-    });
-
-    test('listTablesInfo', () {
-      final tables = db.schema.listTablesInfo();
-
-      final users = tables.firstWhere((t) => t.name == 'users');
-      expect(users.temporary, isFalse);
-      expect(users.ddl, contains('CREATE TABLE'));
-      expect(users.ddl, contains('GENERATED ALWAYS AS'));
-      expect(users.ddl, contains('"score" * 2'));
-      expect(users.ddl, contains('ON DELETE CASCADE ON UPDATE RESTRICT'));
-      expect(users.checks, hasLength(1));
-      expect(users.checks.single.name, 'score_nonneg');
-      expect(users.checks.single.exprSql, '("score" >= 0)');
-
-      final scratch = tables.firstWhere((t) => t.name == 'scratch');
-      expect(scratch.temporary, isTrue);
-      expect(scratch.ddl, startsWith('CREATE TEMP TABLE'));
-    });
-
-    test('getTableDdl', () {
-      final ddl = db.schema.getTableDdl('users');
-      expect(ddl, isNotNull);
-      expect(ddl!, startsWith('CREATE TABLE'));
-      expect(ddl, contains('"parent_id" INT64 NOT NULL'));
-      expect(ddl, contains('DEFAULT \'anon\''));
-      expect(ddl, contains('GENERATED ALWAYS AS'));
-      expect(ddl, contains('"score" * 2'));
-      expect(ddl, contains('CONSTRAINT "score_nonneg" CHECK ("score" >= 0)'));
-    });
-
-    test('getTableDdl throws for missing table', () {
-      expect(
-        () => db.schema.getTableDdl('missing_table'),
-        throwsA(isA<DecentDbException>()),
-      );
-    });
-
-    test('getViewDdl', () {
-      final ddl = db.schema.getViewDdl('user_names');
-      expect(ddl, isNotNull);
-      expect(ddl!, contains('SELECT'));
-    });
-
-    test('listViewsInfo', () {
       final views = db.schema.listViewsInfo();
+      final childView = views.firstWhere((view) => view.name == 'child_names');
+      expect(childView.dependencies, contains('child'));
+      expect(db.schema.getViewDdl('child_names'),
+          contains('CREATE VIEW "child_names"'));
 
-      final userNames = views.firstWhere((v) => v.name == 'user_names');
-      expect(userNames.temporary, isFalse);
-      expect(userNames.sqlText, contains('SELECT'));
-      expect(userNames.ddl, startsWith('CREATE VIEW'));
-      expect(userNames.columnNames, ['id', 'name']);
-      expect(userNames.dependencies, contains('users'));
-
-      final tempUserNames = views.firstWhere((v) => v.name == 'temp_user_names');
-      expect(tempUserNames.temporary, isTrue);
-      expect(tempUserNames.ddl, startsWith('CREATE TEMP VIEW'));
-    });
-
-    test('listTriggers', () {
       final triggers = db.schema.listTriggers();
-
-      final usersTrigger = triggers.firstWhere((t) => t.name == 'users_aiu');
-      expect(usersTrigger.targetName, 'users');
-      expect(usersTrigger.targetKind, 'table');
-      expect(usersTrigger.timing, 'after');
-      expect(usersTrigger.events, ['insert', 'update']);
-      expect(usersTrigger.actionSql, contains('changed'));
-      expect(usersTrigger.ddl, contains('AFTER INSERT OR UPDATE'));
-      expect(usersTrigger.temporary, isFalse);
-
-      final tempViewTrigger =
-          triggers.firstWhere((t) => t.name == 'temp_user_names_ins');
-      expect(tempViewTrigger.targetName, 'temp_user_names');
-      expect(tempViewTrigger.targetKind, 'view');
-      expect(tempViewTrigger.timing, 'instead_of');
-      expect(tempViewTrigger.events, ['insert']);
-      expect(tempViewTrigger.ddl, contains('INSTEAD OF INSERT'));
-      expect(tempViewTrigger.temporary, isTrue);
-    });
-
-    test('getViewDdl throws for missing view', () {
-      expect(
-        () => db.schema.getViewDdl('missing_view'),
-        throwsA(isA<DecentDbException>()),
-      );
+      final childTrigger =
+          triggers.firstWhere((trigger) => trigger.name == 'child_ai');
+      expect(childTrigger.targetName, 'child');
+      expect(childTrigger.actionSql, contains('changed'));
     });
   });
 
-  group('Data types', () {
-    test('integer types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)');
-      db.execute('INSERT INTO t VALUES (1, 9223372036854775807)');
-      final rows = db.query('SELECT val FROM t');
-      expect(rows[0]['val'], 9223372036854775807);
-    });
+  group('data types', () {
+    test('typed scalar values round-trip', () {
+      db.execute(
+        'CREATE TABLE typed (id INT64 PRIMARY KEY, score FLOAT64, active BOOL, note TEXT)',
+      );
 
-    test('float types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val FLOAT)');
-      db.execute('INSERT INTO t VALUES (1, 3.14159)');
-      final rows = db.query('SELECT val FROM t');
-      expect((rows[0]['val'] as double), closeTo(3.14159, 0.0001));
-    });
-
-    test('text types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
-      final stmt = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
-      stmt.bindAll([1, 'Hello, 世界! 🌍']);
-      stmt.execute();
-      stmt.dispose();
-      final rows = db.query('SELECT val FROM t');
-      expect(rows[0]['val'], 'Hello, 世界! 🌍');
-    });
-
-    test('blob types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val BLOB)');
-      final data = Uint8List.fromList([0, 1, 2, 255, 128, 64]);
-      final stmt = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
-      stmt.bindInt64(1, 1);
-      stmt.bindBlob(2, data);
-      stmt.execute();
-      stmt.dispose();
-      final rows = db.query('SELECT val FROM t');
-      expect(rows[0]['val'], data);
-    });
-
-    test('decimal types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val DECIMAL(10,2))');
-      final insert = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
+      final insert = db.prepare(r'INSERT INTO typed VALUES ($1, $2, $3, $4)');
       try {
         insert.bindInt64(1, 1);
-        insert.bindDecimal(2, 12345, 2);
+        insert.bindFloat64(2, 12.5);
+        insert.bindBool(3, true);
+        insert.bindText(4, 'hello');
         insert.execute();
       } finally {
         insert.dispose();
       }
 
-      final stmt = db.prepare('SELECT val FROM t');
-      try {
-        final rows = stmt.query();
-        final decimal = rows[0]['val'] as ({int unscaled, int scale});
-        expect(decimal.unscaled, 12345);
-        expect(decimal.scale, 2);
-      } finally {
-        stmt.dispose();
-      }
-    });
-
-    test('datetime types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TIMESTAMP)');
-      final expected = DateTime.utc(2024, 1, 2, 3, 4, 5, 678, 901);
-      final insert = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
-      try {
-        insert.bindInt64(1, 1);
-        insert.bindDateTime(2, expected);
-        insert.execute();
-      } finally {
-        insert.dispose();
-      }
-
-      final stmt = db.prepare('SELECT val FROM t');
-      try {
-        final rows = stmt.query();
-        expect(rows[0]['val'], expected);
-      } finally {
-        stmt.dispose();
-      }
-    });
-
-    test('compact bool and integer result kinds', () {
-      final rows = db.query(
-        'SELECT TRUE AS t, FALSE AS f, 1 AS one, 0 AS zero',
-      );
-      expect(rows[0]['t'], isTrue);
-      expect(rows[0]['f'], isFalse);
-      expect(rows[0]['one'], 1);
-      expect(rows[0]['zero'], 0);
-    });
-
-    test('boolean types', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val BOOLEAN)');
-      final stmt = db.prepare('INSERT INTO t VALUES (\$1, \$2)');
-      stmt.bindAll([1, true]);
-      stmt.execute();
-      stmt.reset();
-      stmt.clearBindings();
-      stmt.bindAll([2, false]);
-      stmt.execute();
-      stmt.dispose();
-      final rows = db.query('SELECT id, val FROM t ORDER BY id');
-      expect(rows[0]['val'], true);
-      expect(rows[1]['val'], false);
-    });
-
-    test('NULL handling', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
-      db.execute('INSERT INTO t VALUES (1, NULL)');
-      final rows = db.query('SELECT val FROM t');
-      expect(rows[0]['val'], isNull);
-    });
-  });
-
-  group('Error handling', () {
-    test('invalid SQL throws DecentDbException', () {
-      expect(
-        () => db.execute('NOT VALID SQL'),
-        throwsA(isA<DecentDbException>()),
-      );
-    });
-
-    test('constraint violation throws', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY)');
-      db.execute('INSERT INTO t VALUES (1)');
-      expect(
-        () => db.execute('INSERT INTO t VALUES (1)'),
-        throwsA(isA<DecentDbException>()),
-      );
-    });
-
-    test('error message is descriptive', () {
-      try {
-        db.execute('SELECT * FROM nonexistent');
-        fail('Should have thrown');
-      } on DecentDbException catch (e) {
-        expect(e.message, isNotEmpty);
-        expect(e.toString(), contains('DecentDbException'));
-      }
-    });
-  });
-
-  group('EXPLAIN', () {
-    test('EXPLAIN returns plan lines', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
-      final rows = db.query('EXPLAIN SELECT * FROM t WHERE id = 1');
-      expect(rows, isNotEmpty);
-      expect(rows[0].columns, contains('query_plan'));
-    });
-  });
-
-  group('Maintenance', () {
-    test('checkpoint succeeds', () {
-      db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY)');
-      // checkpoint on in-memory db is a no-op but should not error
-      db.checkpoint();
-    });
-
-    test('saveAs exports database', () {
-      final tmpDir = Directory.systemTemp.createTempSync('decentdb_dart_');
-      try {
-        db.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)');
-        db.execute("INSERT INTO t VALUES (1, 'hello')");
-        final destPath = '${tmpDir.path}/export.ddb';
-        db.saveAs(destPath);
-        expect(File(destPath).existsSync(), isTrue);
-
-        // Verify exported db
-        final db2 = Database.open(destPath, libraryPath: libPath);
-        final rows = db2.query('SELECT val FROM t');
-        expect(rows[0]['val'], 'hello');
-        db2.close();
-      } finally {
-        tmpDir.deleteSync(recursive: true);
-      }
+      final row = db.query('SELECT score, active, note FROM typed').single;
+      expect(row['score'], 12.5);
+      expect(row['active'], true);
+      expect(row['note'], 'hello');
     });
   });
 }

@@ -1,355 +1,76 @@
 # Building from Source
 
-Instructions for building DecentDB from source code.
+This repository is the Rust rewrite of DecentDB. The supported local workflow is
+Cargo-based.
 
 ## Prerequisites
 
-### Required
+- [Rust via rustup](https://rustup.rs)
+- A normal platform toolchain capable of building Rust crates with native code
+  dependencies (for example `build-essential` on Debian/Ubuntu or Xcode command
+  line tools on macOS)
 
-- **Rust** >= 1.6.0
-- **libpg_query** (PostgreSQL parser library)
-- **git** (for cloning)
+## Build the workspace
 
-### Optional
-
-- **Python** >= 3.8 (for test harness)
-- **libpg_query development headers** (for building)
-
-## Installing Rust
-
-### Using rustup (Recommended)
+From the repository root:
 
 ```bash
-curl https://sh.rustup.rs -sSf | sh
+cargo build --workspace
 ```
 
-Or on Windows:
-```powershell
-. (Invoke-WebRequest -Uri https://win.rustup.rs -UseBasicParsing).Content
-```
+That builds:
 
-### Using Package Manager
+- `crates/decentdb` — the core engine crate plus the shared library artifact
+- `crates/decentdb-cli` — the `decentdb` command-line tool
 
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install rustc cargo
-```
+## Useful build targets
 
-**macOS:**
-```bash
-brew install rust
-```
-
-**Arch Linux:**
-```bash
-sudo pacman -S rust cargo
-```
-
-### Verify Installation
+Build just the native library crate:
 
 ```bash
-rustc --version
-# Should show >= 1.6.0
+cargo build -p decentdb
 ```
 
-## Installing libpg_query
-
-### Ubuntu/Debian
+Build just the CLI binary:
 
 ```bash
-sudo apt-get install libpg-query-dev
+cargo build -p decentdb-cli
 ```
 
-### macOS
+Optimized release build:
 
 ```bash
-brew install libpg_query
+cargo build --workspace --release
 ```
 
-### From Source
+## Shared library outputs
 
-If your distribution doesn't have it:
+`cargo build -p decentdb` produces the Rust `cdylib` used by the binding smoke
+programs and the in-tree Dart package:
+
+- Linux: `target/debug/libdecentdb.so`
+- macOS: `target/debug/libdecentdb.dylib`
+- Windows: `target/debug/decentdb.dll`
+
+Release builds use the same names under `target/release/`.
+
+## Install the CLI locally
 
 ```bash
-git clone https://github.com/pganalyze/libpg_query.git
-cd libpg_query
-make
-sudo make install
+cargo install --path crates/decentdb-cli
 ```
 
-### Verify
+That places `decentdb` in Cargo's bin directory (typically `~/.cargo/bin`).
+
+## Helpful Cargo aliases
+
+The repository ships a few convenience aliases in `.cargo/config.toml`:
 
 ```bash
-ldconfig -p | grep pg_query
-# Should show libpg_query.so
+cargo t         # nextest run
+cargo test-all  # nextest run --all-features
+cargo lint      # clippy --all-targets --all-features -- -D warnings
 ```
 
-## Cloning the Repository
-
-```bash
-git clone https://github.com/sphildreth/decentdb.git
-cd decentdb
-```
-
-## Building
-
-### Standard Build
-
-```bash
-cargo build
-```
-
-This creates the `decentdb` executable.
-
-### Release Build
-
-Optimized for performance:
-
-```bash
-cargo build -d:release
-```
-
-### Debug Build
-
-With debug symbols and assertions:
-
-```bash
-cargo build -d:debug
-```
-
-### Static Build
-
-Self-contained binary (Linux only):
-
-```bash
-cargo build --passL:"-static" --passL:"-lpg_query -lstdc++"
-```
-
-## Running Tests
-
-### All Tests
-
-```bash
-cargo test
-```
-
-This runs:
-- All Rust unit tests
-- Python harness tests
-- Binding test suites wired through `cargo test_bindings` (`.NET`, Go, Node.js, Python, Dart)
-- Java JDBC tests remain separate: `cargo test_bindings_java`
-
-If you only want the engine test suite without binding prerequisites, run:
-
-```bash
-cargo test_nim
-cargo test_py
-```
-
-### Rust Tests Only
-
-```bash
-cargo test_nim
-```
-
-### Python Tests Only
-
-```bash
-cargo test_py
-```
-
-### Specific Test
-
-```bash
-nim c -r tests/nim/test_wal.rs
-```
-
-## Installation
-
-### Local Install
-
-```bash
-cargo install --path ./cli
-```
-
-Installs to `~/.rsble/bin/`
-
-### System Install
-
-```bash
-sudo cp decentdb /usr/local/bin/
-sudo chmod +x /usr/local/bin/decentdb
-```
-
-### Verify
-
-```bash
-decentdb --help
-```
-
-## Development Build
-
-For active development with fast rebuilds:
-
-```bash
-# Compile without optimization
-nim c -d:development src/decentdb.rs
-
-# Or use the debug task
-cargo build -d:debug
-```
-
-## Cross-Compilation
-
-### Windows from Linux
-
-Requires mingw-w64:
-
-```bash
-nim c -d:release --os:windows --cpu:amd64 src/decentdb.rs
-```
-
-### macOS from Linux
-
-Requires macOS SDK (complex setup).
-
-### ARM64 from x64
-
-```bash
-nim c -d:release --cpu:arm64 src/decentdb.rs
-```
-
-GitHub Releases also publish a native Linux arm64 archive,
-`decentdb-<tag>-Linux-arm64.tar.gz`, for 64-bit Raspberry Pi OS on Raspberry Pi 3/4/5, so end
-users usually do not need to cross-compile manually.
-
-## Troubleshooting
-
-### "libpg_query not found"
-
-**Problem:**
-```
-Error: cannot find -lpg_query
-```
-
-**Solution:**
-```bash
-# Find the library
-find /usr -name "libpg_query*" 2>/dev/null
-
-# Add to library path
-export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-
-# Rebuild
-cargo build
-```
-
-### "nim not found"
-
-**Problem:**
-```
-bash: nim: command not found
-```
-
-**Solution:**
-```bash
-# Add cargo bin to PATH
-export PATH=$HOME/.rsble/bin:$PATH
-
-# Or reinstall rustup
-curl https://sh.rustup.rs -sSf | sh
-```
-
-### Tests Fail
-
-**Problem:**
-Some tests fail after build.
-
-**Solution:**
-```bash
-# Run specific test for details
-nim c -r tests/nim/test_wal.rs
-
-# Check Python tests separately
-python -m unittest -v tests/harness/test_runner.py
-```
-
-### Slow Build
-
-**Problem:**
-Build takes too long.
-
-**Solution:**
-```bash
-# Use release flags (faster compilation)
-cargo build -d:release
-
-# Or parallel compilation
-nim c --parallelBuild:4 src/decentdb.rs
-```
-
-## IDE Setup
-
-### VS Code
-
-Install extensions:
-- **Rust** (by kosz78) - Syntax highlighting, compilation
-- **nim-lsp** - Language server support
-
-Configuration:
-```json
-{
-  "nim.buildCommand": "cargo build",
-  "nim.runOutput": "./decentdb"
-}
-```
-
-### Vim/Neovim
-
-Using nimlsp:
-```vim
-" With coc.nvim
-:CocInstall coc-nim
-
-" With native LSP
-lua require'lspconfig'.rsls.setup{}
-```
-
-### Emacs
-
-Using nim-mode:
-```elisp
-(use-package nim-mode
-  :hook (nim-mode . lsp))
-```
-
-## Continuous Integration
-
-The project uses GitHub Actions:
-
-- **Build**: Compiles on Linux x86_64/arm64, macOS, Windows
-- **Test**: Runs all tests
-- **Lint**: Static analysis
-- **Docs**: Builds documentation
-
-See `.github/workflows/` for details.
-
-## Release Checklist
-
-Before creating a release:
-
-1. [ ] All tests pass
-2. [ ] Version updated in `decentdb.rsble`
-3. [ ] CHANGELOG.md updated
-4. [ ] Documentation built
-5. [ ] Binaries built for all release platforms (Linux x64, Linux arm64/Raspberry Pi, macOS, Windows)
-6. [ ] Version bumped (e.g. `1.0.2` -> `1.1.0`) and changelog updated
-7. [ ] Git tag created: `git tag -a v1.8.1 -m "DecentDB 1.8.1"`
-8. [ ] Tag pushed: `git push origin v1.8.1`
-
-## Next Steps
-
-- [Run Tests](testing.md)
-- [Contribute](contributing.md)
-- [API Reference](../api/rust-api.md)
+Use plain `cargo build`, `cargo test`, and `cargo clippy` if you prefer not to
+rely on aliases.

@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Build DecentDB shared library for the current platform.
-# Run from the repository root.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+
 cd "$REPO_ROOT"
 
 echo "Building DecentDB shared library..."
-nimble build_lib
+cargo build -p decentdb
 
-echo ""
+echo
 echo "Build complete. Library location:"
 case "$(uname -s)" in
-  Linux*)   echo "  $REPO_ROOT/build/libc_api.so" ;;
-  Darwin*)  echo "  $REPO_ROOT/build/libc_api.dylib" ;;
+  Linux*)   echo "  $REPO_ROOT/target/debug/libdecentdb.so" ;;
+  Darwin*)  echo "  $REPO_ROOT/target/debug/libdecentdb.dylib" ;;
   MINGW*|MSYS*|CYGWIN*)
-            echo "  $REPO_ROOT/build/c_api.dll" ;;
-  *)        echo "  $REPO_ROOT/build/" ;;
+            echo "  $REPO_ROOT/target/debug/decentdb.dll" ;;
+  *)        echo "  $REPO_ROOT/target/debug/" ;;
 esac

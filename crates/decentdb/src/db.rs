@@ -61,6 +61,13 @@ struct WriteTxn {
 struct SqlTxnState {
     runtime: EngineRuntime,
     base_lsn: u64,
+    savepoints: Vec<SqlSavepoint>,
+}
+
+#[derive(Clone, Debug)]
+struct SqlSavepoint {
+    name: String,
+    runtime: EngineRuntime,
 }
 
 impl Db {
@@ -128,7 +135,11 @@ impl Db {
                 "SQL transaction is already active on this handle",
             ));
         }
-        *txn = Some(SqlTxnState { runtime, base_lsn });
+        *txn = Some(SqlTxnState {
+            runtime,
+            base_lsn,
+            savepoints: Vec::new(),
+        });
         Ok(())
     }
 
@@ -167,6 +178,64 @@ impl Db {
             .lock()
             .map(|txn| txn.is_some())
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))
+    }
+
+    /// Creates a named savepoint inside the current explicit SQL transaction.
+    pub fn create_savepoint(&self, name: &str) -> Result<()> {
+        let mut txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        let state = txn
+            .as_mut()
+            .ok_or_else(|| DbError::transaction("SAVEPOINT requires an active SQL transaction"))?;
+        state.savepoints.push(SqlSavepoint {
+            name: canonical_savepoint_name(name),
+            runtime: state.runtime.clone(),
+        });
+        Ok(())
+    }
+
+    /// Releases a named savepoint and any nested savepoints created after it.
+    pub fn release_savepoint(&self, name: &str) -> Result<()> {
+        let mut txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        let state = txn.as_mut().ok_or_else(|| {
+            DbError::transaction("RELEASE SAVEPOINT requires an active SQL transaction")
+        })?;
+        let target = canonical_savepoint_name(name);
+        let index = state
+            .savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == target)
+            .ok_or_else(|| DbError::transaction(format!("savepoint {name} does not exist")))?;
+        state.savepoints.truncate(index);
+        Ok(())
+    }
+
+    /// Rolls the current explicit SQL transaction back to a named savepoint.
+    pub fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
+        let mut txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        let state = txn.as_mut().ok_or_else(|| {
+            DbError::transaction("ROLLBACK TO SAVEPOINT requires an active SQL transaction")
+        })?;
+        let target = canonical_savepoint_name(name);
+        let index = state
+            .savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name == target)
+            .ok_or_else(|| DbError::transaction(format!("savepoint {name} does not exist")))?;
+        state.runtime = state.savepoints[index].runtime.clone();
+        state.savepoints.truncate(index + 1);
+        Ok(())
     }
 
     /// Returns a structured snapshot of the current storage state.
@@ -452,6 +521,13 @@ impl Db {
                         self.commit_transaction()?;
                     }
                     TransactionControl::Rollback => self.rollback_transaction()?,
+                    TransactionControl::Savepoint(name) => self.create_savepoint(&name)?,
+                    TransactionControl::ReleaseSavepoint(name) => {
+                        self.release_savepoint(&name)?;
+                    }
+                    TransactionControl::RollbackToSavepoint(name) => {
+                        self.rollback_to_savepoint(&name)?;
+                    }
                 }
                 results.push(QueryResult::with_affected_rows(0));
                 continue;
@@ -619,6 +695,17 @@ impl Db {
         ))
     }
 
+    /// Returns canonical `CREATE TABLE` SQL for a named table.
+    pub fn table_ddl(&self, name: &str) -> Result<String> {
+        let runtime = self.runtime_for_inspection()?;
+        let table = runtime
+            .catalog
+            .tables
+            .get(name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {name}")))?;
+        Ok(render_create_table(table))
+    }
+
     /// Returns all index definitions.
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>> {
         let runtime = self.runtime_for_inspection()?;
@@ -629,6 +716,17 @@ impl Db {
     pub fn list_views(&self) -> Result<Vec<ViewInfo>> {
         let runtime = self.runtime_for_inspection()?;
         Ok(runtime.catalog.views.values().map(view_info).collect())
+    }
+
+    /// Returns canonical `CREATE VIEW` SQL for a named view.
+    pub fn view_ddl(&self, name: &str) -> Result<String> {
+        let runtime = self.runtime_for_inspection()?;
+        let view = runtime
+            .catalog
+            .views
+            .get(name)
+            .ok_or_else(|| DbError::sql(format!("unknown view {name}")))?;
+        Ok(render_create_view(view))
     }
 
     /// Returns all trigger definitions.
@@ -944,28 +1042,79 @@ pub fn evict_shared_wal(path: impl AsRef<Path>) -> Result<()> {
     WalHandle::evict(&vfs, path)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TransactionControl {
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    ReleaseSavepoint(String),
+    RollbackToSavepoint(String),
 }
 
 fn parse_transaction_control(sql: &str) -> Option<TransactionControl> {
-    let normalized = sql
-        .trim()
+    let normalized = normalized_control_sql(sql);
+    let upper = normalized.to_ascii_uppercase();
+
+    match upper.as_str() {
+        "BEGIN"
+        | "BEGIN TRANSACTION"
+        | "BEGIN DEFERRED"
+        | "BEGIN DEFERRED TRANSACTION"
+        | "BEGIN IMMEDIATE"
+        | "BEGIN IMMEDIATE TRANSACTION"
+        | "BEGIN EXCLUSIVE"
+        | "BEGIN EXCLUSIVE TRANSACTION" => Some(TransactionControl::Begin),
+        "COMMIT" | "END" | "END TRANSACTION" => Some(TransactionControl::Commit),
+        "ROLLBACK" | "ROLLBACK TRANSACTION" => Some(TransactionControl::Rollback),
+        _ => parse_savepoint_control(&normalized),
+    }
+}
+
+fn normalized_control_sql(sql: &str) -> String {
+    sql.trim()
         .trim_end_matches(';')
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_uppercase();
+}
 
-    match normalized.as_str() {
-        "BEGIN" | "BEGIN TRANSACTION" => Some(TransactionControl::Begin),
-        "COMMIT" | "END" | "END TRANSACTION" => Some(TransactionControl::Commit),
-        "ROLLBACK" | "ROLLBACK TRANSACTION" => Some(TransactionControl::Rollback),
-        _ => None,
+fn parse_savepoint_control(sql: &str) -> Option<TransactionControl> {
+    if let Some(name) = strip_control_prefix(sql, "SAVEPOINT ") {
+        return Some(TransactionControl::Savepoint(name.to_string()));
     }
+    if let Some(name) = strip_control_prefix(sql, "RELEASE SAVEPOINT ") {
+        return Some(TransactionControl::ReleaseSavepoint(name.to_string()));
+    }
+    if let Some(name) = strip_control_prefix(sql, "RELEASE ") {
+        return Some(TransactionControl::ReleaseSavepoint(name.to_string()));
+    }
+    if let Some(name) = strip_control_prefix(sql, "ROLLBACK TO SAVEPOINT ") {
+        return Some(TransactionControl::RollbackToSavepoint(name.to_string()));
+    }
+    if let Some(name) = strip_control_prefix(sql, "ROLLBACK TRANSACTION TO SAVEPOINT ") {
+        return Some(TransactionControl::RollbackToSavepoint(name.to_string()));
+    }
+    if let Some(name) = strip_control_prefix(sql, "ROLLBACK TO ") {
+        return Some(TransactionControl::RollbackToSavepoint(name.to_string()));
+    }
+    None
+}
+
+fn strip_control_prefix<'a>(sql: &'a str, prefix: &str) -> Option<&'a str> {
+    if !sql.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let remainder = sql[prefix.len()..].trim();
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder)
+    }
+}
+
+fn canonical_savepoint_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
 }
 
 fn split_sql_batch(sql: &str) -> Vec<String> {

@@ -208,6 +208,82 @@ fn statement_rollback_constraints_and_on_conflict_returning_work() {
 }
 
 #[test]
+fn sql_savepoints_and_begin_variants_work() {
+    let path = unique_db_path("phase3-savepoints");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE entries (id INT64 PRIMARY KEY, note TEXT)")
+        .expect("create entries");
+    db.execute("BEGIN IMMEDIATE")
+        .expect("begin immediate is accepted");
+    db.execute("INSERT INTO entries (id, note) VALUES (1, 'outer')")
+        .expect("insert outer row");
+    db.execute("SAVEPOINT alpha")
+        .expect("create outer savepoint");
+    db.execute("INSERT INTO entries (id, note) VALUES (2, 'alpha child')")
+        .expect("insert alpha child");
+    db.execute("SAVEPOINT beta")
+        .expect("create nested savepoint");
+    db.execute("INSERT INTO entries (id, note) VALUES (3, 'beta child')")
+        .expect("insert beta child");
+    db.execute("ROLLBACK TO SAVEPOINT beta")
+        .expect("rollback to nested savepoint");
+    db.execute("INSERT INTO entries (id, note) VALUES (4, 'after beta rollback')")
+        .expect("insert after beta rollback");
+    db.execute("ROLLBACK TO SAVEPOINT alpha")
+        .expect("rollback to outer savepoint");
+    db.execute("INSERT INTO entries (id, note) VALUES (5, 'after alpha rollback')")
+        .expect("insert after outer rollback");
+    db.execute("ROLLBACK TO SAVEPOINT alpha")
+        .expect("rollback keeps target savepoint active");
+    db.execute("INSERT INTO entries (id, note) VALUES (6, 'committed child')")
+        .expect("insert final row");
+    db.execute("RELEASE SAVEPOINT alpha")
+        .expect("release outer savepoint");
+    db.execute("COMMIT").expect("commit transaction");
+
+    let rows = db
+        .execute("SELECT id, note FROM entries ORDER BY id")
+        .expect("read committed rows");
+    assert_eq!(
+        rows.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("outer".to_string())],
+            vec![Value::Int64(6), Value::Text("committed child".to_string())],
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn savepoints_require_explicit_transactions_and_known_names() {
+    let path = unique_db_path("phase3-savepoint-errors");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE entries (id INT64 PRIMARY KEY, note TEXT)")
+        .expect("create entries");
+
+    let outside_txn = db
+        .execute("SAVEPOINT orphan")
+        .expect_err("savepoints require BEGIN");
+    assert!(matches!(outside_txn, decentdb::DbError::Transaction { .. }));
+
+    db.execute("BEGIN EXCLUSIVE")
+        .expect("begin exclusive is accepted");
+    let missing = db
+        .execute("ROLLBACK TO SAVEPOINT missing")
+        .expect_err("missing savepoint should fail");
+    assert!(matches!(missing, decentdb::DbError::Transaction { .. }));
+    db.execute("ROLLBACK").expect("rollback transaction");
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn foreign_keys_views_and_triggers_work_for_supported_subset() {
     let path = unique_db_path("phase3-ddl");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

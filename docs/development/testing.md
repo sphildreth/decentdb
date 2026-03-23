@@ -1,436 +1,113 @@
 # Testing
 
-DecentDB has comprehensive testing at multiple levels.
+DecentDB's Rust rewrite uses several complementary test layers.
 
-## Test Overview
+## Test layout
 
-### Test Types
-
-1. **Unit Tests** - Individual module correctness
-2. **Property Tests** - Invariants hold under random operations
-3. **Crash Tests** - Recovery after failures
-4. **Differential Tests** - Match PostgreSQL behavior
-5. **Benchmarks** - Performance regression detection
-
-### Test Organization
-
-```
-tests/
-├── nim/           # Rust unit tests
-├── harness/       # Python test framework
-├── bench/         # Performance benchmarks
-└── data/          # Test datasets
+```text
+crates/decentdb/src/           # unit tests next to engine modules
+crates/decentdb/tests/         # engine integration tests
+crates/decentdb-cli/tests/     # CLI integration tests
+tests/harness/                 # crash/storage scenario runner + datasets
+tests/bindings/                # binding smoke/validation programs
+bindings/dart/dart/test/       # packaged Dart wrapper tests
 ```
 
-## Running Tests
+## Core workspace validation
 
-### All Tests
+Run the main workspace suites from the repository root:
 
 ```bash
-cargo test
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features
 ```
 
-Runs:
-- All Rust unit tests
-- Python harness tests
-- Binding test suites wired through `cargo test_bindings` (`.NET`, Go, Node.js, Python, Dart)
-- Java JDBC tests remain separate: `cargo test_bindings_java`
-
-If you want only the core engine checks without binding prerequisites:
+If you use the Cargo aliases from `.cargo/config.toml`, the equivalent shortcuts
+are:
 
 ```bash
-cargo test_nim
-cargo test_py
+cargo t
+cargo lint
 ```
 
-### Rust Tests Only
+## Focused Rust test commands
+
+Engine library/unit tests:
 
 ```bash
-cargo test_nim
+cargo test -p decentdb --lib
 ```
 
-Or individual test:
-```bash
-nim c -r tests/nim/test_wal.rs
-```
-
-### Python Tests Only
+Engine integration tests:
 
 ```bash
-cargo test_py
+cargo test -p decentdb --test relational_phase3_tests
 ```
 
-Or directly:
-```bash
-python -m unittest tests/harness/test_runner.py
-```
-
-### Specific Test Suite
+CLI tests:
 
 ```bash
-# WAL tests
-nim c -r tests/nim/test_wal.rs
-
-# BTree tests
-nim c -r tests/nim/test_btree.rs
-
-# SQL tests
-nim c -r tests/nim/test_sql_parser.rs
+cargo test -p decentdb-cli
 ```
 
-### Open/Insert/Select/Close Soak Test
+## Crash/storage harness
 
-Use the soak runner when you need very long lifecycle loops to watch for memory growth:
+The storage harness lives under `tests/harness/`.
+
+Run one of the checked-in scenarios with:
 
 ```bash
-cargo build_lib
-python scripts/soak_open_insert_select_close.py \
-  --batches 20 \
-  --iterations-per-batch 500 \
-  --interval-seconds 1
+python tests/harness/runner.py tests/harness/scenarios/short_crash.json
+python tests/harness/runner.py tests/harness/scenarios/soak_storage.json
 ```
 
-Useful options:
+The runner shells out to `cargo run -p decentdb --bin decentdb-test-harness`.
+Scenario fixtures live under `tests/harness/scenarios/`, and reusable datasets
+live under `tests/harness/datasets/`.
+
+## Binding validation
+
+Binding smoke/validation programs live under `tests/bindings/`:
+
+- `tests/bindings/python/`
+- `tests/bindings/dotnet/`
+- `tests/bindings/c/`
+- `tests/bindings/go/`
+- `tests/bindings/java/`
+- `tests/bindings/node/`
+- `tests/bindings/dart/`
+
+See `tests/bindings/README.md` for the shared expectation that the Rust `cdylib`
+has been built first.
+
+## Dart package validation
+
+The in-tree Dart package has its own suite in `bindings/dart/dart/test/`.
+
+Run it with:
 
 ```bash
-# Fail the run if memory growth is above your limits.
-python scripts/soak_open_insert_select_close.py \
-  --batches 100 \
-  --iterations-per-batch 1000 \
-  --interval-seconds 2 \
-  --max-total-growth-mb 64 \
-  --max-slope-kb-per-kiter 128 \
-  --json-out build/soak/open_insert_select_close.json
-
-# Run pure open/insert/select/close with unbounded table growth.
-python scripts/soak_open_insert_select_close.py \
-  --batches 50 \
-  --iterations-per-batch 2000 \
-  --interval-seconds 0 \
-  --unbounded-table
+bindings/dart/scripts/run_tests.sh
 ```
 
-Notes:
-- The script runs `open -> insert -> select -> close` per iteration.
-- Work is grouped by batches and memory is sampled at batch boundaries.
-- By default it reuses logical row slots (`--slot-count`) so table size stays bounded and the signal stays focused on lifecycle retention.
-- Use `--unbounded-table` if you want true insert-only growth during the soak.
-- If `DECENTDB_NATIVE_LIB` is unset, it auto-uses `build/libc_api.so` (or platform equivalent) when present.
+That script builds `target/debug/libdecentdb.*`, runs `dart pub get`, and then
+executes `dart test` for the packaged wrapper.
 
-## Test Layers
+## Benchmarks
 
-### 1. Unit Tests
-
-Test individual functions and modules.
-
-**Example** (from `test_btree.rs`):
-```rust
-test "insert split update delete":
-  let tree = newBTree(pager, rootPage)
-  
-  # Insert
-  let insertRes = tree.insert(1, toBytes("value1"))
-  check insertRes.ok
-  
-  # Find
-  let findRes = tree.find(1)
-  check findRes.ok
-  check findRes.value[1] == toBytes("value1")
-  
-  # Update
-  let updateRes = tree.update(1, toBytes("updated"))
-  check updateRes.ok
-  
-  # Delete
-  let deleteRes = tree.delete(1)
-  check deleteRes.ok
-```
-
-### 2. Property-Based Tests
-
-DecentDB uses invariant-style tests, and some tests include randomized loops to exercise edge cases.
-
-There is not currently a dedicated `tests/nim/test_property.rs` suite; if/when property testing is split out, it should follow the same `tests/nim/test_*.rs` naming convention so `cargo test` picks it up.
-
-**Example** (illustrative):
-```rust
-test "index results == scan results":
-  for i in 0..<100:
-    let query = generateRandomQuery()
-    let indexResults = execWithIndex(query)
-    let scanResults = execWithScan(query)
-    check indexResults == scanResults
-```
-
-### 3. Crash-Injection Tests
-
-Simulate failures to verify recovery.
-
-**Using FaultyVFS**:
-```rust
-test "torn write ignored on recovery":
-  let vfs = newFaultyVfs()
-  vfs.addRule(FaultRule(
-    op: foWrite,
-    action: FaultAction(kind: faPartialWrite, partialBytes: 16)
-  ))
-  
-  # Attempt write
-  let res = writeWithVfs(vfs, data)
-  check not res.ok  # Should fail
-  
-  # Recover
-  let recovered = openAndRecover()
-  check recovered.ok  # Should succeed
-```
-
-### 4. Differential Tests
-
-Compare DecentDB results with PostgreSQL.
-
-**Using Python harness**:
-```python
-def test_select():
-    sql = "SELECT * FROM users WHERE age > 18"
-    
-    # Run on both databases
-    decent_results = run_decentdb(sql)
-    pg_results = run_postgresql(sql)
-    
-    # Should match
-    assert decent_results == pg_results
-```
-
-### 5. Benchmarks
-
-Track performance over time.
+The repository currently ships the `release_metrics` benchmark target:
 
 ```bash
-# Run benchmarks
-cargo bench
-
-# Compare to baseline
-cargo bench_compare
+cargo bench -p decentdb
 ```
 
-## Test Data
+## Adding new tests
 
-### Test Datasets
+- Add unit tests next to the Rust module they exercise via `#[cfg(test)]`.
+- Add engine integration tests under `crates/decentdb/tests/`.
+- Add CLI integration tests under `crates/decentdb-cli/tests/`.
+- Add new crash/storage scenarios under `tests/harness/scenarios/`.
+- Add binding smoke coverage under `tests/bindings/<language>/`.
 
-Located in `tests/data/`:
-
-- **Sequential data**: Scripts to generate sequential ID datasets of various sizes (1K, 10K, 100K, 1M rows)
-- **Unicode text**: Multi-byte characters in various scripts (Latin, Cyrillic, Chinese, Japanese, Korean, Greek)
-- **Edge cases**: NULLs, empty strings, max values, long text fields
-
-### Generating Test Data
-
-```bash
-# Generate edge cases dataset
-python tests/data/generate_edge_cases.py
-
-# Creates:
-# - Empty strings
-# - NULL values
-# - Maximum integer values
-# - Long text fields
-
-# Generate sequential dataset
-python tests/data/generate_sequential.py
-
-# Creates:
-# - Sequential ID sequences
-# - Various sized datasets (1K, 10K, 100K, 1M rows)
-
-# Generate unicode dataset
-python tests/data/generate_unicode.py
-
-# Creates:
-# - Multi-script text (Latin, Cyrillic, Chinese, Japanese, Korean, Greek)
-# - UTF-8 encoded text fields
-```
-
-## Writing Tests
-
-### New Unit Test
-
-Create `tests/nim/test_feature.rs`:
-
-```rust
-import unittest
-import ../src/engine
-import ../src/record/record
-
-suite "Feature Name":
-  test "specific behavior":
-    # Setup
-    let db = openDb(":memory:")
-    check db.ok
-    
-    # Test
-    let res = execSql(db.value, "...")
-    check res.ok
-    check res.value.len == expected
-    
-    # Cleanup
-    discard closeDb(db.value)
-```
-
-### New Crash Test
-
-Create scenario file `tests/harness/scenarios/my_crash.json`:
-
-```json
-{
-  "name": "my_crash_test",
-  "description": "Test crash during operation",
-  "sql": "CREATE TABLE t (id INT); INSERT INTO t VALUES (1)",
-  "failpoint": {
-    "label": "wal_frame",
-    "kind": "error"
-  },
-  "verify": {
-    "expect_crash": true,
-    "post_crash_sql": "SELECT * FROM t",
-    "expect_rows": []
-  }
-}
-```
-
-### New Differential Test
-
-Add to `tests/harness/differential_runner.py`:
-
-```python
-DifferentialTest(
-    name="my_feature",
-    description="Test new feature",
-    schema_sql="CREATE TABLE t (id INT)",
-    test_sql="SELECT * FROM t",
-    expect_rows=["..."]
-)
-```
-
-## Test Coverage
-
-### Measuring Coverage
-
-```bash
-# Rust coverage (requires gcov)
-cargo coverage_nim
-
-# Python coverage
-pip install coverage
-coverage run -m unittest tests/harness/test_runner.py
-coverage report
-```
-
-### Coverage Goals
-
-- Core modules: >90%
-- SQL execution: >85%
-- VFS: >80%
-- CLI: >75%
-
-## Continuous Integration
-
-Tests run automatically on:
-
-- Every pull request
-- Every push to main
-- Daily scheduled builds
-
-**Platforms tested:**
-- Ubuntu 22.04
-- macOS 12
-- Windows Server 2022
-
-## Debugging Test Failures
-
-### Rust Tests
-
-```bash
-# Run with verbose output
-nim c -r tests/nim/test_wal.rs --verbose
-
-# Run specific test
-nim c -r tests/nim/test_wal.rs --run="specific test name"
-
-# Debug build
-nim c -d:debug -r tests/nim/test_wal.rs
-```
-
-### Python Tests
-
-```bash
-# Verbose output
-python -m unittest tests/harness/test_runner.py -v
-
-# Specific test
-python -m unittest tests.harness.test_runner.TestClass.test_method -v
-
-# With debugger
-python -m pdb -m unittest tests.harness.test_runner
-```
-
-### Common Issues
-
-**"Table not found" in tests:**
-- Check if previous test cleaned up
-- Use unique database names per test
-- Or use `:memory:` for in-memory tests
-
-**Timing-related failures:**
-- Tests may fail on slow CI runners
-- Increase timeouts if needed
-- Mark as flaky if necessary
-
-**Platform-specific failures:**
-- Check for path separators (/ vs \)
-- Use os.path.join() for paths
-- Be careful with line endings
-
-## Test Best Practices
-
-1. **Isolate Tests**
-   - Each test should be independent
-   - Clean up resources in teardown
-
-2. **Use Descriptive Names**
-   - `test_insert_updates_index` not `test1`
-
-3. **Test Edge Cases**
-   - Empty inputs
-   - Maximum values
-   - Error conditions
-
-4. **Keep Tests Fast**
-   - Use small datasets
-   - Mock external dependencies
-
-5. **Document Intent**
-   - Comments explaining what and why
-   - Link to issue if fixing bug
-
-## Test Maintenance
-
-### Adding Tests for New Features
-
-Every new feature should include:
-- Unit tests for core functionality
-- Integration tests with other modules
-- Property tests if applicable
-- Documentation examples
-
-### Updating Tests
-
-When changing behavior:
-- Update tests to match new behavior
-- Document breaking changes
-- Keep old tests for backward compatibility checks
-
-## Further Reading
-
-- [Building from Source](building.md)
-- [Contributing](contributing.md)
-- [Architecture Overview](../architecture/overview.md)
+Every behavior-changing code change should include tests at the narrowest layer
+that proves the behavior.

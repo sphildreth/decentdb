@@ -3,138 +3,119 @@ import 'dart:ffi';
 
 import 'package:ffi/ffi.dart';
 
-import 'native_bindings.dart';
 import 'errors.dart';
+import 'native_bindings.dart';
 import 'types.dart';
 
-/// Schema introspection for a DecentDB database.
-///
-/// All methods return Dart objects parsed from the JSON payloads returned by the
-/// native `decentdb_list_*_json` / `decentdb_get_*_json` functions.
 class Schema {
+  const Schema.fromNative(this._bindings, this._dbPtr);
+
   final NativeBindings _bindings;
-  final Pointer<DecentdbDb> _dbPtr;
+  final Pointer<DdbDb> _dbPtr;
 
-  /// @nodoc — Internal constructor. Use [Database.schema] instead.
-  Schema.fromNative(this._bindings, this._dbPtr);
-
-  void _throwIfError() {
-    final errCode = _bindings.lastErrorCode(_dbPtr);
-    if (errCode != 0) {
-      final msgPtr = _bindings.lastErrorMessage(_dbPtr);
-      final msg = msgPtr == nullptr ? 'Unknown error' : msgPtr.toDartString();
-      throw DecentDbException(ErrorCode.fromCode(errCode), msg);
-    }
+  Never _throwStatus(int status, String fallback) {
+    final messagePtr = _bindings.lastErrorMessage();
+    final message =
+        messagePtr == nullptr ? fallback : messagePtr.toDartString();
+    throw DecentDbException(ErrorCode.fromCode(status), message);
   }
 
-  /// Helper: call a native JSON function, parse, free the buffer.
-  String _callJsonFunc(
-    Pointer<Utf8> Function(Pointer<DecentdbDb>, Pointer<Int32>) fn,
+  String _callDbString(
+    int Function(Pointer<DdbDb>, Pointer<Pointer<Utf8>>) fn,
+    String fallback,
   ) {
-    final lenPtr = calloc<Int32>();
+    final out = calloc<Pointer<Utf8>>();
     try {
-      final ptr = fn(_dbPtr, lenPtr);
-      if (ptr == nullptr) {
-        _throwIfError();
-        return '[]';
+      final status = fn(_dbPtr, out);
+      if (status != ddbOk) {
+        _throwStatus(status, fallback);
       }
-      final len = lenPtr.value;
-      final result = ptr.toDartString(length: len);
-      _bindings.free(ptr.cast<Void>());
-      return result;
+      final value = out.value == nullptr ? '' : out.value.toDartString();
+      final freeStatus = _bindings.stringFree(out);
+      if (freeStatus != ddbOk) {
+        _throwStatus(freeStatus, 'Failed to free native string');
+      }
+      return value;
     } finally {
-      calloc.free(lenPtr);
+      calloc.free(out);
     }
   }
 
-  String _callStringByName(
+  String _callNamedString(
     String name,
-    Pointer<Utf8> Function(
-      Pointer<DecentdbDb>,
-      Pointer<Utf8>,
-      Pointer<Int32>,
-    )
-    fn,
+    int Function(Pointer<DdbDb>, Pointer<Utf8>, Pointer<Pointer<Utf8>>) fn,
+    String fallback,
   ) {
-    final namePtr = name.toNativeUtf8();
-    final lenPtr = calloc<Int32>();
+    final nativeName = name.toNativeUtf8();
+    final out = calloc<Pointer<Utf8>>();
     try {
-      final ptr = fn(_dbPtr, namePtr, lenPtr);
-      if (ptr == nullptr) {
-        _throwIfError();
-        return '';
+      final status = fn(_dbPtr, nativeName, out);
+      if (status != ddbOk) {
+        _throwStatus(status, fallback);
       }
-      final len = lenPtr.value;
-      final result = ptr.toDartString(length: len);
-      _bindings.free(ptr.cast<Void>());
-      return result;
+      final value = out.value == nullptr ? '' : out.value.toDartString();
+      final freeStatus = _bindings.stringFree(out);
+      if (freeStatus != ddbOk) {
+        _throwStatus(freeStatus, 'Failed to free native string');
+      }
+      return value;
     } finally {
-      calloc.free(namePtr);
-      calloc.free(lenPtr);
+      calloc.free(out);
+      calloc.free(nativeName);
     }
   }
 
-  /// List all table names in the database.
-  List<String> listTables() {
-    final json = _callJsonFunc(_bindings.listTablesJson);
-    return (jsonDecode(json) as List).cast<String>();
-  }
-
-  /// List detailed metadata for all tables.
   List<TableInfo> listTablesInfo() {
-    final json = _callJsonFunc(_bindings.listTablesInfoJson);
+    final json =
+        _callDbString(_bindings.dbListTablesJson, 'Failed to list tables');
     return (jsonDecode(json) as List)
-        .map((e) => TableInfo.fromJson(e as Map<String, dynamic>))
+        .map((value) => TableInfo.fromJson(value as Map<String, dynamic>))
         .toList();
   }
 
-  /// Get column metadata for a table or view.
-  List<ColumnInfo> getTableColumns(String tableName) {
-    final json = _callStringByName(tableName, _bindings.getTableColumnsJson);
-    return (jsonDecode(json) as List)
-        .map((e) => ColumnInfo.fromJson(e as Map<String, dynamic>))
-        .toList();
+  List<String> listTables() =>
+      listTablesInfo().map((table) => table.name).toList();
+
+  TableInfo describeTable(String name) {
+    final json = _callNamedString(
+      name,
+      _bindings.dbDescribeTableJson,
+      'Failed to describe table $name',
+    );
+    return TableInfo.fromJson(jsonDecode(json) as Map<String, dynamic>);
   }
 
-  /// Get canonical CREATE TABLE DDL for a table.
-  String? getTableDdl(String tableName) {
-    final result = _callStringByName(tableName, _bindings.getTableDdl);
-    return result.isEmpty ? null : result;
-  }
+  List<ColumnInfo> getTableColumns(String name) => describeTable(name).columns;
 
-  /// List all indexes in the database.
+  String getTableDdl(String name) => _callNamedString(
+      name, _bindings.dbGetTableDdl, 'Failed to get DDL for $name');
+
   List<IndexInfo> listIndexes() {
-    final json = _callJsonFunc(_bindings.listIndexesJson);
+    final json =
+        _callDbString(_bindings.dbListIndexesJson, 'Failed to list indexes');
     return (jsonDecode(json) as List)
-        .map((e) => IndexInfo.fromJson(e as Map<String, dynamic>))
+        .map((value) => IndexInfo.fromJson(value as Map<String, dynamic>))
         .toList();
   }
 
-  /// List all view names in the database.
-  List<String> listViews() {
-    final json = _callJsonFunc(_bindings.listViewsJson);
-    return (jsonDecode(json) as List).cast<String>();
-  }
-
-  /// List detailed metadata for all views.
   List<ViewInfo> listViewsInfo() {
-    final json = _callJsonFunc(_bindings.listViewsInfoJson);
+    final json =
+        _callDbString(_bindings.dbListViewsJson, 'Failed to list views');
     return (jsonDecode(json) as List)
-        .map((e) => ViewInfo.fromJson(e as Map<String, dynamic>))
+        .map((value) => ViewInfo.fromJson(value as Map<String, dynamic>))
         .toList();
   }
 
-  /// Get the canonical SELECT body for a view.
-  String? getViewDdl(String viewName) {
-    final result = _callStringByName(viewName, _bindings.getViewDdl);
-    return result.isEmpty ? null : result;
-  }
+  List<String> listViews() => listViewsInfo().map((view) => view.name).toList();
 
-  /// List detailed metadata for all triggers.
+  String getViewDdl(String name) => _callNamedString(
+      name, _bindings.dbGetViewDdl, 'Failed to get view DDL for $name');
+
   List<TriggerInfo> listTriggers() {
-    final json = _callJsonFunc(_bindings.listTriggersJson);
+    final json =
+        _callDbString(_bindings.dbListTriggersJson, 'Failed to list triggers');
     return (jsonDecode(json) as List)
-        .map((e) => TriggerInfo.fromJson(e as Map<String, dynamic>))
+        .map((value) => TriggerInfo.fromJson(value as Map<String, dynamic>))
         .toList();
   }
 }

@@ -1791,8 +1791,19 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Value> {
+        let aggregate_ctx = AggregateEvalContext {
+            runtime: self,
+            dataset,
+            params,
+            ctes,
+        };
         match expr {
-            Expr::Aggregate { name, args, star, distinct } => match name.as_str() {
+            Expr::Aggregate {
+                name,
+                args,
+                star,
+                distinct,
+            } => match name.as_str() {
                 "count" => {
                     if *star {
                         Ok(Value::Int64(group_rows.len() as i64))
@@ -1804,8 +1815,13 @@ impl EngineRuntime {
                                 vals.push(val);
                             }
                         }
-                        vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-                        vals.dedup_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal);
+                        vals.sort_by(|a, b| {
+                            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        vals.dedup_by(|a, b| {
+                            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
+                                == std::cmp::Ordering::Equal
+                        });
                         Ok(Value::Int64(vals.len() as i64))
                     } else {
                         let mut count = 0_i64;
@@ -1821,22 +1837,16 @@ impl EngineRuntime {
                     }
                 }
                 "sum" => aggregate_numeric(
-                    self,
-                    dataset,
+                    &aggregate_ctx,
                     group_rows,
                     &args[0],
-                    params,
-                    ctes,
                     NumericAgg::Sum,
                     *distinct,
                 ),
                 "avg" => aggregate_numeric(
-                    self,
-                    dataset,
+                    &aggregate_ctx,
                     group_rows,
                     &args[0],
-                    params,
-                    ctes,
                     NumericAgg::Avg,
                     *distinct,
                 ),
@@ -2242,13 +2252,24 @@ enum NumericAgg {
     Avg,
 }
 
+struct AggregateEvalContext<'a> {
+    runtime: &'a EngineRuntime,
+    dataset: &'a Dataset,
+    params: &'a [Value],
+    ctes: &'a BTreeMap<String, Dataset>,
+}
+
+impl AggregateEvalContext<'_> {
+    fn eval_row(&self, row: &[Value], expr: &Expr) -> Result<Value> {
+        self.runtime
+            .eval_expr(expr, self.dataset, row, self.params, self.ctes, None)
+    }
+}
+
 fn aggregate_numeric(
-    runtime: &EngineRuntime,
-    dataset: &Dataset,
+    ctx: &AggregateEvalContext<'_>,
     rows: &[Vec<Value>],
     expr: &Expr,
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
     kind: NumericAgg,
     distinct: bool,
 ) -> Result<Value> {
@@ -2256,18 +2277,20 @@ fn aggregate_numeric(
     let mut total_float = 0_f64;
     let mut saw_float = false;
     let mut count = 0_i64;
-    
+
     let mut vals = Vec::new();
     for row in rows {
-        let val = runtime.eval_expr(expr, dataset, row, params, ctes, None)?;
+        let val = ctx.eval_row(row, expr)?;
         if !matches!(val, Value::Null) {
             vals.push(val);
         }
     }
-    
+
     if distinct {
         vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
-        vals.dedup_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal);
+        vals.dedup_by(|a, b| {
+            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
+        });
     }
 
     for val in vals {
@@ -2398,7 +2421,7 @@ fn eval_function(
             } else {
                 None
             };
-            
+
             let char_idx = if start > 0 { start - 1 } else { 0 } as usize;
             let chars = s.chars().skip(char_idx);
             if let Some(l) = length {
@@ -2412,7 +2435,10 @@ fn eval_function(
             if values.len() != 3 {
                 return Err(DbError::sql("REPLACE expects 3 arguments"));
             }
-            if matches!(values[0], Value::Null) || matches!(values[1], Value::Null) || matches!(values[2], Value::Null) {
+            if matches!(values[0], Value::Null)
+                || matches!(values[1], Value::Null)
+                || matches!(values[2], Value::Null)
+            {
                 return Ok(Value::Null);
             }
             let s = match &values[0] {
@@ -2448,7 +2474,7 @@ fn eval_function(
                 Some(idx) => {
                     let char_idx = s[..idx].chars().count();
                     Ok(Value::Int64((char_idx + 1) as i64))
-                },
+                }
                 None => Ok(Value::Int64(0)),
             }
         }

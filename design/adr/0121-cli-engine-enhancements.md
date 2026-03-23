@@ -2,278 +2,84 @@
 
 **Status:** Accepted  
 **Date:** 2026-01-28  
-**Deciders:** Engineering Team  
-**Related:** None
-
----
+**Updated:** 2026-03-23
 
 ## Context
 
-The CLI improvements implementation (Phase 1 complete) established modern CLI interfaces for schema introspection and data import/export. Phase 2 requires deeper engine integration to support:
+The Rust CLI needed a direct path to engine-level controls that materially affect
+operability and performance:
 
-1. **Cache Configuration** - Allow users to tune page cache size for performance
-2. **WAL Checkpoint Control** - Enable manual checkpoint triggering and configuration
-3. **Transaction Control** - Support explicit BEGIN/COMMIT/ROLLBACK commands
+1. page-cache sizing for ad hoc workloads
+2. explicit WAL checkpoint control
+3. explicit transaction control for multi-statement SQL batches
 
-Currently, these features are either hardcoded (cache), not exposed (WAL), or stubbed out (transactions) in the engine layer.
-
-### Current Limitations
-
-**1. Cache Size Hardcoded:**
-```rust
-# engine.rs:109
-let pagerRes = newPager(vfs, file, cachePages = 64)  # Hardcoded!
-```
-
-**2. WAL Not Exposed:**
-```rust
-type Db* = ref object
-  # ... fields ...
-  # No WAL reference! WAL is created/destroyed per operation
-```
-
-**3. Transaction Stubs:**
-```rust
-# engine.rs:494-511
-of skBegin, skCommit, skRollback:
-  discard  # Not implemented!
-```
-
----
+Earlier draft text in this ADR described a pre-implementation rewrite state using
+Nim-era examples. The current implementation lives in the Rust CLI and engine.
 
 ## Decision
 
-We will enhance the `Db` object and `openDb` API to support:
+### 1. Cache configuration is exposed through the CLI `exec` path
 
-### 1. Configurable Cache Size
+**Decision:** `crates/decentdb-cli` exposes cache sizing flags for SQL execution:
 
-**API Changes:**
-```rust
-proc openDb*(path: string, cachePages: int = 64): Result[Db]
-```
+- `--cachePages`
+- `--cacheMb`
 
-**CLI Interface:**
-```bash
-./decentdb exec --db=test.ddb --sql="SELECT ..." --cachePages=256
-./decentdb exec --db=test.ddb --sql="SELECT ..." --cacheMb=1  # Alternative
-```
+These values are threaded into the engine configuration before opening the
+session database.
 
-**Rationale:**
-- Small databases (< 1MB): Use default 64 pages (256KB)
-- Medium databases (1-100MB): Use 256-1024 pages (1-4MB cache)
-- Large databases (> 100MB): Use 2048+ pages (8MB+ cache)
+**Rationale:** Cache sizing is a legitimate operational tuning knob and belongs
+close to the command that executes the workload.
 
-### 2. WAL Handle Exposure
+### 2. WAL checkpoint control is a first-class engine/CLI operation
 
-**API Changes:**
-```rust
-type Db* = ref object
-  # ... existing fields ...
-  wal*: Wal              # Add WAL reference
-  activeWriter*: Option[WalWriter]  # Track active transaction
+**Decision:** The engine exposes checkpointing on `Db`, and the CLI exposes that
+capability through its checkpoint command / execution flow.
 
-proc getWal*(db: Db): Wal  # Accessor for checkpoint operations
-```
+**Rationale:** Manual checkpointing is useful for tests, maintenance workflows,
+and explicit WAL management without breaking encapsulation around the `Db`
+owner.
 
-**CLI Interface:**
-```bash
-./decentdb exec --db=test.ddb --checkpoint  # Force checkpoint
-```
+### 3. Explicit transaction control is handled in the engine's SQL batch layer
 
-**Rationale:**
-- WAL lifetime should match Db lifetime for session consistency
-- Enables checkpoint control without breaking encapsulation
-- Allows future enhancement of checkpoint policies
+**Decision:** The engine accepts transaction-control SQL inside batched execution,
+including:
 
-### 3. Transaction State Management
+- `BEGIN` / `BEGIN TRANSACTION`
+- `BEGIN DEFERRED` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`
+- `COMMIT`
+- `ROLLBACK`
+- `SAVEPOINT` / `RELEASE` / `ROLLBACK TO`
 
-**API Changes:**
-```rust
-proc beginTransaction*(db: Db): Result[Void]
-proc commitTransaction*(db: Db): Result[Void]
-proc rollbackTransaction*(db: Db): Result[Void]
+The `Db` owner maintains explicit SQL transaction state and in-memory savepoint
+snapshots while keeping the single-writer concurrency model intact.
 
-# execSql checks activeWriter and uses it if present
-proc execSql*(db: Db, sqlText: string, params: seq[Value] = @[]): Result[seq[string]]
-```
+**Rationale:** SQL transaction control is part of normal database usage. Handling
+it in the engine's batch-execution path keeps CLI behavior, embedded behavior,
+and tests aligned.
 
-**CLI Interface:**
-```bash
-# Multi-statement transaction (requires engine support for statement batching)
-./decentdb exec --db=test.db --sql="BEGIN; INSERT ...; COMMIT;"
+## Implementation shape
 
-# Or explicit transaction mode (future enhancement)
-./decentdb exec --db=test.db --begin
-./decentdb exec --db=test.db --sql="INSERT ..." --no-auto-commit
-./decentdb exec --db=test.db --commit
-```
+The implemented Rust surfaces are:
 
-**Rationale:**
-- Db object is the natural place for transaction lifecycle
-- Enables multi-statement transactions
-- Maintains ACID guarantees across CLI calls (if used programmatically)
-
----
-
-## Implementation Strategy
-
-### Phase 2A: Cache Configuration (Low Risk)
-
-1. Add `cachePages` parameter to `openDb()`
-2. Thread parameter through to `newPager()`
-3. Add `--cachePages` and `--cacheMb` CLI flags
-4. Update tests to verify cache sizing
-
-**Risk Level:** Low (pure parameter passing)  
-**Breaking Change:** No (default parameter maintains compatibility)
-
-### Phase 2B: WAL Exposure (Medium Risk)
-
-1. Add `wal: Wal` field to `Db` object
-2. Initialize WAL in `openDb()`, close in `closeDb()`
-3. Expose `checkpoint()` via new proc
-4. Add `--checkpoint` CLI flag
-
-**Risk Level:** Medium (changes Db lifecycle)  
-**Breaking Change:** No (additive only)
-
-### Phase 2C: Transaction State (Medium-High Risk)
-
-1. Add `activeWriter: Option[WalWriter]` to `Db`
-2. Implement `beginTransaction/commit/rollback` procs
-3. Modify `execSql` to check/use activeWriter
-4. Handle BEGIN/COMMIT/ROLLBACK statements
-
-**Risk Level:** Medium-High (changes execution semantics)  
-**Breaking Change:** No (changes are opt-in via SQL commands)
-
----
+- CLI flags under `crates/decentdb-cli/src/commands/`
+- transaction/checkpoint methods and SQL batch control in `crates/decentdb/src/db.rs`
+- validation through Rust integration tests in `crates/decentdb/tests/`
 
 ## Consequences
 
 ### Positive
 
-✅ **Tunable Performance** - Users can optimize cache for their workload  
-✅ **Manual Checkpoint Control** - Enables WAL management strategies  
-✅ **Explicit Transactions** - Supports multi-statement ACID transactions  
-✅ **Future-Proof** - Lays groundwork for connection pooling, sessions  
-✅ **Backward Compatible** - All changes use defaults or opt-in
+- users can tune cache size for a specific CLI workload
+- checkpoint control is available without hidden engine hooks
+- multi-statement transactions and savepoints behave consistently across CLI and
+  embedded use
+- the Rust rewrite now has an accurate, documented control surface for these
+  operations
 
-### Negative
+### Trade-offs
 
-⚠️ **API Surface Growth** - More parameters and state to manage  
-⚠️ **Complexity** - Transaction state adds lifecycle concerns  
-⚠️ **Testing Burden** - More edge cases (active tx during close, etc.)
-
-### Risks & Mitigations
-
-| Risk | Mitigation |
-|------|-----------|
-| Memory usage with large cache | Document cache sizing guidelines |
-| Forgotten transactions (no auto-rollback) | Add transaction timeout warning |
-| WAL handle leaks | Ensure proper cleanup in closeDb() |
-| Concurrent access issues | Document single-writer limitation |
-
----
-
-## Testing Strategy
-
-### Unit Tests
-
-```rust
-# Test cache configuration
-test "openDb with custom cache size":
-  let db = openDb("test.db", cachePages = 256)
-  check db.ok
-  check db.value.pager.cacheSize == 256
-
-# Test WAL checkpoint
-test "manual checkpoint":
-  let db = openDb("test.db")
-  # ... insert data ...
-  let ckRes = checkpoint(db.value.wal, db.value.pager)
-  check ckRes.ok
-
-# Test explicit transactions
-test "explicit transaction commit":
-  let db = openDb("test.db")
-  check db.value.beginTransaction().ok
-  # ... SQL operations ...
-  check db.value.commitTransaction().ok
-
-test "explicit transaction rollback":
-  let db = openDb("test.db")
-  check db.value.beginTransaction().ok
-  # ... SQL operations ...
-  check db.value.rollbackTransaction().ok
-```
-
-### Integration Tests
-
-- Verify cache sizing affects performance (benchmark)
-- Test checkpoint reduces WAL size
-- Verify transaction isolation (concurrent readers)
-- Test transaction rollback undoes changes
-
----
-
-## Alternatives Considered
-
-### Alternative 1: Keep Cache Hardcoded
-**Rejected:** Limits performance tuning for diverse workloads
-
-### Alternative 2: Environment Variables for Config
-```bash
-DECENTDB_CACHE_PAGES=256 ./decentdb exec --db=test.ddb
-```
-**Rejected:** Less discoverable, harder to script
-
-### Alternative 3: Configuration File
-```ini
-[performance]
-cache_pages = 256
-```
-**Rejected:** Overkill for the 0.x baseline, can add later
-
-### Alternative 4: Separate Transaction CLI Tool
-```bash
-./decentdb exec --db=test.ddb --begin
-./decentdb exec --db=test.ddb --sql="..."
-./decentdb exec --db=test.ddb --commit
-```
-**Rejected:** Awkward UX, requires shared lock management
-
----
-
-## Implementation Checklist
-
-- [ ] Update `Db` type with `wal` and `activeWriter` fields
-- [ ] Modify `openDb()` signature to accept `cachePages`
-- [ ] Initialize/cleanup WAL in `openDb()`/`closeDb()`
-- [ ] Implement `beginTransaction/commit/rollback` procs
-- [ ] Update `execSql` to handle transaction state
-- [ ] Add cache configuration CLI flags
-- [ ] Add checkpoint CLI flag
-- [ ] Handle BEGIN/COMMIT/ROLLBACK SQL statements
-- [ ] Write unit tests for new functionality
-- [ ] Update documentation
-- [ ] Run full test suite
-
----
-
-## References
-
-- [SQLite WAL Mode](https://www.sqlite.org/wal.html) - Inspiration for checkpoint semantics
-- [PostgreSQL Configuration](https://www.postgresql.org/docs/current/runtime-config.html) - Cache sizing examples
-
----
-
-## Notes
-
-This ADR focuses on **exposing existing engine capabilities** rather than creating new ones. The WAL and transaction infrastructure already exists; we're making it accessible via CLI.
-
-Future enhancements could include:
-- Auto-checkpoint policies (`--checkpointBytes`, `--checkpointMs`)
-- Read-only transaction mode
-- Savepoints (nested transactions)
-- Connection pooling for concurrent CLI invocations
+- more operational flags means more combinations to test
+- explicit transaction state adds engine complexity around lifecycle management
+- savepoint support is intentionally runtime-snapshot based, not a separate WAL
+  format feature

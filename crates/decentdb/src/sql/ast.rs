@@ -657,7 +657,12 @@ impl Expr {
                 name,
                 args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
             ),
-            Self::Aggregate { name, args, star, distinct } => {
+            Self::Aggregate {
+                name,
+                args,
+                star,
+                distinct,
+            } => {
                 if *star {
                     format!("{name}(*)")
                 } else {

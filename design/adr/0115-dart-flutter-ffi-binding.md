@@ -1,54 +1,105 @@
 # ADR-0115: Dart/Flutter FFI Binding Design
 
-**Status:** Accepted
-**Date:** 2026-02-27
+**Status:** Accepted  
+**Date:** 2026-02-27  
+**Updated:** 2026-03-23
 
 ## Context
 
-The Gridlock project needs a Dart/Flutter desktop binding for DecentDB. DecentDB already exposes a stable C ABI (`src/c_api.rs`) used by Go, Python, .NET, Java, and Node.js bindings.
+The Rust rewrite needs an in-tree Dart/Flutter desktop binding that stays aligned
+with the stable native C ABI exported by `include/decentdb.h` and
+`crates/decentdb/src/c_api.rs`.
 
-## Decisions
+Earlier draft examples in this ADR used a legacy `decentdb_*` API shape from the
+rewrite transition. The implemented Rust surface is the `ddb_*` ABI.
 
-### 1. Binding strategy: Reuse existing C ABI
+## Decision
 
-**Decision:** Direct Dart FFI (`dart:ffi`) against the existing `libc_api.so`/`.dylib`/`.dll`. No C shim needed.
+### 1. Binding strategy: reuse the stable `ddb_*` C ABI
 
-**Rationale:** The C ABI is stable, versioned, and battle-tested across five language bindings. Adding a shim would create maintenance burden with no benefit.
+**Decision:** The Dart package uses `dart:ffi` directly against the Rust `ddb_*`
+shared library surface. The native header source of truth is `include/decentdb.h`.
+
+**Rationale:** Keeping Dart on the same ABI as the other bindings avoids a second
+native contract and keeps the Rust implementation authoritative.
 
 ### 2. ABI versioning
 
-**Decision:** Add `decentdb_abi_version()` returning an integer (starting at 1). Bumped on any breaking ABI change. Dart package checks at load time and fails fast on mismatch.
+**Decision:** Expose `ddb_abi_version()` and require the Dart package to check it
+at load time.
 
-### 3. Transaction control
+**Rationale:** Hand-written FFI is easy to keep explicit, but load-time ABI
+validation prevents silent drift.
 
-**Decision:** Add `decentdb_begin()`, `decentdb_commit()`, `decentdb_rollback()` as thin C API wrappers around `engine.beginTransaction/commitTransaction/rollbackTransaction`. This avoids prepare+step overhead for transaction control.
+### 3. Query/result model
 
-Existing bindings use SQL strings ("BEGIN"/"COMMIT"/"ROLLBACK") through the prepare/step path. Both approaches remain valid.
+**Decision:** The native layer remains handle/result based:
 
-### 4. Result paging representation
+- `ddb_db_execute(...)`
+- `ddb_result_row_count(...)`
+- `ddb_result_column_count(...)`
+- `ddb_result_column_name_copy(...)`
+- `ddb_result_value_copy(...)`
 
-**Decision:** Row-at-a-time via `prepare/step/column_*` pattern (same as all other bindings). High-level Dart API provides cursor abstraction with configurable page size that batches rows in Dart memory.
+The high-level Dart `Statement` API is implemented in Dart as a convenience
+wrapper over that result API.
 
-**Rationale:** The C API streams one row at a time. Batching in Dart gives the caller control over memory vs. latency trade-offs without engine changes.
+**Rationale:** This preserves a compact native ABI while still giving Dart users
+prepared-statement-like ergonomics (`bind*`, `execute()`, `nextPage()`, `step()`).
 
-### 5. Memory ownership
+### 4. Transaction control
 
-**Decision:** Follow existing C API rules:
-- **Borrowed pointers** from `column_text/column_blob/row_view`: valid until next `step/reset/finalize`. Dart must copy before next step.
-- **Allocated pointers** from `list_tables_json/get_table_columns_json/list_indexes_json/list_views_json/get_view_ddl`: caller frees with `decentdb_free()`.
-- **Opaque handles** (`decentdb_db*`, `decentdb_stmt*`): managed by open/close and prepare/finalize respectively.
+**Decision:** The Dart package uses the native transaction helpers already
+exported by the Rust C ABI:
 
-### 6. Cancellation semantics
+- `ddb_db_begin_transaction()`
+- `ddb_db_commit_transaction()`
+- `ddb_db_rollback_transaction()`
 
-**Decision:** Best-effort via `decentdb_finalize()` from a different isolate. DecentDB does not currently support mid-query interruption. The Dart API documents this limitation and provides `Statement.dispose()` as the cancellation primitive.
+**Rationale:** These are thin, explicit operations over the engine's transaction
+state and avoid routing transaction control through SQL strings in the wrapper.
+
+### 5. Schema metadata
+
+**Decision:** Expose schema metadata to Dart via JSON-returning C ABI helpers:
+
+- `ddb_db_list_tables_json()`
+- `ddb_db_describe_table_json()`
+- `ddb_db_get_table_ddl()`
+- `ddb_db_list_indexes_json()`
+- `ddb_db_list_views_json()`
+- `ddb_db_get_view_ddl()`
+- `ddb_db_list_triggers_json()`
+
+**Rationale:** The Rust engine already has stable inspection structs. Serializing
+those across the C ABI keeps the Dart wrapper simple and explicit without adding
+native object graphs.
+
+### 6. Memory ownership
+
+**Decision:** The Dart binding follows the native ABI's ownership rules:
+
+- borrowed strings from `ddb_version()` / `ddb_last_error_message()` are valid
+  until the next DecentDB call on the same thread
+- JSON/column-name strings allocated by the C ABI are released with
+  `ddb_string_free()`
+- copied cell values returned through `ddb_result_value_copy()` are released with
+  `ddb_value_dispose()`
+- opaque handles (`ddb_db_t*`, `ddb_result_t*`) are released by the matching
+  free functions
 
 ### 7. FFI generation approach
 
-**Decision:** Hand-written Dart FFI bindings (not `ffigen`). The API surface is small (~40 functions) and hand-written bindings give full control over nullability, naming, and documentation without adding a build-time code generation dependency.
+**Decision:** Keep the Dart bindings hand-written.
+
+**Rationale:** The surface is still small enough that explicit Dart definitions
+remain readable, reviewable, and easy to keep aligned with `include/decentdb.h`.
 
 ## Consequences
 
-- Dart binding follows established patterns; no engine changes to result streaming
-- ABI version check prevents silent incompatibility
-- Native transaction calls reduce overhead for high-frequency commit patterns
-- Hand-written FFI means manual updates when C API changes (mitigated by ABI version check)
+- Dart now shares the same native ABI story as the rest of the Rust rewrite
+- ABI drift is caught immediately at load time
+- The package can offer higher-level ergonomics without requiring a second native
+  statement ABI
+- Metadata and DDL inspection are available through explicit, testable JSON/string
+  helpers rather than ad hoc FFI structs

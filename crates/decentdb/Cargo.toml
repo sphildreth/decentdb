@@ -13,10 +13,22 @@ libpg_query_sys = { path = "../libpg_query_sys" }
 [dev-dependencies]
 proptest = "1.5"
 insta = { version = "1.39", features = ["json"] }
+rusqlite = "0.31"
+duckdb = { version = "1.0", features = ["bundled"] }
+hdrhistogram = "7.5"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.10"
+rand = "0.8"
+chrono = "0.4"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [[bench]]
 name = "release_metrics"
+harness = false
+
+[[bench]]
+name = "embedded_compare"
 harness = false

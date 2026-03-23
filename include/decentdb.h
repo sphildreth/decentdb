@@ -52,6 +52,7 @@ typedef struct ddb_value_t {
 } ddb_value_t;
 
 /* Borrowed pointer valid until the next DecentDB call on the same thread. */
+uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
 const char *ddb_last_error_message(void);
 
@@ -77,6 +78,13 @@ ddb_status_t ddb_db_commit_transaction(ddb_db_t *db, uint64_t *out_lsn);
 ddb_status_t ddb_db_rollback_transaction(ddb_db_t *db);
 ddb_status_t ddb_db_in_transaction(ddb_db_t *db, uint8_t *out_flag);
 ddb_status_t ddb_db_save_as(ddb_db_t *db, const char *dest_path);
+ddb_status_t ddb_db_list_tables_json(ddb_db_t *db, char **out_json);
+ddb_status_t ddb_db_describe_table_json(ddb_db_t *db, const char *name, char **out_json);
+ddb_status_t ddb_db_get_table_ddl(ddb_db_t *db, const char *name, char **out_ddl);
+ddb_status_t ddb_db_list_indexes_json(ddb_db_t *db, char **out_json);
+ddb_status_t ddb_db_list_views_json(ddb_db_t *db, char **out_json);
+ddb_status_t ddb_db_get_view_ddl(ddb_db_t *db, const char *name, char **out_ddl);
+ddb_status_t ddb_db_list_triggers_json(ddb_db_t *db, char **out_json);
 
 ddb_status_t ddb_evict_shared_wal(const char *path);
 

@@ -2,46 +2,17 @@ import 'dart:ffi';
 
 import 'package:ffi/ffi.dart';
 
-import 'native_bindings.dart';
-import 'statement.dart';
-import 'schema.dart';
 import 'errors.dart';
+import 'native_bindings.dart';
+import 'schema.dart';
+import 'statement.dart';
 import 'types.dart';
 
-/// A DecentDB database connection.
-///
-/// ## Basic Usage
-///
-/// ```dart
-/// final db = Database.open('mydata.ddb');
-/// db.execute('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
-/// db.execute("INSERT INTO users VALUES (1, 'Alice')");
-///
-/// final stmt = db.prepare('SELECT * FROM users WHERE id = \$1');
-/// stmt.bindInt64(1, 1);
-/// for (final row in stmt.query()) {
-///   print(row);
-/// }
-/// stmt.dispose();
-/// db.close();
-/// ```
-///
-/// ## Thread Safety
-///
-/// A Database handle must only be used from one thread/isolate at a time.
-/// DecentDB uses a single-writer, multiple-reader model:
-///
-/// - **Writes** (INSERT/UPDATE/DELETE/DDL): serialize on a single isolate.
-/// - **Reads** (SELECT): may run concurrently from separate statement handles,
-///   but each statement handle must be used from one isolate only.
-///
-/// For Flutter apps, run database operations in a dedicated isolate and
-/// communicate results back to the UI isolate via ports/messages.
 class Database {
-  final NativeBindings _bindings;
-  Pointer<DecentdbDb>? _dbPtr;
-
   Database._(this._bindings, this._dbPtr);
+
+  final NativeBindings _bindings;
+  Pointer<DdbDb>? _dbPtr;
 
   void _checkOpen() {
     if (_dbPtr == null || _dbPtr == nullptr) {
@@ -49,214 +20,167 @@ class Database {
     }
   }
 
-  void _throwLastError() {
-    final errCode = _bindings.lastErrorCode(_dbPtr!);
-    final msgPtr = _bindings.lastErrorMessage(_dbPtr!);
-    final msg = msgPtr == nullptr ? 'Unknown error' : msgPtr.toDartString();
-    throw DecentDbException(ErrorCode.fromCode(errCode), msg);
+  Never _throwStatus(int status, String fallback) {
+    final messagePtr = _bindings.lastErrorMessage();
+    final message =
+        messagePtr == nullptr ? fallback : messagePtr.toDartString();
+    throw DecentDbException(ErrorCode.fromCode(status), message);
   }
 
-  // -------------------------------------------------------------------------
-  // Factory constructors
-  // -------------------------------------------------------------------------
-
-  /// Open or create a database at [path].
-  ///
-  /// [options] is an optional query string for configuration:
-  /// - `cache_pages=N` or `cache_mb=N` — page cache size
-  ///
-  /// [libraryPath] is the path to the native library. If omitted, uses the
-  /// platform default name (resolved via system library search paths).
-  ///
-  /// Throws [DecentDbException] on failure.
   static Database open(
     String path, {
     String? options,
     String? libraryPath,
     NativeBindings? bindings,
   }) {
-    final b =
-        bindings ??
+    if (options != null && options.trim().isNotEmpty) {
+      throw ArgumentError(
+        'Database.open(options: ...) is not exposed by the current stable ddb_* ABI.',
+      );
+    }
+
+    final nativeBindings = bindings ??
         NativeBindings.load(libraryPath ?? NativeBindings.defaultLibraryName());
-
-    final pathPtr = path.toNativeUtf8();
-    final optPtr = options?.toNativeUtf8() ?? nullptr;
+    final nativePath = path.toNativeUtf8();
+    final outDb = calloc<Pointer<DdbDb>>();
     try {
-      final dbPtr = b.open(pathPtr, optPtr.cast<Utf8>());
-      if (dbPtr == nullptr) {
-        // Error on a null handle; check global error.
-        final errCode = b.lastErrorCode(nullptr);
-        final msgPtr = b.lastErrorMessage(nullptr);
-        final msg = msgPtr == nullptr
+      final status = nativeBindings.dbOpenOrCreate(nativePath, outDb);
+      if (status != ddbOk) {
+        final messagePtr = nativeBindings.lastErrorMessage();
+        final message = messagePtr == nullptr
             ? 'Failed to open database'
-            : msgPtr.toDartString();
-        throw DecentDbException(ErrorCode.fromCode(errCode), msg);
+            : messagePtr.toDartString();
+        throw DecentDbException(ErrorCode.fromCode(status), message);
       }
-      return Database._(b, dbPtr);
+      return Database._(nativeBindings, outDb.value);
     } finally {
-      calloc.free(pathPtr);
-      if (optPtr != nullptr) calloc.free(optPtr);
+      calloc.free(outDb);
+      calloc.free(nativePath);
     }
   }
 
-  /// Open an in-memory database (no persistence).
-  static Database memory({String? libraryPath, NativeBindings? bindings}) {
-    return open(':memory:', libraryPath: libraryPath, bindings: bindings);
-  }
+  static Database memory({String? libraryPath, NativeBindings? bindings}) =>
+      open(':memory:', libraryPath: libraryPath, bindings: bindings);
 
-  /// The engine version string (e.g. "1.8.1").
   String get engineVersion {
-    final ptr = _bindings.engineVersion();
-    return ptr == nullptr ? 'unknown' : ptr.toDartString();
+    final versionPtr = _bindings.version();
+    return versionPtr == nullptr ? 'unknown' : versionPtr.toDartString();
   }
 
-  // -------------------------------------------------------------------------
-  // SQL execution
-  // -------------------------------------------------------------------------
-
-  /// Execute a SQL statement with no result rows (DDL, INSERT, UPDATE, DELETE).
-  ///
-  /// Returns the number of affected rows (0 for DDL).
-  ///
-  /// For parameterized queries, use [prepare] instead.
-  int execute(String sql) {
-    _checkOpen();
-    final stmt = prepare(sql);
-    try {
-      return stmt.execute();
-    } finally {
-      stmt.dispose();
-    }
-  }
-
-  /// Execute a SQL statement with parameters and return affected rows.
-  int executeWithParams(String sql, List<Object?> params) {
-    _checkOpen();
-    final stmt = prepare(sql);
-    try {
-      stmt.bindAll(params);
-      return stmt.execute();
-    } finally {
-      stmt.dispose();
-    }
-  }
-
-  /// Execute a SELECT and return all result rows.
-  ///
-  /// For large results, use [prepare] + [Statement.nextPage] for paging.
-  List<Row> query(String sql, [List<Object?> params = const []]) {
-    _checkOpen();
-    final stmt = prepare(sql);
-    try {
-      stmt.bindAll(params);
-      return stmt.query();
-    } finally {
-      stmt.dispose();
-    }
-  }
-
-  /// Prepare a SQL statement for execution.
-  ///
-  /// The caller is responsible for calling [Statement.dispose] when done.
   Statement prepare(String sql) {
     _checkOpen();
-    final sqlPtr = sql.toNativeUtf8();
-    final outStmt = calloc<Pointer<DecentdbStmt>>();
+    return Statement.fromSql(_bindings, _dbPtr!, sql);
+  }
+
+  int execute(String sql) {
+    final statement = prepare(sql);
     try {
-      final rc = _bindings.prepare(_dbPtr!, sqlPtr, outStmt);
-      if (rc != 0) {
-        _throwLastError();
-      }
-      final stmtPtr = outStmt.value;
-      if (stmtPtr == nullptr) {
-        _throwLastError();
-      }
-      return Statement.fromNative(_bindings, _dbPtr!, stmtPtr);
+      return statement.execute();
     } finally {
-      calloc.free(sqlPtr);
-      calloc.free(outStmt);
+      statement.dispose();
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Transactions
-  // -------------------------------------------------------------------------
+  int executeWithParams(String sql, List<Object?> params) {
+    final statement = prepare(sql);
+    try {
+      statement.bindAll(params);
+      return statement.execute();
+    } finally {
+      statement.dispose();
+    }
+  }
 
-  /// Begin an explicit transaction.
+  List<Row> query(String sql, [List<Object?> params = const []]) {
+    final statement = prepare(sql);
+    try {
+      statement.bindAll(params);
+      return statement.query();
+    } finally {
+      statement.dispose();
+    }
+  }
+
   void begin() {
     _checkOpen();
-    final rc = _bindings.begin(_dbPtr!);
-    if (rc != 0) _throwLastError();
+    final status = _bindings.dbBeginTransaction(_dbPtr!);
+    if (status != ddbOk) {
+      _throwStatus(status, 'Failed to begin transaction');
+    }
   }
 
-  /// Commit the active transaction.
   void commit() {
     _checkOpen();
-    final rc = _bindings.commit(_dbPtr!);
-    if (rc != 0) _throwLastError();
+    final outLsn = calloc<Uint64>();
+    try {
+      final status = _bindings.dbCommitTransaction(_dbPtr!, outLsn);
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to commit transaction');
+      }
+    } finally {
+      calloc.free(outLsn);
+    }
   }
 
-  /// Rollback the active transaction.
   void rollback() {
     _checkOpen();
-    final rc = _bindings.rollback(_dbPtr!);
-    if (rc != 0) _throwLastError();
+    final status = _bindings.dbRollbackTransaction(_dbPtr!);
+    if (status != ddbOk) {
+      _throwStatus(status, 'Failed to roll back transaction');
+    }
   }
 
-  /// Execute [action] inside a transaction.
-  ///
-  /// Automatically commits on success, rolls back on exception.
   T transaction<T>(T Function() action) {
     begin();
     try {
       final result = action();
       commit();
       return result;
-    } catch (e) {
+    } catch (error, stackTrace) {
       rollback();
-      rethrow;
+      Error.throwWithStackTrace(error, stackTrace);
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Schema introspection
-  // -------------------------------------------------------------------------
+  Schema get schema {
+    _checkOpen();
+    return Schema.fromNative(_bindings, _dbPtr!);
+  }
 
-  /// Access schema introspection methods.
-  Schema get schema => Schema.fromNative(_bindings, _dbPtr!);
-
-  // -------------------------------------------------------------------------
-  // Maintenance
-  // -------------------------------------------------------------------------
-
-  /// Flush the WAL to the main database file.
   void checkpoint() {
     _checkOpen();
-    final rc = _bindings.checkpoint(_dbPtr!);
-    if (rc != 0) _throwLastError();
-  }
-
-  /// Export the database to a new file at [destPath].
-  void saveAs(String destPath) {
-    _checkOpen();
-    final pathPtr = destPath.toNativeUtf8();
-    try {
-      final rc = _bindings.saveAs(_dbPtr!, pathPtr);
-      if (rc != 0) _throwLastError();
-    } finally {
-      calloc.free(pathPtr);
+    final status = _bindings.dbCheckpoint(_dbPtr!);
+    if (status != ddbOk) {
+      _throwStatus(status, 'Failed to checkpoint database');
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Lifecycle
-  // -------------------------------------------------------------------------
+  void saveAs(String destPath) {
+    _checkOpen();
+    final nativePath = destPath.toNativeUtf8();
+    try {
+      final status = _bindings.dbSaveAs(_dbPtr!, nativePath);
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to save database as $destPath');
+      }
+    } finally {
+      calloc.free(nativePath);
+    }
+  }
 
-  /// Close the database and release all native resources.
   void close() {
-    if (_dbPtr != null && _dbPtr != nullptr) {
-      _bindings.close(_dbPtr!);
-      _dbPtr = null;
+    if (_dbPtr == null || _dbPtr == nullptr) {
+      return;
+    }
+    final slot = calloc<Pointer<DdbDb>>()..value = _dbPtr!;
+    try {
+      final status = _bindings.dbFree(slot);
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to close database');
+      }
+      _dbPtr = nullptr;
+    } finally {
+      calloc.free(slot);
     }
   }
 }
