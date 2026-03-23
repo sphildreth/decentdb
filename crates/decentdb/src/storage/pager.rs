@@ -144,12 +144,27 @@ impl PagerHandle {
         self.persist_header(&header)
     }
 
+    pub(crate) fn set_schema_cookie(&self, schema_cookie: u32) -> Result<()> {
+        let mut header = self
+            .inner
+            .header
+            .lock()
+            .map_err(|_| DbError::internal("pager header lock poisoned"))?;
+        header.schema_cookie = schema_cookie;
+        self.persist_header(&header)
+    }
+
     pub(crate) fn header_snapshot(&self) -> Result<DatabaseHeader> {
         self.inner
             .header
             .lock()
             .map(|header| header.clone())
             .map_err(|_| DbError::internal("pager header lock poisoned"))
+    }
+
+    #[must_use]
+    pub(crate) fn page_size(&self) -> u32 {
+        self.inner.page_size
     }
 
     fn read_freelist_next(&self, page_id: PageId) -> Result<PageId> {

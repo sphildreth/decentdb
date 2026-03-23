@@ -1,11 +1,13 @@
-//! System catalog ownership and schema bootstrap scaffolding.
+//! Durable catalog metadata and lookup APIs.
 
-/// Placeholder catalog owner until catalog bootstrap lands.
-#[derive(Debug, Default)]
-pub(crate) struct CatalogHandle;
+pub(crate) mod ddl;
+pub(crate) mod maintenance;
+pub(crate) mod objects;
+pub(crate) mod schema;
 
-impl CatalogHandle {
-    pub(crate) const fn placeholder() -> Self {
-        Self
-    }
-}
+pub(crate) use objects::CatalogHandle;
+pub(crate) use schema::{
+    CatalogState, CheckConstraint, ColumnSchema, ColumnType, ForeignKeyAction,
+    ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
+    TriggerKind, TriggerSchema, ViewSchema,
+};

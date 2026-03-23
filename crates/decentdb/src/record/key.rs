@@ -3,7 +3,6 @@
 //! Implements:
 //! - design/adr/0061-typed-index-key-encoding-text-blob.md
 
-
 use std::cmp::Ordering;
 
 use crate::error::{DbError, Result};

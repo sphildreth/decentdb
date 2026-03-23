@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use crate::error::{DbError, Result};
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Value {
+pub enum Value {
     Null,
     Int64(i64),
     Float64(f64),

@@ -3,16 +3,21 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::CatalogHandle;
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
+use crate::exec::{statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult};
+use crate::record::value::Value;
+use crate::sql::parser::parse_sql_batch;
 use crate::storage::page::{self, PageId};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::vfs::faulty::{self, FailAction, Failpoint};
 use crate::vfs::{FileKind, OpenMode, VfsHandle};
 use crate::wal::reader_registry::ReaderGuard;
+use crate::wal::savepoint::StatementSavepoint;
 use crate::wal::WalHandle;
 
 /// Stable engine owner used across later storage, SQL, and FFI slices.
@@ -28,7 +33,10 @@ struct DbInner {
     _vfs: VfsHandle,
     pager: PagerHandle,
     wal: WalHandle,
-    _catalog: CatalogHandle,
+    catalog: CatalogHandle,
+    engine: RwLock<EngineRuntime>,
+    last_runtime_lsn: AtomicU64,
+    sql_write_lock: Mutex<()>,
     write_txn: Mutex<WriteTxn>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
 }
@@ -221,6 +229,99 @@ impl Db {
             .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)
     }
 
+    /// Executes a single SQL statement without parameters.
+    pub fn execute(&self, sql: &str) -> Result<QueryResult> {
+        self.execute_with_params(sql, &[])
+    }
+
+    /// Executes a single SQL statement with positional `$n` parameters.
+    pub fn execute_with_params(&self, sql: &str, params: &[Value]) -> Result<QueryResult> {
+        let mut results = self.execute_batch_with_params(sql, params)?;
+        if results.len() != 1 {
+            return Err(DbError::sql(format!(
+                "expected exactly one SQL statement, got {}",
+                results.len()
+            )));
+        }
+        Ok(results.remove(0))
+    }
+
+    /// Executes one or more semicolon-delimited SQL statements.
+    pub fn execute_batch(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.execute_batch_with_params(sql, &[])
+    }
+
+    /// Executes one or more semicolon-delimited SQL statements with `$n` parameters.
+    pub fn execute_batch_with_params(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        let statements = parse_sql_batch(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for statement in statements {
+            let result = if statement_is_read_only(&statement) {
+                self.execute_read_statement(&statement, params)?
+            } else {
+                self.execute_write_statement(&statement, params)?
+            };
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    /// Loads rows into a table as a single writer-held bulk operation.
+    pub fn bulk_load_rows(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+        rows: &[Vec<Value>],
+        options: BulkLoadOptions,
+    ) -> Result<u64> {
+        let _writer = self
+            .inner
+            .sql_write_lock
+            .lock()
+            .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        let mut working = self.engine_snapshot()?;
+        let inserted = working.bulk_load_rows(
+            table_name,
+            columns,
+            rows,
+            options,
+            self.inner.config.page_size,
+        )?;
+        self.persist_runtime(working)?;
+        if options.checkpoint_on_complete {
+            self.checkpoint()?;
+        }
+        Ok(inserted)
+    }
+
+    /// Rebuilds a single named index from the persisted table state.
+    pub fn rebuild_index(&self, name: &str) -> Result<()> {
+        let _writer = self
+            .inner
+            .sql_write_lock
+            .lock()
+            .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        let mut working = self.engine_snapshot()?;
+        working.rebuild_index(name, self.inner.config.page_size)?;
+        self.persist_runtime(working)
+    }
+
+    /// Rebuilds all indexes from the persisted table state.
+    pub fn rebuild_indexes(&self) -> Result<()> {
+        let _writer = self
+            .inner
+            .sql_write_lock
+            .lock()
+            .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        let mut working = self.engine_snapshot()?;
+        working.rebuild_indexes(self.inner.config.page_size)?;
+        self.persist_runtime(working)
+    }
+
     /// Holds a snapshot open until `release_snapshot` is called.
     pub fn hold_snapshot(&self) -> Result<u64> {
         let guard = self.inner.wal.begin_reader()?;
@@ -271,10 +372,11 @@ impl Db {
         let header = self.inner.pager.header_snapshot()?;
         let warnings = self.inner.wal.warnings()?;
         Ok(format!(
-            "{{\"path\":\"{}\",\"page_size\":{},\"page_count\":{},\"wal_end_lsn\":{},\"wal_file_size\":{},\"wal_path\":\"{}\",\"last_checkpoint_lsn\":{},\"active_readers\":{},\"wal_versions\":{},\"warning_count\":{},\"shared_wal\":{}}}",
+            "{{\"path\":\"{}\",\"page_size\":{},\"page_count\":{},\"schema_cookie\":{},\"wal_end_lsn\":{},\"wal_file_size\":{},\"wal_path\":\"{}\",\"last_checkpoint_lsn\":{},\"active_readers\":{},\"wal_versions\":{},\"warning_count\":{},\"shared_wal\":{}}}",
             json_escape(self.path().display().to_string()),
             self.inner.config.page_size,
             self.inner.pager.on_disk_page_count()?,
+            header.schema_cookie,
             self.inner.wal.latest_snapshot(),
             self.inner.wal.file_size()?,
             json_escape(self.inner.wal.file_path().display().to_string()),
@@ -347,6 +449,7 @@ impl Db {
         let header = storage::read_database_header_vfs(file.as_ref())?;
         let mut effective_config = config;
         effective_config.page_size = header.page_size;
+        let schema_cookie = header.schema_cookie;
 
         let pager = PagerHandle::open(Arc::clone(&file), header, effective_config.cache_size_mb)?;
         let wal = WalHandle::acquire(
@@ -356,6 +459,9 @@ impl Db {
             effective_config.wal_sync_mode,
         )?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
+        let runtime = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
+        let catalog = CatalogHandle::new(runtime.catalog.clone());
+        let last_runtime_lsn = wal.latest_snapshot();
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -364,7 +470,10 @@ impl Db {
                 _vfs: vfs,
                 pager,
                 wal,
-                _catalog: CatalogHandle::placeholder(),
+                catalog,
+                engine: RwLock::new(runtime),
+                last_runtime_lsn: AtomicU64::new(last_runtime_lsn),
+                sql_write_lock: Mutex::new(()),
                 write_txn: Mutex::new(WriteTxn::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
             }),
@@ -379,6 +488,112 @@ impl Db {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.inner.path
+    }
+
+    pub fn schema_cookie(&self) -> Result<u32> {
+        self.inner.catalog.schema_cookie()
+    }
+
+    pub(crate) fn set_schema_cookie(&self, schema_cookie: u32) -> Result<()> {
+        self.inner.pager.set_schema_cookie(schema_cookie)
+    }
+
+    fn execute_read_statement(
+        &self,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        self.refresh_engine_from_storage()?;
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.execute_read_statement(statement, params, self.inner.config.page_size)
+    }
+
+    fn execute_write_statement(
+        &self,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let _writer = self
+            .inner
+            .sql_write_lock
+            .lock()
+            .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.refresh_engine_from_storage()?;
+        let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        let mut working = self.engine_snapshot()?;
+        let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
+        self.persist_runtime(working)?;
+        Ok(result)
+    }
+
+    fn engine_snapshot(&self) -> Result<EngineRuntime> {
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        let mut snapshot = runtime.clone();
+        snapshot.rebuild_indexes(self.inner.config.page_size)?;
+        Ok(snapshot)
+    }
+
+    fn persist_runtime(&self, runtime: EngineRuntime) -> Result<()> {
+        self.begin_write()?;
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                return Err(error);
+            }
+        };
+        self.inner.catalog.replace(runtime.catalog.clone())?;
+        let mut guard = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        *guard = runtime;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    fn refresh_engine_from_storage(&self) -> Result<()> {
+        let latest_lsn = self.inner.wal.latest_snapshot();
+        if latest_lsn <= self.inner.last_runtime_lsn.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let schema_cookie = self.current_schema_cookie()?;
+        let runtime =
+            EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
+        self.inner.catalog.replace(runtime.catalog.clone())?;
+        let mut guard = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        *guard = runtime;
+        self.inner
+            .last_runtime_lsn
+            .store(latest_lsn, Ordering::Release);
+        Ok(())
+    }
+
+    fn current_schema_cookie(&self) -> Result<u32> {
+        let page = self.read_page(page::HEADER_PAGE_ID)?;
+        let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
+        bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
+        Ok(DatabaseHeader::decode(&bytes)?.schema_cookie)
     }
 }
 

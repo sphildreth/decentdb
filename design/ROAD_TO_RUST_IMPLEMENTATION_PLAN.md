@@ -1,7 +1,7 @@
 # Road to Rust: DecentDB 1.0 Implementation Plan
 **Date:** 2026-03-22
 **Status:** Active Execution
-**Current Active Slice:** `Slice 3.1: Catalog and Schema Bootstrap`
+**Current Active Slice:** `Slice 4.1: C-ABI Core and Error Surface`
 
 This document is the execution plan for the Rust rewrite. It is derived from:
 - `design/PRD.md`
@@ -43,13 +43,13 @@ Coding agents MUST implement only the current active slice unless the user expli
   - [x] **Slice 2.3: B+Tree Read Path**
   - [x] **Slice 2.4: B+Tree Write Path and Overflow Pages**
   - [x] **Slice 2.5: Trigram Storage, Query Support, and Rebuild Fallback**
-- [ ] **Phase 3: Relational Core**
-  - [ ] **Slice 3.1: Catalog and Schema Bootstrap**
-  - [ ] **Slice 3.2: `libpg_query` Integration and AST Normalization**
-  - [ ] **Slice 3.3: Read Planner and Executor**
-  - [ ] **Slice 3.4: Transaction State, DML, Constraints, and Statement Rollback**
-  - [ ] **Slice 3.5: Remaining 1.0 SQL Surface**
-  - [ ] **Slice 3.6: Bulk Load and Maintenance Operations**
+- [x] **Phase 3: Relational Core**
+  - [x] **Slice 3.1: Catalog and Schema Bootstrap**
+  - [x] **Slice 3.2: `libpg_query` Integration and AST Normalization**
+  - [x] **Slice 3.3: Read Planner and Executor**
+  - [x] **Slice 3.4: Transaction State, DML, Constraints, and Statement Rollback**
+  - [x] **Slice 3.5: Remaining 1.0 SQL Surface**
+  - [x] **Slice 3.6: Bulk Load and Maintenance Operations**
 - [ ] **Phase 4: Ecosystem Parity and Release**
   - [ ] **Slice 4.1: C-ABI Core and Error Surface**
   - [ ] **Slice 4.2: Python and .NET Validation**

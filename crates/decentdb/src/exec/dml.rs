@@ -1,0 +1,1020 @@
+//! DML execution helpers.
+
+use crate::catalog::TriggerEvent;
+use crate::error::{DbError, Result};
+use crate::record::value::Value;
+use crate::sql::ast::{
+    Assignment, ConflictAction, ConflictTarget, DeleteStatement, Expr, InsertSource,
+    InsertStatement, SelectItem, UpdateStatement,
+};
+
+use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
+use super::{compare_values, table_row_dataset, EngineRuntime, StoredRow};
+
+impl EngineRuntime {
+    pub(super) fn execute_insert(
+        &mut self,
+        statement: &InsertStatement,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<QueryResult> {
+        if self.catalog.views.contains_key(&statement.table_name) {
+            if !statement.returning.is_empty() {
+                return Err(DbError::sql(
+                    "INSERT ... RETURNING is not supported for view INSTEAD OF triggers",
+                ));
+            }
+            let source_rows = materialize_insert_source(self, &statement.source, params)?;
+            let affected_rows = self.execute_instead_of_triggers(
+                &statement.table_name,
+                TriggerEvent::Insert,
+                source_rows.len(),
+                page_size,
+            )?;
+            return Ok(QueryResult::with_affected_rows(affected_rows));
+        }
+
+        let table_name = statement.table_name.clone();
+        let source_rows = materialize_insert_source(self, &statement.source, params)?;
+        let mut affected_rows = 0_u64;
+        let mut returning_rows = Vec::new();
+
+        for source_row in source_rows {
+            let candidate = {
+                let mut staged_table = self
+                    .catalog
+                    .tables
+                    .get(&table_name)
+                    .cloned()
+                    .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+                let candidate = build_insert_row_values(
+                    self,
+                    &mut staged_table,
+                    &statement.columns,
+                    source_row,
+                    params,
+                )?;
+                self.catalog
+                    .tables
+                    .get_mut(&table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+                    .next_row_id = staged_table.next_row_id;
+                candidate
+            };
+
+            let conflict = if let Some(action) = &statement.on_conflict {
+                let target = conflict_target(action)?;
+                self.find_conflicting_row(&table_name, &candidate, &target)?
+            } else {
+                None
+            };
+
+            if let Some(conflict) = conflict {
+                match statement
+                    .on_conflict
+                    .as_ref()
+                    .ok_or_else(|| DbError::constraint("duplicate key"))?
+                {
+                    ConflictAction::DoNothing { .. } => {}
+                    ConflictAction::DoUpdate {
+                        target,
+                        assignments,
+                        filter,
+                    } => {
+                        if matches!(target, ConflictTarget::Any) {
+                            return Err(DbError::sql(
+                                "targetless ON CONFLICT DO UPDATE is not supported",
+                            ));
+                        }
+                        if let Some(updated_row) = self.apply_conflict_update(
+                            &table_name,
+                            conflict.row_id,
+                            &candidate,
+                            assignments,
+                            filter.as_ref(),
+                            params,
+                        )? {
+                            affected_rows += 1;
+                            if !statement.returning.is_empty() {
+                                returning_rows.push(updated_row);
+                            }
+                        }
+                    }
+                }
+                continue;
+            } else if statement.on_conflict.is_none() {
+                self.validate_row(&table_name, &candidate, None, params)?;
+            }
+
+            if statement.on_conflict.is_some() {
+                self.validate_row(&table_name, &candidate, None, params)?;
+            }
+
+            let row_id = {
+                let table = self
+                    .catalog
+                    .tables
+                    .get(&table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+                primary_row_id(table, &candidate).unwrap_or_else(|| next_row_id(self, &table_name))
+            };
+            let stored_row = StoredRow {
+                row_id,
+                values: candidate,
+            };
+            self.tables
+                .get_mut(&table_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?
+                .rows
+                .push(stored_row.clone());
+            affected_rows += 1;
+            if !statement.returning.is_empty() {
+                returning_rows.push(stored_row.clone());
+            }
+        }
+
+        self.execute_after_triggers(
+            &table_name,
+            TriggerEvent::Insert,
+            affected_rows as usize,
+            page_size,
+        )?;
+
+        if statement.returning.is_empty() {
+            Ok(QueryResult::with_affected_rows(affected_rows))
+        } else {
+            self.render_returning(&table_name, &returning_rows, &statement.returning, params)
+        }
+    }
+
+    pub(super) fn execute_update(
+        &mut self,
+        statement: &UpdateStatement,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<QueryResult> {
+        if self.catalog.views.contains_key(&statement.table_name) {
+            let affected = view_match_count(
+                self,
+                &statement.table_name,
+                statement.filter.as_ref(),
+                params,
+            )?;
+            let affected = self.execute_instead_of_triggers(
+                &statement.table_name,
+                TriggerEvent::Update,
+                affected,
+                page_size,
+            )?;
+            return Ok(QueryResult::with_affected_rows(affected));
+        }
+
+        let table_name = statement.table_name.clone();
+        let table = self
+            .catalog
+            .tables
+            .get(&table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let matching_row_ids = matching_row_ids(
+            self,
+            &table,
+            self.tables
+                .get(&table_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?
+                .rows
+                .as_slice(),
+            statement.filter.as_ref(),
+            params,
+        )?;
+
+        let mut affected_rows = 0_u64;
+        for row_id in matching_row_ids {
+            let row_index = self
+                .tables
+                .get(&table_name)
+                .and_then(|data| data.rows.iter().position(|row| row.row_id == row_id))
+                .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
+            let current_row = self.tables[&table_name].rows[row_index].clone();
+            let mut next_values = current_row.values.clone();
+            let dataset = table_row_dataset(&table, &current_row.values, &table_name);
+            for assignment in &statement.assignments {
+                let column_index = table
+                    .columns
+                    .iter()
+                    .position(|column| column.name == assignment.column_name)
+                    .ok_or_else(|| {
+                        DbError::sql(format!("unknown column {}", assignment.column_name))
+                    })?;
+                let value = self.eval_expr(
+                    &assignment.expr,
+                    &dataset,
+                    &current_row.values,
+                    params,
+                    &std::collections::BTreeMap::new(),
+                    None,
+                )?;
+                next_values[column_index] =
+                    super::cast_value(value, table.columns[column_index].column_type)?;
+            }
+            self.apply_parent_update_actions(
+                &table_name,
+                &table,
+                &current_row.values,
+                &next_values,
+                params,
+            )?;
+            self.validate_row(&table_name, &next_values, Some(row_id), params)?;
+            self.tables
+                .get_mut(&table_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?
+                .rows[row_index]
+                .values = next_values;
+            affected_rows += 1;
+        }
+
+        self.execute_after_triggers(
+            &table_name,
+            TriggerEvent::Update,
+            affected_rows as usize,
+            page_size,
+        )?;
+        Ok(QueryResult::with_affected_rows(affected_rows))
+    }
+
+    pub(super) fn execute_delete(
+        &mut self,
+        statement: &DeleteStatement,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<QueryResult> {
+        if self.catalog.views.contains_key(&statement.table_name) {
+            let affected = view_match_count(
+                self,
+                &statement.table_name,
+                statement.filter.as_ref(),
+                params,
+            )?;
+            let affected = self.execute_instead_of_triggers(
+                &statement.table_name,
+                TriggerEvent::Delete,
+                affected,
+                page_size,
+            )?;
+            return Ok(QueryResult::with_affected_rows(affected));
+        }
+
+        let table_name = statement.table_name.clone();
+        let table = self
+            .catalog
+            .tables
+            .get(&table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let rows = self
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .rows
+            .clone();
+        let matching_rows = rows
+            .into_iter()
+            .filter(|row| {
+                row_matches_filter(self, &table, row, statement.filter.as_ref(), params)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        for row in &matching_rows {
+            self.apply_parent_delete_actions(&table_name, &table, &row.values, params)?;
+        }
+
+        let matching_row_ids = matching_rows
+            .iter()
+            .map(|row| row.row_id)
+            .collect::<Vec<_>>();
+        self.tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .rows
+            .retain(|row| !matching_row_ids.contains(&row.row_id));
+
+        self.execute_after_triggers(
+            &table_name,
+            TriggerEvent::Delete,
+            matching_rows.len(),
+            page_size,
+        )?;
+        Ok(QueryResult::with_affected_rows(matching_rows.len() as u64))
+    }
+
+    fn render_returning(
+        &self,
+        table_name: &str,
+        rows: &[StoredRow],
+        items: &[SelectItem],
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let table = self
+            .catalog
+            .tables
+            .get(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let dataset = Dataset {
+            columns: table
+                .columns
+                .iter()
+                .map(|column| ColumnBinding {
+                    table: Some(table_name.to_string()),
+                    name: column.name.clone(),
+                })
+                .collect(),
+            rows: rows.iter().map(|row| row.values.clone()).collect(),
+        };
+        let projected = self.project_dataset(
+            &dataset,
+            items,
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        )?;
+        Ok(QueryResult::with_rows(
+            projected
+                .columns
+                .into_iter()
+                .map(|column| column.name)
+                .collect(),
+            projected.rows.into_iter().map(QueryRow::new).collect(),
+        ))
+    }
+
+    fn apply_conflict_update(
+        &mut self,
+        table_name: &str,
+        row_id: i64,
+        excluded_values: &[Value],
+        assignments: &[Assignment],
+        filter: Option<&Expr>,
+        params: &[Value],
+    ) -> Result<Option<StoredRow>> {
+        let table = self
+            .catalog
+            .tables
+            .get(table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let row_index = self
+            .tables
+            .get(table_name)
+            .and_then(|data| data.rows.iter().position(|row| row.row_id == row_id))
+            .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPSERT")))?;
+        let current_row = self.tables[table_name].rows[row_index].clone();
+        let dataset = table_row_dataset(&table, &current_row.values, table_name);
+        let excluded = Dataset {
+            columns: table
+                .columns
+                .iter()
+                .map(|column| ColumnBinding {
+                    table: Some("excluded".to_string()),
+                    name: column.name.clone(),
+                })
+                .collect(),
+            rows: vec![excluded_values.to_vec()],
+        };
+        if let Some(filter) = filter {
+            if !matches!(
+                self.eval_expr(
+                    filter,
+                    &dataset,
+                    &current_row.values,
+                    params,
+                    &std::collections::BTreeMap::new(),
+                    Some(&excluded),
+                )?,
+                Value::Bool(true)
+            ) {
+                return Ok(None);
+            }
+        }
+
+        let mut next_values = current_row.values.clone();
+        for assignment in assignments {
+            let column_index = table
+                .columns
+                .iter()
+                .position(|column| column.name == assignment.column_name)
+                .ok_or_else(|| {
+                    DbError::sql(format!("unknown column {}", assignment.column_name))
+                })?;
+            let value = self.eval_expr(
+                &assignment.expr,
+                &dataset,
+                &current_row.values,
+                params,
+                &std::collections::BTreeMap::new(),
+                Some(&excluded),
+            )?;
+            next_values[column_index] =
+                super::cast_value(value, table.columns[column_index].column_type)?;
+        }
+        self.apply_parent_update_actions(
+            table_name,
+            &table,
+            &current_row.values,
+            &next_values,
+            params,
+        )?;
+        self.validate_row(table_name, &next_values, Some(row_id), params)?;
+        self.tables
+            .get_mut(table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .rows[row_index]
+            .values = next_values.clone();
+        Ok(Some(StoredRow {
+            row_id,
+            values: next_values,
+        }))
+    }
+
+    fn apply_parent_delete_actions(
+        &mut self,
+        table_name: &str,
+        table: &crate::catalog::TableSchema,
+        row: &[Value],
+        params: &[Value],
+    ) -> Result<()> {
+        let referencing_tables = self
+            .catalog
+            .tables
+            .values()
+            .filter(|child| {
+                child
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table_name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for child_table in referencing_tables {
+            let foreign_keys = child_table
+                .foreign_keys
+                .iter()
+                .filter(|foreign_key| foreign_key.referenced_table == table_name)
+                .cloned()
+                .collect::<Vec<_>>();
+            for foreign_key in foreign_keys {
+                let matching_children =
+                    matching_foreign_key_children(self, table, row, &child_table, &foreign_key)?;
+                if matching_children.is_empty() {
+                    continue;
+                }
+                match foreign_key.on_delete {
+                    crate::catalog::ForeignKeyAction::NoAction
+                    | crate::catalog::ForeignKeyAction::Restrict => {
+                        return Err(DbError::constraint(format!(
+                            "DELETE on {} violates a foreign key from {}",
+                            table_name, child_table.name
+                        )))
+                    }
+                    crate::catalog::ForeignKeyAction::Cascade => {
+                        for child_row in &matching_children {
+                            self.apply_parent_delete_actions(
+                                &child_table.name,
+                                &child_table,
+                                &child_row.values,
+                                params,
+                            )?;
+                        }
+                        let child_ids = matching_children
+                            .iter()
+                            .map(|row| row.row_id)
+                            .collect::<Vec<_>>();
+                        self.tables
+                            .get_mut(&child_table.name)
+                            .ok_or_else(|| {
+                                DbError::internal(format!(
+                                    "table data for {} is missing",
+                                    child_table.name
+                                ))
+                            })?
+                            .rows
+                            .retain(|child| !child_ids.contains(&child.row_id));
+                    }
+                    crate::catalog::ForeignKeyAction::SetNull => {
+                        for child_row in matching_children {
+                            let row_index = self
+                                .tables
+                                .get(&child_table.name)
+                                .and_then(|data| {
+                                    data.rows
+                                        .iter()
+                                        .position(|row| row.row_id == child_row.row_id)
+                                })
+                                .ok_or_else(|| {
+                                    DbError::internal(format!(
+                                        "row {} vanished during SET NULL",
+                                        child_row.row_id
+                                    ))
+                                })?;
+                            let updated_values = {
+                                let row = &mut self
+                                    .tables
+                                    .get_mut(&child_table.name)
+                                    .ok_or_else(|| {
+                                        DbError::internal(format!(
+                                            "table data for {} is missing",
+                                            child_table.name
+                                        ))
+                                    })?
+                                    .rows[row_index];
+                                for column_name in &foreign_key.columns {
+                                    let column_index = child_table
+                                        .columns
+                                        .iter()
+                                        .position(|column| column.name == *column_name)
+                                        .ok_or_else(|| {
+                                            DbError::internal(format!(
+                                                "unknown child foreign-key column {}",
+                                                column_name
+                                            ))
+                                        })?;
+                                    row.values[column_index] = Value::Null;
+                                }
+                                row.values.clone()
+                            };
+                            self.validate_row(
+                                &child_table.name,
+                                &updated_values,
+                                Some(child_row.row_id),
+                                params,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_parent_update_actions(
+        &mut self,
+        table_name: &str,
+        table: &crate::catalog::TableSchema,
+        old_row: &[Value],
+        new_row: &[Value],
+        params: &[Value],
+    ) -> Result<()> {
+        let referencing_tables = self
+            .catalog
+            .tables
+            .values()
+            .filter(|child| {
+                child
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key.referenced_table == table_name)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for child_table in referencing_tables {
+            let foreign_keys = child_table
+                .foreign_keys
+                .iter()
+                .filter(|foreign_key| foreign_key.referenced_table == table_name)
+                .cloned()
+                .collect::<Vec<_>>();
+            for foreign_key in foreign_keys {
+                let old_parent_key =
+                    parent_key_values(table, old_row, &foreign_key.referenced_columns)?;
+                let new_parent_key =
+                    parent_key_values(table, new_row, &foreign_key.referenced_columns)?;
+                if values_equal(&old_parent_key, &new_parent_key)? {
+                    continue;
+                }
+                let matching_children = matching_foreign_key_children(
+                    self,
+                    table,
+                    old_row,
+                    &child_table,
+                    &foreign_key,
+                )?;
+                if matching_children.is_empty() {
+                    continue;
+                }
+                match foreign_key.on_update {
+                    crate::catalog::ForeignKeyAction::NoAction
+                    | crate::catalog::ForeignKeyAction::Restrict => {
+                        return Err(DbError::constraint(format!(
+                            "UPDATE on {} violates a foreign key from {}",
+                            table_name, child_table.name
+                        )))
+                    }
+                    crate::catalog::ForeignKeyAction::Cascade => {
+                        for child_row in matching_children {
+                            let row_index = self
+                                .tables
+                                .get(&child_table.name)
+                                .and_then(|data| {
+                                    data.rows
+                                        .iter()
+                                        .position(|row| row.row_id == child_row.row_id)
+                                })
+                                .ok_or_else(|| {
+                                    DbError::internal(format!(
+                                        "row {} vanished during CASCADE UPDATE",
+                                        child_row.row_id
+                                    ))
+                                })?;
+                            let updated_values = {
+                                let row = &mut self
+                                    .tables
+                                    .get_mut(&child_table.name)
+                                    .ok_or_else(|| {
+                                        DbError::internal(format!(
+                                            "table data for {} is missing",
+                                            child_table.name
+                                        ))
+                                    })?
+                                    .rows[row_index];
+                                for (child_column, value) in
+                                    foreign_key.columns.iter().zip(&new_parent_key)
+                                {
+                                    let column_index = child_table
+                                        .columns
+                                        .iter()
+                                        .position(|column| column.name == *child_column)
+                                        .ok_or_else(|| {
+                                            DbError::internal(format!(
+                                                "unknown child foreign-key column {}",
+                                                child_column
+                                            ))
+                                        })?;
+                                    row.values[column_index] = value.clone();
+                                }
+                                row.values.clone()
+                            };
+                            self.validate_row(
+                                &child_table.name,
+                                &updated_values,
+                                Some(child_row.row_id),
+                                params,
+                            )?;
+                        }
+                    }
+                    crate::catalog::ForeignKeyAction::SetNull => {
+                        for child_row in matching_children {
+                            let row_index = self
+                                .tables
+                                .get(&child_table.name)
+                                .and_then(|data| {
+                                    data.rows
+                                        .iter()
+                                        .position(|row| row.row_id == child_row.row_id)
+                                })
+                                .ok_or_else(|| {
+                                    DbError::internal(format!(
+                                        "row {} vanished during SET NULL UPDATE",
+                                        child_row.row_id
+                                    ))
+                                })?;
+                            let updated_values = {
+                                let row = &mut self
+                                    .tables
+                                    .get_mut(&child_table.name)
+                                    .ok_or_else(|| {
+                                        DbError::internal(format!(
+                                            "table data for {} is missing",
+                                            child_table.name
+                                        ))
+                                    })?
+                                    .rows[row_index];
+                                for child_column in &foreign_key.columns {
+                                    let column_index = child_table
+                                        .columns
+                                        .iter()
+                                        .position(|column| column.name == *child_column)
+                                        .ok_or_else(|| {
+                                            DbError::internal(format!(
+                                                "unknown child foreign-key column {}",
+                                                child_column
+                                            ))
+                                        })?;
+                                    row.values[column_index] = Value::Null;
+                                }
+                                row.values.clone()
+                            };
+                            self.validate_row(
+                                &child_table.name,
+                                &updated_values,
+                                Some(child_row.row_id),
+                                params,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn build_insert_row_values(
+    runtime: &EngineRuntime,
+    table: &mut crate::catalog::TableSchema,
+    provided_columns: &[String],
+    source_row: Vec<Value>,
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let target_columns = if provided_columns.is_empty() {
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>()
+    } else {
+        provided_columns.to_vec()
+    };
+    if target_columns.len() != source_row.len() {
+        return Err(DbError::sql(format!(
+            "INSERT on {} expected {} values but received {}",
+            table.name,
+            target_columns.len(),
+            source_row.len()
+        )));
+    }
+    let mut values = vec![None; table.columns.len()];
+    for (column_name, value) in target_columns.into_iter().zip(source_row) {
+        let column_index = table
+            .columns
+            .iter()
+            .position(|column| column.name == column_name)
+            .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
+        if values[column_index].is_some() {
+            return Err(DbError::sql(format!(
+                "column {} was assigned more than once in INSERT",
+                column_name
+            )));
+        }
+        values[column_index] = Some(value);
+    }
+
+    let mut resolved = Vec::with_capacity(table.columns.len());
+    for (index, column) in table.columns.iter().enumerate() {
+        let mut value = values[index].take().unwrap_or_else(|| {
+            runtime
+                .default_value_for_column(column, params)
+                .unwrap_or(Value::Null)
+        });
+        if column.auto_increment {
+            match value {
+                Value::Null => {
+                    value = Value::Int64(table.next_row_id);
+                    table.next_row_id += 1;
+                }
+                Value::Int64(explicit) => {
+                    if explicit >= table.next_row_id {
+                        table.next_row_id = explicit + 1;
+                    }
+                }
+                _ => {
+                    return Err(DbError::constraint(format!(
+                        "auto-increment column {}.{} requires INT64 values",
+                        table.name, column.name
+                    )))
+                }
+            }
+        }
+        resolved.push(value);
+    }
+    runtime.coerce_row_values(table, resolved)
+}
+
+fn materialize_insert_source(
+    runtime: &EngineRuntime,
+    source: &InsertSource,
+    params: &[Value],
+) -> Result<Vec<Vec<Value>>> {
+    match source {
+        InsertSource::Values(rows) => rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expr| {
+                        runtime.eval_expr(
+                            expr,
+                            &Dataset::empty(),
+                            &[],
+                            params,
+                            &std::collections::BTreeMap::new(),
+                            None,
+                        )
+                    })
+                    .collect()
+            })
+            .collect(),
+        InsertSource::Query(query) => runtime
+            .evaluate_query(query, params, &std::collections::BTreeMap::new())
+            .map(|dataset| dataset.rows),
+    }
+}
+
+fn conflict_target(action: &ConflictAction) -> Result<ConflictTarget> {
+    match action {
+        ConflictAction::DoNothing { target } => Ok(target.clone()),
+        ConflictAction::DoUpdate { target, .. } => Ok(target.clone()),
+    }
+}
+
+pub(super) fn next_row_id(runtime: &mut EngineRuntime, table_name: &str) -> i64 {
+    let table = runtime
+        .catalog
+        .tables
+        .get_mut(table_name)
+        .expect("table must exist for row-id allocation");
+    let row_id = table.next_row_id;
+    table.next_row_id += 1;
+    row_id
+}
+
+pub(super) fn primary_row_id(table: &crate::catalog::TableSchema, row: &[Value]) -> Option<i64> {
+    if table.primary_key_columns.len() != 1 {
+        return None;
+    }
+    let column_name = &table.primary_key_columns[0];
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name == *column_name)?;
+    if !column.auto_increment {
+        return None;
+    }
+    let index = table
+        .columns
+        .iter()
+        .position(|entry| entry.name == *column_name)?;
+    match row.get(index) {
+        Some(Value::Int64(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn matching_row_ids(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    rows: &[StoredRow],
+    filter: Option<&Expr>,
+    params: &[Value],
+) -> Result<Vec<i64>> {
+    rows.iter()
+        .filter(|row| row_matches_filter(runtime, table, row, filter, params).unwrap_or(false))
+        .map(|row| Ok(row.row_id))
+        .collect()
+}
+
+fn row_matches_filter(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    row: &StoredRow,
+    filter: Option<&Expr>,
+    params: &[Value],
+) -> Result<bool> {
+    let Some(filter) = filter else {
+        return Ok(true);
+    };
+    let dataset = table_row_dataset(table, &row.values, &table.name);
+    Ok(matches!(
+        runtime.eval_expr(
+            filter,
+            &dataset,
+            &row.values,
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        )?,
+        Value::Bool(true)
+    ))
+}
+
+fn view_match_count(
+    runtime: &EngineRuntime,
+    view_name: &str,
+    filter: Option<&Expr>,
+    params: &[Value],
+) -> Result<usize> {
+    let dataset = runtime.evaluate_from_item(
+        &crate::sql::ast::FromItem::Table {
+            name: view_name.to_string(),
+            alias: None,
+        },
+        params,
+        &std::collections::BTreeMap::new(),
+    )?;
+    if let Some(filter) = filter {
+        let bindings = dataset.columns.clone();
+        Ok(dataset
+            .rows
+            .iter()
+            .filter(|row| {
+                runtime
+                    .eval_expr(
+                        filter,
+                        &Dataset {
+                            columns: bindings.clone(),
+                            rows: vec![row.to_vec()],
+                        },
+                        row,
+                        params,
+                        &std::collections::BTreeMap::new(),
+                        None,
+                    )
+                    .is_ok_and(|value| matches!(value, Value::Bool(true)))
+            })
+            .count())
+    } else {
+        Ok(dataset.rows.len())
+    }
+}
+
+fn matching_foreign_key_children(
+    runtime: &EngineRuntime,
+    parent_table: &crate::catalog::TableSchema,
+    parent_row: &[Value],
+    child_table: &crate::catalog::TableSchema,
+    foreign_key: &crate::catalog::ForeignKeyConstraint,
+) -> Result<Vec<StoredRow>> {
+    let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+        parent_table.primary_key_columns.clone()
+    } else {
+        foreign_key.referenced_columns.clone()
+    };
+    let parent_key = parent_key_values(parent_table, parent_row, &referenced_columns)?;
+    let rows = runtime
+        .tables
+        .get(&child_table.name)
+        .map(|data| data.rows.clone())
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            foreign_key
+                .columns
+                .iter()
+                .zip(&parent_key)
+                .all(|(child_column, parent_value)| {
+                    let child_index = child_table
+                        .columns
+                        .iter()
+                        .position(|column| column.name == *child_column)
+                        .expect("child FK column must exist");
+                    compare_values(&row.values[child_index], parent_value)
+                        .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
+                })
+        })
+        .collect())
+}
+
+fn parent_key_values(
+    table: &crate::catalog::TableSchema,
+    row: &[Value],
+    referenced_columns: &[String],
+) -> Result<Vec<Value>> {
+    let columns = if referenced_columns.is_empty() {
+        &table.primary_key_columns
+    } else {
+        referenced_columns
+    };
+    columns
+        .iter()
+        .map(|column_name| {
+            let index = table
+                .columns
+                .iter()
+                .position(|column| column.name == *column_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("unknown parent column {}", column_name))
+                })?;
+            row.get(index)
+                .cloned()
+                .ok_or_else(|| DbError::internal("row is shorter than its schema"))
+        })
+        .collect()
+}
+
+fn values_equal(left: &[Value], right: &[Value]) -> Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left.iter().zip(right) {
+        if compare_values(left, right)? != std::cmp::Ordering::Equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}

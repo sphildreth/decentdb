@@ -22,6 +22,8 @@ mod wal;
 pub use crate::config::{DbConfig, WalSyncMode};
 pub use crate::db::Db;
 pub use crate::error::{DbError, DbErrorCode, Result};
+pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
+pub use crate::record::value::Value;
 
 /// Returns the DecentDB crate version.
 #[must_use]

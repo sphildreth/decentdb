@@ -1,0 +1,12 @@
+[package]
+name = "libpg_query_sys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pg_query = "=6.1.1"
+
+[build-dependencies]
+

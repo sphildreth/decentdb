@@ -2,6 +2,7 @@
 members = [
     "crates/decentdb",       # Core database engine
     "crates/decentdb-cli",   # CLI application
+    "crates/libpg_query_sys", # Pinned SQL parser wrapper
 ]
 resolver = "2"
 

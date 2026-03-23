@@ -5,6 +5,7 @@ pub(crate) mod format;
 pub(crate) mod index;
 pub(crate) mod reader_registry;
 pub(crate) mod recovery;
+pub(crate) mod savepoint;
 pub(crate) mod shared;
 pub(crate) mod writer;
 

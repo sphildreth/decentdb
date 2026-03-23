@@ -4,7 +4,6 @@
 //! - design/adr/0020-overflow-pages-for-blobs.md
 //! - design/adr/0031-overflow-page-format.md
 
-
 use crate::error::{DbError, Result};
 use crate::record::compression::{decompress, maybe_compress, CompressionMode};
 use crate::storage::page::{PageId, PageStore};
