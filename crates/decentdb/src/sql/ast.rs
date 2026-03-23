@@ -175,6 +175,7 @@ pub(crate) enum Expr {
     Aggregate {
         name: String,
         args: Vec<Expr>,
+        distinct: bool,
         star: bool,
     },
     RowNumber {
@@ -656,15 +657,16 @@ impl Expr {
                 name,
                 args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
             ),
-            Self::Aggregate { name, args, star } => {
+            Self::Aggregate { name, args, star, distinct } => {
                 if *star {
                     format!("{name}(*)")
                 } else {
-                    format!(
-                        "{}({})",
-                        name,
-                        args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
-                    )
+                    let args_sql = args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ");
+                    if *distinct {
+                        format!("{name}(DISTINCT {args_sql})")
+                    } else {
+                        format!("{name}({args_sql})")
+                    }
                 }
             }
             Self::RowNumber {

@@ -1792,10 +1792,21 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Value> {
         match expr {
-            Expr::Aggregate { name, args, star } => match name.as_str() {
+            Expr::Aggregate { name, args, star, distinct } => match name.as_str() {
                 "count" => {
                     if *star {
                         Ok(Value::Int64(group_rows.len() as i64))
+                    } else if *distinct {
+                        let mut vals = Vec::new();
+                        for row in group_rows {
+                            let val = self.eval_expr(&args[0], dataset, row, params, ctes, None)?;
+                            if !matches!(val, Value::Null) {
+                                vals.push(val);
+                            }
+                        }
+                        vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                        vals.dedup_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal);
+                        Ok(Value::Int64(vals.len() as i64))
                     } else {
                         let mut count = 0_i64;
                         for row in group_rows {
@@ -1817,6 +1828,7 @@ impl EngineRuntime {
                     params,
                     ctes,
                     NumericAgg::Sum,
+                    *distinct,
                 ),
                 "avg" => aggregate_numeric(
                     self,
@@ -1826,6 +1838,7 @@ impl EngineRuntime {
                     params,
                     ctes,
                     NumericAgg::Avg,
+                    *distinct,
                 ),
                 "min" => aggregate_extreme(self, dataset, group_rows, &args[0], params, ctes, true),
                 "max" => {
@@ -2237,14 +2250,28 @@ fn aggregate_numeric(
     params: &[Value],
     ctes: &BTreeMap<String, Dataset>,
     kind: NumericAgg,
+    distinct: bool,
 ) -> Result<Value> {
     let mut total_int = 0_i64;
     let mut total_float = 0_f64;
     let mut saw_float = false;
     let mut count = 0_i64;
+    
+    let mut vals = Vec::new();
     for row in rows {
-        match runtime.eval_expr(expr, dataset, row, params, ctes, None)? {
-            Value::Null => {}
+        let val = runtime.eval_expr(expr, dataset, row, params, ctes, None)?;
+        if !matches!(val, Value::Null) {
+            vals.push(val);
+        }
+    }
+    
+    if distinct {
+        vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+        vals.dedup_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal);
+    }
+
+    for val in vals {
+        match val {
             Value::Int64(value) => {
                 total_int += value;
                 total_float += value as f64;
@@ -2334,7 +2361,7 @@ fn eval_function(
         }
         "lower" => unary_text_fn(values, |value| value.to_ascii_lowercase()),
         "upper" => unary_text_fn(values, |value| value.to_ascii_uppercase()),
-        "trim" => unary_text_fn(values, |value| value.trim().to_string()),
+        "trim" | "pg_catalog.btrim" => unary_text_fn(values, |value| value.trim().to_string()),
         "length" => {
             if values.len() != 1 {
                 return Err(DbError::sql("LENGTH expects one argument"));
@@ -2343,6 +2370,86 @@ fn eval_function(
                 Value::Text(value) => Ok(Value::Int64(value.chars().count() as i64)),
                 Value::Null => Ok(Value::Null),
                 other => Err(DbError::sql(format!("LENGTH expects text, got {other:?}"))),
+            }
+        }
+        "substr" => {
+            if values.len() < 2 || values.len() > 3 {
+                return Err(DbError::sql("SUBSTR expects 2 or 3 arguments"));
+            }
+            if matches!(values[0], Value::Null) || matches!(values[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            if values.len() == 3 && matches!(values[2], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match &values[0] {
+                Value::Text(s) => s,
+                _ => return Err(DbError::sql("SUBSTR expects text for first argument")),
+            };
+            let start = match &values[1] {
+                Value::Int64(i) => *i,
+                _ => return Err(DbError::sql("SUBSTR expects int for second argument")),
+            };
+            let length = if values.len() == 3 {
+                match &values[2] {
+                    Value::Int64(i) => Some(*i),
+                    _ => return Err(DbError::sql("SUBSTR expects int for third argument")),
+                }
+            } else {
+                None
+            };
+            
+            let char_idx = if start > 0 { start - 1 } else { 0 } as usize;
+            let chars = s.chars().skip(char_idx);
+            if let Some(l) = length {
+                let len = if l > 0 { l as usize } else { 0 };
+                Ok(Value::Text(chars.take(len).collect()))
+            } else {
+                Ok(Value::Text(chars.collect()))
+            }
+        }
+        "replace" => {
+            if values.len() != 3 {
+                return Err(DbError::sql("REPLACE expects 3 arguments"));
+            }
+            if matches!(values[0], Value::Null) || matches!(values[1], Value::Null) || matches!(values[2], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match &values[0] {
+                Value::Text(s) => s,
+                _ => return Err(DbError::sql("REPLACE expects text for first argument")),
+            };
+            let target = match &values[1] {
+                Value::Text(s) => s,
+                _ => return Err(DbError::sql("REPLACE expects text for second argument")),
+            };
+            let replacement = match &values[2] {
+                Value::Text(s) => s,
+                _ => return Err(DbError::sql("REPLACE expects text for third argument")),
+            };
+            Ok(Value::Text(s.replace(target, replacement)))
+        }
+        "instr" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("INSTR expects 2 arguments"));
+            }
+            if matches!(values[0], Value::Null) || matches!(values[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let s = match &values[0] {
+                Value::Text(s) => s,
+                _ => return Err(DbError::sql("INSTR expects text for first argument")),
+            };
+            let target = match &values[1] {
+                Value::Text(s) => s,
+                _ => return Err(DbError::sql("INSTR expects text for second argument")),
+            };
+            match s.find(target) {
+                Some(idx) => {
+                    let char_idx = s[..idx].chars().count();
+                    Ok(Value::Int64((char_idx + 1) as i64))
+                },
+                None => Ok(Value::Int64(0)),
             }
         }
         other => Err(DbError::sql(format!("unsupported scalar function {other}"))),

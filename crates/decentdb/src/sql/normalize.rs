@@ -1083,6 +1083,10 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                     .collect::<Result<Vec<_>>>()?,
                 _ => return Err(unsupported("IN only supports explicit value lists")),
             };
+            let negated = match expr.name.first().and_then(|node| node_kind(node).ok()) {
+                Some(NodeEnum::String(s)) => s.sval == "<>",
+                _ => false,
+            };
             Ok(Expr::InList {
                 expr: Box::new(normalize_expr_node(
                     expr.lexpr
@@ -1090,7 +1094,7 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                         .ok_or_else(|| unsupported("IN is missing its left operand"))?,
                 )?),
                 items,
-                negated: false,
+                negated,
             })
         }
         protobuf::AExprKind::AexprLike | protobuf::AExprKind::AexprIlike => Ok(Expr::Like {
@@ -1194,7 +1198,7 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
         return Ok(Expr::Aggregate {
             name,
             args,
-            star: call.agg_star,
+            star: call.agg_star, distinct: call.agg_distinct,
         });
     }
 
