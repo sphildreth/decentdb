@@ -17,6 +17,14 @@ use crate::repl::run_repl;
 
 #[derive(Parser)]
 #[command(name = "decentdb")]
+#[command(version = decentdb::version())]
+#[command(before_help = concat!(
+    "DecentDB CLI v", env!("CARGO_PKG_VERSION"), "\n",
+    "  ___                 _   ___  ___  \n",
+    " |   \\ ___ __ ___ _ _| |_|   \\| _ ) \n",
+    " | |) / -_) _/ -_) ' \\  _| |) | _ \\ \n",
+    " |___/\\___\\__\\___|_||_\\__|___/|___/ \n"
+))]
 #[command(about = "DecentDB Command Line Interface")]
 pub struct Cli {
     #[command(subcommand)]
@@ -25,27 +33,49 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Print engine version
     Version,
+    /// Execute SQL statements or manage database
     Exec(ExecCommand),
+    /// Interactive REPL mode
     Repl(ReplCommand),
+    /// Import data from CSV or JSON
     Import(ImportCommand),
+    /// Export table data to CSV or JSON
     Export(ExportCommand),
+    /// Bulk load data from CSV
     BulkLoad(BulkLoadCommand),
+    /// Force a WAL checkpoint
     Checkpoint(DbCommand),
+    /// Export the database to a new on-disk file (snapshot backup)
     SaveAs(SaveAsCommand),
+    /// Display database information
     Info(InfoCommand),
+    /// Describe table structure
     Describe(DescribeCommand),
+    /// List all tables in the database
     ListTables(ListTablesCommand),
+    /// List all indexes
     ListIndexes(ListIndexesCommand),
+    /// List all views in the database
     ListViews(ListViewsCommand),
+    /// Dump database as SQL
     Dump(DumpCommand),
+    /// Dump raw database header fields
     DumpHeader(DumpHeaderCommand),
+    /// Rebuild an index
     RebuildIndex(RebuildIndexCommand),
+    /// Rebuild all indexes
     RebuildIndexes(RebuildIndexesCommand),
+    /// Emit shell completion script
     Completion(CompletionCommand),
+    /// Show basic engine statistics
     Stats(StatsCommand),
+    /// Rewrite database into a new file to reclaim space
     Vacuum(VacuumCommand),
+    /// Verify database header checksum
     VerifyHeader(VerifyHeaderCommand),
+    /// Verify index integrity
     VerifyIndex(VerifyIndexCommand),
 }
 

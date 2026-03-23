@@ -11,3 +11,6 @@
 | Dart | Release smoke | `tests/bindings/dart/` |
 
 All non-C bindings in the Rust rewrite currently validate the C ABI directly. Higher-level packaged language APIs remain post-Phase-4 work.
+
+Packaged language integrations will live under `bindings/` as they are ported.
+`tests/bindings/` remains the validation and smoke-test layer.
