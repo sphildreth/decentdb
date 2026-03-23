@@ -228,15 +228,17 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
 }
 
 // -----------------------------------------------------------------------------
-// DecentDB Implementation (Stub)
+// DecentDB Implementation
 // -----------------------------------------------------------------------------
 struct DecentDbBenchmarker {
+    db: Option<decentdb::Db>,
     db_path: PathBuf,
 }
 
 impl DecentDbBenchmarker {
     fn new() -> Self {
         Self {
+            db: None,
             db_path: PathBuf::new(),
         }
     }
@@ -249,19 +251,97 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("decent.db");
+
+        let mut config = decentdb::DbConfig::default();
+        config.wal_sync_mode = decentdb::WalSyncMode::Normal;
+
+        let db = decentdb::Db::create(&self.db_path, config).unwrap();
+
+        db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64, amount FLOAT64);")
+            .unwrap();
+
+        self.db = Some(db);
     }
 
     fn insert_batch(&mut self) -> f64 {
-        100000.0
+        let db = self.db.as_ref().unwrap();
+        let start = Instant::now();
+
+        db.execute("BEGIN;").unwrap();
+        for i in 0..INSERT_COUNT {
+            db.execute_with_params(
+                "INSERT INTO users (id, name) VALUES ($1, $2);",
+                &[
+                    decentdb::Value::Int64(i as i64),
+                    decentdb::Value::Text(format!("User {}", i)),
+                ],
+            )
+            .unwrap();
+        }
+        db.execute("COMMIT;").unwrap();
+
+        let duration = start.elapsed();
+        (INSERT_COUNT as f64) / duration.as_secs_f64()
     }
+
     fn random_reads(&mut self) -> Vec<u64> {
-        vec![50; READ_COUNT]
+        let db = self.db.as_ref().unwrap();
+        let mut latencies = Vec::with_capacity(READ_COUNT);
+
+        for i in 0..READ_COUNT {
+            let id = i % INSERT_COUNT;
+            let start = Instant::now();
+            let result = db
+                .execute_with_params(
+                    "SELECT name FROM users WHERE id = $1;",
+                    &[decentdb::Value::Int64(id as i64)],
+                )
+                .unwrap();
+
+            // Just access the row to ensure we evaluated it
+            assert!(!result.rows().is_empty());
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
+
+        latencies
     }
+
     fn durable_commits(&mut self) -> Vec<u64> {
-        vec![2000; COMMIT_COUNT]
+        // Drop the current connection to reopen with WalSyncMode::Full
+        self.db = None;
+
+        let mut config = decentdb::DbConfig::default();
+        config.wal_sync_mode = decentdb::WalSyncMode::Full;
+        let db = decentdb::Db::open(&self.db_path, config).unwrap();
+
+        let mut latencies = Vec::with_capacity(COMMIT_COUNT);
+
+        for i in 0..COMMIT_COUNT {
+            let start = Instant::now();
+            db.execute_with_params(
+                "INSERT INTO orders (id, user_id, amount) VALUES ($1, $2, $3);",
+                &[
+                    decentdb::Value::Int64(i as i64),
+                    decentdb::Value::Int64((i % 100) as i64),
+                    decentdb::Value::Float64(9.99),
+                ],
+            )
+            .unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
+
+        self.db = Some(db);
+        latencies
     }
+
     fn teardown(&mut self) -> u64 {
-        10 * 1024 * 1024
+        self.db = None;
+        let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
+        let wal_path = self.db_path.with_extension("db-wal");
+        let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        db_size + wal_size
     }
 }
 
@@ -317,12 +397,31 @@ fn main() {
         engines: HashMap::new(),
         metadata: HashMap::new(),
     };
+
+    // Add unique run ID (unix timestamp in milliseconds)
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    summary
+        .metadata
+        .insert("run_id".to_string(), run_id.to_string());
+
+    // Add OS info
     summary
         .metadata
         .insert("os".to_string(), std::env::consts::OS.to_string());
-    summary
-        .metadata
-        .insert("cpu".to_string(), std::env::consts::ARCH.to_string());
+
+    // Attempt to extract the actual CPU model name from /proc/cpuinfo (Linux)
+    let mut cpu_model = std::env::consts::ARCH.to_string(); // Fallback
+    if let Ok(cpu_info) = std::fs::read_to_string("/proc/cpuinfo") {
+        if let Some(line) = cpu_info.lines().find(|l| l.starts_with("model name")) {
+            if let Some(model) = line.split(':').nth(1) {
+                cpu_model = model.trim().to_string();
+            }
+        }
+    }
+    summary.metadata.insert("machine".to_string(), cpu_model);
 
     // SQLite
     let mut sqlite = SqliteBenchmarker::new();

@@ -1,6 +1,6 @@
 {
   "name": "knex-decentdb",
-  "version": "1.8.1",
+  "version": "2.0.0",
   "private": true,
   "description": "Knex client/dialect for DecentDB",
   "main": "index.js",

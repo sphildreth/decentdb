@@ -636,7 +636,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "decentdb"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "chrono",
  "duckdb",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "decentdb-cli"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1464,7 +1464,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libpg_query_sys"
-version = "0.1.0"
+version = "2.0.0"
 dependencies = [
  "pg_query",
 ]

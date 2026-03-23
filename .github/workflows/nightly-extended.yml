@@ -57,6 +57,9 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
 
+      - name: Short Crash Harness
+        run: python tests/harness/runner.py tests/harness/scenarios/short_crash.json
+
       - name: Build cdylib
         run: cargo build -p decentdb
 

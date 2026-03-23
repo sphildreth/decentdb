@@ -1,11 +1,6 @@
 name: Rust Storage Foundation
 
 on:
-  pull_request:
-  push:
-    branches: ["main"]
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
 
 jobs:
@@ -17,16 +12,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Clippy
-        run: cargo clippy -p decentdb --all-targets -- -D warnings
 
       - name: Storage Tests
         run: cargo test -p decentdb
@@ -35,7 +25,7 @@ jobs:
         run: python tests/harness/runner.py tests/harness/scenarios/short_crash.json
 
   storage-soak:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [storage-fast]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

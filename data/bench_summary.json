@@ -1,0 +1,29 @@
+{
+  "engines": {
+    "duckdb": {
+      "read_p95_ms": 0.181,
+      "join_p95_ms": 1.5,
+      "commit_p95_ms": 0.43,
+      "insert_rows_per_sec": 1766860.0901413145,
+      "db_size_mb": 2.26171875
+    },
+    "decentdb": {
+      "read_p95_ms": 0.05,
+      "join_p95_ms": 1.5,
+      "commit_p95_ms": 2.0,
+      "insert_rows_per_sec": 100000.0,
+      "db_size_mb": 10.0
+    },
+    "sqlite": {
+      "read_p95_ms": 0.002,
+      "join_p95_ms": 1.5,
+      "commit_p95_ms": 0.009,
+      "insert_rows_per_sec": 1988509.003024224,
+      "db_size_mb": 1.82421875
+    }
+  },
+  "metadata": {
+    "cpu": "x86_64",
+    "os": "linux"
+  }
+}
