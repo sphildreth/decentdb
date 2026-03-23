@@ -1,6 +1,6 @@
 //! DML execution helpers.
 
-use crate::catalog::{IndexKind, TriggerEvent};
+use crate::catalog::{ColumnType, IndexKind, TriggerEvent};
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
 use crate::record::row::Row;
@@ -29,8 +29,17 @@ pub(crate) struct PreparedBtreeIndex {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PreparedInsertColumn {
+    pub(crate) name: String,
+    pub(crate) column_type: ColumnType,
+    pub(crate) auto_increment: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleInsert {
     pub(crate) table_name: String,
+    pub(crate) columns: Vec<PreparedInsertColumn>,
+    pub(crate) primary_auto_row_id_column_index: Option<usize>,
     pub(crate) value_sources: Vec<PreparedInsertValueSource>,
     pub(crate) required_column_indexes: Vec<usize>,
     pub(crate) unique_indexes: Vec<PreparedBtreeIndex>,
@@ -52,6 +61,23 @@ impl EngineRuntime {
                 && trigger.target_name == statement.table_name
                 && trigger.event == TriggerEvent::Insert
         })
+    }
+
+    pub(crate) fn can_reuse_prepared_simple_insert(
+        &self,
+        prepared: &PreparedSimpleInsert,
+    ) -> bool {
+        self.catalog.tables.contains_key(&prepared.table_name)
+            && (prepared.use_generic_validation
+                || prepared
+                    .unique_indexes
+                    .iter()
+                    .all(|index| self.prepared_btree_index_is_fresh(index)))
+            && (prepared.use_generic_index_updates
+                || prepared
+                    .insert_indexes
+                    .iter()
+                    .all(|index| self.prepared_btree_index_is_fresh(index)))
     }
 
     pub(crate) fn prepare_simple_insert(
@@ -124,6 +150,22 @@ impl EngineRuntime {
                 value_sources.push(PreparedInsertValueSource::Null);
             }
         }
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| PreparedInsertColumn {
+                name: column.name.clone(),
+                column_type: column.column_type,
+                auto_increment: column.auto_increment,
+            })
+            .collect::<Vec<_>>();
+        let primary_auto_row_id_column_index = if table.primary_key_columns.len() == 1 {
+            table.columns.iter().position(|column| {
+                column.name == table.primary_key_columns[0] && column.auto_increment
+            })
+        } else {
+            None
+        };
 
         let required_column_indexes = table
             .columns
@@ -169,6 +211,8 @@ impl EngineRuntime {
 
         Ok(Some(PreparedSimpleInsert {
             table_name: statement.table_name.clone(),
+            columns,
+            primary_auto_row_id_column_index,
             value_sources,
             required_column_indexes,
             unique_indexes,
@@ -178,30 +222,37 @@ impl EngineRuntime {
         }))
     }
 
+    fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
+        matches!(
+            self.catalog.indexes.get(&prepared.name),
+            Some(index) if index.kind == IndexKind::Btree && index.fresh
+        ) && matches!(
+            self.indexes.get(&prepared.name),
+            Some(super::RuntimeIndex::Btree { .. })
+        )
+    }
+
     pub(crate) fn execute_prepared_simple_insert(
         &mut self,
         prepared: &PreparedSimpleInsert,
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        let table_name = prepared.table_name.clone();
-        let mut staged_table = self
+        let table_name = prepared.table_name.as_str();
+        let mut next_row_id = self
             .catalog
             .tables
-            .get(&table_name)
-            .cloned()
-            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
-        let mut candidate = Vec::with_capacity(staged_table.columns.len());
+            .get(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+            .next_row_id;
+        let mut candidate = Vec::with_capacity(prepared.columns.len());
 
         for (index, source) in prepared.value_sources.iter().enumerate() {
-            let (column_type, auto_increment, column_name) = {
-                let column = staged_table.columns.get(index).ok_or_else(|| {
-                    DbError::internal(format!(
-                        "prepared insert column index {index} is out of range for {table_name}"
-                    ))
-                })?;
-                (column.column_type, column.auto_increment, column.name.clone())
-            };
+            let column = prepared.columns.get(index).ok_or_else(|| {
+                DbError::internal(format!(
+                    "prepared insert column index {index} is out of range for {table_name}"
+                ))
+            })?;
             let mut value = match source {
                 PreparedInsertValueSource::Literal(value) => value.clone(),
                 PreparedInsertValueSource::Parameter(number) => params
@@ -221,61 +272,67 @@ impl EngineRuntime {
                 PreparedInsertValueSource::Null => Value::Null,
             };
 
-            if auto_increment {
+            if column.auto_increment {
                 match value {
                     Value::Null => {
-                        value = Value::Int64(staged_table.next_row_id);
-                        staged_table.next_row_id += 1;
+                        value = Value::Int64(next_row_id);
+                        next_row_id += 1;
                     }
                     Value::Int64(explicit) => {
-                        if explicit >= staged_table.next_row_id {
-                            staged_table.next_row_id = explicit + 1;
+                        if explicit >= next_row_id {
+                            next_row_id = explicit + 1;
                         }
                     }
                     _ => {
                         return Err(DbError::constraint(format!(
                             "auto-increment column {}.{} requires INT64 values",
-                            staged_table.name, column_name
+                            table_name, column.name
                         )));
                     }
                 }
             }
 
-            candidate.push(super::cast_value(value, column_type)?);
+            candidate.push(super::cast_value(value, column.column_type)?);
         }
 
         if prepared.use_generic_validation {
-            self.validate_row(&table_name, &candidate, None, params)?;
+            self.validate_row(table_name, &candidate, None, params)?;
         } else {
             validate_prepared_insert(self, prepared, &candidate)?;
         }
-        let row_id = primary_row_id(&staged_table, &candidate).unwrap_or_else(|| {
-            let row_id = staged_table.next_row_id;
-            staged_table.next_row_id += 1;
-            row_id
-        });
+        let row_id = prepared
+            .primary_auto_row_id_column_index
+            .and_then(|column_index| match candidate.get(column_index) {
+                Some(Value::Int64(value)) => Some(*value),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let row_id = next_row_id;
+                next_row_id += 1;
+                row_id
+            });
         let stored_row = StoredRow {
             row_id,
             values: candidate,
         };
         let index_updates = if prepared.use_generic_index_updates {
-            self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?
+            self.prepare_insert_index_updates(table_name, &stored_row, page_size)?
         } else {
             prepared_insert_index_updates(prepared, &stored_row)?
         };
 
         self.catalog
             .tables
-            .get_mut(&table_name)
-            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
-            .next_row_id = staged_table.next_row_id;
+            .get_mut(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+            .next_row_id = next_row_id;
         self.tables
-            .get_mut(&table_name)
+            .get_mut(table_name)
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .push(stored_row);
         self.apply_insert_index_updates(index_updates)?;
-        self.mark_table_dirty(&table_name);
+        self.mark_table_dirty(table_name);
         Ok(QueryResult::with_affected_rows(1))
     }
 

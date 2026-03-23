@@ -650,6 +650,84 @@ fn prepared_param_insert_recompiles_after_schema_change() {
 }
 
 #[test]
+fn prepared_statements_reuse_parameterized_inserts_and_reads() {
+    let path = unique_db_path("phase1-prepared-statement");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+
+    let insert = db
+        .prepare("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .expect("prepare insert");
+    db.execute("BEGIN").expect("begin");
+    for id in 1..=4 {
+        insert
+            .execute(&[
+                Value::Int64(id),
+                Value::Text(format!("user{id}@example.com")),
+            ])
+            .expect("prepared insert");
+    }
+    let duplicate = insert
+        .execute(&[
+            Value::Int64(3),
+            Value::Text("duplicate@example.com".to_string()),
+        ])
+        .expect_err("duplicate primary key should fail");
+    assert!(matches!(duplicate, decentdb::DbError::Constraint { .. }));
+    db.execute("COMMIT").expect("commit");
+
+    let select = db
+        .prepare("SELECT email FROM users WHERE id = $1")
+        .expect("prepare select");
+    let row = select
+        .execute(&[Value::Int64(3)])
+        .expect("prepared select by id");
+    assert_eq!(
+        row.rows()[0].values(),
+        &[Value::Text("user3@example.com".to_string())]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn prepared_statements_fail_after_schema_change() {
+    let path = unique_db_path("phase1-prepared-statement-schema-change");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+
+    let insert = db
+        .prepare("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .expect("prepare insert");
+    insert
+        .execute(&[
+            Value::Int64(1),
+            Value::Text("before@example.com".to_string()),
+        ])
+        .expect("insert before schema change");
+
+    db.execute("ALTER TABLE users ADD COLUMN active BOOL DEFAULT TRUE")
+        .expect("alter table");
+
+    let error = insert
+        .execute(&[
+            Value::Int64(2),
+            Value::Text("after@example.com".to_string()),
+        ])
+        .expect_err("prepared statement should be invalidated");
+    assert!(matches!(
+        error,
+        decentdb::DbError::Sql { message } if message.contains("schema changed")
+    ));
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn unsupported_insert_expression_falls_back_from_prepared_fast_path() {
     let path = unique_db_path("phase1-prepared-insert-fallback");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

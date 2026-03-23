@@ -38,6 +38,27 @@ pub struct Db {
     inner: Arc<DbInner>,
 }
 
+/// Reusable single-statement execution handle bound to the current schema.
+///
+/// Prepared statements become invalid after schema changes and must be
+/// re-prepared. Data changes remain visible across executions.
+#[derive(Clone, Debug)]
+pub struct PreparedStatement {
+    db: Db,
+    schema_cookie: u32,
+    statement: Arc<SqlStatement>,
+    prepared_insert: Option<Arc<PreparedSimpleInsert>>,
+    read_only: bool,
+}
+
+impl PreparedStatement {
+    /// Executes the prepared statement with the provided positional `$n`
+    /// parameters.
+    pub fn execute(&self, params: &[Value]) -> Result<QueryResult> {
+        self.db.execute_prepared_statement(self, params)
+    }
+}
+
 #[derive(Debug)]
 struct DbInner {
     path: PathBuf,
@@ -666,6 +687,30 @@ impl Db {
         Ok(results)
     }
 
+    /// Prepares a single SQL statement for repeated execution.
+    ///
+    /// Prepared statements are bound to the current schema cookie. If the schema
+    /// changes, the handle must be recreated before it can be executed again.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let prepared_sql = prepared_statement_sql(sql)?;
+        let runtime = self.runtime_for_prepare()?;
+        let statement = self.parsed_statement(&prepared_sql)?;
+        let read_only = statement_is_read_only(statement.as_ref());
+        let prepared_insert = match statement.as_ref() {
+            SqlStatement::Insert(insert) => {
+                self.prepared_simple_insert(&prepared_sql, insert, &runtime)?
+            }
+            _ => None,
+        };
+        Ok(PreparedStatement {
+            db: self.clone(),
+            schema_cookie: runtime.catalog.schema_cookie,
+            statement,
+            prepared_insert,
+            read_only,
+        })
+    }
+
     /// Loads rows into a table as a single writer-held bulk operation.
     pub fn bulk_load_rows(
         &self,
@@ -1022,6 +1067,119 @@ impl Db {
         runtime.execute_read_statement(statement, params, self.inner.config.page_size)
     }
 
+    fn execute_prepared_statement(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        if prepared.read_only {
+            self.execute_prepared_read_statement(prepared, params)
+        } else {
+            self.execute_prepared_write_statement(prepared, params)
+        }
+    }
+
+    fn execute_prepared_read_statement(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        if let Some(runtime) = self.transaction_runtime_snapshot()? {
+            self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
+            return runtime.execute_read_statement(
+                prepared.statement.as_ref(),
+                params,
+                self.inner.config.page_size,
+            );
+        }
+
+        self.refresh_engine_from_storage()?;
+        let runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
+        runtime.execute_read_statement(prepared.statement.as_ref(), params, self.inner.config.page_size)
+    }
+
+    fn execute_prepared_write_statement(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let page_size = self.inner.config.page_size;
+
+        let mut txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        if let Some(state) = txn.as_mut() {
+            self.validate_prepared_schema_cookie(prepared, state.runtime.catalog.schema_cookie)?;
+            if let Some(prepared_insert) = prepared
+                .prepared_insert
+                .as_deref()
+                .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+            {
+                return state
+                    .runtime
+                    .execute_prepared_simple_insert(prepared_insert, params, page_size);
+            }
+            if matches!(
+                prepared.statement.as_ref(),
+                crate::sql::ast::Statement::Insert(insert)
+                    if state.runtime.can_execute_insert_in_place(insert)
+            ) {
+                return state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size);
+            }
+            let mut working = state.runtime.clone();
+            working.rebuild_stale_indexes(page_size)?;
+            let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.runtime = working;
+            return Ok(result);
+        }
+        drop(txn);
+
+        let _writer = self
+            .inner
+            .sql_write_lock
+            .lock()
+            .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.refresh_engine_from_storage()?;
+        let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
+            if let Some(prepared_insert) = prepared
+                .prepared_insert
+                .as_deref()
+                .filter(|plan| runtime.can_reuse_prepared_simple_insert(plan))
+            {
+                drop(runtime);
+                return self.execute_autocommit_prepared_insert_in_place(prepared_insert, params);
+            }
+            if matches!(
+                prepared.statement.as_ref(),
+                crate::sql::ast::Statement::Insert(insert)
+                    if runtime.can_execute_insert_in_place(insert)
+            ) {
+                drop(runtime);
+                return self.execute_autocommit_insert_in_place(prepared.statement.as_ref(), params);
+            }
+        }
+        let mut working = self.engine_snapshot()?;
+        let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
+        self.persist_runtime(working)?;
+        Ok(result)
+    }
+
     fn execute_write_statement(
         &self,
         sql: &str,
@@ -1241,6 +1399,14 @@ impl Db {
         self.engine_snapshot()
     }
 
+    fn runtime_for_prepare(&self) -> Result<EngineRuntime> {
+        if let Some(runtime) = self.transaction_runtime_snapshot()? {
+            return Ok(runtime);
+        }
+        self.refresh_engine_from_storage()?;
+        self.engine_snapshot()
+    }
+
     fn transaction_runtime_snapshot(&self) -> Result<Option<EngineRuntime>> {
         let txn = self
             .inner
@@ -1295,6 +1461,19 @@ impl Db {
         let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
         bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
         Ok(DatabaseHeader::decode(&bytes)?.schema_cookie)
+    }
+
+    fn validate_prepared_schema_cookie(
+        &self,
+        prepared: &PreparedStatement,
+        schema_cookie: u32,
+    ) -> Result<()> {
+        if schema_cookie == prepared.schema_cookie {
+            return Ok(());
+        }
+        Err(DbError::sql(
+            "prepared statement is no longer valid because the schema changed",
+        ))
     }
 }
 
@@ -1463,6 +1642,29 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
         statements.push(current);
     }
     statements
+}
+
+fn prepared_statement_sql(sql: &str) -> Result<String> {
+    let statements = split_sql_batch(sql)
+        .into_iter()
+        .map(|statement| statement.trim().to_string())
+        .filter(|statement| !statement.is_empty())
+        .collect::<Vec<_>>();
+    if statements.len() != 1 {
+        return Err(DbError::sql(format!(
+            "expected exactly one SQL statement, got {}",
+            statements.len()
+        )));
+    }
+    let statement = statements.into_iter().next().ok_or_else(|| {
+        DbError::sql("expected exactly one SQL statement, got 0")
+    })?;
+    if parse_transaction_control(&statement).is_some() {
+        return Err(DbError::sql(
+            "prepared statements do not support transaction control",
+        ));
+    }
+    Ok(statement)
 }
 
 fn table_info(table: &TableSchema, row_count: usize) -> TableInfo {
@@ -1855,7 +2057,7 @@ fn json_escape(input: String) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
+    use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
 
     use super::{PreparedInsertCache, StatementCache};
 
@@ -1906,6 +2108,12 @@ mod tests {
     fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {
         PreparedSimpleInsert {
             table_name: table_name.to_string(),
+            columns: vec![PreparedInsertColumn {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                auto_increment: false,
+            }],
+            primary_auto_row_id_column_index: None,
             value_sources: vec![PreparedInsertValueSource::Null],
             required_column_indexes: Vec::new(),
             unique_indexes: Vec::new(),

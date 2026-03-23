@@ -9,10 +9,36 @@ use serde::Serialize;
 use tempfile::TempDir;
 
 const INSERT_COUNT: usize = 100_000;
-const READ_COUNT: usize = 10_000;
+const READ_COUNT: usize = 100_000;
 const COMMIT_COUNT: usize = 1000;
 const JOIN_COUNT: usize = 1_000;
 const JOIN_DATASET_COUNT: usize = 100;
+const POINT_READ_STRIDE: usize = 8_191;
+const JOIN_READ_STRIDE: usize = 37;
+
+fn benchmark_storage_root() -> PathBuf {
+    Path::new("../../target/embedded_compare").to_path_buf()
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn point_read_id(iteration: usize) -> usize {
+    (iteration * POINT_READ_STRIDE) % INSERT_COUNT
+}
+
+fn join_read_id(iteration: usize) -> usize {
+    (iteration * JOIN_READ_STRIDE) % JOIN_DATASET_COUNT
+}
+
+fn p95_index(len: usize) -> usize {
+    ((len as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(len.saturating_sub(1))
+}
 
 #[derive(Serialize)]
 struct BenchSummary {
@@ -86,7 +112,7 @@ impl SqliteBenchmarker {
 
 impl DatabaseBenchmarker for SqliteBenchmarker {
     fn name(&self) -> &'static str {
-        "sqlite"
+        "SQLite"
     }
 
     fn setup(&mut self, path: &Path) {
@@ -95,7 +121,8 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
+             PRAGMA synchronous=FULL;
+             PRAGMA wal_autocheckpoint=0;
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
               CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);
              CREATE TABLE join_users (id INTEGER PRIMARY KEY, name TEXT);
@@ -131,8 +158,10 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         let mut latencies = Vec::with_capacity(READ_COUNT);
 
         let mut stmt = conn.prepare("SELECT name FROM users WHERE id = ?").unwrap();
+        let warmup_id = point_read_id(READ_COUNT / 2);
+        let _warmup: String = stmt.query_row([warmup_id], |row| row.get(0)).unwrap();
         for i in 0..READ_COUNT {
-            let id = i % INSERT_COUNT;
+            let id = point_read_id(i);
             let start = Instant::now();
             let _name: String = stmt.query_row([id], |row| row.get(0)).unwrap();
             latencies.push(start.elapsed().as_micros() as u64);
@@ -150,6 +179,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         let mut stmt = conn
             .prepare("INSERT INTO orders (id, user_id, amount) VALUES (?, ?, ?)")
             .unwrap();
+        stmt.execute(rusqlite::params![-1, 0, 9.99]).unwrap();
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
             stmt.execute(rusqlite::params![i, i % 100, 9.99]).unwrap();
@@ -172,8 +202,12 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
                  WHERE u.id = ?",
             )
             .unwrap();
+        let warmup_id = join_read_id(JOIN_COUNT / 2);
+        let _warmup: (String, String) = stmt
+            .query_row([warmup_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
         for i in 0..JOIN_COUNT {
-            let id = i % JOIN_DATASET_COUNT;
+            let id = join_read_id(i);
             let start = Instant::now();
             let _row: (String, String) = stmt
                 .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -185,9 +219,12 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
     }
 
     fn teardown(&mut self) -> u64 {
+        if let Some(conn) = self.conn.as_mut() {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
         self.conn = None;
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
-        let wal_path = self.db_path.with_extension("db-wal");
+        let wal_path = append_path_suffix(&self.db_path, "-wal");
         let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         db_size + wal_size
     }
@@ -234,7 +271,7 @@ impl DuckDbBenchmarker {
 
 impl DatabaseBenchmarker for DuckDbBenchmarker {
     fn name(&self) -> &'static str {
-        "duckdb"
+        "DuckDB"
     }
 
     fn setup(&mut self, path: &Path) {
@@ -256,14 +293,17 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         let conn = self.conn.as_mut().unwrap();
         let start = Instant::now();
 
+        conn.execute_batch("BEGIN TRANSACTION;").unwrap();
         {
-            let mut appender = conn.appender("users").unwrap();
+            let mut stmt = conn
+                .prepare("INSERT INTO users (id, name) VALUES (?, ?)")
+                .unwrap();
             for i in 0..INSERT_COUNT {
-                appender
-                    .append_row(duckdb::params![i, format!("User {}", i)])
+                stmt.execute(duckdb::params![i, format!("User {}", i)])
                     .unwrap();
             }
         }
+        conn.execute_batch("COMMIT;").unwrap();
 
         let duration = start.elapsed();
         (INSERT_COUNT as f64) / duration.as_secs_f64()
@@ -274,8 +314,10 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         let mut latencies = Vec::with_capacity(READ_COUNT);
 
         let mut stmt = conn.prepare("SELECT name FROM users WHERE id = ?").unwrap();
+        let warmup_id = point_read_id(READ_COUNT / 2);
+        let _warmup: String = stmt.query_row([warmup_id], |row| row.get(0)).unwrap();
         for i in 0..READ_COUNT {
-            let id = i % INSERT_COUNT;
+            let id = point_read_id(i);
             let start = Instant::now();
             let _name: String = stmt.query_row([id], |row| row.get(0)).unwrap();
             latencies.push(start.elapsed().as_micros() as u64);
@@ -291,6 +333,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         let mut stmt = conn
             .prepare("INSERT INTO orders (id, user_id, amount) VALUES (?, ?, ?)")
             .unwrap();
+        stmt.execute(duckdb::params![-1, 0, 9.99]).unwrap();
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
             stmt.execute(duckdb::params![i, i % 100, 9.99]).unwrap();
@@ -313,8 +356,12 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
                  WHERE u.id = ?",
             )
             .unwrap();
+        let warmup_id = join_read_id(JOIN_COUNT / 2);
+        let _warmup: (String, String) = stmt
+            .query_row([warmup_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
         for i in 0..JOIN_COUNT {
-            let id = i % JOIN_DATASET_COUNT;
+            let id = join_read_id(i);
             let start = Instant::now();
             let _row: (String, String) = stmt
                 .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -326,9 +373,12 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
     }
 
     fn teardown(&mut self) -> u64 {
+        if let Some(conn) = self.conn.as_mut() {
+            conn.execute_batch("CHECKPOINT;").unwrap();
+        }
         self.conn = None;
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
-        let wal_path = self.db_path.with_extension("db.wal");
+        let wal_path = append_path_suffix(&self.db_path, ".wal");
         let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         db_size + wal_size
     }
@@ -357,18 +407,22 @@ impl DecentDbBenchmarker {
             return;
         }
         let db = self.db.as_ref().unwrap();
+        let users = db
+            .prepare("INSERT INTO join_users (id, name) VALUES ($1, $2);")
+            .unwrap();
+        let profiles = db
+            .prepare("INSERT INTO join_profiles (id, bio) VALUES ($1, $2);")
+            .unwrap();
         db.execute("BEGIN;").unwrap();
         for i in 0..JOIN_DATASET_COUNT {
-            db.execute_with_params(
-                "INSERT INTO join_users (id, name) VALUES ($1, $2);",
+            users.execute(
                 &[
                     decentdb::Value::Int64(i as i64),
                     decentdb::Value::Text(format!("Join User {}", i)),
                 ],
             )
             .unwrap();
-            db.execute_with_params(
-                "INSERT INTO join_profiles (id, bio) VALUES ($1, $2);",
+            profiles.execute(
                 &[
                     decentdb::Value::Int64(i as i64),
                     decentdb::Value::Text(format!("Bio {}", i)),
@@ -383,16 +437,14 @@ impl DecentDbBenchmarker {
 
 impl DatabaseBenchmarker for DecentDbBenchmarker {
     fn name(&self) -> &'static str {
-        "decentdb"
+        "DecentDB"
     }
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("decent.db");
 
-        let config = decentdb::DbConfig {
-            wal_sync_mode: decentdb::WalSyncMode::Normal,
-            ..decentdb::DbConfig::default()
-        };
+        let mut config = decentdb::DbConfig::default();
+        config.temp_dir = path.to_path_buf();
 
         let db = decentdb::Db::create(&self.db_path, config).unwrap();
 
@@ -410,12 +462,14 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
     fn insert_batch(&mut self) -> f64 {
         let db = self.db.as_ref().unwrap();
+        let insert = db
+            .prepare("INSERT INTO users (id, name) VALUES ($1, $2);")
+            .unwrap();
         let start = Instant::now();
 
         db.execute("BEGIN;").unwrap();
         for i in 0..INSERT_COUNT {
-            db.execute_with_params(
-                "INSERT INTO users (id, name) VALUES ($1, $2);",
+            insert.execute(
                 &[
                     decentdb::Value::Int64(i as i64),
                     decentdb::Value::Text(format!("User {}", i)),
@@ -431,16 +485,18 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
     fn random_reads(&mut self) -> Vec<u64> {
         let db = self.db.as_ref().unwrap();
+        let select = db.prepare("SELECT name FROM users WHERE id = $1;").unwrap();
         let mut latencies = Vec::with_capacity(READ_COUNT);
 
+        let warmup_id = point_read_id(READ_COUNT / 2);
+        let _warmup = select
+            .execute(&[decentdb::Value::Int64(warmup_id as i64)])
+            .unwrap();
         for i in 0..READ_COUNT {
-            let id = i % INSERT_COUNT;
+            let id = point_read_id(i);
             let start = Instant::now();
-            let result = db
-                .execute_with_params(
-                    "SELECT name FROM users WHERE id = $1;",
-                    &[decentdb::Value::Int64(id as i64)],
-                )
+            let result = select
+                .execute(&[decentdb::Value::Int64(id as i64)])
                 .unwrap();
 
             // Just access the row to ensure we evaluated it
@@ -452,21 +508,24 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
     }
 
     fn durable_commits(&mut self) -> Vec<u64> {
-        // Drop the current connection to reopen with WalSyncMode::Full
-        self.db = None;
+        let db = self.db.as_ref().unwrap();
 
-        let config = decentdb::DbConfig {
-            wal_sync_mode: decentdb::WalSyncMode::Full,
-            ..decentdb::DbConfig::default()
-        };
-        let db = decentdb::Db::open(&self.db_path, config).unwrap();
-
+        let insert = db
+            .prepare("INSERT INTO orders (id, user_id, amount) VALUES ($1, $2, $3);")
+            .unwrap();
         let mut latencies = Vec::with_capacity(COMMIT_COUNT);
+
+        insert
+            .execute(&[
+                decentdb::Value::Int64(-1),
+                decentdb::Value::Int64(0),
+                decentdb::Value::Float64(9.99),
+            ])
+            .unwrap();
 
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
-            db.execute_with_params(
-                "INSERT INTO orders (id, user_id, amount) VALUES ($1, $2, $3);",
+            insert.execute(
                 &[
                     decentdb::Value::Int64(i as i64),
                     decentdb::Value::Int64((i % 100) as i64),
@@ -477,26 +536,31 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
             latencies.push(start.elapsed().as_micros() as u64);
         }
 
-        self.db = Some(db);
         latencies
     }
 
     fn join_reads(&mut self) -> Vec<u64> {
         self.ensure_join_seeded();
         let db = self.db.as_ref().unwrap();
+        let join = db
+            .prepare(
+                "SELECT u.name, p.bio \
+                 FROM join_users AS u \
+                 JOIN join_profiles AS p ON u.id = p.id \
+                 WHERE u.id = $1;",
+            )
+            .unwrap();
         let mut latencies = Vec::with_capacity(JOIN_COUNT);
 
+        let warmup_id = join_read_id(JOIN_COUNT / 2);
+        let _warmup = join
+            .execute(&[decentdb::Value::Int64(warmup_id as i64)])
+            .unwrap();
         for i in 0..JOIN_COUNT {
-            let id = i % JOIN_DATASET_COUNT;
+            let id = join_read_id(i);
             let start = Instant::now();
-            let result = db
-                .execute_with_params(
-                    "SELECT u.name, p.bio \
-                     FROM join_users AS u \
-                     JOIN join_profiles AS p ON u.id = p.id \
-                     WHERE u.id = $1;",
-                    &[decentdb::Value::Int64(id as i64)],
-                )
+            let result = join
+                .execute(&[decentdb::Value::Int64(id as i64)])
                 .unwrap();
             assert_eq!(result.rows().len(), 1);
             latencies.push(start.elapsed().as_micros() as u64);
@@ -506,9 +570,12 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
     }
 
     fn teardown(&mut self) -> u64 {
+        if let Some(db) = self.db.as_ref() {
+            db.checkpoint().unwrap();
+        }
         self.db = None;
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
-        let wal_path = self.db_path.with_extension("db-wal");
+        let wal_path = append_path_suffix(&self.db_path, ".wal");
         let wal_size = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         db_size + wal_size
     }
@@ -521,7 +588,9 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     println!("Running benchmarks for {}...", benchmarker.name());
 
-    let temp_dir = TempDir::new().unwrap();
+    let storage_root = benchmark_storage_root();
+    fs::create_dir_all(&storage_root).unwrap();
+    let temp_dir = TempDir::new_in(storage_root).unwrap();
     let mut metrics = EngineMetrics::default();
 
     // 1. Setup
@@ -537,21 +606,21 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     // 3. Point Reads
     let mut read_latencies = benchmarker.random_reads();
     read_latencies.sort_unstable();
-    let p95_read_us = read_latencies[(read_latencies.len() as f64 * 0.95) as usize];
+    let p95_read_us = read_latencies[p95_index(read_latencies.len())];
     metrics.read_p95_ms = p95_read_us as f64 / 1000.0;
     println!("  -> Read p95: {:.3} ms", metrics.read_p95_ms);
 
     // 4. Durable Commits
     let mut commit_latencies = benchmarker.durable_commits();
     commit_latencies.sort_unstable();
-    let p95_commit_us = commit_latencies[(commit_latencies.len() as f64 * 0.95) as usize];
+    let p95_commit_us = commit_latencies[p95_index(commit_latencies.len())];
     metrics.commit_p95_ms = p95_commit_us as f64 / 1000.0;
     println!("  -> Commit p95: {:.3} ms", metrics.commit_p95_ms);
 
     // 5. Joins
     let mut join_latencies = benchmarker.join_reads();
     join_latencies.sort_unstable();
-    let p95_join_us = join_latencies[(join_latencies.len() as f64 * 0.95) as usize];
+    let p95_join_us = join_latencies[p95_index(join_latencies.len())];
     metrics.join_p95_ms = p95_join_us as f64 / 1000.0;
     println!("  -> Join p95: {:.3} ms", metrics.join_p95_ms);
 
@@ -566,6 +635,7 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
 fn main() {
     println!("Starting Embedded DB Benchmarks");
 
+    let storage_root = benchmark_storage_root();
     let mut summary = BenchSummary {
         engines: BTreeMap::new(),
         metadata: BTreeMap::new(),
@@ -595,6 +665,20 @@ fn main() {
         }
     }
     summary.metadata.insert("machine".to_string(), cpu_model);
+    summary
+        .metadata
+        .insert("storage_root".to_string(), storage_root.display().to_string());
+    summary
+        .metadata
+        .insert("durability_profile".to_string(), "durable".to_string());
+    summary.metadata.insert(
+        "read_pattern".to_string(),
+        "deterministic_permutation".to_string(),
+    );
+    summary.metadata.insert(
+        "size_measurement".to_string(),
+        "db_plus_wal_after_checkpoint".to_string(),
+    );
 
     // SQLite
     let mut sqlite = SqliteBenchmarker::new();
