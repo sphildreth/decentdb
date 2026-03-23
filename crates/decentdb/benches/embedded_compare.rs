@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -11,11 +11,13 @@ use tempfile::TempDir;
 const INSERT_COUNT: usize = 100_000;
 const READ_COUNT: usize = 10_000;
 const COMMIT_COUNT: usize = 1000;
+const JOIN_COUNT: usize = 1_000;
+const JOIN_DATASET_COUNT: usize = 100;
 
 #[derive(Serialize)]
 struct BenchSummary {
-    engines: HashMap<String, EngineMetrics>,
-    metadata: HashMap<String, String>,
+    engines: BTreeMap<String, EngineMetrics>,
+    metadata: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -33,6 +35,7 @@ trait DatabaseBenchmarker {
     fn insert_batch(&mut self) -> f64; // returns rows per second
     fn random_reads(&mut self) -> Vec<u64>; // returns latencies in ms/us
     fn durable_commits(&mut self) -> Vec<u64>;
+    fn join_reads(&mut self) -> Vec<u64>;
     fn teardown(&mut self) -> u64; // returns db size in bytes
 }
 
@@ -42,6 +45,7 @@ trait DatabaseBenchmarker {
 struct SqliteBenchmarker {
     conn: Option<SqliteConnection>,
     db_path: PathBuf,
+    join_seeded: bool,
 }
 
 impl SqliteBenchmarker {
@@ -49,7 +53,34 @@ impl SqliteBenchmarker {
         Self {
             conn: None,
             db_path: PathBuf::new(),
+            join_seeded: false,
         }
+    }
+
+    fn ensure_join_seeded(&mut self) {
+        if self.join_seeded {
+            return;
+        }
+        let conn = self.conn.as_mut().unwrap();
+        let tx = conn.transaction().unwrap();
+        {
+            let mut users = tx
+                .prepare("INSERT INTO join_users (id, name) VALUES (?, ?)")
+                .unwrap();
+            let mut profiles = tx
+                .prepare("INSERT INTO join_profiles (id, bio) VALUES (?, ?)")
+                .unwrap();
+            for i in 0..JOIN_DATASET_COUNT {
+                users
+                    .execute(rusqlite::params![i, format!("Join User {}", i)])
+                    .unwrap();
+                profiles
+                    .execute(rusqlite::params![i, format!("Bio {}", i)])
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        self.join_seeded = true;
     }
 }
 
@@ -66,7 +97,9 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
-             CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);",
+              CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);
+             CREATE TABLE join_users (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE join_profiles (id INTEGER PRIMARY KEY, bio TEXT);",
         )
         .unwrap();
 
@@ -126,6 +159,31 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         latencies
     }
 
+    fn join_reads(&mut self) -> Vec<u64> {
+        self.ensure_join_seeded();
+        let conn = self.conn.as_mut().unwrap();
+        let mut latencies = Vec::with_capacity(JOIN_COUNT);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT u.name, p.bio \
+                 FROM join_users AS u \
+                 JOIN join_profiles AS p ON u.id = p.id \
+                 WHERE u.id = ?",
+            )
+            .unwrap();
+        for i in 0..JOIN_COUNT {
+            let id = i % JOIN_DATASET_COUNT;
+            let start = Instant::now();
+            let _row: (String, String) = stmt
+                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
+
+        latencies
+    }
+
     fn teardown(&mut self) -> u64 {
         self.conn = None;
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
@@ -141,6 +199,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
 struct DuckDbBenchmarker {
     conn: Option<DuckdbConnection>,
     db_path: PathBuf,
+    join_seeded: bool,
 }
 
 impl DuckDbBenchmarker {
@@ -148,7 +207,28 @@ impl DuckDbBenchmarker {
         Self {
             conn: None,
             db_path: PathBuf::new(),
+            join_seeded: false,
         }
+    }
+
+    fn ensure_join_seeded(&mut self) {
+        if self.join_seeded {
+            return;
+        }
+        let conn = self.conn.as_mut().unwrap();
+        {
+            let mut users = conn.appender("join_users").unwrap();
+            let mut profiles = conn.appender("join_profiles").unwrap();
+            for i in 0..JOIN_DATASET_COUNT {
+                users
+                    .append_row(duckdb::params![i, format!("Join User {}", i)])
+                    .unwrap();
+                profiles
+                    .append_row(duckdb::params![i, format!("Bio {}", i)])
+                    .unwrap();
+            }
+        }
+        self.join_seeded = true;
     }
 }
 
@@ -163,7 +243,9 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
 
         conn.execute_batch(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR);
-             CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount DOUBLE);",
+              CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount DOUBLE);
+             CREATE TABLE join_users (id INTEGER PRIMARY KEY, name VARCHAR);
+             CREATE TABLE join_profiles (id INTEGER PRIMARY KEY, bio VARCHAR);",
         )
         .unwrap();
 
@@ -218,6 +300,31 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         latencies
     }
 
+    fn join_reads(&mut self) -> Vec<u64> {
+        self.ensure_join_seeded();
+        let conn = self.conn.as_mut().unwrap();
+        let mut latencies = Vec::with_capacity(JOIN_COUNT);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT u.name, p.bio \
+                 FROM join_users AS u \
+                 JOIN join_profiles AS p ON u.id = p.id \
+                 WHERE u.id = ?",
+            )
+            .unwrap();
+        for i in 0..JOIN_COUNT {
+            let id = i % JOIN_DATASET_COUNT;
+            let start = Instant::now();
+            let _row: (String, String) = stmt
+                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
+
+        latencies
+    }
+
     fn teardown(&mut self) -> u64 {
         self.conn = None;
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
@@ -233,6 +340,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
 struct DecentDbBenchmarker {
     db: Option<decentdb::Db>,
     db_path: PathBuf,
+    join_seeded: bool,
 }
 
 impl DecentDbBenchmarker {
@@ -240,7 +348,36 @@ impl DecentDbBenchmarker {
         Self {
             db: None,
             db_path: PathBuf::new(),
+            join_seeded: false,
         }
+    }
+
+    fn ensure_join_seeded(&mut self) {
+        if self.join_seeded {
+            return;
+        }
+        let db = self.db.as_ref().unwrap();
+        db.execute("BEGIN;").unwrap();
+        for i in 0..JOIN_DATASET_COUNT {
+            db.execute_with_params(
+                "INSERT INTO join_users (id, name) VALUES ($1, $2);",
+                &[
+                    decentdb::Value::Int64(i as i64),
+                    decentdb::Value::Text(format!("Join User {}", i)),
+                ],
+            )
+            .unwrap();
+            db.execute_with_params(
+                "INSERT INTO join_profiles (id, bio) VALUES ($1, $2);",
+                &[
+                    decentdb::Value::Int64(i as i64),
+                    decentdb::Value::Text(format!("Bio {}", i)),
+                ],
+            )
+            .unwrap();
+        }
+        db.execute("COMMIT;").unwrap();
+        self.join_seeded = true;
     }
 }
 
@@ -252,14 +389,20 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("decent.db");
 
-        let mut config = decentdb::DbConfig::default();
-        config.wal_sync_mode = decentdb::WalSyncMode::Normal;
+        let config = decentdb::DbConfig {
+            wal_sync_mode: decentdb::WalSyncMode::Normal,
+            ..decentdb::DbConfig::default()
+        };
 
         let db = decentdb::Db::create(&self.db_path, config).unwrap();
 
         db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT);")
             .unwrap();
         db.execute("CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64, amount FLOAT64);")
+            .unwrap();
+        db.execute("CREATE TABLE join_users (id INT64 PRIMARY KEY, name TEXT);")
+            .unwrap();
+        db.execute("CREATE TABLE join_profiles (id INT64 PRIMARY KEY, bio TEXT);")
             .unwrap();
 
         self.db = Some(db);
@@ -312,8 +455,10 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
         // Drop the current connection to reopen with WalSyncMode::Full
         self.db = None;
 
-        let mut config = decentdb::DbConfig::default();
-        config.wal_sync_mode = decentdb::WalSyncMode::Full;
+        let config = decentdb::DbConfig {
+            wal_sync_mode: decentdb::WalSyncMode::Full,
+            ..decentdb::DbConfig::default()
+        };
         let db = decentdb::Db::open(&self.db_path, config).unwrap();
 
         let mut latencies = Vec::with_capacity(COMMIT_COUNT);
@@ -333,6 +478,30 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
         }
 
         self.db = Some(db);
+        latencies
+    }
+
+    fn join_reads(&mut self) -> Vec<u64> {
+        self.ensure_join_seeded();
+        let db = self.db.as_ref().unwrap();
+        let mut latencies = Vec::with_capacity(JOIN_COUNT);
+
+        for i in 0..JOIN_COUNT {
+            let id = i % JOIN_DATASET_COUNT;
+            let start = Instant::now();
+            let result = db
+                .execute_with_params(
+                    "SELECT u.name, p.bio \
+                     FROM join_users AS u \
+                     JOIN join_profiles AS p ON u.id = p.id \
+                     WHERE u.id = $1;",
+                    &[decentdb::Value::Int64(id as i64)],
+                )
+                .unwrap();
+            assert_eq!(result.rows().len(), 1);
+            latencies.push(start.elapsed().as_micros() as u64);
+        }
+
         latencies
     }
 
@@ -379,13 +548,17 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     metrics.commit_p95_ms = p95_commit_us as f64 / 1000.0;
     println!("  -> Commit p95: {:.3} ms", metrics.commit_p95_ms);
 
-    // 5. Teardown & Size
+    // 5. Joins
+    let mut join_latencies = benchmarker.join_reads();
+    join_latencies.sort_unstable();
+    let p95_join_us = join_latencies[(join_latencies.len() as f64 * 0.95) as usize];
+    metrics.join_p95_ms = p95_join_us as f64 / 1000.0;
+    println!("  -> Join p95: {:.3} ms", metrics.join_p95_ms);
+
+    // 6. Teardown & Size
     let db_size_bytes = benchmarker.teardown();
     metrics.db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
     println!("  -> DB Size: {:.2} MB", metrics.db_size_mb);
-
-    // Join mock
-    metrics.join_p95_ms = 1.5;
 
     metrics
 }
@@ -394,8 +567,8 @@ fn main() {
     println!("Starting Embedded DB Benchmarks");
 
     let mut summary = BenchSummary {
-        engines: HashMap::new(),
-        metadata: HashMap::new(),
+        engines: BTreeMap::new(),
+        metadata: BTreeMap::new(),
     };
 
     // Add unique run ID (unix timestamp in milliseconds)

@@ -619,6 +619,7 @@ impl EngineRuntime {
         }
 
         self.catalog.tables.insert(table_name.to_string(), table);
+        self.mark_table_dirty(table_name);
         self.bump_schema_cookie();
         Ok(())
     }

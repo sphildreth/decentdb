@@ -150,6 +150,7 @@ impl EngineRuntime {
                 .rows
                 .push(stored_row.clone());
             self.apply_insert_index_updates(index_updates)?;
+            self.mark_table_dirty(&table_name);
             affected_rows += 1;
             if !statement.returning.is_empty() {
                 returning_rows.push(stored_row.clone());
@@ -262,6 +263,7 @@ impl EngineRuntime {
 
         if affected_rows > 0 {
             self.mark_indexes_stale_for_table(&table_name);
+            self.mark_table_dirty(&table_name);
         }
 
         self.execute_after_triggers(
@@ -332,6 +334,7 @@ impl EngineRuntime {
 
         if !matching_row_ids.is_empty() {
             self.mark_indexes_stale_for_table(&table_name);
+            self.mark_table_dirty(&table_name);
         }
 
         self.execute_after_triggers(
@@ -466,6 +469,7 @@ impl EngineRuntime {
             .rows[row_index]
             .values = next_values.clone();
         self.mark_indexes_stale_for_table(table_name);
+        self.mark_table_dirty(table_name);
         Ok(Some(StoredRow {
             row_id,
             values: next_values,
@@ -537,9 +541,11 @@ impl EngineRuntime {
                             .rows
                             .retain(|child| !child_ids.contains(&child.row_id));
                         self.mark_indexes_stale_for_table(&child_table.name);
+                        self.mark_table_dirty(&child_table.name);
                     }
                     crate::catalog::ForeignKeyAction::SetNull => {
                         self.mark_indexes_stale_for_table(&child_table.name);
+                        self.mark_table_dirty(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
                                 .tables
@@ -650,6 +656,7 @@ impl EngineRuntime {
                     }
                     crate::catalog::ForeignKeyAction::Cascade => {
                         self.mark_indexes_stale_for_table(&child_table.name);
+                        self.mark_table_dirty(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
                                 .tables
@@ -703,6 +710,7 @@ impl EngineRuntime {
                     }
                     crate::catalog::ForeignKeyAction::SetNull => {
                         self.mark_indexes_stale_for_table(&child_table.name);
+                        self.mark_table_dirty(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
                                 .tables
@@ -811,6 +819,7 @@ impl EngineRuntime {
             .rows
             .push(stored_row.clone());
         self.apply_insert_index_updates(index_updates)?;
+        self.mark_table_dirty(&table_name);
 
         let result = if statement.returning.is_empty() {
             QueryResult::with_affected_rows(1)

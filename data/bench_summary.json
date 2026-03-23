@@ -1,30 +1,30 @@
 {
   "engines": {
-    "duckdb": {
-      "read_p95_ms": 0.175,
-      "join_p95_ms": 1.5,
-      "commit_p95_ms": 0.399,
-      "insert_rows_per_sec": 1921888.7892517678,
-      "db_size_mb": 2.26171875
-    },
     "decentdb": {
-      "read_p95_ms": 0.007,
-      "join_p95_ms": 1.5,
-      "commit_p95_ms": 125.723,
-      "insert_rows_per_sec": 219459.81761076418,
-      "db_size_mb": 0.9375
+      "read_p95_ms": 0.006,
+      "join_p95_ms": 4.005,
+      "commit_p95_ms": 1.173,
+      "insert_rows_per_sec": 203963.58851808027,
+      "db_size_mb": 0.4921875
+    },
+    "duckdb": {
+      "read_p95_ms": 0.181,
+      "join_p95_ms": 0.45,
+      "commit_p95_ms": 0.437,
+      "insert_rows_per_sec": 1860531.4031188274,
+      "db_size_mb": 3.26171875
     },
     "sqlite": {
       "read_p95_ms": 0.002,
-      "join_p95_ms": 1.5,
+      "join_p95_ms": 0.002,
       "commit_p95_ms": 0.009,
-      "insert_rows_per_sec": 2030014.9896306833,
-      "db_size_mb": 1.82421875
+      "insert_rows_per_sec": 2085823.7634522337,
+      "db_size_mb": 1.83203125
     }
   },
   "metadata": {
-    "run_id": "1774279411107",
     "machine": "AMD Ryzen 9 3900X 12-Core Processor",
-    "os": "linux"
+    "os": "linux",
+    "run_id": "1774281819926"
   }
 }

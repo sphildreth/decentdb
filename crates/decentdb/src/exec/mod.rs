@@ -10,7 +10,7 @@ pub(crate) mod triggers;
 pub(crate) mod txn;
 pub(crate) mod views;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{CatalogState, IndexKind, IndexSchema, TableSchema};
 use crate::error::{DbError, Result};
@@ -37,6 +37,9 @@ pub use row::{QueryResult, QueryRow};
 const ENGINE_ROOT_MAGIC: [u8; 8] = *b"DDBSQL1\0";
 const ENGINE_ROOT_VERSION: u32 = 1;
 const ENGINE_ROOT_HEADER_SIZE: usize = 32;
+const LEGACY_RUNTIME_PAYLOAD_MAGIC: &[u8; 9] = b"DDBSTATE1";
+const MANIFEST_PAYLOAD_MAGIC: &[u8; 8] = b"DDBMANF1";
+const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredRow {
@@ -47,6 +50,25 @@ pub(crate) struct StoredRow {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TableData {
     pub(crate) rows: Vec<StoredRow>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedTableState {
+    pub(crate) pointer: OverflowPointer,
+    pub(crate) checksum: u32,
+}
+
+impl Default for PersistedTableState {
+    fn default() -> Self {
+        Self {
+            pointer: OverflowPointer {
+                head_page_id: 0,
+                logical_len: 0,
+                flags: 0,
+            },
+            checksum: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +96,8 @@ pub(crate) struct EngineRuntime {
     pub(crate) catalog: CatalogState,
     pub(crate) tables: BTreeMap<String, TableData>,
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
+    pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
+    pub(crate) dirty_tables: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +126,8 @@ impl EngineRuntime {
             catalog: CatalogState::empty(schema_cookie),
             tables: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            persisted_tables: BTreeMap::new(),
+            dirty_tables: BTreeSet::new(),
         }
     }
 
@@ -130,21 +156,67 @@ impl EngineRuntime {
         }
         let mut runtime = if payload.is_empty() {
             Self::empty(root.schema_cookie)
+        } else if payload.starts_with(LEGACY_RUNTIME_PAYLOAD_MAGIC) {
+            let mut runtime = decode_runtime_payload(&payload)?;
+            runtime.mark_all_tables_dirty();
+            runtime
+        } else if payload.starts_with(MANIFEST_PAYLOAD_MAGIC) {
+            decode_manifest_payload(&store, &payload)?
         } else {
-            decode_runtime_payload(&payload)?
+            return Err(DbError::corruption("unknown catalog state payload magic"));
         };
         runtime.catalog.schema_cookie = schema_cookie;
         runtime.rebuild_indexes(pager.page_size())?;
         Ok(runtime)
     }
 
-    pub(crate) fn persist_to_db(&self, db: &crate::db::Db) -> Result<()> {
-        let payload = encode_runtime_payload(self)?;
-        let checksum = crc32c_parts(&[payload.as_slice()]);
+    pub(crate) fn persist_to_db(&mut self, db: &crate::db::Db) -> Result<()> {
         let old_root_page = db.read_page(page::CATALOG_ROOT_PAGE_ID)?;
         let old_root = decode_root_header(&old_root_page)?;
+        let dirty_tables = if self.persisted_tables.is_empty() {
+            self.catalog.tables.keys().cloned().collect::<Vec<_>>()
+        } else {
+            self.dirty_tables.iter().cloned().collect::<Vec<_>>()
+        };
+        let mut table_states = self.persisted_tables.clone();
+        let mut rewritten_old_heads = Vec::new();
 
-        let pointer = if payload.is_empty() {
+        {
+            let mut store = DbTxnPageStore { db };
+            for table_name in dirty_tables {
+                let Some(_table) = self.catalog.tables.get(&table_name) else {
+                    continue;
+                };
+                let data = self.tables.get(&table_name).ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?;
+                let payload = encode_table_payload(data)?;
+                let checksum = crc32c_parts(&[payload.as_slice()]);
+                let pointer = if payload.is_empty() {
+                    OverflowPointer {
+                        head_page_id: 0,
+                        logical_len: 0,
+                        flags: 0,
+                    }
+                } else {
+                    write_overflow(&mut store, &payload, CompressionMode::Auto)?
+                };
+                if let Some(previous) = table_states.insert(
+                    table_name.clone(),
+                    PersistedTableState { pointer, checksum },
+                ) {
+                    if previous.pointer.head_page_id != 0 && previous.pointer.head_page_id != pointer.head_page_id
+                    {
+                        rewritten_old_heads.push(previous.pointer.head_page_id);
+                    }
+                }
+            }
+        }
+        table_states.retain(|table_name, _| self.catalog.tables.contains_key(table_name));
+
+        let manifest = encode_manifest_payload(self, &table_states)?;
+        let checksum = crc32c_parts(&[manifest.as_slice()]);
+        let pointer = if manifest.is_empty() {
             OverflowPointer {
                 head_page_id: 0,
                 logical_len: 0,
@@ -152,7 +224,7 @@ impl EngineRuntime {
             }
         } else {
             let mut store = DbTxnPageStore { db };
-            write_overflow(&mut store, &payload, CompressionMode::Auto)?
+            write_overflow(&mut store, &manifest, CompressionMode::Never)?
         };
 
         let root_page = encode_root_header(
@@ -165,15 +237,33 @@ impl EngineRuntime {
         );
         db.write_page(page::CATALOG_ROOT_PAGE_ID, &root_page)?;
 
-        if let Some(old_root) = old_root {
-            if old_root.pointer.head_page_id != 0
-                && old_root.pointer.head_page_id != pointer.head_page_id
-            {
-                let mut store = DbTxnPageStore { db };
-                crate::record::overflow::free_overflow(&mut store, old_root.pointer.head_page_id)?;
+        {
+            let mut store = DbTxnPageStore { db };
+            if let Some(old_root) = old_root {
+                if old_root.pointer.head_page_id != 0
+                    && old_root.pointer.head_page_id != pointer.head_page_id
+                {
+                    crate::record::overflow::free_overflow(
+                        &mut store,
+                        old_root.pointer.head_page_id,
+                    )?;
+                }
+            }
+            for old_head in rewritten_old_heads {
+                crate::record::overflow::free_overflow(&mut store, old_head)?;
+            }
+            for (table_name, state) in &self.persisted_tables {
+                if self.catalog.tables.contains_key(table_name) {
+                    continue;
+                }
+                if state.pointer.head_page_id != 0 {
+                    crate::record::overflow::free_overflow(&mut store, state.pointer.head_page_id)?;
+                }
             }
         }
 
+        self.persisted_tables = table_states;
+        self.dirty_tables.clear();
         db.set_schema_cookie(self.catalog.schema_cookie)?;
         Ok(())
     }
@@ -231,6 +321,15 @@ impl EngineRuntime {
                 index.fresh = false;
             }
         }
+    }
+
+    pub(super) fn mark_table_dirty(&mut self, table_name: &str) {
+        self.dirty_tables.insert(table_name.to_string());
+    }
+
+    pub(super) fn mark_all_tables_dirty(&mut self) {
+        self.dirty_tables
+            .extend(self.catalog.tables.keys().cloned());
     }
 
     pub(super) fn prepare_insert_index_updates(
@@ -1021,9 +1120,10 @@ fn encode_root_header(page_size: u32, header: RootHeader) -> Vec<u8> {
     page
 }
 
+#[cfg(test)]
 fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    output.extend_from_slice(b"DDBSTATE1");
+    output.extend_from_slice(LEGACY_RUNTIME_PAYLOAD_MAGIC);
     encode_u32(&mut output, runtime.catalog.schema_cookie);
     encode_u32(&mut output, runtime.catalog.tables.len() as u32);
     for table in runtime.catalog.tables.values() {
@@ -1105,7 +1205,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
 fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     let mut cursor = Cursor::new(bytes);
     let magic = cursor.read_bytes(9)?;
-    if magic.as_slice() != b"DDBSTATE1" {
+    if magic.as_slice() != LEGACY_RUNTIME_PAYLOAD_MAGIC {
         return Err(DbError::corruption("catalog state magic is invalid"));
     }
     let mut runtime = EngineRuntime::empty(cursor.read_u32()?);
@@ -1239,6 +1339,274 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             .insert(trigger.name.clone(), trigger);
     }
     Ok(runtime)
+}
+
+fn encode_manifest_payload(
+    runtime: &EngineRuntime,
+    table_states: &BTreeMap<String, PersistedTableState>,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(MANIFEST_PAYLOAD_MAGIC);
+    encode_u32(&mut output, runtime.catalog.schema_cookie);
+    encode_u32(&mut output, runtime.catalog.tables.len() as u32);
+    for table in runtime.catalog.tables.values() {
+        encode_string(&mut output, &table.name)?;
+        encode_u32(&mut output, table.columns.len() as u32);
+        for column in &table.columns {
+            encode_string(&mut output, &column.name)?;
+            output.push(column.column_type as u8);
+            output.push(u8::from(column.nullable));
+            encode_optional_string(&mut output, column.default_sql.as_deref())?;
+            output.push(u8::from(column.primary_key));
+            output.push(u8::from(column.unique));
+            output.push(u8::from(column.auto_increment));
+            encode_u32(&mut output, column.checks.len() as u32);
+            for check in &column.checks {
+                encode_optional_string(&mut output, check.name.as_deref())?;
+                encode_string(&mut output, &check.expression_sql)?;
+            }
+            output.push(u8::from(column.foreign_key.is_some()));
+            if let Some(foreign_key) = &column.foreign_key {
+                encode_foreign_key(&mut output, foreign_key)?;
+            }
+        }
+        encode_u32(&mut output, table.checks.len() as u32);
+        for check in &table.checks {
+            encode_optional_string(&mut output, check.name.as_deref())?;
+            encode_string(&mut output, &check.expression_sql)?;
+        }
+        encode_u32(&mut output, table.foreign_keys.len() as u32);
+        for foreign_key in &table.foreign_keys {
+            encode_foreign_key(&mut output, foreign_key)?;
+        }
+        encode_strings(&mut output, &table.primary_key_columns)?;
+        encode_i64(&mut output, table.next_row_id);
+        let state = table_states.get(&table.name).copied().unwrap_or_default();
+        encode_u32(&mut output, state.checksum);
+        encode_u32(&mut output, state.pointer.head_page_id);
+        encode_u32(&mut output, state.pointer.logical_len);
+        output.push(state.pointer.flags);
+    }
+
+    encode_u32(&mut output, runtime.catalog.indexes.len() as u32);
+    for index in runtime.catalog.indexes.values() {
+        encode_string(&mut output, &index.name)?;
+        encode_string(&mut output, &index.table_name)?;
+        output.push(index.kind as u8);
+        output.push(u8::from(index.unique));
+        encode_u32(&mut output, index.columns.len() as u32);
+        for column in &index.columns {
+            encode_optional_string(&mut output, column.column_name.as_deref())?;
+            encode_optional_string(&mut output, column.expression_sql.as_deref())?;
+        }
+        encode_optional_string(&mut output, index.predicate_sql.as_deref())?;
+        output.push(u8::from(index.fresh));
+    }
+
+    encode_u32(&mut output, runtime.catalog.views.len() as u32);
+    for view in runtime.catalog.views.values() {
+        encode_string(&mut output, &view.name)?;
+        encode_string(&mut output, &view.sql_text)?;
+        encode_strings(&mut output, &view.column_names)?;
+        encode_strings(&mut output, &view.dependencies)?;
+    }
+
+    encode_u32(&mut output, runtime.catalog.triggers.len() as u32);
+    for trigger in runtime.catalog.triggers.values() {
+        encode_string(&mut output, &trigger.name)?;
+        encode_string(&mut output, &trigger.target_name)?;
+        output.push(trigger.kind as u8);
+        output.push(trigger.event as u8);
+        output.push(u8::from(trigger.on_view));
+        encode_string(&mut output, &trigger.action_sql)?;
+    }
+    Ok(output)
+}
+
+fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
+    let mut cursor = Cursor::new(bytes);
+    let magic = cursor.read_bytes(MANIFEST_PAYLOAD_MAGIC.len())?;
+    if magic.as_slice() != MANIFEST_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("catalog manifest magic is invalid"));
+    }
+    let mut runtime = EngineRuntime::empty(cursor.read_u32()?);
+    let table_count = cursor.read_u32()?;
+    for _ in 0..table_count {
+        let table_name = cursor.read_string()?;
+        let column_count = cursor.read_u32()?;
+        let mut table = TableSchema {
+            name: table_name.clone(),
+            columns: Vec::with_capacity(column_count as usize),
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            primary_key_columns: Vec::new(),
+            next_row_id: 1,
+        };
+        for _ in 0..column_count {
+            let name = cursor.read_string()?;
+            let column_type = decode_column_type(cursor.read_u8()?)?;
+            let nullable = cursor.read_bool()?;
+            let default_sql = cursor.read_optional_string()?;
+            let primary_key = cursor.read_bool()?;
+            let unique = cursor.read_bool()?;
+            let auto_increment = cursor.read_bool()?;
+            let check_count = cursor.read_u32()?;
+            let mut checks = Vec::with_capacity(check_count as usize);
+            for _ in 0..check_count {
+                checks.push(crate::catalog::CheckConstraint {
+                    name: cursor.read_optional_string()?,
+                    expression_sql: cursor.read_string()?,
+                });
+            }
+            let has_fk = cursor.read_bool()?;
+            let foreign_key = if has_fk {
+                Some(decode_foreign_key(&mut cursor)?)
+            } else {
+                None
+            };
+            table.columns.push(crate::catalog::ColumnSchema {
+                name,
+                column_type,
+                nullable,
+                default_sql,
+                primary_key,
+                unique,
+                auto_increment,
+                checks,
+                foreign_key,
+            });
+        }
+        let table_check_count = cursor.read_u32()?;
+        for _ in 0..table_check_count {
+            table.checks.push(crate::catalog::CheckConstraint {
+                name: cursor.read_optional_string()?,
+                expression_sql: cursor.read_string()?,
+            });
+        }
+        let fk_count = cursor.read_u32()?;
+        for _ in 0..fk_count {
+            table.foreign_keys.push(decode_foreign_key(&mut cursor)?);
+        }
+        table.primary_key_columns = cursor.read_strings()?;
+        table.next_row_id = cursor.read_i64()?;
+        let state = PersistedTableState {
+            checksum: cursor.read_u32()?,
+            pointer: OverflowPointer {
+                head_page_id: cursor.read_u32()?,
+                logical_len: cursor.read_u32()?,
+                flags: cursor.read_u8()?,
+            },
+        };
+        runtime.catalog.tables.insert(table_name.clone(), table);
+        runtime.persisted_tables.insert(table_name.clone(), state);
+        let data = if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
+            TableData::default()
+        } else {
+            let payload = read_overflow(store, state.pointer)?;
+            if crc32c_parts(&[payload.as_slice()]) != state.checksum {
+                return Err(DbError::corruption(format!(
+                    "table payload checksum mismatch for {table_name}"
+                )));
+            }
+            decode_table_payload(&payload)?
+        };
+        runtime.tables.insert(table_name, data);
+    }
+
+    let index_count = cursor.read_u32()?;
+    for _ in 0..index_count {
+        let name = cursor.read_string()?;
+        let table_name = cursor.read_string()?;
+        let kind = decode_index_kind(cursor.read_u8()?)?;
+        let unique = cursor.read_bool()?;
+        let column_count = cursor.read_u32()?;
+        let mut columns = Vec::with_capacity(column_count as usize);
+        for _ in 0..column_count {
+            columns.push(crate::catalog::IndexColumn {
+                column_name: cursor.read_optional_string()?,
+                expression_sql: cursor.read_optional_string()?,
+            });
+        }
+        let predicate_sql = cursor.read_optional_string()?;
+        let fresh = cursor.read_bool()?;
+        runtime.catalog.indexes.insert(
+            name.clone(),
+            crate::catalog::IndexSchema {
+                name,
+                table_name,
+                kind,
+                unique,
+                columns,
+                predicate_sql,
+                fresh,
+            },
+        );
+    }
+
+    let view_count = cursor.read_u32()?;
+    for _ in 0..view_count {
+        let view = crate::catalog::ViewSchema {
+            name: cursor.read_string()?,
+            sql_text: cursor.read_string()?,
+            column_names: cursor.read_strings()?,
+            dependencies: cursor.read_strings()?,
+        };
+        runtime.catalog.views.insert(view.name.clone(), view);
+    }
+
+    let trigger_count = cursor.read_u32()?;
+    for _ in 0..trigger_count {
+        let trigger = crate::catalog::TriggerSchema {
+            name: cursor.read_string()?,
+            target_name: cursor.read_string()?,
+            kind: decode_trigger_kind(cursor.read_u8()?)?,
+            event: decode_trigger_event(cursor.read_u8()?)?,
+            on_view: cursor.read_bool()?,
+            action_sql: cursor.read_string()?,
+        };
+        runtime
+            .catalog
+            .triggers
+            .insert(trigger.name.clone(), trigger);
+    }
+    Ok(runtime)
+}
+
+fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
+    if data.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(TABLE_PAYLOAD_MAGIC);
+    encode_u32(&mut output, data.rows.len() as u32);
+    for row in &data.rows {
+        encode_i64(&mut output, row.row_id);
+        let encoded = Row::new(row.values.clone()).encode()?;
+        encode_bytes(&mut output, &encoded)?;
+    }
+    Ok(output)
+}
+
+fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
+    if bytes.is_empty() {
+        return Ok(TableData::default());
+    }
+    let mut cursor = Cursor::new(bytes);
+    let magic = cursor.read_bytes(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic.as_slice() != TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+    let row_count = cursor.read_u32()?;
+    let mut data = TableData::default();
+    for _ in 0..row_count {
+        let row_id = cursor.read_i64()?;
+        let row = Row::decode(&cursor.read_vec()?)?;
+        data.rows.push(StoredRow {
+            row_id,
+            values: row.values().to_vec(),
+        });
+    }
+    Ok(data)
 }
 
 fn encode_u32(output: &mut Vec<u8>, value: u32) {
@@ -2729,11 +3097,19 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
+    use crate::record::compression::CompressionMode;
+    use crate::record::overflow::write_overflow;
     use crate::search::TrigramQueryResult;
     use crate::sql::parser::parse_sql_statement;
+    use crate::storage::page::InMemoryPageStore;
 
-    use super::{EngineRuntime, RuntimeIndex};
+    use super::{
+        decode_manifest_payload, decode_runtime_payload, encode_manifest_payload,
+        encode_runtime_payload, encode_table_payload, EngineRuntime, PersistedTableState,
+        RuntimeIndex,
+    };
 
     const PAGE_SIZE: u32 = 4096;
 
@@ -2776,6 +3152,62 @@ mod tests {
             index.query_candidates("alpha", false).expect("query cloned index"),
             TrigramQueryResult::Candidates(vec![1])
         );
+    }
+
+    #[test]
+    fn legacy_runtime_payload_decode_still_round_trips() {
+        let mut runtime = EngineRuntime::empty(7);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT, body TEXT)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email, body) VALUES (1, 'a@example.com', 'alphabet soup')",
+        );
+
+        let payload = encode_runtime_payload(&runtime).expect("encode legacy runtime payload");
+        let decoded = decode_runtime_payload(&payload).expect("decode legacy runtime payload");
+
+        assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
+        assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
+        assert!(decoded.catalog.indexes.contains_key("docs_email_idx"));
+    }
+
+    #[test]
+    fn manifest_payload_decode_loads_per_table_rows() {
+        let mut runtime = EngineRuntime::empty(9);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT, body TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email, body) VALUES (1, 'a@example.com', 'alphabet soup')",
+        );
+
+        let mut store = InMemoryPageStore::new(PAGE_SIZE);
+        let table_payload = encode_table_payload(&runtime.tables["docs"]).expect("encode table payload");
+        let pointer = write_overflow(&mut store, &table_payload, CompressionMode::Auto)
+            .expect("write table payload");
+        let mut table_states = runtime.persisted_tables.clone();
+        table_states.insert(
+            "docs".to_string(),
+            PersistedTableState {
+                pointer,
+                checksum: crate::storage::checksum::crc32c_parts(&[table_payload.as_slice()]),
+            },
+        );
+
+        let manifest =
+            encode_manifest_payload(&runtime, &table_states).expect("encode manifest payload");
+        let decoded =
+            decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
+
+        assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
+        assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
+        assert_eq!(decoded.persisted_tables["docs"], table_states["docs"]);
     }
 
     fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {

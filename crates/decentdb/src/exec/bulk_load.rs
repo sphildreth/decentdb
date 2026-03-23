@@ -72,6 +72,9 @@ impl EngineRuntime {
                 });
             affected_rows += 1;
         }
+        if affected_rows > 0 {
+            self.mark_table_dirty(table_name);
+        }
         self.rebuild_indexes(page_size)?;
         self.execute_after_triggers(
             table_name,
