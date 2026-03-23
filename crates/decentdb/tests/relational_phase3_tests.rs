@@ -539,6 +539,76 @@ fn autocommit_param_inserts_keep_indexes_usable_and_statement_atomic() {
     cleanup_db(&path);
 }
 
+#[test]
+fn prepared_param_insert_recompiles_after_schema_change() {
+    let path = unique_db_path("phase1-prepared-insert-schema-cookie");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+    db.execute_with_params(
+        "INSERT INTO users (id, email) VALUES ($1, $2)",
+        &[Value::Int64(1), Value::Text("before@example.com".to_string())],
+    )
+    .expect("insert before schema change");
+
+    db.execute("ALTER TABLE users ADD COLUMN active BOOL DEFAULT TRUE")
+        .expect("add active column");
+    db.execute_with_params(
+        "INSERT INTO users (id, email) VALUES ($1, $2)",
+        &[Value::Int64(2), Value::Text("after@example.com".to_string())],
+    )
+    .expect("insert after schema change");
+
+    let rows = db
+        .execute("SELECT id, email, active FROM users ORDER BY id")
+        .expect("read rows after schema change");
+    assert_eq!(
+        rows.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("before@example.com".to_string()),
+                Value::Bool(true),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("after@example.com".to_string()),
+                Value::Bool(true),
+            ],
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn unsupported_insert_expression_falls_back_from_prepared_fast_path() {
+    let path = unique_db_path("phase1-prepared-insert-fallback");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+    db.execute_with_params(
+        "INSERT INTO users (id, email) VALUES ($1 + 0, $2)",
+        &[Value::Int64(7), Value::Text("fallback@example.com".to_string())],
+    )
+    .expect("expression insert should use generic path");
+
+    let row = db
+        .execute("SELECT id, email FROM users")
+        .expect("select inserted row");
+    assert_eq!(
+        row.rows()[0].values(),
+        &[Value::Int64(7), Value::Text("fallback@example.com".to_string())]
+    );
+
+    cleanup_db(&path);
+}
+
 fn unique_db_path(label: &str) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

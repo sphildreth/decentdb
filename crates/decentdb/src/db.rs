@@ -13,6 +13,7 @@ use crate::catalog::{
 };
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
+use crate::exec::dml::PreparedSimpleInsert;
 use crate::exec::{
     statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, RuntimeIndex,
 };
@@ -51,6 +52,7 @@ struct DbInner {
     sql_txn: Mutex<Option<SqlTxnState>>,
     write_txn: Mutex<WriteTxn>,
     statement_cache: Mutex<StatementCache>,
+    prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
 }
 
@@ -74,11 +76,25 @@ struct SqlSavepoint {
 }
 
 const STATEMENT_CACHE_CAPACITY: usize = 128;
+const PREPARED_INSERT_CACHE_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 struct StatementCache {
     entries: HashMap<String, Arc<SqlStatement>>,
     order: VecDeque<String>,
+    capacity: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PreparedInsertKey {
+    schema_cookie: u32,
+    sql: String,
+}
+
+#[derive(Debug)]
+struct PreparedInsertCache {
+    entries: HashMap<PreparedInsertKey, Arc<PreparedSimpleInsert>>,
+    order: VecDeque<PreparedInsertKey>,
     capacity: usize,
 }
 
@@ -119,6 +135,60 @@ impl StatementCache {
         self.order.push_back(key.clone());
         self.entries.insert(key, Arc::clone(&statement));
         Ok(statement)
+    }
+}
+
+impl Default for PreparedInsertCache {
+    fn default() -> Self {
+        Self::with_capacity(PREPARED_INSERT_CACHE_CAPACITY)
+    }
+}
+
+impl PreparedInsertCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get_or_prepare<F>(
+        &mut self,
+        sql: &str,
+        schema_cookie: u32,
+        build: F,
+    ) -> Result<Option<Arc<PreparedSimpleInsert>>>
+    where
+        F: FnOnce() -> Result<Option<PreparedSimpleInsert>>,
+    {
+        let key = PreparedInsertKey {
+            schema_cookie,
+            sql: sql.to_string(),
+        };
+        if let Some(plan) = self.entries.get(&key) {
+            return Ok(Some(Arc::clone(plan)));
+        }
+
+        let Some(plan) = build()? else {
+            return Ok(None);
+        };
+        let plan = Arc::new(plan);
+        if self.capacity == 0 {
+            return Ok(Some(plan));
+        }
+
+        while self.entries.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        self.order.push_back(key.clone());
+        self.entries.insert(key, Arc::clone(&plan));
+        Ok(Some(plan))
     }
 }
 
@@ -589,7 +659,7 @@ impl Db {
             let result = if statement_is_read_only(&statement) {
                 self.execute_read_statement(&statement, params)?
             } else {
-                self.execute_write_statement(&statement, params)?
+                self.execute_write_statement(trimmed, &statement, params)?
             };
             results.push(result);
         }
@@ -910,6 +980,7 @@ impl Db {
                 sql_txn: Mutex::new(None),
                 write_txn: Mutex::new(WriteTxn::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
+                prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
             }),
         })
@@ -953,6 +1024,7 @@ impl Db {
 
     fn execute_write_statement(
         &self,
+        sql: &str,
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
@@ -965,6 +1037,15 @@ impl Db {
             let state = txn
                 .as_mut()
                 .ok_or_else(|| DbError::transaction("no active SQL transaction"))?;
+            if let crate::sql::ast::Statement::Insert(insert) = statement {
+                if let Some(prepared) = self.prepared_simple_insert(sql, insert, &state.runtime)? {
+                    return state.runtime.execute_prepared_simple_insert(
+                        prepared.as_ref(),
+                        params,
+                        self.inner.config.page_size,
+                    );
+                }
+            }
             if matches!(
                 statement,
                 crate::sql::ast::Statement::Insert(insert)
@@ -989,6 +1070,19 @@ impl Db {
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        if let crate::sql::ast::Statement::Insert(insert) = statement {
+            let prepared = {
+                let runtime = self
+                    .inner
+                    .engine
+                    .read()
+                    .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+                self.prepared_simple_insert(sql, insert, &runtime)?
+            };
+            if let Some(prepared) = prepared {
+                return self.execute_autocommit_prepared_insert_in_place(prepared.as_ref(), params);
+            }
+        }
         if matches!(
             statement,
             crate::sql::ast::Statement::Insert(insert)
@@ -1012,12 +1106,31 @@ impl Db {
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
+        self.execute_autocommit_in_place(|runtime| {
+            runtime.execute_statement(statement, params, self.inner.config.page_size)
+        })
+    }
+
+    fn execute_autocommit_prepared_insert_in_place(
+        &self,
+        prepared: &PreparedSimpleInsert,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        self.execute_autocommit_in_place(|runtime| {
+            runtime.execute_prepared_simple_insert(prepared, params, self.inner.config.page_size)
+        })
+    }
+
+    fn execute_autocommit_in_place<F>(&self, apply: F) -> Result<QueryResult>
+    where
+        F: FnOnce(&mut EngineRuntime) -> Result<QueryResult>,
+    {
         let mut runtime = self
             .inner
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        let result = match runtime.execute_statement(statement, params, self.inner.config.page_size) {
+        let result = match apply(&mut runtime) {
             Ok(result) => result,
             Err(error) => {
                 self.restore_runtime_from_storage(&mut runtime)?;
@@ -1063,6 +1176,21 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("statement cache lock poisoned"))?
             .get_or_parse(sql)
+    }
+
+    fn prepared_simple_insert(
+        &self,
+        sql: &str,
+        statement: &crate::sql::ast::InsertStatement,
+        runtime: &EngineRuntime,
+    ) -> Result<Option<Arc<PreparedSimpleInsert>>> {
+        self.inner
+            .prepared_insert_cache
+            .lock()
+            .map_err(|_| DbError::internal("prepared insert cache lock poisoned"))?
+            .get_or_prepare(sql, runtime.catalog.schema_cookie, || {
+                runtime.prepare_simple_insert(statement)
+            })
     }
 
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
@@ -1727,7 +1855,9 @@ fn json_escape(input: String) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use super::StatementCache;
+    use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
+
+    use super::{PreparedInsertCache, StatementCache};
 
     #[test]
     fn statement_cache_reuses_parsed_statement() {
@@ -1744,5 +1874,44 @@ mod tests {
         let _second = cache.get_or_parse("SELECT 2").expect("parse second");
         let first_again = cache.get_or_parse("SELECT 1").expect("reparse evicted");
         assert!(!Arc::ptr_eq(&first, &first_again));
+    }
+
+    #[test]
+    fn prepared_insert_cache_is_scoped_by_schema_cookie() {
+        let mut cache = PreparedInsertCache::with_capacity(4);
+        let first = cache
+            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 1, || {
+                Ok(Some(dummy_prepared_insert("users_v1")))
+            })
+            .expect("prepare first")
+            .expect("prepared plan");
+        let cached = cache
+            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 1, || {
+                Ok(Some(dummy_prepared_insert("users_v1_new")))
+            })
+            .expect("prepare cached")
+            .expect("cached plan");
+        assert!(Arc::ptr_eq(&first, &cached));
+
+        let second_schema = cache
+            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 2, || {
+                Ok(Some(dummy_prepared_insert("users_v2")))
+            })
+            .expect("prepare second schema")
+            .expect("prepared plan");
+        assert!(!Arc::ptr_eq(&first, &second_schema));
+        assert_eq!(second_schema.table_name, "users_v2");
+    }
+
+    fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {
+        PreparedSimpleInsert {
+            table_name: table_name.to_string(),
+            value_sources: vec![PreparedInsertValueSource::Null],
+            required_column_indexes: Vec::new(),
+            unique_indexes: Vec::new(),
+            insert_indexes: Vec::new(),
+            use_generic_validation: false,
+            use_generic_index_updates: false,
+        }
     }
 }

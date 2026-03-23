@@ -1,15 +1,43 @@
 //! DML execution helpers.
 
-use crate::catalog::TriggerEvent;
+use crate::catalog::{IndexKind, TriggerEvent};
 use crate::error::{DbError, Result};
+use crate::record::key::encode_index_key;
+use crate::record::row::Row;
 use crate::record::value::Value;
 use crate::sql::ast::{
     Assignment, ConflictAction, ConflictTarget, DeleteStatement, Expr, InsertSource,
     InsertStatement, SelectItem, UpdateStatement,
 };
+use crate::sql::parser::parse_expression_sql;
 
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{compare_values, table_row_dataset, EngineRuntime, StoredRow};
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedInsertValueSource {
+    Literal(Value),
+    Parameter(usize),
+    DefaultExpr(Expr),
+    Null,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedBtreeIndex {
+    pub(crate) name: String,
+    pub(crate) column_indexes: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSimpleInsert {
+    pub(crate) table_name: String,
+    pub(crate) value_sources: Vec<PreparedInsertValueSource>,
+    pub(crate) required_column_indexes: Vec<usize>,
+    pub(crate) unique_indexes: Vec<PreparedBtreeIndex>,
+    pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
+    pub(crate) use_generic_validation: bool,
+    pub(crate) use_generic_index_updates: bool,
+}
 
 impl EngineRuntime {
     pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
@@ -24,6 +52,231 @@ impl EngineRuntime {
                 && trigger.target_name == statement.table_name
                 && trigger.event == TriggerEvent::Insert
         })
+    }
+
+    pub(crate) fn prepare_simple_insert(
+        &self,
+        statement: &InsertStatement,
+    ) -> Result<Option<PreparedSimpleInsert>> {
+        if !self.can_execute_insert_in_place(statement) || !statement.returning.is_empty() {
+            return Ok(None);
+        }
+
+        let table = self
+            .catalog
+            .tables
+            .get(&statement.table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        let InsertSource::Values(rows) = &statement.source else {
+            return Ok(None);
+        };
+        let source_exprs = rows
+            .first()
+            .ok_or_else(|| DbError::internal("simple insert expected one VALUES row"))?;
+        let target_columns = if statement.columns.is_empty() {
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+        } else {
+            statement.columns.clone()
+        };
+        if target_columns.len() != source_exprs.len() {
+            return Err(DbError::sql(format!(
+                "INSERT on {} expected {} values but received {}",
+                table.name,
+                target_columns.len(),
+                source_exprs.len()
+            )));
+        }
+
+        let mut assigned = vec![None; table.columns.len()];
+        for (column_name, expr) in target_columns.iter().zip(source_exprs) {
+            let column_index = table
+                .columns
+                .iter()
+                .position(|column| column.name == *column_name)
+                .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
+            if assigned[column_index].is_some() {
+                return Err(DbError::sql(format!(
+                    "column {} was assigned more than once in INSERT",
+                    column_name
+                )));
+            }
+            let Some(source) = compile_prepared_insert_value_source(expr) else {
+                return Ok(None);
+            };
+            assigned[column_index] = Some(source);
+        }
+
+        let mut value_sources = Vec::with_capacity(table.columns.len());
+        for (index, column) in table.columns.iter().enumerate() {
+            if let Some(source) = assigned[index].take() {
+                value_sources.push(source);
+                continue;
+            }
+            if let Some(default_sql) = &column.default_sql {
+                value_sources.push(PreparedInsertValueSource::DefaultExpr(
+                    parse_expression_sql(default_sql)?,
+                ));
+            } else {
+                value_sources.push(PreparedInsertValueSource::Null);
+            }
+        }
+
+        let required_column_indexes = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| (!column.nullable).then_some(index))
+            .collect::<Vec<_>>();
+        let mut use_generic_validation = table
+            .columns
+            .iter()
+            .any(|column| !column.checks.is_empty())
+            || !table.checks.is_empty()
+            || !table.foreign_keys.is_empty();
+        let mut unique_indexes = Vec::new();
+        for index in self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| index.table_name == statement.table_name && index.unique)
+        {
+            let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
+                use_generic_validation = true;
+                unique_indexes.clear();
+                break;
+            };
+            unique_indexes.push(prepared_index);
+        }
+        let mut use_generic_index_updates = false;
+        let mut insert_indexes = Vec::new();
+        for index in self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| index.table_name == statement.table_name && index.fresh)
+        {
+            let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
+                use_generic_index_updates = true;
+                insert_indexes.clear();
+                break;
+            };
+            insert_indexes.push(prepared_index);
+        }
+
+        Ok(Some(PreparedSimpleInsert {
+            table_name: statement.table_name.clone(),
+            value_sources,
+            required_column_indexes,
+            unique_indexes,
+            insert_indexes,
+            use_generic_validation,
+            use_generic_index_updates,
+        }))
+    }
+
+    pub(crate) fn execute_prepared_simple_insert(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<QueryResult> {
+        let table_name = prepared.table_name.clone();
+        let mut staged_table = self
+            .catalog
+            .tables
+            .get(&table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let mut candidate = Vec::with_capacity(staged_table.columns.len());
+
+        for (index, source) in prepared.value_sources.iter().enumerate() {
+            let (column_type, auto_increment, column_name) = {
+                let column = staged_table.columns.get(index).ok_or_else(|| {
+                    DbError::internal(format!(
+                        "prepared insert column index {index} is out of range for {table_name}"
+                    ))
+                })?;
+                (column.column_type, column.auto_increment, column.name.clone())
+            };
+            let mut value = match source {
+                PreparedInsertValueSource::Literal(value) => value.clone(),
+                PreparedInsertValueSource::Parameter(number) => params
+                    .get(number.saturating_sub(1))
+                    .cloned()
+                    .ok_or_else(|| {
+                        DbError::sql(format!("parameter ${number} was not provided"))
+                    })?,
+                PreparedInsertValueSource::DefaultExpr(expr) => self.eval_expr(
+                    expr,
+                    &Dataset::empty(),
+                    &[],
+                    params,
+                    &std::collections::BTreeMap::new(),
+                    None,
+                )?,
+                PreparedInsertValueSource::Null => Value::Null,
+            };
+
+            if auto_increment {
+                match value {
+                    Value::Null => {
+                        value = Value::Int64(staged_table.next_row_id);
+                        staged_table.next_row_id += 1;
+                    }
+                    Value::Int64(explicit) => {
+                        if explicit >= staged_table.next_row_id {
+                            staged_table.next_row_id = explicit + 1;
+                        }
+                    }
+                    _ => {
+                        return Err(DbError::constraint(format!(
+                            "auto-increment column {}.{} requires INT64 values",
+                            staged_table.name, column_name
+                        )));
+                    }
+                }
+            }
+
+            candidate.push(super::cast_value(value, column_type)?);
+        }
+
+        if prepared.use_generic_validation {
+            self.validate_row(&table_name, &candidate, None, params)?;
+        } else {
+            validate_prepared_insert(self, prepared, &candidate)?;
+        }
+        let row_id = primary_row_id(&staged_table, &candidate).unwrap_or_else(|| {
+            let row_id = staged_table.next_row_id;
+            staged_table.next_row_id += 1;
+            row_id
+        });
+        let stored_row = StoredRow {
+            row_id,
+            values: candidate,
+        };
+        let index_updates = if prepared.use_generic_index_updates {
+            self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?
+        } else {
+            prepared_insert_index_updates(prepared, &stored_row)?
+        };
+
+        self.catalog
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+            .next_row_id = staged_table.next_row_id;
+        self.tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .rows
+            .push(stored_row);
+        self.apply_insert_index_updates(index_updates)?;
+        self.mark_table_dirty(&table_name);
+        Ok(QueryResult::with_affected_rows(1))
     }
 
     pub(super) fn execute_insert(
@@ -772,6 +1025,11 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<Option<QueryResult>> {
+        if let Some(prepared) = self.prepare_simple_insert(statement)? {
+            return self
+                .execute_prepared_simple_insert(&prepared, params, page_size)
+                .map(Some);
+        }
         if !self.can_execute_insert_in_place(statement) {
             return Ok(None);
         }
@@ -904,6 +1162,133 @@ pub(super) fn build_insert_row_values(
         resolved.push(value);
     }
     runtime.coerce_row_values(table, resolved)
+}
+
+fn compile_prepared_insert_value_source(expr: &Expr) -> Option<PreparedInsertValueSource> {
+    match expr {
+        Expr::Literal(value) => Some(PreparedInsertValueSource::Literal(value.clone())),
+        Expr::Parameter(number) => Some(PreparedInsertValueSource::Parameter(*number)),
+        _ => None,
+    }
+}
+
+fn prepare_btree_insert_index(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    index: &crate::catalog::IndexSchema,
+) -> Result<Option<PreparedBtreeIndex>> {
+    if index.kind != IndexKind::Btree
+        || !index.fresh
+        || index.predicate_sql.is_some()
+        || !matches!(runtime.indexes.get(&index.name), Some(super::RuntimeIndex::Btree { .. }))
+    {
+        return Ok(None);
+    }
+
+    let mut column_indexes = Vec::with_capacity(index.columns.len());
+    for column in &index.columns {
+        let Some(column_name) = &column.column_name else {
+            return Ok(None);
+        };
+        if column.expression_sql.is_some() {
+            return Ok(None);
+        }
+        let column_index = table
+            .columns
+            .iter()
+            .position(|entry| entry.name == *column_name)
+            .ok_or_else(|| {
+                DbError::constraint(format!("index column {} does not exist", column_name))
+            })?;
+        column_indexes.push(column_index);
+    }
+
+    Ok(Some(PreparedBtreeIndex {
+        name: index.name.clone(),
+        column_indexes,
+    }))
+}
+
+fn validate_prepared_insert(
+    runtime: &EngineRuntime,
+    prepared: &PreparedSimpleInsert,
+    row: &[Value],
+) -> Result<()> {
+    let table = runtime
+        .catalog
+        .tables
+        .get(&prepared.table_name)
+        .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared.table_name)))?;
+    for &column_index in &prepared.required_column_indexes {
+        if matches!(row.get(column_index), Some(Value::Null)) {
+            let column_name = &table.columns[column_index].name;
+            return Err(DbError::constraint(format!(
+                "column {}.{} may not be NULL",
+                table.name, column_name
+            )));
+        }
+    }
+
+    for index in &prepared.unique_indexes {
+        if prepared_index_contains_null(index, row) {
+            continue;
+        }
+        let key = prepared_btree_index_key(index, row)?;
+        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+            return Err(DbError::internal(format!(
+                "runtime index {} is missing",
+                index.name
+            )));
+        };
+        if keys.get(&key).is_some_and(|row_ids| !row_ids.is_empty()) {
+            return Err(DbError::constraint(format!(
+                "unique constraint {} on {} was violated",
+                index.name, table.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn prepared_insert_index_updates(
+    prepared: &PreparedSimpleInsert,
+    row: &StoredRow,
+) -> Result<Vec<super::PendingIndexInsert>> {
+    prepared
+        .insert_indexes
+        .iter()
+        .map(|index| {
+            Ok(super::PendingIndexInsert::Btree {
+                name: index.name.clone(),
+                key: prepared_btree_index_key(index, &row.values)?,
+                row_id: row.row_id,
+            })
+        })
+        .collect()
+}
+
+fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result<Vec<u8>> {
+    let values = index
+        .column_indexes
+        .iter()
+        .map(|&column_index| {
+            row.get(column_index)
+                .cloned()
+                .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if values.len() == 1 {
+        encode_index_key(&values[0])
+    } else {
+        Row::new(values).encode()
+    }
+}
+
+fn prepared_index_contains_null(index: &PreparedBtreeIndex, row: &[Value]) -> bool {
+    index
+        .column_indexes
+        .iter()
+        .any(|&column_index| matches!(row.get(column_index), Some(Value::Null)))
 }
 
 fn materialize_insert_source(
