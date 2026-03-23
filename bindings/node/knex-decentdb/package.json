@@ -1,0 +1,16 @@
+{
+  "name": "knex-decentdb",
+  "version": "1.8.1",
+  "private": true,
+  "description": "Knex client/dialect for DecentDB",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "knex": ">=2"
+  },
+  "dependencies": {
+    "decentdb-native": "file:../decentdb"
+  }
+}

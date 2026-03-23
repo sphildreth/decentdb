@@ -24,13 +24,14 @@ Use the more specific industry term for each package where it applies:
 ## Migration Policy
 
 - Nim is not a supported target in this repository.
-- `/home/steven/source/decentdb-nim/bindings` is reference material only for API
-  shape, tests, examples, and package layout.
-- Do not copy generated artifacts from any language toolchain into this tree.
+- `/home/steven/source/decentdb-nim/bindings` was copied here as source-only
+  migration input for the Rust rewrite.
+- These packages are not assumed to work against the Rust engine yet.
+- Do not commit generated artifacts from any language toolchain into this tree.
 
-## Planned Layout
+## Current Layout
 
-As packages are ported, prefer a stable language-first layout:
+The following language integration trees now live in-repo under `bindings/`:
 
 - `bindings/python/`
 - `bindings/dotnet/`

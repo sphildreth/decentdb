@@ -1,0 +1,96 @@
+# DecentDB JNI Native Library Build
+#
+# This Makefile builds the JNI bridge library that connects the Java JDBC driver
+# to the DecentDB C API.
+#
+# Usage:
+#   make                        # Build for current platform
+#   make DECENTDB_LIB_DIR=...   # Point to directory containing libc_api.so
+#
+# Prerequisites:
+#   - JDK with jni.h in $JAVA_HOME/include
+#   - DecentDB shared library: run `nimble build_lib` first from the repo root
+#
+# Output: build/libdecentdb_jni.so (Linux), build/libdecentdb_jni.dylib (macOS)
+
+JAVA_HOME ?= $(shell java -XshowSettings:all -version 2>&1 | grep "java.home" | awk '{print $$3}')
+DECENTDB_LIB_DIR ?= $(shell p=$$(realpath ../../../build 2>/dev/null || echo ../../../build); cygpath -m "$$p" 2>/dev/null || echo "$$p")
+BUILD_DIR = $(shell p=$$(realpath ../../../build 2>/dev/null || echo ../../../build); cygpath -m "$$p" 2>/dev/null || echo "$$p")
+
+OS := $(shell uname -s)
+ARCH := $(shell uname -m)
+
+IS_WINDOWS := 0
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(OS)))
+    IS_WINDOWS := 1
+endif
+
+ifeq ($(OS),Darwin)
+    LIB_EXT = dylib
+    SHARED_FLAGS = -dynamiclib
+    OS_INCLUDES = -I$(JAVA_HOME)/include/darwin
+    PLATFORM_FLAGS = -undefined dynamic_lookup
+    RPATH_FLAGS = -Wl,-rpath,@loader_path -Wl,-rpath,$(DECENTDB_LIB_DIR)
+else ifeq ($(OS),Linux)
+    LIB_EXT = so
+    SHARED_FLAGS = -shared -fPIC
+    OS_INCLUDES = -I$(JAVA_HOME)/include/linux
+    PLATFORM_FLAGS =
+    RPATH_FLAGS = -Wl,-rpath,'$$ORIGIN' -Wl,-rpath,$(DECENTDB_LIB_DIR)
+else ifeq ($(IS_WINDOWS),1)
+    LIB_EXT = dll
+    SHARED_FLAGS = -shared
+    OS_INCLUDES = -I$(JAVA_HOME)/include/win32
+    PLATFORM_FLAGS = -Wl,--enable-auto-import
+    RPATH_FLAGS =
+else
+    $(error Unsupported OS: $(OS))
+endif
+
+CC = gcc
+CFLAGS = -O2 -Wall \
+    -I$(JAVA_HOME)/include \
+    $(OS_INCLUDES) \
+    -I.
+
+ifeq ($(IS_WINDOWS),1)
+    OUTPUT_LIB = $(BUILD_DIR)/decentdb_jni.$(LIB_EXT)
+else
+    OUTPUT_LIB = $(BUILD_DIR)/libdecentdb_jni.$(LIB_EXT)
+endif
+
+ifeq ($(IS_WINDOWS),1)
+    # build_lib produces build/c_api.dll on Windows.
+    # Nim (mingw) may also produce build/libc_api.dll.a (import lib).
+    ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libdecentdb.dll.a))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libdecentdb.dll.a
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.lib))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.lib
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libc_api.dll.a))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libc_api.dll.a
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/c_api.dll))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/c_api.dll
+    else
+        DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
+    endif
+else
+    DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
+endif
+
+.PHONY: all clean
+
+all: $(OUTPUT_LIB)
+
+$(OUTPUT_LIB): decentdb_jni.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(SHARED_FLAGS) $(PLATFORM_FLAGS) \
+	    -o $@ \
+	    decentdb_jni.c \
+        $(DECENTDB_LINK_FLAGS) \
+        $(RPATH_FLAGS)
+	@echo "Built: $@"
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+clean:
+	rm -f $(OUTPUT_LIB)

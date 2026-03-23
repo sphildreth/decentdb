@@ -1,0 +1,73 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'org.jkiss.dbeaver.ext'
+version = '1.8.1'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // Embed the DecentDB JDBC driver + its runtime deps into this bundle.
+    implementation project(':driver')
+
+    // DBeaver OSGi bundles – compile-only (provided at runtime by the DBeaver platform).
+    def dbeaverPluginDirProp = project.findProperty('dbeaverPluginDir')
+    def dbeaverPluginDirEnv = System.getenv('DBEAVER_PLUGIN_DIR')
+
+    def candidateDirs = []
+    if (dbeaverPluginDirProp != null) candidateDirs << new File(dbeaverPluginDirProp.toString())
+    if (dbeaverPluginDirEnv != null) candidateDirs << new File(dbeaverPluginDirEnv)
+    candidateDirs << new File('/usr/lib/dbeaver/plugins')
+    candidateDirs << new File('/usr/share/dbeaver/plugins')
+
+    def pluginDir = candidateDirs.find { it.exists() && it.isDirectory() }
+    if (pluginDir == null) {
+        throw new GradleException("DBeaver plugin directory not found. Set -PdbeaverPluginDir=... (or DBEAVER_PLUGIN_DIR) to a folder containing DBeaver's *.jar bundles.")
+    }
+
+    compileOnly fileTree(pluginDir) { include '*.jar' }
+}
+
+jar {
+    dependsOn ':driver:jar'
+
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+    manifest {
+        attributes(
+            'Bundle-SymbolicName': 'org.jkiss.dbeaver.ext.decentdb;singleton:=true',
+            'Bundle-Version': version,
+            'Bundle-Name': 'DecentDB DBeaver Extension',
+            'Bundle-Vendor': 'DecentDB Contributors',
+            'Require-Bundle': 'org.jkiss.dbeaver.model,org.jkiss.dbeaver.model.jdbc,org.jkiss.dbeaver.ext.generic',
+            'Bundle-ManifestVersion': '2',
+            'Bundle-RequiredExecutionEnvironment': 'JavaSE-21',
+            'Export-Package': 'org.jkiss.dbeaver.ext.decentdb.model',
+            'Bundle-ClassPath': '.',
+            'Bundle-ActivationPolicy': 'lazy',
+            'Import-Package': 'org.jkiss.code'
+        )
+    }
+
+    // DBeaver expects plugin.xml at the bundle root.
+    from('plugin.xml')
+
+    // Bundle UI icons referenced by plugin.xml.
+    from('icons') {
+        into 'icons'
+    }
+
+    // Produce a single drop-in bundle jar by unpacking runtime classpath jars.
+    // This embeds the JDBC driver, org.json, and native resources.
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+}

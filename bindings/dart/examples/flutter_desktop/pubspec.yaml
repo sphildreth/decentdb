@@ -1,0 +1,11 @@
+name: decentdb_flutter_example
+description: Minimal DecentDB Flutter desktop example
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  decentdb:
+    path: ../../dart
