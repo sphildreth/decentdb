@@ -1,0 +1,22 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "ffi",
+      "rootUri": "file:///home/steven/.pub-cache/hosted/pub.dev/ffi-2.2.0",
+      "packageUri": "lib/",
+      "languageVersion": "3.7"
+    },
+    {
+      "name": "decentdb_dart_smoke",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.11"
+    }
+  ],
+  "generator": "pub",
+  "generatorVersion": "3.11.1",
+  "flutterRoot": "file:///opt/flutter",
+  "flutterVersion": "3.41.4",
+  "pubCache": "file:///home/steven/.pub-cache"
+}

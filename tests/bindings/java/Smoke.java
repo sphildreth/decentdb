@@ -82,6 +82,6 @@ public final class Smoke {
 
     private static String errorString(MethodHandle lastError) throws Throwable {
         MemorySegment segment = (MemorySegment) lastError.invokeExact();
-        return segment.equals(MemorySegment.NULL) ? "" : segment.getUtf8String(0);
+        return segment.equals(MemorySegment.NULL) ? "" : segment.reinterpret(Long.MAX_VALUE).getString(0);
     }
 }

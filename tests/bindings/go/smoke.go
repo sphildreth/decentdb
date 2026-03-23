@@ -10,7 +10,6 @@ import "C"
 
 import (
 	"fmt"
-	"os"
 	"unsafe"
 )
 
