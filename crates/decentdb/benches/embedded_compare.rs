@@ -112,16 +112,19 @@ impl SqliteBenchmarker {
 
 impl DatabaseBenchmarker for SqliteBenchmarker {
     fn name(&self) -> &'static str {
-        "SQLite"
+        "sqlite"
     }
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("sqlite.db");
         let conn = SqliteConnection::open(&self.db_path).unwrap();
 
+        let journal_mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=FULL;
+            "PRAGMA synchronous=FULL;
              PRAGMA wal_autocheckpoint=0;
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
               CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);
@@ -129,6 +132,15 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
              CREATE TABLE join_profiles (id INTEGER PRIMARY KEY, bio TEXT);",
         )
         .unwrap();
+        let synchronous: i64 = conn.query_row("PRAGMA synchronous;", [], |row| row.get(0)).unwrap();
+        assert_eq!(synchronous, 2, "expected SQLite synchronous=FULL");
+        let wal_autocheckpoint: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            wal_autocheckpoint, 0,
+            "expected SQLite wal_autocheckpoint=0"
+        );
 
         self.conn = Some(conn);
     }
@@ -253,25 +265,31 @@ impl DuckDbBenchmarker {
             return;
         }
         let conn = self.conn.as_mut().unwrap();
+        conn.execute_batch("BEGIN TRANSACTION;").unwrap();
         {
-            let mut users = conn.appender("join_users").unwrap();
-            let mut profiles = conn.appender("join_profiles").unwrap();
+            let mut users = conn
+                .prepare("INSERT INTO join_users (id, name) VALUES (?, ?)")
+                .unwrap();
+            let mut profiles = conn
+                .prepare("INSERT INTO join_profiles (id, bio) VALUES (?, ?)")
+                .unwrap();
             for i in 0..JOIN_DATASET_COUNT {
                 users
-                    .append_row(duckdb::params![i, format!("Join User {}", i)])
+                    .execute(duckdb::params![i, format!("Join User {}", i)])
                     .unwrap();
                 profiles
-                    .append_row(duckdb::params![i, format!("Bio {}", i)])
+                    .execute(duckdb::params![i, format!("Bio {}", i)])
                     .unwrap();
             }
         }
+        conn.execute_batch("COMMIT;").unwrap();
         self.join_seeded = true;
     }
 }
 
 impl DatabaseBenchmarker for DuckDbBenchmarker {
     fn name(&self) -> &'static str {
-        "DuckDB"
+        "duckdb"
     }
 
     fn setup(&mut self, path: &Path) {
@@ -279,10 +297,11 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         let conn = DuckdbConnection::open(&self.db_path).unwrap();
 
         conn.execute_batch(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR);
-              CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount DOUBLE);
-             CREATE TABLE join_users (id INTEGER PRIMARY KEY, name VARCHAR);
-             CREATE TABLE join_profiles (id INTEGER PRIMARY KEY, bio VARCHAR);",
+            "SET threads = 1;
+              CREATE TABLE users (id INTEGER PRIMARY KEY, name VARCHAR);
+               CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount DOUBLE);
+              CREATE TABLE join_users (id INTEGER PRIMARY KEY, name VARCHAR);
+              CREATE TABLE join_profiles (id INTEGER PRIMARY KEY, bio VARCHAR);",
         )
         .unwrap();
 
@@ -437,14 +456,17 @@ impl DecentDbBenchmarker {
 
 impl DatabaseBenchmarker for DecentDbBenchmarker {
     fn name(&self) -> &'static str {
-        "DecentDB"
+        "decentdb"
     }
 
     fn setup(&mut self, path: &Path) {
         self.db_path = path.join("decent.db");
 
-        let mut config = decentdb::DbConfig::default();
-        config.temp_dir = path.to_path_buf();
+        let config = decentdb::DbConfig {
+            wal_sync_mode: decentdb::WalSyncMode::Full,
+            temp_dir: path.to_path_buf(),
+            ..decentdb::DbConfig::default()
+        };
 
         let db = decentdb::Db::create(&self.db_path, config).unwrap();
 
@@ -462,10 +484,10 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
     fn insert_batch(&mut self) -> f64 {
         let db = self.db.as_ref().unwrap();
+        let start = Instant::now();
         let insert = db
             .prepare("INSERT INTO users (id, name) VALUES ($1, $2);")
             .unwrap();
-        let start = Instant::now();
 
         db.execute("BEGIN;").unwrap();
         for i in 0..INSERT_COUNT {
@@ -498,9 +520,11 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
             let result = select
                 .execute(&[decentdb::Value::Int64(id as i64)])
                 .unwrap();
-
-            // Just access the row to ensure we evaluated it
-            assert!(!result.rows().is_empty());
+            assert_eq!(result.rows().len(), 1);
+            let [decentdb::Value::Text(name)] = result.rows()[0].values() else {
+                panic!("expected one TEXT column from point lookup");
+            };
+            let _name = name.clone();
             latencies.push(start.elapsed().as_micros() as u64);
         }
 
@@ -563,6 +587,12 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
                 .execute(&[decentdb::Value::Int64(id as i64)])
                 .unwrap();
             assert_eq!(result.rows().len(), 1);
+            let [decentdb::Value::Text(name), decentdb::Value::Text(bio)] =
+                result.rows()[0].values()
+            else {
+                panic!("expected two TEXT columns from join lookup");
+            };
+            let _row = (name.clone(), bio.clone());
             latencies.push(start.elapsed().as_micros() as u64);
         }
 
@@ -615,7 +645,10 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     commit_latencies.sort_unstable();
     let p95_commit_us = commit_latencies[p95_index(commit_latencies.len())];
     metrics.commit_p95_ms = p95_commit_us as f64 / 1000.0;
-    println!("  -> Commit p95: {:.3} ms", metrics.commit_p95_ms);
+        println!(
+            "  -> Auto-commit insert p95: {:.3} ms",
+            metrics.commit_p95_ms
+        );
 
     // 5. Joins
     let mut join_latencies = benchmarker.join_reads();
@@ -670,7 +703,39 @@ fn main() {
         .insert("storage_root".to_string(), storage_root.display().to_string());
     summary
         .metadata
-        .insert("durability_profile".to_string(), "durable".to_string());
+        .insert("durability_profile".to_string(), "engine_specific".to_string());
+    summary.metadata.insert(
+        "sqlite_durability".to_string(),
+        "wal+synchronous_full+wal_autocheckpoint_0".to_string(),
+    );
+    summary.metadata.insert(
+        "duckdb_durability".to_string(),
+        "engine_default".to_string(),
+    );
+    summary.metadata.insert(
+        "decentdb_durability".to_string(),
+        "wal_sync_full".to_string(),
+    );
+    summary.metadata.insert(
+        "benchmark_profile".to_string(),
+        "single_thread_prepared_statement_oltp".to_string(),
+    );
+    summary.metadata.insert(
+        "insert_workload".to_string(),
+        "prepared_single_row_insert_loop_in_one_explicit_transaction".to_string(),
+    );
+    summary.metadata.insert(
+        "read_workload".to_string(),
+        "prepared_point_lookup_with_value_materialization".to_string(),
+    );
+    summary.metadata.insert(
+        "commit_workload".to_string(),
+        "prepared_single_row_auto_commit_insert_p95".to_string(),
+    );
+    summary.metadata.insert(
+        "join_workload".to_string(),
+        "prepared_inner_join_lookup_with_value_materialization".to_string(),
+    );
     summary.metadata.insert(
         "read_pattern".to_string(),
         "deterministic_permutation".to_string(),

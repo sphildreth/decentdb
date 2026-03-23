@@ -26,6 +26,7 @@ pub(crate) enum PreparedInsertValueSource {
 pub(crate) struct PreparedBtreeIndex {
     pub(crate) name: String,
     pub(crate) column_indexes: Vec<usize>,
+    pub(crate) unique: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -318,9 +319,17 @@ impl EngineRuntime {
         let index_updates = if prepared.use_generic_index_updates {
             self.prepare_insert_index_updates(table_name, &stored_row, page_size)?
         } else {
-            prepared_insert_index_updates(prepared, &stored_row)?
+            Vec::new()
         };
 
+        if !prepared.use_generic_index_updates {
+            apply_prepared_insert_index_updates(
+                self,
+                prepared,
+                &stored_row,
+                !prepared.use_generic_validation,
+            )?;
+        }
         self.catalog
             .tables
             .get_mut(table_name)
@@ -331,7 +340,9 @@ impl EngineRuntime {
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .push(stored_row);
-        self.apply_insert_index_updates(index_updates)?;
+        if prepared.use_generic_index_updates {
+            self.apply_insert_index_updates(index_updates)?;
+        }
         self.mark_table_dirty(table_name);
         Ok(QueryResult::with_affected_rows(1))
     }
@@ -1263,6 +1274,7 @@ fn prepare_btree_insert_index(
     Ok(Some(PreparedBtreeIndex {
         name: index.name.clone(),
         column_indexes,
+        unique: index.unique,
     }))
 }
 
@@ -1285,43 +1297,56 @@ fn validate_prepared_insert(
             )));
         }
     }
-
-    for index in &prepared.unique_indexes {
-        if prepared_index_contains_null(index, row) {
-            continue;
-        }
-        let key = prepared_btree_index_key(index, row)?;
-        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
-            return Err(DbError::internal(format!(
-                "runtime index {} is missing",
-                index.name
-            )));
-        };
-        if keys.get(&key).is_some_and(|row_ids| !row_ids.is_empty()) {
-            return Err(DbError::constraint(format!(
-                "unique constraint {} on {} was violated",
-                index.name, table.name
-            )));
+    if prepared.use_generic_index_updates {
+        for index in &prepared.unique_indexes {
+            if prepared_index_contains_null(index, row) {
+                continue;
+            }
+            let key = prepared_btree_index_key(index, row)?;
+            let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+                return Err(DbError::internal(format!(
+                    "runtime index {} is missing",
+                    index.name
+                )));
+            };
+            if keys.get(&key).is_some_and(|row_ids| !row_ids.is_empty()) {
+                return Err(DbError::constraint(format!(
+                    "unique constraint {} on {} was violated",
+                    index.name, table.name
+                )));
+            }
         }
     }
     Ok(())
 }
 
-fn prepared_insert_index_updates(
+fn apply_prepared_insert_index_updates(
+    runtime: &mut EngineRuntime,
     prepared: &PreparedSimpleInsert,
     row: &StoredRow,
-) -> Result<Vec<super::PendingIndexInsert>> {
-    prepared
-        .insert_indexes
-        .iter()
-        .map(|index| {
-            Ok(super::PendingIndexInsert::Btree {
-                name: index.name.clone(),
-                key: prepared_btree_index_key(index, &row.values)?,
-                row_id: row.row_id,
-            })
-        })
-        .collect()
+    check_unique: bool,
+) -> Result<()> {
+    for index in &prepared.insert_indexes {
+        let key = prepared_btree_index_key(index, &row.values)?;
+        let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
+            return Err(DbError::internal(format!(
+                "runtime index {} is missing",
+                index.name
+            )));
+        };
+        if check_unique
+            && index.unique
+            && !prepared_index_contains_null(index, &row.values)
+            && keys.get(&key).is_some_and(|row_ids| !row_ids.is_empty())
+        {
+            return Err(DbError::constraint(format!(
+                "unique constraint {} on {} was violated",
+                index.name, prepared.table_name
+            )));
+        }
+        keys.entry(key).or_default().push(row.row_id);
+    }
+    Ok(())
 }
 
 fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result<Vec<u8>> {

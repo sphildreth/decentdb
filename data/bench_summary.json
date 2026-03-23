@@ -1,34 +1,42 @@
 {
   "engines": {
-    "DecentDB": {
-      "read_p95_ms": 0.045,
+    "decentdb": {
+      "read_p95_ms": 0.048,
       "join_p95_ms": 0.013,
-      "commit_p95_ms": 4.068,
-      "insert_rows_per_sec": 403147.11148521374,
+      "commit_p95_ms": 4.078,
+      "insert_rows_per_sec": 423635.5329641081,
       "db_size_mb": 0.492218017578125
     },
-    "DuckDB": {
-      "read_p95_ms": 0.178,
-      "join_p95_ms": 0.403,
-      "commit_p95_ms": 3.039,
-      "insert_rows_per_sec": 5625.2382971533725,
+    "duckdb": {
+      "read_p95_ms": 0.154,
+      "join_p95_ms": 0.333,
+      "commit_p95_ms": 3.053,
+      "insert_rows_per_sec": 7120.398579770312,
       "db_size_mb": 3.26171875
     },
-    "SQLite": {
+    "sqlite": {
       "read_p95_ms": 0.002,
       "join_p95_ms": 0.002,
-      "commit_p95_ms": 3.023,
-      "insert_rows_per_sec": 1884840.078575967,
+      "commit_p95_ms": 3.022,
+      "insert_rows_per_sec": 1752322.8967551677,
       "db_size_mb": 1.83203125
     }
   },
   "metadata": {
-    "durability_profile": "durable",
+    "benchmark_profile": "single_thread_prepared_statement_oltp",
+    "commit_workload": "prepared_single_row_auto_commit_insert_p95",
+    "decentdb_durability": "wal_sync_full",
+    "duckdb_durability": "engine_default",
+    "durability_profile": "engine_specific",
+    "insert_workload": "prepared_single_row_insert_loop_in_one_explicit_transaction",
+    "join_workload": "prepared_inner_join_lookup_with_value_materialization",
     "machine": "AMD Ryzen 9 3900X 12-Core Processor",
     "os": "linux",
     "read_pattern": "deterministic_permutation",
-    "run_id": "1774289189563",
+    "read_workload": "prepared_point_lookup_with_value_materialization",
+    "run_id": "1774290374594",
     "size_measurement": "db_plus_wal_after_checkpoint",
+    "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
   }
 }
