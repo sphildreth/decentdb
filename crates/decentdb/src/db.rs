@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -20,6 +21,7 @@ use crate::metadata::{
     TriggerInfo, ViewInfo,
 };
 use crate::record::value::Value;
+use crate::sql::ast::Statement as SqlStatement;
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::page::{self, PageId};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
@@ -48,6 +50,7 @@ struct DbInner {
     sql_write_lock: Mutex<()>,
     sql_txn: Mutex<Option<SqlTxnState>>,
     write_txn: Mutex<WriteTxn>,
+    statement_cache: Mutex<StatementCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
 }
 
@@ -68,6 +71,55 @@ struct SqlTxnState {
 struct SqlSavepoint {
     name: String,
     runtime: EngineRuntime,
+}
+
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
+#[derive(Debug)]
+struct StatementCache {
+    entries: HashMap<String, Arc<SqlStatement>>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for StatementCache {
+    fn default() -> Self {
+        Self::with_capacity(STATEMENT_CACHE_CAPACITY)
+    }
+}
+
+impl StatementCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get_or_parse(&mut self, sql: &str) -> Result<Arc<SqlStatement>> {
+        if let Some(statement) = self.entries.get(sql) {
+            return Ok(Arc::clone(statement));
+        }
+
+        let statement = Arc::new(parse_sql_statement(sql)?);
+        if self.capacity == 0 {
+            return Ok(statement);
+        }
+
+        while self.entries.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+
+        let key = sql.to_string();
+        self.order.push_back(key.clone());
+        self.entries.insert(key, Arc::clone(&statement));
+        Ok(statement)
+    }
 }
 
 impl Db {
@@ -533,7 +585,7 @@ impl Db {
                 continue;
             }
 
-            let statement = parse_sql_statement(trimmed)?;
+            let statement = self.parsed_statement(trimmed)?;
             let result = if statement_is_read_only(&statement) {
                 self.execute_read_statement(&statement, params)?
             } else {
@@ -857,6 +909,7 @@ impl Db {
                 sql_write_lock: Mutex::new(()),
                 sql_txn: Mutex::new(None),
                 write_txn: Mutex::new(WriteTxn::default()),
+                statement_cache: Mutex::new(StatementCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
             }),
         })
@@ -912,6 +965,15 @@ impl Db {
             let state = txn
                 .as_mut()
                 .ok_or_else(|| DbError::transaction("no active SQL transaction"))?;
+            if matches!(
+                statement,
+                crate::sql::ast::Statement::Insert(insert)
+                    if state.runtime.can_execute_insert_in_place(insert)
+            ) {
+                return state
+                    .runtime
+                    .execute_statement(statement, params, self.inner.config.page_size);
+            }
             let mut working = state.runtime.clone();
             working.rebuild_indexes(self.inner.config.page_size)?;
             let result =
@@ -944,6 +1006,14 @@ impl Db {
         Ok(snapshot)
     }
 
+    fn parsed_statement(&self, sql: &str) -> Result<Arc<SqlStatement>> {
+        self.inner
+            .statement_cache
+            .lock()
+            .map_err(|_| DbError::internal("statement cache lock poisoned"))?
+            .get_or_parse(sql)
+    }
+
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
         self.persist_runtime_if_latest(runtime, None)
     }
@@ -953,6 +1023,8 @@ impl Db {
         runtime: EngineRuntime,
         expected_latest_lsn: Option<u64>,
     ) -> Result<u64> {
+        let mut runtime = runtime;
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
@@ -1586,4 +1658,28 @@ fn json_escape(input: String) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::StatementCache;
+
+    #[test]
+    fn statement_cache_reuses_parsed_statement() {
+        let mut cache = StatementCache::with_capacity(4);
+        let first = cache.get_or_parse("SELECT 1").expect("parse");
+        let second = cache.get_or_parse("SELECT 1").expect("cache hit");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn statement_cache_evicts_oldest_entry_when_full() {
+        let mut cache = StatementCache::with_capacity(1);
+        let first = cache.get_or_parse("SELECT 1").expect("parse first");
+        let _second = cache.get_or_parse("SELECT 2").expect("parse second");
+        let first_again = cache.get_or_parse("SELECT 1").expect("reparse evicted");
+        assert!(!Arc::ptr_eq(&first, &first_again));
+    }
 }

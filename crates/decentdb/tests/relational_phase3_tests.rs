@@ -412,6 +412,71 @@ fn alter_table_bulk_load_and_rebuild_entry_points_work() {
     cleanup_db(&path);
 }
 
+#[test]
+fn explicit_transaction_param_inserts_keep_indexes_usable_and_statement_atomic() {
+    let path = unique_db_path("phase0-insert-hot-path");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+    db.execute("CREATE INDEX users_email_idx ON users (email)")
+        .expect("create email index");
+
+    db.execute("BEGIN").expect("begin");
+    for id in 1..=8 {
+        db.execute_with_params(
+            "INSERT INTO users (id, email) VALUES ($1, $2)",
+            &[
+                Value::Int64(id),
+                Value::Text(format!("user{id}@example.com")),
+            ],
+        )
+        .expect("insert user");
+    }
+
+    let duplicate = db
+        .execute_with_params(
+            "INSERT INTO users (id, email) VALUES ($1, $2)",
+            &[Value::Int64(3), Value::Text("duplicate@example.com".to_string())],
+        )
+        .expect_err("duplicate primary key should fail");
+    assert!(matches!(duplicate, decentdb::DbError::Constraint { .. }));
+
+    let count = db
+        .execute("SELECT COUNT(*) FROM users")
+        .expect("count after failed insert");
+    assert_eq!(count.rows()[0].values(), &[Value::Int64(8)]);
+
+    let explain = db
+        .execute("EXPLAIN SELECT id FROM users WHERE email = 'user3@example.com'")
+        .expect("explain email lookup");
+    assert!(
+        explain
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("IndexSeek(table=users")),
+        "expected IndexSeek in {:?}",
+        explain.explain_lines()
+    );
+
+    let row = db
+        .execute_with_params(
+            "SELECT id FROM users WHERE email = $1",
+            &[Value::Text("user3@example.com".to_string())],
+        )
+        .expect("select by indexed email");
+    assert_eq!(row.rows()[0].values(), &[Value::Int64(3)]);
+
+    db.execute("COMMIT").expect("commit");
+
+    let verification = db
+        .verify_index("users_email_idx")
+        .expect("verify email index");
+    assert!(verification.valid, "expected valid index after commit");
+
+    cleanup_db(&path);
+}
+
 fn unique_db_path(label: &str) -> PathBuf {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

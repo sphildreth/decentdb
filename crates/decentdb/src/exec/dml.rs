@@ -12,6 +12,20 @@ use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{compare_values, table_row_dataset, EngineRuntime, StoredRow};
 
 impl EngineRuntime {
+    pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
+        if self.catalog.views.contains_key(&statement.table_name) || statement.on_conflict.is_some() {
+            return false;
+        }
+        if !matches!(&statement.source, InsertSource::Values(rows) if rows.len() == 1) {
+            return false;
+        }
+        !self.catalog.triggers.values().any(|trigger| {
+            !trigger.on_view
+                && trigger.target_name == statement.table_name
+                && trigger.event == TriggerEvent::Insert
+        })
+    }
+
     pub(super) fn execute_insert(
         &mut self,
         statement: &InsertStatement,
@@ -32,6 +46,10 @@ impl EngineRuntime {
                 page_size,
             )?;
             return Ok(QueryResult::with_affected_rows(affected_rows));
+        }
+
+        if let Some(result) = self.try_execute_in_place_insert(statement, params, page_size)? {
+            return Ok(result);
         }
 
         let table_name = statement.table_name.clone();
@@ -122,6 +140,8 @@ impl EngineRuntime {
                 row_id,
                 values: candidate,
             };
+            let index_updates =
+                self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
             self.tables
                 .get_mut(&table_name)
                 .ok_or_else(|| {
@@ -129,6 +149,7 @@ impl EngineRuntime {
                 })?
                 .rows
                 .push(stored_row.clone());
+            self.apply_insert_index_updates(index_updates)?;
             affected_rows += 1;
             if !statement.returning.is_empty() {
                 returning_rows.push(stored_row.clone());
@@ -239,6 +260,10 @@ impl EngineRuntime {
             affected_rows += 1;
         }
 
+        if affected_rows > 0 {
+            self.mark_indexes_stale_for_table(&table_name);
+        }
+
         self.execute_after_triggers(
             &table_name,
             TriggerEvent::Update,
@@ -304,6 +329,10 @@ impl EngineRuntime {
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .retain(|row| !matching_row_ids.contains(&row.row_id));
+
+        if !matching_row_ids.is_empty() {
+            self.mark_indexes_stale_for_table(&table_name);
+        }
 
         self.execute_after_triggers(
             &table_name,
@@ -436,6 +465,7 @@ impl EngineRuntime {
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows[row_index]
             .values = next_values.clone();
+        self.mark_indexes_stale_for_table(table_name);
         Ok(Some(StoredRow {
             row_id,
             values: next_values,
@@ -506,8 +536,10 @@ impl EngineRuntime {
                             })?
                             .rows
                             .retain(|child| !child_ids.contains(&child.row_id));
+                        self.mark_indexes_stale_for_table(&child_table.name);
                     }
                     crate::catalog::ForeignKeyAction::SetNull => {
+                        self.mark_indexes_stale_for_table(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
                                 .tables
@@ -617,6 +649,7 @@ impl EngineRuntime {
                         )))
                     }
                     crate::catalog::ForeignKeyAction::Cascade => {
+                        self.mark_indexes_stale_for_table(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
                                 .tables
@@ -669,6 +702,7 @@ impl EngineRuntime {
                         }
                     }
                     crate::catalog::ForeignKeyAction::SetNull => {
+                        self.mark_indexes_stale_for_table(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
                                 .tables
@@ -722,6 +756,73 @@ impl EngineRuntime {
             }
         }
         Ok(())
+    }
+
+    fn try_execute_in_place_insert(
+        &mut self,
+        statement: &InsertStatement,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<Option<QueryResult>> {
+        if !self.can_execute_insert_in_place(statement) {
+            return Ok(None);
+        }
+
+        let table_name = statement.table_name.clone();
+        let mut source_rows = materialize_insert_source(self, &statement.source, params)?;
+        let source_row = source_rows
+            .pop()
+            .ok_or_else(|| DbError::internal("simple in-place insert expected one source row"))?;
+
+        let mut staged_table = self
+            .catalog
+            .tables
+            .get(&table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let candidate = build_insert_row_values(
+            self,
+            &mut staged_table,
+            &statement.columns,
+            source_row,
+            params,
+        )?;
+        self.validate_row(&table_name, &candidate, None, params)?;
+
+        let row_id = primary_row_id(&staged_table, &candidate).unwrap_or_else(|| {
+            let row_id = staged_table.next_row_id;
+            staged_table.next_row_id += 1;
+            row_id
+        });
+        let stored_row = StoredRow {
+            row_id,
+            values: candidate,
+        };
+        let index_updates = self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
+
+        self.catalog
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+            .next_row_id = staged_table.next_row_id;
+        self.tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .rows
+            .push(stored_row.clone());
+        self.apply_insert_index_updates(index_updates)?;
+
+        let result = if statement.returning.is_empty() {
+            QueryResult::with_affected_rows(1)
+        } else {
+            self.render_returning(
+                &table_name,
+                std::slice::from_ref(&stored_row),
+                &statement.returning,
+                params,
+            )?
+        };
+        Ok(Some(result))
     }
 }
 

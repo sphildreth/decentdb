@@ -56,6 +56,20 @@ pub(crate) enum RuntimeIndex {
 }
 
 #[derive(Debug)]
+pub(super) enum PendingIndexInsert {
+    Btree {
+        name: String,
+        key: Vec<u8>,
+        row_id: i64,
+    },
+    Trigram {
+        name: String,
+        row_id: u64,
+        text: String,
+    },
+}
+
+#[derive(Debug)]
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: CatalogState,
     pub(crate) tables: BTreeMap<String, TableData>,
@@ -175,14 +189,18 @@ impl EngineRuntime {
     }
 
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
+        let indexes = self.catalog.indexes.values().cloned().collect::<Vec<_>>();
         let mut rebuilt = BTreeMap::new();
-        for index in self.catalog.indexes.values() {
+        for index in indexes {
             rebuilt.insert(
                 index.name.clone(),
-                build_runtime_index(index, self, page_size)?,
+                build_runtime_index(&index, self, page_size)?,
             );
         }
         self.indexes = rebuilt;
+        for index in self.catalog.indexes.values_mut() {
+            index.fresh = true;
+        }
         Ok(())
     }
 
@@ -203,6 +221,136 @@ impl EngineRuntime {
         Ok(())
     }
 
+    pub(crate) fn rebuild_stale_indexes(&mut self, page_size: u32) -> Result<()> {
+        let names = self
+            .catalog
+            .indexes
+            .iter()
+            .filter(|(name, index)| !index.fresh || !self.indexes.contains_key(*name))
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        for name in names {
+            self.rebuild_index(&name, page_size)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn mark_indexes_stale_for_table(&mut self, table_name: &str) {
+        for index in self.catalog.indexes.values_mut() {
+            if index.table_name == table_name {
+                index.fresh = false;
+            }
+        }
+    }
+
+    pub(super) fn prepare_insert_index_updates(
+        &mut self,
+        table_name: &str,
+        row: &StoredRow,
+        page_size: u32,
+    ) -> Result<Vec<PendingIndexInsert>> {
+        let table = self
+            .catalog
+            .tables
+            .get(table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        let indexes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| index.table_name == table_name && index.fresh)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut updates = Vec::new();
+
+        for index in indexes {
+            if !self.indexes.contains_key(&index.name) {
+                self.rebuild_index(&index.name, page_size)?;
+            }
+
+            match index.kind {
+                IndexKind::Btree => {
+                    let Some(key) = compute_index_key(self, &index, &table, row)? else {
+                        continue;
+                    };
+                    updates.push(PendingIndexInsert::Btree {
+                        name: index.name.clone(),
+                        key,
+                        row_id: row.row_id,
+                    });
+                }
+                IndexKind::Trigram => {
+                    if !row_satisfies_index_predicate(self, &index, &table, row)? {
+                        continue;
+                    }
+                    let text = compute_index_values(self, &index, &table, row)?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            DbError::constraint("trigram index requires a single text expression")
+                        })?;
+                    let Value::Text(text) = text else {
+                        return Err(DbError::constraint(
+                            "trigram index requires a single text expression",
+                        ));
+                    };
+                    updates.push(PendingIndexInsert::Trigram {
+                        name: index.name.clone(),
+                        row_id: row.row_id as u64,
+                        text,
+                    });
+                }
+            }
+        }
+
+        Ok(updates)
+    }
+
+    pub(super) fn apply_insert_index_updates(
+        &mut self,
+        updates: Vec<PendingIndexInsert>,
+    ) -> Result<()> {
+        for update in updates {
+            match update {
+                PendingIndexInsert::Btree { name, key, row_id } => match self.indexes.get_mut(&name)
+                {
+                    Some(RuntimeIndex::Btree { keys }) => {
+                        keys.entry(key).or_default().push(row_id);
+                    }
+                    Some(_) => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is not a BTREE index"
+                        )))
+                    }
+                    None => {
+                        return Err(DbError::internal(format!(
+                            "runtime index {name} is missing"
+                        )))
+                    }
+                },
+                PendingIndexInsert::Trigram { name, row_id, text } => {
+                    match self.indexes.get_mut(&name) {
+                        Some(RuntimeIndex::Trigram { index }) => {
+                            index.queue_insert(row_id, &text);
+                        }
+                        Some(_) => {
+                            return Err(DbError::internal(format!(
+                                "runtime index {name} is not a trigram index"
+                            )))
+                        }
+                        None => {
+                            return Err(DbError::internal(format!(
+                                "runtime index {name} is missing"
+                            )))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn execute_statement(
         &mut self,
         statement: &Statement,
@@ -215,17 +363,14 @@ impl EngineRuntime {
             }
             Statement::Insert(statement) => {
                 let result = self.execute_insert(statement, params, page_size)?;
-                self.rebuild_indexes(page_size)?;
                 Ok(result)
             }
             Statement::Update(statement) => {
                 let result = self.execute_update(statement, params, page_size)?;
-                self.rebuild_indexes(page_size)?;
                 Ok(result)
             }
             Statement::Delete(statement) => {
                 let result = self.execute_delete(statement, params, page_size)?;
-                self.rebuild_indexes(page_size)?;
                 Ok(result)
             }
             Statement::CreateTable(statement) => {

@@ -1,12 +1,12 @@
 //! Constraint enforcement helpers.
 
-use crate::catalog::{ColumnSchema, IndexSchema, TableSchema};
+use crate::catalog::{ColumnSchema, IndexKind, IndexSchema, TableSchema};
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
 use crate::sql::ast::ConflictTarget;
 use crate::sql::parser::parse_expression_sql;
 
-use super::{compare_values, table_row_dataset, EngineRuntime, StoredRow};
+use super::{compare_values, table_row_dataset, EngineRuntime, RuntimeIndex, StoredRow};
 
 impl EngineRuntime {
     pub(super) fn coerce_row_values(
@@ -80,6 +80,18 @@ impl EngineRuntime {
         for index in unique_indexes_for_table(self, table_name) {
             let candidate = index_values(self, index, table, row)?;
             if candidate.iter().any(|value| matches!(value, Value::Null)) {
+                continue;
+            }
+            if let Some(row_ids) = unique_index_row_ids(self, index, table, row)? {
+                if row_ids
+                    .into_iter()
+                    .any(|row_id| Some(row_id) != existing_row_id)
+                {
+                    return Err(DbError::constraint(format!(
+                        "unique constraint {} on {} was violated",
+                        index.name, table.name
+                    )));
+                }
                 continue;
             }
             let rows = self
@@ -193,6 +205,16 @@ impl EngineRuntime {
             if candidate.iter().any(|value| matches!(value, Value::Null)) {
                 continue;
             }
+            if let Some(row_ids) = unique_index_row_ids(self, index, table, row)? {
+                if let Some(existing) = table_data
+                    .rows
+                    .iter()
+                    .find(|existing| row_ids.contains(&existing.row_id))
+                {
+                    return Ok(Some(existing.clone()));
+                }
+                continue;
+            }
             if let Some(existing) = table_data.rows.iter().find(|existing| {
                 index_values(self, index, table, &existing.values)
                     .and_then(|existing_values| values_equal(&candidate, &existing_values))
@@ -251,6 +273,28 @@ fn unique_indexes_for_table<'a>(
         .values()
         .filter(|index| index.table_name == table_name && index.unique)
         .collect()
+}
+
+fn unique_index_row_ids(
+    runtime: &EngineRuntime,
+    index: &IndexSchema,
+    table: &TableSchema,
+    row: &[Value],
+) -> Result<Option<Vec<i64>>> {
+    if !index.fresh || index.kind != IndexKind::Btree {
+        return Ok(None);
+    }
+    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+        return Ok(None);
+    };
+    let probe = StoredRow {
+        row_id: 0,
+        values: row.to_vec(),
+    };
+    let Some(key) = super::compute_index_key(runtime, index, table, &probe)? else {
+        return Ok(Some(Vec::new()));
+    };
+    Ok(Some(keys.get(&key).cloned().unwrap_or_default()))
 }
 
 fn indexes_for_conflict_target<'a>(

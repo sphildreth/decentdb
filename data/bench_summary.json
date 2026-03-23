@@ -1,29 +1,30 @@
 {
   "engines": {
-    "duckdb": {
-      "read_p95_ms": 0.181,
-      "join_p95_ms": 1.5,
-      "commit_p95_ms": 0.43,
-      "insert_rows_per_sec": 1766860.0901413145,
-      "db_size_mb": 2.26171875
-    },
-    "decentdb": {
-      "read_p95_ms": 0.05,
-      "join_p95_ms": 1.5,
-      "commit_p95_ms": 2.0,
-      "insert_rows_per_sec": 100000.0,
-      "db_size_mb": 10.0
-    },
     "sqlite": {
       "read_p95_ms": 0.002,
       "join_p95_ms": 1.5,
-      "commit_p95_ms": 0.009,
-      "insert_rows_per_sec": 1988509.003024224,
+      "commit_p95_ms": 0.008,
+      "insert_rows_per_sec": 2016510.1770748,
       "db_size_mb": 1.82421875
+    },
+    "decentdb": {
+      "read_p95_ms": 0.005,
+      "join_p95_ms": 1.5,
+      "commit_p95_ms": 192.082,
+      "insert_rows_per_sec": 221071.21543035348,
+      "db_size_mb": 0.9375
+    },
+    "duckdb": {
+      "read_p95_ms": 0.176,
+      "join_p95_ms": 1.5,
+      "commit_p95_ms": 0.393,
+      "insert_rows_per_sec": 1900804.791244589,
+      "db_size_mb": 2.26171875
     }
   },
   "metadata": {
-    "cpu": "x86_64",
-    "os": "linux"
+    "run_id": "1774277743755",
+    "os": "linux",
+    "machine": "AMD Ryzen 9 3900X 12-Core Processor"
   }
 }
