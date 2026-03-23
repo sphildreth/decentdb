@@ -1,9 +1,15 @@
 //! Typed table-row wrapper over the generic B+Tree storage primitives.
 
+use std::collections::BTreeMap;
+
 use crate::btree::cursor::BtreeCursor;
+use crate::btree::page::BtreePage;
+use crate::btree::page::decode_page;
+use crate::btree::read::find_exact;
 use crate::btree::write::Btree;
 use crate::error::Result;
 use crate::record::compression::CompressionMode;
+use crate::record::overflow::free_overflow;
 use crate::record::row::{Row, RowOverflowOptions};
 use crate::record::value::Value;
 use crate::storage::page::{InMemoryPageStore, PageId, PageStore};
@@ -24,6 +30,12 @@ pub(crate) struct TableBtree<S: PageStore> {
 #[derive(Debug)]
 pub(crate) struct TableBtreeCursor<'a, S: PageStore> {
     inner: BtreeCursor<'a, S>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TableBtreeView<'a, S: PageStore> {
+    store: &'a S,
+    root_page_id: Option<PageId>,
 }
 
 impl<S: PageStore> TableBtree<S> {
@@ -61,6 +73,19 @@ impl<S: PageStore> TableBtree<S> {
             .insert(key, payload)?
             .map(|previous| decode_table_row(row_id, previous))
             .transpose()
+    }
+
+    pub(crate) fn replace_rows(&mut self, rows: &[TableRow]) -> Result<()> {
+        let entries = rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    encode_row_id_key(row.row_id),
+                    encode_row_payload::<S>(row.values.clone())?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        self.tree.replace_entries(entries)
     }
 
     pub(crate) fn get_row(&self, row_id: i64) -> Result<Option<TableRow>> {
@@ -102,6 +127,10 @@ impl<S: PageStore> TableBtree<S> {
             inner: self.tree.cursor_seek_backward(encode_row_id_key(row_id))?,
         })
     }
+
+    pub(crate) fn into_parts(self) -> (S, Option<PageId>) {
+        self.tree.into_parts()
+    }
 }
 
 impl TableBtree<InMemoryPageStore> {
@@ -126,6 +155,64 @@ impl<'a, S: PageStore> TableBtreeCursor<'a, S> {
     }
 }
 
+impl<'a, S: PageStore> TableBtreeView<'a, S> {
+    pub(crate) fn new(store: &'a S, root_page_id: Option<PageId>) -> Self {
+        Self { store, root_page_id }
+    }
+
+    pub(crate) fn root_page_id(&self) -> Option<PageId> {
+        self.root_page_id
+    }
+
+    pub(crate) fn get_row(&self, row_id: i64) -> Result<Option<TableRow>> {
+        find_exact(self.store, self.root_page_id, encode_row_id_key(row_id))?
+            .map(|payload| decode_table_row(row_id, payload))
+            .transpose()
+    }
+
+    pub(crate) fn cursor_from_start(&self) -> Result<TableBtreeCursor<'_, S>> {
+        Ok(TableBtreeCursor {
+            inner: BtreeCursor::from_start(self.store, self.root_page_id)?,
+        })
+    }
+
+    pub(crate) fn cursor_seek_forward(&self, row_id: i64) -> Result<TableBtreeCursor<'_, S>> {
+        Ok(TableBtreeCursor {
+            inner: BtreeCursor::seek_forward(self.store, self.root_page_id, encode_row_id_key(row_id))?,
+        })
+    }
+}
+
+pub(crate) fn free_table_btree<S: PageStore>(
+    store: &mut S,
+    root_page_id: Option<PageId>,
+) -> Result<()> {
+    let Some(root_page_id) = root_page_id else {
+        return Ok(());
+    };
+    let mut stack = vec![root_page_id];
+    while let Some(page_id) = stack.pop() {
+        let page = decode_page(&store.read_page(page_id)?)?;
+        match page {
+            BtreePage::Leaf(leaf) => {
+                for cell in leaf.cells {
+                    if let Some(overflow_page_id) = cell.overflow_page_id {
+                        free_overflow(store, overflow_page_id)?;
+                    }
+                }
+            }
+            BtreePage::Internal(internal) => {
+                stack.push(internal.right_child);
+                for cell in internal.cells {
+                    stack.push(cell.child);
+                }
+            }
+        }
+        store.free_page(page_id)?;
+    }
+    Ok(())
+}
+
 fn encode_row_id_key(row_id: i64) -> u64 {
     (row_id as u64) ^ SIGNED_ROW_ID_BIAS
 }
@@ -142,11 +229,21 @@ fn decode_table_row(row_id: i64, payload: Vec<u8>) -> Result<TableRow> {
     })
 }
 
+fn encode_row_payload<S: PageStore>(values: Vec<Value>) -> Result<Vec<u8>> {
+    Row::new(values).encode_with_overflow::<S>(
+        None,
+        RowOverflowOptions {
+            inline_threshold: usize::MAX,
+            compression: CompressionMode::Never,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::record::value::Value;
 
-    use super::{TableBtree, TableRow};
+    use super::{free_table_btree, TableBtree, TableBtreeView, TableRow};
 
     fn collect_forward(tree: &TableBtree<crate::storage::page::InMemoryPageStore>) -> Vec<TableRow> {
         let mut cursor = tree.cursor_from_start().expect("cursor");
@@ -207,5 +304,50 @@ mod tests {
 
         let row = tree.get_row(7).expect("get row").expect("row exists");
         assert_eq!(row.values, vec![Value::Text(large)]);
+    }
+
+    #[test]
+    fn replace_rows_and_view_roundtrip_existing_root() {
+        let rows = vec![
+            TableRow {
+                row_id: -3,
+                values: vec![Value::Int64(-3), Value::Text("left".to_string())],
+            },
+            TableRow {
+                row_id: 9,
+                values: vec![Value::Int64(9), Value::Text("right".to_string())],
+            },
+        ];
+        let mut tree = TableBtree::with_page_size(512);
+        tree.replace_rows(&rows).expect("bulk replace");
+        let root_page_id = tree.root_page_id();
+        let view = TableBtreeView::new(tree.store(), root_page_id);
+
+        let loaded = view.get_row(-3).expect("get row").expect("row exists");
+        assert_eq!(loaded, rows[0]);
+
+        let visible_rows = {
+            let mut cursor = view.cursor_from_start().expect("cursor");
+            let mut visible = Vec::new();
+            while let Some(row) = cursor.next().expect("next") {
+                visible.push(row);
+            }
+            visible
+        };
+        assert_eq!(visible_rows, rows);
+    }
+
+    #[test]
+    fn free_table_btree_releases_pages() {
+        let mut tree = TableBtree::with_page_size(512);
+        tree.insert_row(1, vec![Value::Text("a".repeat(4_096))])
+            .expect("insert row");
+        tree.insert_row(2, vec![Value::Text("b".repeat(4_096))])
+            .expect("insert row");
+
+        let (mut store, root_page_id) = tree.into_parts();
+        assert!(store.allocated_page_count() > 0);
+        free_table_btree(&mut store, root_page_id).expect("free tree");
+        assert_eq!(store.allocated_page_count(), 0);
     }
 }

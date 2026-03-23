@@ -62,8 +62,8 @@ def load_library():
     
     if not lib_path:
         # Search relative to this file, walking up ancestors so this works when
-        # running from the repo (e.g. `.../build/libc_api.so`) as well as when
-        # invoked from different working directories.
+        # running from the repo (e.g. `.../target/debug/libdecentdb.so`) as well
+        # as when invoked from different working directories.
 
         here = os.path.abspath(__file__)
         candidates = []
@@ -77,10 +77,13 @@ def load_library():
             "decentdb.dll",
         ]
 
-        # Check current working directory build first (useful in CI/scripts)
+        # Check common output directories from current working directory first
+        # (useful in CI/scripts and local test runs).
         cwd = os.getcwd()
         for name in lib_names:
             candidates.append(os.path.join(cwd, "build", name))
+            candidates.append(os.path.join(cwd, "target", "debug", name))
+            candidates.append(os.path.join(cwd, "target", "release", name))
 
         # Walk up a few parents from this module's location
         # (native.py -> decentdb/ -> python/ -> bindings/ -> repo root)
@@ -88,6 +91,8 @@ def load_library():
         for _ in range(0, 8):
             for name in lib_names:
                 candidates.append(os.path.join(cur_dir, "build", name))
+                candidates.append(os.path.join(cur_dir, "target", "debug", name))
+                candidates.append(os.path.join(cur_dir, "target", "release", name))
             parent = os.path.dirname(cur_dir)
             if parent == cur_dir:
                 break
@@ -99,7 +104,10 @@ def load_library():
                 break
     
     if not lib_path:
-        raise RuntimeError("Could not find decentdb native library. Set DECENTDB_NATIVE_LIB env var.")
+        raise RuntimeError(
+            "Could not find decentdb native library. Set DECENTDB_NATIVE_LIB "
+            "or build with `cargo build -p decentdb`."
+        )
 
     try:
         _lib = ctypes.CDLL(lib_path)

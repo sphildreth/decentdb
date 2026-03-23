@@ -64,6 +64,11 @@ impl<S: PageStore> Btree<S> {
         Ok(previous)
     }
 
+    pub(crate) fn replace_entries(&mut self, entries: BTreeMap<u64, Vec<u8>>) -> Result<()> {
+        self.entries = entries;
+        self.rebuild_pages()
+    }
+
     pub(crate) fn update(&mut self, key: u64, value: Vec<u8>) -> Result<Option<Vec<u8>>> {
         self.insert(key, value)
     }
@@ -98,6 +103,10 @@ impl<S: PageStore> Btree<S> {
     #[must_use]
     pub(crate) fn entry_count(&self) -> usize {
         self.entries.len()
+    }
+
+    pub(crate) fn into_parts(self) -> (S, Option<PageId>) {
+        (self.store, self.root_page_id)
     }
 
     fn rebuild_pages(&mut self) -> Result<()> {
