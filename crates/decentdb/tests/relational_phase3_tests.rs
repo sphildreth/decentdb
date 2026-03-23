@@ -145,6 +145,70 @@ fn read_executor_supports_joins_aggregates_row_number_and_explain() {
 }
 
 #[test]
+fn read_executor_supports_parameterized_alias_joins_on_either_side() {
+    let path = unique_db_path("phase3-join-fastpath");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT NOT NULL)")
+        .expect("create users");
+    db.execute(
+        "CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64 REFERENCES users(id), total INT64)",
+    )
+    .expect("create orders");
+    db.execute("CREATE INDEX orders_user_id_idx ON orders (user_id)")
+        .expect("create orders index");
+
+    db.execute("INSERT INTO users (id, name) VALUES (1, 'Ada'), (2, 'Grace')")
+        .expect("insert users");
+    db.execute(
+        "INSERT INTO orders (id, user_id, total) VALUES (10, 1, 50), (11, 1, 75), (12, 2, 10)",
+    )
+    .expect("insert orders");
+
+    let left_filtered = db
+        .execute_with_params(
+            "SELECT u.name, o.total \
+             FROM users AS u \
+             JOIN orders AS o ON u.id = o.user_id \
+             WHERE u.id = $1 \
+             ORDER BY o.total",
+            &[Value::Int64(1)],
+        )
+        .expect("left-filtered join");
+    assert_eq!(
+        left_filtered
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Text("Ada".to_string()), Value::Int64(50)],
+            vec![Value::Text("Ada".to_string()), Value::Int64(75)],
+        ]
+    );
+
+    let right_filtered = db
+        .execute_with_params(
+            "SELECT u.name, o.total \
+             FROM users AS u \
+             JOIN orders AS o ON u.id = o.user_id \
+             WHERE o.id = $1",
+            &[Value::Int64(12)],
+        )
+        .expect("right-filtered join");
+    assert_eq!(
+        right_filtered
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Text("Grace".to_string()), Value::Int64(10)]]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn statement_rollback_constraints_and_on_conflict_returning_work() {
     let path = unique_db_path("phase3-dml");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

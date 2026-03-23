@@ -637,6 +637,8 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         let mut dataset = if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
             dataset
+        } else if let Some(dataset) = self.try_indexed_join(select, params, ctes)? {
+            dataset
         } else if select.from.is_empty() {
             Dataset {
                 columns: Vec::new(),
@@ -709,7 +711,10 @@ impl EngineRuntime {
             return Ok(None);
         };
 
-        if let Some((column_name, value_expr)) = simple_btree_lookup(filter) {
+        if let Some((table_qualifier, column_name, value_expr)) = simple_btree_lookup(filter) {
+            if !matches_filter_binding(name, alias, table_qualifier) {
+                return Ok(None);
+            }
             if let Some(index) = self.catalog.indexes.values().find(|index| {
                 index.table_name == *name
                     && index.fresh
@@ -767,6 +772,266 @@ impl EngineRuntime {
         }
 
         Ok(None)
+    }
+
+    fn try_indexed_join(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let Some(filter) = &select.filter else {
+            return Ok(None);
+        };
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            on,
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name, alias),
+            _ => return Ok(None),
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name, alias),
+            _ => return Ok(None),
+        };
+        if ctes.contains_key(left_name)
+            || ctes.contains_key(right_name)
+            || self.catalog.views.contains_key(left_name)
+            || self.catalog.views.contains_key(right_name)
+        {
+            return Ok(None);
+        }
+
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        let Some((left_join, right_join)) = simple_join_equality(on) else {
+            return Ok(None);
+        };
+
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+
+        if matches_table_binding(left_binding, filter_table)
+            && matches_table_binding(left_binding, left_join.table)
+            && matches_table_binding(right_binding, right_join.table)
+        {
+            let Some(left_dataset) = self.indexed_table_lookup(
+                left_name,
+                left_alias,
+                filter_column,
+                value_expr,
+                params,
+                ctes,
+            )?
+            else {
+                return Ok(None);
+            };
+            return self.indexed_inner_join_filtered(
+                IndexedJoinPlan {
+                    filtered_table: left_binding,
+                    filtered_dataset: &left_dataset,
+                    filtered_join_column: left_join.column,
+                    probe_table: right_binding,
+                    probe_join_column: right_join.column,
+                    filtered_on_left: true,
+                    on,
+                },
+                params,
+                ctes,
+            );
+        }
+
+        if matches_table_binding(right_binding, filter_table)
+            && matches_table_binding(right_binding, right_join.table)
+            && matches_table_binding(left_binding, left_join.table)
+        {
+            let Some(right_dataset) = self.indexed_table_lookup(
+                right_name,
+                right_alias,
+                filter_column,
+                value_expr,
+                params,
+                ctes,
+            )?
+            else {
+                return Ok(None);
+            };
+            return self.indexed_inner_join_filtered(
+                IndexedJoinPlan {
+                    filtered_table: right_binding,
+                    filtered_dataset: &right_dataset,
+                    filtered_join_column: right_join.column,
+                    probe_table: left_binding,
+                    probe_join_column: left_join.column,
+                    filtered_on_left: false,
+                    on,
+                },
+                params,
+                ctes,
+            );
+        }
+
+        Ok(None)
+    }
+
+    fn indexed_table_lookup(
+        &self,
+        table_name: &str,
+        alias: &Option<String>,
+        column_name: &str,
+        value_expr: &Expr,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let table = self
+            .catalog
+            .tables
+            .get(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table or view {table_name}")))?;
+        let Some(data) = self.tables.get(table_name) else {
+            return Ok(None);
+        };
+        let Some(index) = self.catalog.indexes.values().find(|index| {
+            index.table_name == table_name
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.columns.len() == 1
+                && index.columns[0].column_name.as_deref() == Some(column_name)
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+
+        let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
+        let key = encode_index_key(&value)?;
+        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            return Ok(None);
+        };
+        let row_ids = keys.get(&key).cloned().unwrap_or_default();
+        self.dataset_from_row_ids(table, data, alias, &row_ids).map(Some)
+    }
+
+    fn indexed_inner_join_filtered(
+        &self,
+        plan: IndexedJoinPlan<'_>,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let filtered_table = self
+            .catalog
+            .tables
+            .get(plan.filtered_table.name)
+            .ok_or_else(|| {
+                DbError::sql(format!(
+                    "unknown table or view {}",
+                    plan.filtered_table.name
+                ))
+            })?;
+        let probe_table = self
+            .catalog
+            .tables
+            .get(plan.probe_table.name)
+            .ok_or_else(|| DbError::sql(format!("unknown table or view {}", plan.probe_table.name)))?;
+        let probe_data = self.tables.get(plan.probe_table.name).cloned().unwrap_or_default();
+        let filtered_join_index = filtered_table
+            .columns
+            .iter()
+            .position(|column| column.name == plan.filtered_join_column)
+            .ok_or_else(|| DbError::sql(format!("unknown column {}", plan.filtered_join_column)))?;
+        let Some(probe_index) = self.catalog.indexes.values().find(|index| {
+            index.table_name == plan.probe_table.name
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.columns.len() == 1
+                && index.columns[0].column_name.as_deref() == Some(plan.probe_join_column)
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
+            return Ok(None);
+        };
+
+        let probe_columns = probe_table
+            .columns
+            .iter()
+            .map(|column| ColumnBinding {
+                table: Some(plan.probe_table.binding_name().to_string()),
+                name: column.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut columns = if plan.filtered_on_left {
+            plan.filtered_dataset.columns.clone()
+        } else {
+            probe_columns.clone()
+        };
+        if plan.filtered_on_left {
+            columns.extend(probe_columns.clone());
+        } else {
+            columns.extend(plan.filtered_dataset.columns.clone());
+        }
+        let mut rows = Vec::new();
+        for filtered_row in &plan.filtered_dataset.rows {
+            let Some(join_value) = filtered_row.get(filtered_join_index) else {
+                return Err(DbError::internal(
+                    "join row is shorter than filtered table schema",
+                ));
+            };
+            if matches!(join_value, Value::Null) {
+                continue;
+            }
+            let key = encode_index_key(join_value)?;
+            let row_ids = keys.get(&key).cloned().unwrap_or_default();
+            if row_ids.is_empty() {
+                continue;
+            }
+            let probe_dataset = self.dataset_from_row_ids(
+                probe_table,
+                &probe_data,
+                plan.probe_table.alias,
+                &row_ids,
+            )?;
+            for probe_row in &probe_dataset.rows {
+                let mut row = if plan.filtered_on_left {
+                    filtered_row.clone()
+                } else {
+                    probe_row.clone()
+                };
+                if plan.filtered_on_left {
+                    row.extend(probe_row.clone());
+                } else {
+                    row.extend(filtered_row.clone());
+                }
+                let dataset = Dataset {
+                    columns: columns.clone(),
+                    rows: Vec::new(),
+                };
+                if matches!(
+                    self.eval_expr(plan.on, &dataset, &row, params, ctes, None)?,
+                    Value::Bool(true)
+                )
+                {
+                    rows.push(row);
+                }
+            }
+        }
+        Ok(Some(Dataset { columns, rows }))
     }
 
     fn evaluate_from_item(
@@ -1824,22 +2089,94 @@ fn projection_has_aggregate_items(items: &[SelectItem]) -> bool {
     })
 }
 
-fn simple_btree_lookup(filter: &Expr) -> Option<(&str, &Expr)> {
+fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
     match filter {
         Expr::Binary { left, op, right } if *op == BinaryOp::Eq => match (&**left, &**right) {
-            (Expr::Column { column, .. }, value)
+            (Expr::Column { table, column }, value)
                 if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
             {
-                Some((column.as_str(), value))
+                Some((table.as_deref(), column.as_str(), value))
             }
-            (value, Expr::Column { column, .. })
+            (value, Expr::Column { table, column })
                 if matches!(value, Expr::Literal(_) | Expr::Parameter(_)) =>
             {
-                Some((column.as_str(), value))
+                Some((table.as_deref(), column.as_str(), value))
             }
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QualifiedColumnRef<'a> {
+    table: Option<&'a str>,
+    column: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TableBindingRef<'a> {
+    name: &'a str,
+    alias: &'a Option<String>,
+}
+
+impl<'a> TableBindingRef<'a> {
+    fn binding_name(self) -> &'a str {
+        self.alias.as_deref().unwrap_or(self.name)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexedJoinPlan<'a> {
+    filtered_table: TableBindingRef<'a>,
+    filtered_dataset: &'a Dataset,
+    filtered_join_column: &'a str,
+    probe_table: TableBindingRef<'a>,
+    probe_join_column: &'a str,
+    filtered_on_left: bool,
+    on: &'a Expr,
+}
+
+fn simple_join_equality(on: &Expr) -> Option<(QualifiedColumnRef<'_>, QualifiedColumnRef<'_>)> {
+    let Expr::Binary { left, op, right } = on else {
+        return None;
+    };
+    if *op != BinaryOp::Eq {
+        return None;
+    }
+    let (
+        Expr::Column {
+            table: left_table,
+            column: left_column,
+        },
+        Expr::Column {
+            table: right_table,
+            column: right_column,
+        },
+    ) = (&**left, &**right)
+    else {
+        return None;
+    };
+    Some((
+        QualifiedColumnRef {
+            table: left_table.as_deref(),
+            column: left_column,
+        },
+        QualifiedColumnRef {
+            table: right_table.as_deref(),
+            column: right_column,
+        },
+    ))
+}
+
+fn matches_table_binding(table: TableBindingRef<'_>, qualifier: Option<&str>) -> bool {
+    qualifier.is_some_and(|qualifier| qualifier == table.binding_name())
+}
+
+fn matches_filter_binding(table_name: &str, alias: &Option<String>, qualifier: Option<&str>) -> bool {
+    match qualifier {
+        Some(qualifier) => qualifier == alias.as_deref().unwrap_or(table_name),
+        None => true,
     }
 }
 

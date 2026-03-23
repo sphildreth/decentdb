@@ -2,29 +2,29 @@
   "engines": {
     "decentdb": {
       "read_p95_ms": 0.006,
-      "join_p95_ms": 4.032,
-      "commit_p95_ms": 1.128,
-      "insert_rows_per_sec": 289765.2343224382,
+      "join_p95_ms": 0.014,
+      "commit_p95_ms": 1.093,
+      "insert_rows_per_sec": 299085.5951419766,
       "db_size_mb": 0.4921875
     },
     "duckdb": {
-      "read_p95_ms": 0.185,
-      "join_p95_ms": 0.417,
-      "commit_p95_ms": 0.438,
-      "insert_rows_per_sec": 1826342.8478003307,
+      "read_p95_ms": 0.178,
+      "join_p95_ms": 0.397,
+      "commit_p95_ms": 0.395,
+      "insert_rows_per_sec": 1893929.1351565784,
       "db_size_mb": 3.26171875
     },
     "sqlite": {
       "read_p95_ms": 0.002,
       "join_p95_ms": 0.002,
-      "commit_p95_ms": 0.009,
-      "insert_rows_per_sec": 2051155.2793670415,
+      "commit_p95_ms": 0.008,
+      "insert_rows_per_sec": 2046376.289145439,
       "db_size_mb": 1.83203125
     }
   },
   "metadata": {
     "machine": "AMD Ryzen 9 3900X 12-Core Processor",
     "os": "linux",
-    "run_id": "1774282616152"
+    "run_id": "1774284532176"
   }
 }
