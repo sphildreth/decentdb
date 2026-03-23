@@ -132,7 +132,9 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
              CREATE TABLE join_profiles (id INTEGER PRIMARY KEY, bio TEXT);",
         )
         .unwrap();
-        let synchronous: i64 = conn.query_row("PRAGMA synchronous;", [], |row| row.get(0)).unwrap();
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous;", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(synchronous, 2, "expected SQLite synchronous=FULL");
         let wal_autocheckpoint: i64 = conn
             .query_row("PRAGMA wal_autocheckpoint;", [], |row| row.get(0))
@@ -232,7 +234,8 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
 
     fn teardown(&mut self) -> u64 {
         if let Some(conn) = self.conn.as_mut() {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
         self.conn = None;
         let db_size = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
@@ -426,30 +429,34 @@ impl DecentDbBenchmarker {
             return;
         }
         let db = self.db.as_ref().unwrap();
-        let users = db
+        let mut txn = db.transaction().unwrap();
+        let users = txn
             .prepare("INSERT INTO join_users (id, name) VALUES ($1, $2);")
             .unwrap();
-        let profiles = db
+        let profiles = txn
             .prepare("INSERT INTO join_profiles (id, bio) VALUES ($1, $2);")
             .unwrap();
-        db.execute("BEGIN;").unwrap();
         for i in 0..JOIN_DATASET_COUNT {
-            users.execute(
-                &[
-                    decentdb::Value::Int64(i as i64),
-                    decentdb::Value::Text(format!("Join User {}", i)),
-                ],
-            )
-            .unwrap();
-            profiles.execute(
-                &[
-                    decentdb::Value::Int64(i as i64),
-                    decentdb::Value::Text(format!("Bio {}", i)),
-                ],
-            )
-            .unwrap();
+            users
+                .execute_in(
+                    &mut txn,
+                    &[
+                        decentdb::Value::Int64(i as i64),
+                        decentdb::Value::Text(format!("Join User {}", i)),
+                    ],
+                )
+                .unwrap();
+            profiles
+                .execute_in(
+                    &mut txn,
+                    &[
+                        decentdb::Value::Int64(i as i64),
+                        decentdb::Value::Text(format!("Bio {}", i)),
+                    ],
+                )
+                .unwrap();
         }
-        db.execute("COMMIT;").unwrap();
+        txn.commit().unwrap();
         self.join_seeded = true;
     }
 }
@@ -491,13 +498,12 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
         db.execute("BEGIN;").unwrap();
         for i in 0..INSERT_COUNT {
-            insert.execute(
-                &[
+            insert
+                .execute(&[
                     decentdb::Value::Int64(i as i64),
                     decentdb::Value::Text(format!("User {}", i)),
-                ],
-            )
-            .unwrap();
+                ])
+                .unwrap();
         }
         db.execute("COMMIT;").unwrap();
 
@@ -549,14 +555,13 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
 
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
-            insert.execute(
-                &[
+            insert
+                .execute(&[
                     decentdb::Value::Int64(i as i64),
                     decentdb::Value::Int64((i % 100) as i64),
                     decentdb::Value::Float64(9.99),
-                ],
-            )
-            .unwrap();
+                ])
+                .unwrap();
             latencies.push(start.elapsed().as_micros() as u64);
         }
 
@@ -583,9 +588,7 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
         for i in 0..JOIN_COUNT {
             let id = join_read_id(i);
             let start = Instant::now();
-            let result = join
-                .execute(&[decentdb::Value::Int64(id as i64)])
-                .unwrap();
+            let result = join.execute(&[decentdb::Value::Int64(id as i64)]).unwrap();
             assert_eq!(result.rows().len(), 1);
             let [decentdb::Value::Text(name), decentdb::Value::Text(bio)] =
                 result.rows()[0].values()
@@ -645,10 +648,10 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     commit_latencies.sort_unstable();
     let p95_commit_us = commit_latencies[p95_index(commit_latencies.len())];
     metrics.commit_p95_ms = p95_commit_us as f64 / 1000.0;
-        println!(
-            "  -> Auto-commit insert p95: {:.3} ms",
-            metrics.commit_p95_ms
-        );
+    println!(
+        "  -> Auto-commit insert p95: {:.3} ms",
+        metrics.commit_p95_ms
+    );
 
     // 5. Joins
     let mut join_latencies = benchmarker.join_reads();
@@ -698,12 +701,14 @@ fn main() {
         }
     }
     summary.metadata.insert("machine".to_string(), cpu_model);
-    summary
-        .metadata
-        .insert("storage_root".to_string(), storage_root.display().to_string());
-    summary
-        .metadata
-        .insert("durability_profile".to_string(), "engine_specific".to_string());
+    summary.metadata.insert(
+        "storage_root".to_string(),
+        storage_root.display().to_string(),
+    );
+    summary.metadata.insert(
+        "durability_profile".to_string(),
+        "engine_specific".to_string(),
+    );
     summary.metadata.insert(
         "sqlite_durability".to_string(),
         "wal+synchronous_full+wal_autocheckpoint_0".to_string(),

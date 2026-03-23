@@ -294,7 +294,7 @@ fn unique_index_row_ids(
     let Some(key) = super::compute_index_key(runtime, index, table, &probe)? else {
         return Ok(Some(Vec::new()));
     };
-    Ok(Some(keys.get(&key).cloned().unwrap_or_default()))
+    Ok(Some(keys.row_ids_for_key(&key)))
 }
 
 fn indexes_for_conflict_target<'a>(

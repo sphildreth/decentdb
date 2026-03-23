@@ -501,7 +501,10 @@ fn explicit_transaction_param_inserts_keep_indexes_usable_and_statement_atomic()
     let duplicate = db
         .execute_with_params(
             "INSERT INTO users (id, email) VALUES ($1, $2)",
-            &[Value::Int64(3), Value::Text("duplicate@example.com".to_string())],
+            &[
+                Value::Int64(3),
+                Value::Text("duplicate@example.com".to_string()),
+            ],
         )
         .expect_err("duplicate primary key should fail");
     assert!(matches!(duplicate, decentdb::DbError::Constraint { .. }));
@@ -565,7 +568,10 @@ fn autocommit_param_inserts_keep_indexes_usable_and_statement_atomic() {
     let duplicate = db
         .execute_with_params(
             "INSERT INTO users (id, email) VALUES ($1, $2)",
-            &[Value::Int64(3), Value::Text("duplicate@example.com".to_string())],
+            &[
+                Value::Int64(3),
+                Value::Text("duplicate@example.com".to_string()),
+            ],
         )
         .expect_err("duplicate primary key should fail");
     assert!(matches!(duplicate, decentdb::DbError::Constraint { .. }));
@@ -612,7 +618,10 @@ fn prepared_param_insert_recompiles_after_schema_change() {
         .expect("create users");
     db.execute_with_params(
         "INSERT INTO users (id, email) VALUES ($1, $2)",
-        &[Value::Int64(1), Value::Text("before@example.com".to_string())],
+        &[
+            Value::Int64(1),
+            Value::Text("before@example.com".to_string()),
+        ],
     )
     .expect("insert before schema change");
 
@@ -620,7 +629,10 @@ fn prepared_param_insert_recompiles_after_schema_change() {
         .expect("add active column");
     db.execute_with_params(
         "INSERT INTO users (id, email) VALUES ($1, $2)",
-        &[Value::Int64(2), Value::Text("after@example.com".to_string())],
+        &[
+            Value::Int64(2),
+            Value::Text("after@example.com".to_string()),
+        ],
     )
     .expect("insert after schema change");
 
@@ -693,6 +705,72 @@ fn prepared_statements_reuse_parameterized_inserts_and_reads() {
 }
 
 #[test]
+fn transaction_handle_reuses_prepared_statements_without_db_lock_churn() {
+    let path = unique_db_path("phase1-transaction-handle");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+    db.execute("CREATE INDEX users_email_idx ON users (email)")
+        .expect("create email index");
+
+    let mut txn = db.transaction().expect("open transaction handle");
+    let insert = txn
+        .prepare("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .expect("prepare insert in transaction");
+    for id in 1..=4 {
+        insert
+            .execute_in(
+                &mut txn,
+                &[
+                    Value::Int64(id),
+                    Value::Text(format!("user{id}@example.com")),
+                ],
+            )
+            .expect("transaction-handle insert");
+    }
+    let duplicate = insert
+        .execute_in(
+            &mut txn,
+            &[
+                Value::Int64(3),
+                Value::Text("duplicate@example.com".to_string()),
+            ],
+        )
+        .expect_err("duplicate primary key should fail");
+    assert!(matches!(duplicate, decentdb::DbError::Constraint { .. }));
+    txn.commit().expect("commit transaction handle");
+
+    let row = db
+        .execute_with_params(
+            "SELECT id FROM users WHERE email = $1",
+            &[Value::Text("user3@example.com".to_string())],
+        )
+        .expect("select by indexed email");
+    assert_eq!(row.rows()[0].values(), &[Value::Int64(3)]);
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn transaction_handle_blocks_db_execution_until_finished() {
+    let path = unique_db_path("phase1-transaction-handle-exclusive");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+
+    let txn = db.transaction().expect("open transaction handle");
+    let error = db
+        .execute("SELECT COUNT(*) FROM users")
+        .expect_err("db handle should reject work while transaction handle is active");
+    assert!(matches!(error, decentdb::DbError::Transaction { .. }));
+    txn.rollback().expect("rollback transaction handle");
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn prepared_statements_fail_after_schema_change() {
     let path = unique_db_path("phase1-prepared-statement-schema-change");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
@@ -736,7 +814,10 @@ fn unsupported_insert_expression_falls_back_from_prepared_fast_path() {
         .expect("create users");
     db.execute_with_params(
         "INSERT INTO users (id, email) VALUES ($1 + 0, $2)",
-        &[Value::Int64(7), Value::Text("fallback@example.com".to_string())],
+        &[
+            Value::Int64(7),
+            Value::Text("fallback@example.com".to_string()),
+        ],
     )
     .expect("expression insert should use generic path");
 
@@ -745,7 +826,10 @@ fn unsupported_insert_expression_falls_back_from_prepared_fast_path() {
         .expect("select inserted row");
     assert_eq!(
         row.rows()[0].values(),
-        &[Value::Int64(7), Value::Text("fallback@example.com".to_string())]
+        &[
+            Value::Int64(7),
+            Value::Text("fallback@example.com".to_string())
+        ]
     );
 
     cleanup_db(&path);

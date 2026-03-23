@@ -51,11 +51,98 @@ pub struct PreparedStatement {
     read_only: bool,
 }
 
+/// Exclusive SQL transaction handle that owns mutable runtime state locally.
+///
+/// While this handle is active, callers should use it for all SQL work on the
+/// same `Db` handle until `commit` or `rollback`.
+#[derive(Debug)]
+pub struct SqlTransaction<'a> {
+    db: &'a Db,
+    state: Option<SqlTxnState>,
+}
+
 impl PreparedStatement {
     /// Executes the prepared statement with the provided positional `$n`
     /// parameters.
     pub fn execute(&self, params: &[Value]) -> Result<QueryResult> {
         self.db.execute_prepared_statement(self, params)
+    }
+
+    /// Executes the prepared statement inside an active [`SqlTransaction`].
+    pub fn execute_in(
+        &self,
+        txn: &mut SqlTransaction<'_>,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        txn.execute_prepared(self, params)
+    }
+}
+
+impl SqlTransaction<'_> {
+    /// Prepares a single SQL statement against this transaction's current schema.
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
+        self.db.prepare_with_runtime(sql, &state.runtime)
+    }
+
+    /// Executes a prepared statement inside this transaction without per-row
+    /// `Db` transaction lock churn.
+    pub fn execute_prepared(
+        &mut self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
+        self.db.execute_prepared_in_state(prepared, params, state)
+    }
+
+    /// Commits this transaction's local runtime into the WAL-backed database.
+    pub fn commit(mut self) -> Result<u64> {
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
+        let result = self
+            .db
+            .persist_runtime_if_latest(state.runtime, Some(state.base_lsn));
+        let release = self.deactivate();
+        match (result, release) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(lsn), Ok(())) => Ok(lsn),
+        }
+    }
+
+    /// Rolls this transaction back and releases the handle.
+    pub fn rollback(mut self) -> Result<()> {
+        self.state.take();
+        self.deactivate()
+    }
+
+    fn deactivate(&mut self) -> Result<()> {
+        let mut txn = self
+            .db
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        *txn = SqlTxnSlot::None;
+        Ok(())
+    }
+}
+
+impl Drop for SqlTransaction<'_> {
+    fn drop(&mut self) {
+        self.state.take();
+        if let Ok(mut txn) = self.db.inner.sql_txn.lock() {
+            *txn = SqlTxnSlot::None;
+        }
     }
 }
 
@@ -70,7 +157,7 @@ struct DbInner {
     engine: RwLock<EngineRuntime>,
     last_runtime_lsn: AtomicU64,
     sql_write_lock: Mutex<()>,
-    sql_txn: Mutex<Option<SqlTxnState>>,
+    sql_txn: Mutex<SqlTxnSlot>,
     write_txn: Mutex<WriteTxn>,
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
@@ -88,6 +175,13 @@ struct SqlTxnState {
     runtime: EngineRuntime,
     base_lsn: u64,
     savepoints: Vec<SqlSavepoint>,
+}
+
+#[derive(Debug)]
+enum SqlTxnSlot {
+    None,
+    Shared(Box<SqlTxnState>),
+    Exclusive,
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +308,27 @@ impl PreparedInsertCache {
 }
 
 impl Db {
+    /// Begins an exclusive SQL transaction handle that keeps mutable runtime
+    /// state local until commit or rollback.
+    pub fn transaction(&self) -> Result<SqlTransaction<'_>> {
+        let state = self.build_sql_txn_state()?;
+        let mut txn = self
+            .inner
+            .sql_txn
+            .lock()
+            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+        if !matches!(*txn, SqlTxnSlot::None) {
+            return Err(DbError::transaction(
+                "SQL transaction is already active on this handle",
+            ));
+        }
+        *txn = SqlTxnSlot::Exclusive;
+        Ok(SqlTransaction {
+            db: self,
+            state: Some(state),
+        })
+    }
+
     /// Creates a brand new database file with an initialized page-1 header and
     /// reserved catalog root page.
     pub fn create(path: impl AsRef<Path>, config: DbConfig) -> Result<Self> {
@@ -265,36 +380,40 @@ impl Db {
 
     /// Begins an explicit SQL transaction on this database handle.
     pub fn begin_transaction(&self) -> Result<()> {
-        self.refresh_engine_from_storage()?;
-        let runtime = self.engine_snapshot()?;
-        let base_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let state = self.build_sql_txn_state()?;
         let mut txn = self
             .inner
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        if txn.is_some() {
+        if !matches!(*txn, SqlTxnSlot::None) {
             return Err(DbError::transaction(
                 "SQL transaction is already active on this handle",
             ));
         }
-        *txn = Some(SqlTxnState {
-            runtime,
-            base_lsn,
-            savepoints: Vec::new(),
-        });
+        *txn = SqlTxnSlot::Shared(Box::new(state));
         Ok(())
     }
 
     /// Commits the current explicit SQL transaction.
     pub fn commit_transaction(&self) -> Result<u64> {
-        let state = self
-            .inner
-            .sql_txn
-            .lock()
-            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?
-            .take()
-            .ok_or_else(|| DbError::transaction("no active SQL transaction to commit"))?;
+        let state = {
+            let mut txn = self
+                .inner
+                .sql_txn
+                .lock()
+                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+            match std::mem::replace(&mut *txn, SqlTxnSlot::None) {
+                SqlTxnSlot::Shared(state) => *state,
+                SqlTxnSlot::Exclusive => {
+                    *txn = SqlTxnSlot::Exclusive;
+                    return Err(self.exclusive_sql_txn_error());
+                }
+                SqlTxnSlot::None => {
+                    return Err(DbError::transaction("no active SQL transaction to commit"));
+                }
+            }
+        };
         self.persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
     }
 
@@ -305,13 +424,16 @@ impl Db {
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        if txn.is_none() {
-            return Err(DbError::transaction(
+        match *txn {
+            SqlTxnSlot::Shared(_) => {
+                *txn = SqlTxnSlot::None;
+                Ok(())
+            }
+            SqlTxnSlot::Exclusive => Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => Err(DbError::transaction(
                 "no active SQL transaction to roll back",
-            ));
+            )),
         }
-        *txn = None;
-        Ok(())
     }
 
     /// Returns whether this handle currently has an explicit SQL transaction.
@@ -319,7 +441,7 @@ impl Db {
         self.inner
             .sql_txn
             .lock()
-            .map(|txn| txn.is_some())
+            .map(|txn| !matches!(*txn, SqlTxnSlot::None))
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))
     }
 
@@ -330,9 +452,15 @@ impl Db {
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        let state = txn
-            .as_mut()
-            .ok_or_else(|| DbError::transaction("SAVEPOINT requires an active SQL transaction"))?;
+        let state = match &mut *txn {
+            SqlTxnSlot::Shared(state) => state,
+            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => {
+                return Err(DbError::transaction(
+                    "SAVEPOINT requires an active SQL transaction",
+                ));
+            }
+        };
         state.savepoints.push(SqlSavepoint {
             name: canonical_savepoint_name(name),
             runtime: state.runtime.clone(),
@@ -347,9 +475,15 @@ impl Db {
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        let state = txn.as_mut().ok_or_else(|| {
-            DbError::transaction("RELEASE SAVEPOINT requires an active SQL transaction")
-        })?;
+        let state = match &mut *txn {
+            SqlTxnSlot::Shared(state) => state,
+            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => {
+                return Err(DbError::transaction(
+                    "RELEASE SAVEPOINT requires an active SQL transaction",
+                ));
+            }
+        };
         let target = canonical_savepoint_name(name);
         let index = state
             .savepoints
@@ -367,9 +501,15 @@ impl Db {
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        let state = txn.as_mut().ok_or_else(|| {
-            DbError::transaction("ROLLBACK TO SAVEPOINT requires an active SQL transaction")
-        })?;
+        let state = match &mut *txn {
+            SqlTxnSlot::Shared(state) => state,
+            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => {
+                return Err(DbError::transaction(
+                    "ROLLBACK TO SAVEPOINT requires an active SQL transaction",
+                ));
+            }
+        };
         let target = canonical_savepoint_name(name);
         let index = state
             .savepoints
@@ -692,23 +832,8 @@ impl Db {
     /// Prepared statements are bound to the current schema cookie. If the schema
     /// changes, the handle must be recreated before it can be executed again.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
-        let prepared_sql = prepared_statement_sql(sql)?;
         let runtime = self.runtime_for_prepare()?;
-        let statement = self.parsed_statement(&prepared_sql)?;
-        let read_only = statement_is_read_only(statement.as_ref());
-        let prepared_insert = match statement.as_ref() {
-            SqlStatement::Insert(insert) => {
-                self.prepared_simple_insert(&prepared_sql, insert, &runtime)?
-            }
-            _ => None,
-        };
-        Ok(PreparedStatement {
-            db: self.clone(),
-            schema_cookie: runtime.catalog.schema_cookie,
-            statement,
-            prepared_insert,
-            read_only,
-        })
+        self.prepare_with_runtime(sql, &runtime)
     }
 
     /// Loads rows into a table as a single writer-held bulk operation.
@@ -1022,7 +1147,7 @@ impl Db {
                 engine: RwLock::new(runtime),
                 last_runtime_lsn: AtomicU64::new(last_runtime_lsn),
                 sql_write_lock: Mutex::new(()),
-                sql_txn: Mutex::new(None),
+                sql_txn: Mutex::new(SqlTxnSlot::None),
                 write_txn: Mutex::new(WriteTxn::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
@@ -1100,7 +1225,11 @@ impl Db {
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
-        runtime.execute_read_statement(prepared.statement.as_ref(), params, self.inner.config.page_size)
+        runtime.execute_read_statement(
+            prepared.statement.as_ref(),
+            params,
+            self.inner.config.page_size,
+        )
     }
 
     fn execute_prepared_write_statement(
@@ -1108,38 +1237,17 @@ impl Db {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let page_size = self.inner.config.page_size;
-
         let mut txn = self
             .inner
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        if let Some(state) = txn.as_mut() {
-            self.validate_prepared_schema_cookie(prepared, state.runtime.catalog.schema_cookie)?;
-            if let Some(prepared_insert) = prepared
-                .prepared_insert
-                .as_deref()
-                .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
-            {
-                return state
-                    .runtime
-                    .execute_prepared_simple_insert(prepared_insert, params, page_size);
+        match &mut *txn {
+            SqlTxnSlot::Shared(state) => {
+                return self.execute_prepared_in_state(prepared, params, state);
             }
-            if matches!(
-                prepared.statement.as_ref(),
-                crate::sql::ast::Statement::Insert(insert)
-                    if state.runtime.can_execute_insert_in_place(insert)
-            ) {
-                return state
-                    .runtime
-                    .execute_statement(prepared.statement.as_ref(), params, page_size);
-            }
-            let mut working = state.runtime.clone();
-            working.rebuild_stale_indexes(page_size)?;
-            let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
-            state.runtime = working;
-            return Ok(result);
+            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => {}
         }
         drop(txn);
 
@@ -1171,11 +1279,16 @@ impl Db {
                     if runtime.can_execute_insert_in_place(insert)
             ) {
                 drop(runtime);
-                return self.execute_autocommit_insert_in_place(prepared.statement.as_ref(), params);
+                return self
+                    .execute_autocommit_insert_in_place(prepared.statement.as_ref(), params);
             }
         }
         let mut working = self.engine_snapshot()?;
-        let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
+        let result = working.execute_statement(
+            prepared.statement.as_ref(),
+            params,
+            self.inner.config.page_size,
+        )?;
         self.persist_runtime(working)?;
         Ok(result)
     }
@@ -1186,39 +1299,19 @@ impl Db {
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        if self.in_transaction()? {
+        {
             let mut txn = self
                 .inner
                 .sql_txn
                 .lock()
                 .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-            let state = txn
-                .as_mut()
-                .ok_or_else(|| DbError::transaction("no active SQL transaction"))?;
-            if let crate::sql::ast::Statement::Insert(insert) = statement {
-                if let Some(prepared) = self.prepared_simple_insert(sql, insert, &state.runtime)? {
-                    return state.runtime.execute_prepared_simple_insert(
-                        prepared.as_ref(),
-                        params,
-                        self.inner.config.page_size,
-                    );
+            match &mut *txn {
+                SqlTxnSlot::Shared(state) => {
+                    return self.execute_statement_in_state(sql, statement, params, state);
                 }
+                SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+                SqlTxnSlot::None => {}
             }
-            if matches!(
-                statement,
-                crate::sql::ast::Statement::Insert(insert)
-                    if state.runtime.can_execute_insert_in_place(insert)
-            ) {
-                return state
-                    .runtime
-                    .execute_statement(statement, params, self.inner.config.page_size);
-            }
-            let mut working = state.runtime.clone();
-            working.rebuild_stale_indexes(self.inner.config.page_size)?;
-            let result =
-                working.execute_statement(statement, params, self.inner.config.page_size)?;
-            state.runtime = working;
-            return Ok(result);
         }
 
         let _writer = self
@@ -1336,6 +1429,29 @@ impl Db {
             .get_or_parse(sql)
     }
 
+    fn prepare_with_runtime(
+        &self,
+        sql: &str,
+        runtime: &EngineRuntime,
+    ) -> Result<PreparedStatement> {
+        let prepared_sql = prepared_statement_sql(sql)?;
+        let statement = self.parsed_statement(&prepared_sql)?;
+        let read_only = statement_is_read_only(statement.as_ref());
+        let prepared_insert = match statement.as_ref() {
+            SqlStatement::Insert(insert) => {
+                self.prepared_simple_insert(&prepared_sql, insert, runtime)?
+            }
+            _ => None,
+        };
+        Ok(PreparedStatement {
+            db: self.clone(),
+            schema_cookie: runtime.catalog.schema_cookie,
+            statement,
+            prepared_insert,
+            read_only,
+        })
+    }
+
     fn prepared_simple_insert(
         &self,
         sql: &str,
@@ -1413,8 +1529,10 @@ impl Db {
             .sql_txn
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        let Some(state) = txn.as_ref() else {
-            return Ok(None);
+        let state = match &*txn {
+            SqlTxnSlot::Shared(state) => state,
+            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+            SqlTxnSlot::None => return Ok(None),
         };
 
         let mut snapshot = state.runtime.clone();
@@ -1474,6 +1592,101 @@ impl Db {
         Err(DbError::sql(
             "prepared statement is no longer valid because the schema changed",
         ))
+    }
+
+    fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
+        self.refresh_engine_from_storage()?;
+        Ok(SqlTxnState {
+            runtime: self.engine_snapshot()?,
+            base_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+            savepoints: Vec::new(),
+        })
+    }
+
+    fn execute_prepared_in_state(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        state: &mut SqlTxnState,
+    ) -> Result<QueryResult> {
+        if !Arc::ptr_eq(&self.inner, &prepared.db.inner) {
+            return Err(DbError::transaction(
+                "prepared statement belongs to a different database handle",
+            ));
+        }
+        self.validate_prepared_schema_cookie(prepared, state.runtime.catalog.schema_cookie)?;
+        if prepared.read_only {
+            return state.runtime.execute_read_statement(
+                prepared.statement.as_ref(),
+                params,
+                self.inner.config.page_size,
+            );
+        }
+
+        let page_size = self.inner.config.page_size;
+        if let Some(prepared_insert) = prepared
+            .prepared_insert
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+        {
+            return state.runtime.execute_prepared_simple_insert(
+                prepared_insert,
+                params,
+                page_size,
+            );
+        }
+        if matches!(
+            prepared.statement.as_ref(),
+            crate::sql::ast::Statement::Insert(insert)
+                if state.runtime.can_execute_insert_in_place(insert)
+        ) {
+            return state
+                .runtime
+                .execute_statement(prepared.statement.as_ref(), params, page_size);
+        }
+        let mut working = state.runtime.clone();
+        working.rebuild_stale_indexes(page_size)?;
+        let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
+        state.runtime = working;
+        Ok(result)
+    }
+
+    fn execute_statement_in_state(
+        &self,
+        sql: &str,
+        statement: &crate::sql::ast::Statement,
+        params: &[Value],
+        state: &mut SqlTxnState,
+    ) -> Result<QueryResult> {
+        if let crate::sql::ast::Statement::Insert(insert) = statement {
+            if let Some(prepared) = self.prepared_simple_insert(sql, insert, &state.runtime)? {
+                return state.runtime.execute_prepared_simple_insert(
+                    prepared.as_ref(),
+                    params,
+                    self.inner.config.page_size,
+                );
+            }
+        }
+        if matches!(
+            statement,
+            crate::sql::ast::Statement::Insert(insert)
+                if state.runtime.can_execute_insert_in_place(insert)
+        ) {
+            return state
+                .runtime
+                .execute_statement(statement, params, self.inner.config.page_size);
+        }
+        let mut working = state.runtime.clone();
+        working.rebuild_stale_indexes(self.inner.config.page_size)?;
+        let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
+        state.runtime = working;
+        Ok(result)
+    }
+
+    fn exclusive_sql_txn_error(&self) -> DbError {
+        DbError::transaction(
+            "a SQL transaction handle is active on this database handle; use it until commit or rollback",
+        )
     }
 }
 
@@ -1656,9 +1869,10 @@ fn prepared_statement_sql(sql: &str) -> Result<String> {
             statements.len()
         )));
     }
-    let statement = statements.into_iter().next().ok_or_else(|| {
-        DbError::sql("expected exactly one SQL statement, got 0")
-    })?;
+    let statement = statements
+        .into_iter()
+        .next()
+        .ok_or_else(|| DbError::sql("expected exactly one SQL statement, got 0"))?;
     if parse_transaction_control(&statement).is_some() {
         return Err(DbError::sql(
             "prepared statements do not support transaction control",
@@ -1783,7 +1997,7 @@ fn trigger_event_name(event: TriggerEvent) -> &'static str {
 
 fn runtime_index_entry_count(index: &RuntimeIndex) -> usize {
     match index {
-        RuntimeIndex::Btree { keys } => keys.values().map(Vec::len).sum(),
+        RuntimeIndex::Btree { keys } => keys.total_row_id_count(),
         RuntimeIndex::Trigram { index } => index.entry_count(),
     }
 }
@@ -2115,7 +2329,7 @@ mod tests {
             }],
             primary_auto_row_id_column_index: None,
             value_sources: vec![PreparedInsertValueSource::Null],
-            required_column_indexes: Vec::new(),
+            required_columns: Vec::new(),
             unique_indexes: Vec::new(),
             insert_indexes: Vec::new(),
             use_generic_validation: false,

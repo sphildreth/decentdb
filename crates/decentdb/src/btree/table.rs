@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::btree::cursor::BtreeCursor;
-use crate::btree::page::BtreePage;
 use crate::btree::page::decode_page;
+use crate::btree::page::BtreePage;
 use crate::btree::read::find_exact;
 use crate::btree::write::Btree;
 use crate::error::Result;
@@ -60,7 +60,11 @@ impl<S: PageStore> TableBtree<S> {
         self.tree.store()
     }
 
-    pub(crate) fn insert_row(&mut self, row_id: i64, values: Vec<Value>) -> Result<Option<TableRow>> {
+    pub(crate) fn insert_row(
+        &mut self,
+        row_id: i64,
+        values: Vec<Value>,
+    ) -> Result<Option<TableRow>> {
         let key = encode_row_id_key(row_id);
         let payload = Row::new(values).encode_with_overflow::<S>(
             None,
@@ -157,7 +161,10 @@ impl<'a, S: PageStore> TableBtreeCursor<'a, S> {
 
 impl<'a, S: PageStore> TableBtreeView<'a, S> {
     pub(crate) fn new(store: &'a S, root_page_id: Option<PageId>) -> Self {
-        Self { store, root_page_id }
+        Self {
+            store,
+            root_page_id,
+        }
     }
 
     pub(crate) fn root_page_id(&self) -> Option<PageId> {
@@ -178,7 +185,11 @@ impl<'a, S: PageStore> TableBtreeView<'a, S> {
 
     pub(crate) fn cursor_seek_forward(&self, row_id: i64) -> Result<TableBtreeCursor<'_, S>> {
         Ok(TableBtreeCursor {
-            inner: BtreeCursor::seek_forward(self.store, self.root_page_id, encode_row_id_key(row_id))?,
+            inner: BtreeCursor::seek_forward(
+                self.store,
+                self.root_page_id,
+                encode_row_id_key(row_id),
+            )?,
         })
     }
 }
@@ -245,7 +256,9 @@ mod tests {
 
     use super::{free_table_btree, TableBtree, TableBtreeView, TableRow};
 
-    fn collect_forward(tree: &TableBtree<crate::storage::page::InMemoryPageStore>) -> Vec<TableRow> {
+    fn collect_forward(
+        tree: &TableBtree<crate::storage::page::InMemoryPageStore>,
+    ) -> Vec<TableRow> {
         let mut cursor = tree.cursor_from_start().expect("cursor");
         let mut rows = Vec::new();
         while let Some(row) = cursor.next().expect("next") {
@@ -272,11 +285,8 @@ mod tests {
     #[test]
     fn insert_get_delete_roundtrip_rows() {
         let mut tree = TableBtree::with_page_size(4096);
-        tree.insert_row(
-            42,
-            vec![Value::Int64(42), Value::Text("Ada".to_string())],
-        )
-        .expect("insert row");
+        tree.insert_row(42, vec![Value::Int64(42), Value::Text("Ada".to_string())])
+            .expect("insert row");
 
         let row = tree.get_row(42).expect("get row").expect("row exists");
         assert_eq!(

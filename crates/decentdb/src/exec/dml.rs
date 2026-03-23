@@ -12,7 +12,7 @@ use crate::sql::ast::{
 use crate::sql::parser::parse_expression_sql;
 
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
-use super::{compare_values, table_row_dataset, EngineRuntime, StoredRow};
+use super::{compare_values, table_row_dataset, EngineRuntime, RuntimeBtreeKey, StoredRow};
 
 #[derive(Clone, Debug)]
 pub(crate) enum PreparedInsertValueSource {
@@ -26,6 +26,8 @@ pub(crate) enum PreparedInsertValueSource {
 pub(crate) struct PreparedBtreeIndex {
     pub(crate) name: String,
     pub(crate) column_indexes: Vec<usize>,
+    pub(crate) int64_key: bool,
+    pub(crate) nullable: bool,
     pub(crate) unique: bool,
 }
 
@@ -37,12 +39,18 @@ pub(crate) struct PreparedInsertColumn {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PreparedRequiredColumn {
+    pub(crate) index: usize,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleInsert {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<PreparedInsertColumn>,
     pub(crate) primary_auto_row_id_column_index: Option<usize>,
     pub(crate) value_sources: Vec<PreparedInsertValueSource>,
-    pub(crate) required_column_indexes: Vec<usize>,
+    pub(crate) required_columns: Vec<PreparedRequiredColumn>,
     pub(crate) unique_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) use_generic_validation: bool,
@@ -51,7 +59,8 @@ pub(crate) struct PreparedSimpleInsert {
 
 impl EngineRuntime {
     pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
-        if self.catalog.views.contains_key(&statement.table_name) || statement.on_conflict.is_some() {
+        if self.catalog.views.contains_key(&statement.table_name) || statement.on_conflict.is_some()
+        {
             return false;
         }
         if !matches!(&statement.source, InsertSource::Values(rows) if rows.len() == 1) {
@@ -64,10 +73,7 @@ impl EngineRuntime {
         })
     }
 
-    pub(crate) fn can_reuse_prepared_simple_insert(
-        &self,
-        prepared: &PreparedSimpleInsert,
-    ) -> bool {
+    pub(crate) fn can_reuse_prepared_simple_insert(&self, prepared: &PreparedSimpleInsert) -> bool {
         self.catalog.tables.contains_key(&prepared.table_name)
             && (prepared.use_generic_validation
                 || prepared
@@ -168,18 +174,21 @@ impl EngineRuntime {
             None
         };
 
-        let required_column_indexes = table
+        let required_columns = table
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(index, column)| (!column.nullable).then_some(index))
+            .filter_map(|(index, column)| {
+                (!column.nullable).then_some(PreparedRequiredColumn {
+                    index,
+                    name: column.name.clone(),
+                })
+            })
             .collect::<Vec<_>>();
-        let mut use_generic_validation = table
-            .columns
-            .iter()
-            .any(|column| !column.checks.is_empty())
-            || !table.checks.is_empty()
-            || !table.foreign_keys.is_empty();
+        let mut use_generic_validation =
+            table.columns.iter().any(|column| !column.checks.is_empty())
+                || !table.checks.is_empty()
+                || !table.foreign_keys.is_empty();
         let mut unique_indexes = Vec::new();
         for index in self
             .catalog
@@ -215,7 +224,7 @@ impl EngineRuntime {
             columns,
             primary_auto_row_id_column_index,
             value_sources,
-            required_column_indexes,
+            required_columns,
             unique_indexes,
             insert_indexes,
             use_generic_validation,
@@ -259,9 +268,7 @@ impl EngineRuntime {
                 PreparedInsertValueSource::Parameter(number) => params
                     .get(number.saturating_sub(1))
                     .cloned()
-                    .ok_or_else(|| {
-                        DbError::sql(format!("parameter ${number} was not provided"))
-                    })?,
+                    .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided")))?,
                 PreparedInsertValueSource::DefaultExpr(expr) => self.eval_expr(
                     expr,
                     &Dataset::empty(),
@@ -1132,7 +1139,8 @@ impl EngineRuntime {
             row_id,
             values: candidate,
         };
-        let index_updates = self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
+        let index_updates =
+            self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
 
         self.catalog
             .tables
@@ -1248,7 +1256,10 @@ fn prepare_btree_insert_index(
     if index.kind != IndexKind::Btree
         || !index.fresh
         || index.predicate_sql.is_some()
-        || !matches!(runtime.indexes.get(&index.name), Some(super::RuntimeIndex::Btree { .. }))
+        || !matches!(
+            runtime.indexes.get(&index.name),
+            Some(super::RuntimeIndex::Btree { .. })
+        )
     {
         return Ok(None);
     }
@@ -1271,9 +1282,26 @@ fn prepare_btree_insert_index(
         column_indexes.push(column_index);
     }
 
+    let int64_key = index.columns.len() == 1
+        && table.columns[column_indexes[0]].column_type == ColumnType::Int64
+        && !table.columns[column_indexes[0]].nullable;
+
     Ok(Some(PreparedBtreeIndex {
         name: index.name.clone(),
         column_indexes,
+        int64_key,
+        nullable: index.columns.iter().any(|column| {
+            column
+                .column_name
+                .as_ref()
+                .and_then(|column_name| {
+                    table
+                        .columns
+                        .iter()
+                        .find(|entry| entry.name == *column_name)
+                })
+                .is_some_and(|column| column.nullable)
+        }),
         unique: index.unique,
     }))
 }
@@ -1283,17 +1311,11 @@ fn validate_prepared_insert(
     prepared: &PreparedSimpleInsert,
     row: &[Value],
 ) -> Result<()> {
-    let table = runtime
-        .catalog
-        .tables
-        .get(&prepared.table_name)
-        .ok_or_else(|| DbError::sql(format!("unknown table {}", prepared.table_name)))?;
-    for &column_index in &prepared.required_column_indexes {
-        if matches!(row.get(column_index), Some(Value::Null)) {
-            let column_name = &table.columns[column_index].name;
+    for required in &prepared.required_columns {
+        if matches!(row.get(required.index), Some(Value::Null)) {
             return Err(DbError::constraint(format!(
                 "column {}.{} may not be NULL",
-                table.name, column_name
+                prepared.table_name, required.name
             )));
         }
     }
@@ -1309,10 +1331,10 @@ fn validate_prepared_insert(
                     index.name
                 )));
             };
-            if keys.get(&key).is_some_and(|row_ids| !row_ids.is_empty()) {
+            if keys.contains_any(&key) {
                 return Err(DbError::constraint(format!(
                     "unique constraint {} on {} was violated",
-                    index.name, table.name
+                    index.name, prepared.table_name
                 )));
             }
         }
@@ -1337,19 +1359,42 @@ fn apply_prepared_insert_index_updates(
         if check_unique
             && index.unique
             && !prepared_index_contains_null(index, &row.values)
-            && keys.get(&key).is_some_and(|row_ids| !row_ids.is_empty())
+            && keys.contains_any(&key)
         {
             return Err(DbError::constraint(format!(
                 "unique constraint {} on {} was violated",
                 index.name, prepared.table_name
             )));
         }
-        keys.entry(key).or_default().push(row.row_id);
+        keys.insert_row_id(key, row.row_id)?;
     }
     Ok(())
 }
 
-fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result<Vec<u8>> {
+fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result<RuntimeBtreeKey> {
+    if index.int64_key {
+        let [column_index] = index.column_indexes.as_slice() else {
+            return Err(DbError::internal(
+                "typed INT64 prepared index expected exactly one indexed column",
+            ));
+        };
+        let Value::Int64(value) = row
+            .get(*column_index)
+            .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
+        else {
+            return Err(DbError::internal(
+                "typed INT64 prepared index expected an INT64 value",
+            ));
+        };
+        return Ok(RuntimeBtreeKey::Int64(*value));
+    }
+    if let [column_index] = index.column_indexes.as_slice() {
+        let value = row
+            .get(*column_index)
+            .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?;
+        return encode_index_key(value).map(RuntimeBtreeKey::Encoded);
+    }
+
     let values = index
         .column_indexes
         .iter()
@@ -1360,13 +1405,16 @@ fn prepared_btree_index_key(index: &PreparedBtreeIndex, row: &[Value]) -> Result
         })
         .collect::<Result<Vec<_>>>()?;
     if values.len() == 1 {
-        encode_index_key(&values[0])
+        encode_index_key(&values[0]).map(RuntimeBtreeKey::Encoded)
     } else {
-        Row::new(values).encode()
+        Row::new(values).encode().map(RuntimeBtreeKey::Encoded)
     }
 }
 
 fn prepared_index_contains_null(index: &PreparedBtreeIndex, row: &[Value]) -> bool {
+    if !index.nullable {
+        return false;
+    }
     index
         .column_indexes
         .iter()

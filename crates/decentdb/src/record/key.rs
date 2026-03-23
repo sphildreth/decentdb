@@ -19,43 +19,53 @@ const TAG_TEXT: u8 = 7;
 const TAG_BLOB: u8 = 8;
 
 pub(crate) fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
-    let mut encoded = Vec::new();
     match value {
-        Value::Null => encoded.push(TAG_NULL),
-        Value::Bool(value) => {
-            encoded.push(TAG_BOOL);
-            encoded.push(u8::from(*value));
-        }
+        Value::Null => Ok(vec![TAG_NULL]),
+        Value::Bool(value) => Ok(vec![TAG_BOOL, u8::from(*value)]),
         Value::Int64(value) => {
+            let mut encoded = Vec::with_capacity(9);
             encoded.push(TAG_INT64);
             encoded.extend_from_slice(&sortable_signed_bytes(*value));
+            Ok(encoded)
         }
         Value::Float64(value) => {
+            let mut encoded = Vec::with_capacity(9);
             encoded.push(TAG_FLOAT64);
             encoded.extend_from_slice(&sortable_float_bytes(*value));
+            Ok(encoded)
         }
         Value::Decimal { scaled, scale } => {
+            let decimal = sortable_decimal_bytes(*scaled, *scale);
+            let mut encoded = Vec::with_capacity(1 + decimal.len());
             encoded.push(TAG_DECIMAL);
-            encoded.extend_from_slice(&sortable_decimal_bytes(*scaled, *scale));
+            encoded.extend_from_slice(&decimal);
+            Ok(encoded)
         }
         Value::TimestampMicros(value) => {
+            let mut encoded = Vec::with_capacity(9);
             encoded.push(TAG_TIMESTAMP);
             encoded.extend_from_slice(&sortable_signed_bytes(*value));
+            Ok(encoded)
         }
         Value::Uuid(value) => {
+            let mut encoded = Vec::with_capacity(17);
             encoded.push(TAG_UUID);
             encoded.extend_from_slice(value);
+            Ok(encoded)
         }
         Value::Text(value) => {
+            let mut encoded = Vec::with_capacity(1 + value.len());
             encoded.push(TAG_TEXT);
             encoded.extend_from_slice(value.as_bytes());
+            Ok(encoded)
         }
         Value::Blob(value) => {
+            let mut encoded = Vec::with_capacity(1 + value.len());
             encoded.push(TAG_BLOB);
             encoded.extend_from_slice(value);
+            Ok(encoded)
         }
     }
-    Ok(encoded)
 }
 
 pub(crate) fn compare_index_values(left: &Value, right: &Value) -> Result<Ordering> {

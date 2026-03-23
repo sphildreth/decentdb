@@ -22,7 +22,7 @@ mod vfs;
 mod wal;
 
 pub use crate::config::{DbConfig, WalSyncMode};
-pub use crate::db::{evict_shared_wal, Db, PreparedStatement};
+pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::metadata::{

@@ -72,8 +72,121 @@ impl Default for PersistedTableState {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum RuntimeBtreeKey {
+    Encoded(Vec<u8>),
+    Int64(i64),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum RuntimeBtreeKeys {
+    UniqueEncoded(BTreeMap<Vec<u8>, i64>),
+    NonUniqueEncoded(BTreeMap<Vec<u8>, Vec<i64>>),
+    UniqueInt64(BTreeMap<i64, i64>),
+    NonUniqueInt64(BTreeMap<i64, Vec<i64>>),
+}
+
+impl RuntimeBtreeKeys {
+    pub(super) fn row_ids_for_key(&self, key: &RuntimeBtreeKey) -> Vec<i64> {
+        match (self, key) {
+            (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                keys.get(key).copied().into_iter().collect()
+            }
+            (Self::NonUniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                keys.get(key).cloned().unwrap_or_default()
+            }
+            (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                keys.get(key).copied().into_iter().collect()
+            }
+            (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                keys.get(key).cloned().unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub(super) fn row_ids_for_value(&self, value: &Value) -> Result<Vec<i64>> {
+        match self {
+            Self::UniqueEncoded(_) | Self::NonUniqueEncoded(_) => {
+                Ok(self.row_ids_for_key(&RuntimeBtreeKey::Encoded(encode_index_key(value)?)))
+            }
+            Self::UniqueInt64(_) | Self::NonUniqueInt64(_) => match value {
+                Value::Int64(value) => Ok(self.row_ids_for_key(&RuntimeBtreeKey::Int64(*value))),
+                _ => Ok(Vec::new()),
+            },
+        }
+    }
+
+    pub(super) fn contains_any(&self, key: &RuntimeBtreeKey) -> bool {
+        match (self, key) {
+            (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => keys.contains_key(key),
+            (Self::NonUniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                keys.get(key).is_some_and(|row_ids| !row_ids.is_empty())
+            }
+            (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => keys.contains_key(key),
+            (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                keys.get(key).is_some_and(|row_ids| !row_ids.is_empty())
+            }
+            _ => false,
+        }
+    }
+
+    pub(super) fn insert_row_id(&mut self, key: RuntimeBtreeKey, row_id: i64) -> Result<()> {
+        match (self, key) {
+            (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                if keys.insert(key, row_id).is_some() {
+                    return Err(DbError::internal(
+                        "unique runtime BTREE index received a duplicate key insert",
+                    ));
+                }
+            }
+            (Self::NonUniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                keys.entry(key).or_default().push(row_id);
+            }
+            (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                if keys.insert(key, row_id).is_some() {
+                    return Err(DbError::internal(
+                        "unique runtime BTREE index received a duplicate key insert",
+                    ));
+                }
+            }
+            (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                keys.entry(key).or_default().push(row_id);
+            }
+            (Self::UniqueEncoded(_), RuntimeBtreeKey::Int64(_))
+            | (Self::NonUniqueEncoded(_), RuntimeBtreeKey::Int64(_))
+            | (Self::UniqueInt64(_), RuntimeBtreeKey::Encoded(_))
+            | (Self::NonUniqueInt64(_), RuntimeBtreeKey::Encoded(_)) => {
+                return Err(DbError::internal(
+                    "runtime BTREE key type did not match the runtime index representation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn total_row_id_count(&self) -> usize {
+        match self {
+            Self::UniqueEncoded(keys) => keys.len(),
+            Self::NonUniqueEncoded(keys) => keys.values().map(Vec::len).sum(),
+            Self::UniqueInt64(keys) => keys.len(),
+            Self::NonUniqueInt64(keys) => keys.values().map(Vec::len).sum(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::UniqueEncoded(keys) => keys.is_empty(),
+            Self::NonUniqueEncoded(keys) => keys.is_empty(),
+            Self::UniqueInt64(keys) => keys.is_empty(),
+            Self::NonUniqueInt64(keys) => keys.is_empty(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum RuntimeIndex {
-    Btree { keys: BTreeMap<Vec<u8>, Vec<i64>> },
+    Btree { keys: RuntimeBtreeKeys },
     Trigram { index: TrigramIndex },
 }
 
@@ -81,7 +194,7 @@ pub(crate) enum RuntimeIndex {
 pub(super) enum PendingIndexInsert {
     Btree {
         name: String,
-        key: Vec<u8>,
+        key: RuntimeBtreeKey,
         row_id: i64,
     },
     Trigram {
@@ -205,7 +318,8 @@ impl EngineRuntime {
                     table_name.clone(),
                     PersistedTableState { pointer, checksum },
                 ) {
-                    if previous.pointer.head_page_id != 0 && previous.pointer.head_page_id != pointer.head_page_id
+                    if previous.pointer.head_page_id != 0
+                        && previous.pointer.head_page_id != pointer.head_page_id
                     {
                         rewritten_old_heads.push(previous.pointer.head_page_id);
                     }
@@ -324,6 +438,9 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_table_dirty(&mut self, table_name: &str) {
+        if self.dirty_tables.contains(table_name) {
+            return;
+        }
         self.dirty_tables.insert(table_name.to_string());
     }
 
@@ -402,22 +519,23 @@ impl EngineRuntime {
     ) -> Result<()> {
         for update in updates {
             match update {
-                PendingIndexInsert::Btree { name, key, row_id } => match self.indexes.get_mut(&name)
-                {
-                    Some(RuntimeIndex::Btree { keys }) => {
-                        keys.entry(key).or_default().push(row_id);
+                PendingIndexInsert::Btree { name, key, row_id } => {
+                    match self.indexes.get_mut(&name) {
+                        Some(RuntimeIndex::Btree { keys }) => {
+                            keys.insert_row_id(key, row_id)?;
+                        }
+                        Some(_) => {
+                            return Err(DbError::internal(format!(
+                                "runtime index {name} is not a BTREE index"
+                            )))
+                        }
+                        None => {
+                            return Err(DbError::internal(format!(
+                                "runtime index {name} is missing"
+                            )))
+                        }
                     }
-                    Some(_) => {
-                        return Err(DbError::internal(format!(
-                            "runtime index {name} is not a BTREE index"
-                        )))
-                    }
-                    None => {
-                        return Err(DbError::internal(format!(
-                            "runtime index {name} is missing"
-                        )))
-                    }
-                },
+                }
                 PendingIndexInsert::Trigram { name, row_id, text } => {
                     match self.indexes.get_mut(&name) {
                         Some(RuntimeIndex::Trigram { index }) => {
@@ -725,9 +843,8 @@ impl EngineRuntime {
             }) {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-                let key = encode_index_key(&value)?;
                 if let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) {
-                    let row_ids = keys.get(&key).cloned().unwrap_or_default();
+                    let row_ids = keys.row_ids_for_value(&value)?;
                     return self
                         .dataset_from_row_ids(table, data, alias, &row_ids)
                         .map(Some);
@@ -919,12 +1036,12 @@ impl EngineRuntime {
         };
 
         let value = self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
-        let key = encode_index_key(&value)?;
         let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
             return Ok(None);
         };
-        let row_ids = keys.get(&key).cloned().unwrap_or_default();
-        self.dataset_from_row_ids(table, data, alias, &row_ids).map(Some)
+        let row_ids = keys.row_ids_for_value(&value)?;
+        self.dataset_from_row_ids(table, data, alias, &row_ids)
+            .map(Some)
     }
 
     fn indexed_inner_join_filtered(
@@ -947,8 +1064,14 @@ impl EngineRuntime {
             .catalog
             .tables
             .get(plan.probe_table.name)
-            .ok_or_else(|| DbError::sql(format!("unknown table or view {}", plan.probe_table.name)))?;
-        let probe_data = self.tables.get(plan.probe_table.name).cloned().unwrap_or_default();
+            .ok_or_else(|| {
+                DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
+            })?;
+        let probe_data = self
+            .tables
+            .get(plan.probe_table.name)
+            .cloned()
+            .unwrap_or_default();
         let filtered_join_index = filtered_table
             .columns
             .iter()
@@ -996,8 +1119,7 @@ impl EngineRuntime {
             if matches!(join_value, Value::Null) {
                 continue;
             }
-            let key = encode_index_key(join_value)?;
-            let row_ids = keys.get(&key).cloned().unwrap_or_default();
+            let row_ids = keys.row_ids_for_value(join_value)?;
             if row_ids.is_empty() {
                 continue;
             }
@@ -1025,8 +1147,7 @@ impl EngineRuntime {
                 if matches!(
                     self.eval_expr(plan.on, &dataset, &row, params, ctes, None)?,
                     Value::Bool(true)
-                )
-                {
+                ) {
                     rows.push(row);
                 }
             }
@@ -1234,14 +1355,82 @@ fn build_runtime_index(
 
     match index.kind {
         IndexKind::Btree => {
-            let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
-            for row in &data.rows {
-                let Some(key) = compute_index_key(runtime, index, table, row)? else {
-                    continue;
-                };
-                keys.entry(key).or_default().push(row.row_id);
+            let int64_keys = btree_uses_typed_int64_keys(index, table);
+            if index.unique && int64_keys {
+                let mut keys = BTreeMap::<i64, i64>::new();
+                for row in &data.rows {
+                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                        continue;
+                    };
+                    let RuntimeBtreeKey::Int64(key) = key else {
+                        return Err(DbError::internal(
+                            "typed INT64 runtime index received an encoded key",
+                        ));
+                    };
+                    if keys.insert(key, row.row_id).is_some() {
+                        return Err(DbError::corruption(format!(
+                            "unique index {} contains duplicate keys",
+                            index.name
+                        )));
+                    }
+                }
+                Ok(RuntimeIndex::Btree {
+                    keys: RuntimeBtreeKeys::UniqueInt64(keys),
+                })
+            } else if index.unique {
+                let mut keys = BTreeMap::<Vec<u8>, i64>::new();
+                for row in &data.rows {
+                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                        continue;
+                    };
+                    let RuntimeBtreeKey::Encoded(key) = key else {
+                        return Err(DbError::internal(
+                            "encoded runtime index received an INT64 key",
+                        ));
+                    };
+                    if keys.insert(key, row.row_id).is_some() {
+                        return Err(DbError::corruption(format!(
+                            "unique index {} contains duplicate keys",
+                            index.name
+                        )));
+                    }
+                }
+                Ok(RuntimeIndex::Btree {
+                    keys: RuntimeBtreeKeys::UniqueEncoded(keys),
+                })
+            } else if int64_keys {
+                let mut keys = BTreeMap::<i64, Vec<i64>>::new();
+                for row in &data.rows {
+                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                        continue;
+                    };
+                    let RuntimeBtreeKey::Int64(key) = key else {
+                        return Err(DbError::internal(
+                            "typed INT64 runtime index received an encoded key",
+                        ));
+                    };
+                    keys.entry(key).or_default().push(row.row_id);
+                }
+                Ok(RuntimeIndex::Btree {
+                    keys: RuntimeBtreeKeys::NonUniqueInt64(keys),
+                })
+            } else {
+                let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
+                for row in &data.rows {
+                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                        continue;
+                    };
+                    let RuntimeBtreeKey::Encoded(key) = key else {
+                        return Err(DbError::internal(
+                            "encoded runtime index received an INT64 key",
+                        ));
+                    };
+                    keys.entry(key).or_default().push(row.row_id);
+                }
+                Ok(RuntimeIndex::Btree {
+                    keys: RuntimeBtreeKeys::NonUniqueEncoded(keys),
+                })
             }
-            Ok(RuntimeIndex::Btree { keys })
         }
         IndexKind::Trigram => {
             let mut trigram = TrigramIndex::new(page_size, 100_000);
@@ -1270,9 +1459,35 @@ fn compute_index_key(
     index: &IndexSchema,
     table: &TableSchema,
     row: &StoredRow,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<RuntimeBtreeKey>> {
     if !row_satisfies_index_predicate(runtime, index, table, row)? {
         return Ok(None);
+    }
+    if btree_uses_typed_int64_keys(index, table) {
+        let [column] = index.columns.as_slice() else {
+            return Err(DbError::internal(
+                "typed INT64 runtime indexes require exactly one indexed column",
+            ));
+        };
+        if let Some(column_name) = &column.column_name {
+            let position = table
+                .columns
+                .iter()
+                .position(|entry| entry.name == *column_name)
+                .ok_or_else(|| {
+                    DbError::constraint(format!("index column {} does not exist", column_name))
+                })?;
+            let Value::Int64(value) = row
+                .values
+                .get(position)
+                .ok_or_else(|| DbError::internal("row is shorter than table schema"))?
+            else {
+                return Err(DbError::internal(
+                    "typed INT64 runtime index expected an INT64 row value",
+                ));
+            };
+            return Ok(Some(RuntimeBtreeKey::Int64(*value)));
+        }
     }
     let values = compute_index_values(runtime, index, table, row)?;
     let key = if values.len() == 1 {
@@ -1280,7 +1495,26 @@ fn compute_index_key(
     } else {
         Row::new(values).encode()?
     };
-    Ok(Some(key))
+    Ok(Some(RuntimeBtreeKey::Encoded(key)))
+}
+
+fn btree_uses_typed_int64_keys(index: &IndexSchema, table: &TableSchema) -> bool {
+    let [column] = index.columns.as_slice() else {
+        return false;
+    };
+    if column.expression_sql.is_some() {
+        return false;
+    }
+    let Some(column_name) = &column.column_name else {
+        return false;
+    };
+    table
+        .columns
+        .iter()
+        .find(|entry| entry.name == *column_name)
+        .is_some_and(|column| {
+            column.column_type == crate::catalog::ColumnType::Int64 && !column.nullable
+        })
 }
 
 fn compute_index_values(
@@ -2173,7 +2407,11 @@ fn matches_table_binding(table: TableBindingRef<'_>, qualifier: Option<&str>) ->
     qualifier.is_some_and(|qualifier| qualifier == table.binding_name())
 }
 
-fn matches_filter_binding(table_name: &str, alias: &Option<String>, qualifier: Option<&str>) -> bool {
+fn matches_filter_binding(
+    table_name: &str,
+    alias: &Option<String>,
+    qualifier: Option<&str>,
+) -> bool {
     match qualifier {
         Some(qualifier) => qualifier == alias.as_deref().unwrap_or(table_name),
         None => true,
@@ -3441,11 +3679,12 @@ mod tests {
     use crate::search::TrigramQueryResult;
     use crate::sql::parser::parse_sql_statement;
     use crate::storage::page::InMemoryPageStore;
+    use crate::Value;
 
     use super::{
         decode_manifest_payload, decode_runtime_payload, encode_manifest_payload,
         encode_runtime_payload, encode_table_payload, EngineRuntime, PersistedTableState,
-        RuntimeIndex,
+        RuntimeBtreeKeys, RuntimeIndex,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -3486,9 +3725,54 @@ mod tests {
             panic!("expected trigram runtime index");
         };
         assert_eq!(
-            index.query_candidates("alpha", false).expect("query cloned index"),
+            index
+                .query_candidates("alpha", false)
+                .expect("query cloned index"),
             TrigramQueryResult::Candidates(vec![1])
         );
+    }
+
+    #[test]
+    fn non_nullable_int64_btree_indexes_use_typed_runtime_keys() {
+        let mut runtime = EngineRuntime::empty(1);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email) VALUES (7, 'a@example.com')",
+        );
+
+        let index_name = runtime
+            .catalog
+            .indexes
+            .keys()
+            .next()
+            .cloned()
+            .expect("primary-key index should exist");
+
+        let RuntimeIndex::Btree { keys } = runtime
+            .indexes
+            .get(&index_name)
+            .expect("INT64 index should exist")
+        else {
+            panic!("expected BTREE runtime index");
+        };
+
+        let RuntimeBtreeKeys::UniqueInt64(entries) = keys else {
+            panic!("expected typed INT64 runtime keys");
+        };
+        assert_eq!(entries.get(&7), Some(&7));
+        assert_eq!(
+            keys.row_ids_for_value(&Value::Int64(7))
+                .expect("INT64 lookup should succeed"),
+            vec![7]
+        );
+        assert!(keys
+            .row_ids_for_value(&Value::Text("7".into()))
+            .expect("mismatched lookup should not fail")
+            .is_empty());
     }
 
     #[test]
@@ -3525,7 +3809,8 @@ mod tests {
         );
 
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
-        let table_payload = encode_table_payload(&runtime.tables["docs"]).expect("encode table payload");
+        let table_payload =
+            encode_table_payload(&runtime.tables["docs"]).expect("encode table payload");
         let pointer = write_overflow(&mut store, &table_payload, CompressionMode::Auto)
             .expect("write table payload");
         let mut table_states = runtime.persisted_tables.clone();
@@ -3539,8 +3824,7 @@ mod tests {
 
         let manifest =
             encode_manifest_payload(&runtime, &table_states).expect("encode manifest payload");
-        let decoded =
-            decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
+        let decoded = decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
 
         assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
         assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
