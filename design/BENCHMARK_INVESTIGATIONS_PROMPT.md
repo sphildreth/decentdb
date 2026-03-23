@@ -50,3 +50,22 @@ If the execution engine is writing pages during the loop, investigate the `DbTxn
 - Do not guess the codebase structure. Use `read`, `bash`, and `grep` to inspect `exec/mod.rs`, `db.rs`, and `catalog/schema.rs`.
 - Do not make changes to the code yet. Output your findings and your proposed architectural plan first.
 - Only proceed with code changes once the user has approved the architectural roadmap.
+## Agent Findings & Roadmap (Added 2026-03-23)
+
+### 1. Root Cause Analysis
+The investigation confirmed that all three hypotheses for the performance bottlenecks are correct:
+* **$O(N^2)$ Execution Loop (`exec/mod.rs`)**: Inside `EngineRuntime::execute_statement`, every mutating operation (`Insert`, `Update`, `Delete`) immediately calls `self.rebuild_indexes(page_size)?`. The `rebuild_indexes` function iterates over `self.catalog.indexes` and rebuilds *every* index from scratch. Since this iterates over all rows in the dataset, executing 100,000 inserts scales with $O(N^2)$ complexity.
+* **SQL Parsing Overhead (`db.rs`)**: In `db.execute_batch_with_params`, which is called by `execute_with_params` inside the benchmark's 100,000 iteration loop, DecentDB calls `parse_sql_statement(trimmed)?` every single time. It uses `libpg_query` to parse the raw string into an AST without any Prepared Statement cache or AST caching. 
+* **In-Memory Storage & Wholesale Serialization (`exec/mod.rs`)**: The `EngineRuntime` currently retains the entire dataset in a `BTreeMap<String, TableData>`. When a transaction commits, `persist_to_db` is called, which in turn calls `encode_runtime_payload(self)`. This function serializes *every row of every table* and the entire catalog into a single massive byte vector, meaning `COMMIT` time scales linearly with total DB size.
+
+### 2. Short-Term Mitigation Plan
+To get benchmarking times down to reasonable levels immediately without rewriting the entire storage engine:
+* **Defer Index Rebuilding**: Remove `self.rebuild_indexes(page_size)?` from the individual statement execution paths (`Insert`, `Update`, `Delete`). Move this call so that it only executes at `COMMIT` time (inside `persist_to_db`), or maintain the indexes incrementally.
+* **AST Caching**: Introduce a simple query cache (e.g., an LRU Cache or `HashMap<String, Arc<Statement>>`) inside `Db` or the parsing module to avoid shelling out to `libpg_query` 100,000 times for the exact same statement string.
+
+### 3. Long-Term Architectural Plan (Phase 1 B-Tree Backed Tables)
+The current "Phase 0" implementation must be replaced with a true on-disk storage architecture:
+* **Slotted Page Architecture**: Replace the in-memory `TableData` storage with a B-Tree backed structure using Slotted Pages. Each page should contain a header, an array of line pointers (growing downwards), and variable-length row tuples (growing upwards).
+* **Direct Page Interaction**: The `EngineRuntime` should read/write rows directly to B-Tree pages via the `DbTxnPageStore` page cache, rather than maintaining a giant in-memory `BTreeMap` of rows.
+* **Incremental Index Updates**: Secondary indexes should become standalone B-Trees. An `INSERT` or `DELETE` should incrementally insert or remove a single entry in the index B-Tree pages rather than rebuilding the entire index.
+* **Efficient Commits**: The `COMMIT` boundary must stop serializing the entire database to an overflow page. Instead, committing a transaction should consist strictly of flushing dirty pages from the `DbTxnPageStore` into the Write-Ahead Log (WAL), making the commit operation $O(1)$ with respect to total database size.
