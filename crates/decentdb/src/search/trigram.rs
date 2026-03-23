@@ -1,4 +1,10 @@
 //! Trigram tokenization and guardrails.
+//!
+//! Implements:
+//! - design/adr/0007-trigram-postings-storage-strategy.md
+//! - design/adr/0008-trigram-pattern-length-guardrails.md
+//! - design/adr/0052-trigram-durability.md
+
 
 use std::collections::BTreeSet;
 
