@@ -16,10 +16,19 @@ pub(crate) struct WalIndex {
 }
 
 impl WalIndex {
-    pub(crate) fn add_version(&mut self, page_id: PageId, version: WalVersion) {
-        let versions = self.pages.entry(page_id).or_default();
-        versions.push(version);
-        versions.sort_by_key(|entry| entry.lsn);
+    pub(crate) fn add_version(
+        &mut self,
+        page_id: PageId,
+        version: WalVersion,
+        retain_history: bool,
+    ) {
+        if retain_history {
+            let versions = self.pages.entry(page_id).or_default();
+            versions.push(version);
+            versions.sort_by_key(|entry| entry.lsn);
+        } else {
+            self.pages.insert(page_id, vec![version]);
+        }
     }
 
     pub(crate) fn latest_visible(&self, page_id: PageId, snapshot_lsn: u64) -> Option<&WalVersion> {
@@ -45,16 +54,20 @@ impl WalIndex {
     pub(crate) fn prune_at_or_below(&mut self, page_ids: &[PageId], safe_lsn: u64) {
         for page_id in page_ids {
             if let Some(entries) = self.pages.get_mut(page_id) {
+                let original_len = entries.len();
                 entries.retain(|entry| entry.lsn > safe_lsn);
                 if entries.is_empty() {
                     self.pages.remove(page_id);
+                } else if entries.len() != original_len {
+                    entries.shrink_to_fit();
                 }
             }
         }
+        self.pages.shrink_to_fit();
     }
 
     pub(crate) fn clear(&mut self) {
-        self.pages.clear();
+        self.pages = HashMap::new();
     }
 
     #[must_use]

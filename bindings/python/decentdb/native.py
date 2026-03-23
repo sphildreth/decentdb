@@ -1,13 +1,19 @@
 import ctypes
 import os
-import sys
-import platform
-from ctypes import c_int, c_int64, c_double, c_char_p, c_void_p, POINTER, c_uint8, Structure
+from ctypes import (
+    POINTER,
+    Structure,
+    c_char_p,
+    c_double,
+    c_int64,
+    c_size_t,
+    c_uint8,
+    c_uint32,
+    c_uint64,
+    c_void_p,
+)
 
-# Error Codes (must match the C API).
-#
-# Internally, `src/errors.nim` has `ErrorCode` starting at 0.
-# The exported C API reserves 0 for OK and maps internal codes to 1..N.
+# Stable engine status codes from include/decentdb.h.
 ERR_OK = 0
 ERR_IO = 1
 ERR_CORRUPTION = 2
@@ -15,9 +21,9 @@ ERR_CONSTRAINT = 3
 ERR_TRANSACTION = 4
 ERR_SQL = 5
 ERR_INTERNAL = 6
+ERR_PANIC = 7
 
-# Legacy / not-yet-exposed codes (not currently produced by the C API).
-# Keep these defined so higher-level Python code can import them.
+# Legacy compatibility aliases kept for higher-level Python imports/tests.
 ERR_ERROR = 100
 ERR_LOCKED = 101
 ERR_NOT_FOUND = 102
@@ -26,32 +32,37 @@ ERR_PERMISSION = 104
 ERR_INVALID = 105
 ERR_NOMEM = 106
 
-# Value Kinds (must match value.nim / c_api.nim logic)
-# In c_api.nim:
-# if val.kind == vkNull: view.isNull = 1
-# vkNull usually 0
-# vkInt64
-# vkFloat64
-# vkText
-# vkBlob
-# vkBool
-# We can look up the enum values in `src/sql/sql.nim` or `src/record/record.nim` or `src/exec/exec.nim`.
-# Based on c_api.nim checks:
-# kind is passed through from internal Value kind.
-# Let's check `src/sql/sql.nim` for `ValueKind` enum.
+# Stable value tags from include/decentdb.h.
+DDB_VALUE_NULL = 0
+DDB_VALUE_INT64 = 1
+DDB_VALUE_FLOAT64 = 2
+DDB_VALUE_BOOL = 3
+DDB_VALUE_TEXT = 4
+DDB_VALUE_BLOB = 5
+DDB_VALUE_DECIMAL = 6
+DDB_VALUE_UUID = 7
+DDB_VALUE_TIMESTAMP_MICROS = 8
 
-class DecentdbValueView(Structure):
+
+class DdbValue(Structure):
     _fields_ = [
-        ("kind", c_int),
-        ("isNull", c_int),
-        ("int64Val", c_int64),
-        ("float64Val", c_double),
-        ("bytes", POINTER(c_uint8)),
-        ("bytesLen", c_int),
-        ("decimalScale", c_int),
+        ("tag", c_uint32),
+        ("bool_value", c_uint8),
+        ("reserved0", c_uint8 * 7),
+        ("int64_value", c_int64),
+        ("float64_value", c_double),
+        ("decimal_scaled", c_int64),
+        ("decimal_scale", c_uint8),
+        ("reserved1", c_uint8 * 7),
+        ("data", POINTER(c_uint8)),
+        ("len", c_size_t),
+        ("uuid_bytes", c_uint8 * 16),
+        ("timestamp_micros", c_int64),
     ]
 
+
 _lib = None
+
 
 def load_library():
     global _lib
@@ -59,34 +70,24 @@ def load_library():
         return _lib
 
     lib_path = os.environ.get("DECENTDB_NATIVE_LIB")
-    
     if not lib_path:
-        # Search relative to this file, walking up ancestors so this works when
-        # running from the repo (e.g. `.../target/debug/libdecentdb.so`) as well
-        # as when invoked from different working directories.
-
         here = os.path.abspath(__file__)
         candidates = []
-
-        # Common build artifact names across platforms
         lib_names = [
-            "libc_api.so",
             "libdecentdb.so",
-            "libc_api.dylib",
             "libdecentdb.dylib",
             "decentdb.dll",
+            "libc_api.so",
+            "libc_api.dylib",
+            "c_api.dll",
         ]
 
-        # Check common output directories from current working directory first
-        # (useful in CI/scripts and local test runs).
         cwd = os.getcwd()
         for name in lib_names:
             candidates.append(os.path.join(cwd, "build", name))
             candidates.append(os.path.join(cwd, "target", "debug", name))
             candidates.append(os.path.join(cwd, "target", "release", name))
 
-        # Walk up a few parents from this module's location
-        # (native.py -> decentdb/ -> python/ -> bindings/ -> repo root)
         cur_dir = os.path.dirname(here)
         for _ in range(0, 8):
             for name in lib_names:
@@ -98,11 +99,11 @@ def load_library():
                 break
             cur_dir = parent
 
-        for p in candidates:
-            if os.path.exists(p):
-                lib_path = p
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                lib_path = candidate
                 break
-    
+
     if not lib_path:
         raise RuntimeError(
             "Could not find decentdb native library. Set DECENTDB_NATIVE_LIB "
@@ -111,152 +112,83 @@ def load_library():
 
     try:
         _lib = ctypes.CDLL(lib_path)
-    except OSError as e:
-        raise RuntimeError(f"Failed to load decentdb native library at {lib_path}: {e}")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to load decentdb native library at {lib_path}: {exc}")
 
-    # Define signatures
+    _lib.ddb_last_error_message.argtypes = []
+    _lib.ddb_last_error_message.restype = c_char_p
 
-    # Memory management for API-allocated buffers
-    _lib.decentdb_free.argtypes = [c_void_p]
-    _lib.decentdb_free.restype = None
+    _lib.ddb_value_init.argtypes = [POINTER(DdbValue)]
+    _lib.ddb_value_init.restype = c_uint32
+    _lib.ddb_value_dispose.argtypes = [POINTER(DdbValue)]
+    _lib.ddb_value_dispose.restype = c_uint32
+    _lib.ddb_string_free.argtypes = [POINTER(c_char_p)]
+    _lib.ddb_string_free.restype = c_uint32
 
-    # Reflection helpers (JSON payloads; caller frees)
-    _lib.decentdb_list_tables_json.argtypes = [c_void_p, POINTER(c_int)]
-    _lib.decentdb_list_tables_json.restype = c_void_p
+    _lib.ddb_db_open_or_create.argtypes = [c_char_p, POINTER(c_void_p)]
+    _lib.ddb_db_open_or_create.restype = c_uint32
+    _lib.ddb_db_free.argtypes = [POINTER(c_void_p)]
+    _lib.ddb_db_free.restype = c_uint32
+    _lib.ddb_db_prepare.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
+    _lib.ddb_db_prepare.restype = c_uint32
+    _lib.ddb_db_execute.argtypes = [c_void_p, c_char_p, ctypes.c_void_p, c_size_t, POINTER(c_void_p)]
+    _lib.ddb_db_execute.restype = c_uint32
+    _lib.ddb_result_free.argtypes = [POINTER(c_void_p)]
+    _lib.ddb_result_free.restype = c_uint32
+    _lib.ddb_db_in_transaction.argtypes = [c_void_p, POINTER(c_uint8)]
+    _lib.ddb_db_in_transaction.restype = c_uint32
+    _lib.ddb_db_commit_transaction.argtypes = [c_void_p, POINTER(c_uint64)]
+    _lib.ddb_db_commit_transaction.restype = c_uint32
+    _lib.ddb_db_rollback_transaction.argtypes = [c_void_p]
+    _lib.ddb_db_rollback_transaction.restype = c_uint32
+    _lib.ddb_db_checkpoint.argtypes = [c_void_p]
+    _lib.ddb_db_checkpoint.restype = c_uint32
+    _lib.ddb_db_save_as.argtypes = [c_void_p, c_char_p]
+    _lib.ddb_db_save_as.restype = c_uint32
+    _lib.ddb_db_list_tables_json.argtypes = [c_void_p, POINTER(c_char_p)]
+    _lib.ddb_db_list_tables_json.restype = c_uint32
+    _lib.ddb_db_describe_table_json.argtypes = [c_void_p, c_char_p, POINTER(c_char_p)]
+    _lib.ddb_db_describe_table_json.restype = c_uint32
+    _lib.ddb_db_list_indexes_json.argtypes = [c_void_p, POINTER(c_char_p)]
+    _lib.ddb_db_list_indexes_json.restype = c_uint32
+    _lib.ddb_evict_shared_wal.argtypes = [c_char_p]
+    _lib.ddb_evict_shared_wal.restype = c_uint32
 
-    _lib.decentdb_get_table_columns_json.argtypes = [c_void_p, c_char_p, POINTER(c_int)]
-    _lib.decentdb_get_table_columns_json.restype = c_void_p
+    _lib.ddb_stmt_free.argtypes = [POINTER(c_void_p)]
+    _lib.ddb_stmt_free.restype = c_uint32
+    _lib.ddb_stmt_reset.argtypes = [c_void_p]
+    _lib.ddb_stmt_reset.restype = c_uint32
+    _lib.ddb_stmt_clear_bindings.argtypes = [c_void_p]
+    _lib.ddb_stmt_clear_bindings.restype = c_uint32
+    _lib.ddb_stmt_bind_null.argtypes = [c_void_p, c_size_t]
+    _lib.ddb_stmt_bind_null.restype = c_uint32
+    _lib.ddb_stmt_bind_int64.argtypes = [c_void_p, c_size_t, c_int64]
+    _lib.ddb_stmt_bind_int64.restype = c_uint32
+    _lib.ddb_stmt_bind_float64.argtypes = [c_void_p, c_size_t, c_double]
+    _lib.ddb_stmt_bind_float64.restype = c_uint32
+    _lib.ddb_stmt_bind_bool.argtypes = [c_void_p, c_size_t, c_uint8]
+    _lib.ddb_stmt_bind_bool.restype = c_uint32
+    _lib.ddb_stmt_bind_text.argtypes = [c_void_p, c_size_t, c_char_p, c_size_t]
+    _lib.ddb_stmt_bind_text.restype = c_uint32
+    _lib.ddb_stmt_bind_blob.argtypes = [c_void_p, c_size_t, POINTER(c_uint8), c_size_t]
+    _lib.ddb_stmt_bind_blob.restype = c_uint32
+    _lib.ddb_stmt_bind_decimal.argtypes = [c_void_p, c_size_t, c_int64, c_uint8]
+    _lib.ddb_stmt_bind_decimal.restype = c_uint32
+    _lib.ddb_stmt_bind_timestamp_micros.argtypes = [c_void_p, c_size_t, c_int64]
+    _lib.ddb_stmt_bind_timestamp_micros.restype = c_uint32
+    _lib.ddb_stmt_step.argtypes = [c_void_p, POINTER(c_uint8)]
+    _lib.ddb_stmt_step.restype = c_uint32
+    _lib.ddb_stmt_column_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    _lib.ddb_stmt_column_count.restype = c_uint32
+    _lib.ddb_stmt_column_name_copy.argtypes = [c_void_p, c_size_t, POINTER(c_char_p)]
+    _lib.ddb_stmt_column_name_copy.restype = c_uint32
+    _lib.ddb_stmt_affected_rows.argtypes = [c_void_p, POINTER(c_uint64)]
+    _lib.ddb_stmt_affected_rows.restype = c_uint32
+    _lib.ddb_stmt_value_copy.argtypes = [c_void_p, c_size_t, POINTER(DdbValue)]
+    _lib.ddb_stmt_value_copy.restype = c_uint32
 
-    _lib.decentdb_list_indexes_json.argtypes = [c_void_p, POINTER(c_int)]
-    _lib.decentdb_list_indexes_json.restype = c_void_p
-
-    # Checkpoint (flush WAL to main database file)
-    _lib.decentdb_checkpoint.argtypes = [c_void_p]
-    _lib.decentdb_checkpoint.restype = c_int
-
-    # SaveAs (export database to a new on-disk file)
-    _lib.decentdb_save_as.argtypes = [c_void_p, c_char_p]
-    _lib.decentdb_save_as.restype = c_int
-
-    # Evict shared WAL (call before replacing a database file on disk)
-    _lib.decentdb_evict_shared_wal.argtypes = [c_char_p]
-    _lib.decentdb_evict_shared_wal.restype = c_int
-    
-    # decentdb_open
-    _lib.decentdb_open.argtypes = [c_char_p, c_char_p]
-    _lib.decentdb_open.restype = c_void_p
-
-    # decentdb_close
-    _lib.decentdb_close.argtypes = [c_void_p]
-    _lib.decentdb_close.restype = c_int
-
-    # decentdb_last_error_code
-    _lib.decentdb_last_error_code.argtypes = [c_void_p]
-    _lib.decentdb_last_error_code.restype = c_int
-
-    # decentdb_last_error_message
-    _lib.decentdb_last_error_message.argtypes = [c_void_p]
-    _lib.decentdb_last_error_message.restype = c_char_p
-
-    # decentdb_prepare
-    _lib.decentdb_prepare.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
-    _lib.decentdb_prepare.restype = c_int
-
-    # decentdb_finalize
-    _lib.decentdb_finalize.argtypes = [c_void_p]
-    _lib.decentdb_finalize.restype = None
-
-    # decentdb_reset
-    _lib.decentdb_reset.argtypes = [c_void_p]
-    _lib.decentdb_reset.restype = c_int
-
-    # decentdb_clear_bindings
-    _lib.decentdb_clear_bindings.argtypes = [c_void_p]
-    _lib.decentdb_clear_bindings.restype = c_int
-
-    # Bindings
-    _lib.decentdb_bind_null.argtypes = [c_void_p, c_int]
-    _lib.decentdb_bind_null.restype = c_int
-
-    _lib.decentdb_bind_int64.argtypes = [c_void_p, c_int, c_int64]
-    _lib.decentdb_bind_int64.restype = c_int
-
-    _lib.decentdb_bind_bool.argtypes = [c_void_p, c_int, c_int]
-    _lib.decentdb_bind_bool.restype = c_int
-
-    _lib.decentdb_bind_float64.argtypes = [c_void_p, c_int, c_double]
-    _lib.decentdb_bind_float64.restype = c_int
-
-    _lib.decentdb_bind_decimal.argtypes = [c_void_p, c_int, c_int64, c_int]
-    _lib.decentdb_bind_decimal.restype = c_int
-
-    _lib.decentdb_bind_datetime.argtypes = [c_void_p, c_int, c_int64]
-    _lib.decentdb_bind_datetime.restype = c_int
-
-    _lib.decentdb_bind_text.argtypes = [c_void_p, c_int, c_char_p, c_int]
-    _lib.decentdb_bind_text.restype = c_int
-
-    _lib.decentdb_bind_blob.argtypes = [c_void_p, c_int, POINTER(c_uint8), c_int]
-    _lib.decentdb_bind_blob.restype = c_int
-
-    # Step
-    _lib.decentdb_step.argtypes = [c_void_p]
-    _lib.decentdb_step.restype = c_int
-
-    # Columns
-    _lib.decentdb_column_count.argtypes = [c_void_p]
-    _lib.decentdb_column_count.restype = c_int
-
-    _lib.decentdb_column_name.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_name.restype = c_char_p
-
-    _lib.decentdb_column_type.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_type.restype = c_int
-
-    # Column Accessors (optional usage if not using row view)
-    _lib.decentdb_column_is_null.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_is_null.restype = c_int
-    
-    _lib.decentdb_column_int64.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_int64.restype = c_int64
-
-    _lib.decentdb_column_float64.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_float64.restype = c_double
-
-    _lib.decentdb_column_decimal_scale.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_decimal_scale.restype = c_int
-
-    _lib.decentdb_column_decimal_unscaled.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_decimal_unscaled.restype = c_int64
-
-    _lib.decentdb_column_datetime.argtypes = [c_void_p, c_int]
-    _lib.decentdb_column_datetime.restype = c_int64
-
-    _lib.decentdb_column_text.argtypes = [c_void_p, c_int, POINTER(c_int)]
-    _lib.decentdb_column_text.restype = c_char_p
-
-    _lib.decentdb_column_blob.argtypes = [c_void_p, c_int, POINTER(c_int)]
-    _lib.decentdb_column_blob.restype = POINTER(c_uint8)
-
-    # Row View
-    _lib.decentdb_row_view.argtypes = [c_void_p, POINTER(POINTER(DecentdbValueView)), POINTER(c_int)]
-    _lib.decentdb_row_view.restype = c_int
-
-    # Combined helper (optional; newer libs only)
-    if hasattr(_lib, "decentdb_step_with_params_row_view"):
-        _lib.decentdb_step_with_params_row_view.argtypes = [
-            c_void_p,
-            POINTER(DecentdbValueView),
-            c_int,
-            POINTER(POINTER(DecentdbValueView)),
-            POINTER(c_int),
-            POINTER(c_int),
-        ]
-        _lib.decentdb_step_with_params_row_view.restype = c_int
-    
-    # Rows Affected
-    _lib.decentdb_rows_affected.argtypes = [c_void_p]
-    _lib.decentdb_rows_affected.restype = c_int64
+    _lib.decentdb_last_error_message = _lib.ddb_last_error_message
+    _lib.decentdb_last_error_code = lambda *_args: getattr(_lib, "_last_error_code", ERR_INTERNAL)
+    _lib.decentdb_list_tables_json = _lib.ddb_db_list_tables_json
 
     return _lib
-

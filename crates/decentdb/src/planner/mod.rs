@@ -201,6 +201,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         Expr::InList { expr, items, .. } => {
             expr_has_aggregate(expr) || items.iter().any(expr_has_aggregate)
         }
+        Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
         Expr::Exists(_) => false,
         Expr::Like {
             expr,

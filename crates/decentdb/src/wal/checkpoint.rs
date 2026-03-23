@@ -13,12 +13,24 @@ use super::writer;
 use super::WalHandle;
 
 pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64) -> Result<()> {
+    struct PendingReset<'a>(&'a WalHandle);
+
+    impl Drop for PendingReset<'_> {
+        fn drop(&mut self) {
+            self.0
+                .inner
+                .checkpoint_pending
+                .store(false, Ordering::SeqCst);
+        }
+    }
+
     let _writer_guard = wal
         .inner
         .write_lock
         .lock()
         .expect("wal write lock should not be poisoned");
     wal.inner.checkpoint_pending.store(true, Ordering::SeqCst);
+    let _pending_reset = PendingReset(wal);
 
     let current_lsn = wal.latest_snapshot();
     let safe_lsn = wal
@@ -75,6 +87,5 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         }
     }
 
-    wal.inner.checkpoint_pending.store(false, Ordering::SeqCst);
     Ok(())
 }

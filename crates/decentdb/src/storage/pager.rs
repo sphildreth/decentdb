@@ -9,6 +9,7 @@ use crate::error::{DbError, Result};
 use crate::vfs::{read_exact_at, write_all_at, VfsFile};
 
 use super::cache::PageCache;
+#[cfg(test)]
 use super::freelist::{decode_freelist_next, encode_freelist_page};
 use super::header::{DatabaseHeader, DB_HEADER_SIZE};
 use super::page::{self, PageId};
@@ -69,9 +70,11 @@ impl PagerHandle {
             page::page_offset(page_id, self.inner.page_size),
             data,
         )?;
-        self.inner.file.set_len(
-            page::page_offset(page_id, self.inner.page_size) + u64::from(self.inner.page_size),
-        )?;
+        let required_len =
+            page::page_offset(page_id, self.inner.page_size) + u64::from(self.inner.page_size);
+        if self.inner.file.file_size()? < required_len {
+            self.inner.file.set_len(required_len)?;
+        }
         self.inner.cache.insert_clean_page(page_id, data.to_vec())
     }
 
@@ -82,6 +85,7 @@ impl PagerHandle {
             .map(|size| page::page_count_for_len(size, self.inner.page_size))
     }
 
+    #[cfg(test)]
     pub(crate) fn allocate_page(&self) -> Result<PageId> {
         let mut header = self
             .inner
@@ -111,6 +115,7 @@ impl PagerHandle {
         Ok(page_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn free_page(&self, page_id: PageId) -> Result<()> {
         if page_id <= page::CATALOG_ROOT_PAGE_ID {
             return Err(DbError::transaction(format!(
@@ -162,11 +167,34 @@ impl PagerHandle {
             .map_err(|_| DbError::internal("pager header lock poisoned"))
     }
 
+    pub(crate) fn header_from_disk(&self) -> Result<DatabaseHeader> {
+        let mut bytes = [0_u8; DB_HEADER_SIZE];
+        read_exact_at(self.inner.file.as_ref(), 0, &mut bytes)?;
+        DatabaseHeader::decode(&bytes)
+    }
+
+    pub(crate) fn refresh_from_disk(&self, header: DatabaseHeader) -> Result<()> {
+        if header.page_size != self.inner.page_size {
+            return Err(DbError::corruption(format!(
+                "database page size changed from {} to {}",
+                self.inner.page_size, header.page_size
+            )));
+        }
+        self.inner.cache.clear()?;
+        *self
+            .inner
+            .header
+            .lock()
+            .map_err(|_| DbError::internal("pager header lock poisoned"))? = header;
+        Ok(())
+    }
+
     #[must_use]
     pub(crate) fn page_size(&self) -> u32 {
         self.inner.page_size
     }
 
+    #[cfg(test)]
     fn read_freelist_next(&self, page_id: PageId) -> Result<PageId> {
         let mut page = page::zeroed_page(self.inner.page_size);
         read_exact_at(
@@ -281,6 +309,45 @@ mod tests {
         pager.free_page(first_allocated).expect("free page");
         let reused = pager.allocate_page().expect("reuse freelist page");
         assert_eq!(reused, 3);
+    }
+
+    #[test]
+    fn write_page_direct_does_not_shrink_existing_file() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("write-page-direct-no-shrink");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        file.set_len(page::page_offset(5, page::DEFAULT_PAGE_SIZE))
+            .expect("extend file to four pages");
+
+        let pager = PagerHandle::open(file, header, 4).expect("open pager");
+        let page_four = vec![0x4A; page::DEFAULT_PAGE_SIZE as usize];
+        pager
+            .write_page_direct(4, &page_four)
+            .expect("seed page four");
+        let original_len = pager
+            .inner
+            .file
+            .file_size()
+            .expect("file size after seeding page four");
+
+        let page_two = vec![0x2B; page::DEFAULT_PAGE_SIZE as usize];
+        pager
+            .write_page_direct(2, &page_two)
+            .expect("rewrite smaller page id");
+
+        assert_eq!(
+            pager
+                .inner
+                .file
+                .file_size()
+                .expect("file size after rewrite"),
+            original_len
+        );
+        assert_eq!(pager.read_page(4).expect("read page four"), page_four);
     }
 
     #[derive(Debug)]

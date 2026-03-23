@@ -356,6 +356,7 @@ fn normalize_create_table(statement: &protobuf::CreateStmt) -> Result<CreateTabl
 fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDefinition> {
     let mut primary_key = false;
     let mut unique = false;
+    let mut not_null = column.is_not_null;
     let mut default = column
         .raw_default
         .as_deref()
@@ -389,7 +390,7 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
                             vec![column.colname.clone()],
                         )?)
                     }
-                    protobuf::ConstrType::ConstrNotnull => {}
+                    protobuf::ConstrType::ConstrNotnull => not_null = true,
                     other => {
                         return Err(unsupported(format!(
                             "column constraint {} is not supported",
@@ -415,7 +416,7 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
                 .as_ref()
                 .ok_or_else(|| unsupported("column definition is missing a type"))?,
         )?,
-        nullable: !column.is_not_null && !primary_key,
+        nullable: !not_null && !primary_key,
         default,
         primary_key,
         unique,
@@ -1132,6 +1133,30 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                 negated: kind == protobuf::AExprKind::AexprNotBetween,
             })
         }
+        protobuf::AExprKind::AexprNullif => {
+            let left = normalize_expr_node(
+                expr.lexpr
+                    .as_deref()
+                    .ok_or_else(|| unsupported("NULLIF is missing its left operand"))?,
+            )?;
+            let right = normalize_expr_node(
+                expr.rexpr
+                    .as_deref()
+                    .ok_or_else(|| unsupported("NULLIF is missing its right operand"))?,
+            )?;
+            Ok(Expr::Case {
+                operand: None,
+                branches: vec![(
+                    Expr::Binary {
+                        left: Box::new(left.clone()),
+                        op: BinaryOp::Eq,
+                        right: Box::new(right),
+                    },
+                    Expr::Literal(Value::Null),
+                )],
+                else_expr: Some(Box::new(left)),
+            })
+        }
         other => Err(unsupported(format!(
             "expression kind {} is not supported",
             other.as_str_name()
@@ -1250,6 +1275,21 @@ fn normalize_sublink(link: &protobuf::SubLink) -> Result<Expr> {
     match protobuf::SubLinkType::try_from(link.sub_link_type)
         .unwrap_or(protobuf::SubLinkType::ExistsSublink)
     {
+        protobuf::SubLinkType::AnySublink if link.oper_name.is_empty() => {
+            let testexpr = link
+                .testexpr
+                .as_deref()
+                .ok_or_else(|| unsupported("IN subquery is missing its test expression"))?;
+            Ok(Expr::InSubquery {
+                expr: Box::new(normalize_expr_node(testexpr)?),
+                query: Box::new(normalize_query(as_select_stmt(
+                    link.subselect
+                        .as_deref()
+                        .ok_or_else(|| unsupported("IN is missing its subquery"))?,
+                )?)?),
+                negated: false,
+            })
+        }
         protobuf::SubLinkType::ExistsSublink => {
             Ok(Expr::Exists(Box::new(normalize_query(as_select_stmt(
                 link.subselect
@@ -1286,14 +1326,23 @@ fn normalize_range_var(range: &protobuf::RangeVar) -> Result<String> {
 fn normalize_type_name(type_name: &protobuf::TypeName) -> Result<ColumnType> {
     let raw = normalize_qualified_name(&type_name.names)?.to_ascii_lowercase();
     match raw.as_str() {
-        "int" | "int8" | "integer" | "bigint" | "int64" => Ok(ColumnType::Int64),
-        "real" | "double precision" | "float8" | "float64" => Ok(ColumnType::Float64),
-        "text" | "varchar" | "character varying" | "char" | "character" => Ok(ColumnType::Text),
-        "bool" | "boolean" => Ok(ColumnType::Bool),
-        "bytea" | "blob" => Ok(ColumnType::Blob),
-        "decimal" | "numeric" => Ok(ColumnType::Decimal),
-        "uuid" => Ok(ColumnType::Uuid),
-        "timestamp" | "timestamp without time zone" => Ok(ColumnType::Timestamp),
+        "int" | "int8" | "integer" | "bigint" | "int64" | "smallint" | "pg_catalog.int2"
+        | "pg_catalog.int4" | "pg_catalog.int8" => Ok(ColumnType::Int64),
+        "real" | "double precision" | "float4" | "float8" | "float64" | "pg_catalog.float4"
+        | "pg_catalog.float8" => Ok(ColumnType::Float64),
+        "text" | "varchar" | "character varying" | "char" | "character" | "pg_catalog.text"
+        | "pg_catalog.varchar" | "pg_catalog.bpchar" => Ok(ColumnType::Text),
+        "bool" | "boolean" | "pg_catalog.bool" => Ok(ColumnType::Bool),
+        "bytea" | "blob" | "pg_catalog.bytea" => Ok(ColumnType::Blob),
+        "decimal" | "numeric" | "pg_catalog.numeric" => Ok(ColumnType::Decimal),
+        "uuid" | "pg_catalog.uuid" => Ok(ColumnType::Uuid),
+        "timestamp"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "pg_catalog.timestamp"
+        | "pg_catalog.timestamptz"
+        | "datetime"
+        | "date" => Ok(ColumnType::Timestamp),
         _ => Err(unsupported(format!("type {raw} is not supported"))),
     }
 }

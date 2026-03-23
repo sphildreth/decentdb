@@ -5,6 +5,7 @@ use std::ffi::{c_char, CStr, CString};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
+use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
 use crate::metadata::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, TriggerInfo, ViewInfo};
 use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
@@ -72,6 +73,18 @@ pub struct DbHandle {
 #[derive(Debug)]
 pub struct ResultHandle {
     result: QueryResult,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct StmtHandle {
+    db: Db,
+    sql: String,
+    prepared: PreparedStatement,
+    bindings: Vec<Value>,
+    result: Option<QueryResult>,
+    current_row: Option<usize>,
+    next_row_index: usize,
 }
 
 thread_local! {
@@ -158,6 +171,10 @@ fn ref_ptr<'a, T>(ptr: *const T, name: &str) -> Result<&'a T> {
 
 fn handle_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T> {
     ref_ptr(ptr, name)
+}
+
+fn handle_mut<'a, T>(ptr: *mut T, name: &str) -> Result<&'a mut T> {
+    out_ptr(ptr, name)
 }
 
 fn c_string_arg<'a>(ptr: *const c_char, name: &str) -> Result<&'a CStr> {
@@ -270,6 +287,65 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
             out.timestamp_micros = *inner;
         }
     }
+}
+
+fn execute_stmt_if_needed(stmt: &mut StmtHandle) -> Result<()> {
+    if stmt.result.is_some() {
+        return Ok(());
+    }
+
+    let execute = || stmt.prepared.execute(&stmt.bindings);
+    match execute() {
+        Ok(result) => {
+            stmt.result = Some(result);
+            stmt.current_row = None;
+            stmt.next_row_index = 0;
+            Ok(())
+        }
+        Err(DbError::Sql { message }) if message.contains("schema changed") => {
+            stmt.prepared = stmt.db.prepare(&stmt.sql)?;
+            let result = stmt.prepared.execute(&stmt.bindings)?;
+            stmt.result = Some(result);
+            stmt.current_row = None;
+            stmt.next_row_index = 0;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn invalidate_stmt_result(stmt: &mut StmtHandle) {
+    stmt.result = None;
+    stmt.current_row = None;
+    stmt.next_row_index = 0;
+}
+
+fn ensure_stmt_binding_slot(stmt: &mut StmtHandle, index_1_based: usize) -> Result<usize> {
+    if index_1_based == 0 {
+        return Err(DbError::sql("statement parameter indexes are 1-based"));
+    }
+    let slot = index_1_based - 1;
+    if stmt.bindings.len() <= slot {
+        stmt.bindings.resize(slot + 1, Value::Null);
+    }
+    Ok(slot)
+}
+
+fn stmt_current_value(stmt: &StmtHandle, column_index: usize) -> Result<&Value> {
+    let result = stmt
+        .result
+        .as_ref()
+        .ok_or_else(|| DbError::sql("statement has not been executed yet"))?;
+    let row_index = stmt
+        .current_row
+        .ok_or_else(|| DbError::sql("statement is not positioned on a row"))?;
+    let row = result
+        .rows()
+        .get(row_index)
+        .ok_or_else(|| DbError::internal("statement row cursor is out of bounds"))?;
+    row.values()
+        .get(column_index)
+        .ok_or_else(|| DbError::sql(format!("column index {column_index} is out of bounds")))
 }
 
 fn owned_bytes(bytes: Vec<u8>) -> *mut u8 {
@@ -601,6 +677,270 @@ pub extern "C" fn ddb_db_save_as(db: *mut DbHandle, dest_path: *const c_char) ->
     ffi_boundary(|| {
         let dest = utf8_arg(dest_path, "dest_path")?;
         handle_ref(db, "db")?.db.save_as(dest)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_prepare(
+    db: *mut DbHandle,
+    sql: *const c_char,
+    out_stmt: *mut *mut StmtHandle,
+) -> u32 {
+    ffi_boundary(|| {
+        let db = handle_ref(db, "db")?;
+        let sql = utf8_arg(sql, "sql")?;
+        let prepared = db.db.prepare(&sql)?;
+        let handle = Box::new(StmtHandle {
+            db: db.db.clone(),
+            sql,
+            prepared,
+            bindings: Vec::new(),
+            result: None,
+            current_row: None,
+            next_row_index: 0,
+        });
+        *out_ptr(out_stmt, "out_stmt")? = Box::into_raw(handle);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_free(stmt: *mut *mut StmtHandle) -> u32 {
+    ffi_boundary(|| {
+        let stmt = out_ptr(stmt, "stmt")?;
+        if (*stmt).is_null() {
+            return Ok(());
+        }
+        unsafe {
+            drop(Box::from_raw(*stmt));
+        }
+        *stmt = ptr::null_mut();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_reset(stmt: *mut StmtHandle) -> u32 {
+    ffi_boundary(|| {
+        invalidate_stmt_result(handle_mut(stmt, "stmt")?);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_clear_bindings(stmt: *mut StmtHandle) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        stmt.bindings.clear();
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_null(stmt: *mut StmtHandle, index_1_based: usize) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Null;
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_int64(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: i64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Int64(value);
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_float64(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: f64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Float64(value);
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_bool(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Bool(value != 0);
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_text(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: *const c_char,
+    byte_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(value.cast::<u8>(), byte_len)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Text(text.to_string());
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_blob(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    data: *const u8,
+    byte_len: usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(data, byte_len)?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Blob(bytes.to_vec());
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_decimal(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    scaled: i64,
+    scale: u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Decimal { scaled, scale };
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_timestamp_micros(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    timestamp_micros: i64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::TimestampMicros(timestamp_micros);
+        invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_step(stmt: *mut StmtHandle, out_has_row: *mut u8) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+        let result = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?;
+        if stmt.next_row_index >= result.rows().len() {
+            stmt.current_row = None;
+            *out_ptr(out_has_row, "out_has_row")? = 0;
+            return Ok(());
+        }
+        stmt.current_row = Some(stmt.next_row_index);
+        stmt.next_row_index += 1;
+        *out_ptr(out_has_row, "out_has_row")? = 1;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_column_count(stmt: *mut StmtHandle, out_columns: *mut usize) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+        *out_ptr(out_columns, "out_columns")? = stmt
+            .result
+            .as_ref()
+            .map_or(0, |result| result.columns().len());
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_column_name_copy(
+    stmt: *mut StmtHandle,
+    column_index: usize,
+    out_name: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+        let result = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::sql("statement has not been executed yet"))?;
+        let column = result
+            .columns()
+            .get(column_index)
+            .ok_or_else(|| DbError::sql(format!("column index {column_index} is out of bounds")))?;
+        *out_ptr(out_name, "out_name")? = CString::new(column.as_str())
+            .map_err(|_| DbError::internal("column name contains an interior NUL"))?
+            .into_raw();
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_affected_rows(stmt: *mut StmtHandle, out_rows: *mut u64) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+        *out_ptr(out_rows, "out_rows")? =
+            stmt.result.as_ref().map_or(0, QueryResult::affected_rows);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_value_copy(
+    stmt: *mut StmtHandle,
+    column_index: usize,
+    out_value: *mut DdbValue,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+        let value = stmt_current_value(stmt, column_index)?;
+        fill_ffi_value(out_ptr(out_value, "out_value")?, value);
+        Ok(())
     })
 }
 

@@ -88,6 +88,34 @@ fn checkpoint_truncates_wal_without_readers_and_preserves_data() {
 }
 
 #[test]
+fn wal_index_keeps_only_latest_versions_without_readers() {
+    let _guard = test_lock().lock().expect("test lock");
+    let path = unique_db_path("wal-latest-only");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    for byte in [0x11_u8, 0x22, 0x33] {
+        db.begin_write().expect("begin write");
+        db.write_page(3, &filled_page(db.config().page_size, byte))
+            .expect("write page image");
+        db.commit().expect("commit page image");
+    }
+
+    let inspect = db
+        .inspect_storage_state_json()
+        .expect("inspect storage state");
+    assert!(
+        inspect.contains("\"wal_versions\":1"),
+        "without active readers the WAL index should retain only the latest page image: {inspect}"
+    );
+    assert_eq!(
+        db.read_page(3).expect("read latest page"),
+        filled_page(db.config().page_size, 0x33)
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn checkpoint_defers_truncation_when_snapshot_is_held_and_prunes_index() {
     let _guard = test_lock().lock().expect("test lock");
     let path = unique_db_path("checkpoint-reader");

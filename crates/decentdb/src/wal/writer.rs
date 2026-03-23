@@ -54,6 +54,7 @@ pub(crate) fn commit_pages(
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
     sync_for_mode(wal.inner.sync_mode, wal)?;
 
+    let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
     {
         let mut index = wal
             .inner
@@ -61,7 +62,7 @@ pub(crate) fn commit_pages(
             .lock()
             .expect("wal index lock should not be poisoned");
         for (page_id, version) in committed {
-            index.add_version(page_id, version);
+            index.add_version(page_id, version, retain_history);
         }
     }
 
@@ -119,6 +120,7 @@ pub(crate) fn commit_pages_if_latest(
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
     sync_for_mode(wal.inner.sync_mode, wal)?;
 
+    let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
     {
         let mut index = wal
             .inner
@@ -126,7 +128,7 @@ pub(crate) fn commit_pages_if_latest(
             .lock()
             .expect("wal index lock should not be poisoned");
         for (page_id, version) in committed {
-            index.add_version(page_id, version);
+            index.add_version(page_id, version, retain_history);
         }
     }
 

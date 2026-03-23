@@ -397,7 +397,7 @@ class TestConnectionCheckpoint:
         """Checkpoint reduces WAL file size."""
         import os
         db_path = str(tmp_path / "checkpoint_size.ddb")
-        wal_path = db_path + "-wal"
+        wal_path = db_path + ".wal"
         
         conn = decentdb.connect(db_path)
         cur = conn.cursor()

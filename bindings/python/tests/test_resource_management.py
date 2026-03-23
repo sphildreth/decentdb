@@ -6,6 +6,7 @@ These tests detect resource leaks that only manifest under realistic usage patte
 These tests would have caught the SPF5000 memory leak caused by connection churn
 with shared WAL.
 """
+import ctypes
 import gc
 import os
 import threading
@@ -26,6 +27,20 @@ def get_rss_bytes():
     """Get current RSS (resident set size) in bytes."""
     proc = psutil.Process(os.getpid())
     return proc.memory_info().rss
+
+
+def trim_process_heap():
+    """Ask glibc to return free heap pages to the OS when available."""
+    try:
+        libc = ctypes.CDLL(None)
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is None:
+            return False
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        return bool(malloc_trim(0))
+    except Exception:
+        return False
 
 
 class TestFileDescriptorManagement:
@@ -130,6 +145,7 @@ class TestRSSManagement:
         conn.close()
         
         gc.collect()
+        trim_process_heap()
         rss_before = get_rss_bytes()
         
         errors = []
@@ -162,6 +178,7 @@ class TestRSSManagement:
         
         gc.collect()
         gc.collect()
+        trim_process_heap()
         rss_after = get_rss_bytes()
         
         rss_growth_mb = (rss_after - rss_before) / (1024 * 1024)
@@ -188,6 +205,7 @@ class TestRSSManagement:
         conn.close()
         
         gc.collect()
+        trim_process_heap()
         rss_before = get_rss_bytes()
         
         write_count = [0]
@@ -248,6 +266,7 @@ class TestRSSManagement:
         
         gc.collect()
         gc.collect()
+        trim_process_heap()
         rss_after = get_rss_bytes()
         
         rss_growth_mb = (rss_after - rss_before) / (1024 * 1024)
@@ -270,6 +289,7 @@ class TestRSSManagement:
         conn.close()
         
         gc.collect()
+        trim_process_heap()
         rss_baseline = get_rss_bytes()
         
         rss_peaks = []
@@ -277,15 +297,19 @@ class TestRSSManagement:
         for cycle in range(3):
             conn = decentdb.connect(db_path)
             cur = conn.cursor()
-            
+            # Keep the focus on close-time memory release rather than the default
+            # per-statement autocommit path, which would dominate runtime here.
+            cur.execute("BEGIN")
+
             # Insert 10K rows with 200 bytes each = ~2MB data
             for i in range(10000):
                 cur.execute(
                     "INSERT INTO t VALUES (?, ?)",
                     (cycle * 10000 + i, f"cycle_{cycle}_row_{i}_" + "x" * 200)
                 )
-                if i % 1000 == 0:
+                if (i + 1) % 1000 == 0 and (i + 1) != 10000:
                     conn.commit()
+                    cur.execute("BEGIN")
             conn.commit()
             
             rss_during = get_rss_bytes()
@@ -295,7 +319,9 @@ class TestRSSManagement:
             del conn
             gc.collect()
             gc.collect()
-        
+            trim_process_heap()
+
+        trim_process_heap()
         rss_after = get_rss_bytes()
         
         # RSS after all cycles should not have grown excessively
@@ -313,7 +339,7 @@ class TestRSSManagement:
         verify WAL file is small and RSS hasn't grown excessively.
         """
         db_path = str(tmp_path / "rss_checkpoint.ddb")
-        wal_path = db_path + "-wal"
+        wal_path = db_path + ".wal"
         
         # Seed schema
         conn = decentdb.connect(db_path)
@@ -347,6 +373,7 @@ class TestRSSManagement:
         conn.close()
         
         gc.collect()
+        trim_process_heap()
         rss_after = get_rss_bytes()
         
         # WAL should be much smaller after checkpoint

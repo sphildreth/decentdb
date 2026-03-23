@@ -156,6 +156,11 @@ pub(crate) enum Expr {
         items: Vec<Expr>,
         negated: bool,
     },
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<Query>,
+        negated: bool,
+    },
     Exists(Box<Query>),
     Like {
         expr: Box<Expr>,
@@ -624,6 +629,16 @@ impl Expr {
                     .map(Expr::to_sql)
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Self::InSubquery {
+                expr,
+                query,
+                negated,
+            } => format!(
+                "({} {}IN ({}))",
+                expr.to_sql(),
+                if *negated { "NOT " } else { "" },
+                query.to_sql()
             ),
             Self::Exists(query) => format!("EXISTS ({})", query.to_sql()),
             Self::Like {

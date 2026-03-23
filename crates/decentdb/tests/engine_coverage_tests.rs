@@ -86,6 +86,27 @@ fn cast_from_text_to_int() {
 }
 
 #[test]
+fn cast_parameterized_text_to_decimal() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute_with_params(
+            "SELECT CAST($1 AS DECIMAL(10,2))",
+            &[Value::Text("19.99".to_string())],
+        )
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values(),
+        &[Value::Decimal {
+            scaled: 1999,
+            scale: 2
+        }]
+    );
+}
+
+#[test]
 fn count_aggregate() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
     db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)")

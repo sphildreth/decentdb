@@ -138,4 +138,14 @@ impl WalHandle {
     pub(crate) fn is_shared(&self) -> bool {
         self.inner.canonical_path.is_some()
     }
+
+    pub(crate) fn strong_handle_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
+    pub(crate) fn set_checkpoint_pending(&self, pending: bool) {
+        self.inner
+            .checkpoint_pending
+            .store(pending, Ordering::SeqCst);
+    }
 }

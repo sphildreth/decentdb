@@ -53,7 +53,10 @@ impl Row {
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.encode_with_overflow::<crate::storage::page::InMemoryPageStore>(
             None,
-            RowOverflowOptions::default(),
+            RowOverflowOptions {
+                inline_threshold: usize::MAX,
+                compression: CompressionMode::Auto,
+            },
         )
     }
 

@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::thread;
 
 use crate::config::WalSyncMode;
 use crate::error::Result;
@@ -33,6 +34,9 @@ pub(crate) fn acquire(
             .lock()
             .expect("shared wal registry lock should not be poisoned");
         if let Some(existing) = registry_guard.get(&canonical_path).and_then(Weak::upgrade) {
+            while existing.checkpoint_pending.load(Ordering::SeqCst) {
+                thread::yield_now();
+            }
             return Ok(WalHandle { inner: existing });
         }
     }

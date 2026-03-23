@@ -23,6 +23,7 @@ enum {
 
 typedef struct ddb_db_handle ddb_db_t;
 typedef struct ddb_result_handle ddb_result_t;
+typedef struct ddb_stmt_handle ddb_stmt_t;
 
 typedef enum ddb_value_tag_t {
   DDB_VALUE_NULL = 0,
@@ -64,6 +65,45 @@ ddb_status_t ddb_db_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_free(ddb_db_t **db);
+
+ddb_status_t ddb_db_prepare(ddb_db_t *db, const char *sql, ddb_stmt_t **out_stmt);
+ddb_status_t ddb_stmt_free(ddb_stmt_t **stmt);
+ddb_status_t ddb_stmt_reset(ddb_stmt_t *stmt);
+ddb_status_t ddb_stmt_clear_bindings(ddb_stmt_t *stmt);
+ddb_status_t ddb_stmt_bind_null(ddb_stmt_t *stmt, size_t index_1_based);
+ddb_status_t ddb_stmt_bind_int64(ddb_stmt_t *stmt, size_t index_1_based, int64_t value);
+ddb_status_t ddb_stmt_bind_float64(ddb_stmt_t *stmt, size_t index_1_based, double value);
+ddb_status_t ddb_stmt_bind_bool(ddb_stmt_t *stmt, size_t index_1_based, uint8_t value);
+ddb_status_t ddb_stmt_bind_text(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const char *value,
+    size_t byte_len);
+ddb_status_t ddb_stmt_bind_blob(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    const uint8_t *data,
+    size_t byte_len);
+ddb_status_t ddb_stmt_bind_decimal(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    int64_t scaled,
+    uint8_t scale);
+ddb_status_t ddb_stmt_bind_timestamp_micros(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    int64_t timestamp_micros);
+ddb_status_t ddb_stmt_step(ddb_stmt_t *stmt, uint8_t *out_has_row);
+ddb_status_t ddb_stmt_column_count(ddb_stmt_t *stmt, size_t *out_columns);
+ddb_status_t ddb_stmt_column_name_copy(
+    ddb_stmt_t *stmt,
+    size_t column_index,
+    char **out_name);
+ddb_status_t ddb_stmt_affected_rows(ddb_stmt_t *stmt, uint64_t *out_rows);
+ddb_status_t ddb_stmt_value_copy(
+    ddb_stmt_t *stmt,
+    size_t column_index,
+    ddb_value_t *out_value);
 
 ddb_status_t ddb_db_execute(
     ddb_db_t *db,

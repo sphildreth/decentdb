@@ -102,12 +102,23 @@ impl PageCache {
         self.insert_page(page_id, data, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn discard(&self, page_id: PageId) -> Result<()> {
         self.state
             .lock()
             .map_err(|_| DbError::internal("page cache lock poisoned"))?
             .pages
             .remove(&page_id);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DbError::internal("page cache lock poisoned"))?;
+        state.pages.clear();
+        state.access_counter = 0;
         Ok(())
     }
 

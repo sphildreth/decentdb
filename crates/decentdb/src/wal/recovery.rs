@@ -62,7 +62,7 @@ pub(crate) fn initialize_or_recover(
             }
             FrameType::Commit => {
                 for (page_id, data, lsn) in pending.drain(..) {
-                    index.add_version(page_id, WalVersion { lsn, data });
+                    index.add_version(page_id, WalVersion { lsn, data }, true);
                 }
             }
             FrameType::Checkpoint => {

@@ -11,6 +11,7 @@ pub(crate) mod txn;
 pub(crate) mod views;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use crate::catalog::{CatalogState, IndexKind, IndexSchema, TableSchema};
 use crate::error::{DbError, Result};
@@ -19,7 +20,7 @@ use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{read_overflow, write_overflow, OverflowPointer};
 use crate::record::row::Row;
-use crate::record::value::Value;
+use crate::record::value::{parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
     BinaryOp, Expr, FromItem, JoinKind, Query, QueryBody, Select, SelectItem, Statement, UnaryOp,
@@ -248,8 +249,9 @@ impl EngineRuntime {
         pager: &PagerHandle,
         wal: &WalHandle,
         schema_cookie: u32,
-    ) -> Result<Self> {
-        let snapshot_lsn = wal.latest_snapshot();
+    ) -> Result<(Self, u64)> {
+        let reader = wal.begin_reader()?;
+        let snapshot_lsn = reader.snapshot_lsn();
         let store = SnapshotPageStore {
             pager,
             wal,
@@ -257,7 +259,7 @@ impl EngineRuntime {
         };
         let root_page = store.read_page(page::CATALOG_ROOT_PAGE_ID)?;
         let Some(root) = decode_root_header(&root_page)? else {
-            return Ok(Self::empty(schema_cookie));
+            return Ok((Self::empty(schema_cookie), snapshot_lsn));
         };
         let payload = if root.pointer.logical_len == 0 || root.pointer.head_page_id == 0 {
             Vec::new()
@@ -280,7 +282,8 @@ impl EngineRuntime {
         };
         runtime.catalog.schema_cookie = schema_cookie;
         runtime.rebuild_indexes(pager.page_size())?;
-        Ok(runtime)
+        drop(reader);
+        Ok((runtime, snapshot_lsn))
     }
 
     pub(crate) fn persist_to_db(&mut self, db: &crate::db::Db) -> Result<()> {
@@ -658,6 +661,23 @@ impl EngineRuntime {
                         .render();
                 if explain.analyze {
                     lines.insert(0, "ANALYZE true".to_string());
+                    let started = Instant::now();
+                    let actual_rows = match explain.statement.as_ref() {
+                        Statement::Query(query) => self
+                            .evaluate_query(query, params, &BTreeMap::new())?
+                            .rows
+                            .len(),
+                        other => {
+                            return Err(DbError::sql(format!(
+                                "EXPLAIN ANALYZE is not supported for {other:?}"
+                            )))
+                        }
+                    };
+                    lines.push(format!("Actual Rows: {actual_rows}"));
+                    lines.push(format!(
+                        "Actual Time: {:.3} ms",
+                        started.elapsed().as_secs_f64() * 1_000.0
+                    ));
                 }
                 Ok(QueryResult::with_explain(lines))
             }
@@ -693,8 +713,30 @@ impl EngineRuntime {
             ctes.insert(cte.name.clone(), dataset);
         }
 
-        let mut dataset = self.evaluate_query_body(&query.body, params, &ctes)?;
-        if !query.order_by.is_empty() {
+        let mut sorted_during_select = false;
+        let mut dataset = match &query.body {
+            QueryBody::Select(select)
+                if !select.group_by.is_empty()
+                    || projection_has_aggregate_items(&select.projection) =>
+            {
+                self.evaluate_select(select, params, &ctes)?
+            }
+            QueryBody::Select(select) => {
+                let mut source = self.build_select_dataset(select, params, &ctes)?;
+                if !query.order_by.is_empty() {
+                    self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
+                }
+                let mut projected =
+                    self.project_dataset(&source, &select.projection, params, &ctes, None)?;
+                if !query.order_by.is_empty() {
+                    self.sort_dataset(&mut projected, &query.order_by, params, &ctes)?;
+                    sorted_during_select = true;
+                }
+                projected
+            }
+            _ => self.evaluate_query_body(&query.body, params, &ctes)?,
+        };
+        if !query.order_by.is_empty() && !sorted_during_select {
             self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
         }
         let offset = query
@@ -753,6 +795,20 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
+        let dataset = self.build_select_dataset(select, params, ctes)?;
+        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+            self.evaluate_grouped_select(select, dataset, params, ctes)
+        } else {
+            self.project_dataset(&dataset, &select.projection, params, ctes, None)
+        }
+    }
+
+    fn build_select_dataset(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Dataset> {
         let mut dataset = if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
             dataset
         } else if let Some(dataset) = self.try_indexed_join(select, params, ctes)? {
@@ -795,11 +851,7 @@ impl EngineRuntime {
             });
         }
 
-        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
-            self.evaluate_grouped_select(select, dataset, params, ctes)
-        } else {
-            self.project_dataset(&dataset, &select.projection, params, ctes, None)
-        }
+        Ok(dataset)
     }
 
     fn try_indexed_scan(
@@ -2456,6 +2508,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::InList { expr, items, .. } => {
             expr_contains_aggregate(expr) || items.iter().any(expr_contains_aggregate)
         }
+        Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
         Expr::Exists(_) => false,
         Expr::Like {
             expr,
@@ -3195,6 +3248,36 @@ impl EngineRuntime {
                     Ok(Value::Bool(*negated))
                 }
             }
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => {
+                let value = self.eval_expr(expr, dataset, row, params, ctes, excluded)?;
+                if matches!(value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let subquery = self.evaluate_query(query, params, ctes)?;
+                if subquery.columns.len() != 1 {
+                    return Err(DbError::sql("IN subquery must return exactly one column"));
+                }
+                let mut saw_null = false;
+                for subquery_row in &subquery.rows {
+                    let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
+                    if matches!(candidate, Value::Null) {
+                        saw_null = true;
+                        continue;
+                    }
+                    if compare_values(&value, &candidate)? == std::cmp::Ordering::Equal {
+                        return Ok(Value::Bool(!*negated));
+                    }
+                }
+                if saw_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(*negated))
+                }
+            }
             Expr::Exists(query) => Ok(Value::Bool(
                 !self.evaluate_query(query, params, ctes)?.rows.is_empty(),
             )),
@@ -3612,10 +3695,37 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
             },
             other => Err(DbError::sql(format!("cannot cast {other:?} to BOOL"))),
         },
-        other => Err(DbError::sql(format!(
-            "CAST to {} is not yet implemented",
-            other.as_str()
-        ))),
+        crate::catalog::ColumnType::Blob => match value {
+            Value::Blob(value) => Ok(Value::Blob(value)),
+            Value::Uuid(value) => Ok(Value::Blob(value.to_vec())),
+            other => Err(DbError::sql(format!("cannot cast {other:?} to BLOB"))),
+        },
+        crate::catalog::ColumnType::Decimal => match value {
+            Value::Decimal { scaled, scale } => Ok(Value::Decimal { scaled, scale }),
+            Value::Int64(value) => Ok(Value::Decimal {
+                scaled: value,
+                scale: 0,
+            }),
+            Value::Text(value) => {
+                let (scaled, scale) = parse_decimal_text(&value)?;
+                Ok(Value::Decimal { scaled, scale })
+            }
+            other => Err(DbError::sql(format!("cannot cast {other:?} to DECIMAL"))),
+        },
+        crate::catalog::ColumnType::Uuid => match value {
+            Value::Uuid(value) => Ok(Value::Uuid(value)),
+            Value::Blob(value) if value.len() == 16 => {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(&value);
+                Ok(Value::Uuid(uuid))
+            }
+            other => Err(DbError::sql(format!("cannot cast {other:?} to UUID"))),
+        },
+        crate::catalog::ColumnType::Timestamp => match value {
+            Value::TimestampMicros(value) => Ok(Value::TimestampMicros(value)),
+            Value::Int64(value) => Ok(Value::TimestampMicros(value)),
+            other => Err(DbError::sql(format!("cannot cast {other:?} to TIMESTAMP"))),
+        },
     }
 }
 

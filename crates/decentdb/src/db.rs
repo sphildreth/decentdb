@@ -24,6 +24,7 @@ use crate::metadata::{
 use crate::record::value::Value;
 use crate::sql::ast::Statement as SqlStatement;
 use crate::sql::parser::parse_sql_statement;
+use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
 use crate::vfs::faulty::{self, FailAction, Failpoint};
@@ -162,6 +163,38 @@ struct DbInner {
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
+}
+
+impl Drop for DbInner {
+    fn drop(&mut self) {
+        if self.wal.latest_snapshot() == 0 {
+            return;
+        }
+        self.wal.set_checkpoint_pending(true);
+        if self.wal.strong_handle_count() != 1 {
+            self.wal.set_checkpoint_pending(false);
+            return;
+        }
+        if self.write_txn.lock().map(|txn| txn.active).unwrap_or(true) {
+            self.wal.set_checkpoint_pending(false);
+            return;
+        }
+        if self
+            .sql_txn
+            .lock()
+            .map(|txn| !matches!(*txn, SqlTxnSlot::None))
+            .unwrap_or(true)
+        {
+            self.wal.set_checkpoint_pending(false);
+            return;
+        }
+        if let Ok(mut held_snapshots) = self.held_snapshots.lock() {
+            held_snapshots.clear();
+        }
+        let _ = self
+            .wal
+            .checkpoint(&self.pager, self.config.checkpoint_timeout_sec);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -630,7 +663,7 @@ impl Db {
 
     /// Allocates a new page from the freelist or file tail.
     pub fn allocate_page(&self) -> Result<u32> {
-        let txn = self
+        let mut txn = self
             .inner
             .write_txn
             .lock()
@@ -640,13 +673,43 @@ impl Db {
                 "allocate_page requires an active write transaction",
             ));
         }
-        drop(txn);
-        self.inner.pager.allocate_page()
+
+        let mut header = self.write_txn_header(&txn)?;
+        if header.freelist.head_page_id != 0 {
+            let page_id = header.freelist.head_page_id;
+            let freelist_page = self.write_txn_visible_page(&txn, page_id)?;
+            let next = decode_freelist_next(&freelist_page)?;
+            header.freelist.head_page_id = next;
+            header.freelist.page_count = header.freelist.page_count.saturating_sub(1);
+            self.stage_write_txn_header(&mut txn, &header);
+            txn.staged_pages
+                .insert(page_id, page::zeroed_page(self.inner.config.page_size));
+            return Ok(page_id);
+        }
+
+        let max_staged_page_id = txn.staged_pages.keys().copied().max().unwrap_or(0);
+        let next_page_id = self
+            .inner
+            .pager
+            .on_disk_page_count()?
+            .max(self.inner.wal.max_page_count())
+            .max(max_staged_page_id)
+            .saturating_add(1);
+        txn.staged_pages
+            .entry(next_page_id)
+            .or_insert_with(|| page::zeroed_page(self.inner.config.page_size));
+        Ok(next_page_id)
     }
 
     /// Frees an existing page back to the freelist.
     pub fn free_page(&self, page_id: u32) -> Result<()> {
-        let txn = self
+        page::validate_page_id(page_id)?;
+        if page_id <= page::CATALOG_ROOT_PAGE_ID {
+            return Err(DbError::transaction(format!(
+                "page {page_id} is reserved and cannot be freed"
+            )));
+        }
+        let mut txn = self
             .inner
             .write_txn
             .lock()
@@ -656,8 +719,15 @@ impl Db {
                 "free_page requires an active write transaction",
             ));
         }
-        drop(txn);
-        self.inner.pager.free_page(page_id)
+
+        let mut header = self.write_txn_header(&txn)?;
+        let page_bytes =
+            encode_freelist_page(self.inner.config.page_size, header.freelist.head_page_id);
+        txn.staged_pages.insert(page_id, page_bytes);
+        header.freelist.head_page_id = page_id;
+        header.freelist.page_count = header.freelist.page_count.saturating_add(1);
+        self.stage_write_txn_header(&mut txn, &header);
+        Ok(())
     }
 
     /// Commits the current write transaction to the WAL.
@@ -729,6 +799,36 @@ impl Db {
         Ok(())
     }
 
+    fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Vec<u8>> {
+        if let Some(staged) = txn.staged_pages.get(&page_id).cloned() {
+            return Ok(staged);
+        }
+
+        let reader = self.inner.wal.begin_reader()?;
+        let snapshot_lsn = reader.snapshot_lsn();
+        if let Some(wal_page) = self
+            .inner
+            .wal
+            .read_page_at_snapshot(page_id, snapshot_lsn)?
+        {
+            return Ok(wal_page);
+        }
+        self.inner.pager.read_page(page_id)
+    }
+
+    fn write_txn_header(&self, txn: &WriteTxn) -> Result<DatabaseHeader> {
+        let page = self.write_txn_visible_page(txn, page::HEADER_PAGE_ID)?;
+        let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
+        bytes.copy_from_slice(&page[..storage::header::DB_HEADER_SIZE]);
+        DatabaseHeader::decode(&bytes)
+    }
+
+    fn stage_write_txn_header(&self, txn: &mut WriteTxn, header: &DatabaseHeader) {
+        let mut page = page::zeroed_page(self.inner.config.page_size);
+        page[..storage::header::DB_HEADER_SIZE].copy_from_slice(&header.encode());
+        txn.staged_pages.insert(page::HEADER_PAGE_ID, page);
+    }
+
     /// Reads the latest visible version of a page.
     pub fn read_page(&self, page_id: u32) -> Result<Vec<u8>> {
         page::validate_page_id(page_id)?;
@@ -744,7 +844,8 @@ impl Db {
             return Ok(staged);
         }
 
-        let snapshot_lsn = self.inner.wal.latest_snapshot();
+        let reader = self.inner.wal.begin_reader()?;
+        let snapshot_lsn = reader.snapshot_lsn();
         if let Some(wal_page) = self
             .inner
             .wal
@@ -1132,9 +1233,8 @@ impl Db {
             effective_config.wal_sync_mode,
         )?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
-        let runtime = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
+        let (runtime, runtime_lsn) = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
         let catalog = CatalogHandle::new(runtime.catalog.clone());
-        let last_runtime_lsn = wal.latest_snapshot();
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -1145,7 +1245,7 @@ impl Db {
                 wal,
                 catalog,
                 engine: RwLock::new(runtime),
-                last_runtime_lsn: AtomicU64::new(last_runtime_lsn),
+                last_runtime_lsn: AtomicU64::new(runtime_lsn),
                 sql_write_lock: Mutex::new(()),
                 sql_txn: Mutex::new(SqlTxnSlot::None),
                 write_txn: Mutex::new(WriteTxn::default()),
@@ -1542,24 +1642,32 @@ impl Db {
 
     fn restore_runtime_from_storage(&self, runtime: &mut EngineRuntime) -> Result<()> {
         let schema_cookie = self.current_schema_cookie()?;
-        let restored =
+        let (restored, restored_lsn) =
             EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
         self.inner.catalog.replace(restored.catalog.clone())?;
         *runtime = restored;
         self.inner
             .last_runtime_lsn
-            .store(self.inner.wal.latest_snapshot(), Ordering::Release);
+            .store(restored_lsn, Ordering::Release);
         Ok(())
     }
 
     fn refresh_engine_from_storage(&self) -> Result<()> {
         let latest_lsn = self.inner.wal.latest_snapshot();
-        if latest_lsn <= self.inner.last_runtime_lsn.load(Ordering::Acquire) {
+        let cached_header = self.inner.pager.header_snapshot()?;
+        let on_disk_header = self.inner.pager.header_from_disk()?;
+        let checkpoint_advanced =
+            on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn;
+        if latest_lsn <= self.inner.last_runtime_lsn.load(Ordering::Acquire) && !checkpoint_advanced
+        {
             return Ok(());
+        }
+        if checkpoint_advanced {
+            self.inner.pager.refresh_from_disk(on_disk_header)?;
         }
 
         let schema_cookie = self.current_schema_cookie()?;
-        let runtime =
+        let (runtime, runtime_lsn) =
             EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
         self.inner.catalog.replace(runtime.catalog.clone())?;
         let mut guard = self
@@ -1570,7 +1678,7 @@ impl Db {
         *guard = runtime;
         self.inner
             .last_runtime_lsn
-            .store(latest_lsn, Ordering::Release);
+            .store(runtime_lsn, Ordering::Release);
         Ok(())
     }
 
@@ -2269,9 +2377,13 @@ fn json_escape(input: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
+    use crate::config::DbConfig;
     use std::sync::Arc;
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
+    use crate::{Db, Value};
 
     use super::{PreparedInsertCache, StatementCache};
 
@@ -2319,6 +2431,171 @@ mod tests {
         assert_eq!(second_schema.table_name, "users_v2");
     }
 
+    #[test]
+    fn reader_handle_refreshes_after_external_checkpoint() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("checkpoint-refresh.ddb");
+        let config = DbConfig::default();
+
+        let setup = Db::open_or_create(&path, config.clone()).expect("open setup");
+        setup
+            .execute("CREATE TABLE t (id INTEGER)")
+            .expect("create table");
+        setup.begin_transaction().expect("begin seed txn");
+        for i in 0_i64..100_i64 {
+            setup
+                .execute_with_params("INSERT INTO t VALUES ($1)", &[Value::Int64(i)])
+                .expect("seed insert");
+        }
+        setup.commit_transaction().expect("commit seed");
+        drop(setup);
+
+        let reader = Db::open_or_create(&path, config.clone()).expect("open reader");
+        assert_eq!(
+            scalar_i64(
+                &reader
+                    .execute("SELECT COUNT(*) FROM t")
+                    .expect("reader count before")
+            ),
+            100
+        );
+
+        let writer = Db::open_or_create(&path, config).expect("open writer");
+        writer.begin_transaction().expect("begin writer txn");
+        for i in 100_i64..200_i64 {
+            writer
+                .execute_with_params("INSERT INTO t VALUES ($1)", &[Value::Int64(i)])
+                .expect("writer insert");
+        }
+        writer.commit_transaction().expect("commit writer");
+        writer.checkpoint().expect("checkpoint writer");
+
+        assert_eq!(
+            scalar_i64(
+                &reader
+                    .execute("SELECT COUNT(*) FROM t")
+                    .expect("reader count after")
+            ),
+            200
+        );
+    }
+
+    #[test]
+    fn checkpoint_preserves_unchanged_table_payload_pages() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("checkpoint-unchanged-table-payload.ddb");
+        let config = DbConfig::default();
+
+        let setup = Db::open_or_create(&path, config.clone()).expect("open setup");
+        setup
+            .execute("CREATE TABLE initial (id INTEGER, val TEXT)")
+            .expect("create initial table");
+        setup
+            .execute_with_params(
+                "INSERT INTO initial VALUES ($1, $2)",
+                &[Value::Int64(1), Value::Text("seed".to_string())],
+            )
+            .expect("seed initial row");
+        setup.checkpoint().expect("checkpoint setup");
+        drop(setup);
+
+        let writer = Db::open_or_create(&path, config).expect("open writer");
+        writer
+            .execute("CREATE TABLE new_table (id INTEGER, val TEXT)")
+            .expect("create new table");
+        writer.begin_transaction().expect("begin writer txn");
+        for i in 0_i64..100_i64 {
+            writer
+                .execute_with_params(
+                    "INSERT INTO new_table VALUES ($1, $2)",
+                    &[Value::Int64(i), Value::Text(format!("value-{i}"))],
+                )
+                .expect("insert new row");
+        }
+        writer.commit_transaction().expect("commit writer");
+        writer.checkpoint().expect("checkpoint writer");
+        drop(writer);
+
+        let reopened = Db::open_or_create(&path, DbConfig::default()).expect("reopen database");
+        assert_eq!(
+            scalar_i64(
+                &reopened
+                    .execute("SELECT COUNT(*) FROM initial")
+                    .expect("count initial rows after checkpoint")
+            ),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &reopened
+                    .execute("SELECT COUNT(*) FROM new_table")
+                    .expect("count new rows after checkpoint")
+            ),
+            100
+        );
+    }
+
+    #[test]
+    fn write_transaction_page_allocation_stays_off_main_file_until_commit() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("txn-page-allocation.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        let initial_page_count = db
+            .inner
+            .pager
+            .on_disk_page_count()
+            .expect("initial page count");
+
+        db.begin_write().expect("begin write txn");
+        let page_id = db.allocate_page().expect("allocate staged page");
+        assert!(page_id > initial_page_count);
+        assert_eq!(
+            db.inner
+                .pager
+                .on_disk_page_count()
+                .expect("page count after staged allocation"),
+            initial_page_count
+        );
+        assert_eq!(
+            db.read_page(page_id).expect("read staged page"),
+            vec![0_u8; db.config().page_size as usize]
+        );
+        db.rollback().expect("rollback write txn");
+
+        let reopened = Db::open_or_create(&path, DbConfig::default()).expect("reopen db");
+        assert_eq!(
+            reopened
+                .inner
+                .pager
+                .on_disk_page_count()
+                .expect("page count after rollback"),
+            initial_page_count
+        );
+    }
+
+    #[test]
+    fn freed_pages_are_reused_after_commit() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("freelist-reuse.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.begin_write().expect("begin allocate txn");
+        let page_id = db.allocate_page().expect("allocate page");
+        db.commit().expect("commit allocated page");
+
+        db.begin_write().expect("begin free txn");
+        db.free_page(page_id).expect("free page");
+        db.commit().expect("commit freed page");
+
+        db.begin_write().expect("begin reuse txn");
+        let reused = db.allocate_page().expect("reuse page");
+        assert_eq!(reused, page_id);
+        db.rollback().expect("rollback reuse txn");
+    }
+
     fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {
         PreparedSimpleInsert {
             table_name: table_name.to_string(),
@@ -2334,6 +2611,13 @@ mod tests {
             insert_indexes: Vec::new(),
             use_generic_validation: false,
             use_generic_index_updates: false,
+        }
+    }
+
+    fn scalar_i64(result: &crate::QueryResult) -> i64 {
+        match result.rows()[0].values()[0] {
+            Value::Int64(value) => value,
+            ref other => panic!("expected INT64 scalar, got {other:?}"),
         }
     }
 }
