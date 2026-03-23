@@ -16,3 +16,7 @@ insta = { version = "1.39", features = ["json"] }
 
 [lib]
 crate-type = ["rlib", "cdylib"]
+
+[[bench]]
+name = "release_metrics"
+harness = false

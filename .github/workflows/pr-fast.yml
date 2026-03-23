@@ -1,0 +1,98 @@
+name: PR Fast
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  rust-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "25"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: |
+          cargo clippy -p decentdb --all-targets -- -D warnings
+          cargo clippy -p decentdb-cli --all-targets -- -D warnings
+
+      - name: Engine Tests
+        run: cargo test -p decentdb
+
+      - name: CLI Tests
+        run: cargo test -p decentdb-cli
+
+      - name: Build cdylib
+        run: cargo build -p decentdb
+
+      - name: Python Validation
+        run: python3 tests/bindings/python/test_ffi.py
+
+      - name: C Smoke
+        run: bash tests/bindings/c/run.sh
+
+      - name: Go Smoke
+        run: go run ./tests/bindings/go/smoke.go
+
+      - name: Java Smoke
+        run: |
+          javac tests/bindings/java/Smoke.java
+          java --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
+
+      - name: Node Smoke
+        run: |
+          bash tests/bindings/node/build.sh
+          node tests/bindings/node/smoke.js
+
+      - name: Dart Smoke
+        run: |
+          cd tests/bindings/dart
+          dart pub get
+          dart run smoke.dart
+
+      - name: .NET Validation
+        run: LD_LIBRARY_PATH=$PWD/target/debug dotnet run --project tests/bindings/dotnet/Smoke/Smoke.csproj
+
+      - name: Rust Docs and Doctests
+        run: |
+          cargo test -p decentdb --doc
+          cargo doc --workspace --no-deps

@@ -14,7 +14,11 @@ mod tests {
         ];
 
         for stmt in valid_statements {
-            assert!(parse_sql_statement(stmt).is_ok(), "Failed to parse: {}", stmt);
+            assert!(
+                parse_sql_statement(stmt).is_ok(),
+                "Failed to parse: {}",
+                stmt
+            );
         }
     }
 
@@ -23,27 +27,38 @@ mod tests {
         let invalid_statements = [
             "CREATE MATERIALIZED VIEW mv AS SELECT 1", // Unsupported DDL
             "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r", // Recursive CTEs out of scope
-            "SELECT * FROM generate_series(1, 10)", // set returning functions not in baseline
+            "SELECT * FROM generate_series(1, 10)",    // set returning functions not in baseline
         ];
 
         for stmt in invalid_statements {
             let res = parse_sql_statement(stmt);
-            assert!(res.is_err() || if let Ok(s) = res { !matches!(s, crate::sql::ast::Statement::Query(_)) } else { false }, "Should have rejected: {}", stmt);
+            assert!(
+                res.is_err()
+                    || if let Ok(s) = res {
+                        !matches!(s, crate::sql::ast::Statement::Query(_))
+                    } else {
+                        false
+                    },
+                "Should have rejected: {}",
+                stmt
+            );
         }
     }
-    
+
     #[test]
     fn thread_safety_tests_for_repeated_parser_invocation() {
         use std::thread;
-        
-        let handles: Vec<_> = (0..10).map(|_| {
-            thread::spawn(|| {
-                for _ in 0..100 {
-                    assert!(parse_sql_statement("SELECT 1 + 1").is_ok());
-                }
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                thread::spawn(|| {
+                    for _ in 0..100 {
+                        assert!(parse_sql_statement("SELECT 1 + 1").is_ok());
+                    }
+                })
             })
-        }).collect();
-        
+            .collect();
+
         for h in handles {
             h.join().unwrap();
         }

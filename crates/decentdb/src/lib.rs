@@ -6,8 +6,8 @@
 //! database file format entry points used by later storage slices.
 
 mod btree;
-mod catalog;
 mod c_api;
+mod catalog;
 mod config;
 mod db;
 mod error;

@@ -33,7 +33,7 @@ Constraints:
 - `UNIQUE` — enforces uniqueness via a secondary index.
 - `CHECK (expression)` — row-level validation; the expression must evaluate to `TRUE` or `NULL` (only `FALSE` is a violation).
 - `DEFAULT value` — default value used when column is omitted from INSERT.
-- `REFERENCES table(column)` — foreign key constraint (see [Foreign Keys](#foreign-keys)).
+- `REFERENCES table(column)` — foreign key constraint.
 - `GENERATED ALWAYS AS (expr) STORED` — computed column persisted on INSERT/UPDATE (see [Generated Columns](#generated-columns)).
 
 ### CREATE TEMP TABLE / CREATE TEMP VIEW
@@ -43,7 +43,7 @@ CREATE TEMP TABLE temp_results (id INT, value TEXT);
 CREATE TEMP VIEW temp_summary AS SELECT category, COUNT(*) AS cnt FROM products GROUP BY category;
 ```
 
-Session-scoped temporary objects that are not persisted to disk. They are visible only to the connection that created them and are dropped when the connection closes. See [ADR-0109](../../design/adr/0109-temporary-tables-views.md).
+Session-scoped temporary objects that are not persisted to disk. They are visible only to the connection that created them and are dropped when the connection closes. See `design/adr/0109-temporary-tables-views.md`.
 
 ### CREATE INDEX
 
@@ -428,7 +428,7 @@ SELECT PRINTF('Hello %s, you are %d', name, age) FROM users;
 
 Supported:
 - Non-recursive `WITH ...` on `SELECT`
-- `WITH RECURSIVE` for hierarchical queries (tree traversal, series generation). See [ADR-0107](../../design/adr/0107-recursive-cte-execution.md).
+- `WITH RECURSIVE` for hierarchical queries (tree traversal, series generation). See `design/adr/0107-recursive-cte-execution.md`.
 - Multiple CTEs in declaration order (`a`, then `b` may reference `a`)
 - Optional CTE output column list (`WITH cte(col1, ...) AS (...)`)
 
@@ -605,7 +605,7 @@ and execution time. The parenthesized form `EXPLAIN (ANALYZE) ...` is also suppo
 
 ### Table-Valued Functions
 
-Table-valued functions appear in the `FROM` clause and return a set of rows. See [ADR-0111](../../design/adr/0111-table-valued-functions.md).
+Table-valued functions appear in the `FROM` clause and return a set of rows. See `design/adr/0111-table-valued-functions.md`.
 
 **`json_each(json)`** — iterates top-level key/value pairs of a JSON object or array.
 
@@ -631,7 +631,7 @@ SELECT key, value, type, path FROM json_tree('{"a":{"b":1},"c":[2,3]}');
 
 ### Generated Columns
 
-Columns defined with `GENERATED ALWAYS AS (expr) STORED` are computed on every INSERT and UPDATE and persisted to disk. See [ADR-0108](../../design/adr/0108-generated-columns-stored.md).
+Columns defined with `GENERATED ALWAYS AS (expr) STORED` are computed on every INSERT and UPDATE and persisted to disk. See `design/adr/0108-generated-columns-stored.md`.
 
 ```sql
 CREATE TABLE products (
@@ -739,4 +739,4 @@ Not currently supported:
 - Stored procedures
 - Distributed transactions
 
-See [Known Limitations](../about/changelog.md#known-limitations) for details.
+See the changelog and release notes for current limitations and follow-up work.

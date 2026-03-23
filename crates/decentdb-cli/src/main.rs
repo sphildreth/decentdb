@@ -1,27 +1,12 @@
+mod commands;
+mod output;
+mod repl;
+
 use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "decentdb")]
-#[command(about = "DecentDB Command Line Interface")]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+use crate::commands::Cli;
 
-#[derive(clap::Subcommand)]
-enum Commands {
-    /// Print engine version
-    Version,
-}
-
-fn main() -> anyhow::Result<()> {
+fn main() {
     let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Version => {
-            println!("DecentDB version: {}", decentdb::version());
-        }
-    }
-
-    Ok(())
+    std::process::exit(commands::run(cli));
 }

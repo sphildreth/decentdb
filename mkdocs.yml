@@ -25,6 +25,7 @@ nav:
     - Rust API: api/rust-api.md
     - JDBC Driver (Java): api/jdbc.md
     - CLI Reference: api/cli-reference.md
+    - Binding Compatibility Matrix: api/bindings-matrix.md
     - Error Codes: api/error-codes.md
     - Configuration: api/configuration.md
     - Language Bindings:
@@ -43,7 +44,6 @@ nav:
   - Development:
     - Building from Source: development/building.md
     - Testing: development/testing.md
-    - Documentation Site (MkDocs): README.md
     - Release process: development/releases.md
     - GitHub Releases: https://github.com/sphildreth/decentdb/releases
     - Import Tools: development/import-tools.md

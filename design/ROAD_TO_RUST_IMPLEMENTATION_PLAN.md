@@ -1,7 +1,7 @@
 # Road to Rust: DecentDB 1.0 Implementation Plan
 **Date:** 2026-03-22
 **Status:** Active Execution
-**Current Active Slice:** `Slice 4.1: C-ABI Core and Error Surface`
+**Current Active Slice:** `Phase 4 Complete: Ecosystem Parity and Release`
 
 This document is the execution plan for the Rust rewrite. It is derived from:
 - `design/PRD.md`
@@ -50,12 +50,12 @@ Coding agents MUST implement only the current active slice unless the user expli
   - [x] **Slice 3.4: Transaction State, DML, Constraints, and Statement Rollback**
   - [x] **Slice 3.5: Remaining 1.0 SQL Surface**
   - [x] **Slice 3.6: Bulk Load and Maintenance Operations**
-- [ ] **Phase 4: Ecosystem Parity and Release**
-  - [ ] **Slice 4.1: C-ABI Core and Error Surface**
-  - [ ] **Slice 4.2: Python and .NET Validation**
-  - [ ] **Slice 4.3: Secondary Binding Smoke Coverage**
-  - [ ] **Slice 4.4: CLI UX and Operator Workflows**
-  - [ ] **Slice 4.5: Documentation, Benchmarks, CI, and 1.0 Release Verification**
+- [x] **Phase 4: Ecosystem Parity and Release**
+  - [x] **Slice 4.1: C-ABI Core and Error Surface**
+  - [x] **Slice 4.2: Python and .NET Validation**
+  - [x] **Slice 4.3: Secondary Binding Smoke Coverage**
+  - [x] **Slice 4.4: CLI UX and Operator Workflows**
+  - [x] **Slice 4.5: Documentation, Benchmarks, CI, and 1.0 Release Verification**
 
 ---
 

@@ -103,7 +103,7 @@ This setting applies to `bulk-load`; regular SQL writes use the default durable 
 
 ## Savepoints
 
-Savepoints allow you to create named checkpoints within a transaction. You can roll back to a savepoint without discarding the entire transaction. See [ADR-0110](../../design/adr/0110-savepoints.md).
+Savepoints allow you to create named checkpoints within a transaction. You can roll back to a savepoint without discarding the entire transaction. See `design/adr/0110-savepoints.md`.
 
 ### Creating a Savepoint
 

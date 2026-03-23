@@ -115,7 +115,8 @@ fn clear_last_error() {
 
 fn set_last_error(message: String) {
     let sanitized = message.replace('\0', " ");
-    let cstring = CString::new(sanitized).unwrap_or_else(|_| CString::new("invalid error").expect("literal"));
+    let cstring =
+        CString::new(sanitized).unwrap_or_else(|_| CString::new("invalid error").expect("literal"));
     LAST_ERROR.with(|slot| {
         *slot.borrow_mut() = Some(cstring);
     });
@@ -187,8 +188,9 @@ fn value_from_ffi(value: &DdbValue) -> Result<Value> {
         x if x == DdbValueTag::Bool as u32 => Ok(Value::Bool(value.bool_value != 0)),
         x if x == DdbValueTag::Text as u32 => {
             let bytes = borrowed_bytes(value.data.cast_const(), value.len)?;
-            let text = std::str::from_utf8(bytes)
-                .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+            let text = std::str::from_utf8(bytes).map_err(|error| {
+                DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}"))
+            })?;
             Ok(Value::Text(text.to_string()))
         }
         x if x == DdbValueTag::Blob as u32 => {
@@ -212,7 +214,9 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
         return Ok(&[]);
     }
     if data.is_null() {
-        return Err(DbError::internal("buffer pointer must not be null when len > 0"));
+        return Err(DbError::internal(
+            "buffer pointer must not be null when len > 0",
+        ));
     }
     // SAFETY: the caller provides a contiguous buffer of `len` bytes.
     Ok(unsafe { std::slice::from_raw_parts(data, len) })
@@ -297,9 +301,9 @@ pub extern "C" fn ddb_version() -> *const c_char {
 pub extern "C" fn ddb_last_error_message() -> *const c_char {
     ffi_cstr_boundary(|| {
         LAST_ERROR.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map_or(ptr::null(), |value| value.as_ptr())
+            slot.borrow()
+                .as_ref()
+                .map_or(ptr::null(), |value| value.as_ptr())
         })
     })
 }
@@ -368,10 +372,7 @@ pub extern "C" fn ddb_db_open(path: *const c_char, out_db: *mut *mut DbHandle) -
 }
 
 #[no_mangle]
-pub extern "C" fn ddb_db_open_or_create(
-    path: *const c_char,
-    out_db: *mut *mut DbHandle,
-) -> u32 {
+pub extern "C" fn ddb_db_open_or_create(path: *const c_char, out_db: *mut *mut DbHandle) -> u32 {
     ffi_boundary(|| {
         let path = utf8_arg(path, "path")?;
         let handle = Box::new(DbHandle {
@@ -430,10 +431,7 @@ pub extern "C" fn ddb_db_begin_transaction(db: *mut DbHandle) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn ddb_db_commit_transaction(
-    db: *mut DbHandle,
-    out_lsn: *mut u64,
-) -> u32 {
+pub extern "C" fn ddb_db_commit_transaction(db: *mut DbHandle, out_lsn: *mut u64) -> u32 {
     ffi_boundary(|| {
         let lsn = handle_ref(db, "db")?.db.commit_transaction()?;
         *out_ptr(out_lsn, "out_lsn")? = lsn;
@@ -455,10 +453,7 @@ pub extern "C" fn ddb_db_in_transaction(db: *mut DbHandle, out_flag: *mut u8) ->
 }
 
 #[no_mangle]
-pub extern "C" fn ddb_db_save_as(
-    db: *mut DbHandle,
-    dest_path: *const c_char,
-) -> u32 {
+pub extern "C" fn ddb_db_save_as(db: *mut DbHandle, dest_path: *const c_char) -> u32 {
     ffi_boundary(|| {
         let dest = utf8_arg(dest_path, "dest_path")?;
         handle_ref(db, "db")?.db.save_as(dest)
@@ -503,16 +498,14 @@ pub extern "C" fn ddb_result_column_count(
     out_columns: *mut usize,
 ) -> u32 {
     ffi_boundary(|| {
-        *out_ptr(out_columns, "out_columns")? = handle_ref(result, "result")?.result.columns().len();
+        *out_ptr(out_columns, "out_columns")? =
+            handle_ref(result, "result")?.result.columns().len();
         Ok(())
     })
 }
 
 #[no_mangle]
-pub extern "C" fn ddb_result_affected_rows(
-    result: *mut ResultHandle,
-    out_rows: *mut u64,
-) -> u32 {
+pub extern "C" fn ddb_result_affected_rows(result: *mut ResultHandle, out_rows: *mut u64) -> u32 {
     ffi_boundary(|| {
         *out_ptr(out_rows, "out_rows")? = handle_ref(result, "result")?.result.affected_rows();
         Ok(())
@@ -527,11 +520,10 @@ pub extern "C" fn ddb_result_column_name_copy(
 ) -> u32 {
     ffi_boundary(|| {
         let result = handle_ref(result, "result")?;
-        let column = result
-            .result
-            .columns()
-            .get(column_index)
-            .ok_or_else(|| DbError::sql(format!("column index {column_index} is out of bounds")))?;
+        let column =
+            result.result.columns().get(column_index).ok_or_else(|| {
+                DbError::sql(format!("column index {column_index} is out of bounds"))
+            })?;
         let cstring = CString::new(column.as_str())
             .map_err(|_| DbError::internal("column name contains an interior NUL"))?;
         *out_ptr(out_name, "out_name")? = cstring.into_raw();
@@ -625,7 +617,8 @@ mod tests {
         let path = CString::new(":memory:").expect("path");
         assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
 
-        let create = CString::new("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)").expect("create");
+        let create =
+            CString::new("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT)").expect("create");
         let mut result = ptr::null_mut();
         assert_eq!(
             ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
@@ -648,7 +641,13 @@ mod tests {
         ];
         let insert = CString::new("INSERT INTO items (id, name) VALUES ($1, $2)").expect("insert");
         assert_eq!(
-            ddb_db_execute(db, insert.as_ptr(), params.as_ptr(), params.len(), &mut result),
+            ddb_db_execute(
+                db,
+                insert.as_ptr(),
+                params.as_ptr(),
+                params.len(),
+                &mut result
+            ),
             DDB_OK
         );
         assert_eq!(ddb_result_free(&mut result), DDB_OK);

@@ -9,6 +9,7 @@ license.workspace = true
 decentdb = { path = "../decentdb" }
 clap.workspace = true
 anyhow.workspace = true
+rustyline.workspace = true
 
 [[bin]]
 name = "decentdb"

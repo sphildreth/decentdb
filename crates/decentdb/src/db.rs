@@ -593,7 +593,15 @@ impl Db {
             .catalog
             .tables
             .values()
-            .map(|table| table_info(table, runtime.tables.get(&table.name).map_or(0, |data| data.rows.len())))
+            .map(|table| {
+                table_info(
+                    table,
+                    runtime
+                        .tables
+                        .get(&table.name)
+                        .map_or(0, |data| data.rows.len()),
+                )
+            })
             .collect())
     }
 
@@ -614,12 +622,7 @@ impl Db {
     /// Returns all index definitions.
     pub fn list_indexes(&self) -> Result<Vec<IndexInfo>> {
         let runtime = self.runtime_for_inspection()?;
-        Ok(runtime
-            .catalog
-            .indexes
-            .values()
-            .map(index_info)
-            .collect())
+        Ok(runtime.catalog.indexes.values().map(index_info).collect())
     }
 
     /// Returns all view definitions.
@@ -813,7 +816,8 @@ impl Db {
                 .ok_or_else(|| DbError::transaction("no active SQL transaction"))?;
             let mut working = state.runtime.clone();
             working.rebuild_indexes(self.inner.config.page_size)?;
-            let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
+            let result =
+                working.execute_statement(statement, params, self.inner.config.page_size)?;
             state.runtime = working;
             return Ok(result);
         }
