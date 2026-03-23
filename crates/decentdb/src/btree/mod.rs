@@ -4,4 +4,5 @@
 pub(crate) mod cursor;
 pub(crate) mod page;
 pub(crate) mod read;
+pub(crate) mod table;
 pub(crate) mod write;
