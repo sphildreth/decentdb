@@ -1,0 +1,20 @@
+{
+  "name": "soak_storage",
+  "page_size": 4096,
+  "ops": [
+    { "op": "create" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 3, "fill_byte": 1 },
+    { "op": "commit" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 3, "fill_byte": 2 },
+    { "op": "commit" },
+    { "op": "hold_snapshot" },
+    { "op": "begin" },
+    { "op": "write", "page_id": 3, "fill_byte": 3 },
+    { "op": "commit" },
+    { "op": "checkpoint" },
+    { "op": "inspect" },
+    { "op": "clear_failpoints" }
+  ]
+}

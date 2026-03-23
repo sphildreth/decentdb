@@ -1,7 +1,7 @@
 # Road to Rust: DecentDB 1.0 Implementation Plan
 **Date:** 2026-03-22
 **Status:** Active Execution
-**Current Active Slice:** `Slice 1.1: VFS Core, Fault Injection, and MemVfs`
+**Current Active Slice:** `Slice 2.1: Value and Record Encoding`
 
 This document is the execution plan for the Rust rewrite. It is derived from:
 - `design/PRD.md`
@@ -31,14 +31,14 @@ Coding agents MUST implement only the current active slice unless the user expli
   - [x] **Slice 0.1: Workspace Guardrails & Module Skeleton**
   - [x] **Slice 0.2: Error Taxonomy & Config Surface**
   - [x] **Slice 0.3: Database Bootstrap & Header Validation**
-- [ ] **Phase 1: Storage Foundation**
-  - [ ] **Slice 1.1: VFS Core, Fault Injection, and MemVfs** **(ACTIVE)**
-  - [ ] **Slice 1.2: Pager, Page Cache, and Freelist**
-  - [ ] **Slice 1.3: WAL Core and Shared WAL Registry**
-  - [ ] **Slice 1.4: Recovery, Reader Registry, and Checkpointing**
-  - [ ] **Slice 1.5: Python Crash Harness and Storage Failure CI**
+- [x] **Phase 1: Storage Foundation**
+  - [x] **Slice 1.1: VFS Core, Fault Injection, and MemVfs**
+  - [x] **Slice 1.2: Pager, Page Cache, and Freelist**
+  - [x] **Slice 1.3: WAL Core and Shared WAL Registry**
+  - [x] **Slice 1.4: Recovery, Reader Registry, and Checkpointing**
+  - [x] **Slice 1.5: Python Crash Harness and Storage Failure CI**
 - [ ] **Phase 2: Data Structures and Indexes**
-  - [ ] **Slice 2.1: Value and Record Encoding**
+  - [ ] **Slice 2.1: Value and Record Encoding** **(ACTIVE)**
   - [ ] **Slice 2.2: Comparable Index Key Encoding**
   - [ ] **Slice 2.3: B+Tree Read Path**
   - [ ] **Slice 2.4: B+Tree Write Path and Overflow Pages**

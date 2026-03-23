@@ -1,0 +1,443 @@
+//! Deterministic fault-injection VFS wrapper.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::error::{DbError, Result};
+
+use super::{FileKind, OpenMode, Vfs, VfsFile};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FailAction {
+    Error,
+    PartialRead { bytes: usize },
+    PartialWrite { bytes: usize },
+    DropSync,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Failpoint {
+    pub(crate) label: String,
+    pub(crate) trigger_on: u64,
+    pub(crate) action: FailAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FailpointLogEntry {
+    pub(crate) label: String,
+    pub(crate) hit: u64,
+    pub(crate) outcome: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct FaultyVfs {
+    inner: Arc<dyn Vfs>,
+    state: Arc<FaultState>,
+}
+
+impl FaultyVfs {
+    pub(crate) fn wrap(inner: Arc<dyn Vfs>) -> Self {
+        Self {
+            inner,
+            state: global_fault_state(),
+        }
+    }
+}
+
+impl Vfs for FaultyVfs {
+    fn open(&self, path: &Path, mode: OpenMode, kind: FileKind) -> Result<Arc<dyn VfsFile>> {
+        let inner = self.inner.open(path, mode, kind)?;
+        Ok(Arc::new(FaultyVfsFile {
+            inner,
+            state: Arc::clone(&self.state),
+        }))
+    }
+
+    fn file_exists(&self, path: &Path) -> Result<bool> {
+        self.inner.file_exists(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn canonicalize_path(&self, path: &Path) -> Result<PathBuf> {
+        self.inner.canonicalize_path(path)
+    }
+
+    fn is_memory(&self) -> bool {
+        self.inner.is_memory()
+    }
+}
+
+#[derive(Debug)]
+struct FaultyVfsFile {
+    inner: Arc<dyn VfsFile>,
+    state: Arc<FaultState>,
+}
+
+impl VfsFile for FaultyVfsFile {
+    fn kind(&self) -> FileKind {
+        self.inner.kind()
+    }
+
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let label = classify_read(self.inner.kind());
+        match self.state.decision(label) {
+            FaultDecision::Pass { hit } => {
+                self.state.log(label, hit, "pass");
+                self.inner.read_at(offset, buf)
+            }
+            FaultDecision::Error { hit } => {
+                self.state.log(label, hit, "error");
+                Err(DbError::io(
+                    format!("fault injected at {label}"),
+                    std::io::Error::other("fault injected read error"),
+                ))
+            }
+            FaultDecision::PartialRead { hit, bytes } => {
+                self.state.log(label, hit, &format!("partial_read:{bytes}"));
+                let mut scratch = vec![0_u8; bytes.min(buf.len())];
+                let read = self.inner.read_at(offset, &mut scratch)?;
+                buf[..read].copy_from_slice(&scratch[..read]);
+                Ok(read)
+            }
+            FaultDecision::PartialWrite { hit, .. } => {
+                self.state.log(label, hit, "pass");
+                self.inner.read_at(offset, buf)
+            }
+            FaultDecision::DropSync { hit } => {
+                self.state.log(label, hit, "pass");
+                self.inner.read_at(offset, buf)
+            }
+        }
+    }
+
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        let label = classify_write(self.inner.kind(), offset, buf);
+        match self.state.decision(label) {
+            FaultDecision::Pass { hit } => {
+                self.state.log(label, hit, "pass");
+                self.inner.write_at(offset, buf)
+            }
+            FaultDecision::Error { hit } => {
+                self.state.log(label, hit, "error");
+                Err(DbError::io(
+                    format!("fault injected at {label}"),
+                    std::io::Error::other("fault injected write error"),
+                ))
+            }
+            FaultDecision::PartialWrite { hit, bytes } => {
+                let shortened = bytes.min(buf.len());
+                self.state
+                    .log(label, hit, &format!("partial_write:{shortened}"));
+                self.inner.write_at(offset, &buf[..shortened])
+            }
+            FaultDecision::PartialRead { hit, .. } => {
+                self.state.log(label, hit, "pass");
+                self.inner.write_at(offset, buf)
+            }
+            FaultDecision::DropSync { hit } => {
+                self.state.log(label, hit, "pass");
+                self.inner.write_at(offset, buf)
+            }
+        }
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        let label = classify_sync(self.inner.kind());
+        match self.state.decision(label) {
+            FaultDecision::Pass { hit } => {
+                self.state.log(label, hit, "pass");
+                self.inner.sync_data()
+            }
+            FaultDecision::DropSync { hit } => {
+                self.state.log(label, hit, "drop_sync");
+                Ok(())
+            }
+            FaultDecision::Error { hit } => {
+                self.state.log(label, hit, "error");
+                Err(DbError::io(
+                    format!("fault injected at {label}"),
+                    std::io::Error::other("fault injected sync error"),
+                ))
+            }
+            FaultDecision::PartialRead { hit, .. } | FaultDecision::PartialWrite { hit, .. } => {
+                self.state.log(label, hit, "pass");
+                self.inner.sync_data()
+            }
+        }
+    }
+
+    fn sync_metadata(&self) -> Result<()> {
+        let label = classify_metadata_sync(self.inner.kind());
+        match self.state.decision(label) {
+            FaultDecision::Pass { hit } => {
+                self.state.log(label, hit, "pass");
+                self.inner.sync_metadata()
+            }
+            FaultDecision::DropSync { hit } => {
+                self.state.log(label, hit, "drop_sync");
+                Ok(())
+            }
+            FaultDecision::Error { hit } => {
+                self.state.log(label, hit, "error");
+                Err(DbError::io(
+                    format!("fault injected at {label}"),
+                    std::io::Error::other("fault injected metadata sync error"),
+                ))
+            }
+            FaultDecision::PartialRead { hit, .. } | FaultDecision::PartialWrite { hit, .. } => {
+                self.state.log(label, hit, "pass");
+                self.inner.sync_metadata()
+            }
+        }
+    }
+
+    fn file_size(&self) -> Result<u64> {
+        self.inner.file_size()
+    }
+
+    fn set_len(&self, len: u64) -> Result<()> {
+        self.inner.set_len(len)
+    }
+}
+
+#[derive(Debug, Default)]
+struct FaultState {
+    failpoints: Mutex<HashMap<String, Vec<Failpoint>>>,
+    hits: Mutex<HashMap<String, u64>>,
+    logs: Mutex<Vec<FailpointLogEntry>>,
+}
+
+impl FaultState {
+    fn decision(&self, label: &str) -> FaultDecision {
+        let hit = {
+            let mut hits = self.hits.lock().expect("fault hit counter lock");
+            let next = hits.entry(label.to_string()).or_insert(0);
+            *next += 1;
+            *next
+        };
+
+        let failpoints = self.failpoints.lock().expect("fault state lock");
+        let Some(entries) = failpoints.get(label) else {
+            return FaultDecision::Pass { hit };
+        };
+
+        for failpoint in entries {
+            if failpoint.trigger_on == hit {
+                return match failpoint.action {
+                    FailAction::Error => FaultDecision::Error { hit },
+                    FailAction::PartialRead { bytes } => FaultDecision::PartialRead { hit, bytes },
+                    FailAction::PartialWrite { bytes } => {
+                        FaultDecision::PartialWrite { hit, bytes }
+                    }
+                    FailAction::DropSync => FaultDecision::DropSync { hit },
+                };
+            }
+        }
+
+        FaultDecision::Pass { hit }
+    }
+
+    fn log(&self, label: &str, hit: u64, outcome: &str) {
+        self.logs
+            .lock()
+            .expect("fault log lock")
+            .push(FailpointLogEntry {
+                label: label.to_string(),
+                hit,
+                outcome: outcome.to_string(),
+            });
+    }
+}
+
+enum FaultDecision {
+    Pass { hit: u64 },
+    Error { hit: u64 },
+    PartialRead { hit: u64, bytes: usize },
+    PartialWrite { hit: u64, bytes: usize },
+    DropSync { hit: u64 },
+}
+
+pub(crate) fn install_failpoint(failpoint: Failpoint) -> Result<()> {
+    let state = global_fault_state();
+    let mut failpoints = state
+        .failpoints
+        .lock()
+        .map_err(|_| DbError::internal("fault state lock poisoned"))?;
+    failpoints
+        .entry(failpoint.label.clone())
+        .or_default()
+        .push(failpoint);
+    Ok(())
+}
+
+pub(crate) fn clear_failpoints() -> Result<()> {
+    let state = global_fault_state();
+    state
+        .failpoints
+        .lock()
+        .map_err(|_| DbError::internal("fault state lock poisoned"))?
+        .clear();
+    state
+        .hits
+        .lock()
+        .map_err(|_| DbError::internal("fault state lock poisoned"))?
+        .clear();
+    state
+        .logs
+        .lock()
+        .map_err(|_| DbError::internal("fault state lock poisoned"))?
+        .clear();
+    Ok(())
+}
+
+pub(crate) fn failpoint_logs() -> Result<Vec<FailpointLogEntry>> {
+    let state = global_fault_state();
+    state
+        .logs
+        .lock()
+        .map(|logs| logs.clone())
+        .map_err(|_| DbError::internal("fault log lock poisoned"))
+}
+
+fn global_fault_state() -> Arc<FaultState> {
+    static STATE: OnceLock<Arc<FaultState>> = OnceLock::new();
+    STATE
+        .get_or_init(|| Arc::new(FaultState::default()))
+        .clone()
+}
+
+fn classify_read(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Database => "db.read",
+        FileKind::Wal => "wal.read",
+    }
+}
+
+fn classify_sync(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Database => "db.fsync",
+        FileKind::Wal => "wal.fsync",
+    }
+}
+
+fn classify_metadata_sync(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Database => "db.sync_metadata",
+        FileKind::Wal => "wal.sync_metadata",
+    }
+}
+
+fn classify_write(kind: FileKind, offset: u64, buf: &[u8]) -> &'static str {
+    match kind {
+        FileKind::Database => {
+            if offset == 0 && buf.len() >= 128 {
+                "db.write_header"
+            } else {
+                "db.write_page"
+            }
+        }
+        FileKind::Wal => {
+            if offset == 0 && buf.len() == 32 {
+                "wal.write_header"
+            } else {
+                match buf.first().copied() {
+                    Some(0) => "wal.write_frame",
+                    Some(1) => "wal.write_commit",
+                    Some(2) => "wal.write_checkpoint",
+                    _ => "wal.write",
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
+
+    use super::{
+        clear_failpoints, failpoint_logs, install_failpoint, FailAction, Failpoint, FaultyVfs,
+    };
+
+    #[test]
+    fn partial_write_and_dropped_sync_are_reproducible() {
+        clear_failpoints().expect("clear failpoints");
+        install_failpoint(Failpoint {
+            label: "db.write_page".to_string(),
+            trigger_on: 1,
+            action: FailAction::PartialWrite { bytes: 3 },
+        })
+        .expect("install partial write");
+        install_failpoint(Failpoint {
+            label: "db.fsync".to_string(),
+            trigger_on: 1,
+            action: FailAction::DropSync,
+        })
+        .expect("install dropped sync");
+
+        let vfs = FaultyVfs::wrap(Arc::new(crate::vfs::mem::MemVfs::default()));
+        let file = vfs
+            .open(
+                Path::new(":memory:"),
+                OpenMode::CreateNew,
+                FileKind::Database,
+            )
+            .expect("create file");
+
+        let written = file.write_at(4096, &[1, 2, 3, 4, 5]).expect("write page");
+        assert_eq!(written, 3);
+        file.sync_data().expect("dropped sync returns success");
+
+        let logs = failpoint_logs().expect("read logs");
+        assert_eq!(logs[0].label, "db.write_page");
+        assert_eq!(logs[0].outcome, "partial_write:3");
+        assert_eq!(logs[1].label, "db.fsync");
+        assert_eq!(logs[1].outcome, "drop_sync");
+
+        clear_failpoints().expect("clear failpoints");
+    }
+
+    #[test]
+    fn failpoint_hits_are_logged_in_order() {
+        clear_failpoints().expect("clear failpoints");
+        install_failpoint(Failpoint {
+            label: "db.read".to_string(),
+            trigger_on: 1,
+            action: FailAction::PartialRead { bytes: 2 },
+        })
+        .expect("install partial read");
+
+        let vfs = FaultyVfs::wrap(Arc::new(crate::vfs::mem::MemVfs::default()));
+        let file = vfs
+            .open(
+                Path::new(":memory:"),
+                OpenMode::CreateNew,
+                FileKind::Database,
+            )
+            .expect("create file");
+        write_all_at(file.as_ref(), 0, &[9, 8, 7, 6]).expect("seed file");
+
+        let mut buf = [0_u8; 4];
+        let read = file.read_at(0, &mut buf).expect("read with failpoint");
+        assert_eq!(read, 2);
+        assert_eq!(&buf[..2], &[9, 8]);
+
+        let logs = failpoint_logs().expect("read logs");
+        assert_eq!(logs[0].label, "db.write_page");
+        assert_eq!(logs[1].label, "db.read");
+        assert_eq!(logs[1].outcome, "partial_read:2");
+
+        clear_failpoints().expect("clear failpoints");
+    }
+}

@@ -1,9 +1,7 @@
 //! Fixed main-database header encoding and validation.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-
 use crate::error::{DbError, Result};
+use crate::vfs::{read_exact_at, write_all_at, VfsFile};
 
 use super::checksum;
 use super::freelist::FreelistState;
@@ -150,30 +148,24 @@ impl DatabaseHeader {
     }
 }
 
-pub(crate) fn write_database_bootstrap(file: &mut File, header: &DatabaseHeader) -> Result<()> {
+pub(crate) fn write_database_bootstrap_vfs(
+    file: &dyn VfsFile,
+    header: &DatabaseHeader,
+) -> Result<()> {
     let page_size = header.page_size as usize;
     let mut first_page = page::zeroed_page(header.page_size);
     first_page[..DB_HEADER_SIZE].copy_from_slice(&header.encode());
     let second_page = page::zeroed_page(header.page_size);
 
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| DbError::io("seek database bootstrap", source))?;
-    file.write_all(&first_page)
-        .map_err(|source| DbError::io("write database header page", source))?;
-    file.write_all(&second_page)
-        .map_err(|source| DbError::io("write catalog root bootstrap page", source))?;
-    file.set_len((page_size * 2) as u64)
-        .map_err(|source| DbError::io("resize database bootstrap file", source))?;
-
+    write_all_at(file, 0, &first_page)?;
+    write_all_at(file, page_size as u64, &second_page)?;
+    file.set_len((page_size * 2) as u64)?;
     Ok(())
 }
 
-pub(crate) fn read_database_header(file: &mut File) -> Result<DatabaseHeader> {
+pub(crate) fn read_database_header_vfs(file: &dyn VfsFile) -> Result<DatabaseHeader> {
     let mut bytes = [0_u8; DB_HEADER_SIZE];
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| DbError::io("seek database header", source))?;
-    file.read_exact(&mut bytes)
-        .map_err(|source| DbError::io("read database header", source))?;
+    read_exact_at(file, 0, &mut bytes)?;
     DatabaseHeader::decode(&bytes)
 }
 

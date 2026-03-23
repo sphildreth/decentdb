@@ -1,0 +1,21 @@
+{
+  "name": "short_crash",
+  "page_size": 4096,
+  "ops": [
+    { "op": "create" },
+    {
+      "op": "install_failpoint",
+      "label": "wal.write_commit",
+      "action": "error",
+      "trigger_on": 1,
+      "value": 0
+    },
+    { "op": "begin" },
+    { "op": "write", "page_id": 3, "fill_byte": 17 },
+    { "op": "commit", "expect": "error" },
+    { "op": "failpoint_log" },
+    { "op": "clear_failpoints" },
+    { "op": "reopen" },
+    { "op": "inspect" }
+  ]
+}

@@ -78,7 +78,7 @@ It targets a single process with **one writer** and **many concurrent readers** 
 </p>
 
 **How this chart is produced**
-- The chart is generated from benchmark runs using `nimble bench_embedded_chart`.
+- The chart is generated from benchmark runs using `cargo bench`.
 - Values are **normalized vs SQLite** (baseline = 1.0).
 - For "lower is better" metrics (latency, DB size), the score is inverted so **higher bars mean better**.
 - Full methodology and raw results live in `benchmarks/embedded_compare/`.
@@ -90,18 +90,15 @@ It targets a single process with **one writer** and **many concurrent readers** 
 
 **Regenerate**
 ```bash
-# Run full benchmark pipeline (run + aggregate + chart)
-nimble bench_embedded_pipeline
-
-# Or generate just the chart from existing results:
-nimble bench_embedded_chart
+# Run benchmark pipeline
+cargo bench
 ```
 
 ## Quick Start
 
 ### Prerequisites
 
-- [Nim](https://nim-lang.org) (includes `nim` + `nimble`)
+- [Rust](https://rustup.rs) (includes `cargo` + `rustc`)
 - libpg_query (C library + headers)
 - Python 3 (optional; for test harness)
 
@@ -124,9 +121,9 @@ Raspberry Pi.
 ### Build from source
 
 ```bash
-nimble build
-# Optionally: install into ~/.nimble/bin
-nimble install
+cargo build
+# Optionally: install into ~/.cargo/bin
+cargo install --path crates/decentdb-cli
 ```
 
 ### Create a Database
@@ -225,7 +222,7 @@ Common commands:
 
 - [User Guide](https://decentdb.org/user-guide/sql-reference/) - SQL reference, tutorials, and examples
 - [Releases](https://decentdb.org/development/releases/) - GitHub release workflow, asset naming, and Linux arm64 / Raspberry Pi packages
-- [Nim API](https://decentdb.org/api/nim-api/) - Embedded API documentation
+- [Rust API](https://docs.rs/decentdb) - Embedded API documentation
 - [Architecture](https://decentdb.org/architecture/overview/) - Design and implementation details
 - [Contributing](https://decentdb.org/development/contributing/) - Development guidelines
 
@@ -246,37 +243,16 @@ DecentDB is organized into focused modules:
 
 ```bash
 # Run the main test suite (engine + harness + .NET/Go/Node/Python/Dart bindings)
-nimble test
+cargo test
 
-# Run Java JDBC binding tests
-nimble test_bindings_java
-
-# Run only the core engine tests
-nimble test_nim
+cargo test -p decentdb
 
 # Run benchmarks
-nimble bench
+cargo bench
 
 # Lint code
-nimble lint
+cargo clippy
 ```
-
-## Coverage
-
-DecentDB can generate a unit test coverage report using `gcov`.
-
-```bash
-# Generate coverage (requires gcov)
-bash scripts/coverage_nim.sh
-
-# Alternative: run coverage in smaller batches
-bash scripts/coverage_batch.sh
-```
-
-Outputs:
-- build/coverage/summary.txt (human-readable summary)
-- build/coverage/summary.json (machine-readable summary)
-- build/coverage/gcov/ (raw per-test `.gcov` files)
 
 See [Contributing Guide](https://decentdb.org/development/contributing/) for development workflow and guidelines.
 
