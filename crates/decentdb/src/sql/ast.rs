@@ -56,6 +56,7 @@ pub(crate) struct Query {
     pub(crate) offset: Option<Expr>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum QueryBody {
     Select(Select),
@@ -385,6 +386,7 @@ pub(crate) struct CreateTriggerStatement {
     pub(crate) action_sql: String,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTableAction {
     AddColumn(ColumnDefinition),

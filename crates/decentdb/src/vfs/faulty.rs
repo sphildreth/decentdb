@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 
 use crate::error::{DbError, Result};
 
@@ -89,6 +90,7 @@ impl VfsFile for FaultyVfsFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let label = classify_read(self.inner.kind());
         match self.state.decision(label) {
+            FaultDecision::Untracked => self.inner.read_at(offset, buf),
             FaultDecision::Pass { hit } => {
                 self.state.log(label, hit, "pass");
                 self.inner.read_at(offset, buf)
@@ -121,6 +123,7 @@ impl VfsFile for FaultyVfsFile {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         let label = classify_write(self.inner.kind(), offset, buf);
         match self.state.decision(label) {
+            FaultDecision::Untracked => self.inner.write_at(offset, buf),
             FaultDecision::Pass { hit } => {
                 self.state.log(label, hit, "pass");
                 self.inner.write_at(offset, buf)
@@ -152,6 +155,7 @@ impl VfsFile for FaultyVfsFile {
     fn sync_data(&self) -> Result<()> {
         let label = classify_sync(self.inner.kind());
         match self.state.decision(label) {
+            FaultDecision::Untracked => self.inner.sync_data(),
             FaultDecision::Pass { hit } => {
                 self.state.log(label, hit, "pass");
                 self.inner.sync_data()
@@ -177,6 +181,7 @@ impl VfsFile for FaultyVfsFile {
     fn sync_metadata(&self) -> Result<()> {
         let label = classify_metadata_sync(self.inner.kind());
         match self.state.decision(label) {
+            FaultDecision::Untracked => self.inner.sync_metadata(),
             FaultDecision::Pass { hit } => {
                 self.state.log(label, hit, "pass");
                 self.inner.sync_metadata()
@@ -213,10 +218,15 @@ struct FaultState {
     failpoints: Mutex<HashMap<String, Vec<Failpoint>>>,
     hits: Mutex<HashMap<String, u64>>,
     logs: Mutex<Vec<FailpointLogEntry>>,
+    owner_thread: Mutex<Option<ThreadId>>,
 }
 
 impl FaultState {
     fn decision(&self, label: &str) -> FaultDecision {
+        if !self.is_owner_thread() {
+            return FaultDecision::Untracked;
+        }
+
         let hit = {
             let mut hits = self.hits.lock().expect("fault hit counter lock");
             let next = hits.entry(label.to_string()).or_insert(0);
@@ -246,6 +256,9 @@ impl FaultState {
     }
 
     fn log(&self, label: &str, hit: u64, outcome: &str) {
+        if !self.is_owner_thread() {
+            return;
+        }
         self.logs
             .lock()
             .expect("fault log lock")
@@ -255,9 +268,17 @@ impl FaultState {
                 outcome: outcome.to_string(),
             });
     }
+
+    fn is_owner_thread(&self) -> bool {
+        let owner = self.owner_thread.lock().expect("fault owner lock");
+        owner
+            .as_ref()
+            .is_none_or(|thread_id| *thread_id == std::thread::current().id())
+    }
 }
 
 enum FaultDecision {
+    Untracked,
     Pass { hit: u64 },
     Error { hit: u64 },
     PartialRead { hit: u64, bytes: usize },
@@ -267,6 +288,12 @@ enum FaultDecision {
 
 pub(crate) fn install_failpoint(failpoint: Failpoint) -> Result<()> {
     let state = global_fault_state();
+    let mut owner = state
+        .owner_thread
+        .lock()
+        .map_err(|_| DbError::internal("fault owner lock poisoned"))?;
+    *owner = Some(std::thread::current().id());
+    drop(owner);
     let mut failpoints = state
         .failpoints
         .lock()
@@ -295,6 +322,11 @@ pub(crate) fn clear_failpoints() -> Result<()> {
         .lock()
         .map_err(|_| DbError::internal("fault state lock poisoned"))?
         .clear();
+    *state
+        .owner_thread
+        .lock()
+        .map_err(|_| DbError::internal("fault owner lock poisoned"))? =
+        Some(std::thread::current().id());
     Ok(())
 }
 

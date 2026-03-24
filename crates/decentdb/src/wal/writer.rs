@@ -26,7 +26,7 @@ pub(crate) fn commit_pages(
     pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
 ) -> Result<u64> {
-    let _writer_guard = wal
+    let mut writer_state = wal
         .inner
         .write_lock
         .lock()
@@ -38,9 +38,11 @@ pub(crate) fn commit_pages(
     }
 
     let page_frame_len = FRAME_HEADER_SIZE + wal.inner.page_size as usize + FRAME_TRAILER_SIZE;
-    let mut page_batch = Vec::with_capacity(page_frame_len * pages.len());
+    let page_batch = &mut writer_state.page_batch;
+    page_batch.clear();
+    page_batch.reserve(page_frame_len * pages.len());
     for (page_id, payload) in &pages {
-        append_page_frame(&mut page_batch, *page_id, payload, wal.inner.page_size)?;
+        append_page_frame(page_batch, *page_id, payload, wal.inner.page_size)?;
     }
     let commit_start_lsn = offset;
     let metadata_changed = ensure_capacity(
@@ -48,7 +50,7 @@ pub(crate) fn commit_pages(
         offset + page_batch.len() as u64 + COMMIT_FRAME_BYTES.len() as u64,
     )?;
     if !page_batch.is_empty() {
-        write_all_at(wal.inner.file.as_ref(), offset, &page_batch)?;
+        write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
         offset += page_batch.len() as u64;
     }
     write_all_at(wal.inner.file.as_ref(), offset, &COMMIT_FRAME_BYTES)?;
@@ -91,7 +93,7 @@ pub(crate) fn commit_pages_if_latest(
     max_page_count: u32,
     expected_latest_lsn: u64,
 ) -> Result<u64> {
-    let _writer_guard = wal
+    let mut writer_state = wal
         .inner
         .write_lock
         .lock()
@@ -110,9 +112,11 @@ pub(crate) fn commit_pages_if_latest(
     }
 
     let page_frame_len = FRAME_HEADER_SIZE + wal.inner.page_size as usize + FRAME_TRAILER_SIZE;
-    let mut page_batch = Vec::with_capacity(page_frame_len * pages.len());
+    let page_batch = &mut writer_state.page_batch;
+    page_batch.clear();
+    page_batch.reserve(page_frame_len * pages.len());
     for (page_id, payload) in &pages {
-        append_page_frame(&mut page_batch, *page_id, payload, wal.inner.page_size)?;
+        append_page_frame(page_batch, *page_id, payload, wal.inner.page_size)?;
     }
     let commit_start_lsn = offset;
     let metadata_changed = ensure_capacity(
@@ -120,7 +124,7 @@ pub(crate) fn commit_pages_if_latest(
         offset + page_batch.len() as u64 + COMMIT_FRAME_BYTES.len() as u64,
     )?;
     if !page_batch.is_empty() {
-        write_all_at(wal.inner.file.as_ref(), offset, &page_batch)?;
+        write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
         offset += page_batch.len() as u64;
     }
     write_all_at(wal.inner.file.as_ref(), offset, &COMMIT_FRAME_BYTES)?;

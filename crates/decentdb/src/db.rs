@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::{
@@ -134,6 +134,7 @@ impl SqlTransaction<'_> {
             .lock()
             .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
         *txn = SqlTxnSlot::None;
+        self.db.inner.sql_txn_active.store(false, Ordering::Release);
         Ok(())
     }
 }
@@ -143,6 +144,7 @@ impl Drop for SqlTransaction<'_> {
         self.state.take();
         if let Ok(mut txn) = self.db.inner.sql_txn.lock() {
             *txn = SqlTxnSlot::None;
+            self.db.inner.sql_txn_active.store(false, Ordering::Release);
         }
     }
 }
@@ -160,6 +162,7 @@ struct DbInner {
     last_seen_checkpoint_epoch: AtomicU64,
     sql_write_lock: Mutex<()>,
     sql_txn: Mutex<SqlTxnSlot>,
+    sql_txn_active: AtomicBool,
     write_txn: Mutex<WriteTxn>,
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
@@ -357,6 +360,7 @@ impl Db {
             ));
         }
         *txn = SqlTxnSlot::Exclusive;
+        self.inner.sql_txn_active.store(true, Ordering::Release);
         Ok(SqlTransaction {
             db: self,
             state: Some(state),
@@ -426,6 +430,7 @@ impl Db {
             ));
         }
         *txn = SqlTxnSlot::Shared(Box::new(state));
+        self.inner.sql_txn_active.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -438,12 +443,17 @@ impl Db {
                 .lock()
                 .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
             match std::mem::replace(&mut *txn, SqlTxnSlot::None) {
-                SqlTxnSlot::Shared(state) => *state,
+                SqlTxnSlot::Shared(state) => {
+                    self.inner.sql_txn_active.store(false, Ordering::Release);
+                    *state
+                }
                 SqlTxnSlot::Exclusive => {
                     *txn = SqlTxnSlot::Exclusive;
+                    self.inner.sql_txn_active.store(true, Ordering::Release);
                     return Err(self.exclusive_sql_txn_error());
                 }
                 SqlTxnSlot::None => {
+                    self.inner.sql_txn_active.store(false, Ordering::Release);
                     return Err(DbError::transaction("no active SQL transaction to commit"));
                 }
             }
@@ -461,6 +471,7 @@ impl Db {
         match *txn {
             SqlTxnSlot::Shared(_) => {
                 *txn = SqlTxnSlot::None;
+                self.inner.sql_txn_active.store(false, Ordering::Release);
                 Ok(())
             }
             SqlTxnSlot::Exclusive => Err(self.exclusive_sql_txn_error()),
@@ -472,6 +483,9 @@ impl Db {
 
     /// Returns whether this handle currently has an explicit SQL transaction.
     pub fn in_transaction(&self) -> Result<bool> {
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(false);
+        }
         self.inner
             .sql_txn
             .lock()
@@ -733,7 +747,7 @@ impl Db {
 
     /// Commits the current write transaction to the WAL.
     pub fn commit(&self) -> Result<u64> {
-        let pages = {
+        let (max_page_id, pages) = {
             let mut txn = self
                 .inner
                 .write_txn
@@ -745,17 +759,20 @@ impl Db {
                 ));
             }
             txn.active = false;
-            std::mem::take(&mut txn.staged_pages)
+            let max_page_id = txn
+                .staged_pages
+                .last_key_value()
+                .map_or(0, |(page_id, _)| *page_id);
+            (max_page_id, std::mem::take(&mut txn.staged_pages))
         };
 
         let pages: Vec<_> = pages.into_iter().collect();
-        let max_page_id = pages.iter().map(|(page_id, _)| *page_id).max().unwrap_or(0);
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
         self.inner.wal.commit_pages(pages, max_page_count)
     }
 
     fn commit_if_latest(&self, expected_latest_lsn: u64) -> Result<u64> {
-        let pages = {
+        let (max_page_id, pages) = {
             let mut txn = self
                 .inner
                 .write_txn
@@ -767,11 +784,14 @@ impl Db {
                 ));
             }
             txn.active = false;
-            std::mem::take(&mut txn.staged_pages)
+            let max_page_id = txn
+                .staged_pages
+                .last_key_value()
+                .map_or(0, |(page_id, _)| *page_id);
+            (max_page_id, std::mem::take(&mut txn.staged_pages))
         };
 
         let pages: Vec<_> = pages.into_iter().collect();
-        let max_page_id = pages.iter().map(|(page_id, _)| *page_id).max().unwrap_or(0);
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
         self.inner
             .wal
@@ -1241,6 +1261,7 @@ impl Db {
                 last_seen_checkpoint_epoch: AtomicU64::new(last_seen_checkpoint_epoch),
                 sql_write_lock: Mutex::new(()),
                 sql_txn: Mutex::new(SqlTxnSlot::None),
+                sql_txn_active: AtomicBool::new(false),
                 write_txn: Mutex::new(WriteTxn::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
@@ -1330,19 +1351,20 @@ impl Db {
         prepared: &PreparedStatement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        let mut txn = self
-            .inner
-            .sql_txn
-            .lock()
-            .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
-        match &mut *txn {
-            SqlTxnSlot::Shared(state) => {
-                return self.execute_prepared_in_state(prepared, params, state);
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            let mut txn = self
+                .inner
+                .sql_txn
+                .lock()
+                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+            match &mut *txn {
+                SqlTxnSlot::Shared(state) => {
+                    return self.execute_prepared_in_state(prepared, params, state);
+                }
+                SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+                SqlTxnSlot::None => {}
             }
-            SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
-            SqlTxnSlot::None => {}
         }
-        drop(txn);
 
         let _writer = self
             .inner
@@ -1393,7 +1415,7 @@ impl Db {
         statement: &crate::sql::ast::Statement,
         params: &[Value],
     ) -> Result<QueryResult> {
-        {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
             let mut txn = self
                 .inner
                 .sql_txn
@@ -1675,6 +1697,9 @@ impl Db {
     }
 
     fn transaction_runtime_snapshot(&self) -> Result<Option<EngineRuntime>> {
+        if !self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let txn = self
             .inner
             .sql_txn

@@ -26,6 +26,12 @@ impl OverflowPointer {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct OverflowTailInfo {
+    pub(crate) page_id: PageId,
+    pub(crate) chunk_len: usize,
+}
+
 pub(crate) fn write_overflow<S: PageStore>(
     store: &mut S,
     bytes: &[u8],
@@ -149,6 +155,160 @@ pub(crate) fn read_overflow_prefix<S: PageStore>(
     }
 
     Ok(Some(prefix))
+}
+
+pub(crate) fn read_uncompressed_overflow_tail<S: PageStore>(
+    store: &S,
+    pointer: OverflowPointer,
+) -> Result<Option<OverflowTailInfo>> {
+    if pointer.head_page_id == 0 || pointer.is_compressed() {
+        return Ok(None);
+    }
+
+    let mut page_id = pointer.head_page_id;
+    let mut logical_len = 0_usize;
+    let mut tail = OverflowTailInfo::default();
+    while page_id != 0 {
+        let page = store.read_page(page_id)?;
+        if page.len() < OVERFLOW_HEADER_SIZE {
+            return Err(DbError::corruption("overflow page shorter than header"));
+        }
+        let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len"));
+        let chunk_end = OVERFLOW_HEADER_SIZE + chunk_len as usize;
+        if chunk_end > page.len() {
+            return Err(DbError::corruption(
+                "overflow chunk length exceeds page payload",
+            ));
+        }
+        logical_len = logical_len.saturating_add(chunk_len as usize);
+        tail = OverflowTailInfo {
+            page_id,
+            chunk_len: chunk_len as usize,
+        };
+        page_id = next_page_id;
+    }
+
+    if logical_len != pointer.logical_len as usize {
+        return Err(DbError::corruption(format!(
+            "overflow logical length mismatch: expected {}, read {}",
+            pointer.logical_len, logical_len
+        )));
+    }
+
+    Ok(Some(tail))
+}
+
+pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
+    store: &mut S,
+    previous: OverflowPointer,
+    previous_tail: OverflowTailInfo,
+    appended: &[u8],
+) -> Result<(OverflowPointer, OverflowTailInfo)> {
+    if previous.head_page_id == 0 {
+        return Err(DbError::internal(
+            "append_uncompressed_with_tail requires an existing overflow chain",
+        ));
+    }
+    if previous.is_compressed() {
+        return Err(DbError::internal(
+            "append_uncompressed_with_tail does not support compressed payloads",
+        ));
+    }
+    if previous_tail.page_id == 0 {
+        return Err(DbError::corruption("append overflow tail page id is invalid"));
+    }
+
+    let page_size = store.page_size() as usize;
+    if page_size <= OVERFLOW_HEADER_SIZE {
+        return Err(DbError::internal("page size too small for overflow pages"));
+    }
+    let chunk_capacity = page_size - OVERFLOW_HEADER_SIZE;
+
+    let mut tail_page = store.read_page(previous_tail.page_id)?;
+    if tail_page.len() < OVERFLOW_HEADER_SIZE {
+        return Err(DbError::corruption("overflow page shorter than header"));
+    }
+    let tail_chunk_len = u32::from_le_bytes(tail_page[4..8].try_into().expect("header chunk len"));
+    if tail_chunk_len as usize != previous_tail.chunk_len {
+        return Err(DbError::corruption(
+            "append overflow tail chunk length did not match cached state",
+        ));
+    }
+    if tail_chunk_len as usize > chunk_capacity {
+        return Err(DbError::corruption(
+            "append overflow tail chunk length exceeds capacity",
+        ));
+    }
+
+    let mut remaining = appended;
+    let available = chunk_capacity.saturating_sub(tail_chunk_len as usize);
+    let mut updated_tail_len = tail_chunk_len as usize;
+    if available > 0 && !remaining.is_empty() {
+        let take = available.min(remaining.len());
+        let start = OVERFLOW_HEADER_SIZE + tail_chunk_len as usize;
+        tail_page[start..start + take].copy_from_slice(&remaining[..take]);
+        updated_tail_len += take;
+        tail_page[4..8].copy_from_slice(
+            &(u32::try_from(updated_tail_len)
+                .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
+            .to_le_bytes(),
+        );
+        remaining = &remaining[take..];
+    }
+
+    let mut final_tail = OverflowTailInfo {
+        page_id: previous_tail.page_id,
+        chunk_len: updated_tail_len,
+    };
+    if !remaining.is_empty() {
+        let mut new_page_ids = Vec::new();
+        let mut new_pages = Vec::new();
+        let mut source = remaining;
+        while !source.is_empty() {
+            let new_page_id = store.allocate_page()?;
+            let take = source.len().min(chunk_capacity);
+            let mut page = vec![0_u8; page_size];
+            page[4..8].copy_from_slice(
+                &(u32::try_from(take)
+                    .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
+                .to_le_bytes(),
+            );
+            page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take].copy_from_slice(&source[..take]);
+            source = &source[take..];
+            new_page_ids.push(new_page_id);
+            new_pages.push(page);
+            final_tail = OverflowTailInfo {
+                page_id: new_page_id,
+                chunk_len: take,
+            };
+        }
+
+        tail_page[0..4].copy_from_slice(&new_page_ids[0].to_le_bytes());
+        for index in 0..new_pages.len().saturating_sub(1) {
+            new_pages[index][0..4].copy_from_slice(&new_page_ids[index + 1].to_le_bytes());
+        }
+
+        store.write_page(previous_tail.page_id, &tail_page)?;
+        for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages.iter()) {
+            store.write_page(new_page_id, new_page)?;
+        }
+    } else {
+        store.write_page(previous_tail.page_id, &tail_page)?;
+    }
+
+    Ok((
+        OverflowPointer {
+            head_page_id: previous.head_page_id,
+            logical_len: previous
+                .logical_len
+                .saturating_add(u32::try_from(appended.len()).map_err(|_| {
+                    DbError::constraint("overflow payload exceeds u32 logical length")
+                })?),
+            flags: previous.flags,
+        },
+        final_tail,
+    ))
 }
 
 pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(

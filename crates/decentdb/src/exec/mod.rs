@@ -23,8 +23,8 @@ use crate::planner;
 use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
-    append_uncompressed_with_first_page_patch, free_overflow, read_overflow,
-    read_overflow_prefix, rewrite_overflow, OverflowPointer,
+    append_uncompressed_with_tail, free_overflow, read_overflow, read_uncompressed_overflow_tail,
+    rewrite_overflow, OverflowPointer, OverflowTailInfo,
 };
 use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
@@ -33,7 +33,7 @@ use crate::sql::ast::{
     BinaryOp, Expr, FromItem, JoinKind, Query, QueryBody, Select, SelectItem, Statement, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
-use crate::storage::checksum::crc32c_parts;
+use crate::storage::checksum::{crc32c_extend, crc32c_parts};
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::PagerHandle;
 use crate::wal::WalHandle;
@@ -85,6 +85,8 @@ impl TableData {
 pub(crate) struct PersistedTableState {
     pub(crate) pointer: OverflowPointer,
     pub(crate) checksum: u32,
+    pub(crate) row_count: usize,
+    pub(crate) tail: OverflowTailInfo,
 }
 
 impl Default for PersistedTableState {
@@ -96,6 +98,8 @@ impl Default for PersistedTableState {
                 flags: 0,
             },
             checksum: 0,
+            row_count: 0,
+            tail: OverflowTailInfo::default(),
         }
     }
 }
@@ -273,6 +277,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) append_only_dirty_tables: BTreeSet<String>,
     root_state: Option<RootHeader>,
     pub(crate) index_state_epoch: u64,
+    manifest_template: Option<ManifestTemplate>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -306,6 +311,7 @@ impl EngineRuntime {
             append_only_dirty_tables: BTreeSet::new(),
             root_state: None,
             index_state_epoch: 0,
+            manifest_template: None,
         }
     }
 
@@ -379,54 +385,45 @@ impl EngineRuntime {
                 let data = self.tables.get(&table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
-                let previous_pointer = self.persisted_tables.get(&table_name).map_or(
-                    OverflowPointer {
-                        head_page_id: 0,
-                        logical_len: 0,
-                        flags: 0,
-                    },
-                    |state| state.pointer,
-                );
+                let previous_state = self
+                    .persisted_tables
+                    .get(&table_name)
+                    .copied()
+                    .unwrap_or_default();
+                let previous_pointer = previous_state.pointer;
                 if self.append_only_dirty_tables.contains(&table_name)
                     && previous_pointer.head_page_id != 0
                     && !previous_pointer.is_compressed()
                 {
-                    let prefix = read_overflow_prefix(
-                        &store,
-                        previous_pointer,
-                        TABLE_PAYLOAD_MAGIC.len() + 4,
-                    )?;
-                    if let Some(prefix) = prefix {
-                        if prefix.len() >= TABLE_PAYLOAD_MAGIC.len() + 4
-                            && prefix[..TABLE_PAYLOAD_MAGIC.len()] == *TABLE_PAYLOAD_MAGIC
-                        {
-                            let existing_count = u32::from_le_bytes(
-                                prefix[TABLE_PAYLOAD_MAGIC.len()..TABLE_PAYLOAD_MAGIC.len() + 4]
-                                    .try_into()
-                                    .expect("table payload row-count prefix"),
-                            ) as usize;
-                            if existing_count <= data.rows.len() {
-                                let appended_rows =
-                                    encode_appended_table_rows(data, existing_count)?;
-                                if !appended_rows.is_empty() {
-                                    let new_count = u32::try_from(data.rows.len()).map_err(|_| {
-                                        DbError::constraint("table row count exceeds u32")
-                                    })?;
-                                    let (pointer, checksum) =
-                                        append_uncompressed_with_first_page_patch(
-                                        &mut store,
-                                        previous_pointer,
-                                        TABLE_PAYLOAD_MAGIC.len(),
-                                        &new_count.to_le_bytes(),
-                                        &appended_rows,
-                                    )?;
-                                    self.persisted_tables.insert(
-                                        table_name.clone(),
-                                        PersistedTableState { pointer, checksum },
-                                    );
-                                    continue;
-                                }
-                            }
+                    let existing_count = previous_state.row_count;
+                    if existing_count <= data.rows.len() {
+                        let appended_rows = encode_appended_table_rows(data, existing_count)?;
+                        if !appended_rows.is_empty() {
+                            let tail = if previous_state.tail.page_id != 0 {
+                                previous_state.tail
+                            } else {
+                                read_uncompressed_overflow_tail(&store, previous_pointer)?.ok_or_else(
+                                    || DbError::corruption("overflow tail info is missing"),
+                                )?
+                            };
+                            let (pointer, tail) = append_uncompressed_with_tail(
+                                &mut store,
+                                previous_pointer,
+                                tail,
+                                &appended_rows,
+                            )?;
+                            let checksum =
+                                crc32c_extend(previous_state.checksum, &[appended_rows.as_slice()]);
+                            self.persisted_tables.insert(
+                                table_name.clone(),
+                                PersistedTableState {
+                                    pointer,
+                                    checksum,
+                                    row_count: data.rows.len(),
+                                    tail,
+                                },
+                            );
+                            continue;
                         }
                     }
                 }
@@ -441,9 +438,16 @@ impl EngineRuntime {
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let pointer =
                     rewrite_overflow(&mut store, previous_pointer, &payload, CompressionMode::Auto)?;
+                let tail = read_uncompressed_overflow_tail(&store, pointer)?
+                    .unwrap_or_default();
                 self.persisted_tables.insert(
                     table_name.clone(),
-                    PersistedTableState { pointer, checksum },
+                    PersistedTableState {
+                        pointer,
+                        checksum,
+                        row_count: data.rows.len(),
+                        tail,
+                    },
                 );
             }
             for table_name in removed_tables {
@@ -456,24 +460,27 @@ impl EngineRuntime {
             }
         }
 
-        let manifest = encode_manifest_payload(self, &self.persisted_tables)?;
-        let checksum = crc32c_parts(&[manifest.as_slice()]);
-        let previous_manifest_pointer = old_root.map_or(
-            OverflowPointer {
-                head_page_id: 0,
-                logical_len: 0,
-                flags: 0,
-            },
-            |root| root.pointer,
-        );
-        let pointer = {
-            let mut store = DbTxnPageStore { db };
-            rewrite_overflow(
-                &mut store,
-                previous_manifest_pointer,
-                &manifest,
-                CompressionMode::Never,
-            )?
+        let (checksum, pointer) = {
+            let manifest = self.manifest_payload()?;
+            let checksum = crc32c_parts(&[manifest]);
+            let previous_manifest_pointer = old_root.map_or(
+                OverflowPointer {
+                    head_page_id: 0,
+                    logical_len: 0,
+                    flags: 0,
+                },
+                |root| root.pointer,
+            );
+            let pointer = {
+                let mut store = DbTxnPageStore { db };
+                rewrite_overflow(
+                    &mut store,
+                    previous_manifest_pointer,
+                    manifest,
+                    CompressionMode::Never,
+                )?
+            };
+            (checksum, pointer)
         };
 
         let root_page = encode_root_header(
@@ -496,6 +503,37 @@ impl EngineRuntime {
             db.set_schema_cookie(self.catalog.schema_cookie)?;
         }
         Ok(())
+    }
+
+    fn manifest_payload(&mut self) -> Result<&[u8]> {
+        let use_template = self.manifest_template.as_ref().is_some_and(|template| {
+            template.schema_cookie == self.catalog.schema_cookie
+                && template.table_state_offsets.len() == self.catalog.tables.len()
+                && self
+                    .catalog
+                    .tables
+                    .keys()
+                    .all(|table_name| template.table_state_offsets.contains_key(table_name))
+        });
+
+        if !use_template {
+            let encoded = encode_manifest_payload_with_offsets(self, &self.persisted_tables)?;
+            self.manifest_template = Some(ManifestTemplate {
+                schema_cookie: self.catalog.schema_cookie,
+                table_state_offsets: encoded.table_state_offsets,
+                bytes: encoded.bytes,
+            });
+        }
+
+        let template = self
+            .manifest_template
+            .as_mut()
+            .ok_or_else(|| DbError::internal("manifest template was not initialized"))?;
+        for (table_name, offset) in &template.table_state_offsets {
+            let state = self.persisted_tables.get(table_name).copied().unwrap_or_default();
+            patch_manifest_table_state(&mut template.bytes, *offset, state)?;
+        }
+        Ok(template.bytes.as_slice())
     }
 
     pub(super) fn table_schema(&self, name: &str) -> Option<&TableSchema> {
@@ -1634,6 +1672,19 @@ struct RootHeader {
     pointer: OverflowPointer,
 }
 
+#[derive(Clone, Debug)]
+struct ManifestTemplate {
+    schema_cookie: u32,
+    table_state_offsets: BTreeMap<String, usize>,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ManifestEncoding {
+    bytes: Vec<u8>,
+    table_state_offsets: BTreeMap<String, usize>,
+}
+
 #[derive(Debug)]
 struct SnapshotPageStore<'a> {
     pager: &'a PagerHandle,
@@ -2418,11 +2469,20 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     Ok(runtime)
 }
 
+#[cfg(test)]
 fn encode_manifest_payload(
     runtime: &EngineRuntime,
     table_states: &BTreeMap<String, PersistedTableState>,
 ) -> Result<Vec<u8>> {
+    Ok(encode_manifest_payload_with_offsets(runtime, table_states)?.bytes)
+}
+
+fn encode_manifest_payload_with_offsets(
+    runtime: &EngineRuntime,
+    table_states: &BTreeMap<String, PersistedTableState>,
+) -> Result<ManifestEncoding> {
     let mut output = Vec::new();
+    let mut table_state_offsets = BTreeMap::new();
     output.extend_from_slice(MANIFEST_PAYLOAD_MAGIC);
     encode_u32(&mut output, runtime.catalog.schema_cookie);
     encode_u32(&mut output, runtime.catalog.tables.len() as u32);
@@ -2458,6 +2518,7 @@ fn encode_manifest_payload(
         }
         encode_strings(&mut output, &table.primary_key_columns)?;
         encode_i64(&mut output, table.next_row_id);
+        table_state_offsets.insert(table.name.clone(), output.len());
         let state = table_states.get(&table.name).copied().unwrap_or_default();
         encode_u32(&mut output, state.checksum);
         encode_u32(&mut output, state.pointer.head_page_id);
@@ -2497,7 +2558,30 @@ fn encode_manifest_payload(
         output.push(u8::from(trigger.on_view));
         encode_string(&mut output, &trigger.action_sql)?;
     }
-    Ok(output)
+    Ok(ManifestEncoding {
+        bytes: output,
+        table_state_offsets,
+    })
+}
+
+fn patch_manifest_table_state(
+    payload: &mut [u8],
+    offset: usize,
+    state: PersistedTableState,
+) -> Result<()> {
+    let end = offset
+        .checked_add(13)
+        .ok_or_else(|| DbError::internal("manifest table-state offset overflow"))?;
+    if end > payload.len() {
+        return Err(DbError::internal(
+            "manifest table-state offset exceeded payload length",
+        ));
+    }
+    payload[offset..offset + 4].copy_from_slice(&state.checksum.to_le_bytes());
+    payload[offset + 4..offset + 8].copy_from_slice(&state.pointer.head_page_id.to_le_bytes());
+    payload[offset + 8..offset + 12].copy_from_slice(&state.pointer.logical_len.to_le_bytes());
+    payload[offset + 12] = state.pointer.flags;
+    Ok(())
 }
 
 fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
@@ -2566,16 +2650,17 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
         }
         table.primary_key_columns = cursor.read_strings()?;
         table.next_row_id = cursor.read_i64()?;
-        let state = PersistedTableState {
+        let mut state = PersistedTableState {
             checksum: cursor.read_u32()?,
             pointer: OverflowPointer {
                 head_page_id: cursor.read_u32()?,
                 logical_len: cursor.read_u32()?,
                 flags: cursor.read_u8()?,
             },
+            row_count: 0,
+            tail: OverflowTailInfo::default(),
         };
         runtime.catalog.tables.insert(table_name.clone(), table);
-        runtime.persisted_tables.insert(table_name.clone(), state);
         let data = if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
             TableData::default()
         } else {
@@ -2587,6 +2672,9 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
             }
             decode_table_payload(&payload)?
         };
+        state.row_count = data.rows.len();
+        state.tail = read_uncompressed_overflow_tail(store, state.pointer)?.unwrap_or_default();
+        runtime.persisted_tables.insert(table_name.clone(), state);
         runtime.tables.insert(table_name, data);
     }
 
@@ -2728,15 +2816,21 @@ fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
     if magic.as_slice() != TABLE_PAYLOAD_MAGIC {
         return Err(DbError::corruption("table payload magic is invalid"));
     }
-    let row_count = cursor.read_u32()?;
+    let row_count = cursor.read_u32()? as usize;
     let mut data = TableData::default();
-    for _ in 0..row_count {
+    data.rows.reserve(row_count);
+    while cursor.offset < cursor.bytes.len() {
         let row_id = cursor.read_i64()?;
         let row = Row::decode(&cursor.read_vec()?)?;
         data.rows.push(StoredRow {
             row_id,
             values: row.values().to_vec(),
         });
+    }
+    if data.rows.len() < row_count {
+        return Err(DbError::corruption(
+            "table payload row count exceeded decoded row content",
+        ));
     }
     Ok(data)
 }
@@ -3389,6 +3483,7 @@ impl EngineRuntime {
         Ok(row_numbers)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compute_window_function_values(
         &self,
         dataset: &Dataset,
@@ -4897,12 +4992,17 @@ mod tests {
         let pointer =
             crate::record::overflow::write_overflow(&mut store, &table_payload, CompressionMode::Auto)
                 .expect("write table payload");
+        let tail = crate::record::overflow::read_uncompressed_overflow_tail(&store, pointer)
+            .expect("read table tail")
+            .expect("table tail");
         let mut table_states = runtime.persisted_tables.clone();
         table_states.insert(
             "docs".to_string(),
             PersistedTableState {
                 pointer,
                 checksum: crate::storage::checksum::crc32c_parts(&[table_payload.as_slice()]),
+                row_count: runtime.tables["docs"].rows.len(),
+                tail,
             },
         );
 

@@ -43,9 +43,23 @@ pub(crate) fn crc32c_parts(parts: &[&[u8]]) -> u32 {
     !crc
 }
 
+#[must_use]
+pub(crate) fn crc32c_extend(initial_crc: u32, parts: &[&[u8]]) -> u32 {
+    let mut crc = !initial_crc;
+
+    for part in parts {
+        for byte in *part {
+            let table_index = ((crc ^ u32::from(*byte)) & 0xFF) as usize;
+            crc = (crc >> 8) ^ CRC32C_TABLE[table_index];
+        }
+    }
+
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, crc32c_parts};
+    use super::{crc32c, crc32c_extend, crc32c_parts};
 
     #[test]
     fn crc32c_matches_known_castagnoli_vector() {
@@ -58,5 +72,14 @@ mod tests {
         let split = crc32c_parts(&[b"dec", b"ent", b"db"]);
 
         assert_eq!(whole, split);
+    }
+
+    #[test]
+    fn crc32c_extend_matches_rehashing_with_appended_bytes() {
+        let prefix = b"decent";
+        let suffix = b"db";
+        let full = crc32c_parts(&[prefix, suffix]);
+        let extended = crc32c_extend(crc32c(prefix), &[suffix]);
+        assert_eq!(full, extended);
     }
 }

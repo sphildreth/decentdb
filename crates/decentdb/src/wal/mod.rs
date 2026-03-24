@@ -38,10 +38,15 @@ pub(crate) struct SharedWalInner {
     wal_end_lsn: AtomicU64,
     max_page_count: AtomicU32,
     allocated_len: AtomicU64,
-    write_lock: Mutex<()>,
+    write_lock: Mutex<WalWriteState>,
     reader_registry: ReaderRegistry,
     checkpoint_pending: AtomicBool,
     checkpoint_epoch: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WalWriteState {
+    pub(crate) page_batch: Vec<u8>,
 }
 
 impl WalHandle {
