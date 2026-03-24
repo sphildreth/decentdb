@@ -51,13 +51,7 @@ impl Row {
     }
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        self.encode_with_overflow::<crate::storage::page::InMemoryPageStore>(
-            None,
-            RowOverflowOptions {
-                inline_threshold: usize::MAX,
-                compression: CompressionMode::Auto,
-            },
-        )
+        Self::encode_values(self.values())
     }
 
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
@@ -66,15 +60,53 @@ impl Row {
 
     pub(crate) fn encode_with_overflow<S: PageStore>(
         &self,
-        mut store: Option<&mut S>,
+        store: Option<&mut S>,
         options: RowOverflowOptions,
     ) -> Result<Vec<u8>> {
-        let mut encoded = encode_varint_u64(
-            u64::try_from(self.values.len())
-                .map_err(|_| DbError::constraint("row field count exceeds u64"))?,
-        );
+        let mut encoded = Vec::new();
+        Self::encode_values_into_with_overflow(self.values(), &mut encoded, store, options)?;
+        Ok(encoded)
+    }
 
-        for value in &self.values {
+    pub(crate) fn encode_values(values: &[Value]) -> Result<Vec<u8>> {
+        let mut encoded = Vec::new();
+        Self::encode_values_into_with_overflow::<crate::storage::page::InMemoryPageStore>(
+            values,
+            &mut encoded,
+            None,
+            RowOverflowOptions {
+                inline_threshold: usize::MAX,
+                compression: CompressionMode::Auto,
+            },
+        )?;
+        Ok(encoded)
+    }
+
+    pub(crate) fn encode_values_into(values: &[Value], output: &mut Vec<u8>) -> Result<()> {
+        output.clear();
+        Self::encode_values_into_with_overflow::<crate::storage::page::InMemoryPageStore>(
+            values,
+            output,
+            None,
+            RowOverflowOptions {
+                inline_threshold: usize::MAX,
+                compression: CompressionMode::Auto,
+            },
+        )
+    }
+
+    fn encode_values_into_with_overflow<S: PageStore>(
+        values: &[Value],
+        output: &mut Vec<u8>,
+        mut store: Option<&mut S>,
+        options: RowOverflowOptions,
+    ) -> Result<()> {
+        output.extend_from_slice(&encode_varint_u64(
+            u64::try_from(values.len())
+                .map_err(|_| DbError::constraint("row field count exceeds u64"))?,
+        ));
+
+        for value in values {
             let (tag, payload) = match value {
                 Value::Null => (TAG_NULL, Vec::new()),
                 Value::Int64(value) => (TAG_INT64, encode_varint_u64(zigzag_encode_i64(*value))),
@@ -107,15 +139,14 @@ impl Row {
                 }
             };
 
-            encoded.push(tag);
-            encoded.extend_from_slice(&encode_varint_u64(
+            output.push(tag);
+            output.extend_from_slice(&encode_varint_u64(
                 u64::try_from(payload.len())
                     .map_err(|_| DbError::constraint("field payload length exceeds u64"))?,
             ));
-            encoded.extend_from_slice(&payload);
+            output.extend_from_slice(&payload);
         }
-
-        Ok(encoded)
+        Ok(())
     }
 
     pub(crate) fn decode_with_overflow<S: PageStore>(
@@ -325,6 +356,25 @@ mod tests {
         let encoded = row.encode().expect("encode");
         let decoded = Row::decode(&encoded).expect("decode");
         assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn encode_values_into_matches_row_encode_and_clears_output() {
+        let values = vec![
+            Value::Int64(42),
+            Value::Text("alpha".to_string()),
+            Value::Bool(true),
+        ];
+        let expected = Row::new(values.clone()).encode().expect("encode");
+
+        let mut scratch = vec![9_u8, 9_u8, 9_u8];
+        Row::encode_values_into(&values, &mut scratch).expect("encode into scratch");
+        assert_eq!(scratch, expected);
+
+        let smaller = vec![Value::Null];
+        let expected_smaller = Row::new(smaller.clone()).encode().expect("encode smaller");
+        Row::encode_values_into(&smaller, &mut scratch).expect("encode smaller into scratch");
+        assert_eq!(scratch, expected_smaller);
     }
 
     fn rows_equal(left: &[Value], right: &[Value]) -> bool {

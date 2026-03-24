@@ -2541,10 +2541,11 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     output.extend_from_slice(TABLE_PAYLOAD_MAGIC);
     encode_u32(&mut output, data.rows.len() as u32);
+    let mut encoded_row = Vec::new();
     for row in &data.rows {
         encode_i64(&mut output, row.row_id);
-        let encoded = Row::new(row.values.clone()).encode()?;
-        encode_bytes(&mut output, &encoded)?;
+        Row::encode_values_into(&row.values, &mut encoded_row)?;
+        encode_bytes(&mut output, &encoded_row)?;
     }
     Ok(output)
 }
