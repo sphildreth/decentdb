@@ -2,6 +2,19 @@
 
 use std::collections::BTreeMap;
 
+#[must_use]
+pub(crate) fn identifiers_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn map_get_ci<'a, V>(map: &'a BTreeMap<String, V>, name: &str) -> Option<&'a V> {
+    map.get(name).or_else(|| {
+        map.iter()
+            .find(|(entry_name, _)| identifiers_equal(entry_name, name))
+            .map(|(_, value)| value)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ColumnType {
     Int64,
@@ -154,9 +167,29 @@ impl CatalogState {
 
     #[must_use]
     pub(crate) fn contains_object(&self, name: &str) -> bool {
-        self.tables.contains_key(name)
-            || self.indexes.contains_key(name)
-            || self.views.contains_key(name)
-            || self.triggers.contains_key(name)
+        self.table(name).is_some()
+            || self.index(name).is_some()
+            || self.view(name).is_some()
+            || self.trigger(name).is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn table(&self, name: &str) -> Option<&TableSchema> {
+        map_get_ci(&self.tables, name)
+    }
+
+    #[must_use]
+    pub(crate) fn index(&self, name: &str) -> Option<&IndexSchema> {
+        map_get_ci(&self.indexes, name)
+    }
+
+    #[must_use]
+    pub(crate) fn view(&self, name: &str) -> Option<&ViewSchema> {
+        map_get_ci(&self.views, name)
+    }
+
+    #[must_use]
+    pub(crate) fn trigger(&self, name: &str) -> Option<&TriggerSchema> {
+        map_get_ci(&self.triggers, name)
     }
 }

@@ -226,7 +226,7 @@ namespace DecentDB.AdoNet
                 var stepResult = stmt.Step();
                 if (stepResult < 0)
                 {
-                    var ex = new DecentDBException(stmt.RowsAffected > 0 ? (int)stmt.RowsAffected : stepResult,
+                    var ex = new DecentDBException(stepResult,
                         db.LastErrorMessage, sql);
                     if (observation != null)
                     {
@@ -438,7 +438,7 @@ namespace DecentDB.AdoNet
 
                 if (stepResult < 0)
                 {
-                    var ex = new DecentDBException(stmt.RowsAffected > 0 ? (int)stmt.RowsAffected : stepResult,
+                    var ex = new DecentDBException(stepResult,
                         _connection.GetNativeDb().LastErrorMessage, sql);
                     InvalidatePreparedStatement();
                     throw ex;

@@ -1,8 +1,8 @@
 //! DDL execution helpers.
 
 use crate::catalog::{
-    CheckConstraint, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint, IndexColumn, IndexKind,
-    IndexSchema, TableSchema,
+    identifiers_equal, CheckConstraint, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint,
+    IndexColumn, IndexKind, IndexSchema, TableSchema,
 };
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
@@ -17,7 +17,7 @@ use super::{EngineRuntime, TableData};
 impl EngineRuntime {
     pub(super) fn execute_create_table(&mut self, statement: &CreateTableStatement) -> Result<()> {
         if self.catalog.contains_object(&statement.table_name) {
-            if statement.if_not_exists && self.catalog.tables.contains_key(&statement.table_name) {
+            if statement.if_not_exists && self.catalog.table(&statement.table_name).is_some() {
                 return Ok(());
             }
             return Err(DbError::sql(format!(
@@ -74,7 +74,7 @@ impl EngineRuntime {
         for primary_key_column in &primary_key_columns {
             let column = columns
                 .iter_mut()
-                .find(|column| column.name == *primary_key_column)
+                .find(|column| identifiers_equal(&column.name, primary_key_column))
                 .ok_or_else(|| {
                     DbError::sql(format!(
                         "primary key column {} does not exist on {}",
@@ -185,7 +185,7 @@ impl EngineRuntime {
                 statement.index_name
             )));
         }
-        if self.catalog.views.contains_key(&statement.table_name) {
+        if self.catalog.view(&statement.table_name).is_some() {
             return Err(DbError::sql(format!(
                 "cannot create an index on view {}",
                 statement.table_name
@@ -193,8 +193,7 @@ impl EngineRuntime {
         }
         let table = self
             .catalog
-            .tables
-            .get(&statement.table_name)
+            .table(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
 
         let access_method = if statement.access_method.is_empty() {
@@ -245,13 +244,13 @@ impl EngineRuntime {
                 return Err(DbError::sql("partial expression indexes are not supported"));
             }
         }
-        if let Some(predicate) = &statement.predicate {
-            if statement.unique || kind != IndexKind::Btree || statement.columns.len() != 1 {
+        if let Some(_predicate) = &statement.predicate {
+            if kind != IndexKind::Btree || statement.columns.len() != 1 {
                 return Err(DbError::sql(
-                    "only single-column non-unique BTREE partial indexes are supported",
+                    "only single-column BTREE partial indexes are supported",
                 ));
             }
-            let column_name = match &statement.columns[0] {
+            let _column_name = match &statement.columns[0] {
                 IndexExpression::Column(column_name) => column_name,
                 IndexExpression::Expr(_) => {
                     return Err(DbError::sql(
@@ -259,12 +258,6 @@ impl EngineRuntime {
                     ))
                 }
             };
-            let expected = format!("{column_name} IS NOT NULL");
-            if !predicate.to_sql().eq_ignore_ascii_case(&expected) {
-                return Err(DbError::sql(
-                    "partial index predicate must be <indexed_column> IS NOT NULL",
-                ));
-            }
         }
 
         for column in &statement.columns {
@@ -272,7 +265,7 @@ impl EngineRuntime {
                 if !table
                     .columns
                     .iter()
-                    .any(|column| column.name == *column_name)
+                    .any(|column| identifiers_equal(&column.name, column_name))
                 {
                     return Err(DbError::sql(format!(
                         "index column {} does not exist on {}",

@@ -12,6 +12,7 @@ mod config;
 mod db;
 mod error;
 mod exec;
+mod json;
 mod metadata;
 mod planner;
 mod record;

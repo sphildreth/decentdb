@@ -161,6 +161,7 @@ pub(crate) enum Expr {
         query: Box<Query>,
         negated: bool,
     },
+    ScalarSubquery(Box<Query>),
     Exists(Box<Query>),
     Like {
         expr: Box<Expr>,
@@ -184,6 +185,12 @@ pub(crate) enum Expr {
         star: bool,
     },
     RowNumber {
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderBy>,
+    },
+    WindowFunction {
+        name: String,
+        args: Vec<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<OrderBy>,
     },
@@ -640,6 +647,7 @@ impl Expr {
                 if *negated { "NOT " } else { "" },
                 query.to_sql()
             ),
+            Self::ScalarSubquery(query) => format!("({})", query.to_sql()),
             Self::Exists(query) => format!("EXISTS ({})", query.to_sql()),
             Self::Like {
                 expr,
@@ -715,6 +723,40 @@ impl Expr {
                     ));
                 }
                 format!("ROW_NUMBER() OVER ({})", over_parts.join(" "))
+            }
+            Self::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+            } => {
+                let mut over_parts = Vec::new();
+                if !partition_by.is_empty() {
+                    over_parts.push(format!(
+                        "PARTITION BY {}",
+                        partition_by
+                            .iter()
+                            .map(Expr::to_sql)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !order_by.is_empty() {
+                    over_parts.push(format!(
+                        "ORDER BY {}",
+                        order_by
+                            .iter()
+                            .map(OrderBy::to_sql)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                format!(
+                    "{}({}) OVER ({})",
+                    name.to_ascii_uppercase(),
+                    args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", "),
+                    over_parts.join(" ")
+                )
             }
             Self::Case {
                 operand,

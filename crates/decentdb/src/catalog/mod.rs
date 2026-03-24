@@ -7,7 +7,7 @@ pub(crate) mod schema;
 
 pub(crate) use objects::CatalogHandle;
 pub(crate) use schema::{
-    CatalogState, CheckConstraint, ColumnSchema, ColumnType, ForeignKeyAction,
+    identifiers_equal, CatalogState, CheckConstraint, ColumnSchema, ColumnType, ForeignKeyAction,
     ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
     TriggerKind, TriggerSchema, ViewSchema,
 };

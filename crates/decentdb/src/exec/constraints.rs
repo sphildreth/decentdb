@@ -1,12 +1,15 @@
 //! Constraint enforcement helpers.
 
-use crate::catalog::{ColumnSchema, IndexKind, IndexSchema, TableSchema};
+use crate::catalog::{identifiers_equal, ColumnSchema, IndexKind, IndexSchema, TableSchema};
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
 use crate::sql::ast::ConflictTarget;
 use crate::sql::parser::parse_expression_sql;
 
-use super::{compare_values, table_row_dataset, EngineRuntime, RuntimeIndex, StoredRow};
+use super::{
+    compare_values, row_satisfies_index_predicate, table_row_dataset, EngineRuntime, RuntimeIndex,
+    StoredRow,
+};
 
 impl EngineRuntime {
     pub(super) fn coerce_row_values(
@@ -58,8 +61,7 @@ impl EngineRuntime {
     ) -> Result<()> {
         let table = self
             .catalog
-            .tables
-            .get(table_name)
+            .table(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
 
         for (column, value) in table.columns.iter().zip(row) {
@@ -78,6 +80,13 @@ impl EngineRuntime {
         }
 
         for index in unique_indexes_for_table(self, table_name) {
+            let probe = StoredRow {
+                row_id: existing_row_id.unwrap_or(0),
+                values: row.to_vec(),
+            };
+            if !row_satisfies_index_predicate(self, index, table, &probe)? {
+                continue;
+            }
             let candidate = index_values(self, index, table, row)?;
             if candidate.iter().any(|value| matches!(value, Value::Null)) {
                 continue;
@@ -101,6 +110,9 @@ impl EngineRuntime {
                 .unwrap_or(&[]);
             for existing in rows {
                 if Some(existing.row_id) == existing_row_id {
+                    continue;
+                }
+                if !row_satisfies_index_predicate(self, index, table, existing)? {
                     continue;
                 }
                 let existing_values = index_values(self, index, table, &existing.values)?;
@@ -190,17 +202,23 @@ impl EngineRuntime {
     ) -> Result<Option<StoredRow>> {
         let table = self
             .catalog
-            .tables
-            .get(table_name)
+            .table(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
         let indexes = indexes_for_conflict_target(self, table_name, target)?;
         if indexes.is_empty() {
             return Ok(None);
         }
-        let Some(table_data) = self.tables.get(table_name) else {
+        let Some(table_data) = self.table_data(table_name) else {
             return Ok(None);
         };
         for index in indexes {
+            let probe = StoredRow {
+                row_id: 0,
+                values: row.to_vec(),
+            };
+            if !row_satisfies_index_predicate(self, index, table, &probe)? {
+                continue;
+            }
             let candidate = index_values(self, index, table, row)?;
             if candidate.iter().any(|value| matches!(value, Value::Null)) {
                 continue;
@@ -216,8 +234,14 @@ impl EngineRuntime {
                 continue;
             }
             if let Some(existing) = table_data.rows.iter().find(|existing| {
-                index_values(self, index, table, &existing.values)
-                    .and_then(|existing_values| values_equal(&candidate, &existing_values))
+                row_satisfies_index_predicate(self, index, table, existing)
+                    .and_then(|matches| {
+                        if !matches {
+                            return Ok(false);
+                        }
+                        index_values(self, index, table, &existing.values)
+                            .and_then(|existing_values| values_equal(&candidate, &existing_values))
+                    })
                     .unwrap_or(false)
             }) {
                 return Ok(Some(existing.clone()));
@@ -271,7 +295,7 @@ fn unique_indexes_for_table<'a>(
         .catalog
         .indexes
         .values()
-        .filter(|index| index.table_name == table_name && index.unique)
+        .filter(|index| identifiers_equal(&index.table_name, table_name) && index.unique)
         .collect()
 }
 
@@ -315,7 +339,10 @@ fn indexes_for_conflict_target<'a>(
                             .iter()
                             .zip(columns)
                             .all(|(candidate, target)| {
-                                candidate.column_name.as_deref() == Some(target.as_str())
+                                candidate
+                                    .column_name
+                                    .as_deref()
+                                    .is_some_and(|name| identifiers_equal(name, target))
                                     && candidate.expression_sql.is_none()
                             })
                 })
@@ -381,7 +408,7 @@ fn lookup_column_value<'a>(
     let index = table
         .columns
         .iter()
-        .position(|column| column.name == column_name)
+        .position(|column| identifiers_equal(&column.name, column_name))
         .ok_or_else(|| DbError::constraint(format!("unknown column {}", column_name)))?;
     row.get(index)
         .ok_or_else(|| DbError::internal("row is shorter than table schema"))

@@ -1,6 +1,6 @@
 //! DML execution helpers.
 
-use crate::catalog::{ColumnType, IndexKind, TriggerEvent};
+use crate::catalog::{identifiers_equal, ColumnType, IndexKind, TriggerEvent};
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
 use crate::record::row::Row;
@@ -59,7 +59,7 @@ pub(crate) struct PreparedSimpleInsert {
 
 impl EngineRuntime {
     pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
-        if self.catalog.views.contains_key(&statement.table_name) || statement.on_conflict.is_some()
+        if self.catalog.view(&statement.table_name).is_some() || statement.on_conflict.is_some()
         {
             return false;
         }
@@ -74,7 +74,7 @@ impl EngineRuntime {
     }
 
     pub(crate) fn can_reuse_prepared_simple_insert(&self, prepared: &PreparedSimpleInsert) -> bool {
-        self.catalog.tables.contains_key(&prepared.table_name)
+        self.catalog.table(&prepared.table_name).is_some()
             && (prepared.use_generic_validation
                 || prepared
                     .unique_indexes
@@ -97,8 +97,7 @@ impl EngineRuntime {
 
         let table = self
             .catalog
-            .tables
-            .get(&statement.table_name)
+            .table(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
         let InsertSource::Values(rows) = &statement.source else {
             return Ok(None);
@@ -129,7 +128,7 @@ impl EngineRuntime {
             let column_index = table
                 .columns
                 .iter()
-                .position(|column| column.name == *column_name)
+                .position(|column| identifiers_equal(&column.name, column_name))
                 .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
             if assigned[column_index].is_some() {
                 return Err(DbError::sql(format!(
@@ -168,7 +167,7 @@ impl EngineRuntime {
             .collect::<Vec<_>>();
         let primary_auto_row_id_column_index = if table.primary_key_columns.len() == 1 {
             table.columns.iter().position(|column| {
-                column.name == table.primary_key_columns[0] && column.auto_increment
+                identifiers_equal(&column.name, &table.primary_key_columns[0]) && column.auto_increment
             })
         } else {
             None
@@ -194,7 +193,7 @@ impl EngineRuntime {
             .catalog
             .indexes
             .values()
-            .filter(|index| index.table_name == statement.table_name && index.unique)
+            .filter(|index| identifiers_equal(&index.table_name, &statement.table_name) && index.unique)
         {
             let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
                 use_generic_validation = true;
@@ -209,7 +208,7 @@ impl EngineRuntime {
             .catalog
             .indexes
             .values()
-            .filter(|index| index.table_name == statement.table_name && index.fresh)
+            .filter(|index| identifiers_equal(&index.table_name, &statement.table_name) && index.fresh)
         {
             let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
                 use_generic_index_updates = true;
@@ -360,7 +359,7 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if self.catalog.views.contains_key(&statement.table_name) {
+        if self.catalog.view(&statement.table_name).is_some() {
             if !statement.returning.is_empty() {
                 return Err(DbError::sql(
                     "INSERT ... RETURNING is not supported for view INSTEAD OF triggers",
@@ -505,7 +504,7 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if self.catalog.views.contains_key(&statement.table_name) {
+        if self.catalog.view(&statement.table_name).is_some() {
             let affected = view_match_count(
                 self,
                 &statement.table_name,
@@ -609,7 +608,7 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if self.catalog.views.contains_key(&statement.table_name) {
+        if self.catalog.view(&statement.table_name).is_some() {
             let affected = view_match_count(
                 self,
                 &statement.table_name,
@@ -904,7 +903,7 @@ impl EngineRuntime {
                                     let column_index = child_table
                                         .columns
                                         .iter()
-                                        .position(|column| column.name == *column_name)
+                                        .position(|column| identifiers_equal(&column.name, column_name))
                                         .ok_or_else(|| {
                                             DbError::internal(format!(
                                                 "unknown child foreign-key column {}",
@@ -1349,6 +1348,9 @@ fn apply_prepared_insert_index_updates(
     check_unique: bool,
 ) -> Result<()> {
     for index in &prepared.insert_indexes {
+        if index.unique && prepared_index_contains_null(index, &row.values) {
+            continue;
+        }
         let key = prepared_btree_index_key(index, &row.values)?;
         let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name) else {
             return Err(DbError::internal(format!(
@@ -1621,7 +1623,7 @@ fn parent_key_values(
             let index = table
                 .columns
                 .iter()
-                .position(|column| column.name == *column_name)
+                .position(|column| identifiers_equal(&column.name, column_name))
                 .ok_or_else(|| {
                     DbError::internal(format!("unknown parent column {}", column_name))
                 })?;

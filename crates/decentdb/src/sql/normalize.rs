@@ -390,6 +390,7 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
                             vec![column.colname.clone()],
                         )?)
                     }
+                    protobuf::ConstrType::ConstrNull => {}
                     protobuf::ConstrType::ConstrNotnull => not_null = true,
                     other => {
                         return Err(unsupported(format!(
@@ -1098,21 +1099,24 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                 negated,
             })
         }
-        protobuf::AExprKind::AexprLike | protobuf::AExprKind::AexprIlike => Ok(Expr::Like {
-            expr: Box::new(normalize_expr_node(
-                expr.lexpr
-                    .as_deref()
-                    .ok_or_else(|| unsupported("LIKE is missing its left operand"))?,
-            )?),
-            pattern: Box::new(normalize_expr_node(
+        protobuf::AExprKind::AexprLike | protobuf::AExprKind::AexprIlike => {
+            let (pattern, escape) = normalize_like_pattern(
                 expr.rexpr
                     .as_deref()
                     .ok_or_else(|| unsupported("LIKE is missing its pattern"))?,
-            )?),
-            escape: None,
-            case_insensitive: kind == protobuf::AExprKind::AexprIlike,
-            negated: false,
-        }),
+            )?;
+            Ok(Expr::Like {
+                expr: Box::new(normalize_expr_node(
+                    expr.lexpr
+                        .as_deref()
+                        .ok_or_else(|| unsupported("LIKE is missing its left operand"))?,
+                )?),
+                pattern: Box::new(pattern),
+                escape: escape.map(Box::new),
+                case_insensitive: kind == protobuf::AExprKind::AexprIlike,
+                negated: false,
+            })
+        }
         protobuf::AExprKind::AexprBetween | protobuf::AExprKind::AexprNotBetween => {
             let bounds = match node_kind(
                 expr.rexpr
@@ -1187,10 +1191,18 @@ fn normalize_bool_expr(expr: &protobuf::BoolExpr) -> Result<Expr> {
 
 fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
     let name = normalize_qualified_name(&call.funcname)?;
+    let args = call
+        .args
+        .iter()
+        .map(normalize_expr_container)
+        .collect::<Result<Vec<_>>>()?;
     if call.over.is_some() {
-        if name != "row_number" {
+        if !matches!(
+            name.as_str(),
+            "row_number" | "rank" | "dense_rank" | "lag" | "lead"
+        ) {
             return Err(unsupported(
-                "only ROW_NUMBER() OVER (...) is supported as a window function",
+                "only ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), and LEAD() OVER (...) are supported as window functions",
             ));
         }
         let window = call
@@ -1198,28 +1210,33 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
             .as_deref()
             .ok_or_else(|| unsupported("window function is missing its OVER clause"))?;
         if window.order_clause.is_empty() {
-            return Err(unsupported("ROW_NUMBER() requires ORDER BY in OVER (...)"));
+            return Err(unsupported("window functions require ORDER BY in OVER (...)"));
         }
-        return Ok(Expr::RowNumber {
-            partition_by: window
-                .partition_clause
-                .iter()
-                .map(normalize_expr_container)
-                .collect::<Result<Vec<_>>>()?,
-            order_by: window
-                .order_clause
-                .iter()
-                .map(normalize_order_by_node)
-                .collect::<Result<Vec<_>>>()?,
-        });
+        let partition_by = window
+            .partition_clause
+            .iter()
+            .map(normalize_expr_container)
+            .collect::<Result<Vec<_>>>()?;
+        let order_by = window
+            .order_clause
+            .iter()
+            .map(normalize_order_by_node)
+            .collect::<Result<Vec<_>>>()?;
+        return if name == "row_number" {
+            Ok(Expr::RowNumber {
+                partition_by,
+                order_by,
+            })
+        } else {
+            Ok(Expr::WindowFunction {
+                name,
+                args,
+                partition_by,
+                order_by,
+            })
+        };
     }
-
-    let args = call
-        .args
-        .iter()
-        .map(normalize_expr_container)
-        .collect::<Result<Vec<_>>>()?;
-    if matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+    if matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max" | "group_concat") {
         return Ok(Expr::Aggregate {
             name,
             args,
@@ -1229,6 +1246,23 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
     }
 
     Ok(Expr::Function { name, args })
+}
+
+fn normalize_like_pattern(node: &protobuf::Node) -> Result<(Expr, Option<Expr>)> {
+    match node_kind(node)? {
+        NodeEnum::FuncCall(call) if normalize_qualified_name(&call.funcname)? == "pg_catalog.like_escape" => {
+            if call.args.len() != 2 {
+                return Err(unsupported(
+                    "pg_catalog.like_escape requires a pattern and escape expression",
+                ));
+            }
+            Ok((
+                normalize_expr_container(&call.args[0])?,
+                Some(normalize_expr_container(&call.args[1])?),
+            ))
+        }
+        _ => Ok((normalize_expr_node(node)?, None)),
+    }
 }
 
 fn normalize_case_expr(case: &protobuf::CaseExpr) -> Result<Expr> {
@@ -1295,6 +1329,13 @@ fn normalize_sublink(link: &protobuf::SubLink) -> Result<Expr> {
                 link.subselect
                     .as_deref()
                     .ok_or_else(|| unsupported("EXISTS is missing its subquery"))?,
+            )?)?)))
+        }
+        protobuf::SubLinkType::ExprSublink => {
+            Ok(Expr::ScalarSubquery(Box::new(normalize_query(as_select_stmt(
+                link.subselect
+                    .as_deref()
+                    .ok_or_else(|| unsupported("scalar subquery is missing its SELECT"))?,
             )?)?)))
         }
         other => Err(unsupported(format!(

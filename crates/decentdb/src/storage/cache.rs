@@ -236,6 +236,14 @@ impl Drop for PageHandle {
 #[cfg(test)]
 mod tests {
     use super::PageCache;
+    use std::cell::Cell;
+
+    fn dirty_flag(cache: &PageCache, page_id: u32) -> bool {
+        let state = cache.state.lock().expect("cache state");
+        let page = state.pages.get(&page_id).expect("page exists");
+        let dirty = page.inner.lock().expect("page inner").dirty;
+        dirty
+    }
 
     #[test]
     fn all_pages_pinned_returns_transaction_error() {
@@ -253,5 +261,110 @@ mod tests {
         assert_eq!(first.read().expect("read first page"), vec![1, 1, 1, 1]);
         assert_eq!(second.read().expect("read second page"), vec![2, 2, 2, 2]);
         assert!(matches!(error, crate::error::DbError::Transaction { .. }));
+    }
+
+    #[test]
+    fn lru_eviction_reloads_oldest_unpinned_page() {
+        let cache = PageCache::new(2, 4);
+        drop(
+            cache
+                .pin_or_load(1, || Ok(vec![1, 1, 1, 1]))
+                .expect("load page1"),
+        );
+        drop(
+            cache
+                .pin_or_load(2, || Ok(vec![2, 2, 2, 2]))
+                .expect("load page2"),
+        );
+
+        drop(
+            cache
+                .pin_or_load(1, || panic!("page1 should still be cached"))
+                .expect("repin page1"),
+        );
+
+        drop(
+            cache
+                .pin_or_load(3, || Ok(vec![3, 3, 3, 3]))
+                .expect("load page3"),
+        );
+
+        drop(
+            cache
+                .pin_or_load(1, || panic!("page1 should remain cached"))
+                .expect("repin page1 again"),
+        );
+
+        let page2_loads = Cell::new(0);
+        let page2 = cache
+            .pin_or_load(2, || {
+                page2_loads.set(page2_loads.get() + 1);
+                Ok(vec![2, 2, 2, 2])
+            })
+            .expect("reload evicted page2");
+        assert_eq!(page2.read().expect("read page2"), vec![2, 2, 2, 2]);
+        assert_eq!(page2_loads.get(), 1, "page2 should be loaded again");
+    }
+
+    #[test]
+    fn dirty_tracking_clear_and_discard_work() {
+        let cache = PageCache::new(2, 4);
+        cache
+            .insert_clean_page(1, vec![1, 1, 1, 1])
+            .expect("insert clean page");
+        cache
+            .insert_page(2, vec![2, 2, 2, 2], true)
+            .expect("insert dirty page");
+
+        assert!(!dirty_flag(&cache, 1));
+        assert!(dirty_flag(&cache, 2));
+
+        cache.discard(2).expect("discard page");
+        let page2_loads = Cell::new(0);
+        let page2 = cache
+            .pin_or_load(2, || {
+                page2_loads.set(page2_loads.get() + 1);
+                Ok(vec![2, 2, 2, 2])
+            })
+            .expect("reload discarded page");
+        assert_eq!(page2.read().expect("read page2"), vec![2, 2, 2, 2]);
+        assert_eq!(page2_loads.get(), 1);
+        drop(page2);
+
+        cache.clear().expect("clear cache");
+        let page1_loads = Cell::new(0);
+        let page1 = cache
+            .pin_or_load(1, || {
+                page1_loads.set(page1_loads.get() + 1);
+                Ok(vec![1, 1, 1, 1])
+            })
+            .expect("reload page1");
+        assert_eq!(page1.read().expect("read page1"), vec![1, 1, 1, 1]);
+        assert_eq!(page1_loads.get(), 1);
+    }
+
+    #[test]
+    fn pin_unpin_allows_reloading_after_drop() {
+        let cache = PageCache::new(1, 4);
+        let first = cache
+            .pin_or_load(1, || Ok(vec![1, 1, 1, 1]))
+            .expect("load page1");
+        let error = cache
+            .pin_or_load(2, || Ok(vec![2, 2, 2, 2]))
+            .expect_err("cache should be full while page1 is pinned");
+        assert!(matches!(error, crate::error::DbError::Transaction { .. }));
+
+        drop(first);
+
+        let second = cache
+            .pin_or_load(2, || Ok(vec![2, 2, 2, 2]))
+            .expect("load page2 after unpin");
+        assert_eq!(second.read().expect("read page2"), vec![2, 2, 2, 2]);
+        drop(second);
+
+        let first_reload = cache
+            .pin_or_load(1, || Ok(vec![1, 1, 1, 1]))
+            .expect("reload page1 after dropping page2");
+        assert_eq!(first_reload.read().expect("read page1"), vec![1, 1, 1, 1]);
     }
 }

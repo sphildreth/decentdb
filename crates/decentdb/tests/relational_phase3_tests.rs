@@ -753,6 +753,196 @@ fn transaction_handle_reuses_prepared_statements_without_db_lock_churn() {
 }
 
 #[test]
+fn prepared_delete_with_correlated_exists_reports_affected_rows() {
+    let path = unique_db_path("phase3-prepared-delete-exists");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute(r#"CREATE TABLE "del_artists" ("Id" INT64 PRIMARY KEY, "LibraryId" INT64, "Name" TEXT)"#)
+        .expect("create artists");
+    db.execute(r#"CREATE TABLE "del_contributors" ("Id" INT64 PRIMARY KEY, "ArtistId" INT64, "Name" TEXT)"#)
+        .expect("create contributors");
+    db.execute(r#"INSERT INTO "del_artists" VALUES (1, 10, 'Artist1')"#)
+        .expect("insert artist1");
+    db.execute(r#"INSERT INTO "del_artists" VALUES (2, 20, 'Artist2')"#)
+        .expect("insert artist2");
+    db.execute(r#"INSERT INTO "del_contributors" VALUES (1, 1, 'Contrib1')"#)
+        .expect("insert contributor1");
+    db.execute(r#"INSERT INTO "del_contributors" VALUES (2, 2, 'Contrib2')"#)
+        .expect("insert contributor2");
+
+    let delete = db
+        .prepare(
+            r#"
+            DELETE FROM "del_contributors"
+            WHERE EXISTS (
+                SELECT 1 FROM "del_contributors" AS "c"
+                INNER JOIN "del_artists" AS "a" ON "c"."ArtistId" = "a"."Id"
+                WHERE "a"."LibraryId" = $1
+                AND "del_contributors"."Id" = "c"."Id"
+            )"#,
+        )
+        .expect("prepare delete");
+    let result = delete
+        .execute(&[Value::Int64(10)])
+        .expect("execute prepared delete");
+    assert_eq!(result.affected_rows(), 1);
+
+    let remaining = db
+        .execute(r#"SELECT COUNT(*) FROM "del_contributors""#)
+        .expect("count remaining rows");
+    assert_eq!(remaining.rows()[0].values(), &[Value::Int64(1)]);
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn prepared_unique_nullable_indexes_allow_multiple_nulls() {
+    let path = unique_db_path("phase3-nullable-unique-prepared");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE artists (id INT64 PRIMARY KEY, spotify_id TEXT)")
+        .expect("create artists");
+    db.execute("CREATE UNIQUE INDEX ux_artists_spotify ON artists (spotify_id)")
+        .expect("create unique index");
+
+    let insert = db
+        .prepare("INSERT INTO artists (id, spotify_id) VALUES ($1, $2)")
+        .expect("prepare insert");
+    insert
+        .execute(&[Value::Int64(1), Value::Null])
+        .expect("insert first null");
+    insert
+        .execute(&[Value::Int64(2), Value::Null])
+        .expect("insert second null");
+
+    let rows = db
+        .execute("SELECT COUNT(*) FROM artists")
+        .expect("count rows");
+    assert_eq!(rows.rows()[0].values(), &[Value::Int64(2)]);
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn create_table_accepts_explicit_null_column_constraints() {
+    let path = unique_db_path("phase3-explicit-null-constraint");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE sample (id INT64 PRIMARY KEY, optional_name TEXT NULL)")
+        .expect("create table with explicit NULL constraint");
+
+    db.execute("INSERT INTO sample (id, optional_name) VALUES (1, NULL)")
+        .expect("insert null value");
+    let rows = db
+        .execute("SELECT optional_name FROM sample WHERE id = 1")
+        .expect("select row");
+    assert_eq!(rows.rows()[0].values(), &[Value::Null]);
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn like_escape_treats_escaped_wildcards_as_literals() {
+    let path = unique_db_path("phase3-like-escape");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, name TEXT)")
+        .expect("create docs");
+    db.execute("INSERT INTO docs VALUES (1, 'raw%_name'), (2, 'plain_name')")
+        .expect("seed docs");
+
+    let rows = db
+        .execute("SELECT name FROM docs WHERE name LIKE '%\\%\\_%' ESCAPE '\\' ORDER BY id")
+        .expect("query escaped like");
+    assert_eq!(rows.rows().len(), 1);
+    assert_eq!(rows.rows()[0].values(), &[Value::Text("raw%_name".to_string())]);
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn integer_division_uses_sql_integer_semantics() {
+    let path = unique_db_path("phase3-integer-division");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    let rows = db
+        .execute("SELECT 5 / 2, 7 / 3, 1 / 0")
+        .expect("evaluate integer division");
+    assert_eq!(
+        rows.rows()[0].values(),
+        &[Value::Int64(2), Value::Int64(2), Value::Null]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn prepared_left_join_or_blob_comparison_preserves_matching_rows() {
+    let path = unique_db_path("phase3-left-join-blob-or");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE artists (id INT64 PRIMARY KEY, name_normalized TEXT, music_brainz_id BLOB)")
+        .expect("create artists");
+    db.execute("CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64)")
+        .expect("create albums");
+    let insert = db
+        .prepare("INSERT INTO artists VALUES ($1, $2, $3)")
+        .expect("prepare artist insert");
+    insert
+        .execute(&[
+            Value::Int64(1),
+            Value::Text("beatles".to_string()),
+            Value::Blob(vec![0x11; 16]),
+        ])
+        .expect("seed artists");
+    db.execute("INSERT INTO albums VALUES (1, 1), (2, 1)")
+        .expect("seed albums");
+
+    let query = db
+        .prepare(
+            "SELECT a.id, b.id \
+             FROM artists AS a \
+             LEFT JOIN albums AS b ON a.id = b.artist_id \
+             WHERE a.name_normalized = $1 \
+                OR (a.music_brainz_id IS NOT NULL AND a.music_brainz_id = $2) \
+             ORDER BY a.id, b.id",
+        )
+        .expect("prepare query");
+    let rows = query
+        .execute(&[
+            Value::Text("beatles".to_string()),
+            Value::Blob(vec![0x11; 16]),
+        ])
+        .expect("execute query");
+
+    assert_eq!(rows.rows().len(), 2);
+    assert_eq!(rows.rows()[0].values(), &[Value::Int64(1), Value::Int64(1)]);
+    assert_eq!(rows.rows()[1].values(), &[Value::Int64(1), Value::Int64(2)]);
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn updating_int64_column_accepts_boolean_values() {
+    let path = unique_db_path("phase3-bool-to-int64-update");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE artists (id INT64 PRIMARY KEY, is_locked INT64)")
+        .expect("create artists");
+    db.execute("INSERT INTO artists VALUES (1, 0)")
+        .expect("seed row");
+    db.execute("UPDATE artists SET is_locked = TRUE WHERE id = 1")
+        .expect("update with bool");
+
+    let rows = db
+        .execute("SELECT is_locked FROM artists WHERE id = 1")
+        .expect("query updated row");
+    assert_eq!(rows.rows()[0].values(), &[Value::Int64(1)]);
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn transaction_handle_blocks_db_execution_until_finished() {
     let path = unique_db_path("phase1-transaction-handle-exclusive");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

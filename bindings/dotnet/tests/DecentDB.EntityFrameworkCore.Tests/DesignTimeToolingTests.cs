@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using Xunit;
 
@@ -197,42 +198,44 @@ public sealed class DesignTimeToolingTests
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
             CopyFirstExisting(
+                Path.Combine(outputDirectory, "libdecentdb.so"),
+                Path.Combine(repoRoot, "target", "debug", "libdecentdb.so"),
+                Path.Combine(repoRoot, "target", "release", "libdecentdb.so"),
                 Path.Combine(repoRoot, "build", "libdecentdb.so"),
                 Path.Combine(repoRoot, "build", "libc_api.so"),
-                Path.Combine(repoRoot, "libdecentdb.so"),
-                destinationPath: Path.Combine(outputDirectory, "libdecentdb.so"));
+                Path.Combine(repoRoot, "libdecentdb.so"));
             return;
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         {
             CopyFirstExisting(
+                Path.Combine(outputDirectory, "libdecentdb.dylib"),
+                Path.Combine(repoRoot, "target", "debug", "libdecentdb.dylib"),
+                Path.Combine(repoRoot, "target", "release", "libdecentdb.dylib"),
                 Path.Combine(repoRoot, "build", "libdecentdb.dylib"),
                 Path.Combine(repoRoot, "build", "libc_api.dylib"),
-                Path.Combine(repoRoot, "libdecentdb.dylib"),
-                destinationPath: Path.Combine(outputDirectory, "libdecentdb.dylib"));
+                Path.Combine(repoRoot, "libdecentdb.dylib"));
             return;
         }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             CopyFirstExisting(
+                Path.Combine(outputDirectory, "decentdb.dll"),
+                Path.Combine(repoRoot, "target", "debug", "decentdb.dll"),
+                Path.Combine(repoRoot, "target", "release", "decentdb.dll"),
                 Path.Combine(repoRoot, "build", "decentdb.dll"),
                 Path.Combine(repoRoot, "build", "c_api.dll"),
-                Path.Combine(repoRoot, "decentdb.dll"),
-                destinationPath: Path.Combine(outputDirectory, "decentdb.dll"));
+                Path.Combine(repoRoot, "decentdb.dll"));
         }
     }
 
-    private static void CopyFirstExisting(string firstPath, string secondPath, string thirdPath, string destinationPath)
+    private static void CopyFirstExisting(string destinationPath, params string[] candidatePaths)
     {
-        var source = File.Exists(firstPath)
-            ? firstPath
-            : File.Exists(secondPath)
-                ? secondPath
-                : thirdPath;
+        var source = candidatePaths.FirstOrDefault(File.Exists);
 
-        if (!File.Exists(source))
+        if (source is null)
         {
             throw new FileNotFoundException("Native DecentDB library not found for design-time tooling test.");
         }

@@ -11,6 +11,57 @@ namespace DecentDB.AdoNet
     /// </summary>
     public static class DecentDBMaintenance
     {
+        private static string ResolveCliExecutablePath(string cliExecutablePath)
+        {
+            if (Path.IsPathRooted(cliExecutablePath) && File.Exists(cliExecutablePath))
+            {
+                return cliExecutablePath;
+            }
+
+            if (File.Exists(cliExecutablePath))
+            {
+                return Path.GetFullPath(cliExecutablePath);
+            }
+
+            foreach (var baseDir in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+            {
+                if (string.IsNullOrWhiteSpace(baseDir))
+                {
+                    continue;
+                }
+
+                var di = new DirectoryInfo(baseDir);
+                for (var cursor = di; cursor != null; cursor = cursor.Parent)
+                {
+                    foreach (var candidate in CandidateCliPaths(cursor.FullName))
+                    {
+                        if (File.Exists(candidate))
+                        {
+                            return candidate;
+                        }
+                    }
+                }
+            }
+
+            return cliExecutablePath;
+        }
+
+        private static IEnumerable<string> CandidateCliPaths(string root)
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                yield return Path.Combine(root, "target", "debug", "decentdb.exe");
+                yield return Path.Combine(root, "target", "release", "decentdb.exe");
+                yield return Path.Combine(root, "decentdb.exe");
+                yield return Path.Combine(root, "decentdb");
+                yield break;
+            }
+
+            yield return Path.Combine(root, "target", "debug", "decentdb");
+            yield return Path.Combine(root, "target", "release", "decentdb");
+            yield return Path.Combine(root, "decentdb");
+        }
+
         /// <summary>
         /// Spawns the DecentDB CLI to perform an offline vacuum.
         /// Performs an atomic swap of the database file if successful.
@@ -32,6 +83,8 @@ namespace DecentDB.AdoNet
 
             if (!File.Exists(databasePath))
                 return false;
+
+            cliExecutablePath = ResolveCliExecutablePath(cliExecutablePath);
 
             var dbFileInfo = new FileInfo(databasePath);
             var tempPath = dbFileInfo.FullName + ".vacuum_tmp";

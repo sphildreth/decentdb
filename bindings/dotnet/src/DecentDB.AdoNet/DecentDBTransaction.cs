@@ -33,9 +33,7 @@ namespace DecentDB.AdoNet
                 throw new InvalidOperationException("Connection is not open");
             }
 
-            using var cmd = _connection.CreateCommand();
-            cmd.CommandText = "COMMIT";
-            cmd.ExecuteNonQuery();
+            _connection.GetNativeDb().CommitTransaction();
 
             _completed = true;
         }
@@ -54,9 +52,7 @@ namespace DecentDB.AdoNet
 
             try
             {
-                using var cmd = _connection.CreateCommand();
-                cmd.CommandText = "ROLLBACK";
-                cmd.ExecuteNonQuery();
+                _connection.GetNativeDb().RollbackTransaction();
             }
             catch
             {

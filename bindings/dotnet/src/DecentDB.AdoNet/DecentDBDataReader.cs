@@ -74,7 +74,7 @@ namespace DecentDB.AdoNet
         private long GetInt64Value(int ordinal)
         {
             return _statement.ColumnType(ordinal) == 17
-                ? DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal)
+                ? _statement.GetTimestampMicros(ordinal)
                 : _statement.GetInt64(ordinal);
         }
 
@@ -137,7 +137,7 @@ namespace DecentDB.AdoNet
                 4 => _statement.GetText(ordinal),
                 5 => _statement.GetBlob(ordinal),
                 12 => _statement.GetDecimal(ordinal),
-                17 => FromUnixEpochMicroseconds(DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal)),
+                17 => FromUnixEpochMicroseconds(_statement.GetTimestampMicros(ordinal)),
                 _ => DBNull.Value
             };
         }
@@ -188,12 +188,12 @@ namespace DecentDB.AdoNet
             }
             else if (nonNullableType == typeof(DateTime))
             {
-                var micros = DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal);
+                var micros = _statement.GetTimestampMicros(ordinal);
                 boxed = FromUnixEpochMicroseconds(micros);
             }
             else if (nonNullableType == typeof(DateTimeOffset))
             {
-                var micros = DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal);
+                var micros = _statement.GetTimestampMicros(ordinal);
                 boxed = new DateTimeOffset(FromUnixEpochMicroseconds(micros), TimeSpan.Zero);
             }
             else if (nonNullableType == typeof(DateOnly))
@@ -325,7 +325,7 @@ namespace DecentDB.AdoNet
 
         public override DateTime GetDateTime(int ordinal)
         {
-            var micros = DecentDBNativeUnsafe.decentdb_column_datetime(_statement.Handle, ordinal);
+            var micros = _statement.GetTimestampMicros(ordinal);
             return FromUnixEpochMicroseconds(micros);
         }
 

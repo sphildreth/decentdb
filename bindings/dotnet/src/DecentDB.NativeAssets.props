@@ -1,20 +1,36 @@
 <Project>
   <PropertyGroup>
+    <DecentDBLinuxTargetDebugNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/debug/libdecentdb.so'))</DecentDBLinuxTargetDebugNativePrimary>
+    <DecentDBLinuxTargetReleaseNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/release/libdecentdb.so'))</DecentDBLinuxTargetReleaseNativePrimary>
     <DecentDBLinuxBuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/libdecentdb.so'))</DecentDBLinuxBuildNativePrimary>
     <DecentDBLinuxBuildNativeFallback>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/libc_api.so'))</DecentDBLinuxBuildNativeFallback>
     <DecentDBLinuxPackagedNative>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)DecentDB.MicroOrm/runtimes/linux-x64/native/libdecentdb.so'))</DecentDBLinuxPackagedNative>
+    <DecentDBMacTargetDebugNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/debug/libdecentdb.dylib'))</DecentDBMacTargetDebugNativePrimary>
+    <DecentDBMacTargetReleaseNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/release/libdecentdb.dylib'))</DecentDBMacTargetReleaseNativePrimary>
     <DecentDBMacBuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/libdecentdb.dylib'))</DecentDBMacBuildNativePrimary>
     <DecentDBMacBuildNativeFallback>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/libc_api.dylib'))</DecentDBMacBuildNativeFallback>
     <DecentDBMacPackagedNative>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)DecentDB.MicroOrm/runtimes/osx-x64/native/libdecentdb.dylib'))</DecentDBMacPackagedNative>
+    <DecentDBWindowsTargetDebugNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/debug/decentdb.dll'))</DecentDBWindowsTargetDebugNativePrimary>
+    <DecentDBWindowsTargetReleaseNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/release/decentdb.dll'))</DecentDBWindowsTargetReleaseNativePrimary>
     <DecentDBWindowsBuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/decentdb.dll'))</DecentDBWindowsBuildNativePrimary>
     <DecentDBWindowsBuildNativeFallback>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/c_api.dll'))</DecentDBWindowsBuildNativeFallback>
     <DecentDBWindowsPackagedNative>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)DecentDB.MicroOrm/runtimes/win-x64/native/decentdb.dll'))</DecentDBWindowsPackagedNative>
   </PropertyGroup>
 
   <!-- Prefer fresh repo build outputs for source builds so the managed bindings stay aligned
-       with the current native engine. Fall back to packaged runtime assets when the repo's
-       native build outputs are unavailable. -->
+        with the current native engine. Fall back to packaged runtime assets when the repo's
+        native build outputs are unavailable. -->
   <Choose>
+    <When Condition="Exists('$(DecentDBLinuxTargetDebugNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBLinuxRuntimeAssetSource>$(DecentDBLinuxTargetDebugNativePrimary)</DecentDBLinuxRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+    <When Condition="Exists('$(DecentDBLinuxTargetReleaseNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBLinuxRuntimeAssetSource>$(DecentDBLinuxTargetReleaseNativePrimary)</DecentDBLinuxRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
     <When Condition="Exists('$(DecentDBLinuxBuildNativePrimary)')">
       <PropertyGroup>
         <DecentDBLinuxRuntimeAssetSource>$(DecentDBLinuxBuildNativePrimary)</DecentDBLinuxRuntimeAssetSource>
@@ -33,6 +49,16 @@
   </Choose>
 
   <Choose>
+    <When Condition="Exists('$(DecentDBMacTargetDebugNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBMacRuntimeAssetSource>$(DecentDBMacTargetDebugNativePrimary)</DecentDBMacRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+    <When Condition="Exists('$(DecentDBMacTargetReleaseNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBMacRuntimeAssetSource>$(DecentDBMacTargetReleaseNativePrimary)</DecentDBMacRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
     <When Condition="Exists('$(DecentDBMacBuildNativePrimary)')">
       <PropertyGroup>
         <DecentDBMacRuntimeAssetSource>$(DecentDBMacBuildNativePrimary)</DecentDBMacRuntimeAssetSource>
@@ -51,6 +77,16 @@
   </Choose>
 
   <Choose>
+    <When Condition="Exists('$(DecentDBWindowsTargetDebugNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBWindowsRuntimeAssetSource>$(DecentDBWindowsTargetDebugNativePrimary)</DecentDBWindowsRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+    <When Condition="Exists('$(DecentDBWindowsTargetReleaseNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBWindowsRuntimeAssetSource>$(DecentDBWindowsTargetReleaseNativePrimary)</DecentDBWindowsRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
     <When Condition="Exists('$(DecentDBWindowsBuildNativePrimary)')">
       <PropertyGroup>
         <DecentDBWindowsRuntimeAssetSource>$(DecentDBWindowsBuildNativePrimary)</DecentDBWindowsRuntimeAssetSource>

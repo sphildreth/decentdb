@@ -91,9 +91,7 @@ namespace DecentDB.AdoNet
                 isolationLevel = IsolationLevel.Snapshot;
             }
 
-            using var cmd = CreateCommand();
-            cmd.CommandText = "BEGIN";
-            cmd.ExecuteNonQuery();
+            _db.BeginTransaction();
 
             return new DecentDBTransaction(this, isolationLevel);
         }
@@ -540,7 +538,9 @@ namespace DecentDB.AdoNet
             var json = System.Text.Json.JsonDocument.Parse(ListIndexesJson());
             foreach (var idx in json.RootElement.EnumerateArray())
             {
-                var tableName = idx.GetProperty("table").GetString()!;
+                var tableName = idx.TryGetProperty("table", out var tableProperty)
+                    ? tableProperty.GetString()!
+                    : idx.GetProperty("table_name").GetString()!;
                 if (tableFilter != null && !string.Equals(tableName, tableFilter, StringComparison.OrdinalIgnoreCase))
                     continue;
 

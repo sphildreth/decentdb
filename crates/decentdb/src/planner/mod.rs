@@ -97,7 +97,7 @@ fn plan_select(select: &Select, catalog: &CatalogState) -> Result<PhysicalPlan> 
 fn plan_from_item(item: &FromItem, catalog: &CatalogState) -> Result<PhysicalPlan> {
     Ok(match item {
         FromItem::Table { name, .. } => PhysicalPlan::TableScan {
-            table: if catalog.views.contains_key(name) {
+            table: if catalog.view(name).is_some() {
                 format!("view:{name}")
             } else {
                 name.clone()
@@ -130,6 +130,7 @@ fn maybe_index_plan(
     let index = catalog.indexes.values().find(|index| {
         index.table_name == *name
             && index.columns.len() == 1
+            && index.predicate_sql.is_none()
             && index.columns[0]
                 .column_name
                 .as_ref()
@@ -202,7 +203,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             expr_has_aggregate(expr) || items.iter().any(expr_has_aggregate)
         }
         Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
-        Expr::Exists(_) => false,
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => false,
         Expr::Like {
             expr,
             pattern,
@@ -215,7 +216,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
         }
         Expr::IsNull { expr, .. } => expr_has_aggregate(expr),
         Expr::Function { args, .. } => args.iter().any(expr_has_aggregate),
-        Expr::RowNumber { .. } => false,
+        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => false,
         Expr::Case {
             operand,
             branches,

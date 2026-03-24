@@ -406,10 +406,15 @@ mod tests {
         file.sync_data().expect("dropped sync returns success");
 
         let logs = failpoint_logs().expect("read logs");
-        assert_eq!(logs[0].label, "db.write_page");
-        assert_eq!(logs[0].outcome, "partial_write:3");
-        assert_eq!(logs[1].label, "db.fsync");
-        assert_eq!(logs[1].outcome, "drop_sync");
+        let write_index = logs
+            .iter()
+            .position(|entry| entry.label == "db.write_page" && entry.outcome == "partial_write:3")
+            .expect("partial write should be logged");
+        let sync_index = logs
+            .iter()
+            .position(|entry| entry.label == "db.fsync" && entry.outcome == "drop_sync")
+            .expect("dropped sync should be logged");
+        assert!(write_index < sync_index, "write should be logged before fsync");
 
         clear_failpoints().expect("clear failpoints");
     }

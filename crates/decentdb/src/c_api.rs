@@ -1334,4 +1334,58 @@ mod tests {
 
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }
+
+    #[test]
+    fn ffi_prepared_delete_with_correlated_exists_reports_affected_rows() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let mut result = ptr::null_mut();
+        for sql in [
+            r#"CREATE TABLE "del_artists" ("Id" INT64 PRIMARY KEY, "LibraryId" INT64, "Name" TEXT)"#,
+            r#"CREATE TABLE "del_contributors" ("Id" INT64 PRIMARY KEY, "ArtistId" INT64, "Name" TEXT)"#,
+            r#"INSERT INTO "del_artists" VALUES (1, 10, 'Artist1')"#,
+            r#"INSERT INTO "del_artists" VALUES (2, 20, 'Artist2')"#,
+            r#"INSERT INTO "del_contributors" VALUES (1, 1, 'Contrib1')"#,
+            r#"INSERT INTO "del_contributors" VALUES (2, 2, 'Contrib2')"#,
+        ] {
+            let sql = CString::new(sql).expect("sql");
+            assert_eq!(ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result), DDB_OK);
+            assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        }
+
+        let delete = CString::new(
+            r#"
+            DELETE FROM "del_contributors"
+            WHERE EXISTS (
+                SELECT 1 FROM "del_contributors" AS "c"
+                INNER JOIN "del_artists" AS "a" ON "c"."ArtistId" = "a"."Id"
+                WHERE "a"."LibraryId" = $1
+                AND "del_contributors"."Id" = "c"."Id"
+            )"#,
+        )
+        .expect("delete sql");
+        let mut stmt = ptr::null_mut();
+        assert_eq!(ddb_db_prepare(db, delete.as_ptr(), &mut stmt), DDB_OK);
+        assert_eq!(ddb_stmt_bind_int64(stmt, 1, 10), DDB_OK);
+
+        let mut has_row = 1;
+        assert_eq!(ddb_stmt_step(stmt, &mut has_row), DDB_OK);
+        assert_eq!(has_row, 0);
+
+        let mut affected_rows = 0;
+        assert_eq!(ddb_stmt_affected_rows(stmt, &mut affected_rows), DDB_OK);
+        assert_eq!(affected_rows, 1);
+
+        let count = CString::new(r#"SELECT COUNT(*) FROM "del_contributors""#).expect("count sql");
+        assert_eq!(ddb_db_execute(db, count.as_ptr(), ptr::null(), 0, &mut result), DDB_OK);
+        let mut remaining = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut remaining), DDB_OK);
+        assert_eq!(remaining.int64_value, 1);
+        assert_eq!(ddb_value_dispose(&mut remaining), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
 }

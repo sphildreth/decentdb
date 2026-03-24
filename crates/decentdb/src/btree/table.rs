@@ -360,4 +360,57 @@ mod tests {
         free_table_btree(&mut store, root_page_id).expect("free tree");
         assert_eq!(store.allocated_page_count(), 0);
     }
+
+    #[test]
+    fn free_table_btree_releases_pages_after_many_small_rows() {
+        let mut tree = TableBtree::with_page_size(512);
+        for row_id in 0..100_i64 {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        let (mut store, root_page_id) = tree.into_parts();
+        assert!(store.allocated_page_count() > 1);
+        free_table_btree(&mut store, root_page_id).expect("free tree");
+        assert_eq!(store.allocated_page_count(), 0);
+    }
+
+    #[test]
+    fn cursor_navigation_and_seek_operations_follow_row_order() {
+        let mut tree = TableBtree::with_page_size(512);
+        for row_id in [5_i64, 1, 9, 3, 7] {
+            tree.insert_row(row_id, vec![Value::Int64(row_id)])
+                .expect("insert row");
+        }
+
+        let mut forward = tree.cursor_from_start().expect("cursor");
+        let mut forward_rows = Vec::new();
+        while let Some(row) = forward.next().expect("next") {
+            forward_rows.push(row.row_id);
+        }
+        assert_eq!(forward_rows, vec![1, 3, 5, 7, 9]);
+
+        let mut backward = tree.cursor_from_end().expect("cursor");
+        let mut backward_rows = Vec::new();
+        while let Some(row) = backward.prev().expect("prev") {
+            backward_rows.push(row.row_id);
+        }
+        assert_eq!(backward_rows, vec![9, 7, 5, 3, 1]);
+
+        let mut seek_forward = tree.cursor_seek_forward(4).expect("cursor");
+        let row = seek_forward.next().expect("next").expect("row");
+        assert_eq!(row.row_id, 5);
+        assert_eq!(row.values, vec![Value::Int64(5)]);
+
+        let mut seek_past_end = tree.cursor_seek_forward(10).expect("cursor");
+        assert!(seek_past_end.next().expect("next").is_none());
+
+        let mut seek_backward = tree.cursor_seek_backward(6).expect("cursor");
+        let row = seek_backward.prev().expect("prev").expect("row");
+        assert_eq!(row.row_id, 5);
+        assert_eq!(row.values, vec![Value::Int64(5)]);
+
+        let mut seek_before_start = tree.cursor_seek_backward(0).expect("cursor");
+        assert!(seek_before_start.prev().expect("prev").is_none());
+    }
 }

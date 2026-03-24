@@ -13,8 +13,11 @@ pub(crate) mod views;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use crate::catalog::{CatalogState, IndexKind, IndexSchema, TableSchema};
+use crate::catalog::{
+    identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, TableSchema,
+};
 use crate::error::{DbError, Result};
+use crate::json::{parse_json, parse_json_path, JsonValue};
 use crate::planner;
 use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
@@ -385,6 +388,15 @@ impl EngineRuntime {
         Ok(())
     }
 
+    pub(super) fn table_schema(&self, name: &str) -> Option<&TableSchema> {
+        self.catalog.table(name)
+    }
+
+    pub(super) fn table_data(&self, name: &str) -> Option<&TableData> {
+        let table_name = self.table_schema(name)?.name.clone();
+        self.tables.get(&table_name)
+    }
+
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
         let indexes = self.catalog.indexes.values().cloned().collect::<Vec<_>>();
         let mut rebuilt = BTreeMap::new();
@@ -434,7 +446,7 @@ impl EngineRuntime {
 
     pub(super) fn mark_indexes_stale_for_table(&mut self, table_name: &str) {
         for index in self.catalog.indexes.values_mut() {
-            if index.table_name == table_name {
+            if identifiers_equal(&index.table_name, table_name) {
                 index.fresh = false;
             }
         }
@@ -459,16 +471,14 @@ impl EngineRuntime {
         page_size: u32,
     ) -> Result<Vec<PendingIndexInsert>> {
         let table = self
-            .catalog
-            .tables
-            .get(table_name)
+            .table_schema(table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
         let indexes = self
             .catalog
             .indexes
             .values()
-            .filter(|index| index.table_name == table_name && index.fresh)
+            .filter(|index| identifiers_equal(&index.table_name, table_name) && index.fresh)
             .cloned()
             .collect::<Vec<_>>();
         let mut updates = Vec::new();
@@ -768,6 +778,95 @@ impl EngineRuntime {
         Ok(dataset)
     }
 
+    fn evaluate_query_with_outer(
+        &self,
+        query: &Query,
+        params: &[Value],
+        inherited_ctes: &BTreeMap<String, Dataset>,
+        outer_dataset: &Dataset,
+        outer_row: &[Value],
+    ) -> Result<Dataset> {
+        if !query_references_outer_scope(query, outer_dataset) {
+            return self.evaluate_query(query, params, inherited_ctes);
+        }
+
+        let mut ctes = inherited_ctes.clone();
+        for cte in &query.ctes {
+            let mut dataset =
+                self.evaluate_query_with_outer(&cte.query, params, &ctes, outer_dataset, outer_row)?;
+            if !cte.column_names.is_empty() {
+                if cte.column_names.len() != dataset.columns.len() {
+                    return Err(DbError::sql(format!(
+                        "CTE {} expected {} columns but produced {}",
+                        cte.name,
+                        cte.column_names.len(),
+                        dataset.columns.len()
+                    )));
+                }
+                for (binding, name) in dataset.columns.iter_mut().zip(&cte.column_names) {
+                    binding.name = name.clone();
+                    binding.table = Some(cte.name.clone());
+                }
+            }
+            ctes.insert(cte.name.clone(), dataset);
+        }
+
+        let mut sorted_during_select = false;
+        let mut dataset = match &query.body {
+            QueryBody::Select(select)
+                if !select.group_by.is_empty()
+                    || projection_has_aggregate_items(&select.projection) =>
+            {
+                self.evaluate_select_with_outer(select, params, &ctes, outer_dataset, outer_row)?
+            }
+            QueryBody::Select(select) => {
+                let mut source =
+                    self.build_select_dataset_with_outer(select, params, &ctes, outer_dataset, outer_row)?;
+                if !query.order_by.is_empty() {
+                    self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
+                }
+                let mut projected =
+                    self.project_dataset(&source, &select.projection, params, &ctes, None)?;
+                if !query.order_by.is_empty() {
+                    self.sort_dataset(&mut projected, &query.order_by, params, &ctes)?;
+                    sorted_during_select = true;
+                }
+                projected
+            }
+            _ => self.evaluate_query_body_with_outer(&query.body, params, &ctes, outer_dataset, outer_row)?,
+        };
+        if !query.order_by.is_empty() && !sorted_during_select {
+            self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
+        }
+        let offset = query
+            .offset
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?
+            .unwrap_or(0);
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &ctes))
+            .transpose()?;
+        if offset > 0 || limit.is_some() {
+            let start = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+            let rows = if start >= dataset.rows.len() {
+                Vec::new()
+            } else {
+                let iter = dataset.rows.into_iter().skip(start);
+                match limit {
+                    Some(limit) => iter
+                        .take(usize::try_from(limit.max(0)).unwrap_or(0))
+                        .collect(),
+                    None => iter.collect(),
+                }
+            };
+            dataset.rows = rows;
+        }
+        Ok(dataset)
+    }
+
     fn evaluate_query_body(
         &self,
         body: &QueryBody,
@@ -789,6 +888,33 @@ impl EngineRuntime {
         }
     }
 
+    fn evaluate_query_body_with_outer(
+        &self,
+        body: &QueryBody,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        outer_dataset: &Dataset,
+        outer_row: &[Value],
+    ) -> Result<Dataset> {
+        match body {
+            QueryBody::Select(select) => {
+                self.evaluate_select_with_outer(select, params, ctes, outer_dataset, outer_row)
+            }
+            QueryBody::SetOperation {
+                op,
+                all,
+                left,
+                right,
+            } => {
+                let left =
+                    self.evaluate_query_body_with_outer(left, params, ctes, outer_dataset, outer_row)?;
+                let right =
+                    self.evaluate_query_body_with_outer(right, params, ctes, outer_dataset, outer_row)?;
+                self.evaluate_set_operation(*op, *all, left, right)
+            }
+        }
+    }
+
     fn evaluate_select(
         &self,
         select: &Select,
@@ -796,6 +922,23 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
         let dataset = self.build_select_dataset(select, params, ctes)?;
+        if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
+            self.evaluate_grouped_select(select, dataset, params, ctes)
+        } else {
+            self.project_dataset(&dataset, &select.projection, params, ctes, None)
+        }
+    }
+
+    fn evaluate_select_with_outer(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        outer_dataset: &Dataset,
+        outer_row: &[Value],
+    ) -> Result<Dataset> {
+        let dataset =
+            self.build_select_dataset_with_outer(select, params, ctes, outer_dataset, outer_row)?;
         if !select.group_by.is_empty() || projection_has_aggregate_items(&select.projection) {
             self.evaluate_grouped_select(select, dataset, params, ctes)
         } else {
@@ -854,6 +997,55 @@ impl EngineRuntime {
         Ok(dataset)
     }
 
+    fn build_select_dataset_with_outer(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        outer_dataset: &Dataset,
+        outer_row: &[Value],
+    ) -> Result<Dataset> {
+        let mut dataset = if select.from.is_empty() {
+            Dataset {
+                columns: Vec::new(),
+                rows: vec![Vec::new()],
+            }
+        } else {
+            let mut iter = select.from.iter();
+            let mut current =
+                self.evaluate_from_item(iter.next().expect("first FROM item"), params, ctes)?;
+            for item in iter {
+                let right = self.evaluate_from_item(item, params, ctes)?;
+                current = nested_loop_join(
+                    current,
+                    right,
+                    JoinKind::Inner,
+                    &Expr::Literal(Value::Bool(true)),
+                    self,
+                    params,
+                    ctes,
+                )?;
+            }
+            current
+        };
+
+        dataset = augment_dataset_with_outer_scope(dataset, outer_dataset, outer_row);
+        if let Some(filter) = &select.filter {
+            let bindings = dataset.columns.clone();
+            dataset.rows.retain(|row| {
+                let temp = Dataset {
+                    columns: bindings.clone(),
+                    rows: Vec::new(),
+                };
+                matches!(
+                    self.eval_expr(filter, &temp, row, params, ctes, None),
+                    Ok(Value::Bool(true))
+                )
+            });
+        }
+        Ok(dataset)
+    }
+
     fn try_indexed_scan(
         &self,
         select: &Select,
@@ -869,15 +1061,13 @@ impl EngineRuntime {
         let FromItem::Table { name, alias } = &select.from[0] else {
             return Ok(None);
         };
-        if ctes.contains_key(name) || self.catalog.views.contains_key(name) {
+        if ctes.contains_key(name) || self.catalog.view(name).is_some() {
             return Ok(None);
         }
         let table = self
-            .catalog
-            .tables
-            .get(name)
+            .table_schema(name)
             .ok_or_else(|| DbError::sql(format!("unknown table or view {name}")))?;
-        let Some(data) = self.tables.get(name) else {
+        let Some(data) = self.table_data(name) else {
             return Ok(None);
         };
 
@@ -886,11 +1076,15 @@ impl EngineRuntime {
                 return Ok(None);
             }
             if let Some(index) = self.catalog.indexes.values().find(|index| {
-                index.table_name == *name
+                identifiers_equal(&index.table_name, name)
                     && index.fresh
                     && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
                     && index.columns.len() == 1
-                    && index.columns[0].column_name.as_deref() == Some(column_name)
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                     && index.columns[0].expression_sql.is_none()
             }) {
                 let value =
@@ -908,11 +1102,15 @@ impl EngineRuntime {
             simple_trigram_lookup(filter)
         {
             if let Some(index) = self.catalog.indexes.values().find(|index| {
-                index.table_name == *name
+                identifiers_equal(&index.table_name, name)
                     && index.fresh
                     && index.kind == IndexKind::Trigram
+                    && index.predicate_sql.is_none()
                     && index.columns.len() == 1
-                    && index.columns[0].column_name.as_deref() == Some(column_name)
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| identifiers_equal(index_column, column_name))
             }) {
                 let pattern =
                     self.eval_expr(pattern_expr, &Dataset::empty(), &[], params, ctes, None)?;
@@ -1069,19 +1267,21 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Option<Dataset>> {
         let table = self
-            .catalog
-            .tables
-            .get(table_name)
+            .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table or view {table_name}")))?;
-        let Some(data) = self.tables.get(table_name) else {
+        let Some(data) = self.table_data(table_name) else {
             return Ok(None);
         };
         let Some(index) = self.catalog.indexes.values().find(|index| {
-            index.table_name == table_name
+            identifiers_equal(&index.table_name, table_name)
                 && index.fresh
                 && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
                 && index.columns.len() == 1
-                && index.columns[0].column_name.as_deref() == Some(column_name)
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, column_name))
                 && index.columns[0].expression_sql.is_none()
         }) else {
             return Ok(None);
@@ -1103,9 +1303,7 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Option<Dataset>> {
         let filtered_table = self
-            .catalog
-            .tables
-            .get(plan.filtered_table.name)
+            .table_schema(plan.filtered_table.name)
             .ok_or_else(|| {
                 DbError::sql(format!(
                     "unknown table or view {}",
@@ -1113,28 +1311,31 @@ impl EngineRuntime {
                 ))
             })?;
         let probe_table = self
-            .catalog
-            .tables
-            .get(plan.probe_table.name)
+            .table_schema(plan.probe_table.name)
             .ok_or_else(|| {
                 DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
             })?;
         let probe_data = self
-            .tables
-            .get(plan.probe_table.name)
+            .table_data(plan.probe_table.name)
             .cloned()
             .unwrap_or_default();
         let filtered_join_index = filtered_table
             .columns
             .iter()
-            .position(|column| column.name == plan.filtered_join_column)
+            .position(|column| identifiers_equal(&column.name, plan.filtered_join_column))
             .ok_or_else(|| DbError::sql(format!("unknown column {}", plan.filtered_join_column)))?;
         let Some(probe_index) = self.catalog.indexes.values().find(|index| {
-            index.table_name == plan.probe_table.name
+            identifiers_equal(&index.table_name, plan.probe_table.name)
                 && index.fresh
                 && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
                 && index.columns.len() == 1
-                && index.columns[0].column_name.as_deref() == Some(plan.probe_join_column)
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| {
+                        identifiers_equal(index_column, plan.probe_join_column)
+                    })
                 && index.columns[0].expression_sql.is_none()
         }) else {
             return Ok(None);
@@ -1224,7 +1425,7 @@ impl EngineRuntime {
                     }
                     return Ok(dataset);
                 }
-                if let Some(view) = self.catalog.views.get(name) {
+                if let Some(view) = self.catalog.view(name) {
                     let view_statement = parse_sql_statement(&view.sql_text)?;
                     let Statement::Query(query) = view_statement else {
                         return Err(DbError::corruption(format!(
@@ -1245,11 +1446,9 @@ impl EngineRuntime {
                     return Ok(dataset);
                 }
                 let table = self
-                    .catalog
-                    .tables
-                    .get(name)
+                    .table_schema(name)
                     .ok_or_else(|| DbError::sql(format!("unknown table or view {name}")))?;
-                let data = self.tables.get(name).cloned().unwrap_or_default();
+                let data = self.table_data(name).cloned().unwrap_or_default();
                 Ok(Dataset {
                     columns: table
                         .columns
@@ -1386,22 +1585,240 @@ impl PageStore for DbTxnPageStore<'_> {
     }
 }
 
+fn augment_dataset_with_outer_scope(
+    mut dataset: Dataset,
+    outer_dataset: &Dataset,
+    outer_row: &[Value],
+) -> Dataset {
+    if outer_dataset.columns.is_empty() || outer_row.is_empty() {
+        return dataset;
+    }
+
+    dataset.columns.extend(outer_dataset.columns.clone());
+    for row in &mut dataset.rows {
+        row.extend_from_slice(outer_row);
+    }
+    dataset
+}
+
+fn query_references_outer_scope(query: &Query, outer_dataset: &Dataset) -> bool {
+    let outer_tables = outer_dataset
+        .columns
+        .iter()
+        .filter_map(|binding| binding.table.clone())
+        .collect::<BTreeSet<_>>();
+    if outer_tables.is_empty() {
+        return false;
+    }
+    query_references_outer_tables(query, &outer_tables)
+}
+
+fn query_references_outer_tables(query: &Query, outer_tables: &BTreeSet<String>) -> bool {
+    let local_tables = collect_query_table_names(query);
+    query
+        .ctes
+        .iter()
+        .any(|cte| query_references_outer_tables(&cte.query, outer_tables))
+        || query_body_references_outer(&query.body, outer_tables, &local_tables)
+        || query
+            .order_by
+            .iter()
+            .any(|order| expr_references_outer(&order.expr, outer_tables, &local_tables))
+        || query
+            .limit
+            .as_ref()
+            .is_some_and(|expr| expr_references_outer(expr, outer_tables, &local_tables))
+        || query
+            .offset
+            .as_ref()
+            .is_some_and(|expr| expr_references_outer(expr, outer_tables, &local_tables))
+}
+
+fn query_body_references_outer(
+    body: &QueryBody,
+    outer_tables: &BTreeSet<String>,
+    local_tables: &BTreeSet<String>,
+) -> bool {
+    match body {
+        QueryBody::Select(select) => select_references_outer(select, outer_tables, local_tables),
+        QueryBody::SetOperation { left, right, .. } => {
+            query_body_references_outer(left, outer_tables, local_tables)
+                || query_body_references_outer(right, outer_tables, local_tables)
+        }
+    }
+}
+
+fn select_references_outer(
+    select: &Select,
+    outer_tables: &BTreeSet<String>,
+    local_tables: &BTreeSet<String>,
+) -> bool {
+    select.projection.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => expr_references_outer(expr, outer_tables, local_tables),
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    }) || select
+        .filter
+        .as_ref()
+        .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+        || select
+            .group_by
+            .iter()
+            .any(|expr| expr_references_outer(expr, outer_tables, local_tables))
+        || select
+            .having
+            .as_ref()
+            .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+}
+
+fn expr_references_outer(
+    expr: &Expr,
+    outer_tables: &BTreeSet<String>,
+    local_tables: &BTreeSet<String>,
+) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::Column { table, .. } => table.as_ref().is_some_and(|table_name| {
+            outer_tables
+                .iter()
+                .any(|outer_table| identifiers_equal(outer_table, table_name))
+                && !local_tables
+                    .iter()
+                    .any(|local_table| identifiers_equal(local_table, table_name))
+        }),
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_references_outer(expr, outer_tables, local_tables)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_references_outer(left, outer_tables, local_tables)
+                || expr_references_outer(right, outer_tables, local_tables)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_references_outer(expr, outer_tables, local_tables)
+                || expr_references_outer(low, outer_tables, local_tables)
+                || expr_references_outer(high, outer_tables, local_tables)
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_references_outer(expr, outer_tables, local_tables)
+                || items
+                    .iter()
+                    .any(|item| expr_references_outer(item, outer_tables, local_tables))
+        }
+        Expr::InSubquery { expr, query, .. } => {
+            expr_references_outer(expr, outer_tables, local_tables)
+                || query_references_outer_tables(query, outer_tables)
+        }
+        Expr::ScalarSubquery(query) | Expr::Exists(query) => {
+            query_references_outer_tables(query, outer_tables)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_references_outer(expr, outer_tables, local_tables)
+                || expr_references_outer(pattern, outer_tables, local_tables)
+                || escape
+                    .as_ref()
+                    .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+        }
+        Expr::Function { args, .. } | Expr::Aggregate { args, .. } => args
+            .iter()
+            .any(|arg| expr_references_outer(arg, outer_tables, local_tables)),
+        Expr::RowNumber {
+            partition_by,
+            order_by,
+        } => {
+            partition_by
+                .iter()
+                .any(|expr| expr_references_outer(expr, outer_tables, local_tables))
+                || order_by
+                    .iter()
+                    .any(|order| expr_references_outer(&order.expr, outer_tables, local_tables))
+        }
+        Expr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            args.iter()
+                .any(|expr| expr_references_outer(expr, outer_tables, local_tables))
+                || partition_by
+                    .iter()
+                    .any(|expr| expr_references_outer(expr, outer_tables, local_tables))
+                || order_by
+                    .iter()
+                    .any(|order| expr_references_outer(&order.expr, outer_tables, local_tables))
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+                || branches.iter().any(|(condition, value)| {
+                    expr_references_outer(condition, outer_tables, local_tables)
+                        || expr_references_outer(value, outer_tables, local_tables)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+        }
+    }
+}
+
+fn collect_query_table_names(query: &Query) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_query_body_table_names(&query.body, &mut names);
+    names
+}
+
+fn collect_query_body_table_names(body: &QueryBody, names: &mut BTreeSet<String>) {
+    match body {
+        QueryBody::Select(select) => {
+            for item in &select.from {
+                collect_from_item_table_names(item, names);
+            }
+        }
+        QueryBody::SetOperation { left, right, .. } => {
+            collect_query_body_table_names(left, names);
+            collect_query_body_table_names(right, names);
+        }
+    }
+}
+
+fn collect_from_item_table_names(item: &FromItem, names: &mut BTreeSet<String>) {
+    match item {
+        FromItem::Table { name, alias } => {
+            names.insert(alias.clone().unwrap_or_else(|| name.clone()));
+        }
+        FromItem::Subquery { alias, .. } => {
+            names.insert(alias.clone());
+        }
+        FromItem::Join { left, right, .. } => {
+            collect_from_item_table_names(left, names);
+            collect_from_item_table_names(right, names);
+        }
+    }
+}
+
 fn build_runtime_index(
     index: &IndexSchema,
     runtime: &EngineRuntime,
     page_size: u32,
 ) -> Result<RuntimeIndex> {
-    let table = runtime
-        .catalog
-        .tables
-        .get(&index.table_name)
-        .ok_or_else(|| {
-            DbError::corruption(format!(
-                "index {} references missing table {}",
-                index.name, index.table_name
-            ))
-        })?;
-    let data = runtime.tables.get(&index.table_name).ok_or_else(|| {
+    let table = runtime.table_schema(&index.table_name).ok_or_else(|| {
+        DbError::corruption(format!(
+            "index {} references missing table {}",
+            index.name, index.table_name
+        ))
+    })?;
+    let data = runtime.table_data(&index.table_name).ok_or_else(|| {
         DbError::corruption(format!("table data for {} is missing", index.table_name))
     })?;
 
@@ -1522,10 +1939,7 @@ fn compute_index_key(
             ));
         };
         if let Some(column_name) = &column.column_name {
-            let position = table
-                .columns
-                .iter()
-                .position(|entry| entry.name == *column_name)
+            let position = column_position(table, column_name)
                 .ok_or_else(|| {
                     DbError::constraint(format!("index column {} does not exist", column_name))
                 })?;
@@ -1542,6 +1956,9 @@ fn compute_index_key(
         }
     }
     let values = compute_index_values(runtime, index, table, row)?;
+    if index.unique && values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(None);
+    }
     let key = if values.len() == 1 {
         encode_index_key(&values[0])?
     } else {
@@ -1560,10 +1977,7 @@ fn btree_uses_typed_int64_keys(index: &IndexSchema, table: &TableSchema) -> bool
     let Some(column_name) = &column.column_name else {
         return false;
     };
-    table
-        .columns
-        .iter()
-        .find(|entry| entry.name == *column_name)
+    column_schema(table, column_name)
         .is_some_and(|column| {
             column.column_type == crate::catalog::ColumnType::Int64 && !column.nullable
         })
@@ -1582,10 +1996,7 @@ fn compute_index_values(
         .iter()
         .map(|column| {
             if let Some(column_name) = &column.column_name {
-                let position = table
-                    .columns
-                    .iter()
-                    .position(|entry| entry.name == *column_name)
+                let position = column_position(table, column_name)
                     .ok_or_else(|| {
                         DbError::constraint(format!("index column {} does not exist", column_name))
                     })?;
@@ -1600,7 +2011,7 @@ fn compute_index_values(
         .collect()
 }
 
-fn row_satisfies_index_predicate(
+pub(super) fn row_satisfies_index_predicate(
     runtime: &EngineRuntime,
     index: &IndexSchema,
     table: &TableSchema,
@@ -2456,7 +2867,7 @@ fn simple_join_equality(on: &Expr) -> Option<(QualifiedColumnRef<'_>, QualifiedC
 }
 
 fn matches_table_binding(table: TableBindingRef<'_>, qualifier: Option<&str>) -> bool {
-    qualifier.is_some_and(|qualifier| qualifier == table.binding_name())
+    qualifier.is_some_and(|qualifier| identifiers_equal(qualifier, table.binding_name()))
 }
 
 fn matches_filter_binding(
@@ -2465,7 +2876,7 @@ fn matches_filter_binding(
     qualifier: Option<&str>,
 ) -> bool {
     match qualifier {
-        Some(qualifier) => qualifier == alias.as_deref().unwrap_or(table_name),
+        Some(qualifier) => identifiers_equal(qualifier, alias.as_deref().unwrap_or(table_name)),
         None => true,
     }
 }
@@ -2509,7 +2920,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
             expr_contains_aggregate(expr) || items.iter().any(expr_contains_aggregate)
         }
         Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
-        Expr::Exists(_) => false,
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => false,
         Expr::Like {
             expr,
             pattern,
@@ -2522,7 +2933,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         }
         Expr::IsNull { expr, .. } => expr_contains_aggregate(expr),
         Expr::Function { args, .. } => args.iter().any(expr_contains_aggregate),
-        Expr::RowNumber { .. } => false,
+        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => false,
         Expr::Case {
             operand,
             branches,
@@ -2653,7 +3064,7 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
         excluded: Option<&Dataset>,
     ) -> Result<Dataset> {
-        let row_number_values = items
+        let window_values = items
             .iter()
             .map(|item| match item {
                 SelectItem::Expr {
@@ -2665,6 +3076,26 @@ impl EngineRuntime {
                     ..
                 } => self
                     .compute_row_number_values(dataset, partition_by, order_by, params, ctes)
+                    .map(Some),
+                SelectItem::Expr {
+                    expr:
+                        Expr::WindowFunction {
+                            name,
+                            args,
+                            partition_by,
+                            order_by,
+                        },
+                    ..
+                } => self
+                    .compute_window_function_values(
+                        dataset,
+                        name,
+                        args,
+                        partition_by,
+                        order_by,
+                        params,
+                        ctes,
+                    )
                     .map(Some),
                 _ => Ok(None),
             })
@@ -2694,13 +3125,13 @@ impl EngineRuntime {
             for (item_index, item) in items.iter().enumerate() {
                 match item {
                     SelectItem::Expr { expr, .. } => match expr {
-                        Expr::RowNumber { .. } => output.push(
-                            row_number_values[item_index]
+                        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => output.push(
+                            window_values[item_index]
                                 .as_ref()
                                 .and_then(|values| values.get(row_index))
                                 .cloned()
                                 .ok_or_else(|| {
-                                    DbError::internal("ROW_NUMBER() values were not precomputed")
+                                    DbError::internal("window-function values were not precomputed")
                                 })?,
                         ),
                         _ => {
@@ -2787,6 +3218,167 @@ impl EngineRuntime {
             }
         }
         Ok(row_numbers)
+    }
+
+    fn compute_window_function_values(
+        &self,
+        dataset: &Dataset,
+        name: &str,
+        args: &[Expr],
+        partition_by: &[Expr],
+        order_by: &[crate::sql::ast::OrderBy],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Vec<Value>> {
+        let mut partitions = BTreeMap::<Vec<u8>, Vec<usize>>::new();
+        for (row_index, row) in dataset.rows.iter().enumerate() {
+            let key = if partition_by.is_empty() {
+                vec![0]
+            } else {
+                let values = partition_by
+                    .iter()
+                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, None))
+                    .collect::<Result<Vec<_>>>()?;
+                row_identity(&values)?
+            };
+            partitions.entry(key).or_default().push(row_index);
+        }
+
+        let mut results = vec![Value::Null; dataset.rows.len()];
+        for indices in partitions.into_values() {
+            let mut sorted = indices;
+            sorted.sort_by(|left, right| {
+                for order in order_by {
+                    let left_value = self
+                        .eval_expr(
+                            &order.expr,
+                            dataset,
+                            &dataset.rows[*left],
+                            params,
+                            ctes,
+                            None,
+                        )
+                        .unwrap_or(Value::Null);
+                    let right_value = self
+                        .eval_expr(
+                            &order.expr,
+                            dataset,
+                            &dataset.rows[*right],
+                            params,
+                            ctes,
+                            None,
+                        )
+                        .unwrap_or(Value::Null);
+                    let ordering = compare_values(&left_value, &right_value)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ordering != std::cmp::Ordering::Equal {
+                        return if order.descending {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        };
+                    }
+                }
+                left.cmp(right)
+            });
+
+            let order_keys = sorted
+                .iter()
+                .map(|row_index| {
+                    order_by
+                        .iter()
+                        .map(|order| {
+                            self.eval_expr(
+                                &order.expr,
+                                dataset,
+                                &dataset.rows[*row_index],
+                                params,
+                                ctes,
+                                None,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            match name {
+                "rank" => {
+                    let mut current_rank = 1_i64;
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        if ordinal > 0
+                            && !window_order_keys_equal(&order_keys[ordinal - 1], &order_keys[ordinal])?
+                        {
+                            current_rank = (ordinal + 1) as i64;
+                        }
+                        results[*row_index] = Value::Int64(current_rank);
+                    }
+                }
+                "dense_rank" => {
+                    let mut current_rank = 1_i64;
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        if ordinal > 0
+                            && !window_order_keys_equal(&order_keys[ordinal - 1], &order_keys[ordinal])?
+                        {
+                            current_rank += 1;
+                        }
+                        results[*row_index] = Value::Int64(current_rank);
+                    }
+                }
+                "lag" | "lead" => {
+                    if args.is_empty() || args.len() > 3 {
+                        return Err(DbError::sql(format!(
+                            "{} expects 1 to 3 arguments",
+                            name.to_ascii_uppercase()
+                        )));
+                    }
+                    let offset = match args.get(1) {
+                        Some(expr) => match self.eval_expr(expr, dataset, &[], params, ctes, None)? {
+                            Value::Int64(value) if value >= 0 => value as usize,
+                            Value::Int64(_) => {
+                                return Err(DbError::sql(format!(
+                                    "{} offset must be non-negative",
+                                    name.to_ascii_uppercase()
+                                )))
+                            }
+                            other => {
+                                return Err(DbError::sql(format!(
+                                    "{} offset must be INT64, got {other:?}",
+                                    name.to_ascii_uppercase()
+                                )))
+                            }
+                        },
+                        None => 1,
+                    };
+                    let ordered_values = sorted
+                        .iter()
+                        .map(|row_index| {
+                            self.eval_expr(&args[0], dataset, &dataset.rows[*row_index], params, ctes, None)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        let target_ordinal = if name == "lag" {
+                            ordinal.checked_sub(offset)
+                        } else {
+                            ordinal.checked_add(offset).filter(|target| *target < sorted.len())
+                        };
+                        results[*row_index] = if let Some(target_ordinal) = target_ordinal {
+                            ordered_values[target_ordinal].clone()
+                        } else if let Some(default_expr) = args.get(2) {
+                            self.eval_expr(default_expr, dataset, &dataset.rows[*row_index], params, ctes, None)?
+                        } else {
+                            Value::Null
+                        };
+                    }
+                }
+                other => {
+                    return Err(DbError::sql(format!(
+                        "unsupported window function {}",
+                        other.to_ascii_uppercase()
+                    )))
+                }
+            }
+        }
+        Ok(results)
     }
 
     fn evaluate_grouped_select(
@@ -2985,6 +3577,9 @@ impl EngineRuntime {
                 "max" => {
                     aggregate_extreme(self, dataset, group_rows, &args[0], params, ctes, false)
                 }
+                "group_concat" => {
+                    aggregate_group_concat(self, dataset, group_rows, args, params, ctes)
+                }
                 other => Err(DbError::sql(format!(
                     "unsupported aggregate function {other}"
                 ))),
@@ -3057,22 +3652,18 @@ impl EngineRuntime {
             Expr::Like {
                 expr,
                 pattern,
+                escape,
                 case_insensitive,
                 negated,
                 ..
             } => {
                 let left = self.eval_group_expr(expr, dataset, group_rows, params, ctes)?;
                 let right = self.eval_group_expr(pattern, dataset, group_rows, params, ctes)?;
-                match (left, right) {
-                    (Value::Text(left), Value::Text(right)) => {
-                        let matches = like_match(&left, &right, *case_insensitive);
-                        Ok(Value::Bool(if *negated { !matches } else { matches }))
-                    }
-                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    other => Err(DbError::sql(format!(
-                        "LIKE expects text values, got {other:?}"
-                    ))),
-                }
+                let escape = escape
+                    .as_ref()
+                    .map(|expr| self.eval_group_expr(expr, dataset, group_rows, params, ctes))
+                    .transpose()?;
+                eval_like(left, right, escape, *case_insensitive, *negated)
             }
             Expr::IsNull { expr, negated } => {
                 let is_null = matches!(
@@ -3155,8 +3746,8 @@ impl EngineRuntime {
                 self.eval_group_expr(expr, dataset, group_rows, params, ctes)?,
                 *target_type,
             ),
-            Expr::RowNumber { .. } => Err(DbError::sql(
-                "ROW_NUMBER() cannot be nested inside grouped expressions",
+            Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
+                "window functions cannot be nested inside grouped expressions",
             )),
             _ => {
                 let row = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
@@ -3257,7 +3848,7 @@ impl EngineRuntime {
                 if matches!(value, Value::Null) {
                     return Ok(Value::Null);
                 }
-                let subquery = self.evaluate_query(query, params, ctes)?;
+                let subquery = self.evaluate_query_with_outer(query, params, ctes, dataset, row)?;
                 if subquery.columns.len() != 1 {
                     return Err(DbError::sql("IN subquery must return exactly one column"));
                 }
@@ -3278,28 +3869,39 @@ impl EngineRuntime {
                     Ok(Value::Bool(*negated))
                 }
             }
+            Expr::ScalarSubquery(query) => {
+                let subquery = self.evaluate_query_with_outer(query, params, ctes, dataset, row)?;
+                if subquery.columns.len() != 1 {
+                    return Err(DbError::sql("scalar subquery must return exactly one column"));
+                }
+                Ok(subquery
+                    .rows
+                    .first()
+                    .and_then(|subquery_row| subquery_row.first())
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            }
             Expr::Exists(query) => Ok(Value::Bool(
-                !self.evaluate_query(query, params, ctes)?.rows.is_empty(),
+                !self
+                    .evaluate_query_with_outer(query, params, ctes, dataset, row)?
+                    .rows
+                    .is_empty(),
             )),
             Expr::Like {
                 expr,
                 pattern,
+                escape,
                 case_insensitive,
                 negated,
                 ..
             } => {
                 let left = self.eval_expr(expr, dataset, row, params, ctes, excluded)?;
                 let right = self.eval_expr(pattern, dataset, row, params, ctes, excluded)?;
-                match (left, right) {
-                    (Value::Text(left), Value::Text(right)) => {
-                        let matches = like_match(&left, &right, *case_insensitive);
-                        Ok(Value::Bool(if *negated { !matches } else { matches }))
-                    }
-                    (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                    other => Err(DbError::sql(format!(
-                        "LIKE expects text values, got {other:?}"
-                    ))),
-                }
+                let escape = escape
+                    .as_ref()
+                    .map(|expr| self.eval_expr(expr, dataset, row, params, ctes, excluded))
+                    .transpose()?;
+                eval_like(left, right, escape, *case_insensitive, *negated)
             }
             Expr::IsNull { expr, negated } => {
                 let is_null = matches!(
@@ -3314,8 +3916,8 @@ impl EngineRuntime {
             Expr::Aggregate { .. } => Err(DbError::sql(
                 "aggregate expressions require grouped evaluation",
             )),
-            Expr::RowNumber { .. } => {
-                Err(DbError::sql("ROW_NUMBER execution is not yet implemented"))
+            Expr::RowNumber { .. } | Expr::WindowFunction { .. } => {
+                Err(DbError::sql("window-function execution is not yet implemented"))
             }
             Expr::Case {
                 operand,
@@ -3364,7 +3966,7 @@ impl EngineRuntime {
         excluded: Option<&Dataset>,
     ) -> Result<Value> {
         if let Some(table_name) = table {
-            if table_name == "excluded" {
+            if identifiers_equal(table_name, "excluded") {
                 let excluded = excluded.ok_or_else(|| {
                     DbError::sql("EXCLUDED is only valid in ON CONFLICT DO UPDATE")
                 })?;
@@ -3382,8 +3984,13 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .filter(|(_, binding)| {
-                binding.name == column
-                    && table.is_none_or(|table| binding.table.as_deref() == Some(table))
+                identifiers_equal(&binding.name, column)
+                    && table.is_none_or(|table| {
+                        binding
+                            .table
+                            .as_deref()
+                            .is_some_and(|binding_table| identifiers_equal(binding_table, table))
+                    })
             })
             .collect::<Vec<_>>();
         match matches.as_slice() {
@@ -3404,6 +4011,8 @@ pub(crate) fn statement_is_read_only(statement: &Statement) -> bool {
 fn infer_expr_name(expr: &Expr, ordinal: usize) -> String {
     match expr {
         Expr::Column { column, .. } => column.clone(),
+        Expr::RowNumber { .. } => "row_number".to_string(),
+        Expr::WindowFunction { name, .. } => name.clone(),
         _ => format!("col{ordinal}"),
     }
 }
@@ -3639,6 +4248,8 @@ fn eval_function(
                 None => Ok(Value::Int64(0)),
             }
         }
+        "json_array_length" => eval_json_array_length(values),
+        "json_extract" => eval_json_extract(values),
         other => Err(DbError::sql(format!("unsupported scalar function {other}"))),
     }
 }
@@ -3656,6 +4267,195 @@ fn unary_text_fn(values: Vec<Value>, f: impl FnOnce(String) -> String) -> Result
     }
 }
 
+fn eval_like(
+    left: Value,
+    right: Value,
+    escape: Option<Value>,
+    case_insensitive: bool,
+    negated: bool,
+) -> Result<Value> {
+    let escape = normalize_like_escape(escape)?;
+    match (left, right) {
+        (Value::Text(left), Value::Text(right)) => {
+            let matches = like_match(&left, &right, case_insensitive, escape);
+            Ok(Value::Bool(if negated { !matches } else { matches }))
+        }
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        other => Err(DbError::sql(format!(
+            "LIKE expects text values, got {other:?}"
+        ))),
+    }
+}
+
+fn normalize_like_escape(escape: Option<Value>) -> Result<Option<char>> {
+    match escape {
+        None => Ok(None),
+        Some(Value::Null) => Ok(None),
+        Some(Value::Text(text)) => {
+            let mut chars = text.chars();
+            let Some(ch) = chars.next() else {
+                return Ok(None);
+            };
+            if chars.next().is_some() {
+                return Err(DbError::sql(
+                    "LIKE ESCAPE expression must evaluate to a single character",
+                ));
+            }
+            Ok(Some(ch))
+        }
+        Some(other) => Err(DbError::sql(format!(
+            "LIKE ESCAPE expects text, got {other:?}"
+        ))),
+    }
+}
+
+fn aggregate_group_concat(
+    runtime: &EngineRuntime,
+    dataset: &Dataset,
+    rows: &[Vec<Value>],
+    args: &[Expr],
+    params: &[Value],
+    ctes: &BTreeMap<String, Dataset>,
+) -> Result<Value> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(DbError::sql("GROUP_CONCAT expects 1 or 2 arguments"));
+    }
+    let mut parts = Vec::new();
+    let mut separator = ",".to_string();
+    for row in rows {
+        let value = runtime.eval_expr(&args[0], dataset, row, params, ctes, None)?;
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        if let Some(separator_expr) = args.get(1) {
+            separator = match runtime.eval_expr(separator_expr, dataset, row, params, ctes, None)? {
+                Value::Text(value) => value,
+                Value::Null => String::new(),
+                other => {
+                    return Err(DbError::sql(format!(
+                        "GROUP_CONCAT separator must be text, got {other:?}"
+                    )))
+                }
+            };
+        }
+        parts.push(value_to_text(&value)?);
+    }
+    if parts.is_empty() {
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Text(parts.join(&separator)))
+    }
+}
+
+fn eval_json_array_length(values: Vec<Value>) -> Result<Value> {
+    if values.is_empty() || values.len() > 2 {
+        return Err(DbError::sql("json_array_length expects 1 or 2 arguments"));
+    }
+    let target = json_target_value(&values)?;
+    match target {
+        Some(JsonValue::Array(array)) => Ok(Value::Int64(array.len() as i64)),
+        Some(_) => Ok(Value::Int64(0)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn eval_json_extract(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 2 {
+        return Err(DbError::sql("json_extract expects 2 arguments"));
+    }
+    let Some(target) = json_target_value(&values)? else {
+        return Ok(Value::Null);
+    };
+    json_value_to_value(target)
+}
+
+fn json_target_value(values: &[Value]) -> Result<Option<JsonValue>> {
+    let json = match values.first() {
+        Some(Value::Null) | None => return Ok(None),
+        Some(Value::Text(value)) => parse_json(value)?,
+        Some(other) => {
+            return Err(DbError::sql(format!(
+                "JSON functions expect text input, got {other:?}"
+            )))
+        }
+    };
+    if let Some(path_value) = values.get(1) {
+        let path = match path_value {
+            Value::Null => return Ok(None),
+            Value::Text(path) => parse_json_path(path)?,
+            other => {
+                return Err(DbError::sql(format!(
+                    "JSON path must be text, got {other:?}"
+                )))
+            }
+        };
+        Ok(json.lookup(&path).cloned())
+    } else {
+        Ok(Some(json))
+    }
+}
+
+fn json_value_to_value(value: JsonValue) -> Result<Value> {
+    match value {
+        JsonValue::Null => Ok(Value::Null),
+        JsonValue::Bool(value) => Ok(Value::Bool(value)),
+        JsonValue::String(value) => Ok(Value::Text(value)),
+        JsonValue::Number(value) => {
+            let (scaled, scale) = parse_decimal_text(&value)?;
+            if scale == 0 {
+                Ok(Value::Int64(scaled))
+            } else {
+                Ok(Value::Float64((scaled as f64) / 10_f64.powi(i32::from(scale))))
+            }
+        }
+        JsonValue::Object(_) | JsonValue::Array(_) => Ok(Value::Text(value.render_json())),
+    }
+}
+
+fn value_to_text(value: &Value) -> Result<String> {
+    match value {
+        Value::Null => Ok(String::new()),
+        Value::Int64(value) => Ok(value.to_string()),
+        Value::Float64(value) => Ok(value.to_string()),
+        Value::Bool(value) => Ok(if *value { "true" } else { "false" }.to_string()),
+        Value::Text(value) => Ok(value.clone()),
+        Value::Blob(_) => Err(DbError::sql("cannot stringify BLOB value")),
+        Value::Decimal { scaled, scale } => {
+            if *scale == 0 {
+                Ok(scaled.to_string())
+            } else {
+                let negative = *scaled < 0;
+                let digits = scaled.unsigned_abs().to_string();
+                let scale = usize::from(*scale);
+                if digits.len() <= scale {
+                    let padded = format!("{digits:0>width$}", width = scale + 1);
+                    let split = padded.len() - scale;
+                    Ok(format!(
+                        "{}{}.{}",
+                        if negative { "-" } else { "" },
+                        &padded[..split],
+                        &padded[split..]
+                    ))
+                } else {
+                    let split = digits.len() - scale;
+                    Ok(format!(
+                        "{}{}.{}",
+                        if negative { "-" } else { "" },
+                        &digits[..split],
+                        &digits[split..]
+                    ))
+                }
+            }
+        }
+        Value::Uuid(value) => Ok(format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+            value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
+        )),
+        Value::TimestampMicros(value) => Ok(value.to_string()),
+    }
+}
+
 fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<Value> {
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
@@ -3664,6 +4464,7 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         crate::catalog::ColumnType::Int64 => match value {
             Value::Int64(value) => Ok(Value::Int64(value)),
             Value::Float64(value) => Ok(Value::Int64(value as i64)),
+            Value::Bool(value) => Ok(Value::Int64(if value { 1 } else { 0 })),
             Value::Text(value) => value
                 .parse::<i64>()
                 .map(Value::Int64)
@@ -3706,6 +4507,10 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
                 scaled: value,
                 scale: 0,
             }),
+            Value::Float64(value) => {
+                let (scaled, scale) = parse_decimal_text(&value.to_string())?;
+                Ok(Value::Decimal { scaled, scale })
+            }
             Value::Text(value) => {
                 let (scaled, scale) = parse_decimal_text(&value)?;
                 Ok(Value::Decimal { scaled, scale })
@@ -3941,6 +4746,67 @@ mod tests {
         assert_eq!(decoded.persisted_tables["docs"], table_states["docs"]);
     }
 
+    #[test]
+    fn non_correlated_in_subquery_does_not_capture_outer_scope() {
+        let mut runtime = EngineRuntime::empty(11);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT, grp INT64)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 1)",
+        );
+
+        let statement = parse_sql_statement(
+            "SELECT COUNT(*) FROM t WHERE grp IN (SELECT grp FROM t WHERE name = 'a')",
+        )
+        .expect("parse SQL");
+        let result = runtime
+            .execute_statement(&statement, &[], PAGE_SIZE)
+            .expect("execute SQL");
+
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+    }
+
+    #[test]
+    fn correlated_exists_uses_outer_table_name_when_inner_table_is_aliased() {
+        let mut runtime = EngineRuntime::empty(12);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE del_artists (Id INT64 PRIMARY KEY, LibraryId INT64)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE del_contributors (Id INT64 PRIMARY KEY, ArtistId INT64)",
+        );
+        execute_sql(&mut runtime, "INSERT INTO del_artists VALUES (1, 10), (2, 20)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO del_contributors VALUES (1, 1), (2, 2)",
+        );
+
+        let delete = parse_sql_statement(
+            "DELETE FROM del_contributors WHERE EXISTS (\
+             SELECT 1 FROM del_contributors AS c \
+             INNER JOIN del_artists AS a ON c.ArtistId = a.Id \
+             WHERE a.LibraryId = $1 AND del_contributors.Id = c.Id)",
+        )
+        .expect("parse delete");
+        let result = runtime
+            .execute_statement(&delete, &[Value::Int64(10)], PAGE_SIZE)
+            .expect("execute delete");
+        assert_eq!(result.affected_rows(), 1);
+
+        let count = parse_sql_statement("SELECT COUNT(*) FROM del_contributors")
+            .expect("parse count");
+        let result = runtime
+            .execute_statement(&count, &[], PAGE_SIZE)
+            .expect("execute count");
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(1)]);
+    }
+
     fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
         let statement = parse_sql_statement(sql).expect("parse SQL");
         runtime
@@ -3954,26 +4820,36 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
         return Ok(Value::Null);
     }
     match (left, right) {
-        (Value::Int64(left), Value::Int64(right)) => Ok(match op {
-            BinaryOp::Add => Value::Int64(left + right),
-            BinaryOp::Sub => Value::Int64(left - right),
-            BinaryOp::Mul => Value::Int64(left * right),
-            BinaryOp::Div => Value::Float64(left as f64 / right as f64),
-            _ => unreachable!(),
-        }),
+        (Value::Int64(left), Value::Int64(right)) => {
+            if matches!(op, BinaryOp::Div) && right == 0 {
+                return Ok(Value::Null);
+            }
+            Ok(match op {
+                BinaryOp::Add => Value::Int64(left + right),
+                BinaryOp::Sub => Value::Int64(left - right),
+                BinaryOp::Mul => Value::Int64(left * right),
+                BinaryOp::Div => Value::Int64(left / right),
+                _ => unreachable!(),
+            })
+        }
         (Value::Int64(left), Value::Float64(right)) => {
             arithmetic(op, Value::Float64(left as f64), Value::Float64(right))
         }
         (Value::Float64(left), Value::Int64(right)) => {
             arithmetic(op, Value::Float64(left), Value::Float64(right as f64))
         }
-        (Value::Float64(left), Value::Float64(right)) => Ok(match op {
-            BinaryOp::Add => Value::Float64(left + right),
-            BinaryOp::Sub => Value::Float64(left - right),
-            BinaryOp::Mul => Value::Float64(left * right),
-            BinaryOp::Div => Value::Float64(left / right),
-            _ => unreachable!(),
-        }),
+        (Value::Float64(left), Value::Float64(right)) => {
+            if matches!(op, BinaryOp::Div) && right == 0.0 {
+                return Ok(Value::Null);
+            }
+            Ok(match op {
+                BinaryOp::Add => Value::Float64(left + right),
+                BinaryOp::Sub => Value::Float64(left - right),
+                BinaryOp::Mul => Value::Float64(left * right),
+                BinaryOp::Div => Value::Float64(left / right),
+                _ => unreachable!(),
+            })
+        }
         other => Err(DbError::sql(format!(
             "arithmetic is not defined for {other:?}"
         ))),
@@ -3982,6 +4858,9 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
 
 fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
     use std::cmp::Ordering;
+    if let Some(ordering) = compare_numeric_text_values(left, right) {
+        return Ok(ordering);
+    }
     match (left, right) {
         (Value::Null, Value::Null) => Ok(Ordering::Equal),
         (Value::Null, _) => Ok(Ordering::Less),
@@ -3992,13 +4871,54 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         (Value::Float64(left), Value::Int64(right)) => Ok(left.total_cmp(&(*right as f64))),
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
+        (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
+        (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
+        (Value::Blob(left), Value::Uuid(right)) => Ok(left.as_slice().cmp(right.as_slice())),
+        (Value::Uuid(left), Value::Blob(right)) => Ok(left.as_slice().cmp(right.as_slice())),
         _ => Err(DbError::sql(format!(
             "cannot compare values {left:?} and {right:?}"
         ))),
     }
 }
 
-fn like_match(input: &str, pattern: &str, case_insensitive: bool) -> bool {
+fn window_order_keys_equal(left: &[Value], right: &[Value]) -> Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left_value, right_value) in left.iter().zip(right) {
+        if compare_values(left_value, right_value)? != std::cmp::Ordering::Equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn compare_numeric_text_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+
+    fn parsed_numeric_text(value: &str) -> Option<f64> {
+        let (scaled, scale) = parse_decimal_text(value).ok()?;
+        Some((scaled as f64) / 10_f64.powi(i32::from(scale)))
+    }
+
+    match (left, right) {
+        (Value::Int64(left), Value::Text(right)) => parsed_numeric_text(right)
+            .map(|right| (*left as f64).total_cmp(&right))
+            .or(Some(Ordering::Less)),
+        (Value::Float64(left), Value::Text(right)) => parsed_numeric_text(right)
+            .map(|right| left.total_cmp(&right))
+            .or(Some(Ordering::Less)),
+        (Value::Text(left), Value::Int64(right)) => parsed_numeric_text(left)
+            .map(|left| left.total_cmp(&(*right as f64)))
+            .or(Some(Ordering::Greater)),
+        (Value::Text(left), Value::Float64(right)) => parsed_numeric_text(left)
+            .map(|left| left.total_cmp(right))
+            .or(Some(Ordering::Greater)),
+        _ => None,
+    }
+}
+
+fn like_match(input: &str, pattern: &str, case_insensitive: bool, escape: Option<char>) -> bool {
     let input = if case_insensitive {
         input.to_ascii_uppercase()
     } else {
@@ -4009,18 +4929,37 @@ fn like_match(input: &str, pattern: &str, case_insensitive: bool) -> bool {
     } else {
         pattern.to_string()
     };
-    like_match_bytes(input.as_bytes(), pattern.as_bytes())
+    let input = input.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    like_match_chars(&input, &pattern, escape)
 }
 
-fn like_match_bytes(input: &[u8], pattern: &[u8]) -> bool {
+fn like_match_chars(input: &[char], pattern: &[char], escape: Option<char>) -> bool {
     if pattern.is_empty() {
         return input.is_empty();
     }
-    match pattern[0] {
-        b'%' => (0..=input.len()).any(|offset| like_match_bytes(&input[offset..], &pattern[1..])),
-        b'_' => !input.is_empty() && like_match_bytes(&input[1..], &pattern[1..]),
-        byte => {
-            !input.is_empty() && input[0] == byte && like_match_bytes(&input[1..], &pattern[1..])
+    let current = pattern[0];
+    if Some(current) == escape {
+        return match pattern.get(1) {
+            Some(literal) => {
+                !input.is_empty()
+                    && input[0] == *literal
+                    && like_match_chars(&input[1..], &pattern[2..], escape)
+            }
+            None => {
+                !input.is_empty()
+                    && input[0] == current
+                    && like_match_chars(&input[1..], &pattern[1..], escape)
+            }
+        };
+    }
+    match current {
+        '%' => (0..=input.len()).any(|offset| like_match_chars(&input[offset..], &pattern[1..], escape)),
+        '_' => !input.is_empty() && like_match_chars(&input[1..], &pattern[1..], escape),
+        literal => {
+            !input.is_empty()
+                && input[0] == literal
+                && like_match_chars(&input[1..], &pattern[1..], escape)
         }
     }
 }
@@ -4035,4 +4974,21 @@ fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
         seen.entry(row_identity(&row)?).or_insert(row);
     }
     Ok(seen.into_values().collect())
+}
+
+pub(super) fn column_position(table: &TableSchema, column_name: &str) -> Option<usize> {
+    table
+        .columns
+        .iter()
+        .position(|column| identifiers_equal(&column.name, column_name))
+}
+
+pub(super) fn column_schema<'a>(
+    table: &'a TableSchema,
+    column_name: &str,
+) -> Option<&'a ColumnSchema> {
+    table
+        .columns
+        .iter()
+        .find(|column| identifiers_equal(&column.name, column_name))
 }

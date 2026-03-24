@@ -1,6 +1,5 @@
 using System;
 using System.Runtime.InteropServices;
-using System.Runtime.Versioning;
 using System.Threading;
 
 namespace DecentDB.Native;
@@ -10,8 +9,12 @@ public static class DecentDBNative
     private const string NativeLib = "decentdb";
 
     private static string? s_libraryPath;
-
     private static int s_resolverRegistered;
+
+    static DecentDBNative()
+    {
+        EnsureInitialized();
+    }
 
     /// <summary>
     /// Overrides the native library file path used to resolve DllImport("decentdb").
@@ -41,18 +44,31 @@ public static class DecentDBNative
 
         try
         {
-            NativeLibrary.SetDllImportResolver(typeof(DecentDBNative).Assembly, (name, assembly, path) =>
+            NativeLibrary.SetDllImportResolver(typeof(DecentDBNative).Assembly, (name, _, _) =>
             {
-                if (name == NativeLib)
+                if (!string.Equals(name, NativeLib, StringComparison.Ordinal))
                 {
-                    foreach (var libPath in EnumerateCandidateLibraryPaths())
-                    {
-                        if (!File.Exists(libPath))
-                        {
-                            continue;
-                        }
+                    return IntPtr.Zero;
+                }
 
+                foreach (var libPath in EnumerateCandidateLibraryPaths())
+                {
+                    if (!File.Exists(libPath))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
                         return NativeLibrary.Load(libPath);
+                    }
+                    catch (DllNotFoundException)
+                    {
+                        // Keep probing other candidates.
+                    }
+                    catch (BadImageFormatException)
+                    {
+                        // Keep probing other candidates.
                     }
                 }
 
@@ -92,10 +108,12 @@ public static class DecentDBNative
             var di = new DirectoryInfo(baseDir);
             for (var cursor = di; cursor != null; cursor = cursor.Parent)
             {
-                var buildDir = Path.Combine(cursor.FullName, "build");
                 foreach (var libName in PlatformLibraryNames())
                 {
-                    yield return Path.Combine(buildDir, libName);
+                    yield return Path.Combine(cursor.FullName, libName);
+                    yield return Path.Combine(cursor.FullName, "target", "debug", libName);
+                    yield return Path.Combine(cursor.FullName, "target", "release", libName);
+                    yield return Path.Combine(cursor.FullName, "build", libName);
                 }
             }
         }
@@ -143,56 +161,62 @@ public static class DecentDBNative
         }
     }
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_close")]
-    public static extern int decentdb_close(IntPtr db);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_last_error_message")]
+    internal static extern IntPtr ddb_last_error_message();
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_checkpoint")]
-    public static extern int decentdb_checkpoint(IntPtr db);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_string_free")]
+    internal static extern uint ddb_string_free(ref IntPtr value);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_save_as")]
-    public static extern int decentdb_save_as(IntPtr db, IntPtr destPathUtf8);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_value_dispose")]
+    internal static extern uint ddb_value_dispose(ref DdbValueNative value);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_last_error_code")]
-    public static extern int decentdb_last_error_code(IntPtr db);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_free")]
+    internal static extern uint ddb_db_free(ref IntPtr db);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_reset")]
-    public static extern int decentdb_reset(IntPtr stmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_checkpoint")]
+    internal static extern uint ddb_db_checkpoint(IntPtr db);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_clear_bindings")]
-    public static extern int decentdb_clear_bindings(IntPtr stmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_begin_transaction")]
+    internal static extern uint ddb_db_begin_transaction(IntPtr db);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_step")]
-    public static extern int decentdb_step(IntPtr stmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_commit_transaction")]
+    internal static extern uint ddb_db_commit_transaction(IntPtr db, out ulong outLsn);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_count")]
-    public static extern int decentdb_column_count(IntPtr stmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_rollback_transaction")]
+    internal static extern uint ddb_db_rollback_transaction(IntPtr db);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_type")]
-    public static extern int decentdb_column_type(IntPtr stmt, int col0Based);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_save_as")]
+    internal static extern uint ddb_db_save_as(IntPtr db, IntPtr destPathUtf8);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_is_null")]
-    public static extern int decentdb_column_is_null(IntPtr stmt, int col0Based);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_free")]
+    internal static extern uint ddb_stmt_free(ref IntPtr stmt);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_int64")]
-    public static extern long decentdb_column_int64(IntPtr stmt, int col0Based);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_reset")]
+    internal static extern uint ddb_stmt_reset(IntPtr stmt);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_float64")]
-    public static extern double decentdb_column_float64(IntPtr stmt, int col0Based);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_clear_bindings")]
+    internal static extern uint ddb_stmt_clear_bindings(IntPtr stmt);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_blob")]
-    public static extern IntPtr decentdb_column_blob(IntPtr stmt, int col0Based, out int outByteLen);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_step")]
+    internal static extern uint ddb_stmt_step(IntPtr stmt, out byte outHasRow);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_row_view")]
-    public static extern int decentdb_row_view(IntPtr stmt, out IntPtr outValues, out int outCount);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_column_count")]
+    internal static extern uint ddb_stmt_column_count(IntPtr stmt, out nuint outColumns);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_rows_affected")]
-    public static extern long decentdb_rows_affected(IntPtr stmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_column_name_copy")]
+    internal static extern uint ddb_stmt_column_name_copy(IntPtr stmt, nuint columnIndex, out IntPtr outName);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_finalize")]
-    public static extern void decentdb_finalize(IntPtr stmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_affected_rows")]
+    internal static extern uint ddb_stmt_affected_rows(IntPtr stmt, out ulong outRows);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_free")]
-    public static extern void decentdb_free(IntPtr ptr);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_value_copy")]
+    internal static extern uint ddb_stmt_value_copy(IntPtr stmt, nuint columnIndex, out DdbValueNative outValue);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_list_tables_json")]
+    internal static extern uint ddb_db_list_tables_json(IntPtr db, out IntPtr outJson);
+
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_list_indexes_json")]
+    internal static extern uint ddb_db_list_indexes_json(IntPtr db, out IntPtr outJson);
 }
 
 public static unsafe class DecentDBNativeUnsafe
@@ -204,62 +228,68 @@ public static unsafe class DecentDBNativeUnsafe
         DecentDBNative.EnsureInitialized();
     }
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_open")]
-    public static extern IntPtr decentdb_open(byte* pathUtf8, byte* optionsUtf8);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_open_or_create")]
+    internal static extern uint ddb_db_open_or_create(byte* pathUtf8, out IntPtr outDb);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_last_error_message")]
-    public static extern byte* decentdb_last_error_message(IntPtr db);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_prepare")]
+    internal static extern uint ddb_db_prepare(IntPtr db, byte* sqlUtf8, out IntPtr outStmt);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_prepare")]
-    public static extern int decentdb_prepare(IntPtr db, byte* sqlUtf8, out IntPtr outStmt);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_null")]
+    internal static extern uint ddb_stmt_bind_null(IntPtr stmt, nuint index1Based);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_null")]
-    public static extern int decentdb_bind_null(IntPtr stmt, int index1Based);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_int64")]
+    internal static extern uint ddb_stmt_bind_int64(IntPtr stmt, nuint index1Based, long value);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_int64")]
-    public static extern int decentdb_bind_int64(IntPtr stmt, int index1Based, long v);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_bool")]
+    internal static extern uint ddb_stmt_bind_bool(IntPtr stmt, nuint index1Based, byte value);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_bool")]
-    public static extern int decentdb_bind_bool(IntPtr stmt, int index1Based, int v);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_decimal")]
+    internal static extern uint ddb_stmt_bind_decimal(IntPtr stmt, nuint index1Based, long scaled, byte scale);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_decimal")]
-    public static extern int decentdb_bind_decimal(IntPtr stmt, int index1Based, long v, int scale);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_float64")]
+    internal static extern uint ddb_stmt_bind_float64(IntPtr stmt, nuint index1Based, double value);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_float64")]
-    public static extern int decentdb_bind_float64(IntPtr stmt, int index1Based, double v);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_text")]
+    internal static extern uint ddb_stmt_bind_text(IntPtr stmt, nuint index1Based, byte* utf8, nuint byteLen);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_text")]
-    public static extern int decentdb_bind_text(IntPtr stmt, int index1Based, byte* utf8, int byteLen);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_blob")]
+    internal static extern uint ddb_stmt_bind_blob(IntPtr stmt, nuint index1Based, byte* data, nuint byteLen);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_blob")]
-    public static extern int decentdb_bind_blob(IntPtr stmt, int index1Based, byte* data, int byteLen);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_stmt_bind_timestamp_micros")]
+    internal static extern uint ddb_stmt_bind_timestamp_micros(IntPtr stmt, nuint index1Based, long timestampMicros);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_bind_datetime")]
-    public static extern int decentdb_bind_datetime(IntPtr stmt, int index1Based, long microsUtc);
+    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_describe_table_json")]
+    internal static extern uint ddb_db_describe_table_json(IntPtr db, byte* tableNameUtf8, out IntPtr outJson);
+}
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_datetime")]
-    public static extern long decentdb_column_datetime(IntPtr stmt, int col0Based);
+internal enum DdbValueTag : uint
+{
+    Null = 0,
+    Int64 = 1,
+    Float64 = 2,
+    Bool = 3,
+    Text = 4,
+    Blob = 5,
+    Decimal = 6,
+    Uuid = 7,
+    TimestampMicros = 8
+}
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_name")]
-    public static extern byte* decentdb_column_name(IntPtr stmt, int col0Based);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_text")]
-    public static extern byte* decentdb_column_text(IntPtr stmt, int col0Based, out int outByteLen);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_decimal_scale")]
-    public static extern int decentdb_column_decimal_scale(IntPtr stmt, int col0Based);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_column_decimal_unscaled")]
-    public static extern long decentdb_column_decimal_unscaled(IntPtr stmt, int col0Based);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_list_tables_json")]
-    public static extern IntPtr decentdb_list_tables_json(IntPtr db, out int outLen);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_get_table_columns_json")]
-    public static extern IntPtr decentdb_get_table_columns_json(IntPtr db, byte* tableNameUtf8, out int outLen);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "decentdb_list_indexes_json")]
-    public static extern IntPtr decentdb_list_indexes_json(IntPtr db, out int outLen);
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct DdbValueNative
+{
+    public uint tag;
+    public byte bool_value;
+    public fixed byte reserved0[7];
+    public long int64_value;
+    public double float64_value;
+    public long decimal_scaled;
+    public byte decimal_scale;
+    public fixed byte reserved1[7];
+    public byte* data;
+    public nuint len;
+    public fixed byte uuid_bytes[16];
+    public long timestamp_micros;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -282,5 +312,6 @@ public enum DbValueKind : int
     Float64 = 3,
     Text = 4,
     Blob = 5,
-    Decimal = 12
+    Decimal = 12,
+    Timestamp = 17
 }
