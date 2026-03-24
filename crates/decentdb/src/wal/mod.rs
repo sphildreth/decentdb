@@ -58,7 +58,7 @@ impl WalHandle {
 
     pub(crate) fn commit_pages(
         &self,
-        pages: &[(PageId, Vec<u8>)],
+        pages: Vec<(PageId, Vec<u8>)>,
         max_page_count: u32,
     ) -> Result<u64> {
         writer::commit_pages(self, pages, max_page_count)
@@ -66,7 +66,7 @@ impl WalHandle {
 
     pub(crate) fn commit_pages_if_latest(
         &self,
-        pages: &[(PageId, Vec<u8>)],
+        pages: Vec<(PageId, Vec<u8>)>,
         max_page_count: u32,
         expected_latest_lsn: u64,
     ) -> Result<u64> {

@@ -24,8 +24,13 @@ pub(crate) fn zigzag_decode_u64(value: u64) -> i64 {
 }
 
 #[must_use]
-pub(crate) fn encode_varint_u64(mut value: u64) -> Vec<u8> {
+pub(crate) fn encode_varint_u64(value: u64) -> Vec<u8> {
     let mut output = Vec::new();
+    encode_varint_u64_into(value, &mut output);
+    output
+}
+
+pub(crate) fn encode_varint_u64_into(mut value: u64, output: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7F) as u8;
         value >>= 7;
@@ -37,7 +42,6 @@ pub(crate) fn encode_varint_u64(mut value: u64) -> Vec<u8> {
             break;
         }
     }
-    output
 }
 
 pub(crate) fn decode_varint_u64(input: &[u8]) -> Result<(u64, usize)> {

@@ -4,7 +4,9 @@ use crate::error::{DbError, Result};
 use crate::record::compression::CompressionMode;
 use crate::record::overflow::{read_overflow, write_overflow, OverflowPointer};
 use crate::record::value::Value;
-use crate::record::{decode_varint_u64, encode_varint_u64, zigzag_decode_u64, zigzag_encode_i64};
+use crate::record::{
+    decode_varint_u64, encode_varint_u64_into, zigzag_decode_u64, zigzag_encode_i64,
+};
 use crate::storage::page::PageStore;
 
 const TAG_NULL: u8 = 0;
@@ -101,50 +103,94 @@ impl Row {
         mut store: Option<&mut S>,
         options: RowOverflowOptions,
     ) -> Result<()> {
-        output.extend_from_slice(&encode_varint_u64(
+        encode_varint_u64_into(
             u64::try_from(values.len())
                 .map_err(|_| DbError::constraint("row field count exceeds u64"))?,
-        ));
+            output,
+        );
 
         for value in values {
-            let (tag, payload) = match value {
-                Value::Null => (TAG_NULL, Vec::new()),
-                Value::Int64(value) => (TAG_INT64, encode_varint_u64(zigzag_encode_i64(*value))),
-                Value::Float64(value) => (TAG_FLOAT64, value.to_le_bytes().to_vec()),
-                Value::Bool(value) => (TAG_BOOL, vec![u8::from(*value)]),
+            match value {
+                Value::Null => {
+                    output.push(TAG_NULL);
+                    encode_varint_u64_into(0, output);
+                }
+                Value::Int64(value) => {
+                    let mut encoded = [0_u8; 10];
+                    let len = encode_varint_u64_fixed(zigzag_encode_i64(*value), &mut encoded);
+                    output.push(TAG_INT64);
+                    encode_varint_u64_into(len as u64, output);
+                    output.extend_from_slice(&encoded[..len]);
+                }
+                Value::Float64(value) => {
+                    output.push(TAG_FLOAT64);
+                    encode_varint_u64_into(8, output);
+                    output.extend_from_slice(&value.to_le_bytes());
+                }
+                Value::Bool(value) => {
+                    output.push(TAG_BOOL);
+                    encode_varint_u64_into(1, output);
+                    output.push(u8::from(*value));
+                }
                 Value::Text(text) if text.len() > options.inline_threshold => {
                     let store = store.as_deref_mut().ok_or_else(|| {
                         DbError::constraint("TEXT overflow requires a page store")
                     })?;
                     let pointer = write_overflow(store, text.as_bytes(), options.compression)?;
-                    (TAG_TEXT_OVERFLOW, encode_overflow_pointer(pointer))
+                    let encoded = encode_overflow_pointer(pointer);
+                    output.push(TAG_TEXT_OVERFLOW);
+                    encode_varint_u64_into(encoded.len() as u64, output);
+                    output.extend_from_slice(&encoded);
                 }
-                Value::Text(text) => (TAG_TEXT, text.as_bytes().to_vec()),
+                Value::Text(text) => {
+                    output.push(TAG_TEXT);
+                    encode_varint_u64_into(
+                        u64::try_from(text.len())
+                            .map_err(|_| DbError::constraint("TEXT payload exceeds u64"))?,
+                        output,
+                    );
+                    output.extend_from_slice(text.as_bytes());
+                }
                 Value::Blob(blob) if blob.len() > options.inline_threshold => {
                     let store = store.as_deref_mut().ok_or_else(|| {
                         DbError::constraint("BLOB overflow requires a page store")
                     })?;
                     let pointer = write_overflow(store, blob, options.compression)?;
-                    (TAG_BLOB_OVERFLOW, encode_overflow_pointer(pointer))
+                    let encoded = encode_overflow_pointer(pointer);
+                    output.push(TAG_BLOB_OVERFLOW);
+                    encode_varint_u64_into(encoded.len() as u64, output);
+                    output.extend_from_slice(&encoded);
                 }
-                Value::Blob(blob) => (TAG_BLOB, blob.clone()),
+                Value::Blob(blob) => {
+                    output.push(TAG_BLOB);
+                    encode_varint_u64_into(
+                        u64::try_from(blob.len())
+                            .map_err(|_| DbError::constraint("BLOB payload exceeds u64"))?,
+                        output,
+                    );
+                    output.extend_from_slice(blob);
+                }
                 Value::Decimal { scaled, scale } => {
-                    let mut payload = vec![*scale];
-                    payload.extend_from_slice(&encode_varint_u64(zigzag_encode_i64(*scaled)));
-                    (TAG_DECIMAL, payload)
+                    let mut encoded = [0_u8; 10];
+                    let len = encode_varint_u64_fixed(zigzag_encode_i64(*scaled), &mut encoded);
+                    output.push(TAG_DECIMAL);
+                    encode_varint_u64_into((len + 1) as u64, output);
+                    output.push(*scale);
+                    output.extend_from_slice(&encoded[..len]);
                 }
-                Value::Uuid(uuid) => (TAG_UUID, uuid.to_vec()),
+                Value::Uuid(uuid) => {
+                    output.push(TAG_UUID);
+                    encode_varint_u64_into(16, output);
+                    output.extend_from_slice(uuid);
+                }
                 Value::TimestampMicros(value) => {
-                    (TAG_TIMESTAMP, encode_varint_u64(zigzag_encode_i64(*value)))
+                    let mut encoded = [0_u8; 10];
+                    let len = encode_varint_u64_fixed(zigzag_encode_i64(*value), &mut encoded);
+                    output.push(TAG_TIMESTAMP);
+                    encode_varint_u64_into(len as u64, output);
+                    output.extend_from_slice(&encoded[..len]);
                 }
-            };
-
-            output.push(tag);
-            output.extend_from_slice(&encode_varint_u64(
-                u64::try_from(payload.len())
-                    .map_err(|_| DbError::constraint("field payload length exceeds u64"))?,
-            ));
-            output.extend_from_slice(&payload);
+            }
         }
         Ok(())
     }
@@ -249,12 +295,28 @@ impl Row {
     }
 }
 
-fn encode_overflow_pointer(pointer: OverflowPointer) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(9);
-    payload.push(pointer.flags);
-    payload.extend_from_slice(&pointer.head_page_id.to_le_bytes());
-    payload.extend_from_slice(&pointer.logical_len.to_le_bytes());
+fn encode_overflow_pointer(pointer: OverflowPointer) -> [u8; 9] {
+    let mut payload = [0_u8; 9];
+    payload[0] = pointer.flags;
+    payload[1..5].copy_from_slice(&pointer.head_page_id.to_le_bytes());
+    payload[5..9].copy_from_slice(&pointer.logical_len.to_le_bytes());
     payload
+}
+
+fn encode_varint_u64_fixed(mut value: u64, output: &mut [u8; 10]) -> usize {
+    let mut cursor = 0;
+    loop {
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output[cursor] = byte;
+        cursor += 1;
+        if value == 0 {
+            return cursor;
+        }
+    }
 }
 
 fn decode_overflow_pointer(payload: &[u8]) -> Result<OverflowPointer> {

@@ -55,6 +55,7 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) use_generic_validation: bool,
     pub(crate) use_generic_index_updates: bool,
+    pub(crate) compiled_index_state_epoch: u64,
 }
 
 impl EngineRuntime {
@@ -74,12 +75,17 @@ impl EngineRuntime {
     }
 
     pub(crate) fn can_reuse_prepared_simple_insert(&self, prepared: &PreparedSimpleInsert) -> bool {
-        self.catalog.table(&prepared.table_name).is_some()
-            && (prepared.use_generic_validation
-                || prepared
-                    .unique_indexes
-                    .iter()
-                    .all(|index| self.prepared_btree_index_is_fresh(index)))
+        if self.catalog.table(&prepared.table_name).is_none() {
+            return false;
+        }
+        if prepared.compiled_index_state_epoch == self.index_state_epoch {
+            return true;
+        }
+        (prepared.use_generic_validation
+            || prepared
+                .unique_indexes
+                .iter()
+                .all(|index| self.prepared_btree_index_is_fresh(index)))
             && (prepared.use_generic_index_updates
                 || prepared
                     .insert_indexes
@@ -228,6 +234,7 @@ impl EngineRuntime {
             insert_indexes,
             use_generic_validation,
             use_generic_index_updates,
+            compiled_index_state_epoch: self.index_state_epoch,
         }))
     }
 
@@ -1358,15 +1365,14 @@ fn apply_prepared_insert_index_updates(
                 index.name
             )));
         };
-        if check_unique
-            && index.unique
-            && !prepared_index_contains_null(index, &row.values)
-            && keys.contains_any(&key)
-        {
-            return Err(DbError::constraint(format!(
-                "unique constraint {} on {} was violated",
-                index.name, prepared.table_name
-            )));
+        if check_unique && index.unique && !prepared_index_contains_null(index, &row.values) {
+            if keys.insert_row_id(key, row.row_id).is_err() {
+                return Err(DbError::constraint(format!(
+                    "unique constraint {} on {} was violated",
+                    index.name, prepared.table_name
+                )));
+            }
+            continue;
         }
         keys.insert_row_id(key, row.row_id)?;
     }

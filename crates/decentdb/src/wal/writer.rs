@@ -10,14 +10,16 @@ use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
 use crate::vfs::write_all_at;
 
-use super::format::{WalFrame, WAL_HEADER_SIZE};
+use super::format::{
+    FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE,
+};
 use super::index::WalVersion;
 use super::recovery;
 use super::WalHandle;
 
 pub(crate) fn commit_pages(
     wal: &WalHandle,
-    pages: &[(PageId, Vec<u8>)],
+    pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
 ) -> Result<u64> {
     let _writer_guard = wal
@@ -31,25 +33,25 @@ pub(crate) fn commit_pages(
         offset = WAL_HEADER_SIZE;
     }
 
-    let mut committed = Vec::new();
+    let page_frame_len = FRAME_HEADER_SIZE + wal.inner.page_size as usize + FRAME_TRAILER_SIZE;
+    let commit_frame_len = FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE;
+    let mut batch = Vec::with_capacity(page_frame_len * pages.len() + commit_frame_len);
+    let mut committed = Vec::with_capacity(pages.len());
+    let mut next_lsn = offset;
     for (page_id, payload) in pages {
-        let frame = WalFrame::page(*page_id, payload.clone());
-        let bytes = frame.encode(wal.inner.page_size)?;
-        write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
-        offset += bytes.len() as u64;
+        let frame_len = append_page_frame(&mut batch, page_id, &payload, wal.inner.page_size)?;
+        next_lsn += frame_len as u64;
         committed.push((
-            *page_id,
+            page_id,
             WalVersion {
-                lsn: offset,
-                data: payload.clone(),
+                lsn: next_lsn,
+                data: payload,
             },
         ));
     }
-
-    let commit = WalFrame::commit();
-    let commit_bytes = commit.encode(wal.inner.page_size)?;
-    write_all_at(wal.inner.file.as_ref(), offset, &commit_bytes)?;
-    offset += commit_bytes.len() as u64;
+    next_lsn += append_commit_frame(&mut batch) as u64;
+    write_all_at(wal.inner.file.as_ref(), offset, &batch)?;
+    offset = next_lsn;
 
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
     sync_for_mode(wal.inner.sync_mode, wal)?;
@@ -75,7 +77,7 @@ pub(crate) fn commit_pages(
 
 pub(crate) fn commit_pages_if_latest(
     wal: &WalHandle,
-    pages: &[(PageId, Vec<u8>)],
+    pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
     expected_latest_lsn: u64,
 ) -> Result<u64> {
@@ -97,25 +99,25 @@ pub(crate) fn commit_pages_if_latest(
         offset = WAL_HEADER_SIZE;
     }
 
-    let mut committed = Vec::new();
+    let page_frame_len = FRAME_HEADER_SIZE + wal.inner.page_size as usize + FRAME_TRAILER_SIZE;
+    let commit_frame_len = FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE;
+    let mut batch = Vec::with_capacity(page_frame_len * pages.len() + commit_frame_len);
+    let mut committed = Vec::with_capacity(pages.len());
+    let mut next_lsn = offset;
     for (page_id, payload) in pages {
-        let frame = WalFrame::page(*page_id, payload.clone());
-        let bytes = frame.encode(wal.inner.page_size)?;
-        write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
-        offset += bytes.len() as u64;
+        let frame_len = append_page_frame(&mut batch, page_id, &payload, wal.inner.page_size)?;
+        next_lsn += frame_len as u64;
         committed.push((
-            *page_id,
+            page_id,
             WalVersion {
-                lsn: offset,
-                data: payload.clone(),
+                lsn: next_lsn,
+                data: payload,
             },
         ));
     }
-
-    let commit = WalFrame::commit();
-    let commit_bytes = commit.encode(wal.inner.page_size)?;
-    write_all_at(wal.inner.file.as_ref(), offset, &commit_bytes)?;
-    offset += commit_bytes.len() as u64;
+    next_lsn += append_commit_frame(&mut batch) as u64;
+    write_all_at(wal.inner.file.as_ref(), offset, &batch)?;
+    offset = next_lsn;
 
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
     sync_for_mode(wal.inner.sync_mode, wal)?;
@@ -168,4 +170,36 @@ fn sync_for_mode(sync_mode: WalSyncMode, wal: &WalHandle) -> Result<()> {
         WalSyncMode::Normal => wal.inner.file.sync_data(),
         WalSyncMode::TestingOnlyUnsafeNoSync => Ok(()),
     }
+}
+
+fn append_page_frame(
+    output: &mut Vec<u8>,
+    page_id: PageId,
+    payload: &[u8],
+    page_size: u32,
+) -> Result<usize> {
+    if page_id == 0 {
+        return Err(DbError::corruption(
+            "page WAL frames must have a non-zero page id",
+        ));
+    }
+    if payload.len() != page_size as usize {
+        return Err(DbError::internal(format!(
+            "WAL frame payload length {} does not match expected payload length {}",
+            payload.len(),
+            page_size
+        )));
+    }
+    output.push(FrameType::Page as u8);
+    output.extend_from_slice(&page_id.to_le_bytes());
+    output.extend_from_slice(payload);
+    output.extend_from_slice(&0_u64.to_le_bytes());
+    Ok(FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE)
+}
+
+fn append_commit_frame(output: &mut Vec<u8>) -> usize {
+    output.push(FrameType::Commit as u8);
+    output.extend_from_slice(&0_u32.to_le_bytes());
+    output.extend_from_slice(&0_u64.to_le_bytes());
+    FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE
 }

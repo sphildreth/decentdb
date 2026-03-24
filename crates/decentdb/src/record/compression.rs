@@ -5,6 +5,9 @@ use miniz_oxide::inflate::decompress_to_vec_zlib;
 
 use crate::error::{DbError, Result};
 
+const AUTO_COMPRESSION_LEVEL: u8 = 1;
+const AUTO_MIN_PAYLOAD_BYTES: usize = 256;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompressionMode {
     Never,
@@ -24,8 +27,14 @@ pub(crate) fn maybe_compress(bytes: &[u8], mode: CompressionMode) -> CompressedP
             compressed: false,
         };
     }
+    if bytes.len() < AUTO_MIN_PAYLOAD_BYTES {
+        return CompressedPayload {
+            bytes: bytes.to_vec(),
+            compressed: false,
+        };
+    }
 
-    let compressed = compress_to_vec_zlib(bytes, 6);
+    let compressed = compress_to_vec_zlib(bytes, AUTO_COMPRESSION_LEVEL);
     if compressed.len() + 8 < bytes.len() {
         CompressedPayload {
             bytes: compressed,

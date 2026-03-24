@@ -106,6 +106,7 @@ pub(crate) struct WalFrame {
 }
 
 impl WalFrame {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn page(page_id: PageId, payload: Vec<u8>) -> Self {
         Self {
@@ -115,6 +116,7 @@ impl WalFrame {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn commit() -> Self {
         Self {

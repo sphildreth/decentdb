@@ -755,7 +755,7 @@ impl Db {
             .on_disk_page_count()?
             .max(self.inner.wal.max_page_count())
             .max(max_page_id);
-        self.inner.wal.commit_pages(&pages, max_page_count)
+        self.inner.wal.commit_pages(pages, max_page_count)
     }
 
     fn commit_if_latest(&self, expected_latest_lsn: u64) -> Result<u64> {
@@ -784,7 +784,7 @@ impl Db {
             .max(max_page_id);
         self.inner
             .wal
-            .commit_pages_if_latest(&pages, max_page_count, expected_latest_lsn)
+            .commit_pages_if_latest(pages, max_page_count, expected_latest_lsn)
     }
 
     /// Rolls back the current write transaction.
@@ -2611,6 +2611,7 @@ mod tests {
             insert_indexes: Vec::new(),
             use_generic_validation: false,
             use_generic_index_updates: false,
+            compiled_index_state_epoch: 0,
         }
     }
 

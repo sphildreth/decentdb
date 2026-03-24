@@ -10,7 +10,7 @@ pub(crate) mod triggers;
 pub(crate) mod txn;
 pub(crate) mod views;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Instant;
 
 use crate::catalog::{
@@ -85,8 +85,8 @@ pub(crate) enum RuntimeBtreeKey {
 pub(crate) enum RuntimeBtreeKeys {
     UniqueEncoded(BTreeMap<Vec<u8>, i64>),
     NonUniqueEncoded(BTreeMap<Vec<u8>, Vec<i64>>),
-    UniqueInt64(BTreeMap<i64, i64>),
-    NonUniqueInt64(BTreeMap<i64, Vec<i64>>),
+    UniqueInt64(HashMap<i64, i64>),
+    NonUniqueInt64(HashMap<i64, Vec<i64>>),
 }
 
 impl RuntimeBtreeKeys {
@@ -215,6 +215,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     pub(crate) dirty_tables: BTreeSet<String>,
+    pub(crate) index_state_epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,6 +246,7 @@ impl EngineRuntime {
             indexes: BTreeMap::new(),
             persisted_tables: BTreeMap::new(),
             dirty_tables: BTreeSet::new(),
+            index_state_epoch: 0,
         }
     }
 
@@ -410,6 +412,7 @@ impl EngineRuntime {
         for index in self.catalog.indexes.values_mut() {
             index.fresh = true;
         }
+        self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -427,6 +430,7 @@ impl EngineRuntime {
         if let Some(index) = self.catalog.indexes.get_mut(name) {
             index.fresh = true;
         }
+        self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -445,10 +449,15 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_indexes_stale_for_table(&mut self, table_name: &str) {
+        let mut changed = false;
         for index in self.catalog.indexes.values_mut() {
-            if identifiers_equal(&index.table_name, table_name) {
+            if identifiers_equal(&index.table_name, table_name) && index.fresh {
                 index.fresh = false;
+                changed = true;
             }
+        }
+        if changed {
+            self.index_state_epoch = self.index_state_epoch.wrapping_add(1);
         }
     }
 
@@ -1826,7 +1835,7 @@ fn build_runtime_index(
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
             if index.unique && int64_keys {
-                let mut keys = BTreeMap::<i64, i64>::new();
+                let mut keys = HashMap::<i64, i64>::new();
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, row)? else {
                         continue;
@@ -1868,7 +1877,7 @@ fn build_runtime_index(
                     keys: RuntimeBtreeKeys::UniqueEncoded(keys),
                 })
             } else if int64_keys {
-                let mut keys = BTreeMap::<i64, Vec<i64>>::new();
+                let mut keys = HashMap::<i64, Vec<i64>>::new();
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, row)? else {
                         continue;
@@ -2538,10 +2547,10 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
     if data.rows.is_empty() {
         return Ok(Vec::new());
     }
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(TABLE_PAYLOAD_MAGIC.len() + 4 + data.rows.len() * 32);
     output.extend_from_slice(TABLE_PAYLOAD_MAGIC);
     encode_u32(&mut output, data.rows.len() as u32);
-    let mut encoded_row = Vec::new();
+    let mut encoded_row = Vec::with_capacity(64);
     for row in &data.rows {
         encode_i64(&mut output, row.row_id);
         Row::encode_values_into(&row.values, &mut encoded_row)?;
