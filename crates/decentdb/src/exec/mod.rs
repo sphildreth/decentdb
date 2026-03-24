@@ -402,9 +402,10 @@ impl EngineRuntime {
                             let tail = if previous_state.tail.page_id != 0 {
                                 previous_state.tail
                             } else {
-                                read_uncompressed_overflow_tail(&store, previous_pointer)?.ok_or_else(
-                                    || DbError::corruption("overflow tail info is missing"),
-                                )?
+                                read_uncompressed_overflow_tail(&store, previous_pointer)?
+                                    .ok_or_else(|| {
+                                        DbError::corruption("overflow tail info is missing")
+                                    })?
                             };
                             let (pointer, tail) = append_uncompressed_with_tail(
                                 &mut store,
@@ -436,10 +437,13 @@ impl EngineRuntime {
                     encode_table_payload(data)?
                 };
                 let checksum = crc32c_parts(&[payload.as_slice()]);
-                let pointer =
-                    rewrite_overflow(&mut store, previous_pointer, &payload, CompressionMode::Auto)?;
-                let tail = read_uncompressed_overflow_tail(&store, pointer)?
-                    .unwrap_or_default();
+                let pointer = rewrite_overflow(
+                    &mut store,
+                    previous_pointer,
+                    &payload,
+                    CompressionMode::Auto,
+                )?;
+                let tail = read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default();
                 self.persisted_tables.insert(
                     table_name.clone(),
                     PersistedTableState {
@@ -530,7 +534,11 @@ impl EngineRuntime {
             .as_mut()
             .ok_or_else(|| DbError::internal("manifest template was not initialized"))?;
         for (table_name, offset) in &template.table_state_offsets {
-            let state = self.persisted_tables.get(table_name).copied().unwrap_or_default();
+            let state = self
+                .persisted_tables
+                .get(table_name)
+                .copied()
+                .unwrap_or_default();
             patch_manifest_table_state(&mut template.bytes, *offset, state)?;
         }
         Ok(template.bytes.as_slice())
@@ -968,8 +976,13 @@ impl EngineRuntime {
 
         let mut ctes = inherited_ctes.clone();
         for cte in &query.ctes {
-            let mut dataset =
-                self.evaluate_query_with_outer(&cte.query, params, &ctes, outer_dataset, outer_row)?;
+            let mut dataset = self.evaluate_query_with_outer(
+                &cte.query,
+                params,
+                &ctes,
+                outer_dataset,
+                outer_row,
+            )?;
             if !cte.column_names.is_empty() {
                 if cte.column_names.len() != dataset.columns.len() {
                     return Err(DbError::sql(format!(
@@ -996,8 +1009,13 @@ impl EngineRuntime {
                 self.evaluate_select_with_outer(select, params, &ctes, outer_dataset, outer_row)?
             }
             QueryBody::Select(select) => {
-                let mut source =
-                    self.build_select_dataset_with_outer(select, params, &ctes, outer_dataset, outer_row)?;
+                let mut source = self.build_select_dataset_with_outer(
+                    select,
+                    params,
+                    &ctes,
+                    outer_dataset,
+                    outer_row,
+                )?;
                 if !query.order_by.is_empty() {
                     self.sort_dataset(&mut source, &query.order_by, params, &ctes)?;
                 }
@@ -1009,7 +1027,13 @@ impl EngineRuntime {
                 }
                 projected
             }
-            _ => self.evaluate_query_body_with_outer(&query.body, params, &ctes, outer_dataset, outer_row)?,
+            _ => self.evaluate_query_body_with_outer(
+                &query.body,
+                params,
+                &ctes,
+                outer_dataset,
+                outer_row,
+            )?,
         };
         if !query.order_by.is_empty() && !sorted_during_select {
             self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
@@ -1082,10 +1106,20 @@ impl EngineRuntime {
                 left,
                 right,
             } => {
-                let left =
-                    self.evaluate_query_body_with_outer(left, params, ctes, outer_dataset, outer_row)?;
-                let right =
-                    self.evaluate_query_body_with_outer(right, params, ctes, outer_dataset, outer_row)?;
+                let left = self.evaluate_query_body_with_outer(
+                    left,
+                    params,
+                    ctes,
+                    outer_dataset,
+                    outer_row,
+                )?;
+                let right = self.evaluate_query_body_with_outer(
+                    right,
+                    params,
+                    ctes,
+                    outer_dataset,
+                    outer_row,
+                )?;
                 self.evaluate_set_operation(*op, *all, left, right)
             }
         }
@@ -1385,16 +1419,14 @@ impl EngineRuntime {
             else {
                 return Ok(None);
             };
-            return self.indexed_inner_join_filtered(
-                IndexedJoinPlan {
-                    filtered_table: left_binding,
-                    filtered_dataset: &left_dataset,
-                    filtered_join_column: left_join.column,
-                    probe_table: right_binding,
-                    probe_join_column: right_join.column,
-                    filtered_on_left: true,
-                },
-            );
+            return self.indexed_inner_join_filtered(IndexedJoinPlan {
+                filtered_table: left_binding,
+                filtered_dataset: &left_dataset,
+                filtered_join_column: left_join.column,
+                probe_table: right_binding,
+                probe_join_column: right_join.column,
+                filtered_on_left: true,
+            });
         }
 
         if matches_table_binding(right_binding, filter_table)
@@ -1412,16 +1444,14 @@ impl EngineRuntime {
             else {
                 return Ok(None);
             };
-            return self.indexed_inner_join_filtered(
-                IndexedJoinPlan {
-                    filtered_table: right_binding,
-                    filtered_dataset: &right_dataset,
-                    filtered_join_column: right_join.column,
-                    probe_table: left_binding,
-                    probe_join_column: left_join.column,
-                    filtered_on_left: false,
-                },
-            );
+            return self.indexed_inner_join_filtered(IndexedJoinPlan {
+                filtered_table: right_binding,
+                filtered_dataset: &right_dataset,
+                filtered_join_column: right_join.column,
+                probe_table: left_binding,
+                probe_join_column: left_join.column,
+                filtered_on_left: false,
+            });
         }
 
         Ok(None)
@@ -1466,23 +1496,16 @@ impl EngineRuntime {
             .map(Some)
     }
 
-    fn indexed_inner_join_filtered(
-        &self,
-        plan: IndexedJoinPlan<'_>,
-    ) -> Result<Option<Dataset>> {
-        let filtered_table = self
-            .table_schema(plan.filtered_table.name)
-            .ok_or_else(|| {
-                DbError::sql(format!(
-                    "unknown table or view {}",
-                    plan.filtered_table.name
-                ))
-            })?;
-        let probe_table = self
-            .table_schema(plan.probe_table.name)
-            .ok_or_else(|| {
-                DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
-            })?;
+    fn indexed_inner_join_filtered(&self, plan: IndexedJoinPlan<'_>) -> Result<Option<Dataset>> {
+        let filtered_table = self.table_schema(plan.filtered_table.name).ok_or_else(|| {
+            DbError::sql(format!(
+                "unknown table or view {}",
+                plan.filtered_table.name
+            ))
+        })?;
+        let probe_table = self.table_schema(plan.probe_table.name).ok_or_else(|| {
+            DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
+        })?;
         let empty_probe_data = TableData::default();
         let probe_data = self
             .table_data(plan.probe_table.name)
@@ -1647,9 +1670,7 @@ impl EngineRuntime {
         let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
         let rows = row_ids
             .iter()
-            .filter_map(|row_id| {
-                data.row_by_id(*row_id).map(|row| row.values.clone())
-            })
+            .filter_map(|row_id| data.row_by_id(*row_id).map(|row| row.values.clone()))
             .collect::<Vec<_>>();
         Ok(Dataset {
             columns: table
@@ -2105,10 +2126,9 @@ fn compute_index_key(
             ));
         };
         if let Some(column_name) = &column.column_name {
-            let position = column_position(table, column_name)
-                .ok_or_else(|| {
-                    DbError::constraint(format!("index column {} does not exist", column_name))
-                })?;
+            let position = column_position(table, column_name).ok_or_else(|| {
+                DbError::constraint(format!("index column {} does not exist", column_name))
+            })?;
             let Value::Int64(value) = row
                 .values
                 .get(position)
@@ -2143,10 +2163,9 @@ fn btree_uses_typed_int64_keys(index: &IndexSchema, table: &TableSchema) -> bool
     let Some(column_name) = &column.column_name else {
         return false;
     };
-    column_schema(table, column_name)
-        .is_some_and(|column| {
-            column.column_type == crate::catalog::ColumnType::Int64 && !column.nullable
-        })
+    column_schema(table, column_name).is_some_and(|column| {
+        column.column_type == crate::catalog::ColumnType::Int64 && !column.nullable
+    })
 }
 
 fn compute_index_values(
@@ -2162,10 +2181,9 @@ fn compute_index_values(
         .iter()
         .map(|column| {
             if let Some(column_name) = &column.column_name {
-                let position = column_position(table, column_name)
-                    .ok_or_else(|| {
-                        DbError::constraint(format!("index column {} does not exist", column_name))
-                    })?;
+                let position = column_position(table, column_name).ok_or_else(|| {
+                    DbError::constraint(format!("index column {} does not exist", column_name))
+                })?;
                 Ok(row.values[position].clone())
             } else if let Some(expression_sql) = &column.expression_sql {
                 let expr = crate::sql::parser::parse_expression_sql(expression_sql)?;
@@ -3570,7 +3588,10 @@ impl EngineRuntime {
                     let mut current_rank = 1_i64;
                     for (ordinal, row_index) in sorted.iter().enumerate() {
                         if ordinal > 0
-                            && !window_order_keys_equal(&order_keys[ordinal - 1], &order_keys[ordinal])?
+                            && !window_order_keys_equal(
+                                &order_keys[ordinal - 1],
+                                &order_keys[ordinal],
+                            )?
                         {
                             current_rank = (ordinal + 1) as i64;
                         }
@@ -3581,7 +3602,10 @@ impl EngineRuntime {
                     let mut current_rank = 1_i64;
                     for (ordinal, row_index) in sorted.iter().enumerate() {
                         if ordinal > 0
-                            && !window_order_keys_equal(&order_keys[ordinal - 1], &order_keys[ordinal])?
+                            && !window_order_keys_equal(
+                                &order_keys[ordinal - 1],
+                                &order_keys[ordinal],
+                            )?
                         {
                             current_rank += 1;
                         }
@@ -3596,39 +3620,57 @@ impl EngineRuntime {
                         )));
                     }
                     let offset = match args.get(1) {
-                        Some(expr) => match self.eval_expr(expr, dataset, &[], params, ctes, None)? {
-                            Value::Int64(value) if value >= 0 => value as usize,
-                            Value::Int64(_) => {
-                                return Err(DbError::sql(format!(
-                                    "{} offset must be non-negative",
-                                    name.to_ascii_uppercase()
-                                )))
+                        Some(expr) => {
+                            match self.eval_expr(expr, dataset, &[], params, ctes, None)? {
+                                Value::Int64(value) if value >= 0 => value as usize,
+                                Value::Int64(_) => {
+                                    return Err(DbError::sql(format!(
+                                        "{} offset must be non-negative",
+                                        name.to_ascii_uppercase()
+                                    )))
+                                }
+                                other => {
+                                    return Err(DbError::sql(format!(
+                                        "{} offset must be INT64, got {other:?}",
+                                        name.to_ascii_uppercase()
+                                    )))
+                                }
                             }
-                            other => {
-                                return Err(DbError::sql(format!(
-                                    "{} offset must be INT64, got {other:?}",
-                                    name.to_ascii_uppercase()
-                                )))
-                            }
-                        },
+                        }
                         None => 1,
                     };
                     let ordered_values = sorted
                         .iter()
                         .map(|row_index| {
-                            self.eval_expr(&args[0], dataset, &dataset.rows[*row_index], params, ctes, None)
+                            self.eval_expr(
+                                &args[0],
+                                dataset,
+                                &dataset.rows[*row_index],
+                                params,
+                                ctes,
+                                None,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()?;
                     for (ordinal, row_index) in sorted.iter().enumerate() {
                         let target_ordinal = if name == "lag" {
                             ordinal.checked_sub(offset)
                         } else {
-                            ordinal.checked_add(offset).filter(|target| *target < sorted.len())
+                            ordinal
+                                .checked_add(offset)
+                                .filter(|target| *target < sorted.len())
                         };
                         results[*row_index] = if let Some(target_ordinal) = target_ordinal {
                             ordered_values[target_ordinal].clone()
                         } else if let Some(default_expr) = args.get(2) {
-                            self.eval_expr(default_expr, dataset, &dataset.rows[*row_index], params, ctes, None)?
+                            self.eval_expr(
+                                default_expr,
+                                dataset,
+                                &dataset.rows[*row_index],
+                                params,
+                                ctes,
+                                None,
+                            )?
                         } else {
                             Value::Null
                         };
@@ -4136,7 +4178,9 @@ impl EngineRuntime {
             Expr::ScalarSubquery(query) => {
                 let subquery = self.evaluate_query_with_outer(query, params, ctes, dataset, row)?;
                 if subquery.columns.len() != 1 {
-                    return Err(DbError::sql("scalar subquery must return exactly one column"));
+                    return Err(DbError::sql(
+                        "scalar subquery must return exactly one column",
+                    ));
                 }
                 Ok(subquery
                     .rows
@@ -4180,9 +4224,9 @@ impl EngineRuntime {
             Expr::Aggregate { .. } => Err(DbError::sql(
                 "aggregate expressions require grouped evaluation",
             )),
-            Expr::RowNumber { .. } | Expr::WindowFunction { .. } => {
-                Err(DbError::sql("window-function execution is not yet implemented"))
-            }
+            Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
+                "window-function execution is not yet implemented",
+            )),
             Expr::Case {
                 operand,
                 branches,
@@ -4669,7 +4713,9 @@ fn json_value_to_value(value: JsonValue) -> Result<Value> {
             if scale == 0 {
                 Ok(Value::Int64(scaled))
             } else {
-                Ok(Value::Float64((scaled as f64) / 10_f64.powi(i32::from(scale))))
+                Ok(Value::Float64(
+                    (scaled as f64) / 10_f64.powi(i32::from(scale)),
+                ))
             }
         }
         JsonValue::Object(_) | JsonValue::Array(_) => Ok(Value::Text(value.render_json())),
@@ -4989,9 +5035,12 @@ mod tests {
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
         let table_payload =
             encode_table_payload(&runtime.tables["docs"]).expect("encode table payload");
-        let pointer =
-            crate::record::overflow::write_overflow(&mut store, &table_payload, CompressionMode::Auto)
-                .expect("write table payload");
+        let pointer = crate::record::overflow::write_overflow(
+            &mut store,
+            &table_payload,
+            CompressionMode::Auto,
+        )
+        .expect("write table payload");
         let tail = crate::record::overflow::read_uncompressed_overflow_tail(&store, pointer)
             .expect("read table tail")
             .expect("table tail");
@@ -5050,7 +5099,10 @@ mod tests {
             &mut runtime,
             "CREATE TABLE del_contributors (Id INT64 PRIMARY KEY, ArtistId INT64)",
         );
-        execute_sql(&mut runtime, "INSERT INTO del_artists VALUES (1, 10), (2, 20)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO del_artists VALUES (1, 10), (2, 20)",
+        );
         execute_sql(
             &mut runtime,
             "INSERT INTO del_contributors VALUES (1, 1), (2, 2)",
@@ -5068,8 +5120,8 @@ mod tests {
             .expect("execute delete");
         assert_eq!(result.affected_rows(), 1);
 
-        let count = parse_sql_statement("SELECT COUNT(*) FROM del_contributors")
-            .expect("parse count");
+        let count =
+            parse_sql_statement("SELECT COUNT(*) FROM del_contributors").expect("parse count");
         let result = runtime
             .execute_statement(&count, &[], PAGE_SIZE)
             .expect("execute count");
@@ -5223,7 +5275,8 @@ fn like_match_chars(input: &[char], pattern: &[char], escape: Option<char>) -> b
         };
     }
     match current {
-        '%' => (0..=input.len()).any(|offset| like_match_chars(&input[offset..], &pattern[1..], escape)),
+        '%' => (0..=input.len())
+            .any(|offset| like_match_chars(&input[offset..], &pattern[1..], escape)),
         '_' => !input.is_empty() && like_match_chars(&input[1..], &pattern[1..], escape),
         literal => {
             !input.is_empty()

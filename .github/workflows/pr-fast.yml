@@ -51,8 +51,19 @@ jobs:
       - name: Set up Dart
         uses: dart-lang/setup-dart@v1
 
-      - name: Format
-        run: cargo fmt --check
+      - name: Format Check
+        run: |
+          echo "Checking Rust code formatting..."
+          if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
+            echo ""
+            echo "::error::Code formatting issues detected"
+            echo ""
+            echo "Formatting diffs (run 'cargo fmt' to fix):"
+            echo "::group::Details"
+            cat /tmp/fmt-check.log
+            echo "::endgroup::"
+            exit 1
+          fi
 
       - name: Clippy
         run: |

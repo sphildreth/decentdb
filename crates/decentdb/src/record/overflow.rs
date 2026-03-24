@@ -216,7 +216,9 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
         ));
     }
     if previous_tail.page_id == 0 {
-        return Err(DbError::corruption("append overflow tail page id is invalid"));
+        return Err(DbError::corruption(
+            "append overflow tail page id is invalid",
+        ));
     }
 
     let page_size = store.page_size() as usize;
@@ -274,7 +276,8 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
                     .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
                 .to_le_bytes(),
             );
-            page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take].copy_from_slice(&source[..take]);
+            page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take]
+                .copy_from_slice(&source[..take]);
             source = &source[take..];
             new_page_ids.push(new_page_id);
             new_pages.push(page);
@@ -300,11 +303,11 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
     Ok((
         OverflowPointer {
             head_page_id: previous.head_page_id,
-            logical_len: previous
-                .logical_len
-                .saturating_add(u32::try_from(appended.len()).map_err(|_| {
+            logical_len: previous.logical_len.saturating_add(
+                u32::try_from(appended.len()).map_err(|_| {
                     DbError::constraint("overflow payload exceeds u32 logical length")
-                })?),
+                })?,
+            ),
             flags: previous.flags,
         },
         final_tail,
@@ -414,7 +417,8 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
                     .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
                 .to_le_bytes(),
             );
-            page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take].copy_from_slice(&source[..take]);
+            page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take]
+                .copy_from_slice(&source[..take]);
             source = &source[take..];
             new_page_ids.push(new_page_id);
             new_pages.push(page);
@@ -431,7 +435,8 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
         checksum_parts.push(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]);
     }
     for page in &new_pages {
-        let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len")) as usize;
+        let chunk_len =
+            u32::from_le_bytes(page[4..8].try_into().expect("header chunk len")) as usize;
         checksum_parts.push(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]);
     }
     let checksum = crc32c_parts(&checksum_parts);
@@ -449,11 +454,11 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
     Ok((
         OverflowPointer {
             head_page_id: previous.head_page_id,
-            logical_len: previous
-                .logical_len
-                .saturating_add(u32::try_from(appended.len()).map_err(|_| {
+            logical_len: previous.logical_len.saturating_add(
+                u32::try_from(appended.len()).map_err(|_| {
                     DbError::constraint("overflow payload exceeds u32 logical length")
-                })?),
+                })?,
+            ),
             flags: previous.flags,
         },
         checksum,
@@ -663,11 +668,14 @@ mod tests {
         let rewritten = rewrite_overflow(&mut store, pointer, &updated, CompressionMode::Never)
             .expect("rewrite");
         assert_eq!(rewritten.head_page_id, pointer.head_page_id);
-        assert_eq!(read_overflow(&store, rewritten).expect("read rewrite"), updated);
+        assert_eq!(
+            read_overflow(&store, rewritten).expect("read rewrite"),
+            updated
+        );
 
         let shrink = vec![42_u8; 1_024];
-        let shrunk =
-            rewrite_overflow(&mut store, rewritten, &shrink, CompressionMode::Never).expect("shrink");
+        let shrunk = rewrite_overflow(&mut store, rewritten, &shrink, CompressionMode::Never)
+            .expect("shrink");
         assert_eq!(shrunk.head_page_id, pointer.head_page_id);
         assert_eq!(read_overflow(&store, shrunk).expect("read shrink"), shrink);
         assert!(store.allocated_page_count() < initial_allocated);
@@ -686,7 +694,10 @@ mod tests {
             .expect("read prefix")
             .expect("uncompressed prefix");
         assert_eq!(&prefix[..8], b"DDBTBL01");
-        assert_eq!(u32::from_le_bytes(prefix[8..12].try_into().expect("count")), 1);
+        assert_eq!(
+            u32::from_le_bytes(prefix[8..12].try_into().expect("count")),
+            1
+        );
 
         let (updated, checksum) = append_uncompressed_with_first_page_patch(
             &mut store,
@@ -698,8 +709,14 @@ mod tests {
         .expect("append and patch");
         let decoded = read_overflow(&store, updated).expect("read updated payload");
         assert_eq!(&decoded[..8], b"DDBTBL01");
-        assert_eq!(u32::from_le_bytes(decoded[8..12].try_into().expect("count")), 2);
+        assert_eq!(
+            u32::from_le_bytes(decoded[8..12].try_into().expect("count")),
+            2
+        );
         assert!(decoded.ends_with(b"tail-row"));
-        assert_eq!(crate::storage::checksum::crc32c_parts(&[decoded.as_slice()]), checksum);
+        assert_eq!(
+            crate::storage::checksum::crc32c_parts(&[decoded.as_slice()]),
+            checksum
+        );
     }
 }

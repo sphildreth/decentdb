@@ -1210,7 +1210,9 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
             .as_deref()
             .ok_or_else(|| unsupported("window function is missing its OVER clause"))?;
         if window.order_clause.is_empty() {
-            return Err(unsupported("window functions require ORDER BY in OVER (...)"));
+            return Err(unsupported(
+                "window functions require ORDER BY in OVER (...)",
+            ));
         }
         let partition_by = window
             .partition_clause
@@ -1236,7 +1238,10 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
             })
         };
     }
-    if matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max" | "group_concat") {
+    if matches!(
+        name.as_str(),
+        "count" | "sum" | "avg" | "min" | "max" | "group_concat"
+    ) {
         return Ok(Expr::Aggregate {
             name,
             args,
@@ -1250,7 +1255,9 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
 
 fn normalize_like_pattern(node: &protobuf::Node) -> Result<(Expr, Option<Expr>)> {
     match node_kind(node)? {
-        NodeEnum::FuncCall(call) if normalize_qualified_name(&call.funcname)? == "pg_catalog.like_escape" => {
+        NodeEnum::FuncCall(call)
+            if normalize_qualified_name(&call.funcname)? == "pg_catalog.like_escape" =>
+        {
             if call.args.len() != 2 {
                 return Err(unsupported(
                     "pg_catalog.like_escape requires a pattern and escape expression",
@@ -1331,13 +1338,13 @@ fn normalize_sublink(link: &protobuf::SubLink) -> Result<Expr> {
                     .ok_or_else(|| unsupported("EXISTS is missing its subquery"))?,
             )?)?)))
         }
-        protobuf::SubLinkType::ExprSublink => {
-            Ok(Expr::ScalarSubquery(Box::new(normalize_query(as_select_stmt(
+        protobuf::SubLinkType::ExprSublink => Ok(Expr::ScalarSubquery(Box::new(normalize_query(
+            as_select_stmt(
                 link.subselect
                     .as_deref()
                     .ok_or_else(|| unsupported("scalar subquery is missing its SELECT"))?,
-            )?)?)))
-        }
+            )?,
+        )?))),
         other => Err(unsupported(format!(
             "subquery type {} is not supported",
             other.as_str_name()

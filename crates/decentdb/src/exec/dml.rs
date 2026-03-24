@@ -60,8 +60,7 @@ pub(crate) struct PreparedSimpleInsert {
 
 impl EngineRuntime {
     pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
-        if self.catalog.view(&statement.table_name).is_some() || statement.on_conflict.is_some()
-        {
+        if self.catalog.view(&statement.table_name).is_some() || statement.on_conflict.is_some() {
             return false;
         }
         if !matches!(&statement.source, InsertSource::Values(rows) if rows.len() == 1) {
@@ -173,7 +172,8 @@ impl EngineRuntime {
             .collect::<Vec<_>>();
         let primary_auto_row_id_column_index = if table.primary_key_columns.len() == 1 {
             table.columns.iter().position(|column| {
-                identifiers_equal(&column.name, &table.primary_key_columns[0]) && column.auto_increment
+                identifiers_equal(&column.name, &table.primary_key_columns[0])
+                    && column.auto_increment
             })
         } else {
             None
@@ -195,12 +195,9 @@ impl EngineRuntime {
                 || !table.checks.is_empty()
                 || !table.foreign_keys.is_empty();
         let mut unique_indexes = Vec::new();
-        for index in self
-            .catalog
-            .indexes
-            .values()
-            .filter(|index| identifiers_equal(&index.table_name, &statement.table_name) && index.unique)
-        {
+        for index in self.catalog.indexes.values().filter(|index| {
+            identifiers_equal(&index.table_name, &statement.table_name) && index.unique
+        }) {
             let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
                 use_generic_validation = true;
                 unique_indexes.clear();
@@ -210,12 +207,9 @@ impl EngineRuntime {
         }
         let mut use_generic_index_updates = false;
         let mut insert_indexes = Vec::new();
-        for index in self
-            .catalog
-            .indexes
-            .values()
-            .filter(|index| identifiers_equal(&index.table_name, &statement.table_name) && index.fresh)
-        {
+        for index in self.catalog.indexes.values().filter(|index| {
+            identifiers_equal(&index.table_name, &statement.table_name) && index.fresh
+        }) {
             let Some(prepared_index) = prepare_btree_insert_index(self, table, index)? else {
                 use_generic_index_updates = true;
                 insert_indexes.clear();
@@ -910,7 +904,9 @@ impl EngineRuntime {
                                     let column_index = child_table
                                         .columns
                                         .iter()
-                                        .position(|column| identifiers_equal(&column.name, column_name))
+                                        .position(|column| {
+                                            identifiers_equal(&column.name, column_name)
+                                        })
                                         .ok_or_else(|| {
                                             DbError::internal(format!(
                                                 "unknown child foreign-key column {}",

@@ -10,9 +10,7 @@ use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
 use crate::vfs::write_all_at;
 
-use super::format::{
-    FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE,
-};
+use super::format::{FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 use super::index::WalVersion;
 use super::recovery;
 use super::WalHandle;
@@ -211,9 +209,7 @@ fn ensure_capacity(wal: &WalHandle, required_len: u64) -> Result<bool> {
         .div_ceil(WAL_PREALLOC_CHUNK_BYTES)
         .saturating_mul(WAL_PREALLOC_CHUNK_BYTES);
     wal.inner.file.set_len(target_len)?;
-    wal.inner
-        .allocated_len
-        .store(target_len, Ordering::Release);
+    wal.inner.allocated_len.store(target_len, Ordering::Release);
     Ok(true)
 }
 

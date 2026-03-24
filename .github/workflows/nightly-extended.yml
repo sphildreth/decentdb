@@ -51,9 +51,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install mkdocs-minify-plugin mkdocs-material mkdocs-awesome-pages-plugin mkdocs-mermaid2-plugin
 
+      - name: Format Check
+        run: |
+          echo "Checking Rust code formatting..."
+          if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
+            echo ""
+            echo "::error::Code formatting issues detected"
+            echo ""
+            echo "Formatting diffs (run 'cargo fmt' to fix):"
+            echo "::group::Details"
+            cat /tmp/fmt-check.log
+            echo "::endgroup::"
+            exit 1
+          fi
+
       - name: Workspace Checks
         run: |
-          cargo fmt --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
 
@@ -63,9 +76,23 @@ jobs:
       - name: Build cdylib
         run: cargo build -p decentdb
 
-      - name: Binding Validation Matrix
+      - name: Python Binding Test Suite
         run: |
-          python3 tests/bindings/python/test_ffi.py
+          cd bindings/python
+          pip install -e .
+          pytest -v tests/
+          cd ../..
+
+      - name: .NET Binding Test Suite
+        run: |
+          cd bindings/dotnet
+          dotnet clean
+          dotnet build
+          dotnet test --verbosity normal
+          cd ../..
+
+      - name: Binding Smoke Tests (Go, Java, Node, Dart, C)
+        run: |
           bash tests/bindings/c/run.sh
           go run ./tests/bindings/go/smoke.go
           javac tests/bindings/java/Smoke.java
@@ -76,7 +103,6 @@ jobs:
           dart pub get
           dart run smoke.dart
           cd ../../..
-          LD_LIBRARY_PATH=$PWD/target/debug dotnet run --project tests/bindings/dotnet/Smoke/Smoke.csproj
 
       - name: Storage Soak Harness
         run: python tests/harness/runner.py tests/harness/scenarios/soak_storage.json

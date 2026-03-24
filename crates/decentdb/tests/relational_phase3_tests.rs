@@ -757,8 +757,10 @@ fn prepared_delete_with_correlated_exists_reports_affected_rows() {
     let path = unique_db_path("phase3-prepared-delete-exists");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
 
-    db.execute(r#"CREATE TABLE "del_artists" ("Id" INT64 PRIMARY KEY, "LibraryId" INT64, "Name" TEXT)"#)
-        .expect("create artists");
+    db.execute(
+        r#"CREATE TABLE "del_artists" ("Id" INT64 PRIMARY KEY, "LibraryId" INT64, "Name" TEXT)"#,
+    )
+    .expect("create artists");
     db.execute(r#"CREATE TABLE "del_contributors" ("Id" INT64 PRIMARY KEY, "ArtistId" INT64, "Name" TEXT)"#)
         .expect("create contributors");
     db.execute(r#"INSERT INTO "del_artists" VALUES (1, 10, 'Artist1')"#)
@@ -855,7 +857,10 @@ fn like_escape_treats_escaped_wildcards_as_literals() {
         .execute("SELECT name FROM docs WHERE name LIKE '%\\%\\_%' ESCAPE '\\' ORDER BY id")
         .expect("query escaped like");
     assert_eq!(rows.rows().len(), 1);
-    assert_eq!(rows.rows()[0].values(), &[Value::Text("raw%_name".to_string())]);
+    assert_eq!(
+        rows.rows()[0].values(),
+        &[Value::Text("raw%_name".to_string())]
+    );
 
     cleanup_db(&path);
 }
@@ -881,8 +886,10 @@ fn prepared_left_join_or_blob_comparison_preserves_matching_rows() {
     let path = unique_db_path("phase3-left-join-blob-or");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
 
-    db.execute("CREATE TABLE artists (id INT64 PRIMARY KEY, name_normalized TEXT, music_brainz_id BLOB)")
-        .expect("create artists");
+    db.execute(
+        "CREATE TABLE artists (id INT64 PRIMARY KEY, name_normalized TEXT, music_brainz_id BLOB)",
+    )
+    .expect("create artists");
     db.execute("CREATE TABLE albums (id INT64 PRIMARY KEY, artist_id INT64)")
         .expect("create albums");
     let insert = db

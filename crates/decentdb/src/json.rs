@@ -41,9 +41,7 @@ pub(crate) fn parse_json_path(path: &str) -> Result<Vec<JsonPathSegment>> {
             b'.' => {
                 offset += 1;
                 let start = offset;
-                while offset < bytes.len()
-                    && !matches!(bytes[offset], b'.' | b'[')
-                {
+                while offset < bytes.len() && !matches!(bytes[offset], b'.' | b'[') {
                     offset += 1;
                 }
                 if start == offset {

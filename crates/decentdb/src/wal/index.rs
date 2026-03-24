@@ -25,9 +25,7 @@ impl WalIndex {
         let versions = self.pages.entry(page_id).or_default();
         if retain_history {
             debug_assert!(
-                versions
-                    .last()
-                    .is_none_or(|entry| entry.lsn <= version.lsn),
+                versions.last().is_none_or(|entry| entry.lsn <= version.lsn),
                 "WAL page versions should be appended in nondecreasing LSN order",
             );
             versions.push(version);

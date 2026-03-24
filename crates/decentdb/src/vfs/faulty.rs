@@ -446,7 +446,10 @@ mod tests {
             .iter()
             .position(|entry| entry.label == "db.fsync" && entry.outcome == "drop_sync")
             .expect("dropped sync should be logged");
-        assert!(write_index < sync_index, "write should be logged before fsync");
+        assert!(
+            write_index < sync_index,
+            "write should be logged before fsync"
+        );
 
         clear_failpoints().expect("clear failpoints");
     }

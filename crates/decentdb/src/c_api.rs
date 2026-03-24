@@ -1351,7 +1351,10 @@ mod tests {
             r#"INSERT INTO "del_contributors" VALUES (2, 2, 'Contrib2')"#,
         ] {
             let sql = CString::new(sql).expect("sql");
-            assert_eq!(ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result), DDB_OK);
+            assert_eq!(
+                ddb_db_execute(db, sql.as_ptr(), ptr::null(), 0, &mut result),
+                DDB_OK
+            );
             assert_eq!(ddb_result_free(&mut result), DDB_OK);
         }
 
@@ -1379,7 +1382,10 @@ mod tests {
         assert_eq!(affected_rows, 1);
 
         let count = CString::new(r#"SELECT COUNT(*) FROM "del_contributors""#).expect("count sql");
-        assert_eq!(ddb_db_execute(db, count.as_ptr(), ptr::null(), 0, &mut result), DDB_OK);
+        assert_eq!(
+            ddb_db_execute(db, count.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
         let mut remaining = DdbValue::default();
         assert_eq!(ddb_result_value_copy(result, 0, 0, &mut remaining), DDB_OK);
         assert_eq!(remaining.int64_value, 1);
