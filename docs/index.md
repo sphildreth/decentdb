@@ -18,7 +18,7 @@ DecentDB is an embedded, single-machine relational database engine focused on **
 - **Generated Columns** — `GENERATED ALWAYS AS (expr) STORED` for computed values
 - **Temporary Objects** — Session-scoped TEMP tables and views
 - **JSON Support** — Scalar functions, table-valued functions (`json_each`, `json_tree`)
-- **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md), [JDBC](api/jdbc.md)
+- **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md), [Dart](api/dart.md), [JDBC](api/jdbc.md)
 - **Cross-Platform** — Linux x86_64/arm64 (including 64-bit Raspberry Pi OS), macOS, Windows
 
 ## Releases
@@ -32,7 +32,7 @@ Releases are driven by Git tags and published via GitHub Actions:
 
 ```bash
 # Install DecentDB
-cargo install --path ./cli decentdb
+cargo install --path crates/decentdb-cli
 
 # Create a database
 # Note: auto-increment works for a single INT64 PRIMARY KEY column (spelling INT/INTEGER/INT64 doesn’t matter).
@@ -58,10 +58,13 @@ decentdb exec --db=mydb.ddb --sql="SELECT * FROM users"
 
 ## Performance
 
-- Point lookups: P95 < 10ms
-- FK joins: P95 < 100ms
-- Substring search: P95 < 200ms
-- Bulk load: 100k records < 20 seconds
+Latest benchmark snapshot
+
+- Point lookups: P95 `0.0008 ms` (~`3.0x` lower than SQLite in the same run)
+- Join lookups: P95 `0.0022 ms` (~`6%` lower than SQLite in the same run)
+- Auto-commit inserts: P95 `3.0017 ms` with full WAL sync
+- Explicit-transaction inserts: `1.91M rows/sec` (~`3.3%` higher than SQLite)
+- Checkpointed database size: `0.52 MB` (~`3.6x` smaller than SQLite)
 
 ## Getting Started
 
