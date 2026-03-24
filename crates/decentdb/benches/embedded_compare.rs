@@ -16,6 +16,10 @@ const JOIN_DATASET_COUNT: usize = 100;
 const POINT_READ_STRIDE: usize = 8_191;
 const JOIN_READ_STRIDE: usize = 37;
 
+fn elapsed_nanos(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn benchmark_storage_root() -> PathBuf {
     Path::new("../../target/embedded_compare").to_path_buf()
 }
@@ -59,7 +63,7 @@ trait DatabaseBenchmarker {
     fn name(&self) -> &'static str;
     fn setup(&mut self, path: &Path);
     fn insert_batch(&mut self) -> f64; // returns rows per second
-    fn random_reads(&mut self) -> Vec<u64>; // returns latencies in ms/us
+    fn random_reads(&mut self) -> Vec<u64>; // returns latencies in ns
     fn durable_commits(&mut self) -> Vec<u64>;
     fn join_reads(&mut self) -> Vec<u64>;
     fn teardown(&mut self) -> u64; // returns db size in bytes
@@ -178,7 +182,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             let id = point_read_id(i);
             let start = Instant::now();
             let _name: String = stmt.query_row([id], |row| row.get(0)).unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -197,7 +201,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
             stmt.execute(rusqlite::params![i, i % 100, 9.99]).unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -226,7 +230,7 @@ impl DatabaseBenchmarker for SqliteBenchmarker {
             let _row: (String, String) = stmt
                 .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -342,7 +346,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
             let id = point_read_id(i);
             let start = Instant::now();
             let _name: String = stmt.query_row([id], |row| row.get(0)).unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -359,7 +363,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
         for i in 0..COMMIT_COUNT {
             let start = Instant::now();
             stmt.execute(duckdb::params![i, i % 100, 9.99]).unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -388,7 +392,7 @@ impl DatabaseBenchmarker for DuckDbBenchmarker {
             let _row: (String, String) = stmt
                 .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -492,20 +496,22 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
     fn insert_batch(&mut self) -> f64 {
         let db = self.db.as_ref().unwrap();
         let start = Instant::now();
-        let insert = db
+        let mut txn = db.transaction().unwrap();
+        let insert = txn
             .prepare("INSERT INTO users (id, name) VALUES ($1, $2);")
             .unwrap();
-
-        db.execute("BEGIN;").unwrap();
         for i in 0..INSERT_COUNT {
             insert
-                .execute(&[
-                    decentdb::Value::Int64(i as i64),
-                    decentdb::Value::Text(format!("User {}", i)),
-                ])
+                .execute_in(
+                    &mut txn,
+                    &[
+                        decentdb::Value::Int64(i as i64),
+                        decentdb::Value::Text(format!("User {}", i)),
+                    ],
+                )
                 .unwrap();
         }
-        db.execute("COMMIT;").unwrap();
+        txn.commit().unwrap();
 
         let duration = start.elapsed();
         (INSERT_COUNT as f64) / duration.as_secs_f64()
@@ -531,7 +537,7 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
                 panic!("expected one TEXT column from point lookup");
             };
             let _name = name.clone();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -562,7 +568,7 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
                     decentdb::Value::Float64(9.99),
                 ])
                 .unwrap();
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -596,7 +602,7 @@ impl DatabaseBenchmarker for DecentDbBenchmarker {
                 panic!("expected two TEXT columns from join lookup");
             };
             let _row = (name.clone(), bio.clone());
-            latencies.push(start.elapsed().as_micros() as u64);
+            latencies.push(elapsed_nanos(start));
         }
 
         latencies
@@ -639,26 +645,26 @@ fn run_engine(benchmarker: &mut dyn DatabaseBenchmarker) -> EngineMetrics {
     // 3. Point Reads
     let mut read_latencies = benchmarker.random_reads();
     read_latencies.sort_unstable();
-    let p95_read_us = read_latencies[p95_index(read_latencies.len())];
-    metrics.read_p95_ms = p95_read_us as f64 / 1000.0;
-    println!("  -> Read p95: {:.3} ms", metrics.read_p95_ms);
+    let p95_read_ns = read_latencies[p95_index(read_latencies.len())];
+    metrics.read_p95_ms = p95_read_ns as f64 / 1_000_000.0;
+    println!("  -> Read p95: {:.6} ms", metrics.read_p95_ms);
 
     // 4. Durable Commits
     let mut commit_latencies = benchmarker.durable_commits();
     commit_latencies.sort_unstable();
-    let p95_commit_us = commit_latencies[p95_index(commit_latencies.len())];
-    metrics.commit_p95_ms = p95_commit_us as f64 / 1000.0;
+    let p95_commit_ns = commit_latencies[p95_index(commit_latencies.len())];
+    metrics.commit_p95_ms = p95_commit_ns as f64 / 1_000_000.0;
     println!(
-        "  -> Auto-commit insert p95: {:.3} ms",
+        "  -> Auto-commit insert p95: {:.6} ms",
         metrics.commit_p95_ms
     );
 
     // 5. Joins
     let mut join_latencies = benchmarker.join_reads();
     join_latencies.sort_unstable();
-    let p95_join_us = join_latencies[p95_index(join_latencies.len())];
-    metrics.join_p95_ms = p95_join_us as f64 / 1000.0;
-    println!("  -> Join p95: {:.3} ms", metrics.join_p95_ms);
+    let p95_join_ns = join_latencies[p95_index(join_latencies.len())];
+    metrics.join_p95_ms = p95_join_ns as f64 / 1_000_000.0;
+    println!("  -> Join p95: {:.6} ms", metrics.join_p95_ms);
 
     // 6. Teardown & Size
     let db_size_bytes = benchmarker.teardown();
@@ -748,6 +754,14 @@ fn main() {
     summary.metadata.insert(
         "size_measurement".to_string(),
         "db_plus_wal_after_checkpoint".to_string(),
+    );
+    summary.metadata.insert(
+        "latency_capture_unit".to_string(),
+        "nanoseconds".to_string(),
+    );
+    summary.metadata.insert(
+        "latency_report_unit".to_string(),
+        "milliseconds".to_string(),
     );
 
     // SQLite

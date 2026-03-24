@@ -22,12 +22,18 @@ impl WalIndex {
         version: WalVersion,
         retain_history: bool,
     ) {
+        let versions = self.pages.entry(page_id).or_default();
         if retain_history {
-            let versions = self.pages.entry(page_id).or_default();
+            debug_assert!(
+                versions
+                    .last()
+                    .is_none_or(|entry| entry.lsn <= version.lsn),
+                "WAL page versions should be appended in nondecreasing LSN order",
+            );
             versions.push(version);
-            versions.sort_by_key(|entry| entry.lsn);
         } else {
-            self.pages.insert(page_id, vec![version]);
+            versions.clear();
+            versions.push(version);
         }
     }
 

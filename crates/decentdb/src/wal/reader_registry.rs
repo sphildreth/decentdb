@@ -20,6 +20,7 @@ pub(crate) struct ReaderRegistry {
 #[derive(Debug, Default)]
 struct ReaderRegistryInner {
     next_id: AtomicU64,
+    active_count: AtomicU64,
     readers: Mutex<HashMap<u64, ReaderInfo>>,
     warnings: Mutex<Vec<String>>,
 }
@@ -51,6 +52,7 @@ impl ReaderRegistry {
                     started_at: SystemTime::now(),
                 },
             );
+        self.inner.active_count.fetch_add(1, Ordering::Release);
         Ok(ReaderGuard {
             inner: Arc::clone(&self.inner),
             reader_id,
@@ -59,11 +61,8 @@ impl ReaderRegistry {
     }
 
     pub(crate) fn active_reader_count(&self) -> Result<usize> {
-        self.inner
-            .readers
-            .lock()
-            .map(|readers| readers.len())
-            .map_err(|_| DbError::internal("reader registry lock poisoned"))
+        let count = self.inner.active_count.load(Ordering::Acquire);
+        usize::try_from(count).map_err(|_| DbError::internal("reader count overflowed usize"))
     }
 
     pub(crate) fn min_snapshot_lsn(&self) -> Result<Option<u64>> {
@@ -130,7 +129,9 @@ impl ReaderGuard {
 impl Drop for ReaderGuard {
     fn drop(&mut self) {
         if let Ok(mut readers) = self.inner.readers.lock() {
-            readers.remove(&self.reader_id);
+            if readers.remove(&self.reader_id).is_some() {
+                self.inner.active_count.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 }

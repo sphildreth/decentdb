@@ -1496,7 +1496,10 @@ impl Db {
                 return Err(error);
             }
         };
-        self.inner.catalog.replace(runtime.catalog.clone())?;
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(runtime.catalog.clone())?;
+        }
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
@@ -1570,6 +1573,7 @@ impl Db {
         expected_latest_lsn: Option<u64>,
     ) -> Result<u64> {
         let mut runtime = runtime;
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
         runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
@@ -1587,7 +1591,9 @@ impl Db {
                 return Err(error);
             }
         };
-        self.inner.catalog.replace(runtime.catalog.clone())?;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(runtime.catalog.clone())?;
+        }
         let mut guard = self
             .inner
             .engine

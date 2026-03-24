@@ -86,7 +86,11 @@ pub(crate) fn rewrite_overflow<S: PageStore>(
     }
     let chunk_capacity = page_size - OVERFLOW_HEADER_SIZE;
     let needed_pages = compressed.bytes.len().div_ceil(chunk_capacity);
-    let mut page_ids = collect_chain_page_ids(store, previous.head_page_id)?;
+    let existing_chain_pages = collect_chain_pages(store, previous.head_page_id)?;
+    let mut page_ids = existing_chain_pages
+        .iter()
+        .map(|(page_id, _)| *page_id)
+        .collect::<Vec<_>>();
     if page_ids.len() < needed_pages {
         for _ in 0..(needed_pages - page_ids.len()) {
             page_ids.push(store.allocate_page()?);
@@ -100,6 +104,7 @@ pub(crate) fn rewrite_overflow<S: PageStore>(
         page_size,
         chunk_capacity,
         true,
+        Some(&existing_chain_pages),
     )?;
     for page_id in page_ids.into_iter().skip(needed_pages) {
         store.free_page(page_id)?;
@@ -191,25 +196,36 @@ fn write_chain<S: PageStore>(store: &mut S, bytes: &[u8]) -> Result<PageId> {
     for _ in 0..chunk_count {
         page_ids.push(store.allocate_page()?);
     }
-    write_chain_pages(store, &page_ids, bytes, page_size, chunk_capacity, false)?;
+    write_chain_pages(
+        store,
+        &page_ids,
+        bytes,
+        page_size,
+        chunk_capacity,
+        false,
+        None,
+    )?;
 
     Ok(page_ids[0])
 }
 
-fn collect_chain_page_ids<S: PageStore>(store: &S, head_page_id: PageId) -> Result<Vec<PageId>> {
+fn collect_chain_pages<S: PageStore>(
+    store: &S,
+    head_page_id: PageId,
+) -> Result<Vec<(PageId, Vec<u8>)>> {
     let mut page_id = head_page_id;
-    let mut page_ids = Vec::new();
+    let mut pages = Vec::new();
 
     while page_id != 0 {
         let page = store.read_page(page_id)?;
         if page.len() < OVERFLOW_HEADER_SIZE {
             return Err(DbError::corruption("overflow page shorter than header"));
         }
-        page_ids.push(page_id);
+        pages.push((page_id, page.clone()));
         page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
     }
 
-    Ok(page_ids)
+    Ok(pages)
 }
 
 fn write_chain_pages<S: PageStore>(
@@ -219,6 +235,7 @@ fn write_chain_pages<S: PageStore>(
     page_size: usize,
     chunk_capacity: usize,
     skip_unchanged: bool,
+    existing_pages: Option<&[(PageId, Vec<u8>)]>,
 ) -> Result<()> {
     let mut offset = 0_usize;
     for (index, page_id) in page_ids.iter().copied().enumerate() {
@@ -239,8 +256,20 @@ fn write_chain_pages<S: PageStore>(
             offset = end;
         }
         if skip_unchanged {
-            let existing = store.read_page(page_id)?;
-            if existing == page {
+            let unchanged = if let Some(existing_pages) = existing_pages {
+                if let Some((existing_page_id, existing_page)) = existing_pages.get(index) {
+                    if *existing_page_id == page_id {
+                        existing_page.as_slice() == page.as_slice()
+                    } else {
+                        store.read_page(page_id)? == page
+                    }
+                } else {
+                    false
+                }
+            } else {
+                store.read_page(page_id)? == page
+            };
+            if unchanged {
                 continue;
             }
         }

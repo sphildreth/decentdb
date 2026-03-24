@@ -32,6 +32,9 @@ It defines a `DatabaseBenchmarker` trait that each engine implements. This trait
 4. `durable_commits()`: Measures p95 latency of individual synchronous commits (testing WAL/fsync).
 5. `teardown()`: Safely closes connections and measures the final database size on disk.
 
+Latency collection detail:
+- Per-operation latencies are captured in **nanoseconds** in the harness and then reported as milliseconds (`*_p95_ms`) in JSON/output. This allows sub-microsecond differences (for example `0.0010 ms` vs `0.0001 ms`) to be visible when the platform timer supports it.
+
 ### Execution
 
 To run the native benchmarks, use standard Cargo tooling from the project root:
