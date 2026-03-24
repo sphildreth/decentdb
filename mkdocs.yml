@@ -22,10 +22,10 @@ nav:
     - Tools:
       - DBeaver Integration: user-guide/dbeaver.md
   - API Reference:
-      - Rust API: api/rust-api.md
-      - CLI Reference: api/cli-reference.md
-      - Binding Compatibility Matrix: api/bindings-matrix.md
-      - Error Codes: api/error-codes.md
+    - Rust API: api/rust-api.md
+    - CLI Reference: api/cli-reference.md
+    - Binding Compatibility Matrix: api/bindings-matrix.md
+    - Error Codes: api/error-codes.md
     - Configuration: api/configuration.md
     - Language Bindings:
       - .NET (C#): api/dotnet.md
