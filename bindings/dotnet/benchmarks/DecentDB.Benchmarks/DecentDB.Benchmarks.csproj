@@ -10,6 +10,8 @@
     <ProjectReference Include="../../src/DecentDB.AdoNet/DecentDB.AdoNet.csproj" />
     <ProjectReference Include="../../src/DecentDB.MicroOrm/DecentDB.MicroOrm.csproj" />
     <ProjectReference Include="../../src/DecentDB.EntityFrameworkCore/DecentDB.EntityFrameworkCore.csproj" />
+    <PackageReference Include="Dapper" Version="2.1.66" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.3" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.3" />
   </ItemGroup>
 </Project>
