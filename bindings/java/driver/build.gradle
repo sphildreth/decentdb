@@ -69,11 +69,11 @@ jar {
 
 def repoRoot = file("${rootProject.projectDir}/../..")
 def nativeLibDirPath = project.findProperty('nativeLibDir') ?:
-    "${rootProject.projectDir}/../../target/debug"
+    "${rootProject.projectDir}/../../target/release"
 
 tasks.register('buildRustNative', Exec) {
     workingDir repoRoot
-    commandLine 'cargo', 'build', '-p', 'decentdb'
+    commandLine 'cargo', 'build', '-p', 'decentdb', '--release'
 }
 
 tasks.register('buildJniNative', Exec) {
@@ -87,4 +87,22 @@ tasks.named('buildJniNative') {
 
 tasks.named('test') {
     dependsOn tasks.named('buildJniNative')
+}
+
+tasks.register('benchmarkFetch', JavaExec) {
+    dependsOn tasks.named('buildJniNative')
+    group = 'verification'
+    description = 'Run fair DecentDB vs SQLite benchmark for JDBC bindings.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.decentdb.jdbc.bench.BenchFetch'
+
+    def benchmarkArgs = project.findProperty('benchmarkArgs')
+    if (benchmarkArgs != null && benchmarkArgs.toString().trim().length() > 0) {
+        args benchmarkArgs.toString().trim().split(/\s+/) as List<String>
+    }
+
+    jvmArgs '-Xms1g', '-Xmx1g'
+    // Keep benchmark single-threaded and deterministic.
+    systemProperty 'java.util.concurrent.ForkJoinPool.common.parallelism', '1'
+    systemProperty 'decentdb.native.lib.dir', nativeLibDirPath
 }

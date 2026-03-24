@@ -1,7 +1,5 @@
 # DecentDB
 
-> ⚠️ **NOTICE:** DecentDB is currently undergoing a complete rewrite from Nim to Rust. This repository is in a pre-alpha state and serves as the workspace for the Rust rewrite. For the previous Nim version, see [decentdb-nim](https://github.com/sphildreth/decentdb-nim).
-
 <p align="center">
     <img src="graphics/logo.png" alt="DecentDB logo" width="220" />
 </p>
@@ -18,15 +16,15 @@
     </a>
 </p>
 
-```text                                       
-  ___                 _   ___  ___ 
+```text
+  ___                 _   ___  ___
  |   \ ___ __ ___ _ _| |_|   \| _ )
  | |) / -_) _/ -_) ' \  _| |) | _ \
  |___/\___\__\___|_||_\__|___/|___/
-                                                             
+
 ```
-                                                  
-DecentDB is an embedded relational database engine built with Rust (Rewrite in progress), focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
+
+DecentDB is an embedded relational database engine built with Rust, focused on **durable ACID writes**, **fast reads**, and **predictable correctness**.
 
 It targets a single process with **one writer** and **many concurrent readers** under snapshot isolation, implementing a PostgreSQL-like SQL dialect (via libpg_query) on top of a fixed-page B+Tree storage engine and a write-ahead log (WAL) for durability.
 
@@ -57,16 +55,17 @@ It targets a single process with **one writer** and **many concurrent readers** 
 
 ## Languages/Toolkits/SDKs
 
-| Language | Toolkit | Description | Documentation |
-|---|---|---|---|
-| C# | ADO.NET + Dapper + MicroOrm (LINQ) + EF Core | Embedded ADO.NET provider, LINQ Micro-ORM, and EF Core integration with DbContext, migrations, and NodaTime support | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
-| Dart | Dart FFI (Flutter desktop) | Embedded FFI binding for Flutter desktop apps with cursor paging and schema introspection | [decentdb.org/api/dart](https://decentdb.org/api/dart/) |
-| Java | JDBC (JNI-backed, in-process) | JDBC driver for connecting to `.ddb` files from Java and tools like DBeaver | [decentdb.org/api/jdbc](https://decentdb.org/api/jdbc/) |
-| Go | `database/sql` driver | Embedded `database/sql` driver with `$N` positional parameters | [decentdb.org/api/go](https://decentdb.org/api/go/) |
-| Node.js | N-API + Knex | Embedded native addon + Knex client for building/issuing queries | [decentdb.org/api/node](https://decentdb.org/api/node/) |
-| Python 3 | SQLAlchemy | Embedded DB-API driver + SQLAlchemy dialect | [decentdb.org/api/python](https://decentdb.org/api/python/) |
+| Language | Toolkit                                      | Description                                                                                                         | Documentation                                               |
+| -------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| C#       | ADO.NET + Dapper + MicroOrm (LINQ) + EF Core | Embedded ADO.NET provider, LINQ Micro-ORM, and EF Core integration with DbContext, migrations, and NodaTime support | [decentdb.org/api/dotnet](https://decentdb.org/api/dotnet/) |
+| Dart     | Dart FFI (Flutter desktop)                   | Embedded FFI binding for Flutter desktop apps with cursor paging and schema introspection                           | [decentdb.org/api/dart](https://decentdb.org/api/dart/)     |
+| Java     | JDBC (JNI-backed, in-process)                | JDBC driver for connecting to `.ddb` files from Java and tools like DBeaver                                         | [decentdb.org/api/jdbc](https://decentdb.org/api/jdbc/)     |
+| Go       | `database/sql` driver                        | Embedded `database/sql` driver with `$N` positional parameters                                                      | [decentdb.org/api/go](https://decentdb.org/api/go/)         |
+| Node.js  | N-API + Knex                                 | Embedded native addon + Knex client for building/issuing queries                                                    | [decentdb.org/api/node](https://decentdb.org/api/node/)     |
+| Python 3 | SQLAlchemy                                   | Embedded DB-API driver + SQLAlchemy dialect                                                                         | [decentdb.org/api/python](https://decentdb.org/api/python/) |
 
 ## Tools
+
 **[Decent Bench](https://github.com/sphildreth/decent-bench)** - Native cross platform DecentDB Bench SQL tool.
 
 ## Performance (at a glance)
@@ -77,17 +76,20 @@ It targets a single process with **one writer** and **many concurrent readers** 
 </p>
 
 **How this chart is produced**
+
 - The chart is generated from benchmark runs using `cargo bench`.
 - Values are **normalized vs SQLite** (baseline = 1.0).
 - For "lower is better" metrics (latency, DB size), the score is inverted so **higher bars mean better**.
 - Full methodology and raw results live in `benchmarks/embedded_compare/`.
 
 **Supported engines**
+
 - DecentDB (native API)
 - SQLite (via C API)
 - DuckDB (via C API) - when library is available
 
 **Regenerate**
+
 ```bash
 # Run benchmark pipeline
 cargo bench
@@ -207,6 +209,7 @@ decentdb rebuild-indexes --db ./my.ddb
 DecentDB provides a unified CLI tool. See `decentdb --help` for all commands.
 
 Common commands:
+
 - `exec` - Execute SQL statements
 - `repl` - Interactive SQL shell
 - `import` / `export` - Data transfer

@@ -7,7 +7,8 @@
   "gypfile": true,
   "scripts": {
     "build": "node --no-deprecation ./node_modules/node-gyp/bin/node-gyp.js rebuild",
-    "test": "npm run build --silent && node --test test/*.test.js"
+    "test": "npm run build --silent && node --test test/*.test.js",
+    "benchmark:fetch": "npm run build --silent && node --expose-gc benchmarks/bench_fetch.js"
   },
   "devDependencies": {
     "node-gyp": "^12.2.0"

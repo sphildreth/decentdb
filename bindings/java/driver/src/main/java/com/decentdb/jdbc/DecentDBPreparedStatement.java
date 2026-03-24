@@ -21,6 +21,7 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
     private final String sql;
     private Object[] params;
     private static final int MAX_PARAMS = 256;
+    private boolean nativePrepared = false;
 
     DecentDBPreparedStatement(DecentDBConnection connection, String sql) throws SQLException {
         super(connection);
@@ -104,12 +105,24 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
     }
 
     private void prepareNative() throws SQLException {
+        if (nativePrepared && stmtHandle != 0) {
+            int rc = DecentDBNative.stmtReset(stmtHandle);
+            if (rc < 0) {
+                Errors.checkResult(connection.getDbHandle(), rc);
+            }
+            rc = DecentDBNative.stmtClearBindings(stmtHandle);
+            if (rc < 0) {
+                Errors.checkResult(connection.getDbHandle(), rc);
+            }
+            return;
+        }
         long[] outStmt = new long[1];
         int rc = DecentDBNative.stmtPrepare(connection.getDbHandle(), sql, outStmt);
         if (rc < 0 || outStmt[0] == 0) {
             Errors.checkResult(connection.getDbHandle(), rc < 0 ? rc : -1);
         }
         stmtHandle = outStmt[0];
+        nativePrepared = true;
     }
 
     private void bindAll() throws SQLException {
@@ -268,6 +281,28 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
     @Override
     public void clearParameters() throws SQLException {
         params = new Object[MAX_PARAMS];
+    }
+
+    @Override
+    protected void finalizeStmt() {
+        if (stmtHandle == 0) {
+            return;
+        }
+        // PreparedStatement should reuse native prepared handles across execute calls.
+        // ResultSet close + executeUpdate paths call finalizeStmt(); for prepared usage
+        // this means "release row state + clear bindings", not native finalize.
+        DecentDBNative.stmtReset(stmtHandle);
+        DecentDBNative.stmtClearBindings(stmtHandle);
+    }
+
+    @Override
+    public void close() throws SQLException {
+        if (stmtHandle != 0) {
+            DecentDBNative.stmtFinalize(stmtHandle);
+            stmtHandle = 0;
+        }
+        nativePrepared = false;
+        super.close();
     }
 
     // ---- Unsupported setters (return notSupported) ----------------------

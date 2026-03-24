@@ -53,9 +53,15 @@ function inferNativeLibPath() {
   }
 
   const candidates = [
+    path.join(__dirname, '..', '..', '..', 'target', 'release', 'libdecentdb.so'),
+    path.join(__dirname, '..', '..', '..', 'target', 'release', 'libdecentdb.dylib'),
+    path.join(__dirname, '..', '..', '..', 'target', 'release', 'decentdb.dll'),
     path.join(__dirname, '..', '..', '..', 'target', 'debug', 'libdecentdb.so'),
     path.join(__dirname, '..', '..', '..', 'target', 'debug', 'libdecentdb.dylib'),
     path.join(__dirname, '..', '..', '..', 'target', 'debug', 'decentdb.dll'),
+    path.join(process.cwd(), 'target', 'release', 'libdecentdb.so'),
+    path.join(process.cwd(), 'target', 'release', 'libdecentdb.dylib'),
+    path.join(process.cwd(), 'target', 'release', 'decentdb.dll'),
     path.join(process.cwd(), 'target', 'debug', 'libdecentdb.so'),
     path.join(process.cwd(), 'target', 'debug', 'libdecentdb.dylib'),
     path.join(process.cwd(), 'target', 'debug', 'decentdb.dll'),
