@@ -100,6 +100,26 @@ impl Default for DdbValueView {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DdbRowI64TextF64View {
+    pub int64_value: i64,
+    pub text_data: *const u8,
+    pub text_len: usize,
+    pub float64_value: f64,
+}
+
+impl Default for DdbRowI64TextF64View {
+    fn default() -> Self {
+        Self {
+            int64_value: 0,
+            text_data: ptr::null(),
+            text_len: 0,
+            float64_value: 0.0,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug)]
 pub struct DbHandle {
     db: Db,
@@ -122,6 +142,7 @@ pub struct StmtHandle {
     current_row: Option<usize>,
     next_row_index: usize,
     row_views: Vec<DdbValueView>,
+    row_i64_text_f64_views: Vec<DdbRowI64TextF64View>,
 }
 
 thread_local! {
@@ -340,7 +361,6 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
 }
 
 fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
-    *out = DdbValueView::default();
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
         Value::Int64(inner) => {
@@ -402,6 +422,48 @@ fn populate_stmt_row_views(stmt: &mut StmtHandle) -> Result<()> {
     Ok(())
 }
 
+fn row_i64_text_f64_view(result: &QueryResult, row_index: usize) -> Result<DdbRowI64TextF64View> {
+    let row = result
+        .rows()
+        .get(row_index)
+        .ok_or_else(|| DbError::internal("statement row cursor is out of bounds"))?;
+    let values = row.values();
+    if values.len() != 3 {
+        return Err(DbError::sql(
+            "statement row shape is not compatible with INT64/TEXT/FLOAT64 view",
+        ));
+    }
+    match (&values[0], &values[1], &values[2]) {
+        (Value::Int64(id), Value::Text(text), Value::Float64(number)) => Ok(DdbRowI64TextF64View {
+            int64_value: *id,
+            text_data: text.as_bytes().as_ptr(),
+            text_len: text.len(),
+            float64_value: *number,
+        }),
+        _ => Err(DbError::sql(
+            "statement row shape is not compatible with INT64/TEXT/FLOAT64 view",
+        )),
+    }
+}
+
+fn populate_stmt_i64_text_f64_row_views(
+    stmt: &mut StmtHandle,
+    start_index: usize,
+    row_count: usize,
+) -> Result<()> {
+    let result = stmt
+        .result
+        .as_ref()
+        .ok_or_else(|| DbError::sql("statement has not been executed yet"))?;
+    stmt.row_i64_text_f64_views.clear();
+    stmt.row_i64_text_f64_views.reserve(row_count);
+    for row_offset in 0..row_count {
+        stmt.row_i64_text_f64_views
+            .push(row_i64_text_f64_view(result, start_index + row_offset)?);
+    }
+    Ok(())
+}
+
 fn execute_stmt_if_needed(stmt: &mut StmtHandle) -> Result<()> {
     if stmt.result.is_some() {
         return Ok(());
@@ -432,6 +494,7 @@ fn invalidate_stmt_result(stmt: &mut StmtHandle) {
     stmt.current_row = None;
     stmt.next_row_index = 0;
     stmt.row_views.clear();
+    stmt.row_i64_text_f64_views.clear();
 }
 
 fn ensure_stmt_binding_slot(stmt: &mut StmtHandle, index_1_based: usize) -> Result<usize> {
@@ -813,6 +876,7 @@ pub extern "C" fn ddb_db_prepare(
             current_row: None,
             next_row_index: 0,
             row_views: Vec::new(),
+            row_i64_text_f64_views: Vec::new(),
         });
         *out_ptr(out_stmt, "out_stmt")? = Box::into_raw(handle);
         Ok(())
@@ -924,6 +988,60 @@ pub extern "C" fn ddb_stmt_bind_int64_step_row_view(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_stmt_bind_int64_step_i64_text_f64(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: i64,
+    out_int64: *mut i64,
+    out_text_data: *mut *const u8,
+    out_text_len: *mut usize,
+    out_float64: *mut f64,
+    out_has_row: *mut u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Int64(value);
+        invalidate_stmt_result(stmt);
+        execute_stmt_if_needed(stmt)?;
+
+        let row_count = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?
+            .rows()
+            .len();
+        if stmt.next_row_index >= row_count {
+            stmt.current_row = None;
+            *out_ptr(out_has_row, "out_has_row")? = 0;
+            *out_ptr(out_int64, "out_int64")? = 0;
+            *out_ptr(out_text_data, "out_text_data")? = ptr::null();
+            *out_ptr(out_text_len, "out_text_len")? = 0;
+            *out_ptr(out_float64, "out_float64")? = 0.0;
+            return Ok(());
+        }
+
+        let row_index = stmt.next_row_index;
+        stmt.current_row = Some(row_index);
+        stmt.next_row_index += 1;
+        let row = {
+            let result = stmt
+                .result
+                .as_ref()
+                .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?;
+            row_i64_text_f64_view(result, row_index)?
+        };
+
+        *out_ptr(out_has_row, "out_has_row")? = 1;
+        *out_ptr(out_int64, "out_int64")? = row.int64_value;
+        *out_ptr(out_text_data, "out_text_data")? = row.text_data;
+        *out_ptr(out_text_len, "out_text_len")? = row.text_len;
+        *out_ptr(out_float64, "out_float64")? = row.float64_value;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_stmt_bind_float64(
     stmt: *mut StmtHandle,
     index_1_based: usize,
@@ -1030,18 +1148,16 @@ pub extern "C" fn ddb_stmt_execute_batch_i64(
     ffi_boundary(|| {
         let stmt = handle_mut(stmt, "stmt")?;
         let ids = ptr_slice(values_i64, row_count, "values_i64")?;
-
-        if stmt.bindings.is_empty() {
-            stmt.bindings.push(Value::Null);
-        }
-        let mut total_affected = 0_u64;
-        for id in ids {
-            stmt.bindings[0] = Value::Int64(*id);
-            invalidate_stmt_result(stmt);
-            execute_stmt_if_needed(stmt)?;
-            total_affected =
-                total_affected.saturating_add(stmt.result.as_ref().map_or(0, QueryResult::affected_rows));
-        }
+        let total_affected = stmt.db.execute_prepared_batch_with_builder(
+            &stmt.prepared,
+            row_count,
+            1,
+            |row_index, params| {
+                params[0] = Value::Int64(ids[row_index]);
+                Ok(())
+            },
+        )?;
+        invalidate_stmt_result(stmt);
 
         *out_ptr(out_total_affected_rows, "out_total_affected_rows")? = total_affected;
         Ok(())
@@ -1064,27 +1180,24 @@ pub extern "C" fn ddb_stmt_execute_batch_i64_text_f64(
         let text_ptrs = ptr_slice(values_text_ptrs, row_count, "values_text_ptrs")?;
         let text_lens = ptr_slice(values_text_lens, row_count, "values_text_lens")?;
         let floats = ptr_slice(values_f64, row_count, "values_f64")?;
-
-        if stmt.bindings.len() < 3 {
-            stmt.bindings.resize(3, Value::Null);
-        }
-        let mut total_affected = 0_u64;
-        for idx in 0..row_count {
-            let text_bytes = borrowed_bytes(text_ptrs[idx].cast::<u8>(), text_lens[idx])?;
-            let text = std::str::from_utf8(text_bytes).map_err(|error| {
-                DbError::sql(format!(
-                    "TEXT parameter at batch row {idx} is not valid UTF-8: {error}"
-                ))
-            })?;
-
-            stmt.bindings[0] = Value::Int64(ids[idx]);
-            stmt.bindings[1] = Value::Text(text.to_string());
-            stmt.bindings[2] = Value::Float64(floats[idx]);
-            invalidate_stmt_result(stmt);
-            execute_stmt_if_needed(stmt)?;
-            total_affected =
-                total_affected.saturating_add(stmt.result.as_ref().map_or(0, QueryResult::affected_rows));
-        }
+        let total_affected = stmt.db.execute_prepared_batch_with_builder(
+            &stmt.prepared,
+            row_count,
+            3,
+            |idx, params| {
+                let text_bytes = borrowed_bytes(text_ptrs[idx].cast::<u8>(), text_lens[idx])?;
+                let text = std::str::from_utf8(text_bytes).map_err(|error| {
+                    DbError::sql(format!(
+                        "TEXT parameter at batch row {idx} is not valid UTF-8: {error}"
+                    ))
+                })?;
+                params[0] = Value::Int64(ids[idx]);
+                params[1] = Value::Text(text.to_string());
+                params[2] = Value::Float64(floats[idx]);
+                Ok(())
+            },
+        )?;
+        invalidate_stmt_result(stmt);
 
         *out_ptr(out_total_affected_rows, "out_total_affected_rows")? = total_affected;
         Ok(())
@@ -1297,6 +1410,59 @@ pub extern "C" fn ddb_stmt_fetch_row_views(
             ptr::null()
         } else {
             stmt.row_views.as_ptr()
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_fetch_rows_i64_text_f64(
+    stmt: *mut StmtHandle,
+    include_current_row: u8,
+    max_rows: usize,
+    out_rows_ptr: *mut *const DdbRowI64TextF64View,
+    out_rows: *mut usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+
+        let result = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?;
+        let total_rows = result.rows().len();
+        let start_index = if include_current_row != 0 {
+            stmt.current_row.unwrap_or(stmt.next_row_index)
+        } else {
+            stmt.next_row_index
+        };
+        if start_index >= total_rows {
+            stmt.current_row = None;
+            stmt.next_row_index = total_rows;
+            stmt.row_i64_text_f64_views.clear();
+            *out_ptr(out_rows, "out_rows")? = 0;
+            *out_ptr(out_rows_ptr, "out_rows_ptr")? = ptr::null();
+            return Ok(());
+        }
+
+        let available_rows = total_rows - start_index;
+        let fetch_rows = if max_rows == 0 {
+            available_rows
+        } else {
+            available_rows.min(max_rows)
+        };
+
+        populate_stmt_i64_text_f64_row_views(stmt, start_index, fetch_rows)?;
+        let last_index = start_index + fetch_rows - 1;
+        stmt.current_row = Some(last_index);
+        stmt.next_row_index = last_index + 1;
+
+        *out_ptr(out_rows, "out_rows")? = fetch_rows;
+        *out_ptr(out_rows_ptr, "out_rows_ptr")? = if stmt.row_i64_text_f64_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_i64_text_f64_views.as_ptr()
         };
         Ok(())
     })
@@ -1805,7 +1971,10 @@ mod tests {
             DDB_OK
         );
         let mut count_value = DdbValue::default();
-        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut count_value), DDB_OK);
+        assert_eq!(
+            ddb_result_value_copy(result, 0, 0, &mut count_value),
+            DDB_OK
+        );
         assert_eq!(count_value.int64_value, 3);
         assert_eq!(ddb_value_dispose(&mut count_value), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
@@ -1834,12 +2003,7 @@ mod tests {
         let ids = [10_i64, 20_i64, 30_i64, 40_i64];
         let mut affected_rows = 0_u64;
         assert_eq!(
-            ddb_stmt_execute_batch_i64(
-                stmt,
-                ids.len(),
-                ids.as_ptr(),
-                &mut affected_rows
-            ),
+            ddb_stmt_execute_batch_i64(stmt, ids.len(), ids.as_ptr(), &mut affected_rows),
             DDB_OK
         );
         assert_eq!(affected_rows, 4);
@@ -1850,7 +2014,10 @@ mod tests {
             DDB_OK
         );
         let mut count_value = DdbValue::default();
-        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut count_value), DDB_OK);
+        assert_eq!(
+            ddb_result_value_copy(result, 0, 0, &mut count_value),
+            DDB_OK
+        );
         assert_eq!(count_value.int64_value, 4);
         assert_eq!(ddb_value_dispose(&mut count_value), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);

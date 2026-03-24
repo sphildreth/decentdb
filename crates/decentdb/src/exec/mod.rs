@@ -865,9 +865,18 @@ impl EngineRuntime {
         _page_size: u32,
     ) -> Result<QueryResult> {
         match statement {
-            Statement::Query(query) => self
-                .evaluate_query(query, params, &BTreeMap::new())
-                .map(dataset_to_result),
+            Statement::Query(query) => {
+                if let Some(result) =
+                    self.try_execute_simple_indexed_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_simple_table_projection_query(query)? {
+                    return Ok(result);
+                }
+                self.evaluate_query(query, params, &BTreeMap::new())
+                    .map(dataset_to_result)
+            }
             Statement::Explain(explain) => {
                 let mut lines =
                     planner::plan_statement(&Statement::Explain(explain.clone()), &self.catalog)?
@@ -898,6 +907,201 @@ impl EngineRuntime {
                 "read-only execution received mutating statement {other:?}"
             ))),
         }
+    }
+
+    fn try_execute_simple_table_projection_query(
+        &self,
+        query: &Query,
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if self.catalog.view(name).is_some() {
+            return Ok(None);
+        }
+
+        let table_schema = match self.table_schema(name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let Some(data) = self.table_data(name) else {
+            return Ok(None);
+        };
+        let Some((projection_indexes, column_names)) =
+            self.simple_projection_plan(select, name, alias, table_schema)
+        else {
+            return Ok(None);
+        };
+
+        let mut rows = Vec::with_capacity(data.rows.len());
+        for stored_row in &data.rows {
+            let mut projected = Vec::with_capacity(projection_indexes.len());
+            for index in &projection_indexes {
+                projected.push(stored_row.values[*index].clone());
+            }
+            rows.push(QueryRow::new(projected));
+        }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn try_execute_simple_indexed_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if self.catalog.view(name).is_some() {
+            return Ok(None);
+        }
+
+        let table_schema = match self.table_schema(name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let Some(data) = self.table_data(name) else {
+            return Ok(None);
+        };
+        let binding_name = alias.as_deref().unwrap_or(name);
+
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        if let Some(table_name) = filter_table {
+            if !identifiers_equal(table_name, name) && !identifiers_equal(table_name, binding_name)
+            {
+                return Ok(None);
+            }
+        }
+
+        let Some(index) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, filter_column))
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+            return Ok(None);
+        };
+
+        let value = self.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let row_ids = keys.row_ids_for_value(&value)?;
+        let Some((projection_indexes, column_names)) =
+            self.simple_projection_plan(select, name, alias, table_schema)
+        else {
+            return Ok(None);
+        };
+
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            let Some(stored_row) = data.row_by_id(row_id) else {
+                continue;
+            };
+            let mut projected = Vec::with_capacity(projection_indexes.len());
+            for index in &projection_indexes {
+                projected.push(stored_row.values[*index].clone());
+            }
+            rows.push(QueryRow::new(projected));
+        }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn simple_projection_plan(
+        &self,
+        select: &Select,
+        table_name: &str,
+        table_alias: &Option<String>,
+        table_schema: &TableSchema,
+    ) -> Option<(Vec<usize>, Vec<String>)> {
+        let binding_name = table_alias.as_deref().unwrap_or(table_name);
+        let mut projection_indexes = Vec::with_capacity(select.projection.len());
+        let mut column_names = Vec::with_capacity(select.projection.len());
+
+        for item in &select.projection {
+            let SelectItem::Expr {
+                expr,
+                alias: select_alias,
+            } = item
+            else {
+                return None;
+            };
+            let Expr::Column {
+                table: table_name_expr,
+                column,
+            } = expr
+            else {
+                return None;
+            };
+            if let Some(projection_table) = table_name_expr.as_deref() {
+                if !identifiers_equal(projection_table, table_name)
+                    && !identifiers_equal(projection_table, binding_name)
+                {
+                    return None;
+                }
+            }
+            let column_index = table_schema
+                .columns
+                .iter()
+                .position(|candidate| identifiers_equal(&candidate.name, column))?;
+            projection_indexes.push(column_index);
+            column_names.push(select_alias.clone().unwrap_or_else(|| column.clone()));
+        }
+
+        Some((projection_indexes, column_names))
     }
 
     pub(crate) fn evaluate_query(

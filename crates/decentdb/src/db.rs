@@ -13,7 +13,7 @@ use crate::catalog::{
 };
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
-use crate::exec::dml::PreparedSimpleInsert;
+use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
 use crate::exec::{
     statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, RuntimeIndex,
 };
@@ -1316,6 +1316,125 @@ impl Db {
         } else {
             self.execute_prepared_write_statement(prepared, params)
         }
+    }
+
+    pub(crate) fn execute_prepared_batch_with_builder<F>(
+        &self,
+        prepared: &PreparedStatement,
+        row_count: usize,
+        param_count: usize,
+        mut build_params: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(usize, &mut [Value]) -> Result<()>,
+    {
+        let mut params = vec![Value::Null; param_count];
+        if row_count == 0 {
+            return Ok(0);
+        }
+
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            let mut txn = self
+                .inner
+                .sql_txn
+                .lock()
+                .map_err(|_| DbError::internal("SQL transaction lock poisoned"))?;
+            match &mut *txn {
+                SqlTxnSlot::Shared(state) => {
+                    self.validate_prepared_schema_cookie(
+                        prepared,
+                        state.runtime.catalog.schema_cookie,
+                    )?;
+                    let mut total_affected = 0_u64;
+                    if prepared.read_only {
+                        for row_index in 0..row_count {
+                            build_params(row_index, &mut params)?;
+                            let result = state.runtime.execute_read_statement(
+                                prepared.statement.as_ref(),
+                                &params,
+                                self.inner.config.page_size,
+                            )?;
+                            total_affected = total_affected.saturating_add(result.affected_rows());
+                        }
+                        return Ok(total_affected);
+                    }
+
+                    if let Some(prepared_insert) = prepared
+                        .prepared_insert
+                        .as_deref()
+                        .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+                    {
+                        if Self::prepared_insert_uses_direct_positional_params(
+                            prepared_insert,
+                            param_count,
+                        ) {
+                            for row_index in 0..row_count {
+                                build_params(row_index, &mut params)?;
+                                let affected = state
+                                    .runtime
+                                    .execute_prepared_simple_insert_positional_params_in_place(
+                                        prepared_insert,
+                                        &mut params,
+                                        self.inner.config.page_size,
+                                    )?;
+                                total_affected = total_affected.saturating_add(affected);
+                            }
+                            return Ok(total_affected);
+                        }
+
+                        for row_index in 0..row_count {
+                            build_params(row_index, &mut params)?;
+                            let result = state.runtime.execute_prepared_simple_insert(
+                                prepared_insert,
+                                &params,
+                                self.inner.config.page_size,
+                            )?;
+                            total_affected = total_affected.saturating_add(result.affected_rows());
+                        }
+                        return Ok(total_affected);
+                    }
+
+                    for row_index in 0..row_count {
+                        build_params(row_index, &mut params)?;
+                        let result = self.execute_prepared_in_state(prepared, &params, state)?;
+                        total_affected = total_affected.saturating_add(result.affected_rows());
+                    }
+                    return Ok(total_affected);
+                }
+                SqlTxnSlot::Exclusive => return Err(self.exclusive_sql_txn_error()),
+                SqlTxnSlot::None => {}
+            }
+        }
+
+        let mut total_affected = 0_u64;
+        for row_index in 0..row_count {
+            build_params(row_index, &mut params)?;
+            let result = self.execute_prepared_statement(prepared, &params)?;
+            total_affected = total_affected.saturating_add(result.affected_rows());
+        }
+        Ok(total_affected)
+    }
+
+    fn prepared_insert_uses_direct_positional_params(
+        prepared_insert: &PreparedSimpleInsert,
+        param_count: usize,
+    ) -> bool {
+        if prepared_insert.value_sources.len() != param_count
+            || prepared_insert.columns.len() != param_count
+        {
+            return false;
+        }
+
+        prepared_insert
+            .value_sources
+            .iter()
+            .enumerate()
+            .all(|(index, source)| {
+                matches!(
+                    source,
+                    PreparedInsertValueSource::Parameter(position) if *position == index + 1
+                )
+            })
     }
 
     fn execute_prepared_read_statement(

@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import random
 import sqlite3
@@ -62,6 +63,17 @@ def to_ms(ns):
     return ns / 1_000_000.0
 
 
+def _run_with_gc_disabled(fn):
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        return fn()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
 def setup_decentdb(db_path):
     conn = decentdb.connect(db_path)
     cur = conn.cursor()
@@ -105,37 +117,59 @@ def run_engine_benchmark(
         raise ValueError(f"Unknown engine: {engine_name}")
 
     insert_cur = conn.cursor()
-    started = time.perf_counter()
+    # Warm the INSERT prepared path outside timed measurements.
     insert_cur.execute("BEGIN")
     try:
-        insert_cur.executemany("INSERT INTO bench VALUES (?, ?, ?)", row_iter(count))
-        insert_cur.execute("COMMIT")
+        insert_cur.execute("INSERT INTO bench VALUES (?, ?, ?)", (-1, "__warm__", -1.0))
+        insert_cur.execute("ROLLBACK")
     except Exception:
         insert_cur.execute("ROLLBACK")
         raise
-    insert_s = time.perf_counter() - started
+
+    def run_insert():
+        started = time.perf_counter()
+        insert_cur.execute("BEGIN")
+        try:
+            insert_cur.executemany("INSERT INTO bench VALUES (?, ?, ?)", row_iter(count))
+            insert_cur.execute("COMMIT")
+        except Exception:
+            insert_cur.execute("ROLLBACK")
+            raise
+        return time.perf_counter() - started
+
+    insert_s = _run_with_gc_disabled(run_insert)
     insert_rps = count / insert_s
     print(f"Insert {count} rows: {insert_s:.4f}s ({insert_rps:,.2f} rows/sec)")
 
-    fetchall_cur = conn.cursor()
-    started = time.perf_counter()
-    fetchall_cur.execute("SELECT id, val, f FROM bench")
-    rows = fetchall_cur.fetchall()
-    fetchall_s = time.perf_counter() - started
+    scan_sql = "SELECT id, val, f FROM bench"
+    scan_cur = conn.cursor()
+    # Warm the scan prepared path outside timed measurements.
+    scan_cur.execute(scan_sql)
+    scan_cur.fetchmany(1)
+
+    def run_fetchall():
+        started = time.perf_counter()
+        scan_cur.execute(scan_sql)
+        rows = scan_cur.fetchall()
+        return time.perf_counter() - started, rows
+
+    fetchall_s, rows = _run_with_gc_disabled(run_fetchall)
     if len(rows) != count:
         raise AssertionError(f"Expected {count} rows from fetchall, got {len(rows)}")
     print(f"Fetchall {count} rows: {fetchall_s:.4f}s")
 
-    fetchmany_cur = conn.cursor()
-    started = time.perf_counter()
-    fetchmany_cur.execute("SELECT id, val, f FROM bench")
-    total = 0
-    while True:
-        batch = fetchmany_cur.fetchmany(fetchmany_batch)
-        if not batch:
-            break
-        total += len(batch)
-    fetchmany_s = time.perf_counter() - started
+    def run_fetchmany():
+        started = time.perf_counter()
+        scan_cur.execute(scan_sql)
+        total_rows = 0
+        while True:
+            batch = scan_cur.fetchmany(fetchmany_batch)
+            if not batch:
+                break
+            total_rows += len(batch)
+        return time.perf_counter() - started, total_rows
+
+    fetchmany_s, total = _run_with_gc_disabled(run_fetchmany)
     if total != count:
         raise AssertionError(f"Expected {count} rows from fetchmany, got {total}")
     print(f"Fetchmany({fetchmany_batch}) {count} rows: {fetchmany_s:.4f}s")
@@ -181,7 +215,7 @@ def run_engine_benchmark(
     }
 
 
-def print_comparison(results):
+def print_comparison(results, *, tie_threshold=0.0):
     if "decentdb" not in results or "sqlite" not in results:
         return
 
@@ -246,6 +280,15 @@ def print_comparison(results):
         if decent == sqlite:
             ties.append(f"{name}: tie ({decent:{fmt}}{unit})")
             continue
+        max_val = max(abs(decent), abs(sqlite))
+        if tie_threshold > 0.0 and max_val > 0.0:
+            rel_delta = abs(decent - sqlite) / max_val
+            if rel_delta <= tie_threshold:
+                ties.append(
+                    f"{name}: statistical tie within {tie_threshold * 100:.1f}% "
+                    f"({decent:{fmt}}{unit} vs {sqlite:{fmt}}{unit})"
+                )
+                continue
 
         if higher_is_better:
             decent_wins = decent > sqlite
@@ -311,8 +354,8 @@ def parse_args():
     parser.add_argument(
         "--fetchmany-batch",
         type=int,
-        default=1000,
-        help="Batch size for fetchmany benchmark (default: 1000)",
+        default=4096,
+        help="Batch size for fetchmany benchmark (default: 4096)",
     )
     parser.add_argument(
         "--point-reads",

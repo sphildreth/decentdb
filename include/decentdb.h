@@ -67,6 +67,13 @@ typedef struct ddb_value_view_t {
   int64_t timestamp_micros;
 } ddb_value_view_t;
 
+typedef struct ddb_row_i64_text_f64_view_t {
+  int64_t int64_value;
+  const uint8_t *text_data;
+  size_t text_len;
+  double float64_value;
+} ddb_row_i64_text_f64_view_t;
+
 /* Borrowed pointer valid until the next DecentDB call on the same thread. */
 uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
@@ -93,6 +100,15 @@ ddb_status_t ddb_stmt_bind_int64_step_row_view(
     int64_t value,
     const ddb_value_view_t **out_values,
     size_t *out_columns,
+    uint8_t *out_has_row);
+ddb_status_t ddb_stmt_bind_int64_step_i64_text_f64(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    int64_t value,
+    int64_t *out_int64,
+    const uint8_t **out_text_data,
+    size_t *out_text_len,
+    double *out_float64,
     uint8_t *out_has_row);
 ddb_status_t ddb_stmt_bind_float64(ddb_stmt_t *stmt, size_t index_1_based, double value);
 ddb_status_t ddb_stmt_bind_bool(ddb_stmt_t *stmt, size_t index_1_based, uint8_t value);
@@ -155,6 +171,12 @@ ddb_status_t ddb_stmt_fetch_row_views(
     const ddb_value_view_t **out_values,
     size_t *out_rows,
     size_t *out_columns);
+ddb_status_t ddb_stmt_fetch_rows_i64_text_f64(
+    ddb_stmt_t *stmt,
+    uint8_t include_current_row,
+    size_t max_rows,
+    const ddb_row_i64_text_f64_view_t **out_rows_ptr,
+    size_t *out_rows);
 
 ddb_status_t ddb_db_execute(
     ddb_db_t *db,

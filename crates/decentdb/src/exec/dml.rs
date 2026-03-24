@@ -302,6 +302,90 @@ impl EngineRuntime {
 
             candidate.push(super::cast_value(value, column.column_type)?);
         }
+        let affected = self.apply_prepared_simple_insert_candidate(
+            prepared,
+            candidate,
+            next_row_id,
+            params,
+            page_size,
+        )?;
+        Ok(QueryResult::with_affected_rows(affected))
+    }
+
+    pub(crate) fn execute_prepared_simple_insert_positional_params_in_place(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        params: &mut [Value],
+        page_size: u32,
+    ) -> Result<u64> {
+        let table_name = prepared.table_name.as_str();
+        let mut next_row_id = self
+            .catalog
+            .tables
+            .get(table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?
+            .next_row_id;
+        let mut candidate = Vec::with_capacity(prepared.columns.len());
+
+        if params.len() < prepared.columns.len() {
+            return Err(DbError::sql(format!(
+                "prepared insert expected {} parameters but received {}",
+                prepared.columns.len(),
+                params.len()
+            )));
+        }
+
+        for (index, column) in prepared.columns.iter().enumerate() {
+            let mut value = std::mem::replace(
+                params.get_mut(index).ok_or_else(|| {
+                    DbError::internal(format!(
+                        "prepared insert parameter index {index} out of bounds"
+                    ))
+                })?,
+                Value::Null,
+            );
+
+            if column.auto_increment {
+                match value {
+                    Value::Null => {
+                        value = Value::Int64(next_row_id);
+                        next_row_id += 1;
+                    }
+                    Value::Int64(explicit) => {
+                        if explicit >= next_row_id {
+                            next_row_id = explicit + 1;
+                        }
+                    }
+                    _ => {
+                        return Err(DbError::constraint(format!(
+                            "auto-increment column {}.{} requires INT64 values",
+                            table_name, column.name
+                        )));
+                    }
+                }
+            }
+
+            candidate.push(super::cast_value(value, column.column_type)?);
+        }
+
+        self.apply_prepared_simple_insert_candidate(
+            prepared,
+            candidate,
+            next_row_id,
+            params,
+            page_size,
+        )
+    }
+
+    fn apply_prepared_simple_insert_candidate(
+        &mut self,
+        prepared: &PreparedSimpleInsert,
+        candidate: Vec<Value>,
+        mut next_row_id: i64,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<u64> {
+        let table_name = prepared.table_name.as_str();
 
         if prepared.use_generic_validation {
             self.validate_row(table_name, &candidate, None, params)?;
@@ -351,7 +435,7 @@ impl EngineRuntime {
             self.apply_insert_index_updates(index_updates)?;
         }
         self.mark_table_append_dirty(table_name);
-        Ok(QueryResult::with_affected_rows(1))
+        Ok(1)
     }
 
     pub(super) fn execute_insert(

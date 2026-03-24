@@ -9,6 +9,11 @@ import uuid
 import weakref
 from collections.abc import Mapping
 
+try:
+    from . import _fastdecode as _fastdecode_native
+except Exception:
+    _fastdecode_native = None
+
 from .native import (
     DDB_VALUE_BLOB,
     DDB_VALUE_BOOL,
@@ -328,6 +333,61 @@ class Cursor:
         self._use_batch_i64_text_f64 = hasattr(
             self._lib, "ddb_stmt_execute_batch_i64_text_f64"
         )
+        self._decode_row_i64_text_f64_native = (
+            getattr(_fastdecode_native, "decode_row_i64_text_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_text_f64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64_text_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_row_i64_native = (
+            getattr(_fastdecode_native, "decode_row_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._decode_matrix_i64_native = (
+            getattr(_fastdecode_native, "decode_matrix_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_execute_batch_i64_text_f64 = (
+            getattr(_fastdecode_native, "execute_batch_i64_text_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_execute_batch_i64_text_f64_iter = (
+            getattr(_fastdecode_native, "execute_batch_i64_text_f64_iter", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_execute_batch_i64 = (
+            getattr(_fastdecode_native, "execute_batch_i64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_execute_batch_i64_iter = (
+            getattr(_fastdecode_native, "execute_batch_i64_iter", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_bind_int64_step_row_view = (
+            getattr(_fastdecode_native, "bind_int64_step_row_view", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_bind_int64_step_i64_text_f64 = (
+            getattr(_fastdecode_native, "bind_int64_step_i64_text_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_fetch_rows_i64_text_f64 = (
+            getattr(_fastdecode_native, "fetch_rows_i64_text_f64", None)
+            if _fastdecode_native is not None
+            else None
+        )
 
     def close(self):
         if self._closed:
@@ -559,6 +619,29 @@ class Cursor:
         return bool(has_row.value), bound_count
 
     def _execute_current_statement_bind_i64_step_row_view(self, sql, param, params):
+        if (
+            self._native_bind_int64_step_i64_text_f64 is not None
+            and self._stmt is not None
+        ):
+            try:
+                row = self._native_bind_int64_step_i64_text_f64(
+                    self._stmt.value, int(param)
+                )
+                if row is None:
+                    return False, 1, None
+                return True, 1, row
+            except Exception:
+                pass
+
+        if self._native_bind_int64_step_row_view is not None and self._stmt is not None:
+            try:
+                row = self._native_bind_int64_step_row_view(self._stmt.value, int(param))
+                if row is None:
+                    return False, 1, None
+                return True, 1, row
+            except Exception:
+                pass
+
         values_ptr = ctypes.POINTER(DdbValueView)()
         out_count = ctypes.c_size_t()
         has_row = ctypes.c_uint8()
@@ -600,6 +683,13 @@ class Cursor:
         row_count = len(rows)
         if row_count == 0:
             return 0
+        if self._native_execute_batch_i64_text_f64 is not None and self._stmt is not None:
+            try:
+                return int(
+                    self._native_execute_batch_i64_text_f64(self._stmt.value, rows)
+                )
+            except Exception:
+                pass
 
         ids = (ctypes.c_int64 * row_count)()
         text_ptrs = (ctypes.c_char_p * row_count)()
@@ -634,6 +724,11 @@ class Cursor:
         row_count = len(rows)
         if row_count == 0:
             return 0
+        if self._native_execute_batch_i64 is not None and self._stmt is not None:
+            try:
+                return int(self._native_execute_batch_i64(self._stmt.value, rows))
+            except Exception:
+                pass
 
         ids = (ctypes.c_int64 * row_count)()
         for idx, params in enumerate(rows):
@@ -661,9 +756,21 @@ class Cursor:
         bind_param = self._bind_param
         reset_stmt = self._lib.ddb_stmt_reset
 
-        batch_size = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "8192") or "8192")
+        batch_size = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "32768") or "32768")
         if batch_size <= 0:
-            batch_size = 8192
+            batch_size = 32768
+
+        if self._native_execute_batch_i64_iter is not None and self._stmt is not None:
+            total_affected = int(
+                self._native_execute_batch_i64_iter(
+                    self._stmt.value,
+                    first_params,
+                    iterator,
+                    batch_size,
+                )
+            )
+            self._bound_param_count = expected_count
+            return total_affected
 
         total_affected = 0
         fast_batch = [first_params]
@@ -725,9 +832,24 @@ class Cursor:
         bind_param = self._bind_param
         reset_stmt = self._lib.ddb_stmt_reset
 
-        batch_size = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "8192") or "8192")
+        batch_size = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "32768") or "32768")
         if batch_size <= 0:
-            batch_size = 8192
+            batch_size = 32768
+
+        if (
+            self._native_execute_batch_i64_text_f64_iter is not None
+            and self._stmt is not None
+        ):
+            total_affected = int(
+                self._native_execute_batch_i64_text_f64_iter(
+                    self._stmt.value,
+                    first_params,
+                    iterator,
+                    batch_size,
+                )
+            )
+            self._bound_param_count = expected_count
+            return total_affected
 
         total_affected = 0
         fast_batch = [first_params]
@@ -1106,6 +1228,13 @@ class Cursor:
                 and int(v1.tag) == DDB_VALUE_TEXT
                 and int(v2.tag) == DDB_VALUE_FLOAT64
             ):
+                if self._decode_row_i64_text_f64_native is not None:
+                    try:
+                        return self._decode_row_i64_text_f64_native(
+                            ctypes.addressof(values_ptr.contents)
+                        )
+                    except Exception:
+                        pass
                 if not v1.data or v1.len == 0:
                     text_value = ""
                 else:
@@ -1116,6 +1245,13 @@ class Cursor:
             v0 = values_ptr[0]
             tag = int(v0.tag)
             if tag == DDB_VALUE_INT64:
+                if self._decode_row_i64_native is not None:
+                    try:
+                        return self._decode_row_i64_native(
+                            ctypes.addressof(values_ptr.contents)
+                        )
+                    except Exception:
+                        pass
                 return (v0.int64_value,)
             if tag == DDB_VALUE_FLOAT64:
                 return (v0.float64_value,)
@@ -1172,6 +1308,13 @@ class Cursor:
         string_at = ctypes.string_at
 
         if col_count == 3:
+            if self._decode_matrix_i64_text_f64_native is not None:
+                try:
+                    return self._decode_matrix_i64_text_f64_native(
+                        ctypes.addressof(values_ptr.contents), row_count
+                    )
+                except Exception:
+                    pass
             for row_index in range(row_count):
                 base = row_index * 3
                 v0 = values_ptr[base]
@@ -1230,6 +1373,13 @@ class Cursor:
             return rows
 
         if col_count == 1:
+            if self._decode_matrix_i64_native is not None:
+                try:
+                    return self._decode_matrix_i64_native(
+                        ctypes.addressof(values_ptr.contents), row_count
+                    )
+                except Exception:
+                    pass
             for row_index in range(row_count):
                 value = values_ptr[row_index]
                 tag = int(value.tag)
@@ -1356,7 +1506,21 @@ class Cursor:
         return self._fetch_rows(limit=size)
 
     def fetchall(self):
-        return self._fetch_rows(limit=None)
+        chunk_size = int(
+            os.environ.get("DECENTDB_PY_FETCHALL_CHUNK_ROWS", "0") or "0"
+        )
+        if chunk_size <= 0:
+            return self._fetch_rows(limit=None)
+
+        rows = []
+        while True:
+            batch = self._fetch_rows(limit=chunk_size)
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < chunk_size:
+                break
+        return rows
 
     def _fetch_rows(self, limit):
         self._ensure_open()
@@ -1366,6 +1530,23 @@ class Cursor:
             return []
 
         if self._use_fetch_row_views:
+            if (
+                self._native_fetch_rows_i64_text_f64 is not None
+                and self._stmt is not None
+                and self._col_count == 3
+            ):
+                try:
+                    rows = self._native_fetch_rows_i64_text_f64(
+                        self._stmt.value,
+                        1 if self._has_buffered_row else 0,
+                        0 if limit is None else int(limit),
+                    )
+                    self._has_buffered_row = False
+                    self._buffered_row = None
+                    return rows
+                except Exception:
+                    pass
+
             values_ptr = ctypes.POINTER(DdbValueView)()
             out_rows = ctypes.c_size_t()
             out_columns = ctypes.c_size_t()
