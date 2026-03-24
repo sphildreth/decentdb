@@ -1050,8 +1050,7 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
     @Override
     public ResultSet getTypeInfo() throws SQLException {
-        // Keep this aligned with DecentDB's canonical catalog type names
-        // (see src/catalog/catalog.nim columnTypeToText).
+        // Keep this aligned with DecentDB's canonical catalog type names.
         List<Object[]> rows = Arrays.asList(
             typeRow("INT64",   Types.BIGINT, 19, false),
             typeRow("BOOL",    Types.BOOLEAN, 1, false),

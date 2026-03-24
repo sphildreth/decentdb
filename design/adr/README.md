@@ -2,7 +2,10 @@
 
 This directory contains the historical and active ADRs for DecentDB. 
 
-> **Note on Language Context:** DecentDB was originally written in Nim and has been completely rewritten in Rust. Many of the ADRs (0001 through 0117) use `.nim` file paths in their examples. The *architectural decisions* (e.g., WAL formats, B-Tree layouts, SQL semantics) remain 100% valid and binding for the Rust engine. 
+> **Note on historical context:** Some earlier ADRs (0001 through 0117) reference
+> older file paths or module names. The *architectural decisions* (for example
+> WAL formats, B-Tree layouts, and SQL semantics) remain valid and binding for
+> the current Rust engine.
 
 ### Recent Rust-Specific ADRs:
 - **0118-rust-ffi-panic-safety.md**: Mandates `catch_unwind` on all C-ABI boundaries.

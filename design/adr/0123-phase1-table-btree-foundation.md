@@ -35,7 +35,10 @@ We will introduce a reusable **table-row B+Tree foundation** that wraps the exis
 ## Rationale
 This gives the repository a concrete, typed storage abstraction for page-backed table rows while staying aligned with the accepted page, record, and rowid decisions. It also creates a narrow seam for later work: once the runtime can target `TableBtree`, the remaining persistence migration becomes a matter of root-page/catalog ownership and incremental mutation behavior rather than inventing yet another row container.
 
-Using the existing compact B+Tree page layout is important. The Rust rewrite's current design documents explicitly reject stale slotted-page assumptions for this storage path, so the new foundation must build on the accepted sequentially parsed varint-cell layout instead of introducing a competing page format.
+Using the existing compact B+Tree page layout is important. Current design
+documents explicitly reject stale slotted-page assumptions for this storage
+path, so the new foundation must build on the accepted sequentially parsed
+varint-cell layout instead of introducing a competing page format.
 
 ## Alternatives Considered
 ### Jump directly to full runtime integration

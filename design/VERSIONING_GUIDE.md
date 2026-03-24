@@ -1,6 +1,7 @@
 # DecentDB Versioning Guide
 
-This guide defines how DecentDB version jumps work in the Rust rewrite and which files must be updated when the project version changes.
+This guide defines how DecentDB version jumps work and which files must be
+updated when the project version changes.
 
 ## 1. Versioning policy
 
@@ -10,11 +11,9 @@ DecentDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 - **Minor (`X.Y.0`)** for backwards-compatible feature additions.
 - **Patch (`X.Y.Z`)** for backwards-compatible fixes, packaging adjustments, CI fixes, and documentation updates that do not change the public contract.
 
-### Historical note
+### Public release line
 
-The Nim-based DecentDB line occupied the `v1.x` series.
-
-The Rust rewrite intentionally starts at `v2.0.0`, not `v1.0.0`, so the language/runtime break is reflected in the public version history.
+The current public DecentDB release line begins at `v2.0.0`.
 
 ## 2. Current version-bearing files
 

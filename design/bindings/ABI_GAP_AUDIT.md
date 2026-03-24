@@ -3,8 +3,8 @@
 ## Purpose
 
 This document compares the current Rust C ABI to the native surface assumed by
-the old packaged integrations. The old Nim repository is reference material
-only; it is not a compatibility target.
+higher-level packaged integrations. Historical package layouts are reference
+material only; they are not compatibility targets.
 
 ## Baseline
 
@@ -19,7 +19,7 @@ Current Rust C ABI:
 
 Reference legacy native surface:
 
-- `/home/steven/source/decentdb-nim/bindings/go/decentdb-go/decentdb.h`
+- archived packaged binding headers and host-language tests
 - statement-oriented API with `prepare`, typed binds, `step`, and borrowed row
   accessors
 - JSON schema introspection helpers

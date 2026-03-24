@@ -213,8 +213,8 @@ class DecentDBDialect(default.DefaultDialect):
     driver = "pysql"
     supports_alter = False
     supports_pk_autoincrement = False # Use explicit IDs or nextval logic if available?
-    # DecentDB doesn't have AUTOINCREMENT keyword in CREATE TABLE yet (based on parsing logic)
-    # Actually check parseColumnType in catalog.nim - no AUTOINCREMENT flag.
+    # DecentDB doesn't have an AUTOINCREMENT keyword in CREATE TABLE yet.
+    # Column parsing does not expose an AUTOINCREMENT flag.
     # But it has `nextRowId` in TableMeta.
     # Insert logic might handle it?
     # "MVP: SELECT/INSERT/UPDATE/DELETE"

@@ -37,7 +37,7 @@ DecentDB uses the following open source components:
 ### Rust Standard Library
 
 - **License:** MIT
-- **Source:** https://nim-lang.org/
+- **Source:** https://www.rust-lang.org/
 - **Purpose:** Core language functionality
 
 ### Material for MkDocs

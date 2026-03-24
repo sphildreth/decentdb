@@ -1,6 +1,7 @@
 # Releases
 
-The Rust rewrite now gates release readiness through the Phase 4 workflows, benchmark binary, and binding matrix.
+Release readiness is gated through the Phase 4 workflows, benchmark binary, and
+binding matrix.
 
 ## CI lanes
 

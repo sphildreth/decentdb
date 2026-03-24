@@ -413,7 +413,7 @@ class TestEvictSharedWal:
         """Evict non-existent path should not crash.
         
         Regression: expandFilename() calls C realpath() which returns NULL
-        for non-existent files, causing an unhandled Nim OSError.
+        for non-existent files, causing an unhandled OS error.
         """
         db_path = str(tmp_path / "nonexistent.ddb")
         

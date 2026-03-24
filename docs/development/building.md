@@ -1,7 +1,7 @@
 # Building from Source
 
-This repository is the Rust rewrite of DecentDB. The supported local workflow is
-Cargo-based.
+This repository contains the DecentDB Rust engine. The supported local workflow
+is Cargo-based.
 
 ## Prerequisites
 

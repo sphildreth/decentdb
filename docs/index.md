@@ -1,6 +1,6 @@
 # DecentDB
 
-> ⚠️ **NOTICE:** DecentDB is currently undergoing a complete rewrite from Nim to Rust. This documentation reflects the target 1.0 architecture and API of the Rust engine.
+> DecentDB documentation tracks the current Rust engine, CLI, and language bindings.
 
 **Durable. Fast. Embedded.**
 

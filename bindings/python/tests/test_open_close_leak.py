@@ -1,8 +1,8 @@
 """Regression test for repeated open/close memory leak.
 
-The WAL overlay closure in engine.nim captured the Db ref, creating a
-reference cycle (Db -> Pager -> closure -> Db) that ARC could not collect.
-closeDb now breaks this cycle by clearing the overlay before closing.
+A previous WAL overlay implementation retained the database handle through a
+reference cycle during shutdown, keeping native resources alive longer than
+expected. The close path now breaks that cycle before releasing the database.
 
 This test verifies that repeated open/close cycles release native resources
 by checking RSS stays bounded.

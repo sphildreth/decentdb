@@ -1,54 +1,101 @@
 # DecentDB Copilot Instructions
 
-These instructions define how coding agents should operate in the DecentDB repository.
-DecentDB is currently undergoing a complete rewrite from Nim to Rust. **The Rust Borrow Checker is our QA Engineer.**
+These instructions define how coding agents should operate in the DecentDB
+repository.
 
-## 1. North Star & Agent Mandate
+## 1. Mission
+
+DecentDB is a Rust-native embedded relational database project. The goal is to
+build a world-class engine that is durable, fast, correct, and easy to embed
+from many host languages.
+
 - **Priority #1:** Durable ACID writes
 - **Priority #2:** Fast reads
-- **Concurrency model:** Single process with **one writer** and **multiple concurrent reader threads**.
-- Correctness is enforced via **tests from day one** (unit + property + crash-injection + differential testing against SQLite and the old Nim version).
-- **NEVER** write code that hallucinates Nim syntax. This is a 100% Rust rewrite.
+- **Priority #3:** Stable, ergonomic multi-language integrations
+- **Concurrency model:** Single process with **one writer** and **multiple
+  concurrent reader threads**
+- **The Rust borrow checker is your QA engineer**
 
-## 2. Rust Coding Conventions and Best Practices
+## 2. Product standards
 
-Follow idiomatic Rust practices and community standards when writing Rust code. These instructions are based on [The Rust Book](https://doc.rust-lang.org/book/), [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/), and the broader Rust community.
+- Rust is the implementation language for the engine and CLI.
+- The stable native boundary is the C ABI exposed by `include/decentdb.h` and
+  the `ddb_*` exports.
+- Bindings should build on that ABI instead of creating parallel native
+  contracts.
+- User-visible behavior should stay aligned across the Rust API, CLI, C ABI, and
+  language bindings.
 
-### General Instructions
-- Always prioritize readability, safety, and zero-cost abstractions to compete with SQLite.
-- Ensure structs have precise byte-level control where necessary (e.g. `#[repr(C)]` or `#[repr(packed)]` for disk pages) to minimize disk bloat.
-- Handle errors gracefully using `Result<T, E>` and custom error types via `thiserror`. Provide meaningful context in error messages.
+## 3. Rust coding conventions
+
+Follow idiomatic Rust practices and community standards. These instructions are
+grounded in [The Rust Book](https://doc.rust-lang.org/book/), the
+[Rust API Guidelines](https://rust-lang.github.io/api-guidelines/), and normal
+Rust ecosystem expectations.
+
+### General instructions
+
+- Prioritize readability, safety, and zero-cost abstractions.
+- Ensure structs have precise byte-level control where necessary (for example
+  `#[repr(C)]` for disk pages or FFI layouts).
+- Handle errors with `Result<T, E>` and meaningful typed errors.
 - Ensure code compiles without warnings. Treat warnings as errors.
-- Never use `unwrap()` or `expect()` unless absolutely necessary—prefer proper error handling with `?`.
-- Avoid panics in library code—return `Result` instead.
+- Avoid panics in library code.
+- Avoid `unwrap()` and `expect()` unless there is a narrowly justified reason.
 
-### Ownership, Borrowing, and Lifetimes
-- Prefer borrowing (`&T`) over cloning unless ownership transfer is necessary.
-- Explicitly annotate lifetimes when the compiler cannot infer them.
-- Avoid unnecessary allocations—prefer borrowing and zero-copy operations.
-- Avoid `unsafe` unless strictly required for mmap, VFS, or tight C-ABI interop, and ALWAYS fully document the safety invariants.
+### Ownership, borrowing, and lifetimes
 
-### Type Safety and Predictability
-- Use newtypes to provide static distinctions.
+- Prefer borrowing (`&T`) over cloning unless ownership transfer is required.
+- Annotate lifetimes explicitly when inference is not enough.
+- Avoid unnecessary allocations and preserve zero-copy paths where they matter.
+- Avoid `unsafe` unless strictly required for FFI, VFS, or similarly low-level
+  boundaries, and fully document the safety invariants.
+
+### Type safety and predictability
+
+- Use newtypes to provide static distinctions where helpful.
 - Functions with a clear receiver should be methods.
-- Eagerly implement common traits where appropriate (`Copy`, `Clone`, `Eq`, `PartialEq`, `Debug`, `Display`).
-- Note: `Send` and `Sync` must be strictly respected. Let the compiler enforce the single-writer/multi-reader concurrency model.
+- Implement common traits where appropriate (`Copy`, `Clone`, `Eq`,
+  `PartialEq`, `Debug`, `Display`).
+- Respect `Send` and `Sync` boundaries so the compiler can enforce the
+  single-writer / multi-reader model.
 
-## 3. Scope Boundaries & ADRs (Architecture Decision Records)
+## 4. Scope boundaries and architecture
+
 - Keep changes small and incremental.
-- **Avoid adding dependencies.** If you must add a dependency (especially for major things like SQL parser, compression, hashing), create an ADR in `design/adr/` and ask the user for approval first.
+- **Avoid adding dependencies.** If you must add a major dependency, create an
+  ADR in `design/adr/` and ask the user for approval first.
 - Prefer boring, explicit implementations over clever ones.
-- Start at the bottom: VFS/Pager/WAL, then B+Tree, then higher layers.
+- Start at the bottom of the stack: VFS, pager, WAL, page cache, B+Tree, then
+  higher layers.
+- Treat on-disk format, WAL semantics, SQL behavior, and ABI stability as
+  product-level compatibility concerns.
 
-## 4. Testing and Documentation
-- Write comprehensive unit tests using `#[cfg(test)]` modules and `#[test]` annotations alongside the code they test.
-- Use property tests where applicable for database invariants.
-- If durability/format-sensitive: ensure crash-injection tests and differential tests are considered.
-- Document all public APIs with rustdoc (`///` comments) following API Guidelines.
-- Write clear and concise comments focusing on *why* complex logic (like B-Tree splits) is done, not *what*.
+## 5. Bindings and documentation
 
-## 5. Commit / PR Hygiene
-- **NEVER run `git commit`, `git push`, or any git write operation without EXPLICIT user approval.** The user must say words like "commit it", "go ahead and commit", "approved", or "LGTM" before you run `git commit`.
-- Showing a diff is NOT approval. Silence is NOT approval.
+- Treat the Rust engine as authoritative and the C ABI as the shared binding
+  boundary.
+- Keep support expectations high for .NET, Python, Go, Java/JDBC, Node.js,
+  Dart/Flutter, and related tooling.
+- When engine work affects bindings, update the relevant binding tests, docs,
+  and examples.
+- Document public APIs with rustdoc (`///` comments) and keep user-facing docs
+  aligned with behavior.
+
+## 6. Validation expectations
+
+- Write comprehensive unit tests next to the code they exercise.
+- Use integration, property, crash-injection, and binding tests where relevant.
+- Run `cargo check`, `cargo clippy`, and the relevant targeted test suites while
+  working.
+- If a change touches the C ABI or binding semantics, run the corresponding
+  binding validation or smoke coverage.
+
+## 7. Commit / PR hygiene
+
+- **NEVER** run `git commit`, `git push`, or any git write operation without
+  explicit user approval.
+- Showing a diff is **not** approval.
+- Silence is **not** approval.
 - Use clear commit messages (imperative, scoped).
 - Avoid mixing unrelated refactors with feature work.

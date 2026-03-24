@@ -1,6 +1,6 @@
 # Testing
 
-DecentDB's Rust rewrite uses several complementary test layers.
+DecentDB uses several complementary test layers.
 
 ## Test layout
 

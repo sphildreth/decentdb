@@ -1,6 +1,6 @@
 # Dart Binding
 
-DecentDB currently ships two Dart-facing validation layers in the Rust rewrite:
+DecentDB ships two Dart-facing validation layers:
 
 - `tests/bindings/dart/` for the narrow smoke test over the raw `ddb_*` C ABI
 - `bindings/dart/dart/` for the packaged Dart wrapper API

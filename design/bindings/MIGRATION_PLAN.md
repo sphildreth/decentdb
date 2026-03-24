@@ -1,4 +1,4 @@
-# Rust Bindings Migration Plan
+# Rust Bindings Packaging Plan
 
 ## Decision
 
@@ -10,11 +10,8 @@ some packages, such as JDBC, Python DB-API, or Go `database/sql`.
 
 ## Scope
 
-This plan covers migration of packaged language integrations from the old Nim-era
-repository shape to the Rust engine.
-
-This plan does not include Nim as a supported language target. The Nim repository
-is reference material only.
+This plan covers continued development of packaged language integrations around
+the Rust engine and its stable C ABI.
 
 ## Terminology
 
@@ -38,13 +35,12 @@ The Rust repository currently ships:
 - a stable C ABI in `include/decentdb.h`
 - language validation and smoke coverage in `tests/bindings/`
 
-The Rust repository does not yet ship the higher-level packaged language APIs
-that existed in the Nim repository.
+Not every higher-level packaged language API is at the same level of
+distribution readiness yet.
 
 ## Product Inventory to Port
 
-Port these products as Rust-engine-backed packages, not as Nim-compatible
-artifacts:
+Continue developing these products as Rust-engine-backed packages:
 
 - Python DB-API package
 - Python SQLAlchemy dialect
@@ -65,12 +61,10 @@ artifacts:
 
 - Keep the Rust C ABI as the only native boundary shared across language
   packages.
-- Do not revive the old Nim native ABI as a compatibility layer.
-- Use the old Nim repository only as a source of:
-  - tests
-  - examples
-  - API contracts
-  - package layout ideas
+- Do not add a second native compatibility layer when the stable C ABI can be
+  extended cleanly.
+- Use existing tests, examples, API contracts, and package layouts as
+  compatibility inputs where helpful.
 - Do not copy generated binaries, libraries, package caches, or build outputs.
 - Keep package-specific toolchains out of the Rust core crates.
 - Reuse `tests/bindings/` as release-blocking ABI and smoke coverage even after
@@ -78,9 +72,9 @@ artifacts:
 
 ## Expected ABI Work
 
-The old Nim-era packages relied on a more statement-oriented native surface than
-the current Rust C ABI. Before porting higher-level packages, audit the ABI for
-gaps in:
+Some higher-level packages rely on a more statement-oriented native surface than
+the current Rust C ABI. Before expanding those packages, audit the ABI for gaps
+in:
 
 - prepared statements
 - parameter binding lifecycle
@@ -104,7 +98,7 @@ handle-based design and panic containment guarantees.
 
 ### Phase 1: ABI Gap Audit
 
-- Compare each old package's native expectations against `include/decentdb.h`.
+- Compare each package's native expectations against `include/decentdb.h`.
 - Produce a per-language gap matrix.
 - Capture the initial gap audit in `design/bindings/ABI_GAP_AUDIT.md`.
 - Land required additive C ABI changes before porting package code.

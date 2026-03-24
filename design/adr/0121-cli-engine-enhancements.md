@@ -13,8 +13,8 @@ operability and performance:
 2. explicit WAL checkpoint control
 3. explicit transaction control for multi-statement SQL batches
 
-Earlier draft text in this ADR described a pre-implementation rewrite state using
-Nim-era examples. The current implementation lives in the Rust CLI and engine.
+Earlier draft text in this ADR described a pre-implementation state using older
+examples. The current implementation lives in the Rust CLI and engine.
 
 ## Decision
 
@@ -74,7 +74,7 @@ The implemented Rust surfaces are:
 - checkpoint control is available without hidden engine hooks
 - multi-statement transactions and savepoints behave consistently across CLI and
   embedded use
-- the Rust rewrite now has an accurate, documented control surface for these
+- the engine now has an accurate, documented control surface for these
   operations
 
 ### Trade-offs

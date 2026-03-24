@@ -113,7 +113,7 @@ final class DecentDBNative {
     /** Returns JSON array of index metadata objects. */
     static native String metaListIndexes(long dbHandle);
 
-    // ---- Value kind constants (must match c_api.nim / value.nim) -------
+    // ---- Value kind constants (must match the DecentDB C ABI) ----------
     static final int KIND_NULL    = 0;
     static final int KIND_INT64   = 1;
     static final int KIND_BOOL    = 2;
@@ -128,7 +128,7 @@ final class DecentDBNative {
     static final int KIND_INT1       = 16;
     static final int KIND_DATETIME   = 17;
 
-    // ---- Error code constants (must match src/errors.nim + c_api.nim) --
+    // ---- Error code constants (must match the DecentDB C ABI) ----------
     static final int ERR_OK          = 0;
     static final int ERR_IO          = 1;
     static final int ERR_CORRUPTION  = 2;

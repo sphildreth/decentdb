@@ -6,12 +6,12 @@
 
 ## Context
 
-The Rust rewrite needs an in-tree Dart/Flutter desktop binding that stays aligned
-with the stable native C ABI exported by `include/decentdb.h` and
+DecentDB needs an in-tree Dart/Flutter desktop binding that stays aligned with
+the stable native C ABI exported by `include/decentdb.h` and
 `crates/decentdb/src/c_api.rs`.
 
-Earlier draft examples in this ADR used a legacy `decentdb_*` API shape from the
-rewrite transition. The implemented Rust surface is the `ddb_*` ABI.
+Earlier draft examples in this ADR used a transitional `decentdb_*` API shape.
+The implemented Rust surface is the `ddb_*` ABI.
 
 ## Decision
 
@@ -97,7 +97,7 @@ remain readable, reviewable, and easy to keep aligned with `include/decentdb.h`.
 
 ## Consequences
 
-- Dart now shares the same native ABI story as the rest of the Rust rewrite
+- Dart now shares the same native ABI story as the rest of DecentDB
 - ABI drift is caught immediately at load time
 - The package can offer higher-level ergonomics without requiring a second native
   statement ABI

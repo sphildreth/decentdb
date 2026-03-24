@@ -13,5 +13,5 @@ DecentDB relies heavily on its C-ABI (`extern "C"`) to support Entity Framework,
 
 ### Rationale
 - Prevents host application crashes.
-- Ensures the bindings developed for the Nim engine continue to function identically with the Rust engine.
+- Ensures bindings observe consistent failure behavior across the Rust C ABI surface.
 - Satisfies the strict safety guarantees required by the project pillars.

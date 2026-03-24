@@ -22,7 +22,7 @@
 #include <stdint.h>
 
 /* Forward declarations for the DecentDB C API. These match the symbols
-   exported by the Nim-compiled shared library (libc_api.so / libdecentdb_jni.so). */
+   exported by the shared library used by this JNI layer. */
 
 typedef void (*decentdb_free_fn)(void *p);
 typedef void *(*decentdb_open_fn)(const char *path, const char *options);

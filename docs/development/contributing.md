@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping with the Rust rewrite of DecentDB.
+Thanks for helping improve DecentDB.
 
 ## Getting started
 
@@ -60,5 +60,5 @@ A good PR description should cover:
 - how you validated it
 - any follow-up work that remains
 
-Keeping docs, tests, and implementation aligned is especially valuable during
-this rewrite.
+Keeping docs, tests, and implementation aligned is especially valuable in a
+database project.

@@ -1,6 +1,6 @@
 # Python Validation
 
-Phase 4 currently ships the Python validation suite over the stable C ABI rather than a packaged DB-API driver.
+DecentDB provides a Python validation suite over the stable C ABI rather than a packaged DB-API driver.
 
 The validation lives in:
 

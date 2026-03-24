@@ -81,11 +81,11 @@ Set `DECENTDB_NATIVE_LIB_PATH` to an absolute path to `libdecentdb.so` (Linux), 
 
 1. Build the library from the repo root:
    ```sh
-   nim c -d:release --mm:arc --threads:on --app:lib --out:libdecentdb.so src/c_api.nim
+   cargo build -p decentdb
    ```
 2. Run tests:
    ```sh
-   DECENTDB_NATIVE_LIB_PATH=$PWD/libdecentdb.so npm test
+   DECENTDB_NATIVE_LIB_PATH=/absolute/path/to/target/debug/libdecentdb.so npm test
    ```
 
 ## Testing
