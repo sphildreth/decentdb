@@ -338,6 +338,7 @@ public sealed class PreparedStatement : IDisposable
     private bool _disposed;
     private readonly string _sql;
     private readonly int _parameterCount;
+    private int _columnCount = -1;
 
     public IntPtr Handle => _handle.Handle;
 
@@ -570,13 +571,19 @@ public sealed class PreparedStatement : IDisposable
     {
         get
         {
+            if (_columnCount >= 0)
+            {
+                return _columnCount;
+            }
+
             var res = _db.RecordStatus(DecentDBNative.ddb_stmt_column_count(Handle, out var columns));
             if (res != 0)
             {
                 throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
             }
 
-            return checked((int)columns);
+            _columnCount = checked((int)columns);
+            return _columnCount;
         }
     }
 

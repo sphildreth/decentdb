@@ -23,6 +23,14 @@ namespace DecentDB.AdoNet
         private PreparedStatement? _preparedStatement;
         private string? _preparedSql;
         private Native.DecentDB? _preparedDb;
+        private string? _cachedSplitSql;
+        private List<string>? _cachedSplitStatements;
+        private string? _cachedRewriteSourceSql;
+        private string? _cachedRewriteSql;
+        private Dictionary<int, DbParameter>? _cachedRewriteParamMap;
+        private DbParameter[]? _cachedRewriteParameterRefs;
+        private string?[]? _cachedRewriteParameterNames;
+        private bool _cachedRewriteNeedsOffsetClamp;
         private bool _disposed;
 
         public DecentDBCommand()
@@ -59,6 +67,8 @@ namespace DecentDB.AdoNet
                     throw new InvalidOperationException("Cannot change CommandText while command is executing");
                 }
                 InvalidatePreparedStatement();
+                InvalidateSplitCache();
+                InvalidateRewriteCache();
                 _commandText = value ?? string.Empty;
             }
         }
@@ -141,14 +151,22 @@ namespace DecentDB.AdoNet
         {
             if (_statement != null)
             {
-                _statement.Dispose();
+                if (ReferenceEquals(_statement, _preparedStatement))
+                {
+                    _statement.Reset().ClearBindings();
+                }
+                else
+                {
+                    _statement.Dispose();
+                }
+
                 _statement = null;
             }
         }
 
         public override int ExecuteNonQuery()
         {
-            var statements = SqlStatementSplitter.Split(_commandText);
+            var statements = GetSplitStatements();
             if (statements.Count <= 1)
             {
                 return ExecuteSingleNonQuery();
@@ -162,6 +180,8 @@ namespace DecentDB.AdoNet
                 foreach (var stmt in statements)
                 {
                     _commandText = stmt;
+                    InvalidateSplitCache();
+                    InvalidateRewriteCache();
                     using var reader = ExecuteDbDataReader(CommandBehavior.Default);
                     while (reader.Read()) { }
                     if (reader.RecordsAffected > 0)
@@ -171,6 +191,8 @@ namespace DecentDB.AdoNet
             finally
             {
                 _commandText = savedText;
+                InvalidateSplitCache();
+                InvalidateRewriteCache();
             }
             return totalRows;
         }
@@ -205,16 +227,26 @@ namespace DecentDB.AdoNet
             }
 
             var db = _connection.GetNativeDb();
-            var (sql, paramMap) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
-            SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
-            sql = SqlParameterRewriter.StripUpdateDeleteAlias(sql);
-
-            var observation = _connection.TryStartSqlObservation(sql, SnapshotParameters(paramMap));
+            var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
+            if (needsOffsetClamp)
+            {
+                SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
+            }
+            var observation = StartSqlObservationIfEnabled(_connection, sql, paramMap);
 
             PreparedStatement? stmt = null;
+            var usingPreparedStatementCache = false;
             try
             {
-                stmt = db.Prepare(sql);
+                if (GetSplitStatements().Count <= 1)
+                {
+                    stmt = EnsurePreparedStatement(sql, resetForExecution: true);
+                    usingPreparedStatementCache = true;
+                }
+                else
+                {
+                    stmt = db.Prepare(sql);
+                }
 
                 foreach (var kvp in paramMap)
                 {
@@ -226,13 +258,18 @@ namespace DecentDB.AdoNet
                 var stepResult = stmt.Step();
                 if (stepResult < 0)
                 {
-                    var ex = new DecentDBException(stepResult,
-                        db.LastErrorMessage, sql);
-                    if (observation != null)
+                    _statement = null;
+
+                    if (usingPreparedStatementCache)
                     {
-                        _connection.CompleteSqlObservation(observation, stmt.RowsAffected, ex);
+                        InvalidatePreparedStatement();
                     }
-                    throw ex;
+                    else
+                    {
+                        stmt.Dispose();
+                    }
+
+                    throw new DecentDBException(stepResult, db.LastErrorMessage, sql);
                 }
 
                 return new DecentDBDataReader(this, stmt, stepResult, observation);
@@ -241,8 +278,12 @@ namespace DecentDB.AdoNet
             {
                 if (_statement == null && stmt != null)
                 {
-                    stmt.Dispose();
+                    if (!usingPreparedStatementCache || !ReferenceEquals(stmt, _preparedStatement))
+                    {
+                        stmt.Dispose();
+                    }
                 }
+                _statement = null;
 
                 if (observation != null)
                 {
@@ -276,6 +317,120 @@ namespace DecentDB.AdoNet
             return values;
         }
 
+        private static SqlObservation? StartSqlObservationIfEnabled(
+            DecentDBConnection connection,
+            string sql,
+            Dictionary<int, DbParameter> paramMap)
+        {
+            if (!connection.IsSqlObservationEnabled)
+            {
+                return null;
+            }
+
+            return connection.TryStartSqlObservation(sql, SnapshotParameters(paramMap));
+        }
+
+        private IReadOnlyList<string> GetSplitStatements()
+        {
+            if (_cachedSplitStatements != null &&
+                string.Equals(_cachedSplitSql, _commandText, StringComparison.Ordinal))
+            {
+                return _cachedSplitStatements;
+            }
+
+            _cachedSplitStatements = SqlStatementSplitter.Split(_commandText);
+            _cachedSplitSql = _commandText;
+            return _cachedSplitStatements;
+        }
+
+        private (string Sql, Dictionary<int, DbParameter> Parameters, bool NeedsOffsetClamp) GetRewrittenSqlAndParameters()
+        {
+            if (CanReuseRewriteCache())
+            {
+                return (_cachedRewriteSql!, _cachedRewriteParamMap!, _cachedRewriteNeedsOffsetClamp);
+            }
+
+            var (sql, parameters) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
+            sql = SqlParameterRewriter.StripUpdateDeleteAlias(sql);
+            CaptureRewriteCache(sql, parameters);
+            return (sql, parameters, _cachedRewriteNeedsOffsetClamp);
+        }
+
+        private bool CanReuseRewriteCache()
+        {
+            if (_cachedRewriteSql == null ||
+                _cachedRewriteParamMap == null ||
+                _cachedRewriteSourceSql == null ||
+                _cachedRewriteParameterRefs == null ||
+                _cachedRewriteParameterNames == null)
+            {
+                return false;
+            }
+
+            if (!string.Equals(_cachedRewriteSourceSql, _commandText, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (_cachedRewriteParameterRefs.Length != _parameters.Count ||
+                _cachedRewriteParameterNames.Length != _parameters.Count)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < _parameters.Count; i++)
+            {
+                if (!ReferenceEquals(_cachedRewriteParameterRefs[i], _parameters[i]))
+                {
+                    return false;
+                }
+
+                if (!string.Equals(
+                        _cachedRewriteParameterNames[i],
+                        _parameters[i].ParameterName,
+                        StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private void CaptureRewriteCache(string rewrittenSql, Dictionary<int, DbParameter> parameters)
+        {
+            var refs = new DbParameter[_parameters.Count];
+            var names = new string?[_parameters.Count];
+            for (var i = 0; i < _parameters.Count; i++)
+            {
+                refs[i] = _parameters[i];
+                names[i] = _parameters[i].ParameterName;
+            }
+
+            _cachedRewriteSourceSql = _commandText;
+            _cachedRewriteSql = rewrittenSql;
+            _cachedRewriteParamMap = parameters;
+            _cachedRewriteParameterRefs = refs;
+            _cachedRewriteParameterNames = names;
+            _cachedRewriteNeedsOffsetClamp = rewrittenSql.IndexOf("OFFSET", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private void InvalidateSplitCache()
+        {
+            _cachedSplitSql = null;
+            _cachedSplitStatements = null;
+        }
+
+        private void InvalidateRewriteCache()
+        {
+            _cachedRewriteSourceSql = null;
+            _cachedRewriteSql = null;
+            _cachedRewriteParamMap = null;
+            _cachedRewriteParameterRefs = null;
+            _cachedRewriteParameterNames = null;
+            _cachedRewriteNeedsOffsetClamp = false;
+        }
+
         protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -300,15 +455,17 @@ namespace DecentDB.AdoNet
                 throw new InvalidOperationException("Connection must be open to prepare command");
             }
 
-            var statements = SqlStatementSplitter.Split(_commandText);
+            var statements = GetSplitStatements();
             if (statements.Count != 1)
             {
                 return;
             }
 
-            var (sql, paramMap) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
-            SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
-            sql = SqlParameterRewriter.StripUpdateDeleteAlias(sql);
+            var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
+            if (needsOffsetClamp)
+            {
+                SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
+            }
 
             EnsurePreparedStatement(sql, resetForExecution: false);
         }
@@ -322,30 +479,74 @@ namespace DecentDB.AdoNet
                 return;
             }
 
-            var type = value.GetType();
-            if (type == typeof(long) || type == typeof(int) || type == typeof(short) || type == typeof(byte))
+            if (value is long l)
             {
-                stmt.BindInt64(index1Based, Convert.ToInt64(value));
+                stmt.BindInt64(index1Based, l);
+                return;
             }
-            else if (type == typeof(ulong) || type == typeof(uint) || type == typeof(ushort))
+
+            if (value is int i32)
             {
-                stmt.BindInt64(index1Based, (long)Convert.ToUInt64(value));
+                stmt.BindInt64(index1Based, i32);
+                return;
             }
-            else if (type == typeof(double) || type == typeof(float))
+
+            if (value is short i16)
             {
-                stmt.BindFloat64(index1Based, Convert.ToDouble(value));
+                stmt.BindInt64(index1Based, i16);
+                return;
             }
-            else if (type == typeof(decimal))
+
+            if (value is byte i8)
             {
-                stmt.BindDecimal(index1Based, (decimal)value);
+                stmt.BindInt64(index1Based, i8);
+                return;
             }
-            else if (type == typeof(bool))
+
+            if (value is ulong u64)
             {
-                stmt.BindBool(index1Based, (bool)value);
+                stmt.BindInt64(index1Based, unchecked((long)u64));
+                return;
             }
-            else if (type == typeof(string))
+
+            if (value is uint u32)
             {
-                var s = (string)value;
+                stmt.BindInt64(index1Based, u32);
+                return;
+            }
+
+            if (value is ushort u16)
+            {
+                stmt.BindInt64(index1Based, u16);
+                return;
+            }
+
+            if (value is double f64)
+            {
+                stmt.BindFloat64(index1Based, f64);
+                return;
+            }
+
+            if (value is float f32)
+            {
+                stmt.BindFloat64(index1Based, f32);
+                return;
+            }
+
+            if (value is decimal dec)
+            {
+                stmt.BindDecimal(index1Based, dec);
+                return;
+            }
+
+            if (value is bool b)
+            {
+                stmt.BindBool(index1Based, b);
+                return;
+            }
+
+            if (value is string s)
+            {
                 if (parameter.Size > 0)
                 {
                     var byteCount = Encoding.UTF8.GetByteCount(s);
@@ -356,55 +557,80 @@ namespace DecentDB.AdoNet
                 }
 
                 stmt.BindText(index1Based, s);
+                return;
             }
-            else if (type == typeof(DateTime))
+
+            if (value is DateTime dt)
             {
-                var dt = (DateTime)value;
                 var utc = dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime();
                 var micros = (utc.Ticks - DateTime.UnixEpoch.Ticks) / 10L;
                 stmt.BindDatetime(index1Based, micros);
+                return;
             }
-            else if (type == typeof(DateTimeOffset))
+
+            if (value is DateTimeOffset dto)
             {
-                var dto = ((DateTimeOffset)value).ToUniversalTime();
-                var micros = (dto.UtcTicks - DateTime.UnixEpoch.Ticks) / 10L;
+                var utc = dto.ToUniversalTime();
+                var micros = (utc.UtcTicks - DateTime.UnixEpoch.Ticks) / 10L;
                 stmt.BindDatetime(index1Based, micros);
+                return;
             }
-            else if (type == typeof(TimeSpan))
+
+            if (value is TimeSpan ts)
             {
-                stmt.BindInt64(index1Based, ((TimeSpan)value).Ticks);
+                stmt.BindInt64(index1Based, ts.Ticks);
+                return;
             }
-            else if (type == typeof(DateOnly))
+
+            if (value is DateOnly date)
             {
-                var date = (DateOnly)value;
                 var epoch = DateOnly.FromDateTime(DateTime.UnixEpoch);
                 stmt.BindInt64(index1Based, date.DayNumber - epoch.DayNumber);
+                return;
             }
-            else if (type == typeof(TimeOnly))
+
+            if (value is TimeOnly time)
             {
-                stmt.BindInt64(index1Based, ((TimeOnly)value).Ticks);
+                stmt.BindInt64(index1Based, time.Ticks);
+                return;
             }
-            else if (type == typeof(byte[]))
+
+            if (value is byte[] blob)
             {
-                stmt.BindBlob(index1Based, (byte[])value);
+                stmt.BindBlob(index1Based, blob);
+                return;
             }
-            else if (type == typeof(Guid))
+
+            if (value is Guid guid)
             {
-                stmt.BindBlob(index1Based, ((Guid)value).ToByteArray());
+                stmt.BindBlob(index1Based, guid.ToByteArray());
+                return;
             }
-            else if (type.IsEnum)
+
+            if (value.GetType().IsEnum)
             {
                 stmt.BindInt64(index1Based, Convert.ToInt64(value));
+                return;
             }
-            else
-            {
-                throw new NotSupportedException($"Unsupported parameter type: {type.FullName}");
-            }
+
+            throw new NotSupportedException($"Unsupported parameter type: {value.GetType().FullName}");
         }
 
         internal void FinalizeStatement()
         {
-            _statement?.Dispose();
+            if (_statement == null)
+            {
+                return;
+            }
+
+            if (ReferenceEquals(_statement, _preparedStatement))
+            {
+                _statement.Reset().ClearBindings();
+                _statement = null;
+                return;
+            }
+
+            _statement.Dispose();
             _statement = null;
         }
 
@@ -415,11 +641,13 @@ namespace DecentDB.AdoNet
                 throw new InvalidOperationException("Command has no connection");
             }
 
-            var (sql, paramMap) = SqlParameterRewriter.Rewrite(_commandText, _parameters);
-            SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
-            sql = SqlParameterRewriter.StripUpdateDeleteAlias(sql);
+            var (sql, paramMap, needsOffsetClamp) = GetRewrittenSqlAndParameters();
+            if (needsOffsetClamp)
+            {
+                SqlParameterRewriter.ClampOffsetParameters(sql, paramMap);
+            }
 
-            var observation = _connection.TryStartSqlObservation(sql, SnapshotParameters(paramMap));
+            var observation = StartSqlObservationIfEnabled(_connection, sql, paramMap);
 
             try
             {
@@ -494,6 +722,11 @@ namespace DecentDB.AdoNet
 
         private void InvalidatePreparedStatement()
         {
+            if (ReferenceEquals(_statement, _preparedStatement))
+            {
+                _statement = null;
+            }
+
             _preparedStatement?.Dispose();
             _preparedStatement = null;
             _preparedSql = null;
@@ -508,6 +741,8 @@ namespace DecentDB.AdoNet
             {
                 FinalizeStatement();
                 InvalidatePreparedStatement();
+                InvalidateSplitCache();
+                InvalidateRewriteCache();
             }
 
             _disposed = true;

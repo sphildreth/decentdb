@@ -196,6 +196,7 @@ namespace DecentDB.AdoNet
         }
 
         internal int DefaultCommandTimeoutSeconds => _defaultCommandTimeoutSeconds;
+        internal bool IsSqlObservationEnabled => _loggingEnabled || _sqlExecuting != null || _sqlExecuted != null;
 
         private static string DescribeSqlForTrace(string sql)
         {
@@ -223,7 +224,7 @@ namespace DecentDB.AdoNet
         internal SqlObservation? TryStartSqlObservation(string sql, IReadOnlyList<SqlParameterValue> parameters)
         {
             // Zero-cost when disabled: one predictable branch, no allocations.
-            if (!_loggingEnabled && _sqlExecuting == null && _sqlExecuted == null)
+            if (!IsSqlObservationEnabled)
             {
                 return null;
             }

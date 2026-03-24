@@ -53,8 +53,13 @@ namespace DecentDB.AdoNet
 
         private string GetStringValue(int ordinal)
         {
-            var type = _statement.ColumnType(ordinal);
-            if (type == 5)
+            var text = _statement.GetText(ordinal);
+            if (text.Length != 0)
+            {
+                return text;
+            }
+
+            if (_statement.ColumnType(ordinal) == 5)
             {
                 var bytes = _statement.GetBlob(ordinal);
                 if (bytes.Length == 16)
@@ -63,7 +68,7 @@ namespace DecentDB.AdoNet
                 }
             }
 
-            return _statement.GetText(ordinal);
+            return text;
         }
 
         private static DateTime FromUnixEpochMicroseconds(long micros)
@@ -73,9 +78,7 @@ namespace DecentDB.AdoNet
 
         private long GetInt64Value(int ordinal)
         {
-            return _statement.ColumnType(ordinal) == 17
-                ? _statement.GetTimestampMicros(ordinal)
-                : _statement.GetInt64(ordinal);
+            return _statement.GetInt64(ordinal);
         }
 
         public override object this[int ordinal] => GetValue(ordinal);
