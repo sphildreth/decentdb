@@ -52,6 +52,21 @@ typedef struct ddb_value_t {
   int64_t timestamp_micros;
 } ddb_value_t;
 
+typedef struct ddb_value_view_t {
+  uint32_t tag;
+  uint8_t bool_value;
+  uint8_t reserved0[7];
+  int64_t int64_value;
+  double float64_value;
+  int64_t decimal_scaled;
+  uint8_t decimal_scale;
+  uint8_t reserved1[7];
+  const uint8_t *data;
+  size_t len;
+  uint8_t uuid_bytes[16];
+  int64_t timestamp_micros;
+} ddb_value_view_t;
+
 /* Borrowed pointer valid until the next DecentDB call on the same thread. */
 uint32_t ddb_abi_version(void);
 const char *ddb_version(void);
@@ -72,6 +87,13 @@ ddb_status_t ddb_stmt_reset(ddb_stmt_t *stmt);
 ddb_status_t ddb_stmt_clear_bindings(ddb_stmt_t *stmt);
 ddb_status_t ddb_stmt_bind_null(ddb_stmt_t *stmt, size_t index_1_based);
 ddb_status_t ddb_stmt_bind_int64(ddb_stmt_t *stmt, size_t index_1_based, int64_t value);
+ddb_status_t ddb_stmt_bind_int64_step_row_view(
+    ddb_stmt_t *stmt,
+    size_t index_1_based,
+    int64_t value,
+    const ddb_value_view_t **out_values,
+    size_t *out_columns,
+    uint8_t *out_has_row);
 ddb_status_t ddb_stmt_bind_float64(ddb_stmt_t *stmt, size_t index_1_based, double value);
 ddb_status_t ddb_stmt_bind_bool(ddb_stmt_t *stmt, size_t index_1_based, uint8_t value);
 ddb_status_t ddb_stmt_bind_text(
@@ -93,6 +115,19 @@ ddb_status_t ddb_stmt_bind_timestamp_micros(
     ddb_stmt_t *stmt,
     size_t index_1_based,
     int64_t timestamp_micros);
+ddb_status_t ddb_stmt_execute_batch_i64(
+    ddb_stmt_t *stmt,
+    size_t row_count,
+    const int64_t *values_i64,
+    uint64_t *out_total_affected_rows);
+ddb_status_t ddb_stmt_execute_batch_i64_text_f64(
+    ddb_stmt_t *stmt,
+    size_t row_count,
+    const int64_t *values_i64,
+    const char *const *values_text_ptrs,
+    const size_t *values_text_lens,
+    const double *values_f64,
+    uint64_t *out_total_affected_rows);
 ddb_status_t ddb_stmt_step(ddb_stmt_t *stmt, uint8_t *out_has_row);
 ddb_status_t ddb_stmt_column_count(ddb_stmt_t *stmt, size_t *out_columns);
 ddb_status_t ddb_stmt_column_name_copy(
@@ -104,6 +139,22 @@ ddb_status_t ddb_stmt_value_copy(
     ddb_stmt_t *stmt,
     size_t column_index,
     ddb_value_t *out_value);
+ddb_status_t ddb_stmt_row_view(
+    ddb_stmt_t *stmt,
+    const ddb_value_view_t **out_values,
+    size_t *out_columns);
+ddb_status_t ddb_stmt_step_row_view(
+    ddb_stmt_t *stmt,
+    const ddb_value_view_t **out_values,
+    size_t *out_columns,
+    uint8_t *out_has_row);
+ddb_status_t ddb_stmt_fetch_row_views(
+    ddb_stmt_t *stmt,
+    uint8_t include_current_row,
+    size_t max_rows,
+    const ddb_value_view_t **out_values,
+    size_t *out_rows,
+    size_t *out_columns);
 
 ddb_status_t ddb_db_execute(
     ddb_db_t *db,

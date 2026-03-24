@@ -20,6 +20,7 @@ from .native import (
     DDB_VALUE_TIMESTAMP_MICROS,
     DDB_VALUE_UUID,
     DdbValue,
+    DdbValueView,
     ERR_CONSTRAINT,
     ERR_CORRUPTION,
     ERR_ERROR,
@@ -91,6 +92,7 @@ BINARY = bytes
 NUMBER = float
 DATETIME = datetime.datetime
 ROWID = int
+_UNIX_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
 def DateFromTicks(ticks):
@@ -102,7 +104,9 @@ def TimeFromTicks(ticks):
 
 
 def TimestampFromTicks(ticks):
-    return datetime.datetime.fromtimestamp(ticks, datetime.timezone.utc).replace(tzinfo=None)
+    return datetime.datetime.fromtimestamp(ticks, datetime.timezone.utc).replace(
+        tzinfo=None
+    )
 
 
 def Binary(value):
@@ -270,8 +274,9 @@ def _decode_ffi_value(lib, value):
     if tag == DDB_VALUE_UUID:
         return bytes(bytearray(value.uuid_bytes))
     if tag == DDB_VALUE_TIMESTAMP_MICROS:
-        epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
-        return epoch + datetime.timedelta(microseconds=int(value.timestamp_micros))
+        return _UNIX_EPOCH_UTC + datetime.timedelta(
+            microseconds=int(value.timestamp_micros)
+        )
     return None
 
 
@@ -294,6 +299,7 @@ class Cursor:
         self._last_sql = None
         self._col_count = 0
         self._has_buffered_row = False
+        self._buffered_row = None
         self._query_active = False
         self.description = None
         self.rowcount = -1
@@ -301,6 +307,27 @@ class Cursor:
         self._closed = False
         self._rewrite_cache_key = None
         self._rewrite_cache_sql = None
+        self._metadata_cache_sql = None
+        self._metadata_cache_col_count = 0
+        self._metadata_cache_description = None
+        self._bound_param_count = None
+        self._use_row_view = (
+            os.environ.get("DECENTDB_PY_USE_ROW_VIEW", "1") != "0"
+            and hasattr(self._lib, "ddb_stmt_row_view")
+        )
+        self._use_step_row_view = self._use_row_view and hasattr(
+            self._lib, "ddb_stmt_step_row_view"
+        )
+        self._use_bind_int64_step_row_view = self._use_step_row_view and hasattr(
+            self._lib, "ddb_stmt_bind_int64_step_row_view"
+        )
+        self._use_fetch_row_views = self._use_row_view and hasattr(
+            self._lib, "ddb_stmt_fetch_row_views"
+        )
+        self._use_batch_i64 = hasattr(self._lib, "ddb_stmt_execute_batch_i64")
+        self._use_batch_i64_text_f64 = hasattr(
+            self._lib, "ddb_stmt_execute_batch_i64_text_f64"
+        )
 
     def close(self):
         if self._closed:
@@ -311,8 +338,13 @@ class Cursor:
         self._last_sql = None
         self._col_count = 0
         self._has_buffered_row = False
+        self._buffered_row = None
         self._query_active = False
         self.description = None
+        self._metadata_cache_sql = None
+        self._metadata_cache_col_count = 0
+        self._metadata_cache_description = None
+        self._bound_param_count = None
         self._closed = True
 
     def __del__(self):
@@ -443,17 +475,54 @@ class Cursor:
             self._col_count = 0
             self._query_active = False
             self._has_buffered_row = False
+            self._buffered_row = None
             self.rowcount = 0
         finally:
             self._lib.ddb_result_free(ctypes.byref(result))
 
-    def execute(self, operation, parameters=None):
-        self._ensure_open()
-        self._has_buffered_row = False
-        self._query_active = False
-        self.description = None
-        self.rowcount = -1
+    def _activate_statement(self, sql, params, param_count):
+        if self._stmt and self._last_sql != sql:
+            self._connection._recycle_statement(self._last_sql, self._stmt)
+            self._stmt = None
+            self._last_sql = None
+            self._bound_param_count = None
 
+        if self._stmt and self._last_sql == sql:
+            code = self._lib.ddb_stmt_reset(self._stmt)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            if self._bound_param_count is None or param_count is None:
+                code = self._lib.ddb_stmt_clear_bindings(self._stmt)
+                if code != ERR_OK:
+                    _raise_error(code, sql=sql, params=params)
+            elif self._bound_param_count != param_count:
+                code = self._lib.ddb_stmt_clear_bindings(self._stmt)
+                if code != ERR_OK:
+                    _raise_error(code, sql=sql, params=params)
+            return
+
+        cached_stmt, hit = self._connection._get_cached_statement(sql)
+        if hit:
+            self._stmt = cached_stmt
+            self._last_sql = sql
+            code = self._lib.ddb_stmt_reset(self._stmt)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            self._bound_param_count = None
+            return
+
+        stmt_ptr = ctypes.c_void_p()
+        self._connection._stats["prepare_count"] += 1
+        code = self._lib.ddb_db_prepare(
+            self._connection._db, sql.encode("utf-8"), ctypes.byref(stmt_ptr)
+        )
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=params)
+        self._stmt = stmt_ptr
+        self._last_sql = sql
+        self._bound_param_count = None
+
+    def _resolve_sql_and_params(self, operation, parameters):
         params_is_mapping = isinstance(parameters, Mapping)
         if parameters is None:
             cache_key = (operation, "none", 0)
@@ -469,98 +538,776 @@ class Cursor:
         if cache_key is not None and cache_key == self._rewrite_cache_key:
             sql = self._rewrite_cache_sql
             params = [] if parameters is None else parameters
-        else:
-            sql, params = _convert_params(operation, parameters)
-            if cache_key is not None:
-                self._rewrite_cache_key = cache_key
-                self._rewrite_cache_sql = sql
+            return sql, params
 
-        if self._stmt and self._last_sql != sql:
-            self._connection._recycle_statement(self._last_sql, self._stmt)
-            self._stmt = None
-            self._last_sql = None
+        sql, params = _convert_params(operation, parameters)
+        if cache_key is not None:
+            self._rewrite_cache_key = cache_key
+            self._rewrite_cache_sql = sql
+        return sql, params
+
+    def _execute_current_statement(self, sql, params):
+        bound_count = 0
+        for i, param in enumerate(params, start=1):
+            self._bind_param(i, param, sql, params)
+            bound_count = i
+
+        has_row = ctypes.c_uint8()
+        code = self._lib.ddb_stmt_step(self._stmt, ctypes.byref(has_row))
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=params)
+        return bool(has_row.value), bound_count
+
+    def _execute_current_statement_bind_i64_step_row_view(self, sql, param, params):
+        values_ptr = ctypes.POINTER(DdbValueView)()
+        out_count = ctypes.c_size_t()
+        has_row = ctypes.c_uint8()
+        code = self._lib.ddb_stmt_bind_int64_step_row_view(
+            self._stmt,
+            1,
+            param,
+            ctypes.byref(values_ptr),
+            ctypes.byref(out_count),
+            ctypes.byref(has_row),
+        )
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=params)
+        if not has_row.value:
+            return False, 1, None
+        row = self._decode_row_view_values(values_ptr, int(out_count.value))
+        return True, 1, row
+
+    @staticmethod
+    def _row_is_single_i64(params):
+        if len(params) != 1:
+            return False
+        return type(params[0]) is int
+
+    @staticmethod
+    def _row_is_i64_text_f64(params):
+        if len(params) != 3:
+            return False
+        p0, p1, p2 = params
+        if type(p0) is not int:
+            return False
+        if type(p1) is not str:
+            return False
+        if type(p2) not in (float, int):
+            return False
+        return True
+
+    def _execute_batch_i64_text_f64_chunk(self, sql, rows):
+        row_count = len(rows)
+        if row_count == 0:
+            return 0
+
+        ids = (ctypes.c_int64 * row_count)()
+        text_ptrs = (ctypes.c_char_p * row_count)()
+        text_lens = (ctypes.c_size_t * row_count)()
+        floats = (ctypes.c_double * row_count)()
+        text_payloads = []
+
+        for idx, params in enumerate(rows):
+            id_value, text_value, float_value = params
+            ids[idx] = id_value
+            raw = text_value.encode("utf-8")
+            text_payloads.append(raw)
+            text_ptrs[idx] = raw
+            text_lens[idx] = len(raw)
+            floats[idx] = float(float_value)
+
+        out_affected = ctypes.c_uint64()
+        code = self._lib.ddb_stmt_execute_batch_i64_text_f64(
+            self._stmt,
+            row_count,
+            ids,
+            text_ptrs,
+            text_lens,
+            floats,
+            ctypes.byref(out_affected),
+        )
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=rows[0])
+        return int(out_affected.value)
+
+    def _execute_batch_i64_chunk(self, sql, rows):
+        row_count = len(rows)
+        if row_count == 0:
+            return 0
+
+        ids = (ctypes.c_int64 * row_count)()
+        for idx, params in enumerate(rows):
+            ids[idx] = params[0]
+
+        out_affected = ctypes.c_uint64()
+        code = self._lib.ddb_stmt_execute_batch_i64(
+            self._stmt,
+            row_count,
+            ids,
+            ctypes.byref(out_affected),
+        )
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=rows[0])
+        return int(out_affected.value)
+
+    def _executemany_i64(self, sql, expected_count, first_params, iterator):
+        if not self._use_batch_i64:
+            return None
+        if expected_count != 1 or not self._row_is_single_i64(first_params):
+            return None
+
+        step_out = ctypes.c_uint8()
+        step_stmt = self._lib.ddb_stmt_step
+        bind_param = self._bind_param
+        reset_stmt = self._lib.ddb_stmt_reset
+
+        batch_size = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "8192") or "8192")
+        if batch_size <= 0:
+            batch_size = 8192
+
+        total_affected = 0
+        fast_batch = [first_params]
+
+        def flush_fast_batch():
+            nonlocal total_affected
+            if not fast_batch:
+                return
+            total_affected += self._execute_batch_i64_chunk(sql, fast_batch)
+            fast_batch.clear()
+
+        def execute_row_generic(params):
+            code = reset_stmt(self._stmt)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            bind_param(1, params[0], sql, params)
+            code = step_stmt(self._stmt, ctypes.byref(step_out))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+
+        for params in iterator:
+            if isinstance(params, Mapping):
+                raise ProgrammingError(
+                    "Mixed parameter styles are not supported in executemany"
+                )
+            try:
+                param_len = len(params)
+            except TypeError:
+                raise ProgrammingError(
+                    "Incorrect number of parameters: "
+                    f"expected {expected_count}, got unknown"
+                )
+            if param_len != expected_count:
+                raise ProgrammingError(
+                    f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                )
+
+            if self._row_is_single_i64(params):
+                fast_batch.append(params)
+                if len(fast_batch) >= batch_size:
+                    flush_fast_batch()
+                continue
+
+            flush_fast_batch()
+            execute_row_generic(params)
+
+        flush_fast_batch()
+        self._bound_param_count = expected_count
+        return total_affected
+
+    def _executemany_i64_text_f64(self, sql, expected_count, first_params, iterator):
+        if not self._use_batch_i64_text_f64:
+            return None
+        if expected_count != 3 or not self._row_is_i64_text_f64(first_params):
+            return None
+
+        step_out = ctypes.c_uint8()
+        step_stmt = self._lib.ddb_stmt_step
+        bind_param = self._bind_param
+        reset_stmt = self._lib.ddb_stmt_reset
+
+        batch_size = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "8192") or "8192")
+        if batch_size <= 0:
+            batch_size = 8192
+
+        total_affected = 0
+        fast_batch = [first_params]
+
+        def flush_fast_batch():
+            nonlocal total_affected
+            if not fast_batch:
+                return
+            total_affected += self._execute_batch_i64_text_f64_chunk(sql, fast_batch)
+            fast_batch.clear()
+
+        def execute_row_generic(params):
+            code = reset_stmt(self._stmt)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            for i, param in enumerate(params, start=1):
+                bind_param(i, param, sql, params)
+            code = step_stmt(self._stmt, ctypes.byref(step_out))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+
+        for params in iterator:
+            if isinstance(params, Mapping):
+                raise ProgrammingError(
+                    "Mixed parameter styles are not supported in executemany"
+                )
+            try:
+                param_len = len(params)
+            except TypeError:
+                raise ProgrammingError(
+                    "Incorrect number of parameters: "
+                    f"expected {expected_count}, got unknown"
+                )
+            if param_len != expected_count:
+                raise ProgrammingError(
+                    f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                )
+
+            if self._row_is_i64_text_f64(params):
+                fast_batch.append(params)
+                if len(fast_batch) >= batch_size:
+                    flush_fast_batch()
+                continue
+
+            flush_fast_batch()
+            execute_row_generic(params)
+
+        flush_fast_batch()
+        self._bound_param_count = expected_count
+        return total_affected
+
+    def execute(self, operation, parameters=None):
+        self._ensure_open()
+        self._has_buffered_row = False
+        self._buffered_row = None
+        self._query_active = False
+        self.description = None
+        self.rowcount = -1
+
+        sql, params = self._resolve_sql_and_params(operation, parameters)
+        try:
+            param_count = len(params)
+        except TypeError:
+            param_count = None
 
         if _is_direct_execute_sql(sql):
             if self._stmt:
                 self._connection._recycle_statement(self._last_sql, self._stmt)
                 self._stmt = None
                 self._last_sql = None
+                self._bound_param_count = None
             self._execute_direct(sql, params)
-            return
-
-        if self._stmt and self._last_sql == sql:
-            code = self._lib.ddb_stmt_reset(self._stmt)
-            if code != ERR_OK:
-                _raise_error(code, sql=sql, params=params)
-            code = self._lib.ddb_stmt_clear_bindings(self._stmt)
-            if code != ERR_OK:
-                _raise_error(code, sql=sql, params=params)
         else:
-            cached_stmt, hit = self._connection._get_cached_statement(sql)
-            if hit:
-                self._stmt = cached_stmt
-                self._last_sql = sql
+            self._activate_statement(sql, params, param_count)
+            if (
+                self._use_bind_int64_step_row_view
+                and param_count == 1
+                and type(params[0]) is int
+            ):
+                has_row, bound_count, buffered_row = (
+                    self._execute_current_statement_bind_i64_step_row_view(
+                        sql, params[0], params
+                    )
+                )
+            else:
+                has_row, bound_count = self._execute_current_statement(sql, params)
+                buffered_row = None
+            self._bound_param_count = bound_count
+
+            if self._metadata_cache_sql == sql:
+                self._col_count = self._metadata_cache_col_count
+                self.description = self._metadata_cache_description
+            else:
+                self._load_description()
+                self._metadata_cache_sql = sql
+                self._metadata_cache_col_count = self._col_count
+                self._metadata_cache_description = self.description
+            self._query_active = self._col_count > 0
+            self._has_buffered_row = has_row and self._query_active
+            self._buffered_row = buffered_row if self._has_buffered_row else None
+
+            if self._query_active:
+                self.rowcount = -1
+            else:
+                self._buffered_row = None
+                affected = ctypes.c_uint64()
+                code = self._lib.ddb_stmt_affected_rows(
+                    self._stmt, ctypes.byref(affected)
+                )
+                if code != ERR_OK:
+                    _raise_error(code, sql=sql, params=params)
+                self.rowcount = int(affected.value)
+        return self
+
+    def executemany(self, operation, seq_of_parameters):
+        self._ensure_open()
+        iterator = iter(seq_of_parameters)
+        try:
+            first_params = next(iterator)
+        except StopIteration:
+            return self
+
+        # Fast path for repeated positional DML binds.
+        if isinstance(first_params, Mapping):
+            self.execute(operation, first_params)
+            for params in iterator:
+                self.execute(operation, params)
+            return self
+
+        try:
+            expected_count = len(first_params)
+        except TypeError:
+            self.execute(operation, first_params)
+            for params in iterator:
+                self.execute(operation, params)
+            return self
+
+        sql, normalized_first = self._resolve_sql_and_params(operation, first_params)
+        if _is_direct_execute_sql(sql):
+            self.execute(operation, first_params)
+            for params in iterator:
+                self.execute(operation, params)
+            return self
+
+        self._has_buffered_row = False
+        self._query_active = False
+        self.description = None
+        self.rowcount = -1
+
+        self._activate_statement(sql, normalized_first, expected_count)
+
+        fast_rowcount = self._executemany_i64(
+            sql, expected_count, normalized_first, iterator
+        )
+        if fast_rowcount is not None:
+            self._col_count = 0
+            self.description = None
+            self._metadata_cache_sql = sql
+            self._metadata_cache_col_count = 0
+            self._metadata_cache_description = None
+            self._query_active = False
+            self._has_buffered_row = False
+            self.rowcount = fast_rowcount
+            return self
+
+        fast_rowcount = self._executemany_i64_text_f64(
+            sql, expected_count, normalized_first, iterator
+        )
+        if fast_rowcount is not None:
+            self._col_count = 0
+            self.description = None
+            self._metadata_cache_sql = sql
+            self._metadata_cache_col_count = 0
+            self._metadata_cache_description = None
+            self._query_active = False
+            self._has_buffered_row = False
+            self.rowcount = fast_rowcount
+            return self
+
+        step_out = ctypes.c_uint8()
+        step_stmt = self._lib.ddb_stmt_step
+        byref = ctypes.byref
+        bind_param = self._bind_param
+        bind_null = self._lib.ddb_stmt_bind_null
+        bind_bool = self._lib.ddb_stmt_bind_bool
+        bind_int64 = self._lib.ddb_stmt_bind_int64
+        bind_float64 = self._lib.ddb_stmt_bind_float64
+        bind_text = self._lib.ddb_stmt_bind_text
+        err_ok = ERR_OK
+
+        def bind_row_fast(params):
+            for i, param in enumerate(params, start=1):
+                ptype = type(param)
+                if param is None:
+                    code = bind_null(self._stmt, i)
+                elif ptype is bool:
+                    code = bind_bool(self._stmt, i, 1 if param else 0)
+                elif ptype is int:
+                    code = bind_int64(self._stmt, i, param)
+                elif ptype is float:
+                    code = bind_float64(self._stmt, i, param)
+                elif ptype is str:
+                    raw = param.encode("utf-8")
+                    code = bind_text(self._stmt, i, raw, len(raw))
+                else:
+                    bind_param(i, param, sql, params)
+                    continue
+
+                if code != err_ok:
+                    _raise_error(code, sql=sql, params=params)
+
+        bind_row_fast(normalized_first)
+        code = step_stmt(self._stmt, byref(step_out))
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=normalized_first)
+        self._bound_param_count = expected_count
+
+        if "?" in operation:
+            for params in iterator:
+                try:
+                    param_len = len(params)
+                except TypeError:
+                    raise ProgrammingError(
+                        "Incorrect number of parameters: "
+                        f"expected {expected_count}, got unknown"
+                    )
+                if param_len != expected_count:
+                    raise ProgrammingError(
+                        f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                    )
                 code = self._lib.ddb_stmt_reset(self._stmt)
                 if code != ERR_OK:
                     _raise_error(code, sql=sql, params=params)
-                code = self._lib.ddb_stmt_clear_bindings(self._stmt)
+                bind_row_fast(params)
+                code = step_stmt(self._stmt, byref(step_out))
                 if code != ERR_OK:
                     _raise_error(code, sql=sql, params=params)
-            else:
-                stmt_ptr = ctypes.c_void_p()
-                self._connection._stats["prepare_count"] += 1
-                code = self._lib.ddb_db_prepare(
-                    self._connection._db, sql.encode("utf-8"), ctypes.byref(stmt_ptr)
-                )
-                if code != ERR_OK:
-                    _raise_error(code, sql=sql, params=params)
-                self._stmt = stmt_ptr
-                self._last_sql = sql
-
-        for i, param in enumerate(params, start=1):
-            self._bind_param(i, param, sql, params)
-
-        has_row = ctypes.c_uint8()
-        code = self._lib.ddb_stmt_step(self._stmt, ctypes.byref(has_row))
-        if code != ERR_OK:
-            _raise_error(code, sql=sql, params=params)
-
-        self._load_description()
-        self._query_active = self._col_count > 0
-        self._has_buffered_row = bool(has_row.value) and self._query_active
-
-        if self._query_active:
-            self.rowcount = -1
         else:
-            affected = ctypes.c_uint64()
-            code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
-            if code != ERR_OK:
-                _raise_error(code, sql=sql, params=params)
-            self.rowcount = int(affected.value)
+            for params in iterator:
+                if isinstance(params, Mapping):
+                    raise ProgrammingError(
+                        "Mixed parameter styles are not supported in executemany"
+                    )
+                try:
+                    param_len = len(params)
+                except TypeError:
+                    raise ProgrammingError(
+                        "Incorrect number of parameters: "
+                        f"expected {expected_count}, got unknown"
+                    )
+                if param_len != expected_count:
+                    raise ProgrammingError(
+                        f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                    )
+                code = self._lib.ddb_stmt_reset(self._stmt)
+                if code != ERR_OK:
+                    _raise_error(code, sql=sql, params=params)
+                bind_row_fast(params)
+                code = step_stmt(self._stmt, byref(step_out))
+                if code != ERR_OK:
+                    _raise_error(code, sql=sql, params=params)
 
-    def executemany(self, operation, seq_of_parameters):
-        for params in seq_of_parameters:
-            self.execute(operation, params)
+        count = ctypes.c_size_t()
+        code = self._lib.ddb_stmt_column_count(self._stmt, ctypes.byref(count))
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=None)
+        self._col_count = int(count.value)
+
+        if self._col_count > 0:
+            self._load_description()
+            self._metadata_cache_sql = sql
+            self._metadata_cache_col_count = self._col_count
+            self._metadata_cache_description = self.description
+            self._query_active = True
+            self._has_buffered_row = True
+            self.rowcount = -1
+            return self
+
+        self.description = None
+        self._metadata_cache_sql = sql
+        self._metadata_cache_col_count = 0
+        self._metadata_cache_description = None
+        self._query_active = False
+        self._has_buffered_row = False
+        affected = ctypes.c_uint64()
+        code = self._lib.ddb_stmt_affected_rows(self._stmt, ctypes.byref(affected))
+        if code != ERR_OK:
+            _raise_error(code, sql=sql, params=None)
+        self.rowcount = int(affected.value)
+        return self
 
     def _decode_current_row(self):
+        if self._use_row_view:
+            return self._decode_current_row_view()
+
         row = []
-        for column_index in range(self._col_count):
-            value = DdbValue()
-            code = self._lib.ddb_value_init(ctypes.byref(value))
-            if code != ERR_OK:
-                _raise_error(code, sql=self._last_sql, params=None)
-            try:
-                code = self._lib.ddb_stmt_value_copy(
-                    self._stmt, column_index, ctypes.byref(value)
-                )
+        value = DdbValue()
+        code = self._lib.ddb_value_init(ctypes.byref(value))
+        if code != ERR_OK:
+            _raise_error(code, sql=self._last_sql, params=None)
+        needs_dispose = False
+        string_at = ctypes.string_at
+        append_row = row.append
+        ddb_stmt_value_copy = self._lib.ddb_stmt_value_copy
+        ddb_value_dispose = self._lib.ddb_value_dispose
+        byref = ctypes.byref
+        text_tag = DDB_VALUE_TEXT
+        blob_tag = DDB_VALUE_BLOB
+        try:
+            for column_index in range(self._col_count):
+                if needs_dispose:
+                    dispose = ddb_value_dispose(byref(value))
+                    if dispose != ERR_OK:
+                        _raise_error(dispose, sql=self._last_sql, params=None)
+                    needs_dispose = False
+
+                code = ddb_stmt_value_copy(self._stmt, column_index, byref(value))
                 if code != ERR_OK:
                     _raise_error(code, sql=self._last_sql, params=None)
-                row.append(_decode_ffi_value(self._lib, value))
-            finally:
-                dispose = self._lib.ddb_value_dispose(ctypes.byref(value))
+
+                tag = int(value.tag)
+                if tag == DDB_VALUE_NULL:
+                    append_row(None)
+                elif tag == DDB_VALUE_INT64:
+                    append_row(int(value.int64_value))
+                elif tag == DDB_VALUE_FLOAT64:
+                    append_row(float(value.float64_value))
+                elif tag == DDB_VALUE_BOOL:
+                    append_row(bool(value.bool_value))
+                elif tag == text_tag:
+                    if not value.data or value.len == 0:
+                        append_row("")
+                    else:
+                        append_row(string_at(value.data, value.len).decode("utf-8"))
+                    needs_dispose = True
+                elif tag == blob_tag:
+                    if not value.data or value.len == 0:
+                        append_row(b"")
+                    else:
+                        append_row(bytes(string_at(value.data, value.len)))
+                    needs_dispose = True
+                else:
+                    append_row(_decode_ffi_value(self._lib, value))
+                    needs_dispose = False
+        finally:
+            if needs_dispose:
+                dispose = ddb_value_dispose(byref(value))
                 if dispose != ERR_OK:
                     _raise_error(dispose, sql=self._last_sql, params=None)
         return tuple(row)
+
+    def _decode_current_row_view(self):
+        values_ptr = ctypes.POINTER(DdbValueView)()
+        out_count = ctypes.c_size_t()
+        code = self._lib.ddb_stmt_row_view(
+            self._stmt, ctypes.byref(values_ptr), ctypes.byref(out_count)
+        )
+        if code != ERR_OK:
+            _raise_error(code, sql=self._last_sql, params=None)
+
+        count = int(out_count.value)
+        return self._decode_row_view_values(values_ptr, count)
+
+    def _decode_row_view_values(self, values_ptr, count):
+        if count == 0:
+            return ()
+
+        string_at = ctypes.string_at
+
+        if count == 3:
+            v0 = values_ptr[0]
+            v1 = values_ptr[1]
+            v2 = values_ptr[2]
+            if (
+                int(v0.tag) == DDB_VALUE_INT64
+                and int(v1.tag) == DDB_VALUE_TEXT
+                and int(v2.tag) == DDB_VALUE_FLOAT64
+            ):
+                if not v1.data or v1.len == 0:
+                    text_value = ""
+                else:
+                    text_value = string_at(v1.data, v1.len).decode("utf-8")
+                return (v0.int64_value, text_value, v2.float64_value)
+
+        if count == 1:
+            v0 = values_ptr[0]
+            tag = int(v0.tag)
+            if tag == DDB_VALUE_INT64:
+                return (v0.int64_value,)
+            if tag == DDB_VALUE_FLOAT64:
+                return (v0.float64_value,)
+            if tag == DDB_VALUE_NULL:
+                return (None,)
+
+        row = []
+        append_row = row.append
+
+        for index in range(count):
+            value = values_ptr[index]
+            tag = int(value.tag)
+            if tag == DDB_VALUE_NULL:
+                append_row(None)
+            elif tag == DDB_VALUE_INT64:
+                append_row(value.int64_value)
+            elif tag == DDB_VALUE_FLOAT64:
+                append_row(value.float64_value)
+            elif tag == DDB_VALUE_BOOL:
+                append_row(value.bool_value != 0)
+            elif tag == DDB_VALUE_TEXT:
+                if not value.data or value.len == 0:
+                    append_row("")
+                else:
+                    append_row(string_at(value.data, value.len).decode("utf-8"))
+            elif tag == DDB_VALUE_BLOB:
+                if not value.data or value.len == 0:
+                    append_row(b"")
+                else:
+                    append_row(bytes(string_at(value.data, value.len)))
+            elif tag == DDB_VALUE_DECIMAL:
+                append_row(decimal.Decimal(int(value.decimal_scaled)) / (
+                    decimal.Decimal(10) ** int(value.decimal_scale)
+                ))
+            elif tag == DDB_VALUE_UUID:
+                append_row(bytes(value.uuid_bytes))
+            elif tag == DDB_VALUE_TIMESTAMP_MICROS:
+                append_row(
+                    _UNIX_EPOCH_UTC
+                    + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                )
+            else:
+                append_row(None)
+        return tuple(row)
+
+    def _decode_row_view_matrix(self, values_ptr, row_count, col_count):
+        if row_count == 0:
+            return []
+        if col_count == 0:
+            return [()] * row_count
+
+        rows = []
+        append_rows = rows.append
+        string_at = ctypes.string_at
+
+        if col_count == 3:
+            for row_index in range(row_count):
+                base = row_index * 3
+                v0 = values_ptr[base]
+                v1 = values_ptr[base + 1]
+                v2 = values_ptr[base + 2]
+                if (
+                    int(v0.tag) == DDB_VALUE_INT64
+                    and int(v1.tag) == DDB_VALUE_TEXT
+                    and int(v2.tag) == DDB_VALUE_FLOAT64
+                ):
+                    if not v1.data or v1.len == 0:
+                        text_value = ""
+                    else:
+                        text_value = string_at(v1.data, v1.len).decode("utf-8")
+                    append_rows((v0.int64_value, text_value, v2.float64_value))
+                    continue
+
+                row = []
+                append_row = row.append
+                for col_index in range(3):
+                    value = values_ptr[base + col_index]
+                    tag = int(value.tag)
+                    if tag == DDB_VALUE_NULL:
+                        append_row(None)
+                    elif tag == DDB_VALUE_INT64:
+                        append_row(value.int64_value)
+                    elif tag == DDB_VALUE_FLOAT64:
+                        append_row(value.float64_value)
+                    elif tag == DDB_VALUE_BOOL:
+                        append_row(value.bool_value != 0)
+                    elif tag == DDB_VALUE_TEXT:
+                        if not value.data or value.len == 0:
+                            append_row("")
+                        else:
+                            append_row(string_at(value.data, value.len).decode("utf-8"))
+                    elif tag == DDB_VALUE_BLOB:
+                        if not value.data or value.len == 0:
+                            append_row(b"")
+                        else:
+                            append_row(bytes(string_at(value.data, value.len)))
+                    elif tag == DDB_VALUE_DECIMAL:
+                        append_row(
+                            decimal.Decimal(int(value.decimal_scaled))
+                            / (decimal.Decimal(10) ** int(value.decimal_scale))
+                        )
+                    elif tag == DDB_VALUE_UUID:
+                        append_row(bytes(value.uuid_bytes))
+                    elif tag == DDB_VALUE_TIMESTAMP_MICROS:
+                        append_row(
+                            _UNIX_EPOCH_UTC
+                            + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                        )
+                    else:
+                        append_row(None)
+                append_rows(tuple(row))
+            return rows
+
+        if col_count == 1:
+            for row_index in range(row_count):
+                value = values_ptr[row_index]
+                tag = int(value.tag)
+                if tag == DDB_VALUE_INT64:
+                    append_rows((value.int64_value,))
+                elif tag == DDB_VALUE_FLOAT64:
+                    append_rows((value.float64_value,))
+                elif tag == DDB_VALUE_NULL:
+                    append_rows((None,))
+                elif tag == DDB_VALUE_TEXT:
+                    if not value.data or value.len == 0:
+                        append_rows(("",))
+                    else:
+                        append_rows((string_at(value.data, value.len).decode("utf-8"),))
+                elif tag == DDB_VALUE_BLOB:
+                    if not value.data or value.len == 0:
+                        append_rows((b"",))
+                    else:
+                        append_rows((bytes(string_at(value.data, value.len)),))
+                elif tag == DDB_VALUE_BOOL:
+                    append_rows((value.bool_value != 0,))
+                elif tag == DDB_VALUE_DECIMAL:
+                    append_rows((
+                        decimal.Decimal(int(value.decimal_scaled))
+                        / (decimal.Decimal(10) ** int(value.decimal_scale)),
+                    ))
+                elif tag == DDB_VALUE_UUID:
+                    append_rows((bytes(value.uuid_bytes),))
+                elif tag == DDB_VALUE_TIMESTAMP_MICROS:
+                    append_rows((
+                        _UNIX_EPOCH_UTC
+                        + datetime.timedelta(microseconds=int(value.timestamp_micros)),
+                    ))
+                else:
+                    append_rows((None,))
+            return rows
+
+        for row_index in range(row_count):
+            base = row_index * col_count
+            row = []
+            append_row = row.append
+            for col_index in range(col_count):
+                value = values_ptr[base + col_index]
+                tag = int(value.tag)
+                if tag == DDB_VALUE_NULL:
+                    append_row(None)
+                elif tag == DDB_VALUE_INT64:
+                    append_row(value.int64_value)
+                elif tag == DDB_VALUE_FLOAT64:
+                    append_row(value.float64_value)
+                elif tag == DDB_VALUE_BOOL:
+                    append_row(value.bool_value != 0)
+                elif tag == DDB_VALUE_TEXT:
+                    if not value.data or value.len == 0:
+                        append_row("")
+                    else:
+                        append_row(string_at(value.data, value.len).decode("utf-8"))
+                elif tag == DDB_VALUE_BLOB:
+                    if not value.data or value.len == 0:
+                        append_row(b"")
+                    else:
+                        append_row(bytes(string_at(value.data, value.len)))
+                elif tag == DDB_VALUE_DECIMAL:
+                    append_row(
+                        decimal.Decimal(int(value.decimal_scaled))
+                        / (decimal.Decimal(10) ** int(value.decimal_scale))
+                    )
+                elif tag == DDB_VALUE_UUID:
+                    append_row(bytes(value.uuid_bytes))
+                elif tag == DDB_VALUE_TIMESTAMP_MICROS:
+                    append_row(
+                        _UNIX_EPOCH_UTC
+                        + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                    )
+                else:
+                    append_row(None)
+            append_rows(tuple(row))
+        return rows
 
     def fetchone(self):
         self._ensure_open()
@@ -571,7 +1318,27 @@ class Cursor:
 
         if self._has_buffered_row:
             self._has_buffered_row = False
+            if self._buffered_row is not None:
+                row = self._buffered_row
+                self._buffered_row = None
+                return row
             return self._decode_current_row()
+
+        if self._use_step_row_view:
+            values_ptr = ctypes.POINTER(DdbValueView)()
+            out_count = ctypes.c_size_t()
+            has_row = ctypes.c_uint8()
+            code = self._lib.ddb_stmt_step_row_view(
+                self._stmt,
+                ctypes.byref(values_ptr),
+                ctypes.byref(out_count),
+                ctypes.byref(has_row),
+            )
+            if code != ERR_OK:
+                _raise_error(code, sql=self._last_sql, params=None)
+            if not has_row.value:
+                return None
+            return self._decode_row_view_values(values_ptr, int(out_count.value))
 
         has_row = ctypes.c_uint8()
         code = self._lib.ddb_stmt_step(self._stmt, ctypes.byref(has_row))
@@ -586,21 +1353,85 @@ class Cursor:
             size = self.arraysize
         if size <= 0:
             return []
-        rows = []
-        for _ in range(size):
-            row = self.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-        return rows
+        return self._fetch_rows(limit=size)
 
     def fetchall(self):
+        return self._fetch_rows(limit=None)
+
+    def _fetch_rows(self, limit):
+        self._ensure_open()
+        if not self._stmt:
+            raise ProgrammingError("No statement")
+        if not self._query_active:
+            return []
+
+        if self._use_fetch_row_views:
+            values_ptr = ctypes.POINTER(DdbValueView)()
+            out_rows = ctypes.c_size_t()
+            out_columns = ctypes.c_size_t()
+            code = self._lib.ddb_stmt_fetch_row_views(
+                self._stmt,
+                1 if self._has_buffered_row else 0,
+                0 if limit is None else int(limit),
+                ctypes.byref(values_ptr),
+                ctypes.byref(out_rows),
+                ctypes.byref(out_columns),
+            )
+            if code != ERR_OK:
+                _raise_error(code, sql=self._last_sql, params=None)
+            self._has_buffered_row = False
+            self._buffered_row = None
+            return self._decode_row_view_matrix(
+                values_ptr, int(out_rows.value), int(out_columns.value)
+            )
+
         rows = []
-        while True:
-            row = self.fetchone()
-            if row is None:
+        append_row = rows.append
+        decode_row = self._decode_current_row
+
+        if self._has_buffered_row:
+            self._has_buffered_row = False
+            if self._buffered_row is not None:
+                append_row(self._buffered_row)
+                self._buffered_row = None
+            else:
+                append_row(decode_row())
+            if limit is not None and len(rows) >= limit:
                 return rows
-            rows.append(row)
+
+        if self._use_step_row_view:
+            values_ptr = ctypes.POINTER(DdbValueView)()
+            out_count = ctypes.c_size_t()
+            has_row = ctypes.c_uint8()
+            step_row_view = self._lib.ddb_stmt_step_row_view
+            byref = ctypes.byref
+            decode_values = self._decode_row_view_values
+            while limit is None or len(rows) < limit:
+                code = step_row_view(
+                    self._stmt,
+                    byref(values_ptr),
+                    byref(out_count),
+                    byref(has_row),
+                )
+                if code != ERR_OK:
+                    _raise_error(code, sql=self._last_sql, params=None)
+                if not has_row.value:
+                    break
+                append_row(decode_values(values_ptr, int(out_count.value)))
+            return rows
+
+        step_stmt = self._lib.ddb_stmt_step
+        byref = ctypes.byref
+        has_row = ctypes.c_uint8()
+        while limit is None or len(rows) < limit:
+            code = step_stmt(self._stmt, byref(has_row))
+            if code != ERR_OK:
+                _raise_error(code, sql=self._last_sql, params=None)
+            if not has_row.value:
+                break
+            append_row(decode_row())
+
+        return rows
 
     def __iter__(self):
         return self

@@ -64,6 +64,42 @@ impl Default for DdbValue {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DdbValueView {
+    pub tag: u32,
+    pub bool_value: u8,
+    pub reserved0: [u8; 7],
+    pub int64_value: i64,
+    pub float64_value: f64,
+    pub decimal_scaled: i64,
+    pub decimal_scale: u8,
+    pub reserved1: [u8; 7],
+    pub data: *const u8,
+    pub len: usize,
+    pub uuid_bytes: [u8; 16],
+    pub timestamp_micros: i64,
+}
+
+impl Default for DdbValueView {
+    fn default() -> Self {
+        Self {
+            tag: DdbValueTag::Null as u32,
+            bool_value: 0,
+            reserved0: [0; 7],
+            int64_value: 0,
+            float64_value: 0.0,
+            decimal_scaled: 0,
+            decimal_scale: 0,
+            reserved1: [0; 7],
+            data: ptr::null(),
+            len: 0,
+            uuid_bytes: [0; 16],
+            timestamp_micros: 0,
+        }
+    }
+}
+
+#[repr(C)]
 #[derive(Debug)]
 pub struct DbHandle {
     db: Db,
@@ -85,6 +121,7 @@ pub struct StmtHandle {
     result: Option<QueryResult>,
     current_row: Option<usize>,
     next_row_index: usize,
+    row_views: Vec<DdbValueView>,
 }
 
 thread_local! {
@@ -205,6 +242,19 @@ fn params_slice<'a>(params: *const DdbValue, params_len: usize) -> Result<&'a [D
     Ok(unsafe { std::slice::from_raw_parts(params, params_len) })
 }
 
+fn ptr_slice<'a, T>(ptr: *const T, len: usize, name: &str) -> Result<&'a [T]> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(DbError::internal(format!(
+            "{name} pointer must not be null when len > 0"
+        )));
+    }
+    // SAFETY: the caller provides a contiguous buffer of `len` entries.
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
 fn value_from_ffi(value: &DdbValue) -> Result<Value> {
     match value.tag {
         x if x == DdbValueTag::Null as u32 => Ok(Value::Null),
@@ -289,6 +339,69 @@ fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
     }
 }
 
+fn fill_ffi_value_view(out: &mut DdbValueView, value: &Value) {
+    *out = DdbValueView::default();
+    match value {
+        Value::Null => out.tag = DdbValueTag::Null as u32,
+        Value::Int64(inner) => {
+            out.tag = DdbValueTag::Int64 as u32;
+            out.int64_value = *inner;
+        }
+        Value::Float64(inner) => {
+            out.tag = DdbValueTag::Float64 as u32;
+            out.float64_value = *inner;
+        }
+        Value::Bool(inner) => {
+            out.tag = DdbValueTag::Bool as u32;
+            out.bool_value = u8::from(*inner);
+        }
+        Value::Text(inner) => {
+            out.tag = DdbValueTag::Text as u32;
+            out.data = inner.as_bytes().as_ptr();
+            out.len = inner.len();
+        }
+        Value::Blob(inner) => {
+            out.tag = DdbValueTag::Blob as u32;
+            out.data = inner.as_ptr();
+            out.len = inner.len();
+        }
+        Value::Decimal { scaled, scale } => {
+            out.tag = DdbValueTag::Decimal as u32;
+            out.decimal_scaled = *scaled;
+            out.decimal_scale = *scale;
+        }
+        Value::Uuid(inner) => {
+            out.tag = DdbValueTag::Uuid as u32;
+            out.uuid_bytes = *inner;
+        }
+        Value::TimestampMicros(inner) => {
+            out.tag = DdbValueTag::TimestampMicros as u32;
+            out.timestamp_micros = *inner;
+        }
+    }
+}
+
+fn populate_stmt_row_views(stmt: &mut StmtHandle) -> Result<()> {
+    let result = stmt
+        .result
+        .as_ref()
+        .ok_or_else(|| DbError::sql("statement has not been executed yet"))?;
+    let row_index = stmt
+        .current_row
+        .ok_or_else(|| DbError::sql("statement is not positioned on a row"))?;
+    let row = result
+        .rows()
+        .get(row_index)
+        .ok_or_else(|| DbError::internal("statement row cursor is out of bounds"))?;
+    let values = row.values();
+
+    stmt.row_views.resize(values.len(), DdbValueView::default());
+    for (idx, value) in values.iter().enumerate() {
+        fill_ffi_value_view(&mut stmt.row_views[idx], value);
+    }
+    Ok(())
+}
+
 fn execute_stmt_if_needed(stmt: &mut StmtHandle) -> Result<()> {
     if stmt.result.is_some() {
         return Ok(());
@@ -318,6 +431,7 @@ fn invalidate_stmt_result(stmt: &mut StmtHandle) {
     stmt.result = None;
     stmt.current_row = None;
     stmt.next_row_index = 0;
+    stmt.row_views.clear();
 }
 
 fn ensure_stmt_binding_slot(stmt: &mut StmtHandle, index_1_based: usize) -> Result<usize> {
@@ -698,6 +812,7 @@ pub extern "C" fn ddb_db_prepare(
             result: None,
             current_row: None,
             next_row_index: 0,
+            row_views: Vec::new(),
         });
         *out_ptr(out_stmt, "out_stmt")? = Box::into_raw(handle);
         Ok(())
@@ -759,6 +874,51 @@ pub extern "C" fn ddb_stmt_bind_int64(
         let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
         stmt.bindings[slot] = Value::Int64(value);
         invalidate_stmt_result(stmt);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_bind_int64_step_row_view(
+    stmt: *mut StmtHandle,
+    index_1_based: usize,
+    value: i64,
+    out_values: *mut *const DdbValueView,
+    out_columns: *mut usize,
+    out_has_row: *mut u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let slot = ensure_stmt_binding_slot(stmt, index_1_based)?;
+        stmt.bindings[slot] = Value::Int64(value);
+        invalidate_stmt_result(stmt);
+        execute_stmt_if_needed(stmt)?;
+
+        let row_count = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?
+            .rows()
+            .len();
+        if stmt.next_row_index >= row_count {
+            stmt.current_row = None;
+            *out_ptr(out_has_row, "out_has_row")? = 0;
+            *out_ptr(out_columns, "out_columns")? = 0;
+            *out_ptr(out_values, "out_values")? = ptr::null();
+            return Ok(());
+        }
+
+        stmt.current_row = Some(stmt.next_row_index);
+        stmt.next_row_index += 1;
+        populate_stmt_row_views(stmt)?;
+
+        *out_ptr(out_has_row, "out_has_row")? = 1;
+        *out_ptr(out_columns, "out_columns")? = stmt.row_views.len();
+        *out_ptr(out_values, "out_values")? = if stmt.row_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_views.as_ptr()
+        };
         Ok(())
     })
 }
@@ -861,6 +1021,77 @@ pub extern "C" fn ddb_stmt_bind_timestamp_micros(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_stmt_execute_batch_i64(
+    stmt: *mut StmtHandle,
+    row_count: usize,
+    values_i64: *const i64,
+    out_total_affected_rows: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let ids = ptr_slice(values_i64, row_count, "values_i64")?;
+
+        if stmt.bindings.is_empty() {
+            stmt.bindings.push(Value::Null);
+        }
+        let mut total_affected = 0_u64;
+        for id in ids {
+            stmt.bindings[0] = Value::Int64(*id);
+            invalidate_stmt_result(stmt);
+            execute_stmt_if_needed(stmt)?;
+            total_affected =
+                total_affected.saturating_add(stmt.result.as_ref().map_or(0, QueryResult::affected_rows));
+        }
+
+        *out_ptr(out_total_affected_rows, "out_total_affected_rows")? = total_affected;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_execute_batch_i64_text_f64(
+    stmt: *mut StmtHandle,
+    row_count: usize,
+    values_i64: *const i64,
+    values_text_ptrs: *const *const c_char,
+    values_text_lens: *const usize,
+    values_f64: *const f64,
+    out_total_affected_rows: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        let ids = ptr_slice(values_i64, row_count, "values_i64")?;
+        let text_ptrs = ptr_slice(values_text_ptrs, row_count, "values_text_ptrs")?;
+        let text_lens = ptr_slice(values_text_lens, row_count, "values_text_lens")?;
+        let floats = ptr_slice(values_f64, row_count, "values_f64")?;
+
+        if stmt.bindings.len() < 3 {
+            stmt.bindings.resize(3, Value::Null);
+        }
+        let mut total_affected = 0_u64;
+        for idx in 0..row_count {
+            let text_bytes = borrowed_bytes(text_ptrs[idx].cast::<u8>(), text_lens[idx])?;
+            let text = std::str::from_utf8(text_bytes).map_err(|error| {
+                DbError::sql(format!(
+                    "TEXT parameter at batch row {idx} is not valid UTF-8: {error}"
+                ))
+            })?;
+
+            stmt.bindings[0] = Value::Int64(ids[idx]);
+            stmt.bindings[1] = Value::Text(text.to_string());
+            stmt.bindings[2] = Value::Float64(floats[idx]);
+            invalidate_stmt_result(stmt);
+            execute_stmt_if_needed(stmt)?;
+            total_affected =
+                total_affected.saturating_add(stmt.result.as_ref().map_or(0, QueryResult::affected_rows));
+        }
+
+        *out_ptr(out_total_affected_rows, "out_total_affected_rows")? = total_affected;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_stmt_step(stmt: *mut StmtHandle, out_has_row: *mut u8) -> u32 {
     ffi_boundary(|| {
         let stmt = handle_mut(stmt, "stmt")?;
@@ -940,6 +1171,133 @@ pub extern "C" fn ddb_stmt_value_copy(
         execute_stmt_if_needed(stmt)?;
         let value = stmt_current_value(stmt, column_index)?;
         fill_ffi_value(out_ptr(out_value, "out_value")?, value);
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_row_view(
+    stmt: *mut StmtHandle,
+    out_values: *mut *const DdbValueView,
+    out_columns: *mut usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+        populate_stmt_row_views(stmt)?;
+
+        *out_ptr(out_columns, "out_columns")? = stmt.row_views.len();
+        *out_ptr(out_values, "out_values")? = if stmt.row_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_views.as_ptr()
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_step_row_view(
+    stmt: *mut StmtHandle,
+    out_values: *mut *const DdbValueView,
+    out_columns: *mut usize,
+    out_has_row: *mut u8,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+
+        let row_count = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?
+            .rows()
+            .len();
+        if stmt.next_row_index >= row_count {
+            stmt.current_row = None;
+            *out_ptr(out_has_row, "out_has_row")? = 0;
+            *out_ptr(out_columns, "out_columns")? = 0;
+            *out_ptr(out_values, "out_values")? = ptr::null();
+            return Ok(());
+        }
+
+        stmt.current_row = Some(stmt.next_row_index);
+        stmt.next_row_index += 1;
+        populate_stmt_row_views(stmt)?;
+
+        *out_ptr(out_has_row, "out_has_row")? = 1;
+        *out_ptr(out_columns, "out_columns")? = stmt.row_views.len();
+        *out_ptr(out_values, "out_values")? = if stmt.row_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_views.as_ptr()
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_stmt_fetch_row_views(
+    stmt: *mut StmtHandle,
+    include_current_row: u8,
+    max_rows: usize,
+    out_values: *mut *const DdbValueView,
+    out_rows: *mut usize,
+    out_columns: *mut usize,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        execute_stmt_if_needed(stmt)?;
+
+        let result = stmt
+            .result
+            .as_ref()
+            .ok_or_else(|| DbError::internal("statement execution did not produce a result"))?;
+        let total_rows = result.rows().len();
+        let col_count = result.columns().len();
+        let start_index = if include_current_row != 0 {
+            stmt.current_row.unwrap_or(stmt.next_row_index)
+        } else {
+            stmt.next_row_index
+        };
+        if start_index >= total_rows {
+            stmt.current_row = None;
+            stmt.next_row_index = total_rows;
+            stmt.row_views.clear();
+            *out_ptr(out_rows, "out_rows")? = 0;
+            *out_ptr(out_columns, "out_columns")? = col_count;
+            *out_ptr(out_values, "out_values")? = ptr::null();
+            return Ok(());
+        }
+
+        let available_rows = total_rows - start_index;
+        let fetch_rows = if max_rows == 0 {
+            available_rows
+        } else {
+            available_rows.min(max_rows)
+        };
+        let view_len = fetch_rows.saturating_mul(col_count);
+        stmt.row_views.resize(view_len, DdbValueView::default());
+
+        for row_offset in 0..fetch_rows {
+            let row = &result.rows()[start_index + row_offset];
+            for (col, value) in row.values().iter().enumerate() {
+                let idx = row_offset * col_count + col;
+                fill_ffi_value_view(&mut stmt.row_views[idx], value);
+            }
+        }
+
+        let last_index = start_index + fetch_rows - 1;
+        stmt.current_row = Some(last_index);
+        stmt.next_row_index = last_index + 1;
+
+        *out_ptr(out_rows, "out_rows")? = fetch_rows;
+        *out_ptr(out_columns, "out_columns")? = col_count;
+        *out_ptr(out_values, "out_values")? = if stmt.row_views.is_empty() {
+            ptr::null()
+        } else {
+            stmt.row_views.as_ptr()
+        };
         Ok(())
     })
 }
@@ -1390,6 +1748,111 @@ mod tests {
         assert_eq!(ddb_result_value_copy(result, 0, 0, &mut remaining), DDB_OK);
         assert_eq!(remaining.int64_value, 1);
         assert_eq!(ddb_value_dispose(&mut remaining), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_stmt_execute_batch_i64_text_f64_inserts_rows() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create =
+            CString::new("CREATE TABLE t (id INT64, name TEXT, score FLOAT64)").expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO t VALUES ($1, $2, $3)").expect("insert");
+        let mut stmt = ptr::null_mut();
+        assert_eq!(ddb_db_prepare(db, insert.as_ptr(), &mut stmt), DDB_OK);
+
+        let ids = [1_i64, 2_i64, 3_i64];
+        let names = [
+            CString::new("a").expect("a"),
+            CString::new("b").expect("b"),
+            CString::new("c").expect("c"),
+        ];
+        let name_ptrs = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+        let name_lens = names
+            .iter()
+            .map(|name| name.as_bytes().len())
+            .collect::<Vec<_>>();
+        let scores = [1.5_f64, 2.5_f64, 3.5_f64];
+        let mut affected_rows = 0_u64;
+        assert_eq!(
+            ddb_stmt_execute_batch_i64_text_f64(
+                stmt,
+                ids.len(),
+                ids.as_ptr(),
+                name_ptrs.as_ptr(),
+                name_lens.as_ptr(),
+                scores.as_ptr(),
+                &mut affected_rows
+            ),
+            DDB_OK
+        );
+        assert_eq!(affected_rows, 3);
+
+        let count_sql = CString::new("SELECT COUNT(*) FROM t").expect("count");
+        assert_eq!(
+            ddb_db_execute(db, count_sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        let mut count_value = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut count_value), DDB_OK);
+        assert_eq!(count_value.int64_value, 3);
+        assert_eq!(ddb_value_dispose(&mut count_value), DDB_OK);
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+        assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
+        assert_eq!(ddb_db_free(&mut db), DDB_OK);
+    }
+
+    #[test]
+    fn ffi_stmt_execute_batch_i64_inserts_rows() {
+        let mut db = ptr::null_mut();
+        let path = CString::new(":memory:").expect("path");
+        assert_eq!(ddb_db_open_or_create(path.as_ptr(), &mut db), DDB_OK);
+
+        let create = CString::new("CREATE TABLE t (id INT64)").expect("create");
+        let mut result = ptr::null_mut();
+        assert_eq!(
+            ddb_db_execute(db, create.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        assert_eq!(ddb_result_free(&mut result), DDB_OK);
+
+        let insert = CString::new("INSERT INTO t VALUES ($1)").expect("insert");
+        let mut stmt = ptr::null_mut();
+        assert_eq!(ddb_db_prepare(db, insert.as_ptr(), &mut stmt), DDB_OK);
+
+        let ids = [10_i64, 20_i64, 30_i64, 40_i64];
+        let mut affected_rows = 0_u64;
+        assert_eq!(
+            ddb_stmt_execute_batch_i64(
+                stmt,
+                ids.len(),
+                ids.as_ptr(),
+                &mut affected_rows
+            ),
+            DDB_OK
+        );
+        assert_eq!(affected_rows, 4);
+
+        let count_sql = CString::new("SELECT COUNT(*) FROM t").expect("count");
+        assert_eq!(
+            ddb_db_execute(db, count_sql.as_ptr(), ptr::null(), 0, &mut result),
+            DDB_OK
+        );
+        let mut count_value = DdbValue::default();
+        assert_eq!(ddb_result_value_copy(result, 0, 0, &mut count_value), DDB_OK);
+        assert_eq!(count_value.int64_value, 4);
+        assert_eq!(ddb_value_dispose(&mut count_value), DDB_OK);
         assert_eq!(ddb_result_free(&mut result), DDB_OK);
         assert_eq!(ddb_stmt_free(&mut stmt), DDB_OK);
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
