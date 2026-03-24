@@ -23,6 +23,7 @@ namespace DecentDB.AdoNet
         private PreparedStatement? _preparedStatement;
         private string? _preparedSql;
         private Native.DecentDB? _preparedDb;
+        private bool _preparedStatementFromConnectionCache;
         private string? _cachedSplitSql;
         private List<string>? _cachedSplitStatements;
         private string? _cachedRewriteSourceSql;
@@ -262,7 +263,7 @@ namespace DecentDB.AdoNet
 
                     if (usingPreparedStatementCache)
                     {
-                        InvalidatePreparedStatement();
+                        InvalidatePreparedStatement(discardFromConnectionCache: true);
                     }
                     else
                     {
@@ -668,7 +669,7 @@ namespace DecentDB.AdoNet
                 {
                     var ex = new DecentDBException(stepResult,
                         _connection.GetNativeDb().LastErrorMessage, sql);
-                    InvalidatePreparedStatement();
+                    InvalidatePreparedStatement(discardFromConnectionCache: true);
                     throw ex;
                 }
 
@@ -681,7 +682,7 @@ namespace DecentDB.AdoNet
             }
             catch (Exception ex)
             {
-                InvalidatePreparedStatement();
+                InvalidatePreparedStatement(discardFromConnectionCache: true);
 
                 if (observation != null)
                 {
@@ -714,23 +715,43 @@ namespace DecentDB.AdoNet
 
             InvalidatePreparedStatement();
 
-            _preparedStatement = nativeDb.Prepare(sql);
+            _preparedStatement = _connection.GetOrAddPreparedStatement(sql);
             _preparedSql = sql;
             _preparedDb = nativeDb;
+            _preparedStatementFromConnectionCache = true;
+            if (resetForExecution)
+            {
+                _preparedStatement.Reset().ClearBindings();
+            }
             return _preparedStatement;
         }
 
-        private void InvalidatePreparedStatement()
+        private void InvalidatePreparedStatement(bool discardFromConnectionCache = false)
         {
             if (ReferenceEquals(_statement, _preparedStatement))
             {
                 _statement = null;
             }
 
-            _preparedStatement?.Dispose();
+            if (_preparedStatement != null)
+            {
+                if (_preparedStatementFromConnectionCache &&
+                    discardFromConnectionCache &&
+                    _connection != null &&
+                    _preparedSql != null)
+                {
+                    _connection.InvalidateCachedPreparedStatement(_preparedSql, _preparedStatement);
+                }
+                else if (!_preparedStatementFromConnectionCache)
+                {
+                    _preparedStatement.Dispose();
+                }
+            }
+
             _preparedStatement = null;
             _preparedSql = null;
             _preparedDb = null;
+            _preparedStatementFromConnectionCache = false;
         }
 
         protected override void Dispose(bool disposing)

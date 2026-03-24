@@ -126,23 +126,7 @@ namespace DecentDB.AdoNet
 
         public override object GetValue(int ordinal)
         {
-            if (_statement.IsNull(ordinal))
-            {
-                return DBNull.Value;
-            }
-
-            var type = _statement.ColumnType(ordinal);
-            return type switch
-            {
-                1 => _statement.GetInt64(ordinal),
-                2 => _statement.GetInt64(ordinal) != 0,
-                3 => _statement.GetFloat64(ordinal),
-                4 => _statement.GetText(ordinal),
-                5 => _statement.GetBlob(ordinal),
-                12 => _statement.GetDecimal(ordinal),
-                17 => FromUnixEpochMicroseconds(_statement.GetTimestampMicros(ordinal)),
-                _ => DBNull.Value
-            };
+            return _statement.GetValueObject(ordinal);
         }
 
         public override T GetFieldValue<T>(int ordinal)

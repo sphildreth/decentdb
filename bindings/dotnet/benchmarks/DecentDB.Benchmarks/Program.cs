@@ -191,10 +191,16 @@ static OfferingResult RunDapperBenchmark(OfferingKind offering, string dbPath, B
     var insertRowsPerSecond = options.Count / insertSeconds;
     Console.WriteLine($"Insert {options.Count:N0} rows: {insertSeconds:0.0000}s ({insertRowsPerSecond:N2} rows/sec)");
 
+    const string scanSql = "SELECT id AS Id, val AS Val, f AS F FROM bench ORDER BY id";
+    using (var warm = conn.Query<DapperBenchRow>(scanSql, buffered: false).GetEnumerator())
+    {
+        _ = warm.MoveNext();
+    }
+
     var fetchallSeconds = RunWithGcDisabled(() =>
     {
         var started = Stopwatch.GetTimestamp();
-        var rows = conn.Query<DapperBenchRow>("SELECT id AS Id, val AS Val, f AS F FROM bench ORDER BY id").AsList();
+        var rows = conn.Query<DapperBenchRow>(scanSql).AsList();
         if (rows.Count != options.Count)
         {
             throw new InvalidOperationException($"Expected {options.Count} rows from fetchall, got {rows.Count}");
@@ -208,7 +214,7 @@ static OfferingResult RunDapperBenchmark(OfferingKind offering, string dbPath, B
     {
         var started = Stopwatch.GetTimestamp();
         var stream = conn.Query<DapperBenchRow>(
-            "SELECT id AS Id, val AS Val, f AS F FROM bench ORDER BY id",
+            scanSql,
             buffered: false);
         var total = ConsumeSyncRowsInBatches(stream, options.FetchmanyBatch);
         if (total != options.Count)
@@ -373,6 +379,8 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
     using var ctx = CreateEfContext(offering, dbPath);
     ctx.ChangeTracker.AutoDetectChangesEnabled = false;
     ctx.Database.OpenConnection();
+    var pointRowByIdQuery = EF.CompileQuery(
+        (BenchEfContext c, long id) => c.BenchRows.AsNoTracking().FirstOrDefault(r => r.Id == id));
 
     using (var warmTx = ctx.Database.BeginTransaction())
     {
@@ -416,6 +424,11 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
     var insertRowsPerSecond = options.Count / insertSeconds;
     Console.WriteLine($"Insert {options.Count:N0} rows: {insertSeconds:0.0000}s ({insertRowsPerSecond:N2} rows/sec)");
 
+    // Warm query compilation/execution for fair steady-state read timing.
+    _ = ctx.BenchRows.AsNoTracking().OrderBy(r => r.Id).Take(1).ToList();
+    _ = ctx.BenchRows.AsNoTracking().OrderBy(r => r.Id).AsEnumerable().Take(1).Count();
+    _ = pointRowByIdQuery(ctx, options.Count / 2);
+
     var fetchallSeconds = RunWithGcDisabled(() =>
     {
         var started = Stopwatch.GetTimestamp();
@@ -445,7 +458,7 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
     Console.WriteLine($"Fetchmany({options.FetchmanyBatch:N0}) {options.Count:N0} rows: {fetchmanySeconds:0.0000}s");
 
     var pointIds = BuildPointReadIds(options.Count, options.PointReads, options.PointSeed);
-    _ = ctx.BenchRows.AsNoTracking().FirstOrDefault(r => r.Id == pointIds[pointIds.Length / 2]) ??
+    _ = pointRowByIdQuery(ctx, pointIds[pointIds.Length / 2]) ??
         throw new InvalidOperationException("Warmup point read missed expected row");
 
     var latencies = RunWithGcDisabled(() =>
@@ -455,7 +468,7 @@ static OfferingResult RunEfCoreBenchmark(OfferingKind offering, string dbPath, B
         {
             var started = Stopwatch.GetTimestamp();
             var id = pointIds[i];
-            var row = ctx.BenchRows.AsNoTracking().FirstOrDefault(r => r.Id == id);
+            var row = pointRowByIdQuery(ctx, id);
             if (row == null)
             {
                 throw new InvalidOperationException($"Point read missed id={id}");
@@ -932,7 +945,14 @@ static T RunWithGcDisabled<T>(Func<T> action)
     {
         if (shouldReEnable)
         {
-            GC.EndNoGCRegion();
+            try
+            {
+                GC.EndNoGCRegion();
+            }
+            catch (InvalidOperationException)
+            {
+                // The runtime can leave no-GC mode early if allocation budget is exceeded.
+            }
         }
     }
 }
@@ -1054,6 +1074,7 @@ static void PrintUsage()
     Console.WriteLine($"  --point-seed <n>                 RNG seed for point lookups (default: {DefaultPointSeed})");
     Console.WriteLine($"  --ef-insert-batch <n>            EF SaveChanges batch size (default: {DefaultEfInsertBatch})");
     Console.WriteLine("  --db-prefix <path_prefix>        Database path prefix (default: dotnet_bench_fetch)");
+    Console.WriteLine("                                  DecentDB files use .ddb by default; SQLite files use .db.");
     Console.WriteLine("  --keep-db                        Keep generated DB files");
     Console.WriteLine("  -h, --help                       Show help");
 }

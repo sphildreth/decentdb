@@ -14,6 +14,7 @@ namespace DecentDB.AdoNet
 {
     public sealed class DecentDBConnection : DbConnection
     {
+        private const int PreparedStatementCacheCapacity = 256;
         private Native.DecentDB? _db;
         private string _connectionString = string.Empty;
         private ConnectionState _state;
@@ -26,6 +27,9 @@ namespace DecentDB.AdoNet
 
         private EventHandler<SqlExecutingEventArgs>? _sqlExecuting;
         private EventHandler<SqlExecutedEventArgs>? _sqlExecuted;
+        private readonly object _preparedStatementCacheLock = new();
+        private readonly Dictionary<string, CachedPreparedStatement> _preparedStatementCache = new(StringComparer.Ordinal);
+        private readonly LinkedList<string> _preparedStatementLru = new();
 
         public event EventHandler<SqlExecutingEventArgs>? SqlExecuting
         {
@@ -102,6 +106,7 @@ namespace DecentDB.AdoNet
 
             try
             {
+                ClearPreparedStatementCache();
                 _db?.Dispose();
                 _db = null;
             }
@@ -195,8 +200,103 @@ namespace DecentDB.AdoNet
             return _db ?? throw new InvalidOperationException("Connection is not open");
         }
 
+        internal PreparedStatement GetOrAddPreparedStatement(string sql)
+        {
+            if (_db == null)
+            {
+                throw new InvalidOperationException("Connection is not open");
+            }
+
+            lock (_preparedStatementCacheLock)
+            {
+                if (_preparedStatementCache.TryGetValue(sql, out var cached))
+                {
+                    TouchPreparedStatement(cached);
+                    return cached.Statement;
+                }
+
+                var stmt = _db.Prepare(sql);
+                var node = _preparedStatementLru.AddFirst(sql);
+                _preparedStatementCache[sql] = new CachedPreparedStatement(stmt, node);
+                EvictPreparedStatementsIfNeeded();
+                return stmt;
+            }
+        }
+
+        internal void InvalidateCachedPreparedStatement(string sql, PreparedStatement statement)
+        {
+            lock (_preparedStatementCacheLock)
+            {
+                if (_preparedStatementCache.TryGetValue(sql, out var cached) &&
+                    ReferenceEquals(cached.Statement, statement))
+                {
+                    _preparedStatementCache.Remove(sql);
+                    _preparedStatementLru.Remove(cached.LruNode);
+                    cached.Statement.Dispose();
+                    return;
+                }
+            }
+
+            statement.Dispose();
+        }
+
         internal int DefaultCommandTimeoutSeconds => _defaultCommandTimeoutSeconds;
         internal bool IsSqlObservationEnabled => _loggingEnabled || _sqlExecuting != null || _sqlExecuted != null;
+
+        private void ClearPreparedStatementCache()
+        {
+            lock (_preparedStatementCacheLock)
+            {
+                foreach (var cached in _preparedStatementCache.Values)
+                {
+                    cached.Statement.Dispose();
+                }
+
+                _preparedStatementCache.Clear();
+                _preparedStatementLru.Clear();
+            }
+        }
+
+        private void EvictPreparedStatementsIfNeeded()
+        {
+            while (_preparedStatementCache.Count > PreparedStatementCacheCapacity)
+            {
+                var oldest = _preparedStatementLru.Last;
+                if (oldest == null)
+                {
+                    return;
+                }
+
+                _preparedStatementLru.RemoveLast();
+                if (_preparedStatementCache.Remove(oldest.Value, out var cached))
+                {
+                    cached.Statement.Dispose();
+                }
+            }
+        }
+
+        private void TouchPreparedStatement(CachedPreparedStatement cached)
+        {
+            if (cached.LruNode.List == null || cached.LruNode == _preparedStatementLru.First)
+            {
+                return;
+            }
+
+            _preparedStatementLru.Remove(cached.LruNode);
+            _preparedStatementLru.AddFirst(cached.LruNode);
+        }
+
+        private sealed class CachedPreparedStatement
+        {
+            public CachedPreparedStatement(PreparedStatement statement, LinkedListNode<string> lruNode)
+            {
+                Statement = statement;
+                LruNode = lruNode;
+            }
+
+            public PreparedStatement Statement { get; }
+            public LinkedListNode<string> LruNode { get; }
+        }
 
         private static string DescribeSqlForTrace(string sql)
         {

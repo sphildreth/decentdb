@@ -751,17 +751,7 @@ public sealed class PreparedStatement : IDisposable
             {
                 return decimal.Parse(GetTextFromValue(value));
             }
-
-            bool isNegative = value.decimal_scaled < 0;
-            ulong magnitude = isNegative
-                ? unchecked((ulong)(-value.decimal_scaled))
-                : unchecked((ulong)value.decimal_scaled);
-
-            int lo = (int)(magnitude & 0xFFFFFFFF);
-            int mid = (int)(magnitude >> 32);
-            int hi = 0;
-
-            return new decimal(lo, mid, hi, isNegative, value.decimal_scale);
+            return GetDecimalValue(value);
         }
         finally
         {
@@ -788,6 +778,31 @@ public sealed class PreparedStatement : IDisposable
         try
         {
             return GetBlobFromValue(value);
+        }
+        finally
+        {
+            DisposeValue(ref value);
+        }
+    }
+
+    public object GetValueObject(int col0Based)
+    {
+        var value = CopyValue(col0Based);
+        try
+        {
+            return (DdbValueTag)value.tag switch
+            {
+                DdbValueTag.Null => DBNull.Value,
+                DdbValueTag.Int64 => value.int64_value,
+                DdbValueTag.Bool => value.bool_value != 0,
+                DdbValueTag.Float64 => value.float64_value,
+                DdbValueTag.Text => GetTextFromValue(value),
+                DdbValueTag.Blob => GetBlobFromValue(value),
+                DdbValueTag.Decimal => GetDecimalValue(value),
+                DdbValueTag.Uuid => GetBlobFromValue(value),
+                DdbValueTag.TimestampMicros => FromUnixEpochMicroseconds(value.timestamp_micros),
+                _ => DBNull.Value
+            };
         }
         finally
         {
@@ -970,6 +985,11 @@ public sealed class PreparedStatement : IDisposable
 
     private static string GetDecimalString(DdbValueNative value)
     {
+        return GetDecimalValue(value).ToString();
+    }
+
+    private static decimal GetDecimalValue(DdbValueNative value)
+    {
         bool isNegative = value.decimal_scaled < 0;
         ulong magnitude = isNegative
             ? unchecked((ulong)(-value.decimal_scaled))
@@ -979,8 +999,11 @@ public sealed class PreparedStatement : IDisposable
         int mid = (int)(magnitude >> 32);
         int hi = 0;
 
-        return new decimal(lo, mid, hi, isNegative, value.decimal_scale).ToString();
+        return new decimal(lo, mid, hi, isNegative, value.decimal_scale);
     }
+
+    private static DateTime FromUnixEpochMicroseconds(long micros)
+        => new DateTime(micros * 10L + DateTime.UnixEpoch.Ticks, DateTimeKind.Utc);
 
     private static DecentdbValueView ToRowViewValue(DdbValueNative value)
     {

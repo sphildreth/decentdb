@@ -11,3 +11,4 @@ From repo root:
 Notes:
 - Timings are sensitive to machine load and CPU frequency scaling.
 - Results are best used for relative comparisons (regressions) rather than absolute guarantees.
+- Default extension guidance: DecentDB databases use `.ddb`; SQLite databases use `.db`.
