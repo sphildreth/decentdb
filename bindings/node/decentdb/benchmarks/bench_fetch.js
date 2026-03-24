@@ -170,11 +170,23 @@ function runDecentDbBenchmark(dbPath, opts) {
     const insertStart = process.hrtime.bigint();
     runWithGcDisabled(() => {
       db.exec('BEGIN');
-      for (let i = 0; i < opts.count; i++) {
-        if (!insertStmt.stepWithParams([i, `value_${i}`, i])) {
-          continue;
+      if (typeof insertStmt._native?.stmtExecuteBatchI64TextF64 === 'function') {
+        const ids = new Array(opts.count);
+        const texts = new Array(opts.count);
+        const floats = new Array(opts.count);
+        for (let i = 0; i < opts.count; i++) {
+          ids[i] = i;
+          texts[i] = `value_${i}`;
+          floats[i] = i;
         }
-        insertStmt.rowArray();
+        insertStmt.executeBatchI64TextF64(ids, texts, floats);
+      } else {
+        for (let i = 0; i < opts.count; i++) {
+          if (!insertStmt.stepWithParams([i, `value_${i}`, i])) {
+            continue;
+          }
+          insertStmt.rowArray();
+        }
       }
       db.exec('COMMIT');
     });
@@ -192,7 +204,16 @@ function runDecentDbBenchmark(dbPath, opts) {
     const fetchallStart = process.hrtime.bigint();
     const fetchallSeconds = runWithGcDisabled(() => {
       const queryStart = process.hrtime.bigint();
-      fetchallRows = db.exec(scanSql).rows;
+      const scanStmt = db.prepare(scanSql);
+      try {
+        if (typeof scanStmt._native?.stmtFetchRowsI64TextF64 === 'function') {
+          fetchallRows = scanStmt.fetchRowsI64TextF64(0);
+        } else {
+          fetchallRows = db.exec(scanSql).rows;
+        }
+      } finally {
+        scanStmt.finalize();
+      }
       return Number(process.hrtime.bigint() - queryStart) / 1e9;
     });
     if (!Array.isArray(fetchallRows) || fetchallRows.length !== opts.count) {
@@ -205,16 +226,29 @@ function runDecentDbBenchmark(dbPath, opts) {
     const fetchmanySeconds = runWithGcDisabled(() => {
       const queryStart = process.hrtime.bigint();
       let total = 0;
-      let pending = 0;
-      while (fetchmanyStmt.step()) {
-        fetchmanyStmt.rowArray();
-        pending++;
-        if (pending === opts.fetchmanyBatch) {
-          total += pending;
-          pending = 0;
+      if (typeof fetchmanyStmt._native?.stmtFetchRowsI64TextF64 === 'function') {
+        while (true) {
+          const batch = fetchmanyStmt.fetchRowsI64TextF64(opts.fetchmanyBatch);
+          if (!Array.isArray(batch) || batch.length === 0) {
+            break;
+          }
+          total += batch.length;
+          if (batch.length < opts.fetchmanyBatch) {
+            break;
+          }
         }
+      } else {
+        let pending = 0;
+        while (fetchmanyStmt.step()) {
+          fetchmanyStmt.rowArray();
+          pending++;
+          if (pending === opts.fetchmanyBatch) {
+            total += pending;
+            pending = 0;
+          }
+        }
+        total += pending;
       }
-      total += pending;
       if (total !== opts.count) {
         throw new Error(`Expected ${opts.count} rows from fetchmany, got ${total}`);
       }

@@ -1,6 +1,7 @@
 #ifndef DECENTDB_H
 #define DECENTDB_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -70,6 +71,31 @@ typedef struct decentdb_value_view {
 } decentdb_value_view;
 
 int decentdb_row_view(decentdb_stmt* stmt, const decentdb_value_view** out_values, int* out_count);
+
+typedef struct decentdb_row_i64_text_f64_view {
+	int64_t int64_value;
+	const uint8_t* text_data;
+	size_t text_len;
+	double float64_value;
+} decentdb_row_i64_text_f64_view;
+
+int decentdb_stmt_execute_batch_i64_text_f64(
+	decentdb_stmt* stmt,
+	size_t row_count,
+	const int64_t* values_i64,
+	const char* const* values_text_ptrs,
+	const size_t* values_text_lens,
+	const double* values_f64,
+	uint64_t* out_total_affected_rows
+);
+
+int decentdb_stmt_fetch_rows_i64_text_f64(
+	decentdb_stmt* stmt,
+	int include_current_row,
+	size_t max_rows,
+	const decentdb_row_i64_text_f64_view** out_rows_ptr,
+	size_t* out_rows
+);
 
 // Decimal support
 int decentdb_bind_decimal(decentdb_stmt* stmt, int index_1_based, int64_t unscaled, int scale);

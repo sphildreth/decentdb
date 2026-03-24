@@ -263,6 +263,13 @@ class Statement {
     return this._native.stmtStepWithParams(this._handle, bindings);
   }
 
+  executeBatchI64TextF64(ids, texts, floats) {
+    if (typeof this._native.stmtExecuteBatchI64TextF64 !== 'function') {
+      throw new Error('Native batch insert API is unavailable in this build');
+    }
+    return this._native.stmtExecuteBatchI64TextF64(this._handle, ids, texts, floats);
+  }
+
   step() {
     return this._native.stmtStep(this._handle);
   }
@@ -278,6 +285,13 @@ class Statement {
 
   columnNames() {
     return this._native.stmtColumnNames(this._handle);
+  }
+
+  fetchRowsI64TextF64(maxRows) {
+    if (typeof this._native.stmtFetchRowsI64TextF64 !== 'function') {
+      throw new Error('Native batch fetch API is unavailable in this build');
+    }
+    return this._native.stmtFetchRowsI64TextF64(this._handle, maxRows);
   }
 
   rows() {

@@ -1,7 +1,5 @@
 # DecentDB
 
-> DecentDB documentation tracks the current Rust engine, CLI, and language bindings.
-
 **Durable. Fast. Embedded.**
 
 DecentDB is an embedded, single-machine relational database engine focused on **durable ACID writes** and **fast reads**.

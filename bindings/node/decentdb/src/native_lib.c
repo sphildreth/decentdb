@@ -49,6 +49,9 @@ static int resolve_all(DL_HANDLE h) {
   g_api.bind_text = (int (*)(decentdb_stmt*, int, const char*, int))load_sym(h, "decentdb_bind_text");
   g_api.bind_blob = (int (*)(decentdb_stmt*, int, const uint8_t*, int))load_sym(h, "decentdb_bind_blob");
   g_api.bind_decimal = (int (*)(decentdb_stmt*, int, int64_t, int))load_sym(h, "decentdb_bind_decimal");
+  g_api.execute_batch_i64_text_f64 =
+      (int (*)(decentdb_stmt*, size_t, const int64_t*, const char* const*, const size_t*, const double*, uint64_t*))
+          load_sym(h, "decentdb_stmt_execute_batch_i64_text_f64");
 
   g_api.reset = (int (*)(decentdb_stmt*))load_sym(h, "decentdb_reset");
   g_api.clear_bindings = (int (*)(decentdb_stmt*))load_sym(h, "decentdb_clear_bindings");
@@ -57,6 +60,9 @@ static int resolve_all(DL_HANDLE h) {
   g_api.column_count = (int (*)(decentdb_stmt*))load_sym(h, "decentdb_column_count");
   g_api.column_name = (const char* (*)(decentdb_stmt*, int))load_sym(h, "decentdb_column_name");
   g_api.row_view = (int (*)(decentdb_stmt*, const decentdb_value_view**, int*))load_sym(h, "decentdb_row_view");
+  g_api.fetch_rows_i64_text_f64 =
+      (int (*)(decentdb_stmt*, int, size_t, const decentdb_row_i64_text_f64_view**, size_t*))
+          load_sym(h, "decentdb_stmt_fetch_rows_i64_text_f64");
   g_api.rows_affected = (int64_t (*)(decentdb_stmt*))load_sym(h, "decentdb_rows_affected");
   g_api.finalize = (void (*)(decentdb_stmt*))load_sym(h, "decentdb_finalize");
 

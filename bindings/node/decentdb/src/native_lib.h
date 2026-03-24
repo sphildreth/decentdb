@@ -26,6 +26,14 @@ typedef struct decentdb_native_api {
   int (*bind_text)(decentdb_stmt* stmt, int index_1_based, const char* utf8, int byte_len);
   int (*bind_blob)(decentdb_stmt* stmt, int index_1_based, const uint8_t* data, int byte_len);
   int (*bind_decimal)(decentdb_stmt* stmt, int index_1_based, int64_t unscaled, int scale);
+  int (*execute_batch_i64_text_f64)(
+      decentdb_stmt* stmt,
+      size_t row_count,
+      const int64_t* values_i64,
+      const char* const* values_text_ptrs,
+      const size_t* values_text_lens,
+      const double* values_f64,
+      uint64_t* out_total_affected_rows);
 
   int (*reset)(decentdb_stmt* stmt);
   int (*clear_bindings)(decentdb_stmt* stmt);
@@ -36,6 +44,12 @@ typedef struct decentdb_native_api {
   const char* (*column_name)(decentdb_stmt* stmt, int col_0_based);
 
   int (*row_view)(decentdb_stmt* stmt, const decentdb_value_view** out_values, int* out_count);
+  int (*fetch_rows_i64_text_f64)(
+      decentdb_stmt* stmt,
+      int include_current_row,
+      size_t max_rows,
+      const decentdb_row_i64_text_f64_view** out_rows_ptr,
+      size_t* out_rows);
   int64_t (*rows_affected)(decentdb_stmt* stmt);
   void (*finalize)(decentdb_stmt* stmt);
 
