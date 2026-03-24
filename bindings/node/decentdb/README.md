@@ -95,3 +95,21 @@ DECENTDB_NATIVE_LIB_PATH=/path/to/libdecentdb.so npm test
 ```
 
 All tests use Node.js built-in test runner (`node:test`) — no additional test dependencies required.
+
+## Benchmark
+
+Run a fair DecentDB vs SQLite benchmark from this package:
+
+```sh
+npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix node_native_bench_fetch
+```
+
+Supported options:
+
+- `--engine <all|decentdb|sqlite>`
+- `--count <n>`
+- `--point-reads <n>`
+- `--fetchmany-batch <n>`
+- `--point-seed <n>`
+- `--db-prefix <prefix>` (DecentDB writes `.ddb`, SQLite writes `.db`)
+- `--keep-db`

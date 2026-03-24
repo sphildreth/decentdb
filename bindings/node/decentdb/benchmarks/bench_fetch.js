@@ -171,10 +171,10 @@ function runDecentDbBenchmark(dbPath, opts) {
     runWithGcDisabled(() => {
       db.exec('BEGIN');
       for (let i = 0; i < opts.count; i++) {
-        insertStmt.reset();
-        insertStmt.clearBindings();
-        insertStmt.bindAll([i, `value_${i}`, i]);
-        insertStmt.step();
+        if (!insertStmt.stepWithParams([i, `value_${i}`, i])) {
+          continue;
+        }
+        insertStmt.rowArray();
       }
       db.exec('COMMIT');
     });
@@ -207,6 +207,7 @@ function runDecentDbBenchmark(dbPath, opts) {
       let total = 0;
       let pending = 0;
       while (fetchmanyStmt.step()) {
+        fetchmanyStmt.rowArray();
         pending++;
         if (pending === opts.fetchmanyBatch) {
           total += pending;
@@ -237,10 +238,7 @@ function runDecentDbBenchmark(dbPath, opts) {
       const out = new Array(pointIds.length);
       for (let i = 0; i < pointIds.length; i++) {
         const started = process.hrtime.bigint();
-        pointStmt.reset();
-        pointStmt.clearBindings();
-        pointStmt.bindAll([pointIds[i]]);
-        if (!pointStmt.step()) {
+        if (!pointStmt.stepWithParams([pointIds[i]])) {
           throw new Error(`Point read missed id=${pointIds[i]}`);
         }
         pointStmt.rowArray();

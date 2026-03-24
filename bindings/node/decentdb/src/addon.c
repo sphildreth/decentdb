@@ -1,6 +1,7 @@
 #include <node_api.h>
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -520,6 +521,140 @@ static napi_value js_stmt_step(napi_env env, napi_callback_info info) {
   return b;
 }
 
+static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  assert(st == napi_ok);
+
+  if (argc < 2) {
+    return throw_error(env, "DECENTDB_ARGS", "stmtStepWithParams(handle, bindings) requires 2 args");
+  }
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  bool is_array = false;
+  st = napi_is_array(env, argv[1], &is_array);
+  assert(st == napi_ok);
+  if (!is_array) {
+    return throw_error(env, "DECENTDB_ARGS", "bindings must be an array");
+  }
+
+  uint32_t bind_count = 0;
+  st = napi_get_array_length(env, argv[1], &bind_count);
+  assert(st == napi_ok);
+
+  int rc = api->reset(w->stmt);
+  if (rc != 0) return throw_last_native_error(env, api);
+  rc = api->clear_bindings(w->stmt);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  for (uint32_t i = 0; i < bind_count; i++) {
+    napi_value value;
+    st = napi_get_element(env, argv[1], i, &value);
+    assert(st == napi_ok);
+
+    int idx = (int)i + 1;
+    napi_valuetype t;
+    st = napi_typeof(env, value, &t);
+    assert(st == napi_ok);
+
+    if (t == napi_undefined || t == napi_null) {
+      rc = api->bind_null(w->stmt, idx);
+    } else if (t == napi_bigint) {
+      int64_t v = 0;
+      bool lossless = false;
+      st = napi_get_value_bigint_int64(env, value, &v, &lossless);
+      if (st != napi_ok || !lossless) {
+        return throw_error(env, "DECENTDB_ARGS", "BigInt value must fit in int64");
+      }
+      rc = api->bind_int64(w->stmt, idx, v);
+    } else if (t == napi_number) {
+      double dv = 0.0;
+      st = napi_get_value_double(env, value, &dv);
+      if (st != napi_ok) {
+        return throw_error(env, "DECENTDB_ARGS", "number binding is invalid");
+      }
+
+      if (isfinite(dv) && floor(dv) == dv &&
+          dv >= (double)INT64_MIN && dv <= (double)INT64_MAX) {
+        rc = api->bind_int64(w->stmt, idx, (int64_t)dv);
+      } else {
+        rc = api->bind_float64(w->stmt, idx, dv);
+      }
+    } else if (t == napi_boolean) {
+      bool bv = false;
+      st = napi_get_value_bool(env, value, &bv);
+      if (st != napi_ok) {
+        return throw_error(env, "DECENTDB_ARGS", "boolean binding is invalid");
+      }
+      rc = api->bind_bool(w->stmt, idx, bv ? 1 : 0);
+    } else if (t == napi_string) {
+      size_t len = 0;
+      st = napi_get_value_string_utf8(env, value, NULL, 0, &len);
+      if (st != napi_ok) {
+        return throw_error(env, "DECENTDB_ARGS", "string binding is invalid");
+      }
+      char* s = (char*)malloc(len + 1);
+      if (!s) {
+        return throw_error(env, "DECENTDB_OOM", "out of memory while binding string");
+      }
+      st = napi_get_value_string_utf8(env, value, s, len + 1, &len);
+      assert(st == napi_ok);
+      rc = api->bind_text(w->stmt, idx, s, (int)len);
+      free(s);
+    } else if (t == napi_object) {
+      bool is_buffer = false;
+      st = napi_is_buffer(env, value, &is_buffer);
+      assert(st == napi_ok);
+      if (is_buffer) {
+        void* data = NULL;
+        size_t len = 0;
+        st = napi_get_buffer_info(env, value, &data, &len);
+        if (st != napi_ok) {
+          return throw_error(env, "DECENTDB_ARGS", "buffer binding is invalid");
+        }
+        rc = api->bind_blob(w->stmt, idx, (const uint8_t*)data, (int)len);
+      } else {
+        bool is_typedarray = false;
+        st = napi_is_typedarray(env, value, &is_typedarray);
+        assert(st == napi_ok);
+        if (is_typedarray) {
+          napi_typedarray_type ta_type;
+          size_t ta_len = 0;
+          void* ta_data = NULL;
+          napi_value ta_arraybuffer;
+          size_t ta_offset = 0;
+          st = napi_get_typedarray_info(
+              env, value, &ta_type, &ta_len, &ta_data, &ta_arraybuffer, &ta_offset);
+          if (st != napi_ok) {
+            return throw_error(env, "DECENTDB_ARGS", "typed array binding is invalid");
+          }
+          rc = api->bind_blob(
+              w->stmt, idx, ((const uint8_t*)ta_data) + ta_offset, (int)ta_len);
+        } else {
+          return throw_error(env, "DECENTDB_ARGS", "unsupported object binding type");
+        }
+      }
+    } else {
+      return throw_error(env, "DECENTDB_ARGS", "unsupported binding type");
+    }
+
+    if (rc != 0) return throw_last_native_error(env, api);
+  }
+
+  rc = api->step(w->stmt);
+  if (rc < 0) return throw_last_native_error(env, api);
+
+  napi_value b;
+  st = napi_get_boolean(env, rc == 1, &b);
+  assert(st == napi_ok);
+  return b;
+}
+
 static napi_value js_stmt_column_names(napi_env env, napi_callback_info info) {
   const decentdb_native_api* api = require_api(env);
 
@@ -975,6 +1110,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"stmtBindDecimal", 0, js_stmt_bind_decimal, 0, 0, 0, napi_default, 0},
 
     {"stmtStep", 0, js_stmt_step, 0, 0, 0, napi_default, 0},
+    {"stmtStepWithParams", 0, js_stmt_step_with_params, 0, 0, 0, napi_default, 0},
     {"stmtNextAsync", 0, js_stmt_next_async, 0, 0, 0, napi_default, 0},
     {"stmtRowArray", 0, js_stmt_row_array, 0, 0, 0, napi_default, 0},
     {"stmtColumnNames", 0, js_stmt_column_names, 0, 0, 0, napi_default, 0},

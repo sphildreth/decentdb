@@ -49,11 +49,7 @@ class Client_DecentDB extends (Client ?? class {}) {
   async destroyRawConnection(connection) {
     if (connection && connection.__decentStmtCache instanceof Map) {
       for (const stmt of connection.__decentStmtCache.values()) {
-        try {
-          stmt.finalize();
-        } catch (error) {
-          // ignore finalize errors during connection teardown
-        }
+        stmt.finalize();
       }
       connection.__decentStmtCache.clear();
     }
@@ -89,19 +85,26 @@ class Client_DecentDB extends (Client ?? class {}) {
     }
 
     try {
-      stmt.reset();
-      stmt.clearBindings();
-      stmt.bindAll(bindings);
+      let hasRow;
+      if (typeof stmt.stepWithParams === 'function') {
+        hasRow = stmt.stepWithParams(bindings);
+      } else {
+        stmt.reset();
+        stmt.clearBindings();
+        stmt.bindAll(bindings);
+        hasRow = stmt.step();
+      }
 
       const colNames = stmt.columnNames();
       const rows = [];
-      while (stmt.step()) {
+      while (hasRow) {
         const row = stmt.rowArray();
         const rowObj = {};
         for (let i = 0; i < row.length; i++) {
           rowObj[colNames[i]] = row[i];
         }
         rows.push(rowObj);
+        hasRow = stmt.step();
       }
 
       // Mimic pg response format
@@ -121,26 +124,48 @@ class Client_DecentDB extends (Client ?? class {}) {
     const sql = this.positionBindings(obj.sql);
     const bindings = obj.bindings || [];
 
-    const stmt = connection.prepare(sql);
+    let stmt;
+    if (connection.__decentStmtCache instanceof Map) {
+      const cacheKey = `${sql}::stream`;
+      stmt = connection.__decentStmtCache.get(cacheKey);
+      if (!stmt) {
+        stmt = connection.prepare(sql);
+        connection.__decentStmtCache.set(cacheKey, stmt);
+      }
+    } else {
+      stmt = connection.prepare(sql);
+    }
+
     return new Promise((resolve, reject) => {
       stream.on('error', reject);
       stream.on('end', resolve);
 
       try {
-        stmt.bindAll(bindings);
+        let hasRow;
+        if (typeof stmt.stepWithParams === 'function') {
+          hasRow = stmt.stepWithParams(bindings);
+        } else {
+          stmt.reset();
+          stmt.clearBindings();
+          stmt.bindAll(bindings);
+          hasRow = stmt.step();
+        }
         const colNames = stmt.columnNames();
-        while (stmt.step()) {
+        while (hasRow) {
           const row = stmt.rowArray();
           const rowObj = {};
           for (let i = 0; i < row.length; i++) {
             rowObj[colNames[i]] = row[i];
           }
           stream.write(rowObj);
+          hasRow = stmt.step();
         }
       } catch (err) {
         stream.emit('error', err);
       } finally {
-        stmt.finalize();
+        if (!(connection.__decentStmtCache instanceof Map)) {
+          stmt.finalize();
+        }
       }
       stream.end();
     });

@@ -389,7 +389,44 @@ class Statement {
 
   int execute() {
     _invalidateExecution();
-    _run();
+    _checkNotDisposed();
+    final sqlPtr = _sql.toNativeUtf8();
+    final resultSlot = calloc<Pointer<DdbResult>>();
+    final encoded = _EncodedParams.fromValues(_params);
+    try {
+      final status = _bindings.dbExecute(
+        _dbPtr,
+        sqlPtr,
+        encoded.values,
+        encoded.length,
+        resultSlot,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to execute SQL');
+      }
+      final affectedRowsPtr = calloc<Uint64>();
+      try {
+        final affectedStatus =
+            _bindings.resultAffectedRows(resultSlot.value, affectedRowsPtr);
+        if (affectedStatus != ddbOk) {
+          _throwStatus(affectedStatus, 'Failed to read affected rows');
+        }
+        _affectedRows = affectedRowsPtr.value;
+      } finally {
+        calloc.free(affectedRowsPtr);
+      }
+
+      final freeStatus = _bindings.resultFree(resultSlot);
+      if (freeStatus != ddbOk) {
+        _throwStatus(freeStatus, 'Failed to free query result');
+      }
+      _cursor = 0;
+      _currentRow = -1;
+    } finally {
+      encoded.dispose();
+      calloc.free(resultSlot);
+      calloc.free(sqlPtr);
+    }
     return _affectedRows;
   }
 

@@ -28,3 +28,12 @@ This produces:
 - Windows: `target/debug/decentdb.dll`
 
 Then point the Node addon at it with `DECENTDB_NATIVE_LIB_PATH` (see package README).
+
+## Benchmarks
+
+- Native addon benchmark:
+  - `cd bindings/node/decentdb`
+  - `npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024`
+- Knex dialect benchmark:
+  - `cd bindings/node/knex-decentdb`
+  - `npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024`

@@ -47,6 +47,14 @@ The following package trees live under `bindings/`:
 - `bindings/node/`: low-level `decentdb/` package and `knex-decentdb/`
 - `bindings/dart/`: Dart package, native glue, scripts, and examples
 
+Benchmark entry points:
+
+- Go: `go run ./benchmarks/bench_fetch/main.go` (from `bindings/go/decentdb-go`)
+- Java: `./gradlew :driver:benchmarkFetch -PbenchmarkArgs="--count 100000"` (from `bindings/java`)
+- Node native: `npm run benchmark:fetch` (from `bindings/node/decentdb`)
+- Node Knex: `npm run benchmark:fetch` (from `bindings/node/knex-decentdb`)
+- Dart: `dart run benchmarks/bench_fetch.dart` (from `bindings/dart/dart`)
+
 ## Repository policy
 
 - Keep bindings aligned with the stable `ddb_*` C ABI in `include/decentdb.h`.

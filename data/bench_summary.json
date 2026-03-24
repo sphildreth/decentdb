@@ -1,24 +1,24 @@
 {
   "engines": {
     "decentdb": {
-      "read_p95_ms": 0.000811,
-      "join_p95_ms": 0.002194,
-      "commit_p95_ms": 3.001657,
-      "insert_rows_per_sec": 1911663.264033501,
+      "read_p95_ms": 0.000762,
+      "join_p95_ms": 0.002545,
+      "commit_p95_ms": 3.02066,
+      "insert_rows_per_sec": 1854204.6315064968,
       "db_size_mb": 0.515655517578125
     },
     "duckdb": {
-      "read_p95_ms": 0.151675,
-      "join_p95_ms": 0.327725,
-      "commit_p95_ms": 3.071617,
-      "insert_rows_per_sec": 7174.609635405203,
+      "read_p95_ms": 0.148198,
+      "join_p95_ms": 0.332974,
+      "commit_p95_ms": 3.065694,
+      "insert_rows_per_sec": 7108.2858979229995,
       "db_size_mb": 3.26171875
     },
     "sqlite": {
-      "read_p95_ms": 0.002445,
-      "join_p95_ms": 0.002334,
-      "commit_p95_ms": 3.020862,
-      "insert_rows_per_sec": 1850819.6428821287,
+      "read_p95_ms": 0.002374,
+      "join_p95_ms": 0.002344,
+      "commit_p95_ms": 3.016251,
+      "insert_rows_per_sec": 1850789.5329338282,
       "db_size_mb": 1.83203125
     }
   },
@@ -36,7 +36,7 @@
     "os": "linux",
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1774381487357",
+    "run_id": "1774387688169",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"

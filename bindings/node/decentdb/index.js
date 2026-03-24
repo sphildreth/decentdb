@@ -259,6 +259,10 @@ class Statement {
     }
   }
 
+  stepWithParams(bindings) {
+    return this._native.stmtStepWithParams(this._handle, bindings);
+  }
+
   step() {
     return this._native.stmtStep(this._handle);
   }

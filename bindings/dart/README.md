@@ -47,6 +47,27 @@ bindings/dart/scripts/run_tests.sh
 That script builds the shared library, runs `dart pub get`, and executes the
 package suite in `bindings/dart/dart/test/decentdb_test.dart`.
 
+## Run the Dart benchmark
+
+From the repository root:
+
+```bash
+cargo build -p decentdb --release
+cd bindings/dart/dart
+dart pub get
+DECENTDB_NATIVE_LIB=../../../target/release/libdecentdb.so dart run benchmarks/bench_fetch.dart --count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix dart_bench_fetch
+```
+
+Benchmark CLI options:
+
+- `--engine <all|decentdb|sqlite>`
+- `--count <n>`
+- `--point-reads <n>`
+- `--fetchmany-batch <n>`
+- `--point-seed <n>`
+- `--db-prefix <prefix>` (DecentDB writes `.ddb`, SQLite writes `.db`)
+- `--keep-db`
+
 ## Quick start
 
 ```dart

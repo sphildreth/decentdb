@@ -4,8 +4,8 @@ import 'dart:math';
 import 'package:decentdb/decentdb.dart';
 import 'package:sqlite3/sqlite3.dart' as sqlite;
 
-const int _defaultCount = 1_000_000;
-const int _defaultPointReads = 10_000;
+const int _defaultCount = 1000000;
+const int _defaultPointReads = 10000;
 const int _defaultPointSeed = 1337;
 const int _defaultFetchmanyBatch = 4096;
 
@@ -41,14 +41,18 @@ void _printUsage() {
   print('');
   print('Options:');
   print('  --engine <all|decentdb|sqlite>   Engines to run (default: all)');
-  print('  --count <n>                      Rows to insert/fetch (default: $_defaultCount)');
+  print(
+      '  --count <n>                      Rows to insert/fetch (default: $_defaultCount)');
   print(
       '  --fetchmany-batch <n>            Batch size for fetchmany metric (default: $_defaultFetchmanyBatch)');
   print(
       '  --point-reads <n>                Random indexed point lookups (default: $_defaultPointReads)');
-  print('  --point-seed <n>                 RNG seed for point lookups (default: $_defaultPointSeed)');
-  print('  --db-prefix <path_prefix>        Database prefix (default: dart_bench_fetch)');
-  print('                                   DecentDB uses .ddb and SQLite uses .db');
+  print(
+      '  --point-seed <n>                 RNG seed for point lookups (default: $_defaultPointSeed)');
+  print(
+      '  --db-prefix <path_prefix>        Database prefix (default: dart_bench_fetch)');
+  print(
+      '                                   DecentDB uses .ddb and SQLite uses .db');
   print('  --keep-db                        Keep generated DB files');
   print('  -h, --help                       Show help');
 }
@@ -94,7 +98,7 @@ _BenchResult _runDecentDbBenchmark(String dbPath, _Options options) {
       insertStmt.dispose();
     }
     insertWatch.stop();
-    final insertSeconds = insertWatch.elapsedMicroseconds / 1_000_000.0;
+    final insertSeconds = insertWatch.elapsedMicroseconds / 1000000.0;
     final insertRowsPerSecond = options.count / insertSeconds;
     print(
       'Insert ${options.count} rows: ${insertSeconds.toStringAsFixed(4)}s '
@@ -111,8 +115,9 @@ _BenchResult _runDecentDbBenchmark(String dbPath, _Options options) {
         'Expected ${options.count} rows from fetchall, got ${fetchallRows.length}',
       );
     }
-    final fetchallSeconds = fetchallWatch.elapsedMicroseconds / 1_000_000.0;
-    print('Fetchall ${options.count} rows: ${fetchallSeconds.toStringAsFixed(4)}s');
+    final fetchallSeconds = fetchallWatch.elapsedMicroseconds / 1000000.0;
+    print(
+        'Fetchall ${options.count} rows: ${fetchallSeconds.toStringAsFixed(4)}s');
 
     final fetchmanyStmt = db.prepare('SELECT id, val, f FROM bench');
     final fetchmanyWatch = Stopwatch()..start();
@@ -134,16 +139,15 @@ _BenchResult _runDecentDbBenchmark(String dbPath, _Options options) {
         'Expected ${options.count} rows from fetchmany, got $fetchmanyTotal',
       );
     }
-    final fetchmanySeconds = fetchmanyWatch.elapsedMicroseconds / 1_000_000.0;
+    final fetchmanySeconds = fetchmanyWatch.elapsedMicroseconds / 1000000.0;
     print(
       'Fetchmany(${options.fetchmanyBatch}) ${options.count} rows: '
       '${fetchmanySeconds.toStringAsFixed(4)}s',
     );
 
-    final pointStmt =
-        db.prepare(r'SELECT id, val, f FROM bench WHERE id = $1');
-    final pointIds =
-        _buildPointReadIds(options.count, options.pointReads, options.pointSeed);
+    final pointStmt = db.prepare(r'SELECT id, val, f FROM bench WHERE id = $1');
+    final pointIds = _buildPointReadIds(
+        options.count, options.pointReads, options.pointSeed);
     pointStmt.bindAll(<Object?>[pointIds[pointIds.length ~/ 2]]);
     final warmupRows = pointStmt.query();
     if (warmupRows.isEmpty) {
@@ -208,7 +212,8 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
 
     db.execute('BEGIN');
     try {
-      db.execute('INSERT INTO bench VALUES (?, ?, ?)', <Object?>[-1, '__warm__', -1.0]);
+      db.execute('INSERT INTO bench VALUES (?, ?, ?)',
+          <Object?>[-1, '__warm__', -1.0]);
       db.execute('ROLLBACK');
     } catch (_) {
       db.execute('ROLLBACK');
@@ -230,7 +235,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
       insertStmt.dispose();
     }
     insertWatch.stop();
-    final insertSeconds = insertWatch.elapsedMicroseconds / 1_000_000.0;
+    final insertSeconds = insertWatch.elapsedMicroseconds / 1000000.0;
     final insertRowsPerSecond = options.count / insertSeconds;
     print(
       'Insert ${options.count} rows: ${insertSeconds.toStringAsFixed(4)}s '
@@ -247,8 +252,9 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
         'Expected ${options.count} rows from fetchall, got ${fetchallRows.length}',
       );
     }
-    final fetchallSeconds = fetchallWatch.elapsedMicroseconds / 1_000_000.0;
-    print('Fetchall ${options.count} rows: ${fetchallSeconds.toStringAsFixed(4)}s');
+    final fetchallSeconds = fetchallWatch.elapsedMicroseconds / 1000000.0;
+    print(
+        'Fetchall ${options.count} rows: ${fetchallSeconds.toStringAsFixed(4)}s');
 
     final fetchmanyStmt =
         db.prepare('SELECT id, val, f FROM bench LIMIT ? OFFSET ?');
@@ -257,7 +263,8 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
     var offset = 0;
     try {
       while (true) {
-        final page = fetchmanyStmt.select(<Object?>[options.fetchmanyBatch, offset]);
+        final page =
+            fetchmanyStmt.select(<Object?>[options.fetchmanyBatch, offset]);
         if (page.isEmpty) {
           break;
         }
@@ -276,16 +283,17 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
         'Expected ${options.count} rows from fetchmany, got $fetchmanyTotal',
       );
     }
-    final fetchmanySeconds = fetchmanyWatch.elapsedMicroseconds / 1_000_000.0;
+    final fetchmanySeconds = fetchmanyWatch.elapsedMicroseconds / 1000000.0;
     print(
       'Fetchmany(${options.fetchmanyBatch}) ${options.count} rows: '
       '${fetchmanySeconds.toStringAsFixed(4)}s',
     );
 
     final pointStmt = db.prepare('SELECT id, val, f FROM bench WHERE id = ?');
-    final pointIds =
-        _buildPointReadIds(options.count, options.pointReads, options.pointSeed);
-    final warmupRows = pointStmt.select(<Object?>[pointIds[pointIds.length ~/ 2]]);
+    final pointIds = _buildPointReadIds(
+        options.count, options.pointReads, options.pointSeed);
+    final warmupRows =
+        pointStmt.select(<Object?>[pointIds[pointIds.length ~/ 2]]);
     if (warmupRows.isEmpty) {
       pointStmt.dispose();
       throw StateError('Warmup point read missed expected row');
@@ -387,7 +395,8 @@ void _printComparison(Map<String, _BenchResult> results) {
 
   for (final metric in metrics) {
     if (metric.decent == metric.sqlite) {
-      ties.add('${metric.name}: tie (${metric.formatter(metric.decent)}${metric.unit})');
+      ties.add(
+          '${metric.name}: tie (${metric.formatter(metric.decent)}${metric.unit})');
       continue;
     }
 
@@ -402,8 +411,7 @@ void _printComparison(Map<String, _BenchResult> results) {
       winner = decentWins ? metric.decent : metric.sqlite;
       loser = decentWins ? metric.sqlite : metric.decent;
       ratio = loser == 0 ? double.infinity : winner / loser;
-      detail =
-          '${metric.name}: ${metric.formatter(winner)}${metric.unit} vs '
+      detail = '${metric.name}: ${metric.formatter(winner)}${metric.unit} vs '
           '${metric.formatter(loser)}${metric.unit} '
           '(${ratio.toStringAsFixed(3)}x higher)';
     } else {
@@ -411,8 +419,7 @@ void _printComparison(Map<String, _BenchResult> results) {
       winner = decentWins ? metric.decent : metric.sqlite;
       loser = decentWins ? metric.sqlite : metric.decent;
       ratio = winner == 0 ? double.infinity : loser / winner;
-      detail =
-          '${metric.name}: ${metric.formatter(winner)}${metric.unit} vs '
+      detail = '${metric.name}: ${metric.formatter(winner)}${metric.unit} vs '
           '${metric.formatter(loser)}${metric.unit} '
           '(${ratio.toStringAsFixed(3)}x faster/lower)';
     }
