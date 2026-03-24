@@ -1,9 +1,13 @@
 using System.Diagnostics;
+using System.Globalization;
 using DecentDB.AdoNet;
 using DecentDB.EntityFrameworkCore;
 using DecentDB.MicroOrm;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+
+const int SeedRows = 1_000_000;
+const int BenchId = 123_456;
 
 static string MakeTempDbPath()
 {
@@ -14,6 +18,7 @@ static string MakeTempDbPath()
 static void DeleteDbFiles(string dbPath)
 {
     TryDelete(dbPath);
+    TryDelete(dbPath + ".wal");
     TryDelete(dbPath + "-wal");
 
     static void TryDelete(string p)
@@ -99,20 +104,25 @@ static void Seed(DecentDBConnection conn, int rows)
 
     var pId = cmd.CreateParameter();
     pId.ParameterName = "@id";
+    pId.DbType = System.Data.DbType.Int64;
     cmd.Parameters.Add(pId);
 
     var pName = cmd.CreateParameter();
     pName.ParameterName = "@name";
+    pName.DbType = System.Data.DbType.String;
     cmd.Parameters.Add(pName);
 
     var pAge = cmd.CreateParameter();
     pAge.ParameterName = "@age";
+    pAge.DbType = System.Data.DbType.Int32;
     cmd.Parameters.Add(pAge);
+
+    cmd.Prepare();
 
     for (var i = 1; i <= rows; i++)
     {
         pId.Value = i;
-        pName.Value = "person_" + i;
+        pName.Value = string.Concat("person_", i.ToString(CultureInfo.InvariantCulture));
         pAge.Value = i % 100;
         cmd.ExecuteNonQuery();
     }
@@ -126,7 +136,8 @@ try
     using var conn = new DecentDBConnection($"Data Source={dbPath}");
     conn.Open();
 
-    Seed(conn, rows: 10_000);
+    var seedMs = MeasureMs(() => Seed(conn, rows: SeedRows));
+    Console.WriteLine($"Seed rows={SeedRows:N0} in {seedMs:0.000}ms");
 
     Console.WriteLine("=== ADO.NET ===");
 
@@ -134,11 +145,13 @@ try
     byId.CommandText = "SELECT id, name, age FROM persons WHERE id = @id";
     var byIdParam = byId.CreateParameter();
     byIdParam.ParameterName = "@id";
+    byIdParam.DbType = System.Data.DbType.Int64;
     byId.Parameters.Add(byIdParam);
+    byId.Prepare();
 
     RunBench("Single record by ID", iterations: 200, warmup: 50, action: () =>
     {
-        byIdParam.Value = 1234;
+        byIdParam.Value = BenchId;
         using var reader = byId.ExecuteReader();
         if (!reader.Read()) throw new InvalidOperationException("missing row");
         _ = reader.GetInt64(0);
@@ -146,27 +159,33 @@ try
         _ = reader.GetInt32(2);
     });
 
+    using var countWithFilter = conn.CreateCommand();
+    countWithFilter.CommandText = "SELECT COUNT(*) FROM persons WHERE age >= @minAge";
+    var minAgeParam = countWithFilter.CreateParameter();
+    minAgeParam.ParameterName = "@minAge";
+    minAgeParam.DbType = System.Data.DbType.Int32;
+    countWithFilter.Parameters.Add(minAgeParam);
+    countWithFilter.Prepare();
+
     RunBench("Count with filter", iterations: 200, warmup: 50, action: () =>
     {
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(*) FROM persons WHERE age >= @minAge";
-        var p = cmd.CreateParameter();
-        p.ParameterName = "@minAge";
-        p.Value = 50;
-        cmd.Parameters.Add(p);
-        var v = cmd.ExecuteScalar();
+        minAgeParam.Value = 50;
+        var v = countWithFilter.ExecuteScalar();
         _ = Convert.ToInt64(v);
     });
 
+    using var filteredList = conn.CreateCommand();
+    filteredList.CommandText = "SELECT id, name, age FROM persons WHERE age >= @minAge ORDER BY id LIMIT 100";
+    var minAgeListParam = filteredList.CreateParameter();
+    minAgeListParam.ParameterName = "@minAge";
+    minAgeListParam.DbType = System.Data.DbType.Int32;
+    filteredList.Parameters.Add(minAgeListParam);
+    filteredList.Prepare();
+
     RunBench("Filtered list (100)", iterations: 100, warmup: 20, action: () =>
     {
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, name, age FROM persons WHERE age >= @minAge ORDER BY id LIMIT 100";
-        var p = cmd.CreateParameter();
-        p.ParameterName = "@minAge";
-        p.Value = 50;
-        cmd.Parameters.Add(p);
-        using var reader = cmd.ExecuteReader();
+        minAgeListParam.Value = 50;
+        using var reader = filteredList.ExecuteReader();
         while (reader.Read())
         {
             _ = reader.GetInt64(0);
@@ -183,7 +202,7 @@ try
 
     RunBench("GetAsync (by id)", iterations: 200, warmup: 50, action: () =>
     {
-        var p = persons.GetAsync(1234).GetAwaiter().GetResult();
+        var p = persons.GetAsync(BenchId).GetAwaiter().GetResult();
         if (p is null) throw new InvalidOperationException("missing row");
         _ = p.Name;
         _ = p.Age;
@@ -230,7 +249,7 @@ try
 
     RunBench("EF end-to-end (FirstOrDefault)", iterations: 200, warmup: 50, action: () =>
     {
-        var p = ef.Persons.Where(x => x.Id == 1234).Select(x => new { x.Id, x.Name, x.Age }).FirstOrDefault();
+        var p = ef.Persons.Where(x => x.Id == BenchId).Select(x => new { x.Id, x.Name, x.Age }).FirstOrDefault();
         if (p is null) throw new InvalidOperationException("missing row");
     });
 

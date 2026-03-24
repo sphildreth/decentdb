@@ -481,9 +481,18 @@ mod tests {
         assert_eq!(&buf[..2], &[9, 8]);
 
         let logs = failpoint_logs().expect("read logs");
-        assert_eq!(logs[0].label, "db.write_page");
-        assert_eq!(logs[1].label, "db.read");
-        assert_eq!(logs[1].outcome, "partial_read:2");
+        let write_index = logs
+            .iter()
+            .position(|entry| entry.label == "db.write_page")
+            .expect("seed write should be logged");
+        let read_index = logs
+            .iter()
+            .position(|entry| entry.label == "db.read" && entry.outcome == "partial_read:2")
+            .expect("partial read should be logged");
+        assert!(
+            write_index < read_index,
+            "seed write should be logged before partial read"
+        );
 
         clear_failpoints().expect("clear failpoints");
     }

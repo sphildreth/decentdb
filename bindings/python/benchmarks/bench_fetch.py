@@ -9,85 +9,105 @@ Usage:
     python bench_fetch.py
 """
 
-import decentdb
-import time
+import argparse
 import os
-import sys
+import time
+
+import decentdb
 
 
-def run_benchmark():
+def remove_if_exists(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def row_iter(count):
+    for i in range(count):
+        yield (i, f"value_{i}", float(i))
+
+
+def run_benchmark(db_path, count, fetchmany_batch):
     """
     Run fetch performance benchmarks.
 
-    Creates a temporary database, inserts 1M rows, then measures
-    the time to fetch all rows using fetchall() and fetchmany().
-    The database is cleaned up after the benchmark completes.
+    Creates a temporary database, inserts rows in one explicit transaction, then
+    measures fetchall() and fetchmany(batch_size). Cleans database files up.
     """
-    db_path = "bench_fetch.db"
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    wal_path = f"{db_path}.wal"
+    remove_if_exists(db_path)
+    remove_if_exists(wal_path)
 
+    print("Setting up data...")
     conn = decentdb.connect(db_path)
     cur = conn.cursor()
-
-    # Setup: create table and insert test data
-    print("Setting up data...")
     cur.execute("CREATE TABLE bench (id INT64, val TEXT, f FLOAT64)")
-
-    # Prepare 1M rows for insertion
-    # Note: Using executemany could be more efficient for batch inserts
-    count = 1000000
-    data = [(i, f"value_{i}", float(i)) for i in range(count)]
-
-    # Insert rows within a transaction for durability
     start_time = time.perf_counter()
     cur.execute("BEGIN")
-    for row in data:
-        cur.execute("INSERT INTO bench VALUES (?, ?, ?)", row)
-    cur.execute("COMMIT")
+    try:
+        cur.executemany("INSERT INTO bench VALUES (?, ?, ?)", row_iter(count))
+        cur.execute("COMMIT")
+    except Exception:
+        cur.execute("ROLLBACK")
+        raise
     end_time = time.perf_counter()
     print(f"Insert {count} rows: {end_time - start_time:.4f}s")
 
-    # Benchmark 1: fetchall() - retrieve all rows at once
-    # Reconnect to ensure a clean cursor state
-    conn.close()
-    conn = decentdb.connect(db_path)
     cur = conn.cursor()
-
     print("Benchmarking fetchall...")
     start_time = time.perf_counter()
     cur.execute("SELECT * FROM bench")
     rows = cur.fetchall()
     end_time = time.perf_counter()
-
     print(f"Fetchall {count} rows: {end_time - start_time:.4f}s")
     assert len(rows) == count
 
-    # Benchmark 2: fetchmany(batch_size) - retrieve rows in batches
-    # This approach can reduce memory pressure for large result sets
-    conn.close()
-    conn = decentdb.connect(db_path)
     cur = conn.cursor()
-
-    print("Benchmarking fetchmany(1000)...")
+    print(f"Benchmarking fetchmany({fetchmany_batch})...")
     start_time = time.perf_counter()
     cur.execute("SELECT * FROM bench")
     total = 0
     while True:
-        batch = cur.fetchmany(1000)
+        batch = cur.fetchmany(fetchmany_batch)
         if not batch:
             break
         total += len(batch)
     end_time = time.perf_counter()
-
-    print(f"Fetchmany(1000) {count} rows: {end_time - start_time:.4f}s")
+    print(f"Fetchmany({fetchmany_batch}) {count} rows: {end_time - start_time:.4f}s")
     assert total == count
 
-    # Cleanup: close connection and remove temporary database
     conn.close()
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    remove_if_exists(db_path)
+    remove_if_exists(wal_path)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Benchmark DecentDB Python fetch performance")
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1_000_000,
+        help="Number of rows to insert and fetch (default: 1000000)",
+    )
+    parser.add_argument(
+        "--fetchmany-batch",
+        type=int,
+        default=1000,
+        help="Batch size for fetchmany benchmark (default: 1000)",
+    )
+    parser.add_argument(
+        "--db-path",
+        default="bench_fetch.ddb",
+        help="Temporary benchmark database path (default: bench_fetch.ddb)",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_benchmark()
+    args = parse_args()
+    run_benchmark(
+        db_path=args.db_path,
+        count=args.count,
+        fetchmany_batch=args.fetchmany_batch,
+    )

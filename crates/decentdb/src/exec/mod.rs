@@ -510,20 +510,26 @@ impl EngineRuntime {
     }
 
     fn manifest_payload(&mut self) -> Result<&[u8]> {
-        let use_template = self.manifest_template.as_ref().is_some_and(|template| {
-            template.schema_cookie == self.catalog.schema_cookie
-                && template.table_state_offsets.len() == self.catalog.tables.len()
-                && self
-                    .catalog
-                    .tables
-                    .keys()
-                    .all(|table_name| template.table_state_offsets.contains_key(table_name))
-        });
+        let use_template =
+            self.manifest_template.as_ref().is_some_and(|template| {
+                template.schema_cookie == self.catalog.schema_cookie
+                    && template.table_next_row_id_offsets.len() == self.catalog.tables.len()
+                    && template.table_state_offsets.len() == self.catalog.tables.len()
+                    && self.catalog.tables.keys().all(|table_name| {
+                        template.table_next_row_id_offsets.contains_key(table_name)
+                    })
+                    && self
+                        .catalog
+                        .tables
+                        .keys()
+                        .all(|table_name| template.table_state_offsets.contains_key(table_name))
+            });
 
         if !use_template {
             let encoded = encode_manifest_payload_with_offsets(self, &self.persisted_tables)?;
             self.manifest_template = Some(ManifestTemplate {
                 schema_cookie: self.catalog.schema_cookie,
+                table_next_row_id_offsets: encoded.table_next_row_id_offsets,
                 table_state_offsets: encoded.table_state_offsets,
                 bytes: encoded.bytes,
             });
@@ -533,6 +539,19 @@ impl EngineRuntime {
             .manifest_template
             .as_mut()
             .ok_or_else(|| DbError::internal("manifest template was not initialized"))?;
+        for (table_name, offset) in &template.table_next_row_id_offsets {
+            let next_row_id = self
+                .catalog
+                .tables
+                .get(table_name)
+                .map(|table| table.next_row_id)
+                .ok_or_else(|| {
+                    DbError::internal(format!(
+                        "manifest next_row_id offset referenced unknown table {table_name}"
+                    ))
+                })?;
+            patch_manifest_table_next_row_id(&mut template.bytes, *offset, next_row_id)?;
+        }
         for (table_name, offset) in &template.table_state_offsets {
             let state = self
                 .persisted_tables
@@ -1696,6 +1715,7 @@ struct RootHeader {
 #[derive(Clone, Debug)]
 struct ManifestTemplate {
     schema_cookie: u32,
+    table_next_row_id_offsets: BTreeMap<String, usize>,
     table_state_offsets: BTreeMap<String, usize>,
     bytes: Vec<u8>,
 }
@@ -1703,6 +1723,7 @@ struct ManifestTemplate {
 #[derive(Clone, Debug)]
 struct ManifestEncoding {
     bytes: Vec<u8>,
+    table_next_row_id_offsets: BTreeMap<String, usize>,
     table_state_offsets: BTreeMap<String, usize>,
 }
 
@@ -2500,6 +2521,7 @@ fn encode_manifest_payload_with_offsets(
     table_states: &BTreeMap<String, PersistedTableState>,
 ) -> Result<ManifestEncoding> {
     let mut output = Vec::new();
+    let mut table_next_row_id_offsets = BTreeMap::new();
     let mut table_state_offsets = BTreeMap::new();
     output.extend_from_slice(MANIFEST_PAYLOAD_MAGIC);
     encode_u32(&mut output, runtime.catalog.schema_cookie);
@@ -2535,6 +2557,7 @@ fn encode_manifest_payload_with_offsets(
             encode_foreign_key(&mut output, foreign_key)?;
         }
         encode_strings(&mut output, &table.primary_key_columns)?;
+        table_next_row_id_offsets.insert(table.name.clone(), output.len());
         encode_i64(&mut output, table.next_row_id);
         table_state_offsets.insert(table.name.clone(), output.len());
         let state = table_states.get(&table.name).copied().unwrap_or_default();
@@ -2578,8 +2601,26 @@ fn encode_manifest_payload_with_offsets(
     }
     Ok(ManifestEncoding {
         bytes: output,
+        table_next_row_id_offsets,
         table_state_offsets,
     })
+}
+
+fn patch_manifest_table_next_row_id(
+    payload: &mut [u8],
+    offset: usize,
+    next_row_id: i64,
+) -> Result<()> {
+    let end = offset
+        .checked_add(8)
+        .ok_or_else(|| DbError::internal("manifest next_row_id offset overflow"))?;
+    if end > payload.len() {
+        return Err(DbError::internal(
+            "manifest next_row_id offset exceeded payload length",
+        ));
+    }
+    payload[offset..end].copy_from_slice(&next_row_id.to_le_bytes());
+    Ok(())
 }
 
 fn patch_manifest_table_state(
@@ -5062,6 +5103,40 @@ mod tests {
         assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
         assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
         assert_eq!(decoded.persisted_tables["docs"], table_states["docs"]);
+    }
+
+    #[test]
+    fn manifest_template_patch_updates_next_row_id() {
+        let mut runtime = EngineRuntime::empty(10);
+        execute_sql(&mut runtime, "CREATE TABLE docs (id INT64 PRIMARY KEY)");
+        runtime
+            .catalog
+            .tables
+            .get_mut("docs")
+            .expect("table should exist")
+            .next_row_id = 42;
+        let store = InMemoryPageStore::new(PAGE_SIZE);
+
+        let first_payload = runtime
+            .manifest_payload()
+            .expect("build first manifest payload")
+            .to_vec();
+        let first = decode_manifest_payload(&store, &first_payload).expect("decode first payload");
+        assert_eq!(first.catalog.tables["docs"].next_row_id, 42);
+
+        runtime
+            .catalog
+            .tables
+            .get_mut("docs")
+            .expect("table should exist")
+            .next_row_id = 99;
+        let second_payload = runtime
+            .manifest_payload()
+            .expect("build second manifest payload")
+            .to_vec();
+        let second =
+            decode_manifest_payload(&store, &second_payload).expect("decode second payload");
+        assert_eq!(second.catalog.tables["docs"].next_row_id, 99);
     }
 
     #[test]

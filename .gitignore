@@ -78,3 +78,7 @@ tests/bindings/**/*.node
 /bindings/**/*.so
 /bindings/**/*.a
 /bindings/**/*.node
+
+# Local DecentDB database artifacts
+*.ddb
+*.ddb.wal
