@@ -1351,6 +1351,15 @@ impl Db {
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        if let Some(prepared_insert) = prepared.prepared_insert.as_deref() {
+            if let Some(result) = self.try_execute_autocommit_prepared_insert_in_place(
+                prepared,
+                prepared_insert,
+                params,
+            )? {
+                return Ok(result);
+            }
+        }
         {
             let runtime = self
                 .inner
@@ -1358,14 +1367,6 @@ impl Db {
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
             self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
-            if let Some(prepared_insert) = prepared
-                .prepared_insert
-                .as_deref()
-                .filter(|plan| runtime.can_reuse_prepared_simple_insert(plan))
-            {
-                drop(runtime);
-                return self.execute_autocommit_prepared_insert_in_place(prepared_insert, params);
-            }
             if matches!(
                 prepared.statement.as_ref(),
                 crate::sql::ast::Statement::Insert(insert)
@@ -1463,6 +1464,57 @@ impl Db {
         self.execute_autocommit_in_place(|runtime| {
             runtime.execute_prepared_simple_insert(prepared, params, self.inner.config.page_size)
         })
+    }
+
+    fn try_execute_autocommit_prepared_insert_in_place(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_insert: &PreparedSimpleInsert,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_schema_cookie(prepared_statement, runtime.catalog.schema_cookie)?;
+        if !runtime.can_reuse_prepared_simple_insert(prepared_insert) {
+            return Ok(None);
+        }
+        let result = match runtime.execute_prepared_simple_insert(
+            prepared_insert,
+            params,
+            self.inner.config.page_size,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        self.begin_write()?;
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(runtime.catalog.clone())?;
+        }
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(Some(result))
     }
 
     fn execute_autocommit_in_place<F>(&self, apply: F) -> Result<QueryResult>

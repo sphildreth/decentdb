@@ -6,6 +6,7 @@
 
 use crate::error::{DbError, Result};
 use crate::record::compression::{decompress, maybe_compress, CompressionMode};
+use crate::storage::checksum::crc32c_parts;
 use crate::storage::page::{PageId, PageStore};
 
 const OVERFLOW_HEADER_SIZE: usize = 8;
@@ -115,6 +116,188 @@ pub(crate) fn rewrite_overflow<S: PageStore>(
         logical_len,
         flags,
     })
+}
+
+pub(crate) fn read_overflow_prefix<S: PageStore>(
+    store: &S,
+    pointer: OverflowPointer,
+    prefix_len: usize,
+) -> Result<Option<Vec<u8>>> {
+    if pointer.head_page_id == 0 || pointer.is_compressed() || prefix_len == 0 {
+        return Ok(None);
+    }
+
+    let mut page_id = pointer.head_page_id;
+    let mut prefix = Vec::with_capacity(prefix_len.min(pointer.logical_len as usize));
+    while page_id != 0 && prefix.len() < prefix_len {
+        let page = store.read_page(page_id)?;
+        if page.len() < OVERFLOW_HEADER_SIZE {
+            return Err(DbError::corruption("overflow page shorter than header"));
+        }
+        let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len"));
+        let chunk_end = OVERFLOW_HEADER_SIZE + chunk_len as usize;
+        if chunk_end > page.len() {
+            return Err(DbError::corruption(
+                "overflow chunk length exceeds page payload",
+            ));
+        }
+        let remaining = prefix_len.saturating_sub(prefix.len());
+        let take = remaining.min(chunk_len as usize);
+        prefix.extend_from_slice(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take]);
+        page_id = next_page_id;
+    }
+
+    Ok(Some(prefix))
+}
+
+pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
+    store: &mut S,
+    previous: OverflowPointer,
+    patch_offset: usize,
+    patch_bytes: &[u8],
+    appended: &[u8],
+) -> Result<(OverflowPointer, u32)> {
+    if previous.head_page_id == 0 {
+        return Err(DbError::internal(
+            "append_uncompressed_with_first_page_patch requires an existing overflow chain",
+        ));
+    }
+    if previous.is_compressed() {
+        return Err(DbError::internal(
+            "append_uncompressed_with_first_page_patch does not support compressed payloads",
+        ));
+    }
+
+    let page_size = store.page_size() as usize;
+    if page_size <= OVERFLOW_HEADER_SIZE {
+        return Err(DbError::internal("page size too small for overflow pages"));
+    }
+    let chunk_capacity = page_size - OVERFLOW_HEADER_SIZE;
+
+    let mut page_ids = Vec::new();
+    let mut pages = Vec::new();
+    let mut chunk_lens = Vec::new();
+    let mut page_id = previous.head_page_id;
+    let mut logical_len = 0_usize;
+    while page_id != 0 {
+        let page = store.read_page(page_id)?;
+        if page.len() < OVERFLOW_HEADER_SIZE {
+            return Err(DbError::corruption("overflow page shorter than header"));
+        }
+        let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len"));
+        let chunk_end = OVERFLOW_HEADER_SIZE + chunk_len as usize;
+        if chunk_end > page.len() {
+            return Err(DbError::corruption(
+                "overflow chunk length exceeds page payload",
+            ));
+        }
+        logical_len = logical_len.saturating_add(chunk_len as usize);
+        page_ids.push(page_id);
+        pages.push(page);
+        chunk_lens.push(chunk_len as usize);
+        page_id = next_page_id;
+    }
+
+    if logical_len != previous.logical_len as usize {
+        return Err(DbError::corruption(format!(
+            "overflow logical length mismatch: expected {}, read {}",
+            previous.logical_len, logical_len
+        )));
+    }
+    if page_ids.is_empty() {
+        return Err(DbError::corruption(
+            "overflow pointer referenced an empty page chain",
+        ));
+    }
+
+    let first_chunk_len = chunk_lens[0];
+    let patch_end = patch_offset.saturating_add(patch_bytes.len());
+    if patch_end > first_chunk_len {
+        return Err(DbError::corruption(
+            "first-page patch exceeded available overflow payload bytes",
+        ));
+    }
+    let patch_start = OVERFLOW_HEADER_SIZE + patch_offset;
+    pages[0][patch_start..patch_start + patch_bytes.len()].copy_from_slice(patch_bytes);
+
+    let mut remaining = appended;
+    let tail_index = page_ids.len() - 1;
+    if !remaining.is_empty() {
+        let tail_chunk_len = chunk_lens[tail_index];
+        let available = chunk_capacity.saturating_sub(tail_chunk_len);
+        if available > 0 {
+            let take = available.min(remaining.len());
+            let start = OVERFLOW_HEADER_SIZE + tail_chunk_len;
+            pages[tail_index][start..start + take].copy_from_slice(&remaining[..take]);
+            chunk_lens[tail_index] += take;
+            pages[tail_index][4..8].copy_from_slice(
+                &(u32::try_from(chunk_lens[tail_index])
+                    .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
+                .to_le_bytes(),
+            );
+            remaining = &remaining[take..];
+        }
+    }
+
+    let mut new_page_ids = Vec::new();
+    let mut new_pages = Vec::new();
+    if !remaining.is_empty() {
+        let mut source = remaining;
+        while !source.is_empty() {
+            let new_page_id = store.allocate_page()?;
+            let take = source.len().min(chunk_capacity);
+            let mut page = vec![0_u8; page_size];
+            page[4..8].copy_from_slice(
+                &(u32::try_from(take)
+                    .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?)
+                .to_le_bytes(),
+            );
+            page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + take].copy_from_slice(&source[..take]);
+            source = &source[take..];
+            new_page_ids.push(new_page_id);
+            new_pages.push(page);
+        }
+
+        pages[tail_index][0..4].copy_from_slice(&new_page_ids[0].to_le_bytes());
+        for index in 0..new_pages.len().saturating_sub(1) {
+            new_pages[index][0..4].copy_from_slice(&new_page_ids[index + 1].to_le_bytes());
+        }
+    }
+
+    let mut checksum_parts = Vec::with_capacity(pages.len() + new_pages.len());
+    for (page, chunk_len) in pages.iter().zip(chunk_lens.iter().copied()) {
+        checksum_parts.push(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]);
+    }
+    for page in &new_pages {
+        let chunk_len = u32::from_le_bytes(page[4..8].try_into().expect("header chunk len")) as usize;
+        checksum_parts.push(&page[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]);
+    }
+    let checksum = crc32c_parts(&checksum_parts);
+
+    if tail_index == 0 {
+        store.write_page(page_ids[0], &pages[0])?;
+    } else {
+        store.write_page(page_ids[0], &pages[0])?;
+        store.write_page(page_ids[tail_index], &pages[tail_index])?;
+    }
+    for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages.iter()) {
+        store.write_page(new_page_id, new_page)?;
+    }
+
+    Ok((
+        OverflowPointer {
+            head_page_id: previous.head_page_id,
+            logical_len: previous
+                .logical_len
+                .saturating_add(u32::try_from(appended.len()).map_err(|_| {
+                    DbError::constraint("overflow payload exceeds u32 logical length")
+                })?),
+            flags: previous.flags,
+        },
+        checksum,
+    ))
 }
 
 pub(crate) fn read_overflow<S: PageStore>(store: &S, pointer: OverflowPointer) -> Result<Vec<u8>> {
@@ -283,7 +466,10 @@ mod tests {
     use crate::record::compression::CompressionMode;
     use crate::storage::page::InMemoryPageStore;
 
-    use super::{free_overflow, read_overflow, rewrite_overflow, write_overflow};
+    use super::{
+        append_uncompressed_with_first_page_patch, free_overflow, read_overflow,
+        read_overflow_prefix, rewrite_overflow, write_overflow,
+    };
 
     #[test]
     fn overflow_roundtrip_and_release_are_deterministic() {
@@ -325,5 +511,35 @@ mod tests {
         assert_eq!(shrunk.head_page_id, pointer.head_page_id);
         assert_eq!(read_overflow(&store, shrunk).expect("read shrink"), shrink);
         assert!(store.allocated_page_count() < initial_allocated);
+    }
+
+    #[test]
+    fn append_uncompressed_with_patch_updates_first_page_and_tail() {
+        let mut store = InMemoryPageStore::default();
+        let mut payload = b"DDBTBL01".to_vec();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(b"seed-row");
+        let pointer =
+            write_overflow(&mut store, &payload, CompressionMode::Never).expect("write payload");
+
+        let prefix = read_overflow_prefix(&store, pointer, 12)
+            .expect("read prefix")
+            .expect("uncompressed prefix");
+        assert_eq!(&prefix[..8], b"DDBTBL01");
+        assert_eq!(u32::from_le_bytes(prefix[8..12].try_into().expect("count")), 1);
+
+        let (updated, checksum) = append_uncompressed_with_first_page_patch(
+            &mut store,
+            pointer,
+            8,
+            &2_u32.to_le_bytes(),
+            b"tail-row",
+        )
+        .expect("append and patch");
+        let decoded = read_overflow(&store, updated).expect("read updated payload");
+        assert_eq!(&decoded[..8], b"DDBTBL01");
+        assert_eq!(u32::from_le_bytes(decoded[8..12].try_into().expect("count")), 2);
+        assert!(decoded.ends_with(b"tail-row"));
+        assert_eq!(crate::storage::checksum::crc32c_parts(&[decoded.as_slice()]), checksum);
     }
 }

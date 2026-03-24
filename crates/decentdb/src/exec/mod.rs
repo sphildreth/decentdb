@@ -22,7 +22,10 @@ use crate::json::{parse_json, parse_json_path, JsonValue};
 use crate::planner;
 use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
-use crate::record::overflow::{free_overflow, read_overflow, rewrite_overflow, OverflowPointer};
+use crate::record::overflow::{
+    append_uncompressed_with_first_page_patch, free_overflow, read_overflow,
+    read_overflow_prefix, rewrite_overflow, OverflowPointer,
+};
 use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
@@ -360,7 +363,12 @@ impl EngineRuntime {
         } else {
             self.dirty_tables.iter().cloned().collect::<Vec<_>>()
         };
-        let mut table_states = self.persisted_tables.clone();
+        let removed_tables = self
+            .persisted_tables
+            .keys()
+            .filter(|table_name| !self.catalog.tables.contains_key(*table_name))
+            .cloned()
+            .collect::<Vec<_>>();
 
         {
             let mut store = DbTxnPageStore { db };
@@ -371,7 +379,7 @@ impl EngineRuntime {
                 let data = self.tables.get(&table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
-                let previous_pointer = table_states.get(&table_name).map_or(
+                let previous_pointer = self.persisted_tables.get(&table_name).map_or(
                     OverflowPointer {
                         head_page_id: 0,
                         logical_len: 0,
@@ -379,6 +387,49 @@ impl EngineRuntime {
                     },
                     |state| state.pointer,
                 );
+                if self.append_only_dirty_tables.contains(&table_name)
+                    && previous_pointer.head_page_id != 0
+                    && !previous_pointer.is_compressed()
+                {
+                    let prefix = read_overflow_prefix(
+                        &store,
+                        previous_pointer,
+                        TABLE_PAYLOAD_MAGIC.len() + 4,
+                    )?;
+                    if let Some(prefix) = prefix {
+                        if prefix.len() >= TABLE_PAYLOAD_MAGIC.len() + 4
+                            && prefix[..TABLE_PAYLOAD_MAGIC.len()] == *TABLE_PAYLOAD_MAGIC
+                        {
+                            let existing_count = u32::from_le_bytes(
+                                prefix[TABLE_PAYLOAD_MAGIC.len()..TABLE_PAYLOAD_MAGIC.len() + 4]
+                                    .try_into()
+                                    .expect("table payload row-count prefix"),
+                            ) as usize;
+                            if existing_count <= data.rows.len() {
+                                let appended_rows =
+                                    encode_appended_table_rows(data, existing_count)?;
+                                if !appended_rows.is_empty() {
+                                    let new_count = u32::try_from(data.rows.len()).map_err(|_| {
+                                        DbError::constraint("table row count exceeds u32")
+                                    })?;
+                                    let (pointer, checksum) =
+                                        append_uncompressed_with_first_page_patch(
+                                        &mut store,
+                                        previous_pointer,
+                                        TABLE_PAYLOAD_MAGIC.len(),
+                                        &new_count.to_le_bytes(),
+                                        &appended_rows,
+                                    )?;
+                                    self.persisted_tables.insert(
+                                        table_name.clone(),
+                                        PersistedTableState { pointer, checksum },
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 let payload = if self.append_only_dirty_tables.contains(&table_name)
                     && previous_pointer.head_page_id != 0
                 {
@@ -390,15 +441,22 @@ impl EngineRuntime {
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let pointer =
                     rewrite_overflow(&mut store, previous_pointer, &payload, CompressionMode::Auto)?;
-                table_states.insert(
+                self.persisted_tables.insert(
                     table_name.clone(),
                     PersistedTableState { pointer, checksum },
                 );
             }
+            for table_name in removed_tables {
+                let Some(state) = self.persisted_tables.remove(&table_name) else {
+                    continue;
+                };
+                if state.pointer.head_page_id != 0 {
+                    free_overflow(&mut store, state.pointer.head_page_id)?;
+                }
+            }
         }
-        table_states.retain(|table_name, _| self.catalog.tables.contains_key(table_name));
 
-        let manifest = encode_manifest_payload(self, &table_states)?;
+        let manifest = encode_manifest_payload(self, &self.persisted_tables)?;
         let checksum = crc32c_parts(&[manifest.as_slice()]);
         let previous_manifest_pointer = old_root.map_or(
             OverflowPointer {
@@ -427,20 +485,6 @@ impl EngineRuntime {
             },
         );
         db.write_page(page::CATALOG_ROOT_PAGE_ID, &root_page)?;
-
-        {
-            let mut store = DbTxnPageStore { db };
-            for (table_name, state) in &self.persisted_tables {
-                if self.catalog.tables.contains_key(table_name) {
-                    continue;
-                }
-                if state.pointer.head_page_id != 0 {
-                    free_overflow(&mut store, state.pointer.head_page_id)?;
-                }
-            }
-        }
-
-        self.persisted_tables = table_states;
         self.dirty_tables.clear();
         self.append_only_dirty_tables.clear();
         self.root_state = Some(RootHeader {
@@ -2621,6 +2665,26 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result<Vec<u8>> {
+    if existing_count > data.rows.len() {
+        return Err(DbError::internal(
+            "append-only table payload rewrite saw fewer rows than the previous persisted payload",
+        ));
+    }
+    if existing_count == data.rows.len() {
+        return Ok(Vec::new());
+    }
+
+    let mut appended = Vec::with_capacity((data.rows.len() - existing_count) * 32);
+    let mut encoded_row = Vec::with_capacity(64);
+    for row in data.rows.iter().skip(existing_count) {
+        encode_i64(&mut appended, row.row_id);
+        Row::encode_values_into(&row.values, &mut encoded_row)?;
+        encode_bytes(&mut appended, &encoded_row)?;
+    }
+    Ok(appended)
+}
+
 fn append_table_payload(mut previous: Vec<u8>, data: &TableData) -> Result<Vec<u8>> {
     if data.rows.is_empty() {
         return Ok(Vec::new());
@@ -2641,12 +2705,8 @@ fn append_table_payload(mut previous: Vec<u8>, data: &TableData) -> Result<Vec<u
             .try_into()
             .expect("row-count header length"),
     ) as usize;
-    if existing_count > data.rows.len() {
-        return Err(DbError::internal(
-            "append-only table payload rewrite saw fewer rows than the previous persisted payload",
-        ));
-    }
-    if existing_count == data.rows.len() {
+    let appended_rows = encode_appended_table_rows(data, existing_count)?;
+    if appended_rows.is_empty() {
         return Ok(previous);
     }
 
@@ -2655,12 +2715,7 @@ fn append_table_payload(mut previous: Vec<u8>, data: &TableData) -> Result<Vec<u
             .map_err(|_| DbError::constraint("table row count exceeds u32"))?
             .to_le_bytes(),
     );
-    let mut encoded_row = Vec::with_capacity(64);
-    for row in data.rows.iter().skip(existing_count) {
-        encode_i64(&mut previous, row.row_id);
-        Row::encode_values_into(&row.values, &mut encoded_row)?;
-        encode_bytes(&mut previous, &encoded_row)?;
-    }
+    previous.extend_from_slice(&appended_rows);
     Ok(previous)
 }
 
