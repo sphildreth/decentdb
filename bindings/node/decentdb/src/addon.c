@@ -351,6 +351,36 @@ static napi_value js_stmt_bind_int64(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+static napi_value js_stmt_bind_int64_number(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  assert(st == napi_ok);
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  int32_t idx;
+  st = napi_get_value_int32(env, argv[1], &idx);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "index must be an int");
+
+  int64_t v = 0;
+  st = napi_get_value_int64(env, argv[2], &v);
+  if (st != napi_ok) {
+    return throw_error(env, "DECENTDB_ARGS", "value must be a safe integer number");
+  }
+
+  int rc = api->bind_int64(w->stmt, idx, v);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value undef;
+  st = napi_get_undefined(env, &undef);
+  assert(st == napi_ok);
+  return undef;
+}
+
 static napi_value js_stmt_bind_bool(napi_env env, napi_callback_info info) {
   const decentdb_native_api* api = require_api(env);
 
@@ -937,6 +967,7 @@ static napi_value init(napi_env env, napi_value exports) {
 
     {"stmtBindNull", 0, js_stmt_bind_null, 0, 0, 0, napi_default, 0},
     {"stmtBindInt64", 0, js_stmt_bind_int64, 0, 0, 0, napi_default, 0},
+    {"stmtBindInt64Number", 0, js_stmt_bind_int64_number, 0, 0, 0, napi_default, 0},
     {"stmtBindBool", 0, js_stmt_bind_bool, 0, 0, 0, napi_default, 0},
     {"stmtBindFloat64", 0, js_stmt_bind_float64, 0, 0, 0, napi_default, 0},
     {"stmtBindText", 0, js_stmt_bind_text, 0, 0, 0, napi_default, 0},

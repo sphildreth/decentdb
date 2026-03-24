@@ -10,7 +10,6 @@ crates/decentdb/tests/         # engine integration tests
 crates/decentdb-cli/tests/     # CLI integration tests
 tests/harness/                 # crash/storage scenario runner + datasets
 tests/bindings/                # binding smoke/validation programs
-bindings/dart/dart/test/       # packaged Dart wrapper tests
 ```
 
 ## Core workspace validation
@@ -80,11 +79,49 @@ Binding smoke/validation programs live under `tests/bindings/`:
 See `tests/bindings/README.md` for the shared expectation that the Rust `cdylib`
 has been built first.
 
-## Dart package validation
+## Package-local binding suites
 
-The in-tree Dart package has its own suite in `bindings/dart/dart/test/`.
+Several language integrations also keep package-local tests under `bindings/`.
 
-Run it with:
+### .NET packages
+
+```bash
+cd bindings/dotnet
+dotnet test DecentDB.NET.sln -v minimal
+```
+
+### Python package
+
+```bash
+python3 -m pip install -e bindings/python
+pytest -q bindings/python/tests
+```
+
+### Go package
+
+```bash
+cd bindings/go/decentdb-go
+go test ./...
+```
+
+### Java / JDBC package
+
+```bash
+cd bindings/java
+./gradlew :driver:test
+```
+
+### Node packages
+
+```bash
+cd bindings/node/decentdb
+DECENTDB_NATIVE_LIB_PATH=/absolute/path/to/target/debug/libdecentdb.so npm test
+
+cd ../knex-decentdb
+DECENTDB_NATIVE_LIB_PATH=/absolute/path/to/target/debug/libdecentdb.so npm test
+```
+
+### Dart package
 
 ```bash
 bindings/dart/scripts/run_tests.sh
@@ -108,6 +145,8 @@ cargo bench -p decentdb
 - Add CLI integration tests under `crates/decentdb-cli/tests/`.
 - Add new crash/storage scenarios under `tests/harness/scenarios/`.
 - Add binding smoke coverage under `tests/bindings/<language>/`.
+- Add package-local binding tests under the relevant `bindings/<language>/`
+  tree when the change affects a shipped host-language surface.
 
 Every behavior-changing code change should include tests at the narrowest layer
 that proves the behavior.

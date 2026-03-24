@@ -188,6 +188,27 @@ function createSqliteKnexConfig(filename) {
       return Promise.resolve(obj);
     }
 
+    _stream(connection, obj, stream, options) {
+      if (!obj.sql) {
+        throw new Error('The query is empty');
+      }
+      return new Promise((resolve, reject) => {
+        stream.on('error', reject);
+        stream.on('end', resolve);
+
+        try {
+          const bindings = obj.bindings || [];
+          const stmt = connection.prepare(obj.sql);
+          for (const row of stmt.iterate(...bindings)) {
+            stream.write(row);
+          }
+        } catch (error) {
+          stream.emit('error', error);
+        }
+        stream.end();
+      });
+    }
+
     processResponse(obj) {
       if (obj.method === 'raw') {
         return obj.response;

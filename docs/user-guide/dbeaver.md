@@ -13,7 +13,7 @@ For JDBC driver details (URL format, properties, isolation mapping), see: [JDBC 
 | Component | Supported |
 |---|---|
 | DBeaver | 23.x+ (tested with Community Edition 25.3.x) |
-| Java | 17 LTS, 21 LTS (must be Java 17+ at runtime) |
+| Java | Java 17+ for the JDBC driver; Java 21 toolchain to build the DBeaver extension |
 | Platforms | Linux x86\_64/arm64 (including 64-bit Raspberry Pi OS), macOS x86\_64/arm64, Windows x86\_64 |
 
 GitHub Releases include native Linux `arm64` artifacts for 64-bit Raspberry Pi OS on Raspberry Pi
@@ -28,9 +28,9 @@ GitHub Releases include native Linux `arm64` artifacts for 64-bit Raspberry Pi O
 1. **Build the driver jar and native library** (or download a release):
    ```bash
    # From the repo root
-   cargo build_lib                          # builds build/libc_api.so
-   cd bindings/java/native && make           # builds build/libdecentdb_jni.so
-   cd ../.. && JAVA_HOME=<jdk17> ./gradlew :driver:jar   # builds driver/build/libs/decentdb-jdbc-*.jar
+   cargo build -p decentdb
+   cd bindings/java/native && make
+   cd .. && JAVA_HOME=<jdk17> ./gradlew :driver:jar
    ```
 
 2. **Open DBeaver → Database → Driver Manager → New**.
@@ -45,16 +45,16 @@ GitHub Releases include native Linux `arm64` artifacts for 64-bit Raspberry Pi O
    | Default Port | *(leave empty)* |
    | Category | SQL |
 
-4. In the **Libraries** tab, click **Add File** and select the `decentdb-jdbc-*.jar`.
+4. In the **Libraries** tab, click **Add File** and select the jar produced in
+   `bindings/java/driver/build/libs/`.
 
-5. Add the JVM flag so the JNI library can be found:
-   - Go to **DBeaver → Window → Preferences → Connections → Driver properties**.
-   - Or append to `dbeaver.ini`:
-     ```
-     -Djava.library.path=/absolute/path/to/build
-     ```
-   Alternatively, place `libdecentdb_jni.so` (and `libc_api.so`) on the system library path
-   (`LD_LIBRARY_PATH` on Linux, `DYLD_LIBRARY_PATH` on macOS).
+5. If you built the jar after `cargo build` and `make`, it already contains the
+   matching native libraries for the current OS/arch, so no extra JVM flags are
+   usually required. If you want DBeaver to use an external native build instead,
+   add this VM option to `dbeaver.ini`:
+   ```
+   -Ddecentdb.native.lib.dir=/absolute/path/to/target/debug
+   ```
 
 6. Click **OK** to save the driver.
 
@@ -65,9 +65,8 @@ The DecentDB DBeaver extension code lives in `bindings/java/dbeaver-extension/` 
 If you want to use the plugin today, build it from source:
 
 ```bash
-# From the repo root
 cd bindings/java
-JAVA_HOME=<jdk17> ./gradlew :dbeaver-extension:jar
+DBEAVER_PLUGIN_DIR=/path/to/dbeaver/plugins JAVA_HOME=<jdk21> ./gradlew :dbeaver-extension:jar
 ```
 
 #### Install location
@@ -89,10 +88,11 @@ You also need to add the bundle to `bundles.info` and start DBeaver once with `-
 1. Copy the jar into the app plugin directory:
 
     # From the DecentDB repo root
-    VERSION=1.8.1
+    PLUGIN_JAR=$(ls bindings/java/dbeaver-extension/build/libs/*.jar | head -n1)
+    VERSION=$(basename "$PLUGIN_JAR" | sed -E 's/.*-([0-9.]+)\.jar/\1/')
 
     sudo install -Dm644 \
-      bindings/java/dbeaver-extension/build/libs/dbeaver-extension-${VERSION}.jar \
+      "$PLUGIN_JAR" \
       /usr/lib/dbeaver/plugins/org.jkiss.dbeaver.ext.decentdb_${VERSION}.jar
 
 2. Add it to the bundle list:
@@ -200,15 +200,26 @@ After installation, verify the following:
 ### Native library fails to load
 
 ```
-UnsatisfiedLinkError: no decentdb_jni in java.library.path
+UnsatisfiedLinkError: Failed to load DecentDB native library
 ```
 
-- Confirm `libdecentdb_jni.so` (and `libc_api.so`) exist in the directory you passed via
-  `-Djava.library.path`.
-- On Linux, also ensure the directory is on `LD_LIBRARY_PATH` or that `libc_api.so` is on the
-  linker's rpath:
+- If you are using a source-built driver jar, rebuild it after:
   ```bash
-  export LD_LIBRARY_PATH=/path/to/build:$LD_LIBRARY_PATH
+  cargo build -p decentdb
+  cd bindings/java/native && make
+  cd .. && ./gradlew :driver:jar
+  ```
+- If you are using external native libraries, point the driver at the directory
+  containing `libdecentdb_jni.*` and `libdecentdb.*`:
+  ```text
+  -Ddecentdb.native.lib.dir=/absolute/path/to/target/debug
+  ```
+- You can also set `DECENTDB_NATIVE_LIB` to the full path of `libdecentdb_jni.*`
+  before launching DBeaver.
+- On Linux, if the JNI bridge still cannot resolve `libdecentdb.so`, ensure the
+  directory is also on `LD_LIBRARY_PATH`:
+  ```bash
+  export LD_LIBRARY_PATH=/path/to/target/debug:$LD_LIBRARY_PATH
   ```
 - On macOS, grant the library permission if Gatekeeper blocks it:
   ```bash

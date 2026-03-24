@@ -173,7 +173,7 @@ function runDecentDbBenchmark(dbPath, opts) {
       for (let i = 0; i < opts.count; i++) {
         insertStmt.reset();
         insertStmt.clearBindings();
-        insertStmt.bindAll([BigInt(i), `value_${i}`, i]);
+        insertStmt.bindAll([i, `value_${i}`, i]);
         insertStmt.step();
       }
       db.exec('COMMIT');
@@ -207,7 +207,6 @@ function runDecentDbBenchmark(dbPath, opts) {
       let total = 0;
       let pending = 0;
       while (fetchmanyStmt.step()) {
-        fetchmanyStmt.rowArray();
         pending++;
         if (pending === opts.fetchmanyBatch) {
           total += pending;
@@ -225,7 +224,7 @@ function runDecentDbBenchmark(dbPath, opts) {
 
     const pointIds = buildPointReadIds(opts.count, opts.pointReads, opts.pointSeed);
     const pointStmt = db.prepare('SELECT id, val, f FROM bench WHERE id = $1');
-    pointStmt.bindAll([BigInt(pointIds[Math.floor(pointIds.length / 2)])]);
+    pointStmt.bindAll([pointIds[Math.floor(pointIds.length / 2)]]);
     if (!pointStmt.step()) {
       pointStmt.finalize();
       throw new Error('Warmup point read missed expected row');
@@ -240,7 +239,7 @@ function runDecentDbBenchmark(dbPath, opts) {
         const started = process.hrtime.bigint();
         pointStmt.reset();
         pointStmt.clearBindings();
-        pointStmt.bindAll([BigInt(pointIds[i])]);
+        pointStmt.bindAll([pointIds[i]]);
         if (!pointStmt.step()) {
           throw new Error(`Point read missed id=${pointIds[i]}`);
         }

@@ -33,11 +33,9 @@ cargo clippy --workspace --all-targets --all-features
 cargo test --workspace
 ```
 
-If you touched the packaged Dart binding, also run:
-
-```bash
-bindings/dart/scripts/run_tests.sh
-```
+If you touched bindings or integration tooling, also run the relevant
+package-local suite and matching `tests/bindings/` smoke path described in the
+[testing guide](testing.md).
 
 If you touched the storage harness or crash behavior, run at least one relevant
 scenario from `tests/harness/scenarios/`.

@@ -237,7 +237,11 @@ class Statement {
       } else if (typeof v === 'number') {
         // Conservatively bind numbers as float64 unless they are safe integers.
         if (Number.isSafeInteger(v)) {
-          this._native.stmtBindInt64(this._handle, index1, BigInt(v));
+          if (typeof this._native.stmtBindInt64Number === 'function') {
+            this._native.stmtBindInt64Number(this._handle, index1, v);
+          } else {
+            this._native.stmtBindInt64(this._handle, index1, BigInt(v));
+          }
         } else {
           this._native.stmtBindFloat64(this._handle, index1, v);
         }

@@ -1,22 +1,15 @@
 # Binding Compatibility Matrix
 
-| Binding surface | Current scope | Source of truth |
+| Binding surface | Current in-tree scope | Source of truth |
 |---|---|---|
 | C ABI | Stable handle/result core surface | `include/decentdb.h`, `crates/decentdb/src/c_api.rs` |
-| Python | Validation suite over the C ABI | `tests/bindings/python/test_ffi.py` |
-| .NET | Validation suite over the C ABI | `tests/bindings/dotnet/Smoke/` |
-| Go | Release smoke over the C ABI | `tests/bindings/go/smoke.go` |
-| Java | Release smoke over the C ABI | `tests/bindings/java/Smoke.java` |
-| Node | Release smoke over the C ABI | `tests/bindings/node/` |
-| Dart smoke | Release smoke over the C ABI | `tests/bindings/dart/` |
-| Dart package | In-tree packaged wrapper validated against the C ABI | `bindings/dart/dart/`, `bindings/dart/dart/test/` |
+| .NET | `DecentDB.Native`, `DecentDB.AdoNet`, `DecentDB.MicroOrm`, EF Core provider family, plus smoke validation | `bindings/dotnet/src/`, `bindings/dotnet/tests/`, `tests/bindings/dotnet/Smoke/` |
+| Python | DB-API driver, SQLAlchemy dialect, import tools, plus direct native validation | `bindings/python/`, `bindings/python/tests/`, `tests/bindings/python/test_ffi.py` |
+| Go | `database/sql` driver, direct DecentDB helper API, plus release smoke | `bindings/go/decentdb-go/`, `tests/bindings/go/smoke.go` |
+| Java / JDBC | JDBC driver, JNI bridge, DBeaver extension, plus low-level FFM smoke | `bindings/java/driver/`, `bindings/java/native/`, `bindings/java/dbeaver-extension/`, `tests/bindings/java/Smoke.java` |
+| Node.js | `decentdb-native` addon/wrapper, `knex-decentdb` dialect, plus release smoke | `bindings/node/`, `tests/bindings/node/` |
+| Dart | Packaged FFI wrapper, examples, and release smoke | `bindings/dart/dart/`, `bindings/dart/examples/`, `tests/bindings/dart/` |
 
-DecentDB treats the C ABI as the authoritative native surface.
-Language-specific packages either validate that ABI directly or layer tested,
-idiomatic wrappers on top of it.
-
-For Dart specifically, there are now two checked layers:
-
-- `tests/bindings/dart/` for the narrow release smoke path
-- `bindings/dart/dart/` for the packaged `Database` / `Statement` / `Schema`
-  wrapper
+DecentDB treats the C ABI as the shared native boundary across bindings.
+`tests/bindings/` contains the narrow cross-language smoke or ABI validation
+paths, while the in-tree package implementations live under `bindings/`.

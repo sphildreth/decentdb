@@ -274,7 +274,8 @@ Add to execution engine:
 
 ## C API and Language Bindings
 
-DecentDB exposes a C API (`src/c_api.rs`) with 35+ functions for use by language bindings:
+DecentDB exposes a stable C API declared in `include/decentdb.h` and
+implemented in `crates/decentdb/src/c_api.rs`.
 
 | Binding | Interface | Notes |
 |---------|-----------|-------|
@@ -282,5 +283,10 @@ DecentDB exposes a C API (`src/c_api.rs`) with 35+ functions for use by language
 | [Go](../api/go.md) | `database/sql` driver + Direct API | CGO linking |
 | [Python](../api/python.md) | DB-API 2.0 + SQLAlchemy | ctypes loading |
 | [Node.js](../api/node.md) | N-API addon + Knex | Dynamic loading |
+| [Dart](../api/dart.md) | Dart FFI wrapper | `Database` / `Statement` / `Schema` package |
+| [JDBC](../api/jdbc.md) | JDBC driver + DBeaver extension | JNI bridge + packaged driver jar |
 
-All bindings support: schema introspection (list tables, columns, indexes), checkpoint, all data types, and auto-assigned IDs for a single INT64 primary key when omitted from INSERT.
+Bindings build on the same native surface and expose overlapping core features
+such as schema introspection, checkpointing, rich value types, and auto-assigned
+IDs for a single INT64 primary key when omitted from `INSERT`. The exact
+high-level API shape varies by language.

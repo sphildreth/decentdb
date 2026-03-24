@@ -11,6 +11,27 @@ The packaged wrapper exposes:
 - a Dart-side `Statement` convenience wrapper for parameter binding and paging
 - `Schema` helpers backed by metadata JSON exported from the stable C ABI
 
+## Use the packaged Dart API
+
+For application development, prefer the packaged `decentdb` Dart API instead of
+the smoke harness under `tests/bindings/dart/`.
+
+Published package releases and local path dependencies use the same package
+name: `decentdb`. From a source checkout, add it to your app with a path
+dependency such as:
+
+```yaml
+dependencies:
+  decentdb:
+    path: /path/to/decentdb/bindings/dart/dart
+```
+
+The Dart package still needs the DecentDB shared library at runtime. The
+easiest ways to provide that library are:
+
+- a DecentDB release bundle
+- or a local `cargo build -p decentdb`
+
 ## Build the native library
 
 From the repository root:
@@ -51,3 +72,4 @@ DECENTDB_NATIVE_LIB=../../../target/debug/libdecentdb.so dart test --reporter ex
 ```
 
 See `bindings/dart/README.md` for the higher-level package API and example code.
+Packaged examples also live under `bindings/dart/examples/`.

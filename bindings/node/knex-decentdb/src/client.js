@@ -41,10 +41,22 @@ class Client_DecentDB extends (Client ?? class {}) {
       throw new Error('DecentDB connection requires { filename }');
     }
     const options = conn.options || null;
-    return new Database({ path: filename, options });
+    const db = new Database({ path: filename, options });
+    db.__decentStmtCache = new Map();
+    return db;
   }
 
   async destroyRawConnection(connection) {
+    if (connection && connection.__decentStmtCache instanceof Map) {
+      for (const stmt of connection.__decentStmtCache.values()) {
+        try {
+          stmt.finalize();
+        } catch (error) {
+          // ignore finalize errors during connection teardown
+        }
+      }
+      connection.__decentStmtCache.clear();
+    }
     if (connection && typeof connection.close === 'function') {
       connection.close();
     }
@@ -65,53 +77,73 @@ class Client_DecentDB extends (Client ?? class {}) {
     const sql = this.positionBindings(obj.sql);
     const bindings = obj.bindings || [];
 
-    const stmt = connection.prepare(sql);
+    let stmt;
+    if (connection.__decentStmtCache instanceof Map) {
+      stmt = connection.__decentStmtCache.get(sql);
+      if (!stmt) {
+        stmt = connection.prepare(sql);
+        connection.__decentStmtCache.set(sql, stmt);
+      }
+    } else {
+      stmt = connection.prepare(sql);
+    }
+
     try {
+      stmt.reset();
+      stmt.clearBindings();
       stmt.bindAll(bindings);
-      
+
       const colNames = stmt.columnNames();
       const rows = [];
-      
-      for await (const row of stmt.rows()) {
+      while (stmt.step()) {
+        const row = stmt.rowArray();
         const rowObj = {};
         for (let i = 0; i < row.length; i++) {
           rowObj[colNames[i]] = row[i];
         }
         rows.push(rowObj);
       }
-      
+
       // Mimic pg response format
-      obj.response = { 
-        rows, 
-        rowCount: stmt.rowsAffected() 
+      obj.response = {
+        rows,
+        rowCount: stmt.rowsAffected()
       };
       return obj;
     } finally {
-      stmt.finalize();
+      if (!(connection.__decentStmtCache instanceof Map)) {
+        stmt.finalize();
+      }
     }
   }
 
-  async _stream(connection, obj, stream, options) {
+  _stream(connection, obj, stream, options) {
     const sql = this.positionBindings(obj.sql);
     const bindings = obj.bindings || [];
 
     const stmt = connection.prepare(sql);
-    try {
-      stmt.bindAll(bindings);
-      const colNames = stmt.columnNames();
-      for await (const row of stmt.rows()) {
-        const rowObj = {};
-        for (let i = 0; i < row.length; i++) {
-          rowObj[colNames[i]] = row[i];
+    return new Promise((resolve, reject) => {
+      stream.on('error', reject);
+      stream.on('end', resolve);
+
+      try {
+        stmt.bindAll(bindings);
+        const colNames = stmt.columnNames();
+        while (stmt.step()) {
+          const row = stmt.rowArray();
+          const rowObj = {};
+          for (let i = 0; i < row.length; i++) {
+            rowObj[colNames[i]] = row[i];
+          }
+          stream.write(rowObj);
         }
-        stream.write(rowObj);
+      } catch (err) {
+        stream.emit('error', err);
+      } finally {
+        stmt.finalize();
       }
       stream.end();
-    } catch (err) {
-      stream.emit('error', err);
-    } finally {
-      stmt.finalize();
-    }
+    });
   }
 
   processResponse(obj, runner) {
