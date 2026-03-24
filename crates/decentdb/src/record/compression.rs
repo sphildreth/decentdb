@@ -6,7 +6,7 @@ use miniz_oxide::inflate::decompress_to_vec_zlib;
 use crate::error::{DbError, Result};
 
 const AUTO_COMPRESSION_LEVEL: u8 = 1;
-const AUTO_MIN_PAYLOAD_BYTES: usize = 256;
+const AUTO_MIN_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompressionMode {
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn compression_roundtrip_preserves_bytes() {
-        let payload = b"repeat-me repeat-me repeat-me repeat-me repeat-me".repeat(64);
+        let payload = b"repeat-me repeat-me repeat-me repeat-me repeat-me".repeat(2_048);
         let compressed = maybe_compress(&payload, CompressionMode::Auto);
         assert!(compressed.compressed);
         assert_eq!(decompress(&compressed.bytes).expect("decompress"), payload);

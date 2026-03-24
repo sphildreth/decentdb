@@ -1,6 +1,27 @@
 //! CRC-32C checksum support for fixed database metadata.
 
 const CRC32C_POLYNOMIAL: u32 = 0x82F6_3B78;
+const CRC32C_TABLE: [u32; 256] = build_crc32c_table();
+
+const fn build_crc32c_table() -> [u32; 256] {
+    let mut table = [0_u32; 256];
+    let mut index = 0_usize;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0_u8;
+        while bit < 8 {
+            if crc & 1 == 1 {
+                crc = (crc >> 1) ^ CRC32C_POLYNOMIAL;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+}
 
 #[cfg(test)]
 #[must_use]
@@ -14,14 +35,8 @@ pub(crate) fn crc32c_parts(parts: &[&[u8]]) -> u32 {
 
     for part in parts {
         for byte in *part {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                if crc & 1 == 1 {
-                    crc = (crc >> 1) ^ CRC32C_POLYNOMIAL;
-                } else {
-                    crc >>= 1;
-                }
-            }
+            let table_index = ((crc ^ u32::from(*byte)) & 0xFF) as usize;
+            crc = (crc >> 8) ^ CRC32C_TABLE[table_index];
         }
     }
 

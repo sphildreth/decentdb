@@ -87,5 +87,7 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
         }
     }
 
+    wal.inner.checkpoint_epoch.fetch_add(1, Ordering::AcqRel);
+
     Ok(())
 }

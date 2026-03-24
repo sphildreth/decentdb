@@ -37,9 +37,11 @@ pub(crate) struct SharedWalInner {
     index: Mutex<WalIndex>,
     wal_end_lsn: AtomicU64,
     max_page_count: AtomicU32,
+    allocated_len: AtomicU64,
     write_lock: Mutex<()>,
     reader_registry: ReaderRegistry,
     checkpoint_pending: AtomicBool,
+    checkpoint_epoch: AtomicU64,
 }
 
 impl WalHandle {
@@ -94,6 +96,10 @@ impl WalHandle {
 
     pub(crate) fn latest_snapshot(&self) -> u64 {
         self.inner.wal_end_lsn.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn checkpoint_epoch(&self) -> u64 {
+        self.inner.checkpoint_epoch.load(Ordering::Acquire)
     }
 
     pub(crate) fn begin_reader(&self) -> Result<ReaderGuard> {

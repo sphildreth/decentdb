@@ -71,6 +71,7 @@ fn build_handle(
     let file = vfs.open(&wal_path, mode, FileKind::Wal)?;
     let (index, end_lsn, recovered_max_page_id) =
         recovery::initialize_or_recover(&file, page_size)?;
+    let allocated_len = file.file_size()?;
 
     Ok(WalHandle {
         inner: Arc::new(SharedWalInner {
@@ -81,9 +82,11 @@ fn build_handle(
             index: Mutex::new(index),
             wal_end_lsn: AtomicU64::new(end_lsn),
             max_page_count: AtomicU32::new(recovered_max_page_id),
+            allocated_len: AtomicU64::new(allocated_len),
             write_lock: Mutex::new(()),
             reader_registry: ReaderRegistry::default(),
             checkpoint_pending: AtomicBool::new(false),
+            checkpoint_epoch: AtomicU64::new(0),
         }),
     })
 }

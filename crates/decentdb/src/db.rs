@@ -157,6 +157,7 @@ struct DbInner {
     catalog: CatalogHandle,
     engine: RwLock<EngineRuntime>,
     last_runtime_lsn: AtomicU64,
+    last_seen_checkpoint_epoch: AtomicU64,
     sql_write_lock: Mutex<()>,
     sql_txn: Mutex<SqlTxnSlot>,
     write_txn: Mutex<WriteTxn>,
@@ -749,12 +750,7 @@ impl Db {
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_id = pages.iter().map(|(page_id, _)| *page_id).max().unwrap_or(0);
-        let max_page_count = self
-            .inner
-            .pager
-            .on_disk_page_count()?
-            .max(self.inner.wal.max_page_count())
-            .max(max_page_id);
+        let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
         self.inner.wal.commit_pages(pages, max_page_count)
     }
 
@@ -776,12 +772,7 @@ impl Db {
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_id = pages.iter().map(|(page_id, _)| *page_id).max().unwrap_or(0);
-        let max_page_count = self
-            .inner
-            .pager
-            .on_disk_page_count()?
-            .max(self.inner.wal.max_page_count())
-            .max(max_page_id);
+        let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
         self.inner
             .wal
             .commit_pages_if_latest(pages, max_page_count, expected_latest_lsn)
@@ -1235,6 +1226,7 @@ impl Db {
         wal.set_max_page_count(pager.on_disk_page_count()?);
         let (runtime, runtime_lsn) = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
         let catalog = CatalogHandle::new(runtime.catalog.clone());
+        let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
 
         Ok(Self {
             inner: Arc::new(DbInner {
@@ -1246,6 +1238,7 @@ impl Db {
                 catalog,
                 engine: RwLock::new(runtime),
                 last_runtime_lsn: AtomicU64::new(runtime_lsn),
+                last_seen_checkpoint_epoch: AtomicU64::new(last_seen_checkpoint_epoch),
                 sql_write_lock: Mutex::new(()),
                 sql_txn: Mutex::new(SqlTxnSlot::None),
                 write_txn: Mutex::new(WriteTxn::default()),
@@ -1654,16 +1647,26 @@ impl Db {
 
     fn refresh_engine_from_storage(&self) -> Result<()> {
         let latest_lsn = self.inner.wal.latest_snapshot();
-        let cached_header = self.inner.pager.header_snapshot()?;
-        let on_disk_header = self.inner.pager.header_from_disk()?;
-        let checkpoint_advanced =
-            on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn;
-        if latest_lsn <= self.inner.last_runtime_lsn.load(Ordering::Acquire) && !checkpoint_advanced
-        {
+        let latest_checkpoint_epoch = self.inner.wal.checkpoint_epoch();
+        let last_runtime_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let last_seen_checkpoint_epoch = self
+            .inner
+            .last_seen_checkpoint_epoch
+            .load(Ordering::Acquire);
+
+        if latest_lsn <= last_runtime_lsn && latest_checkpoint_epoch == last_seen_checkpoint_epoch {
             return Ok(());
         }
-        if checkpoint_advanced {
-            self.inner.pager.refresh_from_disk(on_disk_header)?;
+
+        if latest_checkpoint_epoch != last_seen_checkpoint_epoch {
+            let cached_header = self.inner.pager.header_snapshot()?;
+            let on_disk_header = self.inner.pager.header_from_disk()?;
+            if on_disk_header.last_checkpoint_lsn != cached_header.last_checkpoint_lsn {
+                self.inner.pager.refresh_from_disk(on_disk_header)?;
+            }
+            self.inner
+                .last_seen_checkpoint_epoch
+                .store(latest_checkpoint_epoch, Ordering::Release);
         }
 
         let schema_cookie = self.current_schema_cookie()?;

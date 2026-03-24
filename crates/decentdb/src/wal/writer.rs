@@ -17,6 +17,8 @@ use super::index::WalVersion;
 use super::recovery;
 use super::WalHandle;
 
+const WAL_PREALLOC_CHUNK_BYTES: u64 = 64 << 20;
+
 pub(crate) fn commit_pages(
     wal: &WalHandle,
     pages: Vec<(PageId, Vec<u8>)>,
@@ -50,11 +52,12 @@ pub(crate) fn commit_pages(
         ));
     }
     next_lsn += append_commit_frame(&mut batch) as u64;
+    let metadata_changed = ensure_capacity(wal, offset + batch.len() as u64)?;
     write_all_at(wal.inner.file.as_ref(), offset, &batch)?;
     offset = next_lsn;
 
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
-    sync_for_mode(wal.inner.sync_mode, wal)?;
+    sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
 
     let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
     {
@@ -116,11 +119,12 @@ pub(crate) fn commit_pages_if_latest(
         ));
     }
     next_lsn += append_commit_frame(&mut batch) as u64;
+    let metadata_changed = ensure_capacity(wal, offset + batch.len() as u64)?;
     write_all_at(wal.inner.file.as_ref(), offset, &batch)?;
     offset = next_lsn;
 
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
-    sync_for_mode(wal.inner.sync_mode, wal)?;
+    sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
 
     let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
     {
@@ -149,27 +153,52 @@ pub(crate) fn append_checkpoint_frame(wal: &WalHandle, checkpoint_lsn: u64) -> R
 
     let frame = WalFrame::checkpoint(checkpoint_lsn);
     let bytes = frame.encode(wal.inner.page_size)?;
+    let metadata_changed = ensure_capacity(wal, offset + bytes.len() as u64)?;
     write_all_at(wal.inner.file.as_ref(), offset, &bytes)?;
     offset += bytes.len() as u64;
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
-    sync_for_mode(wal.inner.sync_mode, wal)?;
+    sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
     wal.inner.wal_end_lsn.store(offset, Ordering::Release);
     Ok(offset)
 }
 
 pub(crate) fn truncate_to_header(wal: &WalHandle) -> Result<()> {
     recovery::truncate_to_header(&wal.inner.file, wal.inner.page_size)?;
-    sync_for_mode(wal.inner.sync_mode, wal)?;
+    sync_for_mode(wal.inner.sync_mode, wal, true)?;
     wal.inner.wal_end_lsn.store(0, Ordering::Release);
+    wal.inner
+        .allocated_len
+        .store(WAL_HEADER_SIZE, Ordering::Release);
     Ok(())
 }
 
-fn sync_for_mode(sync_mode: WalSyncMode, wal: &WalHandle) -> Result<()> {
+fn sync_for_mode(sync_mode: WalSyncMode, wal: &WalHandle, metadata_changed: bool) -> Result<()> {
     match sync_mode {
-        WalSyncMode::Full => wal.inner.file.sync_metadata(),
+        WalSyncMode::Full => {
+            if metadata_changed {
+                wal.inner.file.sync_metadata()
+            } else {
+                wal.inner.file.sync_data()
+            }
+        }
         WalSyncMode::Normal => wal.inner.file.sync_data(),
         WalSyncMode::TestingOnlyUnsafeNoSync => Ok(()),
     }
+}
+
+fn ensure_capacity(wal: &WalHandle, required_len: u64) -> Result<bool> {
+    let current_len = wal.inner.allocated_len.load(Ordering::Acquire);
+    if current_len >= required_len {
+        return Ok(false);
+    }
+    let target_len = required_len
+        .div_ceil(WAL_PREALLOC_CHUNK_BYTES)
+        .saturating_mul(WAL_PREALLOC_CHUNK_BYTES);
+    wal.inner.file.set_len(target_len)?;
+    wal.inner
+        .allocated_len
+        .store(target_len, Ordering::Release);
+    Ok(true)
 }
 
 fn append_page_frame(

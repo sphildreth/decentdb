@@ -356,7 +356,7 @@ impl EngineRuntime {
         if prepared.use_generic_index_updates {
             self.apply_insert_index_updates(index_updates)?;
         }
-        self.mark_table_dirty(table_name);
+        self.mark_table_append_dirty(table_name);
         Ok(QueryResult::with_affected_rows(1))
     }
 
@@ -1355,6 +1355,57 @@ fn apply_prepared_insert_index_updates(
     check_unique: bool,
 ) -> Result<()> {
     for index in &prepared.insert_indexes {
+        if index.int64_key {
+            let [column_index] = index.column_indexes.as_slice() else {
+                return Err(DbError::internal(
+                    "typed INT64 prepared index expected exactly one indexed column",
+                ));
+            };
+            let Value::Int64(key) = row
+                .values
+                .get(*column_index)
+                .ok_or_else(|| DbError::internal("row is shorter than prepared insert plan"))?
+            else {
+                return Err(DbError::internal(
+                    "typed INT64 prepared index expected an INT64 value",
+                ));
+            };
+            let Some(super::RuntimeIndex::Btree { keys }) = runtime.indexes.get_mut(&index.name)
+            else {
+                return Err(DbError::internal(format!(
+                    "runtime index {} is missing",
+                    index.name
+                )));
+            };
+            match keys {
+                super::RuntimeBtreeKeys::UniqueInt64(entries) => {
+                    if check_unique && index.unique {
+                        if entries.insert(*key, row.row_id).is_some() {
+                            return Err(DbError::constraint(format!(
+                                "unique constraint {} on {} was violated",
+                                index.name, prepared.table_name
+                            )));
+                        }
+                    } else if entries.insert(*key, row.row_id).is_some() {
+                        return Err(DbError::internal(format!(
+                            "unique runtime BTREE index {} received a duplicate key insert",
+                            index.name
+                        )));
+                    }
+                }
+                super::RuntimeBtreeKeys::NonUniqueInt64(entries) => {
+                    entries.entry(*key).or_default().push(row.row_id);
+                }
+                _ => {
+                    return Err(DbError::internal(format!(
+                        "runtime index {} did not use typed INT64 keys as expected",
+                        index.name
+                    )))
+                }
+            }
+            continue;
+        }
+
         if index.unique && prepared_index_contains_null(index, &row.values) {
             continue;
         }

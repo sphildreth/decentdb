@@ -11,6 +11,7 @@ pub(crate) mod txn;
 pub(crate) mod views;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::time::Instant;
 
 use crate::catalog::{
@@ -21,7 +22,7 @@ use crate::json::{parse_json, parse_json_path, JsonValue};
 use crate::planner;
 use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
-use crate::record::overflow::{read_overflow, write_overflow, OverflowPointer};
+use crate::record::overflow::{free_overflow, read_overflow, rewrite_overflow, OverflowPointer};
 use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
@@ -56,6 +57,27 @@ pub(crate) struct TableData {
     pub(crate) rows: Vec<StoredRow>,
 }
 
+impl TableData {
+    fn row_by_id(&self, row_id: i64) -> Option<&StoredRow> {
+        if let Some(index) = row_id
+            .checked_sub(1)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            if let Some(row) = self.rows.get(index) {
+                if row.row_id == row_id {
+                    return Some(row);
+                }
+            }
+        }
+
+        if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
+            return self.rows.get(index);
+        }
+
+        self.rows.iter().find(|row| row.row_id == row_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PersistedTableState {
     pub(crate) pointer: OverflowPointer,
@@ -81,12 +103,42 @@ pub(crate) enum RuntimeBtreeKey {
     Int64(i64),
 }
 
+#[derive(Default)]
+pub(crate) struct Int64IdentityHasher(u64);
+
+impl Hasher for Int64IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Runtime INT64 index keys are hashed via write_i64/write_u64. This fallback
+        // preserves determinism for any incidental byte-oriented hashing.
+        let mut hash = 0_u64;
+        for (shift, byte) in bytes.iter().copied().take(8).enumerate() {
+            hash |= u64::from(byte) << (shift * 8);
+        }
+        self.0 = hash;
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.0 = value as u64;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type Int64HashBuilder = BuildHasherDefault<Int64IdentityHasher>;
+type Int64Map<V> = HashMap<i64, V, Int64HashBuilder>;
+
 #[derive(Clone, Debug)]
 pub(crate) enum RuntimeBtreeKeys {
     UniqueEncoded(BTreeMap<Vec<u8>, i64>),
     NonUniqueEncoded(BTreeMap<Vec<u8>, Vec<i64>>),
-    UniqueInt64(HashMap<i64, i64>),
-    NonUniqueInt64(HashMap<i64, Vec<i64>>),
+    UniqueInt64(Int64Map<i64>),
+    NonUniqueInt64(Int64Map<Vec<i64>>),
 }
 
 impl RuntimeBtreeKeys {
@@ -215,6 +267,8 @@ pub(crate) struct EngineRuntime {
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     pub(crate) dirty_tables: BTreeSet<String>,
+    pub(crate) append_only_dirty_tables: BTreeSet<String>,
+    root_state: Option<RootHeader>,
     pub(crate) index_state_epoch: u64,
 }
 
@@ -246,6 +300,8 @@ impl EngineRuntime {
             indexes: BTreeMap::new(),
             persisted_tables: BTreeMap::new(),
             dirty_tables: BTreeSet::new(),
+            append_only_dirty_tables: BTreeSet::new(),
+            root_state: None,
             index_state_epoch: 0,
         }
     }
@@ -263,27 +319,31 @@ impl EngineRuntime {
             snapshot_lsn,
         };
         let root_page = store.read_page(page::CATALOG_ROOT_PAGE_ID)?;
-        let Some(root) = decode_root_header(&root_page)? else {
-            return Ok((Self::empty(schema_cookie), snapshot_lsn));
-        };
-        let payload = if root.pointer.logical_len == 0 || root.pointer.head_page_id == 0 {
-            Vec::new()
-        } else {
-            read_overflow(&store, root.pointer)?
-        };
-        if crc32c_parts(&[payload.as_slice()]) != root.payload_checksum {
-            return Err(DbError::corruption("catalog state checksum mismatch"));
-        }
-        let mut runtime = if payload.is_empty() {
-            Self::empty(root.schema_cookie)
-        } else if payload.starts_with(LEGACY_RUNTIME_PAYLOAD_MAGIC) {
-            let mut runtime = decode_runtime_payload(&payload)?;
-            runtime.mark_all_tables_dirty();
+        let root = decode_root_header(&root_page)?;
+        let mut runtime = if let Some(root) = root {
+            let payload = if root.pointer.logical_len == 0 || root.pointer.head_page_id == 0 {
+                Vec::new()
+            } else {
+                read_overflow(&store, root.pointer)?
+            };
+            if crc32c_parts(&[payload.as_slice()]) != root.payload_checksum {
+                return Err(DbError::corruption("catalog state checksum mismatch"));
+            }
+            let mut runtime = if payload.is_empty() {
+                Self::empty(root.schema_cookie)
+            } else if payload.starts_with(LEGACY_RUNTIME_PAYLOAD_MAGIC) {
+                let mut runtime = decode_runtime_payload(&payload)?;
+                runtime.mark_all_tables_dirty();
+                runtime
+            } else if payload.starts_with(MANIFEST_PAYLOAD_MAGIC) {
+                decode_manifest_payload(&store, &payload)?
+            } else {
+                return Err(DbError::corruption("unknown catalog state payload magic"));
+            };
+            runtime.root_state = Some(root);
             runtime
-        } else if payload.starts_with(MANIFEST_PAYLOAD_MAGIC) {
-            decode_manifest_payload(&store, &payload)?
         } else {
-            return Err(DbError::corruption("unknown catalog state payload magic"));
+            Self::empty(schema_cookie)
         };
         runtime.catalog.schema_cookie = schema_cookie;
         runtime.rebuild_indexes(pager.page_size())?;
@@ -292,15 +352,15 @@ impl EngineRuntime {
     }
 
     pub(crate) fn persist_to_db(&mut self, db: &crate::db::Db) -> Result<()> {
-        let old_root_page = db.read_page(page::CATALOG_ROOT_PAGE_ID)?;
-        let old_root = decode_root_header(&old_root_page)?;
+        let old_root = self.root_state;
+        let schema_cookie_changed =
+            old_root.is_none_or(|root| root.schema_cookie != self.catalog.schema_cookie);
         let dirty_tables = if self.persisted_tables.is_empty() {
             self.catalog.tables.keys().cloned().collect::<Vec<_>>()
         } else {
             self.dirty_tables.iter().cloned().collect::<Vec<_>>()
         };
         let mut table_states = self.persisted_tables.clone();
-        let mut rewritten_old_heads = Vec::new();
 
         {
             let mut store = DbTxnPageStore { db };
@@ -311,42 +371,51 @@ impl EngineRuntime {
                 let data = self.tables.get(&table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
-                let payload = encode_table_payload(data)?;
-                let checksum = crc32c_parts(&[payload.as_slice()]);
-                let pointer = if payload.is_empty() {
+                let previous_pointer = table_states.get(&table_name).map_or(
                     OverflowPointer {
                         head_page_id: 0,
                         logical_len: 0,
                         flags: 0,
-                    }
+                    },
+                    |state| state.pointer,
+                );
+                let payload = if self.append_only_dirty_tables.contains(&table_name)
+                    && previous_pointer.head_page_id != 0
+                {
+                    let previous_payload = read_overflow(&store, previous_pointer)?;
+                    append_table_payload(previous_payload, data)?
                 } else {
-                    write_overflow(&mut store, &payload, CompressionMode::Auto)?
+                    encode_table_payload(data)?
                 };
-                if let Some(previous) = table_states.insert(
+                let checksum = crc32c_parts(&[payload.as_slice()]);
+                let pointer =
+                    rewrite_overflow(&mut store, previous_pointer, &payload, CompressionMode::Auto)?;
+                table_states.insert(
                     table_name.clone(),
                     PersistedTableState { pointer, checksum },
-                ) {
-                    if previous.pointer.head_page_id != 0
-                        && previous.pointer.head_page_id != pointer.head_page_id
-                    {
-                        rewritten_old_heads.push(previous.pointer.head_page_id);
-                    }
-                }
+                );
             }
         }
         table_states.retain(|table_name, _| self.catalog.tables.contains_key(table_name));
 
         let manifest = encode_manifest_payload(self, &table_states)?;
         let checksum = crc32c_parts(&[manifest.as_slice()]);
-        let pointer = if manifest.is_empty() {
+        let previous_manifest_pointer = old_root.map_or(
             OverflowPointer {
                 head_page_id: 0,
                 logical_len: 0,
                 flags: 0,
-            }
-        } else {
+            },
+            |root| root.pointer,
+        );
+        let pointer = {
             let mut store = DbTxnPageStore { db };
-            write_overflow(&mut store, &manifest, CompressionMode::Never)?
+            rewrite_overflow(
+                &mut store,
+                previous_manifest_pointer,
+                &manifest,
+                CompressionMode::Never,
+            )?
         };
 
         let root_page = encode_root_header(
@@ -361,32 +430,27 @@ impl EngineRuntime {
 
         {
             let mut store = DbTxnPageStore { db };
-            if let Some(old_root) = old_root {
-                if old_root.pointer.head_page_id != 0
-                    && old_root.pointer.head_page_id != pointer.head_page_id
-                {
-                    crate::record::overflow::free_overflow(
-                        &mut store,
-                        old_root.pointer.head_page_id,
-                    )?;
-                }
-            }
-            for old_head in rewritten_old_heads {
-                crate::record::overflow::free_overflow(&mut store, old_head)?;
-            }
             for (table_name, state) in &self.persisted_tables {
                 if self.catalog.tables.contains_key(table_name) {
                     continue;
                 }
                 if state.pointer.head_page_id != 0 {
-                    crate::record::overflow::free_overflow(&mut store, state.pointer.head_page_id)?;
+                    free_overflow(&mut store, state.pointer.head_page_id)?;
                 }
             }
         }
 
         self.persisted_tables = table_states;
         self.dirty_tables.clear();
-        db.set_schema_cookie(self.catalog.schema_cookie)?;
+        self.append_only_dirty_tables.clear();
+        self.root_state = Some(RootHeader {
+            schema_cookie: self.catalog.schema_cookie,
+            payload_checksum: checksum,
+            pointer,
+        });
+        if schema_cookie_changed {
+            db.set_schema_cookie(self.catalog.schema_cookie)?;
+        }
         Ok(())
     }
 
@@ -435,6 +499,15 @@ impl EngineRuntime {
     }
 
     pub(crate) fn rebuild_stale_indexes(&mut self, page_size: u32) -> Result<()> {
+        if self
+            .catalog
+            .indexes
+            .iter()
+            .all(|(name, index)| index.fresh && self.indexes.contains_key(name))
+        {
+            return Ok(());
+        }
+
         let names = self
             .catalog
             .indexes
@@ -462,15 +535,27 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_table_dirty(&mut self, table_name: &str) {
+        self.append_only_dirty_tables.remove(table_name);
         if self.dirty_tables.contains(table_name) {
             return;
         }
         self.dirty_tables.insert(table_name.to_string());
     }
 
+    pub(super) fn mark_table_append_dirty(&mut self, table_name: &str) {
+        if self.append_only_dirty_tables.contains(table_name)
+            || self.dirty_tables.contains(table_name)
+        {
+            return;
+        }
+        self.dirty_tables.insert(table_name.to_string());
+        self.append_only_dirty_tables.insert(table_name.to_string());
+    }
+
     pub(super) fn mark_all_tables_dirty(&mut self) {
         self.dirty_tables
             .extend(self.catalog.tables.keys().cloned());
+        self.append_only_dirty_tables.clear();
     }
 
     pub(super) fn prepare_insert_index_updates(
@@ -1226,10 +1311,7 @@ impl EngineRuntime {
                     probe_table: right_binding,
                     probe_join_column: right_join.column,
                     filtered_on_left: true,
-                    on,
                 },
-                params,
-                ctes,
             );
         }
 
@@ -1256,10 +1338,7 @@ impl EngineRuntime {
                     probe_table: left_binding,
                     probe_join_column: left_join.column,
                     filtered_on_left: false,
-                    on,
                 },
-                params,
-                ctes,
             );
         }
 
@@ -1308,8 +1387,6 @@ impl EngineRuntime {
     fn indexed_inner_join_filtered(
         &self,
         plan: IndexedJoinPlan<'_>,
-        params: &[Value],
-        ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Option<Dataset>> {
         let filtered_table = self
             .table_schema(plan.filtered_table.name)
@@ -1324,10 +1401,10 @@ impl EngineRuntime {
             .ok_or_else(|| {
                 DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
             })?;
+        let empty_probe_data = TableData::default();
         let probe_data = self
             .table_data(plan.probe_table.name)
-            .cloned()
-            .unwrap_or_default();
+            .unwrap_or(&empty_probe_data);
         let filtered_join_index = filtered_table
             .columns
             .iter()
@@ -1385,13 +1462,10 @@ impl EngineRuntime {
             if row_ids.is_empty() {
                 continue;
             }
-            let probe_dataset = self.dataset_from_row_ids(
-                probe_table,
-                &probe_data,
-                plan.probe_table.alias,
-                &row_ids,
-            )?;
-            for probe_row in &probe_dataset.rows {
+            for row_id in row_ids {
+                let Some(probe_row) = probe_data.row_by_id(row_id).map(|row| &row.values) else {
+                    continue;
+                };
                 let mut row = if plan.filtered_on_left {
                     filtered_row.clone()
                 } else {
@@ -1402,16 +1476,7 @@ impl EngineRuntime {
                 } else {
                     row.extend(filtered_row.clone());
                 }
-                let dataset = Dataset {
-                    columns: columns.clone(),
-                    rows: Vec::new(),
-                };
-                if matches!(
-                    self.eval_expr(plan.on, &dataset, &row, params, ctes, None)?,
-                    Value::Bool(true)
-                ) {
-                    rows.push(row);
-                }
+                rows.push(row);
             }
         }
         Ok(Some(Dataset { columns, rows }))
@@ -1501,10 +1566,7 @@ impl EngineRuntime {
         let rows = row_ids
             .iter()
             .filter_map(|row_id| {
-                data.rows
-                    .iter()
-                    .find(|row| row.row_id == *row_id)
-                    .map(|row| row.values.clone())
+                data.row_by_id(*row_id).map(|row| row.values.clone())
             })
             .collect::<Vec<_>>();
         Ok(Dataset {
@@ -1835,7 +1897,7 @@ fn build_runtime_index(
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
             if index.unique && int64_keys {
-                let mut keys = HashMap::<i64, i64>::new();
+                let mut keys = Int64Map::<i64>::default();
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, row)? else {
                         continue;
@@ -1877,7 +1939,7 @@ fn build_runtime_index(
                     keys: RuntimeBtreeKeys::UniqueEncoded(keys),
                 })
             } else if int64_keys {
-                let mut keys = HashMap::<i64, Vec<i64>>::new();
+                let mut keys = Int64Map::<Vec<i64>>::default();
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, row)? else {
                         continue;
@@ -2559,6 +2621,49 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+fn append_table_payload(mut previous: Vec<u8>, data: &TableData) -> Result<Vec<u8>> {
+    if data.rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if previous.is_empty() {
+        return encode_table_payload(data);
+    }
+    let count_offset = TABLE_PAYLOAD_MAGIC.len();
+    if previous.len() < count_offset + 4 {
+        return Err(DbError::corruption("table payload header is truncated"));
+    }
+    if previous[..count_offset] != *TABLE_PAYLOAD_MAGIC {
+        return Err(DbError::corruption("table payload magic is invalid"));
+    }
+
+    let existing_count = u32::from_le_bytes(
+        previous[count_offset..count_offset + 4]
+            .try_into()
+            .expect("row-count header length"),
+    ) as usize;
+    if existing_count > data.rows.len() {
+        return Err(DbError::internal(
+            "append-only table payload rewrite saw fewer rows than the previous persisted payload",
+        ));
+    }
+    if existing_count == data.rows.len() {
+        return Ok(previous);
+    }
+
+    previous[count_offset..count_offset + 4].copy_from_slice(
+        &u32::try_from(data.rows.len())
+            .map_err(|_| DbError::constraint("table row count exceeds u32"))?
+            .to_le_bytes(),
+    );
+    let mut encoded_row = Vec::with_capacity(64);
+    for row in data.rows.iter().skip(existing_count) {
+        encode_i64(&mut previous, row.row_id);
+        Row::encode_values_into(&row.values, &mut encoded_row)?;
+        encode_bytes(&mut previous, &encoded_row)?;
+    }
+    Ok(previous)
+}
+
 fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
     if bytes.is_empty() {
         return Ok(TableData::default());
@@ -2841,7 +2946,6 @@ struct IndexedJoinPlan<'a> {
     probe_table: TableBindingRef<'a>,
     probe_join_column: &'a str,
     filtered_on_left: bool,
-    on: &'a Expr,
 }
 
 fn simple_join_equality(on: &Expr) -> Option<(QualifiedColumnRef<'_>, QualifiedColumnRef<'_>)> {
@@ -4600,7 +4704,6 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use crate::record::compression::CompressionMode;
-    use crate::record::overflow::write_overflow;
     use crate::search::TrigramQueryResult;
     use crate::sql::parser::parse_sql_statement;
     use crate::storage::page::InMemoryPageStore;
@@ -4736,8 +4839,9 @@ mod tests {
         let mut store = InMemoryPageStore::new(PAGE_SIZE);
         let table_payload =
             encode_table_payload(&runtime.tables["docs"]).expect("encode table payload");
-        let pointer = write_overflow(&mut store, &table_payload, CompressionMode::Auto)
-            .expect("write table payload");
+        let pointer =
+            crate::record::overflow::write_overflow(&mut store, &table_payload, CompressionMode::Auto)
+                .expect("write table payload");
         let mut table_states = runtime.persisted_tables.clone();
         table_states.insert(
             "docs".to_string(),
