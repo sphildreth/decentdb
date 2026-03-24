@@ -183,11 +183,13 @@ public final class NativeLibLoader {
     private static String[] dependentLibCandidateNames() {
         // These are extracted best-effort; the exact core library filename varies by OS/build.
         return new String[]{
+            "libdecentdb.so",
+            "libdecentdb.dylib",
+            "decentdb.dll",
             "libc_api.so",
             "libc_api.dylib",
             "libc_api.dll",
             "c_api.dll",
-            "decentdb.dll",
         };
     }
 }

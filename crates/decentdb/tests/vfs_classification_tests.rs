@@ -23,7 +23,7 @@ fn test_database_write_header_classification_through_db_failpoint() {
 
     // Write exactly 128 bytes at offset 0 - should trigger header write failpoint
     db.begin_write().expect("begin write");
-    let result = db.write_page(0, &vec![0xAA; 128]);
+    let result = db.write_page(0, &[0xAA; 128]);
     db.commit().expect("commit write");
     assert!(
         result.is_err(),
@@ -50,7 +50,7 @@ fn test_database_write_page_classification_through_db_failpoint() {
 
     // Write 100 bytes at offset 0 - should trigger page write failpoint
     db.begin_write().expect("begin write");
-    let result = db.write_page(0, &vec![0xAA; 100]);
+    let result = db.write_page(0, &[0xAA; 100]);
     db.commit().expect("commit write");
     assert!(
         result.is_err(),
@@ -77,7 +77,7 @@ fn test_database_write_at_non_zero_offset_classified_as_page() {
 
     // Write at offset 1000 - should be classified as page write regardless of size
     db.begin_write().expect("begin write");
-    let result = db.write_page(1000, &vec![0xAA; 200]); // > 128 bytes but at offset > 0
+    let result = db.write_page(1000, &[0xAA; 200]); // > 128 bytes but at offset > 0
     db.commit().expect("commit write");
     assert!(
         result.is_err(),
@@ -111,7 +111,7 @@ fn test_wal_write_classifications_through_db_failpoint() {
 
     let db2 = Db::open_or_create(":memory:", DbConfig::default()).expect("open db2");
     db2.begin_write().expect("begin write");
-    let result = db2.write_page(1, &vec![0xBB; 100]); // Page write at offset 1
+    let result = db2.write_page(1, &[0xBB; 100]); // Page write at offset 1
     db2.commit().expect("commit write");
     assert!(result.is_err(), "Page write should trigger failpoint");
 

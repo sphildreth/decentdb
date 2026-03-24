@@ -5,7 +5,7 @@
   "description": "Knex client/dialect for DecentDB",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "npm --prefix ../decentdb run build --silent && node --test test/*.test.js"
   },
   "peerDependencies": {
     "knex": ">=2"

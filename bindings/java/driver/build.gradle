@@ -26,7 +26,7 @@ test {
     useJUnitPlatform()
     // Native library path for integration tests
     def nativeLibDir = project.findProperty('nativeLibDir') ?:
-        "${rootProject.projectDir}/../../build"
+        "${rootProject.projectDir}/../../target/debug"
     systemProperty 'decentdb.native.lib.dir', nativeLibDir
     testLogging {
         events 'passed', 'skipped', 'failed'
@@ -50,17 +50,41 @@ jar {
     def archDir = (arch == 'amd64' || arch == 'x86_64') ? 'x86_64' : ((arch == 'aarch64' || arch == 'arm64') ? 'aarch64' : arch)
     def nativeDir = "native/${osDir}-${archDir}"
 
-    from("${rootProject.projectDir}/../../build") {
+    from("${rootProject.projectDir}/../../target/debug") {
         into nativeDir
         include 'libdecentdb_jni.so'
         include 'libdecentdb_jni.dylib'
         include 'decentdb_jni.dll'
 
         // Core DecentDB C API library name varies by OS/build.
+        include 'libdecentdb.so'
+        include 'libdecentdb.dylib'
+        include 'decentdb.dll'
         include 'libc_api.so'
         include 'libc_api.dylib'
         include 'libc_api.dll'
         include 'c_api.dll'
-        include 'decentdb.dll'
     }
+}
+
+def repoRoot = file("${rootProject.projectDir}/../..")
+def nativeLibDirPath = project.findProperty('nativeLibDir') ?:
+    "${rootProject.projectDir}/../../target/debug"
+
+tasks.register('buildRustNative', Exec) {
+    workingDir repoRoot
+    commandLine 'cargo', 'build', '-p', 'decentdb'
+}
+
+tasks.register('buildJniNative', Exec) {
+    workingDir "${rootProject.projectDir}/native"
+    commandLine 'make', "DECENTDB_LIB_DIR=${nativeLibDirPath}"
+}
+
+tasks.named('buildJniNative') {
+    dependsOn tasks.named('buildRustNative')
+}
+
+tasks.named('test') {
+    dependsOn tasks.named('buildJniNative')
 }

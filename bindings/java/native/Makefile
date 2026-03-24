@@ -5,17 +5,17 @@
 #
 # Usage:
 #   make                        # Build for current platform
-#   make DECENTDB_LIB_DIR=...   # Point to directory containing libc_api.so
+#   make DECENTDB_LIB_DIR=...   # Point to directory containing libdecentdb.so
 #
 # Prerequisites:
 #   - JDK with jni.h in $JAVA_HOME/include
-#   - DecentDB shared library: run `nimble build_lib` first from the repo root
+#   - DecentDB shared library: run `cargo build -p decentdb` first from the repo root
 #
-# Output: build/libdecentdb_jni.so (Linux), build/libdecentdb_jni.dylib (macOS)
+# Output: target/debug/libdecentdb_jni.so (Linux), target/debug/libdecentdb_jni.dylib (macOS)
 
 JAVA_HOME ?= $(shell java -XshowSettings:all -version 2>&1 | grep "java.home" | awk '{print $$3}')
-DECENTDB_LIB_DIR ?= $(shell p=$$(realpath ../../../build 2>/dev/null || echo ../../../build); cygpath -m "$$p" 2>/dev/null || echo "$$p")
-BUILD_DIR = $(shell p=$$(realpath ../../../build 2>/dev/null || echo ../../../build); cygpath -m "$$p" 2>/dev/null || echo "$$p")
+DECENTDB_LIB_DIR ?= $(shell p=$$(realpath ../../../target/debug 2>/dev/null || echo ../../../target/debug); cygpath -m "$$p" 2>/dev/null || echo "$$p")
+BUILD_DIR = $(DECENTDB_LIB_DIR)
 
 OS := $(shell uname -s)
 ARCH := $(shell uname -m)
@@ -60,21 +60,18 @@ else
 endif
 
 ifeq ($(IS_WINDOWS),1)
-    # build_lib produces build/c_api.dll on Windows.
-    # Nim (mingw) may also produce build/libc_api.dll.a (import lib).
+    # Rust cdylib typically produces target/debug/decentdb.dll on Windows.
     ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libdecentdb.dll.a))
         DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libdecentdb.dll.a
     else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.lib))
         DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.lib
-    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/libc_api.dll.a))
-        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/libc_api.dll.a
-    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/c_api.dll))
-        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/c_api.dll
+    else ifneq (,$(wildcard $(DECENTDB_LIB_DIR)/decentdb.dll))
+        DECENTDB_LINK_FLAGS = $(DECENTDB_LIB_DIR)/decentdb.dll
     else
-        DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
+        DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -ldecentdb
     endif
 else
-    DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -lc_api
+    DECENTDB_LINK_FLAGS = -L$(DECENTDB_LIB_DIR) -ldecentdb
 endif
 
 .PHONY: all clean

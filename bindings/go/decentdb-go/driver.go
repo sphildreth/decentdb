@@ -1,7 +1,9 @@
 package decentdb
 
 /*
-#cgo LDFLAGS: -L${SRCDIR}/../../../build -lc_api -Wl,-rpath,${SRCDIR}/../../../build
+#cgo linux LDFLAGS: -L${SRCDIR}/../../../target/debug -ldecentdb -Wl,-rpath,${SRCDIR}/../../../target/debug
+#cgo darwin LDFLAGS: -L${SRCDIR}/../../../target/debug -ldecentdb -Wl,-rpath,${SRCDIR}/../../../target/debug
+#cgo windows LDFLAGS: -L${SRCDIR}/../../../target/debug -ldecentdb
 #include "decentdb.h"
 #include <stdlib.h>
 #include <string.h>
@@ -148,7 +150,9 @@ func (d *DB) SaveAs(destPath string) error { return d.c.SaveAs(destPath) }
 func (d *DB) ListTables() ([]string, error) { return d.c.ListTables() }
 
 // GetTableColumns returns column metadata for a given table.
-func (d *DB) GetTableColumns(tableName string) ([]ColumnInfo, error) { return d.c.GetTableColumns(tableName) }
+func (d *DB) GetTableColumns(tableName string) ([]ColumnInfo, error) {
+	return d.c.GetTableColumns(tableName)
+}
 
 // ListIndexes returns metadata about all indexes.
 func (d *DB) ListIndexes() ([]IndexInfo, error) { return d.c.ListIndexes() }
@@ -283,21 +287,33 @@ func (c *conn) ListTables() ([]string, error) {
 	defer C.decentdb_free(unsafe.Pointer(ptr))
 	jsonStr := C.GoStringN(ptr, outLen)
 	var tables []string
-	if err := json.Unmarshal([]byte(jsonStr), &tables); err != nil {
+	if err := json.Unmarshal([]byte(jsonStr), &tables); err == nil {
+		return tables, nil
+	}
+	var tableObjects []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &tableObjects); err != nil {
 		return nil, fmt.Errorf("failed to parse table list: %w", err)
+	}
+	tables = make([]string, 0, len(tableObjects))
+	for _, entry := range tableObjects {
+		if entry.Name != "" {
+			tables = append(tables, entry.Name)
+		}
 	}
 	return tables, nil
 }
 
 // ColumnInfo describes a column in a table.
 type ColumnInfo struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	NotNull    bool   `json:"not_null"`
-	Unique     bool   `json:"unique"`
-	PrimaryKey bool   `json:"primary_key"`
-	RefTable   string `json:"ref_table,omitempty"`
-	RefColumn  string `json:"ref_column,omitempty"`
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	NotNull     bool   `json:"not_null"`
+	Unique      bool   `json:"unique"`
+	PrimaryKey  bool   `json:"primary_key"`
+	RefTable    string `json:"ref_table,omitempty"`
+	RefColumn   string `json:"ref_column,omitempty"`
 	RefOnDelete string `json:"ref_on_delete,omitempty"`
 	RefOnUpdate string `json:"ref_on_update,omitempty"`
 }
@@ -318,19 +334,56 @@ func (c *conn) GetTableColumns(tableName string) ([]ColumnInfo, error) {
 	defer C.decentdb_free(unsafe.Pointer(ptr))
 	jsonStr := C.GoStringN(ptr, outLen)
 	var cols []ColumnInfo
-	if err := json.Unmarshal([]byte(jsonStr), &cols); err != nil {
+	if err := json.Unmarshal([]byte(jsonStr), &cols); err == nil {
+		return cols, nil
+	}
+
+	var describe struct {
+		Columns []struct {
+			Name       string `json:"name"`
+			ColumnType string `json:"column_type"`
+			Nullable   bool   `json:"nullable"`
+			Unique     bool   `json:"unique"`
+			PrimaryKey bool   `json:"primary_key"`
+			ForeignKey *struct {
+				Table    string `json:"table"`
+				Column   string `json:"column"`
+				OnDelete string `json:"on_delete"`
+				OnUpdate string `json:"on_update"`
+			} `json:"foreign_key"`
+		} `json:"columns"`
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &describe); err != nil {
 		return nil, fmt.Errorf("failed to parse column info: %w", err)
+	}
+	cols = make([]ColumnInfo, 0, len(describe.Columns))
+	for _, c := range describe.Columns {
+		info := ColumnInfo{
+			Name:       c.Name,
+			Type:       c.ColumnType,
+			NotNull:    !c.Nullable,
+			Unique:     c.Unique,
+			PrimaryKey: c.PrimaryKey,
+		}
+		if c.ForeignKey != nil {
+			info.RefTable = c.ForeignKey.Table
+			info.RefColumn = c.ForeignKey.Column
+			info.RefOnDelete = c.ForeignKey.OnDelete
+			info.RefOnUpdate = c.ForeignKey.OnUpdate
+		}
+		cols = append(cols, info)
 	}
 	return cols, nil
 }
 
 // IndexInfo describes an index in the database.
 type IndexInfo struct {
-	Name    string   `json:"name"`
-	Table   string   `json:"table"`
-	Columns []string `json:"columns"`
-	Unique  bool     `json:"unique"`
-	Kind    string   `json:"kind"`
+	Name      string   `json:"name"`
+	Table     string   `json:"table"`
+	TableName string   `json:"table_name,omitempty"`
+	Columns   []string `json:"columns"`
+	Unique    bool     `json:"unique"`
+	Kind      string   `json:"kind"`
 }
 
 // ListIndexes returns metadata about all indexes in the database.
@@ -349,6 +402,11 @@ func (c *conn) ListIndexes() ([]IndexInfo, error) {
 	var indexes []IndexInfo
 	if err := json.Unmarshal([]byte(jsonStr), &indexes); err != nil {
 		return nil, fmt.Errorf("failed to parse index info: %w", err)
+	}
+	for i := range indexes {
+		if indexes[i].Table == "" {
+			indexes[i].Table = indexes[i].TableName
+		}
 	}
 	return indexes, nil
 }

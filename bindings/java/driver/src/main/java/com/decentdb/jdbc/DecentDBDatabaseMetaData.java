@@ -2,6 +2,7 @@ package com.decentdb.jdbc;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 
 import java.math.BigDecimal;
 import java.net.URL;
@@ -508,6 +509,72 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
             "CHAR_OCTET_LENGTH","ORDINAL_POSITION","IS_NULLABLE","SPECIFIC_NAME");
     }
 
+    private static List<String> parseObjectNameArray(String json) {
+        List<String> names = new ArrayList<>();
+        if (json == null || json.isBlank()) return names;
+
+        Object parsed = new JSONTokener(json).nextValue();
+        if (!(parsed instanceof JSONArray)) return names;
+
+        JSONArray arr = (JSONArray) parsed;
+        for (int i = 0; i < arr.length(); i++) {
+            Object item = arr.get(i);
+            if (item instanceof String) {
+                names.add((String) item);
+            } else if (item instanceof JSONObject) {
+                String name = ((JSONObject) item).optString("name", "");
+                if (!name.isEmpty()) names.add(name);
+            }
+        }
+        return names;
+    }
+
+    private static JSONArray parseColumnsPayload(String json) {
+        if (json == null || json.isBlank()) return new JSONArray();
+        Object parsed = new JSONTokener(json).nextValue();
+        if (parsed instanceof JSONArray) return (JSONArray) parsed;
+        if (parsed instanceof JSONObject) {
+            JSONArray cols = ((JSONObject) parsed).optJSONArray("columns");
+            if (cols != null) return cols;
+        }
+        return new JSONArray();
+    }
+
+    private static JSONObject normalizeColumnObject(JSONObject raw) {
+        JSONObject normalized = new JSONObject();
+        normalized.put("name", raw.optString("name", ""));
+        normalized.put("type", raw.has("type") ? raw.optString("type", "") : raw.optString("column_type", ""));
+        boolean notNull = raw.has("not_null") ? raw.optBoolean("not_null", false) : !raw.optBoolean("nullable", true);
+        normalized.put("not_null", notNull);
+        normalized.put("unique", raw.optBoolean("unique", false));
+        normalized.put("primary_key", raw.optBoolean("primary_key", false));
+
+        String refTable = raw.optString("ref_table", "");
+        String refColumn = raw.optString("ref_column", "");
+        String refOnDelete = raw.optString("ref_on_delete", "");
+        String refOnUpdate = raw.optString("ref_on_update", "");
+        if (refTable.isEmpty()) {
+            JSONObject fk = raw.optJSONObject("foreign_key");
+            if (fk != null) {
+                refTable = fk.optString("table", fk.optString("referenced_table", ""));
+                refColumn = fk.optString("column", "");
+                if (refColumn.isEmpty()) {
+                    JSONArray refCols = fk.optJSONArray("referenced_columns");
+                    if (refCols != null && refCols.length() > 0) {
+                        refColumn = refCols.optString(0, "");
+                    }
+                }
+                refOnDelete = fk.optString("on_delete", "");
+                refOnUpdate = fk.optString("on_update", "");
+            }
+        }
+        normalized.put("ref_table", refTable);
+        normalized.put("ref_column", refColumn);
+        normalized.put("ref_on_delete", refOnDelete);
+        normalized.put("ref_on_update", refOnUpdate);
+        return normalized;
+    }
+
     /**
      * Returns tables matching the given criteria.
      *
@@ -532,9 +599,7 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         if (includeTable) {
             String json = DecentDBNative.metaListTables(dbHandle);
             if (json != null) {
-                JSONArray arr = new JSONArray(json);
-                for (int i = 0; i < arr.length(); i++) {
-                    String tbl = arr.getString(i);
+                for (String tbl : parseObjectNameArray(json)) {
                     if (tableNamePattern != null && !tableNamePattern.equals("%") &&
                         !tbl.equalsIgnoreCase(tableNamePattern)) continue;
                     rows.add(new Object[]{
@@ -552,9 +617,7 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         if (includeView) {
             String json = DecentDBNative.metaListViews(dbHandle);
             if (json != null) {
-                JSONArray arr = new JSONArray(json);
-                for (int i = 0; i < arr.length(); i++) {
-                    String tbl = arr.getString(i);
+                for (String tbl : parseObjectNameArray(json)) {
                     if (tableNamePattern != null && !tableNamePattern.equals("%") &&
                         !tbl.equalsIgnoreCase(tableNamePattern)) continue;
                     rows.add(new Object[]{
@@ -620,13 +683,11 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         List<String> allTablesAndViews = new ArrayList<>();
         String tablesJson = DecentDBNative.metaListTables(dbHandle);
         if (tablesJson != null) {
-            JSONArray arr = new JSONArray(tablesJson);
-            for (int i = 0; i < arr.length(); i++) allTablesAndViews.add(arr.getString(i));
+            allTablesAndViews.addAll(parseObjectNameArray(tablesJson));
         }
         String viewsJson = DecentDBNative.metaListViews(dbHandle);
         if (viewsJson != null) {
-            JSONArray arr = new JSONArray(viewsJson);
-            for (int i = 0; i < arr.length(); i++) allTablesAndViews.add(arr.getString(i));
+            allTablesAndViews.addAll(parseObjectNameArray(viewsJson));
         }
 
         if (allTablesAndViews.isEmpty()) return emptyResultSet(COLUMN_COLUMNS);
@@ -638,9 +699,9 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
             String colsJson = DecentDBNative.metaGetTableColumns(dbHandle, tbl);
             if (colsJson == null) continue;
 
-            JSONArray cols = new JSONArray(colsJson);
+            JSONArray cols = parseColumnsPayload(colsJson);
             for (int ci = 0; ci < cols.length(); ci++) {
-                JSONObject col = cols.getJSONObject(ci);
+                JSONObject col = normalizeColumnObject(cols.getJSONObject(ci));
                 String colName = col.getString("name");
                 if (columnNamePattern != null && !columnNamePattern.equals("%") &&
                     !colName.equalsIgnoreCase(columnNamePattern)) continue;
@@ -770,10 +831,10 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         List<Object[]> rows = new ArrayList<>();
 
         if (json != null) {
-            JSONArray cols = new JSONArray(json);
+            JSONArray cols = parseColumnsPayload(json);
             int seq = 1;
             for (int i = 0; i < cols.length(); i++) {
-                JSONObject col = cols.getJSONObject(i);
+                JSONObject col = normalizeColumnObject(cols.getJSONObject(i));
                 if (col.optBoolean("primary_key", false)) {
                     rows.add(new Object[]{
                         null, null, table,
@@ -809,10 +870,10 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         List<Object[]> rows = new ArrayList<>();
 
         if (json != null) {
-            JSONArray cols = new JSONArray(json);
+            JSONArray cols = parseColumnsPayload(json);
             int seq = 1;
             for (int i = 0; i < cols.length(); i++) {
-                JSONObject col = cols.getJSONObject(i);
+                JSONObject col = normalizeColumnObject(cols.getJSONObject(i));
                 String refTable = col.optString("ref_table", "");
                 String refColumn = col.optString("ref_column", "");
                 if (!refTable.isEmpty() && !refColumn.isEmpty()) {
@@ -844,17 +905,15 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         // Scan all tables looking for FKs pointing to `table`
         String tablesJson = DecentDBNative.metaListTables(dbHandle);
         if (tablesJson != null) {
-            JSONArray tables = new JSONArray(tablesJson);
-            for (int ti = 0; ti < tables.length(); ti++) {
-                String fkTable = tables.getString(ti);
+            for (String fkTable : parseObjectNameArray(tablesJson)) {
                 if (fkTable.equalsIgnoreCase(table)) continue;
 
                 String colsJson = DecentDBNative.metaGetTableColumns(dbHandle, fkTable);
                 if (colsJson == null) continue;
-                JSONArray cols = new JSONArray(colsJson);
+                JSONArray cols = parseColumnsPayload(colsJson);
                 int seq = 1;
                 for (int ci = 0; ci < cols.length(); ci++) {
-                    JSONObject col = cols.getJSONObject(ci);
+                    JSONObject col = normalizeColumnObject(cols.getJSONObject(ci));
                     String refTable = col.optString("ref_table", "");
                     if (refTable.equalsIgnoreCase(table)) {
                         String refColumn = col.optString("ref_column", "");
@@ -883,10 +942,10 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
 
         String colsJson = DecentDBNative.metaGetTableColumns(dbHandle, foreignTable);
         if (colsJson != null) {
-            JSONArray cols = new JSONArray(colsJson);
+            JSONArray cols = parseColumnsPayload(colsJson);
             int seq = 1;
             for (int i = 0; i < cols.length(); i++) {
-                JSONObject col = cols.getJSONObject(i);
+                JSONObject col = normalizeColumnObject(cols.getJSONObject(i));
                 String refTable = col.optString("ref_table", "");
                 if (refTable.equalsIgnoreCase(parentTable)) {
                     String refColumn = col.optString("ref_column", "");
@@ -954,7 +1013,10 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
             JSONArray indexes = new JSONArray(json);
             for (int i = 0; i < indexes.length(); i++) {
                 JSONObject idx = indexes.getJSONObject(i);
-                if (!idx.getString("table").equalsIgnoreCase(table)) continue;
+                String idxTable = idx.has("table")
+                    ? idx.optString("table", "")
+                    : idx.optString("table_name", "");
+                if (!idxTable.equalsIgnoreCase(table)) continue;
                 boolean isUnique = idx.optBoolean("unique", false);
                 if (unique && !isUnique) continue;
 

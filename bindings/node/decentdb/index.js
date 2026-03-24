@@ -1,14 +1,79 @@
 'use strict';
 
 const path = require('node:path');
+const fs = require('node:fs');
 
 // Avoid extra deps like node-gyp-build; keep the scaffold minimal.
 // When built, the addon lives at ./build/Release/decentdb_native.node
 const addonPath = path.join(__dirname, 'build', 'Release', 'decentdb_native.node');
 
 let native = null;
+function normalizeTableList(parsed) {
+  if (!Array.isArray(parsed)) return [];
+  if (parsed.length === 0) return [];
+  if (typeof parsed[0] === 'string') return parsed;
+  return parsed
+    .map((entry) => (entry && typeof entry.name === 'string' ? entry.name : null))
+    .filter((name) => name !== null);
+}
+
+function normalizeColumns(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (!parsed || !Array.isArray(parsed.columns)) return [];
+  return parsed.columns.map((col) => {
+    const out = {
+      name: col.name,
+      type: col.type ?? col.column_type,
+      not_null: col.not_null ?? !col.nullable,
+      unique: col.unique ?? false,
+      primary_key: col.primary_key ?? false,
+    };
+    if (col.foreign_key && typeof col.foreign_key === 'object') {
+      out.ref_table = col.foreign_key.table;
+      out.ref_column = col.foreign_key.column;
+      out.ref_on_delete = col.foreign_key.on_delete;
+      out.ref_on_update = col.foreign_key.on_update;
+    }
+    return out;
+  });
+}
+
+function normalizeIndexes(parsed) {
+  if (!Array.isArray(parsed)) return [];
+  return parsed.map((idx) => ({
+    ...idx,
+    table: idx.table ?? idx.table_name ?? '',
+  }));
+}
+
+function inferNativeLibPath() {
+  const explicit = process.env.DECENTDB_NATIVE_LIB_PATH;
+  if (explicit && explicit.length > 0) {
+    return explicit;
+  }
+
+  const candidates = [
+    path.join(__dirname, '..', '..', '..', 'target', 'debug', 'libdecentdb.so'),
+    path.join(__dirname, '..', '..', '..', 'target', 'debug', 'libdecentdb.dylib'),
+    path.join(__dirname, '..', '..', '..', 'target', 'debug', 'decentdb.dll'),
+    path.join(process.cwd(), 'target', 'debug', 'libdecentdb.so'),
+    path.join(process.cwd(), 'target', 'debug', 'libdecentdb.dylib'),
+    path.join(process.cwd(), 'target', 'debug', 'decentdb.dll'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 function loadNative() {
   if (native) return native;
+  const inferred = inferNativeLibPath();
+  if (inferred) {
+    process.env.DECENTDB_NATIVE_LIB_PATH = inferred;
+  }
   // Defer the require() so users can install the package before native build.
   native = require(addonPath);
   return native;
@@ -111,20 +176,20 @@ class Database {
   listTables() {
     if (!this._handle) throw new Error('Database is closed');
     const json = this._native.dbListTablesJson(this._handle);
-    return JSON.parse(json);
+    return normalizeTableList(JSON.parse(json));
   }
 
   getTableColumns(tableName) {
     if (!this._handle) throw new Error('Database is closed');
     if (typeof tableName !== 'string') throw new TypeError('tableName must be a string');
     const json = this._native.dbGetTableColumnsJson(this._handle, tableName);
-    return JSON.parse(json);
+    return normalizeColumns(JSON.parse(json));
   }
 
   listIndexes() {
     if (!this._handle) throw new Error('Database is closed');
     const json = this._native.dbListIndexesJson(this._handle);
-    return JSON.parse(json);
+    return normalizeIndexes(JSON.parse(json));
   }
 }
 

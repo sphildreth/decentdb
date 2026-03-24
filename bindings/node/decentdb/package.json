@@ -7,7 +7,7 @@
   "gypfile": true,
   "scripts": {
     "build": "node --no-deprecation ./node_modules/node-gyp/bin/node-gyp.js rebuild",
-    "test": "node --test test/*.test.js"
+    "test": "npm run build --silent && node --test test/*.test.js"
   },
   "devDependencies": {
     "node-gyp": "^12.2.0"

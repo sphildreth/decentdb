@@ -7,6 +7,7 @@
 
 mod btree;
 mod c_api;
+mod c_api_legacy;
 mod catalog;
 mod config;
 mod db;
