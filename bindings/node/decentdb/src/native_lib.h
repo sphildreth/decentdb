@@ -4,11 +4,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "decentdb.h"
+#include "../../../../include/decentdb.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef ddb_db_t decentdb_db;
+typedef ddb_stmt_t decentdb_stmt;
+typedef ddb_value_view_t decentdb_value_view;
+typedef ddb_row_i64_text_f64_view_t decentdb_row_i64_text_f64_view;
 
 typedef struct decentdb_native_api {
   decentdb_db* (*open)(const char* path_utf8, const char* options_utf8);
@@ -55,6 +60,9 @@ typedef struct decentdb_native_api {
 
   // Checkpoint
   int (*checkpoint)(decentdb_db* db);
+  int (*begin_transaction)(decentdb_db* db);
+  int (*commit_transaction)(decentdb_db* db);
+  int (*rollback_transaction)(decentdb_db* db);
 
   // SaveAs (export database to a new on-disk file)
   int (*save_as)(decentdb_db* db, const char* dest_path_utf8);

@@ -64,10 +64,20 @@ final class Errors {
 
     /** Throws if the native result code indicates an error. */
     static void checkResult(long dbHandle, int result) throws SQLException {
-        if (result < 0) {
+        if (result != 0) {
             String msg = DecentDBNative.dbLastErrorMessage(dbHandle);
             int code = DecentDBNative.dbLastErrorCode(dbHandle);
-            throw fromNative(code, msg != null ? msg : "Unknown native error (code " + result + ")");
+            int effectiveCode = code != 0 ? code : result;
+            throw fromNative(effectiveCode, msg != null ? msg : "Unknown native error (code " + result + ")");
+        }
+    }
+
+    static void checkStatus(long dbHandle, int status) throws SQLException {
+        if (status != 0) {
+            String msg = DecentDBNative.dbLastErrorMessage(dbHandle);
+            int code = DecentDBNative.dbLastErrorCode(dbHandle);
+            int effectiveCode = code != 0 ? code : status;
+            throw fromNative(effectiveCode, msg != null ? msg : "Native status error (code " + status + ")");
         }
     }
 }

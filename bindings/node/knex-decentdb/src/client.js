@@ -72,6 +72,18 @@ class Client_DecentDB extends (Client ?? class {}) {
   async _query(connection, obj) {
     const sql = this.positionBindings(obj.sql);
     const bindings = obj.bindings || [];
+    const normalizedControl = normalizeControlSql(sql);
+    if (normalizedControl && bindings.length === 0) {
+      if (normalizedControl === 'BEGIN') {
+        connection.beginTransaction();
+      } else if (normalizedControl === 'COMMIT') {
+        connection.commitTransaction();
+      } else if (normalizedControl === 'ROLLBACK') {
+        connection.rollbackTransaction();
+      }
+      obj.response = { rows: [], rowCount: 0n };
+      return obj;
+    }
 
     let stmt;
     if (connection.__decentStmtCache instanceof Map) {
@@ -179,6 +191,21 @@ class Client_DecentDB extends (Client ?? class {}) {
     }
     return obj.response.rows;
   }
+}
+
+function normalizeControlSql(sql) {
+  if (typeof sql !== 'string') return null;
+  const trimmed = sql.trim().replace(/;+$/g, '').trim().toUpperCase().replace(/\s+/g, ' ');
+  if (trimmed === 'BEGIN' || trimmed === 'BEGIN TRANSACTION' || trimmed === 'START TRANSACTION') {
+    return 'BEGIN';
+  }
+  if (trimmed === 'COMMIT' || trimmed === 'END' || trimmed === 'END TRANSACTION') {
+    return 'COMMIT';
+  }
+  if (trimmed === 'ROLLBACK' || trimmed === 'ROLLBACK TRANSACTION') {
+    return 'ROLLBACK';
+  }
+  return null;
 }
 
 module.exports = {

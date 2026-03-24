@@ -427,14 +427,14 @@ public final class DecentDBConnection implements Connection {
     void executeUpdate(String sql) throws SQLException {
         long[] outStmt = new long[1];
         int rc = DecentDBNative.stmtPrepare(dbHandle, sql, outStmt);
-        if (rc < 0 || outStmt[0] == 0) {
-            Errors.checkResult(dbHandle, rc < 0 ? rc : -1);
+        if (rc != 0 || outStmt[0] == 0) {
+            Errors.checkStatus(dbHandle, rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
         }
         long stmt = outStmt[0];
         try {
             rc = DecentDBNative.stmtStep(stmt);
-            if (rc < 0) {
-                Errors.checkResult(dbHandle, rc);
+            if (rc != 0 && rc != 1) {
+                Errors.checkStatus(dbHandle, rc);
             }
         } finally {
             DecentDBNative.stmtFinalize(stmt);

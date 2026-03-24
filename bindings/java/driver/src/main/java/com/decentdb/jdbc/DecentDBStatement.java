@@ -62,13 +62,13 @@ public class DecentDBStatement implements Statement {
             closeCurrentResultSet();
             long[] outStmt = new long[1];
             int rc = DecentDBNative.stmtPrepare(connection.getDbHandle(), sql, outStmt);
-            if (rc < 0 || outStmt[0] == 0) {
-                Errors.checkResult(connection.getDbHandle(), rc < 0 ? rc : -1);
+            if (rc != 0 || outStmt[0] == 0) {
+                Errors.checkStatus(connection.getDbHandle(), rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
             }
             stmtHandle = outStmt[0];
             rc = DecentDBNative.stmtStep(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0 && rc != 1) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             updateCount = DecentDBNative.stmtRowsAffected(stmtHandle);
             finalizeStmt();
@@ -89,13 +89,13 @@ public class DecentDBStatement implements Statement {
             closeCurrentResultSet();
             long[] outStmt = new long[1];
             int rc = DecentDBNative.stmtPrepare(connection.getDbHandle(), sql, outStmt);
-            if (rc < 0 || outStmt[0] == 0) {
-                Errors.checkResult(connection.getDbHandle(), rc < 0 ? rc : -1);
+            if (rc != 0 || outStmt[0] == 0) {
+                Errors.checkStatus(connection.getDbHandle(), rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
             }
             stmtHandle = outStmt[0];
             rc = DecentDBNative.stmtStep(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0 && rc != 1) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             if (rc == 1 || isReadStatement(sql)) {
                 // It is a read query, return a ResultSet even if exhausted (rc == 0).
@@ -117,15 +117,15 @@ public class DecentDBStatement implements Statement {
     private int prepareAndStep(String sql) throws SQLException {
         long[] outStmt = new long[1];
         int rc = DecentDBNative.stmtPrepare(connection.getDbHandle(), sql, outStmt);
-        if (rc < 0 || outStmt[0] == 0) {
-            Errors.checkResult(connection.getDbHandle(), rc < 0 ? rc : -1);
+        if (rc != 0 || outStmt[0] == 0) {
+            Errors.checkStatus(connection.getDbHandle(), rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
         }
         stmtHandle = outStmt[0];
         // Step once to prime the cursor: rc=1 means row available, rc=0 means empty result
         rc = DecentDBNative.stmtStep(stmtHandle);
-        if (rc < 0) {
+        if (rc != 0 && rc != 1) {
             finalizeStmt();
-            Errors.checkResult(connection.getDbHandle(), rc);
+            Errors.checkStatus(connection.getDbHandle(), rc);
         }
         return rc; // 1 = row available, 0 = exhausted
     }

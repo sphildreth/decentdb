@@ -77,8 +77,8 @@ public class DecentDBResultSet implements ResultSet {
 
         // Advance to next row
         int rc = DecentDBNative.stmtStep(stmtHandle);
-        if (rc < 0) {
-            Errors.checkResult(dbHandle, rc);
+        if (rc != 0 && rc != 1) {
+            Errors.checkStatus(dbHandle, rc);
         }
         lastStepResult = rc;
         if (rc != 1) {

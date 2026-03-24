@@ -63,8 +63,10 @@ public final class DecentDBDriver implements Driver {
         if (dbHandle == 0) {
             // Try to get global error
             String msg = DecentDBNative.dbLastErrorMessage(0);
+            int code = DecentDBNative.dbLastErrorCode(0);
             throw Errors.connection("Failed to open DecentDB database '" + parsed.filePath + "'" +
-                (msg != null && !msg.isEmpty() ? ": " + msg : ""));
+                (msg != null && !msg.isEmpty() ? ": " + msg : "") +
+                (code != 0 ? " (code " + code + ")" : ""));
         }
 
         return new DecentDBConnection(dbHandle, url, readOnly);

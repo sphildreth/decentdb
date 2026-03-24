@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -68,20 +69,22 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
-	// Options string (simpler for MVP)
-	cOpts := C.CString(rawQuery)
-	defer C.free(unsafe.Pointer(cOpts))
-
-	db := C.decentdb_open(cPath, cOpts)
-	if db == nil {
-		return nil, errors.New("failed to open database")
+	var db *C.ddb_db_t
+	status := C.ddb_db_open_or_create(cPath, &db)
+	if rawQuery != "" {
+		if q, err := url.ParseQuery(rawQuery); err == nil {
+			mode := q.Get("mode")
+			if mode == "create" {
+				db = nil
+				status = C.ddb_db_create(cPath, &db)
+			} else if mode == "open" {
+				db = nil
+				status = C.ddb_db_open(cPath, &db)
+			}
+		}
 	}
-
-	code := int(C.decentdb_last_error_code(db))
-	if code != 0 {
-		msg := C.GoString(C.decentdb_last_error_message(db))
-		C.decentdb_close(db)
-		return nil, &DecentDBError{Code: code, Message: msg}
+	if status != C.DDB_OK || db == nil {
+		return nil, statusError(status, "")
 	}
 
 	return &conn{db: db}, nil
@@ -106,8 +109,48 @@ func (e *DecentDBError) Error() string {
 	return fmt.Sprintf("decentdb error %d: %s", e.Code, e.Message)
 }
 
+func statusCode(status C.ddb_status_t) int {
+	switch status {
+	case C.DDB_OK:
+		return 0
+	case C.DDB_ERR_IO:
+		return 1
+	case C.DDB_ERR_CORRUPTION:
+		return 2
+	case C.DDB_ERR_CONSTRAINT:
+		return 3
+	case C.DDB_ERR_TRANSACTION:
+		return 4
+	case C.DDB_ERR_SQL:
+		return 5
+	case C.DDB_ERR_INTERNAL:
+		return 6
+	case C.DDB_ERR_PANIC:
+		return 7
+	default:
+		return 6
+	}
+}
+
+func statusError(status C.ddb_status_t, sql string) error {
+	msg := C.GoString(C.ddb_last_error_message())
+	return &DecentDBError{
+		Code:    statusCode(status),
+		Message: msg,
+		SQL:     sql,
+	}
+}
+
+func freeAPIString(ptr *C.char) {
+	if ptr == nil {
+		return
+	}
+	p := ptr
+	C.ddb_string_free(&p)
+}
+
 type conn struct {
-	db *C.decentdb_db
+	db *C.ddb_db_t
 }
 
 // DB provides direct access to DecentDB-specific operations beyond
@@ -121,18 +164,11 @@ type DB struct {
 func OpenDirect(path string) (*DB, error) {
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
-	cOpts := C.CString("")
-	defer C.free(unsafe.Pointer(cOpts))
 
-	db := C.decentdb_open(cPath, cOpts)
-	if db == nil {
-		return nil, errors.New("failed to open database")
-	}
-	code := int(C.decentdb_last_error_code(db))
-	if code != 0 {
-		msg := C.GoString(C.decentdb_last_error_message(db))
-		C.decentdb_close(db)
-		return nil, &DecentDBError{Code: code, Message: msg}
+	var db *C.ddb_db_t
+	status := C.ddb_db_open_or_create(cPath, &db)
+	if status != C.DDB_OK || db == nil {
+		return nil, statusError(status, "")
 	}
 	return &DB{c: &conn{db: db}}, nil
 }
@@ -227,11 +263,10 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	cQuery := C.CString(query)
 	defer C.free(unsafe.Pointer(cQuery))
 
-	var stmt *C.decentdb_stmt
-	res := C.decentdb_prepare(c.db, cQuery, &stmt)
-	if res != 0 {
-		msg := C.GoString(C.decentdb_last_error_message(c.db))
-		return nil, &DecentDBError{Code: int(res), Message: msg, SQL: query}
+	var stmt *C.ddb_stmt_t
+	status := C.ddb_db_prepare(c.db, cQuery, &stmt)
+	if status != C.DDB_OK {
+		return nil, statusError(status, query)
 	}
 
 	return &stmtStruct{c: c, query: query, stmt: stmt}, nil
@@ -239,7 +274,11 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 
 func (c *conn) Close() error {
 	if c.db != nil {
-		C.decentdb_close(c.db)
+		dbp := c.db
+		status := C.ddb_db_free(&dbp)
+		if status != C.DDB_OK {
+			return statusError(status, "")
+		}
 		c.db = nil
 	}
 	return nil
@@ -250,10 +289,9 @@ func (c *conn) Checkpoint() error {
 	if c.db == nil {
 		return errors.New("connection is closed")
 	}
-	res := C.decentdb_checkpoint(c.db)
-	if res != 0 {
-		msg := C.GoString(C.decentdb_last_error_message(c.db))
-		return &DecentDBError{Code: int(res), Message: msg}
+	status := C.ddb_db_checkpoint(c.db)
+	if status != C.DDB_OK {
+		return statusError(status, "")
 	}
 	return nil
 }
@@ -265,10 +303,9 @@ func (c *conn) SaveAs(destPath string) error {
 	}
 	cPath := C.CString(destPath)
 	defer C.free(unsafe.Pointer(cPath))
-	res := C.decentdb_save_as(c.db, cPath)
-	if res != 0 {
-		msg := C.GoString(C.decentdb_last_error_message(c.db))
-		return &DecentDBError{Code: int(res), Message: msg}
+	status := C.ddb_db_save_as(c.db, cPath)
+	if status != C.DDB_OK {
+		return statusError(status, "")
 	}
 	return nil
 }
@@ -278,14 +315,13 @@ func (c *conn) ListTables() ([]string, error) {
 	if c.db == nil {
 		return nil, errors.New("connection is closed")
 	}
-	var outLen C.int
-	ptr := C.decentdb_list_tables_json(c.db, &outLen)
-	if ptr == nil {
-		msg := C.GoString(C.decentdb_last_error_message(c.db))
-		return nil, &DecentDBError{Code: int(C.decentdb_last_error_code(c.db)), Message: msg}
+	var ptr *C.char
+	status := C.ddb_db_list_tables_json(c.db, &ptr)
+	if status != C.DDB_OK || ptr == nil {
+		return nil, statusError(status, "")
 	}
-	defer C.decentdb_free(unsafe.Pointer(ptr))
-	jsonStr := C.GoStringN(ptr, outLen)
+	defer freeAPIString(ptr)
+	jsonStr := C.GoString(ptr)
 	var tables []string
 	if err := json.Unmarshal([]byte(jsonStr), &tables); err == nil {
 		return tables, nil
@@ -325,14 +361,13 @@ func (c *conn) GetTableColumns(tableName string) ([]ColumnInfo, error) {
 	}
 	cName := C.CString(tableName)
 	defer C.free(unsafe.Pointer(cName))
-	var outLen C.int
-	ptr := C.decentdb_get_table_columns_json(c.db, cName, &outLen)
-	if ptr == nil {
-		msg := C.GoString(C.decentdb_last_error_message(c.db))
-		return nil, &DecentDBError{Code: int(C.decentdb_last_error_code(c.db)), Message: msg}
+	var ptr *C.char
+	status := C.ddb_db_describe_table_json(c.db, cName, &ptr)
+	if status != C.DDB_OK || ptr == nil {
+		return nil, statusError(status, "")
 	}
-	defer C.decentdb_free(unsafe.Pointer(ptr))
-	jsonStr := C.GoStringN(ptr, outLen)
+	defer freeAPIString(ptr)
+	jsonStr := C.GoString(ptr)
 	var cols []ColumnInfo
 	if err := json.Unmarshal([]byte(jsonStr), &cols); err == nil {
 		return cols, nil
@@ -391,14 +426,13 @@ func (c *conn) ListIndexes() ([]IndexInfo, error) {
 	if c.db == nil {
 		return nil, errors.New("connection is closed")
 	}
-	var outLen C.int
-	ptr := C.decentdb_list_indexes_json(c.db, &outLen)
-	if ptr == nil {
-		msg := C.GoString(C.decentdb_last_error_message(c.db))
-		return nil, &DecentDBError{Code: int(C.decentdb_last_error_code(c.db)), Message: msg}
+	var ptr *C.char
+	status := C.ddb_db_list_indexes_json(c.db, &ptr)
+	if status != C.DDB_OK || ptr == nil {
+		return nil, statusError(status, "")
 	}
-	defer C.decentdb_free(unsafe.Pointer(ptr))
-	jsonStr := C.GoStringN(ptr, outLen)
+	defer freeAPIString(ptr)
+	jsonStr := C.GoString(ptr)
 	var indexes []IndexInfo
 	if err := json.Unmarshal([]byte(jsonStr), &indexes); err != nil {
 		return nil, fmt.Errorf("failed to parse index info: %w", err)
@@ -416,14 +450,65 @@ func (c *conn) Begin() (driver.Tx, error) {
 }
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
-	_, err := c.ExecContext(ctx, "BEGIN", nil)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	status := C.ddb_db_begin_transaction(c.db)
+	if status != C.DDB_OK {
+		_, err := c.ExecContext(ctx, "BEGIN", nil)
+		if err != nil {
+			return nil, err
+		}
+		return &tx{c: c}, nil
 	}
 	return &tx{c: c}, nil
 }
 
+func isTransactionControlQuery(query string, args []driver.NamedValue) string {
+	if len(args) != 0 {
+		return ""
+	}
+	trimmed := strings.TrimSpace(query)
+	trimmed = strings.TrimRight(trimmed, ";")
+	trimmed = strings.ToUpper(strings.Join(strings.Fields(trimmed), " "))
+	switch trimmed {
+	case "BEGIN", "BEGIN TRANSACTION", "START TRANSACTION":
+		return "BEGIN"
+	case "COMMIT", "END", "END TRANSACTION":
+		return "COMMIT"
+	case "ROLLBACK", "ROLLBACK TRANSACTION":
+		return "ROLLBACK"
+	default:
+		return ""
+	}
+}
+
+func (c *conn) executeTransactionControl(ctx context.Context, control string) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var status C.ddb_status_t
+	switch control {
+	case "BEGIN":
+		status = C.ddb_db_begin_transaction(c.db)
+	case "COMMIT":
+		var lsn C.uint64_t
+		status = C.ddb_db_commit_transaction(c.db, &lsn)
+	case "ROLLBACK":
+		status = C.ddb_db_rollback_transaction(c.db)
+	default:
+		return nil, fmt.Errorf("unsupported transaction control: %s", control)
+	}
+	if status != C.DDB_OK {
+		return nil, statusError(status, control)
+	}
+	return driver.RowsAffected(0), nil
+}
+
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if control := isTransactionControlQuery(query, args); control != "" {
+		return c.executeTransactionControl(ctx, control)
+	}
 	s, err := c.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -465,12 +550,16 @@ func (t *tx) Rollback() error {
 type stmtStruct struct {
 	c     *conn
 	query string
-	stmt  *C.decentdb_stmt
+	stmt  *C.ddb_stmt_t
 }
 
 func (s *stmtStruct) Close() error {
 	if s.stmt != nil {
-		C.decentdb_finalize(s.stmt)
+		stmtp := s.stmt
+		status := C.ddb_stmt_free(&stmtp)
+		if status != C.DDB_OK {
+			return statusError(status, s.query)
+		}
 		s.stmt = nil
 	}
 	return nil
@@ -493,52 +582,63 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 		return errors.New("statement is closed")
 	}
 	// Ensure statement reuse is safe: clear previous execution state and bindings.
-	C.decentdb_reset(s.stmt)
-	C.decentdb_clear_bindings(s.stmt)
+	status := C.ddb_stmt_reset(s.stmt)
+	if status != C.DDB_OK {
+		return statusError(status, s.query)
+	}
+	status = C.ddb_stmt_clear_bindings(s.stmt)
+	if status != C.DDB_OK {
+		return statusError(status, s.query)
+	}
 
 	for _, arg := range args {
 		if arg.Ordinal <= 0 {
 			return fmt.Errorf("invalid bind ordinal: %d", arg.Ordinal)
 		}
-		idx := C.int(arg.Ordinal) // 1-based
-		var res C.int
+		idx := C.size_t(arg.Ordinal) // 1-based
 		switch v := arg.Value.(type) {
 		case nil:
-			res = C.decentdb_bind_null(s.stmt, idx)
+			status = C.ddb_stmt_bind_null(s.stmt, idx)
 		case int:
-			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(int64(v)))
+			status = C.ddb_stmt_bind_int64(s.stmt, idx, C.int64_t(int64(v)))
 		case int64:
-			res = C.decentdb_bind_int64(s.stmt, idx, C.int64_t(v))
+			status = C.ddb_stmt_bind_int64(s.stmt, idx, C.int64_t(v))
 		case float64:
-			res = C.decentdb_bind_float64(s.stmt, idx, C.double(v))
+			status = C.ddb_stmt_bind_float64(s.stmt, idx, C.double(v))
 		case bool:
 			vi := 0
 			if v {
 				vi = 1
 			}
-			res = C.decentdb_bind_bool(s.stmt, idx, C.int(vi))
+			status = C.ddb_stmt_bind_bool(s.stmt, idx, C.uint8_t(vi))
 		case string:
 			cs := C.CString(v)
-			res = C.decentdb_bind_text(s.stmt, idx, cs, C.int(len(v)))
+			status = C.ddb_stmt_bind_text(s.stmt, idx, cs, C.size_t(len(v)))
 			C.free(unsafe.Pointer(cs))
 		case []byte:
 			if len(v) == 0 {
-				res = C.decentdb_bind_blob(s.stmt, idx, nil, 0)
+				status = C.ddb_stmt_bind_blob(s.stmt, idx, nil, 0)
 			} else {
-				res = C.decentdb_bind_blob(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.int(len(v)))
+				status = C.ddb_stmt_bind_blob(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.size_t(len(v)))
 			}
 		case time.Time:
 			// Microseconds since Unix epoch UTC
 			micros := v.UnixNano() / 1e3
-			res = C.decentdb_bind_datetime(s.stmt, idx, C.int64_t(micros))
+			status = C.ddb_stmt_bind_timestamp_micros(s.stmt, idx, C.int64_t(micros))
 		case Decimal:
-			res = C.decentdb_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.int(v.Scale))
+			scale := v.Scale
+			if scale < 0 {
+				scale = 0
+			}
+			if scale > 255 {
+				scale = 255
+			}
+			status = C.ddb_stmt_bind_decimal(s.stmt, idx, C.int64_t(v.Unscaled), C.uint8_t(scale))
 		default:
 			return fmt.Errorf("unsupported type: %T", v)
 		}
-		if res != 0 {
-			msg := C.GoString(C.decentdb_last_error_message(s.c.db))
-			return &DecentDBError{Code: int(res), Message: msg, SQL: s.query}
+		if status != C.DDB_OK {
+			return statusError(status, s.query)
 		}
 	}
 	return nil
@@ -552,13 +652,17 @@ func (s *stmtStruct) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		return nil, err
 	}
 
-	res := C.decentdb_step(s.stmt)
-	if res < 0 {
-		msg := C.GoString(C.decentdb_last_error_message(s.c.db))
-		return nil, &DecentDBError{Code: int(res), Message: msg, SQL: s.query}
+	var hasRow C.uint8_t
+	status := C.ddb_stmt_step(s.stmt, &hasRow)
+	if status != C.DDB_OK {
+		return nil, statusError(status, s.query)
 	}
 
-	affected := int64(C.decentdb_rows_affected(s.stmt))
+	var affected C.uint64_t
+	status = C.ddb_stmt_affected_rows(s.stmt, &affected)
+	if status != C.DDB_OK {
+		return nil, statusError(status, s.query)
+	}
 	return driver.RowsAffected(affected), nil
 }
 
@@ -579,10 +683,20 @@ type rows struct {
 }
 
 func (r *rows) Columns() []string {
-	count := int(C.decentdb_column_count(r.s.stmt))
+	var count C.size_t
+	status := C.ddb_stmt_column_count(r.s.stmt, &count)
+	if status != C.DDB_OK {
+		return []string{}
+	}
 	cols := make([]string, count)
-	for i := 0; i < count; i++ {
-		cols[i] = C.GoString(C.decentdb_column_name(r.s.stmt, C.int(i)))
+	for i := 0; i < int(count); i++ {
+		var name *C.char
+		status = C.ddb_stmt_column_name_copy(r.s.stmt, C.size_t(i), &name)
+		if status != C.DDB_OK || name == nil {
+			continue
+		}
+		cols[i] = C.GoString(name)
+		freeAPIString(name)
 	}
 	return cols
 }
@@ -590,7 +704,7 @@ func (r *rows) Columns() []string {
 func (r *rows) Close() error {
 	// Make statement reusable (and release any held read snapshot).
 	if r.s != nil && r.s.stmt != nil {
-		C.decentdb_reset(r.s.stmt)
+		C.ddb_stmt_reset(r.s.stmt)
 	}
 	return nil
 }
@@ -603,58 +717,59 @@ func (r *rows) Next(dest []driver.Value) error {
 		default:
 		}
 	}
-	res := C.decentdb_step(r.s.stmt)
-	if res == 0 {
+	var hasRow C.uint8_t
+	status := C.ddb_stmt_step(r.s.stmt, &hasRow)
+	if status != C.DDB_OK {
+		return statusError(status, r.s.query)
+	}
+	if hasRow == 0 {
 		return io.EOF
 	}
-	if res < 0 {
-		msg := C.GoString(C.decentdb_last_error_message(r.s.c.db))
-		return &DecentDBError{Code: int(res), Message: msg, SQL: r.s.query}
-	}
 
-	var views *C.decentdb_value_view
-	var count C.int
-	viewRes := C.decentdb_row_view(r.s.stmt, &views, &count)
-	if viewRes != 0 {
-		msg := C.GoString(C.decentdb_last_error_message(r.s.c.db))
-		return &DecentDBError{Code: int(viewRes), Message: msg, SQL: r.s.query}
+	var views *C.ddb_value_view_t
+	var count C.size_t
+	status = C.ddb_stmt_row_view(r.s.stmt, &views, &count)
+	if status != C.DDB_OK {
+		return statusError(status, r.s.query)
 	}
 	if count == 0 {
 		return nil
 	}
-	goViews := unsafe.Slice((*C.decentdb_value_view)(unsafe.Pointer(views)), int(count))
+	goViews := unsafe.Slice((*C.ddb_value_view_t)(unsafe.Pointer(views)), int(count))
 	for i := 0; i < int(count) && i < len(dest); i++ {
 		v := goViews[i]
-		if v.is_null != 0 {
+		if v.tag == C.DDB_VALUE_NULL {
 			dest[i] = nil
 			continue
 		}
-		switch int(v.kind) {
-		case 1: // vkInt64
-			dest[i] = int64(v.int64_val)
-		case 2: // vkBool
-			dest[i] = v.int64_val != 0
-		case 3: // vkFloat64
-			dest[i] = float64(v.float64_val)
-		case 4: // vkText
-			if v.bytes_len == 0 || v.bytes == nil {
+		switch v.tag {
+		case C.DDB_VALUE_INT64:
+			dest[i] = int64(v.int64_value)
+		case C.DDB_VALUE_BOOL:
+			dest[i] = v.bool_value != 0
+		case C.DDB_VALUE_FLOAT64:
+			dest[i] = float64(v.float64_value)
+		case C.DDB_VALUE_TEXT:
+			if v.len == 0 || v.data == nil {
 				dest[i] = ""
 				continue
 			}
-			dest[i] = C.GoStringN((*C.char)(unsafe.Pointer(v.bytes)), v.bytes_len)
-		case 5: // vkBlob
-			if v.bytes_len == 0 || v.bytes == nil {
+			dest[i] = C.GoStringN((*C.char)(unsafe.Pointer(v.data)), C.int(v.len))
+		case C.DDB_VALUE_BLOB:
+			if v.len == 0 || v.data == nil {
 				dest[i] = []byte{}
 				continue
 			}
-			dest[i] = C.GoBytes(unsafe.Pointer(v.bytes), v.bytes_len)
-		case 12: // vkDecimal
+			dest[i] = C.GoBytes(unsafe.Pointer(v.data), C.int(v.len))
+		case C.DDB_VALUE_UUID:
+			dest[i] = C.GoBytes(unsafe.Pointer(&v.uuid_bytes[0]), 16)
+		case C.DDB_VALUE_DECIMAL:
 			dest[i] = Decimal{
-				Unscaled: int64(v.int64_val),
+				Unscaled: int64(v.decimal_scaled),
 				Scale:    int(v.decimal_scale),
 			}
-		case 17: // vkDateTime: microseconds since Unix epoch UTC
-			micros := int64(v.int64_val)
+		case C.DDB_VALUE_TIMESTAMP_MICROS:
+			micros := int64(v.timestamp_micros)
 			dest[i] = time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
 		default:
 			dest[i] = nil

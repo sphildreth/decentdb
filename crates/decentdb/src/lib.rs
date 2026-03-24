@@ -7,13 +7,14 @@
 
 mod btree;
 mod c_api;
-mod c_api_legacy;
 mod catalog;
 mod config;
 mod db;
 mod error;
 mod exec;
 mod json;
+#[cfg(test)]
+mod json_tests;
 mod metadata;
 mod planner;
 mod record;

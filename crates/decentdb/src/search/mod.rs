@@ -3,6 +3,8 @@
 
 pub(crate) mod postings;
 pub(crate) mod rebuild;
+#[cfg(test)]
+mod rebuild_tests;
 pub(crate) mod trigram;
 
 use std::collections::{BTreeMap, BTreeSet};

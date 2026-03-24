@@ -85,6 +85,16 @@ function loadNative() {
   return native;
 }
 
+function normalizeControlSql(sql) {
+  if (typeof sql !== 'string') return null;
+  const trimmed = sql.trim().replace(/;+$/g, '').trim().toUpperCase().replace(/\s+/g, ' ');
+  if (trimmed === 'BEGIN' || trimmed === 'BEGIN TRANSACTION') return 'BEGIN';
+  if (trimmed === 'START TRANSACTION') return 'BEGIN';
+  if (trimmed === 'COMMIT' || trimmed === 'END' || trimmed === 'END TRANSACTION') return 'COMMIT';
+  if (trimmed === 'ROLLBACK' || trimmed === 'ROLLBACK TRANSACTION') return 'ROLLBACK';
+  return null;
+}
+
 class Database {
   constructor({ path, options } = {}) {
     if (!path || typeof path !== 'string') {
@@ -141,6 +151,13 @@ class Database {
   }
 
   exec(sql, bindings) {
+    const control = normalizeControlSql(sql);
+    if (control && (bindings == null || (Array.isArray(bindings) && bindings.length === 0))) {
+      if (control === 'BEGIN') this._native.dbBeginTransaction(this._handle);
+      if (control === 'COMMIT') this._native.dbCommitTransaction(this._handle);
+      if (control === 'ROLLBACK') this._native.dbRollbackTransaction(this._handle);
+      return { rows: [], rowsAffected: 0n };
+    }
     const stmt = this.prepare(sql);
     try {
       stmt.bindAll(bindings);
@@ -155,6 +172,13 @@ class Database {
   }
 
   async execAsync(sql, bindings) {
+    const control = normalizeControlSql(sql);
+    if (control && (bindings == null || (Array.isArray(bindings) && bindings.length === 0))) {
+      if (control === 'BEGIN') this._native.dbBeginTransaction(this._handle);
+      if (control === 'COMMIT') this._native.dbCommitTransaction(this._handle);
+      if (control === 'ROLLBACK') this._native.dbRollbackTransaction(this._handle);
+      return { rows: [], rowsAffected: 0n };
+    }
     const stmt = this.prepare(sql);
     try {
       stmt.bindAll(bindings);
@@ -171,6 +195,21 @@ class Database {
   checkpoint() {
     if (!this._handle) throw new Error('Database is closed');
     this._native.dbCheckpoint(this._handle);
+  }
+
+  beginTransaction() {
+    if (!this._handle) throw new Error('Database is closed');
+    this._native.dbBeginTransaction(this._handle);
+  }
+
+  commitTransaction() {
+    if (!this._handle) throw new Error('Database is closed');
+    this._native.dbCommitTransaction(this._handle);
+  }
+
+  rollbackTransaction() {
+    if (!this._handle) throw new Error('Database is closed');
+    this._native.dbRollbackTransaction(this._handle);
   }
 
   saveAs(destPath) {

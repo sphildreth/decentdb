@@ -1,19 +1,5 @@
 /*
- * DecentDB JNI Bridge
- *
- * This file implements the JNI methods declared in DecentDBNative.java.
- * It delegates all operations to the DecentDB C API (libc_api / libdecentdb_jni).
- *
- * Ownership rules:
- * - DB handles (long) are created by dbOpen() and freed by dbClose().
- * - Statement handles (long) are created by stmtPrepare() and freed by stmtFinalize().
- * - All C API strings are freed by calling decentdb_free() on them.
- * - Java strings passed to native are converted to C strings and freed on the stack.
- *
- * Thread-safety:
- * - Statement/result handles are NOT safe for concurrent use.
- * - Connection-level locking in Java (DecentDBConnection.connectionLock) prevents
- *   concurrent calls to the same DB/statement handle from different threads.
+ * DecentDB JNI Bridge (ddb_* ABI)
  */
 
 #include <jni.h>
@@ -21,87 +7,29 @@
 #include <string.h>
 #include <stdint.h>
 
-/* Forward declarations for the DecentDB C API. These match the symbols
-   exported by the shared library used by this JNI layer. */
+#include "../../../include/decentdb.h"
 
-typedef void (*decentdb_free_fn)(void *p);
-typedef void *(*decentdb_open_fn)(const char *path, const char *options);
-typedef int  (*decentdb_close_fn)(void *p);
-typedef int  (*decentdb_last_error_code_fn)(void *p);
-typedef const char *(*decentdb_last_error_message_fn)(void *p);
-typedef int  (*decentdb_prepare_fn)(void *db, const char *sql, void **out_stmt);
-typedef int  (*decentdb_step_fn)(void *stmt);
-typedef int  (*decentdb_reset_fn)(void *stmt);
-typedef int  (*decentdb_clear_bindings_fn)(void *stmt);
-typedef void (*decentdb_finalize_fn)(void *stmt);
-typedef int64_t (*decentdb_rows_affected_fn)(void *stmt);
+static int map_status_to_legacy_code(ddb_status_t status) {
+    switch (status) {
+        case DDB_OK: return 0;
+        case DDB_ERR_IO: return 1;
+        case DDB_ERR_CORRUPTION: return 2;
+        case DDB_ERR_CONSTRAINT: return 3;
+        case DDB_ERR_TRANSACTION: return 4;
+        case DDB_ERR_SQL: return 5;
+        case DDB_ERR_INTERNAL: return 6;
+        case DDB_ERR_PANIC: return 7;
+        default: return 6;
+    }
+}
 
-typedef int  (*decentdb_bind_null_fn)(void *stmt, int col);
-typedef int  (*decentdb_bind_int64_fn)(void *stmt, int col, int64_t val);
-typedef int  (*decentdb_bind_float64_fn)(void *stmt, int col, double val);
-typedef int  (*decentdb_bind_text_fn)(void *stmt, int col, const char *utf8, int byte_len);
-typedef int  (*decentdb_bind_blob_fn)(void *stmt, int col, const uint8_t *data, int byte_len);
+/* Cached global last status for callers passing dbHandle=0. */
+static int g_last_code = 0;
 
-typedef int  (*decentdb_column_count_fn)(void *stmt);
-typedef const char *(*decentdb_column_name_fn)(void *stmt, int col);
-typedef int  (*decentdb_column_type_fn)(void *stmt, int col);
-typedef int  (*decentdb_column_is_null_fn)(void *stmt, int col);
-typedef int64_t (*decentdb_column_int64_fn)(void *stmt, int col);
-typedef double (*decentdb_column_float64_fn)(void *stmt, int col);
-typedef int  (*decentdb_column_decimal_scale_fn)(void *stmt, int col);
-typedef int64_t (*decentdb_column_decimal_unscaled_fn)(void *stmt, int col);
-typedef const char *(*decentdb_column_text_fn)(void *stmt, int col, int *out_len);
-typedef const uint8_t *(*decentdb_column_blob_fn)(void *stmt, int col, int *out_len);
+static void set_last_status(ddb_status_t status) {
+    g_last_code = map_status_to_legacy_code(status);
+}
 
-typedef const char *(*decentdb_list_tables_json_fn)(void *db, int *out_len);
-typedef const char *(*decentdb_get_table_columns_json_fn)(void *db, const char *table, int *out_len);
-typedef const char *(*decentdb_list_indexes_json_fn)(void *db, int *out_len);
-
-/*
- * When compiled as a standalone JNI library that *embeds* the DecentDB engine,
- * we link directly against the DecentDB symbols (provided at link time).
- * This avoids dlopen() complications and matches how SQLite JDBC works.
- */
-
-/* Direct symbol declarations for static/dynamic linking */
-extern void        decentdb_free(void *p);
-extern void       *decentdb_open(const char *path, const char *options);
-extern int         decentdb_close(void *p);
-extern int         decentdb_last_error_code(void *p);
-extern const char *decentdb_last_error_message(void *p);
-extern int         decentdb_prepare(void *db, const char *sql, void **out_stmt);
-extern int         decentdb_step(void *stmt);
-extern int         decentdb_reset(void *stmt);
-extern int         decentdb_clear_bindings(void *stmt);
-extern void        decentdb_finalize(void *stmt);
-extern int64_t     decentdb_rows_affected(void *stmt);
-
-extern int         decentdb_bind_null(void *stmt, int col);
-extern int         decentdb_bind_int64(void *stmt, int col, int64_t val);
-extern int         decentdb_bind_float64(void *stmt, int col, double val);
-extern int         decentdb_bind_text(void *stmt, int col, const char *utf8, int byte_len);
-extern int         decentdb_bind_blob(void *stmt, int col, const uint8_t *data, int byte_len);
-extern int         decentdb_bind_datetime(void *stmt, int col, int64_t micros_utc);
-
-extern int         decentdb_column_count(void *stmt);
-extern const char *decentdb_column_name(void *stmt, int col);
-extern int         decentdb_column_type(void *stmt, int col);
-extern int         decentdb_column_is_null(void *stmt, int col);
-extern int64_t     decentdb_column_int64(void *stmt, int col);
-extern double      decentdb_column_float64(void *stmt, int col);
-extern int         decentdb_column_decimal_scale(void *stmt, int col);
-extern int64_t     decentdb_column_decimal_unscaled(void *stmt, int col);
-extern int64_t     decentdb_column_datetime(void *stmt, int col);
-extern const char *decentdb_column_text(void *stmt, int col, int *out_len);
-extern const uint8_t *decentdb_column_blob(void *stmt, int col, int *out_len);
-
-extern const char *decentdb_list_tables_json(void *db, int *out_len);
-extern const char *decentdb_list_views_json(void *db, int *out_len);
-extern const char *decentdb_get_view_ddl(void *db, const char *view, int *out_len);
-extern const char *decentdb_get_table_columns_json(void *db, const char *table, int *out_len);
-extern const char *decentdb_list_indexes_json(void *db, int *out_len);
-
-/* Helper: convert jstring to a malloc'd C string. Caller must free(). */
 static char *jstring_to_cstr(JNIEnv *env, jstring js) {
     if (js == NULL) return NULL;
     const char *utf = (*env)->GetStringUTFChars(env, js, NULL);
@@ -111,214 +39,382 @@ static char *jstring_to_cstr(JNIEnv *env, jstring js) {
     return copy;
 }
 
-/* Helper: create a Java String from a C string (may be NULL → returns NULL). */
 static jstring cstr_to_jstring(JNIEnv *env, const char *s) {
     if (s == NULL) return NULL;
     return (*env)->NewStringUTF(env, s);
 }
 
-/* ---- Database handle operations ---------------------------------------- */
+static ddb_db_t *as_db(jlong handle) {
+    return (ddb_db_t *)(uintptr_t)handle;
+}
+
+static ddb_stmt_t *as_stmt(jlong handle) {
+    return (ddb_stmt_t *)(uintptr_t)handle;
+}
+
+static int classify_open_mode(const char *opts) {
+    if (opts == NULL || opts[0] == '\0') return 0; /* open_or_create */
+    if (strcmp(opts, "mode=create") == 0) return 1;
+    if (strcmp(opts, "mode=open") == 0) return 2;
+    return 0;
+}
 
 JNIEXPORT jlong JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_dbOpen(JNIEnv *env, jclass cls,
     jstring jpath, jstring joptions)
 {
+    (void)cls;
     char *path = jstring_to_cstr(env, jpath);
     char *opts = jstring_to_cstr(env, joptions);
-    void *handle = decentdb_open(path, opts);
+    if (path == NULL) {
+        free(opts);
+        set_last_status(DDB_ERR_INTERNAL);
+        return 0;
+    }
+
+    ddb_db_t *db = NULL;
+    ddb_status_t status = DDB_ERR_INTERNAL;
+    int mode = classify_open_mode(opts);
+    if (mode == 1) {
+        status = ddb_db_create(path, &db);
+    } else if (mode == 2) {
+        status = ddb_db_open(path, &db);
+    } else {
+        status = ddb_db_open_or_create(path, &db);
+    }
+    set_last_status(status);
+
     free(path);
     free(opts);
-    return (jlong)(uintptr_t)handle;
+
+    if (status != DDB_OK || db == NULL) return 0;
+    return (jlong)(uintptr_t)db;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_dbClose(JNIEnv *env, jclass cls, jlong handle)
 {
+    (void)env;
+    (void)cls;
     if (handle == 0) return 0;
-    return (jint)decentdb_close((void *)(uintptr_t)handle);
+    ddb_db_t *db = as_db(handle);
+    ddb_status_t status = ddb_db_free(&db);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_dbLastErrorCode(JNIEnv *env, jclass cls, jlong handle)
 {
-    if (handle == 0) return 0;
-    return (jint)decentdb_last_error_code((void *)(uintptr_t)handle);
+    (void)env;
+    (void)cls;
+    (void)handle;
+    return (jint)g_last_code;
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_dbLastErrorMessage(JNIEnv *env, jclass cls, jlong handle)
 {
-    if (handle == 0) return NULL;
-    const char *msg = decentdb_last_error_message((void *)(uintptr_t)handle);
+    (void)cls;
+    (void)handle;
+    const char *msg = ddb_last_error_message();
     return cstr_to_jstring(env, msg);
 }
-
-/* ---- Statement operations ---------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_stmtPrepare(JNIEnv *env, jclass cls,
     jlong dbHandle, jstring jsql, jlongArray outStmt)
 {
-    if (dbHandle == 0 || jsql == NULL) return -1;
+    (void)cls;
+    if (dbHandle == 0 || jsql == NULL || outStmt == NULL) {
+        set_last_status(DDB_ERR_INTERNAL);
+        return -1;
+    }
     char *sql = jstring_to_cstr(env, jsql);
-    void *stmt = NULL;
-    int rc = decentdb_prepare((void *)(uintptr_t)dbHandle, sql, &stmt);
+    if (sql == NULL) {
+        set_last_status(DDB_ERR_INTERNAL);
+        return -1;
+    }
+    ddb_stmt_t *stmt = NULL;
+    ddb_status_t status = ddb_db_prepare(as_db(dbHandle), sql, &stmt);
+    set_last_status(status);
     free(sql);
+    if (status != DDB_OK || stmt == NULL) return -1;
     jlong stmtHandle = (jlong)(uintptr_t)stmt;
     (*env)->SetLongArrayRegion(env, outStmt, 0, 1, &stmtHandle);
-    return (jint)rc;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_stmtStep(JNIEnv *env, jclass cls, jlong stmtHandle)
 {
-    if (stmtHandle == 0) return -1;
-    return (jint)decentdb_step((void *)(uintptr_t)stmtHandle);
+    (void)env;
+    (void)cls;
+    if (stmtHandle == 0) {
+        set_last_status(DDB_ERR_INTERNAL);
+        return -1;
+    }
+    uint8_t has_row = 0;
+    ddb_status_t status = ddb_stmt_step(as_stmt(stmtHandle), &has_row);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return has_row ? 1 : 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_stmtReset(JNIEnv *env, jclass cls, jlong stmtHandle)
 {
-    if (stmtHandle == 0) return -1;
-    return (jint)decentdb_reset((void *)(uintptr_t)stmtHandle);
+    (void)env;
+    (void)cls;
+    if (stmtHandle == 0) {
+        set_last_status(DDB_ERR_INTERNAL);
+        return -1;
+    }
+    ddb_status_t status = ddb_stmt_reset(as_stmt(stmtHandle));
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_stmtClearBindings(JNIEnv *env, jclass cls, jlong stmtHandle)
 {
-    if (stmtHandle == 0) return -1;
-    return (jint)decentdb_clear_bindings((void *)(uintptr_t)stmtHandle);
+    (void)env;
+    (void)cls;
+    if (stmtHandle == 0) {
+        set_last_status(DDB_ERR_INTERNAL);
+        return -1;
+    }
+    ddb_status_t status = ddb_stmt_clear_bindings(as_stmt(stmtHandle));
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT void JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_stmtFinalize(JNIEnv *env, jclass cls, jlong stmtHandle)
 {
+    (void)env;
+    (void)cls;
     if (stmtHandle == 0) return;
-    decentdb_finalize((void *)(uintptr_t)stmtHandle);
+    ddb_stmt_t *stmt = as_stmt(stmtHandle);
+    ddb_status_t status = ddb_stmt_free(&stmt);
+    set_last_status(status);
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_stmtRowsAffected(JNIEnv *env, jclass cls, jlong stmtHandle)
 {
-    if (stmtHandle == 0) return 0;
-    return (jlong)decentdb_rows_affected((void *)(uintptr_t)stmtHandle);
+    (void)env;
+    (void)cls;
+    if (stmtHandle == 0) {
+        set_last_status(DDB_ERR_INTERNAL);
+        return 0;
+    }
+    uint64_t rows = 0;
+    ddb_status_t status = ddb_stmt_affected_rows(as_stmt(stmtHandle), &rows);
+    set_last_status(status);
+    if (status != DDB_OK) return 0;
+    return (jlong)rows;
 }
-
-/* ---- Bind operations --------------------------------------------------- */
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_bindNull(JNIEnv *env, jclass cls, jlong s, jint col)
 {
-    if (s == 0) return -1;
-    return (jint)decentdb_bind_null((void *)(uintptr_t)s, (int)col);
+    (void)env;
+    (void)cls;
+    ddb_status_t status = ddb_stmt_bind_null(as_stmt(s), (size_t)col);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_bindInt64(JNIEnv *env, jclass cls, jlong s, jint col, jlong val)
 {
-    if (s == 0) return -1;
-    return (jint)decentdb_bind_int64((void *)(uintptr_t)s, (int)col, (int64_t)val);
+    (void)env;
+    (void)cls;
+    ddb_status_t status = ddb_stmt_bind_int64(as_stmt(s), (size_t)col, (int64_t)val);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_bindFloat64(JNIEnv *env, jclass cls, jlong s, jint col, jdouble val)
 {
-    if (s == 0) return -1;
-    return (jint)decentdb_bind_float64((void *)(uintptr_t)s, (int)col, (double)val);
+    (void)env;
+    (void)cls;
+    ddb_status_t status = ddb_stmt_bind_float64(as_stmt(s), (size_t)col, (double)val);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_bindText(JNIEnv *env, jclass cls, jlong s, jint col, jstring jval)
 {
-    if (s == 0) return -1;
+    (void)cls;
     if (jval == NULL) {
-        return (jint)decentdb_bind_null((void *)(uintptr_t)s, (int)col);
+        ddb_status_t status = ddb_stmt_bind_null(as_stmt(s), (size_t)col);
+        set_last_status(status);
+        if (status != DDB_OK) return -1;
+        return 0;
     }
     const char *utf = (*env)->GetStringUTFChars(env, jval, NULL);
     jsize len = (*env)->GetStringUTFLength(env, jval);
-    int rc = decentdb_bind_text((void *)(uintptr_t)s, (int)col, utf, (int)len);
+    ddb_status_t status = ddb_stmt_bind_text(as_stmt(s), (size_t)col, utf, (size_t)len);
     (*env)->ReleaseStringUTFChars(env, jval, utf);
-    return (jint)rc;
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_bindBlob(JNIEnv *env, jclass cls, jlong s, jint col, jbyteArray jdata)
 {
-    if (s == 0) return -1;
+    (void)cls;
     if (jdata == NULL) {
-        return (jint)decentdb_bind_null((void *)(uintptr_t)s, (int)col);
+        ddb_status_t status = ddb_stmt_bind_null(as_stmt(s), (size_t)col);
+        set_last_status(status);
+        if (status != DDB_OK) return -1;
+        return 0;
     }
     jsize len = (*env)->GetArrayLength(env, jdata);
     jbyte *buf = (*env)->GetByteArrayElements(env, jdata, NULL);
-    int rc = decentdb_bind_blob((void *)(uintptr_t)s, (int)col, (const uint8_t *)buf, (int)len);
+    ddb_status_t status = ddb_stmt_bind_blob(as_stmt(s), (size_t)col, (const uint8_t *)buf, (size_t)len);
     (*env)->ReleaseByteArrayElements(env, jdata, buf, JNI_ABORT);
-    return (jint)rc;
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_bindDatetime(JNIEnv *env, jclass cls, jlong s, jint col, jlong micros_utc)
 {
-    if (s == 0) return -1;
-    return (jint)decentdb_bind_datetime((void *)(uintptr_t)s, (int)col, (int64_t)micros_utc);
+    (void)env;
+    (void)cls;
+    ddb_status_t status = ddb_stmt_bind_timestamp_micros(as_stmt(s), (size_t)col, (int64_t)micros_utc);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    return 0;
 }
 
-/* ---- Column access ----------------------------------------------------- */
+static int col_type_for_tag(uint32_t tag, const ddb_value_view_t *v) {
+    switch (tag) {
+        case DDB_VALUE_NULL: return 0;
+        case DDB_VALUE_INT64:
+            if (v->int64_value == 0) return 15;
+            if (v->int64_value == 1) return 16;
+            return 1;
+        case DDB_VALUE_BOOL: return v->bool_value ? 14 : 13;
+        case DDB_VALUE_FLOAT64: return 3;
+        case DDB_VALUE_TEXT: return 4;
+        case DDB_VALUE_BLOB: return 5;
+        case DDB_VALUE_UUID: return 5;
+        case DDB_VALUE_DECIMAL: return 12;
+        case DDB_VALUE_TIMESTAMP_MICROS: return 17;
+        default: return 0;
+    }
+}
+
+static int row_view_at(jlong s, jint index, const ddb_value_view_t **out_v, size_t *out_cols) {
+    const ddb_value_view_t *values = NULL;
+    size_t cols = 0;
+    ddb_status_t status = ddb_stmt_row_view(as_stmt(s), &values, &cols);
+    set_last_status(status);
+    if (status != DDB_OK) return -1;
+    if (index < 0 || (size_t)index >= cols) return -1;
+    *out_v = &values[(size_t)index];
+    if (out_cols) *out_cols = cols;
+    return 0;
+}
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colCount(JNIEnv *env, jclass cls, jlong s)
 {
+    (void)env;
+    (void)cls;
     if (s == 0) return 0;
-    return (jint)decentdb_column_count((void *)(uintptr_t)s);
+    size_t cols = 0;
+    ddb_status_t status = ddb_stmt_column_count(as_stmt(s), &cols);
+    set_last_status(status);
+    if (status != DDB_OK) return 0;
+    return (jint)cols;
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colName(JNIEnv *env, jclass cls, jlong s, jint index)
 {
+    (void)cls;
     if (s == 0) return NULL;
-    const char *name = decentdb_column_name((void *)(uintptr_t)s, (int)index);
-    return cstr_to_jstring(env, name);
+    char *name = NULL;
+    ddb_status_t status = ddb_stmt_column_name_copy(as_stmt(s), (size_t)index, &name);
+    set_last_status(status);
+    if (status != DDB_OK || name == NULL) return NULL;
+    jstring result = (*env)->NewStringUTF(env, name);
+    ddb_string_free(&name);
+    return result;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colType(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 0;
-    return (jint)decentdb_column_type((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 0;
+    return (jint)col_type_for_tag(v->tag, v);
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colIsNull(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 1;
-    return (jint)decentdb_column_is_null((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 1;
+    return (jint)(v->tag == DDB_VALUE_NULL ? 1 : 0);
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colInt64(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 0;
-    return (jlong)decentdb_column_int64((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 0;
+    if (v->tag == DDB_VALUE_BOOL) return v->bool_value ? 1 : 0;
+    if (v->tag == DDB_VALUE_INT64) return (jlong)v->int64_value;
+    if (v->tag == DDB_VALUE_TIMESTAMP_MICROS) return (jlong)v->timestamp_micros;
+    if (v->tag == DDB_VALUE_DECIMAL) return (jlong)v->decimal_scaled;
+    return 0;
 }
 
 JNIEXPORT jdouble JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colFloat64(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 0.0;
-    return (jdouble)decentdb_column_float64((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 0.0;
+    if (v->tag == DDB_VALUE_FLOAT64) return (jdouble)v->float64_value;
+    if (v->tag == DDB_VALUE_INT64) return (jdouble)v->int64_value;
+    return 0.0;
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colText(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return NULL;
-    int out_len = 0;
-    const char *text = decentdb_column_text((void *)(uintptr_t)s, (int)index, &out_len);
-    if (text == NULL) return NULL;
-    /* The text buffer is NOT null-terminated; copy with explicit length before NewStringUTF. */
-    char *tmp = (char *)malloc((size_t)out_len + 1);
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return NULL;
+    if (v->tag != DDB_VALUE_TEXT || v->data == NULL) return NULL;
+    char *tmp = (char *)malloc(v->len + 1);
     if (tmp == NULL) return NULL;
-    memcpy(tmp, text, (size_t)out_len);
-    tmp[out_len] = '\0';
+    memcpy(tmp, v->data, v->len);
+    tmp[v->len] = '\0';
     jstring result = (*env)->NewStringUTF(env, tmp);
     free(tmp);
     return result;
@@ -327,104 +423,119 @@ Java_com_decentdb_jdbc_DecentDBNative_colText(JNIEnv *env, jclass cls, jlong s, 
 JNIEXPORT jbyteArray JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colBlob(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return NULL;
-    int out_len = 0;
-    const uint8_t *data = decentdb_column_blob((void *)(uintptr_t)s, (int)index, &out_len);
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return NULL;
+    const uint8_t *data = NULL;
+    size_t len = 0;
+    if (v->tag == DDB_VALUE_BLOB) {
+        data = v->data;
+        len = v->len;
+    } else if (v->tag == DDB_VALUE_UUID) {
+        data = v->uuid_bytes;
+        len = 16;
+    } else {
+        return NULL;
+    }
     if (data == NULL) return NULL;
-    jbyteArray arr = (*env)->NewByteArray(env, (jsize)out_len);
+    jbyteArray arr = (*env)->NewByteArray(env, (jsize)len);
     if (arr == NULL) return NULL;
-    (*env)->SetByteArrayRegion(env, arr, 0, (jsize)out_len, (const jbyte *)data);
+    (*env)->SetByteArrayRegion(env, arr, 0, (jsize)len, (const jbyte *)data);
     return arr;
 }
 
 JNIEXPORT jint JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colDecimalScale(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 0;
-    return (jint)decentdb_column_decimal_scale((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 0;
+    if (v->tag != DDB_VALUE_DECIMAL) return 0;
+    return (jint)v->decimal_scale;
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colDecimalUnscaled(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 0;
-    return (jlong)decentdb_column_decimal_unscaled((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 0;
+    if (v->tag != DDB_VALUE_DECIMAL) return 0;
+    return (jlong)v->decimal_scaled;
 }
 
 JNIEXPORT jlong JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_colDatetime(JNIEnv *env, jclass cls, jlong s, jint index)
 {
-    if (s == 0) return 0;
-    return (jlong)decentdb_column_datetime((void *)(uintptr_t)s, (int)index);
+    (void)env;
+    (void)cls;
+    const ddb_value_view_t *v = NULL;
+    if (row_view_at(s, index, &v, NULL) != 0) return 0;
+    if (v->tag != DDB_VALUE_TIMESTAMP_MICROS) return 0;
+    return (jlong)v->timestamp_micros;
 }
 
-/* ---- Metadata (JSON) --------------------------------------------------- */
+static jstring json_from_statused_string(JNIEnv *env, ddb_status_t status, char *json) {
+    set_last_status(status);
+    if (status != DDB_OK || json == NULL) return NULL;
+    jstring out = (*env)->NewStringUTF(env, json);
+    ddb_string_free(&json);
+    return out;
+}
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_metaListTables(JNIEnv *env, jclass cls, jlong dbHandle)
 {
-    if (dbHandle == 0) return NULL;
-    int out_len = 0;
-    const char *json = decentdb_list_tables_json((void *)(uintptr_t)dbHandle, &out_len);
-    if (json == NULL) return NULL;
-    jstring result = (*env)->NewStringUTF(env, json);
-    decentdb_free((void *)json);
-    return result;
+    (void)cls;
+    char *json = NULL;
+    ddb_status_t status = ddb_db_list_tables_json(as_db(dbHandle), &json);
+    return json_from_statused_string(env, status, json);
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_metaListViews(JNIEnv *env, jclass cls, jlong dbHandle)
 {
-    if (dbHandle == 0) return NULL;
-    int out_len = 0;
-    const char *json = decentdb_list_views_json((void *)(uintptr_t)dbHandle, &out_len);
-    if (json == NULL) return NULL;
-    jstring result = (*env)->NewStringUTF(env, json);
-    decentdb_free((void *)json);
-    return result;
+    (void)cls;
+    char *json = NULL;
+    ddb_status_t status = ddb_db_list_views_json(as_db(dbHandle), &json);
+    return json_from_statused_string(env, status, json);
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_metaGetViewDDL(JNIEnv *env, jclass cls,
     jlong dbHandle, jstring jview)
 {
+    (void)cls;
     if (dbHandle == 0 || jview == NULL) return NULL;
     char *view = jstring_to_cstr(env, jview);
     if (view == NULL) return NULL;
-
-    int out_len = 0;
-    const char *ddl = decentdb_get_view_ddl((void *)(uintptr_t)dbHandle, view, &out_len);
+    char *ddl = NULL;
+    ddb_status_t status = ddb_db_get_view_ddl(as_db(dbHandle), view, &ddl);
     free(view);
-
-    if (ddl == NULL) return NULL;
-    jstring result = (*env)->NewStringUTF(env, ddl);
-    decentdb_free((void *)ddl);
-    return result;
+    return json_from_statused_string(env, status, ddl);
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_metaGetTableColumns(JNIEnv *env, jclass cls,
     jlong dbHandle, jstring jtable)
 {
+    (void)cls;
     if (dbHandle == 0 || jtable == NULL) return NULL;
     char *table = jstring_to_cstr(env, jtable);
-    int out_len = 0;
-    const char *json = decentdb_get_table_columns_json((void *)(uintptr_t)dbHandle, table, &out_len);
+    if (table == NULL) return NULL;
+    char *json = NULL;
+    ddb_status_t status = ddb_db_describe_table_json(as_db(dbHandle), table, &json);
     free(table);
-    if (json == NULL) return NULL;
-    jstring result = (*env)->NewStringUTF(env, json);
-    decentdb_free((void *)json);
-    return result;
+    return json_from_statused_string(env, status, json);
 }
 
 JNIEXPORT jstring JNICALL
 Java_com_decentdb_jdbc_DecentDBNative_metaListIndexes(JNIEnv *env, jclass cls, jlong dbHandle)
 {
-    if (dbHandle == 0) return NULL;
-    int out_len = 0;
-    const char *json = decentdb_list_indexes_json((void *)(uintptr_t)dbHandle, &out_len);
-    if (json == NULL) return NULL;
-    jstring result = (*env)->NewStringUTF(env, json);
-    decentdb_free((void *)json);
-    return result;
+    (void)cls;
+    char *json = NULL;
+    ddb_status_t status = ddb_db_list_indexes_json(as_db(dbHandle), &json);
+    return json_from_statused_string(env, status, json);
 }

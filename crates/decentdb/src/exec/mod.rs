@@ -1,6 +1,8 @@
 //! Query execution operators, SQL result values, and runtime state.
 
 pub(crate) mod bulk_load;
+#[cfg(test)]
+mod bulk_load_tests;
 pub(crate) mod constraints;
 pub(crate) mod ddl;
 pub(crate) mod dml;
@@ -9,6 +11,8 @@ pub(crate) mod row;
 pub(crate) mod triggers;
 pub(crate) mod txn;
 pub(crate) mod views;
+#[cfg(test)]
+mod views_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};

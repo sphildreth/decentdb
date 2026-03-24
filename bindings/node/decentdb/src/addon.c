@@ -18,10 +18,13 @@ typedef struct stmt_wrap {
 } stmt_wrap;
 
 enum {
-  DECENTDB_KIND_INT64 = 1,
-  DECENTDB_KIND_FLOAT64 = 3,
-  DECENTDB_KIND_TEXT = 4,
-  DECENTDB_KIND_TEXT_OVERFLOW = 6
+  DECENTDB_KIND_INT64 = DDB_VALUE_INT64,
+  DECENTDB_KIND_FLOAT64 = DDB_VALUE_FLOAT64,
+  DECENTDB_KIND_BOOL = DDB_VALUE_BOOL,
+  DECENTDB_KIND_TEXT = DDB_VALUE_TEXT,
+  DECENTDB_KIND_BLOB = DDB_VALUE_BLOB,
+  DECENTDB_KIND_DECIMAL = DDB_VALUE_DECIMAL,
+  DECENTDB_KIND_DATETIME = DDB_VALUE_TIMESTAMP_MICROS
 };
 
 typedef struct {
@@ -70,6 +73,12 @@ static napi_value throw_last_native_error(napi_env env, const decentdb_native_ap
   char buf[768];
   snprintf(buf, sizeof(buf), "DecentDB native error (%d): %s", code, msg ? msg : "");
   return throw_error(env, "DECENTDB_NATIVE", buf);
+}
+
+static void free_native_owned_string(const decentdb_native_api* api, const char* ptr) {
+  if (api && api->free && ptr) {
+    api->free((void*)ptr);
+  }
 }
 
 static const decentdb_native_api* require_api(napi_env env) {
@@ -911,109 +920,6 @@ static napi_value js_stmt_fetch_rows_i64_text_f64(napi_env env, napi_callback_in
   return arr;
 }
 
-static napi_value js_stmt_fetch_row_arrays(napi_env env, napi_callback_info info) {
-  const decentdb_native_api* api = require_api(env);
-  if (!api->step_with_params_row_view) {
-    return throw_error(env, "DECENTDB_UNSUPPORTED", "native row-view API is unavailable");
-  }
-
-  size_t argc = 2;
-  napi_value argv[2];
-  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
-
-  if (argc < 2) {
-    return throw_error(env, "DECENTDB_ARGS", "stmtFetchRowArrays(handle, maxRows) requires 2 args");
-  }
-
-  stmt_wrap* w = unwrap_stmt(env, argv[0]);
-  if (!w) return NULL;
-
-  int64_t max_rows_i64 = 0;
-  st = napi_get_value_int64(env, argv[1], &max_rows_i64);
-  if (st != napi_ok || max_rows_i64 < 0) {
-    return throw_error(env, "DECENTDB_ARGS", "maxRows must be a non-negative integer");
-  }
-  size_t max_rows = (size_t)max_rows_i64;
-
-  napi_value first = build_row_array(env, api, w->stmt);
-  if (!first) return NULL;
-
-  int col_count = api->column_count(w->stmt);
-  if (col_count < 0) return throw_last_native_error(env, api);
-
-  napi_value out;
-  size_t capacity = max_rows == 0 ? 1024 : max_rows;
-  st = napi_create_array_with_length(env, capacity, &out);
-  assert(st == napi_ok);
-  st = napi_set_element(env, out, 0, first);
-  assert(st == napi_ok);
-
-  size_t written = 1;
-  while (max_rows == 0 || written < max_rows) {
-    int rc = api->step(w->stmt);
-    if (rc < 0) return throw_last_native_error(env, api);
-    if (rc == 0) break;
-
-    const decentdb_value_view* views = NULL;
-    int out_cols = 0;
-    rc = api->row_view(w->stmt, &views, &out_cols);
-    if (rc != 0) return throw_last_native_error(env, api);
-    if (out_cols != col_count) {
-      return throw_error(env, "DECENTDB_INTERNAL", "row column count changed unexpectedly");
-    }
-
-    napi_value row_arr;
-    st = napi_create_array_with_length(env, (size_t)col_count, &row_arr);
-    assert(st == napi_ok);
-
-    for (int c = 0; c < col_count; c++) {
-      const decentdb_value_view* v = &views[c];
-      napi_value cell;
-      if (v->is_null) {
-        st = napi_get_null(env, &cell);
-        assert(st == napi_ok);
-      } else if (v->kind == DECENTDB_KIND_INT64) {
-        st = napi_create_bigint_int64(env, v->int64_val, &cell);
-        assert(st == napi_ok);
-      } else if (v->kind == DECENTDB_KIND_FLOAT64) {
-        st = napi_create_double(env, v->float64_val, &cell);
-        assert(st == napi_ok);
-      } else if (v->kind == DECENTDB_KIND_TEXT || v->kind == DECENTDB_KIND_TEXT_OVERFLOW) {
-        const char* txt = (const char*)v->bytes;
-        size_t txt_len = v->bytes_len < 0 ? 0 : (size_t)v->bytes_len;
-        if (!txt) txt = "";
-        st = napi_create_string_utf8(env, txt, txt_len, &cell);
-        assert(st == napi_ok);
-      } else {
-        st = napi_get_null(env, &cell);
-        assert(st == napi_ok);
-      }
-      st = napi_set_element(env, row_arr, (uint32_t)c, cell);
-      assert(st == napi_ok);
-    }
-
-    st = napi_set_element(env, out, (uint32_t)written, row_arr);
-    assert(st == napi_ok);
-    written++;
-  }
-
-  if (written == capacity) {
-    return out;
-  }
-  napi_value trimmed;
-  st = napi_create_array_with_length(env, written, &trimmed);
-  assert(st == napi_ok);
-  for (size_t i = 0; i < written; i++) {
-    napi_value row;
-    st = napi_get_element(env, out, (uint32_t)i, &row);
-    assert(st == napi_ok);
-    st = napi_set_element(env, trimmed, (uint32_t)i, row);
-    assert(st == napi_ok);
-  }
-  return trimmed;
-}
-
 static napi_value js_stmt_column_names(napi_env env, napi_callback_info info) {
   const decentdb_native_api* api = require_api(env);
 
@@ -1026,16 +932,18 @@ static napi_value js_stmt_column_names(napi_env env, napi_callback_info info) {
   if (!w) return NULL;
 
   int count = api->column_count(w->stmt);
+  if (count < 0) return throw_last_native_error(env, api);
   napi_value arr;
   st = napi_create_array_with_length(env, (size_t)count, &arr);
   assert(st == napi_ok);
 
   for (int i = 0; i < count; i++) {
     const char* name = api->column_name(w->stmt, i);
-    if (!name) name = "";
+    if (!name) return throw_last_native_error(env, api);
     napi_value namev;
     st = napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &namev);
     assert(st == napi_ok);
+    free_native_owned_string(api, name);
     st = napi_set_element(env, arr, (uint32_t)i, namev);
     assert(st == napi_ok);
   }
@@ -1112,60 +1020,55 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
     const decentdb_value_view* v = &values[i];
     napi_value cell;
 
-    if (v->is_null) {
+    if (v->tag == DDB_VALUE_NULL) {
       st = napi_get_null(env, &cell);
       assert(st == napi_ok);
     } else {
-      switch (v->kind) {
-        // record.ValueKind enum order:
-        // 0 null, 1 int64, 2 bool, 3 float64, 4 text, 5 blob, 6 textOverflow, 7 blobOverflow
-        case 1: {
-          st = napi_create_bigint_int64(env, v->int64_val, &cell);
+      switch (v->tag) {
+        case DECENTDB_KIND_INT64: {
+          st = napi_create_bigint_int64(env, v->int64_value, &cell);
           assert(st == napi_ok);
           break;
         }
-        case 2: {
-          st = napi_get_boolean(env, v->int64_val != 0, &cell);
+        case DECENTDB_KIND_BOOL: {
+          st = napi_get_boolean(env, v->bool_value != 0, &cell);
           assert(st == napi_ok);
           break;
         }
-        case 3: {
-          st = napi_create_double(env, v->float64_val, &cell);
+        case DECENTDB_KIND_FLOAT64: {
+          st = napi_create_double(env, v->float64_value, &cell);
           assert(st == napi_ok);
           break;
         }
-        case 4:
-        case 6: {
-          const char* s = (const char*)v->bytes;
-          int len = v->bytes_len;
+        case DECENTDB_KIND_TEXT: {
+          const char* s = (const char*)v->data;
+          size_t len = v->len;
           if (!s) s = "";
-          if (len < 0) len = 0;
-          st = napi_create_string_utf8(env, s, (size_t)len, &cell);
+          st = napi_create_string_utf8(env, s, len, &cell);
           assert(st == napi_ok);
           break;
         }
-        case 5:
-        case 7: {
-          const uint8_t* b = v->bytes;
-          int len = v->bytes_len;
-          if (len < 0) len = 0;
-          st = napi_create_buffer_copy(env, (size_t)len, b, NULL, &cell);
+        case DECENTDB_KIND_BLOB:
+        case DDB_VALUE_UUID: {
+          const uint8_t* b = v->tag == DDB_VALUE_UUID ? v->uuid_bytes : v->data;
+          size_t len = v->tag == DDB_VALUE_UUID ? 16u : v->len;
+          st = napi_create_buffer_copy(env, len, b, NULL, &cell);
           assert(st == napi_ok);
           break;
         }
-        case 12: { // vkDecimal
+        case DECENTDB_KIND_DECIMAL: {
           napi_value obj;
           st = napi_create_object(env, &obj);
           assert(st == napi_ok);
           
           napi_value unscaledv;
-          st = napi_create_bigint_int64(env, v->int64_val, &unscaledv);
+          st = napi_create_bigint_int64(env, v->decimal_scaled, &unscaledv);
           assert(st == napi_ok);
           st = napi_set_named_property(env, obj, "unscaled", unscaledv);
           assert(st == napi_ok);
 
           napi_value scalev;
-          st = napi_create_int32(env, v->decimal_scale, &scalev);
+          st = napi_create_int32(env, (int32_t)v->decimal_scale, &scalev);
           assert(st == napi_ok);
           st = napi_set_named_property(env, obj, "scale", scalev);
           assert(st == napi_ok);
@@ -1173,16 +1076,11 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
           cell = obj;
           break;
         }
-        case 17: { // vkDateTime: microseconds since epoch → JS Date (milliseconds)
-          double ms = (double)v->int64_val / 1000.0;
+        case DECENTDB_KIND_DATETIME: {
+          double ms = (double)v->timestamp_micros / 1000.0;
           napi_value msv;
           st = napi_create_double(env, ms, &msv);
           assert(st == napi_ok);
-          napi_value date_ctor;
-          st = napi_get_global(env, &date_ctor);
-          assert(st == napi_ok);
-          // Return as ISO string for simplicity (Date constructor is async-unsafe in N-API)
-          // Format: expose as a plain number (ms since epoch); callers wrap in new Date(val)
           cell = msv;
           break;
         }
@@ -1371,6 +1269,72 @@ static napi_value js_db_save_as(napi_env env, napi_callback_info info) {
   return result;
 }
 
+static napi_value js_db_begin_transaction(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = decentdb_native_get();
+  if (!api) return throw_error(env, "DECENTDB_LOAD", decentdb_native_last_load_error());
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+
+  db_wrap* w = NULL;
+  napi_status st = napi_get_value_external(env, argv[0], (void**)&w);
+  if (st != napi_ok || !w || !w->db) return throw_error(env, "DECENTDB_ERR", "Invalid db handle");
+
+  int rc = api->begin_transaction(w->db);
+  if (rc != 0) {
+    return throw_last_native_error(env, api);
+  }
+
+  napi_value result;
+  napi_get_undefined(env, &result);
+  return result;
+}
+
+static napi_value js_db_commit_transaction(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = decentdb_native_get();
+  if (!api) return throw_error(env, "DECENTDB_LOAD", decentdb_native_last_load_error());
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+
+  db_wrap* w = NULL;
+  napi_status st = napi_get_value_external(env, argv[0], (void**)&w);
+  if (st != napi_ok || !w || !w->db) return throw_error(env, "DECENTDB_ERR", "Invalid db handle");
+
+  int rc = api->commit_transaction(w->db);
+  if (rc != 0) {
+    return throw_last_native_error(env, api);
+  }
+
+  napi_value result;
+  napi_get_undefined(env, &result);
+  return result;
+}
+
+static napi_value js_db_rollback_transaction(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = decentdb_native_get();
+  if (!api) return throw_error(env, "DECENTDB_LOAD", decentdb_native_last_load_error());
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+
+  db_wrap* w = NULL;
+  napi_status st = napi_get_value_external(env, argv[0], (void**)&w);
+  if (st != napi_ok || !w || !w->db) return throw_error(env, "DECENTDB_ERR", "Invalid db handle");
+
+  int rc = api->rollback_transaction(w->db);
+  if (rc != 0) {
+    return throw_last_native_error(env, api);
+  }
+
+  napi_value result;
+  napi_get_undefined(env, &result);
+  return result;
+}
+
 // --------------- Schema introspection helpers ---------------
 static napi_value json_api_call(napi_env env, db_wrap* w, const decentdb_native_api* api,
                                 const char* (*fn)(decentdb_db*, int*)) {
@@ -1478,6 +1442,9 @@ static napi_value init(napi_env env, napi_value exports) {
     {"stmtRowsAffected", 0, js_stmt_rows_affected, 0, 0, 0, napi_default, 0},
 
     {"dbCheckpoint", 0, js_db_checkpoint, 0, 0, 0, napi_default, 0},
+    {"dbBeginTransaction", 0, js_db_begin_transaction, 0, 0, 0, napi_default, 0},
+    {"dbCommitTransaction", 0, js_db_commit_transaction, 0, 0, 0, napi_default, 0},
+    {"dbRollbackTransaction", 0, js_db_rollback_transaction, 0, 0, 0, napi_default, 0},
     {"dbSaveAs", 0, js_db_save_as, 0, 0, 0, napi_default, 0},
     {"dbListTablesJson", 0, js_db_list_tables_json, 0, 0, 0, napi_default, 0},
     {"dbGetTableColumnsJson", 0, js_db_get_table_columns_json, 0, 0, 0, napi_default, 0},

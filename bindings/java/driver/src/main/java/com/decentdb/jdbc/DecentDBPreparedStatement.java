@@ -44,8 +44,8 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
             prepareNative();
             bindAll();
             int rc = DecentDBNative.stmtStep(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0 && rc != 1) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             currentResultSet = new DecentDBResultSet(this, stmtHandle, connection.getDbHandle(), rc);
             return currentResultSet;
@@ -64,8 +64,8 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
             prepareNative();
             bindAll();
             int rc = DecentDBNative.stmtStep(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0 && rc != 1) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             updateCount = DecentDBNative.stmtRowsAffected(stmtHandle);
             finalizeStmt();
@@ -87,8 +87,8 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
             prepareNative();
             bindAll();
             int rc = DecentDBNative.stmtStep(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0 && rc != 1) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             if (rc == 1) {
                 currentResultSet = new DecentDBResultSet(this, stmtHandle, connection.getDbHandle(), rc);
@@ -107,19 +107,19 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
     private void prepareNative() throws SQLException {
         if (nativePrepared && stmtHandle != 0) {
             int rc = DecentDBNative.stmtReset(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             rc = DecentDBNative.stmtClearBindings(stmtHandle);
-            if (rc < 0) {
-                Errors.checkResult(connection.getDbHandle(), rc);
+            if (rc != 0) {
+                Errors.checkStatus(connection.getDbHandle(), rc);
             }
             return;
         }
         long[] outStmt = new long[1];
         int rc = DecentDBNative.stmtPrepare(connection.getDbHandle(), sql, outStmt);
-        if (rc < 0 || outStmt[0] == 0) {
-            Errors.checkResult(connection.getDbHandle(), rc < 0 ? rc : -1);
+        if (rc != 0 || outStmt[0] == 0) {
+            Errors.checkStatus(connection.getDbHandle(), rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
         }
         stmtHandle = outStmt[0];
         nativePrepared = true;
@@ -132,51 +132,51 @@ public class DecentDBPreparedStatement extends DecentDBStatement implements Prep
             Object v = params[i];
             if (v == NullPlaceholder.INSTANCE) {
                 int rc = DecentDBNative.bindNull(stmtHandle, col);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof Long) {
                 int rc = DecentDBNative.bindInt64(stmtHandle, col, (Long) v);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof Integer) {
                 int rc = DecentDBNative.bindInt64(stmtHandle, col, ((Integer) v).longValue());
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof Short || v instanceof Byte) {
                 int rc = DecentDBNative.bindInt64(stmtHandle, col, ((Number) v).longValue());
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof Double) {
                 int rc = DecentDBNative.bindFloat64(stmtHandle, col, (Double) v);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof Float) {
                 int rc = DecentDBNative.bindFloat64(stmtHandle, col, ((Float) v).doubleValue());
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof Boolean) {
                 int rc = DecentDBNative.bindInt64(stmtHandle, col, (Boolean) v ? 1L : 0L);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof BigDecimal) {
                 BigDecimal bd = (BigDecimal) v;
                 int scale = bd.scale();
                 long unscaled = bd.unscaledValue().longValue();
                 int rc = DecentDBNative.bindInt64(stmtHandle, col, unscaled);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof String) {
                 int rc = DecentDBNative.bindText(stmtHandle, col, (String) v);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof byte[]) {
                 int rc = DecentDBNative.bindBlob(stmtHandle, col, (byte[]) v);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof java.sql.Timestamp) {
                 java.sql.Timestamp ts = (java.sql.Timestamp) v;
                 long micros = ts.getTime() * 1000L + ts.getNanos() / 1000L % 1000L;
                 int rc = DecentDBNative.bindDatetime(stmtHandle, col, micros);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else if (v instanceof java.sql.Date) {
                 java.sql.Date d = (java.sql.Date) v;
                 long micros = d.getTime() * 1000L;
                 int rc = DecentDBNative.bindDatetime(stmtHandle, col, micros);
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             } else {
                 // Fallback: convert to string
                 int rc = DecentDBNative.bindText(stmtHandle, col, v.toString());
-                if (rc < 0) Errors.checkResult(connection.getDbHandle(), rc);
+                if (rc != 0) Errors.checkStatus(connection.getDbHandle(), rc);
             }
         }
     }
