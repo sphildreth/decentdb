@@ -18,6 +18,13 @@ try:
 except ImportError:
     JAYDEBEAPI_AVAILABLE = False
 
+try:
+    import jpype
+
+    JPYPE_AVAILABLE = True
+except ImportError:
+    JPYPE_AVAILABLE = False
+
 
 class JDBCDriver(DatabaseDriver):
     """Generic JDBC driver for Java-based embedded databases."""
@@ -28,18 +35,21 @@ class JDBCDriver(DatabaseDriver):
             "jdbc_prefix": "jdbc:h2:",
             "driver_class": "org.h2.Driver",
             "jar_path": "h2.jar",
+            "jdbc_suffix": ";DB_CLOSE_DELAY=-1",
         },
         "derby": {
             "name": "Apache Derby",
             "jdbc_prefix": "jdbc:derby:",
-            "driver_class": "org.apache.derby.jdbc.EmbeddedDriver",
+            "driver_class": "org.apache.derby.iapi.jdbc.AutoloadedDriver",
             "jar_path": "derby.jar",
+            "jdbc_suffix": ";create=true",
         },
         "hsqldb": {
             "name": "HSQLDB",
             "jdbc_prefix": "jdbc:hsqldb:",
             "driver_class": "org.hsqldb.jdbc.JDBCDriver",
             "jar_path": "hsqldb.jar",
+            "jdbc_suffix": ";hsqldb.write_delay=false",
         },
     }
 
@@ -56,13 +66,29 @@ class JDBCDriver(DatabaseDriver):
         if self.engine in self.ENGINE_CONFIGS:
             eng_cfg = self.ENGINE_CONFIGS[self.engine]
             if not self.jdbc_url:
-                self.jdbc_url = (
-                    f"{eng_cfg['jdbc_prefix']}{self.db_path};DB_CLOSE_DELAY=-1"
-                )
+                suffix = eng_cfg.get("jdbc_suffix", "")
+                self.jdbc_url = f"{eng_cfg['jdbc_prefix']}{self.db_path}{suffix}"
+            elif "{db_path}" in self.jdbc_url:
+                self.jdbc_url = self.jdbc_url.format(db_path=self.db_path)
             if not self.driver_class:
                 self.driver_class = eng_cfg["driver_class"]
             if not self.jar_paths and eng_cfg.get("jar_path"):
                 self.jar_paths = [eng_cfg["jar_path"]]
+
+    def _adapt_sql(self, sql: str) -> str:
+        adapted = sql
+
+        if self.engine in {"derby", "hsqldb"}:
+            adapted = adapted.replace(" TEXT ", " VARCHAR(255) ")
+            adapted = adapted.replace(" TEXT,", " VARCHAR(255),")
+            adapted = adapted.replace(" TEXT\n", " VARCHAR(255)\n")
+            adapted = adapted.replace(" referrer TEXT", " referrer VARCHAR(255)")
+
+        if self.engine == "derby":
+            adapted = adapted.replace(" ORDER BY created_at LIMIT ?", " ORDER BY created_at FETCH FIRST ? ROWS ONLY")
+            adapted = adapted.replace(" ORDER BY o.created_at LIMIT ?", " ORDER BY o.created_at FETCH FIRST ? ROWS ONLY")
+
+        return adapted
 
     @property
     def name(self) -> str:
@@ -79,6 +105,10 @@ class JDBCDriver(DatabaseDriver):
         try:
             # Build classpath from jar_paths
             classpath = ":".join(self.jar_paths) if self.jar_paths else None
+
+            if JPYPE_AVAILABLE and self.jar_paths:
+                for jar_path in self.jar_paths:
+                    jpype.addClassPath(jar_path)
 
             self.connection = jaydebeapi.connect(
                 self.driver_class,
@@ -103,7 +133,7 @@ class JDBCDriver(DatabaseDriver):
 
     def create_schema(self, schema_sql: str):
         cursor = self.connection.cursor()
-        statements = schema_sql.split(";")
+        statements = self._adapt_sql(schema_sql).split(";")
         for statement in statements:
             statement = statement.strip()
             if statement:
@@ -116,6 +146,7 @@ class JDBCDriver(DatabaseDriver):
         cursor.close()
 
     def execute_query(self, sql: str, params: Optional[Tuple] = None) -> List[Dict]:
+        sql = self._adapt_sql(sql)
         cursor = self.connection.cursor()
         if params:
             cursor.execute(sql, params)
@@ -131,6 +162,7 @@ class JDBCDriver(DatabaseDriver):
         return [dict(zip(columns, row)) for row in rows]
 
     def execute_update(self, sql: str, params: Optional[Tuple] = None) -> int:
+        sql = self._adapt_sql(sql)
         cursor = self.connection.cursor()
         if params:
             cursor.execute(sql, params)
@@ -142,6 +174,7 @@ class JDBCDriver(DatabaseDriver):
         return rowcount
 
     def execute_many(self, sql: str, params_list: List[Tuple]) -> int:
+        sql = self._adapt_sql(sql)
         cursor = self.connection.cursor()
         cursor.executemany(sql, params_list)
         rowcount = cursor.rowcount * len(params_list)
@@ -159,6 +192,7 @@ class JDBCDriver(DatabaseDriver):
         self.connection.rollback()
 
     def prepare_statement(self, sql: str):
+        sql = self._adapt_sql(sql)
         cursor = self.connection.cursor()
         cursor.prepare(sql)
         self._prepared_stmts[sql] = cursor

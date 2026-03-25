@@ -16,6 +16,21 @@ engines:
     jar_paths:
       - /tmp/h2.jar
 
+  derby:
+    enabled: true
+    jdbc_url: jdbc:derby:{db_path};create=true
+    driver_class: org.apache.derby.iapi.jdbc.AutoloadedDriver
+    jar_paths:
+      - /opt/Apache/db-derby/lib/derby.jar
+      - /opt/Apache/db-derby/lib/derbyshared.jar
+
+  hsqldb:
+    enabled: true
+    jdbc_url: jdbc:hsqldb:file:{db_path};hsqldb.write_delay=false
+    driver_class: org.hsqldb.jdbc.JDBCDriver
+    jar_paths:
+      - /usr/share/java/hsqldb.jar
+
 dataset:
   seed: 42
   customers_n: 100

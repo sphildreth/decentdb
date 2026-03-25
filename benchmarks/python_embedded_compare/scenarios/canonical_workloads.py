@@ -158,7 +158,7 @@ CREATE INDEX idx_orders_status_created ON orders(status, created_at);
         return {
             "point_lookup": "SELECT * FROM customers WHERE customer_id = ?",
             "range_scan": "SELECT * FROM orders WHERE customer_id = ? AND created_at >= ? AND created_at < ? ORDER BY created_at LIMIT ?",
-            "join": "SELECT o.order_id, o.total_cents, c.email FROM orders o INNER JOIN customers c ON c.customer_id = o.customer_id WHERE o.created_at >= ? AND o.created_at < ? ORDER BY o.created_at LIMIT ?",
+            "join": "SELECT o.order_id, o.total_cents, c.email FROM (SELECT order_id, customer_id, created_at, total_cents FROM orders WHERE created_at >= ? AND created_at < ? ORDER BY created_at LIMIT ?) o INNER JOIN customers c ON c.customer_id = o.customer_id ORDER BY o.created_at",
             "aggregate": "SELECT status, COUNT(*) AS n, SUM(total_cents) AS sum_cents FROM orders WHERE created_at >= ? AND created_at < ? GROUP BY status ORDER BY n DESC",
             "update": "UPDATE orders SET status = ? WHERE order_id = ?",
             "delete": "DELETE FROM orders WHERE order_id = ?",

@@ -99,6 +99,9 @@ class RunManifest:
     # Configuration notes
     config_notes: Dict[str, str] = field(default_factory=dict)
 
+    # Per-engine execution status
+    engine_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # Output path
     output_dir: str = ""
 

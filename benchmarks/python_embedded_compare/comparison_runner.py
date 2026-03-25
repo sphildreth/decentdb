@@ -162,7 +162,7 @@ def run_benchmark_for_engine(
     operations: int,
     warmup: int,
     output_dir: Path,
-) -> Optional[ResultRecord]:
+) -> Dict[str, Any]:
     """Run benchmarks for a single engine.
 
     Args:
@@ -179,8 +179,19 @@ def run_benchmark_for_engine(
         output_dir: Output directory
 
     Returns:
-        List of result records. Empty if failed.
+        Dictionary containing execution status, optional skip/failure reason,
+        and any generated result records.
     """
+    if engine == "litedb":
+        return {
+            "status": "skipped",
+            "reason": (
+                "LiteDB is a document-store baseline and needs its own mapped "
+                "non-SQL workload before it can produce publishable results"
+            ),
+            "results": [],
+        }
+
     # Create temporary directory for database
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = os.path.join(tmpdir, f"{engine}.db")
@@ -190,12 +201,16 @@ def run_benchmark_for_engine(
             driver = create_driver(engine, engine_config, db_path)
         except Exception as e:
             print(f"  [SKIP] Cannot create driver for {engine}: {e}")
-            return []
+            return {"status": "skipped", "reason": str(e), "results": []}
 
         # Connect
         if not driver.connect():
             print(f"  [SKIP] Cannot connect to {engine}")
-            return []
+            return {
+                "status": "skipped",
+                "reason": "connection failed",
+                "results": [],
+            }
 
         try:
             print(f"  Running benchmarks for {driver.name}...")
@@ -291,15 +306,14 @@ def run_benchmark_for_engine(
                 with open(output_file, "w") as f:
                     json.dump(record.to_dict(), f, indent=2)
 
-            # Return first result for summary
-            return result_records
+            return {"status": "completed", "reason": "", "results": result_records}
 
         except Exception as e:
             print(f"  [ERROR] Benchmark failed for {engine}: {e}")
             import traceback
 
             traceback.print_exc()
-            return []
+            return {"status": "failed", "reason": str(e), "results": []}
 
         finally:
             driver.disconnect()
@@ -363,11 +377,16 @@ def run_comparison(
         # Check if engine is enabled
         if not engine_config.get("enabled", True):
             print(f"Skipping disabled engine: {engine}")
+            manifest.engine_status[engine] = {
+                "status": "disabled",
+                "reason": "disabled in configuration",
+                "result_count": 0,
+            }
             continue
 
         print(f"\n=== Benchmarking {engine} ===")
 
-        results = run_benchmark_for_engine(
+        outcome = run_benchmark_for_engine(
             engine=engine,
             engine_config=engine_config,
             workload_name=workload_name,
@@ -381,6 +400,16 @@ def run_comparison(
             output_dir=output_dir,
         )
 
+        results = outcome["results"]
+        manifest.engine_status[engine] = {
+            "status": outcome["status"],
+            "reason": outcome["reason"],
+            "result_count": len(results),
+        }
+
+        if outcome["status"] != "completed":
+            continue
+
         for result in results:
             bundle.add_result(result)
             print(f"  Completed: {result.benchmark}")
@@ -391,6 +420,10 @@ def run_comparison(
     manifest_path = output_dir / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest.to_dict(), f, indent=2)
+
+    engine_status_path = output_dir / "engine_status.json"
+    with open(engine_status_path, "w") as f:
+        json.dump(manifest.engine_status, f, indent=2)
 
     # Save merged results
     merged_path = output_dir / "results_merged.json"
@@ -588,10 +621,12 @@ def main():
     print(f"\nResults saved to: {args.output}")
     if len(op_counts) == 1:
         print("  - manifest.json")
+        print("  - engine_status.json")
         print("  - results_merged.json")
         print("  - results_*.json")
     else:
         print("  - ops_<count>/manifest.json")
+        print("  - ops_<count>/engine_status.json")
         print("  - ops_<count>/results_merged.json")
         print("  - ops_<count>/results_*.json")
     if exported_charts:

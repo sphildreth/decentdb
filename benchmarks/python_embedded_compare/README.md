@@ -45,6 +45,10 @@ python comparison_runner.py --engines sqlite --durability durable --scenario wor
 python comparison_runner.py --engines sqlite,duckdb,decentdb --workload workload_a --ops-list 10000,100000,1000000
 ```
 
+Single `--ops` runs produce per-benchmark comparison charts for one operation count.
+Use `--ops-list` when you want the line charts described in the benchmark plan,
+with operation count on the x-axis and one series per engine.
+
 ## Directory Structure
 
 ```
@@ -117,8 +121,11 @@ SQLite specifically uses multiple explicitly-named variants:
 The runner produces:
 - `out/results_<engine>_<benchmark>.json`: Per-benchmark raw results
 - `out/manifest.json`: Run metadata and fairness contract
+- `out/engine_status.json`: Per-engine run status and skip or failure reasons
 - `out/results_merged.json`: Combined results for aggregation
-- `out/charts/*.svg` and `out/charts/*.png`: Generated benchmark charts
+- `out/charts/latency-comparison-overview.*`: Multi-panel comparison chart for a single `--ops` run
+- `out/charts/latency-overview.*`: Multi-panel line chart for an `--ops-list` sweep
+- `out/charts/<benchmark>-latency.*`: Per-benchmark bar chart for single-op runs or line chart for sweeps
 - `docs/assets/benchmarks/python-embedded-compare/*.svg`: Docs-referenceable chart exports
 
 When `--ops-list` is provided, each operation count is written under `out/ops_<count>/`
