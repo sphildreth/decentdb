@@ -226,9 +226,62 @@ fn read_u64(bytes: &[u8; WAL_HEADER_SIZE_USIZE], offset: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::RwLock;
+
+    use crate::error::{DbError, Result};
     use crate::storage::page;
+    use crate::vfs::{FileKind, VfsFile};
 
     use super::{FrameType, WalFrame, WalHeader};
+
+    /// A minimal in-memory VfsFile for unit-testing frame decode.
+    #[derive(Debug)]
+    struct TestFile {
+        data: RwLock<Vec<u8>>,
+    }
+
+    impl TestFile {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                data: RwLock::new(bytes),
+            }
+        }
+    }
+
+    impl VfsFile for TestFile {
+        fn kind(&self) -> FileKind {
+            FileKind::Wal
+        }
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new(":test:")
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            let data = self.data.read().map_err(|_| DbError::internal("lock"))?;
+            let off = offset as usize;
+            if off >= data.len() {
+                return Ok(0);
+            }
+            let avail = &data[off..];
+            let n = avail.len().min(buf.len());
+            buf[..n].copy_from_slice(&avail[..n]);
+            Ok(n)
+        }
+        fn write_at(&self, _: u64, _: &[u8]) -> Result<usize> {
+            unimplemented!()
+        }
+        fn sync_data(&self) -> Result<()> {
+            Ok(())
+        }
+        fn sync_metadata(&self) -> Result<()> {
+            Ok(())
+        }
+        fn file_size(&self) -> Result<u64> {
+            Ok(self.data.read().unwrap().len() as u64)
+        }
+        fn set_len(&self, _: u64) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn wal_header_roundtrip_preserves_fields() {
@@ -252,5 +305,219 @@ mod tests {
         assert_eq!(commit.encoded_len(page::DEFAULT_PAGE_SIZE), 13);
         assert_eq!(checkpoint.encoded_len(page::DEFAULT_PAGE_SIZE), 21);
         assert_eq!(commit.frame_type, FrameType::Commit);
+    }
+
+    // ------- New decode / roundtrip tests -------
+
+    #[test]
+    fn frame_type_try_from_valid() {
+        assert_eq!(FrameType::try_from(0).unwrap(), FrameType::Page);
+        assert_eq!(FrameType::try_from(1).unwrap(), FrameType::Commit);
+        assert_eq!(FrameType::try_from(2).unwrap(), FrameType::Checkpoint);
+    }
+
+    #[test]
+    fn frame_type_try_from_invalid() {
+        assert!(FrameType::try_from(3).is_err());
+        assert!(FrameType::try_from(255).is_err());
+    }
+
+    #[test]
+    fn wal_header_decode_bad_magic() {
+        let mut bytes = [0_u8; super::WAL_HEADER_SIZE_USIZE];
+        bytes[0..8].copy_from_slice(b"BADMAGIC");
+        assert!(WalHeader::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn wal_header_decode_bad_version() {
+        let header = WalHeader::new(page::DEFAULT_PAGE_SIZE, 4096);
+        let mut encoded = header.encode();
+        // Corrupt the version field (bytes 8..12)
+        encoded[8..12].copy_from_slice(&99_u32.to_le_bytes());
+        assert!(WalHeader::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn wal_header_decode_bad_end_offset() {
+        let header = WalHeader::new(page::DEFAULT_PAGE_SIZE, 4096);
+        let mut encoded = header.encode();
+        // Set wal_end_offset to something < WAL_HEADER_SIZE but non-zero
+        encoded[16..24].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(WalHeader::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn wal_header_zero_end_offset_ok() {
+        let header = WalHeader::new(page::DEFAULT_PAGE_SIZE, 0);
+        let encoded = header.encode();
+        let decoded = WalHeader::decode(&encoded).unwrap();
+        assert_eq!(decoded.wal_end_offset, 0);
+    }
+
+    #[test]
+    fn page_frame_encode_decode_roundtrip() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let payload = vec![42_u8; ps as usize];
+        let frame = WalFrame::page(7, payload.clone());
+        let encoded = frame.encode(ps).unwrap();
+
+        let file = TestFile::new(encoded.to_vec());
+        let total_len = encoded.len() as u64;
+        let decoded = WalFrame::decode_from_file(&file, 0, ps, total_len)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decoded.frame_type, FrameType::Page);
+        assert_eq!(decoded.page_id, 7);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn commit_frame_encode_decode_roundtrip() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame::commit();
+        let encoded = frame.encode(ps).unwrap();
+
+        let file = TestFile::new(encoded.to_vec());
+        let total_len = encoded.len() as u64;
+        let decoded = WalFrame::decode_from_file(&file, 0, ps, total_len)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decoded.frame_type, FrameType::Commit);
+        assert_eq!(decoded.page_id, 0);
+    }
+
+    #[test]
+    fn checkpoint_frame_encode_decode_roundtrip() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame::checkpoint(456);
+        let encoded = frame.encode(ps).unwrap();
+
+        let file = TestFile::new(encoded.to_vec());
+        let total_len = encoded.len() as u64;
+        let decoded = WalFrame::decode_from_file(&file, 0, ps, total_len)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decoded.frame_type, FrameType::Checkpoint);
+        assert_eq!(decoded.page_id, 0);
+        assert_eq!(decoded.payload, 456_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_returns_none_beyond_logical_end() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let file = TestFile::new([].to_vec());
+        assert!(WalFrame::decode_from_file(&file, 0, ps, 0).unwrap().is_none());
+        assert!(WalFrame::decode_from_file(&file, 100, ps, 50).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_returns_none_for_partial_header() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let file = TestFile::new([0, 0, 0].to_vec());
+        // logical_end is 3 which is less than FRAME_HEADER_SIZE(5), so header overflows
+        assert!(WalFrame::decode_from_file(&file, 0, ps, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn decode_returns_none_for_partial_frame() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame::commit();
+        let encoded = frame.encode(ps).unwrap();
+        let file = TestFile::new(encoded.to_vec());
+        // Set logical end to less than the full frame size
+        let short = (encoded.len() - 1) as u64;
+        assert!(WalFrame::decode_from_file(&file, 0, ps, short).unwrap().is_none());
+    }
+
+    #[test]
+    fn encode_error_wrong_payload_size() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        // Page frame with wrong payload size
+        let frame = WalFrame {
+            frame_type: FrameType::Page,
+            page_id: 1,
+            payload: vec![0; 10], // wrong size
+        };
+        assert!(frame.encode(ps).is_err());
+    }
+
+    #[test]
+    fn encode_error_page_with_zero_id() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame {
+            frame_type: FrameType::Page,
+            page_id: 0, // invalid
+            payload: vec![0; ps as usize],
+        };
+        assert!(frame.encode(ps).is_err());
+    }
+
+    #[test]
+    fn encode_error_commit_with_nonzero_id() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame {
+            frame_type: FrameType::Commit,
+            page_id: 5, // should be 0
+            payload: vec![],
+        };
+        assert!(frame.encode(ps).is_err());
+    }
+
+    #[test]
+    fn multi_frame_decode_from_file() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frames = vec![
+            WalFrame::page(1, vec![0xAA; ps as usize]),
+            WalFrame::page(2, vec![0xBB; ps as usize]),
+            WalFrame::commit(),
+        ];
+
+        let mut data = Vec::new();
+        for f in &frames {
+            data.extend_from_slice(&f.encode(ps).unwrap());
+        }
+        let logical_end = data.len() as u64;
+        let file = TestFile::new(data.to_vec());
+
+        let mut offset = 0_u64;
+        let mut decoded = Vec::new();
+        while let Some(frame) = WalFrame::decode_from_file(&file, offset, ps, logical_end).unwrap()
+        {
+            offset += frame.encoded_len(ps) as u64;
+            decoded.push(frame);
+        }
+
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].page_id, 1);
+        assert_eq!(decoded[1].page_id, 2);
+        assert_eq!(decoded[2].frame_type, FrameType::Commit);
+    }
+
+    #[test]
+    fn decode_corrupt_page_id_zero_for_page_frame() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame::page(1, vec![0; ps as usize]);
+        let mut encoded = frame.encode(ps).unwrap();
+        // Corrupt page_id to 0 (bytes 1..5)
+        encoded[1..5].copy_from_slice(&0_u32.to_le_bytes());
+        let file = TestFile::new(encoded.to_vec());
+        let logical_end = encoded.len() as u64;
+        assert!(WalFrame::decode_from_file(&file, 0, ps, logical_end).is_err());
+    }
+
+    #[test]
+    fn decode_corrupt_nonzero_page_id_for_commit() {
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = WalFrame::commit();
+        let mut encoded = frame.encode(ps).unwrap();
+        // Corrupt page_id to non-zero (bytes 1..5)
+        encoded[1..5].copy_from_slice(&42_u32.to_le_bytes());
+        let file = TestFile::new(encoded.to_vec());
+        let logical_end = encoded.len() as u64;
+        assert!(WalFrame::decode_from_file(&file, 0, ps, logical_end).is_err());
     }
 }

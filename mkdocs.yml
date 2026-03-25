@@ -18,6 +18,7 @@ nav:
     - Transactions: user-guide/transactions.md
     - Indexes: user-guide/indexes.md
     - Performance Tuning: user-guide/performance.md
+    - Benchmarks: user-guide/benchmarks.md
     - Comparison (SQLite/DuckDB): user-guide/comparison.md
     - Tools:
       - DBeaver Integration: user-guide/dbeaver.md

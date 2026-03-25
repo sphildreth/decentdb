@@ -243,3 +243,273 @@ fn has_top_level_semicolon(sql: &str) -> bool {
 fn is_keyword_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── top_level_keywords ──────────────────────────────────────────
+
+    #[test]
+    fn keywords_simple_select() {
+        let kw = top_level_keywords("SELECT a FROM t WHERE x = 1");
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert_eq!(names, vec!["SELECT", "A", "FROM", "T", "WHERE", "X", "1"]);
+    }
+
+    #[test]
+    fn keywords_skip_single_quoted_string() {
+        let kw = top_level_keywords("SELECT 'hello world' FROM t");
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"HELLO"),
+            "content inside single quotes should be skipped"
+        );
+        assert!(names.contains(&"SELECT"));
+        assert!(names.contains(&"FROM"));
+    }
+
+    #[test]
+    fn keywords_escaped_single_quote() {
+        let kw = top_level_keywords("SELECT 'it''s' FROM t");
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(
+            !names.contains(&"S"),
+            "escaped single quote should not end string"
+        );
+        assert!(names.contains(&"FROM"));
+    }
+
+    #[test]
+    fn keywords_skip_double_quoted_identifier() {
+        let kw = top_level_keywords(r#"SELECT "My Column" FROM t"#);
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(!names.contains(&"MY"));
+        assert!(!names.contains(&"COLUMN"));
+    }
+
+    #[test]
+    fn keywords_escaped_double_quote() {
+        let kw = top_level_keywords(r#"SELECT "a""b" FROM t"#);
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(!names.contains(&"B"), "escaped double quote should stay in identifier");
+        assert!(names.contains(&"FROM"));
+    }
+
+    #[test]
+    fn keywords_skip_line_comment() {
+        let kw = top_level_keywords("SELECT a -- this is a comment\nFROM t");
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(!names.contains(&"THIS"));
+        assert!(!names.contains(&"COMMENT"));
+        assert!(names.contains(&"FROM"));
+    }
+
+    #[test]
+    fn keywords_skip_block_comment() {
+        let kw = top_level_keywords("SELECT /* hidden keyword CREATE */ a FROM t");
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(!names.contains(&"HIDDEN"));
+        assert!(!names.contains(&"CREATE"));
+        assert!(names.contains(&"A"));
+        assert!(names.contains(&"FROM"));
+    }
+
+    #[test]
+    fn keywords_preserves_positions() {
+        let kw = top_level_keywords("SELECT a");
+        assert_eq!(kw[0], (0, 6, "SELECT".to_string()));
+        assert_eq!(kw[1], (7, 8, "A".to_string()));
+    }
+
+    #[test]
+    fn keywords_empty_input() {
+        assert!(top_level_keywords("").is_empty());
+    }
+
+    #[test]
+    fn keywords_only_comment() {
+        assert!(top_level_keywords("-- nothing here").is_empty());
+    }
+
+    #[test]
+    fn keywords_mixed_comment_and_string() {
+        let kw = top_level_keywords("SELECT 'it''s -- not a comment' FROM t -- real comment");
+        let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
+        assert!(names.contains(&"SELECT"));
+        assert!(names.contains(&"FROM"));
+        assert!(names.contains(&"T"));
+        assert!(!names.contains(&"NOT"));
+        assert!(!names.contains(&"REAL"));
+    }
+
+    // ── has_top_level_semicolon ─────────────────────────────────────
+
+    #[test]
+    fn semicolon_plain() {
+        assert!(has_top_level_semicolon("SELECT 1; SELECT 2"));
+    }
+
+    #[test]
+    fn semicolon_none() {
+        assert!(!has_top_level_semicolon("SELECT 1"));
+    }
+
+    #[test]
+    fn semicolon_inside_single_quotes() {
+        assert!(!has_top_level_semicolon("SELECT 'a;b' FROM t"));
+    }
+
+    #[test]
+    fn semicolon_inside_double_quotes() {
+        assert!(!has_top_level_semicolon(r#"SELECT "a;b" FROM t"#));
+    }
+
+    #[test]
+    fn semicolon_inside_line_comment() {
+        assert!(!has_top_level_semicolon("SELECT 1 -- no;semi\n FROM t"));
+    }
+
+    #[test]
+    fn semicolon_inside_block_comment() {
+        assert!(!has_top_level_semicolon("SELECT /* no;semi */ 1 FROM t"));
+    }
+
+    #[test]
+    fn semicolon_after_escaped_single_quote() {
+        assert!(has_top_level_semicolon("SELECT 'it''s'; SELECT 2"));
+    }
+
+    #[test]
+    fn semicolon_after_escaped_double_quote() {
+        assert!(has_top_level_semicolon(r#"SELECT "a""b"; SELECT 2"#));
+    }
+
+    #[test]
+    fn semicolon_empty_input() {
+        assert!(!has_top_level_semicolon(""));
+    }
+
+    #[test]
+    fn semicolon_after_block_comment_end() {
+        assert!(has_top_level_semicolon("SELECT /* x */ 1; SELECT 2"));
+    }
+
+    #[test]
+    fn semicolon_after_line_comment_newline() {
+        assert!(has_top_level_semicolon("SELECT 1 -- comment\n; SELECT 2"));
+    }
+
+    // ── rewrite_legacy_trigger_body ─────────────────────────────────
+
+    #[test]
+    fn rewrite_passthrough_non_trigger() {
+        let sql = "SELECT 1 FROM t";
+        assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
+    }
+
+    #[test]
+    fn rewrite_trigger_without_begin() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t EXECUTE FUNCTION fn()";
+        assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
+    }
+
+    #[test]
+    fn rewrite_trigger_with_begin_select() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT my_func(); END";
+        let result = rewrite_legacy_trigger_body(sql);
+        assert!(result.contains("EXECUTE FUNCTION my_func()"), "got: {result}");
+        assert!(!result.contains("BEGIN"));
+    }
+
+    #[test]
+    fn rewrite_trigger_with_trailing_semicolons() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT my_func();;; END";
+        let result = rewrite_legacy_trigger_body(sql);
+        assert!(result.contains("EXECUTE FUNCTION my_func()"), "got: {result}");
+    }
+
+    #[test]
+    fn rewrite_trigger_empty_body() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN END";
+        // Empty body — should not rewrite
+        assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
+    }
+
+    #[test]
+    fn rewrite_trigger_multi_statement_body() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT a(); SELECT b(); END";
+        // Has semicolon in body — should not rewrite
+        assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
+    }
+
+    #[test]
+    fn rewrite_trigger_non_select_body() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO log VALUES (1) END";
+        // Body starts with INSERT, not SELECT — should not rewrite
+        assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
+    }
+
+    #[test]
+    fn rewrite_trigger_missing_end() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT fn()";
+        // No END keyword — should not rewrite
+        assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
+    }
+
+    // ── parse_expression_sql ────────────────────────────────────────
+
+    #[test]
+    fn parse_expr_simple() {
+        let expr = parse_expression_sql("1 + 2").unwrap();
+        matches!(expr, Expr::Binary { .. });
+    }
+
+    #[test]
+    fn parse_expr_not_select() {
+        let err = parse_expression_sql("INSERT INTO t VALUES (1)");
+        assert!(err.is_err());
+    }
+
+    // ── parse_sql_statement ─────────────────────────────────────────
+
+    #[test]
+    fn parse_multiple_statements_error() {
+        let err = parse_sql_statement("SELECT 1; SELECT 2");
+        assert!(err.is_err());
+        let msg = err.unwrap_err().to_string();
+        assert!(msg.contains("exactly one"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_empty_sql_error() {
+        let err = parse_sql_statement("");
+        assert!(err.is_err());
+    }
+
+    // ── is_keyword_char ─────────────────────────────────────────────
+
+    #[test]
+    fn keyword_char_alpha() {
+        assert!(is_keyword_char('a'));
+        assert!(is_keyword_char('Z'));
+    }
+
+    #[test]
+    fn keyword_char_digit() {
+        assert!(is_keyword_char('0'));
+        assert!(is_keyword_char('9'));
+    }
+
+    #[test]
+    fn keyword_char_underscore() {
+        assert!(is_keyword_char('_'));
+    }
+
+    #[test]
+    fn keyword_char_special() {
+        assert!(!is_keyword_char(' '));
+        assert!(!is_keyword_char(';'));
+        assert!(!is_keyword_char('('));
+    }
+}
