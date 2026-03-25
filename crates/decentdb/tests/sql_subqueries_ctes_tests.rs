@@ -29,10 +29,68 @@ fn any_all_subquery() {
     db.execute("CREATE TABLE t2(val INT64)").unwrap();
     db.execute("INSERT INTO t1 VALUES (10),(20),(30)").unwrap();
     db.execute("INSERT INTO t2 VALUES (15),(25)").unwrap();
-    // Test > ANY
-    let r = db.execute("SELECT val FROM t1 WHERE val > ANY (SELECT val FROM t2) ORDER BY val");
-    // May or may not be supported
-    assert!(r.is_ok() || r.is_err());
+
+    let any = db
+        .execute("SELECT val FROM t1 WHERE val > ANY (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert_eq!(
+        rows(&any),
+        vec![vec![Value::Int64(20)], vec![Value::Int64(30)]]
+    );
+
+    let all = db
+        .execute("SELECT val FROM t1 WHERE val > ALL (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert_eq!(rows(&all), vec![vec![Value::Int64(30)]]);
+
+    let some = db
+        .execute("SELECT val FROM t1 WHERE val > SOME (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert_eq!(rows(&some), rows(&any));
+}
+
+#[test]
+fn any_all_empty_subquery_semantics() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t1(val INT64)").unwrap();
+    db.execute("CREATE TABLE t2(val INT64)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (10),(20),(30)").unwrap();
+
+    let any = db
+        .execute("SELECT val FROM t1 WHERE val > ANY (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert!(rows(&any).is_empty());
+
+    let all = db
+        .execute("SELECT val FROM t1 WHERE val > ALL (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert_eq!(
+        rows(&all),
+        vec![
+            vec![Value::Int64(10)],
+            vec![Value::Int64(20)],
+            vec![Value::Int64(30)]
+        ]
+    );
+}
+
+#[test]
+fn any_all_null_semantics() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t1(val INT64)").unwrap();
+    db.execute("CREATE TABLE t2(val INT64)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (10),(20)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (NULL),(15)").unwrap();
+
+    let any = db
+        .execute("SELECT val FROM t1 WHERE val > ANY (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert_eq!(rows(&any), vec![vec![Value::Int64(20)]]);
+
+    let all = db
+        .execute("SELECT val FROM t1 WHERE val > ALL (SELECT val FROM t2) ORDER BY val")
+        .unwrap();
+    assert!(rows(&all).is_empty());
 }
 
 #[test]

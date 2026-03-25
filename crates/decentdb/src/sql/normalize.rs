@@ -13,7 +13,8 @@ use super::ast::{
     CreateViewStatement, DeleteStatement, ExplainStatement, Expr, ForeignKeyActionSpec,
     ForeignKeyDefinition, FromItem, IndexExpression, InsertSource, InsertStatement, JoinConstraint,
     JoinKind, OrderBy, Query, QueryBody, Select, SelectItem, SetOperation, Statement,
-    TableConstraint, TriggerEventSpec, TriggerKindSpec, UnaryOp, UpdateStatement,
+    SubqueryQuantifier, TableConstraint, TriggerEventSpec, TriggerKindSpec, UnaryOp,
+    UpdateStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
 };
 
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
@@ -303,9 +304,6 @@ fn normalize_update(statement: &protobuf::UpdateStmt) -> Result<UpdateStatement>
             "UPDATE ... FROM is not supported in DecentDB 1.0",
         ));
     }
-    if !statement.returning_list.is_empty() {
-        return Err(unsupported("UPDATE ... RETURNING is not supported"));
-    }
     Ok(UpdateStatement {
         table_name: normalize_range_var(
             statement
@@ -323,6 +321,11 @@ fn normalize_update(statement: &protobuf::UpdateStmt) -> Result<UpdateStatement>
             .as_deref()
             .map(normalize_expr_node)
             .transpose()?,
+        returning: statement
+            .returning_list
+            .iter()
+            .map(normalize_select_item)
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -331,9 +334,6 @@ fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement>
         return Err(unsupported(
             "DELETE ... USING is not supported in DecentDB 1.0",
         ));
-    }
-    if !statement.returning_list.is_empty() {
-        return Err(unsupported("DELETE ... RETURNING is not supported"));
     }
     Ok(DeleteStatement {
         table_name: normalize_range_var(
@@ -347,6 +347,11 @@ fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement>
             .as_deref()
             .map(normalize_expr_node)
             .transpose()?,
+        returning: statement
+            .returning_list
+            .iter()
+            .map(normalize_select_item)
+            .collect::<Result<Vec<_>>>()?,
     })
 }
 
@@ -1128,6 +1133,21 @@ fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
                 .collect::<Result<Vec<_>>>()?,
         }),
         NodeEnum::SubLink(link) => normalize_sublink(link),
+        NodeEnum::MinMaxExpr(expr) => Ok(Expr::Function {
+            name: match protobuf::MinMaxOp::try_from(expr.op)
+                .unwrap_or(protobuf::MinMaxOp::Undefined)
+            {
+                protobuf::MinMaxOp::IsGreatest => "greatest",
+                protobuf::MinMaxOp::IsLeast => "least",
+                _ => return Err(unsupported("MIN/MAX expression operator is not supported")),
+            }
+            .to_string(),
+            args: expr
+                .args
+                .iter()
+                .map(normalize_expr_container)
+                .collect::<Result<Vec<_>>>()?,
+        }),
         NodeEnum::AArrayExpr(array) => Ok(Expr::Function {
             name: "array".to_string(),
             args: array
@@ -1243,6 +1263,8 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
     let kind = protobuf::AExprKind::try_from(expr.kind).unwrap_or(protobuf::AExprKind::Undefined);
     match kind {
         protobuf::AExprKind::AexprOp
+        | protobuf::AExprKind::AexprOpAny
+        | protobuf::AExprKind::AexprOpAll
         | protobuf::AExprKind::AexprDistinct
         | protobuf::AExprKind::AexprNotDistinct => {
             let operator = normalize_operator_name(&expr.name)?;
@@ -1255,6 +1277,19 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                             .ok_or_else(|| unsupported("unary - is missing its operand"))?,
                     )?),
                 });
+            }
+            if matches!(
+                kind,
+                protobuf::AExprKind::AexprOpAny | protobuf::AExprKind::AexprOpAll
+            ) {
+                let left = normalize_expr_node(expr.lexpr.as_deref().ok_or_else(|| {
+                    unsupported("subquery comparison is missing its left operand")
+                })?)?;
+                let right = expr
+                    .rexpr
+                    .as_deref()
+                    .ok_or_else(|| unsupported("subquery comparison is missing its subquery"))?;
+                return normalize_compare_subquery(kind, &operator, left, right);
             }
             Ok(Expr::Binary {
                 left: Box::new(normalize_expr_node(expr.lexpr.as_deref().ok_or_else(
@@ -1380,6 +1415,65 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
     }
 }
 
+fn normalize_compare_subquery(
+    kind: protobuf::AExprKind,
+    operator: &str,
+    left: Expr,
+    right: &protobuf::Node,
+) -> Result<Expr> {
+    let op = match operator {
+        "=" => BinaryOp::Eq,
+        "<>" | "!=" => BinaryOp::NotEq,
+        "<" => BinaryOp::Lt,
+        "<=" => BinaryOp::LtEq,
+        ">" => BinaryOp::Gt,
+        ">=" => BinaryOp::GtEq,
+        _ => {
+            return Err(unsupported(format!(
+                "subquery comparison operator {operator} is not supported"
+            )))
+        }
+    };
+    let NodeEnum::SubLink(link) = node_kind(right)? else {
+        return Err(unsupported(
+            "subquery comparison requires a subquery right-hand side",
+        ));
+    };
+    let quantifier = match kind {
+        protobuf::AExprKind::AexprOpAny => SubqueryQuantifier::Any,
+        protobuf::AExprKind::AexprOpAll => SubqueryQuantifier::All,
+        _ => {
+            return Err(unsupported(format!(
+                "subquery comparison kind {} is not supported",
+                kind.as_str_name()
+            )))
+        }
+    };
+    let expected_sub_link = match quantifier {
+        SubqueryQuantifier::Any => protobuf::SubLinkType::AnySublink,
+        SubqueryQuantifier::All => protobuf::SubLinkType::AllSublink,
+    };
+    let actual_sub_link = protobuf::SubLinkType::try_from(link.sub_link_type)
+        .unwrap_or(protobuf::SubLinkType::Undefined);
+    if actual_sub_link != expected_sub_link {
+        return Err(unsupported(format!(
+            "subquery comparison expected {}, got {}",
+            expected_sub_link.as_str_name(),
+            actual_sub_link.as_str_name()
+        )));
+    }
+    let query =
+        normalize_query(as_select_stmt(link.subselect.as_deref().ok_or_else(
+            || unsupported("subquery comparison is missing its SELECT"),
+        )?)?)?;
+    Ok(Expr::CompareSubquery {
+        expr: Box::new(left),
+        op,
+        quantifier,
+        query: Box::new(query),
+    })
+}
+
 fn normalize_bool_expr(expr: &protobuf::BoolExpr) -> Result<Expr> {
     let args = expr
         .args
@@ -1409,7 +1503,7 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
         .map(normalize_expr_container)
         .collect::<Result<Vec<_>>>()?;
     if call.over.is_some() {
-        if !matches!(
+        let supports_window = matches!(
             name.as_str(),
             "row_number"
                 | "rank"
@@ -1419,16 +1513,48 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
                 | "first_value"
                 | "last_value"
                 | "nth_value"
-        ) {
+                | "ntile"
+                | "percent_rank"
+                | "cume_dist"
+                | "count"
+                | "sum"
+                | "avg"
+                | "min"
+                | "max"
+                | "total"
+                | "stddev"
+                | "stddev_samp"
+                | "stddev_pop"
+                | "variance"
+                | "var_samp"
+                | "var_pop"
+                | "bool_and"
+                | "bool_or"
+        );
+        if !supports_window {
             return Err(unsupported(
-                "only ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD(), FIRST_VALUE(), LAST_VALUE(), and NTH_VALUE() OVER (...) are supported as window functions",
+                "unsupported window function in OVER (...) clause",
             ));
         }
         let window = call
             .over
             .as_deref()
             .ok_or_else(|| unsupported("window function is missing its OVER clause"))?;
-        if window.order_clause.is_empty() {
+        let requires_order = matches!(
+            name.as_str(),
+            "row_number"
+                | "rank"
+                | "dense_rank"
+                | "lag"
+                | "lead"
+                | "first_value"
+                | "last_value"
+                | "nth_value"
+                | "ntile"
+                | "percent_rank"
+                | "cume_dist"
+        );
+        if requires_order && window.order_clause.is_empty() {
             return Err(unsupported(
                 "window functions require ORDER BY in OVER (...)",
             ));
@@ -1443,10 +1569,17 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
             .iter()
             .map(normalize_order_by_node)
             .collect::<Result<Vec<_>>>()?;
+        let frame = normalize_window_frame(window)?;
+        if frame.is_some() && order_by.is_empty() {
+            return Err(unsupported(
+                "window frame clauses require ORDER BY in OVER (...)",
+            ));
+        }
         return if name == "row_number" {
             Ok(Expr::RowNumber {
                 partition_by,
                 order_by,
+                frame,
             })
         } else {
             Ok(Expr::WindowFunction {
@@ -1454,22 +1587,176 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
                 args,
                 partition_by,
                 order_by,
+                frame,
+                distinct: call.agg_distinct,
+                star: call.agg_star,
             })
         };
     }
     if matches!(
         name.as_str(),
-        "count" | "sum" | "avg" | "min" | "max" | "group_concat" | "string_agg" | "total"
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "group_concat"
+            | "string_agg"
+            | "total"
+            | "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
+            | "bool_and"
+            | "bool_or"
+            | "array_agg"
+            | "median"
+            | "percentile_cont"
+            | "percentile_disc"
     ) {
+        if call.agg_filter.is_some() {
+            return Err(unsupported("aggregate FILTER clauses are not supported"));
+        }
+        let order_by = call
+            .agg_order
+            .iter()
+            .map(normalize_order_by_node)
+            .collect::<Result<Vec<_>>>()?;
+        if call.agg_within_group && order_by.is_empty() {
+            return Err(unsupported(
+                "ordered-set aggregate requires WITHIN GROUP (ORDER BY ...)",
+            ));
+        }
         return Ok(Expr::Aggregate {
             name,
             args,
             star: call.agg_star,
             distinct: call.agg_distinct,
+            order_by,
+            within_group: call.agg_within_group,
         });
     }
 
     Ok(Expr::Function { name, args })
+}
+
+const FRAMEOPTION_NONDEFAULT: i32 = 0x00001;
+const FRAMEOPTION_RANGE: i32 = 0x00002;
+const FRAMEOPTION_ROWS: i32 = 0x00004;
+const FRAMEOPTION_GROUPS: i32 = 0x00008;
+const FRAMEOPTION_BETWEEN: i32 = 0x00010;
+const FRAMEOPTION_START_UNBOUNDED_PRECEDING: i32 = 0x00020;
+const FRAMEOPTION_END_UNBOUNDED_PRECEDING: i32 = 0x00040;
+const FRAMEOPTION_START_UNBOUNDED_FOLLOWING: i32 = 0x00080;
+const FRAMEOPTION_END_UNBOUNDED_FOLLOWING: i32 = 0x00100;
+const FRAMEOPTION_START_CURRENT_ROW: i32 = 0x00200;
+const FRAMEOPTION_END_CURRENT_ROW: i32 = 0x00400;
+const FRAMEOPTION_START_OFFSET_PRECEDING: i32 = 0x00800;
+const FRAMEOPTION_END_OFFSET_PRECEDING: i32 = 0x01000;
+const FRAMEOPTION_START_OFFSET_FOLLOWING: i32 = 0x02000;
+const FRAMEOPTION_END_OFFSET_FOLLOWING: i32 = 0x04000;
+const FRAMEOPTION_EXCLUDE_CURRENT_ROW: i32 = 0x08000;
+const FRAMEOPTION_EXCLUDE_GROUP: i32 = 0x10000;
+const FRAMEOPTION_EXCLUDE_TIES: i32 = 0x20000;
+const FRAMEOPTION_DEFAULTS: i32 =
+    FRAMEOPTION_RANGE | FRAMEOPTION_START_UNBOUNDED_PRECEDING | FRAMEOPTION_END_CURRENT_ROW;
+
+fn normalize_window_frame(window: &protobuf::WindowDef) -> Result<Option<WindowFrame>> {
+    let options = window.frame_options;
+    let has_explicit_frame =
+        (options & FRAMEOPTION_NONDEFAULT) != 0 || (options & !FRAMEOPTION_DEFAULTS) != 0;
+    if !has_explicit_frame {
+        return Ok(None);
+    }
+
+    if (options & FRAMEOPTION_GROUPS) != 0 {
+        return Err(unsupported("window GROUPS frames are not supported"));
+    }
+    if (options
+        & (FRAMEOPTION_EXCLUDE_CURRENT_ROW | FRAMEOPTION_EXCLUDE_GROUP | FRAMEOPTION_EXCLUDE_TIES))
+        != 0
+    {
+        return Err(unsupported(
+            "window EXCLUDE frame clauses are not supported",
+        ));
+    }
+
+    let unit = if (options & FRAMEOPTION_ROWS) != 0 {
+        WindowFrameUnit::Rows
+    } else if (options & FRAMEOPTION_RANGE) != 0 {
+        WindowFrameUnit::Range
+    } else {
+        return Err(unsupported("window frame unit is not supported"));
+    };
+
+    let start = normalize_window_frame_bound(options, true, window.start_offset.as_deref())?;
+    let end = if (options & FRAMEOPTION_BETWEEN) != 0 {
+        Some(normalize_window_frame_bound(
+            options,
+            false,
+            window.end_offset.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    Ok(Some(WindowFrame { unit, start, end }))
+}
+
+fn normalize_window_frame_bound(
+    options: i32,
+    start: bool,
+    offset: Option<&protobuf::Node>,
+) -> Result<WindowFrameBound> {
+    if start {
+        if (options & FRAMEOPTION_START_UNBOUNDED_PRECEDING) != 0 {
+            return Ok(WindowFrameBound::UnboundedPreceding);
+        }
+        if (options & FRAMEOPTION_START_UNBOUNDED_FOLLOWING) != 0 {
+            return Ok(WindowFrameBound::UnboundedFollowing);
+        }
+        if (options & FRAMEOPTION_START_CURRENT_ROW) != 0 {
+            return Ok(WindowFrameBound::CurrentRow);
+        }
+        if (options & FRAMEOPTION_START_OFFSET_PRECEDING) != 0 {
+            let offset = normalize_expr_node(
+                offset.ok_or_else(|| unsupported("window frame start is missing its offset"))?,
+            )?;
+            return Ok(WindowFrameBound::Preceding(Box::new(offset)));
+        }
+        if (options & FRAMEOPTION_START_OFFSET_FOLLOWING) != 0 {
+            let offset = normalize_expr_node(
+                offset.ok_or_else(|| unsupported("window frame start is missing its offset"))?,
+            )?;
+            return Ok(WindowFrameBound::Following(Box::new(offset)));
+        }
+        return Err(unsupported("window frame start bound is not supported"));
+    }
+
+    if (options & FRAMEOPTION_END_UNBOUNDED_PRECEDING) != 0 {
+        return Ok(WindowFrameBound::UnboundedPreceding);
+    }
+    if (options & FRAMEOPTION_END_UNBOUNDED_FOLLOWING) != 0 {
+        return Ok(WindowFrameBound::UnboundedFollowing);
+    }
+    if (options & FRAMEOPTION_END_CURRENT_ROW) != 0 {
+        return Ok(WindowFrameBound::CurrentRow);
+    }
+    if (options & FRAMEOPTION_END_OFFSET_PRECEDING) != 0 {
+        let offset = normalize_expr_node(
+            offset.ok_or_else(|| unsupported("window frame end is missing its offset"))?,
+        )?;
+        return Ok(WindowFrameBound::Preceding(Box::new(offset)));
+    }
+    if (options & FRAMEOPTION_END_OFFSET_FOLLOWING) != 0 {
+        let offset = normalize_expr_node(
+            offset.ok_or_else(|| unsupported("window frame end is missing its offset"))?,
+        )?;
+        return Ok(WindowFrameBound::Following(Box::new(offset)));
+    }
+    Err(unsupported("window frame end bound is not supported"))
 }
 
 fn normalize_like_pattern(node: &protobuf::Node) -> Result<(Expr, Option<Expr>)> {
@@ -1532,9 +1819,9 @@ fn normalize_case_expr(case: &protobuf::CaseExpr) -> Result<Expr> {
 }
 
 fn normalize_sublink(link: &protobuf::SubLink) -> Result<Expr> {
-    match protobuf::SubLinkType::try_from(link.sub_link_type)
-        .unwrap_or(protobuf::SubLinkType::ExistsSublink)
-    {
+    let sub_link = protobuf::SubLinkType::try_from(link.sub_link_type)
+        .unwrap_or(protobuf::SubLinkType::ExistsSublink);
+    match sub_link {
         protobuf::SubLinkType::AnySublink if link.oper_name.is_empty() => {
             let testexpr = link
                 .testexpr
@@ -1548,6 +1835,41 @@ fn normalize_sublink(link: &protobuf::SubLink) -> Result<Expr> {
                         .ok_or_else(|| unsupported("IN is missing its subquery"))?,
                 )?)?),
                 negated: false,
+            })
+        }
+        protobuf::SubLinkType::AnySublink | protobuf::SubLinkType::AllSublink => {
+            let testexpr =
+                normalize_expr_node(link.testexpr.as_deref().ok_or_else(|| {
+                    unsupported("subquery comparison is missing its expression")
+                })?)?;
+            let operator = normalize_operator_name(&link.oper_name)?;
+            let op = match operator.as_str() {
+                "=" => BinaryOp::Eq,
+                "<>" | "!=" => BinaryOp::NotEq,
+                "<" => BinaryOp::Lt,
+                "<=" => BinaryOp::LtEq,
+                ">" => BinaryOp::Gt,
+                ">=" => BinaryOp::GtEq,
+                _ => {
+                    return Err(unsupported(format!(
+                        "subquery comparison operator {operator} is not supported"
+                    )))
+                }
+            };
+            let quantifier = match sub_link {
+                protobuf::SubLinkType::AnySublink => SubqueryQuantifier::Any,
+                protobuf::SubLinkType::AllSublink => SubqueryQuantifier::All,
+                _ => unreachable!(),
+            };
+            Ok(Expr::CompareSubquery {
+                expr: Box::new(testexpr),
+                op,
+                quantifier,
+                query: Box::new(normalize_query(as_select_stmt(
+                    link.subselect
+                        .as_deref()
+                        .ok_or_else(|| unsupported("subquery comparison is missing its SELECT"))?,
+                )?)?),
             })
         }
         protobuf::SubLinkType::ExistsSublink => {
@@ -1737,6 +2059,7 @@ fn describe_node(node: &NodeEnum) -> &'static str {
         NodeEnum::CaseExpr(_) => "CaseExpr",
         NodeEnum::NullTest(_) => "NullTest",
         NodeEnum::SubLink(_) => "SubLink",
+        NodeEnum::MinMaxExpr(_) => "MinMaxExpr",
         NodeEnum::String(_) => "String",
         NodeEnum::List(_) => "List",
         _ => "Node",
@@ -2094,6 +2417,51 @@ mod tests {
     }
 
     #[test]
+    fn func_string_agg_order_by_normalizes() {
+        if let Statement::Query(q) = norm("SELECT STRING_AGG(name, ',' ORDER BY id DESC) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr {
+                    expr: Expr::Aggregate { order_by, .. },
+                    ..
+                } = &s.projection[0]
+                {
+                    assert_eq!(order_by.len(), 1);
+                    assert!(order_by[0].descending);
+                } else {
+                    panic!("expected aggregate");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn func_percentile_within_group_normalizes() {
+        if let Statement::Query(q) =
+            norm("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY salary) FROM t")
+        {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr {
+                    expr:
+                        Expr::Aggregate {
+                            name,
+                            within_group,
+                            order_by,
+                            ..
+                        },
+                    ..
+                } = &s.projection[0]
+                {
+                    assert_eq!(name, "percentile_cont");
+                    assert!(*within_group);
+                    assert_eq!(order_by.len(), 1);
+                } else {
+                    panic!("expected ordered-set aggregate");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn func_window_row_number() {
         if let Statement::Query(q) = norm("SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t") {
             if let QueryBody::Select(s) = q.body {
@@ -2230,6 +2598,79 @@ mod tests {
         }
     }
 
+    #[test]
+    fn func_window_ntile() {
+        if let Statement::Query(q) = norm("SELECT NTILE(4) OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr {
+                    expr: Expr::WindowFunction { name, args, .. },
+                    ..
+                } = &s.projection[0]
+                {
+                    assert_eq!(name, "ntile");
+                    assert_eq!(args.len(), 1);
+                } else {
+                    panic!("expected NTILE window function");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_percent_rank_and_cume_dist() {
+        if let Statement::Query(q) =
+            norm("SELECT PERCENT_RANK() OVER (ORDER BY id), CUME_DIST() OVER (ORDER BY id) FROM t")
+        {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr {
+                    expr: Expr::WindowFunction { name, args, .. },
+                    ..
+                } = &s.projection[0]
+                {
+                    assert_eq!(name, "percent_rank");
+                    assert!(args.is_empty());
+                } else {
+                    panic!("expected PERCENT_RANK window function");
+                }
+                if let SelectItem::Expr {
+                    expr: Expr::WindowFunction { name, args, .. },
+                    ..
+                } = &s.projection[1]
+                {
+                    assert_eq!(name, "cume_dist");
+                    assert!(args.is_empty());
+                } else {
+                    panic!("expected CUME_DIST window function");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_aggregate_with_frame() {
+        if let Statement::Query(q) = norm(
+            "SELECT SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        ) {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr {
+                    expr:
+                        Expr::WindowFunction {
+                            name,
+                            frame: Some(frame),
+                            ..
+                        },
+                    ..
+                } = &s.projection[0]
+                {
+                    assert_eq!(name, "sum");
+                    assert!(matches!(frame.unit, WindowFrameUnit::Rows));
+                } else {
+                    panic!("expected aggregate window function with frame");
+                }
+            }
+        }
+    }
+
     // ── normalize_sublink paths ────────────────────────────────────
 
     #[test]
@@ -2260,6 +2701,38 @@ mod tests {
                         expr: Expr::ScalarSubquery(_),
                         ..
                     }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn sublink_any_comparison() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE x > ANY (SELECT y FROM u)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(
+                    &s.filter,
+                    Some(Expr::CompareSubquery {
+                        op: BinaryOp::Gt,
+                        quantifier: SubqueryQuantifier::Any,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn sublink_all_comparison() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE x <= ALL (SELECT y FROM u)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(
+                    &s.filter,
+                    Some(Expr::CompareSubquery {
+                        op: BinaryOp::LtEq,
+                        quantifier: SubqueryQuantifier::All,
+                        ..
+                    })
                 ));
             }
         }
@@ -2648,6 +3121,24 @@ mod tests {
     fn insert_from_query() {
         if let Statement::Insert(ins) = norm("INSERT INTO t SELECT * FROM u") {
             assert!(matches!(ins.source, InsertSource::Query(_)));
+        }
+    }
+
+    #[test]
+    fn update_returning() {
+        if let Statement::Update(update) = norm("UPDATE t SET a = 1 RETURNING id, a") {
+            assert_eq!(update.returning.len(), 2);
+        } else {
+            panic!("expected Update statement");
+        }
+    }
+
+    #[test]
+    fn delete_returning() {
+        if let Statement::Delete(delete) = norm("DELETE FROM t WHERE id = 1 RETURNING id") {
+            assert_eq!(delete.returning.len(), 1);
+        } else {
+            panic!("expected Delete statement");
         }
     }
 

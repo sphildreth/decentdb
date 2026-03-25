@@ -54,18 +54,19 @@ fn dense_rank_no_gaps() {
 }
 
 #[test]
-fn error_unsupported_window_function() {
+fn percent_rank_window_function() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-    let err = db
-        .execute("SELECT PERCENT_RANK() OVER (ORDER BY id) FROM t")
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("unsupported") || msg.contains("window") || !msg.is_empty(),
-        "unexpected error: {msg}"
-    );
+    db.execute("CREATE TABLE t(id INT64, score INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 30)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id, PERCENT_RANK() OVER (ORDER BY score) FROM t ORDER BY id")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Float64(0.0));
+    assert_eq!(v[1][1], Value::Float64(0.0));
+    assert_eq!(v[2][1], Value::Float64(2.0 / 3.0));
+    assert_eq!(v[3][1], Value::Float64(1.0));
 }
 
 #[test]
@@ -226,13 +227,18 @@ fn row_number_with_partition() {
 }
 
 #[test]
-fn window_count_over_unsupported() {
+fn window_count_over_partition_supported() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
     db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',3)")
         .unwrap();
-    let r = db.execute("SELECT grp, COUNT(*) OVER (PARTITION BY grp) FROM t");
-    assert!(r.is_err());
+    let r = db
+        .execute("SELECT grp, val, COUNT(*) OVER (PARTITION BY grp ORDER BY val) FROM t ORDER BY grp, val")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][2], Value::Int64(1));
+    assert_eq!(v[1][2], Value::Int64(2));
+    assert_eq!(v[2][2], Value::Int64(1));
 }
 
 #[test]
@@ -444,12 +450,21 @@ fn window_lag_lead_with_offset() {
 }
 
 #[test]
-fn window_min_max_over_unsupported() {
+fn window_min_max_over_supported() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20)").unwrap();
-    let r = db.execute("SELECT id, MIN(val) OVER () FROM t");
-    assert!(r.is_err());
+    db.execute("INSERT INTO t VALUES (1,30),(2,10),(3,20)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id, MIN(val) OVER (ORDER BY id), MAX(val) OVER (ORDER BY id) FROM t ORDER BY id")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Int64(30));
+    assert_eq!(v[0][2], Value::Int64(30));
+    assert_eq!(v[1][1], Value::Int64(10));
+    assert_eq!(v[1][2], Value::Int64(30));
+    assert_eq!(v[2][1], Value::Int64(10));
+    assert_eq!(v[2][2], Value::Int64(30));
 }
 
 #[test]
@@ -473,11 +488,16 @@ fn window_ntile() {
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5),(6)")
         .unwrap();
-    // NTILE is not supported; test the error path
-    let err = db
-        .execute("SELECT id, NTILE(3) OVER (ORDER BY id) AS bucket FROM t")
-        .unwrap_err();
-    assert!(err.to_string().contains("supported") || !err.to_string().is_empty());
+    let r = db
+        .execute("SELECT id, NTILE(3) OVER (ORDER BY id) AS bucket FROM t ORDER BY id")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Int64(1));
+    assert_eq!(v[1][1], Value::Int64(1));
+    assert_eq!(v[2][1], Value::Int64(2));
+    assert_eq!(v[3][1], Value::Int64(2));
+    assert_eq!(v[4][1], Value::Int64(3));
+    assert_eq!(v[5][1], Value::Int64(3));
 }
 
 #[test]
@@ -546,14 +566,53 @@ fn window_row_number_no_partition() {
 }
 
 #[test]
-fn window_sum_over_unsupported() {
+fn window_sum_over_partition_supported() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
     db.execute("INSERT INTO t VALUES ('A',10),('A',20),('B',30)")
         .unwrap();
-    // SUM/COUNT/MIN/MAX OVER() are NOT supported as window functions
-    let r = db.execute("SELECT grp, SUM(val) OVER (PARTITION BY grp) FROM t");
-    assert!(r.is_err());
+    let r = db
+        .execute("SELECT grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val) FROM t ORDER BY grp, val")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][2], Value::Int64(10));
+    assert_eq!(v[1][2], Value::Int64(30));
+    assert_eq!(v[2][2], Value::Int64(30));
+}
+
+#[test]
+fn cume_dist_window_function() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, score INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 10), (3, 20), (4, 30)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id, CUME_DIST() OVER (ORDER BY score) FROM t ORDER BY id")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Float64(0.5));
+    assert_eq!(v[1][1], Value::Float64(0.5));
+    assert_eq!(v[2][1], Value::Float64(0.75));
+    assert_eq!(v[3][1], Value::Float64(1.0));
+}
+
+#[test]
+fn window_rows_frame_for_running_sum() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)")
+        .unwrap();
+    let r = db
+        .execute(
+            "SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s
+             FROM t ORDER BY id",
+        )
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Int64(10));
+    assert_eq!(v[1][1], Value::Int64(30));
+    assert_eq!(v[2][1], Value::Int64(50));
+    assert_eq!(v[3][1], Value::Int64(70));
 }
 
 #[test]
@@ -761,8 +820,8 @@ fn window_value_accessors_work_with_partitions() {
                 Value::Int64(1),
                 Value::Int64(1),
                 Value::Text("Ada".to_string()),
-                Value::Text("Linus".to_string()),
-                Value::Text("Grace".to_string()),
+                Value::Text("Ada".to_string()),
+                Value::Null,
             ],
             vec![
                 Value::Text("Grace".to_string()),
@@ -794,8 +853,8 @@ fn window_value_accessors_work_with_partitions() {
                 Value::Int64(1),
                 Value::Int64(1),
                 Value::Text("Ken".to_string()),
-                Value::Text("Denise".to_string()),
-                Value::Text("Denise".to_string()),
+                Value::Text("Ken".to_string()),
+                Value::Null,
             ],
             vec![
                 Value::Text("Denise".to_string()),

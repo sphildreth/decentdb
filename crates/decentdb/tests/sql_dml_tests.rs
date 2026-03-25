@@ -86,11 +86,21 @@ fn delete_returning() {
         .unwrap();
     db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
         .unwrap();
-    // DELETE RETURNING is not supported; verify it errors
-    let err = db
+    let result = db
         .execute("DELETE FROM t WHERE id > 1 RETURNING id, val")
-        .unwrap_err();
-    assert!(err.to_string().contains("RETURNING"));
+        .unwrap();
+    let returned = rows(&result);
+    assert_eq!(returned.len(), 2);
+    assert_eq!(
+        returned[0],
+        vec![Value::Int64(2), Value::Text("b".to_string())]
+    );
+    assert_eq!(
+        returned[1],
+        vec![Value::Int64(3), Value::Text("c".to_string())]
+    );
+    let remaining = db.execute("SELECT id FROM t ORDER BY id").unwrap();
+    assert_eq!(rows(&remaining), vec![vec![Value::Int64(1)]]);
 }
 
 #[test]
@@ -127,10 +137,10 @@ fn delete_with_returning_unsupported() {
     let db = mem_db();
     exec(&db, "CREATE TABLE retr (id INT PRIMARY KEY, val TEXT)");
     exec(&db, "INSERT INTO retr VALUES (1, 'hello')");
-    let err = exec_err(&db, "DELETE FROM retr WHERE id = 1 RETURNING id, val");
-    assert!(
-        err.to_lowercase().contains("returning") || err.to_lowercase().contains("not supported"),
-        "got: {err}"
+    let result = exec(&db, "DELETE FROM retr WHERE id = 1 RETURNING id, val");
+    assert_eq!(
+        rows(&result),
+        vec![vec![Value::Int64(1), Value::Text("hello".to_string())]]
     );
 }
 
@@ -627,11 +637,16 @@ fn update_returning() {
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val INT64)")
         .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10),(2, 20)").unwrap();
-    // UPDATE RETURNING is not supported; verify it errors
-    let err = db
+    let result = db
         .execute("UPDATE t SET val = val + 5 RETURNING id, val")
-        .unwrap_err();
-    assert!(err.to_string().contains("RETURNING"));
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Int64(15)],
+            vec![Value::Int64(2), Value::Int64(25)]
+        ]
+    );
 }
 
 #[test]
@@ -702,13 +717,13 @@ fn update_with_returning_unsupported() {
     let db = mem_db();
     exec(&db, "CREATE TABLE retu (id INT PRIMARY KEY, val TEXT)");
     exec(&db, "INSERT INTO retu VALUES (1, 'hello')");
-    let err = exec_err(
+    let result = exec(
         &db,
         "UPDATE retu SET val = 'world' WHERE id = 1 RETURNING id, val",
     );
-    assert!(
-        err.to_lowercase().contains("returning") || err.to_lowercase().contains("not supported"),
-        "got: {err}"
+    assert_eq!(
+        rows(&result),
+        vec![vec![Value::Int64(1), Value::Text("world".to_string())]]
     );
 }
 

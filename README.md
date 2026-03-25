@@ -1,5 +1,3 @@
-# DecentDB
-
 <p align="center">
     <img src="graphics/logo.png" alt="DecentDB logo" width="220" />
 </p>

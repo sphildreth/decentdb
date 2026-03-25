@@ -405,8 +405,8 @@ fn matrix_window_examples_execute() {
                 Value::Int64(1),
                 Value::Int64(1),
                 Value::Text("Ada".to_string()),
-                Value::Text("Linus".to_string()),
-                Value::Text("Grace".to_string()),
+                Value::Text("Ada".to_string()),
+                Value::Null,
             ],
             vec![
                 Value::Text("Grace".to_string()),
@@ -438,8 +438,8 @@ fn matrix_window_examples_execute() {
                 Value::Int64(1),
                 Value::Int64(1),
                 Value::Text("Ken".to_string()),
-                Value::Text("Denise".to_string()),
-                Value::Text("Denise".to_string()),
+                Value::Text("Ken".to_string()),
+                Value::Null,
             ],
             vec![
                 Value::Text("Denise".to_string()),

@@ -89,6 +89,9 @@ END;
 | UPDATE | ✅ | ✅ | ✅ | ✅ |
 | DELETE | ✅ | ✅ | ✅ | ✅ |
 | INSERT ... RETURNING | ✅ | ❌ | ✅ | ✅ |
+| UPDATE ... RETURNING | ✅ | ❌ | ✅ | ✅ |
+| DELETE ... RETURNING | ✅ | ❌ | ✅ | ✅ |
+| TRUNCATE TABLE | ✅ | ❌ | ✅ | ✅ |
 | INSERT ... ON CONFLICT | ✅ (DO NOTHING/DO UPDATE) | ✅ (ON CONFLICT) | ✅ (ON CONFLICT) | ✅ (ON CONFLICT) |
 | Bulk INSERT | ✅ | ✅ | ✅ | ✅ |
 
@@ -112,8 +115,17 @@ INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie');
 -- UPDATE with WHERE
 UPDATE orders SET amount = amount * 1.1 WHERE user_id = 1;
 
+-- UPDATE ... RETURNING
+UPDATE orders SET amount = amount * 1.1 WHERE user_id = 1 RETURNING id, amount;
+
 -- DELETE with WHERE
 DELETE FROM orders WHERE amount < 1.00;
+
+-- DELETE ... RETURNING
+DELETE FROM orders WHERE amount < 1.00 RETURNING id, amount;
+
+-- TRUNCATE TABLE
+TRUNCATE TABLE temp_events;
 ```
 
 ## JOINs
@@ -205,6 +217,12 @@ SELECT * FROM users ORDER BY id LIMIT 10 OFFSET 20;
 | COUNT(DISTINCT) | ✅ | ✅ | ✅ | ✅ |
 | SUM(DISTINCT) | ✅ | ✅ | ✅ | ✅ |
 | AVG(DISTINCT) | ✅ | ✅ | ✅ | ✅ |
+| STDDEV()/STDDEV_SAMP()/STDDEV_POP() | ✅ | ❌ | ✅ | ✅ |
+| VARIANCE()/VAR_SAMP()/VAR_POP() | ✅ | ❌ | ✅ | ✅ |
+| BOOL_AND()/BOOL_OR() | ✅ | ❌ | ✅ | ✅ |
+| ARRAY_AGG() | ✅ (JSON text array) | ❌ (use `json_group_array`) | ✅ | ✅ |
+| MEDIAN() | ✅ | ❌ | ❌ (use percentile) | ✅ |
+| PERCENTILE_CONT()/PERCENTILE_DISC() WITHIN GROUP | ✅ | ❌ | ✅ | ✅ |
 
 ### Examples
 
@@ -227,6 +245,15 @@ SELECT department, STRING_AGG(name, ', ') FROM employees GROUP BY department;
 -- TOTAL (returns 0.0 for empty sets, unlike SUM which returns NULL)
 SELECT TOTAL(amount) FROM orders WHERE 1 = 0;  -- returns 0.0
 SELECT SUM(amount) FROM orders WHERE 1 = 0;    -- returns NULL
+
+-- Statistical aggregates
+SELECT STDDEV(amount), VARIANCE(amount), BOOL_AND(amount > 0), BOOL_OR(amount > 100) FROM orders;
+
+-- Ordered and collection aggregates
+SELECT ARRAY_AGG(amount ORDER BY created_at) FROM orders;
+SELECT MEDIAN(amount) FROM orders;
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) FROM orders;
+SELECT PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY amount) FROM orders;
 ```
 
 ## Window Functions
@@ -241,6 +268,12 @@ SELECT SUM(amount) FROM orders WHERE 1 = 0;    -- returns NULL
 | FIRST_VALUE() | ✅ | ✅ | ✅ | ✅ |
 | LAST_VALUE() | ✅ | ✅ | ✅ | ✅ |
 | NTH_VALUE() | ✅ | ✅ | ✅ | ✅ |
+| NTILE() | ✅ | ✅ | ✅ | ✅ |
+| PERCENT_RANK() | ✅ | ✅ | ✅ | ✅ |
+| CUME_DIST() | ✅ | ✅ | ✅ | ✅ |
+| Aggregate windows (`SUM/AVG/COUNT/MIN/MAX ... OVER`) | ✅ | ✅ | ✅ | ✅ |
+| `ROWS` frame clauses | ✅ | ✅ | ✅ | ✅ |
+| `RANGE` frame clauses | ⚠️ (CURRENT ROW / UNBOUNDED bounds) | ✅ | ✅ | ✅ |
 
 ### Examples
 
@@ -264,6 +297,21 @@ SELECT name, department, salary,
        LAST_VALUE(name)  OVER (PARTITION BY department ORDER BY salary DESC) AS low_earner,
        NTH_VALUE(name, 2) OVER (PARTITION BY department ORDER BY salary DESC) AS second_earner
 FROM employees;
+
+-- Additional ranking/distribution functions
+SELECT name, salary,
+       NTILE(4) OVER (ORDER BY salary DESC) AS quartile,
+       PERCENT_RANK() OVER (ORDER BY salary) AS pct_rank,
+       CUME_DIST() OVER (ORDER BY salary) AS cume_dist
+FROM employees;
+
+-- Aggregate window with ROWS frame
+SELECT created_at, amount,
+       SUM(amount) OVER (
+         ORDER BY created_at
+         ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+       ) AS rolling_sum
+FROM orders;
 ```
 
 ## Scalar Functions
@@ -283,7 +331,20 @@ FROM employees;
 | LN() | ✅ | ❌ | ✅ | ✅ |
 | LOG() | ✅ | ❌ | ✅ | ✅ |
 | EXP() | ✅ | ✅ | ✅ | ✅ |
+| SIN()/COS()/TAN() | ✅ | ⚠️ (extension-dependent) | ✅ | ✅ |
+| ASIN()/ACOS()/ATAN()/ATAN2() | ✅ | ⚠️ (extension-dependent) | ✅ | ✅ |
+| PI()/DEGREES()/RADIANS()/COT() | ✅ | ⚠️ (extension-dependent) | ✅ | ✅ |
 | RANDOM() | ✅ (returns FLOAT64) | ✅ (returns INT64) | ✅ (returns FLOAT64) | ✅ (returns DOUBLE) |
+
+### Conditional Functions
+
+| Function | DecentDB | SQLite | PostgreSQL | DuckDB |
+|----------|----------|--------|------------|--------|
+| COALESCE() | ✅ | ✅ | ✅ | ✅ |
+| NULLIF() | ✅ | ✅ | ✅ | ✅ |
+| GREATEST() | ✅ | ❌ | ✅ | ✅ |
+| LEAST() | ✅ | ❌ | ✅ | ✅ |
+| IIF() | ✅ | ✅ | ❌ (use CASE) | ✅ |
 
 ### String Functions
 
@@ -341,6 +402,7 @@ FROM employees;
 SELECT ABS(-42), CEIL(3.2), FLOOR(3.8), ROUND(3.14159, 2);
 SELECT SQRT(144), POWER(2, 10), MOD(17, 5), SIGN(-99);
 SELECT LN(2.71828), LOG(1000), EXP(1);
+SELECT SIN(PI() / 2), COS(0), TAN(PI() / 4), DEGREES(PI()), RADIANS(180);
 SELECT RANDOM();  -- returns a random FLOAT64 in [0.0, 1.0)
 ```
 
@@ -355,6 +417,7 @@ SELECT LEFT('hello', 3), RIGHT('hello', 3);  -- 'hel', 'llo'
 SELECT LPAD('42', 5, '0'), RPAD('hi', 5, '!');  -- '00042', 'hi!!!'
 SELECT REPEAT('ab', 3), REVERSE('hello');  -- 'ababab', 'olleh'
 SELECT CHR(65), HEX('ABC');  -- 'A', '414243'
+SELECT GREATEST(10, 7, 12), LEAST(10, 7, 12), IIF(2 > 1, 'yes', 'no');
 ```
 
 ### Date/Time Examples
@@ -417,6 +480,9 @@ SELECT key, value, type FROM json_tree('{"a":{"b":1},"c":[2,3]}');
 | LIKE/ILIKE | ✅ | ✅ | ✅ | ✅ |
 | BETWEEN | ✅ | ✅ | ✅ | ✅ |
 | IN | ✅ | ✅ | ✅ | ✅ |
+| EXISTS / NOT EXISTS | ✅ | ✅ | ✅ | ✅ |
+| `op ANY (subquery)` / `op SOME (subquery)` | ✅ | ✅ | ✅ | ✅ |
+| `op ALL (subquery)` | ✅ | ✅ | ✅ | ✅ |
 | IS NULL | ✅ | ✅ | ✅ | ✅ |
 | CASE | ✅ | ✅ | ✅ | ✅ |
 | COALESCE | ✅ | ✅ | ✅ | ✅ |
@@ -438,6 +504,9 @@ SELECT * FROM users WHERE name ILIKE '%alice%';  -- case-insensitive
 -- Range and membership
 SELECT * FROM orders WHERE amount BETWEEN 10.00 AND 100.00;
 SELECT * FROM users WHERE id IN (1, 2, 3);
+SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
+SELECT * FROM employees WHERE salary > ANY (SELECT salary FROM peers);
+SELECT * FROM employees WHERE salary >= ALL (SELECT salary FROM peers);
 
 -- NULL handling
 SELECT * FROM users WHERE email IS NULL;

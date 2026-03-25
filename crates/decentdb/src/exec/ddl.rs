@@ -962,7 +962,10 @@ fn validate_generated_expr(
         Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
             "generated columns may not use window functions",
         )),
-        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
+        Expr::ScalarSubquery(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery { .. }
+        | Expr::CompareSubquery { .. } => {
             Err(DbError::sql("generated columns may not use subqueries"))
         }
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {

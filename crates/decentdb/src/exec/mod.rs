@@ -42,7 +42,7 @@ use crate::record::value::{parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
     BinaryOp, CommonTableExpr, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select,
-    SelectItem, Statement, UnaryOp,
+    SelectItem, Statement, SubqueryQuantifier, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::{crc32c_extend, crc32c_parts};
@@ -2997,6 +2997,10 @@ fn expr_references_outer(
             expr_references_outer(expr, outer_tables, local_tables)
                 || query_references_outer_tables(query, outer_tables)
         }
+        Expr::CompareSubquery { expr, query, .. } => {
+            expr_references_outer(expr, outer_tables, local_tables)
+                || query_references_outer_tables(query, outer_tables)
+        }
         Expr::ScalarSubquery(query) | Expr::Exists(query) => {
             query_references_outer_tables(query, outer_tables)
         }
@@ -3018,6 +3022,7 @@ fn expr_references_outer(
         Expr::RowNumber {
             partition_by,
             order_by,
+            ..
         } => {
             partition_by
                 .iter()
@@ -3166,6 +3171,7 @@ fn expr_contains_recursive_unsupported_feature(expr: &Expr) -> bool {
         | Expr::RowNumber { .. }
         | Expr::WindowFunction { .. }
         | Expr::InSubquery { .. }
+        | Expr::CompareSubquery { .. }
         | Expr::ScalarSubquery(_)
         | Expr::Exists(_) => true,
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
@@ -4781,6 +4787,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
             expr_contains_aggregate(expr) || items.iter().any(expr_contains_aggregate)
         }
         Expr::InSubquery { expr, .. } => expr_contains_aggregate(expr),
+        Expr::CompareSubquery { expr, .. } => expr_contains_aggregate(expr),
         Expr::ScalarSubquery(_) | Expr::Exists(_) => false,
         Expr::Like {
             expr,
@@ -5187,10 +5194,18 @@ impl EngineRuntime {
                         Expr::RowNumber {
                             partition_by,
                             order_by,
+                            frame,
                         },
                     ..
                 } => self
-                    .compute_row_number_values(dataset, partition_by, order_by, params, ctes)
+                    .compute_row_number_values(
+                        dataset,
+                        partition_by,
+                        order_by,
+                        frame.as_ref(),
+                        params,
+                        ctes,
+                    )
                     .map(Some),
                 SelectItem::Expr {
                     expr:
@@ -5199,6 +5214,9 @@ impl EngineRuntime {
                             args,
                             partition_by,
                             order_by,
+                            frame,
+                            distinct,
+                            star,
                         },
                     ..
                 } => self
@@ -5208,6 +5226,9 @@ impl EngineRuntime {
                         args,
                         partition_by,
                         order_by,
+                        frame.as_ref(),
+                        *distinct,
+                        *star,
                         params,
                         ctes,
                     )
@@ -5285,6 +5306,7 @@ impl EngineRuntime {
         dataset: &Dataset,
         partition_by: &[Expr],
         order_by: &[crate::sql::ast::OrderBy],
+        _frame: Option<&crate::sql::ast::WindowFrame>,
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Vec<Value>> {
@@ -5355,6 +5377,9 @@ impl EngineRuntime {
         args: &[Expr],
         partition_by: &[Expr],
         order_by: &[crate::sql::ast::OrderBy],
+        _frame: Option<&crate::sql::ast::WindowFrame>,
+        _distinct: bool,
+        _star: bool,
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Vec<Value>> {
@@ -5428,9 +5453,13 @@ impl EngineRuntime {
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let (peer_starts, peer_ends) = compute_window_peer_bounds(&order_keys)?;
 
             match name {
                 "rank" => {
+                    if _distinct || _star {
+                        return Err(DbError::sql("RANK does not support DISTINCT or *"));
+                    }
                     let mut current_rank = 1_i64;
                     for (ordinal, row_index) in sorted.iter().enumerate() {
                         if ordinal > 0
@@ -5445,6 +5474,9 @@ impl EngineRuntime {
                     }
                 }
                 "dense_rank" => {
+                    if _distinct || _star {
+                        return Err(DbError::sql("DENSE_RANK does not support DISTINCT or *"));
+                    }
                     let mut current_rank = 1_i64;
                     for (ordinal, row_index) in sorted.iter().enumerate() {
                         if ordinal > 0
@@ -5458,7 +5490,89 @@ impl EngineRuntime {
                         results[*row_index] = Value::Int64(current_rank);
                     }
                 }
+                "percent_rank" => {
+                    if _distinct || _star || !args.is_empty() {
+                        return Err(DbError::sql("PERCENT_RANK expects no arguments"));
+                    }
+                    if sorted.len() == 1 {
+                        results[sorted[0]] = Value::Float64(0.0);
+                        continue;
+                    }
+                    let mut current_rank = 1_i64;
+                    let denominator = (sorted.len() - 1) as f64;
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        if ordinal > 0
+                            && !window_order_keys_equal(
+                                &order_keys[ordinal - 1],
+                                &order_keys[ordinal],
+                            )?
+                        {
+                            current_rank = (ordinal + 1) as i64;
+                        }
+                        let value = (current_rank - 1) as f64 / denominator;
+                        results[*row_index] = Value::Float64(value);
+                    }
+                }
+                "cume_dist" => {
+                    if _distinct || _star || !args.is_empty() {
+                        return Err(DbError::sql("CUME_DIST expects no arguments"));
+                    }
+                    let partition_len = sorted.len() as f64;
+                    let mut ordinal = 0_usize;
+                    while ordinal < sorted.len() {
+                        let peer_end = peer_ends[ordinal];
+                        let value = Value::Float64((peer_end + 1) as f64 / partition_len);
+                        for peer_ordinal in ordinal..=peer_end {
+                            results[sorted[peer_ordinal]] = value.clone();
+                        }
+                        ordinal = peer_end + 1;
+                    }
+                }
+                "ntile" => {
+                    if _distinct || _star || args.len() != 1 {
+                        return Err(DbError::sql("NTILE expects exactly 1 argument"));
+                    }
+                    let first_row = dataset
+                        .rows
+                        .get(sorted[0])
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+                    let buckets = match self
+                        .eval_expr(&args[0], dataset, first_row, params, ctes, None)?
+                    {
+                        Value::Int64(value) if value > 0 => usize::try_from(value)
+                            .map_err(|_| DbError::sql("NTILE bucket count is out of range"))?,
+                        Value::Int64(_) => {
+                            return Err(DbError::sql("NTILE bucket count must be greater than 0"))
+                        }
+                        Value::Null => {
+                            return Err(DbError::sql("NTILE bucket count cannot be NULL"))
+                        }
+                        other => {
+                            return Err(DbError::sql(format!(
+                                "NTILE bucket count must be INT64, got {other:?}"
+                            )))
+                        }
+                    };
+                    let partition_len = sorted.len();
+                    let base_size = partition_len / buckets;
+                    let extra = partition_len % buckets;
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        let bucket = if ordinal < (base_size + 1) * extra {
+                            (ordinal / (base_size + 1)) + 1
+                        } else {
+                            ((ordinal - (base_size + 1) * extra) / base_size.max(1)) + extra + 1
+                        };
+                        results[*row_index] = Value::Int64(bucket as i64);
+                    }
+                }
                 "lag" | "lead" => {
+                    if _distinct || _star {
+                        return Err(DbError::sql(format!(
+                            "{} does not support DISTINCT or *",
+                            name.to_ascii_uppercase()
+                        )));
+                    }
                     if args.is_empty() || args.len() > 3 {
                         return Err(DbError::sql(format!(
                             "{} expects 1 to 3 arguments",
@@ -5523,6 +5637,12 @@ impl EngineRuntime {
                     }
                 }
                 "first_value" | "last_value" => {
+                    if _distinct || _star {
+                        return Err(DbError::sql(format!(
+                            "{} does not support DISTINCT or *",
+                            name.to_ascii_uppercase()
+                        )));
+                    }
                     if args.len() != 1 {
                         return Err(DbError::sql(format!(
                             "{} expects exactly 1 argument",
@@ -5542,16 +5662,33 @@ impl EngineRuntime {
                             )
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let value = if name == "first_value" {
-                        ordered_values.first().cloned().unwrap_or(Value::Null)
-                    } else {
-                        ordered_values.last().cloned().unwrap_or(Value::Null)
-                    };
-                    for row_index in sorted.iter() {
-                        results[*row_index] = value.clone();
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        let frame_range = self.window_frame_bounds_for_row(
+                            dataset,
+                            &sorted,
+                            order_by,
+                            &peer_starts,
+                            &peer_ends,
+                            ordinal,
+                            _frame,
+                            params,
+                            ctes,
+                        )?;
+                        results[*row_index] = if let Some((frame_start, frame_end)) = frame_range {
+                            if name == "first_value" {
+                                ordered_values[frame_start].clone()
+                            } else {
+                                ordered_values[frame_end].clone()
+                            }
+                        } else {
+                            Value::Null
+                        };
                     }
                 }
                 "nth_value" => {
+                    if _distinct || _star {
+                        return Err(DbError::sql("NTH_VALUE does not support DISTINCT or *"));
+                    }
                     if args.len() != 2 {
                         return Err(DbError::sql(
                             "NTH_VALUE expects exactly 2 arguments".to_string(),
@@ -5582,12 +5719,56 @@ impl EngineRuntime {
                             )
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    let value = ordered_values
-                        .get(position.saturating_sub(1))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    for row_index in sorted.iter() {
-                        results[*row_index] = value.clone();
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        let frame_range = self.window_frame_bounds_for_row(
+                            dataset,
+                            &sorted,
+                            order_by,
+                            &peer_starts,
+                            &peer_ends,
+                            ordinal,
+                            _frame,
+                            params,
+                            ctes,
+                        )?;
+                        results[*row_index] = if let Some((frame_start, frame_end)) = frame_range {
+                            frame_start
+                                .checked_add(position.saturating_sub(1))
+                                .filter(|index| *index <= frame_end)
+                                .and_then(|index| ordered_values.get(index))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        };
+                    }
+                }
+                "count" | "sum" | "avg" | "min" | "max" | "total" | "stddev" | "stddev_samp"
+                | "stddev_pop" | "variance" | "var_samp" | "var_pop" | "bool_and" | "bool_or"
+                | "group_concat" | "string_agg" => {
+                    for (ordinal, row_index) in sorted.iter().enumerate() {
+                        let frame_range = self.window_frame_bounds_for_row(
+                            dataset,
+                            &sorted,
+                            order_by,
+                            &peer_starts,
+                            &peer_ends,
+                            ordinal,
+                            _frame,
+                            params,
+                            ctes,
+                        )?;
+                        results[*row_index] = self.eval_window_aggregate(
+                            name,
+                            args,
+                            _distinct,
+                            _star,
+                            dataset,
+                            &sorted,
+                            frame_range,
+                            params,
+                            ctes,
+                        )?;
                     }
                 }
                 other => {
@@ -5599,6 +5780,369 @@ impl EngineRuntime {
             }
         }
         Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn window_frame_bounds_for_row(
+        &self,
+        dataset: &Dataset,
+        sorted: &[usize],
+        order_by: &[crate::sql::ast::OrderBy],
+        peer_starts: &[usize],
+        peer_ends: &[usize],
+        ordinal: usize,
+        frame: Option<&crate::sql::ast::WindowFrame>,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<(usize, usize)>> {
+        if sorted.is_empty() {
+            return Ok(None);
+        }
+
+        if frame.is_none() {
+            if order_by.is_empty() {
+                return Ok(Some((0, sorted.len() - 1)));
+            }
+            return Ok(Some((0, peer_ends[ordinal])));
+        }
+
+        let frame = frame.ok_or_else(|| DbError::internal("window frame is missing"))?;
+        let row_index = *sorted
+            .get(ordinal)
+            .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+        let row = dataset
+            .rows
+            .get(row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+        let default_end = crate::sql::ast::WindowFrameBound::CurrentRow;
+        let end_bound = frame.end.as_ref().unwrap_or(&default_end);
+        let start = self.window_frame_bound_index(
+            dataset,
+            row,
+            &frame.start,
+            true,
+            ordinal,
+            sorted.len(),
+            peer_starts,
+            peer_ends,
+            frame.unit,
+            params,
+            ctes,
+        )?;
+        let end = self.window_frame_bound_index(
+            dataset,
+            row,
+            end_bound,
+            false,
+            ordinal,
+            sorted.len(),
+            peer_starts,
+            peer_ends,
+            frame.unit,
+            params,
+            ctes,
+        )?;
+        normalize_window_frame_range(start, end, sorted.len())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn window_frame_bound_index(
+        &self,
+        dataset: &Dataset,
+        row: &[Value],
+        bound: &crate::sql::ast::WindowFrameBound,
+        start: bool,
+        ordinal: usize,
+        partition_len: usize,
+        peer_starts: &[usize],
+        peer_ends: &[usize],
+        unit: crate::sql::ast::WindowFrameUnit,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<i64> {
+        let partition_len = i64::try_from(partition_len)
+            .map_err(|_| DbError::internal("window partition is too large"))?;
+        let ordinal =
+            i64::try_from(ordinal).map_err(|_| DbError::internal("window ordinal is too large"))?;
+        match (unit, bound) {
+            (
+                crate::sql::ast::WindowFrameUnit::Range,
+                crate::sql::ast::WindowFrameBound::Preceding(_)
+                | crate::sql::ast::WindowFrameBound::Following(_),
+            ) => Err(DbError::sql(
+                "RANGE frames with offset bounds are not supported yet",
+            )),
+            (_, crate::sql::ast::WindowFrameBound::UnboundedPreceding) => Ok(0),
+            (_, crate::sql::ast::WindowFrameBound::UnboundedFollowing) => {
+                if start {
+                    Ok(partition_len)
+                } else {
+                    Ok(partition_len - 1)
+                }
+            }
+            (
+                crate::sql::ast::WindowFrameUnit::Rows,
+                crate::sql::ast::WindowFrameBound::CurrentRow,
+            ) => Ok(ordinal),
+            (
+                crate::sql::ast::WindowFrameUnit::Range,
+                crate::sql::ast::WindowFrameBound::CurrentRow,
+            ) => {
+                if start {
+                    i64::try_from(peer_starts[ordinal as usize])
+                        .map_err(|_| DbError::internal("window peer start is too large"))
+                } else {
+                    i64::try_from(peer_ends[ordinal as usize])
+                        .map_err(|_| DbError::internal("window peer end is too large"))
+                }
+            }
+            (
+                crate::sql::ast::WindowFrameUnit::Rows,
+                crate::sql::ast::WindowFrameBound::Preceding(offset),
+            ) => {
+                let offset = self.eval_window_frame_offset(dataset, row, offset, params, ctes)?;
+                Ok(ordinal - offset)
+            }
+            (
+                crate::sql::ast::WindowFrameUnit::Rows,
+                crate::sql::ast::WindowFrameBound::Following(offset),
+            ) => {
+                let offset = self.eval_window_frame_offset(dataset, row, offset, params, ctes)?;
+                Ok(ordinal + offset)
+            }
+        }
+    }
+
+    fn eval_window_frame_offset(
+        &self,
+        dataset: &Dataset,
+        row: &[Value],
+        offset: &Expr,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<i64> {
+        match self.eval_expr(offset, dataset, row, params, ctes, None)? {
+            Value::Int64(value) if value >= 0 => Ok(value),
+            Value::Int64(_) => Err(DbError::sql(
+                "window frame offset must be a non-negative integer",
+            )),
+            Value::Null => Err(DbError::sql("window frame offset cannot be NULL")),
+            other => Err(DbError::sql(format!(
+                "window frame offset must be INT64, got {other:?}"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_window_aggregate(
+        &self,
+        name: &str,
+        args: &[Expr],
+        distinct: bool,
+        star: bool,
+        dataset: &Dataset,
+        sorted_partition: &[usize],
+        frame_range: Option<(usize, usize)>,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Value> {
+        let aggregate_ctx = AggregateEvalContext {
+            runtime: self,
+            dataset,
+            params,
+            ctes,
+        };
+        let empty_indexes: [usize; 0] = [];
+        let row_indexes = if let Some((start, end)) = frame_range {
+            sorted_partition
+                .get(start..=end)
+                .ok_or_else(|| DbError::internal("window frame range is invalid"))?
+        } else {
+            &empty_indexes
+        };
+
+        match name {
+            "count" => {
+                if star {
+                    if distinct {
+                        return Err(DbError::sql("COUNT(DISTINCT *) is not supported"));
+                    }
+                    return Ok(Value::Int64(row_indexes.len() as i64));
+                }
+                if args.len() != 1 {
+                    return Err(DbError::sql("COUNT expects exactly 1 argument"));
+                }
+                if distinct {
+                    let mut vals = Vec::new();
+                    for row_index in row_indexes {
+                        let row = dataset
+                            .rows
+                            .get(*row_index)
+                            .map(Vec::as_slice)
+                            .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+                        let val = self.eval_expr(&args[0], dataset, row, params, ctes, None)?;
+                        if !matches!(val, Value::Null) {
+                            vals.push(val);
+                        }
+                    }
+                    vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+                    vals.dedup_by(|a, b| {
+                        compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal)
+                            == std::cmp::Ordering::Equal
+                    });
+                    Ok(Value::Int64(vals.len() as i64))
+                } else {
+                    let mut count = 0_i64;
+                    for row_index in row_indexes {
+                        let row = dataset
+                            .rows
+                            .get(*row_index)
+                            .map(Vec::as_slice)
+                            .ok_or_else(|| DbError::internal("window row index is invalid"))?;
+                        if !matches!(
+                            self.eval_expr(&args[0], dataset, row, params, ctes, None)?,
+                            Value::Null
+                        ) {
+                            count += 1;
+                        }
+                    }
+                    Ok(Value::Int64(count))
+                }
+            }
+            "sum" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("SUM expects exactly 1 argument"));
+                }
+                aggregate_numeric(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    NumericAgg::Sum,
+                    distinct,
+                )
+            }
+            "avg" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("AVG expects exactly 1 argument"));
+                }
+                aggregate_numeric(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    NumericAgg::Avg,
+                    distinct,
+                )
+            }
+            "total" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("TOTAL expects exactly 1 argument"));
+                }
+                aggregate_numeric(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    NumericAgg::Total,
+                    distinct,
+                )
+            }
+            "stddev" | "stddev_samp" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("STDDEV expects exactly 1 argument"));
+                }
+                aggregate_variance(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    VarianceAgg::StddevSamp,
+                    distinct,
+                )
+            }
+            "stddev_pop" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("STDDEV_POP expects exactly 1 argument"));
+                }
+                aggregate_variance(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    VarianceAgg::StddevPop,
+                    distinct,
+                )
+            }
+            "variance" | "var_samp" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("VAR_SAMP expects exactly 1 argument"));
+                }
+                aggregate_variance(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    VarianceAgg::VarSamp,
+                    distinct,
+                )
+            }
+            "var_pop" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("VAR_POP expects exactly 1 argument"));
+                }
+                aggregate_variance(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    VarianceAgg::VarPop,
+                    distinct,
+                )
+            }
+            "bool_and" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("BOOL_AND expects exactly 1 argument"));
+                }
+                aggregate_bool(
+                    &aggregate_ctx,
+                    row_indexes,
+                    &args[0],
+                    BoolAgg::And,
+                    distinct,
+                )
+            }
+            "bool_or" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("BOOL_OR expects exactly 1 argument"));
+                }
+                aggregate_bool(&aggregate_ctx, row_indexes, &args[0], BoolAgg::Or, distinct)
+            }
+            "min" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("MIN expects exactly 1 argument"));
+                }
+                aggregate_extreme(self, dataset, row_indexes, &args[0], params, ctes, true)
+            }
+            "max" => {
+                if star || args.len() != 1 {
+                    return Err(DbError::sql("MAX expects exactly 1 argument"));
+                }
+                aggregate_extreme(self, dataset, row_indexes, &args[0], params, ctes, false)
+            }
+            name @ ("group_concat" | "string_agg") => {
+                if star {
+                    return Err(DbError::sql(format!(
+                        "{} does not support *",
+                        name.to_ascii_uppercase()
+                    )));
+                }
+                if distinct {
+                    return Err(DbError::sql(format!(
+                        "{} DISTINCT is not supported in window context",
+                        name.to_ascii_uppercase()
+                    )));
+                }
+                aggregate_group_concat(&aggregate_ctx, row_indexes, args, false, &[], name)
+            }
+            other => Err(DbError::sql(format!(
+                "unsupported aggregate window function {other}"
+            ))),
+        }
     }
 
     fn evaluate_grouped_select(
@@ -5770,7 +6314,112 @@ impl EngineRuntime {
                 args,
                 star,
                 distinct,
+                order_by,
+                within_group,
             } => match name.as_str() {
+                "array_agg" | "median" | "percentile_cont" | "percentile_disc" => {
+                    match name.as_str() {
+                        "array_agg" => {
+                            if *within_group {
+                                return Err(DbError::sql(
+                                    "ARRAY_AGG does not support WITHIN GROUP",
+                                ));
+                            }
+                            if *star || args.len() != 1 {
+                                return Err(DbError::sql("ARRAY_AGG expects exactly 1 argument"));
+                            }
+                            aggregate_array_agg(
+                                &aggregate_ctx,
+                                group_row_indexes,
+                                &args[0],
+                                *distinct,
+                                order_by,
+                            )
+                        }
+                        "median" => {
+                            if *within_group {
+                                return Err(DbError::sql(
+                                    "MEDIAN does not support WITHIN GROUP; use MEDIAN(expr)",
+                                ));
+                            }
+                            if !order_by.is_empty() {
+                                return Err(DbError::sql(
+                                    "MEDIAN does not support aggregate ORDER BY",
+                                ));
+                            }
+                            if *star || args.len() != 1 {
+                                return Err(DbError::sql("MEDIAN expects exactly 1 argument"));
+                            }
+                            aggregate_median(&aggregate_ctx, group_row_indexes, &args[0], *distinct)
+                        }
+                        "percentile_cont" => {
+                            if !*within_group {
+                                return Err(DbError::sql(
+                                    "PERCENTILE_CONT requires WITHIN GROUP (ORDER BY ...)",
+                                ));
+                            }
+                            if *distinct {
+                                return Err(DbError::sql(
+                                    "PERCENTILE_CONT does not support DISTINCT",
+                                ));
+                            }
+                            if *star || args.len() != 1 {
+                                return Err(DbError::sql(
+                                    "PERCENTILE_CONT expects exactly 1 argument",
+                                ));
+                            }
+                            aggregate_percentile_cont(
+                                self,
+                                dataset,
+                                group_row_indexes,
+                                &args[0],
+                                order_by,
+                                params,
+                                ctes,
+                            )
+                        }
+                        "percentile_disc" => {
+                            if !*within_group {
+                                return Err(DbError::sql(
+                                    "PERCENTILE_DISC requires WITHIN GROUP (ORDER BY ...)",
+                                ));
+                            }
+                            if *distinct {
+                                return Err(DbError::sql(
+                                    "PERCENTILE_DISC does not support DISTINCT",
+                                ));
+                            }
+                            if *star || args.len() != 1 {
+                                return Err(DbError::sql(
+                                    "PERCENTILE_DISC expects exactly 1 argument",
+                                ));
+                            }
+                            aggregate_percentile_disc(
+                                self,
+                                dataset,
+                                group_row_indexes,
+                                &args[0],
+                                order_by,
+                                params,
+                                ctes,
+                            )
+                        }
+                        _ => Err(DbError::sql(format!(
+                            "unsupported aggregate function {}",
+                            name.to_ascii_uppercase()
+                        ))),
+                    }
+                }
+                name if *within_group => Err(DbError::sql(format!(
+                    "{} does not support WITHIN GROUP",
+                    name.to_ascii_uppercase()
+                ))),
+                name if !order_by.is_empty() && !matches!(name, "group_concat" | "string_agg") => {
+                    Err(DbError::sql(format!(
+                        "{} does not support aggregate ORDER BY",
+                        name.to_ascii_uppercase()
+                    )))
+                }
                 "count" => {
                     if *star {
                         Ok(Value::Int64(group_row_indexes.len() as i64))
@@ -5832,6 +6481,48 @@ impl EngineRuntime {
                     NumericAgg::Total,
                     *distinct,
                 ),
+                "stddev" | "stddev_samp" => aggregate_variance(
+                    &aggregate_ctx,
+                    group_row_indexes,
+                    &args[0],
+                    VarianceAgg::StddevSamp,
+                    *distinct,
+                ),
+                "stddev_pop" => aggregate_variance(
+                    &aggregate_ctx,
+                    group_row_indexes,
+                    &args[0],
+                    VarianceAgg::StddevPop,
+                    *distinct,
+                ),
+                "variance" | "var_samp" => aggregate_variance(
+                    &aggregate_ctx,
+                    group_row_indexes,
+                    &args[0],
+                    VarianceAgg::VarSamp,
+                    *distinct,
+                ),
+                "var_pop" => aggregate_variance(
+                    &aggregate_ctx,
+                    group_row_indexes,
+                    &args[0],
+                    VarianceAgg::VarPop,
+                    *distinct,
+                ),
+                "bool_and" => aggregate_bool(
+                    &aggregate_ctx,
+                    group_row_indexes,
+                    &args[0],
+                    BoolAgg::And,
+                    *distinct,
+                ),
+                "bool_or" => aggregate_bool(
+                    &aggregate_ctx,
+                    group_row_indexes,
+                    &args[0],
+                    BoolAgg::Or,
+                    *distinct,
+                ),
                 "min" => aggregate_extreme(
                     self,
                     dataset,
@@ -5851,12 +6542,11 @@ impl EngineRuntime {
                     false,
                 ),
                 name @ ("group_concat" | "string_agg") => aggregate_group_concat(
-                    self,
-                    dataset,
+                    &aggregate_ctx,
                     group_row_indexes,
                     args,
-                    params,
-                    ctes,
+                    *distinct,
+                    order_by,
                     name,
                 ),
                 other => Err(DbError::sql(format!(
@@ -6190,6 +6880,47 @@ impl EngineRuntime {
                     Ok(Value::Bool(*negated))
                 }
             }
+            Expr::CompareSubquery {
+                expr,
+                op,
+                quantifier,
+                query,
+            } => {
+                let left_value = self.eval_expr(expr, dataset, row, params, ctes, excluded)?;
+                let subquery = self.evaluate_query_with_outer(query, params, ctes, dataset, row)?;
+                if subquery.columns.len() != 1 {
+                    return Err(DbError::sql(
+                        "subquery comparison must return exactly one column",
+                    ));
+                }
+                let mut saw_null = false;
+                let mut saw_row = false;
+                for subquery_row in &subquery.rows {
+                    saw_row = true;
+                    let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
+                    match eval_binary(op, left_value.clone(), candidate)? {
+                        Value::Bool(result) => match quantifier {
+                            SubqueryQuantifier::Any if result => return Ok(Value::Bool(true)),
+                            SubqueryQuantifier::All if !result => return Ok(Value::Bool(false)),
+                            _ => {}
+                        },
+                        Value::Null => saw_null = true,
+                        other => {
+                            return Err(DbError::internal(format!(
+                                "subquery comparison did not evaluate to boolean: {other:?}"
+                            )))
+                        }
+                    }
+                }
+                if !saw_row {
+                    return Ok(Value::Bool(matches!(quantifier, SubqueryQuantifier::All)));
+                }
+                if saw_null {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Bool(matches!(quantifier, SubqueryQuantifier::All)))
+                }
+            }
             Expr::ScalarSubquery(query) => {
                 let subquery = self.evaluate_query_with_outer(query, params, ctes, dataset, row)?;
                 if subquery.columns.len() != 1 {
@@ -6349,6 +7080,20 @@ enum NumericAgg {
     Total,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VarianceAgg {
+    StddevSamp,
+    StddevPop,
+    VarSamp,
+    VarPop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoolAgg {
+    And,
+    Or,
+}
+
 struct AggregateEvalContext<'a> {
     runtime: &'a EngineRuntime,
     dataset: &'a Dataset,
@@ -6454,6 +7199,141 @@ fn aggregate_numeric(
     })
 }
 
+fn aggregate_variance(
+    ctx: &AggregateEvalContext<'_>,
+    row_indexes: &[usize],
+    expr: &Expr,
+    kind: VarianceAgg,
+    distinct: bool,
+) -> Result<Value> {
+    let mut values = Vec::new();
+    for row_index in row_indexes {
+        let row = ctx
+            .dataset
+            .rows
+            .get(*row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        let value = ctx.eval_row(row, expr)?;
+        if !matches!(value, Value::Null) {
+            values.push(value);
+        }
+    }
+
+    if distinct {
+        values.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+        values.dedup_by(|a, b| {
+            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
+        });
+    }
+
+    let mut count = 0_u64;
+    let mut mean = 0.0_f64;
+    let mut m2 = 0.0_f64;
+    for value in values {
+        let number = match value {
+            Value::Int64(value) => value as f64,
+            Value::Float64(value) => value,
+            other => {
+                return Err(DbError::sql(format!(
+                    "variance aggregate does not support {other:?}"
+                )));
+            }
+        };
+        count += 1;
+        let delta = number - mean;
+        mean += delta / (count as f64);
+        let delta2 = number - mean;
+        m2 += delta * delta2;
+    }
+
+    if count == 0 {
+        return Ok(Value::Null);
+    }
+
+    let denominator = match kind {
+        VarianceAgg::StddevPop | VarianceAgg::VarPop => count as f64,
+        VarianceAgg::StddevSamp | VarianceAgg::VarSamp => {
+            if count < 2 {
+                return Ok(Value::Null);
+            }
+            (count - 1) as f64
+        }
+    };
+    let variance = m2 / denominator;
+    Ok(match kind {
+        VarianceAgg::StddevSamp | VarianceAgg::StddevPop => Value::Float64(variance.sqrt()),
+        VarianceAgg::VarSamp | VarianceAgg::VarPop => Value::Float64(variance),
+    })
+}
+
+fn aggregate_bool(
+    ctx: &AggregateEvalContext<'_>,
+    row_indexes: &[usize],
+    expr: &Expr,
+    kind: BoolAgg,
+    distinct: bool,
+) -> Result<Value> {
+    let mut values = Vec::new();
+    for row_index in row_indexes {
+        let row = ctx
+            .dataset
+            .rows
+            .get(*row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        let value = ctx.eval_row(row, expr)?;
+        if !matches!(value, Value::Null) {
+            values.push(value);
+        }
+    }
+
+    if distinct {
+        values.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+        values.dedup_by(|a, b| {
+            compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
+        });
+    }
+
+    let mut saw_non_null = false;
+    let mut result = match kind {
+        BoolAgg::And => true,
+        BoolAgg::Or => false,
+    };
+
+    for value in values {
+        let boolean = match value {
+            Value::Bool(value) => value,
+            other => {
+                return Err(DbError::sql(format!(
+                    "boolean aggregate does not support {other:?}"
+                )))
+            }
+        };
+        saw_non_null = true;
+        match kind {
+            BoolAgg::And => {
+                result &= boolean;
+                if !result {
+                    break;
+                }
+            }
+            BoolAgg::Or => {
+                result |= boolean;
+                if result {
+                    break;
+                }
+            }
+        }
+    }
+
+    if saw_non_null {
+        Ok(Value::Bool(result))
+    } else {
+        Ok(Value::Null)
+    }
+}
+
 fn aggregate_extreme(
     runtime: &EngineRuntime,
     dataset: &Dataset,
@@ -6519,6 +7399,9 @@ fn eval_function(
                 Ok(values[0].clone())
             }
         }
+        "greatest" => eval_greatest_least(&values, true),
+        "least" => eval_greatest_least(&values, false),
+        "iif" => eval_iif(&values),
         "lower" => unary_text_fn(values, |value| value.to_ascii_lowercase()),
         "upper" => unary_text_fn(values, |value| value.to_ascii_uppercase()),
         "trim" | "pg_catalog.btrim" => unary_text_fn(values, |value| value.trim().to_string()),
@@ -6894,6 +7777,121 @@ fn eval_function(
             };
             Ok(Value::Float64(number.as_f64().exp()))
         }
+        "sin" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("SIN expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("SIN", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(number.as_f64().sin()))
+        }
+        "cos" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("COS expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("COS", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(number.as_f64().cos()))
+        }
+        "tan" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("TAN expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("TAN", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let radians = number.as_f64();
+            if radians.cos().abs() < 1e-12 {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(radians.tan()))
+        }
+        "asin" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("ASIN expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("ASIN", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let value = number.as_f64();
+            if !(-1.0..=1.0).contains(&value) {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(value.asin()))
+        }
+        "acos" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("ACOS expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("ACOS", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let value = number.as_f64();
+            if !(-1.0..=1.0).contains(&value) {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(value.acos()))
+        }
+        "atan" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("ATAN expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("ATAN", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(number.as_f64().atan()))
+        }
+        "atan2" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("ATAN2 expects 2 arguments"));
+            }
+            let Some(y) = expect_numeric_arg("ATAN2", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(x) = expect_numeric_arg("ATAN2", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(y.as_f64().atan2(x.as_f64())))
+        }
+        "pi" => {
+            if !values.is_empty() {
+                return Err(DbError::sql("PI expects 0 arguments"));
+            }
+            Ok(Value::Float64(std::f64::consts::PI))
+        }
+        "degrees" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("DEGREES expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("DEGREES", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(number.as_f64().to_degrees()))
+        }
+        "radians" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("RADIANS expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("RADIANS", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(number.as_f64().to_radians()))
+        }
+        "cot" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("COT expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("COT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let tan = number.as_f64().tan();
+            if tan.abs() < 1e-12 {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(1.0 / tan))
+        }
         "random" => {
             if !values.is_empty() {
                 return Err(DbError::sql("RANDOM expects 0 arguments"));
@@ -6918,6 +7916,40 @@ fn eval_function(
         "json_valid" | "pg_catalog.json_valid" => eval_json_valid(values),
         other => Err(DbError::sql(format!("unsupported scalar function {other}"))),
     }
+}
+
+fn eval_greatest_least(values: &[Value], want_greatest: bool) -> Result<Value> {
+    if values.is_empty() {
+        return Err(DbError::sql(if want_greatest {
+            "GREATEST expects at least 1 argument"
+        } else {
+            "LEAST expects at least 1 argument"
+        }));
+    }
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let mut best = values[0].clone();
+    for value in &values[1..] {
+        let ordering = compare_values(value, &best)?;
+        if (want_greatest && ordering == std::cmp::Ordering::Greater)
+            || (!want_greatest && ordering == std::cmp::Ordering::Less)
+        {
+            best = value.clone();
+        }
+    }
+    Ok(best)
+}
+
+fn eval_iif(values: &[Value]) -> Result<Value> {
+    if values.len() != 3 {
+        return Err(DbError::sql("IIF expects 3 arguments"));
+    }
+    Ok(if matches!(truthy(&values[0]), Some(true)) {
+        values[1].clone()
+    } else {
+        values[2].clone()
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7669,6 +8701,244 @@ fn json_value_from_value(value: &Value) -> Result<JsonValue> {
     }
 }
 
+fn sort_aggregate_row_indexes(
+    runtime: &EngineRuntime,
+    dataset: &Dataset,
+    row_indexes: &[usize],
+    order_by: &[crate::sql::ast::OrderBy],
+    params: &[Value],
+    ctes: &BTreeMap<String, Dataset>,
+) -> Result<Vec<usize>> {
+    if order_by.is_empty() {
+        return Ok(row_indexes.to_vec());
+    }
+    let mut keyed = row_indexes
+        .iter()
+        .map(|row_index| {
+            let row = dataset
+                .rows
+                .get(*row_index)
+                .map(Vec::as_slice)
+                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+            let keys = order_by
+                .iter()
+                .map(|order| runtime.eval_expr(&order.expr, dataset, row, params, ctes, None))
+                .collect::<Result<Vec<_>>>()?;
+            Ok((*row_index, keys))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    keyed.sort_by(|(left_index, left_keys), (right_index, right_keys)| {
+        for (order, (left, right)) in order_by.iter().zip(left_keys.iter().zip(right_keys.iter())) {
+            let ordering = compare_values(left, right).unwrap_or(std::cmp::Ordering::Equal);
+            if ordering != std::cmp::Ordering::Equal {
+                return if order.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+            }
+        }
+        left_index.cmp(right_index)
+    });
+    Ok(keyed.into_iter().map(|(row_index, _)| row_index).collect())
+}
+
+fn values_equal(left: &Value, right: &Value) -> Result<bool> {
+    Ok(compare_values(left, right)? == std::cmp::Ordering::Equal)
+}
+
+fn value_to_numeric_f64(value: Value, fn_name: &str) -> Result<Option<f64>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Int64(value) => Ok(Some(value as f64)),
+        Value::Float64(value) => Ok(Some(value)),
+        Value::Decimal { scaled, scale } => {
+            Ok(Some((scaled as f64) / 10_f64.powi(i32::from(scale))))
+        }
+        other => Err(DbError::sql(format!(
+            "{fn_name} expects numeric values, got {other:?}"
+        ))),
+    }
+}
+
+fn parse_percentile_fraction(value: Value, fn_name: &str) -> Result<f64> {
+    let Some(fraction) = value_to_numeric_f64(value, fn_name)? else {
+        return Err(DbError::sql(format!("{fn_name} fraction cannot be NULL")));
+    };
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(DbError::sql(format!(
+            "{fn_name} fraction must be between 0 and 1"
+        )));
+    }
+    Ok(fraction)
+}
+
+fn aggregate_array_agg(
+    ctx: &AggregateEvalContext<'_>,
+    row_indexes: &[usize],
+    expr: &Expr,
+    distinct: bool,
+    order_by: &[crate::sql::ast::OrderBy],
+) -> Result<Value> {
+    let ordered_indexes = sort_aggregate_row_indexes(
+        ctx.runtime,
+        ctx.dataset,
+        row_indexes,
+        order_by,
+        ctx.params,
+        ctx.ctes,
+    )?;
+    let mut values = Vec::new();
+    let mut seen_values = Vec::<Value>::new();
+    for row_index in ordered_indexes {
+        let row = ctx
+            .dataset
+            .rows
+            .get(row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        let value = ctx.eval_row(row, expr)?;
+        if distinct {
+            if seen_values
+                .iter()
+                .map(|seen| values_equal(seen, &value))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(std::convert::identity)
+            {
+                continue;
+            }
+            seen_values.push(value.clone());
+        }
+        values.push(json_value_from_value(&value)?);
+    }
+    Ok(Value::Text(JsonValue::Array(values).render_json()))
+}
+
+fn aggregate_median(
+    ctx: &AggregateEvalContext<'_>,
+    row_indexes: &[usize],
+    expr: &Expr,
+    distinct: bool,
+) -> Result<Value> {
+    let mut values = Vec::new();
+    for row_index in row_indexes {
+        let row = ctx
+            .dataset
+            .rows
+            .get(*row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        if let Some(number) = value_to_numeric_f64(ctx.eval_row(row, expr)?, "MEDIAN")? {
+            values.push(number);
+        }
+    }
+    if distinct {
+        values.sort_by(|a, b| a.total_cmp(b));
+        values.dedup_by(|a, b| a.total_cmp(b) == std::cmp::Ordering::Equal);
+    } else {
+        values.sort_by(|a, b| a.total_cmp(b));
+    }
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        Ok(Value::Float64(values[mid]))
+    } else {
+        Ok(Value::Float64((values[mid - 1] + values[mid]) / 2.0))
+    }
+}
+
+fn aggregate_percentile_cont(
+    runtime: &EngineRuntime,
+    dataset: &Dataset,
+    row_indexes: &[usize],
+    fraction_expr: &Expr,
+    order_by: &[crate::sql::ast::OrderBy],
+    params: &[Value],
+    ctes: &BTreeMap<String, Dataset>,
+) -> Result<Value> {
+    if order_by.len() != 1 {
+        return Err(DbError::sql(
+            "PERCENTILE_CONT requires exactly one ORDER BY expression",
+        ));
+    }
+    let fraction = parse_percentile_fraction(
+        runtime.eval_expr(fraction_expr, dataset, &[], params, ctes, None)?,
+        "PERCENTILE_CONT",
+    )?;
+    let ordered_indexes =
+        sort_aggregate_row_indexes(runtime, dataset, row_indexes, order_by, params, ctes)?;
+    let mut values = Vec::new();
+    for row_index in ordered_indexes {
+        let row = dataset
+            .rows
+            .get(row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        let order_value = runtime.eval_expr(&order_by[0].expr, dataset, row, params, ctes, None)?;
+        if let Some(number) = value_to_numeric_f64(order_value, "PERCENTILE_CONT")? {
+            values.push(number);
+        }
+    }
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let max_index = (values.len() - 1) as f64;
+    let position = fraction * max_index;
+    let lower_index = position.floor() as usize;
+    let upper_index = position.ceil() as usize;
+    if lower_index == upper_index {
+        Ok(Value::Float64(values[lower_index]))
+    } else {
+        let lower = values[lower_index];
+        let upper = values[upper_index];
+        let weight = position - (lower_index as f64);
+        Ok(Value::Float64(lower + (upper - lower) * weight))
+    }
+}
+
+fn aggregate_percentile_disc(
+    runtime: &EngineRuntime,
+    dataset: &Dataset,
+    row_indexes: &[usize],
+    fraction_expr: &Expr,
+    order_by: &[crate::sql::ast::OrderBy],
+    params: &[Value],
+    ctes: &BTreeMap<String, Dataset>,
+) -> Result<Value> {
+    if order_by.len() != 1 {
+        return Err(DbError::sql(
+            "PERCENTILE_DISC requires exactly one ORDER BY expression",
+        ));
+    }
+    let fraction = parse_percentile_fraction(
+        runtime.eval_expr(fraction_expr, dataset, &[], params, ctes, None)?,
+        "PERCENTILE_DISC",
+    )?;
+    let ordered_indexes =
+        sort_aggregate_row_indexes(runtime, dataset, row_indexes, order_by, params, ctes)?;
+    let mut values = Vec::new();
+    for row_index in ordered_indexes {
+        let row = dataset
+            .rows
+            .get(row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+        let order_value = runtime.eval_expr(&order_by[0].expr, dataset, row, params, ctes, None)?;
+        if !matches!(order_value, Value::Null) {
+            values.push(order_value);
+        }
+    }
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let threshold = ((values.len() as f64) * fraction).ceil() as usize;
+    let index = threshold.saturating_sub(1).min(values.len() - 1);
+    Ok(values[index].clone())
+}
+
 fn decimal_to_string(scaled: i64, scale: u8) -> String {
     if scale == 0 {
         return scaled.to_string();
@@ -7732,12 +9002,11 @@ fn normalize_like_escape(escape: Option<Value>) -> Result<Option<char>> {
 }
 
 fn aggregate_group_concat(
-    runtime: &EngineRuntime,
-    dataset: &Dataset,
+    ctx: &AggregateEvalContext<'_>,
     row_indexes: &[usize],
     args: &[Expr],
-    params: &[Value],
-    ctes: &BTreeMap<String, Dataset>,
+    distinct: bool,
+    order_by: &[crate::sql::ast::OrderBy],
     function_name: &str,
 ) -> Result<Value> {
     let function_name = function_name.to_ascii_uppercase();
@@ -7746,20 +9015,42 @@ fn aggregate_group_concat(
             "{function_name} expects 1 or 2 arguments"
         )));
     }
+    let ordered_indexes = sort_aggregate_row_indexes(
+        ctx.runtime,
+        ctx.dataset,
+        row_indexes,
+        order_by,
+        ctx.params,
+        ctx.ctes,
+    )?;
     let mut parts = Vec::new();
+    let mut seen_values = Vec::<Value>::new();
     let mut separator = ",".to_string();
-    for row_index in row_indexes {
-        let row = dataset
+    for row_index in ordered_indexes {
+        let row = ctx
+            .dataset
             .rows
-            .get(*row_index)
+            .get(row_index)
             .map(Vec::as_slice)
             .ok_or_else(|| DbError::internal("group row index is invalid"))?;
-        let value = runtime.eval_expr(&args[0], dataset, row, params, ctes, None)?;
+        let value = ctx.eval_row(row, &args[0])?;
         if matches!(value, Value::Null) {
             continue;
         }
+        if distinct {
+            if seen_values
+                .iter()
+                .map(|seen| values_equal(seen, &value))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(std::convert::identity)
+            {
+                continue;
+            }
+            seen_values.push(value.clone());
+        }
         if let Some(separator_expr) = args.get(1) {
-            separator = match runtime.eval_expr(separator_expr, dataset, row, params, ctes, None)? {
+            separator = match ctx.eval_row(row, separator_expr)? {
                 Value::Text(value) => value,
                 Value::Null => String::new(),
                 other => {
@@ -8449,6 +9740,47 @@ fn window_order_keys_equal(left: &[Value], right: &[Value]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn compute_window_peer_bounds(order_keys: &[Vec<Value>]) -> Result<(Vec<usize>, Vec<usize>)> {
+    let mut starts = vec![0_usize; order_keys.len()];
+    let mut ends = vec![0_usize; order_keys.len()];
+    let mut ordinal = 0_usize;
+    while ordinal < order_keys.len() {
+        let mut peer_end = ordinal;
+        while peer_end + 1 < order_keys.len()
+            && window_order_keys_equal(&order_keys[ordinal], &order_keys[peer_end + 1])?
+        {
+            peer_end += 1;
+        }
+        for peer in ordinal..=peer_end {
+            starts[peer] = ordinal;
+            ends[peer] = peer_end;
+        }
+        ordinal = peer_end + 1;
+    }
+    Ok((starts, ends))
+}
+
+fn normalize_window_frame_range(
+    start: i64,
+    end: i64,
+    partition_len: usize,
+) -> Result<Option<(usize, usize)>> {
+    if partition_len == 0 {
+        return Ok(None);
+    }
+    let len_i64 = i64::try_from(partition_len)
+        .map_err(|_| DbError::internal("window partition is too large"))?;
+    let start = start.clamp(0, len_i64);
+    let end = end.clamp(-1, len_i64 - 1);
+    if start > end {
+        return Ok(None);
+    }
+    let start =
+        usize::try_from(start).map_err(|_| DbError::internal("window frame start is invalid"))?;
+    let end = usize::try_from(end).map_err(|_| DbError::internal("window frame end is invalid"))?;
+    Ok(Some((start, end)))
 }
 
 fn compare_numeric_text_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {

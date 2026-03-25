@@ -18,6 +18,16 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
     r.rows().iter().map(|r| r.values().to_vec()).collect()
 }
 
+fn assert_float_close(value: &Value, expected: f64) {
+    match value {
+        Value::Float64(actual) => assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        ),
+        other => panic!("expected FLOAT64 result, got {other:?}"),
+    }
+}
+
 #[test]
 fn agg_count_distinct() {
     let db = mem_db();
@@ -96,6 +106,130 @@ fn aggregate_bool_and_or() {
         assert_eq!(v[0][0], Value::Bool(false)); // AND: false because one is false
         assert_eq!(v[0][1], Value::Bool(true)); // OR: true because one is true
     }
+}
+
+#[test]
+fn aggregate_stddev_and_variance() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(x INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    let r = db
+        .execute(
+            "SELECT
+                STDDEV_SAMP(x),
+                STDDEV_POP(x),
+                VAR_SAMP(x),
+                VAR_POP(x),
+                STDDEV(x),
+                VARIANCE(x)
+             FROM t",
+        )
+        .unwrap();
+    let values = r.rows()[0].values();
+    assert_float_close(&values[0], 1.5811388300841898);
+    assert_float_close(&values[1], std::f64::consts::SQRT_2);
+    assert_float_close(&values[2], 2.5);
+    assert_float_close(&values[3], 2.0);
+    assert_float_close(&values[4], 1.5811388300841898);
+    assert_float_close(&values[5], 2.5);
+}
+
+#[test]
+fn aggregate_array_agg_json_output() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, grp TEXT, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'A',10),(2,'A',NULL),(3,'A',20),(4,'B',30)")
+        .unwrap();
+    let r = db
+        .execute("SELECT grp, ARRAY_AGG(val ORDER BY id) FROM t GROUP BY grp ORDER BY grp")
+        .unwrap();
+    let v = rows(&r);
+    assert_eq!(v[0][1], Value::Text("[10,null,20]".into()));
+    assert_eq!(v[1][1], Value::Text("[30]".into()));
+}
+
+#[test]
+fn aggregate_array_agg_distinct() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,10),(3,20),(4,10)")
+        .unwrap();
+    let r = db
+        .execute("SELECT ARRAY_AGG(DISTINCT val ORDER BY id) FROM t")
+        .unwrap();
+    assert_eq!(rows(&r)[0][0], Value::Text("[10,20]".into()));
+}
+
+#[test]
+fn aggregate_median_basic() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(x INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4)").unwrap();
+    let r = db.execute("SELECT MEDIAN(x) FROM t").unwrap();
+    assert_eq!(rows(&r)[0][0], Value::Float64(2.5));
+}
+
+#[test]
+fn aggregate_percentiles_within_group() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(x INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (10),(20),(30),(40)")
+        .unwrap();
+    let r = db
+        .execute(
+            "SELECT
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY x),
+                PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY x)
+             FROM t",
+        )
+        .unwrap();
+    let values = r.rows()[0].values();
+    assert_eq!(values[0], Value::Float64(25.0));
+    assert_eq!(values[1], Value::Int64(20));
+}
+
+#[test]
+fn aggregate_percentile_fraction_validation() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(x INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+    let err = db
+        .execute("SELECT PERCENTILE_CONT(1.5) WITHIN GROUP (ORDER BY x) FROM t")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("between 0 and 1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn aggregate_stats_null_and_empty_behavior() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(x INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (NULL),(NULL)").unwrap();
+    let r = db
+        .execute("SELECT STDDEV(x), VARIANCE(x), BOOL_AND(x > 0), BOOL_OR(x > 0) FROM t")
+        .unwrap();
+    assert_eq!(
+        r.rows()[0].values(),
+        &[Value::Null, Value::Null, Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn aggregate_stats_with_distinct() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(x INT64)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)")
+        .unwrap();
+    let r = db
+        .execute("SELECT VAR_POP(DISTINCT x), STDDEV_POP(DISTINCT x) FROM t")
+        .unwrap();
+    let values = r.rows()[0].values();
+    assert_float_close(&values[0], 2.0 / 3.0);
+    assert_float_close(&values[1], (2.0_f64 / 3.0).sqrt());
 }
 
 #[test]

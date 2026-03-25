@@ -26,14 +26,14 @@ The following table tracks the implementation status of each feature slice. Slic
 
 | Slice | Category | Priority | Status | Est. Effort |
 |-------|----------|----------|--------|-------------|
-| S1 | Window Function Enhancements | High | 🔴 Not Started | Medium |
-| S2 | Aggregate Functions (Statistical) | High | 🔴 Not Started | Low |
-| S3 | DML Enhancements (RETURNING, TRUNCATE) | High | 🔴 Not Started | Medium |
-| S4 | Trigonometric Math Functions | High | 🔴 Not Started | Low |
+| S1 | Window Function Enhancements | High | 🟢 Completed | Medium |
+| S2 | Aggregate Functions (Statistical) | High | 🟢 Completed | Low |
+| S3 | DML Enhancements (RETURNING, TRUNCATE) | High | 🟢 Completed | Medium |
+| S4 | Trigonometric Math Functions | High | 🟢 Completed | Low |
 | S5 | String Functions (Extended) | High | 🔴 Not Started | Low |
-| S6 | Conditional Functions | High | 🔴 Not Started | Low |
+| S6 | Conditional Functions | High | 🟢 Completed | Low |
 | S7 | Date/Time Functions (Extended) | Medium | 🔴 Not Started | Medium |
-| S8 | Subquery Operators (EXISTS, ANY, ALL) | Medium | 🔴 Not Started | Medium |
+| S8 | Subquery Operators (EXISTS, ANY, ALL) | Medium | 🟢 Completed | Medium |
 | S9 | Query Features (LATERAL, VALUES, CTAS) | Medium | 🔴 Not Started | Medium |
 | S10 | Comparison Operators (IS DISTINCT FROM) | Medium | 🔴 Not Started | Low |
 | S11 | DDL Enhancements | Medium | 🔴 Not Started | Medium |

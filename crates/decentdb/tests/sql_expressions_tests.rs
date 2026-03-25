@@ -1019,6 +1019,89 @@ fn expr_abs_and_math() {
 }
 
 #[test]
+fn expr_trigonometric_functions() {
+    let db = mem_db();
+    let r = db
+        .execute(
+            "SELECT
+                SIN(PI() / 2),
+                COS(0),
+                TAN(0),
+                ASIN(1),
+                ACOS(1),
+                ATAN(1),
+                ATAN2(1, 1),
+                DEGREES(PI()),
+                RADIANS(180),
+                COT(PI() / 4)",
+        )
+        .unwrap();
+    let row = r.rows()[0].values();
+    assert_float_close(&row[0], 1.0);
+    assert_float_close(&row[1], 1.0);
+    assert_float_close(&row[2], 0.0);
+    assert_float_close(&row[3], std::f64::consts::FRAC_PI_2);
+    assert_float_close(&row[4], 0.0);
+    assert_float_close(&row[5], std::f64::consts::FRAC_PI_4);
+    assert_float_close(&row[6], std::f64::consts::FRAC_PI_4);
+    assert_float_close(&row[7], 180.0);
+    assert_float_close(&row[8], std::f64::consts::PI);
+    assert_float_close(&row[9], 1.0);
+}
+
+#[test]
+fn expr_trigonometric_domain_and_null_handling() {
+    let db = mem_db();
+    let r = db
+        .execute("SELECT ASIN(2), ACOS(-2), TAN(PI() / 2), COT(0), SIN(NULL)")
+        .unwrap();
+    assert_eq!(
+        r.rows()[0].values(),
+        &[
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]
+    );
+}
+
+#[test]
+fn expr_conditional_functions() {
+    let db = mem_db();
+    let r = db
+        .execute(
+            "SELECT
+                GREATEST(1, 5, 3),
+                LEAST(1, 5, 3),
+                IIF(TRUE, 'yes', 'no'),
+                IIF(FALSE, 'yes', 'no'),
+                IIF(NULL, 'yes', 'no')",
+        )
+        .unwrap();
+    assert_eq!(
+        r.rows()[0].values(),
+        &[
+            Value::Int64(5),
+            Value::Int64(1),
+            Value::Text("yes".to_string()),
+            Value::Text("no".to_string()),
+            Value::Text("no".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn expr_conditional_functions_null_propagation() {
+    let db = mem_db();
+    let r = db
+        .execute("SELECT GREATEST(1, NULL, 3), LEAST(1, NULL, 3)")
+        .unwrap();
+    assert_eq!(r.rows()[0].values(), &[Value::Null, Value::Null]);
+}
+
+#[test]
 fn expr_arithmetic_operators() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();

@@ -154,6 +154,28 @@ pub(crate) struct OrderBy {
     pub(crate) descending: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowFrameUnit {
+    Rows,
+    Range,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum WindowFrameBound {
+    UnboundedPreceding,
+    UnboundedFollowing,
+    CurrentRow,
+    Preceding(Box<Expr>),
+    Following(Box<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WindowFrame {
+    pub(crate) unit: WindowFrameUnit,
+    pub(crate) start: WindowFrameBound,
+    pub(crate) end: Option<WindowFrameBound>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
     Literal(Value),
@@ -187,6 +209,12 @@ pub(crate) enum Expr {
         query: Box<Query>,
         negated: bool,
     },
+    CompareSubquery {
+        expr: Box<Expr>,
+        op: BinaryOp,
+        quantifier: SubqueryQuantifier,
+        query: Box<Query>,
+    },
     ScalarSubquery(Box<Query>),
     Exists(Box<Query>),
     Like {
@@ -209,16 +237,22 @@ pub(crate) enum Expr {
         args: Vec<Expr>,
         distinct: bool,
         star: bool,
+        order_by: Vec<OrderBy>,
+        within_group: bool,
     },
     RowNumber {
         partition_by: Vec<Expr>,
         order_by: Vec<OrderBy>,
+        frame: Option<WindowFrame>,
     },
     WindowFunction {
         name: String,
         args: Vec<Expr>,
         partition_by: Vec<Expr>,
         order_by: Vec<OrderBy>,
+        frame: Option<WindowFrame>,
+        distinct: bool,
+        star: bool,
     },
     Case {
         operand: Option<Box<Expr>>,
@@ -257,6 +291,12 @@ pub(crate) enum BinaryOp {
     JsonExtractText,
     IsDistinctFrom,
     IsNotDistinctFrom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubqueryQuantifier {
+    Any,
+    All,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -298,12 +338,14 @@ pub(crate) struct UpdateStatement {
     pub(crate) table_name: String,
     pub(crate) assignments: Vec<Assignment>,
     pub(crate) filter: Option<Expr>,
+    pub(crate) returning: Vec<SelectItem>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeleteStatement {
     pub(crate) table_name: String,
     pub(crate) filter: Option<Expr>,
+    pub(crate) returning: Vec<SelectItem>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -671,6 +713,42 @@ impl OrderBy {
     }
 }
 
+impl WindowFrameUnit {
+    fn to_sql(self) -> &'static str {
+        match self {
+            Self::Rows => "ROWS",
+            Self::Range => "RANGE",
+        }
+    }
+}
+
+impl WindowFrameBound {
+    fn to_sql(&self) -> String {
+        match self {
+            Self::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+            Self::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+            Self::CurrentRow => "CURRENT ROW".to_string(),
+            Self::Preceding(expr) => format!("{} PRECEDING", expr.to_sql()),
+            Self::Following(expr) => format!("{} FOLLOWING", expr.to_sql()),
+        }
+    }
+}
+
+impl WindowFrame {
+    fn to_sql(&self) -> String {
+        let unit = self.unit.to_sql();
+        if let Some(end) = &self.end {
+            format!(
+                "{unit} BETWEEN {} AND {}",
+                self.start.to_sql(),
+                end.to_sql()
+            )
+        } else {
+            format!("{unit} {}", self.start.to_sql())
+        }
+    }
+}
+
 impl Expr {
     #[must_use]
     pub(crate) fn to_sql(&self) -> String {
@@ -746,6 +824,40 @@ impl Expr {
                 if *negated { "NOT " } else { "" },
                 query.to_sql()
             ),
+            Self::CompareSubquery {
+                expr,
+                op,
+                quantifier,
+                query,
+            } => format!(
+                "({} {} {} ({}))",
+                expr.to_sql(),
+                match op {
+                    BinaryOp::Eq => "=",
+                    BinaryOp::NotEq => "<>",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::LtEq => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::GtEq => ">=",
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                    BinaryOp::Mod => "%",
+                    BinaryOp::And => "AND",
+                    BinaryOp::Or => "OR",
+                    BinaryOp::Concat => "||",
+                    BinaryOp::JsonExtract => "->",
+                    BinaryOp::JsonExtractText => "->>",
+                    BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
+                    BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
+                },
+                match quantifier {
+                    SubqueryQuantifier::Any => "ANY",
+                    SubqueryQuantifier::All => "ALL",
+                },
+                query.to_sql()
+            ),
             Self::ScalarSubquery(query) => format!("({})", query.to_sql()),
             Self::Exists(query) => format!("EXISTS ({})", query.to_sql()),
             Self::Like {
@@ -797,12 +909,41 @@ impl Expr {
                 args,
                 star,
                 distinct,
+                order_by,
+                within_group,
             } => {
                 if *star {
-                    format!("{name}(*)")
+                    if order_by.is_empty() {
+                        format!("{name}(*)")
+                    } else {
+                        let order_sql = order_by
+                            .iter()
+                            .map(OrderBy::to_sql)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{name}(* ORDER BY {order_sql})")
+                    }
                 } else {
                     let args_sql = args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ");
-                    if *distinct {
+                    if *within_group {
+                        let order_sql = order_by
+                            .iter()
+                            .map(OrderBy::to_sql)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{name}({args_sql}) WITHIN GROUP (ORDER BY {order_sql})")
+                    } else if !order_by.is_empty() {
+                        let order_sql = order_by
+                            .iter()
+                            .map(OrderBy::to_sql)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if *distinct {
+                            format!("{name}(DISTINCT {args_sql} ORDER BY {order_sql})")
+                        } else {
+                            format!("{name}({args_sql} ORDER BY {order_sql})")
+                        }
+                    } else if *distinct {
                         format!("{name}(DISTINCT {args_sql})")
                     } else {
                         format!("{name}({args_sql})")
@@ -812,6 +953,7 @@ impl Expr {
             Self::RowNumber {
                 partition_by,
                 order_by,
+                frame,
             } => {
                 let mut over_parts = Vec::new();
                 if !partition_by.is_empty() {
@@ -833,6 +975,9 @@ impl Expr {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
+                }
+                if let Some(frame) = frame {
+                    over_parts.push(frame.to_sql());
                 }
                 format!("ROW_NUMBER() OVER ({})", over_parts.join(" "))
             }
@@ -841,6 +986,9 @@ impl Expr {
                 args,
                 partition_by,
                 order_by,
+                frame,
+                distinct,
+                star,
             } => {
                 let mut over_parts = Vec::new();
                 if !partition_by.is_empty() {
@@ -863,10 +1011,23 @@ impl Expr {
                             .join(", ")
                     ));
                 }
+                if let Some(frame) = frame {
+                    over_parts.push(frame.to_sql());
+                }
+                let args_sql = if *star {
+                    "*".to_string()
+                } else if *distinct {
+                    format!(
+                        "DISTINCT {}",
+                        args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
+                    )
+                } else {
+                    args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
+                };
                 format!(
                     "{}({}) OVER ({})",
                     name.to_ascii_uppercase(),
-                    args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", "),
+                    args_sql,
                     over_parts.join(" ")
                 )
             }

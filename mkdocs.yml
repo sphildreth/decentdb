@@ -24,6 +24,7 @@ nav:
       - DBeaver Integration: user-guide/dbeaver.md
   - API Reference:
     - Rust API: api/rust-api.md
+    - SQL Functions: api/sql-functions.md
     - CLI Reference: api/cli-reference.md
     - Binding Compatibility Matrix: api/bindings-matrix.md
     - Error Codes: api/error-codes.md

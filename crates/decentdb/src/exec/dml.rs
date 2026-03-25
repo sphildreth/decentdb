@@ -78,6 +78,9 @@ impl EngineRuntime {
     }
 
     fn can_execute_update_in_state_without_clone(&self, statement: &UpdateStatement) -> bool {
+        if !statement.returning.is_empty() {
+            return false;
+        }
         if self
             .visible_view(&statement.table_name, super::NameResolutionScope::Session)
             .is_some()
@@ -162,6 +165,9 @@ impl EngineRuntime {
     }
 
     fn can_execute_delete_in_state_without_clone(&self, statement: &DeleteStatement) -> bool {
+        if !statement.returning.is_empty() {
+            return false;
+        }
         if self
             .visible_view(&statement.table_name, super::NameResolutionScope::Session)
             .is_some()
@@ -768,6 +774,11 @@ impl EngineRuntime {
             .visible_view(&statement.table_name, super::NameResolutionScope::Session)
             .is_some()
         {
+            if !statement.returning.is_empty() {
+                return Err(DbError::sql(
+                    "UPDATE ... RETURNING is not supported for view INSTEAD OF triggers",
+                ));
+            }
             let affected = view_match_count(
                 self,
                 &statement.table_name,
@@ -842,6 +853,7 @@ impl EngineRuntime {
 
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
+        let mut returning_rows = Vec::new();
         for row_id in matching_row_ids {
             let (row_index, current_row) = {
                 let table_data = self.table_data(&table_name).ok_or_else(|| {
@@ -870,6 +882,9 @@ impl EngineRuntime {
             apply_generated_columns(self, &table, &mut next_values, params)?;
             if next_values == current_row.values {
                 affected_rows += 1;
+                if !statement.returning.is_empty() {
+                    returning_rows.push(current_row);
+                }
                 continue;
             }
             if has_referencing_tables {
@@ -906,12 +921,20 @@ impl EngineRuntime {
                     }
                 }
             }
+            let returning_values = if statement.returning.is_empty() {
+                None
+            } else {
+                Some(next_values.clone())
+            };
             self.table_data_mut(&table_name)
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
                 .rows[row_index]
                 .values = next_values;
+            if let Some(values) = returning_values {
+                returning_rows.push(StoredRow { row_id, values });
+            }
             affected_rows += 1;
             changed_rows += 1;
         }
@@ -929,7 +952,11 @@ impl EngineRuntime {
             affected_rows as usize,
             page_size,
         )?;
-        Ok(QueryResult::with_affected_rows(affected_rows))
+        if statement.returning.is_empty() {
+            Ok(QueryResult::with_affected_rows(affected_rows))
+        } else {
+            self.render_returning(&table_name, &returning_rows, &statement.returning, params)
+        }
     }
 
     pub(super) fn execute_delete(
@@ -942,6 +969,11 @@ impl EngineRuntime {
             .visible_view(&statement.table_name, super::NameResolutionScope::Session)
             .is_some()
         {
+            if !statement.returning.is_empty() {
+                return Err(DbError::sql(
+                    "DELETE ... RETURNING is not supported for view INSTEAD OF triggers",
+                ));
+            }
             let affected = view_match_count(
                 self,
                 &statement.table_name,
@@ -1048,7 +1080,11 @@ impl EngineRuntime {
             matching_rows.len(),
             page_size,
         )?;
-        Ok(QueryResult::with_affected_rows(matching_rows.len() as u64))
+        if statement.returning.is_empty() {
+            Ok(QueryResult::with_affected_rows(matching_rows.len() as u64))
+        } else {
+            self.render_returning(&table_name, &matching_rows, &statement.returning, params)
+        }
     }
 
     fn render_returning(

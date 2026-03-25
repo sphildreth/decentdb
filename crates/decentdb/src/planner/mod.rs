@@ -231,6 +231,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             expr_has_aggregate(expr) || items.iter().any(expr_has_aggregate)
         }
         Expr::InSubquery { expr, .. } => expr_has_aggregate(expr),
+        Expr::CompareSubquery { expr, .. } => expr_has_aggregate(expr),
         Expr::ScalarSubquery(_) | Expr::Exists(_) => false,
         Expr::Like {
             expr,
@@ -288,6 +289,8 @@ mod tests {
             args: vec![],
             distinct: false,
             star: true,
+            order_by: vec![],
+            within_group: false,
         }
     }
 
@@ -297,6 +300,8 @@ mod tests {
             args: vec![e],
             distinct: false,
             star: false,
+            order_by: vec![],
+            within_group: false,
         }
     }
 
@@ -409,6 +414,32 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_in_compare_subquery_left_expr() {
+        let expr = Expr::CompareSubquery {
+            expr: Box::new(agg_sum(col("x"))),
+            op: BinaryOp::Gt,
+            quantifier: crate::sql::ast::SubqueryQuantifier::Any,
+            query: Box::new(Query {
+                ctes: vec![],
+                recursive: false,
+                body: QueryBody::Select(Select {
+                    distinct: false,
+                    distinct_on: vec![],
+                    projection: vec![],
+                    from: vec![],
+                    filter: None,
+                    group_by: vec![],
+                    having: None,
+                }),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+            }),
+        };
+        assert!(expr_has_aggregate(&expr));
+    }
+
+    #[test]
     fn no_aggregate_scalar_subquery() {
         let q = Query {
             ctes: vec![],
@@ -481,6 +512,9 @@ mod tests {
             args: vec![col("x")],
             partition_by: vec![],
             order_by: vec![],
+            frame: None,
+            distinct: false,
+            star: false,
         };
         assert!(!expr_has_aggregate(&expr));
     }
@@ -490,6 +524,7 @@ mod tests {
         let expr = Expr::RowNumber {
             partition_by: vec![],
             order_by: vec![],
+            frame: None,
         };
         assert!(!expr_has_aggregate(&expr));
     }
