@@ -3,6 +3,7 @@
 use crate::catalog::ColumnType;
 use crate::record::value::Value;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Statement {
     Query(Query),
@@ -41,6 +42,10 @@ pub(crate) enum Statement {
     AlterTable {
         table_name: String,
         actions: Vec<AlterTableAction>,
+    },
+    TruncateTable {
+        table_name: String,
+        restart_identity: bool,
     },
 }
 

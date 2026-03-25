@@ -245,9 +245,39 @@ def _convert_params(sql, params):
 
 
 _TXN_CONTROL_RE = re.compile(
-    r"^\s*(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b",
+    r"^\s*(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b",
     re.IGNORECASE,
 )
+
+_BEGIN_CONTROL_SQL = frozenset(
+    {
+        "BEGIN",
+        "BEGIN TRANSACTION",
+        "BEGIN DEFERRED",
+        "BEGIN DEFERRED TRANSACTION",
+        "BEGIN IMMEDIATE",
+        "BEGIN IMMEDIATE TRANSACTION",
+        "BEGIN EXCLUSIVE",
+        "BEGIN EXCLUSIVE TRANSACTION",
+    }
+)
+_COMMIT_CONTROL_SQL = frozenset({"COMMIT", "END", "END TRANSACTION"})
+_ROLLBACK_CONTROL_SQL = frozenset({"ROLLBACK", "ROLLBACK TRANSACTION"})
+
+
+def _normalize_control_sql(sql):
+    return " ".join(sql.strip().rstrip(";").split()).upper()
+
+
+def _transaction_control_kind(sql):
+    normalized = _normalize_control_sql(sql)
+    if normalized in _BEGIN_CONTROL_SQL:
+        return "begin"
+    if normalized in _COMMIT_CONTROL_SQL:
+        return "commit"
+    if normalized in _ROLLBACK_CONTROL_SQL:
+        return "rollback"
+    return None
 
 
 def _is_direct_execute_sql(sql):
@@ -524,21 +554,44 @@ class Cursor:
             _raise_error(code, sql=sql, params=params)
 
     def _execute_direct(self, sql, params):
-        result = ctypes.c_void_p()
-        code = self._lib.ddb_db_execute(
-            self._connection._db, sql.encode("utf-8"), None, 0, ctypes.byref(result)
-        )
-        if code != ERR_OK:
-            _raise_error(code, sql=sql, params=params)
-        try:
-            self.description = None
-            self._col_count = 0
-            self._query_active = False
-            self._has_buffered_row = False
-            self._buffered_row = None
-            self.rowcount = 0
-        finally:
-            self._lib.ddb_result_free(ctypes.byref(result))
+        control_kind = _transaction_control_kind(sql)
+        if control_kind == "begin":
+            code = self._lib.ddb_db_begin_transaction(self._connection._db)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+        elif control_kind == "commit":
+            lsn = ctypes.c_uint64()
+            code = self._lib.ddb_db_commit_transaction(self._connection._db, ctypes.byref(lsn))
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+        elif control_kind == "rollback":
+            code = self._lib.ddb_db_rollback_transaction(self._connection._db)
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+        else:
+            result = ctypes.c_void_p()
+            code = self._lib.ddb_db_execute(
+                self._connection._db, sql.encode("utf-8"), None, 0, ctypes.byref(result)
+            )
+            if code != ERR_OK:
+                _raise_error(code, sql=sql, params=params)
+            try:
+                self.description = None
+                self._col_count = 0
+                self._query_active = False
+                self._has_buffered_row = False
+                self._buffered_row = None
+                self.rowcount = 0
+            finally:
+                self._lib.ddb_result_free(ctypes.byref(result))
+            return
+
+        self.description = None
+        self._col_count = 0
+        self._query_active = False
+        self._has_buffered_row = False
+        self._buffered_row = None
+        self.rowcount = 0
 
     def _activate_statement(self, sql, params, param_count):
         if self._stmt and self._last_sql != sql:
@@ -1692,6 +1745,12 @@ class Connection:
         self._lib.ddb_db_free(ctypes.byref(self._db))
         self._db = None
         self._closed = True
+
+    def begin_transaction(self):
+        self._ensure_open()
+        code = self._lib.ddb_db_begin_transaction(self._db)
+        if code != ERR_OK:
+            _raise_error(code, sql="BEGIN", params=None)
 
     def commit(self):
         self._ensure_open()

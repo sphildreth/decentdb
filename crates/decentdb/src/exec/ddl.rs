@@ -476,6 +476,66 @@ impl EngineRuntime {
         Ok(())
     }
 
+    pub(super) fn execute_truncate_table(
+        &mut self,
+        table_name: &str,
+        restart_identity: bool,
+        page_size: u32,
+    ) -> Result<()> {
+        if self.temp_table_schema(table_name).is_some() {
+            return Err(DbError::sql(
+                "TRUNCATE TABLE is not supported for temporary tables",
+            ));
+        }
+        if self.temp_view(table_name).is_some() {
+            return Err(DbError::sql(format!("cannot truncate view {}", table_name)));
+        }
+
+        let _table = self
+            .catalog
+            .table(table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+
+        let has_referencing_tables = self.catalog.tables.values().any(|child| {
+            child
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, table_name))
+        });
+
+        if has_referencing_tables {
+            return Err(DbError::sql(format!(
+                "cannot truncate table {} because other tables reference it",
+                table_name
+            )));
+        }
+
+        let data = self.tables.get_mut(table_name).ok_or_else(|| {
+            DbError::internal(format!("table data for {} is missing", table_name))
+        })?;
+
+        let _row_count = data.rows.len();
+        data.rows.clear();
+
+        if restart_identity {
+            let table = self.catalog.tables.get_mut(table_name).ok_or_else(|| {
+                DbError::internal(format!("table schema for {} is missing", table_name))
+            })?;
+            table.next_row_id = 1;
+        }
+
+        self.mark_table_dirty(table_name);
+        self.mark_indexes_stale_for_table(table_name);
+        self.rebuild_indexes(page_size)?;
+
+        self.catalog
+            .table_stats
+            .insert(table_name.to_string(), super::TableStats { row_count: 0 });
+
+        Ok(())
+    }
+
     pub(super) fn execute_alter_table(
         &mut self,
         table_name: &str,

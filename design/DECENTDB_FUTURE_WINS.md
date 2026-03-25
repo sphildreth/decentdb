@@ -19,10 +19,7 @@ quadrantChart
     quadrant-2 Quick Wins
     quadrant-3 Low Priority
     quadrant-4 Nice to Have
-  "JSON Table Functions / Operators": [0.20, 0.82]
-  "Date/Time + UUID Builtins": [0.15, 0.72]
-  "Planner Statistics / ANALYZE": [0.35, 0.78]
-    "JSONB Binary Storage": [0.35, 0.85]
+  "JSONB Binary Storage": [0.35, 0.85]
     "Built-in CDC (Reactive)": [0.45, 0.80]
     "MVCC (Concurrent Writes)": [0.90, 0.95]
     "Native Vector Index (HNSW)": [0.75, 0.70]
@@ -34,34 +31,10 @@ quadrantChart
   "Cross-Process WAL Coordination": [0.55, 0.68]
 ```
 
-### Implementation Status
-
-#### ✅ Already Implemented (Remove From Future-Wins Queue)
-
-| Feature | Status | Notes |
-|---|---|---|
-| Bulk Load API | ✅ Shipped | Engine bulk-load helpers exist today; future work should focus on streaming ingest and COPY-style ergonomics rather than treating bulk load itself as unbuilt |
-| Shared WAL registry | ✅ Shipped (single process) | Connections to the same on-disk database already share a process-global WAL; the remaining gap is cross-process coordination, not same-process visibility |
-| Expanded ALTER TABLE | ✅ Shipped (blocking) | `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, and limited `ALTER COLUMN TYPE` are implemented; the remaining win is non-blocking/background migration |
-
-#### ⚠️ Partially Implemented
-
-| Feature | Status | Gap |
-|---|---|---|
-| JSON support | ⚠️ Partial | `json_extract`, `json_array_length`, and JSON parsing are implemented; missing `->`, `->>` operators plus executable `json_each()` / `json_tree()` runtime support |
-| Date/Time functions | ⚠️ Partial | Native `TIMESTAMP` type is shipped; `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, and `EXTRACT()` still need runtime wiring |
-| UUID functions | ⚠️ Partial | Native `UUID` type is shipped; `GEN_RANDOM_UUID()` still needs runtime wiring |
-| Window functions | ⚠️ Partial | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, and `LEAD` are implemented; broader PostgreSQL-style window support remains future work |
-| Expression / partial indexes | ⚠️ Partial | Both features ship today, but with deliberate v1 limits on supported expressions and predicates |
-
 #### ⏳ Recommended Next Wins
 
 | Feature | Section |
 |---|---|
-| JSON table functions and operators | Section 0.1 below |
-| Date/Time builtins | Section 0.2 below |
-| UUID generation builtin | Section 0.3 below |
-| Planner statistics / `ANALYZE` | Section 0.4 below |
 | JSONB binary storage | Section 2 below |
 | CDC / Reactive Subscriptions | Section 3 below |
 | MVCC | Section 1 below |
@@ -73,62 +46,6 @@ quadrantChart
 | Bulk Load Follow-Ons | Section 9 below |
 | Group Commit / WAL Batching | Section 10 below |
 | Cross-Process WAL Coordination | Section 11 below |
-
-### The Strategy
-*   **Start with true quick wins:** **JSON table functions/operators**, **Date/Time builtins**, **UUID generation**, and **planner statistics / `ANALYZE`**. These are all adjacent to code that already exists, close visible documentation gaps, and improve SQL ergonomics without destabilizing the storage engine.
-*   **Then take on structural wins:** **JSONB Binary Storage**, **Group Commit**, and **Non-Blocking Schema Migration**. These touch storage, planning, and WAL behavior, but build directly on foundations already present in the engine.
-*   **The Ultimate Goal (Top Right - High Value, Complex):** **MVCC**. This still requires a concurrency-model rewrite and should stay a deliberate post-1.0 architectural step, not an opportunistic feature add.
-
----
-
-## 0. Near-Term Wins We Should Prioritize Before New Engine Surfaces
-
-These are the highest-confidence roadmap items because the surrounding infrastructure already exists in code today. They also fix the current mismatch between shipped documentation and executable behavior.
-
-### 0.1 JSON Table Functions and Operators
-
-The engine already has JSON parsing, JSON path lookup, and scalar JSON helpers. The next low-risk step is to finish the missing SQL surface:
-
-*   Add `->` and `->>` operators for PostgreSQL-style JSON ergonomics.
-*   Wire `json_each()` and `json_tree()` into executable FROM-clause runtime support.
-*   Align engine behavior with ADR 0111 and existing docs so bindings and SQL examples stop advertising unavailable behavior.
-
-This is a better near-term investment than jumping straight to JSONB because it closes an existing product gap with a much smaller blast radius.
-
-### 0.2 Date/Time Builtins
-
-DecentDB already stores native `TIMESTAMP` values efficiently. The remaining work is to expose the normal SQL entry points developers expect:
-
-*   `NOW()`
-*   `CURRENT_TIMESTAMP`
-*   `CURRENT_DATE`
-*   `CURRENT_TIME`
-*   `EXTRACT()`
-
-This unlocks defaults, audit columns, and more natural time-based queries across every binding.
-
-### 0.3 UUID Generation Builtin
-
-The type system already supports native `UUID` storage. Shipping `GEN_RANDOM_UUID()` is a high-leverage finish that immediately improves schema ergonomics:
-
-```sql
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID(),
-  email TEXT NOT NULL
-);
-```
-
-This is a small implementation with outsized value because it removes a common source of application-side boilerplate.
-
-### 0.4 Planner Statistics / `ANALYZE`
-
-DecentDB already has a cost-based optimizer, but the roadmap should explicitly call out the next maturity step: persistent planner statistics.
-
-*   Add catalog-backed table/index statistics.
-*   Implement `ANALYZE` to refresh cardinality/selectivity metadata.
-*   Use the stats to make join ordering and index selection less heuristic-heavy.
-
-This is one of the highest-value performance wins still missing from the current planning stack.
 
 ---
 
@@ -171,10 +88,10 @@ sequenceDiagram
 
 DecentDB already ships native rich types that SQLite lacks:
 
-*   **`TIMESTAMP`** (ADR 0114): Stored as zigzag-varint int64 of microseconds since Unix epoch UTC. Type is fully implemented with binding support across .NET, Python, Java, Node.js, and Go. **Note:** `NOW()`, `CURRENT_TIMESTAMP`, and `EXTRACT()` functions are documented but not yet in the scalar dispatcher.
-*   **`UUID`** (ADR 0072, 0091): Stored as a highly optimized 16-byte packed structure (`ColumnType::Uuid`). **Note:** `GEN_RANDOM_UUID()` is documented but not yet implemented.
+*   **`TIMESTAMP`** (ADR 0114): Stored as zigzag-varint int64 of microseconds since Unix epoch UTC. Type is fully implemented with binding support across .NET, Python, Java, Node.js, and Go. `NOW()`, `CURRENT_TIMESTAMP`, and `EXTRACT()` functions are fully wired.
+*   **`UUID`** (ADR 0072, 0091): Stored as a highly optimized 16-byte packed structure (`ColumnType::Uuid`). `GEN_RANDOM_UUID()` is implemented and works in DEFAULT expressions.
 *   **`DECIMAL`** (ADR 0072, 0091): Stored as scaled int64 with explicit scale, avoiding floating-point rounding errors.
-*   **JSON scalar functions** (ADR 0102): `json_extract()` and `json_array_length()` are implemented. **Note:** `->`, `->>` operators and `json_each()`, `json_tree()` table-valued functions are documented but not yet implemented.
+*   **JSON scalar functions** (ADR 0102): `json_extract()`, `json_array_length()`, `->`, `->>` operators, and `json_each()`, `json_tree()` table-valued functions are fully implemented.
 
 ### The Remaining SQLite Pain Point: JSON as Plain Text
 SQLite stores JSON as plain text. Querying JSON requires parsing the string at runtime for *every* row evaluated. While DecentDB already provides `json_extract()` and `json_array_length()` scalar functions (ADR 0102), the underlying storage is still text — the parser runs on every access.

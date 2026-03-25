@@ -297,7 +297,7 @@ Alternative:
     - unqualified columns in `DO UPDATE` expressions bind to target table
 - Aggregate functions: `COUNT(*)`, `COUNT(col)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, `MAX(col)`, `TOTAL(col)`, `GROUP_CONCAT(col, sep)`, `STRING_AGG(col, sep)` with `GROUP BY` and `HAVING`
   - `DISTINCT` aggregate modifier: `COUNT(DISTINCT col)`, `SUM(DISTINCT col)`, `AVG(DISTINCT col)`
-- Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTR`/`SUBSTRING`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`/`CHAR`, `HEX`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SIGN`, `SQRT`, `POWER`/`POW`, `MOD`, `LN`, `LOG`/`LOG10`, `EXP`, `RANDOM`, `PRINTF`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `JSON_TYPE`, `JSON_VALID`, `JSON_OBJECT`, `JSON_ARRAY`
+- Scalar functions: `COALESCE`, `NULLIF`, `LENGTH`, `LOWER`, `UPPER`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `SUBSTR`/`SUBSTRING`, `INSTR`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`/`CHAR`, `HEX`, `ABS`, `ROUND`, `CEIL`/`CEILING`, `FLOOR`, `SIGN`, `SQRT`, `POWER`/`POW`, `MOD`, `LN`, `LOG`/`LOG10`, `EXP`, `RANDOM`, `PRINTF`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `JSON_TYPE`, `JSON_VALID`, `JSON_OBJECT`, `JSON_ARRAY`, `->` (JSON field access returning JSON), `->>` (JSON field access returning text)
 - Date/time functions: `NOW`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `DATE()`, `DATETIME()`, `STRFTIME()`, `EXTRACT()`
 - Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`
 - Expression forms: searched/simple `CASE`, `CAST(expr AS type)` (narrow matrix)

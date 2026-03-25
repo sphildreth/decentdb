@@ -152,6 +152,8 @@ def load_library():
     _lib.ddb_db_execute.restype = c_uint32
     _lib.ddb_result_free.argtypes = [POINTER(c_void_p)]
     _lib.ddb_result_free.restype = c_uint32
+    _lib.ddb_db_begin_transaction.argtypes = [c_void_p]
+    _lib.ddb_db_begin_transaction.restype = c_uint32
     _lib.ddb_db_in_transaction.argtypes = [c_void_p, POINTER(c_uint8)]
     _lib.ddb_db_in_transaction.restype = c_uint32
     _lib.ddb_db_commit_transaction.argtypes = [c_void_p, POINTER(c_uint64)]

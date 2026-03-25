@@ -1117,6 +1117,13 @@ impl EngineRuntime {
                 self.execute_alter_table(table_name, actions, params, page_size)?;
                 Ok(QueryResult::with_affected_rows(0))
             }
+            Statement::TruncateTable {
+                table_name,
+                restart_identity,
+            } => {
+                self.execute_truncate_table(table_name, *restart_identity, page_size)?;
+                Ok(QueryResult::with_affected_rows(0))
+            }
         }
     }
 
@@ -2684,10 +2691,8 @@ impl EngineRuntime {
             } => {
                 let left = self.evaluate_from_item(left, params, ctes)?;
                 if matches!(kind, JoinKind::Inner) {
-                if let Some(dataset) =
-                        self.try_indexed_inner_join_with_right_table(
-                            &left, right, constraint, ctes,
-                        )?
+                    if let Some(dataset) = self
+                        .try_indexed_inner_join_with_right_table(&left, right, constraint, ctes)?
                     {
                         return Ok(dataset);
                     }

@@ -138,6 +138,19 @@ class TestCursorBasics:
 class TestTransactions:
     """Transaction handling tests."""
 
+    def test_begin_transaction_method(self, db_path):
+        """Test explicit begin via Connection.begin_transaction()."""
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE foo (id INT64)")
+        conn.begin_transaction()
+        cur.execute("INSERT INTO foo VALUES (1)")
+        conn.rollback()
+
+        cur.execute("SELECT COUNT(*) FROM foo")
+        assert cur.fetchone()[0] == 0
+        conn.close()
+
     def test_explicit_rollback(self, db_path):
         """Test that ROLLBACK statement requires an active transaction.
 
@@ -602,4 +615,3 @@ class TestAPIEdgeCases:
         with pytest.raises(Exception):
             cur.executemany("INSERT INTO foo VALUES (?, ?)", [(1, 2), (1,)])
         conn.close()
-

@@ -1522,10 +1522,23 @@ fn json_extract_operator() {
     db.execute("CREATE TABLE t(id INT64, data TEXT)").unwrap();
     db.execute(r#"INSERT INTO t VALUES (1, '{"name":"alice","age":30}')"#)
         .unwrap();
-    // Try -> operator
-    let r = db.execute("SELECT data -> 'name' FROM t");
-    // If supported, check result; otherwise just pass
-    assert!(r.is_ok() || r.is_err());
+    let r = db.execute("SELECT data -> 'name' FROM t").unwrap();
+    assert_eq!(
+        r.rows()[0].values()[0],
+        Value::Text("\"alice\"".to_string())
+    );
+
+    let r = db.execute("SELECT data -> 'age' FROM t").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("30".to_string()));
+
+    let r = db.execute("SELECT '{\"a\":1}'::text -> 'a'").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("1".to_string()));
+
+    let r = db.execute("SELECT '[10,20,30]'::text -> 1").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("20".to_string()));
+
+    let r = db.execute("SELECT '{\"x\":null}'::text -> 'x'").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("null".to_string()));
 }
 
 #[test]
@@ -1534,8 +1547,24 @@ fn json_extract_text_operator() {
     db.execute("CREATE TABLE t(id INT64, data TEXT)").unwrap();
     db.execute(r#"INSERT INTO t VALUES (1, '{"key":"value"}')"#)
         .unwrap();
-    let r = db.execute("SELECT data ->> 'key' FROM t");
-    assert!(r.is_ok() || r.is_err());
+    let r = db.execute("SELECT data ->> 'key' FROM t").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("value".to_string()));
+
+    let r = db
+        .execute("SELECT '{\"a\":\"hello\"}'::text ->> 'a'")
+        .unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("hello".to_string()));
+
+    let r = db.execute("SELECT '[10,20,30]'::text ->> 1").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("20".to_string()));
+
+    let r = db.execute("SELECT '[true,false]'::text ->> 0").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Text("true".to_string()));
+
+    let r = db
+        .execute("SELECT '{\"a\":1}'::text ->> 'missing'")
+        .unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Null);
 }
 
 #[test]

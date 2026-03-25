@@ -115,9 +115,7 @@ class DecentDBDriver(DatabaseDriver):
         return cursor.rowcount
 
     def begin_transaction(self):
-        # DecentDB is in autocommit mode by default
-        # Use explicit BEGIN
-        self.connection.execute("BEGIN")
+        self.connection.begin_transaction()
 
     def commit(self):
         self.connection.commit()

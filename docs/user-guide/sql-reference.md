@@ -379,6 +379,8 @@ Supported scalar functions:
 - `JSON_VALID(json)` — returns 1 if valid JSON, 0 otherwise
 - `JSON_OBJECT(key1, val1, ...)` — creates a JSON object from key-value pairs
 - `JSON_ARRAY(val1, val2, ...)` — creates a JSON array from arguments
+- `json -> key` — JSON field access (returns JSON text). Works with text keys on objects and integer indexes on arrays.
+- `json ->> key` — JSON field access (returns text). Extracts the value as plain text.
 
 **Date/Time:**
 - `NOW()` / `CURRENT_TIMESTAMP` — current date and time as a native TIMESTAMP value
@@ -424,6 +426,10 @@ SELECT JSON_TYPE('{"a":1}');  -- Returns 'object'
 SELECT JSON_VALID('not json');  -- Returns 0
 SELECT JSON_OBJECT('name', 'Alice', 'age', 30);
 SELECT JSON_ARRAY(1, 'two', 3.0);
+SELECT '{"a":1}' -> 'a';  -- Returns '1' (JSON text)
+SELECT '{"a":"hello"}' ->> 'a';  -- Returns 'hello' (text)
+SELECT '[10,20,30]' -> 1;  -- Returns '20' (JSON text, 0-indexed)
+SELECT '[10,20,30]' ->> 1;  -- Returns '20' (text)
 SELECT NOW(), CURRENT_DATE, CURRENT_TIME;
 SELECT EXTRACT(YEAR FROM '2026-02-24');  -- Returns 2026
 SELECT STRFTIME('%Y-%m-%d', CURRENT_TIMESTAMP);
