@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Conditional scalar functions: `GREATEST`, `LEAST`, and `IIF`.
 - DML enhancements: `UPDATE ... RETURNING` and `DELETE ... RETURNING`.
 - Subquery comparison operators: `expr op ANY/SOME (subquery)` and `expr op ALL (subquery)`.
+- Regex comparison operators: `~`, `~*`, `!~`, `!~*`.
 
 ### Changed
 - Refreshed repository documentation to present DecentDB as the current Rust engine and binding ecosystem.

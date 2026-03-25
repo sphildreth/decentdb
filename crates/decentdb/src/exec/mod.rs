@@ -7901,6 +7901,16 @@ fn eval_function(
         "now" | "current_timestamp" | "localtimestamp" => eval_current_timestamp(values),
         "current_date" => eval_current_date(values),
         "current_time" | "localtime" => eval_current_time(values),
+        "date_trunc" => eval_date_trunc(values),
+        "date_part" | "pg_catalog.date_part" => eval_date_part(values),
+        "date_diff" => eval_date_diff(values),
+        "last_day" => eval_last_day(values),
+        "next_day" => eval_next_day(values),
+        "make_date" => eval_make_date(values),
+        "make_timestamp" => eval_make_timestamp(values),
+        "to_timestamp" => eval_to_timestamp(values),
+        "interval" => eval_interval(values),
+        "age" => eval_age(values),
         "date" => eval_date(values),
         "datetime" => eval_datetime(values),
         "strftime" => eval_strftime(values),
@@ -8203,9 +8213,461 @@ fn eval_extract(values: Vec<Value>) -> Result<Value> {
         "DOW" => Ok(Value::Int64(i64::from(
             datetime.weekday().num_days_from_sunday(),
         ))),
+        "DOY" => Ok(Value::Int64(i64::from(datetime.ordinal()))),
+        "EPOCH" => Ok(Value::Float64(
+            (datetime.timestamp_micros() as f64) / 1_000_000.0,
+        )),
         other => Err(DbError::sql(format!(
             "EXTRACT field {other} is not supported"
         ))),
+    }
+}
+
+fn eval_date_trunc(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 2 {
+        return Err(DbError::sql("DATE_TRUNC expects 2 arguments"));
+    }
+    let Some(precision) = expect_text_arg("DATE_TRUNC", "first", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let Some(datetime) = datetime_from_value("DATE_TRUNC", &values[1])? else {
+        return Ok(Value::Null);
+    };
+    let truncated = truncate_datetime(datetime, precision)?;
+    Ok(Value::TimestampMicros(truncated.timestamp_micros()))
+}
+
+fn eval_date_part(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 2 {
+        return Err(DbError::sql("DATE_PART expects 2 arguments"));
+    }
+    eval_extract(values)
+}
+
+fn eval_date_diff(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 3 {
+        return Err(DbError::sql("DATE_DIFF expects 3 arguments"));
+    }
+    let Some(part) = expect_text_arg("DATE_DIFF", "first", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let Some(start) = datetime_from_value("DATE_DIFF", &values[1])? else {
+        return Ok(Value::Null);
+    };
+    let Some(end) = datetime_from_value("DATE_DIFF", &values[2])? else {
+        return Ok(Value::Null);
+    };
+    let diff = date_diff_part(part, start, end)?;
+    Ok(Value::Int64(diff))
+}
+
+fn eval_last_day(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(DbError::sql("LAST_DAY expects 1 argument"));
+    }
+    let Some(datetime) = datetime_from_value("LAST_DAY", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let first_of_month = datetime
+        .date_naive()
+        .with_day(1)
+        .ok_or_else(|| DbError::sql("LAST_DAY date is out of range"))?;
+    let next_month = first_of_month
+        .checked_add_months(Months::new(1))
+        .ok_or_else(|| DbError::sql("LAST_DAY date is out of range"))?;
+    let last_day = next_month
+        .pred_opt()
+        .ok_or_else(|| DbError::sql("LAST_DAY date is out of range"))?;
+    Ok(Value::Text(last_day.format("%Y-%m-%d").to_string()))
+}
+
+fn eval_next_day(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 2 {
+        return Err(DbError::sql("NEXT_DAY expects 2 arguments"));
+    }
+    let Some(datetime) = datetime_from_value("NEXT_DAY", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let Some(weekday_text) = expect_text_arg("NEXT_DAY", "second", &values[1])? else {
+        return Ok(Value::Null);
+    };
+    let target = parse_weekday_name(weekday_text)?;
+    let mut days_ahead = i64::from(target.num_days_from_monday())
+        - i64::from(datetime.weekday().num_days_from_monday());
+    if days_ahead <= 0 {
+        days_ahead += 7;
+    }
+    let next = datetime
+        .checked_add_signed(ChronoDuration::days(days_ahead))
+        .ok_or_else(|| DbError::sql("NEXT_DAY result overflowed supported range"))?;
+    Ok(Value::Text(
+        next.date_naive().format("%Y-%m-%d").to_string(),
+    ))
+}
+
+fn eval_make_date(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 3 {
+        return Err(DbError::sql("MAKE_DATE expects 3 arguments"));
+    }
+    let year = expect_int_arg("MAKE_DATE", "first", &values[0])?;
+    let month = expect_int_arg("MAKE_DATE", "second", &values[1])?;
+    let day = expect_int_arg("MAKE_DATE", "third", &values[2])?;
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return Ok(Value::Null);
+    };
+    let year = i32::try_from(year).map_err(|_| DbError::sql("MAKE_DATE year is out of range"))?;
+    let month =
+        u32::try_from(month).map_err(|_| DbError::sql("MAKE_DATE month is out of range"))?;
+    let day = u32::try_from(day).map_err(|_| DbError::sql("MAKE_DATE day is out of range"))?;
+    let date = NaiveDate::from_ymd_opt(year, month, day)
+        .ok_or_else(|| DbError::sql("MAKE_DATE arguments are not a valid date"))?;
+    Ok(Value::Text(date.format("%Y-%m-%d").to_string()))
+}
+
+fn eval_make_timestamp(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 6 {
+        return Err(DbError::sql("MAKE_TIMESTAMP expects 6 arguments"));
+    }
+    let year = expect_int_arg("MAKE_TIMESTAMP", "first", &values[0])?;
+    let month = expect_int_arg("MAKE_TIMESTAMP", "second", &values[1])?;
+    let day = expect_int_arg("MAKE_TIMESTAMP", "third", &values[2])?;
+    let hour = expect_int_arg("MAKE_TIMESTAMP", "fourth", &values[3])?;
+    let minute = expect_int_arg("MAKE_TIMESTAMP", "fifth", &values[4])?;
+    let second = expect_numeric_arg("MAKE_TIMESTAMP", "sixth", &values[5])?;
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) =
+        (year, month, day, hour, minute, second)
+    else {
+        return Ok(Value::Null);
+    };
+    let year =
+        i32::try_from(year).map_err(|_| DbError::sql("MAKE_TIMESTAMP year is out of range"))?;
+    let month =
+        u32::try_from(month).map_err(|_| DbError::sql("MAKE_TIMESTAMP month is out of range"))?;
+    let day = u32::try_from(day).map_err(|_| DbError::sql("MAKE_TIMESTAMP day is out of range"))?;
+    let hour =
+        u32::try_from(hour).map_err(|_| DbError::sql("MAKE_TIMESTAMP hour is out of range"))?;
+    let minute =
+        u32::try_from(minute).map_err(|_| DbError::sql("MAKE_TIMESTAMP minute is out of range"))?;
+    let second_f64 = second.as_f64();
+    if !(0.0..60.0).contains(&second_f64) {
+        return Err(DbError::sql(
+            "MAKE_TIMESTAMP seconds must be between 0 (inclusive) and 60 (exclusive)",
+        ));
+    }
+    let second_whole = second_f64.floor() as u32;
+    let micros = ((second_f64 - f64::from(second_whole)) * 1_000_000.0).round() as u32;
+    let date = NaiveDate::from_ymd_opt(year, month, day)
+        .ok_or_else(|| DbError::sql("MAKE_TIMESTAMP arguments are not a valid date"))?;
+    let datetime = date
+        .and_hms_micro_opt(hour, minute, second_whole, micros.min(999_999))
+        .ok_or_else(|| DbError::sql("MAKE_TIMESTAMP arguments are not a valid timestamp"))?;
+    Ok(Value::TimestampMicros(
+        DateTime::<Utc>::from_naive_utc_and_offset(datetime, Utc).timestamp_micros(),
+    ))
+}
+
+fn eval_to_timestamp(values: Vec<Value>) -> Result<Value> {
+    if values.is_empty() || values.len() > 2 {
+        return Err(DbError::sql("TO_TIMESTAMP expects 1 or 2 arguments"));
+    }
+    match (&values[0], values.get(1)) {
+        (Value::Null, _) => Ok(Value::Null),
+        (Value::Int64(epoch), None) => Ok(Value::TimestampMicros(
+            epoch
+                .checked_mul(1_000_000)
+                .ok_or_else(|| DbError::sql("TO_TIMESTAMP epoch is out of range"))?,
+        )),
+        (Value::Float64(epoch), None) => Ok(Value::TimestampMicros((epoch * 1_000_000.0) as i64)),
+        (Value::Text(text), None) => Ok(Value::TimestampMicros(
+            parse_datetime_text("TO_TIMESTAMP", text)?.timestamp_micros(),
+        )),
+        (Value::Text(text), Some(Value::Text(format))) => Ok(Value::TimestampMicros(
+            parse_to_timestamp_with_format(text, format)?.timestamp_micros(),
+        )),
+        (_, Some(Value::Null)) => Ok(Value::Null),
+        (other, None) => Err(DbError::sql(format!(
+            "TO_TIMESTAMP expects numeric epoch or text input, got {other:?}"
+        ))),
+        (_, Some(other)) => Err(DbError::sql(format!(
+            "TO_TIMESTAMP format argument must be text, got {other:?}"
+        ))),
+    }
+}
+
+fn eval_interval(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(DbError::sql("INTERVAL expects 1 argument"));
+    }
+    let Some(raw) = expect_text_arg("INTERVAL", "first", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let micros = parse_interval_micros(raw)?;
+    Ok(Value::Int64(micros))
+}
+
+fn eval_age(values: Vec<Value>) -> Result<Value> {
+    if values.is_empty() || values.len() > 2 {
+        return Err(DbError::sql("AGE expects 1 or 2 arguments"));
+    }
+    let first = match datetime_from_value("AGE", &values[0])? {
+        Some(value) => value,
+        None => return Ok(Value::Null),
+    };
+    let second = if let Some(second) = values.get(1) {
+        match datetime_from_value("AGE", second)? {
+            Some(value) => value,
+            None => return Ok(Value::Null),
+        }
+    } else {
+        current_utc_datetime()
+    };
+    let delta = first.timestamp_micros() - second.timestamp_micros();
+    Ok(Value::Text(format_age_interval(delta)))
+}
+
+fn truncate_datetime(datetime: DateTime<Utc>, precision: &str) -> Result<DateTime<Utc>> {
+    let lower = precision.to_ascii_lowercase();
+    let date = datetime.date_naive();
+    let time = datetime.time();
+    let truncated = match lower.as_str() {
+        "microsecond" | "microseconds" => datetime.naive_utc(),
+        "millisecond" | "milliseconds" => datetime
+            .naive_utc()
+            .with_nanosecond((time.nanosecond() / 1_000_000) * 1_000_000)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "second" | "seconds" => date
+            .and_hms_opt(time.hour(), time.minute(), time.second())
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "minute" | "minutes" => date
+            .and_hms_opt(time.hour(), time.minute(), 0)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "hour" | "hours" => date
+            .and_hms_opt(time.hour(), 0, 0)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "day" | "days" => date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "week" | "weeks" => {
+            let start = date
+                .checked_sub_signed(ChronoDuration::days(i64::from(
+                    date.weekday().num_days_from_monday(),
+                )))
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?;
+            start
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
+        }
+        "month" | "months" => date
+            .with_day(1)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "quarter" | "quarters" => {
+            let month = ((date.month() - 1) / 3) * 3 + 1;
+            NaiveDate::from_ymd_opt(date.year(), month, 1)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
+        }
+        "year" | "years" => NaiveDate::from_ymd_opt(date.year(), 1, 1)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?,
+        "decade" | "decades" => {
+            let year = date.year().div_euclid(10) * 10;
+            NaiveDate::from_ymd_opt(year, 1, 1)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
+        }
+        "century" | "centuries" => {
+            let year = ((date.year() - 1).div_euclid(100) * 100) + 1;
+            NaiveDate::from_ymd_opt(year, 1, 1)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
+        }
+        "millennium" | "millennia" => {
+            let year = ((date.year() - 1).div_euclid(1000) * 1000) + 1;
+            NaiveDate::from_ymd_opt(year, 1, 1)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid date"))?
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| DbError::sql("DATE_TRUNC produced an invalid timestamp"))?
+        }
+        other => {
+            return Err(DbError::sql(format!(
+                "DATE_TRUNC precision {other} is not supported"
+            )))
+        }
+    };
+    Ok(DateTime::from_naive_utc_and_offset(truncated, Utc))
+}
+
+fn date_diff_part(part: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
+    let part = part.to_ascii_lowercase();
+    let micros = end.timestamp_micros() - start.timestamp_micros();
+    let result = match part.as_str() {
+        "microsecond" | "microseconds" => micros,
+        "millisecond" | "milliseconds" => micros.div_euclid(1_000),
+        "second" | "seconds" => micros.div_euclid(1_000_000),
+        "minute" | "minutes" => micros.div_euclid(60 * 1_000_000),
+        "hour" | "hours" => micros.div_euclid(60 * 60 * 1_000_000),
+        "day" | "days" => micros.div_euclid(24 * 60 * 60 * 1_000_000),
+        "week" | "weeks" => micros.div_euclid(7 * 24 * 60 * 60 * 1_000_000),
+        "month" | "months" => {
+            let start_date = start.date_naive();
+            let end_date = end.date_naive();
+            let mut months = i64::from(end_date.year() - start_date.year()) * 12
+                + i64::from(end_date.month())
+                - i64::from(start_date.month());
+            if end_date.day() < start_date.day() {
+                months -= 1;
+            }
+            months
+        }
+        "year" | "years" => {
+            let start_date = start.date_naive();
+            let end_date = end.date_naive();
+            let mut years = i64::from(end_date.year() - start_date.year());
+            if (end_date.month(), end_date.day()) < (start_date.month(), start_date.day()) {
+                years -= 1;
+            }
+            years
+        }
+        other => {
+            return Err(DbError::sql(format!(
+                "DATE_DIFF part {other} is not supported"
+            )))
+        }
+    };
+    Ok(result)
+}
+
+fn parse_weekday_name(value: &str) -> Result<chrono::Weekday> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "monday" | "mon" => Ok(chrono::Weekday::Mon),
+        "tuesday" | "tue" | "tues" => Ok(chrono::Weekday::Tue),
+        "wednesday" | "wed" => Ok(chrono::Weekday::Wed),
+        "thursday" | "thu" | "thurs" => Ok(chrono::Weekday::Thu),
+        "friday" | "fri" => Ok(chrono::Weekday::Fri),
+        "saturday" | "sat" => Ok(chrono::Weekday::Sat),
+        "sunday" | "sun" => Ok(chrono::Weekday::Sun),
+        other => Err(DbError::sql(format!(
+            "NEXT_DAY weekday {other} is not supported"
+        ))),
+    }
+}
+
+fn parse_to_timestamp_with_format(text: &str, format: &str) -> Result<DateTime<Utc>> {
+    let mapped = match format {
+        "YYYY-MM-DD HH24:MI:SS" => "%Y-%m-%d %H:%M:%S",
+        "YYYY-MM-DD" => "%Y-%m-%d",
+        "DD/MM/YYYY" => "%d/%m/%Y",
+        _ => {
+            return Err(DbError::sql(
+                "TO_TIMESTAMP format is not supported by DecentDB yet",
+            ))
+        }
+    };
+    if mapped.contains("%H") {
+        let naive = NaiveDateTime::parse_from_str(text, mapped)
+            .map_err(|_| DbError::sql("TO_TIMESTAMP input does not match format"))?;
+        Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
+    } else {
+        let date = NaiveDate::parse_from_str(text, mapped)
+            .map_err(|_| DbError::sql("TO_TIMESTAMP input does not match format"))?;
+        let naive = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DbError::sql("TO_TIMESTAMP input is out of range"))?;
+        Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
+    }
+}
+
+fn parse_interval_micros(text: &str) -> Result<i64> {
+    let mut tokens = text.split_whitespace();
+    let mut total_micros: i64 = 0;
+    let mut saw_any = false;
+    while let Some(amount_token) = tokens.next() {
+        let unit_token = tokens
+            .next()
+            .ok_or_else(|| DbError::sql("INTERVAL text must be pairs of amount and unit"))?;
+        let amount = amount_token
+            .parse::<i64>()
+            .map_err(|_| DbError::sql("INTERVAL amount must be an integer"))?;
+        let unit = unit_token.to_ascii_lowercase();
+        let unit = unit.trim_end_matches('s');
+        let unit_micros = match unit {
+            "year" => 365_i64
+                .checked_mul(24)
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(1_000_000))
+                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
+            "month" => 30_i64
+                .checked_mul(24)
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(1_000_000))
+                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
+            "week" => 7_i64
+                .checked_mul(24)
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(1_000_000))
+                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
+            "day" => 24_i64
+                .checked_mul(60)
+                .and_then(|v| v.checked_mul(60))
+                .and_then(|v| v.checked_mul(1_000_000))
+                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
+            "hour" => 60_i64
+                .checked_mul(60)
+                .and_then(|v| v.checked_mul(1_000_000))
+                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
+            "minute" => 60_i64
+                .checked_mul(1_000_000)
+                .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?,
+            "second" => 1_000_000_i64,
+            _ => {
+                return Err(DbError::sql(format!(
+                    "INTERVAL unit {unit_token} is not supported"
+                )))
+            }
+        };
+        let delta = amount
+            .checked_mul(unit_micros)
+            .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?;
+        total_micros = total_micros
+            .checked_add(delta)
+            .ok_or_else(|| DbError::sql("INTERVAL value overflowed"))?;
+        saw_any = true;
+    }
+    if !saw_any {
+        return Err(DbError::sql("INTERVAL text must not be empty"));
+    }
+    Ok(total_micros)
+}
+
+fn format_age_interval(delta_micros: i64) -> String {
+    let negative = delta_micros < 0;
+    let mut remainder = delta_micros.unsigned_abs();
+    let day_micros = 24_u64 * 60 * 60 * 1_000_000;
+    let hour_micros = 60_u64 * 60 * 1_000_000;
+    let minute_micros = 60_u64 * 1_000_000;
+    let second_micros = 1_000_000_u64;
+    let days = remainder / day_micros;
+    remainder %= day_micros;
+    let hours = remainder / hour_micros;
+    remainder %= hour_micros;
+    let minutes = remainder / minute_micros;
+    remainder %= minute_micros;
+    let seconds = remainder / second_micros;
+    let micros = remainder % second_micros;
+    let sign = if negative { "-" } else { "" };
+    if micros == 0 {
+        format!("{sign}{days} days {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{sign}{days} days {hours:02}:{minutes:02}:{seconds:02}.{micros:06}")
     }
 }
 
@@ -9288,6 +9750,10 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
         },
         BinaryOp::JsonExtract => eval_json_binary_operator(&left, &right, false),
         BinaryOp::JsonExtractText => eval_json_binary_operator(&left, &right, true),
+        BinaryOp::RegexMatch => eval_regex(left, right, false, false),
+        BinaryOp::RegexMatchCaseInsensitive => eval_regex(left, right, true, false),
+        BinaryOp::RegexNotMatch => eval_regex(left, right, false, true),
+        BinaryOp::RegexNotMatchCaseInsensitive => eval_regex(left, right, true, true),
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
             arithmetic(op, left, right)
         }
@@ -9312,6 +9778,24 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
                 _ => unreachable!(),
             }))
         }
+    }
+}
+
+fn eval_regex(left: Value, right: Value, case_insensitive: bool, negated: bool) -> Result<Value> {
+    match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(left), Value::Text(pattern)) => {
+            let mut builder = regex::RegexBuilder::new(&pattern);
+            builder.case_insensitive(case_insensitive);
+            let regex = builder
+                .build()
+                .map_err(|error| DbError::sql(format!("invalid regular expression: {error}")))?;
+            let matched = regex.is_match(&left);
+            Ok(Value::Bool(if negated { !matched } else { matched }))
+        }
+        other => Err(DbError::sql(format!(
+            "regex operators expect text values, got {other:?}"
+        ))),
     }
 }
 
@@ -9665,6 +10149,9 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(Value::Null);
     }
+    if let Some(result) = timestamp_interval_arithmetic(op, &left, &right)? {
+        return Ok(result);
+    }
     match (left, right) {
         (Value::Int64(left), Value::Int64(right)) => {
             if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0 {
@@ -9701,6 +10188,37 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
         other => Err(DbError::sql(format!(
             "arithmetic is not defined for {other:?}"
         ))),
+    }
+}
+
+fn timestamp_interval_arithmetic(
+    op: &BinaryOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Option<Value>> {
+    match (op, left, right) {
+        (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
+            Ok(Some(Value::TimestampMicros(
+                timestamp
+                    .checked_add(*interval_micros)
+                    .ok_or_else(|| DbError::sql("timestamp addition overflowed"))?,
+            )))
+        }
+        (BinaryOp::Sub, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
+            Ok(Some(Value::TimestampMicros(
+                timestamp
+                    .checked_sub(*interval_micros)
+                    .ok_or_else(|| DbError::sql("timestamp subtraction overflowed"))?,
+            )))
+        }
+        (BinaryOp::Add, Value::Int64(interval_micros), Value::TimestampMicros(timestamp)) => {
+            Ok(Some(Value::TimestampMicros(
+                timestamp
+                    .checked_add(*interval_micros)
+                    .ok_or_else(|| DbError::sql("timestamp addition overflowed"))?,
+            )))
+        }
+        _ => Ok(None),
     }
 }
 

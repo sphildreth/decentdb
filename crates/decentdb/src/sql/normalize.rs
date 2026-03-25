@@ -1090,18 +1090,7 @@ fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
         NodeEnum::AExpr(expr) => normalize_aexpr(expr),
         NodeEnum::BoolExpr(expr) => normalize_bool_expr(expr),
         NodeEnum::FuncCall(call) => normalize_function_call(call),
-        NodeEnum::TypeCast(cast) => Ok(Expr::Cast {
-            expr: Box::new(normalize_expr_node(
-                cast.arg
-                    .as_deref()
-                    .ok_or_else(|| unsupported("CAST is missing its expression"))?,
-            )?),
-            target_type: normalize_type_name(
-                cast.type_name
-                    .as_ref()
-                    .ok_or_else(|| unsupported("CAST is missing its target type"))?,
-            )?,
-        }),
+        NodeEnum::TypeCast(cast) => normalize_type_cast(cast),
         NodeEnum::CaseExpr(case) => normalize_case_expr(case),
         NodeEnum::NullTest(test) => Ok(Expr::IsNull {
             expr: Box::new(normalize_expr_node(
@@ -1237,6 +1226,29 @@ fn normalize_const(value: &protobuf::AConst) -> Result<Expr> {
     }))
 }
 
+fn normalize_type_cast(cast: &protobuf::TypeCast) -> Result<Expr> {
+    let expr = normalize_expr_node(
+        cast.arg
+            .as_deref()
+            .ok_or_else(|| unsupported("CAST is missing its expression"))?,
+    )?;
+    let type_name = cast
+        .type_name
+        .as_ref()
+        .ok_or_else(|| unsupported("CAST is missing its target type"))?;
+    let raw = normalize_qualified_name(&type_name.names)?.to_ascii_lowercase();
+    if raw == "interval" || raw == "pg_catalog.interval" {
+        return Ok(Expr::Function {
+            name: "interval".to_string(),
+            args: vec![expr],
+        });
+    }
+    Ok(Expr::Cast {
+        expr: Box::new(expr),
+        target_type: normalize_type_name(type_name)?,
+    })
+}
+
 fn normalize_column_ref(column: &protobuf::ColumnRef) -> Result<Expr> {
     let parts = column
         .fields
@@ -1304,6 +1316,10 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                     (_, "<=") => BinaryOp::LtEq,
                     (_, ">") => BinaryOp::Gt,
                     (_, ">=") => BinaryOp::GtEq,
+                    (_, "~") => BinaryOp::RegexMatch,
+                    (_, "~*") => BinaryOp::RegexMatchCaseInsensitive,
+                    (_, "!~") => BinaryOp::RegexNotMatch,
+                    (_, "!~*") => BinaryOp::RegexNotMatchCaseInsensitive,
                     (_, "+") => BinaryOp::Add,
                     (_, "-") => BinaryOp::Sub,
                     (_, "*") => BinaryOp::Mul,
@@ -2285,6 +2301,22 @@ mod tests {
     }
 
     #[test]
+    fn aexpr_regex_operators() {
+        if let Statement::Query(q) = norm(
+            "SELECT * FROM t WHERE name ~ '^a' OR name ~* '^A' OR name !~ 'z$' OR name !~* 'Z$'",
+        ) {
+            if let QueryBody::Select(s) = q.body {
+                let filter = s.filter.expect("expected filter");
+                let sql = filter.to_sql();
+                assert!(sql.contains("~ '^a'"));
+                assert!(sql.contains("~* '^A'"));
+                assert!(sql.contains("!~ 'z$'"));
+                assert!(sql.contains("!~* 'Z$'"));
+            }
+        }
+    }
+
+    #[test]
     fn aexpr_modulo_operator() {
         if let Statement::Query(q) = norm("SELECT 10 % 3") {
             if let QueryBody::Select(s) = q.body {
@@ -2412,6 +2444,21 @@ mod tests {
                 {
                     assert!(star);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn type_cast_interval_normalizes_to_interval_function() {
+        if let Statement::Query(q) = norm("SELECT INTERVAL '2 days'") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(
+                    &s.projection[0],
+                    SelectItem::Expr {
+                        expr: Expr::Function { name, .. },
+                        ..
+                    } if name == "interval"
+                ));
             }
         }
     }

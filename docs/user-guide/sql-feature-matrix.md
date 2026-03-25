@@ -483,6 +483,7 @@ SELECT key, value, type FROM json_tree('{"a":{"b":1},"c":[2,3]}');
 | EXISTS / NOT EXISTS | ✅ | ✅ | ✅ | ✅ |
 | `op ANY (subquery)` / `op SOME (subquery)` | ✅ | ✅ | ✅ | ✅ |
 | `op ALL (subquery)` | ✅ | ✅ | ✅ | ✅ |
+| `~`, `~*`, `!~`, `!~*` (regex) | ✅ | ❌ | ✅ | ✅ |
 | IS NULL | ✅ | ✅ | ✅ | ✅ |
 | CASE | ✅ | ✅ | ✅ | ✅ |
 | COALESCE | ✅ | ✅ | ✅ | ✅ |
@@ -507,6 +508,8 @@ SELECT * FROM users WHERE id IN (1, 2, 3);
 SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id);
 SELECT * FROM employees WHERE salary > ANY (SELECT salary FROM peers);
 SELECT * FROM employees WHERE salary >= ALL (SELECT salary FROM peers);
+SELECT * FROM users WHERE name ~ '^A';
+SELECT * FROM users WHERE name !~* '^admin';
 
 -- NULL handling
 SELECT * FROM users WHERE email IS NULL;

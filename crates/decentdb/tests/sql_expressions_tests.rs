@@ -1570,6 +1570,67 @@ fn is_distinct_from() {
 }
 
 #[test]
+fn regex_match_operators() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(name TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice'),('bob'),('ALPHA')")
+        .unwrap();
+
+    let sensitive = db
+        .execute("SELECT name FROM t WHERE name ~ '^A' ORDER BY name")
+        .unwrap();
+    assert_eq!(
+        rows(&sensitive),
+        vec![
+            vec![Value::Text("ALPHA".to_string())],
+            vec![Value::Text("Alice".to_string())]
+        ]
+    );
+
+    let insensitive = db
+        .execute("SELECT name FROM t WHERE name ~* '^a' ORDER BY name")
+        .unwrap();
+    assert_eq!(
+        rows(&insensitive),
+        vec![
+            vec![Value::Text("ALPHA".to_string())],
+            vec![Value::Text("Alice".to_string())]
+        ]
+    );
+}
+
+#[test]
+fn regex_not_match_operators() {
+    let db = mem_db();
+    db.execute("CREATE TABLE t(name TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice'),('bob'),('ALPHA')")
+        .unwrap();
+
+    let sensitive = db
+        .execute("SELECT name FROM t WHERE name !~ '^A' ORDER BY name")
+        .unwrap();
+    assert_eq!(rows(&sensitive), vec![vec![Value::Text("bob".to_string())]]);
+
+    let insensitive = db
+        .execute("SELECT name FROM t WHERE name !~* '^a' ORDER BY name")
+        .unwrap();
+    assert_eq!(
+        rows(&insensitive),
+        vec![vec![Value::Text("bob".to_string())]]
+    );
+}
+
+#[test]
+fn regex_operator_null_and_invalid_pattern() {
+    let db = mem_db();
+    let null_result = db.execute("SELECT 'abc' ~ NULL, NULL ~ 'a'").unwrap();
+    assert_eq!(rows(&null_result), vec![vec![Value::Null, Value::Null]]);
+
+    let err = exec_err(&db, "SELECT 'abc' ~ '['");
+    assert!(err.contains("invalid regular expression"));
+}
+
+#[test]
 fn is_null_and_is_not_null() {
     let db = mem_db();
     exec(&db, "CREATE TABLE nulls (id INT PRIMARY KEY, val TEXT)");
@@ -3475,6 +3536,135 @@ fn date_time_scalar_functions_cover_documented_slice_6_examples() {
             Value::Int64(3),
             Value::Int64(5),
             Value::Int64(14),
+        ]
+    );
+}
+
+#[test]
+fn extended_datetime_functions_date_trunc_and_parts() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                DATE_TRUNC('month', '2024-03-15 14:30:45'),
+                DATE_TRUNC('day', '2024-03-15 14:30:45'),
+                DATE_TRUNC('hour', '2024-03-15 14:30:45'),
+                DATE_PART('year', '2024-03-15'),
+                DATE_PART('doy', '2024-03-15')",
+        )
+        .unwrap();
+    let row = result.rows()[0].values();
+    assert_eq!(row[0], Value::TimestampMicros(1_709_251_200_000_000));
+    assert_eq!(row[1], Value::TimestampMicros(1_710_460_800_000_000));
+    assert_eq!(row[2], Value::TimestampMicros(1_710_511_200_000_000));
+    assert_eq!(row[3], Value::Int64(2024));
+    assert_eq!(row[4], Value::Int64(75));
+}
+
+#[test]
+fn extended_datetime_functions_diff_and_constructors() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                DATE_DIFF('day', '2024-03-10', '2024-03-15'),
+                DATE_DIFF('month', '2024-01-15', '2024-03-14'),
+                LAST_DAY('2024-02-11'),
+                NEXT_DAY('2024-03-15', 'Monday'),
+                MAKE_DATE(2024, 3, 15),
+                MAKE_TIMESTAMP(2024, 3, 15, 14, 30, 0)",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Int64(5),
+            Value::Int64(1),
+            Value::Text("2024-02-29".to_string()),
+            Value::Text("2024-03-18".to_string()),
+            Value::Text("2024-03-15".to_string()),
+            Value::TimestampMicros(1_710_513_000_000_000),
+        ]
+    );
+}
+
+#[test]
+fn extended_datetime_functions_to_timestamp_and_age() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                TO_TIMESTAMP(1710505800),
+                TO_TIMESTAMP('2024-03-15 14:30:00', 'YYYY-MM-DD HH24:MI:SS'),
+                TO_TIMESTAMP('15/03/2024', 'DD/MM/YYYY'),
+                AGE('2024-03-15', '2024-03-14')",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::TimestampMicros(1_710_505_800_000_000),
+            Value::TimestampMicros(1_710_513_000_000_000),
+            Value::TimestampMicros(1_710_460_800_000_000),
+            Value::Text("1 days 00:00:00".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn extended_datetime_functions_null_propagation() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                DATE_TRUNC('day', NULL),
+                DATE_PART('day', NULL),
+                DATE_DIFF('day', NULL, '2024-01-01'),
+                LAST_DAY(NULL),
+                NEXT_DAY(NULL, 'Monday'),
+                MAKE_DATE(NULL, 1, 1),
+                MAKE_TIMESTAMP(2024, 1, 1, 0, 0, NULL),
+                TO_TIMESTAMP(NULL),
+                AGE(NULL, '2024-01-01')",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]
+    );
+}
+
+#[test]
+fn extended_datetime_interval_arithmetic() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                '2024-03-15 14:30:00'::timestamp + INTERVAL '1 day',
+                '2024-03-15 14:30:00'::timestamp - INTERVAL '2 hour',
+                '2024-03-15 14:30:00'::timestamp + INTERVAL '1 month',
+                '2024-03-15 14:30:00'::timestamp + INTERVAL '1 year 2 months 3 days',
+                '2024-03-15'::date + INTERVAL '7 days'",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::TimestampMicros(1_710_599_400_000_000),
+            Value::TimestampMicros(1_710_505_800_000_000),
+            Value::TimestampMicros(1_713_105_000_000_000),
+            Value::TimestampMicros(1_747_492_200_000_000),
+            Value::TimestampMicros(1_711_065_600_000_000),
         ]
     );
 }

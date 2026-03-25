@@ -646,6 +646,7 @@ dependencies = [
  "miniz_oxide",
  "proptest",
  "rand 0.8.5",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

@@ -32,6 +32,30 @@ SELECT * FROM employees
 WHERE salary >= ALL (SELECT salary FROM peers);
 ```
 
+## Regex comparison operators
+
+Supported:
+
+- `left ~ pattern` (case-sensitive match)
+- `left ~* pattern` (case-insensitive match)
+- `left !~ pattern` (case-sensitive non-match)
+- `left !~* pattern` (case-insensitive non-match)
+
+Behavior notes:
+
+- Both operands must be `TEXT`; otherwise an SQL type error is raised.
+- `NULL` operands yield `NULL`.
+- Invalid regex patterns return an SQL error.
+
+Examples:
+
+```sql
+SELECT name FROM users WHERE name ~ '^A';
+SELECT name FROM users WHERE name ~* '^admin';
+SELECT name FROM users WHERE name !~ 'bot$';
+SELECT name FROM users WHERE name !~* '^test_';
+```
+
 ## Math functions
 
 ### Trigonometric
