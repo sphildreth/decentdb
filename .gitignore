@@ -90,4 +90,4 @@ tests/bindings/**/*.node
 # Local DecentDB database artifacts
 *.ddb
 *.ddb.wal
-benchmarks/python_embedded_compare/derby.log
+*.log

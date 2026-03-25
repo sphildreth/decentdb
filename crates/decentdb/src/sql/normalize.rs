@@ -491,7 +491,7 @@ fn normalize_table_constraint(constraint: &protobuf::Constraint) -> Result<Table
         protobuf::ConstrType::ConstrForeign => Ok(TableConstraint::ForeignKey(
             normalize_foreign_key_constraint(
                 constraint,
-                normalize_constraint_keys(&constraint.keys)?,
+                normalize_constraint_keys(&constraint.fk_attrs)?,
             )?,
         )),
         other => Err(unsupported(format!(

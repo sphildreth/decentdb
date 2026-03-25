@@ -60,6 +60,8 @@ class JDBCDriver(DatabaseDriver):
         self.jdbc_url = config.get("jdbc_url", "")
         self.driver_class = config.get("driver_class", "")
         self.jar_paths = config.get("jar_paths", [])
+        self.connection_properties = dict(config.get("connection_properties", {}))
+        self.jvm_properties = dict(config.get("jvm_properties", {}))
         self._prepared_stmts: Dict[str, Any] = {}
 
         # Get engine-specific config
@@ -119,17 +121,33 @@ class JDBCDriver(DatabaseDriver):
             return False
 
         try:
-            # Build classpath from jar_paths
             classpath = ":".join(self.jar_paths) if self.jar_paths else None
 
-            if JPYPE_AVAILABLE and self.jar_paths:
-                for jar_path in self.jar_paths:
-                    jpype.addClassPath(jar_path)
+            if JPYPE_AVAILABLE:
+                if not jpype.isJVMStarted():
+                    jvm_args = [
+                        f"-D{key}={value}"
+                        for key, value in self.jvm_properties.items()
+                        if value is not None and value != ""
+                    ]
+                    if self.jar_paths:
+                        jpype.startJVM(*jvm_args, classpath=self.jar_paths)
+                    else:
+                        jpype.startJVM(*jvm_args)
+                elif self.jar_paths:
+                    for jar_path in self.jar_paths:
+                        jpype.addClassPath(jar_path)
+
+                if jpype.isJVMStarted() and self.jvm_properties:
+                    java_system = jpype.JClass("java.lang.System")
+                    for key, value in self.jvm_properties.items():
+                        if value is not None and value != "":
+                            java_system.setProperty(key, str(value))
 
             self.connection = jaydebeapi.connect(
                 self.driver_class,
                 self.jdbc_url,
-                [],  # No auth for embedded
+                self.connection_properties or [],
                 classpath,
             )
             self.connection.jconn.setAutoCommit(False)

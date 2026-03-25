@@ -6,11 +6,14 @@ to ensure everything works end-to-end.
 
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
 from drivers.jdbc_driver import JDBCDriver
 from drivers.sqlite_driver import SQLiteDriver
+from drivers.firebird_driver import FirebirdDriver
+from utils.charting import _decentdb_rank_summary, _engine_sort_key
 
 try:
     from drivers.duckdb_driver import DuckDBDriver
@@ -192,6 +195,85 @@ class TestJdbcDriverConfig:
         assert "test;DB_CLOSE_DELAY=-1" not in driver.jdbc_url
         assert "DB_CLOSE_DELAY=-1" in driver.jdbc_url
         assert "run_123" in driver.jdbc_url
+
+    def test_firebird_driver_adds_native_support_jars(self):
+        """Firebird driver should include bundled Jaybird native support jars."""
+        driver = FirebirdDriver(
+            {
+                "database_path": "/tmp/firebird/test.fdb",
+                "jdbc_url": "jdbc:firebirdsql:embedded:{db_path}",
+                "firebird_lib_dir": "/tmp/firebird/lib",
+            }
+        )
+
+        assert any(path.endswith("jaybird-native-6.0.4.jar") for path in driver.jar_paths)
+        assert any(path.endswith("jna-jpms-5.18.1.jar") for path in driver.jar_paths)
+        assert driver.connection_properties["nativeLibraryPath"] == "/tmp/firebird"
+        assert driver.jvm_properties["jna.library.path"] == "/tmp/firebird"
+        assert driver.connection_properties["user"] == "SYSDBA"
+        assert driver.connection_properties["password"] == "masterkey"
+
+    def test_firebird_driver_creates_shim_for_versioned_fbclient(self, tmp_path):
+        """Firebird driver should expose versioned fbclient as libfbclient.so."""
+        versioned_lib = tmp_path / "libfbclient.so.2"
+        versioned_lib.write_text("", encoding="utf-8")
+
+        driver = FirebirdDriver(
+            {
+                "database_path": "/tmp/firebird/test.fdb",
+                "jdbc_url": "jdbc:firebirdsql:embedded:{db_path}",
+                "firebird_lib_dir": str(tmp_path),
+            }
+        )
+
+        shim_dir = Path(driver.connection_properties["nativeLibraryPath"])
+        assert (shim_dir / "libfbclient.so").exists()
+
+
+class TestChartingConfig:
+    """Configuration-only tests for benchmark chart readability helpers."""
+
+    def test_decentdb_series_sorts_first(self):
+        """DecentDB should lead legends and style maps consistently."""
+        engines = ["DuckDB", "DecentDB", "SQLite_wal_full"]
+
+        assert sorted(engines, key=_engine_sort_key)[0] == "DecentDB"
+
+    def test_rank_summary_reports_decentdb_as_leader(self):
+        """Rank summary should call out when DecentDB is winning."""
+        rows = [
+            {"engine": "DuckDB", "operations": 500, "mean_latency_us": 12.0},
+            {"engine": "DecentDB", "operations": 500, "mean_latency_us": 4.0},
+            {"engine": "SQLite_wal_full", "operations": 500, "mean_latency_us": 8.0},
+        ]
+
+        summary = _decentdb_rank_summary(rows, 500)
+
+        assert summary == "DecentDB: 1st of 3 at 500 ops (2.0x faster than #2)"
+
+    def test_rank_summary_reports_decentdb_as_loser(self):
+        """Rank summary should call out when DecentDB trails the leader."""
+        rows = [
+            {"engine": "DuckDB", "operations": 500, "mean_latency_us": 4.0},
+            {"engine": "DecentDB", "operations": 500, "mean_latency_us": 12.0},
+            {"engine": "SQLite_wal_full", "operations": 500, "mean_latency_us": 8.0},
+        ]
+
+        summary = _decentdb_rank_summary(rows, 500)
+
+        assert summary == "DecentDB: 3rd of 3 at 500 ops (3.0x slower than #1)"
+
+    def test_rank_summary_handles_zero_latency_leader(self):
+        """Rank summary should stay readable when the leader rounds to zero latency."""
+        rows = [
+            {"engine": "DecentDB", "operations": 500, "mean_latency_us": 0.0},
+            {"engine": "DuckDB", "operations": 500, "mean_latency_us": 2.0},
+            {"engine": "SQLite_wal_full", "operations": 500, "mean_latency_us": 3.0},
+        ]
+
+        summary = _decentdb_rank_summary(rows, 500)
+
+        assert summary == "DecentDB: 1st of 3 at 500 ops (next best is 2.0 us)"
 
 
 class TestDatasetGenerator:

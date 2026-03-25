@@ -59,6 +59,30 @@ impl EngineRuntime {
         existing_row_id: Option<i64>,
         params: &[Value],
     ) -> Result<()> {
+        self.validate_row_inner(table_name, row, existing_row_id, params, true)
+    }
+
+    /// Validates a row without checking foreign key constraints. Used during
+    /// FK CASCADE / SET NULL actions where the parent row is being
+    /// concurrently mutated and FK consistency is maintained by the caller.
+    pub(super) fn validate_row_skip_fk(
+        &self,
+        table_name: &str,
+        row: &[Value],
+        existing_row_id: Option<i64>,
+        params: &[Value],
+    ) -> Result<()> {
+        self.validate_row_inner(table_name, row, existing_row_id, params, false)
+    }
+
+    fn validate_row_inner(
+        &self,
+        table_name: &str,
+        row: &[Value],
+        existing_row_id: Option<i64>,
+        params: &[Value],
+        check_foreign_keys: bool,
+    ) -> Result<()> {
         let table = self
             .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
@@ -127,6 +151,10 @@ impl EngineRuntime {
                     )));
                 }
             }
+        }
+
+        if !check_foreign_keys {
+            return Ok(());
         }
 
         for foreign_key in &table.foreign_keys {

@@ -1038,7 +1038,7 @@ impl EngineRuntime {
                                 }
                                 row.values.clone()
                             };
-                            self.validate_row(
+                            self.validate_row_skip_fk(
                                 &child_table.name,
                                 &updated_values,
                                 Some(child_row.row_id),
@@ -1152,7 +1152,7 @@ impl EngineRuntime {
                                 }
                                 row.values.clone()
                             };
-                            self.validate_row(
+                            self.validate_row_skip_fk(
                                 &child_table.name,
                                 &updated_values,
                                 Some(child_row.row_id),
@@ -1202,7 +1202,7 @@ impl EngineRuntime {
                                 }
                                 row.values.clone()
                             };
-                            self.validate_row(
+                            self.validate_row_skip_fk(
                                 &child_table.name,
                                 &updated_values,
                                 Some(child_row.row_id),
