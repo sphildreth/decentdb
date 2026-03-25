@@ -139,7 +139,7 @@ fn error_insert_duplicate_column_names() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("assigned more than once") || msg.contains("duplicate") || msg.len() > 0,
+        msg.contains("assigned more than once") || msg.contains("duplicate") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -150,7 +150,7 @@ fn error_insert_into_view() {
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
     let err = db.execute("INSERT INTO v VALUES (1)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn error_insert_too_few_values() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT NOT NULL)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn error_insert_too_many_columns() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, 2)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn error_insert_too_many_values() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, 'a', 'extra')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn error_insert_wrong_column_count() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn on_conflict_do_nothing_no_target() {
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     let r = db.execute("INSERT INTO t VALUES (1, 'b') ON CONFLICT DO NOTHING");
-    if let Ok(_) = r {
+    if r.is_ok() {
         let r2 = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
         assert_eq!(rows(&r2)[0][0], Value::Text("a".into()));
     }
@@ -471,7 +471,7 @@ fn on_conflict_with_where_clause() {
     let r = db.execute(
         "INSERT INTO t VALUES (1, 'new', TRUE) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val WHERE t.active = TRUE",
     );
-    if let Ok(_) = r {
+    if r.is_ok() {
         let r2 = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
         assert_eq!(rows(&r2)[0][0], Value::Text("new".into()));
     }

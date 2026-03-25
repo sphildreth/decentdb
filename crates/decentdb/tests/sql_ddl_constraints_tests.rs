@@ -5,8 +5,19 @@
 //! RESTRICT), generated columns, temp tables, CREATE/DROP INDEX,
 //! trigram/expression/partial indexes, and metadata queries.
 
-use decentdb::{Db, DbConfig, QueryResult, Value};
+use decentdb::{Db, DbConfig, DbError, QueryResult, Value};
+use std::fs;
 use tempfile::TempDir;
+
+fn assert_float_close(value: &Value, expected: f64) {
+    match value {
+        Value::Float64(actual) => assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        ),
+        other => panic!("expected FLOAT64 result, got {other:?}"),
+    }
+}
 
 fn mem_db() -> Db {
     Db::open_or_create(":memory:", DbConfig::default()).unwrap()
@@ -357,10 +368,10 @@ fn check_constraint_multi_column() {
     ).unwrap();
     db.execute("INSERT INTO inventory VALUES (1, 100, 50)").unwrap();
     let err = db.execute("INSERT INTO inventory VALUES (2, 10, 20)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
     // UPDATE that violates check
     let err2 = db.execute("UPDATE inventory SET reserved = 200 WHERE id = 1").unwrap_err();
-    assert!(err2.to_string().len() > 0);
+    assert!(!err2.to_string().is_empty());
 }
 
 #[test]
@@ -376,7 +387,7 @@ fn check_constraint_violation() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, -5)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -554,7 +565,7 @@ fn create_table_with_multi_column_pk() {
     db.execute("CREATE TABLE t(a INT64, b INT64, c TEXT, PRIMARY KEY (a, b))").unwrap();
     db.execute("INSERT INTO t VALUES (1, 1, 'aa'), (1, 2, 'ab'), (2, 1, 'ba')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, 1, 'dup')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -563,7 +574,7 @@ fn create_table_with_multi_column_unique() {
     db.execute("CREATE TABLE t(a INT64, b INT64, UNIQUE(a, b))").unwrap();
     db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, 1)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -683,7 +694,7 @@ fn ddl_cannot_alter_type_of_fk_column() {
     db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
     db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))").unwrap();
     let err = db.execute("ALTER TABLE child ALTER COLUMN p_id TYPE TEXT").unwrap_err();
-    assert!(err.to_string().contains("foreign") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("foreign") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -691,7 +702,7 @@ fn ddl_cannot_alter_type_of_pk_column() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
     let err = db.execute("ALTER TABLE t ALTER COLUMN id TYPE TEXT").unwrap_err();
-    assert!(err.to_string().contains("primary") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("primary") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -700,7 +711,7 @@ fn ddl_cannot_drop_fk_column() {
     db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
     db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))").unwrap();
     let err = db.execute("ALTER TABLE child DROP COLUMN p_id").unwrap_err();
-    assert!(err.to_string().contains("foreign") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("foreign") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -708,7 +719,7 @@ fn ddl_cannot_drop_pk_column() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
     let err = db.execute("ALTER TABLE t DROP COLUMN id").unwrap_err();
-    assert!(err.to_string().contains("primary") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("primary") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -716,7 +727,7 @@ fn ddl_cannot_index_temp_table() {
     let db = mem_db();
     db.execute("CREATE TEMP TABLE t(id INT64, val TEXT)").unwrap();
     let err = db.execute("CREATE INDEX idx ON t(val)").unwrap_err();
-    assert!(err.to_string().contains("temporary") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("temporary") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -725,7 +736,7 @@ fn ddl_check_constraint() {
     db.execute("CREATE TABLE t(id INT64, val INT64 CHECK (val > 0))").unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, -5)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -745,7 +756,7 @@ fn ddl_create_unique_index() {
     db.execute("CREATE UNIQUE INDEX idx_email ON t(email)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a@b.com')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, 'a@b.com')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -803,7 +814,7 @@ fn ddl_multi_column_primary_key() {
     db.execute("INSERT INTO t VALUES (1, 1, 'first')").unwrap();
     db.execute("INSERT INTO t VALUES (1, 2, 'second')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, 1, 'duplicate')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -812,7 +823,7 @@ fn ddl_not_null_constraint() {
     db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'ok')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, NULL)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -839,7 +850,7 @@ fn drop_nonunique_index() {
     db.execute("DROP INDEX idx").unwrap();
     // Verify index is gone
     let err = db.execute("DROP INDEX idx").unwrap_err();
-    assert!(err.to_string().contains("not") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("not") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -927,7 +938,7 @@ fn error_add_existing_column() {
     let err = db.execute("ALTER TABLE t ADD COLUMN id INT64").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("already exists") || msg.len() > 0,
+        msg.contains("already exists") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -942,7 +953,7 @@ fn error_add_not_null_column_without_default() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("NOT NULL") || msg.contains("default") || msg.len() > 0,
+        msg.contains("NOT NULL") || msg.contains("default") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -957,7 +968,7 @@ fn error_alter_fk_parent_column_type() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("referenced") || msg.contains("foreign") || msg.len() > 0,
+        msg.contains("referenced") || msg.contains("foreign") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -968,7 +979,7 @@ fn error_alter_nonexistent_table() {
     let err = db
         .execute("ALTER TABLE nonexistent ADD COLUMN val INT64")
         .unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -978,7 +989,7 @@ fn error_alter_table_nonexistent_column() {
     let err = db
         .execute("ALTER TABLE t ALTER COLUMN nonexistent TYPE TEXT")
         .unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -995,7 +1006,7 @@ fn error_check_constraint_violation_update() {
     db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))").unwrap();
     db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
     let err = db.execute("UPDATE t SET age = -1 WHERE id = 1").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1006,7 +1017,7 @@ fn error_create_index_already_exists() {
     let err = db.execute("CREATE INDEX idx ON t(val)").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("already exists") || msg.len() > 0,
+        msg.contains("already exists") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1018,7 +1029,7 @@ fn error_create_index_nonexistent_column() {
     let err = db.execute("CREATE INDEX idx ON t(bogus)").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("does not exist") || msg.contains("bogus") || msg.len() > 0,
+        msg.contains("does not exist") || msg.contains("bogus") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1031,7 +1042,7 @@ fn error_create_index_on_view() {
     let err = db.execute("CREATE INDEX idx ON v(id)").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("view") || msg.contains("cannot create") || msg.len() > 0,
+        msg.contains("view") || msg.contains("cannot create") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1041,14 +1052,14 @@ fn error_create_table_already_exists() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     let err = db.execute("CREATE TABLE t(id INT64)").unwrap_err();
-    assert!(err.to_string().contains("already exists") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("already exists") || !err.to_string().is_empty());
 }
 
 #[test]
 fn error_create_table_duplicate_column() {
     let db = mem_db();
     let err = db.execute("CREATE TABLE t(x INT64, x INT64)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1058,7 +1069,7 @@ fn error_create_temp_table_already_exists() {
     let err = db.execute("CREATE TEMPORARY TABLE t(id INT64)").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("already exists") || msg.len() > 0,
+        msg.contains("already exists") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1071,7 +1082,7 @@ fn error_drop_column_fk() {
     let err = db.execute("ALTER TABLE child DROP COLUMN pid").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("foreign") || msg.contains("FK") || msg.len() > 0
+        msg.contains("foreign") || msg.contains("FK") || !msg.is_empty()
     );
 }
 
@@ -1082,7 +1093,7 @@ fn error_drop_column_primary_key() {
     let err = db.execute("ALTER TABLE t DROP COLUMN id").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("primary") || msg.contains("PRIMARY") || msg.contains("key") || msg.len() > 0
+        msg.contains("primary") || msg.contains("PRIMARY") || msg.contains("key") || !msg.is_empty()
     );
 }
 
@@ -1094,7 +1105,7 @@ fn error_drop_indexed_column() {
     let err = db.execute("ALTER TABLE t DROP COLUMN val").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("indexed") || msg.contains("index") || msg.len() > 0,
+        msg.contains("indexed") || msg.contains("index") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1106,21 +1117,21 @@ fn error_drop_nonexistent_column() {
     let err = db
         .execute("ALTER TABLE t DROP COLUMN nonexistent")
         .unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn error_drop_nonexistent_index() {
     let db = mem_db();
     let err = db.execute("DROP INDEX nonexistent").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn error_drop_nonexistent_table() {
     let db = mem_db();
     let err = db.execute("DROP TABLE nonexistent").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1131,7 +1142,7 @@ fn error_drop_table_with_fk_dependency() {
     let err = db.execute("DROP TABLE parent").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("foreign key") || msg.contains("reference") || msg.len() > 0,
+        msg.contains("foreign key") || msg.contains("reference") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1144,7 +1155,7 @@ fn error_drop_unique_index() {
     let err = db.execute("DROP INDEX idx").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("unique") || msg.contains("not supported") || msg.len() > 0,
+        msg.contains("unique") || msg.contains("not supported") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1157,7 +1168,7 @@ fn error_generated_column_in_primary_key() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("generated") || msg.contains("PRIMARY KEY") || msg.len() > 0,
+        msg.contains("generated") || msg.contains("PRIMARY KEY") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1168,7 +1179,7 @@ fn error_insert_fk_violation() {
     db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
     db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))").unwrap();
     let err = db.execute("INSERT INTO child VALUES (999)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1180,7 +1191,7 @@ fn error_rename_column_to_existing() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("already exists") || msg.len() > 0,
+        msg.contains("already exists") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1192,14 +1203,14 @@ fn error_rename_nonexistent_column() {
     let err = db
         .execute("ALTER TABLE t RENAME COLUMN nonexistent TO new_name")
         .unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn error_select_from_nonexistent_table() {
     let db = mem_db();
     let err = db.execute("SELECT * FROM nonexistent").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1208,7 +1219,7 @@ fn error_unique_constraint_violation() {
     db.execute("CREATE TABLE t(id INT64 UNIQUE)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1219,7 +1230,7 @@ fn error_update_generated_column() {
     let err = db.execute("UPDATE t SET b = 10 WHERE a = 5").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("generated") || msg.contains("cannot UPDATE") || msg.len() > 0,
+        msg.contains("generated") || msg.contains("cannot UPDATE") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -1231,7 +1242,7 @@ fn expression_index_rejects_multiple_expressions() {
     let err = db
         .execute("CREATE INDEX idx ON t ((UPPER(a)), (LOWER(b)))")
         .unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1250,7 +1261,7 @@ fn expression_index_uniqueness() {
     db.execute("CREATE TABLE t(id INT64, name TEXT)").unwrap();
     // UNIQUE expression indexes are not supported; test the error
     let err = db.execute("CREATE UNIQUE INDEX idx_lower ON t(LOWER(name))").unwrap_err();
-    assert!(err.to_string().contains("expression") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("expression") || !err.to_string().is_empty());
     // Non-unique expression index should work
     db.execute("CREATE INDEX idx_lower ON t(LOWER(name))").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
@@ -1332,7 +1343,7 @@ fn fk_insert_child_with_nonexistent_parent_error() {
     db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))").unwrap();
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     let err = db.execute("INSERT INTO child VALUES (10, 999)").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("foreign") || err.to_string().len() > 0);
+    assert!(err.to_string().to_lowercase().contains("foreign") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -1466,7 +1477,7 @@ fn fk_restrict_on_delete() {
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
     let err = db.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1490,7 +1501,7 @@ fn fk_restrict_prevents_delete() {
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
     let err = db.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("foreign key") || err.to_string().len() > 0);
+    assert!(err.to_string().to_lowercase().contains("foreign key") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -1622,7 +1633,7 @@ fn fk_violation_on_update() {
     db.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
     db.execute("INSERT INTO child VALUES (1)").unwrap();
     let err = db.execute("UPDATE child SET pid = 999").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1634,7 +1645,7 @@ fn fk_with_unique_index_on_parent() {
     db.execute("INSERT INTO parent VALUES (1, 'ABC')").unwrap();
     db.execute("INSERT INTO child VALUES (10, 'ABC')").unwrap();
     let err = db.execute("INSERT INTO child VALUES (20, 'XYZ')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1954,7 +1965,7 @@ fn multi_column_check_constraint() {
     db.execute("CREATE TABLE t(a INT64, b INT64, CHECK (a < b))").unwrap();
     db.execute("INSERT INTO t VALUES (1, 2)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (3, 2)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1966,7 +1977,7 @@ fn multi_column_index() {
         exec(&db, &format!("INSERT INTO multi_idx_t VALUES ({i}, 'a{a}', 'b{b}')", a = i % 5, b = i % 10));
     }
     let r = exec(&db, "SELECT id FROM multi_idx_t WHERE a = 'a0' AND b = 'b0'");
-    assert!(r.rows().len() >= 1);
+    assert!(!r.rows().is_empty());
 }
 
 #[test]
@@ -2016,7 +2027,7 @@ fn not_null_constraint_violation() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, NULL)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -2354,7 +2365,7 @@ fn temp_table_full_lifecycle() {
     assert_eq!(rows(&r).len(), 1);
     db.execute("DROP TABLE temp_t").unwrap();
     let err = db.execute("SELECT * FROM temp_t").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -2418,7 +2429,7 @@ fn temp_table_with_index() {
     db.execute("CREATE TEMPORARY TABLE temp_t(id INT64, val TEXT)").unwrap();
     // Indexes on temp tables are not supported; verify the error
     let err = db.execute("CREATE INDEX temp_idx ON temp_t(val)").unwrap_err();
-    assert!(err.to_string().contains("temporary") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("temporary") || !err.to_string().is_empty());
     // But the table itself works fine
     db.execute("INSERT INTO temp_t VALUES (1, 'a'), (2, 'b')").unwrap();
     let r = db.execute("SELECT id FROM temp_t WHERE val = 'a'").unwrap();
@@ -2431,7 +2442,7 @@ fn temp_table_with_unique_constraint() {
     db.execute("CREATE TEMP TABLE t(id INT64 PRIMARY KEY, val TEXT UNIQUE)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, 'a')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -2506,7 +2517,7 @@ fn unique_constraint_allows_multiple_nulls() {
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap(); // NULLs don't violate UNIQUE
     db.execute("INSERT INTO t VALUES (3, 42)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (4, 42)").unwrap_err(); // duplicate 42 does
-    assert!(err.to_string().contains("unique") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("unique") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -2536,7 +2547,7 @@ fn unique_constraint_with_partial_index_predicate() {
     db.execute("INSERT INTO t VALUES (1, 'active', 'a@b.com')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'inactive', 'a@b.com')").unwrap(); // OK: inactive
     let err = db.execute("INSERT INTO t VALUES (3, 'active', 'a@b.com')").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -2613,5 +2624,123 @@ fn verify_indexes() {
     db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
     let result = db.verify_index("idx").unwrap();
     assert!(result.valid);
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs, create_validation_tests.rs ──
+
+#[test]
+fn analyze_stats_persist_across_reopen() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("analyze-stats.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX docs_email_idx ON docs (email)")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (1, 'a@example.com'), (2, 'b@example.com')")
+            .unwrap();
+        db.execute("ANALYZE docs").unwrap();
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    reopened.execute("ANALYZE docs").unwrap();
+}
+
+#[test]
+fn create_with_invalid_page_size_fails() {
+    let path = std::env::temp_dir().join("decentdb-phase0-invalid-page-size.ddb");
+    let config = DbConfig {
+        page_size: 2048,
+        ..DbConfig::default()
+    };
+    let result = Db::create(&path, config);
+    assert!(result.is_err());
+    if let Err(DbError::Internal { message }) = result {
+        assert!(message.contains("unsupported page size"));
+    } else {
+        panic!("expected internal error about unsupported page size");
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn generated_columns_compute_recompute_and_survive_reopen() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("generated-columns.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        db.execute(
+            "CREATE TABLE products (
+                id INT64 PRIMARY KEY,
+                price FLOAT64,
+                qty INT64,
+                total FLOAT64 GENERATED ALWAYS AS (price * qty) STORED
+            )",
+        )
+        .unwrap();
+        db.execute("INSERT INTO products (id, price, qty) VALUES (1, 9.99, 3)")
+            .unwrap();
+
+        let inserted = db
+            .execute("SELECT total FROM products WHERE id = 1")
+            .unwrap();
+        assert_float_close(&inserted.rows()[0].values()[0], 29.97);
+
+        let insert_err = db
+            .execute("INSERT INTO products (id, price, qty, total) VALUES (2, 5.0, 2, 10.0)")
+            .unwrap_err();
+        assert!(
+            insert_err
+                .to_string()
+                .contains("cannot INSERT into generated column products.total"),
+            "unexpected error: {insert_err}"
+        );
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    reopened
+        .execute("UPDATE products SET qty = 4 WHERE id = 1")
+        .unwrap();
+    let updated = reopened
+        .execute("SELECT total FROM products WHERE id = 1")
+        .unwrap();
+    assert_float_close(&updated.rows()[0].values()[0], 39.96);
+
+    let update_err = reopened
+        .execute("UPDATE products SET total = 0 WHERE id = 1")
+        .unwrap_err();
+    assert!(
+        update_err
+            .to_string()
+            .contains("cannot UPDATE generated column products.total"),
+        "unexpected error: {update_err}"
+    );
+}
+
+#[test]
+fn generated_columns_participate_in_unique_constraints() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE TABLE users (
+            id INT64 PRIMARY KEY,
+            email TEXT,
+            email_lc TEXT GENERATED ALWAYS AS (LOWER(email)) STORED UNIQUE
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO users (id, email) VALUES (1, 'Ada@Example.com')")
+        .unwrap();
+
+    let err = db
+        .execute("INSERT INTO users (id, email) VALUES (2, 'ada@example.com')")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unique constraint") && err.to_string().contains("users"),
+        "unexpected error: {err}"
+    );
 }
 

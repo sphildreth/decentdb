@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant)]
+
 //! SQL transaction, prepared statement, EXPLAIN, and snapshot tests.
 //!
 //! Covers: BEGIN/COMMIT/ROLLBACK, savepoints, autocommit, prepared
@@ -102,7 +104,7 @@ fn error_multiple_statements_in_execute_with_params() {
     let err = db
         .execute_with_params("SELECT $1; SELECT $2", &[Value::Int64(1), Value::Int64(2)])
         .unwrap_err();
-    assert!(err.to_string().contains("expected exactly one") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("expected exactly one") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -149,7 +151,7 @@ fn explain_analyze_select() {
         assert!(!lines.is_empty());
         // ANALYZE adds actual row counts
         let text = lines.join("\n");
-        assert!(text.contains("ANALYZE") || text.len() > 0);
+        assert!(text.contains("ANALYZE") || !text.is_empty());
     }
 }
 
@@ -210,7 +212,7 @@ fn explain_join_shows_nested_loop() {
 
     let result = db.execute("EXPLAIN SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id").unwrap();
     let text = format!("{:?}", rows(&result));
-    assert!(text.len() > 0);
+    assert!(!text.is_empty());
 }
 
 #[test]
@@ -270,7 +272,7 @@ fn explain_sort_and_limit() {
         .execute("EXPLAIN SELECT * FROM t ORDER BY val LIMIT 10 OFFSET 5")
         .unwrap();
     let text = format!("{:?}", rows(&result));
-    assert!(text.len() > 0);
+    assert!(!text.is_empty());
 }
 
 #[test]
@@ -282,7 +284,7 @@ fn explain_union() {
         .execute("EXPLAIN SELECT id FROM t UNION SELECT id FROM t")
         .unwrap();
     let text = format!("{:?}", rows(&result));
-    assert!(text.len() > 0);
+    assert!(!text.is_empty());
 }
 
 #[test]
@@ -302,7 +304,7 @@ fn explain_with_index() {
     let r = db.execute("EXPLAIN SELECT * FROM t WHERE name = 'test'").unwrap();
     let text = format!("{:?}", rows(&r));
     // Should mention the index in the plan
-    assert!(text.len() > 0);
+    assert!(!text.is_empty());
 }
 
 #[test]
@@ -322,11 +324,11 @@ fn hold_and_release_snapshot() {
 #[test]
 fn in_transaction_state() {
     let db = mem_db();
-    assert_eq!(db.in_transaction().unwrap(), false);
+    assert!(!db.in_transaction().unwrap());
     db.begin_transaction().unwrap();
-    assert_eq!(db.in_transaction().unwrap(), true);
+    assert!(db.in_transaction().unwrap());
     db.rollback_transaction().unwrap();
-    assert_eq!(db.in_transaction().unwrap(), false);
+    assert!(!db.in_transaction().unwrap());
 }
 
 #[test]
@@ -1146,5 +1148,63 @@ fn txn_savepoint_release() {
     db.commit_transaction().unwrap();
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(2));
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs ──
+
+#[test]
+fn analyze_executes_in_autocommit_and_rejects_explicit_transactions() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX docs_email_idx ON docs (email)")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'a@example.com'), (2, 'a@example.com')")
+        .unwrap();
+
+    db.execute("ANALYZE docs").unwrap();
+
+    db.execute("BEGIN").unwrap();
+    let err = db.execute("ANALYZE docs").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ANALYZE is not supported inside an explicit SQL transaction"),
+        "unexpected error: {err}"
+    );
+    db.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn commit_persists_changes() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("COMMIT").unwrap();
+
+    let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Int64(1)]);
+}
+
+#[test]
+fn rollback_discards_changes() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (2)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+
+    let result = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Int64(1)]);
 }
 

@@ -34,7 +34,7 @@ fn chained_set_operations() {
         );
     if let Ok(r) = r {
         let v = rows(&r);
-        assert!(v.len() >= 1);
+        assert!(!v.is_empty());
     }
 }
 
@@ -130,7 +130,7 @@ fn error_recursive_cte_with_order_by() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("ORDER BY") || msg.contains("recursive") || msg.len() > 0,
+        msg.contains("ORDER BY") || msg.contains("recursive") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -208,12 +208,12 @@ fn explain_intersect_except() {
     let r1 = db
         .execute("EXPLAIN SELECT id FROM t INTERSECT SELECT id FROM t")
         .unwrap();
-    assert!(r1.rows().len() > 0);
+    assert!(!r1.rows().is_empty());
 
     let r2 = db
         .execute("EXPLAIN SELECT id FROM t EXCEPT ALL SELECT id FROM t")
         .unwrap();
-    assert!(r2.rows().len() > 0);
+    assert!(!r2.rows().is_empty());
 }
 
 #[test]
@@ -736,5 +736,351 @@ fn union_with_order_by_and_limit() {
         .execute("SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2 ORDER BY id LIMIT 3")
         .unwrap();
     assert_eq!(rows(&r).len(), 3);
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs, slice2_execution_test.rs ──
+
+#[test]
+fn distinct_and_pagination_cover_full_row_dedup_and_empty_fetch() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE distinct_edges (id INT64 PRIMARY KEY, a INT64, b TEXT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO distinct_edges VALUES
+            (1, 1, 'x'),
+            (2, 1, 'x'),
+            (3, 1, 'y'),
+            (4, 2, 'z')",
+    )
+    .unwrap();
+
+    let distinct = db
+        .execute("SELECT DISTINCT a, b FROM distinct_edges ORDER BY a, b")
+        .unwrap();
+    assert_eq!(
+        distinct
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("x".to_string())],
+            vec![Value::Int64(1), Value::Text("y".to_string())],
+            vec![Value::Int64(2), Value::Text("z".to_string())],
+        ]
+    );
+
+    let distinct_on = db
+        .execute(
+            "SELECT DISTINCT ON (a) a, b
+             FROM distinct_edges
+             ORDER BY a, b ASC",
+        )
+        .unwrap();
+    assert_eq!(
+        distinct_on
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("x".to_string())],
+            vec![Value::Int64(2), Value::Text("z".to_string())],
+        ]
+    );
+
+    let fetch_empty = db
+        .execute(
+            "SELECT id FROM distinct_edges
+             ORDER BY id
+             OFFSET 10 ROWS FETCH NEXT 2 ROWS ONLY",
+        )
+        .unwrap();
+    assert!(fetch_empty.rows().is_empty());
+}
+
+#[test]
+fn limit_all_keeps_unbounded_results_and_still_allows_offset() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let all_rows = db
+        .execute("SELECT id FROM t ORDER BY id LIMIT ALL")
+        .unwrap();
+    assert_eq!(all_rows.rows().len(), 3);
+    assert_eq!(all_rows.rows()[0].values(), &[Value::Int64(1)]);
+    assert_eq!(all_rows.rows()[1].values(), &[Value::Int64(2)]);
+    assert_eq!(all_rows.rows()[2].values(), &[Value::Int64(3)]);
+
+    let offset_rows = db
+        .execute("SELECT id FROM t ORDER BY id LIMIT ALL OFFSET 1")
+        .unwrap();
+    assert_eq!(offset_rows.rows().len(), 2);
+    assert_eq!(offset_rows.rows()[0].values(), &[Value::Int64(2)]);
+    assert_eq!(offset_rows.rows()[1].values(), &[Value::Int64(3)]);
+}
+
+#[test]
+fn offset_fetch_uses_existing_limit_offset_pipeline() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
+
+    let result = db
+        .execute("SELECT id FROM t ORDER BY id OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY")
+        .unwrap();
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(result.rows()[0].values(), &[Value::Int64(2)]);
+    assert_eq!(result.rows()[1].values(), &[Value::Int64(3)]);
+}
+
+#[test]
+fn recursive_ctes_enforce_iteration_limit_and_v0_recursive_term_guardrails() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let limit_err = db
+        .execute(
+            "WITH RECURSIVE cnt(x) AS (
+               SELECT 1
+               UNION ALL
+               SELECT x + 1 FROM cnt
+             )
+             SELECT x FROM cnt",
+        )
+        .unwrap_err();
+    assert!(
+        limit_err
+            .to_string()
+            .contains("exceeded the 1000 iteration limit"),
+        "unexpected error: {limit_err}"
+    );
+
+    let distinct_err = db
+        .execute(
+            "WITH RECURSIVE cnt(x) AS (
+               SELECT 1
+               UNION ALL
+               SELECT DISTINCT x + 1 FROM cnt WHERE x < 3
+             )
+             SELECT x FROM cnt",
+        )
+        .unwrap_err();
+    assert!(
+        distinct_err
+            .to_string()
+            .contains("recursive term only supports non-distinct SELECT statements"),
+        "unexpected error: {distinct_err}"
+    );
+}
+
+#[test]
+fn select_distinct_and_distinct_on_apply_runtime_deduplication() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, a INT64, b INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 25), (4, 2, 30)")
+        .unwrap();
+
+    let distinct = db.execute("SELECT DISTINCT a FROM t ORDER BY a").unwrap();
+    assert_eq!(distinct.rows().len(), 2);
+    assert_eq!(distinct.rows()[0].values(), &[Value::Int64(1)]);
+    assert_eq!(distinct.rows()[1].values(), &[Value::Int64(2)]);
+
+    let distinct_on = db
+        .execute("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a, b DESC")
+        .unwrap();
+    assert_eq!(distinct_on.rows().len(), 2);
+    assert_eq!(
+        distinct_on.rows()[0].values(),
+        &[Value::Int64(1), Value::Int64(20)]
+    );
+    assert_eq!(
+        distinct_on.rows()[1].values(),
+        &[Value::Int64(2), Value::Int64(30)]
+    );
+}
+
+#[test]
+fn set_operation_all_variants_cover_multi_column_and_empty_inputs() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE lhs_pairs (id INT64 PRIMARY KEY, a INT64, b TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE rhs_pairs (id INT64 PRIMARY KEY, a INT64, b TEXT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO lhs_pairs VALUES
+            (1, 1, 'x'),
+            (2, 1, 'x'),
+            (3, 2, 'y')",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO rhs_pairs VALUES
+            (1, 1, 'x'),
+            (2, 2, 'y'),
+            (3, 2, 'y')",
+    )
+    .unwrap();
+
+    let intersect_all = db
+        .execute(
+            "SELECT a, b FROM lhs_pairs
+             INTERSECT ALL
+             SELECT a, b FROM rhs_pairs
+             ORDER BY a, b",
+        )
+        .unwrap();
+    assert_eq!(intersect_all.rows().len(), 2);
+    assert_eq!(
+        intersect_all.rows()[0].values(),
+        &[Value::Int64(1), Value::Text("x".to_string())]
+    );
+    assert_eq!(
+        intersect_all.rows()[1].values(),
+        &[Value::Int64(2), Value::Text("y".to_string())]
+    );
+
+    let except_all = db
+        .execute(
+            "SELECT a, b FROM lhs_pairs
+             EXCEPT ALL
+             SELECT a, b FROM rhs_pairs
+             ORDER BY a, b",
+        )
+        .unwrap();
+    assert_eq!(except_all.rows().len(), 1);
+    assert_eq!(
+        except_all.rows()[0].values(),
+        &[Value::Int64(1), Value::Text("x".to_string())]
+    );
+
+    let intersect_empty = db
+        .execute(
+            "SELECT a, b FROM lhs_pairs WHERE id > 99
+             INTERSECT ALL
+             SELECT a, b FROM rhs_pairs",
+        )
+        .unwrap();
+    assert!(intersect_empty.rows().is_empty());
+
+    let except_empty_right = db
+        .execute(
+            "SELECT a, b FROM lhs_pairs
+             EXCEPT ALL
+             SELECT a, b FROM rhs_pairs WHERE id > 99
+             ORDER BY a, b",
+        )
+        .unwrap();
+    assert_eq!(
+        except_empty_right
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("x".to_string())],
+            vec![Value::Int64(1), Value::Text("x".to_string())],
+            vec![Value::Int64(2), Value::Text("y".to_string())],
+        ]
+    );
+}
+
+#[test]
+fn set_operation_all_variants_respect_duplicate_counts() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE lhs (id INT64 PRIMARY KEY, value INT64)")
+        .unwrap();
+    db.execute("CREATE TABLE rhs (id INT64 PRIMARY KEY, value INT64)")
+        .unwrap();
+    db.execute("INSERT INTO lhs VALUES (1, 1), (2, 1), (3, 2), (4, 2)")
+        .unwrap();
+    db.execute("INSERT INTO rhs VALUES (1, 1), (2, 2), (3, 2), (4, 2)")
+        .unwrap();
+
+    let intersect_all = db
+        .execute(
+            "SELECT value FROM lhs
+             INTERSECT ALL
+             SELECT value FROM rhs
+             ORDER BY value",
+        )
+        .unwrap();
+    assert_eq!(intersect_all.rows().len(), 3);
+    assert_eq!(intersect_all.rows()[0].values(), &[Value::Int64(1)]);
+    assert_eq!(intersect_all.rows()[1].values(), &[Value::Int64(2)]);
+    assert_eq!(intersect_all.rows()[2].values(), &[Value::Int64(2)]);
+
+    let intersect = db
+        .execute(
+            "SELECT value FROM lhs
+             INTERSECT
+             SELECT value FROM rhs
+             ORDER BY value",
+        )
+        .unwrap();
+    assert_eq!(intersect.rows().len(), 2);
+    assert_eq!(intersect.rows()[0].values(), &[Value::Int64(1)]);
+    assert_eq!(intersect.rows()[1].values(), &[Value::Int64(2)]);
+
+    let except_all = db
+        .execute(
+            "SELECT value FROM lhs
+             EXCEPT ALL
+             SELECT value FROM rhs
+             ORDER BY value",
+        )
+        .unwrap();
+    assert_eq!(except_all.rows().len(), 1);
+    assert_eq!(except_all.rows()[0].values(), &[Value::Int64(1)]);
+
+    let except = db
+        .execute(
+            "SELECT value FROM lhs
+             EXCEPT
+             SELECT value FROM rhs",
+        )
+        .unwrap();
+    assert!(except.rows().is_empty());
+}
+
+#[test]
+fn test_distinct_on() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 30)")
+        .unwrap();
+
+    match db.execute("SELECT DISTINCT ON (a) a, b FROM t ORDER BY a") {
+        Ok(_) => println!("DISTINCT ON: OK"),
+        Err(e) => println!("DISTINCT ON: Error: {}", e),
+    }
+}
+
+#[test]
+fn test_limit_all() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    match db.execute("SELECT * FROM t LIMIT ALL") {
+        Ok(_) => println!("LIMIT ALL: OK"),
+        Err(e) => println!("LIMIT ALL: Error: {}", e),
+    }
+}
+
+#[test]
+fn test_offset_fetch() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
+
+    match db.execute("SELECT * FROM t ORDER BY id OFFSET 1 ROW FETCH NEXT 2 ROWS ONLY") {
+        Ok(_) => println!("OFFSET ... FETCH: OK"),
+        Err(e) => println!("OFFSET ... FETCH: Error: {}", e),
+    }
 }
 

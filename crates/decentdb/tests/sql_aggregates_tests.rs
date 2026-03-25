@@ -14,10 +14,6 @@ fn exec(db: &Db, sql: &str) -> QueryResult {
     db.execute(sql).unwrap()
 }
 
-fn exec_err(db: &Db, sql: &str) -> String {
-    db.execute(sql).unwrap_err().to_string()
-}
-
 fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
     r.rows().iter().map(|r| r.values().to_vec()).collect()
 }
@@ -239,7 +235,7 @@ fn complex_reporting_query() {
              ORDER BY total DESC",
         )
         .unwrap();
-    assert!(rows(&r2).len() >= 1);
+    assert!(!rows(&r2).is_empty());
 }
 
 #[test]
@@ -294,7 +290,7 @@ fn explain_aggregate_shows_group_by() {
 
     let result = db.execute("EXPLAIN SELECT cat, SUM(val) FROM t GROUP BY cat").unwrap();
     let text = format!("{:?}", rows(&result));
-    assert!(text.len() > 0);
+    assert!(!text.is_empty());
 }
 
 #[test]
@@ -574,7 +570,7 @@ fn group_by_with_in_list_having() {
         HAVING SUM(val) IN (1, 3, 5)
         ORDER BY grp
     ");
-    assert!(r.rows().len() >= 1);
+    assert!(!r.rows().is_empty());
 }
 
 #[test]
@@ -776,7 +772,7 @@ fn inspect_storage_state() {
     db.execute("CREATE TABLE t(x INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     let json = db.inspect_storage_state_json().unwrap();
-    assert!(json.contains("{") || json.len() > 0);
+    assert!(json.contains("{") || !json.is_empty());
 }
 
 // ===========================================================================
@@ -787,7 +783,7 @@ fn inspect_storage_state() {
 fn error_table_not_found() {
     let db = mem_db();
     let err = db.execute("SELECT * FROM nonexistent").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -814,14 +810,14 @@ fn error_duplicate_table() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     let err = db.execute("CREATE TABLE t(id INT64)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn error_syntax_error() {
     let db = mem_db();
     let err = db.execute("SELECTT * FROM").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1211,7 +1207,7 @@ fn rename_table() {
     db.execute("INSERT INTO old_name VALUES (1)").unwrap();
     // RENAME TABLE is not supported; verify it errors gracefully
     let err = db.execute("ALTER TABLE old_name RENAME TO new_name").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
     // Original table should still be accessible
     let r = db.execute("SELECT id FROM old_name").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(1));
@@ -1386,5 +1382,167 @@ fn sum_distinct_in_group() {
     exec(&db, "INSERT INTO sd VALUES (1, 'X', 5), (2, 'X', 5), (3, 'X', 10)");
     let r = exec(&db, "SELECT SUM(DISTINCT val) FROM sd WHERE cat = 'X'");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(15)); // 5 + 10
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs ──
+
+#[test]
+fn count_aggregate() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+    let result = db
+        .execute("SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM t")
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values(),
+        &[
+            Value::Int64(3),
+            Value::Int64(60),
+            Value::Float64(20.0),
+            Value::Int64(10),
+            Value::Int64(30)
+        ]
+    );
+}
+
+#[test]
+fn group_by() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, cat TEXT, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a', 10)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'a', 20)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 'b', 30)").unwrap();
+
+    let result = db
+        .execute("SELECT cat, SUM(val) FROM t GROUP BY cat ORDER BY cat")
+        .unwrap();
+    let rows = result.rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].values(),
+        &[Value::Text("a".to_string()), Value::Int64(30)]
+    );
+    assert_eq!(
+        rows[1].values(),
+        &[Value::Text("b".to_string()), Value::Int64(30)]
+    );
+}
+
+#[test]
+fn string_agg_alias_supports_grouped_concatenation() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE employees (id INT64 PRIMARY KEY, dept TEXT, name TEXT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO employees VALUES
+            (1, 'eng', 'Ada'),
+            (2, 'eng', NULL),
+            (3, 'eng', 'Linus'),
+            (4, 'ops', 'Grace')",
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT dept, STRING_AGG(name, ', ')
+             FROM employees
+             GROUP BY dept
+             ORDER BY dept",
+        )
+        .unwrap();
+
+    assert_eq!(result.rows().len(), 2);
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("eng".to_string()),
+            Value::Text("Ada, Linus".to_string())
+        ]
+    );
+    assert_eq!(
+        result.rows()[1].values(),
+        &[
+            Value::Text("ops".to_string()),
+            Value::Text("Grace".to_string())
+        ]
+    );
+}
+
+#[test]
+fn string_agg_and_total_cover_default_separator_and_all_null_input() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE agg_edges (id INT64 PRIMARY KEY, name TEXT, val INT64)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO agg_edges VALUES
+            (1, 'Ada', NULL),
+            (2, NULL, NULL),
+            (3, 'Grace', NULL)",
+    )
+    .unwrap();
+
+    let result = db
+        .execute("SELECT STRING_AGG(name), STRING_AGG(name, NULL), TOTAL(val) FROM agg_edges")
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("Ada,Grace".to_string()),
+            Value::Text("AdaGrace".to_string()),
+            Value::Float64(0.0),
+        ]
+    );
+
+    let empty = db
+        .execute("SELECT STRING_AGG(name), TOTAL(val) FROM agg_edges WHERE id > 99")
+        .unwrap();
+    assert_eq!(
+        empty.rows()[0].values(),
+        &[Value::Null, Value::Float64(0.0)]
+    );
+}
+
+#[test]
+fn total_aggregate_uses_float_semantics_and_zero_for_empty_inputs() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE nums (id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO nums VALUES (1, 10), (2, 10), (3, 20)")
+        .unwrap();
+
+    let totals = db
+        .execute("SELECT TOTAL(val), TOTAL(DISTINCT val), SUM(val) FROM nums")
+        .unwrap();
+    assert_eq!(
+        totals.rows()[0].values(),
+        &[Value::Float64(40.0), Value::Float64(30.0), Value::Int64(40)]
+    );
+
+    let mixed = db
+        .execute(
+            "SELECT TOTAL(CASE id WHEN 1 THEN 1 ELSE 2.5 END)
+             FROM nums
+             WHERE id < 3",
+        )
+        .unwrap();
+    assert_eq!(mixed.rows()[0].values(), &[Value::Float64(3.5)]);
+
+    let empty = db
+        .execute("SELECT TOTAL(val), SUM(val) FROM nums WHERE id > 99")
+        .unwrap();
+    assert_eq!(
+        empty.rows()[0].values(),
+        &[Value::Float64(0.0), Value::Null]
+    );
 }
 

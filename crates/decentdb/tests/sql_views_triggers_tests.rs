@@ -83,7 +83,7 @@ fn alter_view_rename_to_existing_name_errors() {
     db.execute("CREATE VIEW v2 AS SELECT * FROM t").unwrap();
 
     let err = db.execute("ALTER VIEW v1 RENAME TO v2").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -108,7 +108,7 @@ fn ast_display_view_ddl() {
         "CREATE VIEW v AS SELECT id, val, val * 2 AS doubled FROM t WHERE val > 10 ORDER BY id"
     ).unwrap();
     let ddl = db.view_ddl("v").unwrap();
-    assert!(ddl.len() > 0);
+    assert!(!ddl.is_empty());
 }
 
 #[test]
@@ -172,7 +172,7 @@ fn drop_temp_view() {
     db.execute("DROP VIEW tv").unwrap();
 
     let err = db.execute("SELECT * FROM tv").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn drop_view_if_exists() {
     db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
     db.execute("DROP VIEW v").unwrap();
     let err = db.execute("SELECT * FROM v").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -327,14 +327,14 @@ fn error_drop_nonexistent_trigger() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     let err = db.execute("DROP TRIGGER nonexistent ON t").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn error_drop_nonexistent_view() {
     let db = mem_db();
     let err = db.execute("DROP VIEW nonexistent").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn error_drop_table_with_view_dependency() {
     let err = db.execute("DROP TABLE t").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("view") || msg.contains("depend") || msg.len() > 0,
+        msg.contains("view") || msg.contains("depend") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -508,7 +508,7 @@ fn rename_view() {
     let r = db.execute("SELECT * FROM v2").unwrap();
     assert_eq!(rows(&r).len(), 1);
     let err = db.execute("SELECT * FROM v").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -571,7 +571,7 @@ fn trigger_after_insert() {
     .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
     let r = db.execute("SELECT msg FROM audit").unwrap();
-    assert!(rows(&r).len() >= 1);
+    assert!(!rows(&r).is_empty());
     assert_eq!(rows(&r)[0][0], Value::Text("inserted".into()));
 }
 
@@ -762,7 +762,7 @@ fn view_drop() {
     db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
     db.execute("DROP VIEW v").unwrap();
     let err = db.execute("SELECT * FROM v").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -779,7 +779,7 @@ fn view_instead_of_delete_trigger() {
     // The trigger deletes id=1, not the WHERE'd id=2
     let r = db.execute("SELECT id FROM base ORDER BY id").unwrap();
     let v = rows(&r);
-    assert!(v.len() >= 1); // At least some rows remain
+    assert!(!v.is_empty()); // At least some rows remain
 }
 
 #[test]
@@ -1196,5 +1196,88 @@ fn window_in_view_dump() {
     .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("OVER"));
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs ──
+
+#[test]
+fn temp_tables_and_views_are_session_scoped_shadow_persistent_objects_and_do_not_persist() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("temp-objects.ddb");
+
+    let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE base (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO base VALUES (1, 'persistent')")
+        .unwrap();
+
+    let persistent_schema_cookie = db.schema_cookie().unwrap();
+    db.execute("CREATE TEMP TABLE base (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO base VALUES (2, 'temporary')")
+        .unwrap();
+    db.execute("CREATE TEMP VIEW recent_base AS SELECT id, val FROM base")
+        .unwrap();
+
+    assert_eq!(db.schema_cookie().unwrap(), persistent_schema_cookie);
+    assert_eq!(
+        db.execute("SELECT id, val FROM base").unwrap().rows()[0].values(),
+        &[Value::Int64(2), Value::Text("temporary".to_string())]
+    );
+    assert_eq!(
+        db.execute("SELECT id, val FROM recent_base")
+            .unwrap()
+            .rows()[0]
+            .values(),
+        &[Value::Int64(2), Value::Text("temporary".to_string())]
+    );
+    assert!(db
+        .table_ddl("base")
+        .unwrap()
+        .starts_with("CREATE TEMP TABLE"));
+    assert!(db
+        .view_ddl("recent_base")
+        .unwrap()
+        .starts_with("CREATE TEMP VIEW"));
+
+    let tables = db.list_tables().unwrap();
+    assert!(tables
+        .iter()
+        .any(|table| table.name == "base" && table.temporary));
+    assert!(tables
+        .iter()
+        .any(|table| table.name == "base" && !table.temporary));
+    let views = db.list_views().unwrap();
+    assert!(views
+        .iter()
+        .any(|view| view.name == "recent_base" && view.temporary));
+
+    let other = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    assert_eq!(
+        other.execute("SELECT id, val FROM base").unwrap().rows()[0].values(),
+        &[Value::Int64(1), Value::Text("persistent".to_string())]
+    );
+    let missing_temp_view = other.execute("SELECT * FROM recent_base").unwrap_err();
+    assert!(
+        missing_temp_view
+            .to_string()
+            .contains("unknown table or view recent_base"),
+        "unexpected error: {missing_temp_view}"
+    );
+
+    drop(db);
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    assert_eq!(
+        reopened.execute("SELECT id, val FROM base").unwrap().rows()[0].values(),
+        &[Value::Int64(1), Value::Text("persistent".to_string())]
+    );
+    let missing_reopened_temp_view = reopened.execute("SELECT * FROM recent_base").unwrap_err();
+    assert!(
+        missing_reopened_temp_view
+            .to_string()
+            .contains("unknown table or view recent_base"),
+        "unexpected error: {missing_reopened_temp_view}"
+    );
 }
 

@@ -5,6 +5,16 @@
 //! join-related edge cases.
 
 use decentdb::{Db, DbConfig, QueryResult, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_JOIN_ID: AtomicU64 = AtomicU64::new(0);
+
+fn unique_path() -> String {
+    format!(
+        "/tmp/test_join_{}.db",
+        NEXT_JOIN_ID.fetch_add(1, Ordering::SeqCst)
+    )
+}
 
 fn mem_db() -> Db {
     Db::open_or_create(":memory:", DbConfig::default()).unwrap()
@@ -12,10 +22,6 @@ fn mem_db() -> Db {
 
 fn exec(db: &Db, sql: &str) -> QueryResult {
     db.execute(sql).unwrap()
-}
-
-fn exec_err(db: &Db, sql: &str) -> String {
-    db.execute(sql).unwrap_err().to_string()
 }
 
 fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
@@ -325,7 +331,7 @@ fn left_join_with_right_join() {
         );
     if let Ok(r) = r {
         let v = rows(&r);
-        assert!(v.len() >= 1);
+        assert!(!v.is_empty());
     }
 }
 
@@ -373,7 +379,7 @@ fn natural_join_basic() {
     let r = db.execute("SELECT * FROM t1 NATURAL JOIN t2");
     if let Ok(r) = r {
         let v = rows(&r);
-        assert!(v.len() >= 1); // id=1 matches
+        assert!(!v.is_empty()); // id=1 matches
     }
 }
 
@@ -517,5 +523,445 @@ fn three_way_join() {
     assert_eq!(v.len(), 2);
     assert_eq!(v[0][0], Value::Text("a".into()));
     assert_eq!(v[0][2], Value::Text("p".into()));
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs, debug_ast.rs ──
+
+#[test]
+fn cross_right_and_full_outer_joins_execute_with_null_extension() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE lhs (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE rhs (id INT64 PRIMARY KEY, label TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO lhs VALUES (1, 'left-only'), (2, 'shared')")
+        .unwrap();
+    db.execute("INSERT INTO rhs VALUES (2, 'shared'), (3, 'right-only')")
+        .unwrap();
+
+    let cross = db
+        .execute(
+            "SELECT l.id, r.id
+             FROM lhs AS l CROSS JOIN rhs AS r
+             ORDER BY l.id, r.id",
+        )
+        .unwrap();
+    assert_eq!(cross.rows().len(), 4);
+    assert_eq!(
+        cross.rows()[0].values(),
+        &[Value::Int64(1), Value::Int64(2)]
+    );
+    assert_eq!(
+        cross.rows()[1].values(),
+        &[Value::Int64(1), Value::Int64(3)]
+    );
+    assert_eq!(
+        cross.rows()[2].values(),
+        &[Value::Int64(2), Value::Int64(2)]
+    );
+    assert_eq!(
+        cross.rows()[3].values(),
+        &[Value::Int64(2), Value::Int64(3)]
+    );
+
+    let right = db
+        .execute(
+            "SELECT l.id, l.name, r.id, r.label
+             FROM lhs AS l RIGHT JOIN rhs AS r ON l.id = r.id
+             ORDER BY r.id",
+        )
+        .unwrap();
+    assert_eq!(
+        right
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(2),
+                Value::Text("shared".to_string()),
+                Value::Int64(2),
+                Value::Text("shared".to_string()),
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Int64(3),
+                Value::Text("right-only".to_string()),
+            ],
+        ]
+    );
+
+    let full = db
+        .execute(
+            "SELECT l.id, l.name, r.id, r.label
+             FROM lhs AS l FULL OUTER JOIN rhs AS r ON l.id = r.id
+             ORDER BY COALESCE(l.id, r.id)",
+        )
+        .unwrap();
+    assert_eq!(
+        full.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("left-only".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("shared".to_string()),
+                Value::Int64(2),
+                Value::Text("shared".to_string()),
+            ],
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Int64(3),
+                Value::Text("right-only".to_string()),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn joins_cover_empty_sides_and_using_outer_merge_columns() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE left_empty (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE right_populated (id INT64 PRIMARY KEY, label TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO right_populated VALUES (1, 'r1'), (2, 'r2')")
+        .unwrap();
+
+    let cross = db
+        .execute(
+            "SELECT l.id, r.id
+             FROM left_empty AS l CROSS JOIN right_populated AS r",
+        )
+        .unwrap();
+    assert!(cross.rows().is_empty());
+
+    let right = db
+        .execute(
+            "SELECT l.id, r.id
+             FROM left_empty AS l RIGHT JOIN right_populated AS r ON l.id = r.id
+             ORDER BY r.id",
+        )
+        .unwrap();
+    assert_eq!(
+        right
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Null, Value::Int64(1)],
+            vec![Value::Null, Value::Int64(2)],
+        ]
+    );
+
+    db.execute("CREATE TABLE left_populated (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE right_empty (id INT64 PRIMARY KEY, label TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO left_populated VALUES (1, 'l1'), (2, 'l2')")
+        .unwrap();
+
+    let full = db
+        .execute(
+            "SELECT l.id, r.id
+             FROM left_populated AS l FULL OUTER JOIN right_empty AS r ON l.id = r.id
+             ORDER BY l.id",
+        )
+        .unwrap();
+    assert_eq!(
+        full.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Null],
+            vec![Value::Int64(2), Value::Null],
+        ]
+    );
+
+    db.execute("CREATE TABLE full_left (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE full_right (id INT64 PRIMARY KEY, label TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO full_left VALUES (1, 'l1'), (2, 'l2')")
+        .unwrap();
+    db.execute("INSERT INTO full_right VALUES (2, 'r2'), (3, 'r3')")
+        .unwrap();
+
+    let using_full = db
+        .execute("SELECT * FROM full_left FULL OUTER JOIN full_right USING (id) ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        using_full.columns(),
+        &["id".to_string(), "name".to_string(), "label".to_string()]
+    );
+    assert_eq!(
+        using_full
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("l1".into()), Value::Null],
+            vec![
+                Value::Int64(2),
+                Value::Text("l2".into()),
+                Value::Text("r2".into())
+            ],
+            vec![Value::Int64(3), Value::Null, Value::Text("r3".into())],
+        ]
+    );
+}
+
+#[test]
+fn test_join_execution() {
+    let path = unique_path();
+    let db = Db::create(&path, Default::default()).expect("create db");
+    db.execute("CREATE TABLE a (id INT64 PRIMARY KEY)")
+        .expect("create a");
+    db.execute("CREATE TABLE b (id INT64 PRIMARY KEY)")
+        .expect("create b");
+    db.execute("INSERT INTO a VALUES (1), (2)")
+        .expect("insert a");
+    db.execute("INSERT INTO b VALUES (1), (3)")
+        .expect("insert b");
+
+    let queries = vec![
+        ("CROSS JOIN", "SELECT * FROM a CROSS JOIN b"),
+        ("RIGHT JOIN", "SELECT * FROM a RIGHT JOIN b ON a.id = b.id"),
+        (
+            "FULL OUTER JOIN",
+            "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id",
+        ),
+        ("NATURAL JOIN", "SELECT * FROM a NATURAL JOIN b"),
+        ("INNER JOIN", "SELECT * FROM a INNER JOIN b ON a.id = b.id"),
+        ("LEFT JOIN", "SELECT * FROM a LEFT JOIN b ON a.id = b.id"),
+    ];
+
+    for (name, q) in queries {
+        match db.execute(q) {
+            Ok(_result) => println!("✓ Executed: {} - {}", name, q),
+            Err(e) => println!("✗ Failed: {} - {} - {}", name, q, e),
+        }
+    }
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn using_and_natural_joins_merge_output_columns_but_keep_qualified_access() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE TABLE using_left (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            left_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE using_right (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            right_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO using_left VALUES (1, 'left-shared', 'l1'), (2, 'left-two', 'l2')")
+        .unwrap();
+    db.execute(
+        "INSERT INTO using_right VALUES (1, 'right-shared', 'r1'), (3, 'right-three', 'r3')",
+    )
+    .unwrap();
+
+    let using_star = db
+        .execute("SELECT * FROM using_left JOIN using_right USING (id) ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        using_star.columns(),
+        &[
+            "id".to_string(),
+            "shared".to_string(),
+            "left_only".to_string(),
+            "shared".to_string(),
+            "right_only".to_string(),
+        ]
+    );
+    assert_eq!(
+        using_star
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![
+            Value::Int64(1),
+            Value::Text("left-shared".into()),
+            Value::Text("l1".into()),
+            Value::Text("right-shared".into()),
+            Value::Text("r1".into()),
+        ]]
+    );
+
+    db.execute(
+        "CREATE VIEW using_join_view AS
+         SELECT * FROM using_left JOIN using_right USING (id)",
+    )
+    .unwrap();
+    let using_view = db
+        .execute("SELECT * FROM using_join_view ORDER BY id")
+        .unwrap();
+    assert_eq!(using_view.columns(), using_star.columns());
+    assert_eq!(
+        using_view
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        using_star
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>()
+    );
+
+    let qualified = db
+        .execute(
+            "SELECT using_left.id, using_right.id, id
+             FROM using_left JOIN using_right USING (id)",
+        )
+        .unwrap();
+    assert_eq!(
+        qualified.rows()[0].values(),
+        &[Value::Int64(1), Value::Int64(1), Value::Int64(1)]
+    );
+
+    let table_wildcards = db
+        .execute("SELECT using_left.*, using_right.* FROM using_left JOIN using_right USING (id)")
+        .unwrap();
+    assert_eq!(
+        table_wildcards.columns(),
+        &[
+            "id".to_string(),
+            "shared".to_string(),
+            "left_only".to_string(),
+            "id".to_string(),
+            "shared".to_string(),
+            "right_only".to_string(),
+        ]
+    );
+    assert_eq!(
+        table_wildcards.rows()[0].values(),
+        &[
+            Value::Int64(1),
+            Value::Text("left-shared".into()),
+            Value::Text("l1".into()),
+            Value::Int64(1),
+            Value::Text("right-shared".into()),
+            Value::Text("r1".into()),
+        ]
+    );
+
+    let ambiguous = db
+        .execute("SELECT shared FROM using_left JOIN using_right USING (id)")
+        .unwrap_err();
+    assert!(
+        ambiguous
+            .to_string()
+            .contains("ambiguous column reference shared"),
+        "unexpected error: {ambiguous}"
+    );
+
+    db.execute(
+        "CREATE TABLE natural_left (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            left_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE natural_right (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            right_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO natural_left VALUES (1, 'same', 'l1'), (2, 'two', 'l2')")
+        .unwrap();
+    db.execute("INSERT INTO natural_right VALUES (1, 'same', 'r1')")
+        .unwrap();
+
+    let natural = db
+        .execute("SELECT * FROM natural_left NATURAL LEFT JOIN natural_right ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        natural.columns(),
+        &[
+            "id".to_string(),
+            "shared".to_string(),
+            "left_only".to_string(),
+            "right_only".to_string(),
+        ]
+    );
+    assert_eq!(
+        natural
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("same".into()),
+                Value::Text("l1".into()),
+                Value::Text("r1".into()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("two".into()),
+                Value::Text("l2".into()),
+                Value::Null,
+            ],
+        ]
+    );
+
+    db.execute("CREATE TABLE natural_cross_left (left_id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE natural_cross_right (right_id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("INSERT INTO natural_cross_left VALUES (1), (2)")
+        .unwrap();
+    db.execute("INSERT INTO natural_cross_right VALUES (10)")
+        .unwrap();
+
+    let natural_cross = db
+        .execute(
+            "SELECT * FROM natural_cross_left NATURAL JOIN natural_cross_right ORDER BY left_id",
+        )
+        .unwrap();
+    assert_eq!(
+        natural_cross
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Int64(10)],
+            vec![Value::Int64(2), Value::Int64(10)],
+        ]
+    );
 }
 

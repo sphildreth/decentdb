@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant)]
+
 use decentdb::{Db, DbConfig, Value};
 use tempfile::TempDir;
 

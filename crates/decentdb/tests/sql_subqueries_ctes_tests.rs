@@ -414,7 +414,7 @@ fn cte_wrong_column_count_error() {
              SELECT * FROM wrong"
         )
         .unwrap_err();
-    assert!(err.to_string().contains("column") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("column") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn error_cte_column_list_mismatch() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("column") || msg.contains("expected") || msg.len() > 0,
+        msg.contains("column") || msg.contains("expected") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -482,7 +482,7 @@ fn error_recursive_cte_column_count_mismatch() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("column") || msg.contains("produced") || msg.len() > 0,
+        msg.contains("column") || msg.contains("produced") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -502,7 +502,7 @@ fn error_recursive_cte_no_anchor() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("anchor") || msg.contains("recursive") || msg.len() > 0,
+        msg.contains("anchor") || msg.contains("recursive") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -539,7 +539,7 @@ fn error_recursive_cte_with_intersect() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("UNION") || msg.contains("recursive") || msg.len() > 0,
+        msg.contains("UNION") || msg.contains("recursive") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -988,7 +988,7 @@ fn recursive_cte_rejects_case_with_subquery() {
              SELECT * FROM cte",
         )
         .unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1399,5 +1399,82 @@ fn where_in_subquery_with_and() {
         .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs ──
+
+#[test]
+fn recursive_ctes_support_sequence_generation_and_tree_traversal() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let sequence = db
+        .execute(
+            "WITH RECURSIVE cnt(x) AS (
+               SELECT 1
+               UNION ALL
+               SELECT x + 1 FROM cnt WHERE x < 10
+             )
+             SELECT x FROM cnt ORDER BY x",
+        )
+        .unwrap();
+    assert_eq!(
+        sequence
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        (1..=10)
+            .map(|value| vec![Value::Int64(value)])
+            .collect::<Vec<_>>()
+    );
+
+    db.execute("CREATE TABLE categories (id INT64 PRIMARY KEY, name TEXT, parent_id INT64)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO categories VALUES
+            (1, 'root', NULL),
+            (2, 'child_a', 1),
+            (3, 'child_b', 1),
+            (4, 'grandchild', 2)",
+    )
+    .unwrap();
+
+    let descendants = db
+        .execute(
+            "WITH RECURSIVE descendants AS (
+               SELECT id, name, parent_id FROM categories WHERE id = 1
+               UNION ALL
+               SELECT c.id, c.name, c.parent_id
+               FROM categories AS c INNER JOIN descendants AS d ON c.parent_id = d.id
+             )
+             SELECT id, name, parent_id FROM descendants ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        descendants
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("root".into()), Value::Null,],
+            vec![
+                Value::Int64(2),
+                Value::Text("child_a".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Text("child_b".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::Text("grandchild".into()),
+                Value::Int64(2),
+            ],
+        ]
+    );
 }
 

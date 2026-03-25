@@ -1,8 +1,3 @@
----
-agent: ask
-description: "Use when improving DecentDB benchmark standings in the Python embedded comparison harness. Focus on fairness-preserving engine improvements, iterative profiling, targeted fixes, and rerunning the relevant benchmark slices until DecentDB closes gaps or takes the lead."
----
-
 # Improve DecentDB Benchmark Leadership
 
 You are working in the DecentDB repository.

@@ -1,3 +1,5 @@
+#![allow(clippy::approx_constant)]
+
 //! SQL expression evaluation tests.
 //!
 //! Covers: CASE/WHEN, LIKE/ILIKE, BETWEEN, IN, IS NULL, arithmetic,
@@ -8,7 +10,16 @@
 use decentdb::{Db, DbConfig, QueryResult, Value};
 use tempfile::TempDir;
 use std::thread;
-use std::sync::Arc;
+
+fn assert_float_close(value: &Value, expected: f64) {
+    match value {
+        Value::Float64(actual) => assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        ),
+        other => panic!("expected FLOAT64 result, got {other:?}"),
+    }
+}
 
 fn mem_db() -> Db {
     Db::open_or_create(":memory:", DbConfig::default()).unwrap()
@@ -503,7 +514,7 @@ fn compare_float_to_text() {
     db.execute("INSERT INTO t VALUES (3.14, '2.71'), (1.0, '5.0')").unwrap();
     let r = db.execute("SELECT a FROM t WHERE a > b ORDER BY a").unwrap();
     let v = rows(&r);
-    assert!(v.len() >= 1); // 3.14 > '2.71'
+    assert!(!v.is_empty()); // 3.14 > '2.71'
 }
 
 #[test]
@@ -523,7 +534,7 @@ fn compare_int_to_text() {
     db.execute("INSERT INTO t VALUES (5, '10'), (20, '5')").unwrap();
     let r = db.execute("SELECT a, b FROM t WHERE a < b ORDER BY a").unwrap();
     let v = rows(&r);
-    assert!(v.len() >= 1); // 5 < '10' (numeric comparison)
+    assert!(!v.is_empty()); // 5 < '10' (numeric comparison)
 }
 
 #[test]
@@ -817,12 +828,9 @@ fn division_by_zero_int() {
     db.execute("INSERT INTO t VALUES (10, 0)").unwrap();
     let r = db.execute("SELECT a / b FROM t");
     // Should return error or NULL
-    match r {
-        Ok(r) => {
-            let v = rows(&r);
-            assert_eq!(v[0][0], Value::Null);
-        }
-        Err(_) => {} // also acceptable
+    if let Ok(r) = r {
+        let v = rows(&r);
+        assert_eq!(v[0][0], Value::Null);
     }
 }
 
@@ -853,7 +861,7 @@ fn error_lag_negative_offset() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("negative") || msg.contains("offset") || msg.len() > 0,
+        msg.contains("negative") || msg.contains("offset") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -867,7 +875,7 @@ fn error_lag_non_integer_offset() {
         .execute("SELECT LAG(val, 'abc') OVER (ORDER BY id) FROM t")
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.len() > 0, "expected an error for non-integer offset");
+    assert!(!msg.is_empty(), "expected an error for non-integer offset");
 }
 
 #[test]
@@ -876,7 +884,7 @@ fn error_primary_key_violation() {
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (1)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1234,7 +1242,7 @@ fn ilike_case_insensitive() {
     db.execute("INSERT INTO t VALUES ('Alice'),('BOB'),('charlie')").unwrap();
     let r = db.execute("SELECT name FROM t WHERE name ILIKE 'alice'");
     if let Ok(r) = r {
-        assert!(rows(&r).len() >= 1);
+        assert!(!rows(&r).is_empty());
     }
 }
 
@@ -1343,7 +1351,7 @@ fn int_float_comparison() {
     exec(&db, "CREATE TABLE ifc (id INT PRIMARY KEY, val FLOAT)");
     exec(&db, "INSERT INTO ifc VALUES (1, 1.5), (2, 2.0), (3, 3.5)");
     let r = exec(&db, "SELECT id FROM ifc WHERE val > 2.0 ORDER BY id");
-    assert!(r.rows().len() >= 1);
+    assert!(!r.rows().is_empty());
 }
 
 #[test]
@@ -1572,12 +1580,9 @@ fn modulo_by_zero() {
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (10, 0)").unwrap();
     let r = db.execute("SELECT a % b FROM t");
-    match r {
-        Ok(r) => {
-            let v = rows(&r);
-            assert_eq!(v[0][0], Value::Null);
-        }
-        Err(_) => {}
+    if let Ok(r) = r {
+        let v = rows(&r);
+        assert_eq!(v[0][0], Value::Null);
     }
 }
 
@@ -1601,7 +1606,7 @@ fn multi_column_fk() {
     db.execute("INSERT INTO parent VALUES (1, 1, 'ok')").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1, 1)").unwrap();
     let err = db.execute("INSERT INTO child VALUES (20, 1, 2)").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -1863,7 +1868,7 @@ fn not_like() {
         .execute("SELECT name FROM t WHERE NOT (name LIKE 'ali%') ORDER BY name")
         .unwrap();
     let v = rows(&r);
-    assert!(v.len() >= 1);
+    assert!(!v.is_empty());
 }
 
 #[test]
@@ -1882,7 +1887,7 @@ fn not_like_pattern() {
     exec(&db, "INSERT INTO words VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry')");
     let r = exec(&db, "SELECT id FROM words WHERE word NOT LIKE 'a%' ORDER BY id");
     // NOT LIKE 'a%' should exclude 'apple', keeping banana and cherry
-    assert!(r.rows().len() >= 1);
+    assert!(!r.rows().is_empty());
 }
 
 #[test]
@@ -2022,7 +2027,7 @@ fn overflow_multiple_large_rows() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, big TEXT)").unwrap();
     for i in 0..20 {
-        let text = format!("{}", "x".repeat(5000));
+        let text = "x".repeat(5000).to_string();
         db.execute_with_params(
             "INSERT INTO t VALUES ($1, $2)",
             &[Value::Int64(i), Value::Text(text)],
@@ -2371,7 +2376,7 @@ fn planner_aggregation_detection_in_like() {
         HAVING MIN(val) LIKE 'h%'
         ORDER BY grp
     ");
-    assert!(r.rows().len() >= 1);
+    assert!(!r.rows().is_empty());
 }
 
 #[test]
@@ -2879,7 +2884,7 @@ fn unique_index_violation_after_update() {
     db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT UNIQUE)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
     let err = db.execute("UPDATE t SET val = 'a' WHERE id = 2").unwrap_err();
-    assert!(err.to_string().len() > 0);
+    assert!(!err.to_string().is_empty());
 }
 
 #[test]
@@ -2919,5 +2924,670 @@ fn verify_pk_index() {
         let v = db.verify_index(&idx.name).unwrap();
         assert!(v.valid);
     }
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs ──
+
+#[test]
+fn case_when() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END")
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Text("yes".to_string())]);
+}
+
+#[test]
+fn case_with_value() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END")
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Text("one".to_string())]);
+}
+
+#[test]
+fn cast_from_int_to_text() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db.execute("SELECT CAST(42 AS TEXT)").unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Text("42".to_string())]);
+}
+
+#[test]
+fn cast_from_text_to_int() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db.execute("SELECT CAST('42' AS INT64)").unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Int64(42)]);
+}
+
+#[test]
+fn cast_parameterized_text_to_decimal() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute_with_params(
+            "SELECT CAST($1 AS DECIMAL(10,2))",
+            &[Value::Text("19.99".to_string())],
+        )
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values(),
+        &[Value::Decimal {
+            scaled: 1999,
+            scale: 2
+        }]
+    );
+}
+
+#[test]
+fn current_date_time_functions_return_expected_shapes() {
+    use chrono::{Datelike, NaiveDate, NaiveTime, Utc};
+
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP, NOW()")
+        .unwrap();
+    let row = result.rows()[0].values();
+
+    let expected_year = i64::from(Utc::now().year());
+    assert_eq!(
+        db.execute("SELECT EXTRACT(YEAR FROM CURRENT_TIMESTAMP)")
+            .unwrap()
+            .rows()[0]
+            .values()[0],
+        Value::Int64(expected_year)
+    );
+
+    match &row[0] {
+        Value::Text(value) => {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("CURRENT_DATE format")
+        }
+        other => panic!("expected CURRENT_DATE text output, got {other:?}"),
+    };
+    match &row[1] {
+        Value::Text(value) => {
+            NaiveTime::parse_from_str(value, "%H:%M:%S").expect("CURRENT_TIME format")
+        }
+        other => panic!("expected CURRENT_TIME text output, got {other:?}"),
+    };
+    assert!(matches!(row[2], Value::TimestampMicros(_)));
+    assert!(matches!(row[3], Value::TimestampMicros(_)));
+}
+
+#[test]
+fn date_time_functions_propagate_nulls() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT DATE(NULL), DATETIME(NULL), STRFTIME('%Y', NULL), EXTRACT(YEAR FROM NULL)")
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Null, Value::Null, Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn date_time_scalar_functions_cover_documented_slice_6_examples() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                DATE('2024-03-15', '+1 month'),
+                DATETIME('2024-03-15 10:30:00', '+2 hours'),
+                STRFTIME('%Y-%m-%d', '2024-03-15 14:30:00'),
+                STRFTIME('%H:%M:%S', '2024-03-15 14:30:00'),
+                STRFTIME('%Y', '2024-03-15'),
+                EXTRACT(YEAR FROM '2024-03-15'),
+                EXTRACT(MONTH FROM '2024-03-15'),
+                EXTRACT(DOW FROM '2024-03-15'),
+                EXTRACT(HOUR FROM '2024-03-15 14:30:00')",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("2024-04-15".to_string()),
+            Value::Text("2024-03-15 12:30:00".to_string()),
+            Value::Text("2024-03-15".to_string()),
+            Value::Text("14:30:00".to_string()),
+            Value::Text("2024".to_string()),
+            Value::Int64(2024),
+            Value::Int64(3),
+            Value::Int64(5),
+            Value::Int64(14),
+        ]
+    );
+}
+
+#[test]
+fn in_with_list() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let result = db
+        .execute("SELECT id FROM t WHERE id IN (1, 3) ORDER BY id")
+        .unwrap();
+    let rows = result.rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values(), &[Value::Int64(1)]);
+    assert_eq!(rows[1].values(), &[Value::Int64(3)]);
+}
+
+#[test]
+fn instr_function() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db.execute("SELECT INSTR('hello world', 'world')").unwrap();
+    assert_eq!(result.rows()[0].values()[0], Value::Int64(7));
+}
+
+#[test]
+fn is_not_null_operator() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'x')").unwrap();
+
+    let result = db
+        .execute("SELECT id FROM t WHERE val IS NOT NULL")
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Int64(2)]);
+}
+
+#[test]
+fn is_null_operator() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'x')").unwrap();
+
+    let result = db.execute("SELECT id FROM t WHERE val IS NULL").unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Int64(1)]);
+}
+
+#[test]
+fn json_operators_execute_and_round_trip_through_views() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE VIEW json_ops AS
+         SELECT
+             '{\"name\":\"Alice\",\"meta\":{\"version\":2}}'->>'name' AS name_text,
+             '{\"name\":\"Alice\"}'->'name' AS name_json,
+             '[10,20,30]'->>1 AS second_item,
+             '{\"meta\":{\"version\":2}}'->'meta'->>'version' AS version_text",
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT name_text, name_json, second_item, version_text,
+                    NULL->>'name',
+                    '{\"name\":\"Alice\"}'->>'missing'
+             FROM json_ops",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("Alice".to_string()),
+            Value::Text("\"Alice\"".to_string()),
+            Value::Text("20".to_string()),
+            Value::Text("2".to_string()),
+            Value::Null,
+            Value::Null,
+        ]
+    );
+}
+
+#[test]
+fn json_scalar_functions_cover_documented_slice_6_surface() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                JSON_OBJECT('age', 30, 'name', 'Alice'),
+                JSON_ARRAY(1, 2, 'three', NULL),
+                JSON_TYPE('{\"a\": 1}', '$.a'),
+                JSON_TYPE('[1, 2, 3]'),
+                JSON_TYPE('{\"a\": 1}', '$.missing'),
+                JSON_VALID('{\"a\":1}'),
+                JSON_VALID('not json'),
+                JSON_VALID(NULL)",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("{\"age\":30,\"name\":\"Alice\"}".to_string()),
+            Value::Text("[1,2,\"three\",null]".to_string()),
+            Value::Text("integer".to_string()),
+            Value::Text("array".to_string()),
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Null,
+        ]
+    );
+}
+
+#[test]
+fn json_table_functions_execute_documented_examples() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let each = db
+        .execute("SELECT key, value, type FROM json_each('[10,20,30]') ORDER BY key")
+        .unwrap();
+    assert_eq!(
+        each.rows()[0].values(),
+        &[
+            Value::Int64(0),
+            Value::Int64(10),
+            Value::Text("integer".to_string())
+        ]
+    );
+    assert_eq!(
+        each.rows()[1].values(),
+        &[
+            Value::Int64(1),
+            Value::Int64(20),
+            Value::Text("integer".to_string())
+        ]
+    );
+    assert_eq!(
+        each.rows()[2].values(),
+        &[
+            Value::Int64(2),
+            Value::Int64(30),
+            Value::Text("integer".to_string())
+        ]
+    );
+
+    let object_each = db
+        .execute("SELECT key, value, type FROM json_each('{\"a\":1,\"b\":2}') ORDER BY key")
+        .unwrap();
+    assert_eq!(
+        object_each.rows()[0].values(),
+        &[
+            Value::Text("a".to_string()),
+            Value::Int64(1),
+            Value::Text("integer".to_string())
+        ]
+    );
+    assert_eq!(
+        object_each.rows()[1].values(),
+        &[
+            Value::Text("b".to_string()),
+            Value::Int64(2),
+            Value::Text("integer".to_string())
+        ]
+    );
+
+    let tree = db
+        .execute(
+            "SELECT key, value, type, path
+             FROM json_tree('{\"a\":{\"b\":1},\"c\":[2,3]}')
+             ORDER BY path",
+        )
+        .unwrap();
+    assert_eq!(
+        tree.rows()[0].values(),
+        &[
+            Value::Null,
+            Value::Text("{\"a\":{\"b\":1},\"c\":[2,3]}".to_string()),
+            Value::Text("object".to_string()),
+            Value::Text("$".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[1].values(),
+        &[
+            Value::Text("a".to_string()),
+            Value::Text("{\"b\":1}".to_string()),
+            Value::Text("object".to_string()),
+            Value::Text("$.a".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[2].values(),
+        &[
+            Value::Text("b".to_string()),
+            Value::Int64(1),
+            Value::Text("integer".to_string()),
+            Value::Text("$.a.b".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[3].values(),
+        &[
+            Value::Text("c".to_string()),
+            Value::Text("[2,3]".to_string()),
+            Value::Text("array".to_string()),
+            Value::Text("$.c".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[4].values(),
+        &[
+            Value::Int64(0),
+            Value::Int64(2),
+            Value::Text("integer".to_string()),
+            Value::Text("$.c[0]".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[5].values(),
+        &[
+            Value::Int64(1),
+            Value::Int64(3),
+            Value::Text("integer".to_string()),
+            Value::Text("$.c[1]".to_string())
+        ]
+    );
+}
+
+#[test]
+fn json_table_functions_handle_null_inputs_and_view_roundtrip() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let each = db.execute("SELECT * FROM json_each(NULL)").unwrap();
+    assert!(each.rows().is_empty());
+
+    let tree = db.execute("SELECT * FROM json_tree(NULL)").unwrap();
+    assert!(tree.rows().is_empty());
+
+    db.execute("CREATE VIEW json_each_view AS SELECT key, value FROM json_each('[10,20]')")
+        .unwrap();
+    let view_rows = db
+        .execute("SELECT key, value FROM json_each_view ORDER BY key")
+        .unwrap();
+    assert_eq!(view_rows.rows().len(), 2);
+    assert_eq!(
+        view_rows.rows()[0].values(),
+        &[Value::Int64(0), Value::Int64(10)]
+    );
+    assert_eq!(
+        view_rows.rows()[1].values(),
+        &[Value::Int64(1), Value::Int64(20)]
+    );
+}
+
+#[test]
+fn math_scalar_functions_cover_documented_slice_6_surface() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                ABS(-42),
+                CEIL(3.2),
+                CEILING(3.2),
+                FLOOR(3.8),
+                ROUND(3.14159, 2),
+                SQRT(144),
+                POWER(2, 10),
+                POW(2, 3),
+                MOD(17, 5),
+                SIGN(-99),
+                LN(2.718281828),
+                LOG(1000),
+                LOG(2, 8),
+                EXP(1)",
+        )
+        .unwrap();
+    let row = result.rows()[0].values();
+    assert_eq!(row[0], Value::Int64(42));
+    assert_float_close(&row[1], 4.0);
+    assert_float_close(&row[2], 4.0);
+    assert_float_close(&row[3], 3.0);
+    assert_float_close(&row[4], 3.14);
+    assert_float_close(&row[5], 12.0);
+    assert_float_close(&row[6], 1024.0);
+    assert_float_close(&row[7], 8.0);
+    assert_eq!(row[8], Value::Int64(2));
+    assert_eq!(row[9], Value::Int64(-1));
+    assert_float_close(&row[10], 1.0);
+    assert_float_close(&row[11], 3.0);
+    assert_float_close(&row[12], 3.0);
+    assert_float_close(&row[13], std::f64::consts::E);
+}
+
+#[test]
+fn math_scalar_functions_preserve_nulls_and_expected_edge_cases() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT ABS(NULL), MOD(5, 0), SQRT(-1), LOG(-10), ROUND(NULL, 2)")
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]
+    );
+
+    let random = db.execute("SELECT RANDOM()").unwrap();
+    match random.rows()[0].values()[0] {
+        Value::Float64(value) => assert!((0.0..1.0).contains(&value)),
+        ref other => panic!("expected RANDOM() to return FLOAT64, got {other:?}"),
+    }
+}
+
+#[test]
+fn not_in_with_list() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let result = db
+        .execute("SELECT id FROM t WHERE id NOT IN (1, 3)")
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values(), &[Value::Int64(2)]);
+}
+
+#[test]
+fn slice_6_scalar_function_type_errors_are_explicit() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let abs_error = db.execute("SELECT ABS('not-a-number')").unwrap_err();
+    assert!(abs_error
+        .to_string()
+        .contains("ABS expects numeric input for first argument"));
+
+    let left_error = db.execute("SELECT LEFT(123, 2)").unwrap_err();
+    assert!(left_error
+        .to_string()
+        .contains("LEFT expects text for first argument"));
+
+    let uuid_error = db.execute("SELECT UUID_PARSE('not-a-uuid')").unwrap_err();
+    assert!(uuid_error
+        .to_string()
+        .contains("UUID_PARSE expects canonical UUID text"));
+
+    let json_operator_error = db.execute("SELECT 1->>'name'").unwrap_err();
+    assert!(json_operator_error
+        .to_string()
+        .contains("JSON operators expect text JSON input"));
+
+    let json_each_error = db
+        .execute("SELECT * FROM json_each('not json')")
+        .unwrap_err();
+    assert!(json_each_error.to_string().contains("invalid JSON"));
+}
+
+#[test]
+fn string_functions() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT LENGTH('hello'), UPPER('hello'), LOWER('WORLD'), TRIM('  hello  ')")
+        .unwrap();
+    let rows = result.rows();
+    println!("rows: {:?}", rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].values(),
+        &[
+            Value::Int64(5),
+            Value::Text("HELLO".to_string()),
+            Value::Text("world".to_string()),
+            Value::Text("hello".to_string())
+        ]
+    );
+}
+
+#[test]
+fn string_scalar_functions_cover_documented_slice_6_surface() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                LTRIM('  hello'),
+                RTRIM('hello  '),
+                LEFT('hello', 3),
+                RIGHT('hello', 3),
+                LPAD('42', 5, '0'),
+                RPAD('hi', 5, '!'),
+                REPEAT('ab', 3),
+                REVERSE('hello'),
+                CHR(65),
+                HEX('ABC'),
+                SUBSTRING('hello world', 1, 5)",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("hello".to_string()),
+            Value::Text("hello".to_string()),
+            Value::Text("hel".to_string()),
+            Value::Text("llo".to_string()),
+            Value::Text("00042".to_string()),
+            Value::Text("hi!!!".to_string()),
+            Value::Text("ababab".to_string()),
+            Value::Text("olleh".to_string()),
+            Value::Text("A".to_string()),
+            Value::Text("414243".to_string()),
+            Value::Text("hello".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn temp_schema_changes_invalidate_prepared_statements_and_drop_reveals_persistent_tables() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'persistent')")
+        .unwrap();
+
+    let prepared = db.prepare("SELECT val FROM docs").unwrap();
+    assert_eq!(
+        prepared.execute(&[]).unwrap().rows()[0].values(),
+        &[Value::Text("persistent".to_string())]
+    );
+
+    db.execute("CREATE TEMP TABLE docs (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    let stale = prepared.execute(&[]).unwrap_err();
+    assert!(
+        stale
+            .to_string()
+            .contains("prepared statement is no longer valid because the schema changed"),
+        "unexpected error: {stale}"
+    );
+
+    db.execute("INSERT INTO docs VALUES (2, 'temporary')")
+        .unwrap();
+    assert_eq!(
+        db.execute("SELECT val FROM docs").unwrap().rows()[0].values(),
+        &[Value::Text("temporary".to_string())]
+    );
+
+    db.execute("DROP TABLE docs").unwrap();
+    assert_eq!(
+        db.execute("SELECT val FROM docs").unwrap().rows()[0].values(),
+        &[Value::Text("persistent".to_string())]
+    );
+}
+
+#[test]
+fn upper_and_lower_functions() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db.execute("SELECT UPPER('hello'), LOWER('WORLD')").unwrap();
+    assert_eq!(
+        result.rows()[0].values()[0],
+        Value::Text("HELLO".to_string())
+    );
+    assert_eq!(
+        result.rows()[0].values()[1],
+        Value::Text("world".to_string())
+    );
+}
+
+#[test]
+fn uuid_helper_functions_round_trip_and_generate_v4_values() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                UUID_TO_STRING(UUID_PARSE('550e8400-e29b-41d4-a716-446655440000')),
+                GEN_RANDOM_UUID(),
+                UUID_TO_STRING(GEN_RANDOM_UUID()),
+                UUID_PARSE(NULL),
+                UUID_TO_STRING(NULL)",
+        )
+        .unwrap();
+    let row = result.rows()[0].values();
+
+    assert_eq!(
+        row[0],
+        Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string())
+    );
+    match &row[1] {
+        Value::Uuid(value) => {
+            assert_eq!(value[6] & 0xf0, 0x40);
+            assert_eq!(value[8] & 0xc0, 0x80);
+        }
+        other => panic!("expected GEN_RANDOM_UUID() to return UUID, got {other:?}"),
+    }
+    match &row[2] {
+        Value::Text(value) => {
+            assert_eq!(value.len(), 36);
+            assert_eq!(value.as_bytes()[8], b'-');
+            assert_eq!(value.as_bytes()[13], b'-');
+            assert_eq!(value.as_bytes()[18], b'-');
+            assert_eq!(value.as_bytes()[23], b'-');
+        }
+        other => panic!("expected UUID_TO_STRING(GEN_RANDOM_UUID()) text, got {other:?}"),
+    }
+    assert_eq!(row[3], Value::Null);
+    assert_eq!(row[4], Value::Null);
 }
 

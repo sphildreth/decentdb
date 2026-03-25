@@ -13,10 +13,6 @@ fn exec(db: &Db, sql: &str) -> QueryResult {
     db.execute(sql).unwrap()
 }
 
-fn exec_err(db: &Db, sql: &str) -> String {
-    db.execute(sql).unwrap_err().to_string()
-}
-
 fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
     r.rows().iter().map(|r| r.values().to_vec()).collect()
 }
@@ -55,7 +51,7 @@ fn error_unsupported_window_function() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("unsupported") || msg.contains("window") || msg.len() > 0,
+        msg.contains("unsupported") || msg.contains("window") || !msg.is_empty(),
         "unexpected error: {msg}"
     );
 }
@@ -416,7 +412,7 @@ fn window_ntile() {
     let err = db
         .execute("SELECT id, NTILE(3) OVER (ORDER BY id) AS bucket FROM t")
         .unwrap_err();
-    assert!(err.to_string().contains("supported") || err.to_string().len() > 0);
+    assert!(err.to_string().contains("supported") || !err.to_string().is_empty());
 }
 
 #[test]
@@ -527,5 +523,222 @@ fn window_with_partition_by() {
     assert_eq!(v[0][2], Value::Int64(1)); // A group, row 1
     assert_eq!(v[1][2], Value::Int64(2)); // A group, row 2
     assert_eq!(v[2][2], Value::Int64(1)); // B group, row 1
+}
+
+
+// ── Tests merged from engine_coverage_tests.rs ──
+
+#[test]
+fn nth_value_out_of_range_returns_null_and_lag_lead_still_work() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE names (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO names VALUES (1, 'Ada'), (2, 'Grace'), (3, 'Linus')")
+        .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT name,
+                    LAG(name, 1) OVER (ORDER BY id) AS prev_name,
+                    LEAD(name, 1) OVER (ORDER BY id) AS next_name,
+                    NTH_VALUE(name, 10) OVER (ORDER BY id) AS tenth_name
+             FROM names
+             ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Text("Ada".to_string()),
+                Value::Null,
+                Value::Text("Grace".to_string()),
+                Value::Null,
+            ],
+            vec![
+                Value::Text("Grace".to_string()),
+                Value::Text("Ada".to_string()),
+                Value::Text("Linus".to_string()),
+                Value::Null,
+            ],
+            vec![
+                Value::Text("Linus".to_string()),
+                Value::Text("Grace".to_string()),
+                Value::Null,
+                Value::Null,
+            ],
+        ]
+    );
+
+    let err = db
+        .execute("SELECT NTH_VALUE(name, 0) OVER (ORDER BY id) FROM names")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("NTH_VALUE position must be >= 1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn window_value_accessors_cover_single_row_and_argument_validation() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE window_edges (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO window_edges VALUES (1, 'Ada'), (2, 'Grace')")
+        .unwrap();
+
+    let single = db
+        .execute(
+            "SELECT FIRST_VALUE(name) OVER (PARTITION BY id ORDER BY id),
+                    LAST_VALUE(name) OVER (PARTITION BY id ORDER BY id),
+                    NTH_VALUE(name, 1) OVER (PARTITION BY id ORDER BY id)
+             FROM window_edges
+             WHERE id = 1",
+        )
+        .unwrap();
+    assert_eq!(
+        single.rows()[0].values(),
+        &[
+            Value::Text("Ada".to_string()),
+            Value::Text("Ada".to_string()),
+            Value::Text("Ada".to_string()),
+        ]
+    );
+
+    let first_err = db
+        .execute("SELECT FIRST_VALUE(name, name) OVER (ORDER BY id) FROM window_edges")
+        .unwrap_err();
+    assert!(
+        first_err
+            .to_string()
+            .contains("FIRST_VALUE expects exactly 1 argument"),
+        "unexpected error: {first_err}"
+    );
+
+    let last_err = db
+        .execute("SELECT LAST_VALUE() OVER (ORDER BY id) FROM window_edges")
+        .unwrap_err();
+    assert!(
+        last_err
+            .to_string()
+            .contains("LAST_VALUE expects exactly 1 argument"),
+        "unexpected error: {last_err}"
+    );
+
+    let nth_type_err = db
+        .execute("SELECT NTH_VALUE(name, 'bad') OVER (ORDER BY id) FROM window_edges")
+        .unwrap_err();
+    assert!(
+        nth_type_err
+            .to_string()
+            .contains("NTH_VALUE position must be INT64"),
+        "unexpected error: {nth_type_err}"
+    );
+}
+
+#[test]
+fn window_value_accessors_work_with_partitions() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE TABLE employees (
+            id INT64 PRIMARY KEY,
+            name TEXT,
+            department TEXT,
+            salary INT64
+        )",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO employees VALUES
+            (1, 'Ada', 'eng', 100),
+            (2, 'Grace', 'eng', 90),
+            (3, 'Linus', 'eng', 90),
+            (4, 'Ken', 'ops', 80),
+            (5, 'Denise', 'ops', 70)",
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT name, department, salary,
+                    ROW_NUMBER()   OVER (PARTITION BY department ORDER BY salary DESC) AS rn,
+                    RANK()         OVER (PARTITION BY department ORDER BY salary DESC) AS rnk,
+                    DENSE_RANK()   OVER (PARTITION BY department ORDER BY salary DESC) AS dense_rnk,
+                    FIRST_VALUE(name) OVER (PARTITION BY department ORDER BY salary DESC) AS top_earner,
+                    LAST_VALUE(name)  OVER (PARTITION BY department ORDER BY salary DESC) AS low_earner,
+                    NTH_VALUE(name, 2) OVER (PARTITION BY department ORDER BY salary DESC) AS second_earner
+             FROM employees
+             ORDER BY department, salary DESC, name",
+        )
+        .unwrap();
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Text("Ada".to_string()),
+                Value::Text("eng".to_string()),
+                Value::Int64(100),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Text("Ada".to_string()),
+                Value::Text("Linus".to_string()),
+                Value::Text("Grace".to_string()),
+            ],
+            vec![
+                Value::Text("Grace".to_string()),
+                Value::Text("eng".to_string()),
+                Value::Int64(90),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Text("Ada".to_string()),
+                Value::Text("Linus".to_string()),
+                Value::Text("Grace".to_string()),
+            ],
+            vec![
+                Value::Text("Linus".to_string()),
+                Value::Text("eng".to_string()),
+                Value::Int64(90),
+                Value::Int64(3),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Text("Ada".to_string()),
+                Value::Text("Linus".to_string()),
+                Value::Text("Grace".to_string()),
+            ],
+            vec![
+                Value::Text("Ken".to_string()),
+                Value::Text("ops".to_string()),
+                Value::Int64(80),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Text("Ken".to_string()),
+                Value::Text("Denise".to_string()),
+                Value::Text("Denise".to_string()),
+            ],
+            vec![
+                Value::Text("Denise".to_string()),
+                Value::Text("ops".to_string()),
+                Value::Int64(70),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::Text("Ken".to_string()),
+                Value::Text("Denise".to_string()),
+                Value::Text("Denise".to_string()),
+            ],
+        ]
+    );
 }
 

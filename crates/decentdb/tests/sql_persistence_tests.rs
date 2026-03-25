@@ -5,7 +5,36 @@
 //! persistence across reopens.
 
 use decentdb::{Db, DbConfig, QueryResult, Value, BulkLoadOptions};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
+
+static NEXT_PERSIST_ID: AtomicU64 = AtomicU64::new(0);
+
+fn unique_db_path(label: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let ordinal = NEXT_PERSIST_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "decentdb-persist-{label}-{}-{timestamp}-{ordinal}.ddb",
+        std::process::id()
+    ))
+}
+
+fn wal_path(path: &Path) -> PathBuf {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push(".wal");
+    PathBuf::from(wal)
+}
+
+fn cleanup_db(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(wal_path(path));
+}
 
 fn mem_db() -> Db {
     Db::open_or_create(":memory:", DbConfig::default()).unwrap()
@@ -13,10 +42,6 @@ fn mem_db() -> Db {
 
 fn exec(db: &Db, sql: &str) -> QueryResult {
     db.execute(sql).unwrap()
-}
-
-fn exec_err(db: &Db, sql: &str) -> String {
-    db.execute(sql).unwrap_err().to_string()
 }
 
 fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
@@ -820,5 +845,47 @@ fn wal_recovery_with_checkpoint_and_more_writes() {
         let rows = rows(&result);
         assert_eq!(rows[0][0], Value::Int64(150));
     }
+}
+
+
+// ── Tests merged from row_id_persistence_tests.rs ──
+
+#[test]
+fn reopen_preserves_internal_next_row_id_for_rowid_tables() {
+    let path = unique_db_path("row-id-persistence");
+    let config = DbConfig::default();
+
+    let setup = Db::open_or_create(&path, config.clone()).expect("open setup database");
+    setup
+        .execute("CREATE TABLE t (id INT64, payload TEXT)")
+        .expect("create table");
+    for id in 0_i64..30 {
+        setup
+            .execute_with_params(
+                "INSERT INTO t VALUES ($1, $2)",
+                &[Value::Int64(id), Value::Text("seed".repeat(8))],
+            )
+            .expect("insert setup row");
+    }
+    drop(setup);
+
+    let reopened = Db::open(&path, config).expect("reopen database");
+    reopened
+        .execute_with_params(
+            "INSERT INTO t VALUES ($1, $2)",
+            &[Value::Int64(30), Value::Text("writer".repeat(8))],
+        )
+        .expect("insert reopened row");
+    reopened
+        .execute("DELETE FROM t WHERE id >= 30")
+        .expect("delete reopened row");
+
+    let count = reopened
+        .execute("SELECT COUNT(*) FROM t")
+        .expect("count rows");
+    assert_eq!(count.rows()[0].values(), &[Value::Int64(30)]);
+
+    drop(reopened);
+    cleanup_db(&path);
 }
 
