@@ -98,6 +98,7 @@ impl QueryResult {
 pub(crate) struct ColumnBinding {
     pub(crate) table: Option<String>,
     pub(crate) name: String,
+    pub(crate) hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -112,6 +113,26 @@ impl Dataset {
         Self {
             columns: Vec::new(),
             rows: Vec::new(),
+        }
+    }
+}
+
+impl ColumnBinding {
+    #[must_use]
+    pub(crate) fn visible(table: Option<String>, name: String) -> Self {
+        Self {
+            table,
+            name,
+            hidden: false,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn as_output(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            name: self.name.clone(),
+            hidden: false,
         }
     }
 }

@@ -11,9 +11,9 @@ use super::ast::{
     AlterTableAction, Assignment, BinaryOp, ColumnDefinition, CommonTableExpr, ConflictAction,
     ConflictTarget, CreateIndexStatement, CreateTableStatement, CreateTriggerStatement,
     CreateViewStatement, DeleteStatement, ExplainStatement, Expr, ForeignKeyActionSpec,
-    ForeignKeyDefinition, FromItem, IndexExpression, InsertSource, InsertStatement, JoinKind,
-    OrderBy, Query, QueryBody, Select, SelectItem, SetOperation, Statement, TableConstraint,
-    TriggerEventSpec, TriggerKindSpec, UnaryOp, UpdateStatement,
+    ForeignKeyDefinition, FromItem, IndexExpression, InsertSource, InsertStatement, JoinConstraint,
+    JoinKind, OrderBy, Query, QueryBody, Select, SelectItem, SetOperation, Statement,
+    TableConstraint, TriggerEventSpec, TriggerKindSpec, UnaryOp, UpdateStatement,
 };
 
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
@@ -47,6 +47,7 @@ fn normalize_statement(node: &NodeEnum, original_sql: &str) -> Result<Statement>
             statement,
             original_sql,
         )?)),
+        NodeEnum::VacuumStmt(statement) => normalize_vacuum(statement),
         NodeEnum::DropStmt(statement) => normalize_drop(statement),
         NodeEnum::RenameStmt(statement) => normalize_rename(statement),
         NodeEnum::AlterTableStmt(statement) => {
@@ -66,6 +67,10 @@ fn normalize_statement(node: &NodeEnum, original_sql: &str) -> Result<Statement>
 }
 
 fn normalize_query(statement: &protobuf::SelectStmt) -> Result<Query> {
+    let recursive = statement
+        .with_clause
+        .as_ref()
+        .is_some_and(|clause| clause.recursive);
     let ctes = normalize_with_clause(statement.with_clause.as_ref())?;
     let body = normalize_query_body(statement)?;
     let order_by = statement
@@ -91,6 +96,7 @@ fn normalize_query(statement: &protobuf::SelectStmt) -> Result<Query> {
         .map(normalize_expr_node)
         .transpose()?;
     Ok(Query {
+        recursive,
         ctes,
         body,
         order_by,
@@ -345,12 +351,11 @@ fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement>
 }
 
 fn normalize_create_table(statement: &protobuf::CreateStmt) -> Result<CreateTableStatement> {
-    let table_name = normalize_range_var(
-        statement
-            .relation
-            .as_ref()
-            .ok_or_else(|| unsupported("CREATE TABLE is missing a relation name"))?,
-    )?;
+    let relation = statement
+        .relation
+        .as_ref()
+        .ok_or_else(|| unsupported("CREATE TABLE is missing a relation name"))?;
+    let table_name = normalize_range_var(relation)?;
     let mut columns = Vec::new();
     let mut constraints = Vec::new();
     for element in &statement.table_elts {
@@ -369,6 +374,7 @@ fn normalize_create_table(statement: &protobuf::CreateStmt) -> Result<CreateTabl
     }
     Ok(CreateTableStatement {
         table_name,
+        temporary: relation.relpersistence == "t",
         if_not_exists: statement.if_not_exists,
         columns,
         constraints,
@@ -384,6 +390,7 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
         .as_deref()
         .map(normalize_expr_node)
         .transpose()?;
+    let mut generated = None;
     let mut checks = Vec::new();
     let mut references = None;
     for constraint in &column.constraints {
@@ -400,6 +407,16 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
                             .as_deref()
                             .map(normalize_expr_node)
                             .transpose()?;
+                    }
+                    protobuf::ConstrType::ConstrGenerated => {
+                        if constraint.generated_when != "a" {
+                            return Err(unsupported("only GENERATED ALWAYS columns are supported"));
+                        }
+                        generated = Some(normalize_expr_node(
+                            constraint.raw_expr.as_deref().ok_or_else(|| {
+                                unsupported("GENERATED ALWAYS column is missing its expression")
+                            })?,
+                        )?);
                     }
                     protobuf::ConstrType::ConstrCheck => checks.push(normalize_expr_node(
                         constraint.raw_expr.as_deref().ok_or_else(|| {
@@ -441,6 +458,7 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
         )?,
         nullable: !not_null && !primary_key,
         default,
+        generated,
         primary_key,
         unique,
         checks,
@@ -569,13 +587,13 @@ fn normalize_create_view(statement: &protobuf::ViewStmt) -> Result<CreateViewSta
         .iter()
         .map(normalize_string_node)
         .collect::<Result<Vec<_>>>()?;
+    let view = statement
+        .view
+        .as_ref()
+        .ok_or_else(|| unsupported("CREATE VIEW is missing a view name"))?;
     Ok(CreateViewStatement {
-        view_name: normalize_range_var(
-            statement
-                .view
-                .as_ref()
-                .ok_or_else(|| unsupported("CREATE VIEW is missing a view name"))?,
-        )?,
+        view_name: normalize_range_var(view)?,
+        temporary: view.relpersistence == "t",
         replace: statement.replace,
         column_names,
         query: normalize_query(as_select_stmt(
@@ -602,6 +620,46 @@ fn normalize_explain(
         analyze,
         statement: Box::new(normalize_statement(node_kind(query)?, original_sql)?),
     })
+}
+
+fn normalize_vacuum(statement: &protobuf::VacuumStmt) -> Result<Statement> {
+    if statement.is_vacuumcmd {
+        return Err(unsupported("VACUUM is not supported in DecentDB 1.0"));
+    }
+    if !statement.options.is_empty() {
+        return Err(unsupported(
+            "ANALYZE options are not supported in DecentDB 1.0",
+        ));
+    }
+    if statement.rels.len() > 1 {
+        return Err(unsupported(
+            "ANALYZE only supports zero or one target table in DecentDB 1.0",
+        ));
+    }
+    let table_name = statement
+        .rels
+        .first()
+        .map(|relation| match node_kind(relation)? {
+            NodeEnum::VacuumRelation(relation) => {
+                if !relation.va_cols.is_empty() {
+                    return Err(unsupported(
+                        "ANALYZE column lists are not supported in DecentDB 1.0",
+                    ));
+                }
+                normalize_range_var(
+                    relation
+                        .relation
+                        .as_ref()
+                        .ok_or_else(|| unsupported("ANALYZE is missing its target relation"))?,
+                )
+            }
+            other => Err(unsupported(format!(
+                "unexpected ANALYZE target {}",
+                describe_node(other)
+            ))),
+        })
+        .transpose()?;
+    Ok(Statement::Analyze { table_name })
 }
 
 fn normalize_drop(statement: &protobuf::DropStmt) -> Result<Statement> {
@@ -856,6 +914,7 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                 .map(|alias| alias.aliasname.clone())
                 .ok_or_else(|| unsupported("subqueries in FROM require an alias"))?,
         }),
+        NodeEnum::RangeFunction(range) => normalize_range_function(range),
         NodeEnum::JoinExpr(join) => Ok(FromItem::Join {
             left: Box::new(normalize_from_item(
                 join.larg
@@ -870,7 +929,11 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
             kind: match protobuf::JoinType::try_from(join.jointype)
                 .unwrap_or(protobuf::JoinType::Undefined)
             {
-                protobuf::JoinType::JoinInner if join.quals.is_none() => JoinKind::Cross,
+                protobuf::JoinType::JoinInner
+                    if join.quals.is_none() && !join.is_natural && join.using_clause.is_empty() =>
+                {
+                    JoinKind::Cross
+                }
                 protobuf::JoinType::JoinInner => JoinKind::Inner,
                 protobuf::JoinType::JoinLeft => JoinKind::Left,
                 protobuf::JoinType::JoinRight => JoinKind::Right,
@@ -882,17 +945,20 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                     )))
                 }
             },
-            on: {
-                if join.is_natural {
-                    return Err(unsupported("NATURAL JOIN is not supported yet"));
-                }
-                if !join.using_clause.is_empty() {
-                    return Err(unsupported("JOIN ... USING (...) is not supported yet"));
-                }
-                match join.quals.as_deref() {
+            constraint: if join.is_natural {
+                JoinConstraint::Natural
+            } else if !join.using_clause.is_empty() {
+                JoinConstraint::Using(
+                    join.using_clause
+                        .iter()
+                        .map(normalize_string_node)
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            } else {
+                JoinConstraint::On(match join.quals.as_deref() {
                     Some(quals) => normalize_expr_node(quals)?,
                     None => Expr::Literal(Value::Bool(true)),
-                }
+                })
             },
         }),
         other => Err(unsupported(format!(
@@ -900,6 +966,61 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
             describe_node(other)
         ))),
     }
+}
+
+fn normalize_range_function(range: &protobuf::RangeFunction) -> Result<FromItem> {
+    if range.lateral {
+        return Err(unsupported("LATERAL table functions are not supported"));
+    }
+    if range.ordinality {
+        return Err(unsupported("WITH ORDINALITY is not supported"));
+    }
+    if range.is_rowsfrom {
+        return Err(unsupported("ROWS FROM (...) is not supported"));
+    }
+    if !range.coldeflist.is_empty() {
+        return Err(unsupported(
+            "table-function column definitions are not supported",
+        ));
+    }
+    if range.functions.len() != 1 {
+        return Err(unsupported(
+            "FROM only supports one table function at a time in DecentDB v0",
+        ));
+    }
+    let function = range
+        .functions
+        .first()
+        .ok_or_else(|| unsupported("table function is missing its call"))?;
+    let NodeEnum::List(list) = node_kind(function)? else {
+        return Err(unsupported("table function entry is malformed"));
+    };
+    let call = list
+        .items
+        .first()
+        .ok_or_else(|| unsupported("table function is missing its call"))?;
+    let NodeEnum::FuncCall(call) = node_kind(call)? else {
+        return Err(unsupported("table function entry is malformed"));
+    };
+    let name = normalize_qualified_name(&call.funcname)?;
+    if !matches!(
+        name.as_str(),
+        "json_each" | "json_tree" | "pg_catalog.json_each" | "pg_catalog.json_tree"
+    ) {
+        return Err(unsupported(format!(
+            "table function {name} is not supported"
+        )));
+    }
+    let args = call
+        .args
+        .iter()
+        .map(normalize_expr_container)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(FromItem::Function {
+        name,
+        args,
+        alias: range.alias.as_ref().map(|alias| alias.aliasname.clone()),
+    })
 }
 
 fn normalize_assignment(node: &protobuf::Node) -> Result<Assignment> {
@@ -989,6 +1110,7 @@ fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
                 protobuf::NullTestType::IsNotNull
             ),
         }),
+        NodeEnum::SqlvalueFunction(value) => normalize_sql_value_function(value),
         NodeEnum::CoalesceExpr(expr) => Ok(Expr::Function {
             name: "coalesce".to_string(),
             args: expr
@@ -1014,11 +1136,66 @@ fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
                 .map(normalize_expr_container)
                 .collect::<Result<Vec<_>>>()?,
         }),
+        NodeEnum::JsonArrayConstructor(array) => normalize_json_array_constructor(array),
+        NodeEnum::JsonValueExpr(expr) => normalize_json_value_expr(expr),
         other => Err(unsupported(format!(
             "expression node {} is not supported",
             describe_node(other)
         ))),
     }
+}
+
+fn normalize_json_array_constructor(array: &protobuf::JsonArrayConstructor) -> Result<Expr> {
+    if array.output.is_some() {
+        return Err(unsupported("JSON_ARRAY output clauses are not supported"));
+    }
+    Ok(Expr::Function {
+        name: "json_array".to_string(),
+        args: array
+            .exprs
+            .iter()
+            .map(normalize_expr_container)
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn normalize_json_value_expr(expr: &protobuf::JsonValueExpr) -> Result<Expr> {
+    let node = expr
+        .raw_expr
+        .as_deref()
+        .or(expr.formatted_expr.as_deref())
+        .ok_or_else(|| unsupported("JSON value expression is missing its input"))?;
+    normalize_expr_node(node)
+}
+
+fn normalize_sql_value_function(value: &protobuf::SqlValueFunction) -> Result<Expr> {
+    let name = match protobuf::SqlValueFunctionOp::try_from(value.op)
+        .unwrap_or(protobuf::SqlValueFunctionOp::SqlvalueFunctionOpUndefined)
+    {
+        protobuf::SqlValueFunctionOp::SvfopCurrentDate => "current_date",
+        protobuf::SqlValueFunctionOp::SvfopCurrentTime => "current_time",
+        protobuf::SqlValueFunctionOp::SvfopCurrentTimestamp => "current_timestamp",
+        protobuf::SqlValueFunctionOp::SvfopLocaltime => "localtime",
+        protobuf::SqlValueFunctionOp::SvfopLocaltimestamp => "localtimestamp",
+        protobuf::SqlValueFunctionOp::SvfopCurrentTimeN
+        | protobuf::SqlValueFunctionOp::SvfopCurrentTimestampN
+        | protobuf::SqlValueFunctionOp::SvfopLocaltimeN
+        | protobuf::SqlValueFunctionOp::SvfopLocaltimestampN => {
+            return Err(unsupported(
+                "CURRENT_TIME/LOCALTIME/CURRENT_TIMESTAMP/LOCALTIMESTAMP precision modifiers are not supported yet",
+            ));
+        }
+        other => {
+            return Err(unsupported(format!(
+                "SQL value function {} is not supported",
+                other.as_str_name()
+            )))
+        }
+    };
+    Ok(Expr::Function {
+        name: name.to_string(),
+        args: Vec::new(),
+    })
 }
 
 fn normalize_const(value: &protobuf::AConst) -> Result<Expr> {
@@ -1096,7 +1273,10 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                     (_, "-") => BinaryOp::Sub,
                     (_, "*") => BinaryOp::Mul,
                     (_, "/") => BinaryOp::Div,
+                    (_, "%") => BinaryOp::Mod,
                     (_, "||") => BinaryOp::Concat,
+                    (_, "->") => BinaryOp::JsonExtract,
+                    (_, "->>") => BinaryOp::JsonExtractText,
                     _ => return Err(unsupported(format!("operator {operator} is not supported"))),
                 },
                 right: Box::new(normalize_expr_node(expr.rexpr.as_deref().ok_or_else(
@@ -1470,9 +1650,6 @@ fn normalize_with_clause(clause: Option<&protobuf::WithClause>) -> Result<Vec<Co
     let Some(clause) = clause else {
         return Ok(Vec::new());
     };
-    if clause.recursive {
-        return Err(unsupported("WITH RECURSIVE is not supported"));
-    }
     clause
         .ctes
         .iter()

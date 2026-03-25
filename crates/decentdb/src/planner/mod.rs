@@ -3,9 +3,11 @@
 pub(crate) mod logical;
 pub(crate) mod physical;
 
-use crate::catalog::{CatalogState, IndexKind};
+use crate::catalog::{identifiers_equal, CatalogState, IndexKind};
 use crate::error::Result;
-use crate::sql::ast::{BinaryOp, Expr, FromItem, JoinKind, Query, QueryBody, Select, Statement};
+use crate::sql::ast::{
+    BinaryOp, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, Statement,
+};
 
 use self::physical::PhysicalPlan;
 
@@ -66,7 +68,7 @@ fn plan_select(select: &Select, catalog: &CatalogState) -> Result<PhysicalPlan> 
             left: Box::new(plan),
             right: Box::new(plan_from_item(item, catalog)?),
             kind: JoinKind::Inner,
-            on: Expr::Literal(crate::record::value::Value::Bool(true)),
+            constraint: JoinConstraint::On(Expr::Literal(crate::record::value::Value::Bool(true))),
         };
     }
 
@@ -103,17 +105,20 @@ fn plan_from_item(item: &FromItem, catalog: &CatalogState) -> Result<PhysicalPla
                 name.clone()
             },
         },
+        FromItem::Function { name, alias, .. } => PhysicalPlan::TableScan {
+            table: alias.clone().unwrap_or_else(|| format!("tvf:{name}")),
+        },
         FromItem::Subquery { query, .. } => plan_query(query, catalog)?,
         FromItem::Join {
             left,
             right,
             kind,
-            on,
+            constraint,
         } => PhysicalPlan::NestedLoopJoin {
             left: Box::new(plan_from_item(left, catalog)?),
             right: Box::new(plan_from_item(right, catalog)?),
             kind: *kind,
-            on: on.clone(),
+            constraint: constraint.clone(),
         },
     })
 }
@@ -126,9 +131,10 @@ fn maybe_index_plan(
     let FromItem::Table { name, .. } = select.from.first()? else {
         return None;
     };
+    let table = catalog.table(name)?;
     let (column_name, uses_like) = simple_indexable_filter(filter)?;
     let index = catalog.indexes.values().find(|index| {
-        index.table_name == *name
+        identifiers_equal(&index.table_name, &table.name)
             && index.columns.len() == 1
             && index.predicate_sql.is_none()
             && index.columns[0]
@@ -139,19 +145,41 @@ fn maybe_index_plan(
                 || !uses_like && index.kind == IndexKind::Btree)
             && index.fresh
     })?;
+    if !uses_like && !should_use_btree_index(table.name.as_str(), index.name.as_str(), catalog) {
+        return None;
+    }
     Some(if uses_like {
         PhysicalPlan::TrigramSearch {
-            table: name.clone(),
+            table: table.name.clone(),
             index: index.name.clone(),
             predicate: filter.clone(),
         }
     } else {
         PhysicalPlan::IndexSeek {
-            table: name.clone(),
+            table: table.name.clone(),
             index: index.name.clone(),
             predicate: filter.clone(),
         }
     })
+}
+
+fn should_use_btree_index(table_name: &str, index_name: &str, catalog: &CatalogState) -> bool {
+    let Some(table_stats) = catalog.table_stats.get(table_name) else {
+        return true;
+    };
+    let Some(index_stats) = catalog.index_stats.get(index_name) else {
+        return true;
+    };
+    if table_stats.row_count <= 0
+        || index_stats.entry_count <= 0
+        || index_stats.distinct_key_count <= 0
+    {
+        return false;
+    }
+    let estimated_matches =
+        (i128::from(index_stats.entry_count) + i128::from(index_stats.distinct_key_count) - 1)
+            / i128::from(index_stats.distinct_key_count);
+    estimated_matches * 4 < i128::from(table_stats.row_count)
 }
 
 fn simple_indexable_filter(filter: &Expr) -> Option<(&str, bool)> {

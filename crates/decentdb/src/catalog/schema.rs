@@ -73,6 +73,7 @@ pub(crate) struct ColumnSchema {
     pub(crate) column_type: ColumnType,
     pub(crate) nullable: bool,
     pub(crate) default_sql: Option<String>,
+    pub(crate) generated_sql: Option<String>,
     pub(crate) primary_key: bool,
     pub(crate) unique: bool,
     pub(crate) auto_increment: bool,
@@ -106,6 +107,7 @@ pub(crate) struct IndexSchema {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TableSchema {
     pub(crate) name: String,
+    pub(crate) temporary: bool,
     pub(crate) columns: Vec<ColumnSchema>,
     pub(crate) checks: Vec<CheckConstraint>,
     pub(crate) foreign_keys: Vec<ForeignKeyConstraint>,
@@ -116,6 +118,7 @@ pub(crate) struct TableSchema {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ViewSchema {
     pub(crate) name: String,
+    pub(crate) temporary: bool,
     pub(crate) sql_text: String,
     pub(crate) column_names: Vec<String>,
     pub(crate) dependencies: Vec<String>,
@@ -144,6 +147,17 @@ pub(crate) struct TriggerSchema {
     pub(crate) action_sql: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TableStats {
+    pub(crate) row_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IndexStats {
+    pub(crate) entry_count: i64,
+    pub(crate) distinct_key_count: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogState {
     pub(crate) schema_cookie: u32,
@@ -151,6 +165,8 @@ pub(crate) struct CatalogState {
     pub(crate) indexes: BTreeMap<String, IndexSchema>,
     pub(crate) views: BTreeMap<String, ViewSchema>,
     pub(crate) triggers: BTreeMap<String, TriggerSchema>,
+    pub(crate) table_stats: BTreeMap<String, TableStats>,
+    pub(crate) index_stats: BTreeMap<String, IndexStats>,
 }
 
 impl CatalogState {
@@ -162,6 +178,8 @@ impl CatalogState {
             indexes: BTreeMap::new(),
             views: BTreeMap::new(),
             triggers: BTreeMap::new(),
+            table_stats: BTreeMap::new(),
+            index_stats: BTreeMap::new(),
         }
     }
 

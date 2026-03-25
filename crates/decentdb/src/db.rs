@@ -8,14 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::catalog::{
-    CatalogHandle, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint, IndexColumn, IndexKind,
-    IndexSchema, TableSchema, TriggerEvent, TriggerKind, TriggerSchema, ViewSchema,
+    identifiers_equal, CatalogHandle, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint,
+    IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent, TriggerKind, TriggerSchema,
+    ViewSchema,
 };
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
 use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
 use crate::exec::{
-    statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, RuntimeIndex,
+    statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, RuntimeIndex, TableData,
 };
 use crate::metadata::{
     ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification, StorageInfo, TableInfo,
@@ -23,7 +24,7 @@ use crate::metadata::{
 };
 use crate::record::value::Value;
 use crate::sql::ast::Statement as SqlStatement;
-use crate::sql::parser::parse_sql_statement;
+use crate::sql::parser::{parse_sql_statement, rewrite_legacy_trigger_body};
 use crate::storage::freelist::{decode_freelist_next, encode_freelist_page};
 use crate::storage::page::{self, PageId};
 use crate::storage::{self, DatabaseHeader, PagerHandle};
@@ -47,6 +48,7 @@ pub struct Db {
 pub struct PreparedStatement {
     db: Db,
     schema_cookie: u32,
+    temp_schema_cookie: u32,
     statement: Arc<SqlStatement>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     read_only: bool,
@@ -109,9 +111,14 @@ impl SqlTransaction<'_> {
             .state
             .take()
             .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
-        let result = self
-            .db
-            .persist_runtime_if_latest(state.runtime, Some(state.base_lsn));
+        let result = if state.persistent_changed {
+            self.db
+                .persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
+        } else {
+            self.db
+                .install_temp_runtime(state.runtime)
+                .map(|()| state.base_lsn)
+        };
         let release = self.deactivate();
         match (result, release) {
             (Err(error), _) => Err(error),
@@ -164,6 +171,7 @@ struct DbInner {
     sql_txn: Mutex<SqlTxnSlot>,
     sql_txn_active: AtomicBool,
     write_txn: Mutex<WriteTxn>,
+    temp_state: Mutex<TempSchemaState>,
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
@@ -207,10 +215,38 @@ struct WriteTxn {
     staged_pages: BTreeMap<PageId, Vec<u8>>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TempSchemaState {
+    schema_cookie: u32,
+    tables: BTreeMap<String, TableSchema>,
+    table_data: BTreeMap<String, TableData>,
+    views: BTreeMap<String, ViewSchema>,
+    indexes: BTreeMap<String, IndexSchema>,
+}
+
+impl TempSchemaState {
+    fn apply_to_runtime(&self, runtime: &mut EngineRuntime) {
+        runtime.temp_schema_cookie = self.schema_cookie;
+        runtime.temp_tables = self.tables.clone();
+        runtime.temp_table_data = self.table_data.clone();
+        runtime.temp_views = self.views.clone();
+        runtime.temp_indexes = self.indexes.clone();
+    }
+
+    fn update_from_runtime(&mut self, runtime: &EngineRuntime) {
+        self.schema_cookie = runtime.temp_schema_cookie;
+        self.tables = runtime.temp_tables.clone();
+        self.table_data = runtime.temp_table_data.clone();
+        self.views = runtime.temp_views.clone();
+        self.indexes = runtime.temp_indexes.clone();
+    }
+}
+
 #[derive(Debug)]
 struct SqlTxnState {
     runtime: EngineRuntime,
     base_lsn: u64,
+    persistent_changed: bool,
     savepoints: Vec<SqlSavepoint>,
 }
 
@@ -225,6 +261,7 @@ enum SqlTxnSlot {
 struct SqlSavepoint {
     name: String,
     runtime: EngineRuntime,
+    persistent_changed: bool,
 }
 
 const STATEMENT_CACHE_CAPACITY: usize = 128;
@@ -240,6 +277,7 @@ struct StatementCache {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreparedInsertKey {
     schema_cookie: u32,
+    temp_schema_cookie: u32,
     sql: String,
 }
 
@@ -309,6 +347,7 @@ impl PreparedInsertCache {
         &mut self,
         sql: &str,
         schema_cookie: u32,
+        temp_schema_cookie: u32,
         build: F,
     ) -> Result<Option<Arc<PreparedSimpleInsert>>>
     where
@@ -316,6 +355,7 @@ impl PreparedInsertCache {
     {
         let key = PreparedInsertKey {
             schema_cookie,
+            temp_schema_cookie,
             sql: sql.to_string(),
         };
         if let Some(plan) = self.entries.get(&key) {
@@ -458,6 +498,10 @@ impl Db {
                 }
             }
         };
+        if !state.persistent_changed {
+            self.install_temp_runtime(state.runtime)?;
+            return Ok(state.base_lsn);
+        }
         self.persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
     }
 
@@ -512,6 +556,7 @@ impl Db {
         state.savepoints.push(SqlSavepoint {
             name: canonical_savepoint_name(name),
             runtime: state.runtime.clone(),
+            persistent_changed: state.persistent_changed,
         });
         Ok(())
     }
@@ -565,6 +610,7 @@ impl Db {
             .rposition(|savepoint| savepoint.name == target)
             .ok_or_else(|| DbError::transaction(format!("savepoint {name} does not exist")))?;
         state.runtime = state.savepoints[index].runtime.clone();
+        state.persistent_changed = state.savepoints[index].persistent_changed;
         state.savepoints.truncate(index + 1);
         Ok(())
     }
@@ -1069,7 +1115,7 @@ impl Db {
     /// Returns all table definitions with row-count metadata.
     pub fn list_tables(&self) -> Result<Vec<TableInfo>> {
         let runtime = self.runtime_for_inspection()?;
-        Ok(runtime
+        let mut tables = runtime
             .catalog
             .tables
             .values()
@@ -1082,30 +1128,57 @@ impl Db {
                         .map_or(0, |data| data.rows.len()),
                 )
             })
-            .collect())
+            .collect::<Vec<_>>();
+        tables.extend(runtime.temp_tables.values().map(|table| {
+            table_info(
+                table,
+                runtime
+                    .temp_table_data
+                    .get(&table.name)
+                    .map_or(0, |data| data.rows.len()),
+            )
+        }));
+        Ok(tables)
     }
 
     /// Returns a single table definition by name.
     pub fn describe_table(&self, name: &str) -> Result<TableInfo> {
         let runtime = self.runtime_for_inspection()?;
-        let table = runtime
-            .catalog
-            .tables
-            .get(name)
-            .ok_or_else(|| DbError::sql(format!("unknown table {name}")))?;
-        Ok(table_info(
-            table,
-            runtime.tables.get(name).map_or(0, |data| data.rows.len()),
-        ))
+        if runtime.temp_views.contains_key(name) && !runtime.temp_tables.contains_key(name) {
+            return Err(DbError::sql(format!("unknown table {name}")));
+        }
+        let (table, row_count) = if let Some(table) = runtime.temp_tables.get(name) {
+            (
+                table,
+                runtime
+                    .temp_table_data
+                    .get(name)
+                    .map_or(0, |data| data.rows.len()),
+            )
+        } else {
+            let table = runtime
+                .catalog
+                .tables
+                .get(name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {name}")))?;
+            (
+                table,
+                runtime.tables.get(name).map_or(0, |data| data.rows.len()),
+            )
+        };
+        Ok(table_info(table, row_count))
     }
 
     /// Returns canonical `CREATE TABLE` SQL for a named table.
     pub fn table_ddl(&self, name: &str) -> Result<String> {
         let runtime = self.runtime_for_inspection()?;
+        if runtime.temp_views.contains_key(name) && !runtime.temp_tables.contains_key(name) {
+            return Err(DbError::sql(format!("unknown table {name}")));
+        }
         let table = runtime
-            .catalog
-            .tables
+            .temp_tables
             .get(name)
+            .or_else(|| runtime.catalog.tables.get(name))
             .ok_or_else(|| DbError::sql(format!("unknown table {name}")))?;
         Ok(render_create_table(table))
     }
@@ -1119,16 +1192,26 @@ impl Db {
     /// Returns all view definitions.
     pub fn list_views(&self) -> Result<Vec<ViewInfo>> {
         let runtime = self.runtime_for_inspection()?;
-        Ok(runtime.catalog.views.values().map(view_info).collect())
+        let mut views = runtime
+            .catalog
+            .views
+            .values()
+            .map(view_info)
+            .collect::<Vec<_>>();
+        views.extend(runtime.temp_views.values().map(view_info));
+        Ok(views)
     }
 
     /// Returns canonical `CREATE VIEW` SQL for a named view.
     pub fn view_ddl(&self, name: &str) -> Result<String> {
         let runtime = self.runtime_for_inspection()?;
+        if runtime.temp_tables.contains_key(name) && !runtime.temp_views.contains_key(name) {
+            return Err(DbError::sql(format!("unknown view {name}")));
+        }
         let view = runtime
-            .catalog
-            .views
+            .temp_views
             .get(name)
+            .or_else(|| runtime.catalog.views.get(name))
             .ok_or_else(|| DbError::sql(format!("unknown view {name}")))?;
         Ok(render_create_view(view))
     }
@@ -1263,6 +1346,7 @@ impl Db {
                 sql_txn: Mutex::new(SqlTxnSlot::None),
                 sql_txn_active: AtomicBool::new(false),
                 write_txn: Mutex::new(WriteTxn::default()),
+                temp_state: Mutex::new(TempSchemaState::default()),
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
@@ -1344,6 +1428,7 @@ impl Db {
                     self.validate_prepared_schema_cookie(
                         prepared,
                         state.runtime.catalog.schema_cookie,
+                        state.runtime.temp_schema_cookie,
                     )?;
                     let mut total_affected = 0_u64;
                     if prepared.read_only {
@@ -1443,7 +1528,11 @@ impl Db {
         params: &[Value],
     ) -> Result<QueryResult> {
         if let Some(runtime) = self.transaction_runtime_snapshot()? {
-            self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
             return runtime.execute_read_statement(
                 prepared.statement.as_ref(),
                 params,
@@ -1457,7 +1546,11 @@ impl Db {
             .engine
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
+        self.validate_prepared_schema_cookie(
+            prepared,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
         runtime.execute_read_statement(
             prepared.statement.as_ref(),
             params,
@@ -1491,7 +1584,30 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
+        let temp_only = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
+            self.statement_is_temp_only(&runtime, prepared.statement.as_ref())
+        };
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        if temp_only {
+            let mut working = self.engine_snapshot()?;
+            let result = working.execute_statement(
+                prepared.statement.as_ref(),
+                params,
+                self.inner.config.page_size,
+            )?;
+            self.install_temp_runtime(working)?;
+            return Ok(result);
+        }
         if let Some(prepared_insert) = prepared.prepared_insert.as_deref() {
             if let Some(result) = self.try_execute_autocommit_prepared_insert_in_place(
                 prepared,
@@ -1507,7 +1623,11 @@ impl Db {
                 .engine
                 .read()
                 .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-            self.validate_prepared_schema_cookie(prepared, runtime.catalog.schema_cookie)?;
+            self.validate_prepared_schema_cookie(
+                prepared,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+            )?;
             if matches!(
                 prepared.statement.as_ref(),
                 crate::sql::ast::Statement::Insert(insert)
@@ -1555,7 +1675,22 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
+        let temp_only = {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            self.statement_is_temp_only(&runtime, statement)
+        };
         let _savepoint = StatementSavepoint::new(self.inner.wal.latest_snapshot());
+        if temp_only {
+            let mut working = self.engine_snapshot()?;
+            let result =
+                working.execute_statement(statement, params, self.inner.config.page_size)?;
+            self.install_temp_runtime(working)?;
+            return Ok(result);
+        }
         if let crate::sql::ast::Statement::Insert(insert) = statement {
             let prepared = {
                 let runtime = self
@@ -1618,7 +1753,11 @@ impl Db {
             .engine
             .write()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
-        self.validate_prepared_schema_cookie(prepared_statement, runtime.catalog.schema_cookie)?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
         if !runtime.can_reuse_prepared_simple_insert(prepared_insert) {
             return Ok(None);
         }
@@ -1652,6 +1791,7 @@ impl Db {
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner.catalog.replace(runtime.catalog.clone())?;
         }
+        self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
@@ -1693,6 +1833,7 @@ impl Db {
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner.catalog.replace(runtime.catalog.clone())?;
         }
+        self.sync_temp_state_from_runtime(&runtime)?;
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
@@ -1706,8 +1847,68 @@ impl Db {
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         let mut snapshot = runtime.clone();
+        self.apply_temp_state_to_runtime(&mut snapshot)?;
         snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
         Ok(snapshot)
+    }
+
+    fn apply_temp_state_to_runtime(&self, runtime: &mut EngineRuntime) -> Result<()> {
+        self.inner
+            .temp_state
+            .lock()
+            .map_err(|_| DbError::internal("temp schema lock poisoned"))?
+            .apply_to_runtime(runtime);
+        Ok(())
+    }
+
+    fn sync_temp_state_from_runtime(&self, runtime: &EngineRuntime) -> Result<()> {
+        self.inner
+            .temp_state
+            .lock()
+            .map_err(|_| DbError::internal("temp schema lock poisoned"))?
+            .update_from_runtime(runtime);
+        Ok(())
+    }
+
+    fn install_temp_runtime(&self, runtime: EngineRuntime) -> Result<()> {
+        self.sync_temp_state_from_runtime(&runtime)?;
+        let mut guard = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        *guard = runtime;
+        Ok(())
+    }
+
+    fn statement_is_temp_only(
+        &self,
+        runtime: &EngineRuntime,
+        statement: &crate::sql::ast::Statement,
+    ) -> bool {
+        let temp_has_table = |name: &str| {
+            runtime
+                .temp_tables
+                .keys()
+                .any(|entry| identifiers_equal(entry, name))
+        };
+        let temp_has_view = |name: &str| {
+            runtime
+                .temp_views
+                .keys()
+                .any(|entry| identifiers_equal(entry, name))
+        };
+        let temp_has_name = |name: &str| temp_has_table(name) || temp_has_view(name);
+        match statement {
+            crate::sql::ast::Statement::CreateTable(statement) => statement.temporary,
+            crate::sql::ast::Statement::CreateView(statement) => statement.temporary,
+            crate::sql::ast::Statement::DropTable { name, .. } => temp_has_table(name),
+            crate::sql::ast::Statement::DropView { name, .. } => temp_has_view(name),
+            crate::sql::ast::Statement::Insert(statement) => temp_has_name(&statement.table_name),
+            crate::sql::ast::Statement::Update(statement) => temp_has_name(&statement.table_name),
+            crate::sql::ast::Statement::Delete(statement) => temp_has_name(&statement.table_name),
+            _ => false,
+        }
     }
 
     fn parsed_statement(&self, sql: &str) -> Result<Arc<SqlStatement>> {
@@ -1735,6 +1936,7 @@ impl Db {
         Ok(PreparedStatement {
             db: self.clone(),
             schema_cookie: runtime.catalog.schema_cookie,
+            temp_schema_cookie: runtime.temp_schema_cookie,
             statement,
             prepared_insert,
             read_only,
@@ -1751,9 +1953,12 @@ impl Db {
             .prepared_insert_cache
             .lock()
             .map_err(|_| DbError::internal("prepared insert cache lock poisoned"))?
-            .get_or_prepare(sql, runtime.catalog.schema_cookie, || {
-                runtime.prepare_simple_insert(statement)
-            })
+            .get_or_prepare(
+                sql,
+                runtime.catalog.schema_cookie,
+                runtime.temp_schema_cookie,
+                || runtime.prepare_simple_insert(statement),
+            )
     }
 
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
@@ -1787,6 +1992,7 @@ impl Db {
         if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
             self.inner.catalog.replace(runtime.catalog.clone())?;
         }
+        self.sync_temp_state_from_runtime(&runtime)?;
         let mut guard = self
             .inner
             .engine
@@ -1837,8 +2043,9 @@ impl Db {
 
     fn restore_runtime_from_storage(&self, runtime: &mut EngineRuntime) -> Result<()> {
         let schema_cookie = self.current_schema_cookie()?;
-        let (restored, restored_lsn) =
+        let (mut restored, restored_lsn) =
             EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
+        self.apply_temp_state_to_runtime(&mut restored)?;
         self.inner.catalog.replace(restored.catalog.clone())?;
         *runtime = restored;
         self.inner
@@ -1872,8 +2079,9 @@ impl Db {
         }
 
         let schema_cookie = self.current_schema_cookie()?;
-        let (runtime, runtime_lsn) =
+        let (mut runtime, runtime_lsn) =
             EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
+        self.apply_temp_state_to_runtime(&mut runtime)?;
         self.inner.catalog.replace(runtime.catalog.clone())?;
         let mut guard = self
             .inner
@@ -1898,8 +2106,11 @@ impl Db {
         &self,
         prepared: &PreparedStatement,
         schema_cookie: u32,
+        temp_schema_cookie: u32,
     ) -> Result<()> {
-        if schema_cookie == prepared.schema_cookie {
+        if schema_cookie == prepared.schema_cookie
+            && temp_schema_cookie == prepared.temp_schema_cookie
+        {
             return Ok(());
         }
         Err(DbError::sql(
@@ -1912,6 +2123,7 @@ impl Db {
         Ok(SqlTxnState {
             runtime: self.engine_snapshot()?,
             base_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+            persistent_changed: false,
             savepoints: Vec::new(),
         })
     }
@@ -1927,7 +2139,11 @@ impl Db {
                 "prepared statement belongs to a different database handle",
             ));
         }
-        self.validate_prepared_schema_cookie(prepared, state.runtime.catalog.schema_cookie)?;
+        self.validate_prepared_schema_cookie(
+            prepared,
+            state.runtime.catalog.schema_cookie,
+            state.runtime.temp_schema_cookie,
+        )?;
         if prepared.read_only {
             return state.runtime.execute_read_statement(
                 prepared.statement.as_ref(),
@@ -1935,32 +2151,46 @@ impl Db {
                 self.inner.config.page_size,
             );
         }
+        if matches!(
+            prepared.statement.as_ref(),
+            crate::sql::ast::Statement::Analyze { .. }
+        ) {
+            return Err(DbError::transaction(
+                "ANALYZE is not supported inside an explicit SQL transaction",
+            ));
+        }
 
         let page_size = self.inner.config.page_size;
+        let temp_only = self.statement_is_temp_only(&state.runtime, prepared.statement.as_ref());
         if let Some(prepared_insert) = prepared
             .prepared_insert
             .as_deref()
             .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
         {
-            return state.runtime.execute_prepared_simple_insert(
-                prepared_insert,
-                params,
-                page_size,
-            );
+            let result =
+                state
+                    .runtime
+                    .execute_prepared_simple_insert(prepared_insert, params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
         }
         if matches!(
             prepared.statement.as_ref(),
             crate::sql::ast::Statement::Insert(insert)
                 if state.runtime.can_execute_insert_in_place(insert)
         ) {
-            return state
-                .runtime
-                .execute_statement(prepared.statement.as_ref(), params, page_size);
+            let result =
+                state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
         }
         let mut working = state.runtime.clone();
         working.rebuild_stale_indexes(page_size)?;
         let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
         state.runtime = working;
+        state.persistent_changed |= !temp_only;
         Ok(result)
     }
 
@@ -1971,13 +2201,21 @@ impl Db {
         params: &[Value],
         state: &mut SqlTxnState,
     ) -> Result<QueryResult> {
+        if matches!(statement, crate::sql::ast::Statement::Analyze { .. }) {
+            return Err(DbError::transaction(
+                "ANALYZE is not supported inside an explicit SQL transaction",
+            ));
+        }
+        let temp_only = self.statement_is_temp_only(&state.runtime, statement);
         if let crate::sql::ast::Statement::Insert(insert) = statement {
             if let Some(prepared) = self.prepared_simple_insert(sql, insert, &state.runtime)? {
-                return state.runtime.execute_prepared_simple_insert(
+                let result = state.runtime.execute_prepared_simple_insert(
                     prepared.as_ref(),
                     params,
                     self.inner.config.page_size,
-                );
+                )?;
+                state.persistent_changed |= !temp_only;
+                return Ok(result);
             }
         }
         if matches!(
@@ -1985,14 +2223,18 @@ impl Db {
             crate::sql::ast::Statement::Insert(insert)
                 if state.runtime.can_execute_insert_in_place(insert)
         ) {
-            return state
-                .runtime
-                .execute_statement(statement, params, self.inner.config.page_size);
+            let result =
+                state
+                    .runtime
+                    .execute_statement(statement, params, self.inner.config.page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
         }
         let mut working = state.runtime.clone();
         working.rebuild_stale_indexes(self.inner.config.page_size)?;
         let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
         state.runtime = working;
+        state.persistent_changed |= !temp_only;
         Ok(result)
     }
 
@@ -2093,6 +2335,8 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
     let mut in_double = false;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
+    let mut statement_tokens = Vec::new();
+    let mut trigger_body_depth = 0usize;
 
     while let Some(ch) = chars.next() {
         if in_line_comment {
@@ -2137,6 +2381,28 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
         }
 
         match ch {
+            _ if ch.is_ascii_alphanumeric() || ch == '_' => {
+                current.push(ch);
+                let mut token = ch.to_ascii_uppercase().to_string();
+                while let Some(next) = chars.peek().copied() {
+                    if !(next.is_ascii_alphanumeric() || next == '_') {
+                        break;
+                    }
+                    let next = chars.next().expect("peeked token char");
+                    current.push(next);
+                    token.push(next.to_ascii_uppercase());
+                }
+                if statement_tokens.len() < 2 {
+                    statement_tokens.push(token.clone());
+                }
+                if statement_tokens.as_slice() == ["CREATE", "TRIGGER"] {
+                    if token == "BEGIN" {
+                        trigger_body_depth += 1;
+                    } else if token == "END" && trigger_body_depth > 0 {
+                        trigger_body_depth -= 1;
+                    }
+                }
+            }
             '\'' => {
                 in_single = true;
                 current.push(ch);
@@ -2156,8 +2422,13 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
                 in_block_comment = true;
             }
             ';' => {
-                if !current.trim().is_empty() {
-                    statements.push(std::mem::take(&mut current));
+                if trigger_body_depth > 0 {
+                    current.push(ch);
+                } else if !current.trim().is_empty() {
+                    statements.push(rewrite_legacy_trigger_body(current.trim()).into_owned());
+                    current.clear();
+                    statement_tokens.clear();
+                    trigger_body_depth = 0;
                 }
             }
             _ => current.push(ch),
@@ -2165,7 +2436,7 @@ fn split_sql_batch(sql: &str) -> Vec<String> {
     }
 
     if !current.trim().is_empty() {
-        statements.push(current);
+        statements.push(rewrite_legacy_trigger_body(current.trim()).into_owned());
     }
     statements
 }
@@ -2197,6 +2468,7 @@ fn prepared_statement_sql(sql: &str) -> Result<String> {
 fn table_info(table: &TableSchema, row_count: usize) -> TableInfo {
     TableInfo {
         name: table.name.clone(),
+        temporary: table.temporary,
         columns: table.columns.iter().map(column_info).collect(),
         checks: table
             .checks
@@ -2257,6 +2529,7 @@ fn index_info(index: &IndexSchema) -> IndexInfo {
 fn view_info(view: &ViewSchema) -> ViewInfo {
     ViewInfo {
         name: view.name.clone(),
+        temporary: view.temporary,
         sql_text: view.sql_text.clone(),
         column_names: view.column_names.clone(),
         dependencies: view.dependencies.clone(),
@@ -2331,6 +2604,19 @@ fn render_runtime_dump(runtime: &EngineRuntime) -> String {
     for view in runtime.catalog.views.values() {
         lines.push(render_create_view(view));
     }
+    for table in runtime.temp_tables.values() {
+        lines.push(render_create_table(table));
+    }
+    for (table_name, table_data) in &runtime.temp_table_data {
+        if let Some(table) = runtime.temp_tables.get(table_name) {
+            for row in &table_data.rows {
+                lines.push(render_insert(table, &row.values));
+            }
+        }
+    }
+    for view in runtime.temp_views.values() {
+        lines.push(render_create_view(view));
+    }
     for index in runtime.catalog.indexes.values() {
         lines.push(render_create_index(index));
     }
@@ -2361,7 +2647,11 @@ fn render_create_table(table: &TableSchema) -> String {
         if column.auto_increment {
             definition.push_str(" AUTOINCREMENT");
         }
-        if let Some(default_sql) = &column.default_sql {
+        if let Some(generated_sql) = &column.generated_sql {
+            definition.push_str(" GENERATED ALWAYS AS (");
+            definition.push_str(generated_sql);
+            definition.push_str(") STORED");
+        } else if let Some(default_sql) = &column.default_sql {
             definition.push_str(" DEFAULT ");
             definition.push_str(default_sql);
         }
@@ -2396,7 +2686,8 @@ fn render_create_table(table: &TableSchema) -> String {
     }
 
     format!(
-        "CREATE TABLE {} ({});",
+        "CREATE {}TABLE {} ({});",
+        if table.temporary { "TEMP " } else { "" },
         sql_identifier(&table.name),
         definitions.join(", ")
     )
@@ -2473,7 +2764,8 @@ fn render_create_view(view: &ViewSchema) -> String {
         )
     };
     format!(
-        "CREATE VIEW {}{columns} AS {};",
+        "CREATE {}VIEW {}{columns} AS {};",
+        if view.temporary { "TEMP " } else { "" },
         sql_identifier(&view.name),
         view.sql_text
     )
@@ -2590,7 +2882,7 @@ mod tests {
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::{Db, Value};
 
-    use super::{PreparedInsertCache, StatementCache};
+    use super::{split_sql_batch, PreparedInsertCache, StatementCache};
 
     #[test]
     fn statement_cache_reuses_parsed_statement() {
@@ -2610,16 +2902,34 @@ mod tests {
     }
 
     #[test]
+    fn split_sql_batch_preserves_legacy_trigger_body_statement() {
+        let statements = split_sql_batch(
+            "CREATE TRIGGER log_insert AFTER INSERT ON users
+             FOR EACH ROW BEGIN
+               SELECT decentdb_exec_sql('INSERT INTO audit_log (msg) VALUES (''user added'')');
+             END;
+             INSERT INTO users VALUES (1, 'Ada');",
+        );
+        assert_eq!(statements.len(), 2);
+        assert_eq!(
+            statements[0],
+            "CREATE TRIGGER log_insert AFTER INSERT ON users
+             FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log (msg) VALUES (''user added'')')"
+        );
+        assert_eq!(statements[1], "INSERT INTO users VALUES (1, 'Ada')");
+    }
+
+    #[test]
     fn prepared_insert_cache_is_scoped_by_schema_cookie() {
         let mut cache = PreparedInsertCache::with_capacity(4);
         let first = cache
-            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 1, || {
+            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 1, 0, || {
                 Ok(Some(dummy_prepared_insert("users_v1")))
             })
             .expect("prepare first")
             .expect("prepared plan");
         let cached = cache
-            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 1, || {
+            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 1, 0, || {
                 Ok(Some(dummy_prepared_insert("users_v1_new")))
             })
             .expect("prepare cached")
@@ -2627,7 +2937,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &cached));
 
         let second_schema = cache
-            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 2, || {
+            .get_or_prepare("INSERT INTO users (id) VALUES ($1)", 2, 0, || {
                 Ok(Some(dummy_prepared_insert("users_v2")))
             })
             .expect("prepare second schema")

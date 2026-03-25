@@ -59,6 +59,7 @@ pub struct ColumnInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TableInfo {
     pub name: String,
+    pub temporary: bool,
     pub columns: Vec<ColumnInfo>,
     pub checks: Vec<String>,
     pub foreign_keys: Vec<ForeignKeyInfo>,
@@ -80,6 +81,7 @@ pub struct IndexInfo {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewInfo {
     pub name: String,
+    pub temporary: bool,
     pub sql_text: String,
     pub column_names: Vec<String>,
     pub dependencies: Vec<String>,

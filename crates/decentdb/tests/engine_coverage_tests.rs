@@ -1,4 +1,15 @@
 use decentdb::{Db, DbConfig, Value};
+use tempfile::TempDir;
+
+fn assert_float_close(value: &Value, expected: f64) {
+    match value {
+        Value::Float64(actual) => assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        ),
+        other => panic!("expected FLOAT64 result, got {other:?}"),
+    }
+}
 
 #[test]
 fn commit_persists_changes() {
@@ -311,6 +322,462 @@ fn replace_function() {
         result.rows()[0].values()[0],
         Value::Text("hello rust".to_string())
     );
+}
+
+#[test]
+fn math_scalar_functions_cover_documented_slice_6_surface() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                ABS(-42),
+                CEIL(3.2),
+                CEILING(3.2),
+                FLOOR(3.8),
+                ROUND(3.14159, 2),
+                SQRT(144),
+                POWER(2, 10),
+                POW(2, 3),
+                MOD(17, 5),
+                SIGN(-99),
+                LN(2.718281828),
+                LOG(1000),
+                LOG(2, 8),
+                EXP(1)",
+        )
+        .unwrap();
+    let row = result.rows()[0].values();
+    assert_eq!(row[0], Value::Int64(42));
+    assert_float_close(&row[1], 4.0);
+    assert_float_close(&row[2], 4.0);
+    assert_float_close(&row[3], 3.0);
+    assert_float_close(&row[4], 3.14);
+    assert_float_close(&row[5], 12.0);
+    assert_float_close(&row[6], 1024.0);
+    assert_float_close(&row[7], 8.0);
+    assert_eq!(row[8], Value::Int64(2));
+    assert_eq!(row[9], Value::Int64(-1));
+    assert_float_close(&row[10], 1.0);
+    assert_float_close(&row[11], 3.0);
+    assert_float_close(&row[12], 3.0);
+    assert_float_close(&row[13], std::f64::consts::E);
+}
+
+#[test]
+fn math_scalar_functions_preserve_nulls_and_expected_edge_cases() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT ABS(NULL), MOD(5, 0), SQRT(-1), LOG(-10), ROUND(NULL, 2)")
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]
+    );
+
+    let random = db.execute("SELECT RANDOM()").unwrap();
+    match random.rows()[0].values()[0] {
+        Value::Float64(value) => assert!((0.0..1.0).contains(&value)),
+        ref other => panic!("expected RANDOM() to return FLOAT64, got {other:?}"),
+    }
+}
+
+#[test]
+fn string_scalar_functions_cover_documented_slice_6_surface() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                LTRIM('  hello'),
+                RTRIM('hello  '),
+                LEFT('hello', 3),
+                RIGHT('hello', 3),
+                LPAD('42', 5, '0'),
+                RPAD('hi', 5, '!'),
+                REPEAT('ab', 3),
+                REVERSE('hello'),
+                CHR(65),
+                HEX('ABC'),
+                SUBSTRING('hello world', 1, 5)",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("hello".to_string()),
+            Value::Text("hello".to_string()),
+            Value::Text("hel".to_string()),
+            Value::Text("llo".to_string()),
+            Value::Text("00042".to_string()),
+            Value::Text("hi!!!".to_string()),
+            Value::Text("ababab".to_string()),
+            Value::Text("olleh".to_string()),
+            Value::Text("A".to_string()),
+            Value::Text("414243".to_string()),
+            Value::Text("hello".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn json_scalar_functions_cover_documented_slice_6_surface() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                JSON_OBJECT('age', 30, 'name', 'Alice'),
+                JSON_ARRAY(1, 2, 'three', NULL),
+                JSON_TYPE('{\"a\": 1}', '$.a'),
+                JSON_TYPE('[1, 2, 3]'),
+                JSON_TYPE('{\"a\": 1}', '$.missing'),
+                JSON_VALID('{\"a\":1}'),
+                JSON_VALID('not json'),
+                JSON_VALID(NULL)",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("{\"age\":30,\"name\":\"Alice\"}".to_string()),
+            Value::Text("[1,2,\"three\",null]".to_string()),
+            Value::Text("integer".to_string()),
+            Value::Text("array".to_string()),
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Null,
+        ]
+    );
+}
+
+#[test]
+fn date_time_scalar_functions_cover_documented_slice_6_examples() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                DATE('2024-03-15', '+1 month'),
+                DATETIME('2024-03-15 10:30:00', '+2 hours'),
+                STRFTIME('%Y-%m-%d', '2024-03-15 14:30:00'),
+                STRFTIME('%H:%M:%S', '2024-03-15 14:30:00'),
+                STRFTIME('%Y', '2024-03-15'),
+                EXTRACT(YEAR FROM '2024-03-15'),
+                EXTRACT(MONTH FROM '2024-03-15'),
+                EXTRACT(DOW FROM '2024-03-15'),
+                EXTRACT(HOUR FROM '2024-03-15 14:30:00')",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("2024-04-15".to_string()),
+            Value::Text("2024-03-15 12:30:00".to_string()),
+            Value::Text("2024-03-15".to_string()),
+            Value::Text("14:30:00".to_string()),
+            Value::Text("2024".to_string()),
+            Value::Int64(2024),
+            Value::Int64(3),
+            Value::Int64(5),
+            Value::Int64(14),
+        ]
+    );
+}
+
+#[test]
+fn current_date_time_functions_return_expected_shapes() {
+    use chrono::{Datelike, NaiveDate, NaiveTime, Utc};
+
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT CURRENT_DATE, CURRENT_TIME, CURRENT_TIMESTAMP, NOW()")
+        .unwrap();
+    let row = result.rows()[0].values();
+
+    let expected_year = i64::from(Utc::now().year());
+    assert_eq!(
+        db.execute("SELECT EXTRACT(YEAR FROM CURRENT_TIMESTAMP)")
+            .unwrap()
+            .rows()[0]
+            .values()[0],
+        Value::Int64(expected_year)
+    );
+
+    match &row[0] {
+        Value::Text(value) => {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("CURRENT_DATE format")
+        }
+        other => panic!("expected CURRENT_DATE text output, got {other:?}"),
+    };
+    match &row[1] {
+        Value::Text(value) => {
+            NaiveTime::parse_from_str(value, "%H:%M:%S").expect("CURRENT_TIME format")
+        }
+        other => panic!("expected CURRENT_TIME text output, got {other:?}"),
+    };
+    assert!(matches!(row[2], Value::TimestampMicros(_)));
+    assert!(matches!(row[3], Value::TimestampMicros(_)));
+}
+
+#[test]
+fn date_time_functions_propagate_nulls() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute("SELECT DATE(NULL), DATETIME(NULL), STRFTIME('%Y', NULL), EXTRACT(YEAR FROM NULL)")
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[Value::Null, Value::Null, Value::Null, Value::Null]
+    );
+}
+
+#[test]
+fn uuid_helper_functions_round_trip_and_generate_v4_values() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    let result = db
+        .execute(
+            "SELECT
+                UUID_TO_STRING(UUID_PARSE('550e8400-e29b-41d4-a716-446655440000')),
+                GEN_RANDOM_UUID(),
+                UUID_TO_STRING(GEN_RANDOM_UUID()),
+                UUID_PARSE(NULL),
+                UUID_TO_STRING(NULL)",
+        )
+        .unwrap();
+    let row = result.rows()[0].values();
+
+    assert_eq!(
+        row[0],
+        Value::Text("550e8400-e29b-41d4-a716-446655440000".to_string())
+    );
+    match &row[1] {
+        Value::Uuid(value) => {
+            assert_eq!(value[6] & 0xf0, 0x40);
+            assert_eq!(value[8] & 0xc0, 0x80);
+        }
+        other => panic!("expected GEN_RANDOM_UUID() to return UUID, got {other:?}"),
+    }
+    match &row[2] {
+        Value::Text(value) => {
+            assert_eq!(value.len(), 36);
+            assert_eq!(value.as_bytes()[8], b'-');
+            assert_eq!(value.as_bytes()[13], b'-');
+            assert_eq!(value.as_bytes()[18], b'-');
+            assert_eq!(value.as_bytes()[23], b'-');
+        }
+        other => panic!("expected UUID_TO_STRING(GEN_RANDOM_UUID()) text, got {other:?}"),
+    }
+    assert_eq!(row[3], Value::Null);
+    assert_eq!(row[4], Value::Null);
+}
+
+#[test]
+fn json_operators_execute_and_round_trip_through_views() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE VIEW json_ops AS
+         SELECT
+             '{\"name\":\"Alice\",\"meta\":{\"version\":2}}'->>'name' AS name_text,
+             '{\"name\":\"Alice\"}'->'name' AS name_json,
+             '[10,20,30]'->>1 AS second_item,
+             '{\"meta\":{\"version\":2}}'->'meta'->>'version' AS version_text",
+    )
+    .unwrap();
+
+    let result = db
+        .execute(
+            "SELECT name_text, name_json, second_item, version_text,
+                    NULL->>'name',
+                    '{\"name\":\"Alice\"}'->>'missing'
+             FROM json_ops",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("Alice".to_string()),
+            Value::Text("\"Alice\"".to_string()),
+            Value::Text("20".to_string()),
+            Value::Text("2".to_string()),
+            Value::Null,
+            Value::Null,
+        ]
+    );
+}
+
+#[test]
+fn json_table_functions_execute_documented_examples() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let each = db
+        .execute("SELECT key, value, type FROM json_each('[10,20,30]') ORDER BY key")
+        .unwrap();
+    assert_eq!(
+        each.rows()[0].values(),
+        &[
+            Value::Int64(0),
+            Value::Int64(10),
+            Value::Text("integer".to_string())
+        ]
+    );
+    assert_eq!(
+        each.rows()[1].values(),
+        &[
+            Value::Int64(1),
+            Value::Int64(20),
+            Value::Text("integer".to_string())
+        ]
+    );
+    assert_eq!(
+        each.rows()[2].values(),
+        &[
+            Value::Int64(2),
+            Value::Int64(30),
+            Value::Text("integer".to_string())
+        ]
+    );
+
+    let object_each = db
+        .execute("SELECT key, value, type FROM json_each('{\"a\":1,\"b\":2}') ORDER BY key")
+        .unwrap();
+    assert_eq!(
+        object_each.rows()[0].values(),
+        &[
+            Value::Text("a".to_string()),
+            Value::Int64(1),
+            Value::Text("integer".to_string())
+        ]
+    );
+    assert_eq!(
+        object_each.rows()[1].values(),
+        &[
+            Value::Text("b".to_string()),
+            Value::Int64(2),
+            Value::Text("integer".to_string())
+        ]
+    );
+
+    let tree = db
+        .execute(
+            "SELECT key, value, type, path
+             FROM json_tree('{\"a\":{\"b\":1},\"c\":[2,3]}')
+             ORDER BY path",
+        )
+        .unwrap();
+    assert_eq!(
+        tree.rows()[0].values(),
+        &[
+            Value::Null,
+            Value::Text("{\"a\":{\"b\":1},\"c\":[2,3]}".to_string()),
+            Value::Text("object".to_string()),
+            Value::Text("$".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[1].values(),
+        &[
+            Value::Text("a".to_string()),
+            Value::Text("{\"b\":1}".to_string()),
+            Value::Text("object".to_string()),
+            Value::Text("$.a".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[2].values(),
+        &[
+            Value::Text("b".to_string()),
+            Value::Int64(1),
+            Value::Text("integer".to_string()),
+            Value::Text("$.a.b".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[3].values(),
+        &[
+            Value::Text("c".to_string()),
+            Value::Text("[2,3]".to_string()),
+            Value::Text("array".to_string()),
+            Value::Text("$.c".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[4].values(),
+        &[
+            Value::Int64(0),
+            Value::Int64(2),
+            Value::Text("integer".to_string()),
+            Value::Text("$.c[0]".to_string())
+        ]
+    );
+    assert_eq!(
+        tree.rows()[5].values(),
+        &[
+            Value::Int64(1),
+            Value::Int64(3),
+            Value::Text("integer".to_string()),
+            Value::Text("$.c[1]".to_string())
+        ]
+    );
+}
+
+#[test]
+fn json_table_functions_handle_null_inputs_and_view_roundtrip() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let each = db.execute("SELECT * FROM json_each(NULL)").unwrap();
+    assert!(each.rows().is_empty());
+
+    let tree = db.execute("SELECT * FROM json_tree(NULL)").unwrap();
+    assert!(tree.rows().is_empty());
+
+    db.execute("CREATE VIEW json_each_view AS SELECT key, value FROM json_each('[10,20]')")
+        .unwrap();
+    let view_rows = db
+        .execute("SELECT key, value FROM json_each_view ORDER BY key")
+        .unwrap();
+    assert_eq!(view_rows.rows().len(), 2);
+    assert_eq!(
+        view_rows.rows()[0].values(),
+        &[Value::Int64(0), Value::Int64(10)]
+    );
+    assert_eq!(
+        view_rows.rows()[1].values(),
+        &[Value::Int64(1), Value::Int64(20)]
+    );
+}
+
+#[test]
+fn slice_6_scalar_function_type_errors_are_explicit() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let abs_error = db.execute("SELECT ABS('not-a-number')").unwrap_err();
+    assert!(abs_error
+        .to_string()
+        .contains("ABS expects numeric input for first argument"));
+
+    let left_error = db.execute("SELECT LEFT(123, 2)").unwrap_err();
+    assert!(left_error
+        .to_string()
+        .contains("LEFT expects text for first argument"));
+
+    let uuid_error = db.execute("SELECT UUID_PARSE('not-a-uuid')").unwrap_err();
+    assert!(uuid_error
+        .to_string()
+        .contains("UUID_PARSE expects canonical UUID text"));
+
+    let json_operator_error = db.execute("SELECT 1->>'name'").unwrap_err();
+    assert!(json_operator_error
+        .to_string()
+        .contains("JSON operators expect text JSON input"));
+
+    let json_each_error = db
+        .execute("SELECT * FROM json_each('not json')")
+        .unwrap_err();
+    assert!(json_each_error.to_string().contains("invalid JSON"));
 }
 
 #[test]
@@ -768,6 +1235,244 @@ fn cross_right_and_full_outer_joins_execute_with_null_extension() {
 }
 
 #[test]
+fn analyze_executes_in_autocommit_and_rejects_explicit_transactions() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX docs_email_idx ON docs (email)")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'a@example.com'), (2, 'a@example.com')")
+        .unwrap();
+
+    db.execute("ANALYZE docs").unwrap();
+
+    db.execute("BEGIN").unwrap();
+    let err = db.execute("ANALYZE docs").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ANALYZE is not supported inside an explicit SQL transaction"),
+        "unexpected error: {err}"
+    );
+    db.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn analyze_stats_persist_across_reopen() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("analyze-stats.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX docs_email_idx ON docs (email)")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (1, 'a@example.com'), (2, 'b@example.com')")
+            .unwrap();
+        db.execute("ANALYZE docs").unwrap();
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    reopened.execute("ANALYZE docs").unwrap();
+}
+
+#[test]
+fn generated_columns_compute_recompute_and_survive_reopen() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("generated-columns.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        db.execute(
+            "CREATE TABLE products (
+                id INT64 PRIMARY KEY,
+                price FLOAT64,
+                qty INT64,
+                total FLOAT64 GENERATED ALWAYS AS (price * qty) STORED
+            )",
+        )
+        .unwrap();
+        db.execute("INSERT INTO products (id, price, qty) VALUES (1, 9.99, 3)")
+            .unwrap();
+
+        let inserted = db
+            .execute("SELECT total FROM products WHERE id = 1")
+            .unwrap();
+        assert_float_close(&inserted.rows()[0].values()[0], 29.97);
+
+        let insert_err = db
+            .execute("INSERT INTO products (id, price, qty, total) VALUES (2, 5.0, 2, 10.0)")
+            .unwrap_err();
+        assert!(
+            insert_err
+                .to_string()
+                .contains("cannot INSERT into generated column products.total"),
+            "unexpected error: {insert_err}"
+        );
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    reopened
+        .execute("UPDATE products SET qty = 4 WHERE id = 1")
+        .unwrap();
+    let updated = reopened
+        .execute("SELECT total FROM products WHERE id = 1")
+        .unwrap();
+    assert_float_close(&updated.rows()[0].values()[0], 39.96);
+
+    let update_err = reopened
+        .execute("UPDATE products SET total = 0 WHERE id = 1")
+        .unwrap_err();
+    assert!(
+        update_err
+            .to_string()
+            .contains("cannot UPDATE generated column products.total"),
+        "unexpected error: {update_err}"
+    );
+}
+
+#[test]
+fn generated_columns_participate_in_unique_constraints() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE TABLE users (
+            id INT64 PRIMARY KEY,
+            email TEXT,
+            email_lc TEXT GENERATED ALWAYS AS (LOWER(email)) STORED UNIQUE
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO users (id, email) VALUES (1, 'Ada@Example.com')")
+        .unwrap();
+
+    let err = db
+        .execute("INSERT INTO users (id, email) VALUES (2, 'ada@example.com')")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unique constraint") && err.to_string().contains("users"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn temp_tables_and_views_are_session_scoped_shadow_persistent_objects_and_do_not_persist() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("temp-objects.ddb");
+
+    let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE base (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO base VALUES (1, 'persistent')")
+        .unwrap();
+
+    let persistent_schema_cookie = db.schema_cookie().unwrap();
+    db.execute("CREATE TEMP TABLE base (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO base VALUES (2, 'temporary')")
+        .unwrap();
+    db.execute("CREATE TEMP VIEW recent_base AS SELECT id, val FROM base")
+        .unwrap();
+
+    assert_eq!(db.schema_cookie().unwrap(), persistent_schema_cookie);
+    assert_eq!(
+        db.execute("SELECT id, val FROM base").unwrap().rows()[0].values(),
+        &[Value::Int64(2), Value::Text("temporary".to_string())]
+    );
+    assert_eq!(
+        db.execute("SELECT id, val FROM recent_base")
+            .unwrap()
+            .rows()[0]
+            .values(),
+        &[Value::Int64(2), Value::Text("temporary".to_string())]
+    );
+    assert!(db
+        .table_ddl("base")
+        .unwrap()
+        .starts_with("CREATE TEMP TABLE"));
+    assert!(db
+        .view_ddl("recent_base")
+        .unwrap()
+        .starts_with("CREATE TEMP VIEW"));
+
+    let tables = db.list_tables().unwrap();
+    assert!(tables
+        .iter()
+        .any(|table| table.name == "base" && table.temporary));
+    assert!(tables
+        .iter()
+        .any(|table| table.name == "base" && !table.temporary));
+    let views = db.list_views().unwrap();
+    assert!(views
+        .iter()
+        .any(|view| view.name == "recent_base" && view.temporary));
+
+    let other = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    assert_eq!(
+        other.execute("SELECT id, val FROM base").unwrap().rows()[0].values(),
+        &[Value::Int64(1), Value::Text("persistent".to_string())]
+    );
+    let missing_temp_view = other.execute("SELECT * FROM recent_base").unwrap_err();
+    assert!(
+        missing_temp_view
+            .to_string()
+            .contains("unknown table or view recent_base"),
+        "unexpected error: {missing_temp_view}"
+    );
+
+    drop(db);
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    assert_eq!(
+        reopened.execute("SELECT id, val FROM base").unwrap().rows()[0].values(),
+        &[Value::Int64(1), Value::Text("persistent".to_string())]
+    );
+    let missing_reopened_temp_view = reopened.execute("SELECT * FROM recent_base").unwrap_err();
+    assert!(
+        missing_reopened_temp_view
+            .to_string()
+            .contains("unknown table or view recent_base"),
+        "unexpected error: {missing_reopened_temp_view}"
+    );
+}
+
+#[test]
+fn temp_schema_changes_invalidate_prepared_statements_and_drop_reveals_persistent_tables() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute("CREATE TABLE docs (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO docs VALUES (1, 'persistent')")
+        .unwrap();
+
+    let prepared = db.prepare("SELECT val FROM docs").unwrap();
+    assert_eq!(
+        prepared.execute(&[]).unwrap().rows()[0].values(),
+        &[Value::Text("persistent".to_string())]
+    );
+
+    db.execute("CREATE TEMP TABLE docs (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    let stale = prepared.execute(&[]).unwrap_err();
+    assert!(
+        stale
+            .to_string()
+            .contains("prepared statement is no longer valid because the schema changed"),
+        "unexpected error: {stale}"
+    );
+
+    db.execute("INSERT INTO docs VALUES (2, 'temporary')")
+        .unwrap();
+    assert_eq!(
+        db.execute("SELECT val FROM docs").unwrap().rows()[0].values(),
+        &[Value::Text("temporary".to_string())]
+    );
+
+    db.execute("DROP TABLE docs").unwrap();
+    assert_eq!(
+        db.execute("SELECT val FROM docs").unwrap().rows()[0].values(),
+        &[Value::Text("persistent".to_string())]
+    );
+}
+
+#[test]
 fn string_agg_and_total_cover_default_separator_and_all_null_input() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
     db.execute("CREATE TABLE agg_edges (id INT64 PRIMARY KEY, name TEXT, val INT64)")
@@ -1003,7 +1708,7 @@ fn window_value_accessors_cover_single_row_and_argument_validation() {
 }
 
 #[test]
-fn joins_cover_empty_side_and_unsupported_remaining_join_forms() {
+fn joins_cover_empty_sides_and_using_outer_merge_columns() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
     db.execute("CREATE TABLE left_empty (id INT64 PRIMARY KEY, name TEXT)")
         .unwrap();
@@ -1064,23 +1769,354 @@ fn joins_cover_empty_side_and_unsupported_remaining_join_forms() {
         ]
     );
 
-    let natural_err = db
-        .execute("SELECT * FROM left_populated NATURAL JOIN right_empty")
-        .unwrap_err();
-    assert!(
-        natural_err
-            .to_string()
-            .contains("NATURAL JOIN is not supported yet"),
-        "unexpected error: {natural_err}"
+    db.execute("CREATE TABLE full_left (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE full_right (id INT64 PRIMARY KEY, label TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO full_left VALUES (1, 'l1'), (2, 'l2')")
+        .unwrap();
+    db.execute("INSERT INTO full_right VALUES (2, 'r2'), (3, 'r3')")
+        .unwrap();
+
+    let using_full = db
+        .execute("SELECT * FROM full_left FULL OUTER JOIN full_right USING (id) ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        using_full.columns(),
+        &["id".to_string(), "name".to_string(), "label".to_string()]
+    );
+    assert_eq!(
+        using_full
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("l1".into()), Value::Null],
+            vec![
+                Value::Int64(2),
+                Value::Text("l2".into()),
+                Value::Text("r2".into())
+            ],
+            vec![Value::Int64(3), Value::Null, Value::Text("r3".into())],
+        ]
+    );
+}
+
+#[test]
+fn using_and_natural_joins_merge_output_columns_but_keep_qualified_access() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+    db.execute(
+        "CREATE TABLE using_left (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            left_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE using_right (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            right_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO using_left VALUES (1, 'left-shared', 'l1'), (2, 'left-two', 'l2')")
+        .unwrap();
+    db.execute(
+        "INSERT INTO using_right VALUES (1, 'right-shared', 'r1'), (3, 'right-three', 'r3')",
+    )
+    .unwrap();
+
+    let using_star = db
+        .execute("SELECT * FROM using_left JOIN using_right USING (id) ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        using_star.columns(),
+        &[
+            "id".to_string(),
+            "shared".to_string(),
+            "left_only".to_string(),
+            "shared".to_string(),
+            "right_only".to_string(),
+        ]
+    );
+    assert_eq!(
+        using_star
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![
+            Value::Int64(1),
+            Value::Text("left-shared".into()),
+            Value::Text("l1".into()),
+            Value::Text("right-shared".into()),
+            Value::Text("r1".into()),
+        ]]
     );
 
-    let using_err = db
-        .execute("SELECT * FROM left_populated JOIN right_empty USING (id)")
+    db.execute(
+        "CREATE VIEW using_join_view AS
+         SELECT * FROM using_left JOIN using_right USING (id)",
+    )
+    .unwrap();
+    let using_view = db
+        .execute("SELECT * FROM using_join_view ORDER BY id")
+        .unwrap();
+    assert_eq!(using_view.columns(), using_star.columns());
+    assert_eq!(
+        using_view
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        using_star
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>()
+    );
+
+    let qualified = db
+        .execute(
+            "SELECT using_left.id, using_right.id, id
+             FROM using_left JOIN using_right USING (id)",
+        )
+        .unwrap();
+    assert_eq!(
+        qualified.rows()[0].values(),
+        &[Value::Int64(1), Value::Int64(1), Value::Int64(1)]
+    );
+
+    let table_wildcards = db
+        .execute("SELECT using_left.*, using_right.* FROM using_left JOIN using_right USING (id)")
+        .unwrap();
+    assert_eq!(
+        table_wildcards.columns(),
+        &[
+            "id".to_string(),
+            "shared".to_string(),
+            "left_only".to_string(),
+            "id".to_string(),
+            "shared".to_string(),
+            "right_only".to_string(),
+        ]
+    );
+    assert_eq!(
+        table_wildcards.rows()[0].values(),
+        &[
+            Value::Int64(1),
+            Value::Text("left-shared".into()),
+            Value::Text("l1".into()),
+            Value::Int64(1),
+            Value::Text("right-shared".into()),
+            Value::Text("r1".into()),
+        ]
+    );
+
+    let ambiguous = db
+        .execute("SELECT shared FROM using_left JOIN using_right USING (id)")
         .unwrap_err();
     assert!(
-        using_err
+        ambiguous
             .to_string()
-            .contains("JOIN ... USING (...) is not supported yet"),
-        "unexpected error: {using_err}"
+            .contains("ambiguous column reference shared"),
+        "unexpected error: {ambiguous}"
+    );
+
+    db.execute(
+        "CREATE TABLE natural_left (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            left_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE natural_right (
+            id INT64 PRIMARY KEY,
+            shared TEXT,
+            right_only TEXT
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO natural_left VALUES (1, 'same', 'l1'), (2, 'two', 'l2')")
+        .unwrap();
+    db.execute("INSERT INTO natural_right VALUES (1, 'same', 'r1')")
+        .unwrap();
+
+    let natural = db
+        .execute("SELECT * FROM natural_left NATURAL LEFT JOIN natural_right ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        natural.columns(),
+        &[
+            "id".to_string(),
+            "shared".to_string(),
+            "left_only".to_string(),
+            "right_only".to_string(),
+        ]
+    );
+    assert_eq!(
+        natural
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("same".into()),
+                Value::Text("l1".into()),
+                Value::Text("r1".into()),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("two".into()),
+                Value::Text("l2".into()),
+                Value::Null,
+            ],
+        ]
+    );
+
+    db.execute("CREATE TABLE natural_cross_left (left_id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE natural_cross_right (right_id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("INSERT INTO natural_cross_left VALUES (1), (2)")
+        .unwrap();
+    db.execute("INSERT INTO natural_cross_right VALUES (10)")
+        .unwrap();
+
+    let natural_cross = db
+        .execute(
+            "SELECT * FROM natural_cross_left NATURAL JOIN natural_cross_right ORDER BY left_id",
+        )
+        .unwrap();
+    assert_eq!(
+        natural_cross
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Int64(10)],
+            vec![Value::Int64(2), Value::Int64(10)],
+        ]
+    );
+}
+
+#[test]
+fn recursive_ctes_support_sequence_generation_and_tree_traversal() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let sequence = db
+        .execute(
+            "WITH RECURSIVE cnt(x) AS (
+               SELECT 1
+               UNION ALL
+               SELECT x + 1 FROM cnt WHERE x < 10
+             )
+             SELECT x FROM cnt ORDER BY x",
+        )
+        .unwrap();
+    assert_eq!(
+        sequence
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        (1..=10)
+            .map(|value| vec![Value::Int64(value)])
+            .collect::<Vec<_>>()
+    );
+
+    db.execute("CREATE TABLE categories (id INT64 PRIMARY KEY, name TEXT, parent_id INT64)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO categories VALUES
+            (1, 'root', NULL),
+            (2, 'child_a', 1),
+            (3, 'child_b', 1),
+            (4, 'grandchild', 2)",
+    )
+    .unwrap();
+
+    let descendants = db
+        .execute(
+            "WITH RECURSIVE descendants AS (
+               SELECT id, name, parent_id FROM categories WHERE id = 1
+               UNION ALL
+               SELECT c.id, c.name, c.parent_id
+               FROM categories AS c INNER JOIN descendants AS d ON c.parent_id = d.id
+             )
+             SELECT id, name, parent_id FROM descendants ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        descendants
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![Value::Int64(1), Value::Text("root".into()), Value::Null,],
+            vec![
+                Value::Int64(2),
+                Value::Text("child_a".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Text("child_b".into()),
+                Value::Int64(1),
+            ],
+            vec![
+                Value::Int64(4),
+                Value::Text("grandchild".into()),
+                Value::Int64(2),
+            ],
+        ]
+    );
+}
+
+#[test]
+fn recursive_ctes_enforce_iteration_limit_and_v0_recursive_term_guardrails() {
+    let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
+
+    let limit_err = db
+        .execute(
+            "WITH RECURSIVE cnt(x) AS (
+               SELECT 1
+               UNION ALL
+               SELECT x + 1 FROM cnt
+             )
+             SELECT x FROM cnt",
+        )
+        .unwrap_err();
+    assert!(
+        limit_err
+            .to_string()
+            .contains("exceeded the 1000 iteration limit"),
+        "unexpected error: {limit_err}"
+    );
+
+    let distinct_err = db
+        .execute(
+            "WITH RECURSIVE cnt(x) AS (
+               SELECT 1
+               UNION ALL
+               SELECT DISTINCT x + 1 FROM cnt WHERE x < 3
+             )
+             SELECT x FROM cnt",
+        )
+        .unwrap_err();
+    assert!(
+        distinct_err
+            .to_string()
+            .contains("recursive term only supports non-distinct SELECT statements"),
+        "unexpected error: {distinct_err}"
     );
 }

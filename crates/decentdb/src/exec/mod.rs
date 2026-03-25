@@ -16,10 +16,17 @@ mod views_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use chrono::{
+    DateTime, Datelike, Duration as ChronoDuration, Months, NaiveDate, NaiveDateTime, TimeZone,
+    Timelike, Utc,
+};
 
 use crate::catalog::{
-    identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, TableSchema,
+    identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, IndexStats, TableSchema,
+    TableStats, ViewSchema,
 };
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
@@ -34,7 +41,8 @@ use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
-    BinaryOp, Expr, FromItem, JoinKind, Query, QueryBody, Select, SelectItem, Statement, UnaryOp,
+    BinaryOp, CommonTableExpr, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select,
+    SelectItem, Statement, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::{crc32c_extend, crc32c_parts};
@@ -49,9 +57,35 @@ pub use row::{QueryResult, QueryRow};
 const ENGINE_ROOT_MAGIC: [u8; 8] = *b"DDBSQL1\0";
 const ENGINE_ROOT_VERSION: u32 = 1;
 const ENGINE_ROOT_HEADER_SIZE: usize = 32;
+const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 const LEGACY_RUNTIME_PAYLOAD_MAGIC: &[u8; 9] = b"DDBSTATE1";
 const MANIFEST_PAYLOAD_MAGIC: &[u8; 8] = b"DDBMANF1";
 const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
+static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NameResolutionScope {
+    Session,
+}
+
+fn map_get_ci<'a, V>(map: &'a BTreeMap<String, V>, name: &str) -> Option<&'a V> {
+    map.get(name).or_else(|| {
+        map.iter()
+            .find(|(entry_name, _)| identifiers_equal(entry_name, name))
+            .map(|(_, value)| value)
+    })
+}
+
+fn map_get_ci_mut<'a, V>(map: &'a mut BTreeMap<String, V>, name: &str) -> Option<&'a mut V> {
+    if map.contains_key(name) {
+        return map.get_mut(name);
+    }
+    let existing = map
+        .keys()
+        .find(|entry_name| identifiers_equal(entry_name, name))
+        .cloned()?;
+    map.get_mut(&existing)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredRow {
@@ -240,6 +274,15 @@ impl RuntimeBtreeKeys {
         }
     }
 
+    pub(crate) fn distinct_key_count(&self) -> usize {
+        match self {
+            Self::UniqueEncoded(keys) => keys.len(),
+            Self::NonUniqueEncoded(keys) => keys.len(),
+            Self::UniqueInt64(keys) => keys.len(),
+            Self::NonUniqueInt64(keys) => keys.len(),
+        }
+    }
+
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         match self {
@@ -275,6 +318,11 @@ pub(super) enum PendingIndexInsert {
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: CatalogState,
     pub(crate) tables: BTreeMap<String, TableData>,
+    pub(crate) temp_tables: BTreeMap<String, TableSchema>,
+    pub(crate) temp_table_data: BTreeMap<String, TableData>,
+    pub(crate) temp_views: BTreeMap<String, ViewSchema>,
+    pub(crate) temp_indexes: BTreeMap<String, IndexSchema>,
+    pub(crate) temp_schema_cookie: u32,
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     pub(crate) dirty_tables: BTreeSet<String>,
@@ -309,6 +357,11 @@ impl EngineRuntime {
         Self {
             catalog: CatalogState::empty(schema_cookie),
             tables: BTreeMap::new(),
+            temp_tables: BTreeMap::new(),
+            temp_table_data: BTreeMap::new(),
+            temp_views: BTreeMap::new(),
+            temp_indexes: BTreeMap::new(),
+            temp_schema_cookie: 0,
             indexes: BTreeMap::new(),
             persisted_tables: BTreeMap::new(),
             dirty_tables: BTreeSet::new(),
@@ -317,6 +370,23 @@ impl EngineRuntime {
             index_state_epoch: 0,
             manifest_template: None,
         }
+    }
+
+    pub(super) fn bump_temp_schema_cookie(&mut self) {
+        self.temp_schema_cookie = self.temp_schema_cookie.wrapping_add(1);
+        if self.temp_schema_cookie == 0 {
+            self.temp_schema_cookie = 1;
+        }
+    }
+
+    fn persistent_resolution_runtime(&self) -> Self {
+        let mut runtime = self.clone();
+        runtime.temp_tables.clear();
+        runtime.temp_table_data.clear();
+        runtime.temp_views.clear();
+        runtime.temp_indexes.clear();
+        runtime.temp_schema_cookie = 0;
+        runtime
     }
 
     pub(crate) fn load_from_storage(
@@ -567,13 +637,124 @@ impl EngineRuntime {
         Ok(template.bytes.as_slice())
     }
 
-    pub(super) fn table_schema(&self, name: &str) -> Option<&TableSchema> {
+    pub(super) fn planner_catalog(&self) -> CatalogState {
+        let mut catalog = self.catalog.clone();
+        for (name, table) in &self.temp_tables {
+            catalog.views.remove(name);
+            catalog.tables.insert(name.clone(), table.clone());
+            catalog
+                .indexes
+                .retain(|_, index| !identifiers_equal(&index.table_name, name));
+            catalog
+                .triggers
+                .retain(|_, trigger| !identifiers_equal(&trigger.target_name, name));
+            catalog.table_stats.remove(name);
+        }
+        for (name, view) in &self.temp_views {
+            catalog.tables.remove(name);
+            catalog.views.insert(name.clone(), view.clone());
+            catalog
+                .triggers
+                .retain(|_, trigger| !identifiers_equal(&trigger.target_name, name));
+        }
+        catalog
+    }
+
+    pub(super) fn temp_relation_exists(&self, name: &str) -> bool {
+        self.temp_table_schema(name).is_some() || self.temp_view(name).is_some()
+    }
+
+    pub(super) fn temp_table_schema(&self, name: &str) -> Option<&TableSchema> {
+        map_get_ci(&self.temp_tables, name)
+    }
+
+    pub(super) fn temp_table_schema_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
+        map_get_ci_mut(&mut self.temp_tables, name)
+    }
+
+    pub(super) fn temp_table_data(&self, name: &str) -> Option<&TableData> {
+        map_get_ci(&self.temp_table_data, name)
+    }
+
+    pub(super) fn temp_table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
+        map_get_ci_mut(&mut self.temp_table_data, name)
+    }
+
+    pub(super) fn temp_view(&self, name: &str) -> Option<&ViewSchema> {
+        map_get_ci(&self.temp_views, name)
+    }
+
+    pub(super) fn visible_view(
+        &self,
+        name: &str,
+        _scope: NameResolutionScope,
+    ) -> Option<&ViewSchema> {
+        if let Some(view) = self.temp_view(name) {
+            return Some(view);
+        }
+        if self.temp_table_schema(name).is_some() {
+            return None;
+        }
+        self.catalog.view(name)
+    }
+
+    pub(super) fn visible_table_is_temporary(&self, name: &str) -> bool {
+        self.temp_table_schema(name).is_some()
+    }
+
+    pub(super) fn table_schema_in_scope(
+        &self,
+        name: &str,
+        _scope: NameResolutionScope,
+    ) -> Option<&TableSchema> {
+        if self.temp_view(name).is_some() {
+            return None;
+        }
+        if let Some(table) = self.temp_table_schema(name) {
+            return Some(table);
+        }
         self.catalog.table(name)
     }
 
-    pub(super) fn table_data(&self, name: &str) -> Option<&TableData> {
-        let table_name = self.table_schema(name)?.name.clone();
+    pub(super) fn table_schema(&self, name: &str) -> Option<&TableSchema> {
+        self.table_schema_in_scope(name, NameResolutionScope::Session)
+    }
+
+    pub(super) fn table_data_in_scope(
+        &self,
+        name: &str,
+        _scope: NameResolutionScope,
+    ) -> Option<&TableData> {
+        if self.temp_view(name).is_some() {
+            return None;
+        }
+        if let Some(table) = self.temp_table_schema(name) {
+            return self.temp_table_data(&table.name);
+        }
+        let table_name = self.catalog.table(name)?.name.clone();
         self.tables.get(&table_name)
+    }
+
+    pub(super) fn table_data(&self, name: &str) -> Option<&TableData> {
+        self.table_data_in_scope(name, NameResolutionScope::Session)
+    }
+
+    pub(super) fn table_data_mut_in_scope(
+        &mut self,
+        name: &str,
+        _scope: NameResolutionScope,
+    ) -> Option<&mut TableData> {
+        if self.temp_view(name).is_some() {
+            return None;
+        }
+        if self.temp_table_schema(name).is_some() {
+            return self.temp_table_data_mut(name);
+        }
+        map_get_ci_mut(&mut self.tables, name)
+    }
+
+    pub(super) fn table_data_mut(&mut self, name: &str) -> Option<&mut TableData> {
+        self.table_data_mut_in_scope(name, NameResolutionScope::Session)
     }
 
     pub(crate) fn rebuild_indexes(&mut self, page_size: u32) -> Result<()> {
@@ -635,6 +816,9 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_indexes_stale_for_table(&mut self, table_name: &str) {
+        if self.visible_table_is_temporary(table_name) {
+            return;
+        }
         let mut changed = false;
         for index in self.catalog.indexes.values_mut() {
             if identifiers_equal(&index.table_name, table_name) && index.fresh {
@@ -648,6 +832,9 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_table_dirty(&mut self, table_name: &str) {
+        if self.visible_table_is_temporary(table_name) {
+            return;
+        }
         self.append_only_dirty_tables.remove(table_name);
         if self.dirty_tables.contains(table_name) {
             return;
@@ -656,6 +843,9 @@ impl EngineRuntime {
     }
 
     pub(super) fn mark_table_append_dirty(&mut self, table_name: &str) {
+        if self.visible_table_is_temporary(table_name) {
+            return;
+        }
         if self.append_only_dirty_tables.contains(table_name)
             || self.dirty_tables.contains(table_name)
         {
@@ -677,6 +867,9 @@ impl EngineRuntime {
         row: &StoredRow,
         page_size: u32,
     ) -> Result<Vec<PendingIndexInsert>> {
+        if self.visible_table_is_temporary(table_name) {
+            return Ok(Vec::new());
+        }
         let table = self
             .table_schema(table_name)
             .cloned()
@@ -800,6 +993,10 @@ impl EngineRuntime {
                 let result = self.execute_delete(statement, params, page_size)?;
                 Ok(result)
             }
+            Statement::Analyze { table_name } => {
+                self.execute_analyze(table_name.as_deref())?;
+                Ok(QueryResult::with_affected_rows(0))
+            }
             Statement::CreateTable(statement) => {
                 self.execute_create_table(statement)?;
                 self.rebuild_indexes(page_size)?;
@@ -882,9 +1079,12 @@ impl EngineRuntime {
                     .map(dataset_to_result)
             }
             Statement::Explain(explain) => {
-                let mut lines =
-                    planner::plan_statement(&Statement::Explain(explain.clone()), &self.catalog)?
-                        .render();
+                let planner_catalog = self.planner_catalog();
+                let mut lines = planner::plan_statement(
+                    &Statement::Explain(explain.clone()),
+                    &planner_catalog,
+                )?
+                .render();
                 if explain.analyze {
                     lines.insert(0, "ANALYZE true".to_string());
                     let started = Instant::now();
@@ -913,6 +1113,90 @@ impl EngineRuntime {
         }
     }
 
+    fn execute_analyze(&mut self, table_name: Option<&str>) -> Result<()> {
+        let target_tables = if let Some(table_name) = table_name {
+            if self.visible_table_is_temporary(table_name) {
+                return Err(DbError::sql(
+                    "ANALYZE is not supported for temporary tables",
+                ));
+            }
+            if self
+                .visible_view(table_name, NameResolutionScope::Session)
+                .is_some()
+                && self.catalog.table(table_name).is_none()
+            {
+                return Err(DbError::sql(format!("unknown table {table_name}")));
+            }
+            let table = self
+                .catalog
+                .table(table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+            vec![table.name.clone()]
+        } else {
+            self.catalog.tables.keys().cloned().collect::<Vec<_>>()
+        };
+        for table_name in target_tables {
+            self.refresh_table_stats(&table_name)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_table_stats(&mut self, table_name: &str) -> Result<()> {
+        let row_count = self
+            .table_data(table_name)
+            .map(|table| i64::try_from(table.rows.len()))
+            .transpose()
+            .map_err(|_| {
+                DbError::sql(format!(
+                    "table {table_name} exceeds ANALYZE row-count limits"
+                ))
+            })?
+            .unwrap_or(0);
+        self.catalog
+            .table_stats
+            .insert(table_name.to_string(), TableStats { row_count });
+
+        let index_names = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, table_name))
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        for index_name in index_names {
+            self.catalog.index_stats.remove(&index_name);
+            let Some(index) = self.catalog.index(&index_name).cloned() else {
+                continue;
+            };
+            if index.kind != IndexKind::Btree {
+                continue;
+            }
+            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+                continue;
+            };
+            let entry_count = i64::try_from(keys.total_row_id_count()).map_err(|_| {
+                DbError::sql(format!(
+                    "index {} exceeds ANALYZE entry-count limits",
+                    index.name
+                ))
+            })?;
+            let distinct_key_count = i64::try_from(keys.distinct_key_count()).map_err(|_| {
+                DbError::sql(format!(
+                    "index {} exceeds ANALYZE distinct-count limits",
+                    index.name
+                ))
+            })?;
+            self.catalog.index_stats.insert(
+                index.name.clone(),
+                IndexStats {
+                    entry_count,
+                    distinct_key_count,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn try_execute_simple_table_projection_query(
         &self,
         query: &Query,
@@ -938,7 +1222,10 @@ impl EngineRuntime {
         let FromItem::Table { name, alias } = &select.from[0] else {
             return Ok(None);
         };
-        if self.catalog.view(name).is_some() {
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+        {
             return Ok(None);
         }
 
@@ -994,7 +1281,11 @@ impl EngineRuntime {
         let FromItem::Table { name, alias } = &select.from[0] else {
             return Ok(None);
         };
-        if self.catalog.view(name).is_some() {
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(name)
+        {
             return Ok(None);
         }
 
@@ -1115,22 +1406,13 @@ impl EngineRuntime {
         inherited_ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
         let mut ctes = inherited_ctes.clone();
+        let recursive_ctes = validate_recursive_ctes(query)?;
         for cte in &query.ctes {
-            let mut dataset = self.evaluate_query(&cte.query, params, &ctes)?;
-            if !cte.column_names.is_empty() {
-                if cte.column_names.len() != dataset.columns.len() {
-                    return Err(DbError::sql(format!(
-                        "CTE {} expected {} columns but produced {}",
-                        cte.name,
-                        cte.column_names.len(),
-                        dataset.columns.len()
-                    )));
-                }
-                for (binding, name) in dataset.columns.iter_mut().zip(&cte.column_names) {
-                    binding.name = name.clone();
-                    binding.table = Some(cte.name.clone());
-                }
-            }
+            let dataset = if recursive_ctes.contains(&cte.name) {
+                self.evaluate_recursive_cte(cte, params, &ctes)?
+            } else {
+                prepare_cte_dataset(cte, self.evaluate_query(&cte.query, params, &ctes)?)?
+            };
             ctes.insert(cte.name.clone(), dataset);
         }
 
@@ -1198,6 +1480,116 @@ impl EngineRuntime {
         Ok(dataset)
     }
 
+    fn evaluate_recursive_cte(
+        &self,
+        cte: &CommonTableExpr,
+        params: &[Value],
+        inherited_ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Dataset> {
+        if !cte.query.order_by.is_empty() || cte.query.limit.is_some() || cte.query.offset.is_some()
+        {
+            return Err(DbError::sql(format!(
+                "recursive CTE {} does not support ORDER BY, LIMIT, or OFFSET at the CTE level",
+                cte.name
+            )));
+        }
+
+        let QueryBody::SetOperation {
+            op: crate::sql::ast::SetOperation::Union,
+            all,
+            left,
+            right,
+        } = &cte.query.body
+        else {
+            return Err(DbError::sql(format!(
+                "recursive CTE {} must use UNION or UNION ALL between anchor and recursive terms",
+                cte.name
+            )));
+        };
+
+        let anchor_references = query_body_table_reference_count(left, &cte.name);
+        if anchor_references != 0 {
+            return Err(DbError::sql(format!(
+                "recursive CTE {} anchor term must not reference itself",
+                cte.name
+            )));
+        }
+
+        let recursive_references = query_body_table_reference_count(right, &cte.name);
+        if recursive_references != 1 {
+            return Err(DbError::sql(format!(
+                "recursive CTE {} recursive term must reference itself exactly once",
+                cte.name
+            )));
+        }
+        validate_recursive_term(right, &cte.name)?;
+
+        let mut anchor = self.evaluate_query_body(left, params, inherited_ctes)?;
+        if !all {
+            anchor.rows = deduplicate_rows(anchor.rows)?;
+        }
+        let mut result = prepare_cte_dataset(cte, anchor)?;
+        let mut working = result.clone();
+        let mut seen = if *all {
+            None
+        } else {
+            Some(
+                result
+                    .rows
+                    .iter()
+                    .map(|row| row_identity(row))
+                    .collect::<Result<BTreeSet<_>>>()?,
+            )
+        };
+
+        for _ in 0..RECURSIVE_CTE_MAX_ITERATIONS {
+            if working.rows.is_empty() {
+                return Ok(result);
+            }
+
+            let mut recursive_ctes = inherited_ctes.clone();
+            recursive_ctes.insert(cte.name.clone(), working.clone());
+
+            let recursive_rows = prepare_cte_dataset(
+                cte,
+                self.evaluate_query_body(right, params, &recursive_ctes)?,
+            )?;
+            if recursive_rows.columns.len() != result.columns.len() {
+                return Err(DbError::sql(format!(
+                    "recursive CTE {} produced {} columns in its recursive term but {} in its anchor term",
+                    cte.name,
+                    recursive_rows.columns.len(),
+                    result.columns.len()
+                )));
+            }
+
+            let next_rows = if let Some(seen) = &mut seen {
+                let mut rows = Vec::new();
+                for row in recursive_rows.rows {
+                    let identity = row_identity(&row)?;
+                    if seen.insert(identity) {
+                        rows.push(row);
+                    }
+                }
+                rows
+            } else {
+                recursive_rows.rows
+            };
+
+            if next_rows.is_empty() {
+                return Ok(result);
+            }
+
+            result.rows.extend(next_rows.clone());
+            working.rows = next_rows;
+        }
+
+        Err(DbError::sql(format!(
+            "recursive CTE {} exceeded the {} iteration limit",
+            cte.name, RECURSIVE_CTE_MAX_ITERATIONS
+        )))
+    }
+
     fn evaluate_query_with_outer(
         &self,
         query: &Query,
@@ -1208,6 +1600,11 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         if !query_references_outer_scope(query, outer_dataset) {
             return self.evaluate_query(query, params, inherited_ctes);
+        }
+        if query.recursive {
+            return Err(DbError::sql(
+                "WITH RECURSIVE is not supported in correlated subqueries yet",
+            ));
         }
 
         let mut ctes = inherited_ctes.clone();
@@ -1455,6 +1852,7 @@ impl EngineRuntime {
             }
         } else {
             let mut iter = select.from.iter();
+            let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
             let mut current =
                 self.evaluate_from_item(iter.next().expect("first FROM item"), params, ctes)?;
             for item in iter {
@@ -1463,7 +1861,7 @@ impl EngineRuntime {
                     current,
                     right,
                     JoinKind::Inner,
-                    &Expr::Literal(Value::Bool(true)),
+                    &cross_constraint,
                     self,
                     params,
                     ctes,
@@ -1504,6 +1902,7 @@ impl EngineRuntime {
             }
         } else {
             let mut iter = select.from.iter();
+            let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
             let mut current =
                 self.evaluate_from_item(iter.next().expect("first FROM item"), params, ctes)?;
             for item in iter {
@@ -1512,7 +1911,7 @@ impl EngineRuntime {
                     current,
                     right,
                     JoinKind::Inner,
-                    &Expr::Literal(Value::Bool(true)),
+                    &cross_constraint,
                     self,
                     params,
                     ctes,
@@ -1553,7 +1952,12 @@ impl EngineRuntime {
         let FromItem::Table { name, alias } = &select.from[0] else {
             return Ok(None);
         };
-        if ctes.contains_key(name) || self.catalog.view(name).is_some() {
+        if ctes.contains_key(name)
+            || self
+                .visible_view(name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(name)
+        {
             return Ok(None);
         }
         let table = self
@@ -1649,7 +2053,7 @@ impl EngineRuntime {
             left,
             right,
             kind: JoinKind::Inner,
-            on,
+            constraint: JoinConstraint::On(on),
         } = &select.from[0]
         else {
             return Ok(None);
@@ -1664,8 +2068,14 @@ impl EngineRuntime {
         };
         if ctes.contains_key(left_name)
             || ctes.contains_key(right_name)
-            || self.catalog.views.contains_key(left_name)
-            || self.catalog.views.contains_key(right_name)
+            || self
+                .visible_view(left_name, NameResolutionScope::Session)
+                .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
         {
             return Ok(None);
         }
@@ -1820,9 +2230,11 @@ impl EngineRuntime {
         let probe_columns = probe_table
             .columns
             .iter()
-            .map(|column| ColumnBinding {
-                table: Some(plan.probe_table.binding_name().to_string()),
-                name: column.name.clone(),
+            .map(|column| {
+                ColumnBinding::visible(
+                    Some(plan.probe_table.binding_name().to_string()),
+                    column.name.clone(),
+                )
             })
             .collect::<Vec<_>>();
         let mut columns = if plan.filtered_on_left {
@@ -1886,7 +2298,7 @@ impl EngineRuntime {
                     }
                     return Ok(dataset);
                 }
-                if let Some(view) = self.catalog.view(name) {
+                if let Some(view) = self.visible_view(name, NameResolutionScope::Session) {
                     let view_statement = parse_sql_statement(&view.sql_text)?;
                     let Statement::Query(query) = view_statement else {
                         return Err(DbError::corruption(format!(
@@ -1894,7 +2306,12 @@ impl EngineRuntime {
                             view.name
                         )));
                     };
-                    let mut dataset = self.evaluate_query(&query, params, ctes)?;
+                    let mut dataset = if view.temporary {
+                        self.evaluate_query(&query, params, ctes)?
+                    } else {
+                        let persistent_runtime = self.persistent_resolution_runtime();
+                        persistent_runtime.evaluate_query(&query, params, ctes)?
+                    };
                     if let Some(alias) = alias {
                         for column in &mut dataset.columns {
                             column.table = Some(alias.clone());
@@ -1914,9 +2331,11 @@ impl EngineRuntime {
                     columns: table
                         .columns
                         .iter()
-                        .map(|column| ColumnBinding {
-                            table: Some(alias.clone().unwrap_or_else(|| name.clone())),
-                            name: column.name.clone(),
+                        .map(|column| {
+                            ColumnBinding::visible(
+                                Some(alias.clone().unwrap_or_else(|| name.clone())),
+                                column.name.clone(),
+                            )
                         })
                         .collect(),
                     rows: data.rows.into_iter().map(|row| row.values).collect(),
@@ -1929,17 +2348,75 @@ impl EngineRuntime {
                 }
                 Ok(dataset)
             }
+            FromItem::Function { name, args, alias } => {
+                self.evaluate_table_function(name, args, alias, params, ctes)
+            }
             FromItem::Join {
                 left,
                 right,
                 kind,
-                on,
+                constraint,
             } => {
                 let left = self.evaluate_from_item(left, params, ctes)?;
                 let right = self.evaluate_from_item(right, params, ctes)?;
-                nested_loop_join(left, right, *kind, on, self, params, ctes)
+                nested_loop_join(left, right, *kind, constraint, self, params, ctes)
             }
         }
+    }
+
+    fn evaluate_table_function(
+        &self,
+        name: &str,
+        args: &[Expr],
+        alias: &Option<String>,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Dataset> {
+        let empty_dataset = Dataset::empty();
+        let empty_row = Vec::new();
+        let values = args
+            .iter()
+            .map(|expr| self.eval_expr(expr, &empty_dataset, &empty_row, params, ctes, None))
+            .collect::<Result<Vec<_>>>()?;
+        let table_name = alias.clone().unwrap_or_else(|| name.to_string());
+        match name {
+            "json_each" | "pg_catalog.json_each" => {
+                self.evaluate_json_table_function(table_name, values, false)
+            }
+            "json_tree" | "pg_catalog.json_tree" => {
+                self.evaluate_json_table_function(table_name, values, true)
+            }
+            other => Err(DbError::sql(format!("unsupported table function {other}"))),
+        }
+    }
+
+    fn evaluate_json_table_function(
+        &self,
+        table_name: String,
+        values: Vec<Value>,
+        recursive: bool,
+    ) -> Result<Dataset> {
+        if values.len() != 1 {
+            return Err(DbError::sql(if recursive {
+                "json_tree expects 1 argument"
+            } else {
+                "json_each expects 1 argument"
+            }));
+        }
+        let rows = if recursive {
+            expand_json_tree_rows(&values[0])?
+        } else {
+            expand_json_each_rows(&values[0])?
+        };
+        let mut columns = vec![
+            ColumnBinding::visible(Some(table_name.clone()), "key".to_string()),
+            ColumnBinding::visible(Some(table_name.clone()), "value".to_string()),
+            ColumnBinding::visible(Some(table_name.clone()), "type".to_string()),
+        ];
+        if recursive {
+            columns.push(ColumnBinding::visible(Some(table_name), "path".to_string()));
+        }
+        Ok(Dataset { columns, rows })
     }
 
     fn dataset_from_row_ids(
@@ -1958,10 +2435,7 @@ impl EngineRuntime {
             columns: table
                 .columns
                 .iter()
-                .map(|column| ColumnBinding {
-                    table: Some(table_name.clone()),
-                    name: column.name.clone(),
-                })
+                .map(|column| ColumnBinding::visible(Some(table_name.clone()), column.name.clone()))
                 .collect(),
             rows,
         })
@@ -2272,12 +2746,219 @@ fn collect_from_item_table_names(item: &FromItem, names: &mut BTreeSet<String>) 
         FromItem::Table { name, alias } => {
             names.insert(alias.clone().unwrap_or_else(|| name.clone()));
         }
+        FromItem::Function { name, alias, .. } => {
+            names.insert(alias.clone().unwrap_or_else(|| name.clone()));
+        }
         FromItem::Subquery { alias, .. } => {
             names.insert(alias.clone());
         }
         FromItem::Join { left, right, .. } => {
             collect_from_item_table_names(left, names);
             collect_from_item_table_names(right, names);
+        }
+    }
+}
+
+fn prepare_cte_dataset(cte: &CommonTableExpr, mut dataset: Dataset) -> Result<Dataset> {
+    if !cte.column_names.is_empty() {
+        if cte.column_names.len() != dataset.columns.len() {
+            return Err(DbError::sql(format!(
+                "CTE {} expected {} columns but produced {}",
+                cte.name,
+                cte.column_names.len(),
+                dataset.columns.len()
+            )));
+        }
+        for (binding, name) in dataset.columns.iter_mut().zip(&cte.column_names) {
+            binding.name = name.clone();
+        }
+    }
+    for binding in &mut dataset.columns {
+        binding.table = Some(cte.name.clone());
+        binding.hidden = false;
+    }
+    Ok(dataset)
+}
+
+fn recursive_term_has_unsupported_features(body: &QueryBody) -> bool {
+    match body {
+        QueryBody::Select(select) => {
+            select.distinct
+                || !select.distinct_on.is_empty()
+                || !select.group_by.is_empty()
+                || select.having.is_some()
+                || select
+                    .projection
+                    .iter()
+                    .any(select_item_contains_window_or_subquery)
+                || projection_has_aggregate_items(&select.projection)
+                || select
+                    .filter
+                    .as_ref()
+                    .is_some_and(expr_contains_recursive_unsupported_feature)
+                || select
+                    .group_by
+                    .iter()
+                    .any(expr_contains_recursive_unsupported_feature)
+                || select
+                    .having
+                    .as_ref()
+                    .is_some_and(expr_contains_recursive_unsupported_feature)
+                || select
+                    .distinct_on
+                    .iter()
+                    .any(expr_contains_recursive_unsupported_feature)
+                || select.from.iter().any(from_item_contains_subquery)
+        }
+        QueryBody::SetOperation { .. } => true,
+    }
+}
+
+fn select_item_contains_window_or_subquery(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Expr { expr, .. } => expr_contains_recursive_unsupported_feature(expr),
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    }
+}
+
+fn expr_contains_recursive_unsupported_feature(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate { .. }
+        | Expr::RowNumber { .. }
+        | Expr::WindowFunction { .. }
+        | Expr::InSubquery { .. }
+        | Expr::ScalarSubquery(_)
+        | Expr::Exists(_) => true,
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_contains_recursive_unsupported_feature(expr)
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_contains_recursive_unsupported_feature(left)
+                || expr_contains_recursive_unsupported_feature(right)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_recursive_unsupported_feature(expr)
+                || expr_contains_recursive_unsupported_feature(low)
+                || expr_contains_recursive_unsupported_feature(high)
+        }
+        Expr::InList { expr, items, .. } => {
+            expr_contains_recursive_unsupported_feature(expr)
+                || items
+                    .iter()
+                    .any(expr_contains_recursive_unsupported_feature)
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_recursive_unsupported_feature(expr)
+                || expr_contains_recursive_unsupported_feature(pattern)
+                || escape
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_recursive_unsupported_feature(expr))
+        }
+        Expr::Function { args, .. } => args.iter().any(expr_contains_recursive_unsupported_feature),
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_contains_recursive_unsupported_feature(expr))
+                || branches.iter().any(|(condition, value)| {
+                    expr_contains_recursive_unsupported_feature(condition)
+                        || expr_contains_recursive_unsupported_feature(value)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_recursive_unsupported_feature(expr))
+        }
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
+    }
+}
+
+fn from_item_contains_subquery(item: &FromItem) -> bool {
+    match item {
+        FromItem::Table { .. } => false,
+        FromItem::Function { .. } => false,
+        FromItem::Subquery { .. } => true,
+        FromItem::Join { left, right, .. } => {
+            from_item_contains_subquery(left) || from_item_contains_subquery(right)
+        }
+    }
+}
+
+fn validate_recursive_term(body: &QueryBody, cte_name: &str) -> Result<()> {
+    if recursive_term_has_unsupported_features(body) {
+        return Err(DbError::sql(format!(
+            "recursive CTE {} recursive term only supports non-distinct SELECT statements without aggregates, window functions, or subqueries",
+            cte_name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recursive_ctes(query: &Query) -> Result<BTreeSet<String>> {
+    let recursive_ctes = query
+        .ctes
+        .iter()
+        .filter(|cte| query_table_reference_count(&cte.query, &cte.name) > 0)
+        .map(|cte| cte.name.clone())
+        .collect::<BTreeSet<_>>();
+    if recursive_ctes.len() > 1 {
+        return Err(DbError::sql(
+            "WITH RECURSIVE supports only one self-referencing CTE per statement in DecentDB v0",
+        ));
+    }
+    Ok(recursive_ctes)
+}
+
+fn query_table_reference_count(query: &Query, table_name: &str) -> usize {
+    query
+        .ctes
+        .iter()
+        .map(|cte| query_table_reference_count(&cte.query, table_name))
+        .sum::<usize>()
+        + query_body_table_reference_count(&query.body, table_name)
+}
+
+fn query_body_table_reference_count(body: &QueryBody, table_name: &str) -> usize {
+    match body {
+        QueryBody::Select(select) => select
+            .from
+            .iter()
+            .map(|item| from_item_table_reference_count(item, table_name))
+            .sum(),
+        QueryBody::SetOperation { left, right, .. } => {
+            query_body_table_reference_count(left, table_name)
+                + query_body_table_reference_count(right, table_name)
+        }
+    }
+}
+
+fn from_item_table_reference_count(item: &FromItem, table_name: &str) -> usize {
+    match item {
+        FromItem::Table { name, alias } => usize::from(
+            identifiers_equal(name, table_name)
+                || alias
+                    .as_deref()
+                    .is_some_and(|alias| identifiers_equal(alias, table_name)),
+        ),
+        FromItem::Function { name, alias, .. } => usize::from(
+            identifiers_equal(name, table_name)
+                || alias
+                    .as_deref()
+                    .is_some_and(|alias| identifiers_equal(alias, table_name)),
+        ),
+        FromItem::Subquery { query, .. } => query_table_reference_count(query, table_name),
+        FromItem::Join { left, right, .. } => {
+            from_item_table_reference_count(left, table_name)
+                + from_item_table_reference_count(right, table_name)
         }
     }
 }
@@ -2506,10 +3187,7 @@ pub(super) fn table_row_dataset(table: &TableSchema, row: &[Value], table_name: 
         columns: table
             .columns
             .iter()
-            .map(|column| ColumnBinding {
-                table: Some(table_name.to_string()),
-                name: column.name.clone(),
-            })
+            .map(|column| ColumnBinding::visible(Some(table_name.to_string()), column.name.clone()))
             .collect(),
         rows: vec![row.to_vec()],
     }
@@ -2633,6 +3311,7 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         output.push(u8::from(trigger.on_view));
         encode_string(&mut output, &trigger.action_sql)?;
     }
+    encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     Ok(output)
 }
 
@@ -2649,6 +3328,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
         let column_count = cursor.read_u32()?;
         let mut table = TableSchema {
             name: table_name.clone(),
+            temporary: false,
             columns: Vec::with_capacity(column_count as usize),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2682,6 +3362,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 column_type,
                 nullable,
                 default_sql,
+                generated_sql: None,
                 primary_key,
                 unique,
                 auto_increment,
@@ -2750,6 +3431,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     for _ in 0..view_count {
         let view = crate::catalog::ViewSchema {
             name: cursor.read_string()?,
+            temporary: false,
             sql_text: cursor.read_string()?,
             column_names: cursor.read_strings()?,
             dependencies: cursor.read_strings()?,
@@ -2771,6 +3453,9 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             .catalog
             .triggers
             .insert(trigger.name.clone(), trigger);
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
     }
     Ok(runtime)
 }
@@ -2866,6 +3551,32 @@ fn encode_manifest_payload_with_offsets(
         output.push(u8::from(trigger.on_view));
         encode_string(&mut output, &trigger.action_sql)?;
     }
+
+    let table_stats = runtime
+        .catalog
+        .table_stats
+        .iter()
+        .filter(|(name, _)| runtime.catalog.tables.contains_key(*name))
+        .collect::<Vec<_>>();
+    encode_u32(&mut output, table_stats.len() as u32);
+    for (name, stats) in table_stats {
+        encode_string(&mut output, name)?;
+        encode_i64(&mut output, stats.row_count);
+    }
+
+    let index_stats = runtime
+        .catalog
+        .index_stats
+        .iter()
+        .filter(|(name, _)| runtime.catalog.indexes.contains_key(*name))
+        .collect::<Vec<_>>();
+    encode_u32(&mut output, index_stats.len() as u32);
+    for (name, stats) in index_stats {
+        encode_string(&mut output, name)?;
+        encode_i64(&mut output, stats.entry_count);
+        encode_i64(&mut output, stats.distinct_key_count);
+    }
+    encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     Ok(ManifestEncoding {
         bytes: output,
         table_next_row_id_offsets,
@@ -2923,6 +3634,7 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
         let column_count = cursor.read_u32()?;
         let mut table = TableSchema {
             name: table_name.clone(),
+            temporary: false,
             columns: Vec::with_capacity(column_count as usize),
             checks: Vec::new(),
             foreign_keys: Vec::new(),
@@ -2956,6 +3668,7 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
                 column_type,
                 nullable,
                 default_sql,
+                generated_sql: None,
                 primary_key,
                 unique,
                 auto_increment,
@@ -3038,6 +3751,7 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
     for _ in 0..view_count {
         let view = crate::catalog::ViewSchema {
             name: cursor.read_string()?,
+            temporary: false,
             sql_text: cursor.read_string()?,
             column_names: cursor.read_strings()?,
             dependencies: cursor.read_strings()?,
@@ -3059,6 +3773,30 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
             .catalog
             .triggers
             .insert(trigger.name.clone(), trigger);
+    }
+    if cursor.offset < cursor.bytes.len() {
+        let table_stats_count = cursor.read_u32()?;
+        for _ in 0..table_stats_count {
+            let name = cursor.read_string()?;
+            let stats = crate::catalog::TableStats {
+                row_count: cursor.read_i64()?,
+            };
+            runtime.catalog.table_stats.insert(name, stats);
+        }
+    }
+    if cursor.offset < cursor.bytes.len() {
+        let index_stats_count = cursor.read_u32()?;
+        for _ in 0..index_stats_count {
+            let name = cursor.read_string()?;
+            let stats = crate::catalog::IndexStats {
+                entry_count: cursor.read_i64()?,
+                distinct_key_count: cursor.read_i64()?,
+            };
+            runtime.catalog.index_stats.insert(name, stats);
+        }
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
     }
     Ok(runtime)
 }
@@ -3218,6 +3956,66 @@ fn encode_foreign_key(
     encode_strings(output, &foreign_key.referenced_columns)?;
     output.push(foreign_key.on_delete as u8);
     output.push(foreign_key.on_update as u8);
+    Ok(())
+}
+
+fn encode_generated_columns_section(
+    output: &mut Vec<u8>,
+    tables: &BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let generated_columns = tables
+        .values()
+        .flat_map(|table| {
+            table.columns.iter().filter_map(move |column| {
+                column.generated_sql.as_ref().map(|generated_sql| {
+                    (
+                        table.name.as_str(),
+                        column.name.as_str(),
+                        generated_sql.as_str(),
+                    )
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    encode_u32(
+        output,
+        u32::try_from(generated_columns.len())
+            .map_err(|_| DbError::constraint("generated column count exceeds u32"))?,
+    );
+    for (table_name, column_name, generated_sql) in generated_columns {
+        encode_string(output, table_name)?;
+        encode_string(output, column_name)?;
+        encode_string(output, generated_sql)?;
+    }
+    Ok(())
+}
+
+fn decode_generated_columns_section(
+    cursor: &mut Cursor<'_>,
+    tables: &mut BTreeMap<String, TableSchema>,
+) -> Result<()> {
+    let generated_column_count = cursor.read_u32()?;
+    for _ in 0..generated_column_count {
+        let table_name = cursor.read_string()?;
+        let column_name = cursor.read_string()?;
+        let generated_sql = cursor.read_string()?;
+        let table = tables.get_mut(&table_name).ok_or_else(|| {
+            DbError::corruption(format!(
+                "generated column metadata referenced unknown table {table_name}"
+            ))
+        })?;
+        let column = table
+            .columns
+            .iter_mut()
+            .find(|column| identifiers_equal(&column.name, &column_name))
+            .ok_or_else(|| {
+                DbError::corruption(format!(
+                    "generated column metadata referenced unknown column {}.{}",
+                    table_name, column_name
+                ))
+            })?;
+        column.generated_sql = Some(generated_sql);
+    }
     Ok(())
 }
 
@@ -3539,17 +4337,255 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+#[derive(Clone, Debug)]
+struct JoinUsingColumn {
+    name: String,
+    left_index: usize,
+    right_index: usize,
+}
+
+struct JoinEvalContext<'a> {
+    dataset: &'a Dataset,
+    runtime: &'a EngineRuntime,
+    params: &'a [Value],
+    ctes: &'a BTreeMap<String, Dataset>,
+}
+
+fn visible_column_names(dataset: &Dataset) -> Vec<String> {
+    let mut names = Vec::<String>::new();
+    for binding in dataset.columns.iter().filter(|binding| !binding.hidden) {
+        if !names
+            .iter()
+            .any(|name| identifiers_equal(name, &binding.name))
+        {
+            names.push(binding.name.clone());
+        }
+    }
+    names
+}
+
+fn visible_column_exists(dataset: &Dataset, column: &str) -> bool {
+    dataset
+        .columns
+        .iter()
+        .any(|binding| !binding.hidden && identifiers_equal(&binding.name, column))
+}
+
+fn resolve_visible_join_column(
+    dataset: &Dataset,
+    column: &str,
+    join_form: &str,
+    side: &str,
+) -> Result<usize> {
+    let matches = dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, binding)| !binding.hidden && identifiers_equal(&binding.name, column))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [single] => Ok(single.0),
+        [] => Err(DbError::sql(format!(
+            "{join_form} column {column} does not exist in {side} input"
+        ))),
+        _ => Err(DbError::sql(format!(
+            "{join_form} column {column} is ambiguous in {side} input"
+        ))),
+    }
+}
+
+fn resolve_join_using_columns(
+    left: &Dataset,
+    right: &Dataset,
+    constraint: &JoinConstraint,
+) -> Result<Vec<JoinUsingColumn>> {
+    match constraint {
+        JoinConstraint::On(_) => Ok(Vec::new()),
+        JoinConstraint::Using(columns) => {
+            let mut pairs = Vec::with_capacity(columns.len());
+            let mut seen = Vec::<String>::new();
+            for column in columns {
+                if seen
+                    .iter()
+                    .any(|existing| identifiers_equal(existing, column))
+                {
+                    return Err(DbError::sql(format!(
+                        "JOIN USING column {column} specified more than once"
+                    )));
+                }
+                let left_index = resolve_visible_join_column(left, column, "JOIN USING", "left")?;
+                let right_index =
+                    resolve_visible_join_column(right, column, "JOIN USING", "right")?;
+                pairs.push(JoinUsingColumn {
+                    name: left.columns[left_index].name.clone(),
+                    left_index,
+                    right_index,
+                });
+                seen.push(column.clone());
+            }
+            Ok(pairs)
+        }
+        JoinConstraint::Natural => {
+            let mut pairs = Vec::new();
+            for column in visible_column_names(left) {
+                if !visible_column_exists(right, &column) {
+                    continue;
+                }
+                let left_index =
+                    resolve_visible_join_column(left, &column, "NATURAL JOIN", "left")?;
+                let right_index =
+                    resolve_visible_join_column(right, &column, "NATURAL JOIN", "right")?;
+                pairs.push(JoinUsingColumn {
+                    name: left.columns[left_index].name.clone(),
+                    left_index,
+                    right_index,
+                });
+            }
+            Ok(pairs)
+        }
+    }
+}
+
+fn join_output_columns(
+    left: &Dataset,
+    right: &Dataset,
+    using_columns: &[JoinUsingColumn],
+) -> Vec<ColumnBinding> {
+    if using_columns.is_empty() {
+        let mut columns = left.columns.clone();
+        columns.extend(right.columns.clone());
+        return columns;
+    }
+
+    let left_hidden = using_columns
+        .iter()
+        .map(|column| column.left_index)
+        .collect::<BTreeSet<_>>();
+    let right_hidden = using_columns
+        .iter()
+        .map(|column| column.right_index)
+        .collect::<BTreeSet<_>>();
+
+    let mut columns =
+        Vec::with_capacity(using_columns.len() + left.columns.len() + right.columns.len());
+    for column in using_columns {
+        columns.push(ColumnBinding::visible(None, column.name.clone()));
+    }
+    for (index, binding) in left.columns.iter().enumerate() {
+        let mut binding = binding.clone();
+        if left_hidden.contains(&index) {
+            binding.hidden = true;
+        }
+        columns.push(binding);
+    }
+    for (index, binding) in right.columns.iter().enumerate() {
+        let mut binding = binding.clone();
+        if right_hidden.contains(&index) {
+            binding.hidden = true;
+        }
+        columns.push(binding);
+    }
+    columns
+}
+
+fn merged_join_value(left: &Value, right: &Value) -> Value {
+    if matches!(left, Value::Null) {
+        right.clone()
+    } else {
+        left.clone()
+    }
+}
+
+fn join_output_row(
+    left_row: &[Value],
+    right_row: &[Value],
+    using_columns: &[JoinUsingColumn],
+) -> Result<Vec<Value>> {
+    if using_columns.is_empty() {
+        let mut row = left_row.to_vec();
+        row.extend_from_slice(right_row);
+        return Ok(row);
+    }
+
+    let mut row = Vec::with_capacity(using_columns.len() + left_row.len() + right_row.len());
+    for column in using_columns {
+        let left_value = left_row
+            .get(column.left_index)
+            .ok_or_else(|| DbError::internal("left join row is shorter than its bindings"))?;
+        let right_value = right_row
+            .get(column.right_index)
+            .ok_or_else(|| DbError::internal("right join row is shorter than its bindings"))?;
+        row.push(merged_join_value(left_value, right_value));
+    }
+    row.extend_from_slice(left_row);
+    row.extend_from_slice(right_row);
+    Ok(row)
+}
+
+fn join_rows_match(
+    constraint: &JoinConstraint,
+    using_columns: &[JoinUsingColumn],
+    eval_row: &[Value],
+    left_row: &[Value],
+    right_row: &[Value],
+    context: &JoinEvalContext<'_>,
+) -> Result<bool> {
+    match constraint {
+        JoinConstraint::On(on) => Ok(matches!(
+            context.runtime.eval_expr(
+                on,
+                context.dataset,
+                eval_row,
+                context.params,
+                context.ctes,
+                None
+            )?,
+            Value::Bool(true)
+        )),
+        JoinConstraint::Using(_) | JoinConstraint::Natural => {
+            for column in using_columns {
+                let left_value = left_row.get(column.left_index).ok_or_else(|| {
+                    DbError::internal("left join row is shorter than its bindings")
+                })?;
+                let right_value = right_row.get(column.right_index).ok_or_else(|| {
+                    DbError::internal("right join row is shorter than its bindings")
+                })?;
+                if matches!(left_value, Value::Null) || matches!(right_value, Value::Null) {
+                    return Ok(false);
+                }
+                if compare_values(left_value, right_value)? != std::cmp::Ordering::Equal {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+}
+
 fn nested_loop_join(
     left: Dataset,
     right: Dataset,
     kind: JoinKind,
-    on: &Expr,
+    constraint: &JoinConstraint,
     runtime: &EngineRuntime,
     params: &[Value],
     ctes: &BTreeMap<String, Dataset>,
 ) -> Result<Dataset> {
-    let mut columns = left.columns.clone();
-    columns.extend(right.columns.clone());
+    let using_columns = resolve_join_using_columns(&left, &right, constraint)?;
+
+    let mut eval_columns = left.columns.clone();
+    eval_columns.extend(right.columns.clone());
+    let eval_dataset = Dataset {
+        columns: eval_columns,
+        rows: Vec::new(),
+    };
+    let eval_context = JoinEvalContext {
+        dataset: &eval_dataset,
+        runtime,
+        params,
+        ctes,
+    };
+    let columns = join_output_columns(&left, &right, &using_columns);
     let mut rows = Vec::new();
     let mut matched_right = vec![false; right.rows.len()];
     let left_nulls = vec![Value::Null; left.columns.len()];
@@ -3557,33 +4593,29 @@ fn nested_loop_join(
     for left_row in &left.rows {
         let mut matched = false;
         for (right_index, right_row) in right.rows.iter().enumerate() {
-            let mut row = left_row.clone();
-            row.extend(right_row.clone());
-            let dataset = Dataset {
-                columns: columns.clone(),
-                rows: Vec::new(),
-            };
-            if matches!(
-                runtime.eval_expr(on, &dataset, &row, params, ctes, None)?,
-                Value::Bool(true)
-            ) {
+            let mut eval_row = left_row.clone();
+            eval_row.extend(right_row.clone());
+            if join_rows_match(
+                constraint,
+                &using_columns,
+                &eval_row,
+                left_row,
+                right_row,
+                &eval_context,
+            )? {
                 matched = true;
                 matched_right[right_index] = true;
-                rows.push(row);
+                rows.push(join_output_row(left_row, right_row, &using_columns)?);
             }
         }
         if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
-            let mut row = left_row.clone();
-            row.extend(right_nulls.clone());
-            rows.push(row);
+            rows.push(join_output_row(left_row, &right_nulls, &using_columns)?);
         }
     }
     if matches!(kind, JoinKind::Right | JoinKind::Full) {
         for (matched, right_row) in matched_right.iter().zip(&right.rows) {
             if !matched {
-                let mut row = left_nulls.clone();
-                row.extend(right_row.clone());
-                rows.push(row);
+                rows.push(join_output_row(&left_nulls, right_row, &using_columns)?);
             }
         }
     }
@@ -3709,19 +4741,25 @@ impl EngineRuntime {
         let mut columns = Vec::new();
         for (index, item) in items.iter().enumerate() {
             match item {
-                SelectItem::Expr { expr, alias } => columns.push(ColumnBinding {
-                    table: None,
-                    name: alias
+                SelectItem::Expr { expr, alias } => columns.push(ColumnBinding::visible(
+                    None,
+                    alias
                         .clone()
                         .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                }),
-                SelectItem::Wildcard => columns.extend(dataset.columns.clone()),
+                )),
+                SelectItem::Wildcard => columns.extend(
+                    dataset
+                        .columns
+                        .iter()
+                        .filter(|binding| !binding.hidden)
+                        .map(ColumnBinding::as_output),
+                ),
                 SelectItem::QualifiedWildcard(table) => columns.extend(
                     dataset
                         .columns
                         .iter()
                         .filter(|column| column.table.as_deref() == Some(table.as_str()))
-                        .cloned(),
+                        .map(ColumnBinding::as_output),
                 ),
             }
         }
@@ -3744,7 +4782,13 @@ impl EngineRuntime {
                             output.push(self.eval_expr(expr, dataset, row, params, ctes, excluded)?)
                         }
                     },
-                    SelectItem::Wildcard => output.extend(row.clone()),
+                    SelectItem::Wildcard => {
+                        for (binding, value) in dataset.columns.iter().zip(row) {
+                            if !binding.hidden {
+                                output.push(value.clone());
+                            }
+                        }
+                    }
                     SelectItem::QualifiedWildcard(table) => {
                         for (binding, value) in dataset.columns.iter().zip(row) {
                             if binding.table.as_deref() == Some(table.as_str()) {
@@ -4108,20 +5152,16 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .map(|(index, item)| match item {
-                SelectItem::Expr { expr, alias } => ColumnBinding {
-                    table: None,
-                    name: alias
+                SelectItem::Expr { expr, alias } => ColumnBinding::visible(
+                    None,
+                    alias
                         .clone()
                         .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
-                },
-                SelectItem::Wildcard => ColumnBinding {
-                    table: None,
-                    name: format!("col{}", index + 1),
-                },
-                SelectItem::QualifiedWildcard(_) => ColumnBinding {
-                    table: None,
-                    name: format!("col{}", index + 1),
-                },
+                ),
+                SelectItem::Wildcard => ColumnBinding::visible(None, format!("col{}", index + 1)),
+                SelectItem::QualifiedWildcard(_) => {
+                    ColumnBinding::visible(None, format!("col{}", index + 1))
+                }
             })
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
@@ -4692,7 +5732,9 @@ impl EngineRuntime {
             .iter()
             .enumerate()
             .filter(|(_, binding)| {
+                let visible_match = table.is_some() || !binding.hidden;
                 identifiers_equal(&binding.name, column)
+                    && visible_match
                     && table.is_none_or(|table| {
                         binding
                             .table
@@ -4868,6 +5910,10 @@ fn eval_function(
         "lower" => unary_text_fn(values, |value| value.to_ascii_lowercase()),
         "upper" => unary_text_fn(values, |value| value.to_ascii_uppercase()),
         "trim" | "pg_catalog.btrim" => unary_text_fn(values, |value| value.trim().to_string()),
+        "ltrim" | "pg_catalog.ltrim" => {
+            unary_text_fn(values, |value| value.trim_start().to_string())
+        }
+        "rtrim" | "pg_catalog.rtrim" => unary_text_fn(values, |value| value.trim_end().to_string()),
         "length" => {
             if values.len() != 1 {
                 return Err(DbError::sql("LENGTH expects one argument"));
@@ -4878,7 +5924,7 @@ fn eval_function(
                 other => Err(DbError::sql(format!("LENGTH expects text, got {other:?}"))),
             }
         }
-        "substr" => {
+        "substr" | "substring" => {
             if values.len() < 2 || values.len() > 3 {
                 return Err(DbError::sql("SUBSTR expects 2 or 3 arguments"));
             }
@@ -4961,9 +6007,321 @@ fn eval_function(
                 None => Ok(Value::Int64(0)),
             }
         }
+        "left" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("LEFT expects 2 arguments"));
+            }
+            let Some(value) = expect_text_arg("LEFT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(length) = expect_int_arg("LEFT", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(take_left_chars(
+                value,
+                non_negative_usize(length, "LEFT", "second")?,
+            )))
+        }
+        "right" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("RIGHT expects 2 arguments"));
+            }
+            let Some(value) = expect_text_arg("RIGHT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(length) = expect_int_arg("RIGHT", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(take_right_chars(
+                value,
+                non_negative_usize(length, "RIGHT", "second")?,
+            )))
+        }
+        "lpad" => {
+            if values.len() != 3 {
+                return Err(DbError::sql("LPAD expects 3 arguments"));
+            }
+            let Some(value) = expect_text_arg("LPAD", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(target_len) = expect_int_arg("LPAD", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let Some(pad) = expect_text_arg("LPAD", "third", &values[2])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(pad_left(value, target_len, pad)))
+        }
+        "rpad" => {
+            if values.len() != 3 {
+                return Err(DbError::sql("RPAD expects 3 arguments"));
+            }
+            let Some(value) = expect_text_arg("RPAD", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(target_len) = expect_int_arg("RPAD", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let Some(pad) = expect_text_arg("RPAD", "third", &values[2])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(pad_right(value, target_len, pad)))
+        }
+        "repeat" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("REPEAT expects 2 arguments"));
+            }
+            let Some(value) = expect_text_arg("REPEAT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(count) = expect_int_arg("REPEAT", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let count = non_negative_usize(count, "REPEAT", "second")?;
+            Ok(Value::Text(value.repeat(count)))
+        }
+        "reverse" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("REVERSE expects 1 argument"));
+            }
+            let Some(value) = expect_text_arg("REVERSE", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(value.chars().rev().collect()))
+        }
+        "chr" | "char" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("CHR expects 1 argument"));
+            }
+            let Some(codepoint) = expect_int_arg("CHR", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let codepoint = u32::try_from(codepoint)
+                .map_err(|_| DbError::sql("CHR code point must be between 0 and 1114111"))?;
+            let ch = char::from_u32(codepoint)
+                .ok_or_else(|| DbError::sql("CHR code point must be between 0 and 1114111"))?;
+            Ok(Value::Text(ch.to_string()))
+        }
+        "hex" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("HEX expects 1 argument"));
+            }
+            match &values[0] {
+                Value::Null => Ok(Value::Null),
+                Value::Text(value) => Ok(Value::Text(hex_encode_upper(value.as_bytes()))),
+                Value::Blob(value) => Ok(Value::Text(hex_encode_upper(value))),
+                Value::Uuid(value) => Ok(Value::Text(hex_encode_upper(value))),
+                other => Err(DbError::sql(format!(
+                    "HEX expects text, BLOB, or UUID, got {other:?}"
+                ))),
+            }
+        }
+        "abs" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("ABS expects 1 argument"));
+            }
+            match expect_numeric_arg("ABS", "first", &values[0])? {
+                None => Ok(Value::Null),
+                Some(NumericValue::Int64(value)) => value
+                    .checked_abs()
+                    .map(Value::Int64)
+                    .ok_or_else(|| DbError::sql("ABS overflow for INT64 input")),
+                Some(NumericValue::Float64(value)) => Ok(Value::Float64(value.abs())),
+                Some(NumericValue::Decimal { scaled, scale }) => scaled
+                    .checked_abs()
+                    .map(|scaled| Value::Decimal { scaled, scale })
+                    .ok_or_else(|| DbError::sql("ABS overflow for DECIMAL input")),
+            }
+        }
+        "ceil" | "ceiling" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("CEIL expects 1 argument"));
+            }
+            match expect_numeric_arg("CEIL", "first", &values[0])? {
+                None => Ok(Value::Null),
+                Some(NumericValue::Int64(value)) => Ok(Value::Int64(value)),
+                Some(value) => Ok(Value::Float64(value.as_f64().ceil())),
+            }
+        }
+        "floor" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("FLOOR expects 1 argument"));
+            }
+            match expect_numeric_arg("FLOOR", "first", &values[0])? {
+                None => Ok(Value::Null),
+                Some(NumericValue::Int64(value)) => Ok(Value::Int64(value)),
+                Some(value) => Ok(Value::Float64(value.as_f64().floor())),
+            }
+        }
+        "round" => {
+            if values.is_empty() || values.len() > 2 {
+                return Err(DbError::sql("ROUND expects 1 or 2 arguments"));
+            }
+            let Some(number) = expect_numeric_arg("ROUND", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let scale = if let Some(value) = values.get(1) {
+                let Some(scale) = expect_int_arg("ROUND", "second", value)? else {
+                    return Ok(Value::Null);
+                };
+                i32::try_from(scale).map_err(|_| DbError::sql("ROUND precision is out of range"))?
+            } else {
+                0
+            };
+            let factor = 10_f64.powi(scale);
+            Ok(Value::Float64((number.as_f64() * factor).round() / factor))
+        }
+        "sqrt" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("SQRT expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("SQRT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let number = number.as_f64();
+            if number < 0.0 {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(number.sqrt()))
+        }
+        "power" | "pow" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("POWER expects 2 arguments"));
+            }
+            let Some(base) = expect_numeric_arg("POWER", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(exponent) = expect_numeric_arg("POWER", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(base.as_f64().powf(exponent.as_f64())))
+        }
+        "mod" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("MOD expects 2 arguments"));
+            }
+            let Some(left) = expect_numeric_arg("MOD", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(right) = expect_numeric_arg("MOD", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            match (left, right) {
+                (_, NumericValue::Int64(0)) => Ok(Value::Null),
+                (_, NumericValue::Float64(0.0)) => Ok(Value::Null),
+                (_, NumericValue::Decimal { scaled: 0, .. }) => Ok(Value::Null),
+                (NumericValue::Int64(left), NumericValue::Int64(right)) => {
+                    Ok(Value::Int64(left % right))
+                }
+                (left, right) => Ok(Value::Float64(left.as_f64() % right.as_f64())),
+            }
+        }
+        "sign" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("SIGN expects 1 argument"));
+            }
+            match expect_numeric_arg("SIGN", "first", &values[0])? {
+                None => Ok(Value::Null),
+                Some(NumericValue::Int64(value)) => Ok(Value::Int64(value.signum())),
+                Some(NumericValue::Float64(value)) => Ok(Value::Int64(if value > 0.0 {
+                    1
+                } else if value < 0.0 {
+                    -1
+                } else {
+                    0
+                })),
+                Some(NumericValue::Decimal { scaled, .. }) => Ok(Value::Int64(scaled.signum())),
+            }
+        }
+        "ln" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("LN expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("LN", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let number = number.as_f64();
+            if number <= 0.0 {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(number.ln()))
+        }
+        "log" => {
+            if values.is_empty() || values.len() > 2 {
+                return Err(DbError::sql("LOG expects 1 or 2 arguments"));
+            }
+            if values.len() == 1 {
+                let Some(number) = expect_numeric_arg("LOG", "first", &values[0])? else {
+                    return Ok(Value::Null);
+                };
+                let number = number.as_f64();
+                if number <= 0.0 {
+                    return Ok(Value::Null);
+                }
+                return Ok(Value::Float64(number.log10()));
+            }
+            let Some(base) = expect_numeric_arg("LOG", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(number) = expect_numeric_arg("LOG", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let base = base.as_f64();
+            let number = number.as_f64();
+            if base <= 0.0 || base == 1.0 || number <= 0.0 {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Float64(number.log(base)))
+        }
+        "exp" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("EXP expects 1 argument"));
+            }
+            let Some(number) = expect_numeric_arg("EXP", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Float64(number.as_f64().exp()))
+        }
+        "random" => {
+            if !values.is_empty() {
+                return Err(DbError::sql("RANDOM expects 0 arguments"));
+            }
+            Ok(Value::Float64(next_random_f64()))
+        }
+        "now" | "current_timestamp" | "localtimestamp" => eval_current_timestamp(values),
+        "current_date" => eval_current_date(values),
+        "current_time" | "localtime" => eval_current_time(values),
+        "date" => eval_date(values),
+        "datetime" => eval_datetime(values),
+        "strftime" => eval_strftime(values),
+        "extract" | "pg_catalog.extract" => eval_extract(values),
+        "gen_random_uuid" => eval_gen_random_uuid(values),
+        "uuid_parse" => eval_uuid_parse(values),
+        "uuid_to_string" => eval_uuid_to_string(values),
+        "json_array" | "pg_catalog.json_array" => eval_json_array(values),
         "json_array_length" => eval_json_array_length(values),
         "json_extract" => eval_json_extract(values),
+        "json_object" | "pg_catalog.json_object" => eval_json_object(values),
+        "json_type" | "pg_catalog.json_type" => eval_json_type(values),
+        "json_valid" | "pg_catalog.json_valid" => eval_json_valid(values),
         other => Err(DbError::sql(format!("unsupported scalar function {other}"))),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NumericValue {
+    Int64(i64),
+    Float64(f64),
+    Decimal { scaled: i64, scale: u8 },
+}
+
+impl NumericValue {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Int64(value) => value as f64,
+            Self::Float64(value) => value,
+            Self::Decimal { scaled, scale } => (scaled as f64) / 10_f64.powi(i32::from(scale)),
+        }
     }
 }
 
@@ -4971,13 +6329,752 @@ fn unary_text_fn(values: Vec<Value>, f: impl FnOnce(String) -> String) -> Result
     if values.len() != 1 {
         return Err(DbError::sql("function expects one argument"));
     }
-    match values.into_iter().next().expect("one arg") {
-        Value::Text(value) => Ok(Value::Text(f(value))),
-        Value::Null => Ok(Value::Null),
-        other => Err(DbError::sql(format!(
+    match values.into_iter().next() {
+        Some(Value::Text(value)) => Ok(Value::Text(f(value))),
+        Some(Value::Null) => Ok(Value::Null),
+        Some(other) => Err(DbError::sql(format!(
             "function expects text, got {other:?}"
         ))),
+        None => Err(DbError::sql("function expects one argument")),
     }
+}
+
+fn expect_text_arg<'a>(
+    function_name: &str,
+    ordinal: &str,
+    value: &'a Value,
+) -> Result<Option<&'a str>> {
+    match value {
+        Value::Text(value) => Ok(Some(value)),
+        Value::Null => Ok(None),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects text for {ordinal} argument, got {other:?}"
+        ))),
+    }
+}
+
+fn expect_int_arg(function_name: &str, ordinal: &str, value: &Value) -> Result<Option<i64>> {
+    match value {
+        Value::Int64(value) => Ok(Some(*value)),
+        Value::Null => Ok(None),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects int for {ordinal} argument, got {other:?}"
+        ))),
+    }
+}
+
+fn expect_numeric_arg(
+    function_name: &str,
+    ordinal: &str,
+    value: &Value,
+) -> Result<Option<NumericValue>> {
+    match value {
+        Value::Int64(value) => Ok(Some(NumericValue::Int64(*value))),
+        Value::Float64(value) => Ok(Some(NumericValue::Float64(*value))),
+        Value::Decimal { scaled, scale } => Ok(Some(NumericValue::Decimal {
+            scaled: *scaled,
+            scale: *scale,
+        })),
+        Value::Null => Ok(None),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects numeric input for {ordinal} argument, got {other:?}"
+        ))),
+    }
+}
+
+fn non_negative_usize(value: i64, function_name: &str, ordinal: &str) -> Result<usize> {
+    if value < 0 {
+        return Ok(0);
+    }
+    usize::try_from(value).map_err(|_| {
+        DbError::sql(format!(
+            "{function_name} {ordinal} argument is out of range"
+        ))
+    })
+}
+
+fn take_left_chars(value: &str, len: usize) -> String {
+    value.chars().take(len).collect()
+}
+
+fn take_right_chars(value: &str, len: usize) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    let start = chars.len().saturating_sub(len);
+    chars[start..].iter().copied().collect()
+}
+
+fn pad_left(value: &str, target_len: i64, pad: &str) -> String {
+    let target_len = target_len.max(0) as usize;
+    let current_len = value.chars().count();
+    if target_len <= current_len {
+        return take_left_chars(value, target_len);
+    }
+    if pad.is_empty() {
+        return value.to_string();
+    }
+    let padding = repeat_to_char_len(pad, target_len - current_len);
+    format!("{padding}{value}")
+}
+
+fn pad_right(value: &str, target_len: i64, pad: &str) -> String {
+    let target_len = target_len.max(0) as usize;
+    let current_len = value.chars().count();
+    if target_len <= current_len {
+        return take_left_chars(value, target_len);
+    }
+    if pad.is_empty() {
+        return value.to_string();
+    }
+    let padding = repeat_to_char_len(pad, target_len - current_len);
+    format!("{value}{padding}")
+}
+
+fn repeat_to_char_len(pattern: &str, len: usize) -> String {
+    if len == 0 || pattern.is_empty() {
+        return String::new();
+    }
+    let mut output = String::new();
+    while output.chars().count() < len {
+        output.push_str(pattern);
+    }
+    output.chars().take(len).collect()
+}
+
+fn hex_encode_upper(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+
+        let _ = write!(output, "{byte:02X}");
+    }
+    output
+}
+
+fn next_random_u64() -> u64 {
+    let mut observed = RANDOM_STATE.load(Ordering::Relaxed);
+    loop {
+        let current = if observed == 0 {
+            random_seed()
+        } else {
+            observed
+        };
+        let next = splitmix64(current);
+        match RANDOM_STATE.compare_exchange_weak(
+            observed,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+fn next_random_f64() -> f64 {
+    let value = next_random_u64();
+    ((value >> 11) as f64) / ((1_u64 << 53) as f64)
+}
+
+fn random_seed() -> u64 {
+    let nanos = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as u64,
+        Err(_) => 0xDDB5_EED5_A17C_E55D,
+    };
+    nanos ^ 0x9E37_79B9_7F4A_7C15
+}
+
+fn splitmix64(state: u64) -> u64 {
+    let mut value = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn eval_current_timestamp(values: Vec<Value>) -> Result<Value> {
+    if !values.is_empty() {
+        return Err(DbError::sql("CURRENT_TIMESTAMP expects 0 arguments"));
+    }
+    Ok(Value::TimestampMicros(current_utc_timestamp_micros()?))
+}
+
+fn eval_current_date(values: Vec<Value>) -> Result<Value> {
+    if !values.is_empty() {
+        return Err(DbError::sql("CURRENT_DATE expects 0 arguments"));
+    }
+    Ok(Value::Text(format_date(current_utc_datetime())))
+}
+
+fn eval_current_time(values: Vec<Value>) -> Result<Value> {
+    if !values.is_empty() {
+        return Err(DbError::sql("CURRENT_TIME expects 0 arguments"));
+    }
+    Ok(Value::Text(format_time(current_utc_datetime())))
+}
+
+fn eval_date(values: Vec<Value>) -> Result<Value> {
+    let Some(datetime) = resolve_datetime_arguments("DATE", &values, true)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format_date(datetime)))
+}
+
+fn eval_datetime(values: Vec<Value>) -> Result<Value> {
+    let Some(datetime) = resolve_datetime_arguments("DATETIME", &values, true)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format_datetime(datetime)))
+}
+
+fn eval_strftime(values: Vec<Value>) -> Result<Value> {
+    if values.is_empty() {
+        return Err(DbError::sql("STRFTIME expects at least 1 argument"));
+    }
+    let Some(format) = expect_text_arg("STRFTIME", "first", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let Some(datetime) = resolve_datetime_arguments("STRFTIME", &values[1..], true)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(datetime.format(format).to_string()))
+}
+
+fn eval_extract(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 2 {
+        return Err(DbError::sql("EXTRACT expects 2 arguments"));
+    }
+    let Some(field) = expect_text_arg("EXTRACT", "first", &values[0])? else {
+        return Ok(Value::Null);
+    };
+    let Some(datetime) = datetime_from_value("EXTRACT", &values[1])? else {
+        return Ok(Value::Null);
+    };
+    match field.to_ascii_uppercase().as_str() {
+        "YEAR" => Ok(Value::Int64(i64::from(datetime.year()))),
+        "MONTH" => Ok(Value::Int64(i64::from(datetime.month()))),
+        "DAY" => Ok(Value::Int64(i64::from(datetime.day()))),
+        "HOUR" => Ok(Value::Int64(i64::from(datetime.hour()))),
+        "MINUTE" => Ok(Value::Int64(i64::from(datetime.minute()))),
+        "SECOND" => Ok(Value::Int64(i64::from(datetime.second()))),
+        "DOW" => Ok(Value::Int64(i64::from(
+            datetime.weekday().num_days_from_sunday(),
+        ))),
+        other => Err(DbError::sql(format!(
+            "EXTRACT field {other} is not supported"
+        ))),
+    }
+}
+
+fn eval_gen_random_uuid(values: Vec<Value>) -> Result<Value> {
+    if !values.is_empty() {
+        return Err(DbError::sql("GEN_RANDOM_UUID expects 0 arguments"));
+    }
+    let mut value = [0u8; 16];
+    value[..8].copy_from_slice(&next_random_u64().to_be_bytes());
+    value[8..].copy_from_slice(&next_random_u64().to_be_bytes());
+    value[6] = (value[6] & 0x0f) | 0x40;
+    value[8] = (value[8] & 0x3f) | 0x80;
+    Ok(Value::Uuid(value))
+}
+
+fn eval_uuid_parse(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(DbError::sql("UUID_PARSE expects 1 argument"));
+    }
+    match &values[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Text(value) => Ok(Value::Uuid(parse_uuid_text(value)?)),
+        other => Err(DbError::sql(format!(
+            "UUID_PARSE expects text input, got {other:?}"
+        ))),
+    }
+}
+
+fn eval_uuid_to_string(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(DbError::sql("UUID_TO_STRING expects 1 argument"));
+    }
+    match &values[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Uuid(value) => Ok(Value::Text(value_to_text(&Value::Uuid(*value))?)),
+        other => Err(DbError::sql(format!(
+            "UUID_TO_STRING expects UUID input, got {other:?}"
+        ))),
+    }
+}
+
+fn current_utc_datetime() -> DateTime<Utc> {
+    Utc::now()
+}
+
+fn current_utc_timestamp_micros() -> Result<i64> {
+    let now = current_utc_datetime();
+    let seconds = now.timestamp();
+    let micros = i64::from(now.timestamp_subsec_micros());
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(micros))
+        .ok_or_else(|| DbError::sql("CURRENT_TIMESTAMP overflowed the supported range"))
+}
+
+fn resolve_datetime_arguments(
+    function_name: &str,
+    values: &[Value],
+    default_now: bool,
+) -> Result<Option<DateTime<Utc>>> {
+    if values.is_empty() {
+        return if default_now {
+            Ok(Some(current_utc_datetime()))
+        } else {
+            Err(DbError::sql(format!(
+                "{function_name} expects a date/time argument"
+            )))
+        };
+    }
+    let Some(mut datetime) = datetime_from_value(function_name, &values[0])? else {
+        return Ok(None);
+    };
+    for modifier in &values[1..] {
+        let Some(modifier) = expect_text_arg(function_name, "modifier", modifier)? else {
+            return Ok(None);
+        };
+        datetime = apply_datetime_modifier(function_name, datetime, modifier)?;
+    }
+    Ok(Some(datetime))
+}
+
+fn datetime_from_value(function_name: &str, value: &Value) -> Result<Option<DateTime<Utc>>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(value) => parse_datetime_text(function_name, value).map(Some),
+        Value::TimestampMicros(value) => Utc
+            .timestamp_micros(*value)
+            .single()
+            .map(Some)
+            .ok_or_else(|| DbError::sql(format!("{function_name} timestamp is out of range"))),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects text or TIMESTAMP input, got {other:?}"
+        ))),
+    }
+}
+
+fn parse_datetime_text(function_name: &str, value: &str) -> Result<DateTime<Utc>> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("now") {
+        return Ok(current_utc_datetime());
+    }
+    if let Ok(value) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(value.with_timezone(&Utc));
+    }
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(value) = NaiveDateTime::parse_from_str(trimmed, format) {
+            return Ok(DateTime::from_naive_utc_and_offset(value, Utc));
+        }
+    }
+    if let Ok(value) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let value = value
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| DbError::sql("date value is out of range"))?;
+        return Ok(DateTime::from_naive_utc_and_offset(value, Utc));
+    }
+    Err(DbError::sql(format!(
+        "{function_name} expects ISO-like date/time text or 'now'"
+    )))
+}
+
+fn apply_datetime_modifier(
+    function_name: &str,
+    datetime: DateTime<Utc>,
+    modifier: &str,
+) -> Result<DateTime<Utc>> {
+    let modifier = modifier.trim();
+    if modifier.is_empty() {
+        return Err(DbError::sql(format!(
+            "{function_name} date/time modifier must not be empty"
+        )));
+    }
+    let (sign, body) = if let Some(rest) = modifier.strip_prefix('+') {
+        (1_i64, rest)
+    } else if let Some(rest) = modifier.strip_prefix('-') {
+        (-1_i64, rest)
+    } else {
+        (1_i64, modifier)
+    };
+    let mut parts = body.split_whitespace();
+    let amount = parts
+        .next()
+        .ok_or_else(|| DbError::sql(format!("{function_name} date/time modifier is invalid")))?
+        .parse::<i64>()
+        .map_err(|_| DbError::sql(format!("{function_name} date/time modifier is invalid")))?;
+    let amount = amount
+        .checked_mul(sign)
+        .ok_or_else(|| DbError::sql(format!("{function_name} date/time modifier overflowed")))?;
+    let unit = parts
+        .next()
+        .ok_or_else(|| DbError::sql(format!("{function_name} date/time modifier is invalid")))?;
+    if parts.next().is_some() {
+        return Err(DbError::sql(format!(
+            "{function_name} date/time modifier is invalid"
+        )));
+    }
+    match unit.to_ascii_lowercase().trim_end_matches('s') {
+        "year" => shift_datetime_by_months(
+            datetime,
+            amount.checked_mul(12).ok_or_else(|| {
+                DbError::sql(format!("{function_name} date/time modifier overflowed"))
+            })?,
+        ),
+        "month" => shift_datetime_by_months(datetime, amount),
+        "day" => shift_datetime_by_duration(function_name, datetime, ChronoDuration::days(amount)),
+        "hour" => {
+            shift_datetime_by_duration(function_name, datetime, ChronoDuration::hours(amount))
+        }
+        "minute" => {
+            shift_datetime_by_duration(function_name, datetime, ChronoDuration::minutes(amount))
+        }
+        "second" => {
+            shift_datetime_by_duration(function_name, datetime, ChronoDuration::seconds(amount))
+        }
+        other => Err(DbError::sql(format!(
+            "{function_name} does not support date/time modifier unit {other}"
+        ))),
+    }
+}
+
+fn shift_datetime_by_duration(
+    function_name: &str,
+    datetime: DateTime<Utc>,
+    duration: ChronoDuration,
+) -> Result<DateTime<Utc>> {
+    datetime.checked_add_signed(duration).ok_or_else(|| {
+        DbError::sql(format!(
+            "{function_name} date/time modifier overflowed the supported range"
+        ))
+    })
+}
+
+fn shift_datetime_by_months(datetime: DateTime<Utc>, months: i64) -> Result<DateTime<Utc>> {
+    if months == 0 {
+        return Ok(datetime);
+    }
+    let magnitude = months
+        .checked_abs()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| DbError::sql("date/time month modifier is out of range"))?;
+    let naive = if months > 0 {
+        datetime
+            .naive_utc()
+            .checked_add_months(Months::new(magnitude))
+    } else {
+        datetime
+            .naive_utc()
+            .checked_sub_months(Months::new(magnitude))
+    };
+    naive
+        .map(|value| DateTime::from_naive_utc_and_offset(value, Utc))
+        .ok_or_else(|| DbError::sql("date/time month modifier overflowed the supported range"))
+}
+
+fn format_date(datetime: DateTime<Utc>) -> String {
+    datetime.format("%Y-%m-%d").to_string()
+}
+
+fn format_time(datetime: DateTime<Utc>) -> String {
+    datetime.format("%H:%M:%S").to_string()
+}
+
+fn format_datetime(datetime: DateTime<Utc>) -> String {
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn parse_uuid_text(value: &str) -> Result<[u8; 16]> {
+    let compact = if value.len() == 36 {
+        if value.as_bytes().get(8) != Some(&b'-')
+            || value.as_bytes().get(13) != Some(&b'-')
+            || value.as_bytes().get(18) != Some(&b'-')
+            || value.as_bytes().get(23) != Some(&b'-')
+        {
+            return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
+        }
+        value.replace('-', "")
+    } else if value.len() == 32 {
+        value.to_string()
+    } else {
+        return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
+    };
+    if compact.len() != 32 {
+        return Err(DbError::sql("UUID_PARSE expects canonical UUID text"));
+    }
+    let mut uuid = [0u8; 16];
+    for (index, chunk) in compact.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(chunk)
+            .map_err(|_| DbError::sql("UUID_PARSE expects canonical UUID text"))?;
+        uuid[index] = u8::from_str_radix(text, 16)
+            .map_err(|_| DbError::sql("UUID_PARSE expects canonical UUID text"))?;
+    }
+    Ok(uuid)
+}
+
+fn eval_json_binary_operator(left: &Value, right: &Value, text_mode: bool) -> Result<Value> {
+    let Some(target) = json_operator_target(left, right)? else {
+        return Ok(Value::Null);
+    };
+    if text_mode {
+        match target {
+            JsonValue::Null => Ok(Value::Null),
+            JsonValue::String(value) => Ok(Value::Text(value)),
+            JsonValue::Number(value) => Ok(Value::Text(value)),
+            JsonValue::Bool(value) => Ok(Value::Text(if value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            })),
+            other => Ok(Value::Text(other.render_json())),
+        }
+    } else {
+        Ok(Value::Text(target.render_json()))
+    }
+}
+
+fn json_operator_target(left: &Value, right: &Value) -> Result<Option<JsonValue>> {
+    let json = match left {
+        Value::Null => return Ok(None),
+        Value::Text(value) => parse_json(value)?,
+        other => {
+            return Err(DbError::sql(format!(
+                "JSON operators expect text JSON input, got {other:?}"
+            )))
+        }
+    };
+    match right {
+        Value::Null => Ok(None),
+        Value::Text(path) if path.starts_with('$') => {
+            let path = parse_json_path(path)?;
+            Ok(json.lookup(&path).cloned())
+        }
+        Value::Text(key) => match &json {
+            JsonValue::Object(object) => Ok(object.get(key).cloned()),
+            JsonValue::Array(array) => {
+                let Ok(index) = key.parse::<usize>() else {
+                    return Ok(None);
+                };
+                Ok(array.get(index).cloned())
+            }
+            _ => Ok(None),
+        },
+        Value::Int64(index) => {
+            let Ok(index) = usize::try_from(*index) else {
+                return Ok(None);
+            };
+            match &json {
+                JsonValue::Array(array) => Ok(array.get(index).cloned()),
+                _ => Ok(None),
+            }
+        }
+        other => Err(DbError::sql(format!(
+            "JSON operators expect text keys or integer indexes, got {other:?}"
+        ))),
+    }
+}
+
+fn expand_json_each_rows(value: &Value) -> Result<Vec<Vec<Value>>> {
+    let Some(json) = json_table_input("json_each", value)? else {
+        return Ok(Vec::new());
+    };
+    match json {
+        JsonValue::Object(object) => object
+            .into_iter()
+            .map(|(key, value)| json_table_row(Value::Text(key), value, None))
+            .collect(),
+        JsonValue::Array(array) => array
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                json_table_row(
+                    Value::Int64(i64::try_from(index).unwrap_or(i64::MAX)),
+                    value,
+                    None,
+                )
+            })
+            .collect(),
+        other => Ok(vec![json_table_row(Value::Null, other, None)?]),
+    }
+}
+
+fn expand_json_tree_rows(value: &Value) -> Result<Vec<Vec<Value>>> {
+    let Some(json) = json_table_input("json_tree", value)? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = Vec::new();
+    append_json_tree_rows(Value::Null, json, "$".to_string(), &mut rows)?;
+    Ok(rows)
+}
+
+fn json_table_input(function_name: &str, value: &Value) -> Result<Option<JsonValue>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Text(value) => parse_json(value).map(Some),
+        other => Err(DbError::sql(format!(
+            "{function_name} expects text JSON input, got {other:?}"
+        ))),
+    }
+}
+
+fn append_json_tree_rows(
+    key: Value,
+    value: JsonValue,
+    path: String,
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<()> {
+    rows.push(json_table_row(key, value.clone(), Some(path.clone()))?);
+    match value {
+        JsonValue::Object(object) => {
+            for (child_key, child_value) in object {
+                append_json_tree_rows(
+                    Value::Text(child_key.clone()),
+                    child_value,
+                    format!("{path}.{child_key}"),
+                    rows,
+                )?;
+            }
+        }
+        JsonValue::Array(array) => {
+            for (index, child_value) in array.into_iter().enumerate() {
+                append_json_tree_rows(
+                    Value::Int64(i64::try_from(index).unwrap_or(i64::MAX)),
+                    child_value,
+                    format!("{path}[{index}]"),
+                    rows,
+                )?;
+            }
+        }
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::String(_) | JsonValue::Number(_) => {}
+    }
+    Ok(())
+}
+
+fn json_table_row(key: Value, value: JsonValue, path: Option<String>) -> Result<Vec<Value>> {
+    let mut row = vec![
+        key,
+        json_value_to_value(value.clone())?,
+        Value::Text(json_type_name(&value).to_string()),
+    ];
+    if let Some(path) = path {
+        row.push(Value::Text(path));
+    }
+    Ok(row)
+}
+
+fn eval_json_array(values: Vec<Value>) -> Result<Value> {
+    let items = values
+        .iter()
+        .map(json_value_from_value)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::Text(JsonValue::Array(items).render_json()))
+}
+
+fn eval_json_object(values: Vec<Value>) -> Result<Value> {
+    if !values.len().is_multiple_of(2) {
+        return Err(DbError::sql(
+            "json_object expects an even number of arguments",
+        ));
+    }
+    let mut object = BTreeMap::new();
+    for pair in values.chunks_exact(2) {
+        let key = match &pair[0] {
+            Value::Text(value) => value.clone(),
+            Value::Null => return Err(DbError::sql("json_object keys cannot be NULL")),
+            other => {
+                return Err(DbError::sql(format!(
+                    "json_object keys must be text, got {other:?}"
+                )))
+            }
+        };
+        object.insert(key, json_value_from_value(&pair[1])?);
+    }
+    Ok(Value::Text(JsonValue::Object(object).render_json()))
+}
+
+fn eval_json_type(values: Vec<Value>) -> Result<Value> {
+    if values.is_empty() || values.len() > 2 {
+        return Err(DbError::sql("json_type expects 1 or 2 arguments"));
+    }
+    let Some(target) = json_target_value(&values)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(json_type_name(&target).to_string()))
+}
+
+fn eval_json_valid(values: Vec<Value>) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(DbError::sql("json_valid expects 1 argument"));
+    }
+    match &values[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Text(value) => Ok(Value::Bool(parse_json(value).is_ok())),
+        other => Err(DbError::sql(format!(
+            "json_valid expects text input, got {other:?}"
+        ))),
+    }
+}
+
+fn json_type_name(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(true) => "true",
+        JsonValue::Bool(false) => "false",
+        JsonValue::String(_) => "text",
+        JsonValue::Number(number) => {
+            if number.contains('.') {
+                "real"
+            } else {
+                "integer"
+            }
+        }
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+fn json_value_from_value(value: &Value) -> Result<JsonValue> {
+    match value {
+        Value::Null => Ok(JsonValue::Null),
+        Value::Int64(value) => Ok(JsonValue::Number(value.to_string())),
+        Value::Float64(value) => Ok(JsonValue::Number(value.to_string())),
+        Value::Bool(value) => Ok(JsonValue::Bool(*value)),
+        Value::Text(value) => Ok(JsonValue::String(value.clone())),
+        Value::Blob(_) => Err(DbError::sql("cannot encode BLOB value as JSON")),
+        Value::Decimal { scaled, scale } => {
+            Ok(JsonValue::Number(decimal_to_string(*scaled, *scale)))
+        }
+        Value::Uuid(value) => Ok(JsonValue::String(value_to_text(&Value::Uuid(*value))?)),
+        Value::TimestampMicros(value) => Ok(JsonValue::Number(value.to_string())),
+    }
+}
+
+fn decimal_to_string(scaled: i64, scale: u8) -> String {
+    if scale == 0 {
+        return scaled.to_string();
+    }
+    let negative = scaled < 0;
+    let digits = scaled.unsigned_abs().to_string();
+    let scale = usize::from(scale);
+    let padded = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
+    let split = padded.len() - scale;
+    let mut output = format!("{}.{}", &padded[..split], &padded[split..]);
+    if negative {
+        output.insert(0, '-');
+    }
+    output
 }
 
 fn eval_like(
@@ -5248,6 +7345,9 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         crate::catalog::ColumnType::Timestamp => match value {
             Value::TimestampMicros(value) => Ok(Value::TimestampMicros(value)),
             Value::Int64(value) => Ok(Value::TimestampMicros(value)),
+            Value::Text(value) => Ok(Value::TimestampMicros(
+                parse_datetime_text("TIMESTAMP cast", &value)?.timestamp_micros(),
+            )),
             other => Err(DbError::sql(format!("cannot cast {other:?} to TIMESTAMP"))),
         },
     }
@@ -5278,7 +7378,9 @@ fn eval_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             other => Err(DbError::sql(format!("cannot concatenate {other:?}"))),
         },
-        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+        BinaryOp::JsonExtract => eval_json_binary_operator(&left, &right, false),
+        BinaryOp::JsonExtractText => eval_json_binary_operator(&left, &right, true),
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
             arithmetic(op, left, right)
         }
         BinaryOp::IsDistinctFrom => Ok(Value::Bool(
@@ -5571,6 +7673,78 @@ mod tests {
         assert_eq!(result.rows()[0].values(), &[Value::Int64(1)]);
     }
 
+    #[test]
+    fn analyze_collects_table_and_index_stats() {
+        let mut runtime = EngineRuntime::empty(12);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email) VALUES (1, 'a@example.com')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email) VALUES (2, 'a@example.com')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email) VALUES (3, 'b@example.com')",
+        );
+
+        execute_sql(&mut runtime, "ANALYZE docs");
+
+        assert_eq!(
+            runtime.catalog.table_stats.get("docs"),
+            Some(&crate::catalog::TableStats { row_count: 3 })
+        );
+        assert_eq!(
+            runtime.catalog.index_stats.get("docs_email_idx"),
+            Some(&crate::catalog::IndexStats {
+                entry_count: 3,
+                distinct_key_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_round_trip_preserves_analyze_stats() {
+        let mut runtime = EngineRuntime::empty(13);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE docs (id INT64 PRIMARY KEY, email TEXT)",
+        );
+        execute_sql(&mut runtime, "CREATE INDEX docs_email_idx ON docs (email)");
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email) VALUES (1, 'a@example.com')",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO docs (id, email) VALUES (2, 'b@example.com')",
+        );
+        execute_sql(&mut runtime, "ANALYZE");
+
+        let store = InMemoryPageStore::new(PAGE_SIZE);
+        let manifest = encode_manifest_payload(&runtime, &runtime.persisted_tables)
+            .expect("encode manifest payload");
+        let decoded = decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
+
+        assert_eq!(
+            decoded.catalog.table_stats.get("docs"),
+            Some(&crate::catalog::TableStats { row_count: 2 })
+        );
+        assert_eq!(
+            decoded.catalog.index_stats.get("docs_email_idx"),
+            Some(&crate::catalog::IndexStats {
+                entry_count: 2,
+                distinct_key_count: 2,
+            })
+        );
+    }
+
     fn execute_sql(runtime: &mut EngineRuntime, sql: &str) {
         let statement = parse_sql_statement(sql).expect("parse SQL");
         runtime
@@ -5585,7 +7759,7 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
     }
     match (left, right) {
         (Value::Int64(left), Value::Int64(right)) => {
-            if matches!(op, BinaryOp::Div) && right == 0 {
+            if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0 {
                 return Ok(Value::Null);
             }
             Ok(match op {
@@ -5593,6 +7767,7 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
                 BinaryOp::Sub => Value::Int64(left - right),
                 BinaryOp::Mul => Value::Int64(left * right),
                 BinaryOp::Div => Value::Int64(left / right),
+                BinaryOp::Mod => Value::Int64(left % right),
                 _ => unreachable!(),
             })
         }
@@ -5603,7 +7778,7 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
             arithmetic(op, Value::Float64(left), Value::Float64(right as f64))
         }
         (Value::Float64(left), Value::Float64(right)) => {
-            if matches!(op, BinaryOp::Div) && right == 0.0 {
+            if matches!(op, BinaryOp::Div | BinaryOp::Mod) && right == 0.0 {
                 return Ok(Value::Null);
             }
             Ok(match op {
@@ -5611,6 +7786,7 @@ fn arithmetic(op: &BinaryOp, left: Value, right: Value) -> Result<Value> {
                 BinaryOp::Sub => Value::Float64(left - right),
                 BinaryOp::Mul => Value::Float64(left * right),
                 BinaryOp::Div => Value::Float64(left / right),
+                BinaryOp::Mod => Value::Float64(left % right),
                 _ => unreachable!(),
             })
         }
@@ -5637,6 +7813,7 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
         (Value::Uuid(left), Value::Uuid(right)) => Ok(left.cmp(right)),
+        (Value::TimestampMicros(left), Value::TimestampMicros(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Uuid(right)) => Ok(left.as_slice().cmp(right.as_slice())),
         (Value::Uuid(left), Value::Blob(right)) => Ok(left.as_slice().cmp(right.as_slice())),
         _ => Err(DbError::sql(format!(

@@ -151,4 +151,4 @@ SQLite's mechanism for querying multiple database files simultaneously. Not supp
 
 ### Recursive CTEs
 
-`WITH RECURSIVE` is supported for iterative fixpoint queries (counting, tree/graph traversal). Recursive CTEs require `UNION ALL` between anchor and recursive terms. Iteration limit: 1000.
+`WITH RECURSIVE` is supported for iterative fixpoint queries (counting, tree/graph traversal). Recursive CTEs use `UNION` or `UNION ALL` between anchor and recursive terms and are limited to 1000 iterations per statement.

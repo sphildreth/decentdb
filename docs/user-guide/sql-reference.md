@@ -460,7 +460,7 @@ SELECT * FROM tree;
 ```
 
 Current limits:
-- Recursive CTE iteration limit: 1000 rows (prevents infinite loops)
+- Recursive CTE iteration limit: 1000 iterations per statement; exceeding the limit returns an error
 
 ### Set Operations
 

@@ -7,16 +7,29 @@ use crate::catalog::{
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
 use crate::sql::ast::{
-    AlterTableAction, ColumnDefinition, CreateIndexStatement, CreateTableStatement,
+    AlterTableAction, ColumnDefinition, CreateIndexStatement, CreateTableStatement, Expr,
     ForeignKeyActionSpec, ForeignKeyDefinition, IndexExpression, TableConstraint,
 };
+use crate::sql::parser::parse_expression_sql;
 
 use super::constraints::auto_index_name;
-use super::{EngineRuntime, TableData};
+use super::{table_row_dataset, EngineRuntime, TableData};
 
 impl EngineRuntime {
     pub(super) fn execute_create_table(&mut self, statement: &CreateTableStatement) -> Result<()> {
-        if self.catalog.contains_object(&statement.table_name) {
+        if statement.temporary {
+            if self.temp_relation_exists(&statement.table_name) {
+                if statement.if_not_exists
+                    && self.temp_table_schema(&statement.table_name).is_some()
+                {
+                    return Ok(());
+                }
+                return Err(DbError::sql(format!(
+                    "object {} already exists",
+                    statement.table_name
+                )));
+            }
+        } else if self.catalog.contains_object(&statement.table_name) {
             if statement.if_not_exists && self.catalog.table(&statement.table_name).is_some() {
                 return Ok(());
             }
@@ -81,6 +94,12 @@ impl EngineRuntime {
                         primary_key_column, statement.table_name
                     ))
                 })?;
+            if column.generated_sql.is_some() {
+                return Err(DbError::sql(format!(
+                    "generated column {} may not be part of PRIMARY KEY",
+                    column.name
+                )));
+            }
             column.primary_key = true;
             column.unique = true;
             column.nullable = false;
@@ -91,12 +110,65 @@ impl EngineRuntime {
 
         let table = TableSchema {
             name: statement.table_name.clone(),
+            temporary: statement.temporary,
             columns,
             checks: table_checks,
             foreign_keys,
             primary_key_columns,
             next_row_id: 1,
         };
+        validate_generated_columns(self, &table)?;
+        if table.temporary {
+            let mut temp_indexes = Vec::new();
+            if !table.foreign_keys.is_empty() {
+                return Err(DbError::sql(
+                    "foreign keys are not supported on temporary tables",
+                ));
+            }
+            if !table.primary_key_columns.is_empty() {
+                temp_indexes.push(IndexSchema {
+                    name: auto_index_name("pk", &table.name, &table.primary_key_columns),
+                    table_name: table.name.clone(),
+                    kind: IndexKind::Btree,
+                    unique: true,
+                    columns: table
+                        .primary_key_columns
+                        .iter()
+                        .map(|column_name| IndexColumn {
+                            column_name: Some(column_name.clone()),
+                            expression_sql: None,
+                        })
+                        .collect(),
+                    predicate_sql: None,
+                    fresh: false,
+                });
+            }
+            for (name, columns) in secondary_unique_indexes {
+                temp_indexes.push(IndexSchema {
+                    name: name.unwrap_or_else(|| auto_index_name("uq", &table.name, &columns)),
+                    table_name: table.name.clone(),
+                    kind: IndexKind::Btree,
+                    unique: true,
+                    columns: columns
+                        .iter()
+                        .map(|column_name| IndexColumn {
+                            column_name: Some(column_name.clone()),
+                            expression_sql: None,
+                        })
+                        .collect(),
+                    predicate_sql: None,
+                    fresh: false,
+                });
+            }
+            self.temp_tables.insert(statement.table_name.clone(), table);
+            self.temp_table_data
+                .insert(statement.table_name.clone(), TableData::default());
+            for index in temp_indexes {
+                self.temp_indexes.insert(index.name.clone(), index);
+            }
+            self.bump_temp_schema_cookie();
+            return Ok(());
+        }
         validate_foreign_keys(self, &table)?;
 
         self.catalog
@@ -185,15 +257,23 @@ impl EngineRuntime {
                 statement.index_name
             )));
         }
-        if self.catalog.view(&statement.table_name).is_some() {
+        if self.visible_table_is_temporary(&statement.table_name) {
+            return Err(DbError::sql(format!(
+                "cannot create indexes on temporary table {}",
+                statement.table_name
+            )));
+        }
+        if self
+            .visible_view(&statement.table_name, super::NameResolutionScope::Session)
+            .is_some()
+        {
             return Err(DbError::sql(format!(
                 "cannot create an index on view {}",
                 statement.table_name
             )));
         }
         let table = self
-            .catalog
-            .table(&statement.table_name)
+            .table_schema(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
 
         let access_method = if statement.access_method.is_empty() {
@@ -310,17 +390,39 @@ impl EngineRuntime {
         if_exists: bool,
         _page_size: u32,
     ) -> Result<()> {
-        if !self.catalog.tables.contains_key(name) {
+        if self.temp_view(name).is_some() {
             if if_exists {
                 return Ok(());
             }
             return Err(DbError::sql(format!("unknown table {name}")));
         }
-        let dependent_views = super::views::dependent_views(self, name);
+        if let Some(table_name) = self.temp_table_schema(name).map(|table| table.name.clone()) {
+            let dependent_views = super::views::dependent_views(self, &table_name, true);
+            if !dependent_views.is_empty() {
+                return Err(DbError::sql(format!(
+                    "cannot drop table {} because views depend on it: {}",
+                    table_name,
+                    dependent_views.join(", ")
+                )));
+            }
+            self.temp_tables.remove(&table_name);
+            self.temp_table_data.remove(&table_name);
+            self.temp_indexes
+                .retain(|_, index| !identifiers_equal(&index.table_name, &table_name));
+            self.bump_temp_schema_cookie();
+            return Ok(());
+        }
+        let Some(table_name) = self.catalog.table(name).map(|table| table.name.clone()) else {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(DbError::sql(format!("unknown table {name}")));
+        };
+        let dependent_views = super::views::dependent_views(self, &table_name, false);
         if !dependent_views.is_empty() {
             return Err(DbError::sql(format!(
                 "cannot drop table {} because views depend on it: {}",
-                name,
+                table_name,
                 dependent_views.join(", ")
             )));
         }
@@ -329,29 +431,28 @@ impl EngineRuntime {
             .tables
             .values()
             .filter(|table| {
-                table
-                    .foreign_keys
-                    .iter()
-                    .any(|foreign_key| foreign_key.referenced_table == name)
+                table.foreign_keys.iter().any(|foreign_key| {
+                    identifiers_equal(&foreign_key.referenced_table, &table_name)
+                })
             })
             .map(|table| table.name.clone())
             .collect::<Vec<_>>();
         if !referencing_tables.is_empty() {
             return Err(DbError::sql(format!(
                 "cannot drop table {} because foreign keys still reference it from {}",
-                name,
+                table_name,
                 referencing_tables.join(", ")
             )));
         }
 
-        self.catalog.tables.remove(name);
-        self.tables.remove(name);
+        self.catalog.tables.remove(&table_name);
+        self.tables.remove(&table_name);
         self.catalog
             .indexes
-            .retain(|_, index| index.table_name != name);
-        self.catalog
-            .triggers
-            .retain(|_, trigger| trigger.target_name != name || trigger.on_view);
+            .retain(|_, index| !identifiers_equal(&index.table_name, &table_name));
+        self.catalog.triggers.retain(|_, trigger| {
+            !identifiers_equal(&trigger.target_name, &table_name) || trigger.on_view
+        });
         self.bump_schema_cookie();
         Ok(())
     }
@@ -382,12 +483,29 @@ impl EngineRuntime {
         params: &[Value],
         _page_size: u32,
     ) -> Result<()> {
+        if self.temp_table_schema(table_name).is_some() {
+            return Err(DbError::sql(
+                "ALTER TABLE is not supported for temporary tables",
+            ));
+        }
+        if self.temp_view(table_name).is_some() && self.catalog.table(table_name).is_none() {
+            return Err(DbError::sql(format!("unknown table {table_name}")));
+        }
         let mut table = self
             .catalog
             .tables
             .get(table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        if table
+            .columns
+            .iter()
+            .any(|column| column.generated_sql.is_some())
+        {
+            return Err(DbError::sql(
+                "ALTER TABLE is not supported for tables with generated columns",
+            ));
+        }
         if !table.checks.is_empty() || table.columns.iter().any(|column| !column.checks.is_empty())
         {
             return Err(DbError::sql(
@@ -408,6 +526,11 @@ impl EngineRuntime {
         for action in actions {
             match action {
                 AlterTableAction::AddColumn(definition) => {
+                    if definition.generated.is_some() {
+                        return Err(DbError::sql(
+                            "ALTER TABLE ADD COLUMN does not support generated columns",
+                        ));
+                    }
                     if table
                         .columns
                         .iter()
@@ -519,7 +642,7 @@ impl EngineRuntime {
                     }
                 }
                 AlterTableAction::RenameColumn { old_name, new_name } => {
-                    if !super::views::dependent_views(self, table_name).is_empty() {
+                    if !super::views::dependent_views(self, table_name, false).is_empty() {
                         return Err(DbError::sql(
                             "RENAME COLUMN is rejected when dependent views exist",
                         ));
@@ -634,11 +757,24 @@ impl EngineRuntime {
 }
 
 fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<ColumnSchema> {
+    if definition.generated.is_some() && definition.default.is_some() {
+        return Err(DbError::sql(
+            "generated columns may not also define DEFAULT",
+        ));
+    }
+    if definition.generated.is_some() && definition.primary_key {
+        return Err(DbError::sql("generated columns may not be PRIMARY KEY"));
+    }
     Ok(ColumnSchema {
         name: definition.name.clone(),
         column_type: definition.column_type,
         nullable: definition.nullable && !definition.primary_key,
-        default_sql: definition.default.as_ref().map(|expr| expr.to_sql()),
+        default_sql: definition
+            .generated
+            .is_none()
+            .then(|| definition.default.as_ref().map(|expr| expr.to_sql()))
+            .flatten(),
+        generated_sql: definition.generated.as_ref().map(|expr| expr.to_sql()),
         primary_key: definition.primary_key,
         unique: definition.unique || definition.primary_key,
         auto_increment: definition.primary_key
@@ -691,6 +827,142 @@ fn ensure_unique_column_names(columns: &[ColumnSchema], table_name: &str) -> Res
         }
     }
     Ok(())
+}
+
+fn validate_generated_columns(runtime: &EngineRuntime, table: &TableSchema) -> Result<()> {
+    let row = vec![Value::Null; table.columns.len()];
+    let dataset = table_row_dataset(table, &row, &table.name);
+    for column in &table.columns {
+        let Some(generated_sql) = &column.generated_sql else {
+            continue;
+        };
+        let expr = parse_expression_sql(generated_sql)?;
+        validate_generated_expr(&expr, table, &column.name)?;
+        runtime.eval_expr(
+            &expr,
+            &dataset,
+            &row,
+            &[],
+            &std::collections::BTreeMap::new(),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_generated_expr(
+    expr: &Expr,
+    table: &TableSchema,
+    generated_column_name: &str,
+) -> Result<()> {
+    match expr {
+        Expr::Literal(_) => Ok(()),
+        Expr::Column {
+            table: qualifier,
+            column,
+        } => {
+            if let Some(qualifier) = qualifier {
+                if !identifiers_equal(qualifier, &table.name) {
+                    return Err(DbError::sql(format!(
+                        "generated column {} may only reference columns from {}",
+                        generated_column_name, table.name
+                    )));
+                }
+            }
+            let referenced = table
+                .columns
+                .iter()
+                .find(|candidate| identifiers_equal(&candidate.name, column))
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "generated column {} references unknown column {}",
+                        generated_column_name, column
+                    ))
+                })?;
+            if identifiers_equal(&referenced.name, generated_column_name) {
+                return Err(DbError::sql(format!(
+                    "generated column {} may not reference itself",
+                    generated_column_name
+                )));
+            }
+            if referenced.generated_sql.is_some() {
+                return Err(DbError::sql(format!(
+                    "generated column {} may not reference generated column {}",
+                    generated_column_name, referenced.name
+                )));
+            }
+            Ok(())
+        }
+        Expr::Parameter(_) => Err(DbError::sql(
+            "generated columns may not use query parameters",
+        )),
+        Expr::Aggregate { .. } => Err(DbError::sql(
+            "generated columns may not use aggregate expressions",
+        )),
+        Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
+            "generated columns may not use window functions",
+        )),
+        Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery { .. } => {
+            Err(DbError::sql("generated columns may not use subqueries"))
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            validate_generated_expr(expr, table, generated_column_name)
+        }
+        Expr::Binary { left, right, .. } => {
+            validate_generated_expr(left, table, generated_column_name)?;
+            validate_generated_expr(right, table, generated_column_name)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            validate_generated_expr(expr, table, generated_column_name)?;
+            validate_generated_expr(low, table, generated_column_name)?;
+            validate_generated_expr(high, table, generated_column_name)
+        }
+        Expr::InList { expr, items, .. } => {
+            validate_generated_expr(expr, table, generated_column_name)?;
+            for item in items {
+                validate_generated_expr(item, table, generated_column_name)?;
+            }
+            Ok(())
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            validate_generated_expr(expr, table, generated_column_name)?;
+            validate_generated_expr(pattern, table, generated_column_name)?;
+            if let Some(escape) = escape {
+                validate_generated_expr(escape, table, generated_column_name)?;
+            }
+            Ok(())
+        }
+        Expr::Function { args, .. } => {
+            for arg in args {
+                validate_generated_expr(arg, table, generated_column_name)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                validate_generated_expr(operand, table, generated_column_name)?;
+            }
+            for (condition, result) in branches {
+                validate_generated_expr(condition, table, generated_column_name)?;
+                validate_generated_expr(result, table, generated_column_name)?;
+            }
+            if let Some(else_expr) = else_expr {
+                validate_generated_expr(else_expr, table, generated_column_name)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_foreign_keys(runtime: &EngineRuntime, table: &TableSchema) -> Result<()> {

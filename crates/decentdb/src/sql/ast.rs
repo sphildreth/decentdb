@@ -10,6 +10,9 @@ pub(crate) enum Statement {
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+    Analyze {
+        table_name: Option<String>,
+    },
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
     CreateView(CreateViewStatement),
@@ -49,6 +52,7 @@ pub(crate) struct ExplainStatement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Query {
+    pub(crate) recursive: bool,
     pub(crate) ctes: Vec<CommonTableExpr>,
     pub(crate) body: QueryBody,
     pub(crate) order_by: Vec<OrderBy>,
@@ -110,11 +114,16 @@ pub(crate) enum FromItem {
         query: Box<Query>,
         alias: String,
     },
+    Function {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
+    },
     Join {
         left: Box<FromItem>,
         right: Box<FromItem>,
         kind: JoinKind,
-        on: Expr,
+        constraint: JoinConstraint,
     },
 }
 
@@ -125,6 +134,13 @@ pub(crate) enum JoinKind {
     Right,
     Full,
     Cross,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum JoinConstraint {
+    On(Expr),
+    Using(Vec<String>),
+    Natural,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -228,9 +244,12 @@ pub(crate) enum BinaryOp {
     Sub,
     Mul,
     Div,
+    Mod,
     And,
     Or,
     Concat,
+    JsonExtract,
+    JsonExtractText,
     IsDistinctFrom,
     IsNotDistinctFrom,
 }
@@ -291,6 +310,7 @@ pub(crate) struct Assignment {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateTableStatement {
     pub(crate) table_name: String,
+    pub(crate) temporary: bool,
     pub(crate) if_not_exists: bool,
     pub(crate) columns: Vec<ColumnDefinition>,
     pub(crate) constraints: Vec<TableConstraint>,
@@ -302,6 +322,7 @@ pub(crate) struct ColumnDefinition {
     pub(crate) column_type: ColumnType,
     pub(crate) nullable: bool,
     pub(crate) default: Option<Expr>,
+    pub(crate) generated: Option<Expr>,
     pub(crate) primary_key: bool,
     pub(crate) unique: bool,
     pub(crate) checks: Vec<Expr>,
@@ -363,6 +384,7 @@ pub(crate) enum IndexExpression {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CreateViewStatement {
     pub(crate) view_name: String,
+    pub(crate) temporary: bool,
     pub(crate) replace: bool,
     pub(crate) column_names: Vec<String>,
     pub(crate) query: Query,
@@ -413,7 +435,8 @@ impl Query {
         let mut parts = Vec::new();
         if !self.ctes.is_empty() {
             parts.push(format!(
-                "WITH {}",
+                "WITH{} {}",
+                if self.recursive { " RECURSIVE" } else { "" },
                 self.ctes
                     .iter()
                     .map(CommonTableExpr::to_sql)
@@ -560,11 +583,21 @@ impl FromItem {
                 .as_ref()
                 .map_or_else(|| name.clone(), |alias| format!("{name} AS {alias}")),
             Self::Subquery { query, alias } => format!("({}) AS {alias}", query.to_sql()),
+            Self::Function { name, args, alias } => {
+                let base = format!(
+                    "{}({})",
+                    name,
+                    args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
+                );
+                alias
+                    .as_ref()
+                    .map_or(base.clone(), |alias| format!("{base} AS {alias}"))
+            }
             Self::Join {
                 left,
                 right,
                 kind,
-                on,
+                constraint,
             } => {
                 let join_kw = match kind {
                     JoinKind::Inner => "INNER JOIN".to_string(),
@@ -573,18 +606,51 @@ impl FromItem {
                     JoinKind::Full => "FULL OUTER JOIN".to_string(),
                     JoinKind::Cross => "CROSS JOIN".to_string(),
                 };
-                if *kind == JoinKind::Cross {
-                    format!("{} {} {}", left.to_sql(), join_kw, right.to_sql())
-                } else {
-                    format!(
+                match constraint {
+                    JoinConstraint::Natural => {
+                        let natural_join_kw = match kind {
+                            JoinKind::Inner => "NATURAL JOIN",
+                            JoinKind::Left => "NATURAL LEFT JOIN",
+                            JoinKind::Right => "NATURAL RIGHT JOIN",
+                            JoinKind::Full => "NATURAL FULL OUTER JOIN",
+                            JoinKind::Cross => "NATURAL CROSS JOIN",
+                        };
+                        format!("{} {} {}", left.to_sql(), natural_join_kw, right.to_sql())
+                    }
+                    JoinConstraint::Using(columns) => format!(
+                        "{} {} {} USING ({})",
+                        left.to_sql(),
+                        if *kind == JoinKind::Inner {
+                            "JOIN"
+                        } else {
+                            join_kw.as_str()
+                        },
+                        right.to_sql(),
+                        columns.join(", ")
+                    ),
+                    JoinConstraint::On(on) if *kind == JoinKind::Cross => {
+                        format!("{} {} {}", left.to_sql(), join_kw, right.to_sql())
+                    }
+                    JoinConstraint::On(on) => format!(
                         "{} {} {} ON {}",
                         left.to_sql(),
                         join_kw,
                         right.to_sql(),
                         on.to_sql()
-                    )
+                    ),
                 }
             }
+        }
+    }
+}
+
+impl JoinConstraint {
+    #[must_use]
+    pub(crate) fn to_sql(&self) -> String {
+        match self {
+            Self::On(expr) => format!("ON {}", expr.to_sql()),
+            Self::Using(columns) => format!("USING ({})", columns.join(", ")),
+            Self::Natural => "NATURAL".to_string(),
         }
     }
 }
@@ -628,9 +694,12 @@ impl Expr {
                     BinaryOp::Sub => "-",
                     BinaryOp::Mul => "*",
                     BinaryOp::Div => "/",
+                    BinaryOp::Mod => "%",
                     BinaryOp::And => "AND",
                     BinaryOp::Or => "OR",
                     BinaryOp::Concat => "||",
+                    BinaryOp::JsonExtract => "->",
+                    BinaryOp::JsonExtractText => "->>",
                     BinaryOp::IsDistinctFrom => "IS DISTINCT FROM",
                     BinaryOp::IsNotDistinctFrom => "IS NOT DISTINCT FROM",
                 },
@@ -699,6 +768,19 @@ impl Expr {
                 } else {
                     format!("{} IS NULL", expr.to_sql())
                 }
+            }
+            Self::Function { name, args }
+                if args.is_empty()
+                    && matches!(
+                        name.as_str(),
+                        "current_date"
+                            | "current_time"
+                            | "current_timestamp"
+                            | "localtime"
+                            | "localtimestamp"
+                    ) =>
+            {
+                name.to_ascii_uppercase()
             }
             Self::Function { name, args } => format!(
                 "{}({})",

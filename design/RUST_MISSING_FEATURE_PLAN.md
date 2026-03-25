@@ -55,13 +55,13 @@ Implementation slices should be testable with fast local and CI validation. Pref
 | Slice 1 - Query-semantic corrections close to current engine | Completed | Fix gaps that are already close to existing machinery. |
 | Slice 2 - DISTINCT and pagination parity | Completed | `DISTINCT ON`, `LIMIT ALL`, `OFFSET ... FETCH` verification/implementation. |
 | Slice 3 - Window parity completion | Completed | Fill the documented window-function gap. |
-| Slice 4 - Join surface parity | In progress | `RIGHT`, `FULL OUTER`, `CROSS`, and `NATURAL` joins. |
-| Slice 5 - Recursive CTE support | Not started | `WITH RECURSIVE` execution and guardrails. |
-| Slice 6 - Scalar, date/time, and JSON scalar function expansion | Not started | Bring documented function surface closer to reality. |
-| Slice 7 - JSON table functions | Not started | `json_each()` and `json_tree()` in `FROM`. |
-| Slice 8 - Planner statistics and `ANALYZE` | Not started | Add SQL `ANALYZE` plus catalog-backed planner statistics to reduce optimizer guesswork. |
-| Slice 9 - Generated columns and temp objects | Not started | `GENERATED ALWAYS AS (...) STORED`, `CREATE TEMP TABLE`, `CREATE TEMP VIEW`. |
-| Slice 10 - Matrix regression harness | Not started | Convert documented claims into executable regression coverage. |
+| Slice 4 - Join surface parity | Completed | `RIGHT`, `FULL OUTER`, `CROSS`, and `NATURAL` joins. |
+| Slice 5 - Recursive CTE support | Completed | `WITH RECURSIVE` execution and guardrails. |
+| Slice 6 - Scalar, date/time, and JSON scalar function expansion | Completed | Bring documented function surface closer to reality. |
+| Slice 7 - JSON table functions | Completed | `json_each()` and `json_tree()` in `FROM`. |
+| Slice 8 - Planner statistics and `ANALYZE` | Completed | Add SQL `ANALYZE` plus catalog-backed planner statistics to reduce optimizer guesswork. |
+| Slice 9 - Generated columns and temp objects | Completed | `GENERATED ALWAYS AS (...) STORED`, `CREATE TEMP TABLE`, `CREATE TEMP VIEW`. |
+| Slice 10 - Matrix regression harness | Completed | Convert documented claims into executable regression coverage. |
 
 ## Why this plan exists
 
@@ -228,95 +228,38 @@ That implementation is adequate for plain `INTERSECT` and `EXCEPT`, but it does 
 
 This should be treated as a semantic bug relative to the matrix, not as a merely missing parser hook.
 
-### 7. Scalar function coverage is much smaller than the matrix claims
+### 7. The original Slice 6 scalar/date-time/JSON scalar mismatch is now closed
 
-The matrix advertises broad math, string, date/time, and JSON scalar support (`docs/user-guide/sql-feature-matrix.md:275-337`).
+The matrix advertises broad math, string, date/time, UUID, and JSON scalar/operator support (`docs/user-guide/sql-feature-matrix.md:275-337`).
 
-The current scalar dispatch in `exec/mod.rs` only exposes:
+That previously outpaced the Rust rewrite, but the Slice 6 landing now covers the documented math helpers, missing string helpers, date/time entry points, UUID helper functions, JSON scalar helpers, and JSON `->` / `->>` operators end-to-end in the normalizer and executor.
 
-- `coalesce`
-- `nullif`
-- `lower`
-- `upper`
-- `trim`
-- `length`
-- `substr`
-- `replace`
-- `instr`
-- `json_array_length`
-- `json_extract`
+This part of the matrix is now backed by direct runtime coverage in `engine_coverage_tests.rs` plus parser acceptance in `parser_tests.rs`, rather than by grep-based confidence.
 
-See `crates/decentdb/src/exec/mod.rs:4693-4806`.
-
-That leaves large documented gaps:
-
-- math functions such as `ABS`, `CEIL`, `FLOOR`, `ROUND`, `SQRT`, `POWER`, `MOD`, `SIGN`, `LN`, `LOG`, `EXP`, `RANDOM`
-- string functions such as `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
-- date/time functions such as `NOW`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
-- JSON scalar helpers such as `json_type`, `json_valid`, `json_object`, `json_array`
-
-### 8. JSON operators and JSON table functions are not implemented end-to-end
+### 8. The original JSON table-function gap is now closed
 
 The matrix marks `->`, `->>`, `json_each()`, and `json_tree()` as supported (`docs/user-guide/sql-feature-matrix.md:333-336`).
 
-The current expression operator normalization only handles:
+That gap is now closed end-to-end. The AST/normalizer accept `json_each()` / `json_tree()` as `FROM`-clause table functions, the executor expands them into real datasets, and the runtime regression suite covers array/object iteration, recursive tree traversal, null-input behavior, invalid JSON errors, and stored-view round-tripping alongside the earlier `->` / `->>` operator coverage.
 
-- comparison operators
-- arithmetic operators `+`, `-`, `*`, `/`
-- concatenation `||`
+### 9. Generated columns and temp objects are now implemented end-to-end
 
-See `crates/decentdb/src/sql/normalize.rs:1033-1168`.
+The matrix marks stored generated columns plus session-scoped temp tables/views as supported (`docs/user-guide/sql-feature-matrix.md:23-25`, `64-74`).
 
-There is no `->` or `->>` operator case in the AST binary-op mapping, and the scalar-function dispatcher does not include `json_each` or `json_tree` (`crates/decentdb/src/exec/mod.rs:4693-4806`).
+That Slice 9 gap is now closed:
 
-`parser_tests.rs` also explicitly labels set-returning functions as out of baseline scope (`crates/decentdb/src/sql/parser_tests.rs:27-31`), which is consistent with `json_each()` / `json_tree()` not yet being real `FROM`-clause table functions.
+- `ColumnDefinition` / `ColumnSchema` preserve generated-column expressions, DDL validation rejects unsupported generated-column shapes, and INSERT/UPDATE recompute stored generated values before constraint validation
+- generated-column metadata now round-trips through the manifest/runtime payloads without breaking older on-disk layouts, with runtime coverage for insert-time computation, update-time recomputation after reopen, explicit-write rejection, and `UNIQUE` enforcement
+- temp tables/views now live in handle-local `TempSchemaState` on `Db`, are re-applied after runtime refresh, shadow persistent relations within the handle, stay out of WAL/catalog persistence, and participate in prepared-statement invalidation through a dedicated temp schema cookie
+- temp-only writes now install in-memory runtime state without persisting WAL/catalog changes, while runtime/metadata coverage proves temp-object lifetime, shadowing, non-persistence, drop-unshadow behavior, and temp DDL/introspection output
 
-### 9. Generated columns appear absent from the schema model
+### 10. Matrix regression harness now guards the documented SQL surface
 
-The matrix marks stored generated columns as supported (`docs/user-guide/sql-feature-matrix.md:25`, `68-74`).
+Slice 10 is now closed with executable matrix-aligned coverage:
 
-The current `ColumnDefinition` carries:
-
-- `name`
-- `column_type`
-- `nullable`
-- `default`
-- `primary_key`
-- `unique`
-- `checks`
-- `references`
-
-See `crates/decentdb/src/sql/ast.rs:295-305`.
-
-The persisted catalog `ColumnSchema` carries:
-
-- type
-- nullability
-- default SQL
-- primary-key / unique / auto-increment flags
-- checks
-- optional foreign key
-
-See `crates/decentdb/src/catalog/schema.rs:71-81`.
-
-There is no obvious generated-expression field in either structure, and there is no separate recomputation path in the audited DML execution code. Until runtime evidence proves otherwise, generated columns should be treated as missing.
-
-### 10. Temp-object semantics appear absent from the catalog model
-
-The matrix marks `CREATE TEMP TABLE` and `CREATE TEMP VIEW` as supported and session-scoped (`docs/user-guide/sql-feature-matrix.md:23-24`, `64-66`).
-
-The catalog state stores only global maps of:
-
-- tables
-- indexes
-- views
-- triggers
-
-See `crates/decentdb/src/catalog/schema.rs:148-154`.
-
-There is no visible temp-object namespace, persistence flag, or session-only object container in the audited catalog structures. The normalization and DDL paths we inspected also do not preserve a temp/persistence bit.
-
-This does not prove the syntax is rejected, but it is strong evidence that true session-scoped temp semantics are not yet implemented.
+- `crates/decentdb/tests/matrix_regression_tests.rs` mirrors the user-guide families for DDL, DML, joins, query clauses, aggregates, window functions, scalar/date-time/JSON functions, operators, transactions, data types, constraints, set operations, and CTEs
+- the harness also keeps explicit negative coverage for intentionally unsupported surfaces such as materialized views and generic set-returning functions
+- landing the harness exposed and fixed three real drift points that were still hiding under the matrix: binary `%` operator execution, ISO-format text inserts into `DATE` / `TIMESTAMP` columns, and the documented legacy `CREATE TRIGGER ... BEGIN ... END` body form
 
 ### 11. `ALTER TABLE` works, but the matrix overstates its breadth
 
@@ -346,17 +289,17 @@ The implementation slice should resolve actual behavior and then add tests that 
 
 The matrix was not the only place where the docs got ahead of the Rust rewrite. Reviewing the rest of `docs/user-guide/` surfaced several additional SQL claims that either are not implemented, are only partially implemented, or need direct verification before they can be treated as true.
 
-### 13. `ANALYZE` is documented in `sql-reference.md`, but no Rust SQL statement support was found
+### 13. `ANALYZE` is now backed by real SQL, persistence, and planner behavior
 
 `docs/user-guide/sql-reference.md` documents `ANALYZE;` and `ANALYZE table_name;` as supported SQL commands and even describes transaction behavior for them (`docs/user-guide/sql-reference.md:279-291`).
 
-However:
+That user-guide drift has now been closed:
 
-- `Statement` in the Rust AST has no `Analyze` variant (`crates/decentdb/src/sql/ast.rs:7-42`)
-- `normalize_statement` handles `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, DDL, `EXPLAIN`, and triggers, but there is no `AnalyzeStmt` handling (`crates/decentdb/src/sql/normalize.rs:31-65`)
-- repository-wide Rust code search did not find an execution path for SQL `ANALYZE`
-
-This is a user-guide gap beyond the matrix and should be treated as a missing documented SQL feature.
+- `Statement::Analyze { table_name }` exists in the Rust AST, and normalization maps PostgreSQL `VacuumStmt` analyze forms into it
+- the executor now runs `ANALYZE` end-to-end, collecting manifest-backed table and BTREE-index statistics that survive reload
+- explicit SQL transactions now reject `ANALYZE`, matching the documented transaction boundary
+- the planner now consults collected BTREE statistics for equality predicates, allowing `EXPLAIN` plan shape to change after `ANALYZE` when an index is too unselective to beat a full scan
+- parser, executor-unit, and integration coverage now exercise the statement surface, persistence path, and planner-facing behavior
 
 ### 14. `EXPLAIN (ANALYZE)` is documented, but current detection appears too narrow
 
@@ -452,7 +395,7 @@ This needs direct execution tests before it is promoted to “implemented.”
 
 ### `CREATE TEMP TABLE` / `CREATE TEMP VIEW`
 
-Syntax may parse through libpg_query, but true session-only behavior is not evident in the catalog or storage model. This needs direct runtime tests plus implementation work if the behavior proves persistent.
+The syntax remains documented, but the accepted implementation model is still missing. The next safe step is to add the ADR-0109 handle-local temp namespace and then prove shadowing, session lifetime, and non-persistence with direct runtime tests.
 
 ## Recommended implementation order
 
@@ -587,7 +530,7 @@ Close the gap between the five currently supported window functions and the eigh
 
 ## Slice 4 - Join surface parity
 
-**Status:** In progress
+**Status:** Completed
 
 ### Goal
 
@@ -615,13 +558,15 @@ Expand the query engine beyond the current `INNER`/`LEFT` subset.
 
 - `JoinKind` and join normalization/execution now support `CROSS JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN`
 - the nested-loop join path now null-extends the correct side for right/full outer semantics, and `engine_coverage_tests.rs` covers all three landed join kinds
-- `NATURAL JOIN` and `JOIN ... USING (...)` are still explicitly unsupported because they require shared-column matching plus duplicate-column suppression that the current join row-shape does not yet model
-- the remaining work in this slice is therefore concentrated on `NATURAL JOIN` / `USING` semantics rather than the basic outer/cartesian join operators
+- `NATURAL JOIN` and `JOIN ... USING (...)` now normalize into explicit join-constraint metadata instead of being rejected or misclassified as cartesian joins when no `ON` clause is present
+- the executor now models `USING` / `NATURAL` output with visible merged columns plus hidden source-side columns so unqualified references and `SELECT *` suppress redundant join keys while qualified references and `table.*` still expose the original source columns
+- the regression suite now covers duplicate output names, ambiguous unqualified references, merged outer-join key values, `NATURAL JOIN` shared-column matching, the no-common-columns `NATURAL JOIN` fallback to cartesian behavior, and stored-view roundtripping for `JOIN ... USING (...)`
 - the latest regression pass also added extra happy-path and edge-case coverage for the landed slice work, including empty/all-null aggregates, multicolumn set-operation duplicates, full-row distinct behavior, window argument validation, and empty-side join behavior
+- the next default target after this completed slice is Slice 6 (scalar, date/time, and JSON scalar function expansion)
 
 ## Slice 5 - Recursive CTE support
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -645,9 +590,19 @@ Turn `WITH RECURSIVE` from an explicit rejection into a real feature.
 - the canonical recursive examples from the matrix work end-to-end
 - recursion-limit behavior is tested and explicit
 
+### Progress
+
+- query normalization now preserves the `WITH RECURSIVE` clause flag instead of rejecting it, and query SQL serialization round-trips that flag correctly
+- recursive CTE execution now uses an iterative working-table fixpoint loop in the executor with a hard 1000-iteration error guardrail, reusing the existing in-memory `Dataset` model rather than introducing new storage or planner nodes
+- the recursive evaluator supports both `UNION ALL` and `UNION` fixpoint semantics, keeps recursive scope bound to the current working table, and reuses the existing row-identity deduplication helpers for `UNION`
+- v0 guardrails are now executable: only one self-referencing CTE per statement is allowed, the recursive CTE body must be a two-branch `UNION`/`UNION ALL`, the recursive term must reference itself exactly once, and recursive terms with aggregates, `DISTINCT`, window functions, or subqueries fail with explicit SQL errors
+- `engine_coverage_tests.rs` now covers the documented sequence-generation and tree-traversal examples plus iteration-limit and guardrail failures, and `parser_tests.rs` now accepts `WITH RECURSIVE` syntax
+- related user-guide docs were aligned so the recursive limit is described as 1000 iterations per statement and the recursive CTE overview matches the supported `UNION` / `UNION ALL` behavior
+- the next default target is Slice 6 (scalar, date/time, and JSON scalar function expansion)
+
 ## Slice 6 - Scalar, date/time, and JSON scalar function expansion
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -675,9 +630,20 @@ Reduce the largest user-visible mismatch: the function tables in the matrix are 
 
 - the function tables in the matrix are backed by executable tests rather than grep-based confidence
 
+### Progress
+
+- the executor scalar dispatcher now covers the first documented Slice 6 cluster: `ABS`, `CEIL` / `CEILING`, `FLOOR`, `ROUND`, `SQRT`, `POWER` / `POW`, `MOD`, `SIGN`, `LN`, `LOG`, `EXP`, and `RANDOM`
+- missing string helpers now execute end-to-end: `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`, and the `SUBSTRING` alias for `SUBSTR`
+- JSON scalar helpers now cover `json_type`, `json_valid`, `json_object`, and `json_array`; normalization also maps PostgreSQL's `JsonArrayConstructor` / `JsonValueExpr` AST nodes into the existing function-expression path so `json_array(...)` executes instead of failing during normalization
+- `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `NOW()`, `date()`, `datetime()`, `strftime()`, and `EXTRACT()` now normalize and execute end-to-end, including the `SqlvalueFunction` parser nodes needed for `CURRENT_*` keyword syntax and explicit UTC modifier handling for the documented `+1 month` / `+2 hours` style examples
+- `GEN_RANDOM_UUID`, `UUID_PARSE`, and `UUID_TO_STRING` now execute end-to-end on top of `Value::Uuid`, with canonical-format parsing/formatting checks and v4 version/variant regression coverage
+- JSON `->` and `->>` operators now round-trip through the AST, normalize into explicit binary operators, and execute via the JSON extraction helpers; regression coverage includes chained extraction, array indexing, missing-key null behavior, explicit type errors, and stored-view round-tripping
+- `engine_coverage_tests.rs` now contains direct runtime coverage for the full Slice 6 surface, and `parser_tests.rs`, `cargo check -p decentdb --quiet`, and `cargo clippy -p decentdb --quiet` all pass after the landing
+- the next default target is Slice 7 (JSON table functions)
+
 ## Slice 7 - JSON table functions
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -697,9 +663,17 @@ Implement `json_each()` and `json_tree()` as real `FROM`-clause table functions.
 
 - the matrix examples that project `key`, `value`, and `type` from these functions execute as written
 
+### Progress
+
+- `FromItem` and `normalize_from_item()` now carry an explicit function/table-function form, with `RangeFunction` normalization intentionally restricted to the Slice 7 surface (`json_each()` / `json_tree()`) instead of silently enabling unrelated set-returning functions
+- `evaluate_from_item()` now materializes `json_each()` and `json_tree()` as real `Dataset`s, exposing the documented `key`, `value`, and `type` columns plus `path` for recursive traversal, while reusing the existing JSON parser/type helpers instead of inventing a parallel representation
+- `json_each()` now expands top-level array/object members into rows, `json_tree()` now emits the root plus recursive descendants with stable JSON-path strings, SQL `NULL` input returns an empty rowset, and invalid JSON still fails explicitly
+- `engine_coverage_tests.rs` now covers the documented `json_each()` / `json_tree()` examples, null-input handling, invalid JSON errors, and view round-tripping; `parser_tests.rs`, `cargo check -p decentdb --quiet`, and `cargo clippy -p decentdb --quiet` all pass after the landing
+- the next default target is Slice 8 (planner statistics and `ANALYZE`)
+
 ## Slice 8 - Planner statistics and `ANALYZE`
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -729,9 +703,19 @@ Add the missing SQL `ANALYZE` surface and the underlying planner statistics need
 - planner statistics persist and reload correctly
 - the optimizer consults the collected statistics instead of relying only on fixed heuristics
 
+### Progress
+
+- `Statement::Analyze { table_name }` now exists in the SQL AST, and `normalize_statement()` maps PostgreSQL `VacuumStmt` analyze forms into it while still rejecting unsupported `VACUUM`, `ANALYZE` options, and column-list variants
+- the executor now implements `ANALYZE` end-to-end, collecting per-table row counts plus BTREE index entry-count and distinct-key-count statistics through the existing runtime index structures instead of introducing a parallel stats scan path
+- `CatalogState` now carries persisted `table_stats` / `index_stats`, and the manifest payload encode/decode path now round-trips those statistics so they survive reopen without inventing a second catalog persistence mechanism
+- `db.rs` now rejects `ANALYZE` inside explicit SQL transactions, matching the documented autocommit-only behavior for the command
+- the planner now uses collected BTREE stats to suppress low-selectivity equality `IndexSeek` plans after `ANALYZE` while still preserving `IndexSeek` for selective predicates, and `relational_phase3_tests.rs` now pins that behavior through user-visible `EXPLAIN` output
+- `parser_tests.rs`, targeted executor unit tests, `relational_phase3_tests.rs`, `engine_coverage_tests.rs`, `cargo check -p decentdb --quiet`, and `cargo clippy -p decentdb --quiet` all pass after the Slice 8 landing
+- the next default target is Slice 9 (generated columns and temp objects)
+
 ## Slice 9 - Generated columns and temp objects
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -755,9 +739,19 @@ Implement the catalog and execution semantics for two major DDL features that cu
 - generated columns persist computed values correctly
 - temp objects are session-scoped and not durable
 
+### Progress
+
+- stored generated columns now execute end-to-end: the AST/normalizer accept `GENERATED ALWAYS AS (...) STORED`, catalog metadata preserves the expression SQL, and DML recomputes generated values on INSERT/UPDATE before constraint validation
+- generated-column DDL validation now rejects unsupported or unsafe forms (DEFAULT, PRIMARY KEY, self-reference, generated-to-generated references, subqueries, parameters, aggregates, and window functions) instead of deferring those failures until later writes
+- manifest/runtime payload persistence now round-trips generated-column metadata through an additive end-of-payload section so older on-disk layouts still decode cleanly
+- `parser_tests.rs` and `engine_coverage_tests.rs` now prove generated-column parser acceptance, stored-value computation, update-time recomputation after reopen, explicit-write rejection, and `UNIQUE` enforcement on generated columns
+- temp tables/views now execute through a handle-local `TempSchemaState` overlay that survives runtime refreshes, shadows persistent relations within the session, stays out of WAL/catalog persistence, and uses a dedicated temp schema cookie for prepared-statement invalidation
+- temp-only writes now use an in-memory install path (including temp-only explicit transactions) so session objects never dirty WAL/catalog state, while metadata APIs and DDL renderers surface `temporary: true` consistently for the creating handle
+- `parser_tests.rs` and `engine_coverage_tests.rs` now prove temp-object parser acceptance, session lifetime, cross-handle non-visibility, persistent shadowing/drop-unshadow behavior, prepared-statement invalidation, and temp metadata/DDL output
+
 ## Slice 10 - Matrix regression harness
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -776,6 +770,13 @@ Prevent this drift from reappearing.
 ### Acceptance
 
 - future feature-matrix edits can be validated against code, not just reviewed manually
+
+### Progress
+
+- added `crates/decentdb/tests/matrix_regression_tests.rs`, a dedicated integration harness that mirrors the user-guide matrix families instead of burying the checks in one large catch-all file
+- the matrix harness exercises the documented DDL, DML, join, clause, aggregate, window, scalar/date-time/JSON, operator, transaction, data-type, constraint, set-operation, and CTE surfaces end-to-end
+- the harness also keeps explicit rejection coverage for intentionally unsupported materialized views and generic set-returning functions
+- while wiring the harness, the engine gained compatibility support for the documented legacy `CREATE TRIGGER ... BEGIN ... END` form, real `%` operator execution, and ISO-format text casts into `DATE` / `TIMESTAMP` columns so the documented examples execute as written
 
 ## Documentation follow-up tasks for implemented but under-documented features
 
@@ -808,12 +809,6 @@ The user guide currently only shows `EXPLAIN SELECT ...` examples (`docs/user-gu
 
 ## Suggested next coding move
 
-If work starts immediately after this document, continue with **Slice 4**.
+All implementation slices in this plan are now complete.
 
-Finish the remaining `NATURAL JOIN` / `USING` portion of the slice:
-
-- preserve the shared-column list from libpg_query `JoinExpr` instead of discarding it during normalization
-- synthesize the equality predicate for matching column names while keeping ambiguous/no-common-column behavior explicit
-- define result-column suppression so `SELECT *` from a natural join exposes shared columns once, with regression coverage for duplicate names and empty-side behavior
-
-After Slice 1, move to **Slice 6**, **Slice 7**, or **Slice 8** if the priority is to close the most user-visible documentation gaps first. Then tackle the larger structural slices (`Join` parity, recursive CTEs, temp/generated semantics).
+If work continues from here, use the documentation follow-up tasks below (or any newly discovered product-contract clarifications) rather than reopening the missing-feature slices.

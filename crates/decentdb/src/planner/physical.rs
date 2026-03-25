@@ -1,6 +1,6 @@
 //! Physical plan nodes and EXPLAIN rendering helpers.
 
-use crate::sql::ast::{Expr, JoinKind, OrderBy, SelectItem, SetOperation};
+use crate::sql::ast::{Expr, JoinConstraint, JoinKind, OrderBy, SelectItem, SetOperation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PhysicalPlan {
@@ -29,7 +29,7 @@ pub(crate) enum PhysicalPlan {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
         kind: JoinKind,
-        on: Expr,
+        constraint: JoinConstraint,
     },
     Aggregate {
         input: Box<PhysicalPlan>,
@@ -101,12 +101,12 @@ impl PhysicalPlan {
                 left,
                 right,
                 kind,
-                on,
+                constraint,
             } => {
                 output.push(format!(
-                    "{indent}NestedLoopJoin(kind={:?}, on={})",
+                    "{indent}NestedLoopJoin(kind={:?}, {})",
                     kind,
-                    on.to_sql()
+                    constraint.to_sql()
                 ));
                 left.render_into(depth + 1, output);
                 right.render_into(depth + 1, output);

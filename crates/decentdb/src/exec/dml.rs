@@ -60,7 +60,23 @@ pub(crate) struct PreparedSimpleInsert {
 
 impl EngineRuntime {
     pub(crate) fn can_execute_insert_in_place(&self, statement: &InsertStatement) -> bool {
-        if self.catalog.view(&statement.table_name).is_some() || statement.on_conflict.is_some() {
+        if self
+            .visible_view(&statement.table_name, super::NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(&statement.table_name)
+            || statement.on_conflict.is_some()
+        {
+            return false;
+        }
+        if self
+            .table_schema(&statement.table_name)
+            .is_some_and(|table| {
+                table
+                    .columns
+                    .iter()
+                    .any(|column| column.generated_sql.is_some())
+            })
+        {
             return false;
         }
         if !matches!(&statement.source, InsertSource::Values(rows) if rows.len() == 1) {
@@ -74,7 +90,9 @@ impl EngineRuntime {
     }
 
     pub(crate) fn can_reuse_prepared_simple_insert(&self, prepared: &PreparedSimpleInsert) -> bool {
-        if self.catalog.table(&prepared.table_name).is_none() {
+        if self.visible_table_is_temporary(&prepared.table_name)
+            || self.table_schema(&prepared.table_name).is_none()
+        {
             return false;
         }
         if prepared.compiled_index_state_epoch == self.index_state_epoch {
@@ -101,8 +119,7 @@ impl EngineRuntime {
         }
 
         let table = self
-            .catalog
-            .table(&statement.table_name)
+            .table_schema(&statement.table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
         let InsertSource::Values(rows) = &statement.source else {
             return Ok(None);
@@ -444,7 +461,10 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if self.catalog.view(&statement.table_name).is_some() {
+        if self
+            .visible_view(&statement.table_name, super::NameResolutionScope::Session)
+            .is_some()
+        {
             if !statement.returning.is_empty() {
                 return Err(DbError::sql(
                     "INSERT ... RETURNING is not supported for view INSTEAD OF triggers",
@@ -465,6 +485,7 @@ impl EngineRuntime {
         }
 
         let table_name = statement.table_name.clone();
+        let temporary = self.visible_table_is_temporary(&table_name);
         let source_rows = materialize_insert_source(self, &statement.source, params)?;
         let mut affected_rows = 0_u64;
         let mut returning_rows = Vec::new();
@@ -472,9 +493,7 @@ impl EngineRuntime {
         for source_row in source_rows {
             let candidate = {
                 let mut staged_table = self
-                    .catalog
-                    .tables
-                    .get(&table_name)
+                    .table_schema(&table_name)
                     .cloned()
                     .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
                 let candidate = build_insert_row_values(
@@ -484,11 +503,17 @@ impl EngineRuntime {
                     source_row,
                     params,
                 )?;
-                self.catalog
-                    .tables
-                    .get_mut(&table_name)
-                    .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
-                    .next_row_id = staged_table.next_row_id;
+                if temporary {
+                    self.temp_table_schema_mut(&table_name)
+                        .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+                        .next_row_id = staged_table.next_row_id;
+                } else {
+                    self.catalog
+                        .tables
+                        .get_mut(&table_name)
+                        .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+                        .next_row_id = staged_table.next_row_id;
+                }
                 candidate
             };
 
@@ -542,9 +567,7 @@ impl EngineRuntime {
 
             let row_id = {
                 let table = self
-                    .catalog
-                    .tables
-                    .get(&table_name)
+                    .table_schema(&table_name)
                     .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
                 primary_row_id(table, &candidate).unwrap_or_else(|| next_row_id(self, &table_name))
             };
@@ -554,15 +577,16 @@ impl EngineRuntime {
             };
             let index_updates =
                 self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
-            self.tables
-                .get_mut(&table_name)
+            self.table_data_mut(&table_name)
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
                 .rows
                 .push(stored_row.clone());
             self.apply_insert_index_updates(index_updates)?;
-            self.mark_table_dirty(&table_name);
+            if !temporary {
+                self.mark_table_dirty(&table_name);
+            }
             affected_rows += 1;
             if !statement.returning.is_empty() {
                 returning_rows.push(stored_row.clone());
@@ -589,7 +613,10 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if self.catalog.view(&statement.table_name).is_some() {
+        if self
+            .visible_view(&statement.table_name, super::NameResolutionScope::Session)
+            .is_some()
+        {
             let affected = view_match_count(
                 self,
                 &statement.table_name,
@@ -607,16 +634,13 @@ impl EngineRuntime {
 
         let table_name = statement.table_name.clone();
         let table = self
-            .catalog
-            .tables
-            .get(&table_name)
+            .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let matching_row_ids = matching_row_ids(
             self,
             &table,
-            self.tables
-                .get(&table_name)
+            self.table_data(&table_name)
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
@@ -629,11 +653,16 @@ impl EngineRuntime {
         let mut affected_rows = 0_u64;
         for row_id in matching_row_ids {
             let row_index = self
-                .tables
-                .get(&table_name)
+                .table_data(&table_name)
                 .and_then(|data| data.rows.iter().position(|row| row.row_id == row_id))
                 .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPDATE")))?;
-            let current_row = self.tables[&table_name].rows[row_index].clone();
+            let current_row = self
+                .table_data(&table_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?
+                .rows[row_index]
+                .clone();
             let mut next_values = current_row.values.clone();
             let dataset = table_row_dataset(&table, &current_row.values, &table_name);
             for assignment in &statement.assignments {
@@ -644,6 +673,12 @@ impl EngineRuntime {
                     .ok_or_else(|| {
                         DbError::sql(format!("unknown column {}", assignment.column_name))
                     })?;
+                if table.columns[column_index].generated_sql.is_some() {
+                    return Err(DbError::sql(format!(
+                        "cannot UPDATE generated column {}.{}",
+                        table.name, assignment.column_name
+                    )));
+                }
                 let value = self.eval_expr(
                     &assignment.expr,
                     &dataset,
@@ -655,6 +690,7 @@ impl EngineRuntime {
                 next_values[column_index] =
                     super::cast_value(value, table.columns[column_index].column_type)?;
             }
+            apply_generated_columns(self, &table, &mut next_values, params)?;
             self.apply_parent_update_actions(
                 &table_name,
                 &table,
@@ -663,8 +699,7 @@ impl EngineRuntime {
                 params,
             )?;
             self.validate_row(&table_name, &next_values, Some(row_id), params)?;
-            self.tables
-                .get_mut(&table_name)
+            self.table_data_mut(&table_name)
                 .ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?
@@ -693,7 +728,10 @@ impl EngineRuntime {
         params: &[Value],
         page_size: u32,
     ) -> Result<QueryResult> {
-        if self.catalog.view(&statement.table_name).is_some() {
+        if self
+            .visible_view(&statement.table_name, super::NameResolutionScope::Session)
+            .is_some()
+        {
             let affected = view_match_count(
                 self,
                 &statement.table_name,
@@ -711,14 +749,11 @@ impl EngineRuntime {
 
         let table_name = statement.table_name.clone();
         let table = self
-            .catalog
-            .tables
-            .get(&table_name)
+            .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let rows = self
-            .tables
-            .get(&table_name)
+            .table_data(&table_name)
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .clone();
@@ -738,8 +773,7 @@ impl EngineRuntime {
             .iter()
             .map(|row| row.row_id)
             .collect::<Vec<_>>();
-        self.tables
-            .get_mut(&table_name)
+        self.table_data_mut(&table_name)
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .retain(|row| !matching_row_ids.contains(&row.row_id));
@@ -766,17 +800,14 @@ impl EngineRuntime {
         params: &[Value],
     ) -> Result<QueryResult> {
         let table = self
-            .catalog
-            .tables
-            .get(table_name)
+            .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let dataset = Dataset {
             columns: table
                 .columns
                 .iter()
-                .map(|column| ColumnBinding {
-                    table: Some(table_name.to_string()),
-                    name: column.name.clone(),
+                .map(|column| {
+                    ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
                 })
                 .collect(),
             rows: rows.iter().map(|row| row.values.clone()).collect(),
@@ -808,25 +839,25 @@ impl EngineRuntime {
         params: &[Value],
     ) -> Result<Option<StoredRow>> {
         let table = self
-            .catalog
-            .tables
-            .get(table_name)
+            .table_schema(table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let row_index = self
-            .tables
-            .get(table_name)
+            .table_data(table_name)
             .and_then(|data| data.rows.iter().position(|row| row.row_id == row_id))
             .ok_or_else(|| DbError::internal(format!("row {row_id} vanished during UPSERT")))?;
-        let current_row = self.tables[table_name].rows[row_index].clone();
+        let current_row = self
+            .table_data(table_name)
+            .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+            .rows[row_index]
+            .clone();
         let dataset = table_row_dataset(&table, &current_row.values, table_name);
         let excluded = Dataset {
             columns: table
                 .columns
                 .iter()
-                .map(|column| ColumnBinding {
-                    table: Some("excluded".to_string()),
-                    name: column.name.clone(),
+                .map(|column| {
+                    ColumnBinding::visible(Some("excluded".to_string()), column.name.clone())
                 })
                 .collect(),
             rows: vec![excluded_values.to_vec()],
@@ -856,6 +887,12 @@ impl EngineRuntime {
                 .ok_or_else(|| {
                     DbError::sql(format!("unknown column {}", assignment.column_name))
                 })?;
+            if table.columns[column_index].generated_sql.is_some() {
+                return Err(DbError::sql(format!(
+                    "cannot UPDATE generated column {}.{}",
+                    table.name, assignment.column_name
+                )));
+            }
             let value = self.eval_expr(
                 &assignment.expr,
                 &dataset,
@@ -867,6 +904,7 @@ impl EngineRuntime {
             next_values[column_index] =
                 super::cast_value(value, table.columns[column_index].column_type)?;
         }
+        apply_generated_columns(self, &table, &mut next_values, params)?;
         self.apply_parent_update_actions(
             table_name,
             &table,
@@ -875,8 +913,7 @@ impl EngineRuntime {
             params,
         )?;
         self.validate_row(table_name, &next_values, Some(row_id), params)?;
-        self.tables
-            .get_mut(table_name)
+        self.table_data_mut(table_name)
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows[row_index]
             .values = next_values.clone();
@@ -895,6 +932,9 @@ impl EngineRuntime {
         row: &[Value],
         params: &[Value],
     ) -> Result<()> {
+        if table.temporary {
+            return Ok(());
+        }
         let referencing_tables = self
             .catalog
             .tables
@@ -942,8 +982,7 @@ impl EngineRuntime {
                             .iter()
                             .map(|row| row.row_id)
                             .collect::<Vec<_>>();
-                        self.tables
-                            .get_mut(&child_table.name)
+                        self.table_data_mut(&child_table.name)
                             .ok_or_else(|| {
                                 DbError::internal(format!(
                                     "table data for {} is missing",
@@ -960,8 +999,7 @@ impl EngineRuntime {
                         self.mark_table_dirty(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
-                                .tables
-                                .get(&child_table.name)
+                                .table_data(&child_table.name)
                                 .and_then(|data| {
                                     data.rows
                                         .iter()
@@ -975,8 +1013,7 @@ impl EngineRuntime {
                                 })?;
                             let updated_values = {
                                 let row = &mut self
-                                    .tables
-                                    .get_mut(&child_table.name)
+                                    .table_data_mut(&child_table.name)
                                     .ok_or_else(|| {
                                         DbError::internal(format!(
                                             "table data for {} is missing",
@@ -1023,6 +1060,9 @@ impl EngineRuntime {
         new_row: &[Value],
         params: &[Value],
     ) -> Result<()> {
+        if table.temporary {
+            return Ok(());
+        }
         let referencing_tables = self
             .catalog
             .tables
@@ -1073,8 +1113,7 @@ impl EngineRuntime {
                         self.mark_table_dirty(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
-                                .tables
-                                .get(&child_table.name)
+                                .table_data(&child_table.name)
                                 .and_then(|data| {
                                     data.rows
                                         .iter()
@@ -1088,8 +1127,7 @@ impl EngineRuntime {
                                 })?;
                             let updated_values = {
                                 let row = &mut self
-                                    .tables
-                                    .get_mut(&child_table.name)
+                                    .table_data_mut(&child_table.name)
                                     .ok_or_else(|| {
                                         DbError::internal(format!(
                                             "table data for {} is missing",
@@ -1127,8 +1165,7 @@ impl EngineRuntime {
                         self.mark_table_dirty(&child_table.name);
                         for child_row in matching_children {
                             let row_index = self
-                                .tables
-                                .get(&child_table.name)
+                                .table_data(&child_table.name)
                                 .and_then(|data| {
                                     data.rows
                                         .iter()
@@ -1142,8 +1179,7 @@ impl EngineRuntime {
                                 })?;
                             let updated_values = {
                                 let row = &mut self
-                                    .tables
-                                    .get_mut(&child_table.name)
+                                    .table_data_mut(&child_table.name)
                                     .ok_or_else(|| {
                                         DbError::internal(format!(
                                             "table data for {} is missing",
@@ -1202,9 +1238,7 @@ impl EngineRuntime {
             .ok_or_else(|| DbError::internal("simple in-place insert expected one source row"))?;
 
         let mut staged_table = self
-            .catalog
-            .tables
-            .get(&table_name)
+            .table_schema(&table_name)
             .cloned()
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
         let candidate = build_insert_row_values(
@@ -1228,16 +1262,19 @@ impl EngineRuntime {
         let index_updates =
             self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
 
-        self.catalog
-            .tables
-            .get_mut(&table_name)
-            .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
-            .next_row_id = staged_table.next_row_id;
-        self.tables
-            .get_mut(&table_name)
+        self.table_data_mut(&table_name)
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows
             .push(stored_row.clone());
+        if let Some(table) = self.temp_table_schema_mut(&table_name) {
+            table.next_row_id = staged_table.next_row_id;
+        } else {
+            self.catalog
+                .tables
+                .get_mut(&table_name)
+                .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+                .next_row_id = staged_table.next_row_id;
+        }
         self.apply_insert_index_updates(index_updates)?;
         self.mark_table_dirty(&table_name);
 
@@ -1266,6 +1303,7 @@ pub(super) fn build_insert_row_values(
         table
             .columns
             .iter()
+            .filter(|column| column.generated_sql.is_none())
             .map(|column| column.name.clone())
             .collect::<Vec<_>>()
     } else {
@@ -1286,6 +1324,12 @@ pub(super) fn build_insert_row_values(
             .iter()
             .position(|column| column.name == column_name)
             .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
+        if table.columns[column_index].generated_sql.is_some() {
+            return Err(DbError::sql(format!(
+                "cannot INSERT into generated column {}.{}",
+                table.name, column_name
+            )));
+        }
         if values[column_index].is_some() {
             return Err(DbError::sql(format!(
                 "column {} was assigned more than once in INSERT",
@@ -1323,7 +1367,34 @@ pub(super) fn build_insert_row_values(
         }
         resolved.push(value);
     }
-    runtime.coerce_row_values(table, resolved)
+    let mut resolved = runtime.coerce_row_values(table, resolved)?;
+    apply_generated_columns(runtime, table, &mut resolved, params)?;
+    Ok(resolved)
+}
+
+fn apply_generated_columns(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    row: &mut [Value],
+    params: &[Value],
+) -> Result<()> {
+    for (index, column) in table.columns.iter().enumerate() {
+        let Some(generated_sql) = &column.generated_sql else {
+            continue;
+        };
+        let expr = parse_expression_sql(generated_sql)?;
+        let dataset = table_row_dataset(table, row, &table.name);
+        let value = runtime.eval_expr(
+            &expr,
+            &dataset,
+            row,
+            params,
+            &std::collections::BTreeMap::new(),
+            None,
+        )?;
+        row[index] = super::cast_value(value, column.column_type)?;
+    }
+    Ok(())
 }
 
 fn compile_prepared_insert_value_source(expr: &Expr) -> Option<PreparedInsertValueSource> {
@@ -1597,11 +1668,15 @@ fn conflict_target(action: &ConflictAction) -> Result<ConflictTarget> {
 }
 
 pub(super) fn next_row_id(runtime: &mut EngineRuntime, table_name: &str) -> i64 {
-    let table = runtime
-        .catalog
-        .tables
-        .get_mut(table_name)
-        .expect("table must exist for row-id allocation");
+    let table = if let Some(table) = runtime.temp_table_schema_mut(table_name) {
+        table
+    } else {
+        runtime
+            .catalog
+            .tables
+            .get_mut(table_name)
+            .expect("table must exist for row-id allocation")
+    };
     let row_id = table.next_row_id;
     table.next_row_id += 1;
     row_id

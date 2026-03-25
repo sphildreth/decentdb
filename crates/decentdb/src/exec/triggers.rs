@@ -32,6 +32,11 @@ impl EngineRuntime {
             TriggerKindSpec::After => (TriggerKind::After, false),
             TriggerKindSpec::InsteadOf => (TriggerKind::InsteadOf, true),
         };
+        if self.temp_relation_exists(&statement.target_name) {
+            return Err(DbError::sql(
+                "triggers on temporary tables or views are not supported",
+            ));
+        }
         if on_view {
             if !self.catalog.views.contains_key(&statement.target_name) {
                 return Err(DbError::sql(format!(
@@ -141,6 +146,9 @@ fn matching_triggers(
     event: TriggerEvent,
     on_view: bool,
 ) -> Vec<TriggerSchema> {
+    if runtime.temp_relation_exists(target_name) {
+        return Vec::new();
+    }
     runtime
         .catalog
         .triggers

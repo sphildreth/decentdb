@@ -31,6 +31,16 @@ engines:
     jar_paths:
       - /usr/share/java/hsqldb.jar
 
+  firebird:
+    enabled: true
+    jdbc_url: jdbc:firebirdsql:embedded:{db_path}
+    driver_class: org.firebirdsql.jdbc.FBDriver
+    jar_paths:
+      - /home/steven/source/decentdb/benchmarks/python_embedded_compare/vendor/jaybird-6.0.4.jar
+    firebird_home: /home/steven/.local/share/containers/storage/overlay/11952f32074264f3ee87e216fd1577304561abdcd670c321994275d78297a8e0/diff/usr/lib/x86_64-linux-gnu/firebird/3.0
+    firebird_conf: /home/steven/.local/share/containers/storage/overlay/11952f32074264f3ee87e216fd1577304561abdcd670c321994275d78297a8e0/diff/etc/firebird/3.0/firebird.conf
+    firebird_lib_dir: /home/steven/.local/share/containers/storage/overlay/11952f32074264f3ee87e216fd1577304561abdcd670c321994275d78297a8e0/diff/usr/lib/x86_64-linux-gnu
+
 dataset:
   seed: 42
   customers_n: 100

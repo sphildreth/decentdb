@@ -60,8 +60,7 @@ impl EngineRuntime {
         params: &[Value],
     ) -> Result<()> {
         let table = self
-            .catalog
-            .table(table_name)
+            .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
 
         for (column, value) in table.columns.iter().zip(row) {
@@ -104,8 +103,7 @@ impl EngineRuntime {
                 continue;
             }
             let rows = self
-                .tables
-                .get(table_name)
+                .table_data(table_name)
                 .map(|data| data.rows.as_slice())
                 .unwrap_or(&[]);
             for existing in rows {
@@ -201,8 +199,7 @@ impl EngineRuntime {
         target: &ConflictTarget,
     ) -> Result<Option<StoredRow>> {
         let table = self
-            .catalog
-            .table(table_name)
+            .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
         let indexes = indexes_for_conflict_target(self, table_name, target)?;
         if indexes.is_empty() {
@@ -291,6 +288,13 @@ fn unique_indexes_for_table<'a>(
     runtime: &'a EngineRuntime,
     table_name: &str,
 ) -> Vec<&'a IndexSchema> {
+    if runtime.visible_table_is_temporary(table_name) {
+        return runtime
+            .temp_indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, table_name) && index.unique)
+            .collect();
+    }
     runtime
         .catalog
         .indexes

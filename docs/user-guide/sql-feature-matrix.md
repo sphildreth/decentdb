@@ -537,7 +537,7 @@ CREATE TABLE t5 (price DECIMAL(10,2), tax NUMERIC(5,4));
 -- UUID
 CREATE TABLE t6 (id UUID PRIMARY KEY DEFAULT GEN_RANDOM_UUID());
 
--- Date and Timestamp (stored as ISO-format TEXT in DecentDB)
+-- Date and Timestamp (accepted as ISO-format TEXT literals; stored internally as native int64 microseconds in DecentDB)
 CREATE TABLE events (
   id INTEGER PRIMARY KEY,
   event_date DATE,

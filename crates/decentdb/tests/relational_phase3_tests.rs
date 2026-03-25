@@ -145,6 +145,85 @@ fn read_executor_supports_joins_aggregates_row_number_and_explain() {
 }
 
 #[test]
+fn analyze_stats_change_btree_explain_plan_based_on_selectivity() {
+    let path = unique_db_path("phase3-analyze-plan");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE events (id INT64 PRIMARY KEY, category INT64)")
+        .expect("create events");
+    db.execute("CREATE INDEX events_category_idx ON events (category)")
+        .expect("create events index");
+    for id in 1..=40 {
+        let category = if id <= 20 { 1 } else { 2 };
+        db.execute(&format!(
+            "INSERT INTO events (id, category) VALUES ({id}, {category})"
+        ))
+        .expect("insert event");
+    }
+
+    let explain_before = db
+        .execute("EXPLAIN SELECT * FROM events WHERE category = 1")
+        .expect("explain before analyze");
+    assert!(
+        explain_before
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("IndexSeek(table=events")),
+        "expected pre-ANALYZE IndexSeek in {:?}",
+        explain_before.explain_lines()
+    );
+
+    db.execute("ANALYZE events").expect("analyze events");
+
+    let explain_after = db
+        .execute("EXPLAIN SELECT * FROM events WHERE category = 1")
+        .expect("explain after analyze");
+    assert!(
+        explain_after
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("TableScan(table=events)")),
+        "expected post-ANALYZE TableScan in {:?}",
+        explain_after.explain_lines()
+    );
+    assert!(
+        explain_after
+            .explain_lines()
+            .iter()
+            .all(|line| !line.contains("IndexSeek(table=events")),
+        "did not expect post-ANALYZE IndexSeek in {:?}",
+        explain_after.explain_lines()
+    );
+
+    db.execute("CREATE TABLE accounts (id INT64 PRIMARY KEY, email TEXT)")
+        .expect("create accounts");
+    db.execute("CREATE INDEX accounts_email_idx ON accounts (email)")
+        .expect("create accounts index");
+    for id in 1..=40 {
+        db.execute(&format!(
+            "INSERT INTO accounts (id, email) VALUES ({id}, 'user{id}@example.com')"
+        ))
+        .expect("insert account");
+    }
+
+    db.execute("ANALYZE accounts").expect("analyze accounts");
+
+    let selective = db
+        .execute("EXPLAIN SELECT * FROM accounts WHERE email = 'user17@example.com'")
+        .expect("explain selective predicate");
+    assert!(
+        selective
+            .explain_lines()
+            .iter()
+            .any(|line| line.contains("IndexSeek(table=accounts, index=accounts_email_idx")),
+        "expected selective predicate to keep IndexSeek in {:?}",
+        selective.explain_lines()
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn read_executor_supports_parameterized_alias_joins_on_either_side() {
     let path = unique_db_path("phase3-join-fastpath");
     let db = Db::create(&path, DbConfig::default()).expect("create database");

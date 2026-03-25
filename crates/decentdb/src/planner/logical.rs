@@ -1,6 +1,6 @@
 //! Logical plan nodes for the relational executor.
 
-use crate::sql::ast::{Expr, JoinKind, OrderBy, Query, SelectItem, SetOperation};
+use crate::sql::ast::{Expr, JoinConstraint, JoinKind, OrderBy, Query, SelectItem, SetOperation};
 
 #[allow(dead_code, clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
@@ -20,7 +20,7 @@ pub(crate) enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         kind: JoinKind,
-        on: Expr,
+        constraint: JoinConstraint,
     },
     Aggregate {
         input: Box<LogicalPlan>,

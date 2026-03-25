@@ -633,8 +633,9 @@ fn table_json(info: &TableInfo) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{{\"name\":{},\"columns\":[{}],\"checks\":{},\"foreign_keys\":[{}],\"primary_key_columns\":{},\"row_count\":{}}}",
+        "{{\"name\":{},\"temporary\":{},\"columns\":[{}],\"checks\":{},\"foreign_keys\":[{}],\"primary_key_columns\":{},\"row_count\":{}}}",
         json_string(&info.name),
+        json_bool(info.temporary),
         columns,
         checks,
         foreign_keys,
@@ -658,8 +659,9 @@ fn index_json(info: &IndexInfo) -> String {
 
 fn view_json(info: &ViewInfo) -> String {
     format!(
-        "{{\"name\":{},\"sql_text\":{},\"column_names\":{},\"dependencies\":{}}}",
+        "{{\"name\":{},\"temporary\":{},\"sql_text\":{},\"column_names\":{},\"dependencies\":{}}}",
         json_string(&info.name),
+        json_bool(info.temporary),
         json_string(&info.sql_text),
         json_string_list(&info.column_names),
         json_string_list(&info.dependencies),
