@@ -24,6 +24,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -68,15 +71,10 @@ jobs:
           fi
 
       - name: Clippy
-        run: |
-          cargo clippy -p decentdb --all-targets -- -D warnings
-          cargo clippy -p decentdb-cli --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Engine Tests
-        run: cargo test -p decentdb
-
-      - name: CLI Tests
-        run: cargo test -p decentdb-cli
+      - name: Tests
+        run: cargo test --workspace
 
       - name: Build cdylib
         run: cargo build -p decentdb
