@@ -11,6 +11,7 @@ const DEFAULT_COUNT = 1_000_000;
 const DEFAULT_POINT_READS = 10_000;
 const DEFAULT_POINT_SEED = 1337;
 const DEFAULT_FETCHMANY_BATCH = 4096;
+const DEFAULT_INSERT_BATCH = 4096;
 
 function parseCli() {
   const { values } = parseArgs({
@@ -20,6 +21,7 @@ function parseCli() {
       'point-reads': { type: 'string', default: String(DEFAULT_POINT_READS) },
       'point-seed': { type: 'string', default: String(DEFAULT_POINT_SEED) },
       'fetchmany-batch': { type: 'string', default: String(DEFAULT_FETCHMANY_BATCH) },
+      'insert-batch': { type: 'string', default: String(DEFAULT_INSERT_BATCH) },
       'db-prefix': { type: 'string', default: 'node_knex_bench_fetch' },
       'keep-db': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
@@ -40,6 +42,7 @@ function parseCli() {
     throw new Error('--point-seed must be an integer');
   }
   const fetchmanyBatch = parsePositiveInt(values['fetchmany-batch'], '--fetchmany-batch');
+  const insertBatch = parsePositiveInt(values['insert-batch'], '--insert-batch');
   const dbPrefix = values['db-prefix'];
   if (!dbPrefix) {
     throw new Error('--db-prefix cannot be empty');
@@ -54,6 +57,7 @@ function parseCli() {
     pointReads,
     pointSeed,
     fetchmanyBatch,
+    insertBatch,
     dbPrefix,
     keepDb: values['keep-db'] === true,
   };
@@ -68,6 +72,7 @@ function printUsage() {
   console.log('  --engine <all|decentdb|sqlite>   Engines to run (default: all)');
   console.log(`  --count <n>                      Rows to insert/fetch (default: ${DEFAULT_COUNT})`);
   console.log(`  --fetchmany-batch <n>            Batch size for fetchmany metric (default: ${DEFAULT_FETCHMANY_BATCH})`);
+  console.log(`  --insert-batch <n>               Batch size for insert throughput metric (default: ${DEFAULT_INSERT_BATCH})`);
   console.log(`  --point-reads <n>                Random indexed point lookups (default: ${DEFAULT_POINT_READS})`);
   console.log(`  --point-seed <n>                 RNG seed for point lookups (default: ${DEFAULT_POINT_SEED})`);
   console.log('  --db-prefix <path_prefix>        Database prefix (default: node_knex_bench_fetch)');
@@ -265,8 +270,18 @@ async function runDecentKnexBenchmark(dbPath, opts) {
     const insertStart = process.hrtime.bigint();
     await runWithGcDisabled(async () => {
       await k.transaction(async (trx) => {
-        for (let i = 0; i < opts.count; i++) {
-          await trx.raw('INSERT INTO bench VALUES (?, ?, ?)', [i, `value_${i}`, i]);
+        for (let start = 0; start < opts.count; start += opts.insertBatch) {
+          const end = Math.min(start + opts.insertBatch, opts.count);
+          const placeholders = new Array(end - start);
+          const bindings = new Array((end - start) * 3);
+          for (let i = start, row = 0; i < end; i++, row++) {
+            placeholders[row] = '(?, ?, ?)';
+            const base = row * 3;
+            bindings[base] = i;
+            bindings[base + 1] = `value_${i}`;
+            bindings[base + 2] = i;
+          }
+          await trx.raw(`INSERT INTO bench VALUES ${placeholders.join(', ')}`, bindings);
         }
       });
     });
@@ -371,8 +386,18 @@ async function runSqliteKnexBenchmark(dbPath, opts) {
     const insertSeconds = await runWithGcDisabled(async () => {
       const started = process.hrtime.bigint();
       await k.transaction(async (trx) => {
-        for (let i = 0; i < opts.count; i++) {
-          await trx.raw('INSERT INTO bench VALUES (?, ?, ?)', [i, `value_${i}`, i]);
+        for (let start = 0; start < opts.count; start += opts.insertBatch) {
+          const end = Math.min(start + opts.insertBatch, opts.count);
+          const placeholders = new Array(end - start);
+          const bindings = new Array((end - start) * 3);
+          for (let i = start, row = 0; i < end; i++, row++) {
+            placeholders[row] = '(?, ?, ?)';
+            const base = row * 3;
+            bindings[base] = i;
+            bindings[base + 1] = `value_${i}`;
+            bindings[base + 2] = i;
+          }
+          await trx.raw(`INSERT INTO bench VALUES ${placeholders.join(', ')}`, bindings);
         }
       });
       return Number(process.hrtime.bigint() - started) / 1e9;

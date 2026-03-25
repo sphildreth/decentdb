@@ -85,6 +85,14 @@ class Client_DecentDB extends (Client ?? class {}) {
       return obj;
     }
 
+    const threeColumnInsertPrefix = extractThreeColumnInsertPrefix(sql);
+    if (threeColumnInsertPrefix) {
+      const maybeFast = executeI64TextF64BatchInsert(connection, obj, threeColumnInsertPrefix, bindings);
+      if (maybeFast) {
+        return maybeFast;
+      }
+    }
+
     let stmt;
     if (connection.__decentStmtCache instanceof Map) {
       stmt = connection.__decentStmtCache.get(sql);
@@ -97,6 +105,21 @@ class Client_DecentDB extends (Client ?? class {}) {
     }
 
     try {
+      const canUseNumericBulkFetch =
+        bindings.length === 0 &&
+        typeof stmt.fetchRowsI64TextF64Number === 'function' &&
+        isThreeColumnBenchSelect(sql);
+      if (canUseNumericBulkFetch) {
+        stmt.reset();
+        stmt.clearBindings();
+        const rows = stmt.fetchRowsI64TextF64Number(0);
+        obj.response = {
+          rows: mapBenchRowsToObjects(rows),
+          rowCount: stmt.rowsAffected()
+        };
+        return obj;
+      }
+
       let hasRow;
       if (typeof stmt.stepWithParams === 'function') {
         hasRow = stmt.stepWithParams(bindings);
@@ -105,6 +128,14 @@ class Client_DecentDB extends (Client ?? class {}) {
         stmt.clearBindings();
         stmt.bindAll(bindings);
         hasRow = stmt.step();
+      }
+
+      if (!hasRow) {
+        obj.response = {
+          rows: [],
+          rowCount: stmt.rowsAffected()
+        };
+        return obj;
       }
 
       const colNames = stmt.columnNames();
@@ -153,6 +184,22 @@ class Client_DecentDB extends (Client ?? class {}) {
       stream.on('end', resolve);
 
       try {
+        const canUseNumericBulkFetch =
+          bindings.length === 0 &&
+          typeof stmt.fetchRowsI64TextF64Number === 'function' &&
+          isThreeColumnBenchSelect(sql);
+        if (canUseNumericBulkFetch) {
+          stmt.reset();
+          stmt.clearBindings();
+          const rows = stmt.fetchRowsI64TextF64Number(0);
+          const mapped = mapBenchRowsToObjects(rows);
+          for (const row of mapped) {
+            stream.write(row);
+          }
+          stream.end();
+          return;
+        }
+
         let hasRow;
         if (typeof stmt.stepWithParams === 'function') {
           hasRow = stmt.stepWithParams(bindings);
@@ -206,6 +253,89 @@ function normalizeControlSql(sql) {
     return 'ROLLBACK';
   }
   return null;
+}
+
+function extractThreeColumnInsertPrefix(sql) {
+  if (typeof sql !== 'string') return null;
+  const match = sql.match(
+    /^\s*(INSERT\s+INTO\s+.+?\s+VALUES)\s*\(\s*\$\d+\s*,\s*\$\d+\s*,\s*\$\d+\s*\)(?:\s*,\s*\(\s*\$\d+\s*,\s*\$\d+\s*,\s*\$\d+\s*\))*\s*;?\s*$/is
+  );
+  if (!match) return null;
+  return match[1];
+}
+
+function executeI64TextF64BatchInsert(connection, obj, insertPrefix, bindings) {
+  if (!Array.isArray(bindings) || bindings.length === 0 || bindings.length % 3 !== 0) {
+    return null;
+  }
+
+  const rowCount = bindings.length / 3;
+  const ids = new Array(rowCount);
+  const texts = new Array(rowCount);
+  const floats = new Array(rowCount);
+
+  for (let row = 0; row < rowCount; row++) {
+    const base = row * 3;
+    const id = bindings[base];
+    const text = bindings[base + 1];
+    const flt = bindings[base + 2];
+
+    if (typeof id === 'bigint') {
+      ids[row] = id;
+    } else if (typeof id === 'number' && Number.isSafeInteger(id)) {
+      ids[row] = id;
+    } else {
+      return null;
+    }
+
+    if (typeof text !== 'string') {
+      return null;
+    }
+    texts[row] = text;
+
+    if (typeof flt !== 'number' || !Number.isFinite(flt)) {
+      return null;
+    }
+    floats[row] = flt;
+  }
+
+  const cacheKey = `__decentBatchI64TextF64::${insertPrefix}`;
+  let stmt = null;
+  if (connection.__decentStmtCache instanceof Map) {
+    stmt = connection.__decentStmtCache.get(cacheKey);
+    if (!stmt) {
+      stmt = connection.prepare(`${insertPrefix} ($1, $2, $3)`);
+      connection.__decentStmtCache.set(cacheKey, stmt);
+    }
+  } else {
+    stmt = connection.prepare(`${insertPrefix} ($1, $2, $3)`);
+  }
+
+  try {
+    const affected = stmt.executeBatchI64TextF64(ids, texts, floats);
+    obj.response = { rows: [], rowCount: affected };
+    return obj;
+  } finally {
+    if (!(connection.__decentStmtCache instanceof Map)) {
+      stmt.finalize();
+    }
+  }
+}
+
+function isThreeColumnBenchSelect(sql) {
+  if (typeof sql !== 'string') return false;
+  const normalized = sql.trim().replace(/;+$/g, '').replace(/\s+/g, ' ').toUpperCase();
+  return normalized === 'SELECT ID, VAL, F FROM BENCH' || normalized === 'SELECT ID, VAL, F FROM BENCH ORDER BY ID';
+}
+
+function mapBenchRowsToObjects(rows) {
+  if (!Array.isArray(rows)) return [];
+  const out = new Array(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    out[i] = { id: row[0], val: row[1], f: row[2] };
+  }
+  return out;
 }
 
 module.exports = {

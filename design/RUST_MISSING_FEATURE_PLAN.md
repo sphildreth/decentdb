@@ -59,14 +59,17 @@ Implementation slices should be testable with fast local and CI validation. Pref
 | Slice 5 - Recursive CTE support | Not started | `WITH RECURSIVE` execution and guardrails. |
 | Slice 6 - Scalar, date/time, and JSON scalar function expansion | Not started | Bring documented function surface closer to reality. |
 | Slice 7 - JSON table functions | Not started | `json_each()` and `json_tree()` in `FROM`. |
-| Slice 8 - Generated columns and temp objects | Not started | `GENERATED ALWAYS AS (...) STORED`, `CREATE TEMP TABLE`, `CREATE TEMP VIEW`. |
-| Slice 9 - Matrix regression harness | Not started | Convert documented claims into executable regression coverage. |
+| Slice 8 - Planner statistics and `ANALYZE` | Not started | Add SQL `ANALYZE` plus catalog-backed planner statistics to reduce optimizer guesswork. |
+| Slice 9 - Generated columns and temp objects | Not started | `GENERATED ALWAYS AS (...) STORED`, `CREATE TEMP TABLE`, `CREATE TEMP VIEW`. |
+| Slice 10 - Matrix regression harness | Not started | Convert documented claims into executable regression coverage. |
 
 ## Why this plan exists
 
 The user-guide matrix is broad. It documents advanced SQL surface area including recursive CTEs, multiple non-left join kinds, advanced window functions, many scalar/date/time functions, JSON table functions, generated columns, and session-scoped temp objects (`docs/user-guide/sql-feature-matrix.md:21-26`, `91-93`, `123-128`, `167-169`, `202-204`, `236-243`, `275-337`, `463-465`, `627-629`).
 
 The current Rust rewrite clearly implements a meaningful SQL subset, but the codebase also contains explicit rejections for some of those documented features and narrower execution support for others. This plan records the gaps so coding agents can work through them in coherent slices rather than treating the matrix drift as one giant amorphous task.
+
+The deleted `design/DECENTDB_FUTURE_WINS.md` previously carried a handful of near-term ideas that were actually implementation-gap work rather than long-range product bets. Those actionable items now live here: JSON operators and table functions, date/time builtins, UUID generation, and planner statistics / `ANALYZE`.
 
 ## Important documentation drift inside the repository
 
@@ -626,6 +629,7 @@ Reduce the largest user-visible mismatch: the function tables in the matrix are 
 - math functions
 - missing string functions
 - date/time functions
+- UUID helper functions
 - missing JSON scalar functions and operators
 
 ### Concrete tasks
@@ -633,6 +637,7 @@ Reduce the largest user-visible mismatch: the function tables in the matrix are 
 - implement the matrix-listed math functions in the scalar dispatcher
 - add missing string helpers such as `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `LPAD`, `RPAD`, `REPEAT`, `REVERSE`, `CHR`, `HEX`
 - add date/time entry points such as `NOW`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
+- add UUID helper entry points such as `GEN_RANDOM_UUID`, `UUID_PARSE`, and `UUID_TO_STRING`
 - add JSON scalar helpers such as `json_type`, `json_valid`, `json_object`, `json_array`
 - add `->` and `->>` operator support in normalization and execution
 - add tests that pin coercion and null semantics
@@ -663,7 +668,39 @@ Implement `json_each()` and `json_tree()` as real `FROM`-clause table functions.
 
 - the matrix examples that project `key`, `value`, and `type` from these functions execute as written
 
-## Slice 8 - Generated columns and temp objects
+## Slice 8 - Planner statistics and `ANALYZE`
+
+**Status:** Not started
+
+### Goal
+
+Add the missing SQL `ANALYZE` surface and the underlying planner statistics needed to make the cost-based optimizer less heuristic-driven.
+
+### Scope
+
+- SQL `ANALYZE` statement support
+- catalog-backed table and index statistics
+- planner integration for cardinality/selectivity estimates
+
+### Why this slice belongs here
+
+`ANALYZE` is already documented in the user guide, but there is no Rust AST, normalization path, or execution support for it today. This is both a documentation-gap fix and a meaningful optimizer-quality improvement.
+
+### Concrete tasks
+
+- add an `ANALYZE` statement shape to the SQL AST and normalization pipeline
+- define a persisted statistics format that fits the current catalog/versioning constraints
+- collect table and index statistics through `ANALYZE` execution
+- teach the planner to consume the new statistics for row-count and selectivity estimates
+- add regression coverage for both statement behavior and plan-shape changes where stable enough to assert
+
+### Acceptance
+
+- `ANALYZE` executes end-to-end with direct tests
+- planner statistics persist and reload correctly
+- the optimizer consults the collected statistics instead of relying only on fixed heuristics
+
+## Slice 9 - Generated columns and temp objects
 
 **Status:** Not started
 
@@ -689,7 +726,7 @@ Implement the catalog and execution semantics for two major DDL features that cu
 - generated columns persist computed values correctly
 - temp objects are session-scoped and not durable
 
-## Slice 9 - Matrix regression harness
+## Slice 10 - Matrix regression harness
 
 **Status:** Not started
 
@@ -751,4 +788,5 @@ It has the best combination of:
 - direct user-visible improvement
 - strong fit with code that already exists
 
-After Slice 1, move to **Slice 3** or **Slice 2**, then tackle the larger structural slices (`Join` parity, recursive CTEs, temp/generated semantics).
+After Slice 1, move to **Slice 6**, **Slice 7**, or **Slice 8** if the priority is to close the most user-visible documentation gaps first. Then tackle the larger structural slices (`Join` parity, recursive CTEs, temp/generated semantics).
+

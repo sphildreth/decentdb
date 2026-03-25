@@ -333,6 +333,13 @@ class Statement {
     return this._native.stmtFetchRowsI64TextF64(this._handle, maxRows);
   }
 
+  fetchRowsI64TextF64Number(maxRows) {
+    if (typeof this._native.stmtFetchRowsI64TextF64Number !== 'function') {
+      throw new Error('Native numeric batch fetch API is unavailable in this build');
+    }
+    return this._native.stmtFetchRowsI64TextF64Number(this._handle, maxRows);
+  }
+
   rows() {
     const self = this;
     return {

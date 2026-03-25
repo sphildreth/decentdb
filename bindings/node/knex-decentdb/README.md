@@ -34,7 +34,7 @@ This client automatically rewrites Knex’s `?` placeholders to `$N`, respecting
 Run the Knex-level fair benchmark from this package:
 
 ```sh
-npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix node_knex_bench_fetch
+npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024 --insert-batch 1024 --db-prefix node_knex_bench_fetch
 ```
 
 Supported options:
@@ -43,6 +43,7 @@ Supported options:
 - `--count <n>`
 - `--point-reads <n>`
 - `--fetchmany-batch <n>`
+- `--insert-batch <n>`
 - `--point-seed <n>`
 - `--db-prefix <prefix>` (DecentDB writes `.ddb`, SQLite writes `.db`)
 - `--keep-db`

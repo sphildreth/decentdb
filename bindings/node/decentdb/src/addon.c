@@ -39,6 +39,19 @@ typedef struct {
 
 static napi_value build_row_array(napi_env env, const decentdb_native_api* api, decentdb_stmt* stmt);
 
+static void free_batch_buffers(
+    int64_t* ids,
+    double* floats,
+    const char** text_ptrs,
+    size_t* text_lens,
+    char* text_storage) {
+  if (ids) free(ids);
+  if (floats) free(floats);
+  if (text_ptrs) free((void*)text_ptrs);
+  if (text_lens) free(text_lens);
+  if (text_storage) free(text_storage);
+}
+
 static napi_value throw_error(napi_env env, const char* code, const char* msg) {
   napi_value err, msgv, codev;
   napi_status st;
@@ -726,24 +739,20 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
   double* floats = NULL;
   const char** text_ptrs = NULL;
   size_t* text_lens = NULL;
-  char** text_buffers = NULL;
+  char* text_storage = NULL;
 
   if (row_count > 0) {
     ids = (int64_t*)malloc(sizeof(int64_t) * row_count);
     floats = (double*)malloc(sizeof(double) * row_count);
     text_ptrs = (const char**)malloc(sizeof(char*) * row_count);
     text_lens = (size_t*)malloc(sizeof(size_t) * row_count);
-    text_buffers = (char**)calloc(row_count, sizeof(char*));
-    if (!ids || !floats || !text_ptrs || !text_lens || !text_buffers) {
-      if (ids) free(ids);
-      if (floats) free(floats);
-      if (text_ptrs) free(text_ptrs);
-      if (text_lens) free(text_lens);
-      if (text_buffers) free(text_buffers);
+    if (!ids || !floats || !text_ptrs || !text_lens) {
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
       return throw_error(env, "DECENTDB_OOM", "out of memory for batch buffers");
     }
   }
 
+  size_t total_text_bytes = 0;
   for (uint32_t i = 0; i < row_count_ids; i++) {
     napi_value id_value;
     st = napi_get_element(env, argv[1], i, &id_value);
@@ -755,32 +764,17 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
       bool lossless = false;
       st = napi_get_value_bigint_int64(env, id_value, &ids[i], &lossless);
       if (st != napi_ok || !lossless) {
-        for (uint32_t j = 0; j <= i; j++) free(text_buffers[j]);
-        free(text_buffers);
-        free(text_lens);
-        free(text_ptrs);
-        free(floats);
-        free(ids);
+        free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
         return throw_error(env, "DECENTDB_ARGS", "ids must be int64-safe BigInt/Number values");
       }
     } else if (id_type == napi_number) {
       st = napi_get_value_int64(env, id_value, &ids[i]);
       if (st != napi_ok) {
-        for (uint32_t j = 0; j <= i; j++) free(text_buffers[j]);
-        free(text_buffers);
-        free(text_lens);
-        free(text_ptrs);
-        free(floats);
-        free(ids);
+        free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
         return throw_error(env, "DECENTDB_ARGS", "ids must be int64-safe BigInt/Number values");
       }
     } else {
-      for (uint32_t j = 0; j <= i; j++) free(text_buffers[j]);
-      free(text_buffers);
-      free(text_lens);
-      free(text_ptrs);
-      free(floats);
-      free(ids);
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
       return throw_error(env, "DECENTDB_ARGS", "ids must be int64-safe BigInt/Number values");
     }
 
@@ -790,57 +784,62 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
     size_t text_len = 0;
     st = napi_get_value_string_utf8(env, text_value, NULL, 0, &text_len);
     if (st != napi_ok) {
-      for (uint32_t j = 0; j <= i; j++) free(text_buffers[j]);
-      free(text_buffers);
-      free(text_lens);
-      free(text_ptrs);
-      free(floats);
-      free(ids);
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
       return throw_error(env, "DECENTDB_ARGS", "texts must be strings");
     }
-    char* text_buf = (char*)malloc(text_len + 1);
-    if (!text_buf) {
-      for (uint32_t j = 0; j <= i; j++) free(text_buffers[j]);
-      free(text_buffers);
-      free(text_lens);
-      free(text_ptrs);
-      free(floats);
-      free(ids);
-      return throw_error(env, "DECENTDB_OOM", "out of memory for text buffer");
-    }
-    st = napi_get_value_string_utf8(env, text_value, text_buf, text_len + 1, &text_len);
-    assert(st == napi_ok);
-    text_buffers[i] = text_buf;
-    text_ptrs[i] = text_buf;
     text_lens[i] = text_len;
+    if (text_len + 1 > SIZE_MAX - total_text_bytes) {
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
+      return throw_error(env, "DECENTDB_OOM", "text payload too large");
+    }
+    total_text_bytes += text_len + 1;
 
     napi_value float_value;
     st = napi_get_element(env, argv[3], i, &float_value);
     assert(st == napi_ok);
     st = napi_get_value_double(env, float_value, &floats[i]);
     if (st != napi_ok) {
-      for (uint32_t j = 0; j <= i; j++) free(text_buffers[j]);
-      free(text_buffers);
-      free(text_lens);
-      free(text_ptrs);
-      free(floats);
-      free(ids);
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
       return throw_error(env, "DECENTDB_ARGS", "floats must be numbers");
     }
+  }
+
+  if (row_count > 0 && total_text_bytes > 0) {
+    text_storage = (char*)malloc(total_text_bytes);
+    if (!text_storage) {
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
+      return throw_error(env, "DECENTDB_OOM", "out of memory for text storage");
+    }
+  }
+
+  size_t text_offset = 0;
+  for (uint32_t i = 0; i < row_count_ids; i++) {
+    napi_value text_value;
+    st = napi_get_element(env, argv[2], i, &text_value);
+    assert(st == napi_ok);
+
+    size_t text_len = text_lens[i];
+    if (text_len == 0) {
+      text_ptrs[i] = "";
+      continue;
+    }
+
+    char* text_dst = text_storage + text_offset;
+    st = napi_get_value_string_utf8(env, text_value, text_dst, text_len + 1, &text_len);
+    if (st != napi_ok) {
+      free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
+      return throw_error(env, "DECENTDB_ARGS", "texts must be strings");
+    }
+    text_ptrs[i] = text_dst;
+    text_lens[i] = text_len;
+    text_offset += text_len + 1;
   }
 
   uint64_t affected = 0;
   int rc = api->execute_batch_i64_text_f64(
       w->stmt, row_count, ids, text_ptrs, text_lens, floats, &affected);
 
-  if (text_buffers) {
-    for (uint32_t i = 0; i < row_count_ids; i++) free(text_buffers[i]);
-    free(text_buffers);
-  }
-  if (text_lens) free(text_lens);
-  if (text_ptrs) free(text_ptrs);
-  if (floats) free(floats);
-  if (ids) free(ids);
+  free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
 
   if (rc != 0) return throw_last_native_error(env, api);
 
@@ -894,6 +893,83 @@ static napi_value js_stmt_fetch_rows_i64_text_f64(napi_env env, napi_callback_in
 
     napi_value idv;
     st = napi_create_bigint_int64(env, rows_ptr[i].int64_value, &idv);
+    assert(st == napi_ok);
+    st = napi_set_element(env, row_arr, 0, idv);
+    assert(st == napi_ok);
+
+    const char* txt = (const char*)rows_ptr[i].text_data;
+    size_t txt_len = rows_ptr[i].text_len;
+    if (!txt) txt = "";
+    napi_value textv;
+    st = napi_create_string_utf8(env, txt, txt_len, &textv);
+    assert(st == napi_ok);
+    st = napi_set_element(env, row_arr, 1, textv);
+    assert(st == napi_ok);
+
+    napi_value floatv;
+    st = napi_create_double(env, rows_ptr[i].float64_value, &floatv);
+    assert(st == napi_ok);
+    st = napi_set_element(env, row_arr, 2, floatv);
+    assert(st == napi_ok);
+
+    st = napi_set_element(env, arr, (uint32_t)i, row_arr);
+    assert(st == napi_ok);
+  }
+
+  return arr;
+}
+
+static napi_value js_stmt_fetch_rows_i64_text_f64_number(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+  if (!api->fetch_rows_i64_text_f64) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "native batch fetch API is unavailable");
+  }
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  assert(st == napi_ok);
+
+  if (argc < 2) {
+    return throw_error(
+        env,
+        "DECENTDB_ARGS",
+        "stmtFetchRowsI64TextF64Number(handle, maxRows) requires 2 args");
+  }
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  int64_t max_rows_i64 = 0;
+  st = napi_get_value_int64(env, argv[1], &max_rows_i64);
+  if (st != napi_ok || max_rows_i64 < 0) {
+    return throw_error(env, "DECENTDB_ARGS", "maxRows must be a non-negative integer");
+  }
+
+  const decentdb_row_i64_text_f64_view* rows_ptr = NULL;
+  size_t out_rows = 0;
+  int rc = api->fetch_rows_i64_text_f64(
+      w->stmt, 0, (size_t)max_rows_i64, &rows_ptr, &out_rows);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value arr;
+  st = napi_create_array_with_length(env, out_rows, &arr);
+  assert(st == napi_ok);
+
+  for (size_t i = 0; i < out_rows; i++) {
+    napi_value row_arr;
+    st = napi_create_array_with_length(env, 3, &row_arr);
+    assert(st == napi_ok);
+
+    const int64_t id = rows_ptr[i].int64_value;
+    const int64_t max_safe = 9007199254740991LL;
+    const int64_t min_safe = -9007199254740991LL;
+    napi_value idv;
+    if (id >= min_safe && id <= max_safe) {
+      st = napi_create_int64(env, id, &idv);
+    } else {
+      st = napi_create_bigint_int64(env, id, &idv);
+    }
     assert(st == napi_ok);
     st = napi_set_element(env, row_arr, 0, idv);
     assert(st == napi_ok);
@@ -1436,6 +1512,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"stmtStepWithParams", 0, js_stmt_step_with_params, 0, 0, 0, napi_default, 0},
     {"stmtExecuteBatchI64TextF64", 0, js_stmt_execute_batch_i64_text_f64, 0, 0, 0, napi_default, 0},
     {"stmtFetchRowsI64TextF64", 0, js_stmt_fetch_rows_i64_text_f64, 0, 0, 0, napi_default, 0},
+    {"stmtFetchRowsI64TextF64Number", 0, js_stmt_fetch_rows_i64_text_f64_number, 0, 0, 0, napi_default, 0},
     {"stmtNextAsync", 0, js_stmt_next_async, 0, 0, 0, napi_default, 0},
     {"stmtRowArray", 0, js_stmt_row_array, 0, 0, 0, napi_default, 0},
     {"stmtColumnNames", 0, js_stmt_column_names, 0, 0, 0, napi_default, 0},

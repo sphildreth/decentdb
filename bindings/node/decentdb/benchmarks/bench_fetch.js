@@ -204,9 +204,11 @@ function runDecentDbBenchmark(dbPath, opts) {
     const fetchallStart = process.hrtime.bigint();
     const fetchallSeconds = runWithGcDisabled(() => {
       const queryStart = process.hrtime.bigint();
-      const scanStmt = db.prepare(scanSql);
-      try {
-        if (typeof scanStmt._native?.stmtFetchRowsI64TextF64 === 'function') {
+        const scanStmt = db.prepare(scanSql);
+        try {
+        if (typeof scanStmt._native?.stmtFetchRowsI64TextF64Number === 'function') {
+          fetchallRows = scanStmt.fetchRowsI64TextF64Number(0);
+        } else if (typeof scanStmt._native?.stmtFetchRowsI64TextF64 === 'function') {
           fetchallRows = scanStmt.fetchRowsI64TextF64(0);
         } else {
           fetchallRows = db.exec(scanSql).rows;
@@ -226,7 +228,18 @@ function runDecentDbBenchmark(dbPath, opts) {
     const fetchmanySeconds = runWithGcDisabled(() => {
       const queryStart = process.hrtime.bigint();
       let total = 0;
-      if (typeof fetchmanyStmt._native?.stmtFetchRowsI64TextF64 === 'function') {
+      if (typeof fetchmanyStmt._native?.stmtFetchRowsI64TextF64Number === 'function') {
+        while (true) {
+          const batch = fetchmanyStmt.fetchRowsI64TextF64Number(opts.fetchmanyBatch);
+          if (!Array.isArray(batch) || batch.length === 0) {
+            break;
+          }
+          total += batch.length;
+          if (batch.length < opts.fetchmanyBatch) {
+            break;
+          }
+        }
+      } else if (typeof fetchmanyStmt._native?.stmtFetchRowsI64TextF64 === 'function') {
         while (true) {
           const batch = fetchmanyStmt.fetchRowsI64TextF64(opts.fetchmanyBatch);
           if (!Array.isArray(batch) || batch.length === 0) {
