@@ -361,6 +361,15 @@ CREATE INDEX idx_orders_status_created ON orders(status, created_at);
         finally:
             driver.rollback()
 
+    def _execute_write_op(self, driver: DatabaseDriver, sql: str, params: Tuple):
+        driver.begin_transaction()
+        try:
+            driver.execute_update(sql, params)
+            driver.commit()
+        except Exception:
+            driver.rollback()
+            raise
+
     def run_point_lookup(
         self,
         driver: DatabaseDriver,
@@ -544,8 +553,7 @@ CREATE INDEX idx_orders_status_created ON orders(status, created_at);
             op_timer = Timer()
             op_timer.start()
             try:
-                driver.execute_update(queries["update"], params)
-                driver.commit()
+                self._execute_write_op(driver, queries["update"], params)
                 tracker.record(op_timer.stop() * 1000)
             except Exception:
                 tracker.record_error()
@@ -584,8 +592,7 @@ CREATE INDEX idx_orders_status_created ON orders(status, created_at);
             op_timer = Timer()
             op_timer.start()
             try:
-                driver.execute_update(queries["delete"], params)
-                driver.commit()
+                self._execute_write_op(driver, queries["delete"], params)
                 tracker.record(op_timer.stop() * 1000)
             except Exception:
                 tracker.record_error()

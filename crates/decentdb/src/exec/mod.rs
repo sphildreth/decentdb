@@ -99,23 +99,28 @@ pub(crate) struct TableData {
 }
 
 impl TableData {
-    fn row_by_id(&self, row_id: i64) -> Option<&StoredRow> {
+    pub(super) fn row_index_by_id(&self, row_id: i64) -> Option<usize> {
         if let Some(index) = row_id
             .checked_sub(1)
             .and_then(|value| usize::try_from(value).ok())
         {
             if let Some(row) = self.rows.get(index) {
                 if row.row_id == row_id {
-                    return Some(row);
+                    return Some(index);
                 }
             }
         }
 
         if let Ok(index) = self.rows.binary_search_by_key(&row_id, |row| row.row_id) {
-            return self.rows.get(index);
+            return Some(index);
         }
 
-        self.rows.iter().find(|row| row.row_id == row_id)
+        self.rows.iter().position(|row| row.row_id == row_id)
+    }
+
+    pub(super) fn row_by_id(&self, row_id: i64) -> Option<&StoredRow> {
+        self.row_index_by_id(row_id)
+            .and_then(|index| self.rows.get(index))
     }
 }
 
@@ -142,7 +147,7 @@ impl Default for PersistedTableState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeBtreeKey {
     Encoded(Vec<u8>),
     Int64(i64),
@@ -252,6 +257,62 @@ impl RuntimeBtreeKeys {
             }
             (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
                 keys.entry(key).or_default().push(row_id);
+            }
+            (Self::UniqueEncoded(_), RuntimeBtreeKey::Int64(_))
+            | (Self::NonUniqueEncoded(_), RuntimeBtreeKey::Int64(_))
+            | (Self::UniqueInt64(_), RuntimeBtreeKey::Encoded(_))
+            | (Self::NonUniqueInt64(_), RuntimeBtreeKey::Encoded(_)) => {
+                return Err(DbError::internal(
+                    "runtime BTREE key type did not match the runtime index representation",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove_row_id(&mut self, key: &RuntimeBtreeKey, row_id: i64) -> Result<()> {
+        match (self, key) {
+            (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                if let Some(existing) = keys.get(key).copied() {
+                    if existing != row_id {
+                        return Err(DbError::internal(
+                            "unique runtime BTREE index row-id mismatch during delete",
+                        ));
+                    }
+                    keys.remove(key);
+                }
+            }
+            (Self::NonUniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
+                let remove_entry = if let Some(row_ids) = keys.get_mut(key) {
+                    row_ids.retain(|entry| *entry != row_id);
+                    row_ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    keys.remove(key);
+                }
+            }
+            (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                if let Some(existing) = keys.get(key).copied() {
+                    if existing != row_id {
+                        return Err(DbError::internal(
+                            "unique runtime BTREE index row-id mismatch during delete",
+                        ));
+                    }
+                    keys.remove(key);
+                }
+            }
+            (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
+                let remove_entry = if let Some(row_ids) = keys.get_mut(key) {
+                    row_ids.retain(|entry| *entry != row_id);
+                    row_ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    keys.remove(key);
+                }
             }
             (Self::UniqueEncoded(_), RuntimeBtreeKey::Int64(_))
             | (Self::NonUniqueEncoded(_), RuntimeBtreeKey::Int64(_))
@@ -890,7 +951,7 @@ impl EngineRuntime {
 
             match index.kind {
                 IndexKind::Btree => {
-                    let Some(key) = compute_index_key(self, &index, &table, row)? else {
+                    let Some(key) = compute_index_key(self, &index, &table, &row.values)? else {
                         continue;
                     };
                     updates.push(PendingIndexInsert::Btree {
@@ -900,10 +961,10 @@ impl EngineRuntime {
                     });
                 }
                 IndexKind::Trigram => {
-                    if !row_satisfies_index_predicate(self, &index, &table, row)? {
+                    if !row_satisfies_index_predicate(self, &index, &table, &row.values)? {
                         continue;
                     }
-                    let text = compute_index_values(self, &index, &table, row)?
+                    let text = compute_index_values(self, &index, &table, &row.values)?
                         .into_iter()
                         .next()
                         .ok_or_else(|| {
@@ -1845,6 +1906,10 @@ impl EngineRuntime {
             dataset
         } else if let Some(dataset) = self.try_indexed_join(select, params, ctes)? {
             dataset
+        } else if let Some(dataset) =
+            self.try_indexed_prefiltered_inner_join_tree(select, params, ctes)?
+        {
+            dataset
         } else if select.from.is_empty() {
             Dataset {
                 columns: Vec::new(),
@@ -1871,14 +1936,13 @@ impl EngineRuntime {
         };
 
         if let Some(filter) = &select.filter {
-            let bindings = dataset.columns.clone();
+            let filter_dataset = Dataset {
+                columns: dataset.columns.clone(),
+                rows: Vec::new(),
+            };
             dataset.rows.retain(|row| {
-                let temp = Dataset {
-                    columns: bindings.clone(),
-                    rows: Vec::new(),
-                };
                 matches!(
-                    self.eval_expr(filter, &temp, row, params, ctes, None),
+                    self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
                     Ok(Value::Bool(true))
                 )
             });
@@ -1922,14 +1986,13 @@ impl EngineRuntime {
 
         dataset = augment_dataset_with_outer_scope(dataset, outer_dataset, outer_row);
         if let Some(filter) = &select.filter {
-            let bindings = dataset.columns.clone();
+            let filter_dataset = Dataset {
+                columns: dataset.columns.clone(),
+                rows: Vec::new(),
+            };
             dataset.rows.retain(|row| {
-                let temp = Dataset {
-                    columns: bindings.clone(),
-                    rows: Vec::new(),
-                };
                 matches!(
-                    self.eval_expr(filter, &temp, row, params, ctes, None),
+                    self.eval_expr(filter, &filter_dataset, row, params, ctes, None),
                     Ok(Value::Bool(true))
                 )
             });
@@ -2149,6 +2212,126 @@ impl EngineRuntime {
         Ok(None)
     }
 
+    fn try_indexed_prefiltered_inner_join_tree(
+        &self,
+        select: &Select,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let Some(filter) = &select.filter else {
+            return Ok(None);
+        };
+        if select.from.len() != 1 {
+            return Ok(None);
+        }
+        let Some((Some(filter_table), filter_column, value_expr)) = simple_btree_lookup(filter)
+        else {
+            return Ok(None);
+        };
+        if !from_item_is_all_inner_table_joins(&select.from[0]) {
+            return Ok(None);
+        }
+
+        let mut applied_prefilter = false;
+        let dataset = self.evaluate_from_item_with_indexed_prefilter(
+            &select.from[0],
+            params,
+            ctes,
+            filter_table,
+            filter_column,
+            value_expr,
+            &mut applied_prefilter,
+        )?;
+        if applied_prefilter {
+            Ok(Some(dataset))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_from_item_with_indexed_prefilter(
+        &self,
+        item: &FromItem,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        filter_table: &str,
+        filter_column: &str,
+        value_expr: &Expr,
+        applied_prefilter: &mut bool,
+    ) -> Result<Dataset> {
+        match item {
+            FromItem::Table { name, alias } => {
+                if !*applied_prefilter
+                    && matches_filter_binding(name, alias, Some(filter_table))
+                    && !ctes.contains_key(name)
+                    && self
+                        .visible_view(name, NameResolutionScope::Session)
+                        .is_none()
+                    && !self.visible_table_is_temporary(name)
+                {
+                    if let Some(dataset) = self.indexed_table_lookup(
+                        name,
+                        alias,
+                        filter_column,
+                        value_expr,
+                        params,
+                        ctes,
+                    )? {
+                        *applied_prefilter = true;
+                        return Ok(dataset);
+                    }
+                }
+                self.evaluate_from_item(item, params, ctes)
+            }
+            FromItem::Join {
+                left,
+                right,
+                kind,
+                constraint,
+            } => {
+                let left_dataset = self.evaluate_from_item_with_indexed_prefilter(
+                    left,
+                    params,
+                    ctes,
+                    filter_table,
+                    filter_column,
+                    value_expr,
+                    applied_prefilter,
+                )?;
+                if matches!(kind, JoinKind::Inner) {
+                    if let Some(dataset) = self.try_indexed_inner_join_with_right_table(
+                        &left_dataset,
+                        right,
+                        constraint,
+                        ctes,
+                    )? {
+                        return Ok(dataset);
+                    }
+                }
+                let right_dataset = self.evaluate_from_item_with_indexed_prefilter(
+                    right,
+                    params,
+                    ctes,
+                    filter_table,
+                    filter_column,
+                    value_expr,
+                    applied_prefilter,
+                )?;
+                nested_loop_join(
+                    left_dataset,
+                    right_dataset,
+                    *kind,
+                    constraint,
+                    self,
+                    params,
+                    ctes,
+                )
+            }
+            _ => self.evaluate_from_item(item, params, ctes),
+        }
+    }
+
     fn indexed_table_lookup(
         &self,
         table_name: &str,
@@ -2226,6 +2409,20 @@ impl EngineRuntime {
         let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
             return Ok(None);
         };
+        let use_probe_row_position_map = probe_data
+            .rows
+            .len()
+            .saturating_mul(plan.filtered_dataset.rows.len())
+            > 8_192;
+        let probe_row_positions = if use_probe_row_position_map {
+            let mut positions = Int64Map::<usize>::default();
+            for (position, row) in probe_data.rows.iter().enumerate() {
+                positions.insert(row.row_id, position);
+            }
+            Some(positions)
+        } else {
+            None
+        };
 
         let probe_columns = probe_table
             .columns
@@ -2262,19 +2459,147 @@ impl EngineRuntime {
                 continue;
             }
             for row_id in row_ids {
-                let Some(probe_row) = probe_data.row_by_id(row_id).map(|row| &row.values) else {
-                    continue;
-                };
-                let mut row = if plan.filtered_on_left {
-                    filtered_row.clone()
+                let probe_row = if let Some(positions) = probe_row_positions.as_ref() {
+                    let Some(probe_position) = positions.get(&row_id).copied() else {
+                        continue;
+                    };
+                    &probe_data.rows[probe_position].values
                 } else {
-                    probe_row.clone()
+                    let Some(probe_row) = probe_data.row_by_id(row_id) else {
+                        continue;
+                    };
+                    &probe_row.values
                 };
+                let mut row = Vec::with_capacity(filtered_row.len() + probe_row.len());
                 if plan.filtered_on_left {
-                    row.extend(probe_row.clone());
+                    row.extend_from_slice(filtered_row);
+                    row.extend_from_slice(probe_row);
                 } else {
-                    row.extend(filtered_row.clone());
+                    row.extend_from_slice(probe_row);
+                    row.extend_from_slice(filtered_row);
                 }
+                rows.push(row);
+            }
+        }
+        Ok(Some(Dataset { columns, rows }))
+    }
+
+    fn try_indexed_inner_join_with_right_table(
+        &self,
+        left: &Dataset,
+        right_item: &FromItem,
+        constraint: &JoinConstraint,
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Option<Dataset>> {
+        let JoinConstraint::On(on) = constraint else {
+            return Ok(None);
+        };
+        let Some((left_join_ref, right_join_ref)) = simple_join_equality(on) else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: right_name,
+            alias: right_alias,
+        } = right_item
+        else {
+            return Ok(None);
+        };
+        if ctes.contains_key(right_name) {
+            return Ok(None);
+        }
+        if self
+            .visible_view(right_name, NameResolutionScope::Session)
+            .is_some()
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+        let (left_probe_ref, right_join_column) =
+            if matches_table_binding(right_binding, right_join_ref.table) {
+                (left_join_ref, right_join_ref.column)
+            } else if matches_table_binding(right_binding, left_join_ref.table) {
+                (right_join_ref, left_join_ref.column)
+            } else {
+                return Ok(None);
+            };
+        let Some(left_join_index) =
+            dataset_column_index(left, left_probe_ref.table, left_probe_ref.column)
+        else {
+            return Ok(None);
+        };
+
+        let right_table = self
+            .table_schema(right_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table or view {right_name}")))?;
+        let Some(right_data) = self.table_data(right_name) else {
+            return Ok(None);
+        };
+        let Some(probe_index) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, right_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, right_join_column))
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
+            return Ok(None);
+        };
+
+        let use_right_row_position_map =
+            right_data.rows.len().saturating_mul(left.rows.len()) > 8_192;
+        let right_row_positions = if use_right_row_position_map {
+            let mut positions = Int64Map::<usize>::default();
+            for (position, row) in right_data.rows.iter().enumerate() {
+                positions.insert(row.row_id, position);
+            }
+            Some(positions)
+        } else {
+            None
+        };
+
+        let right_binding_name = right_alias.clone().unwrap_or_else(|| right_name.clone());
+        let mut columns = left.columns.clone();
+        columns.extend(right_table.columns.iter().map(|column| {
+            ColumnBinding::visible(Some(right_binding_name.clone()), column.name.clone())
+        }));
+        let mut rows = Vec::new();
+        for left_row in &left.rows {
+            let Some(join_value) = left_row.get(left_join_index) else {
+                return Err(DbError::internal(
+                    "join row is shorter than the left input schema",
+                ));
+            };
+            if matches!(join_value, Value::Null) {
+                continue;
+            }
+            let row_ids = keys.row_ids_for_value(join_value)?;
+            for row_id in row_ids {
+                let right_values = if let Some(positions) = right_row_positions.as_ref() {
+                    let Some(right_position) = positions.get(&row_id).copied() else {
+                        continue;
+                    };
+                    &right_data.rows[right_position].values
+                } else {
+                    let Some(right_row) = right_data.row_by_id(row_id) else {
+                        continue;
+                    };
+                    &right_row.values
+                };
+                let mut row = Vec::with_capacity(left_row.len() + right_values.len());
+                row.extend_from_slice(left_row);
+                row.extend_from_slice(right_values);
                 rows.push(row);
             }
         }
@@ -2358,6 +2683,15 @@ impl EngineRuntime {
                 constraint,
             } => {
                 let left = self.evaluate_from_item(left, params, ctes)?;
+                if matches!(kind, JoinKind::Inner) {
+                if let Some(dataset) =
+                        self.try_indexed_inner_join_with_right_table(
+                            &left, right, constraint, ctes,
+                        )?
+                    {
+                        return Ok(dataset);
+                    }
+                }
                 let right = self.evaluate_from_item(right, params, ctes)?;
                 nested_loop_join(left, right, *kind, constraint, self, params, ctes)
             }
@@ -2984,7 +3318,7 @@ fn build_runtime_index(
             if index.unique && int64_keys {
                 let mut keys = Int64Map::<i64>::default();
                 for row in &data.rows {
-                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                    let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
                     let RuntimeBtreeKey::Int64(key) = key else {
@@ -3005,7 +3339,7 @@ fn build_runtime_index(
             } else if index.unique {
                 let mut keys = BTreeMap::<Vec<u8>, i64>::new();
                 for row in &data.rows {
-                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                    let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
                     let RuntimeBtreeKey::Encoded(key) = key else {
@@ -3026,7 +3360,7 @@ fn build_runtime_index(
             } else if int64_keys {
                 let mut keys = Int64Map::<Vec<i64>>::default();
                 for row in &data.rows {
-                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                    let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
                     let RuntimeBtreeKey::Int64(key) = key else {
@@ -3042,7 +3376,7 @@ fn build_runtime_index(
             } else {
                 let mut keys = BTreeMap::<Vec<u8>, Vec<i64>>::new();
                 for row in &data.rows {
-                    let Some(key) = compute_index_key(runtime, index, table, row)? else {
+                    let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
                     };
                     let RuntimeBtreeKey::Encoded(key) = key else {
@@ -3060,10 +3394,10 @@ fn build_runtime_index(
         IndexKind::Trigram => {
             let mut trigram = TrigramIndex::new(page_size, 100_000);
             for row in &data.rows {
-                if !row_satisfies_index_predicate(runtime, index, table, row)? {
+                if !row_satisfies_index_predicate(runtime, index, table, &row.values)? {
                     continue;
                 }
-                if let Value::Text(text) = compute_index_values(runtime, index, table, row)?
+                if let Value::Text(text) = compute_index_values(runtime, index, table, &row.values)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| {
@@ -3079,13 +3413,13 @@ fn build_runtime_index(
     }
 }
 
-fn compute_index_key(
+pub(super) fn compute_index_key(
     runtime: &EngineRuntime,
     index: &IndexSchema,
     table: &TableSchema,
-    row: &StoredRow,
+    row_values: &[Value],
 ) -> Result<Option<RuntimeBtreeKey>> {
-    if !row_satisfies_index_predicate(runtime, index, table, row)? {
+    if !row_satisfies_index_predicate(runtime, index, table, row_values)? {
         return Ok(None);
     }
     if btree_uses_typed_int64_keys(index, table) {
@@ -3098,8 +3432,7 @@ fn compute_index_key(
             let position = column_position(table, column_name).ok_or_else(|| {
                 DbError::constraint(format!("index column {} does not exist", column_name))
             })?;
-            let Value::Int64(value) = row
-                .values
+            let Value::Int64(value) = row_values
                 .get(position)
                 .ok_or_else(|| DbError::internal("row is shorter than table schema"))?
             else {
@@ -3110,7 +3443,7 @@ fn compute_index_key(
             return Ok(Some(RuntimeBtreeKey::Int64(*value)));
         }
     }
-    let values = compute_index_values(runtime, index, table, row)?;
+    let values = compute_index_values(runtime, index, table, row_values)?;
     if index.unique && values.iter().any(|value| matches!(value, Value::Null)) {
         return Ok(None);
     }
@@ -3137,13 +3470,13 @@ fn btree_uses_typed_int64_keys(index: &IndexSchema, table: &TableSchema) -> bool
     })
 }
 
-fn compute_index_values(
+pub(super) fn compute_index_values(
     runtime: &EngineRuntime,
     index: &IndexSchema,
     table: &TableSchema,
-    row: &StoredRow,
+    row_values: &[Value],
 ) -> Result<Vec<Value>> {
-    let dataset = table_row_dataset(table, &row.values, &table.name);
+    let dataset = table_row_dataset(table, row_values, &table.name);
     let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
     index
         .columns
@@ -3153,7 +3486,7 @@ fn compute_index_values(
                 let position = column_position(table, column_name).ok_or_else(|| {
                     DbError::constraint(format!("index column {} does not exist", column_name))
                 })?;
-                Ok(row.values[position].clone())
+                Ok(row_values[position].clone())
             } else if let Some(expression_sql) = &column.expression_sql {
                 let expr = crate::sql::parser::parse_expression_sql(expression_sql)?;
                 runtime.eval_expr(&expr, &dataset, bindings, &[], &BTreeMap::new(), None)
@@ -3168,13 +3501,13 @@ pub(super) fn row_satisfies_index_predicate(
     runtime: &EngineRuntime,
     index: &IndexSchema,
     table: &TableSchema,
-    row: &StoredRow,
+    row_values: &[Value],
 ) -> Result<bool> {
     let Some(predicate_sql) = &index.predicate_sql else {
         return Ok(true);
     };
     let expr = crate::sql::parser::parse_expression_sql(predicate_sql)?;
-    let dataset = table_row_dataset(table, &row.values, &table.name);
+    let dataset = table_row_dataset(table, row_values, &table.name);
     let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
     Ok(matches!(
         runtime.eval_expr(&expr, &dataset, bindings, &[], &BTreeMap::new(), None)?,
@@ -4268,6 +4601,142 @@ fn matches_filter_binding(
     }
 }
 
+fn dataset_column_index(dataset: &Dataset, qualifier: Option<&str>, column: &str) -> Option<usize> {
+    let matches = dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, binding)| {
+            if !identifiers_equal(&binding.name, column) {
+                return false;
+            }
+            if let Some(qualifier) = qualifier {
+                binding
+                    .table
+                    .as_deref()
+                    .is_some_and(|table| identifiers_equal(table, qualifier))
+            } else {
+                !binding.hidden
+            }
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
+fn from_item_is_all_inner_table_joins(item: &FromItem) -> bool {
+    match item {
+        FromItem::Table { .. } => true,
+        FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(_),
+        } => from_item_is_all_inner_table_joins(left) && from_item_is_all_inner_table_joins(right),
+        _ => false,
+    }
+}
+
+fn simple_select_item_column_index(
+    dataset: &Dataset,
+    table: Option<&str>,
+    column: &str,
+) -> Option<usize> {
+    let matches = dataset
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, binding)| {
+            if !identifiers_equal(&binding.name, column) {
+                return false;
+            }
+            match table {
+                Some(table_name) => binding
+                    .table
+                    .as_deref()
+                    .is_some_and(|binding_table| identifiers_equal(binding_table, table_name)),
+                None => !binding.hidden,
+            }
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [index] => Some(*index),
+        _ => None,
+    }
+}
+
+fn try_project_simple_select_items(
+    dataset: &Dataset,
+    items: &[SelectItem],
+) -> Result<Option<Dataset>> {
+    let mut output_columns = Vec::new();
+    let mut projection_plan = Vec::<usize>::new();
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                let Expr::Column { table, column } = expr else {
+                    return Ok(None);
+                };
+                let Some(source_index) =
+                    simple_select_item_column_index(dataset, table.as_deref(), column)
+                else {
+                    return Ok(None);
+                };
+                projection_plan.push(source_index);
+                output_columns.push(ColumnBinding::visible(
+                    None,
+                    alias
+                        .clone()
+                        .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                ));
+            }
+            SelectItem::Wildcard => {
+                for (source_index, binding) in dataset.columns.iter().enumerate() {
+                    if binding.hidden {
+                        continue;
+                    }
+                    projection_plan.push(source_index);
+                    output_columns.push(binding.as_output());
+                }
+            }
+            SelectItem::QualifiedWildcard(table) => {
+                let mut matched = false;
+                for (source_index, binding) in dataset.columns.iter().enumerate() {
+                    if binding.table.as_deref() != Some(table.as_str()) {
+                        continue;
+                    }
+                    projection_plan.push(source_index);
+                    output_columns.push(binding.as_output());
+                    matched = true;
+                }
+                if !matched {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    let mut output_rows = Vec::with_capacity(dataset.rows.len());
+    for row in &dataset.rows {
+        let mut output_row = Vec::with_capacity(projection_plan.len());
+        for source_index in &projection_plan {
+            let value = row
+                .get(*source_index)
+                .ok_or_else(|| DbError::internal("projection source index exceeds row width"))?;
+            output_row.push(value.clone());
+        }
+        output_rows.push(output_row);
+    }
+    Ok(Some(Dataset {
+        columns: output_columns,
+        rows: output_rows,
+    }))
+}
+
 fn simple_trigram_lookup(filter: &Expr) -> Option<(&str, &Expr, bool)> {
     match filter {
         Expr::Like { expr, pattern, .. } => match (&**expr, &**pattern) {
@@ -4702,6 +5171,9 @@ impl EngineRuntime {
         ctes: &BTreeMap<String, Dataset>,
         excluded: Option<&Dataset>,
     ) -> Result<Dataset> {
+        if let Some(projected) = try_project_simple_select_items(dataset, items)? {
+            return Ok(projected);
+        }
         let window_values = items
             .iter()
             .map(|item| match item {
@@ -5131,11 +5603,11 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
-        let mut groups = BTreeMap::<Vec<u8>, Vec<Vec<Value>>>::new();
+        let mut groups = BTreeMap::<Vec<u8>, Vec<usize>>::new();
         if dataset.rows.is_empty() && select.group_by.is_empty() {
             groups.insert(Vec::new(), Vec::new());
         } else {
-            for row in &dataset.rows {
+            for (row_index, row) in dataset.rows.iter().enumerate() {
                 let key_values = select
                     .group_by
                     .iter()
@@ -5144,7 +5616,7 @@ impl EngineRuntime {
                 groups
                     .entry(row_identity(&key_values)?)
                     .or_default()
-                    .push(row.clone());
+                    .push(row_index);
             }
         }
         let columns = select
@@ -5165,10 +5637,10 @@ impl EngineRuntime {
             })
             .collect::<Vec<_>>();
         let mut rows = Vec::new();
-        for group_rows in groups.into_values() {
+        for group_row_indexes in groups.into_values() {
             if let Some(having) = &select.having {
                 if !matches!(
-                    self.eval_group_expr(having, &dataset, &group_rows, params, ctes)?,
+                    self.eval_group_expr(having, &dataset, &group_row_indexes, params, ctes)?,
                     Value::Bool(true)
                 ) {
                     continue;
@@ -5180,7 +5652,7 @@ impl EngineRuntime {
                     SelectItem::Expr { expr, .. } => output.push(self.eval_group_expr(
                         expr,
                         &dataset,
-                        &group_rows,
+                        &group_row_indexes,
                         params,
                         ctes,
                     )?),
@@ -5203,31 +5675,59 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<()> {
-        let bindings = dataset.columns.clone();
-        dataset.rows.sort_by(|left, right| {
-            for order in order_by {
-                let temp = Dataset {
-                    columns: bindings.clone(),
-                    rows: Vec::new(),
-                };
-                let left_value = self
-                    .eval_expr(&order.expr, &temp, left, params, ctes, None)
-                    .unwrap_or(Value::Null);
-                let right_value = self
-                    .eval_expr(&order.expr, &temp, right, params, ctes, None)
-                    .unwrap_or(Value::Null);
+        if order_by.is_empty() || dataset.rows.len() <= 1 {
+            return Ok(());
+        }
+        let eval_dataset = Dataset {
+            columns: dataset.columns.clone(),
+            rows: Vec::new(),
+        };
+        let sort_keys = dataset
+            .rows
+            .iter()
+            .map(|row| {
+                order_by
+                    .iter()
+                    .map(|order| {
+                        self.eval_expr(&order.expr, &eval_dataset, row, params, ctes, None)
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let mut order = (0..dataset.rows.len()).collect::<Vec<_>>();
+        order.sort_by(|left_index, right_index| {
+            let left_key = &sort_keys[*left_index];
+            let right_key = &sort_keys[*right_index];
+            for (order_clause, (left_value, right_value)) in
+                order_by.iter().zip(left_key.iter().zip(right_key.iter()))
+            {
                 let ordering =
-                    compare_values(&left_value, &right_value).unwrap_or(std::cmp::Ordering::Equal);
+                    compare_values(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
                 if ordering != std::cmp::Ordering::Equal {
-                    return if order.descending {
+                    return if order_clause.descending {
                         ordering.reverse()
                     } else {
                         ordering
                     };
                 }
             }
-            std::cmp::Ordering::Equal
+            left_index.cmp(right_index)
         });
+
+        let mut rows = std::mem::take(&mut dataset.rows)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        dataset.rows = order
+            .into_iter()
+            .map(|row_index| {
+                rows.get_mut(row_index)
+                    .and_then(Option::take)
+                    .ok_or_else(|| DbError::internal("sorted row index is invalid"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(())
     }
 
@@ -5249,7 +5749,7 @@ impl EngineRuntime {
         &self,
         expr: &Expr,
         dataset: &Dataset,
-        group_rows: &[Vec<Value>],
+        group_row_indexes: &[usize],
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Value> {
@@ -5268,10 +5768,14 @@ impl EngineRuntime {
             } => match name.as_str() {
                 "count" => {
                     if *star {
-                        Ok(Value::Int64(group_rows.len() as i64))
+                        Ok(Value::Int64(group_row_indexes.len() as i64))
                     } else if *distinct {
                         let mut vals = Vec::new();
-                        for row in group_rows {
+                        for row_index in group_row_indexes {
+                            let row =
+                                dataset.rows.get(*row_index).map(Vec::as_slice).ok_or_else(
+                                    || DbError::internal("group row index is invalid"),
+                                )?;
                             let val = self.eval_expr(&args[0], dataset, row, params, ctes, None)?;
                             if !matches!(val, Value::Null) {
                                 vals.push(val);
@@ -5287,7 +5791,11 @@ impl EngineRuntime {
                         Ok(Value::Int64(vals.len() as i64))
                     } else {
                         let mut count = 0_i64;
-                        for row in group_rows {
+                        for row_index in group_row_indexes {
+                            let row =
+                                dataset.rows.get(*row_index).map(Vec::as_slice).ok_or_else(
+                                    || DbError::internal("group row index is invalid"),
+                                )?;
                             if !matches!(
                                 self.eval_expr(&args[0], dataset, row, params, ctes, None)?,
                                 Value::Null
@@ -5300,38 +5808,58 @@ impl EngineRuntime {
                 }
                 "sum" => aggregate_numeric(
                     &aggregate_ctx,
-                    group_rows,
+                    group_row_indexes,
                     &args[0],
                     NumericAgg::Sum,
                     *distinct,
                 ),
                 "avg" => aggregate_numeric(
                     &aggregate_ctx,
-                    group_rows,
+                    group_row_indexes,
                     &args[0],
                     NumericAgg::Avg,
                     *distinct,
                 ),
                 "total" => aggregate_numeric(
                     &aggregate_ctx,
-                    group_rows,
+                    group_row_indexes,
                     &args[0],
                     NumericAgg::Total,
                     *distinct,
                 ),
-                "min" => aggregate_extreme(self, dataset, group_rows, &args[0], params, ctes, true),
-                "max" => {
-                    aggregate_extreme(self, dataset, group_rows, &args[0], params, ctes, false)
-                }
-                name @ ("group_concat" | "string_agg") => {
-                    aggregate_group_concat(self, dataset, group_rows, args, params, ctes, name)
-                }
+                "min" => aggregate_extreme(
+                    self,
+                    dataset,
+                    group_row_indexes,
+                    &args[0],
+                    params,
+                    ctes,
+                    true,
+                ),
+                "max" => aggregate_extreme(
+                    self,
+                    dataset,
+                    group_row_indexes,
+                    &args[0],
+                    params,
+                    ctes,
+                    false,
+                ),
+                name @ ("group_concat" | "string_agg") => aggregate_group_concat(
+                    self,
+                    dataset,
+                    group_row_indexes,
+                    args,
+                    params,
+                    ctes,
+                    name,
+                ),
                 other => Err(DbError::sql(format!(
                     "unsupported aggregate function {other}"
                 ))),
             },
             Expr::Unary { op, expr } => {
-                let value = self.eval_group_expr(expr, dataset, group_rows, params, ctes)?;
+                let value = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
                 match op {
                     UnaryOp::Not => Ok(match truthy(&value) {
                         Some(value) => Value::Bool(!value),
@@ -5347,8 +5875,8 @@ impl EngineRuntime {
             }
             Expr::Binary { left, op, right } => eval_binary(
                 op,
-                self.eval_group_expr(left, dataset, group_rows, params, ctes)?,
-                self.eval_group_expr(right, dataset, group_rows, params, ctes)?,
+                self.eval_group_expr(left, dataset, group_row_indexes, params, ctes)?,
+                self.eval_group_expr(right, dataset, group_row_indexes, params, ctes)?,
             ),
             Expr::Between {
                 expr,
@@ -5356,9 +5884,9 @@ impl EngineRuntime {
                 high,
                 negated,
             } => {
-                let value = self.eval_group_expr(expr, dataset, group_rows, params, ctes)?;
-                let low = self.eval_group_expr(low, dataset, group_rows, params, ctes)?;
-                let high = self.eval_group_expr(high, dataset, group_rows, params, ctes)?;
+                let value = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
+                let low = self.eval_group_expr(low, dataset, group_row_indexes, params, ctes)?;
+                let high = self.eval_group_expr(high, dataset, group_row_indexes, params, ctes)?;
                 if matches!(value, Value::Null)
                     || matches!(low, Value::Null)
                     || matches!(high, Value::Null)
@@ -5374,13 +5902,14 @@ impl EngineRuntime {
                 items,
                 negated,
             } => {
-                let value = self.eval_group_expr(expr, dataset, group_rows, params, ctes)?;
+                let value = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
                 if matches!(value, Value::Null) {
                     return Ok(Value::Null);
                 }
                 let mut saw_null = false;
                 for item in items {
-                    let item = self.eval_group_expr(item, dataset, group_rows, params, ctes)?;
+                    let item =
+                        self.eval_group_expr(item, dataset, group_row_indexes, params, ctes)?;
                     if matches!(item, Value::Null) {
                         saw_null = true;
                         continue;
@@ -5403,26 +5932,37 @@ impl EngineRuntime {
                 negated,
                 ..
             } => {
-                let left = self.eval_group_expr(expr, dataset, group_rows, params, ctes)?;
-                let right = self.eval_group_expr(pattern, dataset, group_rows, params, ctes)?;
+                let left = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
+                let right =
+                    self.eval_group_expr(pattern, dataset, group_row_indexes, params, ctes)?;
                 let escape = escape
                     .as_ref()
-                    .map(|expr| self.eval_group_expr(expr, dataset, group_rows, params, ctes))
+                    .map(|expr| {
+                        self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)
+                    })
                     .transpose()?;
                 eval_like(left, right, escape, *case_insensitive, *negated)
             }
             Expr::IsNull { expr, negated } => {
                 let is_null = matches!(
-                    self.eval_group_expr(expr, dataset, group_rows, params, ctes)?,
+                    self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?,
                     Value::Null
                 );
                 Ok(Value::Bool(if *negated { !is_null } else { is_null }))
             }
             Expr::Function { name, args } => {
-                let row = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                let row = if let Some(row_index) = group_row_indexes.first().copied() {
+                    dataset
+                        .rows
+                        .get(row_index)
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| DbError::internal("group row index is invalid"))?
+                } else {
+                    &[]
+                };
                 let values = args
                     .iter()
-                    .map(|arg| self.eval_group_expr(arg, dataset, group_rows, params, ctes))
+                    .map(|arg| self.eval_group_expr(arg, dataset, group_row_indexes, params, ctes))
                     .collect::<Result<Vec<_>>>()?;
                 match name.as_str() {
                     "coalesce" => Ok(values
@@ -5464,39 +6004,69 @@ impl EngineRuntime {
             } => {
                 let operand_value = operand
                     .as_deref()
-                    .map(|expr| self.eval_group_expr(expr, dataset, group_rows, params, ctes))
+                    .map(|expr| {
+                        self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)
+                    })
                     .transpose()?;
                 for (condition, result) in branches {
                     let matches = if let Some(operand_value) = &operand_value {
                         compare_values(
                             operand_value,
-                            &self.eval_group_expr(condition, dataset, group_rows, params, ctes)?,
+                            &self.eval_group_expr(
+                                condition,
+                                dataset,
+                                group_row_indexes,
+                                params,
+                                ctes,
+                            )?,
                         )? == std::cmp::Ordering::Equal
                     } else {
                         matches!(
-                            self.eval_group_expr(condition, dataset, group_rows, params, ctes)?,
+                            self.eval_group_expr(
+                                condition,
+                                dataset,
+                                group_row_indexes,
+                                params,
+                                ctes,
+                            )?,
                             Value::Bool(true)
                         )
                     };
                     if matches {
-                        return self.eval_group_expr(result, dataset, group_rows, params, ctes);
+                        return self.eval_group_expr(
+                            result,
+                            dataset,
+                            group_row_indexes,
+                            params,
+                            ctes,
+                        );
                     }
                 }
                 else_expr
                     .as_deref()
-                    .map(|expr| self.eval_group_expr(expr, dataset, group_rows, params, ctes))
+                    .map(|expr| {
+                        self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)
+                    })
                     .transpose()?
                     .map_or(Ok(Value::Null), Ok)
             }
             Expr::Cast { expr, target_type } => cast_value(
-                self.eval_group_expr(expr, dataset, group_rows, params, ctes)?,
+                self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?,
                 *target_type,
             ),
             Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
                 "window functions cannot be nested inside grouped expressions",
             )),
             _ => {
-                let row = group_rows.first().map(Vec::as_slice).unwrap_or(&[]);
+                let row = if let Some(row_index) = group_row_indexes.first().copied() {
+                    dataset
+                        .rows
+                        .get(row_index)
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| DbError::internal("group row index is invalid"))?
+                } else {
+                    &[]
+                };
                 self.eval_expr(expr, dataset, row, params, ctes, None)
             }
         }
@@ -5727,29 +6297,30 @@ impl EngineRuntime {
                 );
             }
         }
-        let matches = dataset
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, binding)| {
-                let visible_match = table.is_some() || !binding.hidden;
-                identifiers_equal(&binding.name, column)
-                    && visible_match
-                    && table.is_none_or(|table| {
-                        binding
-                            .table
-                            .as_deref()
-                            .is_some_and(|binding_table| identifiers_equal(binding_table, table))
-                    })
-            })
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [single] => row
-                .get(single.0)
+        let mut matched_index = None;
+        for (index, binding) in dataset.columns.iter().enumerate() {
+            let visible_match = table.is_some() || !binding.hidden;
+            if !visible_match || !identifiers_equal(&binding.name, column) {
+                continue;
+            }
+            if table.is_some_and(|table| {
+                !binding
+                    .table
+                    .as_deref()
+                    .is_some_and(|binding_table| identifiers_equal(binding_table, table))
+            }) {
+                continue;
+            }
+            if matched_index.replace(index).is_some() {
+                return Err(DbError::sql(format!("ambiguous column reference {column}")));
+            }
+        }
+        if let Some(index) = matched_index {
+            row.get(index)
                 .cloned()
-                .ok_or_else(|| DbError::internal("row is shorter than its bindings")),
-            [] => Err(DbError::sql(format!("unknown column {column}"))),
-            _ => Err(DbError::sql(format!("ambiguous column reference {column}"))),
+                .ok_or_else(|| DbError::internal("row is shorter than its bindings"))
+        } else {
+            Err(DbError::sql(format!("unknown column {column}")))
         }
     }
 }
@@ -5789,7 +6360,7 @@ impl AggregateEvalContext<'_> {
 
 fn aggregate_numeric(
     ctx: &AggregateEvalContext<'_>,
-    rows: &[Vec<Value>],
+    row_indexes: &[usize],
     expr: &Expr,
     kind: NumericAgg,
     distinct: bool,
@@ -5799,37 +6370,68 @@ fn aggregate_numeric(
     let mut saw_float = false;
     let mut count = 0_i64;
 
-    let mut vals = Vec::new();
-    for row in rows {
-        let val = ctx.eval_row(row, expr)?;
-        if !matches!(val, Value::Null) {
-            vals.push(val);
-        }
-    }
-
     if distinct {
+        let mut vals = Vec::new();
+        for row_index in row_indexes {
+            let row = ctx
+                .dataset
+                .rows
+                .get(*row_index)
+                .map(Vec::as_slice)
+                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+            let val = ctx.eval_row(row, expr)?;
+            if !matches!(val, Value::Null) {
+                vals.push(val);
+            }
+        }
         vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
         vals.dedup_by(|a, b| {
             compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal) == std::cmp::Ordering::Equal
         });
-    }
-
-    for val in vals {
-        match val {
-            Value::Int64(value) => {
-                total_int += value;
-                total_float += value as f64;
-                count += 1;
+        for val in vals {
+            match val {
+                Value::Int64(value) => {
+                    total_int += value;
+                    total_float += value as f64;
+                    count += 1;
+                }
+                Value::Float64(value) => {
+                    total_float += value;
+                    saw_float = true;
+                    count += 1;
+                }
+                other => {
+                    return Err(DbError::sql(format!(
+                        "numeric aggregate does not support {other:?}"
+                    )))
+                }
             }
-            Value::Float64(value) => {
-                total_float += value;
-                saw_float = true;
-                count += 1;
-            }
-            other => {
-                return Err(DbError::sql(format!(
-                    "numeric aggregate does not support {other:?}"
-                )))
+        }
+    } else {
+        for row_index in row_indexes {
+            let row = ctx
+                .dataset
+                .rows
+                .get(*row_index)
+                .map(Vec::as_slice)
+                .ok_or_else(|| DbError::internal("group row index is invalid"))?;
+            match ctx.eval_row(row, expr)? {
+                Value::Null => {}
+                Value::Int64(value) => {
+                    total_int += value;
+                    total_float += value as f64;
+                    count += 1;
+                }
+                Value::Float64(value) => {
+                    total_float += value;
+                    saw_float = true;
+                    count += 1;
+                }
+                other => {
+                    return Err(DbError::sql(format!(
+                        "numeric aggregate does not support {other:?}"
+                    )))
+                }
             }
         }
     }
@@ -5850,14 +6452,19 @@ fn aggregate_numeric(
 fn aggregate_extreme(
     runtime: &EngineRuntime,
     dataset: &Dataset,
-    rows: &[Vec<Value>],
+    row_indexes: &[usize],
     expr: &Expr,
     params: &[Value],
     ctes: &BTreeMap<String, Dataset>,
     want_min: bool,
 ) -> Result<Value> {
     let mut current: Option<Value> = None;
-    for row in rows {
+    for row_index in row_indexes {
+        let row = dataset
+            .rows
+            .get(*row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
         let value = runtime.eval_expr(expr, dataset, row, params, ctes, None)?;
         if matches!(value, Value::Null) {
             continue;
@@ -7122,7 +7729,7 @@ fn normalize_like_escape(escape: Option<Value>) -> Result<Option<char>> {
 fn aggregate_group_concat(
     runtime: &EngineRuntime,
     dataset: &Dataset,
-    rows: &[Vec<Value>],
+    row_indexes: &[usize],
     args: &[Expr],
     params: &[Value],
     ctes: &BTreeMap<String, Dataset>,
@@ -7136,7 +7743,12 @@ fn aggregate_group_concat(
     }
     let mut parts = Vec::new();
     let mut separator = ",".to_string();
-    for row in rows {
+    for row_index in row_indexes {
+        let row = dataset
+            .rows
+            .get(*row_index)
+            .map(Vec::as_slice)
+            .ok_or_else(|| DbError::internal("group row index is invalid"))?;
         let value = runtime.eval_expr(&args[0], dataset, row, params, ctes, None)?;
         if matches!(value, Value::Null) {
             continue;

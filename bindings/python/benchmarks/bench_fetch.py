@@ -139,7 +139,7 @@ def run_engine_benchmark(
 
     insert_s = _run_with_gc_disabled(run_insert)
     insert_rps = count / insert_s
-    print(f"Insert {count} rows: {insert_s:.4f}s ({insert_rps:,.2f} rows/sec)")
+    print(f"Insert {count} rows: {insert_s:.9f}s ({insert_rps:,.2f} rows/sec)")
 
     scan_sql = "SELECT id, val, f FROM bench"
     scan_cur = conn.cursor()
@@ -156,7 +156,7 @@ def run_engine_benchmark(
     fetchall_s, rows = _run_with_gc_disabled(run_fetchall)
     if len(rows) != count:
         raise AssertionError(f"Expected {count} rows from fetchall, got {len(rows)}")
-    print(f"Fetchall {count} rows: {fetchall_s:.4f}s")
+    print(f"Fetchall {count} rows: {fetchall_s:.9f}s")
 
     def run_fetchmany():
         started = time.perf_counter()
@@ -172,7 +172,7 @@ def run_engine_benchmark(
     fetchmany_s, total = _run_with_gc_disabled(run_fetchmany)
     if total != count:
         raise AssertionError(f"Expected {count} rows from fetchmany, got {total}")
-    print(f"Fetchmany({fetchmany_batch}) {count} rows: {fetchmany_s:.4f}s")
+    print(f"Fetchmany({fetchmany_batch}) {count} rows: {fetchmany_s:.9f}s")
 
     point_cur = conn.cursor()
     point_sql = "SELECT id, val, f FROM bench WHERE id = ?"
@@ -237,7 +237,7 @@ def print_comparison(results, *, tie_threshold=0.0):
             "sqlite": s["fetchall_s"],
             "unit": "s",
             "higher_is_better": False,
-            "fmt": ".6f",
+            "fmt": ".9f",
         },
         {
             "name": "Fetchmany time",
@@ -245,7 +245,7 @@ def print_comparison(results, *, tie_threshold=0.0):
             "sqlite": s["fetchmany_s"],
             "unit": "s",
             "higher_is_better": False,
-            "fmt": ".6f",
+            "fmt": ".9f",
         },
         {
             "name": "Point read p50",

@@ -8,8 +8,8 @@
 //! and parser/normalize edge cases.
 
 use decentdb::{Db, DbConfig, QueryResult, Value};
-use tempfile::TempDir;
 use std::thread;
+use tempfile::TempDir;
 
 fn assert_float_close(value: &Value, expected: f64) {
     match value {
@@ -48,14 +48,20 @@ fn abs_function() {
 #[test]
 fn all_basic_types_roundtrip() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE all_types (
+    exec(
+        &db,
+        "CREATE TABLE all_types (
         id INT PRIMARY KEY,
         i INT,
         f FLOAT,
         t TEXT,
         b BOOLEAN
-    )");
-    exec(&db, "INSERT INTO all_types VALUES (1, 42, 3.14, 'hello', true)");
+    )",
+    );
+    exec(
+        &db,
+        "INSERT INTO all_types VALUES (1, 42, 3.14, 'hello', true)",
+    );
     let r = exec(&db, "SELECT * FROM all_types");
     assert_eq!(r.rows().len(), 1);
     let vals = r.rows()[0].values();
@@ -123,7 +129,8 @@ fn array_in_where() {
 #[test]
 fn ast_display_complex_table() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent_ref(id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent_ref(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE complex(
             id INT64 PRIMARY KEY,
@@ -132,8 +139,9 @@ fn ast_display_complex_table() {
             age INT64 CHECK (age >= 0),
             status TEXT DEFAULT 'active',
             parent_id INT64 REFERENCES parent_ref(id) ON DELETE CASCADE
-        )"
-    ).unwrap();
+        )",
+    )
+    .unwrap();
     let ddl = db.table_ddl("complex").unwrap();
     assert!(ddl.contains("CREATE TABLE"));
     assert!(ddl.contains("PRIMARY KEY") || ddl.contains("id"));
@@ -143,8 +151,11 @@ fn ast_display_complex_table() {
 fn between_expression() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)").unwrap();
-    let r = db.execute("SELECT val FROM t WHERE val BETWEEN 5 AND 15 ORDER BY val").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)")
+        .unwrap();
+    let r = db
+        .execute("SELECT val FROM t WHERE val BETWEEN 5 AND 15 ORDER BY val")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 3); // 5, 10, 15
 }
@@ -153,7 +164,8 @@ fn between_expression() {
 fn between_on_column() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)")
+        .unwrap();
     let r = db
         .execute("SELECT val FROM t WHERE val BETWEEN 5 AND 15 ORDER BY val")
         .unwrap();
@@ -167,7 +179,10 @@ fn between_on_column() {
 fn between_with_non_integer_types() {
     let db = mem_db();
     exec(&db, "CREATE TABLE bni (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "INSERT INTO bni VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date')");
+    exec(
+        &db,
+        "INSERT INTO bni VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'), (4, 'date')",
+    );
     let r = exec(
         &db,
         "SELECT name FROM bni WHERE name BETWEEN 'banana' AND 'date' ORDER BY name",
@@ -178,9 +193,18 @@ fn between_with_non_integer_types() {
 #[test]
 fn between_with_nulls() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE between_null (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO between_null VALUES (1, 5), (2, NULL), (3, 15)");
-    let r = exec(&db, "SELECT id FROM between_null WHERE val BETWEEN 1 AND 10 ORDER BY id");
+    exec(
+        &db,
+        "CREATE TABLE between_null (id INT PRIMARY KEY, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO between_null VALUES (1, 5), (2, NULL), (3, 15)",
+    );
+    let r = exec(
+        &db,
+        "SELECT id FROM between_null WHERE val BETWEEN 1 AND 10 ORDER BY id",
+    );
     assert_eq!(r.rows().len(), 1);
     assert_eq!(r.rows()[0].values()[0], Value::Int64(1));
 }
@@ -207,7 +231,9 @@ fn blob_large() {
 #[test]
 fn bool_and_null() {
     let db = mem_db();
-    let r = db.execute("SELECT TRUE AND NULL, FALSE AND NULL, NULL AND NULL").unwrap();
+    let r = db
+        .execute("SELECT TRUE AND NULL, FALSE AND NULL, NULL AND NULL")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Null);
     assert_eq!(v[0][1], Value::Bool(false));
@@ -217,7 +243,9 @@ fn bool_and_null() {
 #[test]
 fn bool_or_null() {
     let db = mem_db();
-    let r = db.execute("SELECT TRUE OR NULL, FALSE OR NULL, NULL OR NULL").unwrap();
+    let r = db
+        .execute("SELECT TRUE OR NULL, FALSE OR NULL, NULL OR NULL")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Bool(true));
     assert_eq!(v[0][1], Value::Null);
@@ -236,8 +264,14 @@ fn bool_to_int_comparison() {
 #[test]
 fn boolean_and_or_not_in_where() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE bool_t (id INT PRIMARY KEY, a BOOLEAN, b BOOLEAN)");
-    exec(&db, "INSERT INTO bool_t VALUES (1, true, false), (2, false, true), (3, true, true)");
+    exec(
+        &db,
+        "CREATE TABLE bool_t (id INT PRIMARY KEY, a BOOLEAN, b BOOLEAN)",
+    );
+    exec(
+        &db,
+        "INSERT INTO bool_t VALUES (1, true, false), (2, false, true), (3, true, true)",
+    );
     let r = exec(&db, "SELECT id FROM bool_t WHERE a AND b");
     assert_eq!(r.rows().len(), 1);
     assert_eq!(r.rows()[0].values()[0], Value::Int64(3));
@@ -274,20 +308,20 @@ fn btree_exercise_splits_and_deletes() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("test.ddb");
     let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     // Insert enough rows to cause splits
     for i in 0..200 {
         db.execute_with_params(
             "INSERT INTO t VALUES ($1, $2)",
             &[Value::Int64(i), Value::Text(format!("value_{:03}", i))],
-        ).unwrap();
+        )
+        .unwrap();
     }
     // Delete every other row
     for i in (0..200).step_by(2) {
-        db.execute_with_params(
-            "DELETE FROM t WHERE id = $1",
-            &[Value::Int64(i)],
-        ).unwrap();
+        db.execute_with_params("DELETE FROM t WHERE id = $1", &[Value::Int64(i)])
+            .unwrap();
     }
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(100));
@@ -303,7 +337,8 @@ fn btree_exercise_splits_and_deletes() {
 fn case_expression_searched() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT val, CASE WHEN val < 3 THEN 'low' WHEN val < 5 THEN 'mid' ELSE 'high' END AS label FROM t ORDER BY val",
@@ -354,7 +389,10 @@ fn case_insensitive_column_in_where() {
 #[test]
 fn case_insensitive_table_name() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE MixedCase (Id INT PRIMARY KEY, Name TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE MixedCase (Id INT PRIMARY KEY, Name TEXT)",
+    );
     exec(&db, "INSERT INTO MixedCase VALUES (1, 'hello')");
     let r = exec(&db, "SELECT name FROM mixedcase WHERE id = 1");
     assert_eq!(r.rows().len(), 1);
@@ -457,8 +495,14 @@ fn coalesce_expression() {
 #[test]
 fn coalesce_function() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE coal (id INT PRIMARY KEY, a TEXT, b TEXT)");
-    exec(&db, "INSERT INTO coal VALUES (1, NULL, 'fallback'), (2, 'primary', 'fallback')");
+    exec(
+        &db,
+        "CREATE TABLE coal (id INT PRIMARY KEY, a TEXT, b TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO coal VALUES (1, NULL, 'fallback'), (2, 'primary', 'fallback')",
+    );
     let r = exec(&db, "SELECT COALESCE(a, b) FROM coal ORDER BY id");
     assert_eq!(r.rows()[0].values()[0], Value::Text("fallback".to_string()));
     assert_eq!(r.rows()[1].values()[0], Value::Text("primary".to_string()));
@@ -467,7 +511,9 @@ fn coalesce_function() {
 #[test]
 fn coalesce_many_args() {
     let db = mem_db();
-    let r = db.execute("SELECT COALESCE(NULL, NULL, NULL, 42, 99)").unwrap();
+    let r = db
+        .execute("SELECT COALESCE(NULL, NULL, NULL, 42, 99)")
+        .unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(42));
 }
 
@@ -488,7 +534,8 @@ fn coalesce_returns_first_non_null() {
 #[test]
 fn column_default_numeric_expression() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64 DEFAULT 42)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64 DEFAULT 42)")
+        .unwrap();
     db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
 
     let result = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
@@ -499,7 +546,8 @@ fn column_default_numeric_expression() {
 #[test]
 fn column_default_value_applied_on_insert() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, status TEXT DEFAULT 'active')").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, status TEXT DEFAULT 'active')")
+        .unwrap();
     db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
 
     let result = db.execute("SELECT status FROM t WHERE id = 1").unwrap();
@@ -511,8 +559,11 @@ fn column_default_value_applied_on_insert() {
 fn compare_float_to_text() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a FLOAT64, b TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (3.14, '2.71'), (1.0, '5.0')").unwrap();
-    let r = db.execute("SELECT a FROM t WHERE a > b ORDER BY a").unwrap();
+    db.execute("INSERT INTO t VALUES (3.14, '2.71'), (1.0, '5.0')")
+        .unwrap();
+    let r = db
+        .execute("SELECT a FROM t WHERE a > b ORDER BY a")
+        .unwrap();
     let v = rows(&r);
     assert!(!v.is_empty()); // 3.14 > '2.71'
 }
@@ -521,7 +572,8 @@ fn compare_float_to_text() {
 fn compare_float_with_text() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val FLOAT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1.5), (2.5), (3.5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1.5), (2.5), (3.5)")
+        .unwrap();
     let r = db.execute("SELECT val FROM t WHERE val = '2.5'").unwrap();
     let v = rows(&r);
     assert!(v.len() <= 1);
@@ -531,8 +583,11 @@ fn compare_float_with_text() {
 fn compare_int_to_text() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (5, '10'), (20, '5')").unwrap();
-    let r = db.execute("SELECT a, b FROM t WHERE a < b ORDER BY a").unwrap();
+    db.execute("INSERT INTO t VALUES (5, '10'), (20, '5')")
+        .unwrap();
+    let r = db
+        .execute("SELECT a, b FROM t WHERE a < b ORDER BY a")
+        .unwrap();
     let v = rows(&r);
     assert!(!v.is_empty()); // 5 < '10' (numeric comparison)
 }
@@ -541,7 +596,8 @@ fn compare_int_to_text() {
 fn compare_int_with_text() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, label TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, '1'), (2, '2'), (3, 'three')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, '1'), (2, '2'), (3, 'three')")
+        .unwrap();
     // Comparing INT64 column with text literal
     let r = db.execute("SELECT id FROM t WHERE id = '2'").unwrap();
     // May or may not match depending on coercion rules
@@ -595,7 +651,8 @@ fn comparison_with_null() {
 fn complex_boolean_with_nulls() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, NULL), (NULL, 2), (NULL, NULL), (1, 2)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL), (NULL, 2), (NULL, NULL), (1, 2)")
+        .unwrap();
     // Test AND/OR with NULLs
     let r = db
         .execute("SELECT COUNT(*) FROM t WHERE a = 1 AND b = 2")
@@ -672,7 +729,8 @@ fn current_date_time_functions() {
 #[test]
 fn decimal_column_basic() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, price DECIMAL(10, 2))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, price DECIMAL(10, 2))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 19.99)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 100.00)").unwrap();
     let r = db.execute("SELECT price FROM t ORDER BY id").unwrap();
@@ -683,8 +741,14 @@ fn decimal_column_basic() {
 #[test]
 fn decimal_column_display() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE prices (id INT PRIMARY KEY, price DECIMAL(10, 2))");
-    exec(&db, "INSERT INTO prices VALUES (1, 19.99), (2, 0.01), (3, 100.00)");
+    exec(
+        &db,
+        "CREATE TABLE prices (id INT PRIMARY KEY, price DECIMAL(10, 2))",
+    );
+    exec(
+        &db,
+        "INSERT INTO prices VALUES (1, 19.99), (2, 0.01), (3, 100.00)",
+    );
     let r = exec(&db, "SELECT price FROM prices ORDER BY id");
     assert_eq!(r.rows().len(), 3);
 }
@@ -693,7 +757,8 @@ fn decimal_column_display() {
 fn decimal_comparison() {
     let db = mem_db();
     db.execute("CREATE TABLE t(price DECIMAL(10,2))").unwrap();
-    db.execute("INSERT INTO t VALUES (10.50), (20.75), (5.25)").unwrap();
+    db.execute("INSERT INTO t VALUES (10.50), (20.75), (5.25)")
+        .unwrap();
     // Decimal comparison not fully supported; just verify data storage
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(3));
@@ -738,7 +803,10 @@ fn decimal_negative() {
 #[test]
 fn decimal_negative_values() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE ledger (id INT PRIMARY KEY, amount DECIMAL(10, 2))");
+    exec(
+        &db,
+        "CREATE TABLE ledger (id INT PRIMARY KEY, amount DECIMAL(10, 2))",
+    );
     exec(&db, "INSERT INTO ledger VALUES (1, -5.50), (2, -0.01)");
     let r = exec(&db, "SELECT amount FROM ledger ORDER BY id");
     assert_eq!(r.rows().len(), 2);
@@ -747,8 +815,10 @@ fn decimal_negative_values() {
 #[test]
 fn decimal_operations() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, price DECIMAL(10,2))").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 19.99), (2, 29.99), (3, 9.99)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, price DECIMAL(10,2))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 19.99), (2, 29.99), (3, 9.99)")
+        .unwrap();
     // Decimal aggregates (SUM/AVG) not supported; test simple select
     let r = db.execute("SELECT price FROM t ORDER BY id").unwrap();
     assert_eq!(rows(&r).len(), 3);
@@ -757,7 +827,10 @@ fn decimal_operations() {
 #[test]
 fn decimal_small_fraction() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE precise (id INT PRIMARY KEY, val DECIMAL(10, 4))");
+    exec(
+        &db,
+        "CREATE TABLE precise (id INT PRIMARY KEY, val DECIMAL(10, 4))",
+    );
     exec(&db, "INSERT INTO precise VALUES (1, 0.0001)");
     let r = exec(&db, "SELECT val FROM precise");
     assert_eq!(r.rows().len(), 1);
@@ -766,7 +839,10 @@ fn decimal_small_fraction() {
 #[test]
 fn decimal_zero_scale() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE counts (id INT PRIMARY KEY, cnt DECIMAL(10, 0))");
+    exec(
+        &db,
+        "CREATE TABLE counts (id INT PRIMARY KEY, cnt DECIMAL(10, 0))",
+    );
     exec(&db, "INSERT INTO counts VALUES (1, 42)");
     let r = exec(&db, "SELECT cnt FROM counts");
     assert_eq!(r.rows().len(), 1);
@@ -785,7 +861,8 @@ fn deeply_nested_expressions() {
 #[test]
 fn default_expression_evaluated() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, computed INT64 DEFAULT 1 + 2 + 3)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, computed INT64 DEFAULT 1 + 2 + 3)")
+        .unwrap();
     db.execute("INSERT INTO t(id) VALUES (1)").unwrap();
     let r = db.execute("SELECT computed FROM t WHERE id = 1").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(6));
@@ -794,7 +871,8 @@ fn default_expression_evaluated() {
 #[test]
 fn default_text_expression() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, label TEXT DEFAULT 'hello' || ' ' || 'world')").unwrap();
+    db.execute("CREATE TABLE t(id INT64, label TEXT DEFAULT 'hello' || ' ' || 'world')")
+        .unwrap();
     db.execute("INSERT INTO t(id) VALUES (1)").unwrap();
     let r = db.execute("SELECT label FROM t WHERE id = 1").unwrap();
     // Might eval to concatenated string or just the literal depending on parsing
@@ -805,7 +883,10 @@ fn default_text_expression() {
 #[test]
 fn default_value_expression() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, created_at INT64 DEFAULT 0, status TEXT DEFAULT 'pending')").unwrap();
+    db.execute(
+        "CREATE TABLE t(id INT64, created_at INT64 DEFAULT 0, status TEXT DEFAULT 'pending')",
+    )
+    .unwrap();
     db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
     let r = db.execute("SELECT created_at, status FROM t").unwrap();
     let v = rows(&r);
@@ -920,7 +1001,8 @@ fn execute_batch_with_params() {
 fn execute_with_params() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'hello'),(2,'world')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'hello'),(2,'world')")
+        .unwrap();
     let r = db
         .execute_with_params("SELECT val FROM t WHERE id = $1", &[Value::Int64(1)])
         .unwrap();
@@ -956,7 +1038,8 @@ fn expr_arithmetic_operators() {
 fn expr_between_not_between() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)")
+        .unwrap();
     let r = db
         .execute("SELECT x FROM t WHERE x BETWEEN 5 AND 15 ORDER BY x")
         .unwrap();
@@ -973,13 +1056,9 @@ fn expr_boolean_and_or_combinations() {
     db.execute("CREATE TABLE t(a BOOLEAN, b BOOLEAN)").unwrap();
     db.execute("INSERT INTO t VALUES (TRUE, TRUE), (TRUE, FALSE), (FALSE, TRUE), (FALSE, FALSE)")
         .unwrap();
-    let r = db
-        .execute("SELECT a, b FROM t WHERE a AND b")
-        .unwrap();
+    let r = db.execute("SELECT a, b FROM t WHERE a AND b").unwrap();
     assert_eq!(rows(&r).len(), 1);
-    let r2 = db
-        .execute("SELECT a, b FROM t WHERE a OR b")
-        .unwrap();
+    let r2 = db.execute("SELECT a, b FROM t WHERE a OR b").unwrap();
     assert_eq!(rows(&r2).len(), 3);
 }
 
@@ -987,13 +1066,14 @@ fn expr_boolean_and_or_combinations() {
 fn expr_case_simple_form() {
     let db = mem_db();
     db.execute("CREATE TABLE t(status TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('active'),('inactive'),('pending')").unwrap();
+    db.execute("INSERT INTO t VALUES ('active'),('inactive'),('pending')")
+        .unwrap();
     let r = db
         .execute("SELECT CASE status WHEN 'active' THEN 1 WHEN 'inactive' THEN 0 ELSE -1 END AS code FROM t ORDER BY status")
         .unwrap();
     let v = rows(&r);
-    assert_eq!(v[0][0], Value::Int64(1));  // active
-    assert_eq!(v[1][0], Value::Int64(0));  // inactive
+    assert_eq!(v[0][0], Value::Int64(1)); // active
+    assert_eq!(v[1][0], Value::Int64(0)); // inactive
     assert_eq!(v[2][0], Value::Int64(-1)); // pending
 }
 
@@ -1001,7 +1081,8 @@ fn expr_case_simple_form() {
 fn expr_case_when_simple() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(NULL)")
+        .unwrap();
     let r = db
         .execute("SELECT x, CASE WHEN x = 1 THEN 'one' WHEN x = 2 THEN 'two' ELSE 'other' END AS label FROM t ORDER BY x")
         .unwrap();
@@ -1025,24 +1106,28 @@ fn expr_cast_int_to_text_to_float() {
 fn expr_coalesce_and_nullif() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (NULL, 10), (5, 5), (3, NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (NULL, 10), (5, 5), (3, NULL)")
+        .unwrap();
     let r = db
-        .execute("SELECT COALESCE(a, b, 0) AS c, NULLIF(a, b) AS n FROM t ORDER BY COALESCE(a, b, 0)")
+        .execute(
+            "SELECT COALESCE(a, b, 0) AS c, NULLIF(a, b) AS n FROM t ORDER BY COALESCE(a, b, 0)",
+        )
         .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(3));
     assert_eq!(v[0][1], Value::Int64(3)); // 3 != NULL → 3
     assert_eq!(v[1][0], Value::Int64(5));
-    assert_eq!(v[1][1], Value::Null);     // 5 = 5 → NULL
+    assert_eq!(v[1][1], Value::Null); // 5 = 5 → NULL
     assert_eq!(v[2][0], Value::Int64(10));
-    assert_eq!(v[2][1], Value::Null);     // NULL, 10 → COALESCE=10, NULLIF(NULL,10)=NULL
+    assert_eq!(v[2][1], Value::Null); // NULL, 10 → COALESCE=10, NULLIF(NULL,10)=NULL
 }
 
 #[test]
 fn expr_comparison_operators() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     assert_eq!(
         rows(&db.execute("SELECT COUNT(*) FROM t WHERE x > 3").unwrap())[0][0],
         Value::Int64(2)
@@ -1070,9 +1155,7 @@ fn expr_concat_operator() {
     let db = mem_db();
     db.execute("CREATE TABLE t(first TEXT, last TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES ('John', 'Doe')").unwrap();
-    let r = db
-        .execute("SELECT first || ' ' || last FROM t")
-        .unwrap();
+    let r = db.execute("SELECT first || ' ' || last FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("John Doe".into()));
 }
 
@@ -1094,7 +1177,8 @@ fn expr_float_arithmetic() {
 fn expr_in_list_and_not_in() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     let r = db
         .execute("SELECT x FROM t WHERE x IN (2, 4) ORDER BY x")
         .unwrap();
@@ -1112,7 +1196,8 @@ fn expr_in_list_and_not_in() {
 fn expr_is_null_is_not_null() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL)")
+        .unwrap();
     let r = db
         .execute("SELECT COUNT(*) FROM t WHERE x IS NULL")
         .unwrap();
@@ -1127,7 +1212,8 @@ fn expr_is_null_is_not_null() {
 fn expr_like_and_ilike() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('Alice'),('Bob'),('ALICE'),('Charlie')").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice'),('Bob'),('ALICE'),('Charlie')")
+        .unwrap();
     let r = db
         .execute("SELECT name FROM t WHERE name LIKE 'A%' ORDER BY name")
         .unwrap();
@@ -1144,7 +1230,8 @@ fn expr_like_and_ilike() {
 fn expr_like_with_underscore_pattern() {
     let db = mem_db();
     db.execute("CREATE TABLE t(code TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('AB'),('ABC'),('A1'),('XY')").unwrap();
+    db.execute("INSERT INTO t VALUES ('AB'),('ABC'),('A1'),('XY')")
+        .unwrap();
     let r = db
         .execute("SELECT code FROM t WHERE code LIKE 'A_' ORDER BY code")
         .unwrap();
@@ -1179,10 +1266,11 @@ fn expr_substring_and_trim() {
 fn expr_unary_minus_and_not() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (5, TRUE), (-3, FALSE)").unwrap();
+    db.execute("INSERT INTO t VALUES (5, TRUE), (-3, FALSE)")
+        .unwrap();
     let r = db.execute("SELECT -x FROM t ORDER BY x").unwrap();
     let v = rows(&r);
-    assert_eq!(v[0][0], Value::Int64(3));  // -(-3) = 3
+    assert_eq!(v[0][0], Value::Int64(3)); // -(-3) = 3
     assert_eq!(v[1][0], Value::Int64(-5)); // -(5)
     let r2 = db
         .execute("SELECT x FROM t WHERE NOT flag ORDER BY x")
@@ -1194,7 +1282,8 @@ fn expr_unary_minus_and_not() {
 fn expression_with_table_data() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (10, 3), (20, 7), (15, 5)").unwrap();
+    db.execute("INSERT INTO t VALUES (10, 3), (20, 7), (15, 5)")
+        .unwrap();
     // Complex expression in SELECT
     let r = db
         .execute("SELECT a * b + (a - b), a / b, a % b FROM t ORDER BY a")
@@ -1211,7 +1300,6 @@ fn failpoint_log() {
         assert!(json.starts_with('[') || json.starts_with('{'));
     }
 }
-
 
 #[test]
 fn file_save_as() {
@@ -1239,7 +1327,8 @@ fn float_division_by_zero() {
 fn ilike_case_insensitive() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('Alice'),('BOB'),('charlie')").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice'),('BOB'),('charlie')")
+        .unwrap();
     let r = db.execute("SELECT name FROM t WHERE name ILIKE 'alice'");
     if let Ok(r) = r {
         assert!(!rows(&r).is_empty());
@@ -1250,8 +1339,11 @@ fn ilike_case_insensitive() {
 fn ilike_pattern() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('Alice'),('ALICE'),('Bob')").unwrap();
-    let r = db.execute("SELECT name FROM t WHERE name ILIKE 'alice' ORDER BY name").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice'),('ALICE'),('Bob')")
+        .unwrap();
+    let r = db
+        .execute("SELECT name FROM t WHERE name ILIKE 'alice' ORDER BY name")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
 }
@@ -1260,8 +1352,14 @@ fn ilike_pattern() {
 fn ilike_pattern_matching() {
     let db = mem_db();
     exec(&db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "INSERT INTO items VALUES (1, 'Hello'), (2, 'WORLD'), (3, 'hello')");
-    let r = exec(&db, "SELECT id FROM items WHERE name ILIKE 'hello' ORDER BY id");
+    exec(
+        &db,
+        "INSERT INTO items VALUES (1, 'Hello'), (2, 'WORLD'), (3, 'hello')",
+    );
+    let r = exec(
+        &db,
+        "SELECT id FROM items WHERE name ILIKE 'hello' ORDER BY id",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
@@ -1269,8 +1367,14 @@ fn ilike_pattern_matching() {
 fn ilike_with_mixed_case() {
     let db = mem_db();
     exec(&db, "CREATE TABLE il (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO il VALUES (1, 'Hello'), (2, 'HELLO'), (3, 'hello'), (4, 'World')");
-    let r = exec(&db, "SELECT id FROM il WHERE val ILIKE '%ello%' ORDER BY id");
+    exec(
+        &db,
+        "INSERT INTO il VALUES (1, 'Hello'), (2, 'HELLO'), (3, 'hello'), (4, 'World')",
+    );
+    let r = exec(
+        &db,
+        "SELECT id FROM il WHERE val ILIKE '%ello%' ORDER BY id",
+    );
     assert_eq!(r.rows().len(), 3);
 }
 
@@ -1287,8 +1391,11 @@ fn implicit_type_coercion_int_to_float() {
 fn in_list() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
-    let r = db.execute("SELECT id FROM t WHERE id IN (2, 4) ORDER BY id").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id FROM t WHERE id IN (2, 4) ORDER BY id")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
     assert_eq!(v[0][0], Value::Int64(2));
@@ -1299,17 +1406,25 @@ fn in_list() {
 fn in_list_with_nulls() {
     let db = mem_db();
     exec(&db, "CREATE TABLE nullcheck (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO nullcheck VALUES (1, 10), (2, NULL), (3, 30)");
-    let r = exec(&db, "SELECT id FROM nullcheck WHERE val IN (10, 30) ORDER BY id");
+    exec(
+        &db,
+        "INSERT INTO nullcheck VALUES (1, 10), (2, NULL), (3, 30)",
+    );
+    let r = exec(
+        &db,
+        "SELECT id FROM nullcheck WHERE val IN (10, 30) ORDER BY id",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
 #[test]
 fn index_rebuild() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
     db.rebuild_index("idx_val").unwrap();
     let r = db.execute("SELECT id FROM t WHERE val = 'b'").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(2));
@@ -1318,7 +1433,8 @@ fn index_rebuild() {
 #[test]
 fn index_rebuild_all() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
     db.execute("INSERT INTO t VALUES (1,'a')").unwrap();
     db.rebuild_indexes().unwrap();
@@ -1327,7 +1443,8 @@ fn index_rebuild_all() {
 #[test]
 fn index_verify() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
     db.execute("INSERT INTO t VALUES (1,'a'),(2,'b')").unwrap();
     let verification = db.verify_index("idx_val").unwrap();
@@ -1337,7 +1454,8 @@ fn index_verify() {
 #[test]
 fn indexes_list() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
     // Index should be usable
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
@@ -1358,7 +1476,8 @@ fn int_float_comparison() {
 fn is_distinct_from() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (NULL, NULL), (1, NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (NULL, NULL), (1, NULL)")
+        .unwrap();
     let r = db
         .execute("SELECT a, b FROM t WHERE a IS DISTINCT FROM b ORDER BY a, b")
         .unwrap();
@@ -1371,10 +1490,16 @@ fn is_distinct_from() {
 fn is_null_and_is_not_null() {
     let db = mem_db();
     exec(&db, "CREATE TABLE nulls (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO nulls VALUES (1, 'a'), (2, NULL), (3, 'c')");
+    exec(
+        &db,
+        "INSERT INTO nulls VALUES (1, 'a'), (2, NULL), (3, 'c')",
+    );
     let r1 = exec(&db, "SELECT id FROM nulls WHERE val IS NULL");
     assert_eq!(r1.rows().len(), 1);
-    let r2 = exec(&db, "SELECT id FROM nulls WHERE val IS NOT NULL ORDER BY id");
+    let r2 = exec(
+        &db,
+        "SELECT id FROM nulls WHERE val IS NOT NULL ORDER BY id",
+    );
     assert_eq!(r2.rows().len(), 2);
 }
 
@@ -1395,7 +1520,8 @@ fn is_null_is_not_null() {
 fn json_extract_operator() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, data TEXT)").unwrap();
-    db.execute(r#"INSERT INTO t VALUES (1, '{"name":"alice","age":30}')"#).unwrap();
+    db.execute(r#"INSERT INTO t VALUES (1, '{"name":"alice","age":30}')"#)
+        .unwrap();
     // Try -> operator
     let r = db.execute("SELECT data -> 'name' FROM t");
     // If supported, check result; otherwise just pass
@@ -1406,7 +1532,8 @@ fn json_extract_operator() {
 fn json_extract_text_operator() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, data TEXT)").unwrap();
-    db.execute(r#"INSERT INTO t VALUES (1, '{"key":"value"}')"#).unwrap();
+    db.execute(r#"INSERT INTO t VALUES (1, '{"key":"value"}')"#)
+        .unwrap();
     let r = db.execute("SELECT data ->> 'key' FROM t");
     assert!(r.is_ok() || r.is_err());
 }
@@ -1416,10 +1543,11 @@ fn large_blob_storage_and_retrieval() {
     let db = mem_db();
     exec(&db, "CREATE TABLE large_b (id INT PRIMARY KEY, data BLOB)");
     let big_blob = vec![0xABu8; 100_000];
-    db.execute_with_params("INSERT INTO large_b VALUES ($1, $2)", &[
-        Value::Int64(1),
-        Value::Blob(big_blob.clone()),
-    ]).unwrap();
+    db.execute_with_params(
+        "INSERT INTO large_b VALUES ($1, $2)",
+        &[Value::Int64(1), Value::Blob(big_blob.clone())],
+    )
+    .unwrap();
     let r = exec(&db, "SELECT data FROM large_b WHERE id = 1");
     assert_eq!(r.rows()[0].values()[0], Value::Blob(big_blob));
 }
@@ -1445,9 +1573,7 @@ fn large_blob_values() {
 fn large_integer_arithmetic() {
     let db = mem_db();
     // Very large integers are parsed as Float64 by SQL parser
-    let r = db
-        .execute("SELECT 1000000 + 0, 1000000 - 0")
-        .unwrap();
+    let r = db.execute("SELECT 1000000 + 0, 1000000 - 0").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(1_000_000));
 }
@@ -1457,10 +1583,11 @@ fn large_text_storage_and_retrieval() {
     let db = mem_db();
     exec(&db, "CREATE TABLE large_t (id INT PRIMARY KEY, data TEXT)");
     let big_text = "x".repeat(100_000);
-    db.execute_with_params("INSERT INTO large_t VALUES ($1, $2)", &[
-        Value::Int64(1),
-        Value::Text(big_text.clone()),
-    ]).unwrap();
+    db.execute_with_params(
+        "INSERT INTO large_t VALUES ($1, $2)",
+        &[Value::Int64(1), Value::Text(big_text.clone())],
+    )
+    .unwrap();
     let r = exec(&db, "SELECT data FROM large_t WHERE id = 1");
     assert_eq!(r.rows()[0].values()[0], Value::Text(big_text));
 }
@@ -1493,8 +1620,11 @@ fn length_function() {
 fn like_patterns() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('Alice'),('Bob'),('Charlie'),('Alicia')").unwrap();
-    let r = db.execute("SELECT name FROM t WHERE name LIKE 'Ali%' ORDER BY name").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice'),('Bob'),('Charlie'),('Alicia')")
+        .unwrap();
+    let r = db
+        .execute("SELECT name FROM t WHERE name LIKE 'Ali%' ORDER BY name")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
     assert_eq!(v[0][0], Value::Text("Alice".into()));
@@ -1505,7 +1635,10 @@ fn like_patterns() {
 fn like_percent_in_middle() {
     let db = mem_db();
     exec(&db, "CREATE TABLE lm (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO lm VALUES (1, 'abc_def'), (2, 'abc_xyz'), (3, 'xyz_def')");
+    exec(
+        &db,
+        "INSERT INTO lm VALUES (1, 'abc_def'), (2, 'abc_xyz'), (3, 'xyz_def')",
+    );
     let r = exec(&db, "SELECT id FROM lm WHERE val LIKE 'abc%' ORDER BY id");
     assert_eq!(r.rows().len(), 2);
 }
@@ -1514,7 +1647,10 @@ fn like_percent_in_middle() {
 fn like_underscore_wildcard() {
     let db = mem_db();
     exec(&db, "CREATE TABLE lu (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO lu VALUES (1, 'cat'), (2, 'car'), (3, 'cab'), (4, 'cap'), (5, 'cage')");
+    exec(
+        &db,
+        "INSERT INTO lu VALUES (1, 'cat'), (2, 'car'), (3, 'cab'), (4, 'cap'), (5, 'cage')",
+    );
     let r = exec(&db, "SELECT id FROM lu WHERE val LIKE 'ca_' ORDER BY id");
     assert_eq!(r.rows().len(), 4); // cat, car, cab, cap (3 chars matching 'ca_')
 }
@@ -1523,8 +1659,14 @@ fn like_underscore_wildcard() {
 fn like_with_escape_character() {
     let db = mem_db();
     exec(&db, "CREATE TABLE patterns (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO patterns VALUES (1, 'abc%def'), (2, 'abcXdef'), (3, 'abc')");
-    let r = exec(&db, "SELECT id FROM patterns WHERE val LIKE 'abc!%def' ESCAPE '!'");
+    exec(
+        &db,
+        "INSERT INTO patterns VALUES (1, 'abc%def'), (2, 'abcXdef'), (3, 'abc')",
+    );
+    let r = exec(
+        &db,
+        "SELECT id FROM patterns WHERE val LIKE 'abc!%def' ESCAPE '!'",
+    );
     assert_eq!(r.rows().len(), 1);
     assert_eq!(r.rows()[0].values()[0], Value::Int64(1));
 }
@@ -1533,8 +1675,11 @@ fn like_with_escape_character() {
 fn like_with_underscore() {
     let db = mem_db();
     db.execute("CREATE TABLE t(code TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('AB'),('AC'),('ABC'),('A1')").unwrap();
-    let r = db.execute("SELECT code FROM t WHERE code LIKE 'A_' ORDER BY code").unwrap();
+    db.execute("INSERT INTO t VALUES ('AB'),('AC'),('ABC'),('A1')")
+        .unwrap();
+    let r = db
+        .execute("SELECT code FROM t WHERE code LIKE 'A_' ORDER BY code")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 3); // AB, AC, A1
 }
@@ -1555,7 +1700,9 @@ fn many_columns_wide_row() {
 #[test]
 fn math_functions() {
     let db = mem_db();
-    let r = db.execute("SELECT ABS(-42), ABS(42), ROUND(3.14159, 2), ROUND(3.5, 0)").unwrap();
+    let r = db
+        .execute("SELECT ABS(-42), ABS(42), ROUND(3.14159, 2), ROUND(3.5, 0)")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(42));
     assert_eq!(v[0][1], Value::Int64(42));
@@ -1565,7 +1712,8 @@ fn math_functions() {
 fn mixed_type_comparison() {
     let db = mem_db();
     db.execute("CREATE TABLE t(a INT64, b FLOAT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (10, 10.5), (20, 19.5)").unwrap();
+    db.execute("INSERT INTO t VALUES (10, 10.5), (20, 19.5)")
+        .unwrap();
     let r = db
         .execute("SELECT a, b FROM t WHERE a > b ORDER BY a")
         .unwrap();
@@ -1598,14 +1746,19 @@ fn modulo_operator() {
 #[test]
 fn multi_column_fk() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(a INT64, b INT64, val TEXT, PRIMARY KEY (a, b))").unwrap();
+    db.execute("CREATE TABLE parent(a INT64, b INT64, val TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
     db.execute(
         "CREATE TABLE child(id INT64, pa INT64, pb INT64,
-         FOREIGN KEY (pa, pb) REFERENCES parent(a, b))"
-    ).unwrap();
-    db.execute("INSERT INTO parent VALUES (1, 1, 'ok')").unwrap();
+         FOREIGN KEY (pa, pb) REFERENCES parent(a, b))",
+    )
+    .unwrap();
+    db.execute("INSERT INTO parent VALUES (1, 1, 'ok')")
+        .unwrap();
     db.execute("INSERT INTO child VALUES (10, 1, 1)").unwrap();
-    let err = db.execute("INSERT INTO child VALUES (20, 1, 2)").unwrap_err();
+    let err = db
+        .execute("INSERT INTO child VALUES (20, 1, 2)")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -1631,12 +1784,14 @@ fn multiple_triggers_same_event() {
     db.execute("CREATE TABLE log(msg TEXT)").unwrap();
     db.execute(
         "CREATE TRIGGER trg1 AFTER INSERT ON t FOR EACH ROW
-         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''trigger1'')')"
-    ).unwrap();
+         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''trigger1'')')",
+    )
+    .unwrap();
     db.execute(
         "CREATE TRIGGER trg2 AFTER INSERT ON t FOR EACH ROW
-         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''trigger2'')')"
-    ).unwrap();
+         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''trigger2'')')",
+    )
+    .unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     let r = db.execute("SELECT COUNT(*) FROM log").unwrap();
     assert!(rows(&r)[0][0] == Value::Int64(2));
@@ -1684,8 +1839,10 @@ fn negative_zero_operations() {
 #[test]
 fn nested_boolean_expressions() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9)")
+        .unwrap();
     let r = db
         .execute("SELECT * FROM t WHERE (a > 1 AND b < 8) OR (c = 9)")
         .unwrap();
@@ -1695,9 +1852,17 @@ fn nested_boolean_expressions() {
 #[test]
 fn nested_case_expression() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE nested_case (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO nested_case VALUES (1, 10), (2, 50), (3, 90)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "CREATE TABLE nested_case (id INT PRIMARY KEY, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO nested_case VALUES (1, 10), (2, 50), (3, 90)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT id, 
             CASE 
                 WHEN val < 30 THEN CASE WHEN val < 20 THEN 'very_low' ELSE 'low' END
@@ -1706,7 +1871,8 @@ fn nested_case_expression() {
             END as category
         FROM nested_case
         ORDER BY id
-    ");
+    ",
+    );
     assert_eq!(r.rows()[0].values()[1], Value::Text("very_low".to_string()));
     assert_eq!(r.rows()[1].values()[1], Value::Text("medium".to_string()));
     assert_eq!(r.rows()[2].values()[1], Value::Text("high".to_string()));
@@ -1716,7 +1882,8 @@ fn nested_case_expression() {
 fn nested_case_expressions() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT val,
@@ -1738,14 +1905,15 @@ fn nested_case_expressions() {
 fn nested_case_when() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(5),(10),(20)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(5),(10),(20)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT x, CASE
                 WHEN x < 5 THEN CASE WHEN x = 1 THEN 'one' ELSE 'few' END
                 WHEN x < 15 THEN 'medium'
                 ELSE 'many'
-             END AS label FROM t ORDER BY x"
+             END AS label FROM t ORDER BY x",
         )
         .unwrap();
     let v = rows(&r);
@@ -1767,7 +1935,8 @@ fn nested_function_calls() {
 fn nested_subqueries_three_levels() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT * FROM (
@@ -1785,7 +1954,8 @@ fn nested_subqueries_three_levels() {
 fn not_between() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(5),(10),(15),(20)")
+        .unwrap();
     let r = db
         .execute("SELECT val FROM t WHERE val NOT BETWEEN 5 AND 15 ORDER BY val")
         .unwrap();
@@ -1812,7 +1982,10 @@ fn not_between_filter() {
     let db = mem_db();
     exec(&db, "CREATE TABLE nb (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO nb VALUES (1, 5), (2, 15), (3, 25)");
-    let r = exec(&db, "SELECT id FROM nb WHERE val NOT BETWEEN 10 AND 20 ORDER BY id");
+    let r = exec(
+        &db,
+        "SELECT id FROM nb WHERE val NOT BETWEEN 10 AND 20 ORDER BY id",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
@@ -1830,9 +2003,7 @@ fn not_boolean_expression() {
 fn not_exists() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    let r = db
-        .execute("SELECT NOT EXISTS (SELECT 1 FROM t)")
-        .unwrap();
+    let r = db.execute("SELECT NOT EXISTS (SELECT 1 FROM t)").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Bool(true));
 }
 
@@ -1840,8 +2011,11 @@ fn not_exists() {
 fn not_in_list() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
-    let r = db.execute("SELECT id FROM t WHERE id NOT IN (2, 4) ORDER BY id").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
+    let r = db
+        .execute("SELECT id FROM t WHERE id NOT IN (2, 4) ORDER BY id")
+        .unwrap();
     assert_eq!(rows(&r).len(), 3);
 }
 
@@ -1862,7 +2036,8 @@ fn not_in_list_expression() {
 fn not_like() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('alice'),('bob'),('charlie')").unwrap();
+    db.execute("INSERT INTO t VALUES ('alice'),('bob'),('charlie')")
+        .unwrap();
     // Test NOT LIKE operator exists and works
     let r = db
         .execute("SELECT name FROM t WHERE NOT (name LIKE 'ali%') ORDER BY name")
@@ -1875,17 +2050,29 @@ fn not_like() {
 fn not_like_expression() {
     let db = mem_db();
     exec(&db, "CREATE TABLE nlk (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "INSERT INTO nlk VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Alicia')");
+    exec(
+        &db,
+        "INSERT INTO nlk VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Alicia')",
+    );
     // Exercise NOT LIKE code path
-    let _r = exec(&db, "SELECT id FROM nlk WHERE name NOT LIKE 'Al%' ORDER BY id");
+    let _r = exec(
+        &db,
+        "SELECT id FROM nlk WHERE name NOT LIKE 'Al%' ORDER BY id",
+    );
 }
 
 #[test]
 fn not_like_pattern() {
     let db = mem_db();
     exec(&db, "CREATE TABLE words (id INT PRIMARY KEY, word TEXT)");
-    exec(&db, "INSERT INTO words VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry')");
-    let r = exec(&db, "SELECT id FROM words WHERE word NOT LIKE 'a%' ORDER BY id");
+    exec(
+        &db,
+        "INSERT INTO words VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry')",
+    );
+    let r = exec(
+        &db,
+        "SELECT id FROM words WHERE word NOT LIKE 'a%' ORDER BY id",
+    );
     // NOT LIKE 'a%' should exclude 'apple', keeping banana and cherry
     assert!(!r.rows().is_empty());
 }
@@ -1907,7 +2094,9 @@ fn null_and_true_is_null() {
 #[test]
 fn null_arithmetic() {
     let db = mem_db();
-    let r = db.execute("SELECT NULL + 1, NULL * 5, NULL - NULL").unwrap();
+    let r = db
+        .execute("SELECT NULL + 1, NULL * 5, NULL - NULL")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Null);
     assert_eq!(v[0][1], Value::Null);
@@ -1989,7 +2178,8 @@ fn overflow_large_blob() {
     db.execute_with_params(
         "INSERT INTO t VALUES ($1, $2)",
         &[Value::Int64(1), Value::Blob(big_blob.clone())],
-    ).unwrap();
+    )
+    .unwrap();
     let r = db.execute("SELECT data FROM t WHERE id = 1").unwrap();
     if let Value::Blob(b) = &rows(&r)[0][0] {
         assert_eq!(b.len(), 20_000);
@@ -2001,7 +2191,8 @@ fn overflow_large_blob() {
 #[test]
 fn overflow_multiple_large_columns() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, a TEXT, b TEXT, c TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, a TEXT, b TEXT, c TEXT)")
+        .unwrap();
     let large_a = "A".repeat(5000);
     let large_b = "B".repeat(5000);
     let large_c = "C".repeat(5000);
@@ -2015,7 +2206,9 @@ fn overflow_multiple_large_columns() {
         ],
     )
     .unwrap();
-    let r = db.execute("SELECT LENGTH(a), LENGTH(b), LENGTH(c) FROM t").unwrap();
+    let r = db
+        .execute("SELECT LENGTH(a), LENGTH(b), LENGTH(c) FROM t")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(5000));
     assert_eq!(v[0][1], Value::Int64(5000));
@@ -2031,12 +2224,15 @@ fn overflow_multiple_large_rows() {
         db.execute_with_params(
             "INSERT INTO t VALUES ($1, $2)",
             &[Value::Int64(i), Value::Text(text)],
-        ).unwrap();
+        )
+        .unwrap();
     }
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(20));
     // Verify we can read them back
-    let r2 = db.execute("SELECT LENGTH(big) FROM t WHERE id = 5").unwrap();
+    let r2 = db
+        .execute("SELECT LENGTH(big) FROM t WHERE id = 5")
+        .unwrap();
     assert_eq!(rows(&r2)[0][0], Value::Int64(5000));
 }
 
@@ -2055,7 +2251,8 @@ fn parameterized_delete() {
 fn parameterized_select() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
     let r = db
         .execute_with_params("SELECT id, val FROM t WHERE id > $1", &[Value::Int64(1)])
         .unwrap();
@@ -2079,9 +2276,8 @@ fn parameterized_update() {
 #[test]
 fn params_all_types() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE t(i INT64, f FLOAT64, t TEXT, b BOOLEAN, bl BYTEA)"
-    ).unwrap();
+    db.execute("CREATE TABLE t(i INT64, f FLOAT64, t TEXT, b BOOLEAN, bl BYTEA)")
+        .unwrap();
     db.execute_with_params(
         "INSERT INTO t VALUES ($1, $2, $3, $4, $5)",
         &[
@@ -2091,11 +2287,14 @@ fn params_all_types() {
             Value::Bool(true),
             Value::Blob(vec![1, 2, 3]),
         ],
-    ).unwrap();
-    let r = db.execute_with_params(
-        "SELECT * FROM t WHERE i = $1 AND f > $2",
-        &[Value::Int64(42), Value::Float64(3.0)],
-    ).unwrap();
+    )
+    .unwrap();
+    let r = db
+        .execute_with_params(
+            "SELECT * FROM t WHERE i = $1 AND f > $2",
+            &[Value::Int64(42), Value::Float64(3.0)],
+        )
+        .unwrap();
     assert_eq!(rows(&r).len(), 1);
 }
 
@@ -2119,7 +2318,9 @@ fn parse_boolean_literals() {
 #[test]
 fn parse_column_alias() {
     let db = mem_db();
-    let r = db.execute("SELECT 1 + 2 AS result, 'hello' AS greeting").unwrap();
+    let r = db
+        .execute("SELECT 1 + 2 AS result, 'hello' AS greeting")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(3));
     assert_eq!(v[0][1], Value::Text("hello".into()));
@@ -2148,7 +2349,8 @@ fn parse_complex_default_expressions() {
 #[test]
 fn parse_complex_where_clause() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b TEXT, c FLOAT64)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b TEXT, c FLOAT64)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello', 3.14), (2, 'world', 2.72), (3, NULL, 1.0)")
         .unwrap();
     let r = db
@@ -2163,8 +2365,10 @@ fn parse_complex_where_clause() {
 #[test]
 fn parse_complex_where_with_parens() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9)")
+        .unwrap();
     let r = db
         .execute("SELECT a FROM t WHERE ((a > 1 AND b > 3) OR c = 3) AND a < 8 ORDER BY a")
         .unwrap();
@@ -2214,7 +2418,9 @@ fn parse_escaped_string_literal() {
 #[test]
 fn parse_explicit_cast_syntax() {
     let db = mem_db();
-    let r = db.execute("SELECT CAST(42 AS TEXT), CAST('100' AS INT64), CAST(3.14 AS INT64)").unwrap();
+    let r = db
+        .execute("SELECT CAST(42 AS TEXT), CAST('100' AS INT64), CAST(3.14 AS INT64)")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Text("42".into()));
     assert_eq!(v[0][1], Value::Int64(100));
@@ -2224,7 +2430,10 @@ fn parse_explicit_cast_syntax() {
 #[test]
 fn parse_expression_with_nested_parens() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE expr_t (id INT PRIMARY KEY, a INT, b INT, c INT)");
+    exec(
+        &db,
+        "CREATE TABLE expr_t (id INT PRIMARY KEY, a INT, b INT, c INT)",
+    );
     exec(&db, "INSERT INTO expr_t VALUES (1, 2, 3, 4)");
     let r = exec(&db, "SELECT ((a + b) * c) FROM expr_t");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(20));
@@ -2295,7 +2504,8 @@ fn parse_nested_function_calls() {
 fn parse_qualified_column_names() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, val TEXT)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, ref_id INT64)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, ref_id INT64)")
+        .unwrap();
     db.execute("INSERT INTO t1 VALUES (1, 'a')").unwrap();
     db.execute("INSERT INTO t2 VALUES (10, 1)").unwrap();
     let r = db
@@ -2321,9 +2531,13 @@ fn parse_star_with_table_qualifier() {
 #[test]
 fn parse_table_alias() {
     let db = mem_db();
-    db.execute("CREATE TABLE employees(id INT64, name TEXT)").unwrap();
-    db.execute("INSERT INTO employees VALUES (1, 'Alice')").unwrap();
-    let r = db.execute("SELECT e.id, e.name FROM employees AS e").unwrap();
+    db.execute("CREATE TABLE employees(id INT64, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO employees VALUES (1, 'Alice')")
+        .unwrap();
+    let r = db
+        .execute("SELECT e.id, e.name FROM employees AS e")
+        .unwrap();
     assert_eq!(rows(&r).len(), 1);
 }
 
@@ -2338,13 +2552,19 @@ fn parse_type_cast() {
 fn planner_aggregation_detection_in_between() {
     let db = mem_db();
     exec(&db, "CREATE TABLE between_agg (grp TEXT, val INT)");
-    exec(&db, "INSERT INTO between_agg VALUES ('a', 1), ('a', 2), ('b', 10)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO between_agg VALUES ('a', 1), ('a', 2), ('b', 10)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp
         FROM between_agg
         GROUP BY grp
         HAVING SUM(val) BETWEEN 1 AND 5
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 1);
 }
 
@@ -2352,13 +2572,19 @@ fn planner_aggregation_detection_in_between() {
 fn planner_aggregation_detection_in_case() {
     let db = mem_db();
     exec(&db, "CREATE TABLE agg_test (grp TEXT, val INT)");
-    exec(&db, "INSERT INTO agg_test VALUES ('a', 1), ('a', 2), ('b', 3)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO agg_test VALUES ('a', 1), ('a', 2), ('b', 3)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, CASE WHEN COUNT(*) > 1 THEN 'many' ELSE 'one' END as cnt_label
         FROM agg_test
         GROUP BY grp
         ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
     assert_eq!(r.rows()[0].values()[1], Value::Text("many".to_string()));
     assert_eq!(r.rows()[1].values()[1], Value::Text("one".to_string()));
@@ -2368,14 +2594,20 @@ fn planner_aggregation_detection_in_case() {
 fn planner_aggregation_detection_in_like() {
     let db = mem_db();
     exec(&db, "CREATE TABLE like_agg (grp TEXT, val TEXT)");
-    exec(&db, "INSERT INTO like_agg VALUES ('a', 'hello'), ('a', 'world'), ('b', 'hi')");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO like_agg VALUES ('a', 'hello'), ('a', 'world'), ('b', 'hi')",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, MIN(val) as min_val
         FROM like_agg
         GROUP BY grp
         HAVING MIN(val) LIKE 'h%'
         ORDER BY grp
-    ");
+    ",
+    );
     assert!(!r.rows().is_empty());
 }
 
@@ -2394,18 +2626,23 @@ fn planner_index_scan_with_equality_filter() {
 #[test]
 fn pragma_dump_covers_tables_views_indexes_triggers() {
     let db = mem_db();
-    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT DEFAULT 'anon', active BOOL)").unwrap();
-    db.execute("CREATE TABLE orders (id INT64 PRIMARY KEY, uid INT64 REFERENCES users(id))").unwrap();
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT DEFAULT 'anon', active BOOL)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (id INT64 PRIMARY KEY, uid INT64 REFERENCES users(id))")
+        .unwrap();
     db.execute("CREATE INDEX idx_name ON users (name)").unwrap();
-    db.execute("CREATE VIEW active_users AS SELECT * FROM users WHERE active = TRUE").unwrap();
+    db.execute("CREATE VIEW active_users AS SELECT * FROM users WHERE active = TRUE")
+        .unwrap();
     db.execute("CREATE TABLE audit_log (event TEXT)").unwrap();
     db.execute(
         "CREATE TRIGGER after_insert_user AFTER INSERT ON users FOR EACH ROW \
          EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log(event) VALUES (''inserted'')')",
     )
     .unwrap();
-    db.execute("INSERT INTO users VALUES (1, 'alice', TRUE)").unwrap();
-    db.execute("INSERT INTO users VALUES (2, NULL, FALSE)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'alice', TRUE)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (2, NULL, FALSE)")
+        .unwrap();
     db.execute("INSERT INTO orders VALUES (10, 1)").unwrap();
 
     let dump = db.dump_sql().unwrap();
@@ -2425,8 +2662,10 @@ fn qualified_wildcard() {
 #[test]
 fn query_with_computed_columns() {
     let db = mem_db();
-    db.execute("CREATE TABLE products(name TEXT, price INT64, qty INT64)").unwrap();
-    db.execute("INSERT INTO products VALUES ('A', 10, 5), ('B', 20, 3), ('C', 5, 10)").unwrap();
+    db.execute("CREATE TABLE products(name TEXT, price INT64, qty INT64)")
+        .unwrap();
+    db.execute("INSERT INTO products VALUES ('A', 10, 5), ('B', 20, 3), ('C', 5, 10)")
+        .unwrap();
     let r = db
         .execute("SELECT name, price * qty AS total FROM products ORDER BY total DESC")
         .unwrap();
@@ -2483,8 +2722,10 @@ fn save_as_creates_copy() {
     let dst = dir.path().join("backup.ddb");
 
     let db = Db::open_or_create(src.to_str().unwrap(), DbConfig::default()).unwrap();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')")
+        .unwrap();
 
     db.save_as(dst.to_str().unwrap()).unwrap();
 
@@ -2515,7 +2756,9 @@ fn scalar_concat() {
 #[test]
 fn scalar_left_right() {
     let db = mem_db();
-    let r = db.execute("SELECT LEFT('hello world', 5), RIGHT('hello world', 5)").unwrap();
+    let r = db
+        .execute("SELECT LEFT('hello world', 5), RIGHT('hello world', 5)")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Text("hello".into()));
     assert_eq!(v[0][1], Value::Text("world".into()));
@@ -2557,7 +2800,10 @@ fn select_expression_no_from() {
 fn select_from_nonexistent_table() {
     let db = mem_db();
     let err = exec_err(&db, "SELECT * FROM ghost_table");
-    assert!(err.contains("ghost_table") || err.contains("not found") || err.contains("unknown"), "got: {err}");
+    assert!(
+        err.contains("ghost_table") || err.contains("not found") || err.contains("unknown"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -2576,7 +2822,9 @@ fn select_from_table_valued_function_unsupported() {
 #[test]
 fn select_literal_no_from() {
     let db = mem_db();
-    let r = db.execute("SELECT 1 + 2 AS result, 'hello' AS greeting").unwrap();
+    let r = db
+        .execute("SELECT 1 + 2 AS result, 'hello' AS greeting")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 1);
     assert_eq!(v[0][0], Value::Int64(3));
@@ -2586,7 +2834,8 @@ fn select_literal_no_from() {
 #[test]
 fn select_star_from_empty_table_with_index() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx ON t(val)").unwrap();
     let r = db.execute("SELECT * FROM t WHERE val = 'nothing'").unwrap();
     assert_eq!(rows(&r).len(), 0);
@@ -2650,9 +2899,17 @@ fn set_intersect() {
 #[test]
 fn simple_case_expression_with_operand() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE simple_case (id INT PRIMARY KEY, status TEXT)");
-    exec(&db, "INSERT INTO simple_case VALUES (1, 'active'), (2, 'inactive'), (3, 'pending')");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "CREATE TABLE simple_case (id INT PRIMARY KEY, status TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO simple_case VALUES (1, 'active'), (2, 'inactive'), (3, 'pending')",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT id,
             CASE status
                 WHEN 'active' THEN 1
@@ -2661,7 +2918,8 @@ fn simple_case_expression_with_operand() {
             END as code
         FROM simple_case
         ORDER BY id
-    ");
+    ",
+    );
     assert_eq!(r.rows()[0].values()[1], Value::Int64(1));
     assert_eq!(r.rows()[1].values()[1], Value::Int64(0));
     assert_eq!(r.rows()[2].values()[1], Value::Int64(-1));
@@ -2670,7 +2928,9 @@ fn simple_case_expression_with_operand() {
 #[test]
 fn sql_with_block_comments_containing_semicolons() {
     let db = mem_db();
-    let result = db.execute("/* this has a ; in it */ SELECT 1 AS val").unwrap();
+    let result = db
+        .execute("/* this has a ; in it */ SELECT 1 AS val")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][0], Value::Int64(1));
 }
@@ -2709,7 +2969,8 @@ fn storage_write_page_operations() {
 fn string_comparison_operators() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('apple'),('banana'),('cherry')").unwrap();
+    db.execute("INSERT INTO t VALUES ('apple'),('banana'),('cherry')")
+        .unwrap();
     let r = db
         .execute("SELECT name FROM t WHERE name >= 'banana' ORDER BY name")
         .unwrap();
@@ -2722,7 +2983,10 @@ fn string_comparison_operators() {
 #[test]
 fn string_concatenation_operator() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE concat_t (id INT PRIMARY KEY, first TEXT, last TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE concat_t (id INT PRIMARY KEY, first TEXT, last TEXT)",
+    );
     exec(&db, "INSERT INTO concat_t VALUES (1, 'John', 'Doe')");
     let r = exec(&db, "SELECT first || ' ' || last FROM concat_t");
     assert_eq!(r.rows()[0].values()[0], Value::Text("John Doe".to_string()));
@@ -2757,7 +3021,10 @@ fn string_functions_coverage() {
 fn string_length_function() {
     let db = mem_db();
     exec(&db, "CREATE TABLE str_t (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO str_t VALUES (1, 'hello'), (2, ''), (3, 'world!')");
+    exec(
+        &db,
+        "INSERT INTO str_t VALUES (1, 'hello'), (2, ''), (3, 'world!')",
+    );
     let r = exec(&db, "SELECT length(val) FROM str_t ORDER BY id");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(5));
     assert_eq!(r.rows()[1].values()[0], Value::Int64(0));
@@ -2770,16 +3037,24 @@ fn string_lower_upper() {
     exec(&db, "CREATE TABLE case_t (id INT PRIMARY KEY, val TEXT)");
     exec(&db, "INSERT INTO case_t VALUES (1, 'Hello World')");
     let r1 = exec(&db, "SELECT lower(val) FROM case_t");
-    assert_eq!(r1.rows()[0].values()[0], Value::Text("hello world".to_string()));
+    assert_eq!(
+        r1.rows()[0].values()[0],
+        Value::Text("hello world".to_string())
+    );
     let r2 = exec(&db, "SELECT upper(val) FROM case_t");
-    assert_eq!(r2.rows()[0].values()[0], Value::Text("HELLO WORLD".to_string()));
+    assert_eq!(
+        r2.rows()[0].values()[0],
+        Value::Text("HELLO WORLD".to_string())
+    );
 }
 
 #[test]
 fn string_operators_on_columns() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(first_name TEXT, last_name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('John', 'Doe'), ('Jane', 'Smith')").unwrap();
+    db.execute("CREATE TABLE t(first_name TEXT, last_name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES ('John', 'Doe'), ('Jane', 'Smith')")
+        .unwrap();
     let r = db
         .execute("SELECT first_name || ' ' || last_name AS full_name FROM t ORDER BY first_name")
         .unwrap();
@@ -2792,7 +3067,9 @@ fn string_operators_on_columns() {
 fn string_position() {
     let db = mem_db();
     // POSITION is not supported; test REPLACE and LENGTH instead
-    let r = db.execute("SELECT REPLACE('hello world', 'world', 'there')").unwrap();
+    let r = db
+        .execute("SELECT REPLACE('hello world', 'world', 'there')")
+        .unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("hello there".into()));
     let r2 = db.execute("SELECT LENGTH('hello')").unwrap();
     assert_eq!(rows(&r2)[0][0], Value::Int64(5));
@@ -2803,7 +3080,9 @@ fn string_replace() {
     let db = mem_db();
     db.execute("CREATE TABLE t(s TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES ('hello world')").unwrap();
-    let r = db.execute("SELECT REPLACE(s, 'world', 'rust') FROM t").unwrap();
+    let r = db
+        .execute("SELECT REPLACE(s, 'world', 'rust') FROM t")
+        .unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("hello rust".into()));
 }
 
@@ -2817,7 +3096,8 @@ fn substr_function() {
 #[test]
 fn table_info_api() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT, val FLOAT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT, val FLOAT64)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a', 1.0)").unwrap();
     let tables = db.list_tables().unwrap();
     let t = tables.iter().find(|t| t.name == "t").unwrap();
@@ -2848,8 +3128,10 @@ fn text_to_number_coercion_in_comparison() {
 #[test]
 fn timestamp_type() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, '2024-01-15 10:30:00')").unwrap();
+    db.execute("CREATE TABLE t(id INT64, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '2024-01-15 10:30:00')")
+        .unwrap();
     let r = db.execute("SELECT ts FROM t WHERE id = 1").unwrap();
     assert!(rows(&r)[0][0] != Value::Null);
 }
@@ -2881,9 +3163,13 @@ fn unary_not_in_where() {
 #[test]
 fn unique_index_violation_after_update() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT UNIQUE)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
-    let err = db.execute("UPDATE t SET val = 'a' WHERE id = 2").unwrap_err();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    let err = db
+        .execute("UPDATE t SET val = 'a' WHERE id = 2")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -2900,11 +3186,17 @@ fn uuid_column_type() {
     let db = mem_db();
     exec(&db, "CREATE TABLE uuid_t (id INT PRIMARY KEY, uid UUID)");
     // Use parameterized insert for UUID
-    db.execute_with_params("INSERT INTO uuid_t VALUES ($1, $2)", &[
-        Value::Int64(1),
-        Value::Uuid([0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
-                     0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00]),
-    ]).unwrap();
+    db.execute_with_params(
+        "INSERT INTO uuid_t VALUES ($1, $2)",
+        &[
+            Value::Int64(1),
+            Value::Uuid([
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00,
+            ]),
+        ],
+    )
+    .unwrap();
     let r = exec(&db, "SELECT uid FROM uuid_t");
     assert_eq!(r.rows().len(), 1);
 }
@@ -2912,12 +3204,14 @@ fn uuid_column_type() {
 #[test]
 fn verify_pk_index() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     for i in 0..50 {
         db.execute_with_params(
             "INSERT INTO t VALUES ($1, $2)",
             &[Value::Int64(i), Value::Text(format!("v{}", i))],
-        ).unwrap();
+        )
+        .unwrap();
     }
     let indexes = db.list_indexes().unwrap();
     for idx in &indexes {
@@ -2925,7 +3219,6 @@ fn verify_pk_index() {
         assert!(v.valid);
     }
 }
-
 
 // ── Tests merged from engine_coverage_tests.rs ──
 
@@ -3590,4 +3883,3 @@ fn uuid_helper_functions_round_trip_and_generate_v4_values() {
     assert_eq!(row[3], Value::Null);
     assert_eq!(row[4], Value::Null);
 }
-

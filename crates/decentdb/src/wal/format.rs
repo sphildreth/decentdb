@@ -410,8 +410,12 @@ mod tests {
     fn decode_returns_none_beyond_logical_end() {
         let ps = page::DEFAULT_PAGE_SIZE;
         let file = TestFile::new([].to_vec());
-        assert!(WalFrame::decode_from_file(&file, 0, ps, 0).unwrap().is_none());
-        assert!(WalFrame::decode_from_file(&file, 100, ps, 50).unwrap().is_none());
+        assert!(WalFrame::decode_from_file(&file, 0, ps, 0)
+            .unwrap()
+            .is_none());
+        assert!(WalFrame::decode_from_file(&file, 100, ps, 50)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -419,7 +423,9 @@ mod tests {
         let ps = page::DEFAULT_PAGE_SIZE;
         let file = TestFile::new([0, 0, 0].to_vec());
         // logical_end is 3 which is less than FRAME_HEADER_SIZE(5), so header overflows
-        assert!(WalFrame::decode_from_file(&file, 0, ps, 3).unwrap().is_none());
+        assert!(WalFrame::decode_from_file(&file, 0, ps, 3)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -430,7 +436,9 @@ mod tests {
         let file = TestFile::new(encoded.to_vec());
         // Set logical end to less than the full frame size
         let short = (encoded.len() - 1) as u64;
-        assert!(WalFrame::decode_from_file(&file, 0, ps, short).unwrap().is_none());
+        assert!(WalFrame::decode_from_file(&file, 0, ps, short)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

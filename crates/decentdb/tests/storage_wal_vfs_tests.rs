@@ -354,4 +354,3 @@ fn wal_index_keeps_only_latest_versions_without_readers() {
 
     cleanup_db(&path);
 }
-

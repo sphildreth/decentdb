@@ -51,7 +51,8 @@ fn add_column_with_default_to_populated_table() {
 #[test]
 fn alter_column_drop_default() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val TEXT DEFAULT 'hi')").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val TEXT DEFAULT 'hi')")
+        .unwrap();
     let r = db.execute("ALTER TABLE t ALTER COLUMN val DROP DEFAULT");
     assert!(r.is_ok() || r.is_err());
 }
@@ -59,7 +60,8 @@ fn alter_column_drop_default() {
 #[test]
 fn alter_column_drop_not_null() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val TEXT NOT NULL)")
+        .unwrap();
     let r = db.execute("ALTER TABLE t ALTER COLUMN val DROP NOT NULL");
     assert!(r.is_ok() || r.is_err());
 }
@@ -87,7 +89,8 @@ fn alter_column_type() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 42)").unwrap();
-    db.execute("ALTER TABLE t ALTER COLUMN val TYPE TEXT").unwrap();
+    db.execute("ALTER TABLE t ALTER COLUMN val TYPE TEXT")
+        .unwrap();
     let r = db.execute("SELECT val FROM t").unwrap();
     // After type change, val should be text
     match &rows(&r)[0][0] {
@@ -108,7 +111,10 @@ fn alter_table_add_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE evolve (id INT PRIMARY KEY)");
     exec(&db, "INSERT INTO evolve VALUES (1)");
-    exec(&db, "ALTER TABLE evolve ADD COLUMN name TEXT DEFAULT 'unnamed'");
+    exec(
+        &db,
+        "ALTER TABLE evolve ADD COLUMN name TEXT DEFAULT 'unnamed'",
+    );
     let r = exec(&db, "SELECT name FROM evolve");
     assert_eq!(r.rows().len(), 1);
 }
@@ -126,17 +132,29 @@ fn alter_table_add_column_duplicate_name() {
     let db = mem_db();
     exec(&db, "CREATE TABLE dup_col (id INT PRIMARY KEY, name TEXT)");
     let err = exec_err(&db, "ALTER TABLE dup_col ADD COLUMN name TEXT");
-    assert!(err.contains("name") || err.contains("duplicate") || err.contains("column") || err.contains("already"), "got: {err}");
+    assert!(
+        err.contains("name")
+            || err.contains("duplicate")
+            || err.contains("column")
+            || err.contains("already"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn alter_table_add_column_with_check_constraint() {
     let db = mem_db();
     exec(&db, "CREATE TABLE checked (id INT PRIMARY KEY)");
-    exec(&db, "ALTER TABLE checked ADD COLUMN val INT CHECK (val > 0)");
+    exec(
+        &db,
+        "ALTER TABLE checked ADD COLUMN val INT CHECK (val > 0)",
+    );
     exec(&db, "INSERT INTO checked VALUES (1, 5)");
     let err = exec_err(&db, "INSERT INTO checked VALUES (2, -1)");
-    assert!(err.contains("check") || err.contains("constraint") || err.contains("violat"), "got: {err}");
+    assert!(
+        err.contains("check") || err.contains("constraint") || err.contains("violat"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -176,7 +194,8 @@ fn alter_table_add_not_null_with_default() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1),(2)").unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+        .unwrap();
     let r = db.execute("SELECT id, status FROM t ORDER BY id").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][1], Value::Text("pending".into()));
@@ -196,9 +215,15 @@ fn alter_table_drop_column() {
 #[test]
 fn alter_table_drop_default_unsupported() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dd (id INT PRIMARY KEY, val INT DEFAULT 42)");
+    exec(
+        &db,
+        "CREATE TABLE dd (id INT PRIMARY KEY, val INT DEFAULT 42)",
+    );
     let err = exec_err(&db, "ALTER TABLE dd ALTER COLUMN val DROP DEFAULT");
-    assert!(err.contains("not supported") || err.contains("AT_ColumnDefault"), "got: {err}");
+    assert!(
+        err.contains("not supported") || err.contains("AT_ColumnDefault"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -215,15 +240,24 @@ fn alter_table_drop_nonexistent_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE drop_col (id INT PRIMARY KEY, a TEXT)");
     let err = exec_err(&db, "ALTER TABLE drop_col DROP COLUMN nonexistent");
-    assert!(err.contains("nonexistent") || err.contains("column") || err.contains("not found"), "got: {err}");
+    assert!(
+        err.contains("nonexistent") || err.contains("column") || err.contains("not found"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn alter_table_drop_not_null_unsupported() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dnn (id INT PRIMARY KEY, val TEXT NOT NULL)");
+    exec(
+        &db,
+        "CREATE TABLE dnn (id INT PRIMARY KEY, val TEXT NOT NULL)",
+    );
     let err = exec_err(&db, "ALTER TABLE dnn ALTER COLUMN val DROP NOT NULL");
-    assert!(err.contains("not supported") || err.contains("AT_DropNotNull"), "got: {err}");
+    assert!(
+        err.contains("not supported") || err.contains("AT_DropNotNull"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -231,15 +265,20 @@ fn alter_table_drop_primary_key_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE drop_pk (id INT PRIMARY KEY, val TEXT)");
     let err = exec_err(&db, "ALTER TABLE drop_pk DROP COLUMN id");
-    assert!(err.contains("primary") || err.contains("key") || err.contains("cannot"), "got: {err}");
+    assert!(
+        err.contains("primary") || err.contains("key") || err.contains("cannot"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn alter_table_rename_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, old_name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, old_name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'val')").unwrap();
-    db.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name").unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name")
+        .unwrap();
 
     let result = db.execute("SELECT new_name FROM t WHERE id = 1").unwrap();
     let rows = rows(&result);
@@ -291,7 +330,10 @@ fn alter_table_set_column_not_null_unsupported() {
     let db = mem_db();
     exec(&db, "CREATE TABLE snn (id INT PRIMARY KEY, val TEXT)");
     let err = exec_err(&db, "ALTER TABLE snn ALTER COLUMN val SET NOT NULL");
-    assert!(err.contains("not supported") || err.contains("AT_SetNotNull"), "got: {err}");
+    assert!(
+        err.contains("not supported") || err.contains("AT_SetNotNull"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -299,14 +341,18 @@ fn alter_table_set_default_unsupported() {
     let db = mem_db();
     exec(&db, "CREATE TABLE sd (id INT PRIMARY KEY, val INT)");
     let err = exec_err(&db, "ALTER TABLE sd ALTER COLUMN val SET DEFAULT 99");
-    assert!(err.contains("not supported") || err.contains("AT_ColumnDefault"), "got: {err}");
+    assert!(
+        err.contains("not supported") || err.contains("AT_ColumnDefault"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn auto_increment_basic() {
     let db = mem_db();
     // Use auto_increment column (supported via internal flag, not SQL syntax)
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
     db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
@@ -321,7 +367,8 @@ fn auto_increment_basic() {
 fn auto_increment_with_explicit_id() {
     let db = mem_db();
     // Test explicit ID values on a PK column
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (100, 'a')").unwrap();
     db.execute("INSERT INTO t VALUES (200, 'b')").unwrap();
     let r = db.execute("SELECT id FROM t ORDER BY id").unwrap();
@@ -333,7 +380,8 @@ fn auto_increment_with_explicit_id() {
 #[test]
 fn check_constraint_allows_null() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap(); // NULL should pass CHECK
     let r = db.execute("SELECT age FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Null);
@@ -342,7 +390,10 @@ fn check_constraint_allows_null() {
 #[test]
 fn check_constraint_allows_valid() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE ccv (id INT PRIMARY KEY, val INT CHECK (val > 0))");
+    exec(
+        &db,
+        "CREATE TABLE ccv (id INT PRIMARY KEY, val INT CHECK (val > 0))",
+    );
     exec(&db, "INSERT INTO ccv VALUES (1, 10)");
     let r = exec(&db, "SELECT val FROM ccv");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(10));
@@ -351,10 +402,8 @@ fn check_constraint_allows_valid() {
 #[test]
 fn check_constraint_complex() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE t(a INT64, b INT64, CHECK (a > 0 AND b > 0 AND a + b < 100))",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, CHECK (a > 0 AND b > 0 AND a + b < 100))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (10, 20)").unwrap(); // ok
     let err = db.execute("INSERT INTO t VALUES (50, 60)"); // 50+60=110 > 100
     assert!(err.is_err());
@@ -366,18 +415,26 @@ fn check_constraint_multi_column() {
     db.execute(
         "CREATE TABLE inventory(id INT64, quantity INT64, reserved INT64, CHECK (reserved <= quantity))"
     ).unwrap();
-    db.execute("INSERT INTO inventory VALUES (1, 100, 50)").unwrap();
-    let err = db.execute("INSERT INTO inventory VALUES (2, 10, 20)").unwrap_err();
+    db.execute("INSERT INTO inventory VALUES (1, 100, 50)")
+        .unwrap();
+    let err = db
+        .execute("INSERT INTO inventory VALUES (2, 10, 20)")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
     // UPDATE that violates check
-    let err2 = db.execute("UPDATE inventory SET reserved = 200 WHERE id = 1").unwrap_err();
+    let err2 = db
+        .execute("UPDATE inventory SET reserved = 200 WHERE id = 1")
+        .unwrap_err();
     assert!(!err2.to_string().is_empty());
 }
 
 #[test]
 fn check_constraint_rejects_insert() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE cci (id INT PRIMARY KEY, val INT CHECK (val > 0))");
+    exec(
+        &db,
+        "CREATE TABLE cci (id INT PRIMARY KEY, val INT CHECK (val > 0))",
+    );
     let err = exec_err(&db, "INSERT INTO cci VALUES (1, -5)");
     assert!(!err.is_empty());
 }
@@ -385,7 +442,8 @@ fn check_constraint_rejects_insert() {
 #[test]
 fn check_constraint_violation() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))")
+        .unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, -5)").unwrap_err();
     assert!(!err.to_string().is_empty());
 }
@@ -417,15 +475,21 @@ fn check_constraint_with_expression() {
 #[test]
 fn check_constraint_with_multiple_columns() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE mc_check (
+    exec(
+        &db,
+        "CREATE TABLE mc_check (
         id INT PRIMARY KEY,
         low INT,
         high INT,
         CHECK (low < high)
-    )");
+    )",
+    );
     exec(&db, "INSERT INTO mc_check VALUES (1, 1, 10)");
     let err = exec_err(&db, "INSERT INTO mc_check VALUES (2, 10, 5)");
-    assert!(err.contains("check") || err.contains("constraint"), "got: {err}");
+    assert!(
+        err.contains("check") || err.contains("constraint"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -456,24 +520,34 @@ fn create_index_on_nonexistent_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE t (id INT PRIMARY KEY)");
     let err = exec_err(&db, "CREATE INDEX idx ON t (nonexistent)");
-    assert!(err.contains("column") || err.contains("nonexistent"), "got: {err}");
+    assert!(
+        err.contains("column") || err.contains("nonexistent"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_index_on_nonexistent_table() {
     let db = mem_db();
     let err = exec_err(&db, "CREATE INDEX idx ON nonexistent (col)");
-    assert!(err.contains("nonexistent") || err.contains("table"), "got: {err}");
+    assert!(
+        err.contains("nonexistent") || err.contains("table"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_partial_index() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, status TEXT, val INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, status TEXT, val INT64)")
+        .unwrap();
     let r = db.execute("CREATE INDEX idx_active ON t(val) WHERE status = 'active'");
     if r.is_ok() {
-        db.execute("INSERT INTO t VALUES (1, 'active', 100), (2, 'inactive', 200)").unwrap();
-        let r2 = db.execute("SELECT val FROM t WHERE status = 'active' AND val > 0").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'active', 100), (2, 'inactive', 200)")
+            .unwrap();
+        let r2 = db
+            .execute("SELECT val FROM t WHERE status = 'active' AND val > 0")
+            .unwrap();
         assert_eq!(rows(&r2).len(), 1);
     }
 }
@@ -481,7 +555,10 @@ fn create_partial_index() {
 #[test]
 fn create_table_double_precision() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dp (id INT PRIMARY KEY, val DOUBLE PRECISION)");
+    exec(
+        &db,
+        "CREATE TABLE dp (id INT PRIMARY KEY, val DOUBLE PRECISION)",
+    );
     exec(&db, "INSERT INTO dp VALUES (1, 3.14)");
     let r = exec(&db, "SELECT val FROM dp");
     assert_eq!(r.rows().len(), 1);
@@ -491,45 +568,64 @@ fn create_table_double_precision() {
 fn create_table_duplicate_column_names() {
     let db = mem_db();
     let err = exec_err(&db, "CREATE TABLE bad (a INT, a TEXT)");
-    assert!(err.contains("duplicate") || err.contains("column"), "got: {err}");
+    assert!(
+        err.contains("duplicate") || err.contains("column"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_table_fk_references_nonexistent_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE parent (id INT PRIMARY KEY)");
-    let err = exec_err(&db, "
+    let err = exec_err(
+        &db,
+        "
         CREATE TABLE child (
             id INT PRIMARY KEY,
             parent_id INT REFERENCES parent(nonexistent_col)
         )
-    ");
-    assert!(err.contains("column") || err.contains("nonexistent") || err.contains("foreign"), "got: {err}");
+    ",
+    );
+    assert!(
+        err.contains("column") || err.contains("nonexistent") || err.contains("foreign"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_table_fk_references_nonexistent_table() {
     let db = mem_db();
-    let err = exec_err(&db, "
+    let err = exec_err(
+        &db,
+        "
         CREATE TABLE child (
             id INT PRIMARY KEY,
             parent_id INT REFERENCES nonexistent(id)
         )
-    ");
-    assert!(err.contains("nonexistent") || err.contains("foreign key") || err.contains("table"), "got: {err}");
+    ",
+    );
+    assert!(
+        err.contains("nonexistent") || err.contains("foreign key") || err.contains("table"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_table_if_not_exists() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    db.execute("CREATE TABLE IF NOT EXISTS t(id INT64)").unwrap();
+    db.execute("CREATE TABLE IF NOT EXISTS t(id INT64)")
+        .unwrap();
 }
 
 #[test]
 fn create_table_with_default_expression() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE de (id INT PRIMARY KEY, val INT DEFAULT 0, label TEXT DEFAULT 'none')");
+    exec(
+        &db,
+        "CREATE TABLE de (id INT PRIMARY KEY, val INT DEFAULT 0, label TEXT DEFAULT 'none')",
+    );
     exec(&db, "INSERT INTO de (id) VALUES (1)");
     let r = exec(&db, "SELECT val, label FROM de");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(0));
@@ -540,9 +636,13 @@ fn create_table_with_default_expression() {
 fn create_table_with_expression_index() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE INDEX idx_lower ON t(LOWER(name))").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'Alice'), (2, 'BOB'), (3, 'alice')").unwrap();
-    let r = db.execute("SELECT id FROM t WHERE LOWER(name) = 'alice' ORDER BY id").unwrap();
+    db.execute("CREATE INDEX idx_lower ON t(LOWER(name))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'Alice'), (2, 'BOB'), (3, 'alice')")
+        .unwrap();
+    let r = db
+        .execute("SELECT id FROM t WHERE LOWER(name) = 'alice' ORDER BY id")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
 }
@@ -550,10 +650,8 @@ fn create_table_with_expression_index() {
 #[test]
 fn create_table_with_generated_column() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE t(a INT64, b INT64, c INT64 GENERATED ALWAYS AS (a + b) STORED)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64 GENERATED ALWAYS AS (a + b) STORED)")
+        .unwrap();
     db.execute("INSERT INTO t (a, b) VALUES (10, 20)").unwrap();
     let r = db.execute("SELECT c FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(30));
@@ -562,17 +660,23 @@ fn create_table_with_generated_column() {
 #[test]
 fn create_table_with_multi_column_pk() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, c TEXT, PRIMARY KEY (a, b))").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1, 'aa'), (1, 2, 'ab'), (2, 1, 'ba')").unwrap();
-    let err = db.execute("INSERT INTO t VALUES (1, 1, 'dup')").unwrap_err();
+    db.execute("CREATE TABLE t(a INT64, b INT64, c TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 'aa'), (1, 2, 'ab'), (2, 1, 'ba')")
+        .unwrap();
+    let err = db
+        .execute("INSERT INTO t VALUES (1, 1, 'dup')")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn create_table_with_multi_column_unique() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, UNIQUE(a, b))").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, UNIQUE(a, b))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (2, 1)")
+        .unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, 1)").unwrap_err();
     assert!(!err.to_string().is_empty());
 }
@@ -580,29 +684,43 @@ fn create_table_with_multi_column_unique() {
 #[test]
 fn create_table_with_multiple_check_constraints() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE multichecked (
+    exec(
+        &db,
+        "CREATE TABLE multichecked (
         id INT PRIMARY KEY,
         age INT CHECK (age >= 0),
         name TEXT CHECK (length(name) > 0)
-    )");
+    )",
+    );
     exec(&db, "INSERT INTO multichecked VALUES (1, 25, 'Alice')");
     let err = exec_err(&db, "INSERT INTO multichecked VALUES (2, -1, 'Bob')");
-    assert!(err.contains("check") || err.contains("constraint"), "got: {err}");
+    assert!(
+        err.contains("check") || err.contains("constraint"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_table_with_not_null_constraint() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE nn (id INT PRIMARY KEY, val TEXT NOT NULL)");
+    exec(
+        &db,
+        "CREATE TABLE nn (id INT PRIMARY KEY, val TEXT NOT NULL)",
+    );
     exec(&db, "INSERT INTO nn VALUES (1, 'ok')");
     let err = exec_err(&db, "INSERT INTO nn VALUES (2, NULL)");
-    assert!(err.contains("null") || err.contains("NOT NULL") || err.contains("constraint"), "got: {err}");
+    assert!(
+        err.contains("null") || err.contains("NOT NULL") || err.contains("constraint"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn create_table_with_various_type_aliases() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE types (
+    exec(
+        &db,
+        "CREATE TABLE types (
         a SMALLINT PRIMARY KEY,
         b REAL,
         c CHARACTER VARYING,
@@ -610,7 +728,8 @@ fn create_table_with_various_type_aliases() {
         e NUMERIC,
         f UUID,
         g TIMESTAMP WITH TIME ZONE
-    )");
+    )",
+    );
     // Just verify it creates successfully
     let r = exec(&db, "SELECT COUNT(*) FROM types");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(0));
@@ -637,11 +756,17 @@ fn create_temp_table_if_not_exists() {
 #[test]
 fn create_unique_index() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE unique_idx_t (id INT PRIMARY KEY, code TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE unique_idx_t (id INT PRIMARY KEY, code TEXT)",
+    );
     exec(&db, "CREATE UNIQUE INDEX idx_code ON unique_idx_t (code)");
     exec(&db, "INSERT INTO unique_idx_t VALUES (1, 'a')");
     let err = exec_err(&db, "INSERT INTO unique_idx_t VALUES (2, 'a')");
-    assert!(err.contains("unique") || err.contains("duplicate") || err.contains("constraint"), "got: {err}");
+    assert!(
+        err.contains("unique") || err.contains("duplicate") || err.contains("constraint"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -649,7 +774,8 @@ fn ddl_alter_add_column() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1),(2)").unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN name TEXT DEFAULT 'unknown'").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN name TEXT DEFAULT 'unknown'")
+        .unwrap();
     let r = db.execute("SELECT id, name FROM t ORDER BY id").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][1], Value::Text("unknown".into()));
@@ -661,7 +787,8 @@ fn ddl_alter_column_type() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
     db.execute("INSERT INTO t VALUES (1, '42')").unwrap();
-    db.execute("ALTER TABLE t ALTER COLUMN val TYPE INT64").unwrap();
+    db.execute("ALTER TABLE t ALTER COLUMN val TYPE INT64")
+        .unwrap();
     let r = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
     let v = rows(&r);
     // After type change, the value should be converted
@@ -671,7 +798,8 @@ fn ddl_alter_column_type() {
 #[test]
 fn ddl_alter_drop_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT, extra INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT, extra INT64)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a', 100)").unwrap();
     db.execute("ALTER TABLE t DROP COLUMN extra").unwrap();
     let r = db.execute("SELECT * FROM t").unwrap();
@@ -681,9 +809,11 @@ fn ddl_alter_drop_column() {
 #[test]
 fn ddl_alter_rename_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, old_name TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, old_name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
-    db.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name").unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name")
+        .unwrap();
     let r = db.execute("SELECT new_name FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("hello".into()));
 }
@@ -691,33 +821,45 @@ fn ddl_alter_rename_column() {
 #[test]
 fn ddl_cannot_alter_type_of_fk_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))").unwrap();
-    let err = db.execute("ALTER TABLE child ALTER COLUMN p_id TYPE TEXT").unwrap_err();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))")
+        .unwrap();
+    let err = db
+        .execute("ALTER TABLE child ALTER COLUMN p_id TYPE TEXT")
+        .unwrap_err();
     assert!(err.to_string().contains("foreign") || !err.to_string().is_empty());
 }
 
 #[test]
 fn ddl_cannot_alter_type_of_pk_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
-    let err = db.execute("ALTER TABLE t ALTER COLUMN id TYPE TEXT").unwrap_err();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
+    let err = db
+        .execute("ALTER TABLE t ALTER COLUMN id TYPE TEXT")
+        .unwrap_err();
     assert!(err.to_string().contains("primary") || !err.to_string().is_empty());
 }
 
 #[test]
 fn ddl_cannot_drop_fk_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))").unwrap();
-    let err = db.execute("ALTER TABLE child DROP COLUMN p_id").unwrap_err();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))")
+        .unwrap();
+    let err = db
+        .execute("ALTER TABLE child DROP COLUMN p_id")
+        .unwrap_err();
     assert!(err.to_string().contains("foreign") || !err.to_string().is_empty());
 }
 
 #[test]
 fn ddl_cannot_drop_pk_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     let err = db.execute("ALTER TABLE t DROP COLUMN id").unwrap_err();
     assert!(err.to_string().contains("primary") || !err.to_string().is_empty());
 }
@@ -725,7 +867,8 @@ fn ddl_cannot_drop_pk_column() {
 #[test]
 fn ddl_cannot_index_temp_table() {
     let db = mem_db();
-    db.execute("CREATE TEMP TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE TEMP TABLE t(id INT64, val TEXT)")
+        .unwrap();
     let err = db.execute("CREATE INDEX idx ON t(val)").unwrap_err();
     assert!(err.to_string().contains("temporary") || !err.to_string().is_empty());
 }
@@ -733,7 +876,8 @@ fn ddl_cannot_index_temp_table() {
 #[test]
 fn ddl_check_constraint() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val INT64 CHECK (val > 0))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val INT64 CHECK (val > 0))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, -5)").unwrap_err();
     assert!(!err.to_string().is_empty());
@@ -743,7 +887,8 @@ fn ddl_check_constraint() {
 fn ddl_create_index_and_use() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'Alice'),(2,'Bob'),(3,'Charlie')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'Alice'),(2,'Bob'),(3,'Charlie')")
+        .unwrap();
     db.execute("CREATE INDEX idx_name ON t(name)").unwrap();
     let r = db.execute("SELECT id FROM t WHERE name = 'Bob'").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(2));
@@ -753,9 +898,12 @@ fn ddl_create_index_and_use() {
 fn ddl_create_unique_index() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, email TEXT)").unwrap();
-    db.execute("CREATE UNIQUE INDEX idx_email ON t(email)").unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_email ON t(email)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a@b.com')").unwrap();
-    let err = db.execute("INSERT INTO t VALUES (2, 'a@b.com')").unwrap_err();
+    let err = db
+        .execute("INSERT INTO t VALUES (2, 'a@b.com')")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -765,7 +913,9 @@ fn ddl_default_value() {
     db.execute("CREATE TABLE t(id INT64, status TEXT DEFAULT 'pending', count INT64 DEFAULT 0)")
         .unwrap();
     db.execute("INSERT INTO t(id) VALUES (1)").unwrap();
-    let r = db.execute("SELECT status, count FROM t WHERE id = 1").unwrap();
+    let r = db
+        .execute("SELECT status, count FROM t WHERE id = 1")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Text("pending".into()));
     assert_eq!(v[0][1], Value::Int64(0));
@@ -795,7 +945,8 @@ fn ddl_if_not_exists() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     // Should not error
-    db.execute("CREATE TABLE IF NOT EXISTS t(id INT64)").unwrap();
+    db.execute("CREATE TABLE IF NOT EXISTS t(id INT64)")
+        .unwrap();
 }
 
 #[test]
@@ -804,23 +955,28 @@ fn ddl_index_if_not_exists() {
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
     db.execute("CREATE INDEX idx ON t(val)").unwrap();
     // Should not error with IF NOT EXISTS
-    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(val)").unwrap();
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(val)")
+        .unwrap();
 }
 
 #[test]
 fn ddl_multi_column_primary_key() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, val TEXT, PRIMARY KEY (a, b))").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, val TEXT, PRIMARY KEY (a, b))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1, 'first')").unwrap();
     db.execute("INSERT INTO t VALUES (1, 2, 'second')").unwrap();
-    let err = db.execute("INSERT INTO t VALUES (1, 1, 'duplicate')").unwrap_err();
+    let err = db
+        .execute("INSERT INTO t VALUES (1, 1, 'duplicate')")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
 #[test]
 fn ddl_not_null_constraint() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'ok')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, NULL)").unwrap_err();
     assert!(!err.to_string().is_empty());
@@ -829,8 +985,10 @@ fn ddl_not_null_constraint() {
 #[test]
 fn drop_column_from_table() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val TEXT, extra INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'hello', 100)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val TEXT, extra INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello', 100)")
+        .unwrap();
     db.execute("ALTER TABLE t DROP COLUMN extra").unwrap();
     let r = db.execute("SELECT * FROM t").unwrap();
     assert_eq!(r.columns().len(), 2);
@@ -874,7 +1032,10 @@ fn drop_table_if_exists_nonexistent() {
 fn drop_table_with_fk_reference_error() {
     let db = mem_db();
     exec(&db, "CREATE TABLE dtf_parent (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE dtf_child (id INT PRIMARY KEY, pid INT REFERENCES dtf_parent(id))");
+    exec(
+        &db,
+        "CREATE TABLE dtf_child (id INT PRIMARY KEY, pid INT REFERENCES dtf_parent(id))",
+    );
     let err = exec_err(&db, "DROP TABLE dtf_parent");
     assert!(!err.is_empty());
 }
@@ -882,7 +1043,8 @@ fn drop_table_with_fk_reference_error() {
 #[test]
 fn dump_sql_with_all_constraint_types() {
     let db = mem_db();
-    db.execute("CREATE TABLE refs(id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE refs(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE everything(
             id INT64 PRIMARY KEY,
@@ -894,13 +1056,15 @@ fn dump_sql_with_all_constraint_types() {
         )",
     )
     .unwrap();
-    db.execute("CREATE INDEX idx_score ON everything(score)").unwrap();
+    db.execute("CREATE INDEX idx_score ON everything(score)")
+        .unwrap();
     db.execute(
         "CREATE VIEW active_items AS SELECT id, name FROM everything WHERE status = 'pending'",
     )
     .unwrap();
     db.execute("INSERT INTO refs VALUES (1)").unwrap();
-    db.execute("INSERT INTO everything VALUES (1, 'test', 25, 'pending', 1, 99.5)").unwrap();
+    db.execute("INSERT INTO everything VALUES (1, 'test', 25, 'pending', 1, 99.5)")
+        .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.len() > 200);
     assert!(sql.contains("CREATE TABLE"));
@@ -909,7 +1073,10 @@ fn dump_sql_with_all_constraint_types() {
 #[test]
 fn dump_sql_with_check_constraint() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dump_check (id INT PRIMARY KEY, val INT CHECK (val > 0))");
+    exec(
+        &db,
+        "CREATE TABLE dump_check (id INT PRIMARY KEY, val INT CHECK (val > 0))",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CHECK"));
 }
@@ -918,7 +1085,10 @@ fn dump_sql_with_check_constraint() {
 fn dump_sql_with_foreign_key() {
     let db = mem_db();
     exec(&db, "CREATE TABLE dump_parent (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE dump_child (id INT PRIMARY KEY, parent_id INT REFERENCES dump_parent(id))");
+    exec(
+        &db,
+        "CREATE TABLE dump_child (id INT PRIMARY KEY, parent_id INT REFERENCES dump_parent(id))",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("REFERENCES"));
 }
@@ -926,7 +1096,10 @@ fn dump_sql_with_foreign_key() {
 #[test]
 fn dump_sql_with_unique_constraint() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dump_unique (id INT PRIMARY KEY, email TEXT UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE dump_unique (id INT PRIMARY KEY, email TEXT UNIQUE)",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("UNIQUE") || sql.contains("unique"));
 }
@@ -961,8 +1134,10 @@ fn error_add_not_null_column_without_default() {
 #[test]
 fn error_alter_fk_parent_column_type() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))")
+        .unwrap();
     let err = db
         .execute("ALTER TABLE parent ALTER COLUMN id TYPE TEXT")
         .unwrap_err();
@@ -996,16 +1171,20 @@ fn error_alter_table_nonexistent_column() {
 fn error_auto_increment_non_int64() {
     let db = mem_db();
     // Identity columns are not fully supported; test the error path
-    let r = db.execute("CREATE TABLE t(id INT64 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, val TEXT)");
+    let r =
+        db.execute("CREATE TABLE t(id INT64 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, val TEXT)");
     assert!(r.is_err()); // column constraint CONSTR_IDENTITY is not supported
 }
 
 #[test]
 fn error_check_constraint_violation_update() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, age INT64 CHECK (age >= 0))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
-    let err = db.execute("UPDATE t SET age = -1 WHERE id = 1").unwrap_err();
+    let err = db
+        .execute("UPDATE t SET age = -1 WHERE id = 1")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -1066,7 +1245,9 @@ fn error_create_table_duplicate_column() {
 fn error_create_temp_table_already_exists() {
     let db = mem_db();
     db.execute("CREATE TEMPORARY TABLE t(id INT64)").unwrap();
-    let err = db.execute("CREATE TEMPORARY TABLE t(id INT64)").unwrap_err();
+    let err = db
+        .execute("CREATE TEMPORARY TABLE t(id INT64)")
+        .unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("already exists") || !msg.is_empty(),
@@ -1077,23 +1258,27 @@ fn error_create_temp_table_already_exists() {
 #[test]
 fn error_drop_column_fk() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id))")
+        .unwrap();
     let err = db.execute("ALTER TABLE child DROP COLUMN pid").unwrap_err();
     let msg = err.to_string();
-    assert!(
-        msg.contains("foreign") || msg.contains("FK") || !msg.is_empty()
-    );
+    assert!(msg.contains("foreign") || msg.contains("FK") || !msg.is_empty());
 }
 
 #[test]
 fn error_drop_column_primary_key() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     let err = db.execute("ALTER TABLE t DROP COLUMN id").unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("primary") || msg.contains("PRIMARY") || msg.contains("key") || !msg.is_empty()
+        msg.contains("primary")
+            || msg.contains("PRIMARY")
+            || msg.contains("key")
+            || !msg.is_empty()
     );
 }
 
@@ -1137,8 +1322,10 @@ fn error_drop_nonexistent_table() {
 #[test]
 fn error_drop_table_with_fk_dependency() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id))")
+        .unwrap();
     let err = db.execute("DROP TABLE parent").unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -1176,8 +1363,10 @@ fn error_generated_column_in_primary_key() {
 #[test]
 fn error_insert_fk_violation() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))")
+        .unwrap();
     let err = db.execute("INSERT INTO child VALUES (999)").unwrap_err();
     assert!(!err.to_string().is_empty());
 }
@@ -1225,7 +1414,8 @@ fn error_unique_constraint_violation() {
 #[test]
 fn error_update_generated_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64 GENERATED ALWAYS AS (a * 2) STORED)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64 GENERATED ALWAYS AS (a * 2) STORED)")
+        .unwrap();
     db.execute("INSERT INTO t (a) VALUES (5)").unwrap();
     let err = db.execute("UPDATE t SET b = 10 WHERE a = 5").unwrap_err();
     let msg = err.to_string();
@@ -1238,7 +1428,8 @@ fn error_update_generated_column() {
 #[test]
 fn expression_index_rejects_multiple_expressions() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, a TEXT, b TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, a TEXT, b TEXT)")
+        .unwrap();
     let err = db
         .execute("CREATE INDEX idx ON t ((UPPER(a)), (LOWER(b)))")
         .unwrap_err();
@@ -1248,11 +1439,15 @@ fn expression_index_rejects_multiple_expressions() {
 #[test]
 fn expression_index_rejects_unique() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
     let err = db
         .execute("CREATE UNIQUE INDEX idx ON t ((UPPER(name)))")
         .unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("unique") || err.to_string().to_lowercase().contains("expression"));
+    assert!(
+        err.to_string().to_lowercase().contains("unique")
+            || err.to_string().to_lowercase().contains("expression")
+    );
 }
 
 #[test]
@@ -1260,13 +1455,18 @@ fn expression_index_uniqueness() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, name TEXT)").unwrap();
     // UNIQUE expression indexes are not supported; test the error
-    let err = db.execute("CREATE UNIQUE INDEX idx_lower ON t(LOWER(name))").unwrap_err();
+    let err = db
+        .execute("CREATE UNIQUE INDEX idx_lower ON t(LOWER(name))")
+        .unwrap_err();
     assert!(err.to_string().contains("expression") || !err.to_string().is_empty());
     // Non-unique expression index should work
-    db.execute("CREATE INDEX idx_lower ON t(LOWER(name))").unwrap();
+    db.execute("CREATE INDEX idx_lower ON t(LOWER(name))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
     db.execute("INSERT INTO t VALUES (2, 'ALICE')").unwrap();
-    let r = db.execute("SELECT id FROM t WHERE LOWER(name) = 'alice' ORDER BY id").unwrap();
+    let r = db
+        .execute("SELECT id FROM t WHERE LOWER(name) = 'alice' ORDER BY id")
+        .unwrap();
     assert_eq!(rows(&r).len(), 2);
 }
 
@@ -1274,8 +1474,14 @@ fn expression_index_uniqueness() {
 fn fk_cascade_chain() {
     let db = mem_db();
     db.execute("CREATE TABLE a(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE b(id INT64 PRIMARY KEY, a_id INT64 REFERENCES a(id) ON DELETE CASCADE)").unwrap();
-    db.execute("CREATE TABLE c(id INT64 PRIMARY KEY, b_id INT64 REFERENCES b(id) ON DELETE CASCADE)").unwrap();
+    db.execute(
+        "CREATE TABLE b(id INT64 PRIMARY KEY, a_id INT64 REFERENCES a(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE c(id INT64 PRIMARY KEY, b_id INT64 REFERENCES b(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
     db.execute("INSERT INTO a VALUES (1)").unwrap();
     db.execute("INSERT INTO b VALUES (10, 1)").unwrap();
     db.execute("INSERT INTO c VALUES (100, 10)").unwrap();
@@ -1290,8 +1496,14 @@ fn fk_cascade_chain() {
 fn fk_cascade_delete_three_levels() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gp (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE par (id INT PRIMARY KEY, gp_id INT REFERENCES gp(id) ON DELETE CASCADE)");
-    exec(&db, "CREATE TABLE child (id INT PRIMARY KEY, par_id INT REFERENCES par(id) ON DELETE CASCADE)");
+    exec(
+        &db,
+        "CREATE TABLE par (id INT PRIMARY KEY, gp_id INT REFERENCES gp(id) ON DELETE CASCADE)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, par_id INT REFERENCES par(id) ON DELETE CASCADE)",
+    );
     exec(&db, "INSERT INTO gp VALUES (1)");
     exec(&db, "INSERT INTO par VALUES (10, 1)");
     exec(&db, "INSERT INTO child VALUES (100, 10)");
@@ -1305,9 +1517,8 @@ fn fk_cascade_delete_three_levels() {
 #[test]
 fn fk_cascade_multi_level() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE grandparent(id INT64 PRIMARY KEY)"
-    ).unwrap();
+    db.execute("CREATE TABLE grandparent(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE parent(id INT64 PRIMARY KEY, gp_id INT64 REFERENCES grandparent(id) ON DELETE CASCADE)"
     ).unwrap();
@@ -1315,8 +1526,10 @@ fn fk_cascade_multi_level() {
         "CREATE TABLE child(id INT64 PRIMARY KEY, p_id INT64 REFERENCES parent(id) ON DELETE CASCADE)"
     ).unwrap();
     db.execute("INSERT INTO grandparent VALUES (1)").unwrap();
-    db.execute("INSERT INTO parent VALUES (10, 1),(20, 1)").unwrap();
-    db.execute("INSERT INTO child VALUES (100, 10),(200, 10),(300, 20)").unwrap();
+    db.execute("INSERT INTO parent VALUES (10, 1),(20, 1)")
+        .unwrap();
+    db.execute("INSERT INTO child VALUES (100, 10),(200, 10),(300, 20)")
+        .unwrap();
     db.execute("DELETE FROM grandparent WHERE id = 1").unwrap();
     let r = db.execute("SELECT COUNT(*) FROM parent").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(0));
@@ -1327,7 +1540,10 @@ fn fk_cascade_multi_level() {
 #[test]
 fn fk_cascade_update_propagates() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE cu_parent (id INT PRIMARY KEY, name TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE cu_parent (id INT PRIMARY KEY, name TEXT)",
+    );
     exec(&db, "CREATE TABLE cu_child (id INT PRIMARY KEY, parent_id INT REFERENCES cu_parent(id) ON UPDATE CASCADE)");
     exec(&db, "INSERT INTO cu_parent VALUES (1, 'old')");
     exec(&db, "INSERT INTO cu_child VALUES (100, 1)");
@@ -1339,10 +1555,14 @@ fn fk_cascade_update_propagates() {
 #[test]
 fn fk_insert_child_with_nonexistent_parent_error() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, p_id INT64 REFERENCES parent(id))")
+        .unwrap();
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
-    let err = db.execute("INSERT INTO child VALUES (10, 999)").unwrap_err();
+    let err = db
+        .execute("INSERT INTO child VALUES (10, 999)")
+        .unwrap_err();
     assert!(err.to_string().to_lowercase().contains("foreign") || !err.to_string().is_empty());
 }
 
@@ -1350,7 +1570,10 @@ fn fk_insert_child_with_nonexistent_parent_error() {
 fn fk_mixed_actions_on_multiple_children() {
     let db = mem_db();
     exec(&db, "CREATE TABLE mp (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE mc_cascade (id INT PRIMARY KEY, pid INT REFERENCES mp(id) ON DELETE CASCADE)");
+    exec(
+        &db,
+        "CREATE TABLE mc_cascade (id INT PRIMARY KEY, pid INT REFERENCES mp(id) ON DELETE CASCADE)",
+    );
     exec(&db, "CREATE TABLE mc_setnull (id INT PRIMARY KEY, pid INT REFERENCES mp(id) ON DELETE SET NULL)");
     exec(&db, "INSERT INTO mp VALUES (1)");
     exec(&db, "INSERT INTO mc_cascade VALUES (10, 1)");
@@ -1365,13 +1588,15 @@ fn fk_mixed_actions_on_multiple_children() {
 #[test]
 fn fk_on_delete_cascade() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 REFERENCES parent(id) ON DELETE CASCADE)",
     )
     .unwrap();
     db.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
-    db.execute("INSERT INTO child VALUES (10, 1), (20, 1), (30, 2)").unwrap();
+    db.execute("INSERT INTO child VALUES (10, 1), (20, 1), (30, 2)")
+        .unwrap();
 
     db.execute("DELETE FROM parent WHERE id = 1").unwrap();
 
@@ -1383,7 +1608,8 @@ fn fk_on_delete_cascade() {
 #[test]
 fn fk_on_delete_set_null() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 REFERENCES parent(id) ON DELETE SET NULL)",
     )
@@ -1393,7 +1619,9 @@ fn fk_on_delete_set_null() {
 
     db.execute("DELETE FROM parent WHERE id = 1").unwrap();
 
-    let result = db.execute("SELECT parent_id FROM child WHERE id = 10").unwrap();
+    let result = db
+        .execute("SELECT parent_id FROM child WHERE id = 10")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][0], Value::Null);
 }
@@ -1401,17 +1629,22 @@ fn fk_on_delete_set_null() {
 #[test]
 fn fk_on_update_cascade() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 REFERENCES parent(id) ON UPDATE CASCADE)",
     )
     .unwrap();
-    db.execute("INSERT INTO parent VALUES (1, 'alice')").unwrap();
+    db.execute("INSERT INTO parent VALUES (1, 'alice')")
+        .unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
 
-    db.execute("UPDATE parent SET id = 100 WHERE id = 1").unwrap();
+    db.execute("UPDATE parent SET id = 100 WHERE id = 1")
+        .unwrap();
 
-    let result = db.execute("SELECT parent_id FROM child WHERE id = 10").unwrap();
+    let result = db
+        .execute("SELECT parent_id FROM child WHERE id = 10")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][0], Value::Int64(100));
 }
@@ -1419,7 +1652,8 @@ fn fk_on_update_cascade() {
 #[test]
 fn fk_on_update_restrict_errors() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 REFERENCES parent(id) ON UPDATE RESTRICT)",
     )
@@ -1427,14 +1661,20 @@ fn fk_on_update_restrict_errors() {
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
 
-    let err = db.execute("UPDATE parent SET id = 100 WHERE id = 1").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("foreign key") || err.to_string().to_lowercase().contains("constraint"));
+    let err = db
+        .execute("UPDATE parent SET id = 100 WHERE id = 1")
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("foreign key")
+            || err.to_string().to_lowercase().contains("constraint")
+    );
 }
 
 #[test]
 fn fk_on_update_set_null() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 REFERENCES parent(id) ON UPDATE SET NULL)",
     )
@@ -1442,9 +1682,12 @@ fn fk_on_update_set_null() {
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
 
-    db.execute("UPDATE parent SET id = 100 WHERE id = 1").unwrap();
+    db.execute("UPDATE parent SET id = 100 WHERE id = 1")
+        .unwrap();
 
-    let result = db.execute("SELECT parent_id FROM child WHERE id = 10").unwrap();
+    let result = db
+        .execute("SELECT parent_id FROM child WHERE id = 10")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][0], Value::Null);
 }
@@ -1452,7 +1695,10 @@ fn fk_on_update_set_null() {
 #[test]
 fn fk_parent_missing_referenced_column() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE fk_parent (id INT PRIMARY KEY, name TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE fk_parent (id INT PRIMARY KEY, name TEXT)",
+    );
     let err = exec_err(
         &db,
         "CREATE TABLE fk_child (
@@ -1472,8 +1718,12 @@ fn fk_parent_missing_referenced_column() {
 #[test]
 fn fk_restrict_on_delete() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id) ON DELETE RESTRICT)").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id) ON DELETE RESTRICT)",
+    )
+    .unwrap();
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
     let err = db.execute("DELETE FROM parent WHERE id = 1").unwrap_err();
@@ -1484,7 +1734,10 @@ fn fk_restrict_on_delete() {
 fn fk_restrict_on_update() {
     let db = mem_db();
     exec(&db, "CREATE TABLE rup (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE ruc (id INT PRIMARY KEY, pid INT REFERENCES rup(id) ON UPDATE RESTRICT)");
+    exec(
+        &db,
+        "CREATE TABLE ruc (id INT PRIMARY KEY, pid INT REFERENCES rup(id) ON UPDATE RESTRICT)",
+    );
     exec(&db, "INSERT INTO rup VALUES (1)");
     exec(&db, "INSERT INTO ruc VALUES (100, 1)");
     let err = exec_err(&db, "UPDATE rup SET id = 2 WHERE id = 1");
@@ -1494,7 +1747,8 @@ fn fk_restrict_on_update() {
 #[test]
 fn fk_restrict_prevents_delete() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child(id INT64 PRIMARY KEY, p_id INT64 REFERENCES parent(id) ON DELETE RESTRICT)"
     ).unwrap();
@@ -1507,12 +1761,19 @@ fn fk_restrict_prevents_delete() {
 #[test]
 fn fk_set_null_on_delete() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id) ON DELETE SET NULL)").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
     db.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
-    db.execute("INSERT INTO child VALUES (10, 1), (20, 2)").unwrap();
+    db.execute("INSERT INTO child VALUES (10, 1), (20, 2)")
+        .unwrap();
     db.execute("DELETE FROM parent WHERE id = 1").unwrap();
-    let r = db.execute("SELECT id, parent_id FROM child ORDER BY id").unwrap();
+    let r = db
+        .execute("SELECT id, parent_id FROM child ORDER BY id")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][1], Value::Null);
     assert_eq!(v[1][1], Value::Int64(2));
@@ -1521,10 +1782,7 @@ fn fk_set_null_on_delete() {
 #[test]
 fn fk_set_null_on_non_nullable_column() {
     let db = mem_db();
-    exec(
-        &db,
-        "CREATE TABLE fk_p2 (id INT PRIMARY KEY)",
-    );
+    exec(&db, "CREATE TABLE fk_p2 (id INT PRIMARY KEY)");
     let err = exec_err(
         &db,
         "CREATE TABLE fk_c2 (
@@ -1543,7 +1801,8 @@ fn fk_set_null_on_non_nullable_column() {
 #[test]
 fn fk_set_null_on_non_nullable_column_rejected() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)")
+        .unwrap();
     // Table-level FK with SET NULL on NOT NULL column should fail at CREATE time
     let err = db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, parent_id INT64 NOT NULL,
@@ -1552,9 +1811,11 @@ fn fk_set_null_on_non_nullable_column_rejected() {
     // Even if DDL doesn't reject this, the SET NULL at runtime would fail.
     // Just verify we can create the table or get an error about set null on not-null.
     if let Err(e) = &err {
-        assert!(e.to_string().to_lowercase().contains("null")
-            || e.to_string().to_lowercase().contains("constraint")
-            || e.to_string().to_lowercase().contains("foreign"));
+        assert!(
+            e.to_string().to_lowercase().contains("null")
+                || e.to_string().to_lowercase().contains("constraint")
+                || e.to_string().to_lowercase().contains("foreign")
+        );
     }
 }
 
@@ -1562,7 +1823,10 @@ fn fk_set_null_on_non_nullable_column_rejected() {
 fn fk_set_null_on_update() {
     let db = mem_db();
     exec(&db, "CREATE TABLE snu_p (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE snu_c (id INT PRIMARY KEY, pid INT REFERENCES snu_p(id) ON UPDATE SET NULL)");
+    exec(
+        &db,
+        "CREATE TABLE snu_c (id INT PRIMARY KEY, pid INT REFERENCES snu_p(id) ON UPDATE SET NULL)",
+    );
     exec(&db, "INSERT INTO snu_p VALUES (1)");
     exec(&db, "INSERT INTO snu_c VALUES (100, 1)");
     exec(&db, "UPDATE snu_p SET id = 2 WHERE id = 1");
@@ -1592,7 +1856,8 @@ fn fk_unknown_parent_table() {
 #[test]
 fn fk_update_cascade() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child(id INT64 PRIMARY KEY, p_id INT64 REFERENCES parent(id) ON UPDATE CASCADE)"
     ).unwrap();
@@ -1606,8 +1871,10 @@ fn fk_update_cascade() {
 #[test]
 fn fk_violation_delete_restrict() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id))")
+        .unwrap();
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (1, 1)").unwrap();
     let err = db.execute("DELETE FROM parent WHERE id = 1");
@@ -1617,8 +1884,10 @@ fn fk_violation_delete_restrict() {
 #[test]
 fn fk_violation_insert() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, parent_id INT64 REFERENCES parent(id))")
+        .unwrap();
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (1, 1)").unwrap(); // ok
     let err = db.execute("INSERT INTO child VALUES (2, 999)"); // no parent 999
@@ -1628,8 +1897,10 @@ fn fk_violation_insert() {
 #[test]
 fn fk_violation_on_update() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE child(pid INT64 REFERENCES parent(id))")
+        .unwrap();
     db.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
     db.execute("INSERT INTO child VALUES (1)").unwrap();
     let err = db.execute("UPDATE child SET pid = 999").unwrap_err();
@@ -1639,12 +1910,17 @@ fn fk_violation_on_update() {
 #[test]
 fn fk_with_unique_index_on_parent() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64, code TEXT)").unwrap();
-    db.execute("CREATE UNIQUE INDEX idx_parent_code ON parent(code)").unwrap();
-    db.execute("CREATE TABLE child(id INT64, p_code TEXT REFERENCES parent(code))").unwrap();
+    db.execute("CREATE TABLE parent(id INT64, code TEXT)")
+        .unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_parent_code ON parent(code)")
+        .unwrap();
+    db.execute("CREATE TABLE child(id INT64, p_code TEXT REFERENCES parent(code))")
+        .unwrap();
     db.execute("INSERT INTO parent VALUES (1, 'ABC')").unwrap();
     db.execute("INSERT INTO child VALUES (10, 'ABC')").unwrap();
-    let err = db.execute("INSERT INTO child VALUES (20, 'XYZ')").unwrap_err();
+    let err = db
+        .execute("INSERT INTO child VALUES (20, 'XYZ')")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -1652,10 +1928,13 @@ fn fk_with_unique_index_on_parent() {
 fn foreign_key_on_delete_set_null() {
     let db = mem_db();
     exec(&db, "CREATE TABLE fk_parent (id INT PRIMARY KEY)");
-    exec(&db, "CREATE TABLE fk_child (
+    exec(
+        &db,
+        "CREATE TABLE fk_child (
         id INT PRIMARY KEY,
         parent_id INT REFERENCES fk_parent(id) ON DELETE SET NULL
-    )");
+    )",
+    );
     exec(&db, "INSERT INTO fk_parent VALUES (1), (2)");
     exec(&db, "INSERT INTO fk_child VALUES (10, 1), (20, 2)");
     exec(&db, "DELETE FROM fk_parent WHERE id = 1");
@@ -1666,11 +1945,17 @@ fn foreign_key_on_delete_set_null() {
 #[test]
 fn foreign_key_on_update_cascade() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE fk_up_parent (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "CREATE TABLE fk_up_child (
+    exec(
+        &db,
+        "CREATE TABLE fk_up_parent (id INT PRIMARY KEY, val TEXT)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE fk_up_child (
         id INT PRIMARY KEY,
         parent_id INT REFERENCES fk_up_parent(id) ON UPDATE CASCADE
-    )");
+    )",
+    );
     exec(&db, "INSERT INTO fk_up_parent VALUES (1, 'old')");
     exec(&db, "INSERT INTO fk_up_child VALUES (10, 1)");
     exec(&db, "UPDATE fk_up_parent SET id = 100 WHERE id = 1");
@@ -1684,7 +1969,8 @@ fn generated_column() {
     db.execute(
         "CREATE TABLE t(id INT64, price INT64, qty INT64, total INT64 GENERATED ALWAYS AS (price * qty) STORED)"
     ).unwrap();
-    db.execute("INSERT INTO t(id, price, qty) VALUES (1, 10, 5)").unwrap();
+    db.execute("INSERT INTO t(id, price, qty) VALUES (1, 10, 5)")
+        .unwrap();
     let r = db.execute("SELECT total FROM t WHERE id = 1").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(50));
 }
@@ -1731,7 +2017,10 @@ fn generated_column_rejects_aggregate() {
     let err = db
         .execute("CREATE TABLE t (id INT64, gen INT64 GENERATED ALWAYS AS (COUNT(*)) STORED)")
         .unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("generated") || err.to_string().to_lowercase().contains("aggregate"));
+    assert!(
+        err.to_string().to_lowercase().contains("generated")
+            || err.to_string().to_lowercase().contains("aggregate")
+    );
 }
 
 #[test]
@@ -1758,7 +2047,9 @@ fn generated_column_with_between() {
     .unwrap();
     db.execute("INSERT INTO t (id) VALUES (5), (15)").unwrap();
 
-    let result = db.execute("SELECT id, in_range FROM t ORDER BY id").unwrap();
+    let result = db
+        .execute("SELECT id, in_range FROM t ORDER BY id")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][1], Value::Bool(true));
     assert_eq!(rows[1][1], Value::Bool(false));
@@ -1772,7 +2063,8 @@ fn generated_column_with_case() {
          tier TEXT GENERATED ALWAYS AS (CASE WHEN val > 100 THEN 'high' WHEN val > 50 THEN 'mid' ELSE 'low' END) STORED)",
     )
     .unwrap();
-    db.execute("INSERT INTO t (val) VALUES (10), (75), (200)").unwrap();
+    db.execute("INSERT INTO t (val) VALUES (10), (75), (200)")
+        .unwrap();
 
     let result = db.execute("SELECT val, tier FROM t ORDER BY val").unwrap();
     let rows = rows(&result);
@@ -1806,9 +2098,12 @@ fn generated_column_with_in_list() {
         "CREATE TABLE t (id INT64 PRIMARY KEY, is_special BOOL GENERATED ALWAYS AS (id IN (1, 3, 5)) STORED)",
     )
     .unwrap();
-    db.execute("INSERT INTO t (id) VALUES (1), (2), (3)").unwrap();
+    db.execute("INSERT INTO t (id) VALUES (1), (2), (3)")
+        .unwrap();
 
-    let result = db.execute("SELECT id, is_special FROM t ORDER BY id").unwrap();
+    let result = db
+        .execute("SELECT id, is_special FROM t ORDER BY id")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][1], Value::Bool(true));
     assert_eq!(rows[1][1], Value::Bool(false));
@@ -1818,13 +2113,14 @@ fn generated_column_with_in_list() {
 #[test]
 fn generated_column_with_like() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE t (name TEXT, is_a BOOL GENERATED ALWAYS AS (name LIKE 'a%') STORED)",
-    )
-    .unwrap();
-    db.execute("INSERT INTO t (name) VALUES ('alice'), ('bob')").unwrap();
+    db.execute("CREATE TABLE t (name TEXT, is_a BOOL GENERATED ALWAYS AS (name LIKE 'a%') STORED)")
+        .unwrap();
+    db.execute("INSERT INTO t (name) VALUES ('alice'), ('bob')")
+        .unwrap();
 
-    let result = db.execute("SELECT name, is_a FROM t ORDER BY name").unwrap();
+    let result = db
+        .execute("SELECT name, is_a FROM t ORDER BY name")
+        .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][1], Value::Bool(true));
     assert_eq!(rows[1][1], Value::Bool(false));
@@ -1838,7 +2134,10 @@ fn indexed_inner_join_uses_btree() {
     exec(&db, "CREATE INDEX ij2_fk ON ij2 (ij1_id)");
     exec(&db, "INSERT INTO ij1 VALUES (1, 'a'), (2, 'b')");
     exec(&db, "INSERT INTO ij2 VALUES (10, 1), (20, 2), (30, 1)");
-    let r = exec(&db, "SELECT ij1.val, ij2.id FROM ij1 INNER JOIN ij2 ON ij1.id = ij2.ij1_id ORDER BY ij2.id");
+    let r = exec(
+        &db,
+        "SELECT ij1.val, ij2.id FROM ij1 INNER JOIN ij2 ON ij1.id = ij2.ij1_id ORDER BY ij2.id",
+    );
     assert_eq!(r.rows().len(), 3);
 }
 
@@ -1877,7 +2176,8 @@ fn list_tables_api() {
 #[test]
 fn metadata_describe_table() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, name TEXT NOT NULL, val FLOAT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, name TEXT NOT NULL, val FLOAT64)")
+        .unwrap();
     let info = db.describe_table("t").unwrap();
     assert_eq!(info.name, "t");
     assert!(info.columns.len() >= 3);
@@ -1952,7 +2252,8 @@ fn metadata_storage_info() {
 #[test]
 fn metadata_table_ddl() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     let ddl = db.table_ddl("t").unwrap();
     assert!(ddl.contains("CREATE TABLE"));
     assert!(ddl.contains("id"));
@@ -1962,7 +2263,8 @@ fn metadata_table_ddl() {
 #[test]
 fn multi_column_check_constraint() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, CHECK (a < b))").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, CHECK (a < b))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 2)").unwrap();
     let err = db.execute("INSERT INTO t VALUES (3, 2)").unwrap_err();
     assert!(!err.to_string().is_empty());
@@ -1971,19 +2273,33 @@ fn multi_column_check_constraint() {
 #[test]
 fn multi_column_index() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE multi_idx_t (id INT PRIMARY KEY, a TEXT, b TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE multi_idx_t (id INT PRIMARY KEY, a TEXT, b TEXT)",
+    );
     exec(&db, "CREATE INDEX idx_ab ON multi_idx_t (a, b)");
     for i in 0..50 {
-        exec(&db, &format!("INSERT INTO multi_idx_t VALUES ({i}, 'a{a}', 'b{b}')", a = i % 5, b = i % 10));
+        exec(
+            &db,
+            &format!(
+                "INSERT INTO multi_idx_t VALUES ({i}, 'a{a}', 'b{b}')",
+                a = i % 5,
+                b = i % 10
+            ),
+        );
     }
-    let r = exec(&db, "SELECT id FROM multi_idx_t WHERE a = 'a0' AND b = 'b0'");
+    let r = exec(
+        &db,
+        "SELECT id FROM multi_idx_t WHERE a = 'a0' AND b = 'b0'",
+    );
     assert!(!r.rows().is_empty());
 }
 
 #[test]
 fn multi_column_unique_constraint() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, UNIQUE(a, b))").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, UNIQUE(a, b))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 2)").unwrap(); // different b, ok
     db.execute("INSERT INTO t VALUES (2, 1)").unwrap(); // different a, ok
@@ -2000,8 +2316,7 @@ fn not_null_constraint_insert_null() {
     );
     let err = exec_err(&db, "INSERT INTO nn VALUES (1, NULL)");
     assert!(
-        err.to_lowercase().contains("null")
-            || err.to_lowercase().contains("not null"),
+        err.to_lowercase().contains("null") || err.to_lowercase().contains("not null"),
         "got: {err}"
     );
 }
@@ -2016,8 +2331,7 @@ fn not_null_constraint_update_to_null() {
     exec(&db, "INSERT INTO nn2 VALUES (1, 'hello')");
     let err = exec_err(&db, "UPDATE nn2 SET val = NULL WHERE id = 1");
     assert!(
-        err.to_lowercase().contains("null")
-            || err.to_lowercase().contains("not null"),
+        err.to_lowercase().contains("null") || err.to_lowercase().contains("not null"),
         "got: {err}"
     );
 }
@@ -2025,7 +2339,8 @@ fn not_null_constraint_update_to_null() {
 #[test]
 fn not_null_constraint_violation() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)")
+        .unwrap();
     let err = db.execute("INSERT INTO t VALUES (1, NULL)").unwrap_err();
     assert!(!err.to_string().is_empty());
 }
@@ -2049,11 +2364,14 @@ fn on_conflict_named_constraint_nonexistent() {
 #[test]
 fn on_conflict_on_constraint_by_columns() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
 
-    db.execute("INSERT INTO t VALUES (1, 'updated') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val")
-        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 'updated') ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val",
+    )
+    .unwrap();
 
     let result = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
     let rows = rows(&result);
@@ -2064,8 +2382,10 @@ fn on_conflict_on_constraint_by_columns() {
 fn parse_create_index_if_not_exists() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(val)").unwrap();
-    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(val)").unwrap(); // No error
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(val)")
+        .unwrap();
+    db.execute("CREATE INDEX IF NOT EXISTS idx ON t(val)")
+        .unwrap(); // No error
 }
 
 #[test]
@@ -2082,10 +2402,8 @@ fn parse_create_table_with_all_types() {
         )",
     )
     .unwrap();
-    db.execute(
-        "INSERT INTO all_types VALUES (1, 3.14, 'hello', TRUE, NULL, 19.99)",
-    )
-    .unwrap();
+    db.execute("INSERT INTO all_types VALUES (1, 3.14, 'hello', TRUE, NULL, 19.99)")
+        .unwrap();
     let r = db.execute("SELECT * FROM all_types").unwrap();
     assert_eq!(rows(&r).len(), 1);
 }
@@ -2093,8 +2411,14 @@ fn parse_create_table_with_all_types() {
 #[test]
 fn partial_index_creation_and_use() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE pi (id INT PRIMARY KEY, active BOOL, val TEXT)");
-    exec(&db, "CREATE INDEX pi_active_idx ON pi (val) WHERE active = true");
+    exec(
+        &db,
+        "CREATE TABLE pi (id INT PRIMARY KEY, active BOOL, val TEXT)",
+    );
+    exec(
+        &db,
+        "CREATE INDEX pi_active_idx ON pi (val) WHERE active = true",
+    );
     for i in 0..20 {
         exec(
             &db,
@@ -2105,18 +2429,33 @@ fn partial_index_creation_and_use() {
         );
     }
     exec(&db, "ANALYZE pi");
-    let r = exec(&db, "SELECT id FROM pi WHERE active = true AND val = 'val10'");
+    let r = exec(
+        &db,
+        "SELECT id FROM pi WHERE active = true AND val = 'val10'",
+    );
     assert_eq!(r.rows().len(), 1);
 }
 
 #[test]
 fn partial_index_only_indexes_matching_rows() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE pi (id INT PRIMARY KEY, status TEXT, val INT)");
-    exec(&db, "CREATE INDEX pi_active ON pi (val) WHERE status = 'active'");
-    exec(&db, "INSERT INTO pi VALUES (1, 'active', 10), (2, 'inactive', 10), (3, 'active', 20)");
+    exec(
+        &db,
+        "CREATE TABLE pi (id INT PRIMARY KEY, status TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "CREATE INDEX pi_active ON pi (val) WHERE status = 'active'",
+    );
+    exec(
+        &db,
+        "INSERT INTO pi VALUES (1, 'active', 10), (2, 'inactive', 10), (3, 'active', 20)",
+    );
     // Both active rows should be findable via the partial index
-    let r = exec(&db, "SELECT id FROM pi WHERE status = 'active' AND val = 10");
+    let r = exec(
+        &db,
+        "SELECT id FROM pi WHERE status = 'active' AND val = 10",
+    );
     assert_eq!(r.rows().len(), 1);
 }
 
@@ -2129,7 +2468,8 @@ fn persist_with_indexes_and_constraints() {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
         db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, name TEXT NOT NULL UNIQUE, val INT64 CHECK (val >= 0))").unwrap();
         db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")
+            .unwrap();
         db.checkpoint().unwrap();
     }
     {
@@ -2172,7 +2512,8 @@ fn prepared_insert_auto_increment() {
 #[test]
 fn prepared_insert_check_constraint() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val INT64 CHECK (val > 0))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val INT64 CHECK (val > 0))")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     stmt.execute_in(&mut txn, &[Value::Int64(1), Value::Int64(10)])
@@ -2196,9 +2537,11 @@ fn prepared_select_after_drop_table() {
 #[test]
 fn rename_column() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, old_name TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, old_name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
-    db.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name").unwrap();
+    db.execute("ALTER TABLE t RENAME COLUMN old_name TO new_name")
+        .unwrap();
     let r = db.execute("SELECT new_name FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("hello".into()));
 }
@@ -2220,7 +2563,8 @@ fn select_with_index_on_wrong_type() {
 #[test]
 fn table_ddl_api() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
     let ddl = db.table_ddl("t").unwrap();
     assert!(ddl.contains("CREATE TABLE"));
     assert!(ddl.contains("id"));
@@ -2269,7 +2613,8 @@ fn table_ddl_nonexistent() {
 #[test]
 fn table_ddl_with_all_constraint_types() {
     let db = mem_db();
-    db.execute("CREATE TABLE ref_tbl(id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE ref_tbl(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE complex_tbl(
             id INT64 PRIMARY KEY,
@@ -2307,7 +2652,8 @@ fn table_ddl_with_check_and_default() {
 #[test]
 fn table_ddl_with_fk() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE)").unwrap();
     let ddl = db.table_ddl("child").unwrap();
     assert!(ddl.contains("CREATE TABLE"));
@@ -2316,20 +2662,22 @@ fn table_ddl_with_fk() {
 #[test]
 fn table_level_check_constraint() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE t (a INT64, b INT64, CHECK (a > 0 AND b > 0))",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (a INT64, b INT64, CHECK (a > 0 AND b > 0))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
 
     let err = db.execute("INSERT INTO t VALUES (-1, 1)").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("check") || err.to_string().to_lowercase().contains("constraint"));
+    assert!(
+        err.to_string().to_lowercase().contains("check")
+            || err.to_string().to_lowercase().contains("constraint")
+    );
 }
 
 #[test]
 fn table_level_foreign_key_constraint() {
     let db = mem_db();
-    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE parent (id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute(
         "CREATE TABLE child (id INT64 PRIMARY KEY, pid INT64,
          FOREIGN KEY (pid) REFERENCES parent(id))",
@@ -2338,29 +2686,37 @@ fn table_level_foreign_key_constraint() {
     db.execute("INSERT INTO parent VALUES (1)").unwrap();
     db.execute("INSERT INTO child VALUES (10, 1)").unwrap();
 
-    let err = db.execute("INSERT INTO child VALUES (20, 999)").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("foreign") || err.to_string().to_lowercase().contains("constraint"));
+    let err = db
+        .execute("INSERT INTO child VALUES (20, 999)")
+        .unwrap_err();
+    assert!(
+        err.to_string().to_lowercase().contains("foreign")
+            || err.to_string().to_lowercase().contains("constraint")
+    );
 }
 
 #[test]
 fn table_level_unique_constraint() {
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE t (a INT64, b INT64, UNIQUE (a, b))",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t (a INT64, b INT64, UNIQUE (a, b))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 2)").unwrap();
 
     let err = db.execute("INSERT INTO t VALUES (1, 1)").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("unique") || err.to_string().to_lowercase().contains("duplicate"));
+    assert!(
+        err.to_string().to_lowercase().contains("unique")
+            || err.to_string().to_lowercase().contains("duplicate")
+    );
 }
 
 #[test]
 fn temp_table_full_lifecycle() {
     let db = mem_db();
-    db.execute("CREATE TEMPORARY TABLE temp_t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO temp_t VALUES (1, 'hello')").unwrap();
+    db.execute("CREATE TEMPORARY TABLE temp_t(id INT64, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO temp_t VALUES (1, 'hello')")
+        .unwrap();
     let r = db.execute("SELECT * FROM temp_t").unwrap();
     assert_eq!(rows(&r).len(), 1);
     db.execute("DROP TABLE temp_t").unwrap();
@@ -2373,7 +2729,8 @@ fn temp_table_if_not_exists() {
     let db = mem_db();
     db.execute("CREATE TEMP TABLE t(id INT64)").unwrap();
     // IF NOT EXISTS on existing temp table should succeed silently
-    db.execute("CREATE TEMP TABLE IF NOT EXISTS t(id INT64)").unwrap();
+    db.execute("CREATE TEMP TABLE IF NOT EXISTS t(id INT64)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(1));
@@ -2404,7 +2761,10 @@ fn temp_table_not_visible_after_reconnect() {
     {
         let db = Db::open_or_create(path, DbConfig::default()).unwrap();
         let err = exec_err(&db, "SELECT * FROM tmp2");
-        assert!(err.contains("tmp2") || err.contains("not found") || err.contains("unknown"), "got: {err}");
+        assert!(
+            err.contains("tmp2") || err.contains("not found") || err.contains("unknown"),
+            "got: {err}"
+        );
     }
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(format!("{path}.wal"));
@@ -2416,8 +2776,10 @@ fn temp_table_shadows_persistent() {
     let path = dir.path().join("test.ddb");
     let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'persistent')").unwrap();
-    db.execute("CREATE TEMP TABLE t(id INT64, val TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'persistent')")
+        .unwrap();
+    db.execute("CREATE TEMP TABLE t(id INT64, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (2, 'temporary')").unwrap();
     let r = db.execute("SELECT val FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("temporary".into()));
@@ -2426,12 +2788,16 @@ fn temp_table_shadows_persistent() {
 #[test]
 fn temp_table_with_index() {
     let db = mem_db();
-    db.execute("CREATE TEMPORARY TABLE temp_t(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE TEMPORARY TABLE temp_t(id INT64, val TEXT)")
+        .unwrap();
     // Indexes on temp tables are not supported; verify the error
-    let err = db.execute("CREATE INDEX temp_idx ON temp_t(val)").unwrap_err();
+    let err = db
+        .execute("CREATE INDEX temp_idx ON temp_t(val)")
+        .unwrap_err();
     assert!(err.to_string().contains("temporary") || !err.to_string().is_empty());
     // But the table itself works fine
-    db.execute("INSERT INTO temp_t VALUES (1, 'a'), (2, 'b')").unwrap();
+    db.execute("INSERT INTO temp_t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
     let r = db.execute("SELECT id FROM temp_t WHERE val = 'a'").unwrap();
     assert_eq!(rows(&r).len(), 1);
 }
@@ -2439,7 +2805,8 @@ fn temp_table_with_index() {
 #[test]
 fn temp_table_with_unique_constraint() {
     let db = mem_db();
-    db.execute("CREATE TEMP TABLE t(id INT64 PRIMARY KEY, val TEXT UNIQUE)").unwrap();
+    db.execute("CREATE TEMP TABLE t(id INT64 PRIMARY KEY, val TEXT UNIQUE)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     let err = db.execute("INSERT INTO t VALUES (2, 'a')").unwrap_err();
     assert!(!err.to_string().is_empty());
@@ -2448,11 +2815,14 @@ fn temp_table_with_unique_constraint() {
 #[test]
 fn trigram_index_basic() {
     let db = mem_db();
-    db.execute("CREATE TABLE docs(id INT64, content TEXT)").unwrap();
+    db.execute("CREATE TABLE docs(id INT64, content TEXT)")
+        .unwrap();
     let r = db.execute("CREATE INDEX idx_trigram ON docs USING TRIGRAM (content)");
     if r.is_ok() {
-        db.execute("INSERT INTO docs VALUES (1, 'hello world')").unwrap();
-        db.execute("INSERT INTO docs VALUES (2, 'goodbye world')").unwrap();
+        db.execute("INSERT INTO docs VALUES (1, 'hello world')")
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (2, 'goodbye world')")
+            .unwrap();
         let r2 = db.execute("SELECT id FROM docs WHERE content LIKE '%hello%'");
         assert!(r2.is_ok() || r2.is_err());
     }
@@ -2465,7 +2835,10 @@ fn trigram_index_ilike_query() {
     exec(&db, "CREATE INDEX trgm2_idx ON trgm2 USING gin (body)");
     exec(&db, "INSERT INTO trgm2 VALUES (1, 'Hello World')");
     exec(&db, "INSERT INTO trgm2 VALUES (2, 'hello again')");
-    let _r = exec(&db, "SELECT id FROM trgm2 WHERE body ILIKE '%hello%' ORDER BY id");
+    let _r = exec(
+        &db,
+        "SELECT id FROM trgm2 WHERE body ILIKE '%hello%' ORDER BY id",
+    );
 }
 
 #[test]
@@ -2477,7 +2850,10 @@ fn trigram_index_like_query() {
     exec(&db, "INSERT INTO trgm_t VALUES (2, 'lazy dog sleeps')");
     exec(&db, "INSERT INTO trgm_t VALUES (3, 'quick brown bear')");
     // Trigram index is used as a filter — results may vary; just exercise the path
-    let _r = exec(&db, "SELECT id FROM trgm_t WHERE body LIKE '%quick%' ORDER BY id");
+    let _r = exec(
+        &db,
+        "SELECT id FROM trgm_t WHERE body LIKE '%quick%' ORDER BY id",
+    );
 }
 
 #[test]
@@ -2503,7 +2879,10 @@ fn trigram_index_with_updates() {
     exec(&db, "CREATE INDEX trg_gin ON trg USING gin (body)");
     exec(&db, "INSERT INTO trg VALUES (1, 'the quick brown fox')");
     exec(&db, "INSERT INTO trg VALUES (2, 'lazy dog sleeps')");
-    exec(&db, "UPDATE trg SET body = 'the fast brown fox' WHERE id = 1");
+    exec(
+        &db,
+        "UPDATE trg SET body = 'the fast brown fox' WHERE id = 1",
+    );
     exec(&db, "DELETE FROM trg WHERE id = 2");
     let r = exec(&db, "SELECT id FROM trg");
     assert_eq!(r.rows().len(), 1);
@@ -2512,7 +2891,8 @@ fn trigram_index_with_updates() {
 #[test]
 fn unique_constraint_allows_multiple_nulls() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val INT64 UNIQUE)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val INT64 UNIQUE)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     db.execute("INSERT INTO t VALUES (2, NULL)").unwrap(); // NULLs don't violate UNIQUE
     db.execute("INSERT INTO t VALUES (3, 42)").unwrap();
@@ -2523,17 +2903,26 @@ fn unique_constraint_allows_multiple_nulls() {
 #[test]
 fn unique_constraint_on_multiple_columns() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE mc_uniq (id INT PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))");
+    exec(
+        &db,
+        "CREATE TABLE mc_uniq (id INT PRIMARY KEY, a TEXT, b TEXT, UNIQUE (a, b))",
+    );
     exec(&db, "INSERT INTO mc_uniq VALUES (1, 'x', 'y')");
     let err = exec_err(&db, "INSERT INTO mc_uniq VALUES (2, 'x', 'y')");
-    assert!(err.contains("unique") || err.contains("duplicate") || err.contains("constraint"), "got: {err}");
+    assert!(
+        err.contains("unique") || err.contains("duplicate") || err.contains("constraint"),
+        "got: {err}"
+    );
     exec(&db, "INSERT INTO mc_uniq VALUES (3, 'x', 'z')");
 }
 
 #[test]
 fn unique_constraint_rejects_duplicate() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE ucr (id INT PRIMARY KEY, email TEXT UNIQUE)");
+    exec(
+        &db,
+        "CREATE TABLE ucr (id INT PRIMARY KEY, email TEXT UNIQUE)",
+    );
     exec(&db, "INSERT INTO ucr VALUES (1, 'a@b.com')");
     let err = exec_err(&db, "INSERT INTO ucr VALUES (2, 'a@b.com')");
     assert!(!err.is_empty());
@@ -2542,11 +2931,17 @@ fn unique_constraint_rejects_duplicate() {
 #[test]
 fn unique_constraint_with_partial_index_predicate() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, status TEXT, email TEXT)").unwrap();
-    db.execute("CREATE UNIQUE INDEX idx_active_email ON t(email) WHERE status = 'active'").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'active', 'a@b.com')").unwrap();
-    db.execute("INSERT INTO t VALUES (2, 'inactive', 'a@b.com')").unwrap(); // OK: inactive
-    let err = db.execute("INSERT INTO t VALUES (3, 'active', 'a@b.com')").unwrap_err();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, status TEXT, email TEXT)")
+        .unwrap();
+    db.execute("CREATE UNIQUE INDEX idx_active_email ON t(email) WHERE status = 'active'")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'active', 'a@b.com')")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'inactive', 'a@b.com')")
+        .unwrap(); // OK: inactive
+    let err = db
+        .execute("INSERT INTO t VALUES (3, 'active', 'a@b.com')")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
 }
 
@@ -2570,7 +2965,8 @@ fn update_generated_column_error() {
 #[test]
 fn upsert_on_conflict_constraint_name() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
     // ON CONFLICT on the PK index
     let indexes = db.list_indexes().unwrap();
@@ -2599,9 +2995,11 @@ fn verify_index_after_operations() {
 #[test]
 fn verify_index_api() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx ON t(val)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
     let v = db.verify_index("idx").unwrap();
     assert!(v.valid);
 }
@@ -2619,13 +3017,14 @@ fn verify_index_fresh() {
 #[test]
 fn verify_indexes() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx ON t(val)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
     let result = db.verify_index("idx").unwrap();
     assert!(result.valid);
 }
-
 
 // ── Tests merged from engine_coverage_tests.rs, create_validation_tests.rs ──
 
@@ -2743,4 +3142,3 @@ fn generated_columns_participate_in_unique_constraints() {
         "unexpected error: {err}"
     );
 }
-

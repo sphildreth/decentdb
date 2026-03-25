@@ -103,11 +103,7 @@ impl EngineRuntime {
         }
 
         for index in unique_indexes_for_table(self, table_name) {
-            let probe = StoredRow {
-                row_id: existing_row_id.unwrap_or(0),
-                values: row.to_vec(),
-            };
-            if !row_satisfies_index_predicate(self, index, table, &probe)? {
+            if !row_satisfies_index_predicate(self, index, table, row)? {
                 continue;
             }
             let candidate = index_values(self, index, table, row)?;
@@ -134,7 +130,7 @@ impl EngineRuntime {
                 if Some(existing.row_id) == existing_row_id {
                     continue;
                 }
-                if !row_satisfies_index_predicate(self, index, table, existing)? {
+                if !row_satisfies_index_predicate(self, index, table, &existing.values)? {
                     continue;
                 }
                 let existing_values = index_values(self, index, table, &existing.values)?;
@@ -237,11 +233,7 @@ impl EngineRuntime {
             return Ok(None);
         };
         for index in indexes {
-            let probe = StoredRow {
-                row_id: 0,
-                values: row.to_vec(),
-            };
-            if !row_satisfies_index_predicate(self, index, table, &probe)? {
+            if !row_satisfies_index_predicate(self, index, table, row)? {
                 continue;
             }
             let candidate = index_values(self, index, table, row)?;
@@ -259,7 +251,7 @@ impl EngineRuntime {
                 continue;
             }
             if let Some(existing) = table_data.rows.iter().find(|existing| {
-                row_satisfies_index_predicate(self, index, table, existing)
+                row_satisfies_index_predicate(self, index, table, &existing.values)
                     .and_then(|matches| {
                         if !matches {
                             return Ok(false);
@@ -343,11 +335,7 @@ fn unique_index_row_ids(
     let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
         return Ok(None);
     };
-    let probe = StoredRow {
-        row_id: 0,
-        values: row.to_vec(),
-    };
-    let Some(key) = super::compute_index_key(runtime, index, table, &probe)? else {
+    let Some(key) = super::compute_index_key(runtime, index, table, row)? else {
         return Ok(Some(Vec::new()));
     };
     Ok(Some(keys.row_ids_for_key(&key)))

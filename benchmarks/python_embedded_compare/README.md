@@ -47,6 +47,9 @@ python comparison_runner.py --engines sqlite --durability durable --scenario wor
 # Run an operation sweep and export docs-referenceable charts
 python comparison_runner.py --engines sqlite,duckdb,decentdb --workload workload_a --ops-list 10000,100000,1000000
 
+# Run a sweep and refresh docs/user-guide/benchmarks.md summary sections
+python comparison_runner.py --engines sqlite,duckdb,decentdb --workload workload_a --ops-list 10,50,100,250,500 --update-benchmarks-doc
+
 # Run the flat-table binding-parity workload using orders_n as the row count
 python comparison_runner.py --engines sqlite,decentdb --workload workload_c --customers 1 --orders 1000000 --events 1 --ops 1000
 ```
@@ -54,6 +57,9 @@ python comparison_runner.py --engines sqlite,decentdb --workload workload_c --cu
 Single `--ops` runs produce per-benchmark comparison charts for one operation count.
 Use `--ops-list` when you want the line charts described in the benchmark plan,
 with operation count on the x-axis and one series per engine.
+Add `--update-benchmarks-doc` to regenerate marked summary sections in
+`docs/user-guide/benchmarks.md` from the exported `chart_data.json` files under
+`docs/assets/benchmarks/python-embedded-compare/`.
 
 ## Directory Structure
 

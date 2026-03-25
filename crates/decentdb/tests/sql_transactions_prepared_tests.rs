@@ -54,7 +54,10 @@ fn analyze_table() {
     exec(&db, "CREATE TABLE analyze_t (id INT PRIMARY KEY, val TEXT)");
     exec(&db, "CREATE INDEX idx_analyze ON analyze_t (val)");
     for i in 0..100 {
-        exec(&db, &format!("INSERT INTO analyze_t VALUES ({i}, 'v{v}')", v = i % 10));
+        exec(
+            &db,
+            &format!("INSERT INTO analyze_t VALUES ({i}, 'v{v}')", v = i % 10),
+        );
     }
     exec(&db, "ANALYZE");
 }
@@ -63,7 +66,8 @@ fn analyze_table() {
 fn analyze_with_data() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
     db.execute("CREATE INDEX idx ON t(val)").unwrap();
     let r = db.execute("ANALYZE");
     assert!(r.is_ok() || r.is_err());
@@ -94,7 +98,9 @@ fn error_multiple_statements_in_execute() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     let err = db.execute("SELECT 1; SELECT 2").unwrap_err();
-    assert!(err.to_string().contains("expected exactly one SQL statement"));
+    assert!(err
+        .to_string()
+        .contains("expected exactly one SQL statement"));
 }
 
 #[test]
@@ -144,7 +150,8 @@ fn explain_analyze_query() {
 fn explain_analyze_select() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
     let r = db.execute("EXPLAIN ANALYZE SELECT * FROM t WHERE id > 1");
     if let Ok(r) = r {
         let lines = r.explain_lines();
@@ -160,9 +167,7 @@ fn explain_cte() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     let r = db
-        .execute(
-            "EXPLAIN WITH cte AS (SELECT id FROM t WHERE id > 0) SELECT * FROM cte",
-        )
+        .execute("EXPLAIN WITH cte AS (SELECT id FROM t WHERE id > 0) SELECT * FROM cte")
         .unwrap();
     assert!(!r.explain_lines().is_empty());
 }
@@ -179,7 +184,10 @@ fn explain_delete() {
 #[test]
 fn explain_insert() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE explain_ins (id INT PRIMARY KEY, val TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE explain_ins (id INT PRIMARY KEY, val TEXT)",
+    );
     let r = exec(&db, "EXPLAIN INSERT INTO explain_ins VALUES (1, 'test')");
     assert!(!r.explain_lines().is_empty());
 }
@@ -188,7 +196,8 @@ fn explain_insert() {
 fn explain_join() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)")
+        .unwrap();
     let r = db
         .execute("EXPLAIN SELECT * FROM t1 JOIN t2 ON t1.id = t2.t1_id")
         .unwrap();
@@ -200,17 +209,24 @@ fn explain_join_query() {
     let db = mem_db();
     exec(&db, "CREATE TABLE ej1 (id INT PRIMARY KEY, val TEXT)");
     exec(&db, "CREATE TABLE ej2 (id INT PRIMARY KEY, ref_id INT)");
-    let r = exec(&db, "EXPLAIN SELECT * FROM ej1 JOIN ej2 ON ej1.id = ej2.ref_id");
+    let r = exec(
+        &db,
+        "EXPLAIN SELECT * FROM ej1 JOIN ej2 ON ej1.id = ej2.ref_id",
+    );
     assert!(!r.explain_lines().is_empty());
 }
 
 #[test]
 fn explain_join_shows_nested_loop() {
     let db = mem_db();
-    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY)")
+        .unwrap();
 
-    let result = db.execute("EXPLAIN SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id").unwrap();
+    let result = db
+        .execute("EXPLAIN SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.id")
+        .unwrap();
     let text = format!("{:?}", rows(&result));
     assert!(!text.is_empty());
 }
@@ -230,9 +246,7 @@ fn explain_left_right_full_cross_joins() {
     let _ = db
         .execute("EXPLAIN SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id")
         .unwrap();
-    let _ = db
-        .execute("EXPLAIN SELECT * FROM a CROSS JOIN b")
-        .unwrap();
+    let _ = db.execute("EXPLAIN SELECT * FROM a CROSS JOIN b").unwrap();
 }
 
 #[test]
@@ -266,7 +280,8 @@ fn explain_select_produces_output() {
 #[test]
 fn explain_sort_and_limit() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let result = db
         .execute("EXPLAIN SELECT * FROM t ORDER BY val LIMIT 10 OFFSET 5")
@@ -301,7 +316,9 @@ fn explain_with_index() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, name TEXT)").unwrap();
     db.execute("CREATE INDEX idx ON t(name)").unwrap();
-    let r = db.execute("EXPLAIN SELECT * FROM t WHERE name = 'test'").unwrap();
+    let r = db
+        .execute("EXPLAIN SELECT * FROM t WHERE name = 'test'")
+        .unwrap();
     let text = format!("{:?}", rows(&r));
     // Should mention the index in the plan
     assert!(!text.is_empty());
@@ -334,9 +351,12 @@ fn in_transaction_state() {
 #[test]
 fn large_transaction_many_rows() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, a TEXT, b TEXT, c INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, a TEXT, b TEXT, c INT64)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
-    let stmt = txn.prepare("INSERT INTO t VALUES ($1, $2, $3, $4)").unwrap();
+    let stmt = txn
+        .prepare("INSERT INTO t VALUES ($1, $2, $3, $4)")
+        .unwrap();
     for i in 0..2000 {
         stmt.execute_in(
             &mut txn,
@@ -390,18 +410,19 @@ fn multiple_transactions_on_file() {
     let path = dir.path().join("test.ddb");
     let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    
+
     // Transaction 1: insert
     db.begin_transaction().unwrap();
     db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
     db.execute("INSERT INTO t VALUES (2, 200)").unwrap();
     db.commit_transaction().unwrap();
-    
+
     // Transaction 2: update
     db.begin_transaction().unwrap();
-    db.execute("UPDATE t SET val = val + 50 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET val = val + 50 WHERE id = 1")
+        .unwrap();
     db.commit_transaction().unwrap();
-    
+
     let r = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(150));
 }
@@ -456,7 +477,8 @@ fn nested_savepoints_rollback_inner() {
 #[test]
 fn prepared_batch_in_transaction() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let prepared = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
 
@@ -476,7 +498,8 @@ fn prepared_batch_in_transaction() {
 #[test]
 fn prepared_batch_insert() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     let prepared = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     for i in 1..=50_i64 {
@@ -517,8 +540,10 @@ fn prepared_insert_and_query() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
     let stmt = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
-    stmt.execute(&[Value::Int64(1), Value::Text("a".into())]).unwrap();
-    stmt.execute(&[Value::Int64(2), Value::Text("b".into())]).unwrap();
+    stmt.execute(&[Value::Int64(1), Value::Text("a".into())])
+        .unwrap();
+    stmt.execute(&[Value::Int64(2), Value::Text("b".into())])
+        .unwrap();
     let r = db.execute("SELECT * FROM t ORDER BY id").unwrap();
     assert_eq!(rows(&r).len(), 2);
 }
@@ -526,7 +551,8 @@ fn prepared_insert_and_query() {
 #[test]
 fn prepared_insert_basic() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT, val INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT, val INT64)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn.prepare("INSERT INTO t VALUES ($1, $2, $3)").unwrap();
     for i in 0..20 {
@@ -549,7 +575,9 @@ fn prepared_insert_basic() {
 fn prepared_insert_batch_positional_params() {
     let db = mem_db();
     exec(&db, "CREATE TABLE items (id INT PRIMARY KEY, name TEXT)");
-    let stmt = db.prepare("INSERT INTO items (id, name) VALUES ($1, $2)").unwrap();
+    let stmt = db
+        .prepare("INSERT INTO items (id, name) VALUES ($1, $2)")
+        .unwrap();
     for i in 0..10 {
         let name = format!("item_{i}");
         stmt.execute(&[Value::Int64(i), Value::Text(name)]).unwrap();
@@ -561,7 +589,8 @@ fn prepared_insert_batch_positional_params() {
 #[test]
 fn prepared_insert_dup_pk_error() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     stmt.execute_in(&mut txn, &[Value::Int64(1), Value::Text("a".into())])
@@ -575,11 +604,14 @@ fn prepared_insert_dup_pk_error() {
 fn prepared_insert_in_transaction() {
     let db = mem_db();
     exec(&db, "CREATE TABLE txitems (id INT PRIMARY KEY, label TEXT)");
-    let stmt = db.prepare("INSERT INTO txitems (id, label) VALUES ($1, $2)").unwrap();
+    let stmt = db
+        .prepare("INSERT INTO txitems (id, label) VALUES ($1, $2)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     for i in 0..5 {
         let label = format!("label_{i}");
-        stmt.execute_in(&mut txn, &[Value::Int64(i), Value::Text(label)]).unwrap();
+        stmt.execute_in(&mut txn, &[Value::Int64(i), Value::Text(label)])
+            .unwrap();
     }
     txn.commit().unwrap();
     let r = exec(&db, "SELECT COUNT(*) FROM txitems");
@@ -589,7 +621,8 @@ fn prepared_insert_in_transaction() {
 #[test]
 fn prepared_insert_null_into_not_null() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT NOT NULL)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     let err = stmt.execute_in(&mut txn, &[Value::Int64(1), Value::Null]);
@@ -661,7 +694,9 @@ fn prepared_insert_with_index() {
 fn prepared_insert_with_null_params() {
     let db = mem_db();
     exec(&db, "CREATE TABLE pin (id INT PRIMARY KEY, val TEXT)");
-    let stmt = db.prepare("INSERT INTO pin (id, val) VALUES ($1, $2)").unwrap();
+    let stmt = db
+        .prepare("INSERT INTO pin (id, val) VALUES ($1, $2)")
+        .unwrap();
     stmt.execute(&[Value::Int64(1), Value::Null]).unwrap();
     let r = exec(&db, "SELECT val FROM pin WHERE id = 1");
     assert_eq!(r.rows()[0].values()[0], Value::Null);
@@ -670,15 +705,13 @@ fn prepared_insert_with_null_params() {
 #[test]
 fn prepared_insert_with_pk() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     for i in 0..50 {
-        stmt.execute_in(
-            &mut txn,
-            &[Value::Int64(i), Value::Text(format!("v{}", i))],
-        )
-        .unwrap();
+        stmt.execute_in(&mut txn, &[Value::Int64(i), Value::Text(format!("v{}", i))])
+            .unwrap();
     }
     txn.commit().unwrap();
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
@@ -689,7 +722,8 @@ fn prepared_insert_with_pk() {
 fn prepared_read_in_transaction() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn.prepare("SELECT val FROM t WHERE id = $1").unwrap();
     let r = stmt.execute_in(&mut txn, &[Value::Int64(2)]).unwrap();
@@ -712,8 +746,13 @@ fn prepared_select_read_only_batch() {
 fn prepared_select_with_multiple_params() {
     let db = mem_db();
     exec(&db, "CREATE TABLE psm (id INT PRIMARY KEY, a INT, b INT)");
-    exec(&db, "INSERT INTO psm VALUES (1, 10, 20), (2, 30, 40), (3, 50, 60)");
-    let stmt = db.prepare("SELECT id FROM psm WHERE a >= $1 AND b <= $2").unwrap();
+    exec(
+        &db,
+        "INSERT INTO psm VALUES (1, 10, 20), (2, 30, 40), (3, 50, 60)",
+    );
+    let stmt = db
+        .prepare("SELECT id FROM psm WHERE a >= $1 AND b <= $2")
+        .unwrap();
     let r = stmt.execute(&[Value::Int64(30), Value::Int64(50)]).unwrap();
     assert_eq!(r.rows().len(), 1);
     assert_eq!(r.rows()[0].values()[0], Value::Int64(2));
@@ -733,7 +772,8 @@ fn prepared_select_with_params() {
 #[test]
 fn prepared_statement_all_types() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(i INT64, f FLOAT64, t TEXT, b BOOL, bl BLOB)").unwrap();
+    db.execute("CREATE TABLE t(i INT64, f FLOAT64, t TEXT, b BOOL, bl BLOB)")
+        .unwrap();
     let mut txn = db.transaction().unwrap();
     let stmt = txn
         .prepare("INSERT INTO t VALUES ($1, $2, $3, $4, $5)")
@@ -830,8 +870,11 @@ fn prepared_update_with_params() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-    db.execute_with_params("UPDATE t SET val = $1 WHERE id = $2", &[Value::Int64(99), Value::Int64(1)])
-        .unwrap();
+    db.execute_with_params(
+        "UPDATE t SET val = $1 WHERE id = $2",
+        &[Value::Int64(99), Value::Int64(1)],
+    )
+    .unwrap();
     let r = db.execute("SELECT val FROM t WHERE id = 1").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(99));
 }
@@ -840,9 +883,12 @@ fn prepared_update_with_params() {
 fn prepared_write_outside_transaction() {
     let db = mem_db();
     exec(&db, "CREATE TABLE pw (id INT PRIMARY KEY, val TEXT)");
-    let stmt = db.prepare("INSERT INTO pw (id, val) VALUES ($1, $2)").unwrap();
+    let stmt = db
+        .prepare("INSERT INTO pw (id, val) VALUES ($1, $2)")
+        .unwrap();
     for i in 0..20 {
-        stmt.execute(&[Value::Int64(i), Value::Text(format!("val_{i}"))]).unwrap();
+        stmt.execute(&[Value::Int64(i), Value::Text(format!("val_{i}"))])
+            .unwrap();
     }
     let r = exec(&db, "SELECT COUNT(*) FROM pw");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(20));
@@ -1150,7 +1196,6 @@ fn txn_savepoint_release() {
     assert_eq!(rows(&r)[0][0], Value::Int64(2));
 }
 
-
 // ── Tests merged from engine_coverage_tests.rs ──
 
 #[test]
@@ -1207,4 +1252,3 @@ fn rollback_discards_changes() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values(), &[Value::Int64(1)]);
 }
-

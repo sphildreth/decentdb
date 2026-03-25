@@ -4,7 +4,7 @@
 //! reopen after close, dump_sql, bulk load operations, and schema
 //! persistence across reopens.
 
-use decentdb::{Db, DbConfig, QueryResult, Value, BulkLoadOptions};
+use decentdb::{BulkLoadOptions, Db, DbConfig, QueryResult, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,7 +51,8 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
 #[test]
 fn bulk_load_basic() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, name TEXT, score INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, name TEXT, score INT64)")
+        .unwrap();
     let cols = &["id", "name", "score"];
     let data: Vec<Vec<Value>> = (0..100)
         .map(|i| {
@@ -71,7 +72,8 @@ fn bulk_load_basic() {
 #[test]
 fn bulk_load_large() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, a TEXT, b INT64, c FLOAT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, a TEXT, b INT64, c FLOAT64)")
+        .unwrap();
     let cols = &["id", "a", "b", "c"];
     let data: Vec<Vec<Value>> = (0..5000)
         .map(|i| {
@@ -113,7 +115,8 @@ fn bulk_load_no_checkpoint() {
 #[test]
 fn bulk_load_with_index() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx ON t(val)").unwrap();
     let cols = &["id", "val"];
     let data: Vec<Vec<Value>> = (0..100)
@@ -137,7 +140,9 @@ fn bulk_load_with_nulls() {
     ];
     db.bulk_load_rows("t", cols, &data, BulkLoadOptions::default())
         .unwrap();
-    let r = db.execute("SELECT COUNT(*) FROM t WHERE val IS NULL").unwrap();
+    let r = db
+        .execute("SELECT COUNT(*) FROM t WHERE val IS NULL")
+        .unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(1));
 }
 
@@ -153,7 +158,8 @@ fn checkpoint_on_memory_db() {
 #[test]
 fn decimal_in_dump_sql() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, price DECIMAL(8, 2))").unwrap();
+    db.execute("CREATE TABLE t(id INT64, price DECIMAL(8, 2))")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, 19.99)").unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CREATE TABLE"));
@@ -166,13 +172,16 @@ fn dump_sql_complex_schema() {
         .unwrap();
     db.execute("CREATE TABLE posts(id INT64 PRIMARY KEY, user_id INT64 REFERENCES users(id) ON DELETE CASCADE, title TEXT NOT NULL, body TEXT, score INT64 DEFAULT 0 CHECK (score >= 0))")
         .unwrap();
-    db.execute("CREATE INDEX idx_posts_user ON posts(user_id)").unwrap();
+    db.execute("CREATE INDEX idx_posts_user ON posts(user_id)")
+        .unwrap();
     db.execute("CREATE VIEW user_posts AS SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id")
         .unwrap();
     db.execute("CREATE TABLE audit(msg TEXT)").unwrap();
     db.execute("CREATE TRIGGER trg_post AFTER INSERT ON posts FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit VALUES (''new_post'')')").unwrap();
-    db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@test.com')").unwrap();
-    db.execute("INSERT INTO posts VALUES (1, 1, 'Hello', 'World', 5)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@test.com')")
+        .unwrap();
+    db.execute("INSERT INTO posts VALUES (1, 1, 'Hello', 'World', 5)")
+        .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CREATE TABLE"));
     assert!(sql.len() > 100);
@@ -185,14 +194,20 @@ fn dump_sql_includes_tables_and_indexes() {
     exec(&db, "CREATE INDEX ds_name ON ds (name)");
     exec(&db, "INSERT INTO ds VALUES (1, 'hello')");
     let dump = db.dump_sql().unwrap();
-    assert!(dump.contains("CREATE TABLE"), "dump should contain CREATE TABLE");
+    assert!(
+        dump.contains("CREATE TABLE"),
+        "dump should contain CREATE TABLE"
+    );
     assert!(dump.contains("INSERT"), "dump should contain INSERT");
 }
 
 #[test]
 fn dump_sql_roundtrip() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dsr (id INT PRIMARY KEY, val TEXT NOT NULL)");
+    exec(
+        &db,
+        "CREATE TABLE dsr (id INT PRIMARY KEY, val TEXT NOT NULL)",
+    );
     exec(&db, "INSERT INTO dsr VALUES (1, 'hello'), (2, 'world')");
     let dump = db.dump_sql().unwrap();
     assert!(dump.contains("CREATE TABLE"));
@@ -202,7 +217,8 @@ fn dump_sql_roundtrip() {
 #[test]
 fn dump_sql_with_bool_default() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, active BOOL DEFAULT TRUE)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, active BOOL DEFAULT TRUE)")
+        .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CREATE TABLE"));
 }
@@ -210,8 +226,10 @@ fn dump_sql_with_bool_default() {
 #[test]
 fn dump_sql_with_complex_views() {
     let db = mem_db();
-    db.execute("CREATE TABLE t1(id INT64, name TEXT, val INT64)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, label TEXT)").unwrap();
+    db.execute("CREATE TABLE t1(id INT64, name TEXT, val INT64)")
+        .unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, label TEXT)")
+        .unwrap();
     db.execute(
         "CREATE VIEW joined_v AS
          SELECT t1.name, t2.label, t1.val
@@ -239,9 +257,15 @@ fn dump_sql_with_default_values() {
 #[test]
 fn dump_sql_with_indexes_and_views() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE dump_base (id INT PRIMARY KEY, name TEXT, val INT)");
+    exec(
+        &db,
+        "CREATE TABLE dump_base (id INT PRIMARY KEY, name TEXT, val INT)",
+    );
     exec(&db, "CREATE INDEX dump_idx ON dump_base (name)");
-    exec(&db, "CREATE VIEW dump_view AS SELECT id, name FROM dump_base WHERE val > 10");
+    exec(
+        &db,
+        "CREATE VIEW dump_view AS SELECT id, name FROM dump_base WHERE val > 10",
+    );
     exec(&db, "INSERT INTO dump_base VALUES (1, 'test', 20)");
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CREATE TABLE"));
@@ -252,12 +276,15 @@ fn dump_sql_with_indexes_and_views() {
 #[test]
 fn dump_sql_with_not_null_and_defaults() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE d_full (
+    exec(
+        &db,
+        "CREATE TABLE d_full (
         id INT PRIMARY KEY,
         name TEXT NOT NULL,
         val INT DEFAULT 0,
         flag BOOLEAN DEFAULT true
-    )");
+    )",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("NOT NULL"));
     assert!(sql.contains("DEFAULT"));
@@ -266,7 +293,8 @@ fn dump_sql_with_not_null_and_defaults() {
 #[test]
 fn dump_sql_with_null_defaults() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val TEXT DEFAULT NULL)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val TEXT DEFAULT NULL)")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CREATE TABLE"));
@@ -394,10 +422,13 @@ fn file_persistence_with_fk() {
     let path_str = path.to_str().unwrap();
     {
         let db = Db::open_or_create(path_str, DbConfig::default()).unwrap();
-        db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)").unwrap();
-        db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id))").unwrap();
+        db.execute("CREATE TABLE parent(id INT64 PRIMARY KEY)")
+            .unwrap();
+        db.execute("CREATE TABLE child(id INT64, pid INT64 REFERENCES parent(id))")
+            .unwrap();
         db.execute("INSERT INTO parent VALUES (1), (2)").unwrap();
-        db.execute("INSERT INTO child VALUES (10, 1), (20, 2)").unwrap();
+        db.execute("INSERT INTO child VALUES (10, 1), (20, 2)")
+            .unwrap();
         db.checkpoint().unwrap();
     }
     {
@@ -414,9 +445,11 @@ fn file_persistence_with_index() {
     let path_str = path.to_str().unwrap();
     {
         let db = Db::open_or_create(path_str, DbConfig::default()).unwrap();
-        db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta')").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta')")
+            .unwrap();
         db.checkpoint().unwrap();
     }
     {
@@ -434,7 +467,8 @@ fn file_persistence_with_views_and_triggers() {
     {
         let db = Db::open_or_create(path_str, DbConfig::default()).unwrap();
         db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-        db.execute("CREATE VIEW v AS SELECT id, val FROM t WHERE id > 0").unwrap();
+        db.execute("CREATE VIEW v AS SELECT id, val FROM t WHERE id > 0")
+            .unwrap();
         db.execute("CREATE TABLE log(msg TEXT)").unwrap();
         db.execute("CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''row_added'')')").unwrap();
         db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
@@ -488,7 +522,8 @@ fn persist_delete_and_reinsert() {
     let ps = path.to_str().unwrap();
     {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
-        db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+            .unwrap();
         for i in 0..50 {
             db.execute(&format!("INSERT INTO t VALUES ({}, 'v_{}')", i, i))
                 .unwrap();
@@ -576,9 +611,7 @@ fn persist_many_tables() {
     {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
         for i in 0..20 {
-            let r = db
-                .execute(&format!("SELECT COUNT(*) FROM t{}", i))
-                .unwrap();
+            let r = db.execute(&format!("SELECT COUNT(*) FROM t{}", i)).unwrap();
             assert_eq!(rows(&r)[0][0], Value::Int64(1));
         }
     }
@@ -597,7 +630,8 @@ fn persist_schema_changes_across_opens() {
     }
     {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
-        db.execute("CREATE TABLE t2(id INT64, ref_id INT64 REFERENCES t1(id))").unwrap();
+        db.execute("CREATE TABLE t2(id INT64, ref_id INT64 REFERENCES t1(id))")
+            .unwrap();
         db.execute("INSERT INTO t2 VALUES (10, 1)").unwrap();
         db.execute("CREATE INDEX idx ON t2(ref_id)").unwrap();
         db.checkpoint().unwrap();
@@ -605,7 +639,8 @@ fn persist_schema_changes_across_opens() {
     {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
         db.execute("ALTER TABLE t1 ADD COLUMN name TEXT").unwrap();
-        db.execute("UPDATE t1 SET name = 'hello' WHERE id = 1").unwrap();
+        db.execute("UPDATE t1 SET name = 'hello' WHERE id = 1")
+            .unwrap();
         db.checkpoint().unwrap();
     }
     {
@@ -627,8 +662,10 @@ fn persist_update_and_delete() {
     {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
         db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-        db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
-        db.execute("UPDATE t SET val = 'updated' WHERE id = 2").unwrap();
+        db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+        db.execute("UPDATE t SET val = 'updated' WHERE id = 2")
+            .unwrap();
         db.execute("DELETE FROM t WHERE id = 3").unwrap();
         db.checkpoint().unwrap();
     }
@@ -720,7 +757,8 @@ fn wal_checkpoint_and_reopen() {
             db.execute_with_params(
                 "INSERT INTO t VALUES ($1, $2)",
                 &[Value::Int64(i), Value::Text(format!("val_{}", i))],
-            ).unwrap();
+            )
+            .unwrap();
         }
         db.checkpoint().unwrap();
     }
@@ -740,10 +778,8 @@ fn wal_recovery_after_crash() {
         let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
         db.execute("CREATE TABLE t(id INT64)").unwrap();
         for i in 0..100 {
-            db.execute_with_params(
-                "INSERT INTO t VALUES ($1)",
-                &[Value::Int64(i)],
-            ).unwrap();
+            db.execute_with_params("INSERT INTO t VALUES ($1)", &[Value::Int64(i)])
+                .unwrap();
         }
         // Don't checkpoint — leave data in WAL
     }
@@ -762,7 +798,8 @@ fn wal_recovery_after_reopen() {
 
     {
         let db = Db::open_or_create(path.to_str().unwrap(), DbConfig::default()).unwrap();
-        db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
         db.execute("INSERT INTO t VALUES (2, 'world')").unwrap();
     }
@@ -806,12 +843,14 @@ fn wal_recovery_partial_checkpoint() {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
         db.execute("CREATE TABLE t(id INT64)").unwrap();
         for i in 0..20 {
-            db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({})", i))
+                .unwrap();
         }
         db.checkpoint().unwrap();
         // More writes after checkpoint
         for i in 20..40 {
-            db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+            db.execute(&format!("INSERT INTO t VALUES ({})", i))
+                .unwrap();
         }
         drop(db);
     }
@@ -846,7 +885,6 @@ fn wal_recovery_with_checkpoint_and_more_writes() {
         assert_eq!(rows[0][0], Value::Int64(150));
     }
 }
-
 
 // ── Tests merged from row_id_persistence_tests.rs ──
 
@@ -888,4 +926,3 @@ fn reopen_preserves_internal_next_row_id_for_rowid_tables() {
     drop(reopened);
     cleanup_db(&path);
 }
-

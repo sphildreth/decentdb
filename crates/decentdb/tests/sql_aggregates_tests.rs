@@ -22,7 +22,8 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
 fn agg_count_distinct() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)")
+        .unwrap();
     let r = db.execute("SELECT COUNT(DISTINCT x) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(3));
 }
@@ -31,7 +32,8 @@ fn agg_count_distinct() {
 fn agg_count_sum_avg_min_max() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (10),(20),(30),(40),(50)").unwrap();
+    db.execute("INSERT INTO t VALUES (10),(20),(30),(40),(50)")
+        .unwrap();
     let r = db
         .execute("SELECT COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t")
         .unwrap();
@@ -45,8 +47,10 @@ fn agg_count_sum_avg_min_max() {
 #[test]
 fn agg_group_by_multiple_cols() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a TEXT, b TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('X','Y',1),('X','Y',2),('X','Z',3),('W','Y',4)").unwrap();
+    db.execute("CREATE TABLE t(a TEXT, b TEXT, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES ('X','Y',1),('X','Y',2),('X','Z',3),('W','Y',4)")
+        .unwrap();
     let r = db
         .execute("SELECT a, b, SUM(val) FROM t GROUP BY a, b ORDER BY a, b")
         .unwrap();
@@ -58,7 +62,8 @@ fn agg_group_by_multiple_cols() {
 fn agg_having_filter() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',10),('B',20),('C',100)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',10),('B',20),('C',100)")
+        .unwrap();
     let r = db
         .execute("SELECT grp, SUM(val) AS s FROM t GROUP BY grp HAVING SUM(val) > 5 ORDER BY grp")
         .unwrap();
@@ -71,7 +76,10 @@ fn agg_having_filter() {
 fn aggregate_avg() {
     let db = mem_db();
     exec(&db, "CREATE TABLE avg_t (id INT PRIMARY KEY, val FLOAT)");
-    exec(&db, "INSERT INTO avg_t VALUES (1, 10.0), (2, 20.0), (3, 30.0)");
+    exec(
+        &db,
+        "INSERT INTO avg_t VALUES (1, 10.0), (2, 20.0), (3, 30.0)",
+    );
     let r = exec(&db, "SELECT AVG(val) FROM avg_t");
     assert_eq!(r.rows().len(), 1);
 }
@@ -80,7 +88,8 @@ fn aggregate_avg() {
 fn aggregate_bool_and_or() {
     let db = mem_db();
     db.execute("CREATE TABLE t(flag BOOL)").unwrap();
-    db.execute("INSERT INTO t VALUES (TRUE),(TRUE),(FALSE)").unwrap();
+    db.execute("INSERT INTO t VALUES (TRUE),(TRUE),(FALSE)")
+        .unwrap();
     let r = db.execute("SELECT BOOL_AND(flag), BOOL_OR(flag) FROM t");
     if let Ok(r) = r {
         let v = rows(&r);
@@ -93,10 +102,9 @@ fn aggregate_bool_and_or() {
 fn aggregate_count_distinct() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)").unwrap();
-    let r = db
-        .execute("SELECT COUNT(DISTINCT val) FROM t")
+    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)")
         .unwrap();
+    let r = db.execute("SELECT COUNT(DISTINCT val) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(3));
 }
 
@@ -105,7 +113,9 @@ fn aggregate_empty_group_by() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
     // No data — GROUP BY should return no rows
-    let r = db.execute("SELECT grp, SUM(val) FROM t GROUP BY grp").unwrap();
+    let r = db
+        .execute("SELECT grp, SUM(val) FROM t GROUP BY grp")
+        .unwrap();
     assert_eq!(rows(&r).len(), 0);
 }
 
@@ -113,7 +123,8 @@ fn aggregate_empty_group_by() {
 fn aggregate_min_max_on_text() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('charlie'),('alice'),('bob')").unwrap();
+    db.execute("INSERT INTO t VALUES ('charlie'),('alice'),('bob')")
+        .unwrap();
     let r = db.execute("SELECT MIN(name), MAX(name) FROM t").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Text("alice".into()));
@@ -124,7 +135,8 @@ fn aggregate_min_max_on_text() {
 fn aggregate_min_max_text() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('Charlie'),('Alice'),('Bob')").unwrap();
+    db.execute("INSERT INTO t VALUES ('Charlie'),('Alice'),('Bob')")
+        .unwrap();
     let r = db.execute("SELECT MIN(name), MAX(name) FROM t").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Text("Alice".into()));
@@ -150,9 +162,18 @@ fn aggregate_on_empty_table() {
 #[test]
 fn aggregate_string_agg() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE str_agg (id INT PRIMARY KEY, grp TEXT, val TEXT)");
-    exec(&db, "INSERT INTO str_agg VALUES (1, 'a', 'x'), (2, 'a', 'y'), (3, 'b', 'z')");
-    let r = exec(&db, "SELECT grp, STRING_AGG(val, ',') FROM str_agg GROUP BY grp ORDER BY grp");
+    exec(
+        &db,
+        "CREATE TABLE str_agg (id INT PRIMARY KEY, grp TEXT, val TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO str_agg VALUES (1, 'a', 'x'), (2, 'a', 'y'), (3, 'b', 'z')",
+    );
+    let r = exec(
+        &db,
+        "SELECT grp, STRING_AGG(val, ',') FROM str_agg GROUP BY grp ORDER BY grp",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
@@ -160,7 +181,8 @@ fn aggregate_string_agg() {
 fn aggregate_sum_mixed_null() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (10),(NULL),(20),(NULL),(30)").unwrap();
+    db.execute("INSERT INTO t VALUES (10),(NULL),(20),(NULL),(30)")
+        .unwrap();
     let r = db.execute("SELECT SUM(val) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(60));
 }
@@ -169,7 +191,8 @@ fn aggregate_sum_mixed_null() {
 fn aggregate_with_all_nulls() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (NULL),(NULL),(NULL)").unwrap();
+    db.execute("INSERT INTO t VALUES (NULL),(NULL),(NULL)")
+        .unwrap();
     let r = db
         .execute("SELECT COUNT(*), COUNT(val), SUM(val), MIN(val), MAX(val) FROM t")
         .unwrap();
@@ -183,8 +206,11 @@ fn aggregate_with_all_nulls() {
 fn aggregate_with_null_values() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL),(5)").unwrap();
-    let r = db.execute("SELECT COUNT(*), COUNT(val), SUM(val), AVG(val) FROM t").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL),(5)")
+        .unwrap();
+    let r = db
+        .execute("SELECT COUNT(*), COUNT(val), SUM(val), AVG(val) FROM t")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(5)); // COUNT(*) includes NULLs
     assert_eq!(v[0][1], Value::Int64(3)); // COUNT(val) excludes NULLs
@@ -214,7 +240,10 @@ fn complex_analytics_query() {
 #[test]
 fn complex_reporting_query() {
     let db = mem_db();
-    db.execute("CREATE TABLE orders(id INT64, customer TEXT, product TEXT, amount INT64, qty INT64)").unwrap();
+    db.execute(
+        "CREATE TABLE orders(id INT64, customer TEXT, product TEXT, amount INT64, qty INT64)",
+    )
+    .unwrap();
     db.execute("INSERT INTO orders VALUES (1,'Alice','Widget',100,2),(2,'Alice','Gadget',200,1),(3,'Bob','Widget',150,3),(4,'Bob','Widget',50,1),(5,'Charlie','Gadget',300,2)").unwrap();
 
     // Revenue by customer
@@ -250,10 +279,17 @@ fn count_distinct() {
 #[test]
 fn count_star_vs_count_col_vs_count_distinct() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE csd (id INT PRIMARY KEY, cat TEXT, val INT)");
-    exec(&db, "INSERT INTO csd VALUES (1, 'A', 10), (2, 'A', 10), (3, 'A', NULL), (4, 'B', 20)");
-    let r = exec(&db,
-        "SELECT cat, COUNT(*), COUNT(val), COUNT(DISTINCT val) FROM csd GROUP BY cat ORDER BY cat"
+    exec(
+        &db,
+        "CREATE TABLE csd (id INT PRIMARY KEY, cat TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO csd VALUES (1, 'A', 10), (2, 'A', 10), (3, 'A', NULL), (4, 'B', 20)",
+    );
+    let r = exec(
+        &db,
+        "SELECT cat, COUNT(*), COUNT(val), COUNT(DISTINCT val) FROM csd GROUP BY cat ORDER BY cat",
     );
     // A: count(*)=3, count(val)=2 (NULL excluded), count(distinct val)=1 (just 10)
     assert_eq!(r.rows().len(), 2);
@@ -288,7 +324,9 @@ fn explain_aggregate_shows_group_by() {
     let db = mem_db();
     db.execute("CREATE TABLE t (cat TEXT, val INT64)").unwrap();
 
-    let result = db.execute("EXPLAIN SELECT cat, SUM(val) FROM t GROUP BY cat").unwrap();
+    let result = db
+        .execute("EXPLAIN SELECT cat, SUM(val) FROM t GROUP BY cat")
+        .unwrap();
     let text = format!("{:?}", rows(&result));
     assert!(!text.is_empty());
 }
@@ -315,7 +353,8 @@ fn explain_group_by_having() {
 fn expression_in_group_by() {
     let db = mem_db();
     db.execute("CREATE TABLE t(name TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('Alice',10),('alice',20),('BOB',30),('bob',40)").unwrap();
+    db.execute("INSERT INTO t VALUES ('Alice',10),('alice',20),('BOB',30),('bob',40)")
+        .unwrap();
     let r = db
         .execute("SELECT LOWER(name) AS lname, SUM(val) AS total FROM t GROUP BY LOWER(name) ORDER BY lname")
         .unwrap();
@@ -329,7 +368,10 @@ fn expression_in_group_by() {
 fn group_by_case_expression() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gbc (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO gbc VALUES (1, 10), (2, 20), (3, 10), (4, 30)");
+    exec(
+        &db,
+        "INSERT INTO gbc VALUES (1, 10), (2, 20), (3, 10), (4, 30)",
+    );
     let r = exec(
         &db,
         "SELECT CASE WHEN val > 15 THEN 'high' ELSE 'low' END as bucket, COUNT(*)
@@ -343,7 +385,10 @@ fn group_by_case_expression() {
 fn group_by_cast_expression() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gbcast (id INT PRIMARY KEY, val FLOAT)");
-    exec(&db, "INSERT INTO gbcast VALUES (1, 1.5), (2, 2.5), (3, 1.5)");
+    exec(
+        &db,
+        "INSERT INTO gbcast VALUES (1, 1.5), (2, 2.5), (3, 1.5)",
+    );
     let r = exec(
         &db,
         "SELECT CAST(val AS INT) as int_val, COUNT(*)
@@ -357,8 +402,14 @@ fn group_by_cast_expression() {
 fn group_by_expression_not_just_column() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gbe (id INT PRIMARY KEY, val INT)");
-    exec(&db, "INSERT INTO gbe VALUES (1, 10), (2, 15), (3, 20), (4, 25)");
-    let r = exec(&db, "SELECT val / 10 AS bucket, COUNT(*) FROM gbe GROUP BY val / 10 ORDER BY bucket");
+    exec(
+        &db,
+        "INSERT INTO gbe VALUES (1, 10), (2, 15), (3, 20), (4, 25)",
+    );
+    let r = exec(
+        &db,
+        "SELECT val / 10 AS bucket, COUNT(*) FROM gbe GROUP BY val / 10 ORDER BY bucket",
+    );
     assert_eq!(r.rows().len(), 2); // bucket 1 and 2
 }
 
@@ -366,9 +417,12 @@ fn group_by_expression_not_just_column() {
 fn group_by_having() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',10),('A',20),('B',5),('B',3),('C',100)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A',10),('A',20),('B',5),('B',3),('C',100)")
+        .unwrap();
     let r = db
-        .execute("SELECT grp, SUM(val) AS total FROM t GROUP BY grp HAVING SUM(val) > 10 ORDER BY grp")
+        .execute(
+            "SELECT grp, SUM(val) AS total FROM t GROUP BY grp HAVING SUM(val) > 10 ORDER BY grp",
+        )
         .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2); // A=30, C=100
@@ -377,9 +431,18 @@ fn group_by_having() {
 #[test]
 fn group_by_having_filter() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE gh (id INT PRIMARY KEY, cat TEXT, val INT)");
-    exec(&db, "INSERT INTO gh VALUES (1,'A',1),(2,'A',2),(3,'B',3),(4,'B',4),(5,'B',5)");
-    let r = exec(&db, "SELECT cat, SUM(val) AS s FROM gh GROUP BY cat HAVING SUM(val) > 5");
+    exec(
+        &db,
+        "CREATE TABLE gh (id INT PRIMARY KEY, cat TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO gh VALUES (1,'A',1),(2,'A',2),(3,'B',3),(4,'B',4),(5,'B',5)",
+    );
+    let r = exec(
+        &db,
+        "SELECT cat, SUM(val) AS s FROM gh GROUP BY cat HAVING SUM(val) > 5",
+    );
     assert_eq!(r.rows().len(), 1);
     assert_eq!(r.rows()[0].values()[0], Value::Text("B".into()));
 }
@@ -388,7 +451,10 @@ fn group_by_having_filter() {
 fn group_by_in_list_expression() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gbil (id INT PRIMARY KEY, status TEXT)");
-    exec(&db, "INSERT INTO gbil VALUES (1, 'active'), (2, 'pending'), (3, 'active'), (4, 'closed')");
+    exec(
+        &db,
+        "INSERT INTO gbil VALUES (1, 'active'), (2, 'pending'), (3, 'active'), (4, 'closed')",
+    );
     let r = exec(
         &db,
         "SELECT status IN ('active', 'pending') as is_open, COUNT(*)
@@ -402,7 +468,10 @@ fn group_by_in_list_expression() {
 fn group_by_is_null_expression() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gbin (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO gbin VALUES (1, 'a'), (2, NULL), (3, 'b'), (4, NULL)");
+    exec(
+        &db,
+        "INSERT INTO gbin VALUES (1, 'a'), (2, NULL), (3, 'b'), (4, NULL)",
+    );
     let r = exec(
         &db,
         "SELECT val IS NULL as is_nil, COUNT(*) FROM gbin GROUP BY val IS NULL ORDER BY is_nil",
@@ -414,7 +483,10 @@ fn group_by_is_null_expression() {
 fn group_by_like_expression() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gbl (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "INSERT INTO gbl VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Alicia'), (4, 'Charlie')");
+    exec(
+        &db,
+        "INSERT INTO gbl VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Alicia'), (4, 'Charlie')",
+    );
     let r = exec(
         &db,
         "SELECT name LIKE 'Al%' as starts_al, COUNT(*)
@@ -427,8 +499,10 @@ fn group_by_like_expression() {
 #[test]
 fn group_by_multiple_columns() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a TEXT, b TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('X','Y',1),('X','Y',2),('X','Z',3),('W','Y',4)").unwrap();
+    db.execute("CREATE TABLE t(a TEXT, b TEXT, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES ('X','Y',1),('X','Y',2),('X','Z',3),('W','Y',4)")
+        .unwrap();
     let r = db
         .execute("SELECT a, b, SUM(val) AS total FROM t GROUP BY a, b ORDER BY a, b")
         .unwrap();
@@ -447,7 +521,8 @@ fn group_by_on_empty_table() {
 #[test]
 fn group_by_with_between_in_having() {
     let db = mem_db();
-    db.execute("CREATE TABLE sales (region TEXT, amount INT64)").unwrap();
+    db.execute("CREATE TABLE sales (region TEXT, amount INT64)")
+        .unwrap();
     db.execute("INSERT INTO sales VALUES ('A', 10), ('A', 20), ('B', 5), ('B', 50), ('C', 100)")
         .unwrap();
 
@@ -466,8 +541,10 @@ fn group_by_with_between_in_having() {
 #[test]
 fn group_by_with_case_expression() {
     let db = mem_db();
-    db.execute("CREATE TABLE scores (team TEXT, pts INT64)").unwrap();
-    db.execute("INSERT INTO scores VALUES ('A', 10), ('A', 20), ('B', 5)").unwrap();
+    db.execute("CREATE TABLE scores (team TEXT, pts INT64)")
+        .unwrap();
+    db.execute("INSERT INTO scores VALUES ('A', 10), ('A', 20), ('B', 5)")
+        .unwrap();
 
     let result = db
         .execute(
@@ -484,14 +561,20 @@ fn group_by_with_case_expression() {
 fn group_by_with_case_in_select() {
     let db = mem_db();
     exec(&db, "CREATE TABLE sales (region TEXT, amount INT)");
-    exec(&db, "INSERT INTO sales VALUES ('east', 100), ('east', 200), ('west', 50), ('west', 150)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO sales VALUES ('east', 100), ('east', 200), ('west', 50), ('west', 150)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT region,
             CASE WHEN SUM(amount) > 200 THEN 'high' ELSE 'low' END as level
         FROM sales
         GROUP BY region
         ORDER BY region
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
     assert_eq!(r.rows()[0].values()[1], Value::Text("high".to_string()));
     assert_eq!(r.rows()[1].values()[1], Value::Text("low".to_string()));
@@ -500,13 +583,13 @@ fn group_by_with_case_in_select() {
 #[test]
 fn group_by_with_cast_and_coalesce() {
     let db = mem_db();
-    db.execute("CREATE TABLE nums (grp TEXT, val TEXT)").unwrap();
-    db.execute("INSERT INTO nums VALUES ('a', '10'), ('a', '20'), ('b', NULL)").unwrap();
+    db.execute("CREATE TABLE nums (grp TEXT, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO nums VALUES ('a', '10'), ('a', '20'), ('b', NULL)")
+        .unwrap();
 
     let result = db
-        .execute(
-            "SELECT grp, COALESCE(MAX(val), 'none') FROM nums GROUP BY grp ORDER BY grp",
-        )
+        .execute("SELECT grp, COALESCE(MAX(val), 'none') FROM nums GROUP BY grp ORDER BY grp")
         .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][1], Value::Text("20".into()));
@@ -517,13 +600,19 @@ fn group_by_with_cast_and_coalesce() {
 fn group_by_with_cast_in_select() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gh_cast (grp TEXT, val INT)");
-    exec(&db, "INSERT INTO gh_cast VALUES ('a', 10), ('a', 20), ('b', 30)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO gh_cast VALUES ('a', 10), ('a', 20), ('b', 30)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, CAST(SUM(val) AS TEXT) as sum_text
         FROM gh_cast
         GROUP BY grp
         ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
     assert_eq!(r.rows()[0].values()[1], Value::Text("30".to_string()));
 }
@@ -532,21 +621,29 @@ fn group_by_with_cast_in_select() {
 fn group_by_with_function_in_select() {
     let db = mem_db();
     exec(&db, "CREATE TABLE words (grp INT, word TEXT)");
-    exec(&db, "INSERT INTO words VALUES (1, 'hello'), (1, 'WORLD'), (2, 'foo')");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO words VALUES (1, 'hello'), (1, 'WORLD'), (2, 'foo')",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, upper(MIN(word)) as upper_min
         FROM words 
         GROUP BY grp 
         ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
 #[test]
 fn group_by_with_in_list_filter() {
     let db = mem_db();
-    db.execute("CREATE TABLE items (cat TEXT, price INT64)").unwrap();
-    db.execute("INSERT INTO items VALUES ('X', 1), ('X', 2), ('Y', 3), ('Z', 4)").unwrap();
+    db.execute("CREATE TABLE items (cat TEXT, price INT64)")
+        .unwrap();
+    db.execute("INSERT INTO items VALUES ('X', 1), ('X', 2), ('Y', 3), ('Z', 4)")
+        .unwrap();
 
     let result = db
         .execute(
@@ -563,13 +660,19 @@ fn group_by_with_in_list_filter() {
 fn group_by_with_in_list_having() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gh_in (grp TEXT, val INT)");
-    exec(&db, "INSERT INTO gh_in VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO gh_in VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp FROM gh_in
         GROUP BY grp
         HAVING SUM(val) IN (1, 3, 5)
         ORDER BY grp
-    ");
+    ",
+    );
     assert!(!r.rows().is_empty());
 }
 
@@ -577,23 +680,31 @@ fn group_by_with_in_list_having() {
 fn group_by_with_is_null_check() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gh_null (grp TEXT, val INT)");
-    exec(&db, "INSERT INTO gh_null VALUES ('a', NULL), ('a', NULL), ('b', 1), ('b', 2)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO gh_null VALUES ('a', NULL), ('a', NULL), ('b', 1), ('b', 2)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, MIN(val) IS NULL as all_null
         FROM gh_null
         GROUP BY grp
         ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
-    assert_eq!(r.rows()[0].values()[1], Value::Bool(true));  // 'a' has all NULLs
+    assert_eq!(r.rows()[0].values()[1], Value::Bool(true)); // 'a' has all NULLs
     assert_eq!(r.rows()[1].values()[1], Value::Bool(false)); // 'b' has values
 }
 
 #[test]
 fn group_by_with_like_filter() {
     let db = mem_db();
-    db.execute("CREATE TABLE tags (prefix TEXT, n INT64)").unwrap();
-    db.execute("INSERT INTO tags VALUES ('abc', 1), ('abc', 2), ('xyz', 3), ('xbc', 4)").unwrap();
+    db.execute("CREATE TABLE tags (prefix TEXT, n INT64)")
+        .unwrap();
+    db.execute("INSERT INTO tags VALUES ('abc', 1), ('abc', 2), ('xyz', 3), ('xbc', 4)")
+        .unwrap();
 
     let result = db
         .execute(
@@ -608,13 +719,19 @@ fn group_by_with_like_filter() {
 fn group_by_with_like_in_having() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gh_like (grp TEXT, val TEXT)");
-    exec(&db, "INSERT INTO gh_like VALUES ('alpha', 'x'), ('beta', 'y'), ('gamma', 'z')");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO gh_like VALUES ('alpha', 'x'), ('beta', 'y'), ('gamma', 'z')",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, MIN(val) as min_val
         FROM gh_like
         GROUP BY grp
         HAVING grp LIKE 'a%'
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 1);
 }
 
@@ -622,19 +739,27 @@ fn group_by_with_like_in_having() {
 fn group_by_with_lower_of_max() {
     let db = mem_db();
     exec(&db, "CREATE TABLE glm (grp INT, val TEXT)");
-    exec(&db, "INSERT INTO glm VALUES (1, 'ALPHA'), (1, 'BETA'), (2, 'GAMMA')");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO glm VALUES (1, 'ALPHA'), (1, 'BETA'), (2, 'GAMMA')",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, lower(MAX(val)) as lo_max
         FROM glm GROUP BY grp ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows()[0].values()[1], Value::Text("beta".to_string()));
 }
 
 #[test]
 fn group_by_with_lower_upper_trim() {
     let db = mem_db();
-    db.execute("CREATE TABLE names (grp INT64, name TEXT)").unwrap();
-    db.execute("INSERT INTO names VALUES (1, ' Alice '), (1, ' BOB '), (2, 'charlie')").unwrap();
+    db.execute("CREATE TABLE names (grp INT64, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO names VALUES (1, ' Alice '), (1, ' BOB '), (2, 'charlie')")
+        .unwrap();
 
     // String functions on non-aggregate columns in grouped query
     let result = db
@@ -654,13 +779,19 @@ fn group_by_with_lower_upper_trim() {
 fn group_by_with_negation_in_select() {
     let db = mem_db();
     exec(&db, "CREATE TABLE measurements (category TEXT, value INT)");
-    exec(&db, "INSERT INTO measurements VALUES ('a', 10), ('a', 20), ('b', 30)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO measurements VALUES ('a', 10), ('a', 20), ('b', 30)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT category, -SUM(value) as neg_sum 
         FROM measurements 
         GROUP BY category 
         ORDER BY category
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
     assert_eq!(r.rows()[0].values()[1], Value::Int64(-30));
     assert_eq!(r.rows()[1].values()[1], Value::Int64(-30));
@@ -670,14 +801,20 @@ fn group_by_with_negation_in_select() {
 fn group_by_with_not_in_having() {
     let db = mem_db();
     exec(&db, "CREATE TABLE flags (grp TEXT, active BOOLEAN)");
-    exec(&db, "INSERT INTO flags VALUES ('x', true), ('x', false), ('y', true), ('y', true)");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO flags VALUES ('x', true), ('x', false), ('y', true), ('y', true)",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, COUNT(*) as cnt
         FROM flags 
         GROUP BY grp
         HAVING NOT (COUNT(*) < 2)
         ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
@@ -685,7 +822,8 @@ fn group_by_with_not_in_having() {
 fn group_by_with_null_group() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',1),('A',2),(NULL,3),(NULL,4)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A',1),('A',2),(NULL,3),(NULL,4)")
+        .unwrap();
     let r = db
         .execute("SELECT grp, SUM(val) FROM t GROUP BY grp ORDER BY grp")
         .unwrap();
@@ -696,13 +834,13 @@ fn group_by_with_null_group() {
 #[test]
 fn group_by_with_nullif_and_length() {
     let db = mem_db();
-    db.execute("CREATE TABLE words (cat TEXT, word TEXT)").unwrap();
-    db.execute("INSERT INTO words VALUES ('a', 'hi'), ('a', ''), ('b', 'hello')").unwrap();
+    db.execute("CREATE TABLE words (cat TEXT, word TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO words VALUES ('a', 'hi'), ('a', ''), ('b', 'hello')")
+        .unwrap();
 
     let result = db
-        .execute(
-            "SELECT cat, LENGTH(MAX(NULLIF(word, ''))) FROM words GROUP BY cat ORDER BY cat",
-        )
+        .execute("SELECT cat, LENGTH(MAX(NULLIF(word, ''))) FROM words GROUP BY cat ORDER BY cat")
         .unwrap();
     let rows = rows(&result);
     assert_eq!(rows[0][1], Value::Int64(2));
@@ -713,22 +851,37 @@ fn group_by_with_nullif_and_length() {
 fn group_by_with_trim_of_min() {
     let db = mem_db();
     exec(&db, "CREATE TABLE gtm (grp INT, val TEXT)");
-    exec(&db, "INSERT INTO gtm VALUES (1, '  hello  '), (1, '  world  ')");
+    exec(
+        &db,
+        "INSERT INTO gtm VALUES (1, '  hello  '), (1, '  world  ')",
+    );
     // trim(MIN(val)) fails — use a subquery or CASE instead
-    let r = exec(&db, "
+    let r = exec(
+        &db,
+        "
         SELECT grp, MIN(val) as min_val
         FROM gtm GROUP BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 1);
 }
 
 #[test]
 fn group_by_with_unary_not_negate() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE gun (id INT PRIMARY KEY, flag BOOL, val INT)");
-    exec(&db, "INSERT INTO gun VALUES (1, true, 10), (2, false, 20), (3, true, 30)");
+    exec(
+        &db,
+        "CREATE TABLE gun (id INT PRIMARY KEY, flag BOOL, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO gun VALUES (1, true, 10), (2, false, 20), (3, true, 30)",
+    );
     // Group by negated value
-    let r = exec(&db, "SELECT -val / 10 AS neg_bucket, COUNT(*) FROM gun GROUP BY -val / 10");
+    let r = exec(
+        &db,
+        "SELECT -val / 10 AS neg_bucket, COUNT(*) FROM gun GROUP BY -val / 10",
+    );
     assert!(r.rows().len() >= 2);
 }
 
@@ -736,19 +889,31 @@ fn group_by_with_unary_not_negate() {
 fn group_by_with_upper_of_min() {
     let db = mem_db();
     exec(&db, "CREATE TABLE guf (grp INT, val TEXT)");
-    exec(&db, "INSERT INTO guf VALUES (1, 'alpha'), (1, 'beta'), (2, 'gamma')");
-    let r = exec(&db, "
+    exec(
+        &db,
+        "INSERT INTO guf VALUES (1, 'alpha'), (1, 'beta'), (2, 'gamma')",
+    );
+    let r = exec(
+        &db,
+        "
         SELECT grp, upper(MIN(val)) as up_min
         FROM guf GROUP BY grp ORDER BY grp
-    ");
+    ",
+    );
     assert_eq!(r.rows()[0].values()[1], Value::Text("ALPHA".to_string()));
 }
 
 #[test]
 fn having_filters_groups() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE hfg (id INT PRIMARY KEY, grp TEXT, val INT)");
-    exec(&db, "INSERT INTO hfg VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'b', 6)");
+    exec(
+        &db,
+        "CREATE TABLE hfg (id INT PRIMARY KEY, grp TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO hfg VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'b', 6)",
+    );
     let r = exec(
         &db,
         "SELECT grp, SUM(val) as total FROM hfg GROUP BY grp HAVING SUM(val) > 15 ORDER BY grp",
@@ -762,7 +927,9 @@ fn having_without_group_by() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
-    let r = db.execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 2").unwrap();
+    let r = db
+        .execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 2")
+        .unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(3));
 }
 
@@ -859,7 +1026,8 @@ fn complex_nested_subquery_with_join() {
 #[test]
 fn complex_group_by_having_order_limit() {
     let db = mem_db();
-    db.execute("CREATE TABLE sales(product TEXT, amount INT64)").unwrap();
+    db.execute("CREATE TABLE sales(product TEXT, amount INT64)")
+        .unwrap();
     db.execute(
         "INSERT INTO sales VALUES ('A',10),('A',20),('B',5),('B',50),('C',100),('C',1),('D',1)",
     )
@@ -881,12 +1049,18 @@ fn complex_group_by_having_order_limit() {
 #[test]
 fn complex_multi_join_with_aggregates() {
     let db = mem_db();
-    db.execute("CREATE TABLE customers(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE TABLE orders(id INT64, cust_id INT64, total FLOAT64)").unwrap();
-    db.execute("CREATE TABLE items(id INT64, order_id INT64, qty INT64)").unwrap();
-    db.execute("INSERT INTO customers VALUES (1,'Alice'),(2,'Bob')").unwrap();
-    db.execute("INSERT INTO orders VALUES (10,1,100.0),(20,1,200.0),(30,2,50.0)").unwrap();
-    db.execute("INSERT INTO items VALUES (100,10,2),(101,10,3),(102,20,1),(103,30,5)").unwrap();
+    db.execute("CREATE TABLE customers(id INT64, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders(id INT64, cust_id INT64, total FLOAT64)")
+        .unwrap();
+    db.execute("CREATE TABLE items(id INT64, order_id INT64, qty INT64)")
+        .unwrap();
+    db.execute("INSERT INTO customers VALUES (1,'Alice'),(2,'Bob')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10,1,100.0),(20,1,200.0),(30,2,50.0)")
+        .unwrap();
+    db.execute("INSERT INTO items VALUES (100,10,2),(101,10,3),(102,20,1),(103,30,5)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT c.name, SUM(i.qty) AS total_qty
@@ -907,12 +1081,12 @@ fn complex_multi_join_with_aggregates() {
 #[test]
 fn complex_case_in_update() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, status TEXT, priority INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'new',1),(2,'new',5),(3,'old',3)").unwrap();
-    db.execute(
-        "UPDATE t SET status = CASE WHEN priority > 3 THEN 'high' ELSE 'low' END",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, status TEXT, priority INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'new',1),(2,'new',5),(3,'old',3)")
+        .unwrap();
+    db.execute("UPDATE t SET status = CASE WHEN priority > 3 THEN 'high' ELSE 'low' END")
+        .unwrap();
     let r = db.execute("SELECT id, status FROM t ORDER BY id").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][1], Value::Text("low".into()));
@@ -924,10 +1098,13 @@ fn complex_case_in_update() {
 fn complex_insert_from_cte() {
     let db = mem_db();
     db.execute("CREATE TABLE src(id INT64, val INT64)").unwrap();
-    db.execute("CREATE TABLE dst(id INT64, doubled INT64)").unwrap();
-    db.execute("INSERT INTO src VALUES (1,10),(2,20),(3,30)").unwrap();
+    db.execute("CREATE TABLE dst(id INT64, doubled INT64)")
+        .unwrap();
+    db.execute("INSERT INTO src VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
     // CTE in INSERT may not be supported; use INSERT...SELECT instead
-    db.execute("INSERT INTO dst SELECT id, val * 2 FROM src").unwrap();
+    db.execute("INSERT INTO dst SELECT id, val * 2 FROM src")
+        .unwrap();
     let r = db.execute("SELECT * FROM dst ORDER BY id").unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 3);
@@ -937,10 +1114,14 @@ fn complex_insert_from_cte() {
 #[test]
 fn complex_correlated_subquery_update() {
     let db = mem_db();
-    db.execute("CREATE TABLE t1(id INT64 PRIMARY KEY, val INT64)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, bonus INT64)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1, 100),(2, 200)").unwrap();
-    db.execute("INSERT INTO t2 VALUES (10, 1, 5),(20, 1, 10),(30, 2, 20)").unwrap();
+    db.execute("CREATE TABLE t1(id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, bonus INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 100),(2, 200)")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (10, 1, 5),(20, 1, 10),(30, 2, 20)")
+        .unwrap();
     db.execute(
         "UPDATE t1 SET val = val + (SELECT COALESCE(SUM(bonus), 0) FROM t2 WHERE t2.t1_id = t1.id)",
     )
@@ -978,8 +1159,10 @@ fn complex_union_with_cte_and_join() {
 #[test]
 fn types_boolean() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, flag BOOLEAN)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, flag BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, TRUE), (2, FALSE)")
+        .unwrap();
     let r = db.execute("SELECT flag FROM t WHERE flag = TRUE").unwrap();
     assert_eq!(rows(&r).len(), 1);
 }
@@ -1015,22 +1198,26 @@ fn types_decimal() {
 fn types_null_handling_in_aggregates() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL),(5)")
+        .unwrap();
     let r = db
         .execute("SELECT COUNT(*), COUNT(x), SUM(x), AVG(x) FROM t")
         .unwrap();
     let v = rows(&r);
-    assert_eq!(v[0][0], Value::Int64(5));  // COUNT(*) includes NULLs
-    assert_eq!(v[0][1], Value::Int64(3));  // COUNT(x) excludes NULLs
-    assert_eq!(v[0][2], Value::Int64(9));  // SUM excludes NULLs
+    assert_eq!(v[0][0], Value::Int64(5)); // COUNT(*) includes NULLs
+    assert_eq!(v[0][1], Value::Int64(3)); // COUNT(x) excludes NULLs
+    assert_eq!(v[0][2], Value::Int64(9)); // SUM excludes NULLs
 }
 
 #[test]
 fn types_mixed_int_float_comparison() {
     let db = mem_db();
     db.execute("CREATE TABLE t(i INT64, f FLOAT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (5, 5.0), (3, 3.5)").unwrap();
-    let r = db.execute("SELECT i, f FROM t WHERE i <= f ORDER BY i").unwrap();
+    db.execute("INSERT INTO t VALUES (5, 5.0), (3, 3.5)")
+        .unwrap();
+    let r = db
+        .execute("SELECT i, f FROM t WHERE i <= f ORDER BY i")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
 }
@@ -1044,9 +1231,7 @@ fn alias_column_alias_in_order_by() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (3),(1),(2)").unwrap();
-    let r = db
-        .execute("SELECT x AS val FROM t ORDER BY val")
-        .unwrap();
+    let r = db.execute("SELECT x AS val FROM t ORDER BY val").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(1));
 }
@@ -1055,7 +1240,8 @@ fn alias_column_alias_in_order_by() {
 fn alias_table_alias_in_join() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, val INT64)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)")
+        .unwrap();
     db.execute("INSERT INTO t1 VALUES (1, 100)").unwrap();
     db.execute("INSERT INTO t2 VALUES (10, 1)").unwrap();
     let r = db
@@ -1071,16 +1257,21 @@ fn alias_table_alias_in_join() {
 #[test]
 fn trigram_index_like_search() {
     let db = mem_db();
-    db.execute("CREATE TABLE docs(id INT64, content TEXT)").unwrap();
-    db.execute("CREATE INDEX idx_trgm ON docs USING TRIGRAM (content)").unwrap();
-    db.execute("INSERT INTO docs VALUES (1,'the quick brown fox'),(2,'lazy dog'),(3,'quick silver')").unwrap();
+    db.execute("CREATE TABLE docs(id INT64, content TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_trgm ON docs USING TRIGRAM (content)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO docs VALUES (1,'the quick brown fox'),(2,'lazy dog'),(3,'quick silver')",
+    )
+    .unwrap();
     // Trigram indexes may use ILIKE or need specific query patterns
     let r = db
         .execute("SELECT id FROM docs WHERE content ILIKE '%quick%' ORDER BY id")
         .unwrap();
     let v = rows(&r);
     assert!(v.len() >= 2 || v.is_empty()); // The index may or may not filter here
-    // At minimum verify the index was created and queries don't error
+                                           // At minimum verify the index was created and queries don't error
     let r2 = db.execute("SELECT COUNT(*) FROM docs").unwrap();
     assert_eq!(rows(&r2)[0][0], Value::Int64(3));
 }
@@ -1093,8 +1284,10 @@ fn trigram_index_like_search() {
 fn expression_index() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE INDEX idx_lower ON t(LOWER(name))").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'Alice'),(2,'BOB'),(3,'Charlie')").unwrap();
+    db.execute("CREATE INDEX idx_lower ON t(LOWER(name))")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'Alice'),(2,'BOB'),(3,'Charlie')")
+        .unwrap();
     let r = db
         .execute("SELECT id FROM t WHERE LOWER(name) = 'bob'")
         .unwrap();
@@ -1108,8 +1301,10 @@ fn expression_index() {
 #[test]
 fn partial_index_with_where() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, status TEXT, val INT64)").unwrap();
-    db.execute("CREATE INDEX idx_active ON t(val) WHERE status = 'active'").unwrap();
+    db.execute("CREATE TABLE t(id INT64, status TEXT, val INT64)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_active ON t(val) WHERE status = 'active'")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (1,'active',100),(2,'inactive',200),(3,'active',300)")
         .unwrap();
     let r = db
@@ -1141,7 +1336,8 @@ fn temp_table_lifecycle() {
 #[test]
 fn where_complex_boolean_tree() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b TEXT, c BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b TEXT, c BOOLEAN)")
+        .unwrap();
     db.execute(
         "INSERT INTO t VALUES (1,'x',TRUE),(2,'y',FALSE),(3,'x',FALSE),(4,'y',TRUE),(5,'z',TRUE)",
     )
@@ -1158,8 +1354,10 @@ fn where_complex_boolean_tree() {
 #[test]
 fn where_nested_and_or() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(x INT64, y INT64, z INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9),(10,11,12)").unwrap();
+    db.execute("CREATE TABLE t(x INT64, y INT64, z INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,2,3),(4,5,6),(7,8,9),(10,11,12)")
+        .unwrap();
     let r = db
         .execute("SELECT x FROM t WHERE (x > 3 AND y < 10) OR z = 3 ORDER BY x")
         .unwrap();
@@ -1176,7 +1374,8 @@ fn schema_evolution_add_then_query() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1)").unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN name TEXT DEFAULT 'default'").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN name TEXT DEFAULT 'default'")
+        .unwrap();
     db.execute("INSERT INTO t VALUES (2, 'explicit')").unwrap();
     let r = db.execute("SELECT id, name FROM t ORDER BY id").unwrap();
     let v = rows(&r);
@@ -1206,7 +1405,9 @@ fn rename_table() {
     db.execute("CREATE TABLE old_name(id INT64)").unwrap();
     db.execute("INSERT INTO old_name VALUES (1)").unwrap();
     // RENAME TABLE is not supported; verify it errors gracefully
-    let err = db.execute("ALTER TABLE old_name RENAME TO new_name").unwrap_err();
+    let err = db
+        .execute("ALTER TABLE old_name RENAME TO new_name")
+        .unwrap_err();
     assert!(!err.to_string().is_empty());
     // Original table should still be accessible
     let r = db.execute("SELECT id FROM old_name").unwrap();
@@ -1221,7 +1422,8 @@ fn rename_table() {
 fn insert_multiple_rows_at_once() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')").unwrap();
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+        .unwrap();
     let r = db.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(5));
 }
@@ -1249,7 +1451,8 @@ fn query_empty_table() {
 #[test]
 fn large_dataset_insert_and_query() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
     for i in 0..500 {
         db.execute_with_params(
@@ -1275,7 +1478,8 @@ fn large_dataset_insert_and_query() {
 #[test]
 fn large_text_overflow_record() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, big_text TEXT)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, big_text TEXT)")
+        .unwrap();
     let big = "x".repeat(10000);
     db.execute_with_params(
         "INSERT INTO t VALUES ($1, $2)",
@@ -1298,7 +1502,8 @@ fn large_text_overflow_record() {
 fn select_star_with_where_order_limit_offset() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+        .unwrap();
     let r = db
         .execute("SELECT * FROM t WHERE val > 15 ORDER BY id DESC LIMIT 2 OFFSET 1")
         .unwrap();
@@ -1315,11 +1520,16 @@ fn select_star_with_where_order_limit_offset() {
 #[test]
 fn multiple_updates_same_table() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
-    db.execute("UPDATE t SET val = val + 1 WHERE id = 1").unwrap();
-    db.execute("UPDATE t SET val = val + 1 WHERE id = 2").unwrap();
-    db.execute("UPDATE t SET val = val + 1 WHERE id = 3").unwrap();
+    db.execute("CREATE TABLE t(id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
+    db.execute("UPDATE t SET val = val + 1 WHERE id = 1")
+        .unwrap();
+    db.execute("UPDATE t SET val = val + 1 WHERE id = 2")
+        .unwrap();
+    db.execute("UPDATE t SET val = val + 1 WHERE id = 3")
+        .unwrap();
     let r = db.execute("SELECT SUM(val) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(63));
 }
@@ -1337,7 +1547,6 @@ fn delete_all_then_reinsert() {
     assert_eq!(rows(&r2)[0][0], Value::Int64(2));
 }
 
-
 #[test]
 fn large_insert_and_aggregate() {
     let db = mem_db();
@@ -1349,7 +1558,9 @@ fn large_insert_and_aggregate() {
             .unwrap();
     }
     txn.commit().unwrap();
-    let r = db.execute("SELECT COUNT(*), SUM(val), AVG(val) FROM t").unwrap();
+    let r = db
+        .execute("SELECT COUNT(*), SUM(val), AVG(val) FROM t")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(1000));
 }
@@ -1370,7 +1581,8 @@ fn query_with_having_display() {
 fn sum_distinct() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(1),(2),(2),(3)")
+        .unwrap();
     let r = db.execute("SELECT SUM(DISTINCT val) FROM t").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(6));
 }
@@ -1378,12 +1590,17 @@ fn sum_distinct() {
 #[test]
 fn sum_distinct_in_group() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE sd (id INT PRIMARY KEY, cat TEXT, val INT)");
-    exec(&db, "INSERT INTO sd VALUES (1, 'X', 5), (2, 'X', 5), (3, 'X', 10)");
+    exec(
+        &db,
+        "CREATE TABLE sd (id INT PRIMARY KEY, cat TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO sd VALUES (1, 'X', 5), (2, 'X', 5), (3, 'X', 10)",
+    );
     let r = exec(&db, "SELECT SUM(DISTINCT val) FROM sd WHERE cat = 'X'");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(15)); // 5 + 10
 }
-
 
 // ── Tests merged from engine_coverage_tests.rs ──
 
@@ -1545,4 +1762,3 @@ fn total_aggregate_uses_float_semantics_and_zero_for_empty_inputs() {
         &[Value::Float64(0.0), Value::Null]
     );
 }
-

@@ -45,6 +45,7 @@ except ImportError:
     FirebirdDriver = None
 
 from scenarios.canonical_workloads import get_workload, WORKLOADS
+from utils.benchmarks_doc import update_benchmarks_markdown
 from utils.charting import export_latency_charts
 from utils.dataset_generator import DatasetGenerator, GeneratorConfig
 from utils.manifest import RunManifest, ResultsBundle, ResultRecord
@@ -56,6 +57,9 @@ DEFAULT_DOCS_ASSETS_DIR = (
     / "assets"
     / "benchmarks"
     / "python-embedded-compare"
+)
+DEFAULT_BENCHMARKS_DOC_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "user-guide" / "benchmarks.md"
 )
 
 
@@ -521,6 +525,17 @@ def main():
         help="Directory where docs-referenceable benchmark charts should be written",
     )
     parser.add_argument(
+        "--update-benchmarks-doc",
+        action="store_true",
+        help="Regenerate benchmarks markdown summary sections from docs chart_data exports",
+    )
+    parser.add_argument(
+        "--benchmarks-doc-path",
+        type=Path,
+        default=DEFAULT_BENCHMARKS_DOC_PATH,
+        help="Path to docs benchmark markdown file to update",
+    )
+    parser.add_argument(
         "--customers",
         type=int,
         default=1000,
@@ -543,6 +558,7 @@ def main():
     args.config = args.config.resolve()
     args.output = args.output.resolve()
     args.docs_assets_dir = args.docs_assets_dir.resolve()
+    args.benchmarks_doc_path = args.benchmarks_doc_path.resolve()
 
     # Parse engines
     engines = [e.strip() for e in args.engines.split(",")]
@@ -608,6 +624,15 @@ def main():
         output_dir=chart_output_dir,
         docs_assets_dir=docs_chart_dir,
     )
+    if args.update_benchmarks_doc:
+        snapshot_ops = update_benchmarks_markdown(
+            docs_markdown_path=args.benchmarks_doc_path,
+            docs_assets_dir=args.docs_assets_dir,
+        )
+        print(
+            f"Updated benchmark doc: {args.benchmarks_doc_path} "
+            f"(snapshot ops={snapshot_ops})"
+        )
 
     print("\n" + "=" * 60)
     print("Results Summary")
@@ -637,6 +662,8 @@ def main():
         print(f"  - charts/*.png")
         if docs_chart_dir:
             print(f"  - docs assets exported to: {docs_chart_dir}")
+    if args.update_benchmarks_doc:
+        print(f"  - benchmark doc updated: {args.benchmarks_doc_path}")
 
 
 if __name__ == "__main__":

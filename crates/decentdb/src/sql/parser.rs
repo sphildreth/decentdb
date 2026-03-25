@@ -292,7 +292,10 @@ mod tests {
     fn keywords_escaped_double_quote() {
         let kw = top_level_keywords(r#"SELECT "a""b" FROM t"#);
         let names: Vec<&str> = kw.iter().map(|(_, _, k)| k.as_str()).collect();
-        assert!(!names.contains(&"B"), "escaped double quote should stay in identifier");
+        assert!(
+            !names.contains(&"B"),
+            "escaped double quote should stay in identifier"
+        );
         assert!(names.contains(&"FROM"));
     }
 
@@ -418,7 +421,10 @@ mod tests {
     fn rewrite_trigger_with_begin_select() {
         let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT my_func(); END";
         let result = rewrite_legacy_trigger_body(sql);
-        assert!(result.contains("EXECUTE FUNCTION my_func()"), "got: {result}");
+        assert!(
+            result.contains("EXECUTE FUNCTION my_func()"),
+            "got: {result}"
+        );
         assert!(!result.contains("BEGIN"));
     }
 
@@ -426,7 +432,10 @@ mod tests {
     fn rewrite_trigger_with_trailing_semicolons() {
         let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT my_func();;; END";
         let result = rewrite_legacy_trigger_body(sql);
-        assert!(result.contains("EXECUTE FUNCTION my_func()"), "got: {result}");
+        assert!(
+            result.contains("EXECUTE FUNCTION my_func()"),
+            "got: {result}"
+        );
     }
 
     #[test]
@@ -438,7 +447,8 @@ mod tests {
 
     #[test]
     fn rewrite_trigger_multi_statement_body() {
-        let sql = "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT a(); SELECT b(); END";
+        let sql =
+            "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW BEGIN SELECT a(); SELECT b(); END";
         // Has semicolon in body — should not rewrite
         assert_eq!(rewrite_legacy_trigger_body(sql).as_ref(), sql);
     }

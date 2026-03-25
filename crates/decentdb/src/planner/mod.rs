@@ -398,7 +398,6 @@ mod tests {
                     filter: None,
                     group_by: vec![],
                     having: None,
-                    
                 }),
                 order_by: vec![],
                 limit: None,
@@ -422,7 +421,6 @@ mod tests {
                 filter: None,
                 group_by: vec![],
                 having: None,
-                
             }),
             order_by: vec![],
             limit: None,
@@ -632,9 +630,9 @@ mod tests {
 
     #[test]
     fn select_item_qualified_wildcard_no_aggregate() {
-        assert!(!select_item_has_aggregate(
-            &SelectItem::QualifiedWildcard("t".to_string())
-        ));
+        assert!(!select_item_has_aggregate(&SelectItem::QualifiedWildcard(
+            "t".to_string()
+        )));
     }
 
     #[test]
@@ -674,7 +672,6 @@ mod tests {
             filter: None,
             group_by: vec![],
             having: None,
-            
         };
         assert!(projection_has_aggregate(&select));
     }
@@ -695,7 +692,6 @@ mod tests {
             filter: None,
             group_by: vec![],
             having: None,
-            
         };
         assert!(!projection_has_aggregate(&select));
     }
@@ -721,10 +717,9 @@ mod tests {
     #[test]
     fn btree_zero_row_count_skip() {
         let mut catalog = CatalogState::empty(0);
-        catalog.table_stats.insert(
-            "t".to_string(),
-            crate::catalog::TableStats { row_count: 0 },
-        );
+        catalog
+            .table_stats
+            .insert("t".to_string(), crate::catalog::TableStats { row_count: 0 });
         catalog.index_stats.insert(
             "idx".to_string(),
             crate::catalog::IndexStats {

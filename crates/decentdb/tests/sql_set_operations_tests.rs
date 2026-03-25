@@ -25,13 +25,12 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
 #[test]
 fn chained_set_operations() {
     let db = mem_db();
-    let r = db
-        .execute(
-            "(SELECT 1 AS v UNION SELECT 2 UNION SELECT 3)
+    let r = db.execute(
+        "(SELECT 1 AS v UNION SELECT 2 UNION SELECT 3)
              EXCEPT
              (SELECT 2 AS v)
              ORDER BY v",
-        );
+    );
     if let Ok(r) = r {
         let v = rows(&r);
         assert!(!v.is_empty());
@@ -68,12 +67,15 @@ fn cte_with_offset_and_limit() {
     for i in 1..=20 {
         exec(&db, &format!("INSERT INTO nums VALUES ({i})"));
     }
-    let r = exec(&db, "
+    let r = exec(
+        &db,
+        "
         WITH paged AS (
             SELECT n FROM nums ORDER BY n LIMIT 5 OFFSET 10
         )
         SELECT * FROM paged
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 5);
 }
 
@@ -81,7 +83,8 @@ fn cte_with_offset_and_limit() {
 fn distinct_on_basic() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',3),('B',4)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',3),('B',4)")
+        .unwrap();
     let r = db.execute("SELECT DISTINCT ON (grp) grp, val FROM t ORDER BY grp, val");
     if let Ok(r) = r {
         let v = rows(&r);
@@ -92,8 +95,14 @@ fn distinct_on_basic() {
 #[test]
 fn distinct_on_keeps_first() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE don (id INT PRIMARY KEY, grp TEXT, val INT)");
-    exec(&db, "INSERT INTO don VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 5)");
+    exec(
+        &db,
+        "CREATE TABLE don (id INT PRIMARY KEY, grp TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO don VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 30), (4, 'b', 5)",
+    );
     let r = exec(
         &db,
         "SELECT DISTINCT ON (grp) grp, val FROM don ORDER BY grp, val",
@@ -106,10 +115,17 @@ fn distinct_on_keeps_first() {
 #[test]
 fn distinct_on_single_key() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE don (id INT PRIMARY KEY, category TEXT, val INT)");
-    exec(&db, "INSERT INTO don VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 5)");
-    let r = exec(&db,
-        "SELECT DISTINCT ON (category) category, val FROM don ORDER BY category, val"
+    exec(
+        &db,
+        "CREATE TABLE don (id INT PRIMARY KEY, category TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO don VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 5)",
+    );
+    let r = exec(
+        &db,
+        "SELECT DISTINCT ON (category) category, val FROM don ORDER BY category, val",
     );
     assert_eq!(r.rows().len(), 2);
 }
@@ -181,7 +197,8 @@ fn except_basic() {
 fn except_query() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
     let r = db
         .execute("SELECT id FROM t EXCEPT SELECT id FROM t WHERE id > 3")
         .unwrap();
@@ -196,7 +213,10 @@ fn except_removes_matching() {
     exec(&db, "CREATE TABLE e2 (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO e1 VALUES (1, 10), (2, 20), (3, 30)");
     exec(&db, "INSERT INTO e2 VALUES (4, 20)");
-    let r = exec(&db, "SELECT val FROM e1 EXCEPT SELECT val FROM e2 ORDER BY val");
+    let r = exec(
+        &db,
+        "SELECT val FROM e1 EXCEPT SELECT val FROM e2 ORDER BY val",
+    );
     assert_eq!(r.rows().len(), 2); // 10, 30
 }
 
@@ -248,7 +268,10 @@ fn intersect_all_with_duplicates() {
     exec(&db, "CREATE TABLE ia2 (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO ia1 VALUES (1, 10), (2, 10), (3, 20)");
     exec(&db, "INSERT INTO ia2 VALUES (4, 10), (5, 20), (6, 20)");
-    let r = exec(&db, "SELECT val FROM ia1 INTERSECT ALL SELECT val FROM ia2 ORDER BY val");
+    let r = exec(
+        &db,
+        "SELECT val FROM ia1 INTERSECT ALL SELECT val FROM ia2 ORDER BY val",
+    );
     // ia1 has 10x2, 20x1; ia2 has 10x1, 20x2 → min(2,1)=1 for 10, min(1,2)=1 for 20
     assert_eq!(r.rows().len(), 2);
 }
@@ -273,7 +296,8 @@ fn intersect_basic() {
 fn intersect_query() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)")
+        .unwrap();
     let r = db
         .execute("SELECT id FROM t WHERE id <= 3 INTERSECT SELECT id FROM t WHERE id >= 2")
         .unwrap();
@@ -288,7 +312,10 @@ fn intersect_returns_common() {
     exec(&db, "CREATE TABLE i2 (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO i1 VALUES (1, 10), (2, 20), (3, 30)");
     exec(&db, "INSERT INTO i2 VALUES (4, 20), (5, 30), (6, 40)");
-    let r = exec(&db, "SELECT val FROM i1 INTERSECT SELECT val FROM i2 ORDER BY val");
+    let r = exec(
+        &db,
+        "SELECT val FROM i1 INTERSECT SELECT val FROM i2 ORDER BY val",
+    );
     assert_eq!(r.rows().len(), 2); // 20, 30
 }
 
@@ -296,7 +323,8 @@ fn intersect_returns_common() {
 fn limit_and_offset() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+        .unwrap();
     let r = db
         .execute("SELECT x FROM t ORDER BY x LIMIT 2 OFFSET 1")
         .unwrap();
@@ -311,17 +339,17 @@ fn limit_zero() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
-    let r = db
-        .execute("SELECT id FROM t LIMIT 0")
-        .unwrap();
+    let r = db.execute("SELECT id FROM t LIMIT 0").unwrap();
     assert_eq!(rows(&r).len(), 0);
 }
 
 #[test]
 fn multi_column_order_by() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,2,3),(1,1,4),(2,1,5),(2,2,6)").unwrap();
+    db.execute("CREATE TABLE t(a INT64, b INT64, c INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,2,3),(1,1,4),(2,1,5),(2,2,6)")
+        .unwrap();
     let r = db
         .execute("SELECT a, b, c FROM t ORDER BY a ASC, b DESC, c ASC")
         .unwrap();
@@ -335,7 +363,8 @@ fn offset_and_limit() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     for i in 0..20 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", i))
+            .unwrap();
     }
     let r = db
         .execute("SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10")
@@ -361,7 +390,8 @@ fn offset_beyond_rows() {
 fn order_by_desc() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (3),(1),(4),(1),(5)").unwrap();
+    db.execute("INSERT INTO t VALUES (3),(1),(4),(1),(5)")
+        .unwrap();
     let r = db.execute("SELECT id FROM t ORDER BY id DESC").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(5));
@@ -392,12 +422,15 @@ fn order_by_expression() {
 fn order_by_expression_and_positional() {
     let db = mem_db();
     db.execute("CREATE TABLE t(x INT64, y INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,5),(3,15)").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,5),(3,15)")
+        .unwrap();
     // Order by expression
-    let r = db.execute("SELECT x, y FROM t ORDER BY x + y DESC").unwrap();
+    let r = db
+        .execute("SELECT x, y FROM t ORDER BY x + y DESC")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v[0][0], Value::Int64(3)); // 3+15=18
-    // Order by column position (second column)
+                                          // Order by column position (second column)
     let r2 = db.execute("SELECT x, y FROM t ORDER BY y ASC").unwrap();
     let v2 = rows(&r2);
     assert_eq!(v2[0][1], Value::Int64(5)); // y=5 first
@@ -406,36 +439,48 @@ fn order_by_expression_and_positional() {
 #[test]
 fn order_by_multiple_columns() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE omc (id INT PRIMARY KEY, grp TEXT, val INT)");
-    exec(&db, "INSERT INTO omc VALUES (1, 'a', 2), (2, 'b', 1), (3, 'a', 1), (4, 'b', 2)");
+    exec(
+        &db,
+        "CREATE TABLE omc (id INT PRIMARY KEY, grp TEXT, val INT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO omc VALUES (1, 'a', 2), (2, 'b', 1), (3, 'a', 1), (4, 'b', 2)",
+    );
     let r = exec(&db, "SELECT id FROM omc ORDER BY grp ASC, val DESC");
-    assert_eq!(r.rows()[0].values()[0], Value::Int64(1));  // a,2
-    assert_eq!(r.rows()[1].values()[0], Value::Int64(3));  // a,1
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(1)); // a,2
+    assert_eq!(r.rows()[1].values()[0], Value::Int64(3)); // a,1
 }
 
 #[test]
 fn order_by_nulls_first_last() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL),(2)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(NULL),(3),(NULL),(2)")
+        .unwrap();
     // Verify NULLS FIRST/LAST syntax parses and returns results
-    let r = db.execute("SELECT val FROM t ORDER BY val ASC NULLS FIRST").unwrap();
+    let r = db
+        .execute("SELECT val FROM t ORDER BY val ASC NULLS FIRST")
+        .unwrap();
     assert_eq!(rows(&r).len(), 5);
-    let r2 = db.execute("SELECT val FROM t ORDER BY val ASC NULLS LAST").unwrap();
+    let r2 = db
+        .execute("SELECT val FROM t ORDER BY val ASC NULLS LAST")
+        .unwrap();
     assert_eq!(rows(&r2).len(), 5);
-    let r3 = db.execute("SELECT val FROM t ORDER BY val DESC NULLS FIRST").unwrap();
+    let r3 = db
+        .execute("SELECT val FROM t ORDER BY val DESC NULLS FIRST")
+        .unwrap();
     assert_eq!(rows(&r3).len(), 5);
-    let r4 = db.execute("SELECT val FROM t ORDER BY val DESC NULLS LAST").unwrap();
+    let r4 = db
+        .execute("SELECT val FROM t ORDER BY val DESC NULLS LAST")
+        .unwrap();
     assert_eq!(rows(&r4).len(), 5);
 }
 
 #[test]
 fn query_with_distinct_on_display() {
     let db = mem_db();
-    exec(
-        &db,
-        "CREATE TABLE dod (grp INT, val INT, name TEXT)",
-    );
+    exec(&db, "CREATE TABLE dod (grp INT, val INT, name TEXT)");
     exec(
         &db,
         "CREATE VIEW dod_v AS SELECT DISTINCT ON (grp) grp, val, name FROM dod ORDER BY grp, val DESC",
@@ -494,7 +539,7 @@ fn recursive_cte_with_union_distinct() {
                 UNION
                 SELECT n + 1 FROM cnt WHERE n < 5
             )
-            SELECT n FROM cnt ORDER BY n"
+            SELECT n FROM cnt ORDER BY n",
         )
         .unwrap();
     let v = rows(&r);
@@ -505,8 +550,11 @@ fn recursive_cte_with_union_distinct() {
 fn select_distinct() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val TEXT)").unwrap();
-    db.execute("INSERT INTO t VALUES ('a'),('b'),('a'),('c'),('b')").unwrap();
-    let r = db.execute("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    db.execute("INSERT INTO t VALUES ('a'),('b'),('a'),('c'),('b')")
+        .unwrap();
+    let r = db
+        .execute("SELECT DISTINCT val FROM t ORDER BY val")
+        .unwrap();
     assert_eq!(rows(&r).len(), 3);
 }
 
@@ -514,7 +562,10 @@ fn select_distinct() {
 fn select_distinct_basic() {
     let db = mem_db();
     exec(&db, "CREATE TABLE dist (id INT PRIMARY KEY, val TEXT)");
-    exec(&db, "INSERT INTO dist VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'c')");
+    exec(
+        &db,
+        "INSERT INTO dist VALUES (1, 'a'), (2, 'b'), (3, 'a'), (4, 'b'), (5, 'c')",
+    );
     let r = exec(&db, "SELECT DISTINCT val FROM dist ORDER BY val");
     assert_eq!(r.rows().len(), 3);
 }
@@ -522,8 +573,10 @@ fn select_distinct_basic() {
 #[test]
 fn select_distinct_on() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(category TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',3),('A',1),('B',2),('B',5)").unwrap();
+    db.execute("CREATE TABLE t(category TEXT, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES ('A',3),('A',1),('B',2),('B',5)")
+        .unwrap();
     let r = db
         .execute("SELECT DISTINCT ON (category) category, val FROM t ORDER BY category, val")
         .unwrap();
@@ -538,8 +591,11 @@ fn select_distinct_on() {
 fn select_distinct_with_null() {
     let db = mem_db();
     db.execute("CREATE TABLE t(val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1),(NULL),(1),(NULL),(2)").unwrap();
-    let r = db.execute("SELECT DISTINCT val FROM t ORDER BY val").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(NULL),(1),(NULL),(2)")
+        .unwrap();
+    let r = db
+        .execute("SELECT DISTINCT val FROM t ORDER BY val")
+        .unwrap();
     let v = rows(&r);
     assert!(v.len() >= 3); // 1, 2, NULL
 }
@@ -570,9 +626,12 @@ fn select_with_limit_offset() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     for i in 1..=20 {
-        db.execute(&format!("INSERT INTO t VALUES ({})", i)).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES ({})", i))
+            .unwrap();
     }
-    let r = db.execute("SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10").unwrap();
+    let r = db
+        .execute("SELECT id FROM t ORDER BY id LIMIT 5 OFFSET 10")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 5);
     assert_eq!(v[0][0], Value::Int64(11));
@@ -610,7 +669,9 @@ fn set_operation_in_correlated_subquery() {
     exec(&db, "INSERT INTO outer_set VALUES (1), (2)");
     exec(&db, "INSERT INTO inner1 VALUES (10, 1), (20, 2)");
     exec(&db, "INSERT INTO inner2 VALUES (30, 1), (40, 3)");
-    let r = exec(&db, "
+    let r = exec(
+        &db,
+        "
         SELECT os.id, (
             SELECT COUNT(*) FROM (
                 SELECT id FROM inner1 WHERE ref_id = os.id
@@ -620,7 +681,8 @@ fn set_operation_in_correlated_subquery() {
         ) as total
         FROM outer_set os
         ORDER BY os.id
-    ");
+    ",
+    );
     assert_eq!(r.rows().len(), 2);
 }
 
@@ -632,9 +694,7 @@ fn set_operation_in_subquery() {
     db.execute("INSERT INTO t1 VALUES (1),(2),(3)").unwrap();
     db.execute("INSERT INTO t2 VALUES (2),(3),(4)").unwrap();
     let r = db
-        .execute(
-            "SELECT * FROM (SELECT x FROM t1 UNION SELECT x FROM t2) AS combined ORDER BY x"
-        )
+        .execute("SELECT * FROM (SELECT x FROM t1 UNION SELECT x FROM t2) AS combined ORDER BY x")
         .unwrap();
     assert_eq!(rows(&r).len(), 4);
 }
@@ -685,7 +745,10 @@ fn union_all_preserves_duplicates() {
     exec(&db, "CREATE TABLE s2 (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO s1 VALUES (1, 10), (2, 20)");
     exec(&db, "INSERT INTO s2 VALUES (3, 10), (4, 20)");
-    let r = exec(&db, "SELECT val FROM s1 UNION ALL SELECT val FROM s2 ORDER BY val");
+    let r = exec(
+        &db,
+        "SELECT val FROM s1 UNION ALL SELECT val FROM s2 ORDER BY val",
+    );
     assert_eq!(r.rows().len(), 4); // duplicates preserved
 }
 
@@ -695,7 +758,9 @@ fn union_all_three_queries() {
     db.execute("CREATE TABLE t(id INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
     let r = db
-        .execute("SELECT id FROM t UNION ALL SELECT id + 10 FROM t UNION ALL SELECT id + 100 FROM t")
+        .execute(
+            "SELECT id FROM t UNION ALL SELECT id + 10 FROM t UNION ALL SELECT id + 100 FROM t",
+        )
         .unwrap();
     assert_eq!(rows(&r).len(), 6);
 }
@@ -707,7 +772,10 @@ fn union_deduplicates() {
     exec(&db, "CREATE TABLE u2 (id INT PRIMARY KEY, val INT)");
     exec(&db, "INSERT INTO u1 VALUES (1, 10), (2, 20)");
     exec(&db, "INSERT INTO u2 VALUES (3, 10), (4, 30)");
-    let r = exec(&db, "SELECT val FROM u1 UNION SELECT val FROM u2 ORDER BY val");
+    let r = exec(
+        &db,
+        "SELECT val FROM u1 UNION SELECT val FROM u2 ORDER BY val",
+    );
     assert_eq!(r.rows().len(), 3); // 10, 20, 30
 }
 
@@ -737,7 +805,6 @@ fn union_with_order_by_and_limit() {
         .unwrap();
     assert_eq!(rows(&r).len(), 3);
 }
-
 
 // ── Tests merged from engine_coverage_tests.rs, slice2_execution_test.rs ──
 
@@ -1083,4 +1150,3 @@ fn test_offset_fetch() {
         Err(e) => println!("OFFSET ... FETCH: Error: {}", e),
     }
 }
-

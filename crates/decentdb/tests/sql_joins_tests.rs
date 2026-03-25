@@ -31,12 +31,20 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
 #[test]
 fn complex_multi_join_with_filter() {
     let db = mem_db();
-    db.execute("CREATE TABLE customers(id INT64 PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("CREATE TABLE orders(id INT64 PRIMARY KEY, cust_id INT64, total INT64)").unwrap();
-    db.execute("CREATE TABLE items(id INT64, order_id INT64, product TEXT)").unwrap();
-    db.execute("INSERT INTO customers VALUES (1,'Alice'),(2,'Bob'),(3,'Charlie')").unwrap();
-    db.execute("INSERT INTO orders VALUES (10,1,100),(20,1,200),(30,2,50)").unwrap();
-    db.execute("INSERT INTO items VALUES (1,10,'Widget'),(2,10,'Gadget'),(3,20,'Widget'),(4,30,'Gadget')").unwrap();
+    db.execute("CREATE TABLE customers(id INT64 PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders(id INT64 PRIMARY KEY, cust_id INT64, total INT64)")
+        .unwrap();
+    db.execute("CREATE TABLE items(id INT64, order_id INT64, product TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO customers VALUES (1,'Alice'),(2,'Bob'),(3,'Charlie')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10,1,100),(20,1,200),(30,2,50)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO items VALUES (1,10,'Widget'),(2,10,'Gadget'),(3,20,'Widget'),(4,30,'Gadget')",
+    )
+    .unwrap();
     let r = db
         .execute(
             "SELECT c.name, COUNT(DISTINCT o.id) AS order_count, COUNT(i.id) AS item_count
@@ -60,7 +68,10 @@ fn cross_join() {
     exec(&db, "CREATE TABLE cj2 (id INT PRIMARY KEY)");
     exec(&db, "INSERT INTO cj1 VALUES (1), (2)");
     exec(&db, "INSERT INTO cj2 VALUES (10), (20)");
-    let r = exec(&db, "SELECT cj1.id, cj2.id FROM cj1 CROSS JOIN cj2 ORDER BY cj1.id, cj2.id");
+    let r = exec(
+        &db,
+        "SELECT cj1.id, cj2.id FROM cj1 CROSS JOIN cj2 ORDER BY cj1.id, cj2.id",
+    );
     assert_eq!(r.rows().len(), 4);
 }
 
@@ -71,7 +82,9 @@ fn cross_join_basic() {
     db.execute("CREATE TABLE t2(b INT64)").unwrap();
     db.execute("INSERT INTO t1 VALUES (1), (2)").unwrap();
     db.execute("INSERT INTO t2 VALUES (10), (20)").unwrap();
-    let r = db.execute("SELECT a, b FROM t1 CROSS JOIN t2 ORDER BY a, b").unwrap();
+    let r = db
+        .execute("SELECT a, b FROM t1 CROSS JOIN t2 ORDER BY a, b")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 4); // 2 x 2 = 4 rows
 }
@@ -91,8 +104,10 @@ fn full_outer_join() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
     db.execute("CREATE TABLE t2(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (2,200),(3,300),(4,400)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (2,200),(3,300),(4,400)")
+        .unwrap();
     let r = db
         .execute("SELECT t1.name, t2.val FROM t1 FULL OUTER JOIN t2 ON t1.id = t2.id ORDER BY COALESCE(t1.id, t2.id)")
         .unwrap();
@@ -105,8 +120,10 @@ fn full_outer_join_basic() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, a TEXT)").unwrap();
     db.execute("CREATE TABLE t2(id INT64, b TEXT)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1, 'x'), (2, 'y')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (2, 'p'), (3, 'q')").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (2, 'p'), (3, 'q')")
+        .unwrap();
     let r = db
         .execute("SELECT t1.id, t1.a, t2.id, t2.b FROM t1 FULL OUTER JOIN t2 ON t1.id = t2.id ORDER BY COALESCE(t1.id, t2.id)")
         .unwrap();
@@ -160,7 +177,10 @@ fn implicit_cross_join() {
     exec(&db, "CREATE TABLE cj2 (id INT PRIMARY KEY)");
     exec(&db, "INSERT INTO cj1 VALUES (1), (2)");
     exec(&db, "INSERT INTO cj2 VALUES (10), (20)");
-    let r = exec(&db, "SELECT cj1.id, cj2.id FROM cj1, cj2 ORDER BY cj1.id, cj2.id");
+    let r = exec(
+        &db,
+        "SELECT cj1.id, cj2.id FROM cj1, cj2 ORDER BY cj1.id, cj2.id",
+    );
     assert_eq!(r.rows().len(), 4);
 }
 
@@ -199,7 +219,9 @@ fn implicit_cross_join_three_tables() {
     db.execute("INSERT INTO a VALUES (1), (2)").unwrap();
     db.execute("INSERT INTO b VALUES (10), (20)").unwrap();
     db.execute("INSERT INTO c VALUES (100)").unwrap();
-    let r = db.execute("SELECT x, y, z FROM a, b, c ORDER BY x, y").unwrap();
+    let r = db
+        .execute("SELECT x, y, z FROM a, b, c ORDER BY x, y")
+        .unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 4); // 2*2*1
 }
@@ -219,9 +241,12 @@ fn join_cross() {
 fn join_inner() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (10,1,100),(20,1,200),(30,2,300)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (10,1,100),(20,1,200),(30,2,300)")
+        .unwrap();
     let r = db
         .execute("SELECT t1.name, t2.val FROM t1 INNER JOIN t2 ON t1.id = t2.t1_id ORDER BY t2.val")
         .unwrap();
@@ -234,8 +259,10 @@ fn join_inner() {
 fn join_left() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE TABLE t2(t1_id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')").unwrap();
+    db.execute("CREATE TABLE t2(t1_id INT64, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')")
+        .unwrap();
     db.execute("INSERT INTO t2 VALUES (1,100),(1,200)").unwrap();
     let r = db
         .execute("SELECT t1.name, t2.val FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.name, t2.val")
@@ -253,7 +280,8 @@ fn join_multi_table() {
     db.execute("CREATE TABLE c(id INT64, b_id INT64)").unwrap();
     db.execute("INSERT INTO a VALUES (1),(2)").unwrap();
     db.execute("INSERT INTO b VALUES (10,1),(20,2)").unwrap();
-    db.execute("INSERT INTO c VALUES (100,10),(200,20),(300,10)").unwrap();
+    db.execute("INSERT INTO c VALUES (100,10),(200,20),(300,10)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT a.id, b.id, c.id FROM a
@@ -269,7 +297,8 @@ fn join_multi_table() {
 fn join_right() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE TABLE t2(t1_id INT64, val INT64)").unwrap();
+    db.execute("CREATE TABLE t2(t1_id INT64, val INT64)")
+        .unwrap();
     db.execute("INSERT INTO t1 VALUES (1,'A')").unwrap();
     db.execute("INSERT INTO t2 VALUES (1,100),(2,200)").unwrap();
     let r = db
@@ -278,14 +307,16 @@ fn join_right() {
     let v = rows(&r);
     assert_eq!(v.len(), 2);
     assert_eq!(v[0][0], Value::Text("A".into())); // matched
-    assert_eq!(v[1][0], Value::Null);              // no t1 match
+    assert_eq!(v[1][0], Value::Null); // no t1 match
 }
 
 #[test]
 fn join_self() {
     let db = mem_db();
-    db.execute("CREATE TABLE emp(id INT64, name TEXT, manager_id INT64)").unwrap();
-    db.execute("INSERT INTO emp VALUES (1,'CEO',NULL),(2,'VP',1),(3,'Dev',2)").unwrap();
+    db.execute("CREATE TABLE emp(id INT64, name TEXT, manager_id INT64)")
+        .unwrap();
+    db.execute("INSERT INTO emp VALUES (1,'CEO',NULL),(2,'VP',1),(3,'Dev',2)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT e.name, m.name AS manager FROM emp e
@@ -293,9 +324,9 @@ fn join_self() {
         )
         .unwrap();
     let v = rows(&r);
-    assert_eq!(v[0][1], Value::Null);                // CEO has no manager
-    assert_eq!(v[1][1], Value::Text("CEO".into()));   // VP's manager is CEO
-    assert_eq!(v[2][1], Value::Text("VP".into()));    // Dev's manager is VP
+    assert_eq!(v[0][1], Value::Null); // CEO has no manager
+    assert_eq!(v[1][1], Value::Text("CEO".into())); // VP's manager is CEO
+    assert_eq!(v[2][1], Value::Text("VP".into())); // Dev's manager is VP
 }
 
 #[test]
@@ -322,13 +353,12 @@ fn left_join_with_right_join() {
     db.execute("INSERT INTO t1 VALUES (1),(2)").unwrap();
     db.execute("INSERT INTO t2 VALUES (2),(3)").unwrap();
     db.execute("INSERT INTO t3 VALUES (3),(4)").unwrap();
-    let r = db
-        .execute(
-            "SELECT t1.id, t2.id, t3.id FROM t1
+    let r = db.execute(
+        "SELECT t1.id, t2.id, t3.id FROM t1
              LEFT JOIN t2 ON t1.id = t2.id
              RIGHT JOIN t3 ON t2.id = t3.id
              ORDER BY t3.id",
-        );
+    );
     if let Ok(r) = r {
         let v = rows(&r);
         assert!(!v.is_empty());
@@ -339,11 +369,14 @@ fn left_join_with_right_join() {
 fn multiple_joins() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)").unwrap();
-    db.execute("CREATE TABLE t3(id INT64, t2_id INT64)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)")
+        .unwrap();
+    db.execute("CREATE TABLE t3(id INT64, t2_id INT64)")
+        .unwrap();
     db.execute("INSERT INTO t1 VALUES (1),(2)").unwrap();
     db.execute("INSERT INTO t2 VALUES (10, 1),(20, 2)").unwrap();
-    db.execute("INSERT INTO t3 VALUES (100, 10),(200, 20)").unwrap();
+    db.execute("INSERT INTO t3 VALUES (100, 10),(200, 20)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT t1.id, t2.id, t3.id FROM t1
@@ -374,8 +407,10 @@ fn natural_join_basic() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
     db.execute("CREATE TABLE t2(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (1, 100), (3, 300)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (1, 100), (3, 300)")
+        .unwrap();
     let r = db.execute("SELECT * FROM t1 NATURAL JOIN t2");
     if let Ok(r) = r {
         let v = rows(&r);
@@ -388,8 +423,10 @@ fn parse_complex_join_conditions() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, a TEXT)").unwrap();
     db.execute("CREATE TABLE t2(id INT64, b TEXT)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1, 'x'), (2, 'y')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (1, 'x'), (2, 'z')").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (1, 'x'), (2, 'z')")
+        .unwrap();
     let r = db
         .execute("SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.id AND t1.a = t2.b")
         .unwrap();
@@ -454,8 +491,10 @@ fn right_join_basic() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
     db.execute("CREATE TABLE t2(id INT64, label TEXT)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (2, 'x'), (3, 'y')").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (2, 'x'), (3, 'y')")
+        .unwrap();
     let r = db
         .execute("SELECT t1.id, t1.name, t2.id, t2.label FROM t1 RIGHT JOIN t2 ON t1.id = t2.id ORDER BY t2.id")
         .unwrap();
@@ -489,8 +528,10 @@ fn select_from_three_tables_implicit_cross_join() {
 #[test]
 fn self_join() {
     let db = mem_db();
-    db.execute("CREATE TABLE emp(id INT64, name TEXT, manager_id INT64)").unwrap();
-    db.execute("INSERT INTO emp VALUES (1,'Alice',NULL),(2,'Bob',1),(3,'Charlie',1)").unwrap();
+    db.execute("CREATE TABLE emp(id INT64, name TEXT, manager_id INT64)")
+        .unwrap();
+    db.execute("INSERT INTO emp VALUES (1,'Alice',NULL),(2,'Bob',1),(3,'Charlie',1)")
+        .unwrap();
     let r = db
         .execute(
             "SELECT e.name, m.name AS manager FROM emp e LEFT JOIN emp m ON e.manager_id = m.id ORDER BY e.id",
@@ -506,11 +547,15 @@ fn self_join() {
 fn three_way_join() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, label TEXT)").unwrap();
-    db.execute("CREATE TABLE t3(id INT64, t2_id INT64, tag TEXT)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, label TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE t3(id INT64, t2_id INT64, tag TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t1 VALUES (1,'a'),(2,'b')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (10,1,'x'),(20,2,'y')").unwrap();
-    db.execute("INSERT INTO t3 VALUES (100,10,'p'),(200,20,'q')").unwrap();
+    db.execute("INSERT INTO t2 VALUES (10,1,'x'),(20,2,'y')")
+        .unwrap();
+    db.execute("INSERT INTO t3 VALUES (100,10,'p'),(200,20,'q')")
+        .unwrap();
     let r = db
         .execute(
             "SELECT t1.name, t2.label, t3.tag
@@ -524,7 +569,6 @@ fn three_way_join() {
     assert_eq!(v[0][0], Value::Text("a".into()));
     assert_eq!(v[0][2], Value::Text("p".into()));
 }
-
 
 // ── Tests merged from engine_coverage_tests.rs, debug_ast.rs ──
 
@@ -964,4 +1008,3 @@ fn using_and_natural_joins_merge_output_columns_but_keep_qualified_access() {
         ]
     );
 }
-

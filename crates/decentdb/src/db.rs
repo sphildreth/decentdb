@@ -1638,14 +1638,13 @@ impl Db {
                     .execute_autocommit_insert_in_place(prepared.statement.as_ref(), params);
             }
         }
-        let mut working = self.engine_snapshot()?;
-        let result = working.execute_statement(
-            prepared.statement.as_ref(),
-            params,
-            self.inner.config.page_size,
-        )?;
-        self.persist_runtime(working)?;
-        Ok(result)
+        self.execute_autocommit_in_place(|runtime| {
+            runtime.execute_statement(
+                prepared.statement.as_ref(),
+                params,
+                self.inner.config.page_size,
+            )
+        })
     }
 
     fn execute_write_statement(
@@ -1716,10 +1715,9 @@ impl Db {
         ) {
             return self.execute_autocommit_insert_in_place(statement, params);
         }
-        let mut working = self.engine_snapshot()?;
-        let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
-        self.persist_runtime(working)?;
-        Ok(result)
+        self.execute_autocommit_in_place(|runtime| {
+            runtime.execute_statement(statement, params, self.inner.config.page_size)
+        })
     }
 
     fn execute_autocommit_insert_in_place(
@@ -2186,6 +2184,17 @@ impl Db {
             state.persistent_changed |= !temp_only;
             return Ok(result);
         }
+        if state
+            .runtime
+            .can_execute_statement_in_state_without_clone(prepared.statement.as_ref())
+        {
+            let result =
+                state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
         let mut working = state.runtime.clone();
         working.rebuild_stale_indexes(page_size)?;
         let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
@@ -2223,6 +2232,17 @@ impl Db {
             crate::sql::ast::Statement::Insert(insert)
                 if state.runtime.can_execute_insert_in_place(insert)
         ) {
+            let result =
+                state
+                    .runtime
+                    .execute_statement(statement, params, self.inner.config.page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+        if state
+            .runtime
+            .can_execute_statement_in_state_without_clone(statement)
+        {
             let result =
                 state
                     .runtime

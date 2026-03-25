@@ -726,8 +726,7 @@ mod tests {
     fn overflow_never_compression() {
         let mut store = InMemoryPageStore::default();
         let payload = vec![0_u8; 10_000]; // highly compressible
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
         assert!(!pointer.is_compressed());
         let decoded = read_overflow(&store, pointer).expect("read");
         assert_eq!(decoded, payload);
@@ -737,8 +736,7 @@ mod tests {
     fn overflow_auto_compression_highly_compressible() {
         let mut store = InMemoryPageStore::default();
         let payload = vec![0_u8; 10_000]; // highly compressible
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Auto).expect("write");
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Auto).expect("write");
         // Auto may or may not compress; just verify roundtrip
         let decoded = read_overflow(&store, pointer).expect("read");
         assert_eq!(decoded, payload);
@@ -748,8 +746,7 @@ mod tests {
     fn overflow_auto_compression_large_compressible() {
         let mut store = InMemoryPageStore::default();
         let payload = vec![42_u8; 20_000]; // large and compressible
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Auto).expect("write");
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Auto).expect("write");
         // Auto should compress this
         let decoded = read_overflow(&store, pointer).expect("read");
         assert_eq!(decoded, payload);
@@ -759,9 +756,10 @@ mod tests {
     fn overflow_auto_compression_random_data() {
         let mut store = InMemoryPageStore::default();
         // Random-ish data that doesn't compress well
-        let payload: Vec<u8> = (0..10_000_u32).map(|i| ((i * 7 + 13) % 256) as u8).collect();
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Auto).expect("write");
+        let payload: Vec<u8> = (0..10_000_u32)
+            .map(|i| ((i * 7 + 13) % 256) as u8)
+            .collect();
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Auto).expect("write");
         let decoded = read_overflow(&store, pointer).expect("read");
         assert_eq!(decoded, payload);
     }
@@ -818,8 +816,7 @@ mod tests {
         use super::read_uncompressed_overflow_tail;
         let mut store = InMemoryPageStore::default();
         let payload = b"hello world overflow tail test data".repeat(500);
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
         let tail = read_uncompressed_overflow_tail(&store, pointer)
             .expect("read tail")
             .expect("should be some");
@@ -862,14 +859,12 @@ mod tests {
         use super::{append_uncompressed_with_tail, read_uncompressed_overflow_tail};
         let mut store = InMemoryPageStore::default();
         let payload = b"initial data".to_vec();
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
         let tail = read_uncompressed_overflow_tail(&store, pointer)
             .expect("read tail")
             .expect("some");
         let (updated, new_tail) =
-            append_uncompressed_with_tail(&mut store, pointer, tail, b"appended")
-                .expect("append");
+            append_uncompressed_with_tail(&mut store, pointer, tail, b"appended").expect("append");
         let decoded = read_overflow(&store, updated).expect("read");
         assert!(decoded.starts_with(b"initial data"));
         assert!(decoded.ends_with(b"appended"));
@@ -898,8 +893,7 @@ mod tests {
     fn free_overflow_multi_page_chain() {
         let mut store = InMemoryPageStore::default();
         let payload = vec![42_u8; 50_000];
-        let pointer =
-            write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
+        let pointer = write_overflow(&mut store, &payload, CompressionMode::Never).expect("write");
         let pages_before = store.allocated_page_count();
         assert!(pages_before > 1);
         let freed = free_overflow(&mut store, pointer.head_page_id).expect("free");

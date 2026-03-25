@@ -28,14 +28,10 @@ fn rows(r: &QueryResult) -> Vec<Vec<Value>> {
 fn alter_temp_view_rename_error() {
     let db = mem_db();
     exec(&db, "CREATE TABLE atvr (id INT PRIMARY KEY)");
-    exec(
-        &db,
-        "CREATE TEMPORARY VIEW atvr_v AS SELECT id FROM atvr",
-    );
+    exec(&db, "CREATE TEMPORARY VIEW atvr_v AS SELECT id FROM atvr");
     let err = exec_err(&db, "ALTER VIEW atvr_v RENAME TO atvr_v2");
     assert!(
-        err.to_lowercase().contains("temporary")
-            || err.to_lowercase().contains("not supported"),
+        err.to_lowercase().contains("temporary") || err.to_lowercase().contains("not supported"),
         "got: {err}"
     );
 }
@@ -43,7 +39,8 @@ fn alter_temp_view_rename_error() {
 #[test]
 fn alter_view_rename() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
     db.execute("ALTER VIEW v RENAME TO v2").unwrap();
 
@@ -94,8 +91,7 @@ fn alter_view_rename_with_dependent() {
     exec(&db, "CREATE VIEW av2 AS SELECT id FROM av1");
     let err = exec_err(&db, "ALTER VIEW av1 RENAME TO av1_new");
     assert!(
-        err.to_lowercase().contains("depend")
-            || err.to_lowercase().contains("cannot rename"),
+        err.to_lowercase().contains("depend") || err.to_lowercase().contains("cannot rename"),
         "got: {err}"
     );
 }
@@ -105,8 +101,9 @@ fn ast_display_view_ddl() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
     db.execute(
-        "CREATE VIEW v AS SELECT id, val, val * 2 AS doubled FROM t WHERE val > 10 ORDER BY id"
-    ).unwrap();
+        "CREATE VIEW v AS SELECT id, val, val * 2 AS doubled FROM t WHERE val > 10 ORDER BY id",
+    )
+    .unwrap();
     let ddl = db.view_ddl("v").unwrap();
     assert!(!ddl.is_empty());
 }
@@ -114,7 +111,10 @@ fn ast_display_view_ddl() {
 #[test]
 fn create_or_replace_view() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE base (id INT PRIMARY KEY, a TEXT, b TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE base (id INT PRIMARY KEY, a TEXT, b TEXT)",
+    );
     exec(&db, "INSERT INTO base VALUES (1, 'x', 'y')");
     exec(&db, "CREATE VIEW v AS SELECT id, a FROM base");
     exec(&db, "CREATE OR REPLACE VIEW v AS SELECT id, b FROM base");
@@ -153,7 +153,8 @@ fn create_view_replace_non_view() {
 fn distinct_on_in_view_dump() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    let r = db.execute("CREATE VIEW v AS SELECT DISTINCT ON (grp) grp, val FROM t ORDER BY grp, val");
+    let r =
+        db.execute("CREATE VIEW v AS SELECT DISTINCT ON (grp) grp, val FROM t ORDER BY grp, val");
     if r.is_ok() {
         let sql = db.dump_sql().unwrap();
         assert!(sql.contains("VIEW"));
@@ -164,7 +165,8 @@ fn distinct_on_in_view_dump() {
 fn drop_temp_view() {
     let db = mem_db();
     db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TEMPORARY VIEW tv AS SELECT * FROM t").unwrap();
+    db.execute("CREATE TEMPORARY VIEW tv AS SELECT * FROM t")
+        .unwrap();
 
     let result = db.execute("SELECT * FROM tv").unwrap();
     assert_eq!(result.rows().len(), 0);
@@ -179,18 +181,14 @@ fn drop_temp_view() {
 fn drop_temp_view_with_dependent() {
     let db = mem_db();
     exec(&db, "CREATE TABLE dtvd (id INT PRIMARY KEY)");
-    exec(
-        &db,
-        "CREATE TEMPORARY VIEW dtvd_v1 AS SELECT id FROM dtvd",
-    );
+    exec(&db, "CREATE TEMPORARY VIEW dtvd_v1 AS SELECT id FROM dtvd");
     exec(
         &db,
         "CREATE TEMPORARY VIEW dtvd_v2 AS SELECT id FROM dtvd_v1",
     );
     let err = exec_err(&db, "DROP VIEW dtvd_v1");
     assert!(
-        err.to_lowercase().contains("depend")
-            || err.to_lowercase().contains("cannot drop"),
+        err.to_lowercase().contains("depend") || err.to_lowercase().contains("cannot drop"),
         "got: {err}"
     );
 }
@@ -226,7 +224,10 @@ fn drop_view_basic() {
     exec(&db, "CREATE VIEW v AS SELECT * FROM t");
     exec(&db, "DROP VIEW v");
     let err = exec_err(&db, "SELECT * FROM v");
-    assert!(err.contains("v") || err.contains("not found") || err.contains("unknown"), "got: {err}");
+    assert!(
+        err.contains("v") || err.contains("not found") || err.contains("unknown"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -259,8 +260,7 @@ fn drop_view_that_is_table() {
     exec(&db, "CREATE TABLE dvt (id INT PRIMARY KEY)");
     let err = exec_err(&db, "DROP VIEW dvt");
     assert!(
-        err.to_lowercase().contains("unknown view")
-            || err.to_lowercase().contains("not a view"),
+        err.to_lowercase().contains("unknown view") || err.to_lowercase().contains("not a view"),
         "got: {err}"
     );
 }
@@ -273,8 +273,7 @@ fn drop_view_with_dependent_view() {
     exec(&db, "CREATE VIEW dv2 AS SELECT id FROM dv1");
     let err = exec_err(&db, "DROP VIEW dv1");
     assert!(
-        err.to_lowercase().contains("depend")
-            || err.to_lowercase().contains("cannot drop"),
+        err.to_lowercase().contains("depend") || err.to_lowercase().contains("cannot drop"),
         "got: {err}"
     );
 }
@@ -283,12 +282,18 @@ fn drop_view_with_dependent_view() {
 fn dump_sql_with_complex_view_joins() {
     let db = mem_db();
     exec(&db, "CREATE TABLE d_users (id INT PRIMARY KEY, name TEXT)");
-    exec(&db, "CREATE TABLE d_orders (id INT PRIMARY KEY, user_id INT, amount INT)");
-    exec(&db, "CREATE VIEW user_totals AS 
+    exec(
+        &db,
+        "CREATE TABLE d_orders (id INT PRIMARY KEY, user_id INT, amount INT)",
+    );
+    exec(
+        &db,
+        "CREATE VIEW user_totals AS 
         SELECT d_users.id, d_users.name, SUM(d_orders.amount) as total
         FROM d_users 
         LEFT JOIN d_orders ON d_users.id = d_orders.user_id 
-        GROUP BY d_users.id, d_users.name");
+        GROUP BY d_users.id, d_users.name",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("LEFT JOIN") || sql.contains("left join") || sql.contains("LEFT"));
 }
@@ -297,8 +302,11 @@ fn dump_sql_with_complex_view_joins() {
 fn dump_sql_with_view_having_case() {
     let db = mem_db();
     exec(&db, "CREATE TABLE d_items (id INT PRIMARY KEY, val INT)");
-    exec(&db, "CREATE VIEW item_category AS 
-        SELECT id, val, CASE WHEN val > 50 THEN 'high' ELSE 'low' END as cat FROM d_items");
+    exec(
+        &db,
+        "CREATE VIEW item_category AS 
+        SELECT id, val, CASE WHEN val > 50 THEN 'high' ELSE 'low' END as cat FROM d_items",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("CASE") || sql.contains("case"));
 }
@@ -308,8 +316,11 @@ fn dump_sql_with_view_having_subquery() {
     let db = mem_db();
     exec(&db, "CREATE TABLE d_main (id INT PRIMARY KEY)");
     exec(&db, "CREATE TABLE d_ref (main_id INT)");
-    exec(&db, "CREATE VIEW has_refs AS 
-        SELECT id FROM d_main WHERE EXISTS (SELECT 1 FROM d_ref WHERE d_ref.main_id = d_main.id)");
+    exec(
+        &db,
+        "CREATE VIEW has_refs AS 
+        SELECT id FROM d_main WHERE EXISTS (SELECT 1 FROM d_ref WHERE d_ref.main_id = d_main.id)",
+    );
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("EXISTS") || sql.contains("exists"));
 }
@@ -354,9 +365,8 @@ fn error_drop_table_with_view_dependency() {
 fn first_last_value_in_view() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    let r = db.execute(
-        "CREATE VIEW fv AS SELECT id, FIRST_VALUE(val) OVER (ORDER BY id) AS fv FROM t",
-    );
+    let r =
+        db.execute("CREATE VIEW fv AS SELECT id, FIRST_VALUE(val) OVER (ORDER BY id) AS fv FROM t");
     if r.is_ok() {
         let sql = db.dump_sql().unwrap();
         assert!(sql.contains("FIRST_VALUE"));
@@ -387,14 +397,20 @@ fn metadata_view_ddl() {
 #[test]
 fn normalize_create_trigger_basic() {
     let db = mem_db();
-    exec(&db, "CREATE TABLE trig_table (id INT PRIMARY KEY, val TEXT)");
+    exec(
+        &db,
+        "CREATE TABLE trig_table (id INT PRIMARY KEY, val TEXT)",
+    );
     exec(&db, "CREATE TABLE audit_log (msg TEXT)");
-    exec(&db, "
+    exec(
+        &db,
+        "
         CREATE TRIGGER trig_insert
         AFTER INSERT ON trig_table
         FOR EACH ROW
         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log VALUES (''inserted'')')
-    ");
+    ",
+    );
     exec(&db, "INSERT INTO trig_table VALUES (1, 'test')");
     let r = exec(&db, "SELECT * FROM audit_log");
     assert_eq!(r.rows().len(), 1);
@@ -407,7 +423,8 @@ fn persist_trigger_across_reopen() {
     let ps = path.to_str().unwrap();
     {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
-        db.execute("CREATE TABLE items(id INT64, name TEXT)").unwrap();
+        db.execute("CREATE TABLE items(id INT64, name TEXT)")
+            .unwrap();
         db.execute("CREATE TABLE audit(cnt INT64)").unwrap();
         db.execute("INSERT INTO audit VALUES (0)").unwrap();
         db.execute(
@@ -435,7 +452,8 @@ fn persist_view_across_reopen() {
         let db = Db::open_or_create(ps, DbConfig::default()).unwrap();
         db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
         db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
-        db.execute("CREATE VIEW v AS SELECT id, val * 2 AS doubled FROM t").unwrap();
+        db.execute("CREATE VIEW v AS SELECT id, val * 2 AS doubled FROM t")
+            .unwrap();
         db.checkpoint().unwrap();
     }
     {
@@ -457,8 +475,7 @@ fn persistent_view_depending_on_temp_table_error() {
     exec(&db, "INSERT INTO tt VALUES (1, 'x')");
     let err = exec_err(&db, "CREATE VIEW pv_on_temp AS SELECT * FROM tt");
     assert!(
-        err.to_lowercase().contains("temporary")
-            || err.to_lowercase().contains("persistent"),
+        err.to_lowercase().contains("temporary") || err.to_lowercase().contains("persistent"),
         "got: {err}"
     );
 }
@@ -482,7 +499,8 @@ fn rank_in_view_dump() {
 #[test]
 fn recursive_cte_in_view() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, parent_id INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, parent_id INT64)")
+        .unwrap();
     let r = db.execute(
         "CREATE VIEW hierarchy AS
          WITH RECURSIVE tree(id, depth) AS (
@@ -524,14 +542,8 @@ fn select_qualified_wildcard_in_view() {
 fn temp_view_already_exists_error() {
     let db = mem_db();
     exec(&db, "CREATE TABLE tve (id INT PRIMARY KEY)");
-    exec(
-        &db,
-        "CREATE TEMPORARY VIEW tve_view AS SELECT id FROM tve",
-    );
-    let err = exec_err(
-        &db,
-        "CREATE TEMPORARY VIEW tve_view AS SELECT id FROM tve",
-    );
+    exec(&db, "CREATE TEMPORARY VIEW tve_view AS SELECT id FROM tve");
+    let err = exec_err(&db, "CREATE TEMPORARY VIEW tve_view AS SELECT id FROM tve");
     assert!(err.contains("already exists"), "got: {err}");
 }
 
@@ -593,7 +605,8 @@ fn trigger_after_update() {
 fn trigger_before_insert() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("CREATE TABLE audit(action TEXT, item_id INT64)").unwrap();
+    db.execute("CREATE TABLE audit(action TEXT, item_id INT64)")
+        .unwrap();
     // Only AFTER triggers are supported in DecentDB
     db.execute(
         "CREATE TRIGGER trg_ins AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit VALUES (''insert'', 0)')",
@@ -627,8 +640,9 @@ fn trigger_fires_for_each_row() {
     db.execute("CREATE TABLE log(msg TEXT)").unwrap();
     db.execute(
         "CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW
-         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''row_inserted'')')"
-    ).unwrap();
+         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''row_inserted'')')",
+    )
+    .unwrap();
     db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
     let r = db.execute("SELECT COUNT(*) FROM log").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(3));
@@ -649,7 +663,8 @@ fn trigger_instead_of_insert_on_view() {
 #[test]
 fn trigger_maintains_audit_count() {
     let db = mem_db();
-    db.execute("CREATE TABLE items(id INT64, name TEXT)").unwrap();
+    db.execute("CREATE TABLE items(id INT64, name TEXT)")
+        .unwrap();
     db.execute("CREATE TABLE audit(cnt INT64)").unwrap();
     db.execute("INSERT INTO audit VALUES (0)").unwrap();
     db.execute(
@@ -686,7 +701,8 @@ fn trigger_on_delete() {
 #[test]
 fn trigger_on_update() {
     let db = mem_db();
-    db.execute("CREATE TABLE items(id INT64, val TEXT)").unwrap();
+    db.execute("CREATE TABLE items(id INT64, val TEXT)")
+        .unwrap();
     db.execute("CREATE TABLE update_count(cnt INT64)").unwrap();
     db.execute("INSERT INTO update_count VALUES (0)").unwrap();
     db.execute(
@@ -695,8 +711,10 @@ fn trigger_on_update() {
          EXECUTE FUNCTION decentdb_exec_sql('UPDATE update_count SET cnt = cnt + 1')",
     )
     .unwrap();
-    db.execute("INSERT INTO items VALUES (1, 'before')").unwrap();
-    db.execute("UPDATE items SET val = 'after' WHERE id = 1").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'before')")
+        .unwrap();
+    db.execute("UPDATE items SET val = 'after' WHERE id = 1")
+        .unwrap();
     let r = db.execute("SELECT cnt FROM update_count").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(1));
 }
@@ -705,10 +723,7 @@ fn trigger_on_update() {
 fn trigger_on_view_insert_target() {
     let db = mem_db();
     exec(&db, "CREATE TABLE tov (id INT PRIMARY KEY, val TEXT)");
-    exec(
-        &db,
-        "CREATE TABLE tov_log (id INT PRIMARY KEY, msg TEXT)",
-    );
+    exec(&db, "CREATE TABLE tov_log (id INT PRIMARY KEY, msg TEXT)");
     // Trigger on actual table (not view), then verify view drop behavior separately
     exec(
         &db,
@@ -723,8 +738,10 @@ fn trigger_on_view_insert_target() {
 fn view_create_and_query() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id, val FROM t WHERE val > 15").unwrap();
+    db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT id, val FROM t WHERE val > 15")
+        .unwrap();
     let r = db.execute("SELECT * FROM v ORDER BY id").unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
@@ -734,7 +751,8 @@ fn view_create_and_query() {
 #[test]
 fn view_ddl_reconstruction() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, val TEXT, score FLOAT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, val TEXT, score FLOAT64)")
+        .unwrap();
     db.execute(
         "CREATE VIEW v AS SELECT id, val, score FROM t WHERE score > 50 ORDER BY score DESC",
     )
@@ -773,8 +791,9 @@ fn view_instead_of_delete_trigger() {
     db.execute("CREATE VIEW v AS SELECT id FROM base").unwrap();
     db.execute(
         "CREATE TRIGGER trg_v_del INSTEAD OF DELETE ON v FOR EACH ROW
-         EXECUTE FUNCTION decentdb_exec_sql('DELETE FROM base WHERE id = 1')"
-    ).unwrap();
+         EXECUTE FUNCTION decentdb_exec_sql('DELETE FROM base WHERE id = 1')",
+    )
+    .unwrap();
     db.execute("DELETE FROM v WHERE id = 2").unwrap();
     // The trigger deletes id=1, not the WHERE'd id=2
     let r = db.execute("SELECT id FROM base ORDER BY id").unwrap();
@@ -786,11 +805,13 @@ fn view_instead_of_delete_trigger() {
 fn view_instead_of_insert_trigger() {
     let db = mem_db();
     db.execute("CREATE TABLE base(id INT64, val TEXT)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id, val FROM base").unwrap();
+    db.execute("CREATE VIEW v AS SELECT id, val FROM base")
+        .unwrap();
     db.execute(
         "CREATE TRIGGER trg_v_ins INSTEAD OF INSERT ON v FOR EACH ROW
-         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO base VALUES (99, ''from_view'')')"
-    ).unwrap();
+         EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO base VALUES (99, ''from_view'')')",
+    )
+    .unwrap();
     db.execute("INSERT INTO v VALUES (1, 'ignored')").unwrap();
     let r = db.execute("SELECT id, val FROM base").unwrap();
     let v = rows(&r);
@@ -802,13 +823,17 @@ fn view_instead_of_insert_trigger() {
 fn view_instead_of_update_trigger() {
     let db = mem_db();
     db.execute("CREATE TABLE base(id INT64, val TEXT)").unwrap();
-    db.execute("INSERT INTO base VALUES (1, 'original')").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id, val FROM base").unwrap();
+    db.execute("INSERT INTO base VALUES (1, 'original')")
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT id, val FROM base")
+        .unwrap();
     db.execute(
         "CREATE TRIGGER trg_v_upd INSTEAD OF UPDATE ON v FOR EACH ROW
-         EXECUTE FUNCTION decentdb_exec_sql('UPDATE base SET val = ''updated_via_view''')"
-    ).unwrap();
-    db.execute("UPDATE v SET val = 'ignored' WHERE id = 1").unwrap();
+         EXECUTE FUNCTION decentdb_exec_sql('UPDATE base SET val = ''updated_via_view''')",
+    )
+    .unwrap();
+    db.execute("UPDATE v SET val = 'ignored' WHERE id = 1")
+        .unwrap();
     let r = db.execute("SELECT val FROM base WHERE id = 1").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Text("updated_via_view".into()));
 }
@@ -819,7 +844,8 @@ fn view_or_replace() {
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
     db.execute("INSERT INTO t VALUES (1,10),(2,20)").unwrap();
     db.execute("CREATE VIEW v AS SELECT id FROM t").unwrap();
-    db.execute("CREATE OR REPLACE VIEW v AS SELECT id, val FROM t").unwrap();
+    db.execute("CREATE OR REPLACE VIEW v AS SELECT id, val FROM t")
+        .unwrap();
     let r = db.execute("SELECT * FROM v ORDER BY id").unwrap();
     assert_eq!(r.columns().len(), 2);
 }
@@ -828,8 +854,10 @@ fn view_or_replace() {
 fn view_with_aggregate() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',10),('A',20),('B',30)").unwrap();
-    db.execute("CREATE VIEW agg_v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp").unwrap();
+    db.execute("INSERT INTO t VALUES ('A',10),('A',20),('B',30)")
+        .unwrap();
+    db.execute("CREATE VIEW agg_v AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp")
+        .unwrap();
     let r = db.execute("SELECT * FROM agg_v ORDER BY grp").unwrap();
     let v = rows(&r);
     assert_eq!(v[0][1], Value::Int64(30));
@@ -839,7 +867,8 @@ fn view_with_aggregate() {
 fn view_with_aggregation() {
     let db = mem_db();
     db.execute("CREATE TABLE t(grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',3)").unwrap();
+    db.execute("INSERT INTO t VALUES ('A',1),('A',2),('B',3)")
+        .unwrap();
     db.execute("CREATE VIEW agg_view AS SELECT grp, SUM(val) AS total FROM t GROUP BY grp")
         .unwrap();
     let r = db
@@ -866,7 +895,8 @@ fn view_with_between_expr() {
 fn view_with_between_expression() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val INT64)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id FROM t WHERE val BETWEEN 10 AND 100").unwrap();
+    db.execute("CREATE VIEW v AS SELECT id FROM t WHERE val BETWEEN 10 AND 100")
+        .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("BETWEEN"));
 }
@@ -874,8 +904,10 @@ fn view_with_between_expression() {
 #[test]
 fn view_with_between_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT * FROM t WHERE val BETWEEN 1 AND 10").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t WHERE val BETWEEN 1 AND 10")
+        .unwrap();
 
     let result = db.execute("SELECT * FROM v").unwrap();
     assert_eq!(result.rows().len(), 0);
@@ -896,7 +928,8 @@ fn view_with_case_expr() {
 #[test]
 fn view_with_case_expression() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, status INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, status INT64)")
+        .unwrap();
     db.execute(
         "CREATE VIEW v AS SELECT id,
          CASE status WHEN 1 THEN 'active' WHEN 2 THEN 'inactive' ELSE 'unknown' END AS label
@@ -910,7 +943,8 @@ fn view_with_case_expression() {
 #[test]
 fn view_with_case_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
     db.execute(
         "CREATE VIEW v AS SELECT id, CASE WHEN val > 10 THEN 'high' ELSE 'low' END AS tier FROM t",
     )
@@ -938,7 +972,8 @@ fn view_with_cast_expr() {
 #[test]
 fn view_with_coalesce_nullif() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, a INT64, b INT64)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, a INT64, b INT64)")
+        .unwrap();
     db.execute(
         "CREATE VIEW v AS SELECT id, COALESCE(a, b, 0) AS val, NULLIF(a, 0) AS nonzero FROM t",
     )
@@ -951,8 +986,10 @@ fn view_with_coalesce_nullif() {
 #[test]
 fn view_with_complex_query() {
     let db = mem_db();
-    db.execute("CREATE TABLE t(id INT64, grp TEXT, val INT64)").unwrap();
-    db.execute("INSERT INTO t VALUES (1,'A',10),(2,'A',20),(3,'B',30)").unwrap();
+    db.execute("CREATE TABLE t(id INT64, grp TEXT, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'A',10),(2,'A',20),(3,'B',30)")
+        .unwrap();
     db.execute(
         "CREATE VIEW summary AS SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM t GROUP BY grp",
     )
@@ -979,10 +1016,13 @@ fn view_with_exists_subquery() {
 #[test]
 fn view_with_exists_subquery_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE t2 (t1_id INT64)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id)")
+    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)")
         .unwrap();
+    db.execute("CREATE TABLE t2 (t1_id INT64)").unwrap();
+    db.execute(
+        "CREATE VIEW v AS SELECT * FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id)",
+    )
+    .unwrap();
 
     db.execute("INSERT INTO t1 VALUES (1), (2)").unwrap();
     db.execute("INSERT INTO t2 VALUES (1)").unwrap();
@@ -995,7 +1035,8 @@ fn view_with_exists_subquery_roundtrips() {
 fn view_with_in_list() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, status TEXT)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id FROM t WHERE status IN ('a', 'b', 'c')").unwrap();
+    db.execute("CREATE VIEW v AS SELECT id FROM t WHERE status IN ('a', 'b', 'c')")
+        .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("IN"));
 }
@@ -1016,7 +1057,8 @@ fn view_with_in_list_expr() {
 fn view_with_in_list_roundtrips() {
     let db = mem_db();
     db.execute("CREATE TABLE t (id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT * FROM t WHERE id IN (1, 2, 3)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t WHERE id IN (1, 2, 3)")
+        .unwrap();
 
     db.execute("INSERT INTO t VALUES (1), (2), (4)").unwrap();
     let result = db.execute("SELECT * FROM v ORDER BY id").unwrap();
@@ -1027,9 +1069,11 @@ fn view_with_in_list_roundtrips() {
 #[test]
 fn view_with_in_subquery_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)")
+        .unwrap();
     db.execute("CREATE TABLE t2 (ref_id INT64)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT * FROM t1 WHERE id IN (SELECT ref_id FROM t2)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t1 WHERE id IN (SELECT ref_id FROM t2)")
+        .unwrap();
 
     db.execute("INSERT INTO t1 VALUES (1), (2), (3)").unwrap();
     db.execute("INSERT INTO t2 VALUES (1), (3)").unwrap();
@@ -1054,13 +1098,14 @@ fn view_with_is_null_expr() {
 fn view_with_join() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64, name TEXT)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, val INT64)").unwrap();
-    db.execute("INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
-    db.execute("INSERT INTO t2 VALUES (10, 1, 100), (20, 2, 200)").unwrap();
-    db.execute(
-        "CREATE VIEW joined AS SELECT t1.name, t2.val FROM t1 JOIN t2 ON t1.id = t2.t1_id",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64, val INT64)")
+        .unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob')")
+        .unwrap();
+    db.execute("INSERT INTO t2 VALUES (10, 1, 100), (20, 2, 200)")
+        .unwrap();
+    db.execute("CREATE VIEW joined AS SELECT t1.name, t2.val FROM t1 JOIN t2 ON t1.id = t2.t1_id")
+        .unwrap();
     let r = db.execute("SELECT * FROM joined ORDER BY name").unwrap();
     let v = rows(&r);
     assert_eq!(v.len(), 2);
@@ -1109,8 +1154,10 @@ fn view_with_not_expr() {
 #[test]
 fn view_with_scalar_subquery_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id, (SELECT MAX(val) FROM t) AS max_val FROM t").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, val INT64)")
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT id, (SELECT MAX(val) FROM t) AS max_val FROM t")
+        .unwrap();
 
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
     let result = db.execute("SELECT id, max_val FROM v ORDER BY id").unwrap();
@@ -1122,9 +1169,12 @@ fn view_with_scalar_subquery_roundtrips() {
 #[test]
 fn view_with_set_operation_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id FROM t1 UNION SELECT id FROM t2").unwrap();
+    db.execute("CREATE TABLE t1 (id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE TABLE t2 (id INT64 PRIMARY KEY)")
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT id FROM t1 UNION SELECT id FROM t2")
+        .unwrap();
 
     db.execute("INSERT INTO t1 VALUES (1), (2)").unwrap();
     db.execute("INSERT INTO t2 VALUES (2), (3)").unwrap();
@@ -1137,8 +1187,10 @@ fn view_with_set_operation_roundtrips() {
 fn view_with_subquery() {
     let db = mem_db();
     db.execute("CREATE TABLE t1(id INT64)").unwrap();
-    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)").unwrap();
-    db.execute("CREATE VIEW v AS SELECT id FROM t1 WHERE id IN (SELECT t1_id FROM t2)").unwrap();
+    db.execute("CREATE TABLE t2(id INT64, t1_id INT64)")
+        .unwrap();
+    db.execute("CREATE VIEW v AS SELECT id FROM t1 WHERE id IN (SELECT t1_id FROM t2)")
+        .unwrap();
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("SELECT"));
 }
@@ -1174,13 +1226,15 @@ fn view_with_union_dependency() {
 #[test]
 fn view_with_window_function_roundtrips() {
     let db = mem_db();
-    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, cat TEXT, val INT64)").unwrap();
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, cat TEXT, val INT64)")
+        .unwrap();
     db.execute(
         "CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER (PARTITION BY cat ORDER BY val) AS rn FROM t",
     )
     .unwrap();
 
-    db.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5)")
+        .unwrap();
     let result = db.execute("SELECT id, rn FROM v ORDER BY id").unwrap();
     let rows = rows(&result);
     assert_eq!(rows.len(), 3);
@@ -1197,7 +1251,6 @@ fn window_in_view_dump() {
     let sql = db.dump_sql().unwrap();
     assert!(sql.contains("OVER"));
 }
-
 
 // ── Tests merged from engine_coverage_tests.rs ──
 
@@ -1280,4 +1333,3 @@ fn temp_tables_and_views_are_session_scoped_shadow_persistent_objects_and_do_not
         "unexpected error: {missing_reopened_temp_view}"
     );
 }
-
