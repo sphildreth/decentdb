@@ -68,12 +68,28 @@ class JDBCDriver(DatabaseDriver):
             if not self.jdbc_url:
                 suffix = eng_cfg.get("jdbc_suffix", "")
                 self.jdbc_url = f"{eng_cfg['jdbc_prefix']}{self.db_path}{suffix}"
-            elif "{db_path}" in self.jdbc_url:
-                self.jdbc_url = self.jdbc_url.format(db_path=self.db_path)
+            else:
+                self.jdbc_url = self._resolve_jdbc_url(self.jdbc_url)
             if not self.driver_class:
                 self.driver_class = eng_cfg["driver_class"]
             if not self.jar_paths and eng_cfg.get("jar_path"):
                 self.jar_paths = [eng_cfg["jar_path"]]
+
+    def _resolve_jdbc_url(self, jdbc_url: str) -> str:
+        if "{db_path}" in jdbc_url:
+            return jdbc_url.format(db_path=self.db_path)
+
+        if self.engine == "h2" and jdbc_url.startswith("jdbc:h2:mem:"):
+            prefix, separator, suffix = jdbc_url.partition(";")
+            unique_name = "".join(
+                ch if ch.isalnum() else "_" for ch in os.path.abspath(self.db_path)
+            )
+            resolved = f"jdbc:h2:mem:{unique_name}"
+            if separator:
+                resolved = f"{resolved};{suffix}"
+            return resolved
+
+        return jdbc_url
 
     def _adapt_sql(self, sql: str) -> str:
         adapted = sql

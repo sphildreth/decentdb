@@ -25,6 +25,24 @@ class BenchmarkResult:
     errors: int = 0
 
 
+def empty_benchmark_result(benchmark_name: str) -> BenchmarkResult:
+    """Return a placeholder result for unsupported operations."""
+
+    return BenchmarkResult(
+        benchmark_name=benchmark_name,
+        operations=0,
+        duration_sec=0,
+        latency_ms={
+            "p50_ms": 0,
+            "p95_ms": 0,
+            "p99_ms": 0,
+            "ops_count": 0,
+            "error_count": 0,
+        },
+        throughput_ops_sec=0,
+    )
+
+
 class Workload(ABC):
     """Abstract base class for benchmark workloads."""
 
@@ -746,20 +764,7 @@ CREATE INDEX idx_events_ts ON events(ts);
         operations: int,
         warmup: int = 100,
     ) -> BenchmarkResult:
-        # Events workload doesn't have joins - return placeholder
-        return BenchmarkResult(
-            benchmark_name="join",
-            operations=0,
-            duration_sec=0,
-            latency_ms={
-                "p50_ms": 0,
-                "p95_ms": 0,
-                "p99_ms": 0,
-                "ops_count": 0,
-                "error_count": 0,
-            },
-            throughput_ops_sec=0,
-        )
+        return empty_benchmark_result("join")
 
     def run_aggregate(
         self,
@@ -807,20 +812,7 @@ CREATE INDEX idx_events_ts ON events(ts);
         operations: int,
         warmup: int = 100,
     ) -> BenchmarkResult:
-        # Not applicable for events workload
-        return BenchmarkResult(
-            benchmark_name="update",
-            operations=0,
-            duration_sec=0,
-            latency_ms={
-                "p50_ms": 0,
-                "p95_ms": 0,
-                "p99_ms": 0,
-                "ops_count": 0,
-                "error_count": 0,
-            },
-            throughput_ops_sec=0,
-        )
+        return empty_benchmark_result("update")
 
     def run_delete(
         self,
@@ -828,26 +820,181 @@ CREATE INDEX idx_events_ts ON events(ts);
         operations: int,
         warmup: int = 100,
     ) -> BenchmarkResult:
-        # Not applicable for events workload
+        return empty_benchmark_result("delete")
+
+
+class BindingParityWorkload(Workload):
+    """Flat-table indexed read workload aligned with the Python binding benchmark."""
+
+    def __init__(self):
+        self._row_count = 0
+
+    @property
+    def name(self) -> str:
+        return "workload_c_binding_parity"
+
+    def get_schema_sql(self) -> str:
+        return """
+CREATE TABLE bench (
+    id INTEGER PRIMARY KEY,
+    val TEXT NOT NULL,
+    f REAL NOT NULL
+);
+
+CREATE INDEX bench_id_idx ON bench(id);
+"""
+
+    def load_data(
+        self,
+        driver: DatabaseDriver,
+        customers: List[Customer],
+        orders: List[Order],
+        events: List[Event],
+        transaction_mode: str,
+        batch_size: int = 1000,
+    ):
+        insert_sql = "INSERT INTO bench (id, val, f) VALUES (?, ?, ?)"
+        rows = [
+            (order.order_id, f"value_{order.order_id}", float(order.total_cents))
+            for order in orders
+        ]
+
+        if transaction_mode == "autocommit":
+            for row in rows:
+                driver.execute_update(insert_sql, row)
+                driver.commit()
+        elif transaction_mode == "batched":
+            for i in range(0, len(rows), batch_size):
+                driver.begin_transaction()
+                batch = rows[i : i + batch_size]
+                for row in batch:
+                    driver.execute_update(insert_sql, row)
+                driver.commit()
+        elif transaction_mode == "explicit":
+            driver.begin_transaction()
+            for row in rows:
+                driver.execute_update(insert_sql, row)
+            driver.commit()
+
+        self._row_count = len(rows)
+
+    def _require_loaded_data(self):
+        if self._row_count == 0:
+            raise ValueError("Workload data must be loaded before running benchmarks")
+
+    def _generate_point_lookup_params(self, n: int) -> List[Tuple]:
+        import random
+
+        rng = random.Random(60)
+        return [(rng.randrange(self._row_count),) for _ in range(n)]
+
+    def _run_query_benchmark(
+        self,
+        driver: DatabaseDriver,
+        sql: str,
+        params_list: List[Optional[Tuple]],
+        benchmark_name: str,
+        warmup: int,
+    ) -> BenchmarkResult:
+        for params in params_list[:warmup]:
+            driver.execute_query(sql, params)
+
+        tracker = LatencyTracker()
+        timer = Timer()
+        timer.start()
+
+        for params in params_list[warmup:]:
+            op_timer = Timer()
+            op_timer.start()
+            try:
+                driver.execute_query(sql, params)
+                tracker.record(op_timer.stop() * 1000)
+            except Exception:
+                tracker.record_error()
+
+        duration = timer.stop()
+        stats = tracker.get_statistics()
+        operations = len(params_list) - warmup
+
         return BenchmarkResult(
-            benchmark_name="delete",
-            operations=0,
-            duration_sec=0,
-            latency_ms={
-                "p50_ms": 0,
-                "p95_ms": 0,
-                "p99_ms": 0,
-                "ops_count": 0,
-                "error_count": 0,
-            },
-            throughput_ops_sec=0,
+            benchmark_name=benchmark_name,
+            operations=operations,
+            duration_sec=duration,
+            latency_ms=stats,
+            throughput_ops_sec=operations / duration if duration > 0 else 0,
+            errors=stats["error_count"],
         )
+
+    def run_point_lookup(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        self._require_loaded_data()
+        params_list = self._generate_point_lookup_params(operations + warmup)
+        return self._run_query_benchmark(
+            driver,
+            "SELECT id, val, f FROM bench WHERE id = ?",
+            params_list,
+            "point_select",
+            warmup,
+        )
+
+    def run_range_scan(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        self._require_loaded_data()
+        params_list = [None] * (operations + warmup)
+        return self._run_query_benchmark(
+            driver,
+            "SELECT id, val, f FROM bench",
+            params_list,
+            "full_scan",
+            warmup,
+        )
+
+    def run_join(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        return empty_benchmark_result("join")
+
+    def run_aggregate(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        return empty_benchmark_result("aggregate")
+
+    def run_update(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        return empty_benchmark_result("update")
+
+    def run_delete(
+        self,
+        driver: DatabaseDriver,
+        operations: int,
+        warmup: int = 100,
+    ) -> BenchmarkResult:
+        return empty_benchmark_result("delete")
 
 
 # Registry of available workloads
 WORKLOADS = {
     "workload_a": OrdersWorkload,
     "workload_b": EventsWorkload,
+    "workload_c": BindingParityWorkload,
 }
 
 

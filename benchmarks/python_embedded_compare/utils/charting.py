@@ -252,12 +252,17 @@ def export_latency_charts(
             exported.extend(_plot_benchmark_bar(rows, benchmark, output_dir))
 
     if docs_assets_dir is not None:
-        docs_assets_dir.mkdir(parents=True, exist_ok=True)
-        (docs_assets_dir / "chart_data.json").write_text(
+        workload_name = str(rows[0]["workload"])
+        workload_docs_dir = docs_assets_dir / workload_name
+        workload_docs_dir.mkdir(parents=True, exist_ok=True)
+        for existing_path in workload_docs_dir.iterdir():
+            if existing_path.is_file():
+                existing_path.unlink()
+        (workload_docs_dir / "chart_data.json").write_text(
             json.dumps(rows, indent=2), encoding="utf-8"
         )
         for path in exported:
-            target = docs_assets_dir / path.name
+            target = workload_docs_dir / path.name
             target.write_bytes(path.read_bytes())
 
     return exported

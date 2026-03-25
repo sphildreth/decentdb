@@ -300,7 +300,9 @@ Supports:
 - Arithmetic operators: `+`, `-`, `*`, `/`
 - Pattern matching: `LIKE`, `ILIKE` (case-insensitive), with optional `ESCAPE` clause
 - Null checks: `IS NULL`, `IS NOT NULL`
-- IN operator: `col IN (val1, val2, ...)`
+- Null-safe comparisons: `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`
+- IN operator: `col IN (val1, val2, ...)` or `col IN (SELECT ...)`
+- Scalar subqueries: a parenthesized `SELECT` that returns a single value, usable anywhere an expression is expected
 - Range predicates: `BETWEEN`, `NOT BETWEEN`
 - Existence predicates: `EXISTS (SELECT ...)`
 - String concatenation: `lhs || rhs`
@@ -309,13 +311,17 @@ NULL handling follows SQL three-valued logic:
 - Comparisons with `NULL` evaluate to `NULL` (unknown), not `TRUE` or `FALSE`
 - `NOT NULL` is `NULL`
 - In `WHERE`, only `TRUE` keeps a row (`FALSE` and `NULL` are both filtered out)
+- `IS DISTINCT FROM` treats `NULL` as a comparable value: `NULL IS DISTINCT FROM NULL` is `FALSE`, and `NULL IS DISTINCT FROM 1` is `TRUE`. `IS NOT DISTINCT FROM` is the inverse.
 
 ```sql
 SELECT * FROM users WHERE age > 18 AND name LIKE '%son%';
 SELECT * FROM users WHERE email IS NOT NULL;
 SELECT * FROM users WHERE id IN (1, 2, 3);
+SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount > 100);
+SELECT * FROM users WHERE age = (SELECT MAX(age) FROM users);
 SELECT * FROM users WHERE age BETWEEN 18 AND 30;
 SELECT * FROM users WHERE name LIKE 'a\_%' ESCAPE '\';
+SELECT * FROM users WHERE status IS DISTINCT FROM 'active';
 ```
 
 ### Scalar Functions
@@ -592,7 +598,7 @@ For details, see [Transactions](transactions.md).
 EXPLAIN SELECT * FROM users WHERE id = 1;
 ```
 
-Produces a text-based query execution plan.
+Produces a text-based query execution plan. `EXPLAIN` currently supports `SELECT` queries.
 
 ### Explain Analyze
 
@@ -602,6 +608,7 @@ EXPLAIN ANALYZE SELECT * FROM users WHERE id = 1;
 
 Executes the query and produces the execution plan annotated with actual row counts
 and execution time. The parenthesized form `EXPLAIN (ANALYZE) ...` is also supported.
+`EXPLAIN ANALYZE` currently supports `SELECT` queries only.
 
 ### Table-Valued Functions
 

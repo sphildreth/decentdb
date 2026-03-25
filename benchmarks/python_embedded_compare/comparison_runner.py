@@ -288,7 +288,7 @@ def run_benchmark_for_engine(
                     record = ResultRecord(
                         engine=driver.name,
                         engine_version=metadata.version,
-                        benchmark=bench_name,
+                        benchmark=bench_result.benchmark_name,
                         operations=bench_result.operations,
                         duration_sec=bench_result.duration_sec,
                         latency_ms=bench_result.latency_ms,
@@ -540,6 +540,9 @@ def main():
     )
 
     args = parser.parse_args()
+    args.config = args.config.resolve()
+    args.output = args.output.resolve()
+    args.docs_assets_dir = args.docs_assets_dir.resolve()
 
     # Parse engines
     engines = [e.strip() for e in args.engines.split(",")]

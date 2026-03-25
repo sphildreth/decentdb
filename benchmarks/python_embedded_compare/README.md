@@ -9,6 +9,9 @@ This framework benchmarks embedded database engines across multiple runtimes:
 - **Phase 2 (JDBC):** H2, Apache Derby, HSQLDB
 - **Phase 3 (Optional):** Firebird, LiteDB
 
+It now also includes a flat-table indexed-read workload that mirrors the Python
+binding benchmark shape more closely than the OLTP-style canonical suite.
+
 ## Fairness Contract
 
 This framework treats fairness as a non-negotiable product requirement:
@@ -43,6 +46,9 @@ python comparison_runner.py --engines sqlite --durability durable --scenario wor
 
 # Run an operation sweep and export docs-referenceable charts
 python comparison_runner.py --engines sqlite,duckdb,decentdb --workload workload_a --ops-list 10000,100000,1000000
+
+# Run the flat-table binding-parity workload using orders_n as the row count
+python comparison_runner.py --engines sqlite,decentdb --workload workload_c --customers 1 --orders 1000000 --events 1 --ops 1000
 ```
 
 Single `--ops` runs produce per-benchmark comparison charts for one operation count.
@@ -101,6 +107,22 @@ Operations:
 - Recent events by time range
 - Per-user rollup (COUNT, SUM) within time window
 
+### Workload C: Binding-Parity Flat Table
+
+Schema:
+- `bench` (id PK, val, f)
+
+Operations:
+- Random indexed point lookups by `id`
+- Full table scans
+
+Notes:
+- This workload is intended to mirror the simpler shape from
+    [bindings/python/benchmarks/bench_fetch.py](/home/steven/source/decentdb/bindings/python/benchmarks/bench_fetch.py)
+    more closely than the OLTP-style workloads.
+- `orders_n` controls the row count for this workload; `customers_n` and `events_n`
+    are ignored after dataset generation.
+
 ## Transaction Modes
 
 - **autocommit**: Commit after each statement
@@ -126,11 +148,11 @@ The runner produces:
 - `out/charts/latency-comparison-overview.*`: Multi-panel comparison chart for a single `--ops` run
 - `out/charts/latency-overview.*`: Multi-panel line chart for an `--ops-list` sweep
 - `out/charts/<benchmark>-latency.*`: Per-benchmark bar chart for single-op runs or line chart for sweeps
-- `docs/assets/benchmarks/python-embedded-compare/*.svg`: Docs-referenceable chart exports
+- `docs/assets/benchmarks/python-embedded-compare/<workload>/*.svg`: Docs-referenceable chart exports grouped by workload
 
 When `--ops-list` is provided, each operation count is written under `out/ops_<count>/`
 and the combined chart assets are still written to `out/charts/` and
-`docs/assets/benchmarks/python-embedded-compare/`.
+`docs/assets/benchmarks/python-embedded-compare/<workload>/`.
 
 ## Integration with Native Benchmarks
 

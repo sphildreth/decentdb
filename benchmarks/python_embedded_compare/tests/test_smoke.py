@@ -9,6 +9,7 @@ import tempfile
 
 import pytest
 
+from drivers.jdbc_driver import JDBCDriver
 from drivers.sqlite_driver import SQLiteDriver
 
 try:
@@ -157,10 +158,40 @@ class TestWorkloads:
         assert "event_id" in schema
         assert "user_id" in schema
 
+    def test_workload_c_schema(self):
+        """Workload C should expose the flat benchmark table."""
+        workload = get_workload("workload_c")
+
+        schema = workload.get_schema_sql()
+
+        assert "bench" in schema
+        assert "bench_id_idx" in schema
+        assert "val" in schema
+
     def test_workload_registry(self):
         """Workload registry should have expected workloads."""
         assert "workload_a" in WORKLOADS
         assert "workload_b" in WORKLOADS
+        assert "workload_c" in WORKLOADS
+
+
+class TestJdbcDriverConfig:
+    """Configuration-only tests for JDBC URL handling."""
+
+    def test_h2_mem_url_uses_unique_db_path(self):
+        """Configured H2 mem URLs should still isolate runs by db path."""
+        driver = JDBCDriver(
+            {
+                "engine": "h2",
+                "database_path": "/tmp/run-123/h2.db",
+                "jdbc_url": "jdbc:h2:mem:test;DB_CLOSE_DELAY=-1",
+            }
+        )
+
+        assert driver.jdbc_url.startswith("jdbc:h2:mem:")
+        assert "test;DB_CLOSE_DELAY=-1" not in driver.jdbc_url
+        assert "DB_CLOSE_DELAY=-1" in driver.jdbc_url
+        assert "run_123" in driver.jdbc_url
 
 
 class TestDatasetGenerator:
