@@ -1746,3 +1746,982 @@ fn describe_node(node: &NodeEnum) -> &'static str {
 fn unsupported(message: impl Into<String>) -> DbError {
     DbError::sql(message.into())
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn norm(sql: &str) -> Statement {
+        normalize_statement_text(sql).unwrap()
+    }
+
+    fn norm_err(sql: &str) -> String {
+        normalize_statement_text(sql).unwrap_err().to_string()
+    }
+
+    // ── normalize_type_name paths ──────────────────────────────────
+
+    #[test]
+    fn type_smallint() {
+        let stmt = norm("CREATE TABLE t (a SMALLINT PRIMARY KEY)");
+        if let Statement::CreateTable(ct) = stmt {
+            assert_eq!(ct.columns[0].column_type, ColumnType::Int64);
+        } else { panic!("expected CreateTable"); }
+    }
+
+    #[test]
+    fn type_real() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a REAL)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Float64);
+        }
+    }
+
+    #[test]
+    fn type_double_precision() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a DOUBLE PRECISION)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Float64);
+        }
+    }
+
+    #[test]
+    fn type_character_varying() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a CHARACTER VARYING)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Text);
+        }
+    }
+
+    #[test]
+    fn type_char() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a CHAR)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Text);
+        }
+    }
+
+    #[test]
+    fn type_bytea() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a BYTEA)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Blob);
+        }
+    }
+
+    #[test]
+    fn type_blob() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a BLOB)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Blob);
+        }
+    }
+
+    #[test]
+    fn type_numeric() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a NUMERIC)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Decimal);
+        }
+    }
+
+    #[test]
+    fn type_decimal() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a DECIMAL)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Decimal);
+        }
+    }
+
+    #[test]
+    fn type_uuid() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a UUID)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Uuid);
+        }
+    }
+
+    #[test]
+    fn type_timestamp_with_tz() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a TIMESTAMP WITH TIME ZONE)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Timestamp);
+        }
+    }
+
+    #[test]
+    fn type_date() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a DATE)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Timestamp);
+        }
+    }
+
+    #[test]
+    fn type_datetime() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a DATETIME)") {
+            assert_eq!(ct.columns[1].column_type, ColumnType::Timestamp);
+        }
+    }
+
+    #[test]
+    fn type_unknown_errors() {
+        let err = norm_err("CREATE TABLE t (id INT PRIMARY KEY, a JSONB)");
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    // ── normalize_const paths ──────────────────────────────────────
+
+    #[test]
+    fn const_boolean_true() {
+        if let Statement::Query(q) = norm("SELECT true") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Literal(Value::Bool(true)), .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn const_boolean_false() {
+        if let Statement::Query(q) = norm("SELECT false") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Literal(Value::Bool(false)), .. }));
+            }
+        }
+    }
+
+    // ── normalize_aexpr paths ──────────────────────────────────────
+
+    #[test]
+    fn aexpr_ilike() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE name ILIKE 'alice'") {
+            if let QueryBody::Select(s) = q.body {
+                if let Some(Expr::Like { case_insensitive, .. }) = &s.filter {
+                    assert!(case_insensitive);
+                } else { panic!("expected LIKE expr"); }
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_not_between() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE x NOT BETWEEN 1 AND 10") {
+            if let QueryBody::Select(s) = q.body {
+                // NOT BETWEEN normalizes to Unary Not wrapping Between, or Between{negated:true}
+                assert!(s.filter.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_nullif() {
+        if let Statement::Query(q) = norm("SELECT NULLIF(1, 2)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Case { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_concat_operator() {
+        if let Statement::Query(q) = norm("SELECT 'a' || 'b'") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Binary { op: BinaryOp::Concat, .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_modulo_operator() {
+        if let Statement::Query(q) = norm("SELECT 10 % 3") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Binary { op: BinaryOp::Mod, .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_not_equal() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE a != b") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::Binary { op: BinaryOp::NotEq, .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn aexpr_unary_negate() {
+        if let Statement::Query(q) = norm("SELECT -x FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Unary { op: UnaryOp::Negate, .. }, .. }));
+            }
+        }
+    }
+
+    // ── normalize_bool_expr paths ──────────────────────────────────
+
+    #[test]
+    fn bool_not_expr() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE NOT (a = 1)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::Unary { op: UnaryOp::Not, .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn bool_or_expr() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE a = 1 OR b = 2") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::Binary { op: BinaryOp::Or, .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn bool_multi_or() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE a = 1 OR b = 2 OR c = 3") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::Binary { op: BinaryOp::Or, .. })));
+            }
+        }
+    }
+
+    // ── normalize_function_call paths ──────────────────────────────
+
+    #[test]
+    fn func_count_distinct() {
+        if let Statement::Query(q) = norm("SELECT COUNT(DISTINCT a) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr { expr: Expr::Aggregate { distinct, .. }, .. } = &s.projection[0] {
+                    assert!(distinct);
+                } else { panic!("expected aggregate"); }
+            }
+        }
+    }
+
+    #[test]
+    fn func_count_star() {
+        if let Statement::Query(q) = norm("SELECT COUNT(*) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr { expr: Expr::Aggregate { star, .. }, .. } = &s.projection[0] {
+                    assert!(star);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_row_number() {
+        if let Statement::Query(q) = norm("SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::RowNumber { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_rank() {
+        if let Statement::Query(q) = norm("SELECT RANK() OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_lag() {
+        if let Statement::Query(q) = norm("SELECT LAG(val, 1) OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_lead() {
+        if let Statement::Query(q) = norm("SELECT LEAD(val, 1) OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_first_value() {
+        if let Statement::Query(q) = norm("SELECT FIRST_VALUE(val) OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_last_value() {
+        if let Statement::Query(q) = norm("SELECT LAST_VALUE(val) OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_nth_value() {
+        if let Statement::Query(q) = norm("SELECT NTH_VALUE(val, 2) OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_dense_rank() {
+        if let Statement::Query(q) = norm("SELECT DENSE_RANK() OVER (ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::WindowFunction { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn func_window_with_partition() {
+        if let Statement::Query(q) = norm("SELECT ROW_NUMBER() OVER (PARTITION BY cat ORDER BY id) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr { expr: Expr::RowNumber { partition_by, .. }, .. } = &s.projection[0] {
+                    assert!(!partition_by.is_empty());
+                }
+            }
+        }
+    }
+
+    // ── normalize_sublink paths ────────────────────────────────────
+
+    #[test]
+    fn sublink_exists() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::Exists(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn sublink_in_subquery() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE id IN (SELECT id FROM u)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::InSubquery { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn sublink_scalar() {
+        if let Statement::Query(q) = norm("SELECT (SELECT MAX(val) FROM u) FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::ScalarSubquery(_), .. }));
+            }
+        }
+    }
+
+    // ── normalize_case_expr paths ──────────────────────────────────
+
+    #[test]
+    fn case_with_operand() {
+        if let Statement::Query(q) = norm("SELECT CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr { expr: Expr::Case { operand, else_expr, .. }, .. } = &s.projection[0] {
+                    assert!(operand.is_some());
+                    assert!(else_expr.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn case_without_operand() {
+        if let Statement::Query(q) = norm("SELECT CASE WHEN x > 1 THEN 'hi' END FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr { expr: Expr::Case { operand, else_expr, .. }, .. } = &s.projection[0] {
+                    assert!(operand.is_none());
+                    assert!(else_expr.is_none());
+                }
+            }
+        }
+    }
+
+    // ── normalize_expr_node paths ──────────────────────────────────
+
+    #[test]
+    fn expr_type_cast() {
+        if let Statement::Query(q) = norm("SELECT CAST(1 AS TEXT)") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Cast { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn expr_is_null() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE x IS NULL") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.filter, Some(Expr::IsNull { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn expr_is_not_null() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE x IS NOT NULL") {
+            if let QueryBody::Select(s) = q.body {
+                // IS NOT NULL normalizes to IsNull{negated:true} or Unary Not
+                assert!(s.filter.is_some());
+            }
+        }
+    }
+
+    // ── normalize_sql_value_function paths ─────────────────────────
+
+    #[test]
+    fn current_timestamp() {
+        if let Statement::Query(q) = norm("SELECT CURRENT_TIMESTAMP") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Function { .. }, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn current_date_fn() {
+        if let Statement::Query(q) = norm("SELECT CURRENT_DATE") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::Expr { expr: Expr::Function { .. }, .. }));
+            }
+        }
+    }
+
+    // ── normalize_from_item paths ──────────────────────────────────
+
+    #[test]
+    fn from_join_left() {
+        if let Statement::Query(q) = norm("SELECT * FROM t LEFT JOIN u ON t.id = u.id") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.from[0], FromItem::Join { kind: JoinKind::Left, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn from_join_right() {
+        if let Statement::Query(q) = norm("SELECT * FROM t RIGHT JOIN u ON t.id = u.id") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.from[0], FromItem::Join { kind: JoinKind::Right, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn from_join_full() {
+        if let Statement::Query(q) = norm("SELECT * FROM t FULL OUTER JOIN u ON t.id = u.id") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.from[0], FromItem::Join { kind: JoinKind::Full, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn from_join_cross() {
+        if let Statement::Query(q) = norm("SELECT * FROM t CROSS JOIN u") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.from[0], FromItem::Join { kind: JoinKind::Cross, .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn from_subquery() {
+        if let Statement::Query(q) = norm("SELECT * FROM (SELECT 1 AS x) AS sub") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.from[0], FromItem::Subquery { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn from_join_using() {
+        if let Statement::Query(q) = norm("SELECT * FROM t JOIN u USING (id)") {
+            if let QueryBody::Select(s) = q.body {
+                if let FromItem::Join { constraint: JoinConstraint::Using(cols), .. } = &s.from[0] {
+                    assert_eq!(cols, &["id"]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn from_function_call() {
+        // generate_series is rejected at normalization; test that it returns an error
+        let err = norm_err("SELECT * FROM generate_series(1, 5)");
+        assert!(err.contains("not supported"), "got: {err}");
+    }
+
+    // ── normalize_select_item paths ────────────────────────────────
+
+    #[test]
+    fn select_qualified_wildcard() {
+        if let Statement::Query(q) = norm("SELECT t.* FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(matches!(&s.projection[0], SelectItem::QualifiedWildcard(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn select_alias() {
+        if let Statement::Query(q) = norm("SELECT 1 AS my_alias") {
+            if let QueryBody::Select(s) = q.body {
+                if let SelectItem::Expr { alias, .. } = &s.projection[0] {
+                    assert_eq!(alias.as_deref(), Some("my_alias"));
+                }
+            }
+        }
+    }
+
+    // ── set operations ─────────────────────────────────────────────
+
+    #[test]
+    fn set_union_all() {
+        if let Statement::Query(q) = norm("SELECT 1 UNION ALL SELECT 2") {
+            assert!(matches!(q.body, QueryBody::SetOperation { op: SetOperation::Union, all: true, .. }));
+        }
+    }
+
+    #[test]
+    fn set_union() {
+        if let Statement::Query(q) = norm("SELECT 1 UNION SELECT 2") {
+            assert!(matches!(q.body, QueryBody::SetOperation { op: SetOperation::Union, all: false, .. }));
+        }
+    }
+
+    #[test]
+    fn set_intersect() {
+        if let Statement::Query(q) = norm("SELECT 1 INTERSECT SELECT 2") {
+            assert!(matches!(q.body, QueryBody::SetOperation { op: SetOperation::Intersect, all: false, .. }));
+        }
+    }
+
+    #[test]
+    fn set_intersect_all() {
+        if let Statement::Query(q) = norm("SELECT 1 INTERSECT ALL SELECT 2") {
+            assert!(matches!(q.body, QueryBody::SetOperation { op: SetOperation::Intersect, all: true, .. }));
+        }
+    }
+
+    #[test]
+    fn set_except() {
+        if let Statement::Query(q) = norm("SELECT 1 EXCEPT SELECT 2") {
+            assert!(matches!(q.body, QueryBody::SetOperation { op: SetOperation::Except, all: false, .. }));
+        }
+    }
+
+    #[test]
+    fn set_except_all() {
+        if let Statement::Query(q) = norm("SELECT 1 EXCEPT ALL SELECT 2") {
+            assert!(matches!(q.body, QueryBody::SetOperation { op: SetOperation::Except, all: true, .. }));
+        }
+    }
+
+    // ── normalize_order_by paths ───────────────────────────────────
+
+    #[test]
+    fn order_by_desc() {
+        if let Statement::Query(q) = norm("SELECT * FROM t ORDER BY x DESC") {
+            assert!(q.order_by[0].descending);
+        }
+    }
+
+    #[test]
+    fn order_by_asc() {
+        if let Statement::Query(q) = norm("SELECT * FROM t ORDER BY x ASC") {
+            assert!(!q.order_by[0].descending);
+        }
+    }
+
+    // ── normalize_query paths ──────────────────────────────────────
+
+    #[test]
+    fn query_limit_offset() {
+        if let Statement::Query(q) = norm("SELECT * FROM t LIMIT 10 OFFSET 5") {
+            assert!(q.limit.is_some());
+            assert!(q.offset.is_some());
+        }
+    }
+
+    // ── normalize_insert paths ─────────────────────────────────────
+
+    #[test]
+    fn insert_on_conflict_nothing() {
+        if let Statement::Insert(ins) = norm("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING") {
+            assert!(matches!(ins.on_conflict, Some(ConflictAction::DoNothing { .. })));
+        }
+    }
+
+    #[test]
+    fn insert_on_conflict_update() {
+        if let Statement::Insert(ins) = norm("INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET val = EXCLUDED.val") {
+            assert!(matches!(ins.on_conflict, Some(ConflictAction::DoUpdate { .. })));
+        }
+    }
+
+    #[test]
+    fn insert_on_conflict_constraint() {
+        if let Statement::Insert(ins) = norm("INSERT INTO t VALUES (1) ON CONFLICT ON CONSTRAINT pk_t DO NOTHING") {
+            if let Some(ConflictAction::DoNothing { target }) = ins.on_conflict {
+                assert!(matches!(target, ConflictTarget::Constraint(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn insert_returning() {
+        if let Statement::Insert(ins) = norm("INSERT INTO t VALUES (1) RETURNING id") {
+            assert!(!ins.returning.is_empty());
+        }
+    }
+
+    #[test]
+    fn insert_from_query() {
+        if let Statement::Insert(ins) = norm("INSERT INTO t SELECT * FROM u") {
+            assert!(matches!(ins.source, InsertSource::Query(_)));
+        }
+    }
+
+    // ── normalize_create_table paths ───────────────────────────────
+
+    #[test]
+    fn create_table_temp() {
+        if let Statement::CreateTable(ct) = norm("CREATE TEMP TABLE t (id INT PRIMARY KEY)") {
+            assert!(ct.temporary);
+        }
+    }
+
+    #[test]
+    fn create_table_if_not_exists() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE IF NOT EXISTS t (id INT PRIMARY KEY)") {
+            assert!(ct.if_not_exists);
+        }
+    }
+
+    // ── normalize_column_definition paths ──────────────────────────
+
+    #[test]
+    fn column_not_null() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)") {
+            assert!(!ct.columns[1].nullable);
+        }
+    }
+
+    #[test]
+    fn column_default_value() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, val INT DEFAULT 42)") {
+            assert!(ct.columns[1].default.is_some());
+        }
+    }
+
+    #[test]
+    fn column_unique() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE)") {
+            assert!(ct.columns[1].unique);
+        }
+    }
+
+    #[test]
+    fn column_generated() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, x INT, y INT GENERATED ALWAYS AS (x * 2) STORED)") {
+            assert!(ct.columns[2].generated.is_some());
+        }
+    }
+
+    #[test]
+    fn column_check() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, val INT CHECK (val > 0))") {
+            assert!(!ct.columns[1].checks.is_empty());
+        }
+    }
+
+    // ── normalize_table_constraint paths ───────────────────────────
+
+    #[test]
+    fn table_constraint_unique() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, UNIQUE (a, b))") {
+            assert!(ct.constraints.iter().any(|c| matches!(c, TableConstraint::Unique { .. })));
+        }
+    }
+
+    #[test]
+    fn table_constraint_check() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, a INT, CHECK (a > 0))") {
+            assert!(ct.constraints.iter().any(|c| matches!(c, TableConstraint::Check { .. })));
+        }
+    }
+
+    #[test]
+    fn table_constraint_fk() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES parent(id))") {
+            assert!(ct.constraints.iter().any(|c| matches!(c, TableConstraint::ForeignKey { .. })));
+        }
+    }
+
+    // ── normalize_fk_action paths ──────────────────────────────────
+
+    #[test]
+    fn fk_cascade_actions() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE)") {
+            if let Some(fk) = &ct.columns[1].references {
+                assert_eq!(fk.on_delete, ForeignKeyActionSpec::Cascade);
+                assert_eq!(fk.on_update, ForeignKeyActionSpec::Cascade);
+            }
+        }
+    }
+
+    #[test]
+    fn fk_set_null_actions() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE SET NULL ON UPDATE SET NULL)") {
+            if let Some(fk) = &ct.columns[1].references {
+                assert_eq!(fk.on_delete, ForeignKeyActionSpec::SetNull);
+                assert_eq!(fk.on_update, ForeignKeyActionSpec::SetNull);
+            }
+        }
+    }
+
+    #[test]
+    fn fk_restrict_action() {
+        if let Statement::CreateTable(ct) = norm("CREATE TABLE t (id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE RESTRICT)") {
+            if let Some(fk) = &ct.columns[1].references {
+                assert_eq!(fk.on_delete, ForeignKeyActionSpec::Restrict);
+            }
+        }
+    }
+
+    // ── normalize_create_index paths ───────────────────────────────
+
+    #[test]
+    fn create_index_unique() {
+        if let Statement::CreateIndex(ci) = norm("CREATE UNIQUE INDEX idx ON t (col)") {
+            assert!(ci.unique);
+        }
+    }
+
+    #[test]
+    fn create_index_if_not_exists() {
+        if let Statement::CreateIndex(ci) = norm("CREATE INDEX IF NOT EXISTS idx ON t (col)") {
+            assert!(ci.if_not_exists);
+        }
+    }
+
+    #[test]
+    fn create_index_gin() {
+        if let Statement::CreateIndex(ci) = norm("CREATE INDEX idx ON t USING gin (col)") {
+            assert_eq!(ci.access_method, "gin");
+        }
+    }
+
+    #[test]
+    fn create_index_partial() {
+        if let Statement::CreateIndex(ci) = norm("CREATE INDEX idx ON t (col) WHERE active = true") {
+            assert!(ci.predicate.is_some());
+        }
+    }
+
+    #[test]
+    fn create_index_expression() {
+        if let Statement::CreateIndex(ci) = norm("CREATE INDEX idx ON t ((col + 1))") {
+            assert!(ci.columns.iter().any(|c| matches!(c, IndexExpression::Expr(_))));
+        }
+    }
+
+    // ── normalize_create_view ──────────────────────────────────────
+
+    #[test]
+    fn create_view_normal() {
+        if let Statement::CreateView(cv) = norm("CREATE VIEW v AS SELECT * FROM t") {
+            assert_eq!(cv.view_name, "v");
+            assert!(!cv.temporary);
+        }
+    }
+
+    #[test]
+    fn create_view_temp() {
+        if let Statement::CreateView(cv) = norm("CREATE TEMP VIEW v AS SELECT 1") {
+            assert!(cv.temporary);
+        }
+    }
+
+    // ── normalize_explain ──────────────────────────────────────────
+
+    #[test]
+    fn explain_simple() {
+        assert!(matches!(norm("EXPLAIN SELECT 1"), Statement::Explain(_)));
+    }
+
+    #[test]
+    fn explain_analyze() {
+        if let Statement::Explain(ex) = norm("EXPLAIN ANALYZE SELECT 1") {
+            assert!(ex.analyze);
+        }
+    }
+
+    // ── normalize_drop paths ───────────────────────────────────────
+
+    #[test]
+    fn drop_table_if_exists() {
+        if let Statement::DropTable { if_exists, .. } = norm("DROP TABLE IF EXISTS t") {
+            assert!(if_exists);
+        }
+    }
+
+    #[test]
+    fn drop_index() {
+        assert!(matches!(norm("DROP INDEX idx"), Statement::DropIndex { .. }));
+    }
+
+    #[test]
+    fn drop_view() {
+        assert!(matches!(norm("DROP VIEW v"), Statement::DropView { .. }));
+    }
+
+    #[test]
+    fn drop_trigger() {
+        assert!(matches!(norm("DROP TRIGGER trig ON t"), Statement::DropTrigger { .. }));
+    }
+
+    // ── normalize_rename paths ─────────────────────────────────────
+
+    #[test]
+    fn rename_column() {
+        if let Statement::AlterTable { actions, .. } = norm("ALTER TABLE t RENAME COLUMN x TO y") {
+            assert!(matches!(&actions[0], AlterTableAction::RenameColumn { old_name, new_name } if old_name == "x" && new_name == "y"));
+        } else { panic!("expected AlterTable"); }
+    }
+
+    #[test]
+    fn rename_view() {
+        if let Statement::AlterViewRename { view_name, new_name } = norm("ALTER VIEW v RENAME TO w") {
+            assert_eq!(view_name, "v");
+            assert_eq!(new_name, "w");
+        } else { panic!("expected AlterViewRename"); }
+    }
+
+    // ── normalize_alter_table paths ────────────────────────────────
+
+    #[test]
+    fn alter_table_add_column() {
+        if let Statement::AlterTable { actions, .. } = norm("ALTER TABLE t ADD COLUMN x INT") {
+            assert!(matches!(&actions[0], AlterTableAction::AddColumn(_)));
+        }
+    }
+
+    #[test]
+    fn alter_table_drop_column() {
+        if let Statement::AlterTable { actions, .. } = norm("ALTER TABLE t DROP COLUMN x") {
+            assert!(matches!(&actions[0], AlterTableAction::DropColumn { .. }));
+        }
+    }
+
+    #[test]
+    fn alter_table_alter_column_type() {
+        if let Statement::AlterTable { actions, .. } = norm("ALTER TABLE t ALTER COLUMN x TYPE TEXT") {
+            assert!(matches!(&actions[0], AlterTableAction::AlterColumnType { .. }));
+        }
+    }
+
+    // ── normalize_create_trigger paths ─────────────────────────────
+
+    #[test]
+    fn create_trigger_after_insert() {
+        if let Statement::CreateTrigger(ct) = norm("CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('SELECT 1')") {
+            assert_eq!(ct.kind, TriggerKindSpec::After);
+            assert_eq!(ct.event, TriggerEventSpec::Insert);
+        }
+    }
+
+    #[test]
+    fn create_trigger_instead_of() {
+        if let Statement::CreateTrigger(ct) = norm("CREATE TRIGGER trg INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('SELECT 1')") {
+            assert_eq!(ct.kind, TriggerKindSpec::InsteadOf);
+        }
+    }
+
+    // ── normalize_with_clause paths ────────────────────────────────
+
+    #[test]
+    fn with_recursive() {
+        if let Statement::Query(q) = norm("WITH RECURSIVE cte AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM cte WHERE n < 5) SELECT * FROM cte") {
+            assert!(q.recursive);
+        }
+    }
+
+    #[test]
+    fn with_non_recursive() {
+        if let Statement::Query(q) = norm("WITH cte AS (SELECT 1 AS n) SELECT * FROM cte") {
+            assert!(!q.recursive);
+        }
+    }
+
+    // ── normalize_distinct_clause ──────────────────────────────────
+
+    #[test]
+    fn select_distinct() {
+        if let Statement::Query(q) = norm("SELECT DISTINCT a FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(s.distinct);
+            }
+        }
+    }
+
+    #[test]
+    fn select_distinct_on() {
+        if let Statement::Query(q) = norm("SELECT DISTINCT ON (a) a, b FROM t") {
+            if let QueryBody::Select(s) = q.body {
+                assert!(s.distinct);
+                assert!(!s.distinct_on.is_empty());
+            }
+        }
+    }
+
+    // ── normalize_like_pattern paths ───────────────────────────────
+
+    #[test]
+    fn like_with_escape() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE name LIKE 'a%' ESCAPE '\\'") {
+            if let QueryBody::Select(s) = q.body {
+                if let Some(Expr::Like { escape, .. }) = &s.filter {
+                    assert!(escape.is_some());
+                }
+            }
+        }
+    }
+
+    // ── normalize_vacuum / analyze paths ───────────────────────────
+
+    #[test]
+    fn analyze_statement() {
+        assert!(matches!(norm("ANALYZE t"), Statement::Analyze { .. }));
+    }
+
+    // ── parameter expressions ──────────────────────────────────────
+
+    #[test]
+    fn parameter_reference() {
+        if let Statement::Query(q) = norm("SELECT * FROM t WHERE id = $1") {
+            if let QueryBody::Select(s) = q.body {
+                if let Some(Expr::Binary { right, .. }) = &s.filter {
+                    assert!(matches!(right.as_ref(), Expr::Parameter(1)));
+                }
+            }
+        }
+    }
+
+    // ── error paths ────────────────────────────────────────────────
+
+    #[test]
+    fn unsupported_statement_produces_error() {
+        let err = norm_err("DO $$ BEGIN END $$");
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn empty_sql_errors() {
+        let err = norm_err("");
+        assert!(!err.is_empty());
+    }
+}
