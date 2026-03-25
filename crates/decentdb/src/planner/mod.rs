@@ -43,6 +43,7 @@ pub(crate) fn plan_query(query: &Query, catalog: &CatalogState) -> Result<Physic
 fn plan_query_body(query: &QueryBody, catalog: &CatalogState) -> Result<PhysicalPlan> {
     match query {
         QueryBody::Select(select) => plan_select(select, catalog),
+        QueryBody::Values(_) => Ok(PhysicalPlan::Empty),
         QueryBody::SetOperation {
             op,
             all,

@@ -15,6 +15,7 @@ pub(crate) enum Statement {
         table_name: Option<String>,
     },
     CreateTable(CreateTableStatement),
+    CreateTableAs(CreateTableAsStatement),
     CreateIndex(CreateIndexStatement),
     CreateView(CreateViewStatement),
     CreateTrigger(CreateTriggerStatement),
@@ -69,6 +70,7 @@ pub(crate) struct Query {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum QueryBody {
     Select(Select),
+    Values(Vec<Vec<Expr>>),
     SetOperation {
         op: SetOperation,
         all: bool,
@@ -118,11 +120,13 @@ pub(crate) enum FromItem {
     Subquery {
         query: Box<Query>,
         alias: String,
+        lateral: bool,
     },
     Function {
         name: String,
         args: Vec<Expr>,
         alias: Option<String>,
+        lateral: bool,
     },
     Join {
         left: Box<FromItem>,
@@ -368,6 +372,16 @@ pub(crate) struct CreateTableStatement {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateTableAsStatement {
+    pub(crate) table_name: String,
+    pub(crate) temporary: bool,
+    pub(crate) if_not_exists: bool,
+    pub(crate) column_names: Vec<String>,
+    pub(crate) query: Query,
+    pub(crate) with_data: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ColumnDefinition {
     pub(crate) name: String,
     pub(crate) column_type: ColumnType,
@@ -521,6 +535,19 @@ impl QueryBody {
     pub(crate) fn to_sql(&self) -> String {
         match self {
             Self::Select(select) => select.to_sql(),
+            Self::Values(rows) => {
+                let rendered_rows = rows
+                    .iter()
+                    .map(|row| {
+                        format!(
+                            "({})",
+                            row.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("VALUES {rendered_rows}")
+            }
             Self::SetOperation {
                 op,
                 all,
@@ -633,16 +660,37 @@ impl FromItem {
             Self::Table { name, alias } => alias
                 .as_ref()
                 .map_or_else(|| name.clone(), |alias| format!("{name} AS {alias}")),
-            Self::Subquery { query, alias } => format!("({}) AS {alias}", query.to_sql()),
-            Self::Function { name, args, alias } => {
+            Self::Subquery {
+                query,
+                alias,
+                lateral,
+            } => {
+                let base = format!("({}) AS {alias}", query.to_sql());
+                if *lateral {
+                    format!("LATERAL {base}")
+                } else {
+                    base
+                }
+            }
+            Self::Function {
+                name,
+                args,
+                alias,
+                lateral,
+            } => {
                 let base = format!(
                     "{}({})",
                     name,
                     args.iter().map(Expr::to_sql).collect::<Vec<_>>().join(", ")
                 );
-                alias
+                let rendered = alias
                     .as_ref()
-                    .map_or(base.clone(), |alias| format!("{base} AS {alias}"))
+                    .map_or(base.clone(), |alias| format!("{base} AS {alias}"));
+                if *lateral {
+                    format!("LATERAL {rendered}")
+                } else {
+                    rendered
+                }
             }
             Self::Join {
                 left,

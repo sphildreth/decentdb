@@ -177,6 +177,7 @@ fn collect_view_dependencies(query: &Query) -> Vec<String> {
 
 fn collect_body_dependencies(body: &QueryBody, dependencies: &mut BTreeSet<String>) {
     match body {
+        QueryBody::Values(_) => {}
         QueryBody::Select(select) => {
             for from in &select.from {
                 collect_from_dependencies(from, dependencies);

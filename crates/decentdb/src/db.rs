@@ -1899,6 +1899,7 @@ impl Db {
         let temp_has_name = |name: &str| temp_has_table(name) || temp_has_view(name);
         match statement {
             crate::sql::ast::Statement::CreateTable(statement) => statement.temporary,
+            crate::sql::ast::Statement::CreateTableAs(statement) => statement.temporary,
             crate::sql::ast::Statement::CreateView(statement) => statement.temporary,
             crate::sql::ast::Statement::DropTable { name, .. } => temp_has_table(name),
             crate::sql::ast::Statement::DropView { name, .. } => temp_has_view(name),

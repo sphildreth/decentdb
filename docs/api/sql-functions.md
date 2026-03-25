@@ -109,6 +109,82 @@ SELECT GREATEST(10, 20, 15), LEAST(10, 20, 15);
 SELECT IIF(score >= 60, 'pass', 'fail') FROM exams;
 ```
 
+## Date/time functions
+
+Supported:
+
+- `DATE_TRUNC(precision, timestamp)`
+- `DATE_PART(field, timestamp)`
+- `DATE_DIFF(part, start, end)`
+- `LAST_DAY(timestamp)`
+- `NEXT_DAY(timestamp, weekday)`
+- `MAKE_DATE(year, month, day)`
+- `MAKE_TIMESTAMP(year, month, day, hour, minute, second)`
+- `TO_TIMESTAMP(epoch_or_text [, format])`
+- `AGE(timestamp [, timestamp])`
+- `INTERVAL '...'` (for timestamp arithmetic)
+
+Behavior notes:
+
+- `DATE_TRUNC` supports: microsecond, millisecond, second, minute, hour, day, week, month, quarter, year, decade, century, millennium.
+- `TO_TIMESTAMP(text, format)` currently supports formats: `YYYY-MM-DD HH24:MI:SS`, `YYYY-MM-DD`, and `DD/MM/YYYY`.
+- `AGE` returns a textual interval (for example, `"1 days 00:00:00"`).
+- `INTERVAL` literal parsing supports integer `year/month/week/day/hour/minute/second` units in amount-unit pairs.
+- Timestamp interval arithmetic supports `timestamp +/- INTERVAL '...'` and date/timestamp text on the left side.
+
+Examples:
+
+```sql
+SELECT DATE_TRUNC('month', '2024-03-15 14:30:45');
+SELECT DATE_PART('doy', '2024-03-15');
+SELECT DATE_DIFF('day', '2024-03-10', '2024-03-15');
+SELECT LAST_DAY('2024-02-11'), NEXT_DAY('2024-03-15', 'Monday');
+SELECT MAKE_DATE(2024, 3, 15), MAKE_TIMESTAMP(2024, 3, 15, 14, 30, 0);
+SELECT TO_TIMESTAMP(1710505800), TO_TIMESTAMP('15/03/2024', 'DD/MM/YYYY');
+SELECT AGE('2024-03-15', '2024-03-14');
+SELECT '2024-03-15 14:30:00'::timestamp + INTERVAL '1 day';
+```
+
+## String functions
+
+Supported:
+
+- `CONCAT(expr, ...)`
+- `CONCAT_WS(separator, expr, ...)`
+- `POSITION(substring IN string)`
+- `INITCAP(string)`
+- `ASCII(string)`
+- `REGEXP_REPLACE(string, pattern, replacement [, flags])`
+- `SPLIT_PART(string, delimiter, index)`
+- `STRING_TO_ARRAY(string, delimiter)`
+- `QUOTE_IDENT(string)`
+- `QUOTE_LITERAL(string)`
+- `MD5(string)`
+- `SHA256(string)`
+
+Behavior notes:
+
+- `CONCAT` treats `NULL` arguments as empty strings.
+- `CONCAT_WS` skips `NULL` value arguments; `NULL` separator returns `NULL`.
+- `POSITION` returns 1-based positions, and `0` if no match exists.
+- `REGEXP_REPLACE` supports `g` (global) and `i` (case-insensitive) flags.
+- `STRING_TO_ARRAY` returns a JSON text array.
+
+Examples:
+
+```sql
+SELECT CONCAT('hello', ' ', 'world');
+SELECT CONCAT_WS(', ', 'Alice', NULL, 'Bob');
+SELECT POSITION('world' IN 'hello world');
+SELECT INITCAP('hello world from decentdb');
+SELECT ASCII('A');
+SELECT REGEXP_REPLACE('abc123def', '\d', '', 'g');
+SELECT SPLIT_PART('a,b,c', ',', 2);
+SELECT STRING_TO_ARRAY('a,b,c', ',');
+SELECT QUOTE_IDENT('table name'), QUOTE_LITERAL('O''Brien');
+SELECT MD5('hello'), SHA256('hello');
+```
+
 ## Aggregate functions
 
 ### Statistical aggregates

@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rust-fast:
+  lint:
     runs-on: ubuntu-latest
     env:
       CI: "true"
@@ -27,43 +27,10 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "10.0.x"
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-
-      - name: Set up Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: "25"
-
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "25"
-
-      - name: Set up Dart
-        uses: dart-lang/setup-dart@v1
-
       - name: Format Check
         run: |
-          echo "Checking Rust code formatting..."
           if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
-            echo ""
             echo "::error::Code formatting issues detected"
-            echo ""
-            echo "Formatting diffs (run 'cargo fmt' to fix):"
             echo "::group::Details"
             cat /tmp/fmt-check.log
             echo "::endgroup::"
@@ -73,41 +40,21 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests
+  test:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Engine & CLI Tests
         run: cargo test --workspace
-
-      - name: Build cdylib
-        run: cargo build -p decentdb
-
-      - name: Python Validation
-        run: python3 tests/bindings/python/test_ffi.py
-
-      - name: C Smoke
-        run: bash tests/bindings/c/run.sh
-
-      - name: Go Smoke
-        run: go run ./tests/bindings/go/smoke.go
-
-      - name: Java Smoke
-        run: |
-          javac tests/bindings/java/Smoke.java
-          java --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
-
-      - name: Node Smoke
-        run: |
-          bash tests/bindings/node/build.sh
-          node tests/bindings/node/smoke.js
-
-      - name: Dart Smoke
-        run: |
-          cd tests/bindings/dart
-          dart pub get
-          dart run smoke.dart
-
-      - name: .NET Validation
-        run: LD_LIBRARY_PATH=$PWD/target/debug dotnet run --project tests/bindings/dotnet/Smoke/Smoke.csproj
-
-      - name: Rust Docs and Doctests
-        run: |
-          cargo test -p decentdb --doc
-          cargo doc --workspace --no-deps

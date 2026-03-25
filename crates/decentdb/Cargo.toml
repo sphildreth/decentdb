@@ -11,6 +11,8 @@ miniz_oxide.workspace = true
 libpg_query_sys = { path = "../libpg_query_sys" }
 chrono = "0.4"
 regex = "1.11"
+md5 = "0.7"
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1.5"

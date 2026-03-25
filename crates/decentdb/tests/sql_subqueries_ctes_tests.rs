@@ -258,6 +258,73 @@ fn correlated_subquery_with_case_expression() {
 }
 
 #[test]
+fn lateral_subquery_can_reference_left_table() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE users(id INT64, name TEXT)");
+    exec(&db, "INSERT INTO users VALUES (1, 'alice'), (2, 'bob')");
+    let result = exec(
+        &db,
+        "SELECT u.id, x.twice
+         FROM users u
+         JOIN LATERAL (SELECT u.id * 2 AS twice) AS x ON true
+         ORDER BY u.id",
+    );
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Int64(2)],
+            vec![Value::Int64(2), Value::Int64(4)],
+        ]
+    );
+}
+
+#[test]
+fn lateral_left_join_keeps_unmatched_left_rows() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE users(id INT64)");
+    exec(&db, "INSERT INTO users VALUES (1), (2)");
+    let result = exec(
+        &db,
+        "SELECT u.id, x.hit
+         FROM users u
+         LEFT JOIN LATERAL (
+           SELECT 1 AS hit
+           WHERE u.id = 1
+         ) AS x ON true
+         ORDER BY u.id",
+    );
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Int64(1)],
+            vec![Value::Int64(2), Value::Null],
+        ]
+    );
+}
+
+#[test]
+fn lateral_table_function_accepts_correlated_argument() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE docs(id INT64, payload TEXT)");
+    exec(&db, "INSERT INTO docs VALUES (1, '[10,20]'), (2, '[30]')");
+    let result = exec(
+        &db,
+        "SELECT d.id, j.value
+         FROM docs d
+         JOIN LATERAL json_each(d.payload) AS j ON true
+         ORDER BY d.id, j.key",
+    );
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Int64(10)],
+            vec![Value::Int64(1), Value::Int64(20)],
+            vec![Value::Int64(2), Value::Int64(30)],
+        ]
+    );
+}
+
+#[test]
 fn correlated_subquery_with_function_call() {
     let db = mem_db();
     exec(&db, "CREATE TABLE names (id INT PRIMARY KEY, name TEXT)");

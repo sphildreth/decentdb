@@ -9,12 +9,12 @@ use crate::record::value::Value;
 
 use super::ast::{
     AlterTableAction, Assignment, BinaryOp, ColumnDefinition, CommonTableExpr, ConflictAction,
-    ConflictTarget, CreateIndexStatement, CreateTableStatement, CreateTriggerStatement,
-    CreateViewStatement, DeleteStatement, ExplainStatement, Expr, ForeignKeyActionSpec,
-    ForeignKeyDefinition, FromItem, IndexExpression, InsertSource, InsertStatement, JoinConstraint,
-    JoinKind, OrderBy, Query, QueryBody, Select, SelectItem, SetOperation, Statement,
-    SubqueryQuantifier, TableConstraint, TriggerEventSpec, TriggerKindSpec, UnaryOp,
-    UpdateStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
+    ConflictTarget, CreateIndexStatement, CreateTableAsStatement, CreateTableStatement,
+    CreateTriggerStatement, CreateViewStatement, DeleteStatement, ExplainStatement, Expr,
+    ForeignKeyActionSpec, ForeignKeyDefinition, FromItem, IndexExpression, InsertSource,
+    InsertStatement, JoinConstraint, JoinKind, OrderBy, Query, QueryBody, Select, SelectItem,
+    SetOperation, Statement, SubqueryQuantifier, TableConstraint, TriggerEventSpec,
+    TriggerKindSpec, UnaryOp, UpdateStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
 };
 
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
@@ -38,6 +38,9 @@ fn normalize_statement(node: &NodeEnum, original_sql: &str) -> Result<Statement>
         NodeEnum::CreateStmt(statement) => {
             Ok(Statement::CreateTable(normalize_create_table(statement)?))
         }
+        NodeEnum::CreateTableAsStmt(statement) => Ok(Statement::CreateTableAs(
+            normalize_create_table_as(statement)?,
+        )),
         NodeEnum::IndexStmt(statement) => {
             Ok(Statement::CreateIndex(normalize_create_index(statement)?))
         }
@@ -107,6 +110,12 @@ fn normalize_query(statement: &protobuf::SelectStmt) -> Result<Query> {
 }
 
 fn normalize_query_body(statement: &protobuf::SelectStmt) -> Result<QueryBody> {
+    if !statement.values_lists.is_empty() {
+        return Ok(QueryBody::Values(normalize_values_lists(
+            &statement.values_lists,
+        )?));
+    }
+
     let op =
         protobuf::SetOperation::try_from(statement.op).unwrap_or(protobuf::SetOperation::SetopNone);
     if op != protobuf::SetOperation::SetopNone {
@@ -252,6 +261,22 @@ fn normalize_insert_source(node: &protobuf::Node) -> Result<InsertSource> {
     }
 }
 
+fn normalize_values_lists(rows: &[protobuf::Node]) -> Result<Vec<Vec<Expr>>> {
+    rows.iter()
+        .map(|row| match node_kind(row)? {
+            NodeEnum::List(list) => list
+                .items
+                .iter()
+                .map(normalize_expr_container)
+                .collect::<Result<Vec<_>>>(),
+            other => Err(unsupported(format!(
+                "VALUES row kind {} is not supported",
+                describe_node(other)
+            ))),
+        })
+        .collect()
+}
+
 fn normalize_on_conflict(clause: &protobuf::OnConflictClause) -> Result<ConflictAction> {
     let action = protobuf::OnConflictAction::try_from(clause.action)
         .unwrap_or(protobuf::OnConflictAction::Undefined);
@@ -383,6 +408,65 @@ fn normalize_create_table(statement: &protobuf::CreateStmt) -> Result<CreateTabl
         if_not_exists: statement.if_not_exists,
         columns,
         constraints,
+    })
+}
+
+fn normalize_create_table_as(
+    statement: &protobuf::CreateTableAsStmt,
+) -> Result<CreateTableAsStatement> {
+    let objtype = protobuf::ObjectType::try_from(statement.objtype)
+        .unwrap_or(protobuf::ObjectType::Undefined);
+    if objtype != protobuf::ObjectType::ObjectTable {
+        return Err(unsupported("CREATE MATERIALIZED VIEW is not supported"));
+    }
+
+    let into = statement
+        .into
+        .as_deref()
+        .ok_or_else(|| unsupported("CREATE TABLE AS is missing target table"))?;
+    if !into.options.is_empty() {
+        return Err(unsupported(
+            "CREATE TABLE AS WITH (...) options are not supported",
+        ));
+    }
+    if !into.access_method.is_empty() {
+        return Err(unsupported(
+            "CREATE TABLE AS access methods are not supported",
+        ));
+    }
+    if !into.table_space_name.is_empty() {
+        return Err(unsupported("CREATE TABLE AS TABLESPACE is not supported"));
+    }
+    let on_commit = protobuf::OnCommitAction::try_from(into.on_commit)
+        .unwrap_or(protobuf::OnCommitAction::Undefined);
+    if on_commit != protobuf::OnCommitAction::OncommitNoop {
+        return Err(unsupported(
+            "CREATE TABLE AS ON COMMIT options are not supported",
+        ));
+    }
+
+    let relation = into
+        .rel
+        .as_ref()
+        .ok_or_else(|| unsupported("CREATE TABLE AS is missing target relation"))?;
+    let table_name = normalize_range_var(relation)?;
+    let temporary = relation.relpersistence == "t";
+    let column_names = into
+        .col_names
+        .iter()
+        .map(normalize_string_node)
+        .collect::<Result<Vec<_>>>()?;
+    let query =
+        normalize_query(as_select_stmt(statement.query.as_deref().ok_or_else(
+            || unsupported("CREATE TABLE AS is missing source query"),
+        )?)?)?;
+    Ok(CreateTableAsStatement {
+        table_name,
+        temporary,
+        if_not_exists: statement.if_not_exists,
+        column_names,
+        query,
+        with_data: !into.skip_data,
     })
 }
 
@@ -918,6 +1002,7 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                 .as_ref()
                 .map(|alias| alias.aliasname.clone())
                 .ok_or_else(|| unsupported("subqueries in FROM require an alias"))?,
+            lateral: range.lateral,
         }),
         NodeEnum::RangeFunction(range) => normalize_range_function(range),
         NodeEnum::JoinExpr(join) => Ok(FromItem::Join {
@@ -974,9 +1059,6 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
 }
 
 fn normalize_range_function(range: &protobuf::RangeFunction) -> Result<FromItem> {
-    if range.lateral {
-        return Err(unsupported("LATERAL table functions are not supported"));
-    }
     if range.ordinality {
         return Err(unsupported("WITH ORDINALITY is not supported"));
     }
@@ -1025,6 +1107,7 @@ fn normalize_range_function(range: &protobuf::RangeFunction) -> Result<FromItem>
         name,
         args,
         alias: range.alias.as_ref().map(|alias| alias.aliasname.clone()),
+        lateral: range.lateral,
     })
 }
 
@@ -2049,6 +2132,7 @@ fn describe_node(node: &NodeEnum) -> &'static str {
         NodeEnum::UpdateStmt(_) => "UpdateStmt",
         NodeEnum::DeleteStmt(_) => "DeleteStmt",
         NodeEnum::CreateStmt(_) => "CreateStmt",
+        NodeEnum::CreateTableAsStmt(_) => "CreateTableAsStmt",
         NodeEnum::IndexStmt(_) => "IndexStmt",
         NodeEnum::ViewStmt(_) => "ViewStmt",
         NodeEnum::DropStmt(_) => "DropStmt",
@@ -3512,6 +3596,77 @@ mod tests {
     fn with_non_recursive() {
         if let Statement::Query(q) = norm("WITH cte AS (SELECT 1 AS n) SELECT * FROM cte") {
             assert!(!q.recursive);
+        }
+    }
+
+    #[test]
+    fn values_query_body_normalizes() {
+        if let Statement::Query(query) = norm("VALUES (1, 'a'), (2, 'b')") {
+            match query.body {
+                QueryBody::Values(rows) => {
+                    assert_eq!(rows.len(), 2);
+                    assert_eq!(rows[0].len(), 2);
+                }
+                other => panic!("expected VALUES query body, got {other:?}"),
+            }
+        } else {
+            panic!("expected Query");
+        }
+    }
+
+    #[test]
+    fn create_table_as_normalizes() {
+        if let Statement::CreateTableAs(statement) =
+            norm("CREATE TABLE t_copy AS SELECT 1 AS id, 'x' AS name")
+        {
+            assert_eq!(statement.table_name, "t_copy");
+            assert!(!statement.temporary);
+            assert!(statement.with_data);
+            assert!(statement.column_names.is_empty());
+        } else {
+            panic!("expected CreateTableAs");
+        }
+    }
+
+    #[test]
+    fn create_table_as_with_no_data_normalizes() {
+        if let Statement::CreateTableAs(statement) =
+            norm("CREATE TABLE t_copy AS SELECT 1 AS id WITH NO DATA")
+        {
+            assert!(!statement.with_data);
+        } else {
+            panic!("expected CreateTableAs");
+        }
+    }
+
+    #[test]
+    fn create_table_as_column_list_normalizes() {
+        if let Statement::CreateTableAs(statement) =
+            norm("CREATE TABLE t_copy (a, b) AS SELECT 1, 'x'")
+        {
+            assert_eq!(
+                statement.column_names,
+                vec!["a".to_string(), "b".to_string()]
+            );
+        } else {
+            panic!("expected CreateTableAs");
+        }
+    }
+
+    #[test]
+    fn lateral_subquery_normalizes() {
+        if let Statement::Query(query) = norm("SELECT * FROM t, LATERAL (SELECT t.id) AS x") {
+            match &query.body {
+                QueryBody::Select(select) => {
+                    assert!(matches!(
+                        &select.from[1],
+                        FromItem::Subquery { lateral: true, .. }
+                    ));
+                }
+                other => panic!("expected SELECT body, got {other:?}"),
+            }
+        } else {
+            panic!("expected Query");
         }
     }
 

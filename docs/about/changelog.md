@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DML enhancements: `UPDATE ... RETURNING` and `DELETE ... RETURNING`.
 - Subquery comparison operators: `expr op ANY/SOME (subquery)` and `expr op ALL (subquery)`.
 - Regex comparison operators: `~`, `~*`, `!~`, `!~*`.
+- Extended date/time functions: `DATE_TRUNC`, `DATE_PART`, `DATE_DIFF`, `LAST_DAY`, `NEXT_DAY`, `MAKE_DATE`, `MAKE_TIMESTAMP`, `TO_TIMESTAMP`, `AGE`, and timestamp `INTERVAL` arithmetic.
+- Extended string functions: `CONCAT`, `CONCAT_WS`, `POSITION`, `INITCAP`, `ASCII`, `REGEXP_REPLACE`, `SPLIT_PART`, `STRING_TO_ARRAY`, `QUOTE_IDENT`, `QUOTE_LITERAL`, `MD5`, and `SHA256`.
+- Query features slice (S9): standalone `VALUES` query bodies, `VALUES` table sources, `CREATE TABLE ... AS SELECT` (including `WITH NO DATA` and `IF NOT EXISTS`), and `LATERAL` subqueries/table-function joins.
 
 ### Changed
 - Refreshed repository documentation to present DecentDB as the current Rust engine and binding ecosystem.

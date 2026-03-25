@@ -179,6 +179,11 @@ SELECT * FROM orders NATURAL JOIN order_details;
 | DISTINCT ON | ✅ | ❌ | ✅ | ✅ |
 | LIMIT ALL | ✅ | ✅ | ✅ | ✅ |
 | OFFSET with FETCH | ✅ | ✅ | ✅ | ✅ |
+| Standalone `VALUES (...)` queries | ✅ | ✅ | ✅ | ✅ |
+| `FROM (VALUES ...) AS alias(...)` | ✅ | ✅ | ✅ | ✅ |
+| `CREATE TABLE ... AS SELECT` (CTAS) | ✅ | ✅ | ✅ | ✅ |
+| CTAS `WITH NO DATA` | ✅ | ❌ | ✅ | ✅ (`WITH NO DATA`) |
+| LATERAL subqueries/table functions | ✅ | ⚠️ (implicit only) | ✅ | ✅ |
 
 ### Examples
 
@@ -199,6 +204,27 @@ SELECT * FROM users ORDER BY id OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY;
 
 -- LIMIT / OFFSET (traditional form)
 SELECT * FROM users ORDER BY id LIMIT 10 OFFSET 20;
+
+-- Standalone VALUES query body
+VALUES (1, 'one'), (2, 'two');
+
+-- VALUES as table source
+SELECT t.id, t.label
+FROM (VALUES (1, 'one'), (2, 'two')) AS t(id, label)
+ORDER BY t.id;
+
+-- CTAS with inferred schema
+CREATE TABLE active_users AS
+SELECT id, name FROM users WHERE active = TRUE;
+
+-- CTAS structure only (no row copy)
+CREATE TABLE active_users_template AS
+SELECT id, name FROM users WITH NO DATA;
+
+-- LATERAL subquery
+SELECT u.id, x.twice
+FROM users u
+JOIN LATERAL (SELECT u.id * 2 AS twice) AS x ON true;
 ```
 
 ## Aggregate Functions
@@ -367,6 +393,18 @@ FROM orders;
 | REVERSE() | ✅ | ✅ | ✅ | ✅ |
 | CHR() | ✅ | ❌ (uses CHAR) | ✅ | ✅ |
 | HEX() | ✅ | ✅ | ✅ | ✅ |
+| CONCAT() | ✅ | ❌ | ✅ | ✅ |
+| CONCAT_WS() | ✅ | ❌ | ✅ | ✅ |
+| POSITION() | ✅ | ✅ | ✅ | ✅ |
+| INITCAP() | ✅ | ❌ | ✅ | ✅ |
+| ASCII() | ✅ | ✅ | ✅ | ✅ |
+| REGEXP_REPLACE() | ✅ | ❌ | ✅ | ✅ |
+| SPLIT_PART() | ✅ | ❌ | ✅ | ✅ |
+| STRING_TO_ARRAY() | ✅ | ❌ | ✅ | ✅ |
+| QUOTE_IDENT() | ✅ | ❌ | ✅ | ✅ |
+| QUOTE_LITERAL() | ✅ | ❌ | ✅ | ✅ |
+| MD5() | ✅ | ❌ | ✅ | ✅ |
+| SHA256() | ✅ | ❌ | ✅ | ✅ |
 
 ### Date/Time Functions
 
@@ -380,6 +418,16 @@ FROM orders;
 | datetime() | ✅ | ✅ | ✅ (different) | ❌ (use CAST) |
 | strftime() | ✅ | ✅ | ❌ | ✅ |
 | EXTRACT() | ✅ | ❌ | ✅ | ✅ |
+| DATE_TRUNC() | ✅ | ❌ | ✅ | ✅ |
+| DATE_PART() | ✅ | ❌ | ✅ | ✅ |
+| DATE_DIFF() | ✅ | ❌ | ❌ | ✅ |
+| LAST_DAY() | ✅ | ❌ | ❌ | ✅ |
+| NEXT_DAY() | ✅ | ❌ | ❌ | ✅ |
+| MAKE_DATE() | ✅ | ❌ | ✅ | ✅ |
+| MAKE_TIMESTAMP() | ✅ | ❌ | ✅ | ✅ |
+| TO_TIMESTAMP() | ✅ | ❌ | ✅ | ✅ |
+| AGE() | ✅ | ❌ | ✅ | ✅ |
+| TIMESTAMP ± INTERVAL | ✅ | ❌ | ✅ | ✅ |
 
 ### JSON Functions
 
@@ -417,6 +465,12 @@ SELECT LEFT('hello', 3), RIGHT('hello', 3);  -- 'hel', 'llo'
 SELECT LPAD('42', 5, '0'), RPAD('hi', 5, '!');  -- '00042', 'hi!!!'
 SELECT REPEAT('ab', 3), REVERSE('hello');  -- 'ababab', 'olleh'
 SELECT CHR(65), HEX('ABC');  -- 'A', '414243'
+SELECT CONCAT('hello', ' ', 'world'), CONCAT_WS('-', '2024', '03', '25');
+SELECT POSITION('world' IN 'hello world'), INITCAP('hello world');
+SELECT REGEXP_REPLACE('abc123def', '\d', '', 'g');
+SELECT SPLIT_PART('a,b,c', ',', 2), STRING_TO_ARRAY('a,b,c', ',');
+SELECT QUOTE_IDENT('table name'), QUOTE_LITERAL('O''Brien');
+SELECT MD5('hello'), SHA256('hello');
 SELECT GREATEST(10, 7, 12), LEAST(10, 7, 12), IIF(2 > 1, 'yes', 'no');
 ```
 
@@ -439,6 +493,15 @@ SELECT strftime('%Y', '2024-03-15');  -- '2024'
 SELECT EXTRACT(YEAR FROM CURRENT_TIMESTAMP);
 SELECT EXTRACT(MONTH FROM '2024-03-15');
 SELECT EXTRACT(DOW FROM '2024-03-15');  -- day of week
+
+-- Extended date/time helpers
+SELECT DATE_TRUNC('month', '2024-03-15 14:30:45');
+SELECT DATE_PART('doy', '2024-03-15');
+SELECT DATE_DIFF('day', '2024-03-10', '2024-03-15');
+SELECT LAST_DAY('2024-02-11'), NEXT_DAY('2024-03-15', 'Monday');
+SELECT MAKE_DATE(2024, 3, 15), MAKE_TIMESTAMP(2024, 3, 15, 14, 30, 0);
+SELECT TO_TIMESTAMP(1710505800), AGE('2024-03-15', '2024-03-14');
+SELECT '2024-03-15 14:30:00'::timestamp + INTERVAL '1 day';
 ```
 
 ### JSON Examples

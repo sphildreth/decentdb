@@ -30,11 +30,11 @@ The following table tracks the implementation status of each feature slice. Slic
 | S2 | Aggregate Functions (Statistical) | High | 🟢 Completed | Low |
 | S3 | DML Enhancements (RETURNING, TRUNCATE) | High | 🟢 Completed | Medium |
 | S4 | Trigonometric Math Functions | High | 🟢 Completed | Low |
-| S5 | String Functions (Extended) | High | 🔴 Not Started | Low |
+| S5 | String Functions (Extended) | High | 🟢 Completed | Low |
 | S6 | Conditional Functions | High | 🟢 Completed | Low |
-| S7 | Date/Time Functions (Extended) | Medium | 🔴 Not Started | Medium |
+| S7 | Date/Time Functions (Extended) | Medium | 🟢 Completed | Medium |
 | S8 | Subquery Operators (EXISTS, ANY, ALL) | Medium | 🟢 Completed | Medium |
-| S9 | Query Features (LATERAL, VALUES, CTAS) | Medium | 🔴 Not Started | Medium |
+| S9 | Query Features (LATERAL, VALUES, CTAS) | Medium | 🟢 Completed | Medium |
 | S10 | Comparison Operators (IS DISTINCT FROM) | Medium | 🟢 Completed | Low |
 | S11 | DDL Enhancements | Medium | 🔴 Not Started | Medium |
 | S12 | Utility Commands (EXPLAIN) | Medium | 🔴 Not Started | Medium |

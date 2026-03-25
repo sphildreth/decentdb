@@ -2921,9 +2921,24 @@ fn scalar_abs() {
 #[test]
 fn scalar_concat() {
     let db = mem_db();
-    // CONCAT function not supported; use || operator instead
-    let r = db.execute("SELECT 'hello' || ' ' || 'world'").unwrap();
-    assert_eq!(rows(&r)[0][0], Value::Text("hello world".into()));
+    let r = db
+        .execute(
+            "SELECT
+                CONCAT('hello', ' ', 'world'),
+                CONCAT('a', NULL, 'b'),
+                CONCAT_WS('-', '2024', '03', '25'),
+                CONCAT_WS(', ', 'Alice', NULL, 'Bob')",
+        )
+        .unwrap();
+    assert_eq!(
+        rows(&r)[0],
+        &[
+            Value::Text("hello world".into()),
+            Value::Text("ab".into()),
+            Value::Text("2024-03-25".into()),
+            Value::Text("Alice, Bob".into()),
+        ]
+    );
 }
 
 #[test]
@@ -3036,6 +3051,51 @@ fn select_without_from() {
     let db = mem_db();
     let r = exec(&db, "SELECT 1 + 2 AS result");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(3));
+}
+
+#[test]
+fn values_query_body_executes() {
+    let db = mem_db();
+    let r = exec(&db, "VALUES (1, 'one'), (2, 'two') ORDER BY col1");
+    assert_eq!(
+        rows(&r),
+        vec![
+            vec![Value::Int64(1), Value::Text("one".into())],
+            vec![Value::Int64(2), Value::Text("two".into())],
+        ]
+    );
+}
+
+#[test]
+fn create_table_as_select_populates_rows() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE src(id INT64, name TEXT)");
+    exec(&db, "INSERT INTO src VALUES (1, 'a'), (2, 'b')");
+    exec(
+        &db,
+        "CREATE TABLE copy AS SELECT id, name FROM src ORDER BY id",
+    );
+    let r = exec(&db, "SELECT id, name FROM copy ORDER BY id");
+    assert_eq!(
+        rows(&r),
+        vec![
+            vec![Value::Int64(1), Value::Text("a".into())],
+            vec![Value::Int64(2), Value::Text("b".into())],
+        ]
+    );
+}
+
+#[test]
+fn create_table_as_with_column_list_and_no_data() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE ctas_named (a, b) AS SELECT 1, 'x' WITH NO DATA",
+    );
+    let count = exec(&db, "SELECT COUNT(*) FROM ctas_named");
+    assert_eq!(rows(&count)[0][0], Value::Int64(0));
+    let r = exec(&db, "SELECT a, b FROM ctas_named");
+    assert_eq!(r.columns(), &["a".to_string(), "b".to_string()]);
 }
 
 #[test]
@@ -3239,13 +3299,45 @@ fn string_operators_on_columns() {
 #[test]
 fn string_position() {
     let db = mem_db();
-    // POSITION is not supported; test REPLACE and LENGTH instead
     let r = db
-        .execute("SELECT REPLACE('hello world', 'world', 'there')")
+        .execute("SELECT POSITION('world' IN 'hello world'), POSITION('xyz' IN 'hello world')")
         .unwrap();
-    assert_eq!(rows(&r)[0][0], Value::Text("hello there".into()));
-    let r2 = db.execute("SELECT LENGTH('hello')").unwrap();
-    assert_eq!(rows(&r2)[0][0], Value::Int64(5));
+    assert_eq!(rows(&r)[0], &[Value::Int64(7), Value::Int64(0)]);
+}
+
+#[test]
+fn extended_string_functions_slice5() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                INITCAP('hello world from decentdb'),
+                ASCII('A'),
+                REGEXP_REPLACE('abc123def', '\\d', '', 'g'),
+                SPLIT_PART('a,b,c', ',', 2),
+                STRING_TO_ARRAY('a,b,c', ','),
+                QUOTE_IDENT('table name'),
+                QUOTE_LITERAL('O''Brien'),
+                MD5('hello'),
+                SHA256('hello')",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::Text("Hello World From Decentdb".to_string()),
+            Value::Int64(65),
+            Value::Text("abcdef".to_string()),
+            Value::Text("b".to_string()),
+            Value::Text("[\"a\",\"b\",\"c\"]".to_string()),
+            Value::Text("\"table name\"".to_string()),
+            Value::Text("'O''Brien'".to_string()),
+            Value::Text("5d41402abc4b2a76b9719d911017c592".to_string()),
+            Value::Text(
+                "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824".to_string(),
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -3665,6 +3757,27 @@ fn extended_datetime_interval_arithmetic() {
             Value::TimestampMicros(1_713_105_000_000_000),
             Value::TimestampMicros(1_747_492_200_000_000),
             Value::TimestampMicros(1_711_065_600_000_000),
+        ]
+    );
+}
+
+#[test]
+fn extended_datetime_interval_arithmetic_with_casted_text() {
+    let db = mem_db();
+    let result = db
+        .execute(
+            "SELECT
+                CAST('2024-03-15 14:30:00' AS TIMESTAMP) + CAST('1 day' AS INTERVAL),
+                CAST('2024-03-15' AS DATE) + CAST('1 month' AS INTERVAL),
+                CAST('2024-03-15 14:30:00' AS TIMESTAMP) - CAST('2 hour' AS INTERVAL)",
+        )
+        .unwrap();
+    assert_eq!(
+        result.rows()[0].values(),
+        &[
+            Value::TimestampMicros(1_710_599_400_000_000),
+            Value::TimestampMicros(1_713_052_800_000_000),
+            Value::TimestampMicros(1_710_505_800_000_000),
         ]
     );
 }

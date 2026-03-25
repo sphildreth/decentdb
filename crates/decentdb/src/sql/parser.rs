@@ -49,6 +49,9 @@ pub(crate) fn parse_expression_sql(sql: &str) -> Result<Expr> {
                     )),
                 }
             }
+            super::ast::QueryBody::Values(rows) if rows.len() == 1 && rows[0].len() == 1 => {
+                Ok(rows[0][0].clone())
+            }
             _ => Err(DbError::sql("expression parser expected a simple SELECT")),
         },
         _ => Err(DbError::sql(

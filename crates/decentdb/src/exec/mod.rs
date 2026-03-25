@@ -41,8 +41,9 @@ use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
-    BinaryOp, CommonTableExpr, Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select,
-    SelectItem, Statement, SubqueryQuantifier, UnaryOp,
+    BinaryOp, ColumnDefinition, CommonTableExpr, CreateTableAsStatement, CreateTableStatement,
+    Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, SelectItem, Statement,
+    SubqueryQuantifier, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::{crc32c_extend, crc32c_parts};
@@ -1063,6 +1064,11 @@ impl EngineRuntime {
                 self.rebuild_indexes(page_size)?;
                 Ok(QueryResult::with_affected_rows(0))
             }
+            Statement::CreateTableAs(statement) => {
+                let result = self.execute_create_table_as(statement, params, page_size)?;
+                self.rebuild_indexes(page_size)?;
+                Ok(result)
+            }
             Statement::CreateIndex(statement) => {
                 self.execute_create_index(statement, page_size)?;
                 self.rebuild_indexes(page_size)?;
@@ -1125,6 +1131,145 @@ impl EngineRuntime {
                 Ok(QueryResult::with_affected_rows(0))
             }
         }
+    }
+
+    fn execute_create_table_as(
+        &mut self,
+        statement: &CreateTableAsStatement,
+        params: &[Value],
+        page_size: u32,
+    ) -> Result<QueryResult> {
+        if statement.temporary {
+            if self.temp_relation_exists(&statement.table_name) {
+                if statement.if_not_exists
+                    && self.temp_table_schema(&statement.table_name).is_some()
+                {
+                    return Ok(QueryResult::with_affected_rows(0));
+                }
+                return Err(DbError::sql(format!(
+                    "object {} already exists",
+                    statement.table_name
+                )));
+            }
+        } else if self.catalog.contains_object(&statement.table_name) {
+            if statement.if_not_exists && self.catalog.table(&statement.table_name).is_some() {
+                return Ok(QueryResult::with_affected_rows(0));
+            }
+            return Err(DbError::sql(format!(
+                "object {} already exists",
+                statement.table_name
+            )));
+        }
+
+        let mut source = self.evaluate_query(&statement.query, params, &BTreeMap::new())?;
+        let target_columns = if statement.column_names.is_empty() {
+            source
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| {
+                    if binding.name.is_empty() {
+                        format!("column{}", index + 1)
+                    } else {
+                        binding.name.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            if statement.column_names.len() != source.columns.len() {
+                return Err(DbError::sql(format!(
+                    "CREATE TABLE AS expected {} column names but query produced {} columns",
+                    statement.column_names.len(),
+                    source.columns.len()
+                )));
+            }
+            statement.column_names.clone()
+        };
+
+        let columns = target_columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ColumnDefinition {
+                name: name.clone(),
+                column_type: infer_column_type_for_ctas(&source.rows, index),
+                nullable: true,
+                default: None,
+                generated: None,
+                primary_key: false,
+                unique: false,
+                checks: Vec::new(),
+                references: None,
+            })
+            .collect::<Vec<_>>();
+        let create_statement = CreateTableStatement {
+            table_name: statement.table_name.clone(),
+            temporary: statement.temporary,
+            if_not_exists: false,
+            columns,
+            constraints: Vec::new(),
+        };
+        self.execute_create_table(&create_statement)?;
+        if !statement.with_data {
+            return Ok(QueryResult::with_affected_rows(0));
+        }
+
+        let table_name = statement.table_name.clone();
+        let temporary = self.visible_table_is_temporary(&table_name);
+        let mut affected_rows = 0_u64;
+        for source_row in source.rows.drain(..) {
+            let candidate = {
+                let mut staged_table = self
+                    .table_schema(&table_name)
+                    .cloned()
+                    .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+                let candidate = dml::build_insert_row_values(
+                    self,
+                    &mut staged_table,
+                    &target_columns,
+                    source_row,
+                    params,
+                )?;
+                if temporary {
+                    self.temp_table_schema_mut(&table_name)
+                        .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+                        .next_row_id = staged_table.next_row_id;
+                } else {
+                    self.catalog
+                        .tables
+                        .get_mut(&table_name)
+                        .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?
+                        .next_row_id = staged_table.next_row_id;
+                }
+                candidate
+            };
+            self.validate_row(&table_name, &candidate, None, params)?;
+            let row_id = {
+                let table = self
+                    .table_schema(&table_name)
+                    .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+                dml::primary_row_id(table, &candidate)
+                    .unwrap_or_else(|| dml::next_row_id(self, &table_name))
+            };
+            let stored_row = StoredRow {
+                row_id,
+                values: candidate,
+            };
+            let index_updates =
+                self.prepare_insert_index_updates(&table_name, &stored_row, page_size)?;
+            self.table_data_mut(&table_name)
+                .ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?
+                .rows
+                .push(stored_row);
+            self.apply_insert_index_updates(index_updates)?;
+            if !temporary {
+                self.mark_table_dirty(&table_name);
+            }
+            affected_rows += 1;
+        }
+
+        Ok(QueryResult::with_affected_rows(affected_rows))
     }
 
     pub(crate) fn execute_read_statement(
@@ -1785,6 +1930,7 @@ impl EngineRuntime {
     ) -> Result<Dataset> {
         match body {
             QueryBody::Select(select) => self.evaluate_select(select, params, ctes),
+            QueryBody::Values(rows) => self.evaluate_values_body(rows, params, ctes),
             QueryBody::SetOperation {
                 op,
                 all,
@@ -1809,6 +1955,9 @@ impl EngineRuntime {
         match body {
             QueryBody::Select(select) => {
                 self.evaluate_select_with_outer(select, params, ctes, outer_dataset, outer_row)
+            }
+            QueryBody::Values(rows) => {
+                self.evaluate_values_body_with_outer(rows, params, ctes, outer_dataset, outer_row)
             }
             QueryBody::SetOperation {
                 op,
@@ -1909,37 +2058,21 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
-        let mut dataset = if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
-            dataset
-        } else if let Some(dataset) = self.try_indexed_join(select, params, ctes)? {
-            dataset
-        } else if let Some(dataset) =
-            self.try_indexed_prefiltered_inner_join_tree(select, params, ctes)?
-        {
-            dataset
-        } else if select.from.is_empty() {
-            Dataset {
-                columns: Vec::new(),
-                rows: vec![Vec::new()],
+        let has_lateral = select.from.iter().any(from_item_contains_lateral);
+        let mut dataset = if !has_lateral {
+            if let Some(dataset) = self.try_indexed_scan(select, params, ctes)? {
+                dataset
+            } else if let Some(dataset) = self.try_indexed_join(select, params, ctes)? {
+                dataset
+            } else if let Some(dataset) =
+                self.try_indexed_prefiltered_inner_join_tree(select, params, ctes)?
+            {
+                dataset
+            } else {
+                self.evaluate_from_clause(&select.from, params, ctes, &Dataset::empty(), &[])?
             }
         } else {
-            let mut iter = select.from.iter();
-            let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
-            let mut current =
-                self.evaluate_from_item(iter.next().expect("first FROM item"), params, ctes)?;
-            for item in iter {
-                let right = self.evaluate_from_item(item, params, ctes)?;
-                current = nested_loop_join(
-                    current,
-                    right,
-                    JoinKind::Inner,
-                    &cross_constraint,
-                    self,
-                    params,
-                    ctes,
-                )?;
-            }
-            current
+            self.evaluate_from_clause(&select.from, params, ctes, &Dataset::empty(), &[])?
         };
 
         if let Some(filter) = &select.filter {
@@ -1966,30 +2099,8 @@ impl EngineRuntime {
         outer_dataset: &Dataset,
         outer_row: &[Value],
     ) -> Result<Dataset> {
-        let mut dataset = if select.from.is_empty() {
-            Dataset {
-                columns: Vec::new(),
-                rows: vec![Vec::new()],
-            }
-        } else {
-            let mut iter = select.from.iter();
-            let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
-            let mut current =
-                self.evaluate_from_item(iter.next().expect("first FROM item"), params, ctes)?;
-            for item in iter {
-                let right = self.evaluate_from_item(item, params, ctes)?;
-                current = nested_loop_join(
-                    current,
-                    right,
-                    JoinKind::Inner,
-                    &cross_constraint,
-                    self,
-                    params,
-                    ctes,
-                )?;
-            }
-            current
-        };
+        let mut dataset =
+            self.evaluate_from_clause(&select.from, params, ctes, outer_dataset, outer_row)?;
 
         dataset = augment_dataset_with_outer_scope(dataset, outer_dataset, outer_row);
         if let Some(filter) = &select.filter {
@@ -2005,6 +2116,58 @@ impl EngineRuntime {
             });
         }
         Ok(dataset)
+    }
+
+    fn evaluate_from_clause(
+        &self,
+        from: &[FromItem],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        scope_dataset: &Dataset,
+        scope_row: &[Value],
+    ) -> Result<Dataset> {
+        if from.is_empty() {
+            return Ok(Dataset {
+                columns: Vec::new(),
+                rows: vec![Vec::new()],
+            });
+        }
+        let mut iter = from.iter();
+        let cross_constraint = JoinConstraint::On(Expr::Literal(Value::Bool(true)));
+        let mut current = self.evaluate_from_item_in_scope(
+            iter.next().expect("first FROM item"),
+            params,
+            ctes,
+            scope_dataset,
+            scope_row,
+        )?;
+        for item in iter {
+            current = if from_item_is_lateral(item) {
+                self.evaluate_join_with_lateral_right(
+                    current,
+                    item,
+                    JoinKind::Inner,
+                    &cross_constraint,
+                    params,
+                    ctes,
+                    scope_dataset,
+                    scope_row,
+                )?
+            } else {
+                let right =
+                    self.evaluate_from_item_in_scope(item, params, ctes, scope_dataset, scope_row)?;
+                nested_loop_join(
+                    current,
+                    right,
+                    JoinKind::Inner,
+                    &cross_constraint,
+                    self,
+                    params,
+                    ctes,
+                )?
+            };
+        }
+        Ok(current)
     }
 
     fn try_indexed_scan(
@@ -2105,6 +2268,64 @@ impl EngineRuntime {
         }
 
         Ok(None)
+    }
+
+    fn evaluate_values_body(
+        &self,
+        rows: &[Vec<Expr>],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Dataset> {
+        self.evaluate_values_body_inner(rows, params, ctes, &Dataset::empty(), &[])
+    }
+
+    fn evaluate_values_body_with_outer(
+        &self,
+        rows: &[Vec<Expr>],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        outer_dataset: &Dataset,
+        outer_row: &[Value],
+    ) -> Result<Dataset> {
+        self.evaluate_values_body_inner(rows, params, ctes, outer_dataset, outer_row)
+    }
+
+    fn evaluate_values_body_inner(
+        &self,
+        rows: &[Vec<Expr>],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        scope_dataset: &Dataset,
+        scope_row: &[Value],
+    ) -> Result<Dataset> {
+        let width = rows.first().map_or(0, Vec::len);
+        let mut columns = Vec::with_capacity(width);
+        if let Some(first_row) = rows.first() {
+            for (index, expr) in first_row.iter().enumerate() {
+                columns.push(ColumnBinding::visible(
+                    None,
+                    infer_expr_name(expr, index + 1),
+                ));
+            }
+        }
+
+        let mut result_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != width {
+                return Err(DbError::sql(
+                    "VALUES rows must all have the same number of columns",
+                ));
+            }
+            let values = row
+                .iter()
+                .map(|expr| self.eval_expr(expr, scope_dataset, scope_row, params, ctes, None))
+                .collect::<Result<Vec<_>>>()?;
+            result_rows.push(values);
+        }
+        Ok(Dataset {
+            columns,
+            rows: result_rows,
+        })
     }
 
     fn try_indexed_join(
@@ -2619,6 +2840,17 @@ impl EngineRuntime {
         params: &[Value],
         ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
+        self.evaluate_from_item_in_scope(item, params, ctes, &Dataset::empty(), &[])
+    }
+
+    fn evaluate_from_item_in_scope(
+        &self,
+        item: &FromItem,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        scope_dataset: &Dataset,
+        scope_row: &[Value],
+    ) -> Result<Dataset> {
         match item {
             FromItem::Table { name, alias } => {
                 if let Some(dataset) = ctes.get(name) {
@@ -2673,15 +2905,38 @@ impl EngineRuntime {
                     rows: data.rows.into_iter().map(|row| row.values).collect(),
                 })
             }
-            FromItem::Subquery { query, alias } => {
-                let mut dataset = self.evaluate_query(query, params, ctes)?;
+            FromItem::Subquery {
+                query,
+                alias,
+                lateral,
+            } => {
+                let mut dataset = if *lateral {
+                    self.evaluate_query_with_outer(query, params, ctes, scope_dataset, scope_row)?
+                } else {
+                    self.evaluate_query(query, params, ctes)?
+                };
                 for column in &mut dataset.columns {
                     column.table = Some(alias.clone());
                 }
                 Ok(dataset)
             }
-            FromItem::Function { name, args, alias } => {
-                self.evaluate_table_function(name, args, alias, params, ctes)
+            FromItem::Function {
+                name,
+                args,
+                alias,
+                lateral,
+            } => {
+                let eval_dataset = if *lateral {
+                    scope_dataset
+                } else {
+                    &Dataset::empty()
+                };
+                let eval_row = if *lateral { scope_row } else { &[] };
+                let values = args
+                    .iter()
+                    .map(|expr| self.eval_expr(expr, eval_dataset, eval_row, params, ctes, None))
+                    .collect::<Result<Vec<_>>>()?;
+                self.evaluate_table_function(name, values, alias)
             }
             FromItem::Join {
                 left,
@@ -2689,7 +2944,20 @@ impl EngineRuntime {
                 kind,
                 constraint,
             } => {
-                let left = self.evaluate_from_item(left, params, ctes)?;
+                let left =
+                    self.evaluate_from_item_in_scope(left, params, ctes, scope_dataset, scope_row)?;
+                if from_item_is_lateral(right) {
+                    return self.evaluate_join_with_lateral_right(
+                        left,
+                        right,
+                        *kind,
+                        constraint,
+                        params,
+                        ctes,
+                        scope_dataset,
+                        scope_row,
+                    );
+                }
                 if matches!(kind, JoinKind::Inner) {
                     if let Some(dataset) = self
                         .try_indexed_inner_join_with_right_table(&left, right, constraint, ctes)?
@@ -2697,26 +2965,71 @@ impl EngineRuntime {
                         return Ok(dataset);
                     }
                 }
-                let right = self.evaluate_from_item(right, params, ctes)?;
+                let right = self.evaluate_from_item_in_scope(
+                    right,
+                    params,
+                    ctes,
+                    scope_dataset,
+                    scope_row,
+                )?;
                 nested_loop_join(left, right, *kind, constraint, self, params, ctes)
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_join_with_lateral_right(
+        &self,
+        left: Dataset,
+        right_item: &FromItem,
+        kind: JoinKind,
+        constraint: &JoinConstraint,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        scope_dataset: &Dataset,
+        scope_row: &[Value],
+    ) -> Result<Dataset> {
+        if matches!(kind, JoinKind::Right | JoinKind::Full) {
+            return Err(DbError::sql(
+                "LATERAL is only supported with INNER, LEFT, and CROSS joins",
+            ));
+        }
+
+        let mut columns = left.columns.clone();
+        let mut rows = Vec::new();
+        for left_row in &left.rows {
+            let left_single = Dataset {
+                columns: left.columns.clone(),
+                rows: vec![left_row.clone()],
+            };
+            let scope_with_left =
+                augment_dataset_with_outer_scope(left_single.clone(), scope_dataset, scope_row);
+            let scope_values = scope_with_left
+                .rows
+                .first()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let right = self.evaluate_from_item_in_scope(
+                right_item,
+                params,
+                ctes,
+                &scope_with_left,
+                scope_values,
+            )?;
+            let joined =
+                nested_loop_join(left_single, right, kind, constraint, self, params, ctes)?;
+            columns = joined.columns.clone();
+            rows.extend(joined.rows);
+        }
+        Ok(Dataset { columns, rows })
+    }
+
     fn evaluate_table_function(
         &self,
         name: &str,
-        args: &[Expr],
+        values: Vec<Value>,
         alias: &Option<String>,
-        params: &[Value],
-        ctes: &BTreeMap<String, Dataset>,
     ) -> Result<Dataset> {
-        let empty_dataset = Dataset::empty();
-        let empty_row = Vec::new();
-        let values = args
-            .iter()
-            .map(|expr| self.eval_expr(expr, &empty_dataset, &empty_row, params, ctes, None))
-            .collect::<Result<Vec<_>>>()?;
         let table_name = alias.clone().unwrap_or_else(|| name.to_string());
         match name {
             "json_each" | "pg_catalog.json_each" => {
@@ -2925,6 +3238,10 @@ fn query_body_references_outer(
 ) -> bool {
     match body {
         QueryBody::Select(select) => select_references_outer(select, outer_tables, local_tables),
+        QueryBody::Values(rows) => rows
+            .iter()
+            .flatten()
+            .any(|expr| expr_references_outer(expr, outer_tables, local_tables)),
         QueryBody::SetOperation { left, right, .. } => {
             query_body_references_outer(left, outer_tables, local_tables)
                 || query_body_references_outer(right, outer_tables, local_tables)
@@ -3078,6 +3395,7 @@ fn collect_query_body_table_names(body: &QueryBody, names: &mut BTreeSet<String>
                 collect_from_item_table_names(item, names);
             }
         }
+        QueryBody::Values(_) => {}
         QueryBody::SetOperation { left, right, .. } => {
             collect_query_body_table_names(left, names);
             collect_query_body_table_names(right, names);
@@ -3154,6 +3472,7 @@ fn recursive_term_has_unsupported_features(body: &QueryBody) -> bool {
                     .any(expr_contains_recursive_unsupported_feature)
                 || select.from.iter().any(from_item_contains_subquery)
         }
+        QueryBody::Values(_) => true,
         QueryBody::SetOperation { .. } => true,
     }
 }
@@ -3238,6 +3557,23 @@ fn from_item_contains_subquery(item: &FromItem) -> bool {
     }
 }
 
+fn from_item_is_lateral(item: &FromItem) -> bool {
+    match item {
+        FromItem::Subquery { lateral, .. } | FromItem::Function { lateral, .. } => *lateral,
+        FromItem::Table { .. } | FromItem::Join { .. } => false,
+    }
+}
+
+fn from_item_contains_lateral(item: &FromItem) -> bool {
+    match item {
+        FromItem::Subquery { lateral, .. } | FromItem::Function { lateral, .. } => *lateral,
+        FromItem::Table { .. } => false,
+        FromItem::Join { left, right, .. } => {
+            from_item_contains_lateral(left) || from_item_contains_lateral(right)
+        }
+    }
+}
+
 fn validate_recursive_term(body: &QueryBody, cte_name: &str) -> Result<()> {
     if recursive_term_has_unsupported_features(body) {
         return Err(DbError::sql(format!(
@@ -3279,6 +3615,7 @@ fn query_body_table_reference_count(body: &QueryBody, table_name: &str) -> usize
             .iter()
             .map(|item| from_item_table_reference_count(item, table_name))
             .sum(),
+        QueryBody::Values(_) => 0,
         QueryBody::SetOperation { left, right, .. } => {
             query_body_table_reference_count(left, table_name)
                 + query_body_table_reference_count(right, table_name)
@@ -7402,6 +7739,32 @@ fn eval_function(
         "greatest" => eval_greatest_least(&values, true),
         "least" => eval_greatest_least(&values, false),
         "iif" => eval_iif(&values),
+        "concat" => {
+            let mut output = String::new();
+            for value in &values {
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                output.push_str(&value_to_text(value)?);
+            }
+            Ok(Value::Text(output))
+        }
+        "concat_ws" => {
+            if values.is_empty() {
+                return Err(DbError::sql("CONCAT_WS expects at least 1 argument"));
+            }
+            let Some(separator) = expect_text_arg("CONCAT_WS", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let mut parts = Vec::new();
+            for value in &values[1..] {
+                if matches!(value, Value::Null) {
+                    continue;
+                }
+                parts.push(value_to_text(value)?);
+            }
+            Ok(Value::Text(parts.join(separator)))
+        }
         "lower" => unary_text_fn(values, |value| value.to_ascii_lowercase()),
         "upper" => unary_text_fn(values, |value| value.to_ascii_uppercase()),
         "trim" | "pg_catalog.btrim" => unary_text_fn(values, |value| value.trim().to_string()),
@@ -7409,6 +7772,68 @@ fn eval_function(
             unary_text_fn(values, |value| value.trim_start().to_string())
         }
         "rtrim" | "pg_catalog.rtrim" => unary_text_fn(values, |value| value.trim_end().to_string()),
+        "position" | "pg_catalog.position" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("POSITION expects 2 arguments"));
+            }
+            let Some(haystack) = expect_text_arg("POSITION", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(needle) = expect_text_arg("POSITION", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            if needle.is_empty() {
+                return Ok(Value::Int64(1));
+            }
+            if let Some(idx) = haystack.find(needle) {
+                let char_idx = haystack[..idx].chars().count();
+                Ok(Value::Int64((char_idx + 1) as i64))
+            } else {
+                Ok(Value::Int64(0))
+            }
+        }
+        "initcap" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("INITCAP expects 1 argument"));
+            }
+            let Some(value) = expect_text_arg("INITCAP", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let mut output = String::with_capacity(value.len());
+            let mut start_of_word = true;
+            for ch in value.chars() {
+                if ch.is_alphanumeric() {
+                    if start_of_word {
+                        for upper in ch.to_uppercase() {
+                            output.push(upper);
+                        }
+                        start_of_word = false;
+                    } else {
+                        for lower in ch.to_lowercase() {
+                            output.push(lower);
+                        }
+                    }
+                } else {
+                    start_of_word = true;
+                    output.push(ch);
+                }
+            }
+            Ok(Value::Text(output))
+        }
+        "ascii" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("ASCII expects 1 argument"));
+            }
+            let Some(value) = expect_text_arg("ASCII", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Int64(
+                value
+                    .chars()
+                    .next()
+                    .map_or(0_i64, |ch| i64::from(ch as u32)),
+            ))
+        }
         "length" => {
             if values.len() != 1 {
                 return Err(DbError::sql("LENGTH expects one argument"));
@@ -7478,6 +7903,128 @@ fn eval_function(
                 _ => return Err(DbError::sql("REPLACE expects text for third argument")),
             };
             Ok(Value::Text(s.replace(target, replacement)))
+        }
+        "regexp_replace" => {
+            if values.len() < 3 || values.len() > 4 {
+                return Err(DbError::sql("REGEXP_REPLACE expects 3 or 4 arguments"));
+            }
+            let Some(input) = expect_text_arg("REGEXP_REPLACE", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(pattern) = expect_text_arg("REGEXP_REPLACE", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let Some(replacement) = expect_text_arg("REGEXP_REPLACE", "third", &values[2])? else {
+                return Ok(Value::Null);
+            };
+            let flags = if let Some(flag_value) = values.get(3) {
+                let Some(flags) = expect_text_arg("REGEXP_REPLACE", "fourth", flag_value)? else {
+                    return Ok(Value::Null);
+                };
+                Some(flags)
+            } else {
+                None
+            };
+            Ok(Value::Text(eval_regexp_replace(
+                input,
+                pattern,
+                replacement,
+                flags,
+            )?))
+        }
+        "split_part" => {
+            if values.len() != 3 {
+                return Err(DbError::sql("SPLIT_PART expects 3 arguments"));
+            }
+            let Some(value) = expect_text_arg("SPLIT_PART", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(delimiter) = expect_text_arg("SPLIT_PART", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let Some(index) = expect_int_arg("SPLIT_PART", "third", &values[2])? else {
+                return Ok(Value::Null);
+            };
+            if index <= 0 {
+                return Err(DbError::sql("SPLIT_PART index must be greater than 0"));
+            }
+            if delimiter.is_empty() {
+                if index == 1 {
+                    return Ok(Value::Text(value.to_string()));
+                }
+                return Ok(Value::Text(String::new()));
+            }
+            let index = usize::try_from(index - 1)
+                .map_err(|_| DbError::sql("SPLIT_PART index is out of range"))?;
+            Ok(Value::Text(
+                value
+                    .split(delimiter)
+                    .nth(index)
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        }
+        "string_to_array" => {
+            if values.len() != 2 {
+                return Err(DbError::sql("STRING_TO_ARRAY expects 2 arguments"));
+            }
+            let Some(value) = expect_text_arg("STRING_TO_ARRAY", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let Some(delimiter) = expect_text_arg("STRING_TO_ARRAY", "second", &values[1])? else {
+                return Ok(Value::Null);
+            };
+            let array = if delimiter.is_empty() {
+                JsonValue::Array(vec![JsonValue::String(value.to_string())])
+            } else {
+                JsonValue::Array(
+                    value
+                        .split(delimiter)
+                        .map(|part| JsonValue::String(part.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            Ok(Value::Text(array.render_json()))
+        }
+        "quote_ident" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("QUOTE_IDENT expects 1 argument"));
+            }
+            let Some(identifier) = expect_text_arg("QUOTE_IDENT", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(format!(
+                "\"{}\"",
+                identifier.replace('"', "\"\"")
+            )))
+        }
+        "quote_literal" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("QUOTE_LITERAL expects 1 argument"));
+            }
+            let Some(literal) = expect_text_arg("QUOTE_LITERAL", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(format!("'{}'", literal.replace('\'', "''"))))
+        }
+        "md5" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("MD5 expects 1 argument"));
+            }
+            let Some(value) = expect_text_arg("MD5", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            Ok(Value::Text(format!("{:x}", md5::compute(value.as_bytes()))))
+        }
+        "sha256" => {
+            if values.len() != 1 {
+                return Err(DbError::sql("SHA256 expects 1 argument"));
+            }
+            let Some(value) = expect_text_arg("SHA256", "first", &values[0])? else {
+                return Ok(Value::Null);
+            };
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(value.as_bytes());
+            Ok(Value::Text(hex_encode_lower(&digest)))
         }
         "instr" => {
             if values.len() != 2 {
@@ -8104,6 +8651,49 @@ fn hex_encode_upper(bytes: &[u8]) -> String {
     output
 }
 
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn eval_regexp_replace(
+    input: &str,
+    pattern: &str,
+    replacement: &str,
+    flags: Option<&str>,
+) -> Result<String> {
+    let mut case_insensitive = false;
+    let mut global = false;
+    if let Some(flags) = flags {
+        for flag in flags.chars() {
+            match flag {
+                'i' | 'I' => case_insensitive = true,
+                'g' | 'G' => global = true,
+                _ => {
+                    return Err(DbError::sql(format!(
+                        "REGEXP_REPLACE flag {flag} is not supported"
+                    )))
+                }
+            }
+        }
+    }
+    let mut builder = regex::RegexBuilder::new(pattern);
+    builder.case_insensitive(case_insensitive);
+    let regex = builder
+        .build()
+        .map_err(|error| DbError::sql(format!("invalid regular expression: {error}")))?;
+    if global {
+        Ok(regex.replace_all(input, replacement).to_string())
+    } else {
+        Ok(regex.replace(input, replacement).to_string())
+    }
+}
+
 fn next_random_u64() -> u64 {
     let mut observed = RANDOM_STATE.load(Ordering::Relaxed);
     loop {
@@ -8398,8 +8988,14 @@ fn eval_interval(values: Vec<Value>) -> Result<Value> {
     if values.len() != 1 {
         return Err(DbError::sql("INTERVAL expects 1 argument"));
     }
-    let Some(raw) = expect_text_arg("INTERVAL", "first", &values[0])? else {
-        return Ok(Value::Null);
+    let raw = match &values[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(raw) => raw.as_str(),
+        other => {
+            return Err(DbError::sql(format!(
+                "INTERVAL expects text literal input, got {other:?}"
+            )))
+        }
     };
     let micros = parse_interval_micros(raw)?;
     Ok(Value::Int64(micros))
@@ -9723,6 +10319,29 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
     }
 }
 
+fn infer_column_type_for_ctas(
+    rows: &[Vec<Value>],
+    column_index: usize,
+) -> crate::catalog::ColumnType {
+    for row in rows {
+        let Some(value) = row.get(column_index) else {
+            continue;
+        };
+        match value {
+            Value::Null => continue,
+            Value::Int64(_) => return crate::catalog::ColumnType::Int64,
+            Value::Float64(_) => return crate::catalog::ColumnType::Float64,
+            Value::Text(_) => return crate::catalog::ColumnType::Text,
+            Value::Bool(_) => return crate::catalog::ColumnType::Bool,
+            Value::Blob(_) => return crate::catalog::ColumnType::Blob,
+            Value::Decimal { .. } => return crate::catalog::ColumnType::Decimal,
+            Value::Uuid(_) => return crate::catalog::ColumnType::Uuid,
+            Value::TimestampMicros(_) => return crate::catalog::ColumnType::Timestamp,
+        }
+    }
+    crate::catalog::ColumnType::Text
+}
+
 fn truthy(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(value) => Some(*value),
@@ -10198,27 +10817,95 @@ fn timestamp_interval_arithmetic(
 ) -> Result<Option<Value>> {
     match (op, left, right) {
         (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
-            Ok(Some(Value::TimestampMicros(
-                timestamp
-                    .checked_add(*interval_micros)
-                    .ok_or_else(|| DbError::sql("timestamp addition overflowed"))?,
-            )))
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                *timestamp,
+                *interval_micros,
+                true,
+            )?)))
         }
         (BinaryOp::Sub, Value::TimestampMicros(timestamp), Value::Int64(interval_micros)) => {
-            Ok(Some(Value::TimestampMicros(
-                timestamp
-                    .checked_sub(*interval_micros)
-                    .ok_or_else(|| DbError::sql("timestamp subtraction overflowed"))?,
-            )))
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                *timestamp,
+                *interval_micros,
+                false,
+            )?)))
         }
         (BinaryOp::Add, Value::Int64(interval_micros), Value::TimestampMicros(timestamp)) => {
-            Ok(Some(Value::TimestampMicros(
-                timestamp
-                    .checked_add(*interval_micros)
-                    .ok_or_else(|| DbError::sql("timestamp addition overflowed"))?,
-            )))
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                *timestamp,
+                *interval_micros,
+                true,
+            )?)))
+        }
+        (BinaryOp::Add, Value::Text(timestamp), Value::Int64(interval_micros)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                *interval_micros,
+                true,
+            )?)))
+        }
+        (BinaryOp::Sub, Value::Text(timestamp), Value::Int64(interval_micros)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                *interval_micros,
+                false,
+            )?)))
+        }
+        (BinaryOp::Add, Value::Int64(interval_micros), Value::Text(timestamp)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                *interval_micros,
+                true,
+            )?)))
+        }
+        (BinaryOp::Add, Value::Text(timestamp), Value::Text(interval_text)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                parse_interval_micros(interval_text)?,
+                true,
+            )?)))
+        }
+        (BinaryOp::Sub, Value::Text(timestamp), Value::Text(interval_text)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                parse_datetime_text("interval arithmetic", timestamp)?.timestamp_micros(),
+                parse_interval_micros(interval_text)?,
+                false,
+            )?)))
+        }
+        (BinaryOp::Add, Value::TimestampMicros(timestamp), Value::Text(interval_text)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                *timestamp,
+                parse_interval_micros(interval_text)?,
+                true,
+            )?)))
+        }
+        (BinaryOp::Sub, Value::TimestampMicros(timestamp), Value::Text(interval_text)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                *timestamp,
+                parse_interval_micros(interval_text)?,
+                false,
+            )?)))
+        }
+        (BinaryOp::Add, Value::Text(interval_text), Value::TimestampMicros(timestamp)) => {
+            Ok(Some(Value::TimestampMicros(apply_interval_micros(
+                *timestamp,
+                parse_interval_micros(interval_text)?,
+                true,
+            )?)))
         }
         _ => Ok(None),
+    }
+}
+
+fn apply_interval_micros(timestamp_micros: i64, interval_micros: i64, add: bool) -> Result<i64> {
+    if add {
+        timestamp_micros
+            .checked_add(interval_micros)
+            .ok_or_else(|| DbError::sql("timestamp addition overflowed"))
+    } else {
+        timestamp_micros
+            .checked_sub(interval_micros)
+            .ok_or_else(|| DbError::sql("timestamp subtraction overflowed"))
     }
 }
 
