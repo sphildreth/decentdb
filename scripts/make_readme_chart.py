@@ -34,7 +34,17 @@ METRICS = [
     ("insert_rows_per_sec", "Insert (rows/s)", "higher"),
 ]
 
-BASELINE_ENGINE = "SQLite"  # normalize against this engine
+BASELINE_ENGINE = "sqlite"  # normalize against this engine key
+
+ENGINE_LABELS = {
+    "decentdb": "DecentDB",
+    "duckdb": "DuckDB",
+    "sqlite": "SQLite",
+}
+
+
+def display_engine_name(engine: str) -> str:
+    return ENGINE_LABELS.get(engine, engine)
 
 def load():
     with DATA.open("r", encoding="utf-8") as f:
@@ -82,7 +92,13 @@ def plot(norm: pd.DataFrame, meta: dict):
             v = row.get(key)
             if v is None or (isinstance(v, float) and math.isnan(v)):
                 continue
-            records.append({"Metric": label, "Engine": row["engine"], "Score": float(v)})
+            records.append(
+                {
+                    "Metric": label,
+                    "Engine": display_engine_name(row["engine"]),
+                    "Score": float(v),
+                }
+            )
 
     long = pd.DataFrame(records)
     if long.empty:
@@ -90,7 +106,19 @@ def plot(norm: pd.DataFrame, meta: dict):
 
     # Order engines: DecentDB first, then baseline, then others
     engines = list(dict.fromkeys(
-        ["DecentDB", BASELINE_ENGINE] + [e for e in long["Engine"].unique().tolist() if e not in ("DecentDB", BASELINE_ENGINE)]
+        [
+            display_engine_name("decentdb"),
+            display_engine_name(BASELINE_ENGINE),
+        ]
+        + [
+            e
+            for e in long["Engine"].unique().tolist()
+            if e
+            not in (
+                display_engine_name("decentdb"),
+                display_engine_name(BASELINE_ENGINE),
+            )
+        ]
     ))
     long["Engine"] = pd.Categorical(long["Engine"], categories=engines, ordered=True)
 
@@ -100,7 +128,9 @@ def plot(norm: pd.DataFrame, meta: dict):
     # Plot
     plt.figure(figsize=(12, 5))
     ax = piv.plot(kind="bar")  # default colors (per instructions)
-    ax.set_ylabel("Normalized score vs SQLite (higher is better)")
+    ax.set_ylabel(
+        f"Normalized score vs {display_engine_name(BASELINE_ENGINE)} (higher is better)"
+    )
     ax.set_xlabel("")
     ax.set_title("DecentDB vs common embedded engines (normalized)")
 

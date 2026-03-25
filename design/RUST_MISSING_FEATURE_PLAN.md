@@ -52,10 +52,10 @@ Implementation slices should be testable with fast local and CI validation. Pref
 | Slice | Status | Scope |
 | --- | --- | --- |
 | Slice 0 - Audit capture and implementation plan | Completed | Capture current findings and turn them into coding slices. |
-| Slice 1 - Query-semantic corrections close to current engine | Not started | Fix gaps that are already close to existing machinery. |
-| Slice 2 - DISTINCT and pagination parity | Not started | `DISTINCT ON`, `LIMIT ALL`, `OFFSET ... FETCH` verification/implementation. |
-| Slice 3 - Window parity completion | Not started | Fill the documented window-function gap. |
-| Slice 4 - Join surface parity | Not started | `RIGHT`, `FULL OUTER`, `CROSS`, and `NATURAL` joins. |
+| Slice 1 - Query-semantic corrections close to current engine | Completed | Fix gaps that are already close to existing machinery. |
+| Slice 2 - DISTINCT and pagination parity | Completed | `DISTINCT ON`, `LIMIT ALL`, `OFFSET ... FETCH` verification/implementation. |
+| Slice 3 - Window parity completion | Completed | Fill the documented window-function gap. |
+| Slice 4 - Join surface parity | In progress | `RIGHT`, `FULL OUTER`, `CROSS`, and `NATURAL` joins. |
 | Slice 5 - Recursive CTE support | Not started | `WITH RECURSIVE` execution and guardrails. |
 | Slice 6 - Scalar, date/time, and JSON scalar function expansion | Not started | Bring documented function surface closer to reality. |
 | Slice 7 - JSON table functions | Not started | `json_each()` and `json_tree()` in `FROM`. |
@@ -475,7 +475,7 @@ Capture the current mismatch between the matrix and the Rust implementation in o
 
 ## Slice 1 - Query-semantic corrections close to the current engine
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -511,9 +511,16 @@ This slice does not need catalog-format changes, temp-object semantics, or recur
 - the matrix rows for `STRING_AGG`, `TOTAL`, `INTERSECT ALL`, and `EXCEPT ALL` have direct executor tests
 - `INTERSECT` / `EXCEPT` non-`ALL` behavior remains unchanged
 
+### Done
+
+- aggregate normalization now treats `string_agg` and `total` as aggregate functions
+- grouped execution reuses the existing text-concatenation path for `STRING_AGG` and adds `TOTAL` float semantics, including `0.0` for empty inputs
+- `INTERSECT ALL` and `EXCEPT ALL` now consume counted row identities instead of using presence-only membership checks
+- `crates/decentdb/tests/engine_coverage_tests.rs` now covers grouped `STRING_AGG`, `TOTAL` empty/distinct/mixed-numeric behavior, and duplicate-aware set-operation semantics
+
 ## Slice 2 - DISTINCT and pagination parity
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -538,9 +545,16 @@ Bring the distinct/pagination rows in the matrix in line with the actual query m
 - `DISTINCT ON` round-trips through AST and executes correctly with `ORDER BY`
 - `LIMIT ALL` and `OFFSET ... FETCH` have direct coverage
 
+### Done
+
+- query normalization now distinguishes plain `SELECT DISTINCT` from `SELECT DISTINCT ON (...)` by treating raw nil `distinct_clause` entries as the plain distinct marker and preserving real `DISTINCT ON` expressions
+- select execution now applies runtime deduplication for both plain `DISTINCT` and order-sensitive `DISTINCT ON` queries
+- `LIMIT ALL` now normalizes to an unbounded limit instead of surfacing a null-constant error
+- `crates/decentdb/tests/engine_coverage_tests.rs` now covers `LIMIT ALL`, `OFFSET ... FETCH`, plain `SELECT DISTINCT`, and `DISTINCT ON` row-order behavior
+
 ## Slice 3 - Window parity completion
 
-**Status:** Not started
+**Status:** Completed
 
 ### Goal
 
@@ -564,9 +578,16 @@ Close the gap between the five currently supported window functions and the eigh
 
 - all eight matrix-listed window functions have direct execution coverage
 
+### Done
+
+- the window-function normalizer now accepts `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE` alongside the previously supported names
+- `compute_window_function_values` now evaluates partition-global first, last, and nth ordered values, including null results for out-of-range `NTH_VALUE` and explicit validation for invalid positions
+- `crates/decentdb/tests/engine_coverage_tests.rs` now covers partitioned `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `FIRST_VALUE`, `LAST_VALUE`, and `NTH_VALUE`, plus non-partitioned `LAG`/`LEAD` and `NTH_VALUE` edge cases
+- `cargo test -p decentdb --test relational_phase3_tests --quiet` still passes, providing extra confidence that the existing phase-3 read executor behavior stayed intact
+
 ## Slice 4 - Join surface parity
 
-**Status:** Not started
+**Status:** In progress
 
 ### Goal
 
@@ -589,6 +610,14 @@ Expand the query engine beyond the current `INNER`/`LEFT` subset.
 ### Acceptance
 
 - each documented join type has a direct execution test, not just parser acceptance
+
+### Progress
+
+- `JoinKind` and join normalization/execution now support `CROSS JOIN`, `RIGHT JOIN`, and `FULL OUTER JOIN`
+- the nested-loop join path now null-extends the correct side for right/full outer semantics, and `engine_coverage_tests.rs` covers all three landed join kinds
+- `NATURAL JOIN` and `JOIN ... USING (...)` are still explicitly unsupported because they require shared-column matching plus duplicate-column suppression that the current join row-shape does not yet model
+- the remaining work in this slice is therefore concentrated on `NATURAL JOIN` / `USING` semantics rather than the basic outer/cartesian join operators
+- the latest regression pass also added extra happy-path and edge-case coverage for the landed slice work, including empty/all-null aggregates, multicolumn set-operation duplicates, full-row distinct behavior, window argument validation, and empty-side join behavior
 
 ## Slice 5 - Recursive CTE support
 
@@ -779,14 +808,12 @@ The user guide currently only shows `EXPLAIN SELECT ...` examples (`docs/user-gu
 
 ## Suggested next coding move
 
-If work starts immediately after this document, start with **Slice 1**.
+If work starts immediately after this document, continue with **Slice 4**.
 
-It has the best combination of:
+Finish the remaining `NATURAL JOIN` / `USING` portion of the slice:
 
-- high confidence in the gap
-- low architectural blast radius
-- direct user-visible improvement
-- strong fit with code that already exists
+- preserve the shared-column list from libpg_query `JoinExpr` instead of discarding it during normalization
+- synthesize the equality predicate for matching column names while keeping ambiguous/no-common-column behavior explicit
+- define result-column suppression so `SELECT *` from a natural join exposes shared columns once, with regression coverage for duplicate names and empty-side behavior
 
 After Slice 1, move to **Slice 6**, **Slice 7**, or **Slice 8** if the priority is to close the most user-visible documentation gaps first. Then tackle the larger structural slices (`Join` parity, recursive CTEs, temp/generated semantics).
-

@@ -90,6 +90,7 @@ pub(crate) struct Select {
     pub(crate) group_by: Vec<Expr>,
     pub(crate) having: Option<Expr>,
     pub(crate) distinct: bool,
+    pub(crate) distinct_on: Vec<Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +122,9 @@ pub(crate) enum FromItem {
 pub(crate) enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
+    Cross,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -479,10 +483,19 @@ impl Select {
     #[must_use]
     pub(crate) fn to_sql(&self) -> String {
         let mut parts = Vec::new();
-        let select_kw = if self.distinct {
-            "SELECT DISTINCT"
+        let select_kw = if !self.distinct_on.is_empty() {
+            format!(
+                "SELECT DISTINCT ON ({})",
+                self.distinct_on
+                    .iter()
+                    .map(Expr::to_sql)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if self.distinct {
+            "SELECT DISTINCT".to_string()
         } else {
-            "SELECT"
+            "SELECT".to_string()
         };
         parts.push(format!(
             "{} {}",
@@ -552,16 +565,26 @@ impl FromItem {
                 right,
                 kind,
                 on,
-            } => format!(
-                "{} {} JOIN {} ON {}",
-                left.to_sql(),
-                match kind {
-                    JoinKind::Inner => "INNER",
-                    JoinKind::Left => "LEFT",
-                },
-                right.to_sql(),
-                on.to_sql()
-            ),
+            } => {
+                let join_kw = match kind {
+                    JoinKind::Inner => "INNER JOIN".to_string(),
+                    JoinKind::Left => "LEFT JOIN".to_string(),
+                    JoinKind::Right => "RIGHT JOIN".to_string(),
+                    JoinKind::Full => "FULL OUTER JOIN".to_string(),
+                    JoinKind::Cross => "CROSS JOIN".to_string(),
+                };
+                if *kind == JoinKind::Cross {
+                    format!("{} {} {}", left.to_sql(), join_kw, right.to_sql())
+                } else {
+                    format!(
+                        "{} {} {} ON {}",
+                        left.to_sql(),
+                        join_kw,
+                        right.to_sql(),
+                        on.to_sql()
+                    )
+                }
+            }
         }
     }
 }

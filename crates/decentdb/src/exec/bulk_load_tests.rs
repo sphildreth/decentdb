@@ -22,9 +22,21 @@ mod tests {
         db.execute("CREATE TABLE users (id INT64, name TEXT, age INT64)")?;
 
         let rows: Vec<Vec<Value>> = vec![
-            vec![Value::Int64(1), Value::Text("Alice".to_string()), Value::Int64(30)],
-            vec![Value::Int64(2), Value::Text("Bob".to_string()), Value::Int64(25)],
-            vec![Value::Int64(3), Value::Text("Charlie".to_string()), Value::Int64(35)],
+            vec![
+                Value::Int64(1),
+                Value::Text("Alice".to_string()),
+                Value::Int64(30),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("Bob".to_string()),
+                Value::Int64(25),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Text("Charlie".to_string()),
+                Value::Int64(35),
+            ],
         ];
 
         let options = crate::BulkLoadOptions::default();
@@ -33,9 +45,30 @@ mod tests {
 
         let result = db.execute("SELECT * FROM users ORDER BY id")?;
         assert_eq!(result.rows().len(), 3);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(1), Value::Text("Alice".to_string()), Value::Int64(30)]);
-        assert_eq!(result.rows()[1].values(), &[Value::Int64(2), Value::Text("Bob".to_string()), Value::Int64(25)]);
-        assert_eq!(result.rows()[2].values(), &[Value::Int64(3), Value::Text("Charlie".to_string()), Value::Int64(35)]);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("Alice".to_string()),
+                Value::Int64(30)
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(2),
+                Value::Text("Bob".to_string()),
+                Value::Int64(25)
+            ]
+        );
+        assert_eq!(
+            result.rows()[2].values(),
+            &[
+                Value::Int64(3),
+                Value::Text("Charlie".to_string()),
+                Value::Int64(35)
+            ]
+        );
 
         Ok(())
     }
@@ -104,7 +137,10 @@ mod tests {
         let options = crate::BulkLoadOptions::default();
         let result = db.bulk_load_rows("base_view", &["id"], &rows, options);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("bulk load targets must be base tables"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("bulk load targets must be base tables"));
 
         Ok(())
     }
@@ -142,8 +178,14 @@ mod tests {
 
         let result = db.execute("SELECT * FROM typed ORDER BY id")?;
         assert_eq!(result.rows().len(), 2);
-        assert_eq!(result.rows()[0].values(), &[Value::Int64(1), Value::Float64(V1)]);
-        assert_eq!(result.rows()[1].values(), &[Value::Int64(2), Value::Float64(V2)]);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(1), Value::Float64(V1)]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[Value::Int64(2), Value::Float64(V2)]
+        );
 
         Ok(())
     }

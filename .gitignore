@@ -79,6 +79,14 @@ tests/bindings/**/*.node
 /bindings/**/*.a
 /bindings/**/*.node
 
+# Benchmark runner output artifacts
+/benchmarks/python_embedded_compare/out/*
+!/benchmarks/python_embedded_compare/out/.gitkeep
+/benchmarks/python_embedded_compare/helpers/**/bin/
+/benchmarks/python_embedded_compare/helpers/**/obj/
+/benchmarks/python_embedded_compare/**/__pycache__/
+/benchmarks/python_embedded_compare/**/*.pyc
+
 # Local DecentDB database artifacts
 *.ddb
 *.ddb.wal

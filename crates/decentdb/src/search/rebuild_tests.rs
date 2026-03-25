@@ -201,12 +201,8 @@ mod tests {
         state.mark_stale();
 
         for i in 0..3 {
-            let result = state.ensure_fresh(|| {
-                Err(crate::error::DbError::internal(format!(
-                    "error {}",
-                    i
-                )))
-            });
+            let result =
+                state.ensure_fresh(|| Err(crate::error::DbError::internal(format!("error {}", i))));
             assert!(result.is_err());
             assert_eq!(state.freshness(), Freshness::Stale);
         }

@@ -73,11 +73,18 @@ fn normalize_query(statement: &protobuf::SelectStmt) -> Result<Query> {
         .iter()
         .map(normalize_order_by_node)
         .collect::<Result<Vec<_>>>()?;
-    let limit = statement
-        .limit_count
-        .as_deref()
-        .map(normalize_expr_node)
-        .transpose()?;
+    let limit_option = protobuf::LimitOption::try_from(statement.limit_option)
+        .unwrap_or(protobuf::LimitOption::Undefined);
+    let limit = match statement.limit_count.as_deref() {
+        Some(node)
+            if limit_option == protobuf::LimitOption::Count
+                && matches!(node_kind(node)?, NodeEnum::AConst(value) if value.isnull) =>
+        {
+            None
+        }
+        Some(node) => Some(normalize_expr_node(node)?),
+        None => None,
+    };
     let offset = statement
         .limit_offset
         .as_deref()
@@ -147,14 +154,29 @@ fn normalize_query_body(statement: &protobuf::SelectStmt) -> Result<QueryBody> {
         .as_deref()
         .map(normalize_expr_node)
         .transpose()?;
+    let (distinct, distinct_on) = normalize_distinct_clause(&statement.distinct_clause)?;
     Ok(QueryBody::Select(Select {
         projection,
         from,
         filter,
         group_by,
         having,
-        distinct: !statement.distinct_clause.is_empty(),
+        distinct,
+        distinct_on,
     }))
+}
+
+fn normalize_distinct_clause(distinct_clause: &[protobuf::Node]) -> Result<(bool, Vec<Expr>)> {
+    if distinct_clause.is_empty() {
+        return Ok((false, Vec::new()));
+    }
+
+    let distinct_on = distinct_clause
+        .iter()
+        .filter(|node| node.node.is_some())
+        .map(normalize_expr_node)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((true, distinct_on))
 }
 
 fn normalize_insert(statement: &protobuf::InsertStmt) -> Result<InsertStatement> {
@@ -848,8 +870,11 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
             kind: match protobuf::JoinType::try_from(join.jointype)
                 .unwrap_or(protobuf::JoinType::Undefined)
             {
+                protobuf::JoinType::JoinInner if join.quals.is_none() => JoinKind::Cross,
                 protobuf::JoinType::JoinInner => JoinKind::Inner,
                 protobuf::JoinType::JoinLeft => JoinKind::Left,
+                protobuf::JoinType::JoinRight => JoinKind::Right,
+                protobuf::JoinType::JoinFull => JoinKind::Full,
                 other => {
                     return Err(unsupported(format!(
                         "join type {} is not supported",
@@ -857,11 +882,18 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                     )))
                 }
             },
-            on: normalize_expr_node(
-                join.quals
-                    .as_deref()
-                    .ok_or_else(|| unsupported("JOIN is missing its ON clause"))?,
-            )?,
+            on: {
+                if join.is_natural {
+                    return Err(unsupported("NATURAL JOIN is not supported yet"));
+                }
+                if !join.using_clause.is_empty() {
+                    return Err(unsupported("JOIN ... USING (...) is not supported yet"));
+                }
+                match join.quals.as_deref() {
+                    Some(quals) => normalize_expr_node(quals)?,
+                    None => Expr::Literal(Value::Bool(true)),
+                }
+            },
         }),
         other => Err(unsupported(format!(
             "FROM source {} is not supported",
@@ -1199,10 +1231,17 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
     if call.over.is_some() {
         if !matches!(
             name.as_str(),
-            "row_number" | "rank" | "dense_rank" | "lag" | "lead"
+            "row_number"
+                | "rank"
+                | "dense_rank"
+                | "lag"
+                | "lead"
+                | "first_value"
+                | "last_value"
+                | "nth_value"
         ) {
             return Err(unsupported(
-                "only ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), and LEAD() OVER (...) are supported as window functions",
+                "only ROW_NUMBER(), RANK(), DENSE_RANK(), LAG(), LEAD(), FIRST_VALUE(), LAST_VALUE(), and NTH_VALUE() OVER (...) are supported as window functions",
             ));
         }
         let window = call
@@ -1240,7 +1279,7 @@ fn normalize_function_call(call: &protobuf::FuncCall) -> Result<Expr> {
     }
     if matches!(
         name.as_str(),
-        "count" | "sum" | "avg" | "min" | "max" | "group_concat"
+        "count" | "sum" | "avg" | "min" | "max" | "group_concat" | "string_agg" | "total"
     ) {
         return Ok(Expr::Aggregate {
             name,

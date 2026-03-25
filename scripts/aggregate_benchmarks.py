@@ -58,6 +58,9 @@ def merge_python_embedded_compare_results(engines, py_results_path):
     This is intentionally best-effort and only fills metrics we can derive.
     Missing metrics remain absent (or null), and the chart generator will
     omit those bars.
+
+    Supports both legacy format (p95_us_per_op) and new Python framework
+    format (latency_ms.p95_ms).
     """
     p = Path(py_results_path)
     if not p.exists():
@@ -85,7 +88,7 @@ def merge_python_embedded_compare_results(engines, py_results_path):
     grouped = defaultdict(list)
     for row in results:
         eng = row.get("engine")
-        bench = row.get("bench")
+        bench = row.get("bench") or row.get("benchmark")  # Support both
         if not eng or not bench:
             continue
         grouped[(eng, bench)].append(row)
@@ -110,16 +113,33 @@ def merge_python_embedded_compare_results(engines, py_results_path):
         if chosen is None:
             continue
 
-        if py_bench == "point_select":
-            p95_us_per_op = _safe_float(chosen.get("p95_us_per_op"))
-            if p95_us_per_op is not None and p95_us_per_op != 0:
-                engines[out_name]["read_p95_ms"] = p95_us_per_op / 1000.0
+        # Handle new Python format: latency_ms contains p50, p95, p99 in ms
+        latency_ms = chosen.get("latency_ms", {})
 
-        elif py_bench == "insert_txn":
-            # Convert p50 us/op into rows/sec (higher is better).
-            p50_us_per_op = _safe_float(chosen.get("p50_us_per_op"))
-            if p50_us_per_op is not None and p50_us_per_op != 0:
-                engines[out_name]["insert_rows_per_sec"] = 1_000_000.0 / p50_us_per_op
+        if py_bench == "point_select":
+            # Try new format first (latency_ms.p95_ms)
+            p95_ms = _safe_float(latency_ms.get("p95_ms"))
+            if p95_ms is not None and p95_ms != 0:
+                engines[out_name]["read_p95_ms"] = p95_ms
+            else:
+                # Fallback to legacy format (p95_us_per_op)
+                p95_us_per_op = _safe_float(chosen.get("p95_us_per_op"))
+                if p95_us_per_op is not None and p95_us_per_op != 0:
+                    engines[out_name]["read_p95_ms"] = p95_us_per_op / 1000.0
+
+        elif py_bench in ("insert", "insert_txn"):
+            # Try new format first (latency_ms.p50_ms -> ops/sec)
+            p50_ms = _safe_float(latency_ms.get("p50_ms"))
+            if p50_ms is not None and p50_ms != 0:
+                # Convert p50 ms/op to ops/sec
+                engines[out_name]["insert_rows_per_sec"] = 1000.0 / p50_ms
+            else:
+                # Fallback to legacy format
+                p50_us_per_op = _safe_float(chosen.get("p50_us_per_op"))
+                if p50_us_per_op is not None and p50_us_per_op != 0:
+                    engines[out_name]["insert_rows_per_sec"] = (
+                        1_000_000.0 / p50_us_per_op
+                    )
 
     return True
 
@@ -187,7 +207,9 @@ def main():
 
     # Enforce that we are aggregating a single durability profile.
     # Mixing safe/default (or other) profiles makes the summary misleading.
-    all_durabilities = sorted({r.get("durability") for r in records if r.get("durability")})
+    all_durabilities = sorted(
+        {r.get("durability") for r in records if r.get("durability")}
+    )
     if len(all_durabilities) > 1:
         raise SystemExit(
             "Mixed durability profiles found in input: "
@@ -281,7 +303,9 @@ def main():
         args.python_embedded_compare_results,
     )
     if merged:
-        result["metadata"]["notes"] += f"; merged extra engines from {args.python_embedded_compare_results}"
+        result["metadata"]["notes"] += (
+            f"; merged extra engines from {args.python_embedded_compare_results}"
+        )
 
     outp.parent.mkdir(parents=True, exist_ok=True)
     with outp.open("w", encoding="utf-8") as f:

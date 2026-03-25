@@ -1,0 +1,60 @@
+# Example database configuration
+# Copy this file to database_configs.yaml and customize
+
+engines:
+  sqlite:
+    enabled: true
+    variant: wal_full  # wal_full, wal_normal
+    # variant notes:
+    #   wal_full: journal_mode=WAL, synchronous=FULL (durable)
+    #   wal_normal: journal_mode=WAL, synchronous=NORMAL (relaxed)
+  
+  duckdb:
+    enabled: true
+    # DuckDB is primarily analytical; single-threaded for fair OLTP comparison
+  
+  decentdb:
+    enabled: false  # Requires Python bindings to be installed
+    temp_dir: /tmp/decentdb_bench
+  
+  h2:
+    enabled: false  # Requires Java and H2 jar
+    # jdbc_url: jdbc:h2:mem:test;DB_CLOSE_DELAY=-1
+    # driver_class: org.h2.Driver
+    # jar_paths:
+    #   - /path/to/h2.jar
+  
+  derby:
+    enabled: false  # Requires Java and Derby jars
+    # jdbc_url: jdbc:derby:derby_db;create=true
+    # driver_class: org.apache.derby.jdbc.EmbeddedDriver
+    # jar_paths:
+    #   - /path/to/derby.jar
+  
+  hsqldb:
+    enabled: false  # Requires Java and HSQLDB jar
+    # jdbc_url: jdbc:hsqldb:hsqldb_db;hsqldb.write_delay=false
+    # driver_class: org.hsqldb.jdbc.JDBCDriver
+    # jar_paths:
+    #   - /path/to/hsqldb.jar
+  
+  firebird:
+    enabled: false  # Requires Firebird native library
+    # driver_class: org.firebirdsql.jdbc.FBDriver
+    # jar_paths:
+    #   - /path/to/jaybird.jar
+
+# Dataset configuration
+dataset:
+  seed: 42  # Fixed seed for reproducibility
+  customers_n: 1000
+  orders_n: 10000
+  events_n: 10000
+  time_range_seconds: 2592000  # 30 days
+  path_cardinality: 100
+
+# Benchmark configuration
+benchmark:
+  operations: 10000  # Operations per benchmark
+  warmup: 100  # Warmup operations
+  batch_size: 1000  # Rows per batch for batched transactions

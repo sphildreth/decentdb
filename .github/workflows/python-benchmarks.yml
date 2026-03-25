@@ -1,0 +1,182 @@
+name: Python Benchmark Suite
+
+on:
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: 'Comma-separated engines to benchmark'
+        required: false
+        default: 'sqlite,duckdb'
+      operations:
+        description: 'Number of operations per benchmark'
+        required: false
+        default: '10000'
+      dataset_size:
+        description: 'Dataset size (small, medium, large)'
+        required: false
+        default: 'small'
+
+jobs:
+  smoke:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r benchmarks/python_embedded_compare/requirements.txt
+          pip install pytest
+
+      - name: Run smoke tests
+        run: |
+          cd benchmarks/python_embedded_compare
+          pytest tests/test_smoke.py -v
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r benchmarks/python_embedded_compare/requirements.txt
+          pip install pytest
+
+      - name: Run unit tests
+        run: |
+          cd benchmarks/python_embedded_compare
+          pytest tests/test_dataset_generator.py tests/test_manifest.py -v
+
+  benchmark:
+    name: Benchmark (${{ matrix.engine }})
+    needs: [smoke, unit-tests]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - engine: sqlite
+            variant: wal_full
+          - engine: sqlite
+            variant: wal_normal
+          - engine: duckdb
+            variant: default
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r benchmarks/python_embedded_compare/requirements.txt
+
+      - name: Create config
+        run: |
+          cat > benchmarks/python_embedded_compare/config/database_configs.yaml << EOF
+          engines:
+            sqlite:
+              enabled: true
+              variant: ${{ matrix.variant }}
+            duckdb:
+              enabled: ${{ matrix.engine == 'duckdb' }}
+          dataset:
+            seed: 42
+            customers_n: 1000
+            orders_n: 10000
+            events_n: 10000
+          benchmark:
+            operations: 10000
+            warmup: 100
+          EOF
+
+      - name: Run benchmark
+        run: |
+          cd benchmarks/python_embedded_compare
+          python comparison_runner.py \
+            --engines ${{ matrix.engine }} \
+            --workload workload_a \
+            --scenario nightly \
+            --transaction-mode batched \
+            --durability durable \
+            --ops 10000 \
+            --warmup 100 \
+            --output out/${{ matrix.engine }}-${{ matrix.variant }}
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.engine }}-${{ matrix.variant }}
+          path: |
+            benchmarks/python_embedded_compare/out/**/results_*.json
+            benchmarks/python_embedded_compare/out/**/manifest.json
+          retention-days: 30
+
+  aggregate:
+    name: Aggregate Results
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: benchmark-results-*
+          merge-multiple: true
+
+      - name: Merge results
+        run: |
+          # Create merged results from artifacts
+          python -c "
+          import json
+          import os
+          from pathlib import Path
+          
+          merged = {'results': []}
+          
+          for root, dirs, files in os.walk('artifacts'):
+              for f in files:
+                  if f.startswith('results_') and f.endswith('.json'):
+                      p = Path(root) / f
+                      with open(p) as fp:
+                          data = json.load(fp)
+                          if isinstance(data, list):
+                              merged['results'].extend(data)
+                          elif isinstance(data, dict):
+                              merged['results'].append(data)
+          
+          # Save merged results
+          Path('benchmarks/python_embedded_compare/out').mkdir(parents=True, exist_ok=True)
+          with open('benchmarks/python_embedded_compare/out/results_merged.json', 'w') as f:
+              json.dump(merged, f, indent=2)
+          "
+
+      - name: Upload merged results
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-benchmark-results
+          path: benchmarks/python_embedded_compare/out/results_merged.json
+          retention-days: 90

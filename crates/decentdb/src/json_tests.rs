@@ -104,7 +104,10 @@ mod tests {
     #[test]
     fn test_parse_json_single_element_array() {
         let result = parse_json("[1]").unwrap();
-        assert_eq!(result, JsonValue::Array(vec![JsonValue::Number("1".to_string())]));
+        assert_eq!(
+            result,
+            JsonValue::Array(vec![JsonValue::Number("1".to_string())])
+        );
     }
 
     #[test]
@@ -309,7 +312,10 @@ mod tests {
     fn test_parse_json_path_invalid_no_root() {
         let result = parse_json_path("key");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid JSON path"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid JSON path"));
     }
 
     #[test]
@@ -414,10 +420,7 @@ mod tests {
 
     #[test]
     fn test_json_value_render_number() {
-        assert_eq!(
-            JsonValue::Number("42".to_string()).render_json(),
-            "42"
-        );
+        assert_eq!(JsonValue::Number("42".to_string()).render_json(), "42");
         assert_eq!(
             JsonValue::Number("-3.14".to_string()).render_json(),
             "-3.14"

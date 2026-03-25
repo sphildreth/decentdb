@@ -1,0 +1,27 @@
+engines:
+  sqlite:
+    enabled: true
+    variant: wal_full
+  
+  duckdb:
+    enabled: true
+  
+  decentdb:
+    enabled: true
+  
+  h2:
+    enabled: true
+    jdbc_url: jdbc:h2:mem:test;DB_CLOSE_DELAY=-1
+    driver_class: org.h2.Driver
+    jar_paths:
+      - /tmp/h2.jar
+
+dataset:
+  seed: 42
+  customers_n: 100
+  orders_n: 500
+  events_n: 500
+
+benchmark:
+  operations: 500
+  warmup: 50

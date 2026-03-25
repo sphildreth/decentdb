@@ -34,9 +34,7 @@ mod tests {
         let (db, _temp) = create_test_db()?;
 
         db.execute("CREATE TABLE products (id INT64, name TEXT, price FLOAT64)")?;
-        db.execute(
-            "INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)",
-        )?;
+        db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)")?;
         // Note: Column aliases in CREATE VIEW name(cols) syntax uses inferred names from SELECT
         db.execute(
             "CREATE VIEW cheap_products AS SELECT id, name FROM products WHERE price < 15.0",
@@ -62,9 +60,7 @@ mod tests {
         let result1 = db.execute("SELECT * FROM item_view")?;
         assert_eq!(result1.columns().len(), 1);
 
-        db.execute(
-            "CREATE OR REPLACE VIEW item_view AS SELECT id, value FROM items",
-        )?;
+        db.execute("CREATE OR REPLACE VIEW item_view AS SELECT id, value FROM items")?;
 
         let result2 = db.execute("SELECT * FROM item_view")?;
         assert_eq!(result2.columns().len(), 2);
@@ -137,13 +133,14 @@ mod tests {
 
         db.execute("CREATE TABLE base (id INT64, value TEXT)")?;
         db.execute("CREATE VIEW base_view AS SELECT id FROM base")?;
-        db.execute(
-            "CREATE VIEW dependent_view AS SELECT id FROM base_view",
-        )?;
+        db.execute("CREATE VIEW dependent_view AS SELECT id FROM base_view")?;
 
         let result = db.execute("DROP VIEW base_view");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("because views depend on it"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("because views depend on it"));
 
         Ok(())
     }
@@ -190,9 +187,7 @@ mod tests {
 
         db.execute("CREATE TABLE authors (id INT64, name TEXT)")?;
         db.execute("CREATE TABLE books (id INT64, author_id INT64, title TEXT)")?;
-        db.execute(
-            "INSERT INTO authors VALUES (1, 'Alice'), (2, 'Bob')",
-        )?;
+        db.execute("INSERT INTO authors VALUES (1, 'Alice'), (2, 'Bob')")?;
         db.execute(
             "INSERT INTO books VALUES (1, 1, 'Book A'), (2, 1, 'Book B'), (3, 2, 'Book C')",
         )?;
@@ -211,9 +206,7 @@ mod tests {
         let (db, _temp) = create_test_db()?;
 
         db.execute("CREATE TABLE test (id INT64, name TEXT)")?;
-        db.execute(
-            "CREATE VIEW test_view AS SELECT id as user_id, name as user_name FROM test",
-        )?;
+        db.execute("CREATE VIEW test_view AS SELECT id as user_id, name as user_name FROM test")?;
 
         let result = db.execute("SELECT * FROM test_view")?;
         assert_eq!(result.columns()[0], "user_id");
@@ -237,12 +230,11 @@ mod tests {
         let (db, _temp) = create_test_db()?;
 
         db.execute("CREATE TABLE items (id INT64, value TEXT)")?;
-        db.execute(
-            "INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c')",
-        )?;
+        db.execute("INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
         db.execute("CREATE VIEW item_view AS SELECT id, value FROM items")?;
 
-        let result = db.execute_with_params("SELECT * FROM item_view WHERE id > $1", &[Value::Int64(1)])?;
+        let result =
+            db.execute_with_params("SELECT * FROM item_view WHERE id > $1", &[Value::Int64(1)])?;
         assert_eq!(result.rows().len(), 2);
 
         Ok(())

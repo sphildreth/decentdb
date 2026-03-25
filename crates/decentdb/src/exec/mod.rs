@@ -1157,6 +1157,15 @@ impl EngineRuntime {
             }
             _ => self.evaluate_query_body(&query.body, params, &ctes)?,
         };
+        if let QueryBody::Select(select) = &query.body {
+            if select.distinct {
+                if !query.order_by.is_empty() && !sorted_during_select {
+                    self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
+                    sorted_during_select = true;
+                }
+                dataset = self.apply_select_distinct(select, dataset, params, &ctes)?;
+            }
+        }
         if !query.order_by.is_empty() && !sorted_during_select {
             self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
         }
@@ -1262,6 +1271,15 @@ impl EngineRuntime {
                 outer_row,
             )?,
         };
+        if let QueryBody::Select(select) = &query.body {
+            if select.distinct {
+                if !query.order_by.is_empty() && !sorted_during_select {
+                    self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
+                    sorted_during_select = true;
+                }
+                dataset = self.apply_select_distinct(select, dataset, params, &ctes)?;
+            }
+        }
         if !query.order_by.is_empty() && !sorted_during_select {
             self.sort_dataset(&mut dataset, &query.order_by, params, &ctes)?;
         }
@@ -1381,6 +1399,43 @@ impl EngineRuntime {
         } else {
             self.project_dataset(&dataset, &select.projection, params, ctes, None)
         }
+    }
+
+    fn apply_select_distinct(
+        &self,
+        select: &Select,
+        dataset: Dataset,
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<Dataset> {
+        if !select.distinct {
+            return Ok(dataset);
+        }
+
+        let columns = dataset.columns;
+        let rows = if select.distinct_on.is_empty() {
+            deduplicate_rows_stable(dataset.rows)?
+        } else {
+            let key_dataset = Dataset {
+                columns: columns.clone(),
+                rows: Vec::new(),
+            };
+            let mut seen = BTreeSet::new();
+            let mut distinct_rows = Vec::new();
+            for row in dataset.rows {
+                let key = select
+                    .distinct_on
+                    .iter()
+                    .map(|expr| self.eval_expr(expr, &key_dataset, &row, params, ctes, None))
+                    .collect::<Result<Vec<_>>>()?;
+                if seen.insert(row_identity(&key)?) {
+                    distinct_rows.push(row);
+                }
+            }
+            distinct_rows
+        };
+
+        Ok(Dataset { columns, rows })
     }
 
     fn build_select_dataset(
@@ -2084,6 +2139,10 @@ fn select_references_outer(
             .having
             .as_ref()
             .is_some_and(|expr| expr_references_outer(expr, outer_tables, local_tables))
+        || select
+            .distinct_on
+            .iter()
+            .any(|expr| expr_references_outer(expr, outer_tables, local_tables))
 }
 
 fn expr_references_outer(
@@ -3492,9 +3551,12 @@ fn nested_loop_join(
     let mut columns = left.columns.clone();
     columns.extend(right.columns.clone());
     let mut rows = Vec::new();
+    let mut matched_right = vec![false; right.rows.len()];
+    let left_nulls = vec![Value::Null; left.columns.len()];
+    let right_nulls = vec![Value::Null; right.columns.len()];
     for left_row in &left.rows {
         let mut matched = false;
-        for right_row in &right.rows {
+        for (right_index, right_row) in right.rows.iter().enumerate() {
             let mut row = left_row.clone();
             row.extend(right_row.clone());
             let dataset = Dataset {
@@ -3506,13 +3568,23 @@ fn nested_loop_join(
                 Value::Bool(true)
             ) {
                 matched = true;
+                matched_right[right_index] = true;
                 rows.push(row);
             }
         }
-        if !matched && kind == JoinKind::Left {
+        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
             let mut row = left_row.clone();
-            row.extend(std::iter::repeat_n(Value::Null, right.columns.len()));
+            row.extend(right_nulls.clone());
             rows.push(row);
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        for (matched, right_row) in matched_right.iter().zip(&right.rows) {
+            if !matched {
+                let mut row = left_nulls.clone();
+                row.extend(right_row.clone());
+                rows.push(row);
+            }
         }
     }
     Ok(Dataset { columns, rows })
@@ -3543,41 +3615,45 @@ impl EngineRuntime {
                 }
             }
             crate::sql::ast::SetOperation::Intersect => {
-                let right_keys = right
-                    .rows
-                    .iter()
-                    .map(|row| row_identity(row))
-                    .collect::<Result<Vec<_>>>()?;
-                let mut rows = left
-                    .rows
-                    .into_iter()
-                    .filter(|row| {
-                        row_identity(row)
-                            .map(|identity| right_keys.contains(&identity))
-                            .unwrap_or(false)
-                    })
-                    .collect::<Vec<_>>();
-                if !all {
+                let right_counts = count_row_identities(&right.rows)?;
+                let mut rows = Vec::new();
+                if all {
+                    let mut remaining = right_counts;
+                    for row in left.rows {
+                        let identity = row_identity(&row)?;
+                        if consume_row_identity_count(&mut remaining, &identity) {
+                            rows.push(row);
+                        }
+                    }
+                } else {
+                    for row in left.rows {
+                        let identity = row_identity(&row)?;
+                        if right_counts.contains_key(&identity) {
+                            rows.push(row);
+                        }
+                    }
                     rows = deduplicate_rows(rows)?;
                 }
                 rows
             }
             crate::sql::ast::SetOperation::Except => {
-                let right_keys = right
-                    .rows
-                    .iter()
-                    .map(|row| row_identity(row))
-                    .collect::<Result<Vec<_>>>()?;
-                let mut rows = left
-                    .rows
-                    .into_iter()
-                    .filter(|row| {
-                        row_identity(row)
-                            .map(|identity| !right_keys.contains(&identity))
-                            .unwrap_or(false)
-                    })
-                    .collect::<Vec<_>>();
-                if !all {
+                let right_counts = count_row_identities(&right.rows)?;
+                let mut rows = Vec::new();
+                if all {
+                    let mut remaining = right_counts;
+                    for row in left.rows {
+                        let identity = row_identity(&row)?;
+                        if !consume_row_identity_count(&mut remaining, &identity) {
+                            rows.push(row);
+                        }
+                    }
+                } else {
+                    for row in left.rows {
+                        let identity = row_identity(&row)?;
+                        if !right_counts.contains_key(&identity) {
+                            rows.push(row);
+                        }
+                    }
                     rows = deduplicate_rows(rows)?;
                 }
                 rows
@@ -3925,6 +4001,74 @@ impl EngineRuntime {
                         };
                     }
                 }
+                "first_value" | "last_value" => {
+                    if args.len() != 1 {
+                        return Err(DbError::sql(format!(
+                            "{} expects exactly 1 argument",
+                            name.to_ascii_uppercase()
+                        )));
+                    }
+                    let ordered_values = sorted
+                        .iter()
+                        .map(|row_index| {
+                            self.eval_expr(
+                                &args[0],
+                                dataset,
+                                &dataset.rows[*row_index],
+                                params,
+                                ctes,
+                                None,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let value = if name == "first_value" {
+                        ordered_values.first().cloned().unwrap_or(Value::Null)
+                    } else {
+                        ordered_values.last().cloned().unwrap_or(Value::Null)
+                    };
+                    for row_index in sorted.iter() {
+                        results[*row_index] = value.clone();
+                    }
+                }
+                "nth_value" => {
+                    if args.len() != 2 {
+                        return Err(DbError::sql(
+                            "NTH_VALUE expects exactly 2 arguments".to_string(),
+                        ));
+                    }
+                    let position =
+                        match self.eval_expr(&args[1], dataset, &[], params, ctes, None)? {
+                            Value::Int64(value) if value >= 1 => value as usize,
+                            Value::Int64(_) => {
+                                return Err(DbError::sql("NTH_VALUE position must be >= 1"))
+                            }
+                            other => {
+                                return Err(DbError::sql(format!(
+                                    "NTH_VALUE position must be INT64, got {other:?}"
+                                )))
+                            }
+                        };
+                    let ordered_values = sorted
+                        .iter()
+                        .map(|row_index| {
+                            self.eval_expr(
+                                &args[0],
+                                dataset,
+                                &dataset.rows[*row_index],
+                                params,
+                                ctes,
+                                None,
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let value = ordered_values
+                        .get(position.saturating_sub(1))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    for row_index in sorted.iter() {
+                        results[*row_index] = value.clone();
+                    }
+                }
                 other => {
                     return Err(DbError::sql(format!(
                         "unsupported window function {}",
@@ -4128,12 +4272,19 @@ impl EngineRuntime {
                     NumericAgg::Avg,
                     *distinct,
                 ),
+                "total" => aggregate_numeric(
+                    &aggregate_ctx,
+                    group_rows,
+                    &args[0],
+                    NumericAgg::Total,
+                    *distinct,
+                ),
                 "min" => aggregate_extreme(self, dataset, group_rows, &args[0], params, ctes, true),
                 "max" => {
                     aggregate_extreme(self, dataset, group_rows, &args[0], params, ctes, false)
                 }
-                "group_concat" => {
-                    aggregate_group_concat(self, dataset, group_rows, args, params, ctes)
+                name @ ("group_concat" | "string_agg") => {
+                    aggregate_group_concat(self, dataset, group_rows, args, params, ctes, name)
                 }
                 other => Err(DbError::sql(format!(
                     "unsupported aggregate function {other}"
@@ -4577,6 +4728,7 @@ fn infer_expr_name(expr: &Expr, ordinal: usize) -> String {
 enum NumericAgg {
     Sum,
     Avg,
+    Total,
 }
 
 struct AggregateEvalContext<'a> {
@@ -4640,12 +4792,16 @@ fn aggregate_numeric(
         }
     }
     if count == 0 {
-        return Ok(Value::Null);
+        return Ok(match kind {
+            NumericAgg::Total => Value::Float64(0.0),
+            NumericAgg::Sum | NumericAgg::Avg => Value::Null,
+        });
     }
     Ok(match kind {
         NumericAgg::Sum if saw_float => Value::Float64(total_float),
         NumericAgg::Sum => Value::Int64(total_int),
         NumericAgg::Avg => Value::Float64(total_float / count as f64),
+        NumericAgg::Total => Value::Float64(total_float),
     })
 }
 
@@ -4873,9 +5029,13 @@ fn aggregate_group_concat(
     args: &[Expr],
     params: &[Value],
     ctes: &BTreeMap<String, Dataset>,
+    function_name: &str,
 ) -> Result<Value> {
+    let function_name = function_name.to_ascii_uppercase();
     if args.is_empty() || args.len() > 2 {
-        return Err(DbError::sql("GROUP_CONCAT expects 1 or 2 arguments"));
+        return Err(DbError::sql(format!(
+            "{function_name} expects 1 or 2 arguments"
+        )));
     }
     let mut parts = Vec::new();
     let mut separator = ",".to_string();
@@ -4890,7 +5050,7 @@ fn aggregate_group_concat(
                 Value::Null => String::new(),
                 other => {
                     return Err(DbError::sql(format!(
-                        "GROUP_CONCAT separator must be text, got {other:?}"
+                        "{function_name} separator must be text, got {other:?}"
                     )))
                 }
             };
@@ -5571,6 +5731,35 @@ fn like_match_chars(input: &[char], pattern: &[char], escape: Option<char>) -> b
 
 fn row_identity(row: &[Value]) -> Result<Vec<u8>> {
     Row::new(row.to_vec()).encode()
+}
+
+fn deduplicate_rows_stable(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
+    let mut seen = BTreeSet::new();
+    let mut distinct_rows = Vec::new();
+    for row in rows {
+        if seen.insert(row_identity(&row)?) {
+            distinct_rows.push(row);
+        }
+    }
+    Ok(distinct_rows)
+}
+
+fn count_row_identities(rows: &[Vec<Value>]) -> Result<HashMap<Vec<u8>, usize>> {
+    let mut counts = HashMap::new();
+    for row in rows {
+        *counts.entry(row_identity(row)?).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+fn consume_row_identity_count(counts: &mut HashMap<Vec<u8>, usize>, identity: &[u8]) -> bool {
+    if let Some(remaining) = counts.get_mut(identity) {
+        if *remaining > 0 {
+            *remaining -= 1;
+            return true;
+        }
+    }
+    false
 }
 
 fn deduplicate_rows(rows: Vec<Vec<Value>>) -> Result<Vec<Vec<Value>>> {
