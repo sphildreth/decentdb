@@ -551,6 +551,35 @@ impl EngineRuntime {
         if self.temp_view(table_name).is_some() && self.catalog.table(table_name).is_none() {
             return Err(DbError::sql(format!("unknown table {table_name}")));
         }
+        if actions
+            .iter()
+            .any(|action| matches!(action, AlterTableAction::RenameTable { .. }))
+        {
+            if actions.len() != 1 {
+                return Err(DbError::sql(
+                    "ALTER TABLE RENAME TO cannot be combined with other ALTER TABLE actions",
+                ));
+            }
+            let AlterTableAction::RenameTable { new_name } = &actions[0] else {
+                return Err(DbError::internal(
+                    "ALTER TABLE RENAME dispatch reached a non-rename action",
+                ));
+            };
+            return self.execute_alter_table_rename(table_name, new_name);
+        }
+        if actions.iter().any(|action| {
+            matches!(
+                action,
+                AlterTableAction::AddConstraint(_) | AlterTableAction::DropConstraint { .. }
+            )
+        }) {
+            if actions.len() != 1 {
+                return Err(DbError::sql(
+                    "ALTER TABLE ADD/DROP CONSTRAINT cannot be combined with other ALTER TABLE actions",
+                ));
+            }
+            return self.execute_alter_table_constraint(table_name, &actions[0]);
+        }
         let mut table = self
             .catalog
             .tables
@@ -791,11 +820,173 @@ impl EngineRuntime {
                     }
                     table.columns[index].column_type = *new_type;
                 }
+                AlterTableAction::RenameTable { .. } => {
+                    return Err(DbError::internal(
+                        "ALTER TABLE RENAME action should have been dispatched earlier",
+                    ));
+                }
+                AlterTableAction::AddConstraint(_) | AlterTableAction::DropConstraint { .. } => {
+                    return Err(DbError::internal(
+                        "ALTER TABLE constraint action should have been dispatched earlier",
+                    ));
+                }
             }
         }
 
         self.catalog.tables.insert(table_name.to_string(), table);
         self.mark_table_dirty(table_name);
+        self.bump_schema_cookie();
+        Ok(())
+    }
+
+    fn execute_alter_table_constraint(
+        &mut self,
+        table_name: &str,
+        action: &AlterTableAction,
+    ) -> Result<()> {
+        let table_name = self
+            .catalog
+            .table(table_name)
+            .map(|table| table.name.clone())
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        let mut table = self
+            .catalog
+            .tables
+            .get(&table_name)
+            .cloned()
+            .ok_or_else(|| {
+                DbError::internal(format!("table schema for {} is missing", table_name))
+            })?;
+        match action {
+            AlterTableAction::AddConstraint(TableConstraint::Check { name, expr }) => {
+                if let Some(constraint_name) = name {
+                    if table
+                        .checks
+                        .iter()
+                        .any(|check| check.name.as_deref() == Some(constraint_name.as_str()))
+                    {
+                        return Err(DbError::sql(format!(
+                            "constraint {} already exists on {}",
+                            constraint_name, table_name
+                        )));
+                    }
+                }
+                let expression_sql = expr.to_sql();
+                let candidate = CheckConstraint {
+                    name: name.clone(),
+                    expression_sql: expression_sql.clone(),
+                };
+                if table
+                    .checks
+                    .iter()
+                    .any(|check| check.expression_sql == expression_sql)
+                {
+                    return Err(DbError::sql(format!(
+                        "constraint expression already exists on {}",
+                        table_name
+                    )));
+                }
+                let probe_table = {
+                    let mut probe = table.clone();
+                    probe.checks.push(candidate.clone());
+                    probe
+                };
+                for row in &self
+                    .tables
+                    .get(&table_name)
+                    .ok_or_else(|| {
+                        DbError::internal(format!("table data for {table_name} is missing"))
+                    })?
+                    .rows
+                {
+                    let expr = parse_expression_sql(&candidate.expression_sql)?;
+                    let dataset = table_row_dataset(&probe_table, &row.values, &probe_table.name);
+                    if let Value::Bool(false) = self.eval_expr(
+                        &expr,
+                        &dataset,
+                        &row.values,
+                        &[],
+                        &std::collections::BTreeMap::new(),
+                        None,
+                    )? {
+                        return Err(DbError::constraint(format!(
+                            "CHECK constraint failed on table {}",
+                            table_name
+                        )));
+                    }
+                }
+                table.checks.push(candidate);
+                self.catalog.tables.insert(table_name.clone(), table);
+                self.bump_schema_cookie();
+                Ok(())
+            }
+            AlterTableAction::AddConstraint(other) => Err(DbError::sql(format!(
+                "ALTER TABLE ADD CONSTRAINT supports only CHECK constraints in DecentDB 1.0 (received {other:?})"
+            ))),
+            AlterTableAction::DropConstraint { constraint_name } => {
+                let Some(index) = table
+                    .checks
+                    .iter()
+                    .position(|check| check.name.as_deref() == Some(constraint_name.as_str()))
+                else {
+                    return Err(DbError::sql(format!(
+                        "unknown constraint {} on {}",
+                        constraint_name, table_name
+                    )));
+                };
+                table.checks.remove(index);
+                self.catalog.tables.insert(table_name.clone(), table);
+                self.bump_schema_cookie();
+                Ok(())
+            }
+            _ => Err(DbError::internal(
+                "ALTER TABLE constraint dispatch reached a non-constraint action",
+            )),
+        }
+    }
+
+    fn execute_alter_table_rename(&mut self, table_name: &str, new_name: &str) -> Result<()> {
+        if self.catalog.contains_object(new_name) {
+            return Err(DbError::sql(format!("object {} already exists", new_name)));
+        }
+        let old_table_name = self
+            .catalog
+            .table(table_name)
+            .map(|table| table.name.clone())
+            .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        let dependent_views = super::views::dependent_views(self, &old_table_name, false);
+        if !dependent_views.is_empty() {
+            return Err(DbError::sql(format!(
+                "cannot rename table {} because dependent views exist: {}",
+                old_table_name,
+                dependent_views.join(", ")
+            )));
+        }
+        let mut table = self.catalog.tables.remove(&old_table_name).ok_or_else(|| {
+            DbError::internal(format!("table schema for {} is missing", table_name))
+        })?;
+        table.name = new_name.to_string();
+        self.catalog.tables.insert(new_name.to_string(), table);
+
+        let data = self.tables.remove(&old_table_name).ok_or_else(|| {
+            DbError::internal(format!("table data for {} is missing", table_name))
+        })?;
+        self.tables.insert(new_name.to_string(), data);
+
+        if let Some(state) = self.persisted_tables.remove(&old_table_name) {
+            self.persisted_tables.insert(new_name.to_string(), state);
+        }
+        if let Some(stats) = self.catalog.table_stats.remove(&old_table_name) {
+            self.catalog.table_stats.insert(new_name.to_string(), stats);
+        }
+        if self.dirty_tables.remove(&old_table_name) {
+            self.dirty_tables.insert(new_name.to_string());
+        }
+        if self.append_only_dirty_tables.remove(&old_table_name) {
+            self.append_only_dirty_tables.insert(new_name.to_string());
+        }
+
+        rename_table_references(self, &old_table_name, new_name);
         self.bump_schema_cookie();
         Ok(())
     }
@@ -1144,6 +1335,35 @@ fn rename_column_references(
                     if column_name == old_name {
                         *column_name = new_name.to_string();
                     }
+                }
+            }
+        }
+    }
+}
+
+fn rename_table_references(runtime: &mut EngineRuntime, old_name: &str, new_name: &str) {
+    for index in runtime.catalog.indexes.values_mut() {
+        if identifiers_equal(&index.table_name, old_name) {
+            index.table_name = new_name.to_string();
+        }
+    }
+
+    for trigger in runtime.catalog.triggers.values_mut() {
+        if !trigger.on_view && identifiers_equal(&trigger.target_name, old_name) {
+            trigger.target_name = new_name.to_string();
+        }
+    }
+
+    for table in runtime.catalog.tables.values_mut() {
+        for foreign_key in &mut table.foreign_keys {
+            if identifiers_equal(&foreign_key.referenced_table, old_name) {
+                foreign_key.referenced_table = new_name.to_string();
+            }
+        }
+        for column in &mut table.columns {
+            if let Some(foreign_key) = &mut column.foreign_key {
+                if identifiers_equal(&foreign_key.referenced_table, old_name) {
+                    foreign_key.referenced_table = new_name.to_string();
                 }
             }
         }

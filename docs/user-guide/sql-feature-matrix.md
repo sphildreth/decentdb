@@ -14,8 +14,11 @@ This document provides a comprehensive matrix of SQL features, comparing support
 | DROP INDEX | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE ADD COLUMN | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE DROP COLUMN | ✅ | ✅ | ✅ | ✅ |
+| ALTER TABLE RENAME TO | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE RENAME COLUMN | ✅ | ✅ (via ALTER TABLE RENAME) | ✅ | ✅ |
 | ALTER TABLE ALTER COLUMN TYPE | ✅ | ✅ | ✅ | ✅ |
+| ALTER TABLE ADD CONSTRAINT (CHECK) | ✅ | ✅ | ✅ | ✅ |
+| ALTER TABLE DROP CONSTRAINT (CHECK) | ✅ | ⚠️ (limited support) | ✅ | ✅ |
 | CREATE VIEW | ✅ | ✅ | ✅ | ✅ |
 | DROP VIEW | ✅ | ✅ | ✅ | ✅ |
 | CREATE TRIGGER | ✅ | ✅ | ✅ | ❌ |
@@ -52,8 +55,11 @@ CREATE INDEX idx_orders_user ON orders (user_id) WHERE user_id IS NOT NULL;
 -- ALTER TABLE
 ALTER TABLE users ADD COLUMN email TEXT;
 ALTER TABLE users DROP COLUMN email;
+ALTER TABLE users RENAME TO customers;
 ALTER TABLE users RENAME COLUMN name TO full_name;
 ALTER TABLE users ALTER COLUMN name TYPE VARCHAR(255);
+ALTER TABLE users ADD CONSTRAINT chk_email CHECK (email LIKE '%@%');
+ALTER TABLE users DROP CONSTRAINT chk_email;
 
 -- CREATE VIEW
 CREATE VIEW user_orders AS
@@ -632,6 +638,39 @@ INSERT INTO users (name) VALUES ('Y');
 ROLLBACK TO SAVEPOINT inner;  -- undoes Y
 RELEASE SAVEPOINT outer;
 COMMIT;  -- only X is committed
+```
+
+## Utility and Introspection Commands
+
+| Feature | DecentDB | SQLite | PostgreSQL | DuckDB |
+|---------|----------|--------|------------|--------|
+| `EXPLAIN <query>` | ✅ | ✅ | ✅ | ✅ |
+| `EXPLAIN ANALYZE <query>` | ✅ | ✅ | ✅ | ✅ |
+| `PRAGMA page_size` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA cache_size` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA integrity_check` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA database_list` | ✅ | ✅ | ❌ | ❌ |
+| `PRAGMA table_info(table)` | ✅ | ✅ | ❌ | ❌ |
+| Broad SQLite PRAGMA surface | ⚠️ (limited subset only) | ✅ | ❌ | ❌ |
+
+### Examples
+
+```sql
+-- Query planning / execution diagnostics
+EXPLAIN SELECT * FROM users WHERE id = 42;
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 1;
+
+-- SQLite-compatible PRAGMA subset
+PRAGMA page_size;
+PRAGMA cache_size;
+PRAGMA integrity_check;
+PRAGMA database_list;
+PRAGMA table_info(users);
+
+-- Assignment form has constrained behavior in DecentDB:
+-- no-op only when value matches current open configuration.
+PRAGMA page_size = 4096;
+PRAGMA cache_size = 1024;
 ```
 
 ## Data Types

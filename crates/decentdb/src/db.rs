@@ -16,7 +16,8 @@ use crate::config::DbConfig;
 use crate::error::{DbError, Result};
 use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
 use crate::exec::{
-    statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, RuntimeIndex, TableData,
+    statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, QueryRow, RuntimeIndex,
+    TableData,
 };
 use crate::metadata::{
     ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification, StorageInfo, TableInfo,
@@ -973,6 +974,11 @@ impl Db {
                 results.push(QueryResult::with_affected_rows(0));
                 continue;
             }
+            if let Some(pragma) = parse_pragma_command(trimmed)? {
+                let result = self.execute_pragma_command(pragma)?;
+                results.push(result);
+                continue;
+            }
 
             let statement = self.parsed_statement(trimmed)?;
             let result = if statement_is_read_only(&statement) {
@@ -1388,6 +1394,148 @@ impl Db {
             .read()
             .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
         runtime.execute_read_statement(statement, params, self.inner.config.page_size)
+    }
+
+    fn execute_pragma_command(&self, command: PragmaCommand) -> Result<QueryResult> {
+        match command {
+            PragmaCommand::Query(PragmaName::PageSize) => Ok(QueryResult::with_rows(
+                vec!["page_size".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(i64::from(
+                    self.inner.config.page_size,
+                ))])],
+            )),
+            PragmaCommand::Query(PragmaName::CacheSize) => Ok(QueryResult::with_rows(
+                vec!["cache_size".to_string()],
+                vec![QueryRow::new(vec![Value::Int64(cache_size_pages(
+                    &self.inner.config,
+                ))])],
+            )),
+            PragmaCommand::Query(PragmaName::DatabaseList) => {
+                let file_name = if is_memory_path(&self.inner.path) {
+                    ":memory:".to_string()
+                } else {
+                    self.inner.path.display().to_string()
+                };
+                Ok(QueryResult::with_rows(
+                    vec!["seq".to_string(), "name".to_string(), "file".to_string()],
+                    vec![QueryRow::new(vec![
+                        Value::Int64(0),
+                        Value::Text("main".to_string()),
+                        Value::Text(file_name),
+                    ])],
+                ))
+            }
+            PragmaCommand::Query(PragmaName::TableInfo) => Err(DbError::sql(
+                "PRAGMA table_info(table_name) requires a table name argument",
+            )),
+            PragmaCommand::TableInfo(table_name) => {
+                let info = self.describe_table(&table_name)?;
+                let rows = info
+                    .columns
+                    .into_iter()
+                    .enumerate()
+                    .map(|(cid, column)| {
+                        QueryRow::new(vec![
+                            Value::Int64(i64::try_from(cid).unwrap_or(i64::MAX)),
+                            Value::Text(column.name),
+                            Value::Text(column.column_type),
+                            Value::Int64(if column.nullable { 0 } else { 1 }),
+                            column.default_sql.map_or(Value::Null, Value::Text),
+                            Value::Int64(if column.primary_key { 1 } else { 0 }),
+                        ])
+                    })
+                    .collect();
+                Ok(QueryResult::with_rows(
+                    vec![
+                        "cid".to_string(),
+                        "name".to_string(),
+                        "type".to_string(),
+                        "notnull".to_string(),
+                        "dflt_value".to_string(),
+                        "pk".to_string(),
+                    ],
+                    rows,
+                ))
+            }
+            PragmaCommand::Query(PragmaName::IntegrityCheck) => {
+                let mut runtime = self.runtime_for_inspection()?;
+                runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+                let mut errors = Vec::new();
+                for (table_name, table) in &runtime.catalog.tables {
+                    let Some(data) = runtime.tables.get(table_name) else {
+                        errors.push(format!("table {} is missing row storage", table_name));
+                        continue;
+                    };
+                    if let Some((row_id, row_len)) = data.rows.iter().find_map(|row| {
+                        (row.values.len() != table.columns.len())
+                            .then_some((row.row_id, row.values.len()))
+                    }) {
+                        errors.push(format!(
+                            "table {} row {} has {} values but schema defines {} columns",
+                            table_name,
+                            row_id,
+                            row_len,
+                            table.columns.len()
+                        ));
+                    }
+                }
+                for index in runtime.catalog.indexes.values() {
+                    if runtime.catalog.table(&index.table_name).is_none() {
+                        errors.push(format!(
+                            "index {} references missing table {}",
+                            index.name, index.table_name
+                        ));
+                    }
+                    if !runtime.indexes.contains_key(&index.name) {
+                        errors.push(format!("runtime index {} is missing", index.name));
+                    }
+                }
+                if errors.is_empty() {
+                    Ok(QueryResult::with_rows(
+                        vec!["integrity_check".to_string()],
+                        vec![QueryRow::new(vec![Value::Text("ok".to_string())])],
+                    ))
+                } else {
+                    Ok(QueryResult::with_rows(
+                        vec!["integrity_check".to_string()],
+                        errors
+                            .into_iter()
+                            .map(|error| QueryRow::new(vec![Value::Text(error)]))
+                            .collect(),
+                    ))
+                }
+            }
+            PragmaCommand::Set(name, value) => self.execute_pragma_set(name, value),
+        }
+    }
+
+    fn execute_pragma_set(&self, name: PragmaName, value: i64) -> Result<QueryResult> {
+        match name {
+            PragmaName::PageSize => {
+                if value == i64::from(self.inner.config.page_size) {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA page_size cannot be changed on an open database; reopen with DbConfig::page_size",
+                    ))
+                }
+            }
+            PragmaName::CacheSize => {
+                if value == cache_size_pages(&self.inner.config) {
+                    Ok(QueryResult::with_affected_rows(0))
+                } else {
+                    Err(DbError::sql(
+                        "PRAGMA cache_size cannot be changed on an open connection; reopen with DbConfig::cache_size_mb",
+                    ))
+                }
+            }
+            PragmaName::IntegrityCheck | PragmaName::DatabaseList | PragmaName::TableInfo => {
+                Err(DbError::sql(format!(
+                    "PRAGMA {} does not support assignment",
+                    pragma_name_sql(name)
+                )))
+            }
+        }
     }
 
     fn execute_prepared_statement(
@@ -2283,6 +2431,22 @@ enum TransactionControl {
     RollbackToSavepoint(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PragmaCommand {
+    Query(PragmaName),
+    TableInfo(String),
+    Set(PragmaName, i64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PragmaName {
+    PageSize,
+    CacheSize,
+    IntegrityCheck,
+    DatabaseList,
+    TableInfo,
+}
+
 fn parse_transaction_control(sql: &str) -> Option<TransactionControl> {
     let normalized = normalized_control_sql(sql);
     let upper = normalized.to_ascii_uppercase();
@@ -2300,6 +2464,131 @@ fn parse_transaction_control(sql: &str) -> Option<TransactionControl> {
         "ROLLBACK" | "ROLLBACK TRANSACTION" => Some(TransactionControl::Rollback),
         _ => parse_savepoint_control(&normalized),
     }
+}
+
+fn parse_pragma_command(sql: &str) -> Result<Option<PragmaCommand>> {
+    let trimmed = sql.trim();
+    let Some(_) = trimmed
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("PRAGMA"))
+    else {
+        return Ok(None);
+    };
+    let body = trimmed[6..].trim();
+    if body.is_empty() {
+        return Err(DbError::sql("PRAGMA requires a name"));
+    }
+    let body = body.trim_end_matches(';').trim();
+    if body.is_empty() {
+        return Err(DbError::sql("PRAGMA requires a name"));
+    }
+
+    if let Some(open_paren) = body.find('(') {
+        let close_paren = body
+            .rfind(')')
+            .ok_or_else(|| DbError::sql("PRAGMA call is missing closing ')'"))?;
+        if close_paren <= open_paren {
+            return Err(DbError::sql("PRAGMA call has invalid parentheses"));
+        }
+        let name = body[..open_paren].trim();
+        let argument = body[open_paren + 1..close_paren].trim();
+        let trailing = body[close_paren + 1..].trim();
+        if !trailing.is_empty() {
+            return Err(DbError::sql("PRAGMA call has unexpected trailing content"));
+        }
+        let name = parse_pragma_name(name)?;
+        if argument.is_empty() {
+            return Err(DbError::sql("PRAGMA call requires an argument"));
+        }
+        return match name {
+            PragmaName::TableInfo => {
+                let table_name = parse_pragma_table_argument(argument)?;
+                Ok(Some(PragmaCommand::TableInfo(table_name)))
+            }
+            _ => Err(DbError::sql(format!(
+                "PRAGMA {} does not accept call syntax",
+                pragma_name_sql(name)
+            ))),
+        };
+    }
+
+    let (name, value) = if let Some(eq_index) = body.find('=') {
+        let name = body[..eq_index].trim();
+        let value = body[eq_index + 1..].trim();
+        if name.is_empty() || value.is_empty() {
+            return Err(DbError::sql("PRAGMA assignment requires a name and value"));
+        }
+        (name, Some(value))
+    } else {
+        (body, None)
+    };
+    let pragma_name = parse_pragma_name(name)?;
+    let command = if let Some(value) = value {
+        let value = value.parse::<i64>().map_err(|_| {
+            DbError::sql(format!(
+                "PRAGMA {} expects an integer value",
+                name.to_ascii_lowercase()
+            ))
+        })?;
+        PragmaCommand::Set(pragma_name, value)
+    } else {
+        PragmaCommand::Query(pragma_name)
+    };
+    Ok(Some(command))
+}
+
+fn parse_pragma_name(name: &str) -> Result<PragmaName> {
+    let normalized = name.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "page_size" => Ok(PragmaName::PageSize),
+        "cache_size" => Ok(PragmaName::CacheSize),
+        "integrity_check" => Ok(PragmaName::IntegrityCheck),
+        "database_list" => Ok(PragmaName::DatabaseList),
+        "table_info" => Ok(PragmaName::TableInfo),
+        _ => Err(DbError::sql(format!("unsupported PRAGMA {}", normalized))),
+    }
+}
+
+fn pragma_name_sql(name: PragmaName) -> &'static str {
+    match name {
+        PragmaName::PageSize => "page_size",
+        PragmaName::CacheSize => "cache_size",
+        PragmaName::IntegrityCheck => "integrity_check",
+        PragmaName::DatabaseList => "database_list",
+        PragmaName::TableInfo => "table_info",
+    }
+}
+
+fn parse_pragma_table_argument(argument: &str) -> Result<String> {
+    let trimmed = argument.trim();
+    if trimmed.is_empty() {
+        return Err(DbError::sql("PRAGMA table_info requires a table name"));
+    }
+    if trimmed.starts_with('\"') {
+        if !trimmed.ends_with('\"') || trimmed.len() < 2 {
+            return Err(DbError::sql(
+                "PRAGMA table_info has invalid quoted table name",
+            ));
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return Ok(inner.replace("\"\"", "\""));
+    }
+    if trimmed.starts_with('\'') {
+        if !trimmed.ends_with('\'') || trimmed.len() < 2 {
+            return Err(DbError::sql(
+                "PRAGMA table_info has invalid quoted table name",
+            ));
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        return Ok(inner.replace("''", "'"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn cache_size_pages(config: &DbConfig) -> i64 {
+    let bytes = config.cache_size_mb.saturating_mul(1024 * 1024);
+    let pages = (bytes / config.page_size as usize).max(1);
+    i64::try_from(pages).unwrap_or(i64::MAX)
 }
 
 fn normalized_control_sql(sql: &str) -> String {
@@ -2938,6 +3227,154 @@ mod tests {
              FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log (msg) VALUES (''user added'')')"
         );
         assert_eq!(statements[1], "INSERT INTO users VALUES (1, 'Ada')");
+    }
+
+    #[test]
+    fn pragma_page_size_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        let result = db.execute("PRAGMA page_size").expect("pragma page_size");
+        assert_eq!(result.columns(), &["page_size".to_string()]);
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(i64::from(db.config().page_size))]
+        );
+    }
+
+    #[test]
+    fn pragma_cache_size_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        let result = db.execute("PRAGMA cache_size").expect("pragma cache_size");
+        assert_eq!(result.columns(), &["cache_size".to_string()]);
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[Value::Int64(super::cache_size_pages(db.config()))]
+        );
+    }
+
+    #[test]
+    fn pragma_integrity_check_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'a')")
+            .expect("insert row");
+        let result = db
+            .execute("PRAGMA integrity_check")
+            .expect("pragma integrity_check");
+        assert_eq!(result.columns(), &["integrity_check".to_string()]);
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Text("ok".to_string())]);
+    }
+
+    #[test]
+    fn pragma_database_list_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        let result = db
+            .execute("PRAGMA database_list")
+            .expect("pragma database_list");
+        assert_eq!(
+            result.columns(),
+            &["seq".to_string(), "name".to_string(), "file".to_string()]
+        );
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(0),
+                Value::Text("main".to_string()),
+                Value::Text(":memory:".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn pragma_table_info_query() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t(id INT PRIMARY KEY, name TEXT DEFAULT 'anon')")
+            .expect("create table");
+
+        let result = db.execute("PRAGMA table_info(t)").expect("table_info");
+        assert_eq!(
+            result.columns(),
+            &[
+                "cid".to_string(),
+                "name".to_string(),
+                "type".to_string(),
+                "notnull".to_string(),
+                "dflt_value".to_string(),
+                "pk".to_string()
+            ]
+        );
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                Value::Int64(0),
+                Value::Text("id".to_string()),
+                Value::Text("INT64".to_string()),
+                Value::Int64(1),
+                Value::Null,
+                Value::Int64(1)
+            ]
+        );
+        assert_eq!(
+            result.rows()[1].values(),
+            &[
+                Value::Int64(1),
+                Value::Text("name".to_string()),
+                Value::Text("TEXT".to_string()),
+                Value::Int64(0),
+                Value::Text("'anon'".to_string()),
+                Value::Int64(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn pragma_table_info_assignment_is_rejected() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        let error = db
+            .execute("PRAGMA table_info = 1")
+            .expect_err("assignment should fail");
+        assert!(
+            error.to_string().contains("does not support assignment"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn pragma_assignments_are_limited() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        let page_size_noop = db.execute("PRAGMA page_size = 4096");
+        assert!(
+            page_size_noop.is_ok(),
+            "expected no-op assignment to succeed"
+        );
+
+        let cache_size_error = db
+            .execute("PRAGMA cache_size = 8")
+            .expect_err("cache_size assignment should fail");
+        assert!(cache_size_error
+            .to_string()
+            .contains("cannot be changed on an open connection"));
+
+        let integrity_assignment_error = db
+            .execute("PRAGMA integrity_check = 1")
+            .expect_err("integrity_check assignment should fail");
+        assert!(integrity_assignment_error
+            .to_string()
+            .contains("does not support assignment"));
+    }
+
+    #[test]
+    fn unsupported_pragma_reports_sql_error() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        let error = db
+            .execute("PRAGMA foreign_keys")
+            .expect_err("unsupported pragma should fail");
+        assert!(error.to_string().contains("unsupported PRAGMA"));
     }
 
     #[test]

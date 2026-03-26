@@ -277,7 +277,7 @@ For very large databases, archived WAL segments could be:
 
 ## Configuration
 
-DecentDB does not support SQLite-style `PRAGMA` statements. Checkpointing and reader timeouts are configured via API/CLI flags.
+DecentDB supports a limited SQLite-compatible PRAGMA subset (`page_size`, `cache_size`, `integrity_check`, `database_list`, `table_info(table)`). Checkpointing and reader timeouts are configured via API/CLI flags (not PRAGMA).
 
 ### Checkpointing
 

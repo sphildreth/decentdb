@@ -481,6 +481,13 @@ pub(crate) struct CreateTriggerStatement {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AlterTableAction {
     AddColumn(ColumnDefinition),
+    RenameTable {
+        new_name: String,
+    },
+    AddConstraint(TableConstraint),
+    DropConstraint {
+        constraint_name: String,
+    },
     DropColumn {
         column_name: String,
     },

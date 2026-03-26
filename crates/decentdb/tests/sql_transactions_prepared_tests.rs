@@ -74,6 +74,97 @@ fn analyze_with_data() {
 }
 
 #[test]
+fn pragma_query_commands_return_expected_shapes() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE pragma_t (id INT64 PRIMARY KEY, v TEXT)");
+    exec(&db, "INSERT INTO pragma_t VALUES (1, 'a')");
+
+    let page_size = exec(&db, "PRAGMA page_size");
+    assert_eq!(page_size.columns(), &["page_size".to_string()]);
+    assert_eq!(rows(&page_size), vec![vec![Value::Int64(4096)]]);
+
+    let cache_size = exec(&db, "PRAGMA cache_size");
+    assert_eq!(cache_size.columns(), &["cache_size".to_string()]);
+    assert_eq!(cache_size.rows().len(), 1);
+    assert!(matches!(rows(&cache_size)[0][0], Value::Int64(v) if v > 0));
+
+    let integrity = exec(&db, "PRAGMA integrity_check");
+    assert_eq!(integrity.columns(), &["integrity_check".to_string()]);
+    assert_eq!(rows(&integrity), vec![vec![Value::Text("ok".to_string())]]);
+
+    let db_list = exec(&db, "PRAGMA database_list");
+    assert_eq!(
+        db_list.columns(),
+        &["seq".to_string(), "name".to_string(), "file".to_string()]
+    );
+    assert_eq!(
+        rows(&db_list),
+        vec![vec![
+            Value::Int64(0),
+            Value::Text("main".to_string()),
+            Value::Text(":memory:".to_string())
+        ]]
+    );
+
+    let table_info = exec(&db, "PRAGMA table_info(pragma_t)");
+    assert_eq!(
+        table_info.columns(),
+        &[
+            "cid".to_string(),
+            "name".to_string(),
+            "type".to_string(),
+            "notnull".to_string(),
+            "dflt_value".to_string(),
+            "pk".to_string()
+        ]
+    );
+    assert_eq!(table_info.rows().len(), 2);
+    let first_col = table_info.rows()[0].values();
+    assert_eq!(first_col[0], Value::Int64(0));
+    assert_eq!(first_col[1], Value::Text("id".to_string()));
+    assert_eq!(first_col[5], Value::Int64(1));
+}
+
+#[test]
+fn pragma_assignment_semantics_are_enforced() {
+    let db = mem_db();
+
+    exec(&db, "PRAGMA page_size = 4096");
+
+    let cache_err = exec_err(&db, "PRAGMA cache_size = 8");
+    assert!(
+        cache_err.contains("cannot be changed on an open connection"),
+        "unexpected error: {cache_err}"
+    );
+
+    let integrity_err = exec_err(&db, "PRAGMA integrity_check = 1");
+    assert!(
+        integrity_err.contains("does not support assignment"),
+        "unexpected error: {integrity_err}"
+    );
+}
+
+#[test]
+fn pragma_unknown_name_is_rejected() {
+    let db = mem_db();
+    let err = exec_err(&db, "PRAGMA foreign_keys");
+    assert!(
+        err.contains("unsupported PRAGMA"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn pragma_table_info_errors_for_unknown_table() {
+    let db = mem_db();
+    let err = exec_err(&db, "PRAGMA table_info(missing_table)");
+    assert!(
+        err.contains("unknown table"),
+        "unexpected error for missing table: {err}"
+    );
+}
+
+#[test]
 fn commit_without_begin_error() {
     let db = mem_db();
     let err = exec_err(&db, "COMMIT");

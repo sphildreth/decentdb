@@ -799,6 +799,17 @@ fn normalize_rename(statement: &protobuf::RenameStmt) -> Result<Statement> {
     let rename_type = protobuf::ObjectType::try_from(statement.rename_type)
         .unwrap_or(protobuf::ObjectType::Undefined);
     match rename_type {
+        protobuf::ObjectType::ObjectTable => Ok(Statement::AlterTable {
+            table_name: normalize_range_var(
+                statement
+                    .relation
+                    .as_ref()
+                    .ok_or_else(|| unsupported("ALTER TABLE RENAME is missing the table"))?,
+            )?,
+            actions: vec![AlterTableAction::RenameTable {
+                new_name: statement.newname.clone(),
+            }],
+        }),
         protobuf::ObjectType::ObjectView => Ok(Statement::AlterViewRename {
             view_name: normalize_range_var(
                 statement
@@ -886,6 +897,23 @@ fn normalize_alter_table_command(command: &protobuf::AlterTableCmd) -> Result<Al
                 _ => Err(unsupported("unsupported ALTER TABLE type specification")),
             }
         }
+        protobuf::AlterTableType::AtAddConstraint => {
+            let definition = command
+                .def
+                .as_deref()
+                .ok_or_else(|| unsupported("ALTER TABLE ADD CONSTRAINT is missing a definition"))?;
+            match node_kind(definition)? {
+                NodeEnum::Constraint(constraint) => Ok(AlterTableAction::AddConstraint(
+                    normalize_table_constraint(constraint)?,
+                )),
+                _ => Err(unsupported(
+                    "unsupported ALTER TABLE ADD CONSTRAINT definition",
+                )),
+            }
+        }
+        protobuf::AlterTableType::AtDropConstraint => Ok(AlterTableAction::DropConstraint {
+            constraint_name: command.name.clone(),
+        }),
         other => Err(unsupported(format!(
             "ALTER TABLE action {} is not supported",
             other.as_str_name()
@@ -3514,6 +3542,22 @@ mod tests {
     // ── normalize_rename paths ─────────────────────────────────────
 
     #[test]
+    fn rename_table() {
+        if let Statement::AlterTable {
+            table_name,
+            actions,
+        } = norm("ALTER TABLE t RENAME TO u")
+        {
+            assert_eq!(table_name, "t");
+            assert!(
+                matches!(&actions[0], AlterTableAction::RenameTable { new_name } if new_name == "u")
+            );
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    #[test]
     fn rename_column() {
         if let Statement::AlterTable { actions, .. } = norm("ALTER TABLE t RENAME COLUMN x TO y") {
             assert!(
@@ -3563,6 +3607,33 @@ mod tests {
                 &actions[0],
                 AlterTableAction::AlterColumnType { .. }
             ));
+        }
+    }
+
+    #[test]
+    fn alter_table_add_constraint() {
+        if let Statement::AlterTable { actions, .. } =
+            norm("ALTER TABLE t ADD CONSTRAINT c CHECK (x > 0)")
+        {
+            assert!(matches!(
+                &actions[0],
+                AlterTableAction::AddConstraint(TableConstraint::Check { name, .. })
+                    if name.as_deref() == Some("c")
+            ));
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    #[test]
+    fn alter_table_drop_constraint() {
+        if let Statement::AlterTable { actions, .. } = norm("ALTER TABLE t DROP CONSTRAINT c") {
+            assert!(matches!(
+                &actions[0],
+                AlterTableAction::DropConstraint { constraint_name } if constraint_name == "c"
+            ));
+        } else {
+            panic!("expected AlterTable");
         }
     }
 

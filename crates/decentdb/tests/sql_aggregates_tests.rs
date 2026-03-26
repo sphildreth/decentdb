@@ -1538,14 +1538,11 @@ fn rename_table() {
     let db = mem_db();
     db.execute("CREATE TABLE old_name(id INT64)").unwrap();
     db.execute("INSERT INTO old_name VALUES (1)").unwrap();
-    // RENAME TABLE is not supported; verify it errors gracefully
-    let err = db
-        .execute("ALTER TABLE old_name RENAME TO new_name")
-        .unwrap_err();
-    assert!(!err.to_string().is_empty());
-    // Original table should still be accessible
-    let r = db.execute("SELECT id FROM old_name").unwrap();
+    db.execute("ALTER TABLE old_name RENAME TO new_name")
+        .unwrap();
+    let r = db.execute("SELECT id FROM new_name").unwrap();
     assert_eq!(rows(&r)[0][0], Value::Int64(1));
+    assert!(db.execute("SELECT id FROM old_name").is_err());
 }
 
 // ===========================================================================

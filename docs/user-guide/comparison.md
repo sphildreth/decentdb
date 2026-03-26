@@ -123,15 +123,16 @@ DecentDB intentionally does not support certain SQLite-specific features. This s
 
 ### PRAGMA
 
-SQLite's runtime configuration mechanism (hundreds of directives) is not supported.
+DecentDB supports a small compatibility subset of SQLite-style PRAGMAs (`page_size`, `cache_size`, `integrity_check`, `database_list`, `table_info(table)`) and intentionally does not implement SQLite's broader PRAGMA surface.
 
 | Common PRAGMA | DecentDB Alternative |
 |---|---|
 | `PRAGMA journal_mode` | Not applicable; DecentDB uses WAL-only mode |
 | `PRAGMA foreign_keys` | Always enabled; cannot be disabled |
-| `PRAGMA table_info(t)` | Use `decentdb describe --db=... --table=t` |
 | `PRAGMA synchronous` | Not configurable; commits are durable by default (fsync-on-commit). Use `bulk-load --durability=...` for ingestion tradeoffs |
-| `PRAGMA cache_size` | Configure cache at open: CLI `--cachePages/--cacheMb`, Rust `openDb(..., cachePages=...)` |
+| `PRAGMA cache_size` | Query is supported. Changing cache size requires reopen: CLI `--cachePages/--cacheMb`, Rust `openDb(..., cachePages=...)` |
+| `PRAGMA page_size` | Query is supported. Changing page size requires reopening with matching `DbConfig.page_size` |
+| `PRAGMA table_info(t)` | Supported via `PRAGMA table_info(t)` and via `decentdb describe --db=... --table=t` |
 
 ### rowid / _rowid_ Pseudo-Columns
 

@@ -49,7 +49,7 @@ DecentDB uses a write-ahead log (WAL) and performs an `fsync()` on commit by def
 
 ### Durability
 
-There is currently no SQL-level `PRAGMA` to change durability for normal DML (`INSERT`/`UPDATE`/`DELETE`). For high-throughput ingestion, use bulk-load durability modes instead:
+DecentDB exposes a narrow SQL-level PRAGMA subset (`page_size`, `cache_size`, `integrity_check`, `database_list`). There is no SQL-level PRAGMA to change durability for normal DML (`INSERT`/`UPDATE`/`DELETE`). For high-throughput ingestion, use bulk-load durability modes instead:
 
 - CLI: `decentdb bulk-load --durability=full|deferred|none` (default: `deferred`)
 - Rust: `BulkLoadOptions.durability = dmFull|dmDeferred|dmNone`
@@ -120,7 +120,16 @@ decentdb info --db=my.ddb --schema-summary
 
 ### Checkpoint/Reader Settings (CLI)
 
-DecentDB does not support SQLite-style `PRAGMA` statements.
+DecentDB supports a limited SQLite-compatible PRAGMA subset:
+- `PRAGMA page_size`
+- `PRAGMA cache_size`
+- `PRAGMA integrity_check`
+- `PRAGMA database_list`
+- `PRAGMA table_info(<table>)`
+
+Assignment form is accepted only with constrained behavior:
+- `PRAGMA page_size = <current_value>` is a no-op; changing page size requires reopening with `DbConfig.page_size`.
+- `PRAGMA cache_size = <current_value>` is a no-op; changing cache size requires reopening with `DbConfig.cache_size_mb`.
 
 To override checkpoint/reader settings for a single `exec` invocation, use:
 - `--checkpointBytes`

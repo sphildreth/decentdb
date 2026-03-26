@@ -286,6 +286,144 @@ fn alter_table_rename_column() {
 }
 
 #[test]
+fn alter_table_rename_table() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE rt (id INT PRIMARY KEY, val TEXT)");
+    exec(&db, "INSERT INTO rt VALUES (1, 'a')");
+    exec(&db, "ALTER TABLE rt RENAME TO rt_new");
+
+    let r = exec(&db, "SELECT id, val FROM rt_new");
+    assert_eq!(r.rows().len(), 1);
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(1));
+    assert_eq!(r.rows()[0].values()[1], Value::Text("a".into()));
+    assert!(db.execute("SELECT id FROM rt").is_err());
+}
+
+#[test]
+fn alter_table_rename_table_updates_fk_references() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE parent (id INT PRIMARY KEY)");
+    exec(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+    );
+    exec(&db, "ALTER TABLE parent RENAME TO parent_new");
+
+    let ddl = db.table_ddl("child").unwrap();
+    assert!(ddl.contains("REFERENCES \"parent_new\""), "ddl: {ddl}");
+}
+
+#[test]
+fn alter_table_rename_table_updates_indexes_and_triggers() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE base (id INT PRIMARY KEY, val TEXT)");
+    exec(&db, "CREATE INDEX base_val_idx ON base (val)");
+    exec(&db, "CREATE TABLE log (msg TEXT)");
+    exec(
+        &db,
+        "CREATE TRIGGER base_after_insert AFTER INSERT ON base FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO log VALUES (''x'')')",
+    );
+    exec(&db, "ALTER TABLE base RENAME TO base_new");
+    exec(&db, "INSERT INTO base_new VALUES (1, 'ok')");
+
+    let indexes = db.list_indexes().unwrap();
+    let idx = indexes
+        .iter()
+        .find(|index| index.name == "base_val_idx")
+        .expect("index should still exist");
+    assert_eq!(idx.table_name, "base_new");
+
+    let triggers = db.list_triggers().unwrap();
+    let trigger = triggers
+        .iter()
+        .find(|trigger| trigger.name == "base_after_insert")
+        .expect("trigger should still exist");
+    assert_eq!(trigger.target_name, "base_new");
+
+    let rows = exec(&db, "SELECT msg FROM log").rows().to_vec();
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
+fn alter_table_rename_table_rejects_dependent_views() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE base (id INT PRIMARY KEY)");
+    exec(&db, "CREATE VIEW v_base AS SELECT id FROM base");
+    let err = exec_err(&db, "ALTER TABLE base RENAME TO base_new");
+    assert!(err.contains("dependent views"), "got: {err}");
+}
+
+#[test]
+fn alter_table_rename_table_rejects_existing_name() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE left_t (id INT PRIMARY KEY)");
+    exec(&db, "CREATE TABLE right_t (id INT PRIMARY KEY)");
+    let err = exec_err(&db, "ALTER TABLE left_t RENAME TO right_t");
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+#[test]
+fn alter_table_rename_table_cannot_mix_actions() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE t (id INT PRIMARY KEY, v INT)");
+    let err = exec_err(&db, "ALTER TABLE t RENAME TO t2, ADD COLUMN extra TEXT");
+    assert!(err.contains("syntax error"), "got: {err}");
+}
+
+#[test]
+fn alter_table_add_named_check_constraint() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE ac1 (id INT PRIMARY KEY, amount INT)");
+    exec(
+        &db,
+        "ALTER TABLE ac1 ADD CONSTRAINT chk_amount_nonneg CHECK (amount >= 0)",
+    );
+    exec(&db, "INSERT INTO ac1 VALUES (1, 0)");
+    let err = exec_err(&db, "INSERT INTO ac1 VALUES (2, -1)");
+    assert!(err.contains("CHECK constraint failed"), "got: {err}");
+}
+
+#[test]
+fn alter_table_add_check_constraint_rejects_invalid_existing_rows() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE ac2 (id INT PRIMARY KEY, amount INT)");
+    exec(&db, "INSERT INTO ac2 VALUES (1, -5)");
+    let err = exec_err(
+        &db,
+        "ALTER TABLE ac2 ADD CONSTRAINT chk_amount_nonneg CHECK (amount >= 0)",
+    );
+    assert!(err.contains("CHECK constraint failed"), "got: {err}");
+}
+
+#[test]
+fn alter_table_drop_constraint_removes_check_enforcement() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE ac3 (id INT PRIMARY KEY, amount INT)");
+    exec(
+        &db,
+        "ALTER TABLE ac3 ADD CONSTRAINT chk_amount_nonneg CHECK (amount >= 0)",
+    );
+    exec(&db, "ALTER TABLE ac3 DROP CONSTRAINT chk_amount_nonneg");
+    exec(&db, "INSERT INTO ac3 VALUES (1, -3)");
+}
+
+#[test]
+fn alter_table_add_constraint_only_supports_check() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE ac4 (id INT PRIMARY KEY, code TEXT)");
+    let err = exec_err(&db, "ALTER TABLE ac4 ADD CONSTRAINT uq_code UNIQUE (code)");
+    assert!(err.contains("supports only CHECK"), "got: {err}");
+}
+
+#[test]
+fn alter_table_drop_constraint_unknown_name() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE ac5 (id INT PRIMARY KEY, amount INT)");
+    let err = exec_err(&db, "ALTER TABLE ac5 DROP CONSTRAINT nope");
+    assert!(err.contains("unknown constraint"), "got: {err}");
+}
+
+#[test]
 fn alter_table_rename_column_with_fk() {
     let db = mem_db();
     exec(&db, "CREATE TABLE arp (id INT PRIMARY KEY)");
