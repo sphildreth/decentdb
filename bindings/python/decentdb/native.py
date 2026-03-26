@@ -79,6 +79,74 @@ class DdbValueView(Structure):
 
 
 _lib = None
+_preloaded_lib = None
+
+
+def _candidate_library_paths():
+    lib_path = os.environ.get("DECENTDB_NATIVE_LIB")
+    if lib_path:
+        return [lib_path]
+
+    here = os.path.abspath(__file__)
+    candidates = []
+    lib_names = [
+        "libdecentdb.so",
+        "libdecentdb.dylib",
+        "decentdb.dll",
+        "libc_api.so",
+        "libc_api.dylib",
+        "c_api.dll",
+    ]
+
+    cwd = os.getcwd()
+    for name in lib_names:
+        candidates.append(os.path.join(cwd, "build", name))
+        candidates.append(os.path.join(cwd, "target", "release", name))
+        candidates.append(os.path.join(cwd, "target", "debug", name))
+
+    cur_dir = os.path.dirname(here)
+    for _ in range(0, 8):
+        for name in lib_names:
+            candidates.append(os.path.join(cur_dir, "build", name))
+            candidates.append(os.path.join(cur_dir, "target", "release", name))
+            candidates.append(os.path.join(cur_dir, "target", "debug", name))
+        parent = os.path.dirname(cur_dir)
+        if parent == cur_dir:
+            break
+        cur_dir = parent
+
+    return candidates
+
+
+def resolve_library_path():
+    for candidate in _candidate_library_paths():
+        if os.path.exists(candidate):
+            return candidate
+    raise RuntimeError(
+        "Could not find decentdb native library. Set DECENTDB_NATIVE_LIB "
+        "or build with `cargo build -p decentdb`."
+    )
+
+
+def preload_library_for_extensions():
+    global _preloaded_lib
+    if _preloaded_lib is not None:
+        return _preloaded_lib
+
+    try:
+        lib_path = resolve_library_path()
+    except RuntimeError:
+        return None
+
+    try:
+        if hasattr(ctypes, "RTLD_GLOBAL"):
+            _preloaded_lib = ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+        else:
+            _preloaded_lib = ctypes.CDLL(lib_path)
+    except OSError:
+        return None
+
+    return _preloaded_lib
 
 
 def load_library():
@@ -86,49 +154,13 @@ def load_library():
     if _lib is not None:
         return _lib
 
-    lib_path = os.environ.get("DECENTDB_NATIVE_LIB")
-    if not lib_path:
-        here = os.path.abspath(__file__)
-        candidates = []
-        lib_names = [
-            "libdecentdb.so",
-            "libdecentdb.dylib",
-            "decentdb.dll",
-            "libc_api.so",
-            "libc_api.dylib",
-            "c_api.dll",
-        ]
-
-        cwd = os.getcwd()
-        for name in lib_names:
-            candidates.append(os.path.join(cwd, "build", name))
-            candidates.append(os.path.join(cwd, "target", "release", name))
-            candidates.append(os.path.join(cwd, "target", "debug", name))
-
-        cur_dir = os.path.dirname(here)
-        for _ in range(0, 8):
-            for name in lib_names:
-                candidates.append(os.path.join(cur_dir, "build", name))
-                candidates.append(os.path.join(cur_dir, "target", "release", name))
-                candidates.append(os.path.join(cur_dir, "target", "debug", name))
-            parent = os.path.dirname(cur_dir)
-            if parent == cur_dir:
-                break
-            cur_dir = parent
-
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                lib_path = candidate
-                break
-
-    if not lib_path:
-        raise RuntimeError(
-            "Could not find decentdb native library. Set DECENTDB_NATIVE_LIB "
-            "or build with `cargo build -p decentdb`."
-        )
+    lib_path = resolve_library_path()
 
     try:
-        _lib = ctypes.CDLL(lib_path)
+        if _preloaded_lib is not None and getattr(_preloaded_lib, "_name", None) == lib_path:
+            _lib = _preloaded_lib
+        else:
+            _lib = ctypes.CDLL(lib_path)
     except OSError as exc:
         raise RuntimeError(f"Failed to load decentdb native library at {lib_path}: {exc}")
 

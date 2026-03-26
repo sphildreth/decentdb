@@ -1,5 +1,10 @@
-import pytest
 import os
+import pathlib
+import subprocess
+import sys
+
+import pytest
+
 import decentdb
 import time
 
@@ -170,3 +175,36 @@ def test_error_includes_sql_and_code(db_path):
     assert "\"sql\":" in msg
 
     conn.close()
+
+
+def test_fastdecode_imports_with_native_lib_env():
+    package_dir = pathlib.Path(__file__).resolve().parents[1]
+    extension_files = list(package_dir.glob("decentdb/_fastdecode*.so"))
+    if not extension_files:
+        pytest.skip("fastdecode extension is not built")
+
+    repo_root = package_dir.parents[1]
+    native_candidates = [
+        repo_root / "target" / "release" / "libdecentdb.so",
+        repo_root / "target" / "debug" / "libdecentdb.so",
+        repo_root / "build" / "libdecentdb.so",
+    ]
+    native_lib = next((path for path in native_candidates if path.exists()), None)
+    if native_lib is None:
+        pytest.skip("decentdb native library is not built")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(package_dir)
+    env["DECENTDB_NATIVE_LIB"] = str(native_lib)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import decentdb, sys; sys.exit(0 if decentdb._fastdecode_native is not None else 1)",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout

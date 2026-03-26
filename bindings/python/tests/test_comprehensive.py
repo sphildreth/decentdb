@@ -163,6 +163,25 @@ class TestCursorAttributesComprehensive:
 
         conn.close()
 
+    def test_cursor_execute_two_float_range_scan(self, db_path):
+        """Two-float execute paths should fall back cleanly when prefetch declines."""
+        conn = decentdb.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE items (id INT64, name TEXT, price FLOAT64)")
+        cur.execute("INSERT INTO items VALUES (1, 'a', 1.0)")
+        cur.execute("INSERT INTO items VALUES (2, 'b', 1.5)")
+        cur.execute("INSERT INTO items VALUES (3, 'c', 3.0)")
+        conn.commit()
+
+        cur.execute(
+            "SELECT id, name, price FROM items WHERE price >= ? AND price < ? ORDER BY price LIMIT 100",
+            (1.0, 2.0),
+        )
+
+        assert cur.fetchall() == [(1, "a", 1.0), (2, "b", 1.5)]
+        assert cur.rowcount == -1
+        conn.close()
+
     def test_cursor_arraysize_default(self, db_path):
         """Test cursor.arraysize default value."""
         conn = decentdb.connect(db_path)

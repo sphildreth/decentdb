@@ -254,6 +254,50 @@ fn update_single_row_id_alias_email_parameterized() {
 }
 
 #[test]
+fn update_missing_integer_primary_key_is_noop() {
+    let db = mem_db();
+    db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a@example.com')")
+        .unwrap();
+
+    let result = db
+        .execute("UPDATE users SET email = 'ghost@example.com' WHERE id = 999")
+        .unwrap();
+
+    assert_eq!(result.affected_rows(), 0);
+    let remaining = db.execute("SELECT id, email FROM users").unwrap();
+    assert_eq!(
+        rows(&remaining),
+        vec![vec![
+            Value::Int64(1),
+            Value::Text("a@example.com".to_string())
+        ]]
+    );
+}
+
+#[test]
+fn delete_missing_integer_primary_key_is_noop() {
+    let db = mem_db();
+    db.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a@example.com')")
+        .unwrap();
+
+    let result = db.execute("DELETE FROM users WHERE id = 999").unwrap();
+
+    assert_eq!(result.affected_rows(), 0);
+    let remaining = db.execute("SELECT id, email FROM users").unwrap();
+    assert_eq!(
+        rows(&remaining),
+        vec![vec![
+            Value::Int64(1),
+            Value::Text("a@example.com".to_string())
+        ]]
+    );
+}
+
+#[test]
 fn insert_column_count_mismatch() {
     let db = mem_db();
     exec(&db, "CREATE TABLE ccm (id INT PRIMARY KEY, a TEXT, b TEXT)");

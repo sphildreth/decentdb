@@ -2423,7 +2423,10 @@ fn indexed_row_ids_for_filter(
     }
     if row_id_alias_column_name(table).is_some_and(|entry| identifiers_equal(entry, column_name)) {
         return Ok(Some(match value {
-            Value::Int64(row_id) => vec![row_id],
+            Value::Int64(row_id) => match runtime.table_data_for_schema(table, &table.name)? {
+                Some(rows) if rows.row_index_by_id(row_id).is_some() => vec![row_id],
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         }));
     }

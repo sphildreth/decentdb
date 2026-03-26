@@ -191,6 +191,38 @@ fn between_with_non_integer_types() {
 }
 
 #[test]
+fn float_range_scan_with_params_and_limit() {
+    let db = mem_db();
+    db.execute("CREATE TABLE items(id INT64, name TEXT, price FLOAT64)")
+        .unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'a', 1.0),(2, 'b', 1.5),(3, 'c', 3.0)")
+        .unwrap();
+
+    let result = db
+        .execute_with_params(
+            "SELECT id, name, price FROM items WHERE price >= $1 AND price < $2 ORDER BY price LIMIT 100",
+            &[Value::Float64(1.0), Value::Float64(2.0)],
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![
+                Value::Int64(1),
+                Value::Text("a".to_string()),
+                Value::Float64(1.0),
+            ],
+            vec![
+                Value::Int64(2),
+                Value::Text("b".to_string()),
+                Value::Float64(1.5),
+            ],
+        ]
+    );
+}
+
+#[test]
 fn between_with_nulls() {
     let db = mem_db();
     exec(

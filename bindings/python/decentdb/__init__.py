@@ -9,6 +9,10 @@ import uuid
 import weakref
 from collections.abc import Mapping
 
+from . import native as _native
+
+_native.preload_library_for_extensions()
+
 try:
     from . import _fastdecode as _fastdecode_native
 except Exception:
@@ -1593,10 +1597,6 @@ class Cursor:
                 )
                 if prefetched_rows is not None:
                     prefetched_bound_count = 1
-            if prefetched_rows is not None:
-                has_row = bool(prefetched_rows)
-                bound_count = 0 if prefetched_bound_count is None else prefetched_bound_count
-                buffered_row = None
             elif (
                 self._use_fetch_row_views
                 and param_count == 1
@@ -1607,10 +1607,7 @@ class Cursor:
                     sql, params[0]
                 )
                 if prefetched_rows is not None:
-                    has_row = bool(prefetched_rows)
-                    bound_count = 1
                     prefetched_bound_count = 1
-                    buffered_row = None
             elif (
                 self._use_fetch_row_views
                 and param_count == 2
@@ -1622,10 +1619,11 @@ class Cursor:
                     self._execute_current_statement_bind_f64_f64_fetch_all_row_views(sql, params)
                 )
                 if prefetched_rows is not None:
-                    has_row = bool(prefetched_rows)
-                    bound_count = 2
                     prefetched_bound_count = 2
-                    buffered_row = None
+            if prefetched_rows is not None:
+                has_row = bool(prefetched_rows)
+                bound_count = 0 if prefetched_bound_count is None else prefetched_bound_count
+                buffered_row = None
             elif (
                 self._use_bind_int64_step_row_view
                 and self._should_buffer_first_row(sql)

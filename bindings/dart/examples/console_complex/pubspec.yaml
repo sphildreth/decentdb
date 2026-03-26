@@ -1,0 +1,11 @@
+name: decentdb_console_complex_example
+description: Complex DecentDB Dart console demo showcasing joins, indexes, queries, and performance
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  decentdb:
+    path: ../../dart
