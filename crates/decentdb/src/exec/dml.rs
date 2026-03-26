@@ -2455,7 +2455,7 @@ fn indexed_row_ids_for_filter(
     Ok(Some(row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)))
 }
 
-fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> Option<&str> {
+pub(crate) fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> Option<&str> {
     if table.primary_key_columns.len() != 1 {
         return None;
     }

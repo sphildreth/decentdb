@@ -1899,14 +1899,32 @@ impl EngineRuntime {
         {
             return Ok(None);
         }
-        let Some(filtered_dataset) = self.indexed_table_lookup(
-            filtered_table,
-            filtered_alias,
-            filter_column,
+        let Some(filtered_data) = self.table_data(filtered_table) else {
+            return Ok(None);
+        };
+        let Some(filter_index) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, filtered_table)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, filter_column))
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let filter_value = self.eval_expr(
             value_expr,
+            &Dataset::empty(),
+            &[],
             params,
             &BTreeMap::new(),
-        )?
+            None,
+        )?;
+        let Some(RuntimeIndex::Btree { keys: filter_keys }) = self.indexes.get(&filter_index.name)
         else {
             return Ok(None);
         };
@@ -1918,22 +1936,37 @@ impl EngineRuntime {
         let Some(probe_data) = self.table_data(probe_table) else {
             return Ok(None);
         };
-        let Some(probe_index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, probe_table)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, probe_join_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
-            return Ok(None);
+        let is_probe_rowid_alias = crate::exec::dml::row_id_alias_column_name(probe_schema)
+            .is_some_and(|name| identifiers_equal(name, probe_join_column));
+
+        let probe_index = if is_probe_rowid_alias {
+            None
+        } else {
+            self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, probe_table)
+                    && index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| {
+                            identifiers_equal(index_column, probe_join_column)
+                        })
+                    && index.columns[0].expression_sql.is_none()
+            })
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
+        if probe_index.is_none() && !is_probe_rowid_alias {
             return Ok(None);
+        }
+        let keys = if let Some(index) = probe_index {
+            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+                return Ok(None);
+            };
+            Some(keys)
+        } else {
+            None
         };
         let Some((projection_plan, column_names)) = simple_join_projection_plan(
             &select.projection,
@@ -1957,7 +1990,7 @@ impl EngineRuntime {
         let use_probe_row_position_map = probe_data
             .rows
             .len()
-            .saturating_mul(filtered_dataset.rows.len())
+            .saturating_mul(filtered_data.rows.len())
             > 8_192;
         let probe_row_positions = if use_probe_row_position_map {
             let mut positions = Int64Map::<usize>::default();
@@ -1971,18 +2004,43 @@ impl EngineRuntime {
 
         let mut rows = Vec::new();
         let mut projection_error = None;
-        for filtered_row in &filtered_dataset.rows {
-            let Some(join_value) = filtered_row.get(filtered_join_index) else {
-                return Err(DbError::internal(
+        let mut stop = false;
+        let filtered_row_ids = filter_keys.row_ids_for_value_set(&filter_value)?;
+
+        filtered_row_ids.for_each(|filtered_row_id| {
+            if stop || projection_error.is_some() {
+                return;
+            }
+            let Some(filtered_row) = filtered_data.row_by_id(filtered_row_id) else {
+                return;
+            };
+            let Some(join_value) = filtered_row.values.get(filtered_join_index) else {
+                projection_error = Some(DbError::internal(
                     "join row is shorter than filtered table schema",
                 ));
+                stop = true;
+                return;
             };
             if matches!(join_value, Value::Null) {
-                continue;
+                return;
             }
-            let row_ids = keys.row_ids_for_value_set(join_value)?;
-            let mut stop = false;
-            row_ids.for_each(|row_id| {
+
+            let probe_row_ids = if let Some(keys) = keys {
+                match keys.row_ids_for_value_set(join_value) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        projection_error = Some(e);
+                        stop = true;
+                        return;
+                    }
+                }
+            } else if let Value::Int64(val) = join_value {
+                RuntimeRowIdSet::Single(*val)
+            } else {
+                RuntimeRowIdSet::Empty
+            };
+
+            probe_row_ids.for_each(|row_id| {
                 if stop || projection_error.is_some() {
                     return;
                 }
@@ -2001,7 +2059,9 @@ impl EngineRuntime {
                 let mut projected = Vec::with_capacity(projection_plan.len());
                 for slot in &projection_plan {
                     let value = match slot {
-                        SimpleJoinProjectionSource::Filtered(index) => filtered_row.get(*index),
+                        SimpleJoinProjectionSource::Filtered(index) => {
+                            filtered_row.values.get(*index)
+                        }
                         SimpleJoinProjectionSource::Probe(index) => probe_row.get(*index),
                     };
                     let Some(value) = value else {
@@ -2018,14 +2078,11 @@ impl EngineRuntime {
                     stop = true;
                 }
             });
-            if let Some(error) = projection_error.take() {
-                return Err(error);
-            }
-            if limit.is_some_and(|limit| rows.len() >= limit) {
-                break;
-            }
-        }
+        });
 
+        if let Some(error) = projection_error.take() {
+            return Err(error);
+        }
         let rows = rows.into_iter().map(QueryRow::new).collect();
         Ok(Some(QueryResult::with_rows(column_names, rows)))
     }
@@ -4322,24 +4379,37 @@ impl EngineRuntime {
             .iter()
             .position(|column| identifiers_equal(&column.name, plan.filtered_join_column))
             .ok_or_else(|| DbError::sql(format!("unknown column {}", plan.filtered_join_column)))?;
-        let Some(probe_index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, plan.probe_table.name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| {
-                        identifiers_equal(index_column, plan.probe_join_column)
-                    })
-                && index.columns[0].expression_sql.is_none()
-        }) else {
-            return Ok(None);
+        let is_probe_rowid_alias = crate::exec::dml::row_id_alias_column_name(probe_table)
+            .is_some_and(|name| identifiers_equal(name, plan.probe_join_column));
+
+        let probe_index = if is_probe_rowid_alias {
+            None
+        } else {
+            self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, plan.probe_table.name)
+                    && index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| {
+                            identifiers_equal(index_column, plan.probe_join_column)
+                        })
+                    && index.columns[0].expression_sql.is_none()
+            })
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
+        if probe_index.is_none() && !is_probe_rowid_alias {
             return Ok(None);
+        }
+        let keys = if let Some(index) = probe_index {
+            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+                return Ok(None);
+            };
+            Some(keys)
+        } else {
+            None
         };
         let use_probe_row_position_map = probe_data
             .rows
@@ -4386,7 +4456,13 @@ impl EngineRuntime {
             if matches!(join_value, Value::Null) {
                 continue;
             }
-            let row_ids = keys.row_ids_for_value_set(join_value)?;
+            let row_ids = if let Some(keys) = keys {
+                keys.row_ids_for_value_set(join_value)?
+            } else if let Value::Int64(val) = join_value {
+                RuntimeRowIdSet::Single(*val)
+            } else {
+                RuntimeRowIdSet::Empty
+            };
             if row_ids.is_empty() {
                 continue;
             }
@@ -4474,22 +4550,37 @@ impl EngineRuntime {
         let Some(right_data) = self.table_data(right_name) else {
             return Ok(None);
         };
-        let Some(probe_index) = self.catalog.indexes.values().find(|index| {
-            identifiers_equal(&index.table_name, right_name)
-                && index.fresh
-                && index.kind == IndexKind::Btree
-                && index.predicate_sql.is_none()
-                && index.columns.len() == 1
-                && index.columns[0]
-                    .column_name
-                    .as_deref()
-                    .is_some_and(|index_column| identifiers_equal(index_column, right_join_column))
-                && index.columns[0].expression_sql.is_none()
-        }) else {
-            return Ok(None);
+        let is_probe_rowid_alias = crate::exec::dml::row_id_alias_column_name(right_table)
+            .is_some_and(|name| identifiers_equal(name, right_join_column));
+
+        let probe_index = if is_probe_rowid_alias {
+            None
+        } else {
+            self.catalog.indexes.values().find(|index| {
+                identifiers_equal(&index.table_name, right_name)
+                    && index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0]
+                        .column_name
+                        .as_deref()
+                        .is_some_and(|index_column| {
+                            identifiers_equal(index_column, right_join_column)
+                        })
+                    && index.columns[0].expression_sql.is_none()
+            })
         };
-        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
+        if probe_index.is_none() && !is_probe_rowid_alias {
             return Ok(None);
+        }
+        let keys = if let Some(index) = probe_index {
+            let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
+                return Ok(None);
+            };
+            Some(keys)
+        } else {
+            None
         };
 
         let use_right_row_position_map =
@@ -4519,7 +4610,13 @@ impl EngineRuntime {
             if matches!(join_value, Value::Null) {
                 continue;
             }
-            let row_ids = keys.row_ids_for_value_set(join_value)?;
+            let row_ids = if let Some(keys) = keys {
+                keys.row_ids_for_value_set(join_value)?
+            } else if let Value::Int64(val) = join_value {
+                RuntimeRowIdSet::Single(*val)
+            } else {
+                RuntimeRowIdSet::Empty
+            };
             row_ids.for_each(|row_id| {
                 let right_values = if let Some(positions) = right_row_positions.as_ref() {
                     let Some(right_position) = positions.get(&row_id).copied() else {

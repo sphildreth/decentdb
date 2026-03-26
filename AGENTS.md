@@ -104,6 +104,7 @@ build a world-class engine that is:
 
 ### 6.2 While coding
 
+- **Use the `.tmp/` directory** for any temporary files (like `perf.data`, flamegraphs, patches, or throwaway scripts). Do not pollute the repository root with untracked files, and never commit them.
 - Keep changes incremental and scoped.
 - Use `cargo check` and `cargo clippy` frequently.
 - If the compiler reports ownership or lifetime errors, fix them systematically;
