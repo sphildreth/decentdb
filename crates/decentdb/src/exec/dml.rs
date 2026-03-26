@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use crate::catalog::{identifiers_equal, ColumnType, IndexKind, TriggerEvent};
+use crate::catalog::{identifiers_equal, ColumnType, ForeignKeyAction, IndexKind, TriggerEvent};
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
 use crate::record::row::Row;
@@ -97,17 +97,6 @@ impl EngineRuntime {
         let Some(table) = self.table_schema(&statement.table_name) else {
             return false;
         };
-        if table.foreign_keys.is_empty() {
-            if self.catalog.tables.values().any(|child| {
-                child.foreign_keys.iter().any(|foreign_key| {
-                    identifiers_equal(&foreign_key.referenced_table, &statement.table_name)
-                })
-            }) {
-                return false;
-            }
-        } else {
-            return false;
-        }
         if table.checks.iter().any(|_| true)
             || table
                 .columns
@@ -143,6 +132,12 @@ impl EngineRuntime {
                 })
             },
         ) {
+            return false;
+        }
+        if assignment_targets_foreign_key_columns(table, &assignment_columns) {
+            return false;
+        }
+        if assignment_targets_referenced_parent_key_columns(self, table, &assignment_columns) {
             return false;
         }
         let table_indexes = self
@@ -184,11 +179,7 @@ impl EngineRuntime {
         let Some(table) = self.table_schema(&statement.table_name) else {
             return false;
         };
-        if self.catalog.tables.values().any(|child| {
-            child.foreign_keys.iter().any(|foreign_key| {
-                identifiers_equal(&foreign_key.referenced_table, &statement.table_name)
-            })
-        }) {
+        if table_has_referencing_non_restrict_delete_actions(self, &statement.table_name) {
             return false;
         }
         let table_indexes = self
@@ -831,18 +822,16 @@ impl EngineRuntime {
                 Ok(column_index)
             })
             .collect::<Result<Vec<_>>>()?;
+        let updates_foreign_key_columns =
+            assignment_targets_foreign_key_columns(&table, &assignment_columns);
         let has_referencing_tables = !table.temporary
-            && self.catalog.tables.values().any(|child| {
-                child.foreign_keys.iter().any(|foreign_key| {
-                    identifiers_equal(&foreign_key.referenced_table, &table_name)
-                })
-            });
+            && assignment_targets_referenced_parent_key_columns(self, &table, &assignment_columns);
         let indexes_to_update = table_indexes
             .iter()
             .filter(|index| index_might_change_for_assignments(&table, index, &assignment_columns))
             .cloned()
             .collect::<Vec<_>>();
-        let assignment_only_validation = table.foreign_keys.is_empty()
+        let assignment_only_validation = !updates_foreign_key_columns
             && table.checks.is_empty()
             && table
                 .columns
@@ -2046,12 +2035,11 @@ fn matching_row_ids(
     if let Some(indexed_row_ids) = indexed_row_ids_for_filter(runtime, table, filter, params)? {
         return Ok(indexed_row_ids);
     }
-    let rows = runtime
-        .table_data_for_schema(table, &table.name)?
-        .map(Cow::into_owned)
-        .unwrap_or_default()
-        .rows;
-    rows.iter()
+    let Some(rows) = runtime.table_data_for_schema(table, &table.name)? else {
+        return Ok(Vec::new());
+    };
+    rows.rows
+        .iter()
         .filter(|row| row_matches_filter(runtime, table, row, filter, params).unwrap_or(false))
         .map(|row| Ok(row.row_id))
         .collect()
@@ -2319,29 +2307,87 @@ fn matching_foreign_key_children(
         foreign_key.referenced_columns.clone()
     };
     let parent_key = parent_key_values(parent_table, parent_row, &referenced_columns)?;
-    let rows = runtime
-        .table_data_for_schema(child_table, &child_table.name)?
-        .map(Cow::into_owned)
-        .unwrap_or_default()
-        .rows;
-    Ok(rows
-        .into_iter()
-        .filter(|row| {
-            foreign_key
+    let child_column_indexes = foreign_key
+        .columns
+        .iter()
+        .map(|child_column| {
+            child_table
                 .columns
                 .iter()
+                .position(|column| column.name == *child_column)
+                .ok_or_else(|| {
+                    DbError::internal(format!("unknown child foreign-key column {child_column}"))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some(rows) = runtime.table_data_for_schema(child_table, &child_table.name)? else {
+        return Ok(Vec::new());
+    };
+    if let Some(indexed_row_ids) =
+        fk_matching_row_ids_via_index(runtime, child_table, foreign_key, &parent_key)?
+    {
+        let mut matches = Vec::with_capacity(indexed_row_ids.len());
+        for row_id in indexed_row_ids {
+            let Some(row) = rows.row_by_id(row_id) else {
+                continue;
+            };
+            let is_match = child_column_indexes
+                .iter()
                 .zip(&parent_key)
-                .all(|(child_column, parent_value)| {
-                    let child_index = child_table
-                        .columns
-                        .iter()
-                        .position(|column| column.name == *child_column)
-                        .expect("child FK column must exist");
-                    compare_values(&row.values[child_index], parent_value)
+                .all(|(child_index, parent_value)| {
+                    compare_values(&row.values[*child_index], parent_value)
+                        .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
+                });
+            if is_match {
+                matches.push(row.clone());
+            }
+        }
+        return Ok(matches);
+    }
+    Ok(rows
+        .rows
+        .iter()
+        .filter(|row| {
+            child_column_indexes
+                .iter()
+                .zip(&parent_key)
+                .all(|(child_index, parent_value)| {
+                    compare_values(&row.values[*child_index], parent_value)
                         .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
                 })
         })
+        .cloned()
         .collect())
+}
+
+fn fk_matching_row_ids_via_index(
+    runtime: &EngineRuntime,
+    child_table: &crate::catalog::TableSchema,
+    foreign_key: &crate::catalog::ForeignKeyConstraint,
+    parent_key: &[Value],
+) -> Result<Option<Vec<i64>>> {
+    if foreign_key.columns.len() != 1 || parent_key.len() != 1 {
+        return Ok(None);
+    }
+    let child_column = &foreign_key.columns[0];
+    let Some(index) = runtime.catalog.indexes.values().find(|index| {
+        identifiers_equal(&index.table_name, &child_table.name)
+            && index.fresh
+            && index.kind == IndexKind::Btree
+            && index.predicate_sql.is_none()
+            && index.columns.len() == 1
+            && index.columns[0].expression_sql.is_none()
+            && index.columns[0]
+                .column_name
+                .as_ref()
+                .is_some_and(|entry| identifiers_equal(entry, child_column))
+    }) else {
+        return Ok(None);
+    };
+    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+        return Ok(None);
+    };
+    keys.row_ids_for_value(&parent_key[0]).map(Some)
 }
 
 fn parent_key_values(
@@ -2431,6 +2477,73 @@ fn index_might_change_for_assignments(
     assignment_columns
         .iter()
         .any(|column_index| indexed_columns.contains(column_index))
+}
+
+fn assignment_targets_foreign_key_columns(
+    table: &crate::catalog::TableSchema,
+    assignment_columns: &[usize],
+) -> bool {
+    table.foreign_keys.iter().any(|foreign_key| {
+        foreign_key.columns.iter().any(|column_name| {
+            let Some(column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, column_name))
+            else {
+                return true;
+            };
+            assignment_columns.contains(&column_index)
+        })
+    })
+}
+
+fn assignment_targets_referenced_parent_key_columns(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    assignment_columns: &[usize],
+) -> bool {
+    runtime.catalog.tables.values().any(|child| {
+        child
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+            .any(|foreign_key| {
+                let referenced_columns: Cow<'_, [String]> =
+                    if foreign_key.referenced_columns.is_empty() {
+                        Cow::Borrowed(table.primary_key_columns.as_slice())
+                    } else {
+                        Cow::Borrowed(foreign_key.referenced_columns.as_slice())
+                    };
+                if referenced_columns.is_empty() {
+                    return true;
+                }
+                referenced_columns.iter().any(|column_name| {
+                    let Some(column_index) = table
+                        .columns
+                        .iter()
+                        .position(|column| identifiers_equal(&column.name, column_name))
+                    else {
+                        return true;
+                    };
+                    assignment_columns.contains(&column_index)
+                })
+            })
+    })
+}
+
+fn table_has_referencing_non_restrict_delete_actions(
+    runtime: &EngineRuntime,
+    table_name: &str,
+) -> bool {
+    runtime.catalog.tables.values().any(|child| {
+        child.foreign_keys.iter().any(|foreign_key| {
+            identifiers_equal(&foreign_key.referenced_table, table_name)
+                && !matches!(
+                    foreign_key.on_delete,
+                    ForeignKeyAction::NoAction | ForeignKeyAction::Restrict
+                )
+        })
+    })
 }
 
 fn validate_assigned_not_null_columns(

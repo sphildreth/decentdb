@@ -2267,8 +2267,15 @@ impl Db {
 
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         self.refresh_engine_from_storage()?;
+        let mut runtime = self
+            .inner
+            .engine
+            .read()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?
+            .clone();
+        self.apply_temp_state_to_runtime(&mut runtime)?;
         Ok(SqlTxnState {
-            runtime: self.engine_snapshot()?,
+            runtime,
             base_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
             persistent_changed: false,
             savepoints: Vec::new(),

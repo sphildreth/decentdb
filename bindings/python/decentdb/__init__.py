@@ -559,15 +559,18 @@ class Cursor:
             code = self._lib.ddb_db_begin_transaction(self._connection._db)
             if code != ERR_OK:
                 _raise_error(code, sql=sql, params=params)
+            self._connection._in_explicit_txn = True
         elif control_kind == "commit":
             lsn = ctypes.c_uint64()
             code = self._lib.ddb_db_commit_transaction(self._connection._db, ctypes.byref(lsn))
             if code != ERR_OK:
                 _raise_error(code, sql=sql, params=params)
+            self._connection._in_explicit_txn = False
         elif control_kind == "rollback":
             code = self._lib.ddb_db_rollback_transaction(self._connection._db)
             if code != ERR_OK:
                 _raise_error(code, sql=sql, params=params)
+            self._connection._in_explicit_txn = False
         else:
             result = ctypes.c_void_p()
             code = self._lib.ddb_db_execute(
@@ -1682,6 +1685,7 @@ class Connection:
         self._lib = load_library()
         self._db = ctypes.c_void_p()
         self._closed = False
+        self._in_explicit_txn = False
         self.cursors = weakref.WeakSet()
         self._stmt_cache = collections.OrderedDict()
         self._stmt_cache_size = stmt_cache_size
@@ -1751,31 +1755,26 @@ class Connection:
         code = self._lib.ddb_db_begin_transaction(self._db)
         if code != ERR_OK:
             _raise_error(code, sql="BEGIN", params=None)
+        self._in_explicit_txn = True
 
     def commit(self):
         self._ensure_open()
-        active = ctypes.c_uint8()
-        code = self._lib.ddb_db_in_transaction(self._db, ctypes.byref(active))
-        if code != ERR_OK:
-            _raise_error(code, sql="COMMIT", params=None)
-        if not active.value:
+        if not self._in_explicit_txn:
             return
         lsn = ctypes.c_uint64()
         code = self._lib.ddb_db_commit_transaction(self._db, ctypes.byref(lsn))
         if code != ERR_OK:
             _raise_error(code, sql="COMMIT", params=None)
+        self._in_explicit_txn = False
 
     def rollback(self):
         self._ensure_open()
-        active = ctypes.c_uint8()
-        code = self._lib.ddb_db_in_transaction(self._db, ctypes.byref(active))
-        if code != ERR_OK:
-            _raise_error(code, sql="ROLLBACK", params=None)
-        if not active.value:
+        if not self._in_explicit_txn:
             return
         code = self._lib.ddb_db_rollback_transaction(self._db)
         if code != ERR_OK:
             _raise_error(code, sql="ROLLBACK", params=None)
+        self._in_explicit_txn = False
 
     def cursor(self):
         self._ensure_open()
