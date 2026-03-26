@@ -49,18 +49,19 @@ Work in tight iterations.
 
 For each iteration:
 
-1. Re-read the relevant benchmark data and identify the worst DecentDB gap.
-2. Trace the likely root cause in engine code, planner, executor, storage, indexing, pager, WAL, or bindings overhead.
+1. Re-read relevant benchmark data and identify the worst DecentDB gap.
+2. Trace likely root cause in engine code, planner, executor, storage, indexing, pager, WAL, or bindings overhead.
 3. Form a concrete hypothesis for why DecentDB is behind.
 4. Make the smallest plausible code change to test that hypothesis.
 5. Run targeted validation first:
    - `cargo check`
    - `cargo clippy`
-   - the smallest relevant Rust tests
+   - smallest relevant Rust tests
    - any directly impacted binding or harness smoke tests
-6. Run the narrowest benchmark slice that proves or disproves the change.
-7. Record the before/after outcome.
-8. Decide whether to keep iterating on the same bottleneck or move to the next one.
+6. Run quick validation with `bench_complex.py` for immediate feedback across all metric types before running full comparison framework.
+7. Run the narrowest benchmark slice that proves or disproves change.
+8. Record before/after outcome.
+9. Decide whether to keep iterating on the same bottleneck or move to the next one.
 
 Prefer several small, validated improvements over a broad speculative rewrite.
 
@@ -82,11 +83,23 @@ Reasoning:
 - `range_scan`, `join`, and `aggregate` likely expose deeper planner, index, or executor limitations.
 - `point_select` is already close enough that smaller improvements may flip the lead.
 
+## Quick validation approach
+
+Before running the full comparison framework, use `bench_complex.py` for rapid iteration feedback:
+
+- **Purpose**: Single-script comprehensive benchmark that covers all major metric types tested in python_embedded_compare
+- **Coverage**: Point lookups, range scans, joins, aggregates, updates, deletes, and full table scans
+- **Advantages**: Faster execution, simpler setup, immediate feedback on multiple metrics
+- **Relationship**: If DecentDB leads in all `bench_complex.py` metrics, it is highly likely to be the leader in the full comparison framework
+
+Use `bench_complex.py` as your primary validation tool during optimization iterations. Run the full python_embedded_compare framework less frequently (e.g., when major milestones are reached or for final validation).
+
 ## Files and areas to inspect first
 
 Benchmark and docs context:
 
 - [docs/user-guide/benchmarks.md](../../docs/user-guide/benchmarks.md)
+- `bindings/python/benchmarks/bench_complex.py` - Comprehensive single-script benchmark covering all major metric types
 - `benchmarks/python_embedded_compare/README.md`
 - `benchmarks/python_embedded_compare/comparison_runner.py`
 - `benchmarks/python_embedded_compare/scenarios/canonical_workloads.py`
@@ -106,7 +119,21 @@ Likely engine hot paths:
 
 Use targeted runs before full sweeps.
 
-Examples:
+**Quick validation with bench_complex.py:**
+
+For rapid feedback during iteration, use the comprehensive bench_complex.py script which tests all major metric categories in a single run:
+
+```bash
+python bindings/python/benchmarks/bench_complex.py \
+  --engine sqlite,decentdb \
+  --users 1000 --items 200 --orders 1000 \
+  --point-lookups 1000 --range-scans 1000 --joins 1000 \
+  --aggregates 1000 --updates 500 --deletes 500 --table-scans 100
+```
+
+This script tests point lookups, range scans, joins, aggregates, updates, deletes, and table scans. If DecentDB leads in all these metrics, it is highly likely to be the leader in the full comparison framework.
+
+**Full comparison runner:**
 
 ```bash
 /home/steven/source/decentdb/.venv-mkdocs/bin/python /home/steven/source/decentdb/benchmarks/python_embedded_compare/comparison_runner.py \
@@ -141,7 +168,8 @@ Every accepted change should include:
 - passing `cargo check`
 - passing `cargo clippy`
 - relevant unit or integration coverage if behavior changes
-- targeted benchmark rerun evidence
+- targeted `bench_complex.py` rerun showing improvement across relevant metric types
+- selective python_embedded_compare framework rerun for final validation
 - notes on regressions, if any
 
 If you discover that a benchmark gap is caused by a genuine architectural limitation, say so plainly and explain the tradeoff rather than masking it.
@@ -153,13 +181,19 @@ When you report back, include:
 1. The benchmark target you worked on
 2. The root-cause hypothesis
 3. The code changed
-4. Validation run results
-5. Before/after ranking or latency deltas
-6. Whether the change should be kept, revised, or reverted
-7. The next highest-value target
+4. `bench_complex.py` validation run results (before/after comparison)
+5. Selective python_embedded_compare framework validation (if applicable)
+6. Before/after ranking or latency deltas
+7. Whether change should be kept, revised, or reverted
+8. The next highest-value target
 
 ## Definition of success
 
 Success means moving DecentDB toward leadership across all benchmark categories without violating correctness, durability, or fairness.
+
+- **Quick validation**: Achieve leadership in all metrics tested by `bench_complex.py` (point lookups, range scans, joins, aggregates, updates, deletes, and table scans)
+- **Full validation**: Achieve leadership in all python_embedded_compare framework workloads (workload_a, workload_b, workload_c)
+
+Use `bench_complex.py` as the primary indicator of progress. When DecentDB leads in all `bench_complex.py` metrics, it is highly likely to be the leader in the full comparison framework.
 
 If full leadership is not yet achieved, continue iteratively on the highest-value remaining gap rather than stopping after one improvement.

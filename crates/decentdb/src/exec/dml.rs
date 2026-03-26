@@ -867,14 +867,16 @@ impl EngineRuntime {
                 })?;
                 (row_index, table_data.rows[row_index].clone())
             };
+            let current_eval_values =
+                materialize_row_for_generated(self, &table, &current_row.values)?.into_owned();
             let mut next_values = current_row.values.clone();
-            let dataset = table_row_dataset(&table, &current_row.values, &table_name);
+            let dataset = table_row_dataset(&table, &current_eval_values, &table_name);
             for (assignment, column_index) in statement.assignments.iter().zip(&assignment_columns)
             {
                 let value = self.eval_expr(
                     &assignment.expr,
                     &dataset,
-                    &current_row.values,
+                    &current_eval_values,
                     params,
                     &std::collections::BTreeMap::new(),
                     None,
@@ -1122,10 +1124,7 @@ impl EngineRuntime {
                     ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
                 })
                 .collect(),
-            rows: rendered_rows
-                .iter()
-                .map(|row| row.values.clone())
-                .collect(),
+            rows: rendered_rows.iter().map(|row| row.values.clone()).collect(),
         };
         let projected = self.project_dataset(
             &dataset,
@@ -1166,7 +1165,9 @@ impl EngineRuntime {
             .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
             .rows[row_index]
             .clone();
-        let dataset = table_row_dataset(&table, &current_row.values, table_name);
+        let current_eval_values =
+            materialize_row_for_generated(self, &table, &current_row.values)?.into_owned();
+        let dataset = table_row_dataset(&table, &current_eval_values, table_name);
         let excluded = Dataset {
             columns: table
                 .columns
@@ -1182,7 +1183,7 @@ impl EngineRuntime {
                 self.eval_expr(
                     filter,
                     &dataset,
-                    &current_row.values,
+                    &current_eval_values,
                     params,
                     &std::collections::BTreeMap::new(),
                     Some(&excluded),
@@ -1211,7 +1212,7 @@ impl EngineRuntime {
             let value = self.eval_expr(
                 &assignment.expr,
                 &dataset,
-                &current_row.values,
+                &current_eval_values,
                 params,
                 &std::collections::BTreeMap::new(),
                 Some(&excluded),
@@ -1697,6 +1698,10 @@ fn apply_generated_columns(
         let Some(generated_sql) = &column.generated_sql else {
             continue;
         };
+        if !column.generated_stored {
+            row[index] = Value::Null;
+            continue;
+        }
         let expr = parse_expression_sql(generated_sql)?;
         let dataset = table_row_dataset(table, row, &table.name);
         let value = runtime.eval_expr(
@@ -1710,6 +1715,19 @@ fn apply_generated_columns(
         row[index] = super::cast_value(value, column.column_type)?;
     }
     Ok(())
+}
+
+fn materialize_row_for_generated<'a>(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    row: &'a [Value],
+) -> Result<Cow<'a, [Value]>> {
+    if generated_columns_are_stored(table) {
+        return Ok(Cow::Borrowed(row));
+    }
+    let mut materialized = row.to_vec();
+    runtime.apply_virtual_generated_columns(table, &mut materialized)?;
+    Ok(Cow::Owned(materialized))
 }
 
 fn compile_prepared_insert_value_source(expr: &Expr) -> Option<PreparedInsertValueSource> {
@@ -2233,12 +2251,13 @@ fn row_matches_filter(
     let Some(filter) = filter else {
         return Ok(true);
     };
-    let dataset = table_row_dataset(table, &row.values, &table.name);
+    let eval_values = materialize_row_for_generated(runtime, table, &row.values)?;
+    let dataset = table_row_dataset(table, eval_values.as_ref(), &table.name);
     Ok(matches!(
         runtime.eval_expr(
             filter,
             &dataset,
-            &row.values,
+            eval_values.as_ref(),
             params,
             &std::collections::BTreeMap::new(),
             None,
@@ -2301,10 +2320,10 @@ fn matching_foreign_key_children(
     };
     let parent_key = parent_key_values(parent_table, parent_row, &referenced_columns)?;
     let rows = runtime
-        .tables
-        .get(&child_table.name)
-        .map(|data| data.rows.clone())
-        .unwrap_or_default();
+        .table_data_for_schema(child_table, &child_table.name)?
+        .map(Cow::into_owned)
+        .unwrap_or_default()
+        .rows;
     Ok(rows
         .into_iter()
         .filter(|row| {

@@ -56,7 +56,7 @@ DecentDB's current baseline includes:
 - Date/time functions: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `date()`, `datetime()`, `strftime()`, `EXTRACT()`
 - JSON functions: `JSON_EXTRACT`, `JSON_ARRAY_LENGTH`, `json_type`, `json_valid`, `json_object`, `json_array`, `->`, `->>`
 - Table-valued functions: `json_each()`, `json_tree()`
-- Generated columns: `GENERATED ALWAYS AS (expr) STORED`
+- Generated columns: `GENERATED ALWAYS AS (expr)` in `STORED` and `VIRTUAL` modes
 - Other functions: `COALESCE`, `NULLIF`, `CAST`, `CASE`, `GEN_RANDOM_UUID`, `UUID_PARSE`, `UUID_TO_STRING`, `PRINTF`
 - Operators: `+`, `-`, `*`, `/`, `%` (modulo), `||` (string concatenation)
 - Transaction control: `BEGIN`, `BEGIN IMMEDIATE`/`BEGIN EXCLUSIVE` (treated as `BEGIN`), `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE SAVEPOINT`, `ROLLBACK TO SAVEPOINT`
@@ -92,7 +92,7 @@ DecentDB has implemented many previously planned baseline features, including:
 - `EXPLAIN` / `EXPLAIN ANALYZE` plan output
 - Join types (`INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`, `NATURAL`)
 - `DISTINCT ON`, `DISTINCT` aggregates (`COUNT(DISTINCT ...)`, `SUM(DISTINCT ...)`, `AVG(DISTINCT ...)`)
-- `DEFAULT` and generated columns (STORED)
+- `DEFAULT` and generated columns (STORED + VIRTUAL)
 - `CREATE TEMP TABLE` / `CREATE TEMP VIEW` (session-scoped)
 - `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
 

@@ -7,8 +7,8 @@ use crate::sql::ast::ConflictTarget;
 use crate::sql::parser::parse_expression_sql;
 
 use super::{
-    compare_values, row_satisfies_index_predicate, table_row_dataset, EngineRuntime, RuntimeIndex,
-    StoredRow,
+    compare_values, generated_columns_are_stored, row_satisfies_index_predicate, table_row_dataset,
+    EngineRuntime, RuntimeIndex, StoredRow,
 };
 
 impl EngineRuntime {
@@ -86,8 +86,16 @@ impl EngineRuntime {
         let table = self
             .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {table_name}")))?;
+        let row_materialized = if generated_columns_are_stored(table) {
+            std::borrow::Cow::Borrowed(row)
+        } else {
+            let mut materialized = row.to_vec();
+            self.apply_virtual_generated_columns(table, &mut materialized)?;
+            std::borrow::Cow::Owned(materialized)
+        };
+        let row_for_eval = row_materialized.as_ref();
 
-        for (column, value) in table.columns.iter().zip(row) {
+        for (column, value) in table.columns.iter().zip(row_for_eval) {
             if !column.nullable && matches!(value, Value::Null) {
                 return Err(DbError::constraint(format!(
                     "column {}.{} may not be NULL",
@@ -95,22 +103,22 @@ impl EngineRuntime {
                 )));
             }
             for check in &column.checks {
-                self.assert_check(table, row, &check.expression_sql, params)?;
+                self.assert_check(table, row_for_eval, &check.expression_sql, params)?;
             }
         }
         for check in &table.checks {
-            self.assert_check(table, row, &check.expression_sql, params)?;
+            self.assert_check(table, row_for_eval, &check.expression_sql, params)?;
         }
 
         for index in unique_indexes_for_table(self, table_name) {
-            if !row_satisfies_index_predicate(self, index, table, row)? {
+            if !row_satisfies_index_predicate(self, index, table, row_for_eval)? {
                 continue;
             }
-            let candidate = index_values(self, index, table, row)?;
+            let candidate = index_values(self, index, table, row_for_eval)?;
             if candidate.iter().any(|value| matches!(value, Value::Null)) {
                 continue;
             }
-            if let Some(row_ids) = unique_index_row_ids(self, index, table, row)? {
+            if let Some(row_ids) = unique_index_row_ids(self, index, table, row_for_eval)? {
                 if row_ids
                     .into_iter()
                     .any(|row_id| Some(row_id) != existing_row_id)
@@ -123,9 +131,10 @@ impl EngineRuntime {
                 continue;
             }
             let rows = self
-                .table_data(table_name)
-                .map(|data| data.rows.as_slice())
-                .unwrap_or(&[]);
+                .table_data_for_schema(table, table_name)?
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_default()
+                .rows;
             for existing in rows {
                 if Some(existing.row_id) == existing_row_id {
                     continue;
@@ -157,7 +166,7 @@ impl EngineRuntime {
             let child_values = foreign_key
                 .columns
                 .iter()
-                .map(|column_name| lookup_column_value(table, row, column_name))
+                .map(|column_name| lookup_column_value(table, row_for_eval, column_name))
                 .collect::<Result<Vec<_>>>()?;
             if child_values
                 .iter()
@@ -189,7 +198,10 @@ impl EngineRuntime {
                         .unwrap_or_else(|| format!("{}_fk", table.name))
                 )));
             }
-            let Some(parent_rows) = self.tables.get(&foreign_key.referenced_table) else {
+            let Some(parent_rows) = self
+                .table_data_for_schema(parent, &foreign_key.referenced_table)?
+                .map(std::borrow::Cow::into_owned)
+            else {
                 return Err(DbError::constraint(format!(
                     "foreign key parent table {} has no row store",
                     foreign_key.referenced_table

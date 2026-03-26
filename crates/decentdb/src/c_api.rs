@@ -646,12 +646,13 @@ fn table_json(info: &TableInfo) -> String {
 
 fn index_json(info: &IndexInfo) -> String {
     format!(
-        "{{\"name\":{},\"table_name\":{},\"kind\":{},\"unique\":{},\"columns\":{},\"predicate_sql\":{},\"fresh\":{}}}",
+        "{{\"name\":{},\"table_name\":{},\"kind\":{},\"unique\":{},\"columns\":{},\"include_columns\":{},\"predicate_sql\":{},\"fresh\":{}}}",
         json_string(&info.name),
         json_string(&info.table_name),
         json_string(&info.kind),
         json_bool(info.unique),
         json_string_list(&info.columns),
+        json_string_list(&info.include_columns),
         json_optional_string(info.predicate_sql.as_deref()),
         json_bool(info.fresh),
     )
@@ -1836,6 +1837,7 @@ mod tests {
         let indexes_json = take_json(&mut indexes_json);
         assert!(indexes_json.contains("\"name\":\"idx_child_parent\""));
         assert!(indexes_json.contains("\"kind\":\"btree\""));
+        assert!(indexes_json.contains("\"include_columns\":[]"));
 
         let mut views_json = ptr::null_mut();
         assert_eq!(ddb_db_list_views_json(db, &mut views_json), DDB_OK);

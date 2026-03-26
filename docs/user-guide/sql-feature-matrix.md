@@ -11,6 +11,7 @@ This document provides a comprehensive matrix of SQL features, comparing support
 | CREATE TABLE | ✅ | ✅ | ✅ | ✅ |
 | DROP TABLE | ✅ | ✅ | ✅ | ✅ |
 | CREATE INDEX | ✅ | ✅ | ✅ | ✅ |
+| Covering indexes (`INCLUDE (...)`) | ✅ (BTREE key-column indexes) | ❌ | ✅ | ❌ |
 | DROP INDEX | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE ADD COLUMN | ✅ | ✅ | ✅ | ✅ |
 | ALTER TABLE DROP COLUMN | ✅ | ✅ | ✅ | ✅ |
@@ -25,8 +26,9 @@ This document provides a comprehensive matrix of SQL features, comparing support
 | DROP TRIGGER | ✅ | ✅ | ✅ | ❌ |
 | CREATE TEMP TABLE | ✅ | ✅ | ✅ | ✅ |
 | CREATE TEMP VIEW | ✅ | ✅ | ✅ | ✅ |
-| Generated columns (STORED) | ✅ | ✅ | ✅ | ✅ |
+| Generated columns (STORED, VIRTUAL) | ✅ | ✅ | ✅ | ✅ |
 | Table-level FOREIGN KEY | ✅ | ✅ | ✅ | ⚠️ (parsed, not enforced) |
+| CREATE SCHEMA | ✅ (catalog registration) | ✅ | ✅ | ✅ |
 
 ### Examples
 
@@ -71,12 +73,13 @@ CREATE OR REPLACE VIEW active_users AS
 CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, val TEXT);
 CREATE TEMP VIEW recent_orders AS SELECT * FROM orders WHERE id > 100;
 
--- Generated columns
+-- Generated columns (STORED or VIRTUAL)
 CREATE TABLE products (
   id INTEGER PRIMARY KEY,
   price DECIMAL(10,2),
   tax_rate DECIMAL(4,2),
-  total DECIMAL(10,2) GENERATED ALWAYS AS (price * (1 + tax_rate)) STORED
+  total_stored DECIMAL(10,2) GENERATED ALWAYS AS (price * (1 + tax_rate)) STORED,
+  total_virtual DECIMAL(10,2) GENERATED ALWAYS AS (price * (1 + tax_rate)) VIRTUAL
 );
 
 -- CREATE TRIGGER (AFTER row trigger)

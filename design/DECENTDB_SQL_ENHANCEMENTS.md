@@ -36,9 +36,9 @@ The following table tracks the implementation status of each feature slice. Slic
 | S8 | Subquery Operators (EXISTS, ANY, ALL) | Medium | 🟢 Completed | Medium |
 | S9 | Query Features (LATERAL, VALUES, CTAS) | Medium | 🟢 Completed | Medium |
 | S10 | Comparison Operators (IS DISTINCT FROM) | Medium | 🟢 Completed | Low |
-| S11 | DDL Enhancements | Medium | 🟡 In Progress | Medium |
-| S12 | Utility Commands (EXPLAIN, PRAGMA subset) | Medium | 🟡 In Progress | Medium |
-| S13 | Advanced Features | Low | 🔴 Not Started | High |
+| S11 | DDL Enhancements | Medium | 🟢 Completed | Medium |
+| S12 | Utility Commands (EXPLAIN, PRAGMA subset) | Medium | 🟢 Completed | Medium |
+| S13 | Advanced Features | Low | 🟡 In Progress | High |
 
 **Status Legend:**
 - 🔴 Not Started
@@ -1568,7 +1568,7 @@ Advanced features for specialized use cases. Lower priority due to complexity or
 
 | Feature | Description | Complexity | Use Case |
 |---------|-------------|------------|----------|
-| `CREATE SCHEMA` | Namespace organization | Medium | Multi-tenant applications |
+| `CREATE SCHEMA` | Namespace organization | ✅ Implemented | Catalog namespaces with `IF NOT EXISTS`; schema-qualified object names not yet supported |
 | `CREATE SEQUENCE` | Explicit sequence objects | Medium | Custom ID generation |
 | `CREATE FUNCTION` | User-defined functions | High | Extensibility |
 | `CREATE TYPE` | Custom composite types | High | Complex data modeling |

@@ -2831,6 +2831,7 @@ fn index_info(index: &IndexSchema) -> IndexInfo {
         .to_string(),
         unique: index.unique,
         columns: index.columns.iter().map(index_column_name).collect(),
+        include_columns: index.include_columns.clone(),
         predicate_sql: index.predicate_sql.clone(),
         fresh: index.fresh,
     }
@@ -2960,7 +2961,11 @@ fn render_create_table(table: &TableSchema) -> String {
         if let Some(generated_sql) = &column.generated_sql {
             definition.push_str(" GENERATED ALWAYS AS (");
             definition.push_str(generated_sql);
-            definition.push_str(") STORED");
+            if column.generated_stored {
+                definition.push_str(") STORED");
+            } else {
+                definition.push_str(") VIRTUAL");
+            }
         } else if let Some(default_sql) = &column.default_sql {
             definition.push_str(" DEFAULT ");
             definition.push_str(default_sql);
@@ -3093,13 +3098,26 @@ fn render_create_index(index: &IndexSchema) -> String {
         .map(index_column_name)
         .collect::<Vec<_>>()
         .join(", ");
+    let include = if index.include_columns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " INCLUDE ({})",
+            index
+                .include_columns
+                .iter()
+                .map(|column| sql_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let predicate = index
         .predicate_sql
         .as_ref()
         .map(|predicate| format!(" WHERE {predicate}"))
         .unwrap_or_default();
     format!(
-        "CREATE {unique}INDEX {} ON {}{using} ({columns}){predicate};",
+        "CREATE {unique}INDEX {} ON {}{using} ({columns}){include}{predicate};",
         sql_identifier(&index.name),
         sql_identifier(&index.table_name)
     )

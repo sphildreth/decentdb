@@ -26,8 +26,8 @@ use chrono::{
 };
 
 use crate::catalog::{
-    identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, IndexStats, TableSchema,
-    TableStats, ViewSchema,
+    identifiers_equal, CatalogState, ColumnSchema, IndexKind, IndexSchema, IndexStats, SchemaInfo,
+    TableSchema, TableStats, ViewSchema,
 };
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
@@ -64,6 +64,8 @@ const LEGACY_RUNTIME_PAYLOAD_MAGIC: &[u8; 9] = b"DDBSTATE1";
 const MANIFEST_PAYLOAD_MAGIC: &[u8; 8] = b"DDBMANF1";
 const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
 const GENERATED_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBGCM02";
+const INDEX_INCLUDE_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBICL1\0";
+const SCHEMAS_SECTION_MAGIC: &[u8; 8] = b"DDBSCH01";
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
 
 fn generated_columns_are_stored(table: &TableSchema) -> bool {
@@ -1097,6 +1099,13 @@ impl EngineRuntime {
                 self.rebuild_indexes(page_size)?;
                 Ok(QueryResult::with_affected_rows(0))
             }
+            Statement::CreateSchema {
+                name,
+                if_not_exists,
+            } => {
+                self.execute_create_schema(name, *if_not_exists)?;
+                Ok(QueryResult::with_affected_rows(0))
+            }
             Statement::CreateTableAs(statement) => {
                 let result = self.execute_create_table_as(statement, params, page_size)?;
                 self.rebuild_indexes(page_size)?;
@@ -1480,6 +1489,9 @@ impl EngineRuntime {
             Some(table) => table,
             None => return Ok(None),
         };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
         let Some(data) = self.table_data(name) else {
             return Ok(None);
         };
@@ -1540,6 +1552,9 @@ impl EngineRuntime {
             Some(table) => table,
             None => return Ok(None),
         };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
         let Some(data) = self.table_data(name) else {
             return Ok(None);
         };
@@ -2230,6 +2245,9 @@ impl EngineRuntime {
         let table = self
             .table_schema(name)
             .ok_or_else(|| DbError::sql(format!("unknown table or view {name}")))?;
+        if !generated_columns_are_stored(table) {
+            return Ok(None);
+        }
         let Some(data) = self.table_data(name) else {
             return Ok(None);
         };
@@ -2606,6 +2624,9 @@ impl EngineRuntime {
         let table = self
             .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table or view {table_name}")))?;
+        if !generated_columns_are_stored(table) {
+            return Ok(None);
+        }
         let Some(data) = self.table_data(table_name) else {
             return Ok(None);
         };
@@ -2643,6 +2664,11 @@ impl EngineRuntime {
         let probe_table = self.table_schema(plan.probe_table.name).ok_or_else(|| {
             DbError::sql(format!("unknown table or view {}", plan.probe_table.name))
         })?;
+        if !generated_columns_are_stored(filtered_table)
+            || !generated_columns_are_stored(probe_table)
+        {
+            return Ok(None);
+        }
         let empty_probe_data = TableData::default();
         let probe_data = self
             .table_data(plan.probe_table.name)
@@ -2798,6 +2824,9 @@ impl EngineRuntime {
         let right_table = self
             .table_schema(right_name)
             .ok_or_else(|| DbError::sql(format!("unknown table or view {right_name}")))?;
+        if !generated_columns_are_stored(right_table) {
+            return Ok(None);
+        }
         let Some(right_data) = self.table_data(right_name) else {
             return Ok(None);
         };
@@ -3861,7 +3890,15 @@ pub(super) fn compute_index_values(
     table: &TableSchema,
     row_values: &[Value],
 ) -> Result<Vec<Value>> {
-    let dataset = table_row_dataset(table, row_values, &table.name);
+    let row_materialized = if generated_columns_are_stored(table) {
+        Cow::Borrowed(row_values)
+    } else {
+        let mut materialized = row_values.to_vec();
+        runtime.apply_virtual_generated_columns(table, &mut materialized)?;
+        Cow::Owned(materialized)
+    };
+    let row_for_eval = row_materialized.as_ref();
+    let dataset = table_row_dataset(table, row_for_eval, &table.name);
     let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
     index
         .columns
@@ -3871,7 +3908,7 @@ pub(super) fn compute_index_values(
                 let position = column_position(table, column_name).ok_or_else(|| {
                     DbError::constraint(format!("index column {} does not exist", column_name))
                 })?;
-                Ok(row_values[position].clone())
+                Ok(row_for_eval[position].clone())
             } else if let Some(expression_sql) = &column.expression_sql {
                 let expr = crate::sql::parser::parse_expression_sql(expression_sql)?;
                 runtime.eval_expr(&expr, &dataset, bindings, &[], &BTreeMap::new(), None)
@@ -3892,7 +3929,15 @@ pub(super) fn row_satisfies_index_predicate(
         return Ok(true);
     };
     let expr = crate::sql::parser::parse_expression_sql(predicate_sql)?;
-    let dataset = table_row_dataset(table, row_values, &table.name);
+    let row_materialized = if generated_columns_are_stored(table) {
+        Cow::Borrowed(row_values)
+    } else {
+        let mut materialized = row_values.to_vec();
+        runtime.apply_virtual_generated_columns(table, &mut materialized)?;
+        Cow::Owned(materialized)
+    };
+    let row_for_eval = row_materialized.as_ref();
+    let dataset = table_row_dataset(table, row_for_eval, &table.name);
     let bindings = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
     Ok(matches!(
         runtime.eval_expr(&expr, &dataset, bindings, &[], &BTreeMap::new(), None)?,
@@ -4011,7 +4056,6 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         encode_optional_string(&mut output, index.predicate_sql.as_deref())?;
         output.push(u8::from(index.fresh));
     }
-
     encode_u32(&mut output, runtime.catalog.views.len() as u32);
     for view in runtime.catalog.views.values() {
         encode_string(&mut output, &view.name)?;
@@ -4029,6 +4073,8 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
         output.push(u8::from(trigger.on_view));
         encode_string(&mut output, &trigger.action_sql)?;
     }
+    encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
+    encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     Ok(output)
 }
@@ -4140,12 +4186,12 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 kind,
                 unique,
                 columns,
+                include_columns: Vec::new(),
                 predicate_sql,
                 fresh,
             },
         );
     }
-
     let view_count = cursor.read_u32()?;
     for _ in 0..view_count {
         let view = crate::catalog::ViewSchema {
@@ -4172,6 +4218,12 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
             .catalog
             .triggers
             .insert(trigger.name.clone(), trigger);
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_schemas_section(&mut cursor, &mut runtime.catalog.schemas)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog.indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
@@ -4252,7 +4304,6 @@ fn encode_manifest_payload_with_offsets(
         encode_optional_string(&mut output, index.predicate_sql.as_deref())?;
         output.push(u8::from(index.fresh));
     }
-
     encode_u32(&mut output, runtime.catalog.views.len() as u32);
     for view in runtime.catalog.views.values() {
         encode_string(&mut output, &view.name)?;
@@ -4295,6 +4346,8 @@ fn encode_manifest_payload_with_offsets(
         encode_i64(&mut output, stats.entry_count);
         encode_i64(&mut output, stats.distinct_key_count);
     }
+    encode_schemas_section(&mut output, &runtime.catalog.schemas)?;
+    encode_index_include_columns_section(&mut output, &runtime.catalog.indexes)?;
     encode_generated_columns_section(&mut output, &runtime.catalog.tables)?;
     Ok(ManifestEncoding {
         bytes: output,
@@ -4461,12 +4514,12 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
                 kind,
                 unique,
                 columns,
+                include_columns: Vec::new(),
                 predicate_sql,
                 fresh,
             },
         );
     }
-
     let view_count = cursor.read_u32()?;
     for _ in 0..view_count {
         let view = crate::catalog::ViewSchema {
@@ -4514,6 +4567,12 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
             };
             runtime.catalog.index_stats.insert(name, stats);
         }
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_schemas_section(&mut cursor, &mut runtime.catalog.schemas)?;
+    }
+    if cursor.offset < cursor.bytes.len() {
+        decode_index_include_columns_section(&mut cursor, &mut runtime.catalog.indexes)?;
     }
     if cursor.offset < cursor.bytes.len() {
         decode_generated_columns_section(&mut cursor, &mut runtime.catalog.tables)?;
@@ -4712,6 +4771,138 @@ fn encode_generated_columns_section(
         output.push(u8::from(generated_stored));
     }
     Ok(())
+}
+
+fn encode_index_include_columns_section(
+    output: &mut Vec<u8>,
+    indexes: &BTreeMap<String, IndexSchema>,
+) -> Result<()> {
+    let include_entries = indexes
+        .iter()
+        .filter(|(_, index)| !index.include_columns.is_empty())
+        .collect::<Vec<_>>();
+    output.extend_from_slice(INDEX_INCLUDE_COLUMNS_SECTION_MAGIC);
+    output.push(1);
+    encode_u32(
+        output,
+        u32::try_from(include_entries.len())
+            .map_err(|_| DbError::constraint("index include entry count exceeds u32"))?,
+    );
+    for (index_name, index) in include_entries {
+        encode_string(output, index_name)?;
+        encode_strings(output, &index.include_columns)?;
+    }
+    Ok(())
+}
+
+fn encode_schemas_section(
+    output: &mut Vec<u8>,
+    schemas: &BTreeMap<String, SchemaInfo>,
+) -> Result<()> {
+    output.extend_from_slice(SCHEMAS_SECTION_MAGIC);
+    output.push(1);
+    encode_u32(
+        output,
+        u32::try_from(schemas.len())
+            .map_err(|_| DbError::constraint("schema count exceeds u32"))?,
+    );
+    for schema in schemas.values() {
+        encode_string(output, &schema.name)?;
+    }
+    Ok(())
+}
+
+fn decode_schemas_section(
+    cursor: &mut Cursor<'_>,
+    schemas: &mut BTreeMap<String, SchemaInfo>,
+) -> Result<()> {
+    let section_is_present = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + SCHEMAS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == SCHEMAS_SECTION_MAGIC);
+    if !section_is_present {
+        return Ok(());
+    }
+    cursor.offset += SCHEMAS_SECTION_MAGIC.len();
+    let version = cursor.read_u8()?;
+    if version != 1 {
+        return Err(DbError::corruption(format!(
+            "unknown schemas section version {version}"
+        )));
+    }
+    let schema_count = cursor.read_u32()?;
+    for _ in 0..schema_count {
+        let name = cursor.read_string()?;
+        schemas.insert(name.clone(), SchemaInfo { name });
+    }
+    Ok(())
+}
+
+fn decode_index_include_columns_section(
+    cursor: &mut Cursor<'_>,
+    indexes: &mut BTreeMap<String, IndexSchema>,
+) -> Result<()> {
+    let section_is_present = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + INDEX_INCLUDE_COLUMNS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == INDEX_INCLUDE_COLUMNS_SECTION_MAGIC);
+    if !section_is_present {
+        return Ok(());
+    }
+    cursor.offset += INDEX_INCLUDE_COLUMNS_SECTION_MAGIC.len();
+    let version = cursor.read_u8()?;
+    if version != 1 {
+        return Err(DbError::corruption(format!(
+            "unknown index include columns section version {version}"
+        )));
+    }
+    let entry_count = cursor.read_u32()?;
+    for _ in 0..entry_count {
+        let index_name = cursor.read_string()?;
+        let include_columns = cursor.read_strings()?;
+        let index = indexes.get_mut(&index_name).ok_or_else(|| {
+            DbError::corruption(format!(
+                "index include metadata referenced unknown index {index_name}"
+            ))
+        })?;
+        index.include_columns = include_columns;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn drop_index_include_columns_section(payload: &[u8]) -> Result<Vec<u8>> {
+    let start = payload
+        .windows(INDEX_INCLUDE_COLUMNS_SECTION_MAGIC.len())
+        .position(|window| window == INDEX_INCLUDE_COLUMNS_SECTION_MAGIC)
+        .ok_or_else(|| DbError::internal("index include columns section not found"))?;
+    let mut cursor = Cursor::new(
+        payload
+            .get(start + INDEX_INCLUDE_COLUMNS_SECTION_MAGIC.len()..)
+            .ok_or_else(|| DbError::internal("index include columns section header truncated"))?,
+    );
+    let _version = cursor.read_u8()?;
+    let entry_count = cursor.read_u32()?;
+    for _ in 0..entry_count {
+        let _index_name = cursor.read_string()?;
+        let _include_columns = cursor.read_strings()?;
+    }
+    let section_len = INDEX_INCLUDE_COLUMNS_SECTION_MAGIC.len() + cursor.offset;
+    let end = start
+        .checked_add(section_len)
+        .ok_or_else(|| DbError::internal("index include section length overflow"))?;
+    let mut output = Vec::with_capacity(payload.len().saturating_sub(section_len));
+    output.extend_from_slice(
+        payload
+            .get(..start)
+            .ok_or_else(|| DbError::internal("invalid include section start"))?,
+    );
+    output.extend_from_slice(
+        payload
+            .get(end..)
+            .ok_or_else(|| DbError::internal("invalid include section end"))?,
+    );
+    Ok(output)
 }
 
 fn decode_generated_columns_section(
@@ -10525,9 +10716,9 @@ mod tests {
     use crate::Value;
 
     use super::{
-        decode_manifest_payload, decode_runtime_payload, encode_manifest_payload,
-        encode_runtime_payload, encode_table_payload, EngineRuntime, PersistedTableState,
-        RuntimeBtreeKeys, RuntimeIndex,
+        decode_manifest_payload, decode_runtime_payload, drop_index_include_columns_section,
+        encode_manifest_payload, encode_runtime_payload, encode_table_payload, EngineRuntime,
+        PersistedTableState, RuntimeBtreeKeys, RuntimeIndex,
     };
 
     const PAGE_SIZE: u32 = 4096;
@@ -10681,6 +10872,81 @@ mod tests {
         assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
         assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
         assert_eq!(decoded.persisted_tables["docs"], table_states["docs"]);
+    }
+
+    #[test]
+    fn index_include_columns_round_trip_manifest_and_legacy_payloads() {
+        let mut runtime = EngineRuntime::empty(13);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE cover_idx (id INT64 PRIMARY KEY, k TEXT, payload TEXT, flag BOOL)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX cover_idx_k ON cover_idx (k) INCLUDE (payload, flag)",
+        );
+
+        let legacy = encode_runtime_payload(&runtime).expect("encode legacy runtime payload");
+        let legacy_decoded =
+            decode_runtime_payload(&legacy).expect("decode legacy runtime payload");
+        assert_eq!(
+            legacy_decoded.catalog.indexes["cover_idx_k"].include_columns,
+            vec!["payload".to_string(), "flag".to_string()]
+        );
+
+        let store = InMemoryPageStore::new(PAGE_SIZE);
+        let manifest =
+            encode_manifest_payload(&runtime, &runtime.persisted_tables).expect("encode manifest");
+        let manifest_decoded =
+            decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
+        assert_eq!(
+            manifest_decoded.catalog.indexes["cover_idx_k"].include_columns,
+            vec!["payload".to_string(), "flag".to_string()]
+        );
+    }
+
+    #[test]
+    fn manifest_decode_without_index_include_section_defaults_to_empty_include_columns() {
+        let mut runtime = EngineRuntime::empty(14);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE cover_legacy (id INT64 PRIMARY KEY, k TEXT, payload TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "CREATE INDEX cover_legacy_idx ON cover_legacy (k) INCLUDE (payload)",
+        );
+        let store = InMemoryPageStore::new(PAGE_SIZE);
+        let manifest =
+            encode_manifest_payload(&runtime, &runtime.persisted_tables).expect("encode manifest");
+        let legacy_manifest =
+            drop_index_include_columns_section(&manifest).expect("drop include section");
+        let decoded =
+            decode_manifest_payload(&store, &legacy_manifest).expect("decode legacy manifest");
+        assert!(decoded.catalog.indexes["cover_legacy_idx"]
+            .include_columns
+            .is_empty());
+    }
+
+    #[test]
+    fn schema_entries_round_trip_manifest_and_legacy_payloads() {
+        let mut runtime = EngineRuntime::empty(15);
+        execute_sql(&mut runtime, "CREATE SCHEMA app");
+        execute_sql(&mut runtime, "CREATE SCHEMA IF NOT EXISTS analytics");
+
+        let legacy = encode_runtime_payload(&runtime).expect("encode legacy runtime payload");
+        let legacy_decoded =
+            decode_runtime_payload(&legacy).expect("decode legacy runtime payload");
+        assert!(legacy_decoded.catalog.schemas.contains_key("app"));
+        assert!(legacy_decoded.catalog.schemas.contains_key("analytics"));
+
+        let store = InMemoryPageStore::new(PAGE_SIZE);
+        let manifest =
+            encode_manifest_payload(&runtime, &runtime.persisted_tables).expect("encode manifest");
+        let manifest_decoded =
+            decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
+        assert!(manifest_decoded.catalog.schemas.contains_key("app"));
+        assert!(manifest_decoded.catalog.schemas.contains_key("analytics"));
     }
 
     #[test]

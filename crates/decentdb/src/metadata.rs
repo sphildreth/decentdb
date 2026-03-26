@@ -74,6 +74,7 @@ pub struct IndexInfo {
     pub kind: String,
     pub unique: bool,
     pub columns: Vec<String>,
+    pub include_columns: Vec<String>,
     pub predicate_sql: Option<String>,
     pub fresh: bool,
 }

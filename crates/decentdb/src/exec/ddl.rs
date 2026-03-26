@@ -2,7 +2,7 @@
 
 use crate::catalog::{
     identifiers_equal, CheckConstraint, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint,
-    IndexColumn, IndexKind, IndexSchema, TableSchema,
+    IndexColumn, IndexKind, IndexSchema, SchemaInfo, TableSchema,
 };
 use crate::error::{DbError, Result};
 use crate::record::value::Value;
@@ -16,6 +16,26 @@ use super::constraints::auto_index_name;
 use super::{table_row_dataset, EngineRuntime, TableData};
 
 impl EngineRuntime {
+    pub(super) fn execute_create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<()> {
+        if self.catalog.schema(name).is_some() {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(DbError::sql(format!("schema {} already exists", name)));
+        }
+        if self.catalog.contains_non_schema_object(name) {
+            return Err(DbError::sql(format!("object {} already exists", name)));
+        }
+        self.catalog.schemas.insert(
+            name.to_string(),
+            SchemaInfo {
+                name: name.to_string(),
+            },
+        );
+        self.bump_schema_cookie();
+        Ok(())
+    }
+
     pub(super) fn execute_create_table(&mut self, statement: &CreateTableStatement) -> Result<()> {
         if statement.temporary {
             if self.temp_relation_exists(&statement.table_name) {
@@ -139,6 +159,7 @@ impl EngineRuntime {
                             expression_sql: None,
                         })
                         .collect(),
+                    include_columns: Vec::new(),
                     predicate_sql: None,
                     fresh: false,
                 });
@@ -156,6 +177,7 @@ impl EngineRuntime {
                             expression_sql: None,
                         })
                         .collect(),
+                    include_columns: Vec::new(),
                     predicate_sql: None,
                     fresh: false,
                 });
@@ -191,6 +213,7 @@ impl EngineRuntime {
                         expression_sql: None,
                     })
                     .collect(),
+                include_columns: Vec::new(),
                 predicate_sql: None,
                 fresh: true,
             })?;
@@ -209,6 +232,7 @@ impl EngineRuntime {
                         expression_sql: None,
                     })
                     .collect(),
+                include_columns: Vec::new(),
                 predicate_sql: None,
                 fresh: true,
             })?;
@@ -233,6 +257,7 @@ impl EngineRuntime {
                             expression_sql: None,
                         })
                         .collect(),
+                    include_columns: Vec::new(),
                     predicate_sql: None,
                     fresh: true,
                 })?;
@@ -307,6 +332,11 @@ impl EngineRuntime {
             if statement.predicate.is_some() {
                 return Err(DbError::sql("partial trigram indexes are not supported"));
             }
+            if !statement.include_columns.is_empty() {
+                return Err(DbError::sql(
+                    "trigram indexes do not support INCLUDE columns",
+                ));
+            }
         }
         if has_expression {
             if kind != IndexKind::Btree {
@@ -322,6 +352,11 @@ impl EngineRuntime {
             }
             if statement.predicate.is_some() {
                 return Err(DbError::sql("partial expression indexes are not supported"));
+            }
+            if !statement.include_columns.is_empty() {
+                return Err(DbError::sql(
+                    "expression indexes do not support INCLUDE columns",
+                ));
             }
         }
         if let Some(_predicate) = &statement.predicate {
@@ -354,6 +389,41 @@ impl EngineRuntime {
                 }
             }
         }
+        for (include_index, include_column) in statement.include_columns.iter().enumerate() {
+            if !table
+                .columns
+                .iter()
+                .any(|column| identifiers_equal(&column.name, include_column))
+            {
+                return Err(DbError::sql(format!(
+                    "index INCLUDE column {} does not exist on {}",
+                    include_column, table.name
+                )));
+            }
+            if statement.columns.iter().any(|column| {
+                matches!(
+                    column,
+                    IndexExpression::Column(column_name)
+                        if identifiers_equal(column_name, include_column)
+                )
+            }) {
+                return Err(DbError::sql(format!(
+                    "index INCLUDE column {} duplicates key column",
+                    include_column
+                )));
+            }
+            if statement
+                .include_columns
+                .iter()
+                .take(include_index)
+                .any(|column| identifiers_equal(column, include_column))
+            {
+                return Err(DbError::sql(format!(
+                    "index INCLUDE column {} is duplicated",
+                    include_column
+                )));
+            }
+        }
 
         self.insert_index_schema(IndexSchema {
             name: statement.index_name.clone(),
@@ -374,6 +444,7 @@ impl EngineRuntime {
                     },
                 })
                 .collect(),
+            include_columns: statement.include_columns.clone(),
             predicate_sql: statement
                 .predicate
                 .as_ref()
@@ -703,10 +774,11 @@ impl EngineRuntime {
                     }
                     if self.catalog.indexes.values().any(|index| {
                         index.table_name == table_name
-                            && index
+                            && (index
                                 .columns
                                 .iter()
                                 .any(|column| column.column_name.as_deref() == Some(column_name))
+                                || index.include_columns.iter().any(|name| name == column_name))
                     }) {
                         return Err(DbError::sql(format!(
                             "cannot drop indexed column {}",
@@ -1321,6 +1393,11 @@ fn rename_column_references(
             for column in &mut index.columns {
                 if column.column_name.as_deref() == Some(old_name) {
                     column.column_name = Some(new_name.to_string());
+                }
+            }
+            for include_column in &mut index.include_columns {
+                if include_column == old_name {
+                    *include_column = new_name.to_string();
                 }
             }
             if let Some(predicate) = &mut index.predicate_sql {

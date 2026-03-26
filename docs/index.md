@@ -13,7 +13,7 @@ DecentDB is an embedded, single-machine relational database engine focused on **
 - **Full-Text Substring Search** — Trigram inverted index for `LIKE '%pattern%'` queries
 - **Auto-Assigned Primary Keys** — If a table has a single INT64 primary key column, omitting the value on INSERT will auto-assign an ID (INT/INTEGER/INT64/BIGINT are synonyms)
 - **Foreign Keys** — Referential integrity with CASCADE, SET NULL, RESTRICT
-- **Generated Columns** — `GENERATED ALWAYS AS (expr) STORED` for computed values
+- **Generated Columns** — `GENERATED ALWAYS AS (expr)` in `STORED` or `VIRTUAL` mode
 - **Temporary Objects** — Session-scoped TEMP tables and views
 - **JSON Support** — Scalar functions, table-valued functions (`json_each`, `json_tree`)
 - **Multiple Language Bindings** — [.NET](api/dotnet.md), [Go](api/go.md), [Python](api/python.md), [Node.js](api/node.md), [Dart](api/dart.md), [JDBC](api/jdbc.md)

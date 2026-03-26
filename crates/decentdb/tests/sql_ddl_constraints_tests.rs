@@ -2338,6 +2338,85 @@ fn metadata_list_indexes() {
 }
 
 #[test]
+fn create_index_include_columns_render_and_metadata() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE ci (id INT64 PRIMARY KEY, k TEXT, payload TEXT, flag BOOL)",
+    );
+    exec(&db, "CREATE INDEX ci_idx ON ci (k) INCLUDE (payload, flag)");
+    let ddl = db.dump_sql().unwrap();
+    assert!(
+        ddl.contains("CREATE INDEX \"ci_idx\" ON \"ci\" (k) INCLUDE (\"payload\", \"flag\")"),
+        "unexpected dump sql: {ddl}"
+    );
+    let indexes = db.list_indexes().unwrap();
+    let idx = indexes
+        .iter()
+        .find(|index| index.name == "ci_idx")
+        .expect("ci_idx metadata");
+    assert_eq!(
+        idx.include_columns,
+        vec!["payload".to_string(), "flag".to_string()]
+    );
+}
+
+#[test]
+fn include_column_validation_errors() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE icv (id INT64 PRIMARY KEY, k TEXT, payload TEXT)",
+    );
+    let missing = exec_err(&db, "CREATE INDEX icv_idx ON icv (k) INCLUDE (missing_col)");
+    assert!(missing.contains("index INCLUDE column missing_col does not exist"));
+
+    let duplicate = exec_err(&db, "CREATE INDEX icv_idx2 ON icv (k) INCLUDE (k)");
+    assert!(duplicate.contains("index INCLUDE column k duplicates key column"));
+
+    let duplicate_include = exec_err(
+        &db,
+        "CREATE INDEX icv_idx3 ON icv (k) INCLUDE (payload, payload)",
+    );
+    assert!(duplicate_include.contains("index INCLUDE column payload is duplicated"));
+}
+
+#[test]
+fn include_columns_not_supported_for_expression_or_trigram_indexes() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE iex (id INT64 PRIMARY KEY, k TEXT, payload TEXT)",
+    );
+    let expr_err = exec_err(
+        &db,
+        "CREATE INDEX iex_idx ON iex ((LOWER(k))) INCLUDE (payload)",
+    );
+    assert!(expr_err.contains("expression indexes do not support INCLUDE columns"));
+
+    let trigram_err = exec_err(
+        &db,
+        "CREATE INDEX iex_trgm ON iex USING trigram (k) INCLUDE (payload)",
+    );
+    assert!(trigram_err.contains("trigram indexes do not support INCLUDE columns"));
+}
+
+#[test]
+fn drop_indexed_include_column_is_rejected() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE idc (id INT64 PRIMARY KEY, k TEXT, payload TEXT)",
+    );
+    exec(&db, "CREATE INDEX idc_idx ON idc (k) INCLUDE (payload)");
+    let err = exec_err(&db, "ALTER TABLE idc DROP COLUMN payload");
+    assert!(
+        err.contains("cannot drop indexed column payload"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn metadata_list_tables() {
     let db = mem_db();
     db.execute("CREATE TABLE alpha(id INT64)").unwrap();
@@ -3204,6 +3283,29 @@ fn create_with_invalid_page_size_fails() {
 }
 
 #[test]
+fn create_schema_basic_and_if_not_exists() {
+    let db = mem_db();
+    db.execute("CREATE SCHEMA app").unwrap();
+    db.execute("CREATE SCHEMA IF NOT EXISTS app").unwrap();
+    let err = db.execute("CREATE SCHEMA app").unwrap_err();
+    assert!(
+        err.to_string().contains("schema app already exists"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn create_schema_conflicts_with_existing_object_name() {
+    let db = mem_db();
+    db.execute("CREATE TABLE app (id INT64)").unwrap();
+    let err = db.execute("CREATE SCHEMA app").unwrap_err();
+    assert!(
+        err.to_string().contains("object app already exists"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn generated_columns_compute_recompute_and_survive_reopen() {
     let tempdir = TempDir::new().unwrap();
     let path = tempdir.path().join("generated-columns.ddb");
@@ -3278,5 +3380,83 @@ fn generated_columns_participate_in_unique_constraints() {
     assert!(
         err.to_string().contains("unique constraint") && err.to_string().contains("users"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn generated_virtual_columns_compute_returning_and_persist_mode() {
+    let tempdir = TempDir::new().unwrap();
+    let path = tempdir.path().join("generated-virtual-columns.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        db.execute(
+            "CREATE TABLE products (
+                id INT64 PRIMARY KEY,
+                price FLOAT64,
+                qty INT64,
+                total FLOAT64 GENERATED ALWAYS AS (price * qty) VIRTUAL
+            )",
+        )
+        .unwrap();
+
+        db.execute("INSERT INTO products (id, price, qty) VALUES (1, 9.99, 3)")
+            .unwrap();
+
+        let inserted = db
+            .execute("SELECT total FROM products WHERE id = 1")
+            .unwrap();
+        assert_float_close(&inserted.rows()[0].values()[0], 29.97);
+
+        let updated_returning = db
+            .execute("UPDATE products SET qty = 4 WHERE id = 1 RETURNING total")
+            .unwrap();
+        assert_float_close(&updated_returning.rows()[0].values()[0], 39.96);
+
+        let deleted_returning = db
+            .execute("DELETE FROM products WHERE id = 1 RETURNING total")
+            .unwrap();
+        assert_float_close(&deleted_returning.rows()[0].values()[0], 39.96);
+
+        db.execute("INSERT INTO products (id, price, qty) VALUES (2, 5.0, 2)")
+            .unwrap();
+
+        let insert_err = db
+            .execute("INSERT INTO products (id, price, qty, total) VALUES (3, 1.0, 2, 2.0)")
+            .unwrap_err();
+        assert!(
+            insert_err
+                .to_string()
+                .contains("cannot INSERT into generated column products.total"),
+            "unexpected error: {insert_err}"
+        );
+
+        let update_err = db
+            .execute("UPDATE products SET total = 0 WHERE id = 2")
+            .unwrap_err();
+        assert!(
+            update_err
+                .to_string()
+                .contains("cannot UPDATE generated column products.total"),
+            "unexpected error: {update_err}"
+        );
+
+        let ddl = db.table_ddl("products").unwrap();
+        assert!(
+            ddl.contains("\"total\" FLOAT64 GENERATED ALWAYS AS ((price * qty)) VIRTUAL"),
+            "unexpected DDL: {ddl}"
+        );
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    let selected = reopened
+        .execute("SELECT total FROM products WHERE id = 2")
+        .unwrap();
+    assert_float_close(&selected.rows()[0].values()[0], 10.0);
+
+    let ddl = reopened.table_ddl("products").unwrap();
+    assert!(
+        ddl.contains("\"total\" FLOAT64 GENERATED ALWAYS AS ((price * qty)) VIRTUAL"),
+        "unexpected DDL after reopen: {ddl}"
     );
 }

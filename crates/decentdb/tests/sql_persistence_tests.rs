@@ -274,6 +274,71 @@ fn dump_sql_with_indexes_and_views() {
 }
 
 #[test]
+fn dump_sql_with_covering_index_include_clause() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE dump_cover (id INT PRIMARY KEY, k TEXT, payload TEXT, flag BOOL)",
+    );
+    exec(
+        &db,
+        "CREATE INDEX dump_cover_idx ON dump_cover (k) INCLUDE (payload, flag)",
+    );
+    let sql = db.dump_sql().unwrap();
+    assert!(sql.contains(
+        "CREATE INDEX \"dump_cover_idx\" ON \"dump_cover\" (k) INCLUDE (\"payload\", \"flag\")"
+    ));
+}
+
+#[test]
+fn covering_index_include_columns_persist_after_reopen() {
+    let path = unique_db_path("covering-index-persist");
+    cleanup_db(&path);
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        exec(
+            &db,
+            "CREATE TABLE cip (id INT64 PRIMARY KEY, k TEXT, payload TEXT, flag BOOL)",
+        );
+        exec(
+            &db,
+            "CREATE INDEX cip_idx ON cip (k) INCLUDE (payload, flag)",
+        );
+        db.checkpoint().unwrap();
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    let indexes = reopened.list_indexes().unwrap();
+    let idx = indexes
+        .iter()
+        .find(|index| index.name == "cip_idx")
+        .expect("covering index metadata");
+    assert_eq!(
+        idx.include_columns,
+        vec!["payload".to_string(), "flag".to_string()]
+    );
+    let sql = reopened.dump_sql().unwrap();
+    assert!(sql.contains("CREATE INDEX \"cip_idx\" ON \"cip\" (k) INCLUDE (\"payload\", \"flag\")"));
+    cleanup_db(&path);
+}
+
+#[test]
+fn create_schema_persists_after_reopen() {
+    let path = unique_db_path("create-schema-persist");
+    cleanup_db(&path);
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        exec(&db, "CREATE SCHEMA app");
+        db.checkpoint().unwrap();
+    }
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    reopened.execute("CREATE SCHEMA IF NOT EXISTS app").unwrap();
+    let err = reopened.execute("CREATE SCHEMA app").unwrap_err();
+    assert!(err.to_string().contains("schema app already exists"));
+    cleanup_db(&path);
+}
+
+#[test]
 fn dump_sql_with_not_null_and_defaults() {
     let db = mem_db();
     exec(

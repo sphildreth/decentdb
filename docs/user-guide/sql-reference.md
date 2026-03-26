@@ -34,7 +34,7 @@ Constraints:
 - `CHECK (expression)` — row-level validation; the expression must evaluate to `TRUE` or `NULL` (only `FALSE` is a violation).
 - `DEFAULT value` — default value used when column is omitted from INSERT.
 - `REFERENCES table(column)` — foreign key constraint.
-- `GENERATED ALWAYS AS (expr) STORED` — computed column persisted on INSERT/UPDATE (see [Generated Columns](#generated-columns)).
+- `GENERATED ALWAYS AS (expr) STORED|VIRTUAL` — computed column in persisted (`STORED`) or read-time (`VIRTUAL`) mode (see [Generated Columns](#generated-columns)).
 
 ### CREATE TEMP TABLE / CREATE TEMP VIEW
 
@@ -44,6 +44,18 @@ CREATE TEMP VIEW temp_summary AS SELECT category, COUNT(*) AS cnt FROM products 
 ```
 
 Session-scoped temporary objects that are not persisted to disk. They are visible only to the connection that created them and are dropped when the connection closes. See `design/adr/0109-temporary-tables-views.md`.
+
+### CREATE SCHEMA
+
+```sql
+CREATE SCHEMA app;
+CREATE SCHEMA IF NOT EXISTS analytics;
+```
+
+Notes:
+- Schemas are currently catalog namespaces only (name registration and persistence).
+- Schema-qualified relation names (for example `app.users`) are not yet supported.
+- `CREATE SCHEMA ... AUTHORIZATION ...` and inline schema elements are not supported.
 
 ### CREATE INDEX
 
@@ -62,15 +74,20 @@ CREATE INDEX index_name ON table_name(column_name) WHERE column_name IS NOT NULL
 
 -- Expression index (BTREE only; single expression)
 CREATE INDEX index_name ON table_name((LOWER(column_name)));
+
+-- Covering index (BTREE only; include payload columns)
+CREATE INDEX index_name ON table_name(column_name) INCLUDE (other_col, more_col);
 ```
 
 Notes:
 - Partial/filtered indexes are supported for BTREE indexes with arbitrary predicates (including multi-column and `UNIQUE`). Partial trigram indexes are not supported.
+- Covering indexes (`INCLUDE (...)`) are supported for BTREE key-column indexes and store additional non-key columns in index metadata for compatibility.
 - Expression indexes are currently limited to **a single** deterministic expression:
   - column reference
   - `LOWER(col)`, `UPPER(col)`, `TRIM(col)`, `LENGTH(col)`
   - `CAST(col AS INT64|FLOAT64|TEXT|BOOL)`
 - `UNIQUE` expression indexes, partial expression indexes, and multi-expression index keys are not supported.
+- `INCLUDE (...)` is not supported on expression or trigram indexes, and included columns cannot duplicate key columns.
 
 ### DROP TABLE / DROP INDEX
 
@@ -249,7 +266,7 @@ Notes:
 - `INSERT ... RETURNING` is supported.
 - `CHECK` constraints are enforced on `INSERT` and `UPDATE` (including `ON CONFLICT ... DO UPDATE`).
 - CHECK fails only when the predicate is `FALSE`; `TRUE` and `NULL` pass.
-- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are not supported.
+- `UPDATE ... RETURNING` and `DELETE ... RETURNING` are supported.
 
 ### SELECT
 
@@ -644,7 +661,12 @@ SELECT key, value, type, path FROM json_tree('{"a":{"b":1},"c":[2,3]}');
 
 ### Generated Columns
 
-Columns defined with `GENERATED ALWAYS AS (expr) STORED` are computed on every INSERT and UPDATE and persisted to disk. See `design/adr/0108-generated-columns-stored.md`.
+Columns defined with `GENERATED ALWAYS AS (expr)` support both storage modes:
+
+- `STORED` computes on INSERT/UPDATE and persists the value to disk.
+- `VIRTUAL` computes on read and is not persisted as a materialized value.
+
+See `design/adr/0108-generated-columns-stored.md` for the original STORED design baseline.
 
 ```sql
 CREATE TABLE products (
@@ -656,6 +678,16 @@ CREATE TABLE products (
 
 INSERT INTO products (id, price, qty) VALUES (1, 9.99, 3);
 SELECT total FROM products WHERE id = 1;  -- Returns 29.97
+
+CREATE TABLE products_virtual (
+    id INT PRIMARY KEY,
+    price REAL,
+    qty INT,
+    total REAL GENERATED ALWAYS AS (price * qty) VIRTUAL
+);
+
+INSERT INTO products_virtual (id, price, qty) VALUES (1, 9.99, 3);
+SELECT total FROM products_virtual WHERE id = 1;  -- Returns 29.97
 ```
 
 ## Constraints

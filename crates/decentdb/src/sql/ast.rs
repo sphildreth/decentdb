@@ -16,6 +16,10 @@ pub(crate) enum Statement {
     },
     CreateTable(CreateTableStatement),
     CreateTableAs(CreateTableAsStatement),
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
     CreateIndex(CreateIndexStatement),
     CreateView(CreateViewStatement),
     CreateTrigger(CreateTriggerStatement),
@@ -438,6 +442,7 @@ pub(crate) struct CreateIndexStatement {
     pub(crate) if_not_exists: bool,
     pub(crate) access_method: String,
     pub(crate) columns: Vec<IndexExpression>,
+    pub(crate) include_columns: Vec<String>,
     pub(crate) predicate: Option<Expr>,
 }
 

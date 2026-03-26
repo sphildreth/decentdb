@@ -50,12 +50,10 @@ fn normalize_statement_with_generated_modes(
         NodeEnum::InsertStmt(statement) => Ok(Statement::Insert(normalize_insert(statement)?)),
         NodeEnum::UpdateStmt(statement) => Ok(Statement::Update(normalize_update(statement)?)),
         NodeEnum::DeleteStmt(statement) => Ok(Statement::Delete(normalize_delete(statement)?)),
-        NodeEnum::CreateStmt(statement) => {
-            Ok(Statement::CreateTable(normalize_create_table(
-                statement,
-                generated_column_modes,
-            )?))
-        }
+        NodeEnum::CreateStmt(statement) => Ok(Statement::CreateTable(normalize_create_table(
+            statement,
+            generated_column_modes,
+        )?)),
         NodeEnum::CreateTableAsStmt(statement) => Ok(Statement::CreateTableAs(
             normalize_create_table_as(statement)?,
         )),
@@ -69,6 +67,7 @@ fn normalize_statement_with_generated_modes(
             statement,
             original_sql,
         )?)),
+        NodeEnum::CreateSchemaStmt(statement) => normalize_create_schema(statement),
         NodeEnum::VacuumStmt(statement) => normalize_vacuum(statement),
         NodeEnum::DropStmt(statement) => normalize_drop(statement),
         NodeEnum::RenameStmt(statement) => normalize_rename(statement),
@@ -705,6 +704,14 @@ fn normalize_create_index(statement: &protobuf::IndexStmt) -> Result<CreateIndex
                 _ => Err(unsupported("unsupported index key expression")),
             })
             .collect::<Result<Vec<_>>>()?,
+        include_columns: statement
+            .index_including_params
+            .iter()
+            .map(|node| match node_kind(node)? {
+                NodeEnum::IndexElem(index) if !index.name.is_empty() => Ok(index.name.clone()),
+                _ => Err(unsupported("unsupported index INCLUDE column")),
+            })
+            .collect::<Result<Vec<_>>>()?,
         predicate: statement
             .where_clause
             .as_deref()
@@ -836,6 +843,24 @@ fn normalize_drop(statement: &protobuf::DropStmt) -> Result<Statement> {
             other.as_str_name()
         ))),
     }
+}
+
+fn normalize_create_schema(statement: &protobuf::CreateSchemaStmt) -> Result<Statement> {
+    if statement.schemaname.is_empty() {
+        return Err(unsupported("CREATE SCHEMA is missing schema name"));
+    }
+    if statement.authrole.is_some() {
+        return Err(unsupported("CREATE SCHEMA AUTHORIZATION is not supported"));
+    }
+    if !statement.schema_elts.is_empty() {
+        return Err(unsupported(
+            "CREATE SCHEMA with nested schema elements is not supported",
+        ));
+    }
+    Ok(Statement::CreateSchema {
+        name: statement.schemaname.clone(),
+        if_not_exists: statement.if_not_exists,
+    })
 }
 
 fn normalize_rename(statement: &protobuf::RenameStmt) -> Result<Statement> {
@@ -2210,6 +2235,7 @@ fn describe_node(node: &NodeEnum) -> &'static str {
         NodeEnum::RenameStmt(_) => "RenameStmt",
         NodeEnum::AlterTableStmt(_) => "AlterTableStmt",
         NodeEnum::CreateTrigStmt(_) => "CreateTrigStmt",
+        NodeEnum::CreateSchemaStmt(_) => "CreateSchemaStmt",
         NodeEnum::ExplainStmt(_) => "ExplainStmt",
         NodeEnum::AExpr(_) => "AExpr",
         NodeEnum::BoolExpr(_) => "BoolExpr",
@@ -3397,6 +3423,20 @@ mod tests {
             "CREATE TABLE t (id INT PRIMARY KEY, x INT, y INT GENERATED ALWAYS AS (x * 2) STORED)",
         ) {
             assert!(ct.columns[2].generated.is_some());
+            assert!(ct.columns[2].generated_stored);
+        }
+    }
+
+    #[test]
+    fn column_generated_virtual_mode() {
+        if let Statement::CreateTable(ct) = normalize_statement_text_with_generated_modes(
+            "CREATE TABLE t (id INT PRIMARY KEY, x INT, y INT GENERATED ALWAYS AS (x * 2) STORED)",
+            &[false],
+        )
+        .unwrap()
+        {
+            assert!(ct.columns[2].generated.is_some());
+            assert!(!ct.columns[2].generated_stored);
         }
     }
 
@@ -3512,6 +3552,13 @@ mod tests {
     }
 
     #[test]
+    fn create_index_include_columns() {
+        if let Statement::CreateIndex(ci) = norm("CREATE INDEX idx ON t (col) INCLUDE (a, b)") {
+            assert_eq!(ci.include_columns, vec!["a".to_string(), "b".to_string()]);
+        }
+    }
+
+    #[test]
     fn create_index_expression() {
         if let Statement::CreateIndex(ci) = norm("CREATE INDEX idx ON t ((col + 1))") {
             assert!(ci
@@ -3519,6 +3566,40 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, IndexExpression::Expr(_))));
         }
+    }
+
+    #[test]
+    fn create_schema_basic() {
+        if let Statement::CreateSchema {
+            name,
+            if_not_exists,
+        } = norm("CREATE SCHEMA app")
+        {
+            assert_eq!(name, "app");
+            assert!(!if_not_exists);
+        } else {
+            panic!("expected create schema");
+        }
+    }
+
+    #[test]
+    fn create_schema_if_not_exists() {
+        if let Statement::CreateSchema {
+            name,
+            if_not_exists,
+        } = norm("CREATE SCHEMA IF NOT EXISTS app")
+        {
+            assert_eq!(name, "app");
+            assert!(if_not_exists);
+        } else {
+            panic!("expected create schema");
+        }
+    }
+
+    #[test]
+    fn create_schema_with_authorization_is_rejected() {
+        let err = norm_err("CREATE SCHEMA app AUTHORIZATION bob");
+        assert!(err.contains("AUTHORIZATION"));
     }
 
     // ── normalize_create_view ──────────────────────────────────────

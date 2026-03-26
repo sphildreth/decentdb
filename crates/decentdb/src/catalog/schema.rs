@@ -101,6 +101,7 @@ pub(crate) struct IndexSchema {
     pub(crate) kind: IndexKind,
     pub(crate) unique: bool,
     pub(crate) columns: Vec<IndexColumn>,
+    pub(crate) include_columns: Vec<String>,
     pub(crate) predicate_sql: Option<String>,
     pub(crate) fresh: bool,
 }
@@ -162,6 +163,7 @@ pub(crate) struct IndexStats {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogState {
     pub(crate) schema_cookie: u32,
+    pub(crate) schemas: BTreeMap<String, SchemaInfo>,
     pub(crate) tables: BTreeMap<String, TableSchema>,
     pub(crate) indexes: BTreeMap<String, IndexSchema>,
     pub(crate) views: BTreeMap<String, ViewSchema>,
@@ -175,6 +177,7 @@ impl CatalogState {
     pub(crate) fn empty(schema_cookie: u32) -> Self {
         Self {
             schema_cookie,
+            schemas: BTreeMap::new(),
             tables: BTreeMap::new(),
             indexes: BTreeMap::new(),
             views: BTreeMap::new(),
@@ -186,6 +189,20 @@ impl CatalogState {
 
     #[must_use]
     pub(crate) fn contains_object(&self, name: &str) -> bool {
+        self.schema(name).is_some()
+            || self.table(name).is_some()
+            || self.index(name).is_some()
+            || self.view(name).is_some()
+            || self.trigger(name).is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn schema(&self, name: &str) -> Option<&SchemaInfo> {
+        map_get_ci(&self.schemas, name)
+    }
+
+    #[must_use]
+    pub(crate) fn contains_non_schema_object(&self, name: &str) -> bool {
         self.table(name).is_some()
             || self.index(name).is_some()
             || self.view(name).is_some()
@@ -211,4 +228,9 @@ impl CatalogState {
     pub(crate) fn trigger(&self, name: &str) -> Option<&TriggerSchema> {
         map_get_ci(&self.triggers, name)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SchemaInfo {
+    pub(crate) name: String,
 }

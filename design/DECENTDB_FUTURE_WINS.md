@@ -32,6 +32,9 @@ quadrantChart
   "Zero-Copy Branching": [0.70, 0.85]
   "Group Commit / WAL Batching": [0.35, 0.75]
   "Cross-Process WAL Coordination": [0.55, 0.68]
+  "Transparent Data Compression": [0.40, 0.80]
+  "Built-in Observability (Telemetry)": [0.25, 0.88]
+  "Cloud-Native VFS (S3/R2)": [0.85, 0.95]
 ```
 
 #### ⏳ Recommended Next Wins (Ranked by Priority)
@@ -46,12 +49,14 @@ quadrantChart
 | 6 | Built-in HTTP / Remote Server Mode | Section 13 below |
 | 7 | WAL Streaming Replication | Section 8 below |
 | 8 | Zero-Copy Database Branching | Section 14 below |
-| 9 | Bulk Load Follow-Ons | Section 9 below |
-| 10 | Group Commit / WAL Batching | Section 10 below |
-| 11 | Transparent Data Encryption (TDE) | Section 5 below |
-| 12 | Full-Text Search (FTS) | Section 6 below |
-| 13 | Non-Blocking Schema Migration | Section 7 below |
-| 14 | Cross-Process WAL Coordination | Section 11 below |
+| 9 | Built-in Observability (Telemetry) | Section 16 below |
+| 10 | Cloud-Native Object Storage VFS | Section 17 below |
+| 11 | Transparent Data Compression | Section 15 below |
+| 12 | Group Commit / WAL Batching | Section 10 below |
+| 13 | Transparent Data Encryption (TDE) | Section 5 below |
+| 14 | Full-Text Search (FTS) | Section 6 below |
+| 15 | Non-Blocking Schema Migration | Section 7 below |
+| 16 | Cross-Process WAL Coordination | Section 11 below |
 
 ---
 
@@ -395,6 +400,63 @@ To achieve pure CoW semantics without destroying read performance, the engine mo
 
 ---
 
+## 15. Transparent Data Compression (zstd/lz4)
+
+### The SQLite Pain Point
+Storing massive JSON payloads, application logs, or raw document texts inevitably bloats database size and destroys cache locality during sequential scans. SQLite requires developers to either manually compress data at the application layer or use complicated file-archive extensions like `sqlar` which force rigid, secondary schemas.
+
+### The DecentDB Win
+DecentDB introduces **Transparent Column/Page Compression**. Developers can mark a column as compressed (e.g., `CREATE TABLE logs (message TEXT COMPRESSED)`), or configure background page-level compression across the whole file. Using high-speed streaming algorithms like `lz4` or `zstd`, the engine silently compresses data before hitting the disk. Because this pairs natively with DecentDB's B-Tree Overflow architecture, large payloads are shunted out of the primary B-Tree pages. This guarantees that unindexed table scans remain blisteringly fast because the massive compressed blobs are skipped during metadata traversal.
+
+### Implementation Guidelines for Agents
+
+To ensure that compression acts as a pure performance and storage multiplier, agents must adhere to the following:
+
+1. **Leverage Overflow Pages:** Ensure that compression primarily targets payloads destined for B-Tree overflow pages. Compressing small inline B-Tree cells adds useless computational overhead to every search traversal. Keeping primary branch and leaf pages strictly uncompressed, while heavily compressing the pointed-to overflow pages, is the ideal architecture.
+2. **Algorithm Selection:** Rely on the established `zstd` (for heavy storage savings) or `lz4` (for maximum throughput) crates from the Rust ecosystem. Do not reinvent compression algorithms or try to manipulate the C ABI to accept custom compression dictionaries from Python/C#.
+3. **Lazy Decompression:** The Pager/Execution boundary must be strictly lazy. Compressed overflow pages should only be read from disk and decompressed *if and only if* the query explicitly projects or evaluates that specific column. If a query scans rows but ignores the `TEXT` column, the engine must bypass the decompression penalty entirely.
+
+---
+
+## 16. Built-in Observability & Telemetry Virtual Tables
+
+### The SQLite Pain Point
+A common complaint in real-world deployments is the lack of performance tooling and foolproofing. Users frequently complain about "thrashing," unpredictable slowdowns during heavy INSERTS (WAL overruns), and connection timeouts, but because embedded databases are just files/libraries, developers have zero visibility into what's actually happening unless they compile a custom instrumented version or litter their code with manual timers.
+
+### The DecentDB Win
+DecentDB shouldn't require external APM agents or custom profiling builds to figure out why a query is slow or why writes are blocked. Because it's embedded, it should expose its internal state natively via `sys.*` virtual tables.
+
+Developers can simply query the database to diagnose problems in real time:
+*   `SELECT * FROM sys.wal_metrics;` (See checkpoint lag, flush queue size, disk write rates)
+*   `SELECT * FROM sys.slow_queries;` (Automatically tracks queries taking >100ms without needing external wrappers)
+*   `SELECT * FROM sys.lock_waits;` (Which concurrent process/reader is currently holding up the writer?)
+
+### Implementation Guidelines for Agents
+1.  **Sys Schema:** Create a reserved system schema (e.g. `sys` or `information_schema`) that cannot be dropped or mutated by the user, providing virtual tables.
+2.  **Zero-Overhead Defaults:** Telemetry collection should have near-zero overhead by default, using simple atomic counters for global metrics.
+3.  **Configurable Tracing:** Allow pragma-based configuration to turn on more expensive tracing (e.g. `PRAGMA slow_query_log_threshold_ms = 50;`) which writes to an in-memory ring buffer (e.g., `sys.slow_queries`) to avoid recursive disk writes.
+4.  **B-Tree/Pager Metrics:** Expose buffer pool hit/miss rates, index usage statistics, and active transaction count to allow developers to build dashboarding around their embedded databases.
+
+---
+
+## 17. Cloud-Native Object Storage VFS (S3 / R2)
+
+### The SQLite Pain Point
+Deploying standard SQLite on "true serverless" environments—like AWS Lambda, Cloudflare Workers, or Vercel Edge—is notoriously difficult. Because these environments are strictly ephemeral, executing for only milliseconds before being destroyed, any data written to the local disk simply disappears. Attempting to work around this requires developers to implement complex logic to sync entire `.sqlite` files from cloud storage on every cold start, or to pay for highly specialized hosted database services.
+
+### The DecentDB Win
+DecentDB introduces an **Object Storage VFS (Virtual File System)**. By utilizing its clean Pager/VFS abstraction layer and Rust's powerful async networking ecosystem, DecentDB will support direct reads and writes of 4KB/8KB pages via S3, Cloudflare R2, Azure Blob Storage, or arbitrary HTTP APIs.
+*   **Zero-Copy Cold Starts:** Only the root B-Tree pages are pulled over the network to establish the session.
+*   **Partial Syncs:** Committed transactions sync only the exact changed pages directly to the object store instead of writing an entire database file.
+*   **True Serverless Edge:** Serverless functions can operate natively as ephemeral compute nodes while DecentDB transparently coordinates the durable "disk" across the network interface.
+
+### Implementation Guidelines for Agents
+1.  **VFS Trait Expansion:** Ensure the VFS layer abstracts away block I/O completely, separating synchronous local disk operations from potential `async` network fetch operations required for cloud endpoints.
+2.  **Range Requests:** Remote data reads MUST utilize HTTP `Range` headers to fetch exact 4KB/8KB pages, effectively treating the object storage bucket exactly like a block storage device.
+3.  **Local Caching:** For edge compute environments, the Object Storage VFS should lean heavily heavily on available ephemeral local storage (or memory) to cache heavily used branch nodes.
+
+---
+
 ## Conclusion
 
 DecentDB has already shipped significant differentiators from SQLite, and this document should treat them as foundations rather than future ideas:
@@ -402,22 +464,22 @@ DecentDB has already shipped significant differentiators from SQLite, and this d
 *   **Native rich types:** TIMESTAMP, UUID, DECIMAL with proper storage formats
 *   **Advanced indexing:** Trigram indexes for `LIKE '%pattern%'`, plus shipping expression and partial indexes within the current v1 subset
 *   **Modern SQL:** Recursive CTEs, savepoints, generated columns, temp tables, and a focused first slice of window functions
+*   **Built-in Functions:** Date/Time functions, UUID generation, and JSON scalar/table functions
 *   **Upsert support:** `INSERT ... ON CONFLICT DO UPDATE/NOTHING` and `INSERT ... RETURNING`
 *   **ORM integration:** Native EF Core provider with query translation
-*   **Developer experience:** In-memory VFS for testing, cost-based optimizer, bulk load API, and shared WAL visibility across same-process connections
+*   **Developer experience:** In-memory VFS for testing, cost-based optimizer with `ANALYZE` and planner statistics, bulk load API, and shared WAL visibility across same-process connections
 
-The remaining roadmap items now break cleanly into two groups: short-horizon finish work and long-horizon platform bets.
+The remaining roadmap items now break cleanly into several categories of major platform bets:
 
 | Category | Features |
 |----------|----------|
-| **Finish the Surface Area** | JSON table functions/operators, Date/Time builtins, UUID generation, Planner statistics / `ANALYZE` |
-| **Ecosystem & Deployment** | First-Class WASM (OPFS VFS), Built-in HTTP Server (`decentdb serve`) |
-| **Performance** | JSONB, Group Commit, Bulk Load follow-ons |
+| **Ecosystem & Deployment** | First-Class WASM (OPFS VFS), Built-in HTTP Server (`decentdb serve`), Cloud-Native Object Storage VFS (S3/R2) |
+| **Performance** | JSONB, Group Commit, Bulk Load follow-ons, Transparent Data Compression |
 | **Concurrency** | Transparent Write Queuing, Cross-process WAL coordination |
 | **Real-time** | CDC / Reactive Subscriptions |
 | **AI/ML** | Vector / HNSW Index |
 | **Security** | Transparent Data Encryption |
 | **Search** | Full-Text Search with BM25 |
-| **Operations** | Zero-Copy Branching, Non-blocking schema migration, WAL streaming replication |
+| **Operations** | Zero-Copy Branching, Non-blocking schema migration, WAL streaming replication, Built-in Observability |
 
 By executing on these features, DecentDB shifts from being "another embedded database" to an indispensable, modern infrastructure component that actively solves the hardest parts of local-first development, AI integration, and high-concurrency embedded systems.

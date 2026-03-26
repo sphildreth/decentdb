@@ -6,11 +6,14 @@ mod tests {
     fn parse_matrix_tests_for_supported_syntax() {
         let valid_statements = [
             "CREATE TABLE users (id INT64 PRIMARY KEY)",
+            "CREATE SCHEMA app",
             "CREATE TABLE products (id INT64 PRIMARY KEY, price FLOAT64, qty INT64, total FLOAT64 GENERATED ALWAYS AS (price * qty) STORED)",
+            "CREATE TABLE products_v (id INT64 PRIMARY KEY, price FLOAT64, qty INT64, total FLOAT64 GENERATED ALWAYS AS (price * qty) VIRTUAL)",
             "CREATE TEMP TABLE scratch (id INT64 PRIMARY KEY, val TEXT)",
             "CREATE TEMP VIEW scratch_view AS SELECT 1",
             "CREATE TRIGGER log_insert AFTER INSERT ON users FOR EACH ROW BEGIN SELECT decentdb_exec_sql('INSERT INTO audit_log (msg) VALUES (''user added'')'); END",
             "CREATE INDEX ix_name ON users(name)",
+            "CREATE INDEX ix_covering ON users(name) INCLUDE (id)",
             "INSERT INTO users (id) VALUES (1)",
             "SELECT * FROM users WHERE id = 1",
             "SELECT 10 % 3",
