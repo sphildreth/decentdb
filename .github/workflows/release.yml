@@ -1,0 +1,322 @@
+name: Release (GitHub)
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    name: Full Validation Suite
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "25"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+
+      - name: Install docs tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install mkdocs-minify-plugin mkdocs-material mkdocs-awesome-pages-plugin mkdocs-mermaid2-plugin
+
+      - name: Format Check
+        run: |
+          echo "Checking Rust code formatting..."
+          if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
+            echo ""
+            echo "::error::Code formatting issues detected"
+            echo ""
+            echo "Formatting diffs (run 'cargo fmt' to fix):"
+            echo "::group::Details"
+            cat /tmp/fmt-check.log
+            echo "::endgroup::"
+            exit 1
+          fi
+
+      - name: Workspace Checks
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Short Crash Harness
+        run: python tests/harness/runner.py tests/harness/scenarios/short_crash.json
+
+      - name: Build cdylib
+        run: cargo build -p decentdb
+
+      - name: Python Binding Test Suite
+        run: |
+          cd bindings/python
+          pip install -e .
+          pytest -v tests/
+          cd ../..
+
+      - name: .NET Binding Test Suite
+        run: |
+          cd bindings/dotnet
+          dotnet clean
+          dotnet build
+          dotnet test --verbosity normal
+          cd ../..
+
+      - name: Binding Smoke Tests (Go, Java, Node, Dart, C)
+        run: |
+          bash tests/bindings/c/run.sh
+          go run ./tests/bindings/go/smoke.go
+          javac tests/bindings/java/Smoke.java
+          java --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke
+          bash tests/bindings/node/build.sh
+          node tests/bindings/node/smoke.js
+          cd tests/bindings/dart
+          dart pub get
+          dart run smoke.dart
+          cd ../../..
+
+      - name: Storage Soak Harness
+        run: python tests/harness/runner.py tests/harness/scenarios/soak_storage.json
+
+      - name: Release Benchmarks
+        run: cargo bench -p decentdb --bench release_metrics
+
+      - name: Docs Build
+        run: |
+          cargo test -p decentdb --doc
+          cargo doc --workspace --no-deps
+          mkdocs build --config-file mkdocs.yml --site-dir site
+
+  build:
+    name: Build artifacts (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    needs: [validate]
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Linux x64
+            runner: ubuntu-latest
+            release_suffix: Linux-x64
+            java_suffix: Linux
+            artifact_name: linux-x64
+          - label: Linux arm64
+            runner: ubuntu-24.04-arm
+            release_suffix: Linux-arm64
+            java_suffix: Linux-arm64
+            artifact_name: linux-arm64
+          - label: Windows x64
+            runner: windows-latest
+            release_suffix: Windows-x64
+            java_suffix: Windows
+            artifact_name: windows-x64
+          - label: macOS
+            runner: macos-latest
+            release_suffix: macOS-x64
+            java_suffix: macOS
+            artifact_name: macos-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Download DBeaver plugins (for compile)
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo_root="$PWD"
+          dbeaver_dir="$repo_root/.dbeaver"
+          mkdir -p "$dbeaver_dir"
+
+          curl -fsSL -o "$dbeaver_dir/dbeaver.zip" \
+            https://dbeaver.io/files/dbeaver-ce-latest-win32.win32.x86_64.zip
+
+          python - "$dbeaver_dir/dbeaver.zip" "$dbeaver_dir" <<'PY'
+          import sys, zipfile
+          zip_path, dest = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(zip_path) as z:
+              z.extractall(dest)
+          PY
+
+          test -d "$dbeaver_dir/dbeaver/plugins"
+          echo "DBEAVER_PLUGIN_DIR=$dbeaver_dir/dbeaver/plugins" >> "$GITHUB_ENV"
+
+      - name: Build native library (Rust cdylib)
+        run: cargo build -p decentdb --release
+
+      - name: Build CLI (release)
+        run: cargo build -p decentdb-cli --release
+
+      - name: Build JNI bridge native library (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C bindings/java/native clean all DECENTDB_LIB_DIR="$PWD/target/release"
+
+      - name: Build JNI bridge native library (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C bindings/java/native clean all DECENTDB_LIB_DIR="$(cygpath -m "$PWD/target/release")"
+
+      - name: Build JDBC driver + DBeaver plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd bindings/java
+          ./gradlew --no-daemon :driver:jar :dbeaver-extension:jar -PnativeLibDir="$GITHUB_WORKSPACE/target/release" -PdbeaverPluginDir="$DBEAVER_PLUGIN_DIR"
+
+          mkdir -p "$GITHUB_WORKSPACE/dbeaver-dist/dbeaver/plugins"
+          cp -v dbeaver-extension/build/libs/dbeaver-extension-*.jar "$GITHUB_WORKSPACE/dbeaver-dist/dbeaver/plugins/org.jkiss.dbeaver.ext.decentdb_${GITHUB_REF_NAME#v}.jar"
+          cp -v driver/build/libs/driver-*.jar "$GITHUB_WORKSPACE/decentdb-jdbc-${GITHUB_REF_NAME}-${{ matrix.java_suffix }}.jar"
+
+      - name: Stage artifacts (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -v target/release/decentdb dist/
+          cp -v target/release/libdecentdb.so dist/libdecentdb.so 2>/dev/null || true
+          cp -v target/release/libdecentdb.dylib dist/libdecentdb.dylib 2>/dev/null || true
+          cp -v target/release/libdecentdb_jni.so dist/ 2>/dev/null || true
+          cp -v target/release/libdecentdb_jni.dylib dist/ 2>/dev/null || true
+
+      - name: Stage artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Force target\release\decentdb.exe dist\
+          Copy-Item -Force target\release\decentdb.dll dist\ 2>$null
+          Copy-Item -Force target\release\decentdb_jni.dll dist\ 2>$null
+          if (!(Test-Path dist\decentdb.dll)) { throw "Native DLL not found" }
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          OUT="decentdb-${TAG}-${{ matrix.release_suffix }}.tar.gz"
+          tar -C dist -czf "$OUT" .
+
+      - name: Package DBeaver plugin (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="decentdb-dbeaver-${GITHUB_REF_NAME}-${{ matrix.java_suffix }}.zip"
+          cd dbeaver-dist
+          zip -r "../$OUT" dbeaver
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = "$env:GITHUB_REF_NAME"
+          $out = "decentdb-$tag-${{ matrix.release_suffix }}.zip"
+          Compress-Archive -Path dist\* -DestinationPath $out -Force
+
+      - name: Package DBeaver plugin (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "decentdb-dbeaver-$env:GITHUB_REF_NAME-${{ matrix.java_suffix }}.zip"
+          if (Test-Path $out) { Remove-Item -Force $out }
+          Compress-Archive -Path dbeaver-dist\dbeaver -DestinationPath $out -Force
+
+      - name: Upload artifact
+        uses: Wandalen/wretry.action@v3.8.0
+        with:
+          attempt_limit: 3
+          attempt_delay: 10000
+          action: actions/upload-artifact@v4
+          with: |
+            name: release-${{ matrix.artifact_name }}
+            path: |
+              decentdb-${{ github.ref_name }}-${{ matrix.release_suffix }}.tar.gz
+              decentdb-${{ github.ref_name }}-${{ matrix.release_suffix }}.zip
+              decentdb-jdbc-${{ github.ref_name }}-${{ matrix.java_suffix }}.jar
+              decentdb-dbeaver-${{ github.ref_name }}-${{ matrix.java_suffix }}.zip
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') || contains(github.ref_name, '-rc.') }}
+          files: |
+            artifacts/**/decentdb-${{ github.ref_name }}-Linux-x64.tar.gz
+            artifacts/**/decentdb-${{ github.ref_name }}-Linux-arm64.tar.gz
+            artifacts/**/decentdb-${{ github.ref_name }}-macOS-x64.tar.gz
+            artifacts/**/decentdb-${{ github.ref_name }}-Windows-x64.zip
+            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux.jar
+            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux-arm64.jar
+            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-macOS.jar
+            artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Windows.jar
+            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-Linux.zip
+            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-Linux-arm64.zip
+            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-macOS.zip
+            artifacts/**/decentdb-dbeaver-${{ github.ref_name }}-Windows.zip
