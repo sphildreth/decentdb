@@ -14,6 +14,7 @@ pub(crate) mod views;
 #[cfg(test)]
 mod views_tests;
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,7 +63,15 @@ const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 const LEGACY_RUNTIME_PAYLOAD_MAGIC: &[u8; 9] = b"DDBSTATE1";
 const MANIFEST_PAYLOAD_MAGIC: &[u8; 8] = b"DDBMANF1";
 const TABLE_PAYLOAD_MAGIC: &[u8; 8] = b"DDBTBL01";
+const GENERATED_COLUMNS_SECTION_MAGIC: &[u8; 8] = b"DDBGCM02";
 static RANDOM_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn generated_columns_are_stored(table: &TableSchema) -> bool {
+    table
+        .columns
+        .iter()
+        .all(|column| column.generated_sql.is_none() || column.generated_stored)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NameResolutionScope {
@@ -801,6 +810,30 @@ impl EngineRuntime {
         self.table_data_in_scope(name, NameResolutionScope::Session)
     }
 
+    pub(super) fn table_data_for_schema<'a>(
+        &'a self,
+        table: &TableSchema,
+        name: &str,
+    ) -> Result<Option<Cow<'a, TableData>>> {
+        let Some(data) = self.table_data(name) else {
+            return Ok(None);
+        };
+        if generated_columns_are_stored(table) {
+            return Ok(Some(Cow::Borrowed(data)));
+        }
+        let mut materialized = TableData::default();
+        materialized.rows.reserve(data.rows.len());
+        for stored_row in &data.rows {
+            let mut values = stored_row.values.clone();
+            self.apply_virtual_generated_columns(table, &mut values)?;
+            materialized.rows.push(StoredRow {
+                row_id: stored_row.row_id,
+                values,
+            });
+        }
+        Ok(Some(Cow::Owned(materialized)))
+    }
+
     pub(super) fn table_data_mut_in_scope(
         &mut self,
         name: &str,
@@ -1195,6 +1228,7 @@ impl EngineRuntime {
                 nullable: true,
                 default: None,
                 generated: None,
+                generated_stored: true,
                 primary_key: false,
                 unique: false,
                 checks: Vec::new(),
@@ -2890,7 +2924,10 @@ impl EngineRuntime {
                 let table = self
                     .table_schema(name)
                     .ok_or_else(|| DbError::sql(format!("unknown table or view {name}")))?;
-                let data = self.table_data(name).cloned().unwrap_or_default();
+                let data = self
+                    .table_data_for_schema(table, name)
+                    .map(|data| data.map(Cow::into_owned))?
+                    .unwrap_or_default();
                 Ok(Dataset {
                     columns: table
                         .columns
@@ -4044,6 +4081,7 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
                 nullable,
                 default_sql,
                 generated_sql: None,
+                generated_stored: true,
                 primary_key,
                 unique,
                 auto_increment,
@@ -4350,6 +4388,7 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
                 nullable,
                 default_sql,
                 generated_sql: None,
+                generated_stored: true,
                 primary_key,
                 unique,
                 auto_increment,
@@ -4653,20 +4692,24 @@ fn encode_generated_columns_section(
                         table.name.as_str(),
                         column.name.as_str(),
                         generated_sql.as_str(),
+                        column.generated_stored,
                     )
                 })
             })
         })
         .collect::<Vec<_>>();
+    output.extend_from_slice(GENERATED_COLUMNS_SECTION_MAGIC);
+    output.push(1);
     encode_u32(
         output,
         u32::try_from(generated_columns.len())
             .map_err(|_| DbError::constraint("generated column count exceeds u32"))?,
     );
-    for (table_name, column_name, generated_sql) in generated_columns {
+    for (table_name, column_name, generated_sql, generated_stored) in generated_columns {
         encode_string(output, table_name)?;
         encode_string(output, column_name)?;
         encode_string(output, generated_sql)?;
+        output.push(u8::from(generated_stored));
     }
     Ok(())
 }
@@ -4675,11 +4718,29 @@ fn decode_generated_columns_section(
     cursor: &mut Cursor<'_>,
     tables: &mut BTreeMap<String, TableSchema>,
 ) -> Result<()> {
+    let section_is_versioned = cursor
+        .bytes
+        .get(cursor.offset..cursor.offset + GENERATED_COLUMNS_SECTION_MAGIC.len())
+        .is_some_and(|magic| magic == GENERATED_COLUMNS_SECTION_MAGIC);
+    if section_is_versioned {
+        cursor.offset += GENERATED_COLUMNS_SECTION_MAGIC.len();
+        let version = cursor.read_u8()?;
+        if version != 1 {
+            return Err(DbError::corruption(format!(
+                "unknown generated columns section version {version}"
+            )));
+        }
+    }
     let generated_column_count = cursor.read_u32()?;
     for _ in 0..generated_column_count {
         let table_name = cursor.read_string()?;
         let column_name = cursor.read_string()?;
         let generated_sql = cursor.read_string()?;
+        let generated_stored = if section_is_versioned {
+            cursor.read_bool()?
+        } else {
+            true
+        };
         let table = tables.get_mut(&table_name).ok_or_else(|| {
             DbError::corruption(format!(
                 "generated column metadata referenced unknown table {table_name}"
@@ -4696,6 +4757,7 @@ fn decode_generated_columns_section(
                 ))
             })?;
         column.generated_sql = Some(generated_sql);
+        column.generated_stored = generated_stored;
     }
     Ok(())
 }
@@ -7395,6 +7457,41 @@ impl EngineRuntime {
         } else {
             Err(DbError::sql(format!("unknown column {column}")))
         }
+    }
+
+    pub(super) fn apply_virtual_generated_columns(
+        &self,
+        table: &TableSchema,
+        row: &mut [Value],
+    ) -> Result<()> {
+        if generated_columns_are_stored(table) {
+            return Ok(());
+        }
+        let mut base_values = row.to_vec();
+        for (index, column) in table.columns.iter().enumerate() {
+            let Some(generated_sql) = &column.generated_sql else {
+                continue;
+            };
+            if column.generated_stored {
+                base_values[index] = row
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| DbError::internal("row is shorter than table schema"))?;
+                continue;
+            }
+            let expr = crate::sql::parser::parse_expression_sql(generated_sql)?;
+            let dataset = table_row_dataset(table, &base_values, &table.name);
+            let eval_row = dataset.rows.first().map(Vec::as_slice).unwrap_or(&[]);
+            let value = self.eval_expr(&expr, &dataset, eval_row, &[], &BTreeMap::new(), None)?;
+            let cast_value = cast_value(value, column.column_type)?;
+            if let Some(slot) = row.get_mut(index) {
+                *slot = cast_value.clone();
+            } else {
+                return Err(DbError::internal("row is shorter than table schema"));
+            }
+            base_values[index] = cast_value;
+        }
+        Ok(())
     }
 }
 

@@ -1026,6 +1026,7 @@ fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<Column
             .then(|| definition.default.as_ref().map(|expr| expr.to_sql()))
             .flatten(),
         generated_sql: definition.generated.as_ref().map(|expr| expr.to_sql()),
+        generated_stored: definition.generated_stored,
         primary_key: definition.primary_key,
         unique: definition.unique || definition.primary_key,
         auto_increment: definition.primary_key

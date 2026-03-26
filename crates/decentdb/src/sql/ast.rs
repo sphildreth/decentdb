@@ -388,6 +388,7 @@ pub(crate) struct ColumnDefinition {
     pub(crate) nullable: bool,
     pub(crate) default: Option<Expr>,
     pub(crate) generated: Option<Expr>,
+    pub(crate) generated_stored: bool,
     pub(crate) primary_key: bool,
     pub(crate) unique: bool,
     pub(crate) checks: Vec<Expr>,

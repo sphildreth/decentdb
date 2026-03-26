@@ -1,5 +1,7 @@
 //! DML execution helpers.
 
+use std::borrow::Cow;
+
 use crate::catalog::{identifiers_equal, ColumnType, IndexKind, TriggerEvent};
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
@@ -13,8 +15,9 @@ use crate::sql::parser::parse_expression_sql;
 
 use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
-    compare_values, compute_index_key, compute_index_values, row_satisfies_index_predicate,
-    table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex, StoredRow,
+    compare_values, compute_index_key, compute_index_values, generated_columns_are_stored,
+    row_satisfies_index_predicate, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
+    StoredRow,
 };
 
 #[derive(Clone, Debug)]
@@ -1097,6 +1100,20 @@ impl EngineRuntime {
         let table = self
             .table_schema(table_name)
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let rendered_rows = if generated_columns_are_stored(table) {
+            rows.to_vec()
+        } else {
+            let mut rendered_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut values = row.values.clone();
+                self.apply_virtual_generated_columns(table, &mut values)?;
+                rendered_rows.push(StoredRow {
+                    row_id: row.row_id,
+                    values,
+                });
+            }
+            rendered_rows
+        };
         let dataset = Dataset {
             columns: table
                 .columns
@@ -1105,7 +1122,10 @@ impl EngineRuntime {
                     ColumnBinding::visible(Some(table_name.to_string()), column.name.clone())
                 })
                 .collect(),
-            rows: rows.iter().map(|row| row.values.clone()).collect(),
+            rows: rendered_rows
+                .iter()
+                .map(|row| row.values.clone())
+                .collect(),
         };
         let projected = self.project_dataset(
             &dataset,
@@ -2009,10 +2029,10 @@ fn matching_row_ids(
         return Ok(indexed_row_ids);
     }
     let rows = runtime
-        .table_data(&table.name)
-        .ok_or_else(|| DbError::internal(format!("table data for {} is missing", table.name)))?
-        .rows
-        .as_slice();
+        .table_data_for_schema(table, &table.name)?
+        .map(Cow::into_owned)
+        .unwrap_or_default()
+        .rows;
     rows.iter()
         .filter(|row| row_matches_filter(runtime, table, row, filter, params).unwrap_or(false))
         .map(|row| Ok(row.row_id))
@@ -2025,6 +2045,9 @@ fn indexed_row_ids_for_filter(
     filter: Option<&Expr>,
     params: &[Value],
 ) -> Result<Option<Vec<i64>>> {
+    if !generated_columns_are_stored(table) {
+        return Ok(None);
+    }
     let Some(filter) = filter else {
         return Ok(None);
     };

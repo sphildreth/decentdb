@@ -18,6 +18,13 @@ use super::ast::{
 };
 
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
+    normalize_statement_text_with_generated_modes(sql, &[])
+}
+
+pub(crate) fn normalize_statement_text_with_generated_modes(
+    sql: &str,
+    generated_column_modes: &[bool],
+) -> Result<Statement> {
     let parsed = libpg_query_sys::parse_statement(sql)
         .map_err(|error| DbError::sql(error.message().to_string()))?;
     let raw = parsed
@@ -26,17 +33,28 @@ pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
         .and_then(|stmt| stmt.stmt.as_ref())
         .and_then(|stmt| stmt.node.as_ref())
         .ok_or_else(|| DbError::sql("parser returned an empty statement"))?;
-    normalize_statement(raw, sql)
+    normalize_statement_with_generated_modes(raw, sql, generated_column_modes)
 }
 
 fn normalize_statement(node: &NodeEnum, original_sql: &str) -> Result<Statement> {
+    normalize_statement_with_generated_modes(node, original_sql, &[])
+}
+
+fn normalize_statement_with_generated_modes(
+    node: &NodeEnum,
+    original_sql: &str,
+    generated_column_modes: &[bool],
+) -> Result<Statement> {
     match node {
         NodeEnum::SelectStmt(statement) => Ok(Statement::Query(normalize_query(statement)?)),
         NodeEnum::InsertStmt(statement) => Ok(Statement::Insert(normalize_insert(statement)?)),
         NodeEnum::UpdateStmt(statement) => Ok(Statement::Update(normalize_update(statement)?)),
         NodeEnum::DeleteStmt(statement) => Ok(Statement::Delete(normalize_delete(statement)?)),
         NodeEnum::CreateStmt(statement) => {
-            Ok(Statement::CreateTable(normalize_create_table(statement)?))
+            Ok(Statement::CreateTable(normalize_create_table(
+                statement,
+                generated_column_modes,
+            )?))
         }
         NodeEnum::CreateTableAsStmt(statement) => Ok(Statement::CreateTableAs(
             normalize_create_table_as(statement)?,
@@ -380,7 +398,10 @@ fn normalize_delete(statement: &protobuf::DeleteStmt) -> Result<DeleteStatement>
     })
 }
 
-fn normalize_create_table(statement: &protobuf::CreateStmt) -> Result<CreateTableStatement> {
+fn normalize_create_table(
+    statement: &protobuf::CreateStmt,
+    generated_column_modes: &[bool],
+) -> Result<CreateTableStatement> {
     let relation = statement
         .relation
         .as_ref()
@@ -388,9 +409,27 @@ fn normalize_create_table(statement: &protobuf::CreateStmt) -> Result<CreateTabl
     let table_name = normalize_range_var(relation)?;
     let mut columns = Vec::new();
     let mut constraints = Vec::new();
+    let mut generated_mode_index = 0_usize;
     for element in &statement.table_elts {
         match node_kind(element)? {
-            NodeEnum::ColumnDef(column) => columns.push(normalize_column_definition(column)?),
+            NodeEnum::ColumnDef(column) => {
+                let generated_stored = generated_column_modes
+                    .get(generated_mode_index)
+                    .copied()
+                    .unwrap_or(true);
+                columns.push(normalize_column_definition(column, generated_stored)?);
+                if column.constraints.iter().any(|constraint| {
+                    matches!(
+                        node_kind(constraint),
+                        Ok(NodeEnum::Constraint(constraint))
+                            if protobuf::ConstrType::try_from(constraint.contype)
+                                .unwrap_or(protobuf::ConstrType::Undefined)
+                                == protobuf::ConstrType::ConstrGenerated
+                    )
+                }) {
+                    generated_mode_index += 1;
+                }
+            }
             NodeEnum::Constraint(constraint) => {
                 constraints.push(normalize_table_constraint(constraint)?)
             }
@@ -470,7 +509,10 @@ fn normalize_create_table_as(
     })
 }
 
-fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDefinition> {
+fn normalize_column_definition(
+    column: &protobuf::ColumnDef,
+    generated_stored: bool,
+) -> Result<ColumnDefinition> {
     let mut primary_key = false;
     let mut unique = false;
     let mut not_null = column.is_not_null;
@@ -548,6 +590,7 @@ fn normalize_column_definition(column: &protobuf::ColumnDef) -> Result<ColumnDef
         nullable: !not_null && !primary_key,
         default,
         generated,
+        generated_stored,
         primary_key,
         unique,
         checks,
@@ -868,7 +911,7 @@ fn normalize_alter_table_command(command: &protobuf::AlterTableCmd) -> Result<Al
                 .ok_or_else(|| unsupported("ALTER TABLE ADD COLUMN is missing a definition"))?;
             match node_kind(definition)? {
                 NodeEnum::ColumnDef(column) => Ok(AlterTableAction::AddColumn(
-                    normalize_column_definition(column)?,
+                    normalize_column_definition(column, true)?,
                 )),
                 _ => Err(unsupported("unsupported ALTER TABLE ADD COLUMN definition")),
             }

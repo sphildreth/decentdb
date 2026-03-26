@@ -74,6 +74,7 @@ pub(crate) struct ColumnSchema {
     pub(crate) nullable: bool,
     pub(crate) default_sql: Option<String>,
     pub(crate) generated_sql: Option<String>,
+    pub(crate) generated_stored: bool,
     pub(crate) primary_key: bool,
     pub(crate) unique: bool,
     pub(crate) auto_increment: bool,

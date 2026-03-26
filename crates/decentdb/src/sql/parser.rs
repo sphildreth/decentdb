@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use crate::error::{DbError, Result};
 
 use super::ast::{Expr, SelectItem, Statement};
-use super::normalize::normalize_statement_text;
+use super::normalize::{normalize_statement_text, normalize_statement_text_with_generated_modes};
 
 pub(crate) fn parse_sql_statement(sql: &str) -> Result<Statement> {
     let mut statements = parse_sql_batch(sql)?;
@@ -19,18 +19,421 @@ pub(crate) fn parse_sql_statement(sql: &str) -> Result<Statement> {
 }
 
 pub(crate) fn parse_sql_batch(sql: &str) -> Result<Vec<Statement>> {
-    let compat_sql = rewrite_legacy_trigger_body(sql);
+    let (generated_modes, sql_with_generated_rewrite) = rewrite_generated_virtual_columns(sql);
+    let compat_sql = rewrite_legacy_trigger_body(sql_with_generated_rewrite.as_ref());
     let statements = libpg_query_sys::split_statements(compat_sql.as_ref())
         .map_err(|error| DbError::sql(error.message().to_string()))?;
     if statements.is_empty() {
         return Err(DbError::sql("no SQL statements found"));
     }
 
+    let mut generated_mode_index = 0_usize;
     statements
         .into_iter()
         .filter(|statement| !statement.trim().is_empty())
-        .map(|statement| normalize_statement_text(&statement))
+        .map(|statement| {
+            let generated_count = count_generated_columns(&statement);
+            if generated_mode_index.saturating_add(generated_count) > generated_modes.len() {
+                return Err(DbError::sql(
+                    "failed to normalize generated column definition",
+                ));
+            }
+            let modes = &generated_modes
+                [generated_mode_index..generated_mode_index.saturating_add(generated_count)];
+            generated_mode_index = generated_mode_index.saturating_add(generated_count);
+            if generated_count == 0 {
+                normalize_statement_text(&statement)
+            } else {
+                normalize_statement_text_with_generated_modes(&statement, modes)
+            }
+        })
         .collect()
+}
+
+fn rewrite_generated_virtual_columns(sql: &str) -> (Vec<bool>, Cow<'_, str>) {
+    let mut generated_modes = Vec::new();
+    let mut output = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut index = 0_usize;
+    let mut changed = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if in_line_comment {
+            output.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_block_comment {
+            output.push(ch);
+            if ch == '*' && index + 1 < bytes.len() && bytes[index + 1] as char == '/' {
+                output.push('/');
+                index += 2;
+                in_block_comment = false;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_single {
+            output.push(ch);
+            if ch == '\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] as char == '\'' {
+                    output.push('\'');
+                    index += 2;
+                } else {
+                    index += 1;
+                    in_single = false;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_double {
+            output.push(ch);
+            if ch == '"' {
+                if index + 1 < bytes.len() && bytes[index + 1] as char == '"' {
+                    output.push('"');
+                    index += 2;
+                } else {
+                    index += 1;
+                    in_double = false;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        if ch == '-' && index + 1 < bytes.len() && bytes[index + 1] as char == '-' {
+            output.push('-');
+            output.push('-');
+            index += 2;
+            in_line_comment = true;
+            continue;
+        }
+        if ch == '/' && index + 1 < bytes.len() && bytes[index + 1] as char == '*' {
+            output.push('/');
+            output.push('*');
+            index += 2;
+            in_block_comment = true;
+            continue;
+        }
+        if ch == '\'' {
+            output.push(ch);
+            in_single = true;
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            output.push(ch);
+            in_double = true;
+            index += 1;
+            continue;
+        }
+
+        if starts_with_keyword(bytes, index, "GENERATED") {
+            let output_len_before = output.len();
+            let generated_start = index;
+            output.push_str("GENERATED");
+            index += "GENERATED".len();
+            let mut local_modes = Vec::new();
+            loop {
+                let ws_after_generated = consume_and_copy_whitespace(bytes, &mut output, index);
+                index = ws_after_generated;
+                if !starts_with_keyword(bytes, index, "ALWAYS") {
+                    break;
+                }
+                output.push_str("ALWAYS");
+                index += "ALWAYS".len();
+
+                index = consume_and_copy_whitespace(bytes, &mut output, index);
+                if !starts_with_keyword(bytes, index, "AS") {
+                    break;
+                }
+                output.push_str("AS");
+                index += "AS".len();
+
+                index = consume_and_copy_whitespace(bytes, &mut output, index);
+                if index >= bytes.len() || bytes[index] as char != '(' {
+                    break;
+                }
+                output.push('(');
+                index += 1;
+                let mut depth = 1_i32;
+                let mut expr_in_single = false;
+                let mut expr_in_double = false;
+                let mut expr_in_line_comment = false;
+                let mut expr_in_block_comment = false;
+                while index < bytes.len() && depth > 0 {
+                    let expr_ch = bytes[index] as char;
+                    output.push(expr_ch);
+                    if expr_in_line_comment {
+                        if expr_ch == '\n' {
+                            expr_in_line_comment = false;
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    if expr_in_block_comment {
+                        if expr_ch == '*' && index + 1 < bytes.len() && bytes[index + 1] as char == '/'
+                        {
+                            output.push('/');
+                            index += 2;
+                            expr_in_block_comment = false;
+                        } else {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    if expr_in_single {
+                        if expr_ch == '\'' {
+                            if index + 1 < bytes.len() && bytes[index + 1] as char == '\'' {
+                                output.push('\'');
+                                index += 2;
+                            } else {
+                                index += 1;
+                                expr_in_single = false;
+                            }
+                        } else {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    if expr_in_double {
+                        if expr_ch == '"' {
+                            if index + 1 < bytes.len() && bytes[index + 1] as char == '"' {
+                                output.push('"');
+                                index += 2;
+                            } else {
+                                index += 1;
+                                expr_in_double = false;
+                            }
+                        } else {
+                            index += 1;
+                        }
+                        continue;
+                    }
+                    if expr_ch == '-' && index + 1 < bytes.len() && bytes[index + 1] as char == '-' {
+                        output.push('-');
+                        index += 2;
+                        expr_in_line_comment = true;
+                        continue;
+                    }
+                    if expr_ch == '/' && index + 1 < bytes.len() && bytes[index + 1] as char == '*' {
+                        output.push('*');
+                        index += 2;
+                        expr_in_block_comment = true;
+                        continue;
+                    }
+                    if expr_ch == '\'' {
+                        expr_in_single = true;
+                        index += 1;
+                        continue;
+                    }
+                    if expr_ch == '"' {
+                        expr_in_double = true;
+                        index += 1;
+                        continue;
+                    }
+                    if expr_ch == '(' {
+                        depth += 1;
+                        index += 1;
+                        continue;
+                    }
+                    if expr_ch == ')' {
+                        depth -= 1;
+                        index += 1;
+                        continue;
+                    }
+                    index += 1;
+                }
+
+                index = consume_and_copy_whitespace(bytes, &mut output, index);
+                if starts_with_keyword(bytes, index, "STORED") {
+                    output.push_str("STORED");
+                    index += "STORED".len();
+                    local_modes.push(true);
+                } else if starts_with_keyword(bytes, index, "VIRTUAL") {
+                    output.push_str("STORED");
+                    index += "VIRTUAL".len();
+                    local_modes.push(false);
+                    changed = true;
+                } else {
+                    local_modes.push(true);
+                }
+                break;
+            }
+            if local_modes.is_empty() {
+                output.truncate(output_len_before);
+                output.push(bytes[generated_start] as char);
+                index = generated_start + 1;
+            } else {
+                generated_modes.extend(local_modes);
+            }
+            continue;
+        }
+
+        output.push(ch);
+        index += 1;
+    }
+
+    if changed {
+        (generated_modes, Cow::Owned(output))
+    } else {
+        (generated_modes, Cow::Borrowed(sql))
+    }
+}
+
+fn count_generated_columns(sql: &str) -> usize {
+    let mut count = 0_usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let bytes = sql.as_bytes();
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        let ch = bytes[index] as char;
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if in_block_comment {
+            if ch == '*' && index + 1 < bytes.len() && bytes[index + 1] as char == '/' {
+                index += 2;
+                in_block_comment = false;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                if index + 1 < bytes.len() && bytes[index + 1] as char == '\'' {
+                    index += 2;
+                } else {
+                    index += 1;
+                    in_single = false;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                if index + 1 < bytes.len() && bytes[index + 1] as char == '"' {
+                    index += 2;
+                } else {
+                    index += 1;
+                    in_double = false;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if ch == '-' && index + 1 < bytes.len() && bytes[index + 1] as char == '-' {
+            index += 2;
+            in_line_comment = true;
+            continue;
+        }
+        if ch == '/' && index + 1 < bytes.len() && bytes[index + 1] as char == '*' {
+            index += 2;
+            in_block_comment = true;
+            continue;
+        }
+        if ch == '\'' {
+            index += 1;
+            in_single = true;
+            continue;
+        }
+        if ch == '"' {
+            index += 1;
+            in_double = true;
+            continue;
+        }
+        if starts_with_keyword(bytes, index, "GENERATED") {
+            let generated_start = index;
+            index += "GENERATED".len();
+            while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+                index += 1;
+            }
+            if !starts_with_keyword(bytes, index, "ALWAYS") {
+                index = generated_start + 1;
+                continue;
+            }
+            index += "ALWAYS".len();
+            while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+                index += 1;
+            }
+            if !starts_with_keyword(bytes, index, "AS") {
+                index = generated_start + 1;
+                continue;
+            }
+            index += "AS".len();
+            while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+                index += 1;
+            }
+            if index < bytes.len() && bytes[index] as char == '(' {
+                count += 1;
+            } else {
+                index = generated_start + 1;
+            }
+            continue;
+        }
+        index += 1;
+    }
+    count
+}
+
+fn starts_with_keyword(bytes: &[u8], index: usize, keyword: &str) -> bool {
+    let end = index.saturating_add(keyword.len());
+    if end > bytes.len() {
+        return false;
+    }
+    if index > 0 {
+        let prev = bytes[index - 1] as char;
+        if is_keyword_char(prev) {
+            return false;
+        }
+    }
+    let mut keyword_bytes = keyword.bytes();
+    for &candidate in &bytes[index..end] {
+        let Some(keyword_byte) = keyword_bytes.next() else {
+            return false;
+        };
+        if !candidate.eq_ignore_ascii_case(&keyword_byte) {
+            return false;
+        }
+    }
+    if end < bytes.len() {
+        let next = bytes[end] as char;
+        if is_keyword_char(next) {
+            return false;
+        }
+    }
+    true
+}
+
+fn consume_and_copy_whitespace(bytes: &[u8], output: &mut String, mut index: usize) -> usize {
+    while index < bytes.len() && (bytes[index] as char).is_ascii_whitespace() {
+        output.push(bytes[index] as char);
+        index += 1;
+    }
+    index
 }
 
 pub(crate) fn parse_expression_sql(sql: &str) -> Result<Expr> {

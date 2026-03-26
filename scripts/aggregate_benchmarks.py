@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 
 def _safe_float(x):
+    """Safely convert value to float, handling None and bools as None."""
     if x is None:
         return None
     try:
