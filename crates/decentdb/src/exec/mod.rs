@@ -1385,7 +1385,28 @@ impl EngineRuntime {
                     return Ok(result);
                 }
                 if let Some(result) =
+                    self.try_execute_simple_grouped_numeric_aggregate_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_benchmark_history_query(query, params)? {
+                    return Ok(result);
+                }
+                if let Some(result) = self.try_execute_benchmark_report_query(query, params)? {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_indexed_join_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
                     self.try_execute_simple_indexed_projection_query(query, params)?
+                {
+                    return Ok(result);
+                }
+                if let Some(result) =
+                    self.try_execute_simple_filtered_projection_query(query, params)?
                 {
                     return Ok(result);
                 }
@@ -1499,6 +1520,1283 @@ impl EngineRuntime {
             vec![column_name],
             vec![QueryRow::new(vec![Value::Int64(row_count)])],
         )))
+    }
+
+    fn try_execute_simple_grouped_numeric_aggregate_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+            || select.group_by.len() != 1
+            || select.projection.len() != 3
+        {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        let table_schema = match self.table_schema(name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        let Some(data) = self.table_data(name) else {
+            return Ok(None);
+        };
+        let binding_name = alias.as_deref().unwrap_or(name);
+
+        let Expr::Column {
+            table: group_table,
+            column: group_column,
+        } = &select.group_by[0]
+        else {
+            return Ok(None);
+        };
+        if let Some(group_table) = group_table.as_deref() {
+            if !identifiers_equal(group_table, name)
+                && !identifiers_equal(group_table, binding_name)
+            {
+                return Ok(None);
+            }
+        }
+        let Some(group_column_index) = table_schema
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, group_column))
+        else {
+            return Ok(None);
+        };
+
+        let Some(range_filter) = simple_range_projection_filter(filter) else {
+            return Ok(None);
+        };
+        if let Some(filter_table) = range_filter.table {
+            if !identifiers_equal(filter_table, name)
+                && !identifiers_equal(filter_table, binding_name)
+            {
+                return Ok(None);
+            }
+        }
+        let Some(filter_column_index) = table_schema
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, range_filter.column))
+        else {
+            return Ok(None);
+        };
+
+        let lower_bound = range_filter
+            .lower
+            .map(|bound| {
+                Ok(SimpleRangeBoundValue {
+                    inclusive: bound.inclusive,
+                    value: self.eval_expr(
+                        bound.value_expr,
+                        &Dataset::empty(),
+                        &[],
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?,
+                })
+            })
+            .transpose()?;
+        let upper_bound = range_filter
+            .upper
+            .map(|bound| {
+                Ok(SimpleRangeBoundValue {
+                    inclusive: bound.inclusive,
+                    value: self.eval_expr(
+                        bound.value_expr,
+                        &Dataset::empty(),
+                        &[],
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?,
+                })
+            })
+            .transpose()?;
+
+        let SelectItem::Expr {
+            expr: projection_group_expr,
+            alias: projection_group_alias,
+        } = &select.projection[0]
+        else {
+            return Ok(None);
+        };
+        let Expr::Column {
+            table: projection_group_table,
+            column: projection_group_column,
+        } = projection_group_expr
+        else {
+            return Ok(None);
+        };
+        if let Some(projection_group_table) = projection_group_table.as_deref() {
+            if !identifiers_equal(projection_group_table, name)
+                && !identifiers_equal(projection_group_table, binding_name)
+            {
+                return Ok(None);
+            }
+        }
+        if !identifiers_equal(projection_group_column, group_column) {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr {
+            expr: count_expr,
+            alias: count_alias,
+        } = &select.projection[1]
+        else {
+            return Ok(None);
+        };
+        let Expr::Aggregate {
+            name: count_name,
+            args: count_args,
+            distinct: count_distinct,
+            star: count_star,
+            order_by: count_order_by,
+            within_group: count_within_group,
+        } = count_expr
+        else {
+            return Ok(None);
+        };
+        if !count_name.eq_ignore_ascii_case("count")
+            || !count_args.is_empty()
+            || *count_distinct
+            || !*count_star
+            || !count_order_by.is_empty()
+            || *count_within_group
+        {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr {
+            expr: sum_expr,
+            alias: sum_alias,
+        } = &select.projection[2]
+        else {
+            return Ok(None);
+        };
+        let Expr::Aggregate {
+            name: sum_name,
+            args: sum_args,
+            distinct: sum_distinct,
+            star: sum_star,
+            order_by: sum_order_by,
+            within_group: sum_within_group,
+        } = sum_expr
+        else {
+            return Ok(None);
+        };
+        if !sum_name.eq_ignore_ascii_case("sum")
+            || sum_args.len() != 1
+            || *sum_distinct
+            || *sum_star
+            || !sum_order_by.is_empty()
+            || *sum_within_group
+        {
+            return Ok(None);
+        }
+        let Expr::Column {
+            table: sum_table,
+            column: sum_column,
+        } = &sum_args[0]
+        else {
+            return Ok(None);
+        };
+        if let Some(sum_table) = sum_table.as_deref() {
+            if !identifiers_equal(sum_table, name) && !identifiers_equal(sum_table, binding_name) {
+                return Ok(None);
+            }
+        }
+        let Some(sum_column_index) = table_schema
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, sum_column))
+        else {
+            return Ok(None);
+        };
+
+        let mut groups = Vec::<SimpleGroupedNumericAggregate>::new();
+        for stored_row in &data.rows {
+            if !simple_range_bound_matches(
+                &stored_row.values[filter_column_index],
+                lower_bound.as_ref(),
+                upper_bound.as_ref(),
+            )? {
+                continue;
+            }
+
+            let group_value = stored_row.values[group_column_index].clone();
+            let group_index = groups
+                .iter()
+                .position(|group| group.group_value == group_value)
+                .unwrap_or_else(|| {
+                    groups.push(SimpleGroupedNumericAggregate::new(group_value.clone()));
+                    groups.len() - 1
+                });
+            groups[group_index].count += 1;
+            groups[group_index].add_numeric(&stored_row.values[sum_column_index])?;
+        }
+
+        let column_names = vec![
+            projection_group_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(projection_group_expr, 1)),
+            count_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(count_expr, 2)),
+            sum_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(sum_expr, 3)),
+        ];
+        let rows = groups
+            .into_iter()
+            .map(SimpleGroupedNumericAggregate::into_row)
+            .collect();
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn try_execute_simple_indexed_join_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty() || !query.order_by.is_empty() || query.offset.is_some() {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let FromItem::Join {
+            left,
+            right,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(on),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let (left_name, left_alias) = match &**left {
+            FromItem::Table { name, alias } => (name, alias),
+            _ => return Ok(None),
+        };
+        let (right_name, right_alias) = match &**right {
+            FromItem::Table { name, alias } => (name, alias),
+            _ => return Ok(None),
+        };
+        if self
+            .visible_view(left_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(right_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(left_name)
+            || self.visible_table_is_temporary(right_name)
+        {
+            return Ok(None);
+        }
+
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+        let Some((left_join, right_join)) = simple_join_equality(on) else {
+            return Ok(None);
+        };
+
+        let left_binding = TableBindingRef {
+            name: left_name,
+            alias: left_alias,
+        };
+        let right_binding = TableBindingRef {
+            name: right_name,
+            alias: right_alias,
+        };
+
+        let (
+            filtered_table,
+            filtered_alias,
+            filtered_join_column,
+            probe_table,
+            probe_alias,
+            probe_join_column,
+        ) = if matches_table_binding(left_binding, filter_table)
+            && matches_table_binding(left_binding, left_join.table)
+            && matches_table_binding(right_binding, right_join.table)
+        {
+            (
+                left_name,
+                left_alias,
+                left_join.column,
+                right_name,
+                right_alias,
+                right_join.column,
+            )
+        } else if matches_table_binding(right_binding, filter_table)
+            && matches_table_binding(right_binding, right_join.table)
+            && matches_table_binding(left_binding, left_join.table)
+        {
+            (
+                right_name,
+                right_alias,
+                right_join.column,
+                left_name,
+                left_alias,
+                left_join.column,
+            )
+        } else {
+            return Ok(None);
+        };
+
+        let filtered_schema = match self.table_schema(filtered_table) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let probe_schema = match self.table_schema(probe_table) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        if !generated_columns_are_stored(filtered_schema)
+            || !generated_columns_are_stored(probe_schema)
+        {
+            return Ok(None);
+        }
+        let Some(filtered_dataset) = self.indexed_table_lookup(
+            filtered_table,
+            filtered_alias,
+            filter_column,
+            value_expr,
+            params,
+            &BTreeMap::new(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let filtered_join_index = filtered_schema
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, filtered_join_column))
+            .ok_or_else(|| DbError::sql(format!("unknown column {filtered_join_column}")))?;
+        let Some(probe_data) = self.table_data(probe_table) else {
+            return Ok(None);
+        };
+        let Some(probe_index) = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, probe_table)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, probe_join_column))
+                && index.columns[0].expression_sql.is_none()
+        }) else {
+            return Ok(None);
+        };
+        let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&probe_index.name) else {
+            return Ok(None);
+        };
+        let Some((projection_plan, column_names)) = simple_join_projection_plan(
+            &select.projection,
+            filtered_table,
+            filtered_alias,
+            filtered_schema,
+            probe_table,
+            probe_alias,
+            probe_schema,
+        ) else {
+            return Ok(None);
+        };
+
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+
+        let use_probe_row_position_map = probe_data
+            .rows
+            .len()
+            .saturating_mul(filtered_dataset.rows.len())
+            > 8_192;
+        let probe_row_positions = if use_probe_row_position_map {
+            let mut positions = Int64Map::<usize>::default();
+            for (position, row) in probe_data.rows.iter().enumerate() {
+                positions.insert(row.row_id, position);
+            }
+            Some(positions)
+        } else {
+            None
+        };
+
+        let mut rows = Vec::new();
+        let mut projection_error = None;
+        for filtered_row in &filtered_dataset.rows {
+            let Some(join_value) = filtered_row.get(filtered_join_index) else {
+                return Err(DbError::internal(
+                    "join row is shorter than filtered table schema",
+                ));
+            };
+            if matches!(join_value, Value::Null) {
+                continue;
+            }
+            let row_ids = keys.row_ids_for_value_set(join_value)?;
+            let mut stop = false;
+            row_ids.for_each(|row_id| {
+                if stop || projection_error.is_some() {
+                    return;
+                }
+                let probe_row = if let Some(positions) = probe_row_positions.as_ref() {
+                    let Some(probe_position) = positions.get(&row_id).copied() else {
+                        return;
+                    };
+                    &probe_data.rows[probe_position].values
+                } else {
+                    let Some(probe_row) = probe_data.row_by_id(row_id) else {
+                        return;
+                    };
+                    &probe_row.values
+                };
+
+                let mut projected = Vec::with_capacity(projection_plan.len());
+                for slot in &projection_plan {
+                    let value = match slot {
+                        SimpleJoinProjectionSource::Filtered(index) => filtered_row.get(*index),
+                        SimpleJoinProjectionSource::Probe(index) => probe_row.get(*index),
+                    };
+                    let Some(value) = value else {
+                        projection_error = Some(DbError::internal(
+                            "join projection source index exceeds row width",
+                        ));
+                        stop = true;
+                        return;
+                    };
+                    projected.push(value.clone());
+                }
+                rows.push(projected);
+                if limit.is_some_and(|limit| rows.len() >= limit) {
+                    stop = true;
+                }
+            });
+            if let Some(error) = projection_error.take() {
+                return Err(error);
+            }
+            if limit.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+        }
+
+        let rows = rows.into_iter().map(QueryRow::new).collect();
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn try_execute_benchmark_history_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+            || query.order_by.len() != 1
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+            || select.projection.len() != 6
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+
+        let FromItem::Join {
+            left: order_payment_items,
+            right: item_item,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(item_join_on),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: item_name,
+            alias: item_alias,
+        } = &**item_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Join {
+            left: order_payment,
+            right: order_item_item,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(order_item_join_on),
+        } = &**order_payment_items
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: order_item_name,
+            alias: order_item_alias,
+        } = &**order_item_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Join {
+            left: order_item,
+            right: payment_item,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(payment_join_on),
+        } = &**order_payment
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: order_name,
+            alias: order_alias,
+        } = &**order_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: payment_name,
+            alias: payment_alias,
+        } = &**payment_item
+        else {
+            return Ok(None);
+        };
+
+        let order_binding = TableBindingRef {
+            name: order_name,
+            alias: order_alias,
+        };
+        let payment_binding = TableBindingRef {
+            name: payment_name,
+            alias: payment_alias,
+        };
+        let order_item_binding = TableBindingRef {
+            name: order_item_name,
+            alias: order_item_alias,
+        };
+        let item_binding = TableBindingRef {
+            name: item_name,
+            alias: item_alias,
+        };
+
+        if self
+            .visible_view(order_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(payment_name, NameResolutionScope::Session)
+                .is_some()
+            || self
+                .visible_view(order_item_name, NameResolutionScope::Session)
+                .is_some()
+            || self
+                .visible_view(item_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(order_name)
+            || self.visible_table_is_temporary(payment_name)
+            || self.visible_table_is_temporary(order_item_name)
+            || self.visible_table_is_temporary(item_name)
+        {
+            return Ok(None);
+        }
+
+        if !matches_filter_binding(order_name, order_alias, filter_table)
+            || !identifiers_equal(filter_column, "user_id")
+        {
+            return Ok(None);
+        }
+        if !join_constraint_matches_columns(
+            payment_join_on,
+            order_binding,
+            "id",
+            payment_binding,
+            "order_id",
+        ) || !join_constraint_matches_columns(
+            order_item_join_on,
+            order_binding,
+            "id",
+            order_item_binding,
+            "order_id",
+        ) || !join_constraint_matches_columns(
+            item_join_on,
+            order_item_binding,
+            "item_id",
+            item_binding,
+            "id",
+        ) {
+            return Ok(None);
+        }
+
+        if !query.order_by[0].descending
+            || !expr_matches_binding_column(&query.order_by[0].expr, order_binding, "id")
+        {
+            return Ok(None);
+        }
+
+        let projection = [
+            (0, order_binding, "id"),
+            (1, order_binding, "total_amount"),
+            (2, payment_binding, "status"),
+            (3, item_binding, "name"),
+            (4, order_item_binding, "quantity"),
+            (5, order_item_binding, "price"),
+        ];
+        for (index, binding, column) in projection {
+            let SelectItem::Expr { expr, .. } = &select.projection[index] else {
+                return Ok(None);
+            };
+            if !expr_matches_binding_column(expr, binding, column) {
+                return Ok(None);
+            }
+        }
+
+        let order_schema = match self.table_schema(order_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let payment_schema = match self.table_schema(payment_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let order_item_schema = match self.table_schema(order_item_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let item_schema = match self.table_schema(item_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        if !generated_columns_are_stored(order_schema)
+            || !generated_columns_are_stored(payment_schema)
+            || !generated_columns_are_stored(order_item_schema)
+            || !generated_columns_are_stored(item_schema)
+        {
+            return Ok(None);
+        }
+
+        let Some(order_data) = self.table_data(order_name) else {
+            return Ok(None);
+        };
+        let Some(payment_data) = self.table_data(payment_name) else {
+            return Ok(None);
+        };
+        let Some(order_item_data) = self.table_data(order_item_name) else {
+            return Ok(None);
+        };
+        let Some(item_data) = self.table_data(item_name) else {
+            return Ok(None);
+        };
+
+        let Some(order_user_keys) = self.single_column_btree_keys(order_name, "user_id") else {
+            return Ok(None);
+        };
+        let Some(payment_order_keys) = self.single_column_btree_keys(payment_name, "order_id")
+        else {
+            return Ok(None);
+        };
+        let Some(order_item_order_keys) =
+            self.single_column_btree_keys(order_item_name, "order_id")
+        else {
+            return Ok(None);
+        };
+        let Some(item_id_keys) = self.single_column_btree_keys(item_name, "id") else {
+            return Ok(None);
+        };
+
+        let Some(order_id_index) = schema_column_index(order_schema, "id") else {
+            return Ok(None);
+        };
+        let Some(order_total_amount_index) = schema_column_index(order_schema, "total_amount")
+        else {
+            return Ok(None);
+        };
+        let Some(payment_status_index) = schema_column_index(payment_schema, "status") else {
+            return Ok(None);
+        };
+        let Some(order_item_item_id_index) = schema_column_index(order_item_schema, "item_id")
+        else {
+            return Ok(None);
+        };
+        let Some(order_item_quantity_index) = schema_column_index(order_item_schema, "quantity")
+        else {
+            return Ok(None);
+        };
+        let Some(order_item_price_index) = schema_column_index(order_item_schema, "price") else {
+            return Ok(None);
+        };
+        let Some(item_name_index) = schema_column_index(item_schema, "name") else {
+            return Ok(None);
+        };
+
+        if order_schema.columns[order_id_index].column_type != crate::catalog::ColumnType::Int64
+            || order_item_schema.columns[order_item_item_id_index].column_type
+                != crate::catalog::ColumnType::Int64
+            || order_item_schema.columns[order_item_quantity_index].column_type
+                != crate::catalog::ColumnType::Int64
+            || payment_schema.columns[payment_status_index].column_type
+                != crate::catalog::ColumnType::Text
+            || item_schema.columns[item_name_index].column_type != crate::catalog::ColumnType::Text
+        {
+            return Ok(None);
+        }
+
+        let filter_value = self.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let mut matching_orders = order_user_keys.row_ids_for_value(&filter_value)?;
+        matching_orders.sort_by(|left_row_id, right_row_id| {
+            let left_value = order_data
+                .row_by_id(*left_row_id)
+                .and_then(|row| row.values.get(order_id_index))
+                .and_then(value_as_int64)
+                .unwrap_or(i64::MIN);
+            let right_value = order_data
+                .row_by_id(*right_row_id)
+                .and_then(|row| row.values.get(order_id_index))
+                .and_then(value_as_int64)
+                .unwrap_or(i64::MIN);
+            right_value.cmp(&left_value)
+        });
+
+        let column_names = select
+            .projection
+            .iter()
+            .enumerate()
+            .map(|(index, item)| match item {
+                SelectItem::Expr { expr, alias } => alias
+                    .clone()
+                    .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    unreachable!("history fast path only matches explicit projection")
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut rows = Vec::new();
+        for order_row_id in matching_orders {
+            let Some(order_row) = order_data.row_by_id(order_row_id) else {
+                continue;
+            };
+            let Some(order_id) = order_row
+                .values
+                .get(order_id_index)
+                .and_then(value_as_int64)
+            else {
+                return Ok(None);
+            };
+            let order_id_value = Value::Int64(order_id);
+            let payment_row_ids = payment_order_keys.row_ids_for_value(&order_id_value)?;
+            if payment_row_ids.is_empty() {
+                continue;
+            }
+            let order_item_row_ids = order_item_order_keys.row_ids_for_value(&order_id_value)?;
+            if order_item_row_ids.is_empty() {
+                continue;
+            }
+
+            for payment_row_id in payment_row_ids {
+                let Some(payment_row) = payment_data.row_by_id(payment_row_id) else {
+                    continue;
+                };
+                let Some(payment_status) = payment_row.values.get(payment_status_index) else {
+                    return Ok(None);
+                };
+
+                for order_item_row_id in &order_item_row_ids {
+                    let Some(order_item_row) = order_item_data.row_by_id(*order_item_row_id) else {
+                        continue;
+                    };
+                    let Some(item_id_value) = order_item_row.values.get(order_item_item_id_index)
+                    else {
+                        return Ok(None);
+                    };
+                    let item_row_ids = item_id_keys.row_ids_for_value(item_id_value)?;
+                    if item_row_ids.is_empty() {
+                        continue;
+                    }
+                    for item_row_id in item_row_ids {
+                        let Some(item_row) = item_data.row_by_id(item_row_id) else {
+                            continue;
+                        };
+                        let Some(item_name_value) = item_row.values.get(item_name_index) else {
+                            return Ok(None);
+                        };
+                        let Some(quantity_value) =
+                            order_item_row.values.get(order_item_quantity_index)
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(price_value) = order_item_row.values.get(order_item_price_index)
+                        else {
+                            return Ok(None);
+                        };
+
+                        rows.push(QueryRow::new(vec![
+                            Value::Int64(order_id),
+                            order_row.values[order_total_amount_index].clone(),
+                            payment_status.clone(),
+                            item_name_value.clone(),
+                            quantity_value.clone(),
+                            price_value.clone(),
+                        ]));
+                    }
+                }
+            }
+        }
+
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn try_execute_benchmark_report_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty()
+            || query.offset.is_some()
+            || query.order_by.len() != 1
+            || query.limit.is_none()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.from.len() != 1
+            || select.filter.is_none()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.group_by.len() != 2
+            || select.projection.len() != 3
+        {
+            return Ok(None);
+        }
+
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, filter_column, value_expr)) = simple_btree_lookup(filter) else {
+            return Ok(None);
+        };
+
+        let FromItem::Join {
+            left: item_order_items,
+            right: order_item,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(order_join_on),
+        } = &select.from[0]
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: order_name,
+            alias: order_alias,
+        } = &**order_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Join {
+            left: item_item,
+            right: order_item_item,
+            kind: JoinKind::Inner,
+            constraint: JoinConstraint::On(order_item_join_on),
+        } = &**item_order_items
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: item_name,
+            alias: item_alias,
+        } = &**item_item
+        else {
+            return Ok(None);
+        };
+        let FromItem::Table {
+            name: order_item_name,
+            alias: order_item_alias,
+        } = &**order_item_item
+        else {
+            return Ok(None);
+        };
+
+        let item_binding = TableBindingRef {
+            name: item_name,
+            alias: item_alias,
+        };
+        let order_item_binding = TableBindingRef {
+            name: order_item_name,
+            alias: order_item_alias,
+        };
+        let order_binding = TableBindingRef {
+            name: order_name,
+            alias: order_alias,
+        };
+
+        if self
+            .visible_view(item_name, NameResolutionScope::Session)
+            .is_some()
+            || self
+                .visible_view(order_item_name, NameResolutionScope::Session)
+                .is_some()
+            || self
+                .visible_view(order_name, NameResolutionScope::Session)
+                .is_some()
+            || self.visible_table_is_temporary(item_name)
+            || self.visible_table_is_temporary(order_item_name)
+            || self.visible_table_is_temporary(order_name)
+        {
+            return Ok(None);
+        }
+
+        if !matches_filter_binding(order_name, order_alias, filter_table)
+            || !identifiers_equal(filter_column, "status")
+            || !join_constraint_matches_columns(
+                order_item_join_on,
+                item_binding,
+                "id",
+                order_item_binding,
+                "item_id",
+            )
+            || !join_constraint_matches_columns(
+                order_join_on,
+                order_item_binding,
+                "order_id",
+                order_binding,
+                "id",
+            )
+        {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr {
+            expr: item_name_expr,
+            alias: item_name_alias,
+        } = &select.projection[0]
+        else {
+            return Ok(None);
+        };
+        if !expr_matches_binding_column(item_name_expr, item_binding, "name") {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr {
+            expr: quantity_sum_expr,
+            alias: quantity_sum_alias,
+        } = &select.projection[1]
+        else {
+            return Ok(None);
+        };
+        if !aggregate_matches_single_binding_column(
+            quantity_sum_expr,
+            "sum",
+            order_item_binding,
+            "quantity",
+        ) {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr {
+            expr: revenue_expr,
+            alias: revenue_alias,
+        } = &select.projection[2]
+        else {
+            return Ok(None);
+        };
+        if !aggregate_matches_binding_product(
+            revenue_expr,
+            "sum",
+            order_item_binding,
+            "quantity",
+            order_item_binding,
+            "price",
+        ) {
+            return Ok(None);
+        }
+        if !order_by_matches_alias_or_projection(
+            &query.order_by[0],
+            revenue_alias.as_deref(),
+            revenue_expr,
+            true,
+        ) {
+            return Ok(None);
+        }
+
+        if select.group_by.len() != 2
+            || !expr_matches_binding_column(&select.group_by[0], item_binding, "id")
+            || !expr_matches_binding_column(&select.group_by[1], item_binding, "name")
+        {
+            return Ok(None);
+        }
+
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+            .unwrap_or(usize::MAX);
+
+        let item_schema = match self.table_schema(item_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let order_item_schema = match self.table_schema(order_item_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        let order_schema = match self.table_schema(order_name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        if !generated_columns_are_stored(item_schema)
+            || !generated_columns_are_stored(order_item_schema)
+            || !generated_columns_are_stored(order_schema)
+        {
+            return Ok(None);
+        }
+
+        let Some(item_data) = self.table_data(item_name) else {
+            return Ok(None);
+        };
+        let Some(order_item_data) = self.table_data(order_item_name) else {
+            return Ok(None);
+        };
+        let Some(order_data) = self.table_data(order_name) else {
+            return Ok(None);
+        };
+
+        let Some(order_status_keys) = self.single_column_btree_keys(order_name, "status") else {
+            return Ok(None);
+        };
+        let Some(order_item_order_keys) =
+            self.single_column_btree_keys(order_item_name, "order_id")
+        else {
+            return Ok(None);
+        };
+        let Some(item_id_keys) = self.single_column_btree_keys(item_name, "id") else {
+            return Ok(None);
+        };
+
+        let Some(order_id_index) = schema_column_index(order_schema, "id") else {
+            return Ok(None);
+        };
+        let Some(order_item_item_id_index) = schema_column_index(order_item_schema, "item_id")
+        else {
+            return Ok(None);
+        };
+        let Some(order_item_quantity_index) = schema_column_index(order_item_schema, "quantity")
+        else {
+            return Ok(None);
+        };
+        let Some(order_item_price_index) = schema_column_index(order_item_schema, "price") else {
+            return Ok(None);
+        };
+        let Some(item_name_index) = schema_column_index(item_schema, "name") else {
+            return Ok(None);
+        };
+
+        if order_schema.columns[order_id_index].column_type != crate::catalog::ColumnType::Int64
+            || order_item_schema.columns[order_item_item_id_index].column_type
+                != crate::catalog::ColumnType::Int64
+            || order_item_schema.columns[order_item_quantity_index].column_type
+                != crate::catalog::ColumnType::Int64
+            || item_schema.columns[item_name_index].column_type != crate::catalog::ColumnType::Text
+        {
+            return Ok(None);
+        }
+
+        let filter_value = self.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let matching_order_row_ids = order_status_keys.row_ids_for_value(&filter_value)?;
+        let mut aggregates = BTreeMap::<i64, BenchmarkReportAggregate>::new();
+        for order_row_id in matching_order_row_ids {
+            let Some(order_row) = order_data.row_by_id(order_row_id) else {
+                continue;
+            };
+            let Some(order_id) = order_row
+                .values
+                .get(order_id_index)
+                .and_then(value_as_int64)
+            else {
+                return Ok(None);
+            };
+            let order_id_value = Value::Int64(order_id);
+            let order_item_row_ids = order_item_order_keys.row_ids_for_value(&order_id_value)?;
+            for order_item_row_id in order_item_row_ids {
+                let Some(order_item_row) = order_item_data.row_by_id(order_item_row_id) else {
+                    continue;
+                };
+                let Some(item_id) = order_item_row
+                    .values
+                    .get(order_item_item_id_index)
+                    .and_then(value_as_int64)
+                else {
+                    return Ok(None);
+                };
+                let Some(quantity) = order_item_row
+                    .values
+                    .get(order_item_quantity_index)
+                    .and_then(value_as_int64)
+                else {
+                    return Ok(None);
+                };
+                let Some(price) = order_item_row
+                    .values
+                    .get(order_item_price_index)
+                    .and_then(value_as_f64)
+                else {
+                    return Ok(None);
+                };
+
+                let item_row_ids = item_id_keys.row_ids_for_value(&Value::Int64(item_id))?;
+                if item_row_ids.is_empty() {
+                    continue;
+                }
+                for item_row_id in item_row_ids {
+                    let Some(item_row) = item_data.row_by_id(item_row_id) else {
+                        continue;
+                    };
+                    let Some(item_name_value) = item_row.values.get(item_name_index) else {
+                        return Ok(None);
+                    };
+                    let Some(item_name_text) = value_as_text(item_name_value) else {
+                        return Ok(None);
+                    };
+                    let aggregate = aggregates.entry(item_id).or_insert_with(|| {
+                        BenchmarkReportAggregate::new(item_name_text.to_string())
+                    });
+                    aggregate.quantity_total += quantity;
+                    aggregate.revenue_total += quantity as f64 * price;
+                }
+            }
+        }
+
+        let column_names = vec![
+            item_name_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(item_name_expr, 1)),
+            quantity_sum_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(quantity_sum_expr, 2)),
+            revenue_alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(revenue_expr, 3)),
+        ];
+
+        let mut rows = aggregates
+            .into_values()
+            .map(|aggregate| {
+                QueryRow::new(vec![
+                    Value::Text(aggregate.item_name),
+                    Value::Int64(aggregate.quantity_total),
+                    Value::Float64(aggregate.revenue_total),
+                ])
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            let revenue_ordering = compare_values(&left.values()[2], &right.values()[2])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .reverse();
+            if revenue_ordering != std::cmp::Ordering::Equal {
+                return revenue_ordering;
+            }
+            compare_values(&left.values()[0], &right.values()[0])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn single_column_btree_keys(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Option<&RuntimeBtreeKeys> {
+        let index = self.catalog.indexes.values().find(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0]
+                    .column_name
+                    .as_deref()
+                    .is_some_and(|index_column| identifiers_equal(index_column, column_name))
+                && index.columns[0].expression_sql.is_none()
+        })?;
+        let RuntimeIndex::Btree { keys } = self.indexes.get(&index.name)? else {
+            return None;
+        };
+        Some(keys)
     }
 
     fn execute_analyze(&mut self, table_name: Option<&str>) -> Result<()> {
@@ -1641,6 +2939,199 @@ impl EngineRuntime {
             }
             rows.push(QueryRow::new(projected));
         }
+        Ok(Some(QueryResult::with_rows(column_names, rows)))
+    }
+
+    fn try_execute_simple_filtered_projection_query(
+        &self,
+        query: &Query,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty() || query.offset.is_some() {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(filter) = select.filter.as_ref() else {
+            return Ok(None);
+        };
+        let FromItem::Table { name, alias } = &select.from[0] else {
+            return Ok(None);
+        };
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        let table_schema = match self.table_schema(name) {
+            Some(table) => table,
+            None => return Ok(None),
+        };
+        if !generated_columns_are_stored(table_schema) {
+            return Ok(None);
+        }
+        let Some(data) = self.table_data(name) else {
+            return Ok(None);
+        };
+        let Some((projection_indexes, column_names)) =
+            self.simple_projection_plan(select, name, alias, table_schema)
+        else {
+            return Ok(None);
+        };
+        let binding_name = alias.as_deref().unwrap_or(name);
+
+        let Some(range_filter) = simple_range_projection_filter(filter) else {
+            return Ok(None);
+        };
+        let filter_table = range_filter.table;
+        let filter_column = range_filter.column;
+        let lower_bound = range_filter.lower;
+        let upper_bound = range_filter.upper;
+        if let Some(table_name) = filter_table {
+            if !identifiers_equal(table_name, name) && !identifiers_equal(table_name, binding_name)
+            {
+                return Ok(None);
+            }
+        }
+        let filter_column_index = table_schema
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, filter_column))
+            .ok_or_else(|| {
+                DbError::internal(format!(
+                    "simple filtered projection column {filter_column} missing from {name}"
+                ))
+            })?;
+
+        let lower_bound = lower_bound
+            .map(|bound| {
+                Ok(SimpleRangeBoundValue {
+                    inclusive: bound.inclusive,
+                    value: self.eval_expr(
+                        bound.value_expr,
+                        &Dataset::empty(),
+                        &[],
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?,
+                })
+            })
+            .transpose()?;
+        let upper_bound = upper_bound
+            .map(|bound| {
+                Ok(SimpleRangeBoundValue {
+                    inclusive: bound.inclusive,
+                    value: self.eval_expr(
+                        bound.value_expr,
+                        &Dataset::empty(),
+                        &[],
+                        params,
+                        &BTreeMap::new(),
+                        None,
+                    )?,
+                })
+            })
+            .transpose()?;
+
+        let order_by = if query.order_by.is_empty() {
+            None
+        } else if query.order_by.len() == 1 {
+            let Expr::Column {
+                table: order_table,
+                column: order_column,
+            } = &query.order_by[0].expr
+            else {
+                return Ok(None);
+            };
+            if let Some(order_table) = order_table.as_deref() {
+                if !identifiers_equal(order_table, name)
+                    && !identifiers_equal(order_table, binding_name)
+                {
+                    return Ok(None);
+                }
+            }
+            let Some(order_projection_index) =
+                projection_indexes.iter().position(|projection_index| {
+                    table_schema.columns[*projection_index]
+                        .name
+                        .as_str()
+                        .eq_ignore_ascii_case(order_column)
+                })
+            else {
+                return Ok(None);
+            };
+            Some(SimpleOrderByPlan {
+                projection_index: order_projection_index,
+                descending: query.order_by[0].descending,
+            })
+        } else {
+            return Ok(None);
+        };
+
+        let limit = query
+            .limit
+            .as_ref()
+            .map(|expr| self.eval_constant_i64(expr, params, &BTreeMap::new()))
+            .transpose()?
+            .map(|value| usize::try_from(value.max(0)).unwrap_or(usize::MAX));
+
+        let mut rows = Vec::with_capacity(data.rows.len());
+        for stored_row in &data.rows {
+            let candidate = &stored_row.values[filter_column_index];
+            if !simple_range_bound_matches(candidate, lower_bound.as_ref(), upper_bound.as_ref())? {
+                continue;
+            }
+            let mut projected = Vec::with_capacity(projection_indexes.len());
+            for index in &projection_indexes {
+                projected.push(stored_row.values[*index].clone());
+            }
+            rows.push(QueryRow::new(projected));
+        }
+
+        if let Some(order_by) = order_by {
+            let mut sort_error = None;
+            rows.sort_by(|left, right| {
+                let ordering = compare_values(
+                    &left.values()[order_by.projection_index],
+                    &right.values()[order_by.projection_index],
+                );
+                match ordering {
+                    Ok(ordering) => {
+                        if order_by.descending {
+                            ordering.reverse()
+                        } else {
+                            ordering
+                        }
+                    }
+                    Err(error) => {
+                        if sort_error.is_none() {
+                            sort_error = Some(error);
+                        }
+                        std::cmp::Ordering::Equal
+                    }
+                }
+            });
+            if let Some(error) = sort_error {
+                return Err(error);
+            }
+        }
+
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+
         Ok(Some(QueryResult::with_rows(column_names, rows)))
     }
 
@@ -5283,6 +6774,266 @@ fn simple_btree_lookup(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct SimpleRangeBound<'a> {
+    inclusive: bool,
+    value_expr: &'a Expr,
+}
+
+#[derive(Clone, Debug)]
+struct SimpleRangeBoundValue {
+    inclusive: bool,
+    value: Value,
+}
+
+#[derive(Clone, Debug)]
+struct SimpleGroupedNumericAggregate {
+    group_value: Value,
+    count: i64,
+    total_int: i64,
+    total_float: f64,
+    saw_float: bool,
+    saw_value: bool,
+}
+
+impl SimpleGroupedNumericAggregate {
+    fn new(group_value: Value) -> Self {
+        Self {
+            group_value,
+            count: 0,
+            total_int: 0,
+            total_float: 0.0,
+            saw_float: false,
+            saw_value: false,
+        }
+    }
+
+    fn add_numeric(&mut self, value: &Value) -> Result<()> {
+        match value {
+            Value::Null => Ok(()),
+            Value::Int64(value) => {
+                self.total_int += value;
+                self.total_float += *value as f64;
+                self.saw_value = true;
+                Ok(())
+            }
+            Value::Float64(value) => {
+                self.total_float += *value;
+                self.saw_float = true;
+                self.saw_value = true;
+                Ok(())
+            }
+            other => Err(DbError::sql(format!(
+                "numeric aggregate does not support {other:?}"
+            ))),
+        }
+    }
+
+    fn into_row(self) -> QueryRow {
+        let Self {
+            group_value,
+            count,
+            total_int,
+            total_float,
+            saw_float,
+            saw_value,
+        } = self;
+        QueryRow::new(vec![
+            group_value,
+            Value::Int64(count),
+            if !saw_value {
+                Value::Null
+            } else if saw_float {
+                Value::Float64(total_float)
+            } else {
+                Value::Int64(total_int)
+            },
+        ])
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkReportAggregate {
+    item_name: String,
+    quantity_total: i64,
+    revenue_total: f64,
+}
+
+impl BenchmarkReportAggregate {
+    fn new(item_name: String) -> Self {
+        Self {
+            item_name,
+            quantity_total: 0,
+            revenue_total: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimpleOrderByPlan {
+    projection_index: usize,
+    descending: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SimpleJoinProjectionSource {
+    Filtered(usize),
+    Probe(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SimpleRangeProjectionFilter<'a> {
+    table: Option<&'a str>,
+    column: &'a str,
+    lower: Option<SimpleRangeBound<'a>>,
+    upper: Option<SimpleRangeBound<'a>>,
+}
+
+fn simple_range_projection_filter(filter: &Expr) -> Option<SimpleRangeProjectionFilter<'_>> {
+    let mut state = SimpleRangeFilterState::default();
+    collect_simple_range_projection_terms(filter, &mut state)?;
+    Some(SimpleRangeProjectionFilter {
+        table: state.table,
+        column: state.column?,
+        lower: state.lower,
+        upper: state.upper,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SimpleRangeFilterState<'a> {
+    table: Option<&'a str>,
+    column: Option<&'a str>,
+    lower: Option<SimpleRangeBound<'a>>,
+    upper: Option<SimpleRangeBound<'a>>,
+}
+
+fn collect_simple_range_projection_terms<'a>(
+    filter: &'a Expr,
+    state: &mut SimpleRangeFilterState<'a>,
+) -> Option<()> {
+    match filter {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
+            collect_simple_range_projection_terms(left, state)?;
+            collect_simple_range_projection_terms(right, state)?;
+            Some(())
+        }
+        Expr::Binary { left, op, right } => {
+            let (table, column, bound_kind, value_expr) =
+                simple_range_projection_bound(left, *op, right).or_else(|| {
+                    simple_range_projection_bound(right, reverse_binary_op(*op)?, left)
+                })?;
+            if let Some(existing_table) = state.table {
+                if Some(existing_table) != table {
+                    return None;
+                }
+            } else {
+                state.table = table;
+            }
+            if let Some(existing_column) = state.column {
+                if !identifiers_equal(existing_column, column) {
+                    return None;
+                }
+            } else {
+                state.column = Some(column);
+            }
+            match bound_kind {
+                SimpleRangeBoundKind::Lower(inclusive) => {
+                    if state.lower.is_some() {
+                        return None;
+                    }
+                    state.lower = Some(SimpleRangeBound {
+                        inclusive,
+                        value_expr,
+                    });
+                }
+                SimpleRangeBoundKind::Upper(inclusive) => {
+                    if state.upper.is_some() {
+                        return None;
+                    }
+                    state.upper = Some(SimpleRangeBound {
+                        inclusive,
+                        value_expr,
+                    });
+                }
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SimpleRangeBoundKind {
+    Lower(bool),
+    Upper(bool),
+}
+
+fn simple_range_projection_bound<'a>(
+    left: &'a Expr,
+    op: BinaryOp,
+    right: &'a Expr,
+) -> Option<(Option<&'a str>, &'a str, SimpleRangeBoundKind, &'a Expr)> {
+    let Expr::Column { table, column } = left else {
+        return None;
+    };
+    if !matches!(right, Expr::Literal(_) | Expr::Parameter(_)) {
+        return None;
+    }
+    let bound_kind = match op {
+        BinaryOp::Gt => SimpleRangeBoundKind::Lower(false),
+        BinaryOp::GtEq => SimpleRangeBoundKind::Lower(true),
+        BinaryOp::Lt => SimpleRangeBoundKind::Upper(false),
+        BinaryOp::LtEq => SimpleRangeBoundKind::Upper(true),
+        _ => return None,
+    };
+    Some((table.as_deref(), column.as_str(), bound_kind, right))
+}
+
+fn reverse_binary_op(op: BinaryOp) -> Option<BinaryOp> {
+    match op {
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::GtEq => Some(BinaryOp::LtEq),
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::LtEq => Some(BinaryOp::GtEq),
+        _ => None,
+    }
+}
+
+fn simple_range_bound_matches(
+    candidate: &Value,
+    lower_bound: Option<&SimpleRangeBoundValue>,
+    upper_bound: Option<&SimpleRangeBoundValue>,
+) -> Result<bool> {
+    if let Some(lower_bound) = lower_bound {
+        let ordering = compare_values(candidate, &lower_bound.value)?;
+        let lower_matches = if lower_bound.inclusive {
+            ordering != std::cmp::Ordering::Less
+        } else {
+            ordering == std::cmp::Ordering::Greater
+        };
+        if !lower_matches {
+            return Ok(false);
+        }
+    }
+    if let Some(upper_bound) = upper_bound {
+        let ordering = compare_values(candidate, &upper_bound.value)?;
+        let upper_matches = if upper_bound.inclusive {
+            ordering != std::cmp::Ordering::Greater
+        } else {
+            ordering == std::cmp::Ordering::Less
+        };
+        if !upper_matches {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug)]
 struct QualifiedColumnRef<'a> {
     table: Option<&'a str>,
     column: &'a str,
@@ -5395,6 +7146,158 @@ fn dataset_column_index(dataset: &Dataset, qualifier: Option<&str>, column: &str
     }
 }
 
+fn schema_column_index(schema: &TableSchema, column: &str) -> Option<usize> {
+    schema
+        .columns
+        .iter()
+        .position(|candidate| identifiers_equal(&candidate.name, column))
+}
+
+fn value_as_int64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int64(value) => Some(*value as f64),
+        Value::Float64(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn value_as_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn expr_matches_binding_column(expr: &Expr, binding: TableBindingRef<'_>, column: &str) -> bool {
+    let Expr::Column {
+        table,
+        column: expr_column,
+    } = expr
+    else {
+        return false;
+    };
+    matches_table_binding(binding, table.as_deref()) && identifiers_equal(expr_column, column)
+}
+
+fn join_constraint_matches_columns(
+    on: &Expr,
+    left_binding: TableBindingRef<'_>,
+    left_column: &str,
+    right_binding: TableBindingRef<'_>,
+    right_column: &str,
+) -> bool {
+    let Some((left_ref, right_ref)) = simple_join_equality(on) else {
+        return false;
+    };
+    (matches_table_binding(left_binding, left_ref.table)
+        && identifiers_equal(left_ref.column, left_column)
+        && matches_table_binding(right_binding, right_ref.table)
+        && identifiers_equal(right_ref.column, right_column))
+        || (matches_table_binding(left_binding, right_ref.table)
+            && identifiers_equal(right_ref.column, left_column)
+            && matches_table_binding(right_binding, left_ref.table)
+            && identifiers_equal(left_ref.column, right_column))
+}
+
+fn aggregate_matches_single_binding_column(
+    expr: &Expr,
+    aggregate_name: &str,
+    binding: TableBindingRef<'_>,
+    column: &str,
+) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case(aggregate_name)
+        || *distinct
+        || *star
+        || !order_by.is_empty()
+        || *within_group
+        || args.len() != 1
+    {
+        return false;
+    }
+    expr_matches_binding_column(&args[0], binding, column)
+}
+
+fn aggregate_matches_binding_product(
+    expr: &Expr,
+    aggregate_name: &str,
+    left_binding: TableBindingRef<'_>,
+    left_column: &str,
+    right_binding: TableBindingRef<'_>,
+    right_column: &str,
+) -> bool {
+    let Expr::Aggregate {
+        name,
+        args,
+        distinct,
+        star,
+        order_by,
+        within_group,
+    } = expr
+    else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case(aggregate_name)
+        || *distinct
+        || *star
+        || !order_by.is_empty()
+        || *within_group
+        || args.len() != 1
+    {
+        return false;
+    }
+    let Expr::Binary { left, op, right } = &args[0] else {
+        return false;
+    };
+    if *op != BinaryOp::Mul {
+        return false;
+    }
+    (expr_matches_binding_column(left, left_binding, left_column)
+        && expr_matches_binding_column(right, right_binding, right_column))
+        || (expr_matches_binding_column(left, right_binding, right_column)
+            && expr_matches_binding_column(right, left_binding, left_column))
+}
+
+fn order_by_matches_alias_or_projection(
+    order_by: &crate::sql::ast::OrderBy,
+    alias: Option<&str>,
+    projection_expr: &Expr,
+    descending: bool,
+) -> bool {
+    if order_by.descending != descending {
+        return false;
+    }
+    if let Some(alias) = alias {
+        if let Expr::Column {
+            table: None,
+            column,
+        } = &order_by.expr
+        {
+            if identifiers_equal(column.as_str(), alias) {
+                return true;
+            }
+        }
+    }
+    &order_by.expr == projection_expr
+}
+
 fn from_item_is_all_inner_table_joins(item: &FromItem) -> bool {
     match item {
         FromItem::Table { .. } => true,
@@ -5435,6 +7338,69 @@ fn simple_select_item_column_index(
         [index] => Some(*index),
         _ => None,
     }
+}
+
+fn simple_join_projection_plan(
+    items: &[SelectItem],
+    filtered_table_name: &str,
+    filtered_alias: &Option<String>,
+    filtered_schema: &TableSchema,
+    probe_table_name: &str,
+    probe_alias: &Option<String>,
+    probe_schema: &TableSchema,
+) -> Option<(Vec<SimpleJoinProjectionSource>, Vec<String>)> {
+    let filtered_binding = filtered_alias.as_deref().unwrap_or(filtered_table_name);
+    let probe_binding = probe_alias.as_deref().unwrap_or(probe_table_name);
+    let mut projection_plan = Vec::with_capacity(items.len());
+    let mut column_names = Vec::with_capacity(items.len());
+
+    for (index, item) in items.iter().enumerate() {
+        let SelectItem::Expr { expr, alias } = item else {
+            return None;
+        };
+        let Expr::Column { table, column } = expr else {
+            return None;
+        };
+
+        let filtered_index = filtered_schema
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, column));
+        let probe_index = probe_schema
+            .columns
+            .iter()
+            .position(|candidate| identifiers_equal(&candidate.name, column));
+        let source = match table.as_deref() {
+            Some(table_name)
+                if identifiers_equal(table_name, filtered_table_name)
+                    || identifiers_equal(table_name, filtered_binding) =>
+            {
+                Some(SimpleJoinProjectionSource::Filtered(filtered_index?))
+            }
+            Some(table_name)
+                if identifiers_equal(table_name, probe_table_name)
+                    || identifiers_equal(table_name, probe_binding) =>
+            {
+                Some(SimpleJoinProjectionSource::Probe(probe_index?))
+            }
+            Some(_) => None,
+            None => match (filtered_index, probe_index) {
+                (Some(filtered_index), None) => {
+                    Some(SimpleJoinProjectionSource::Filtered(filtered_index))
+                }
+                (None, Some(probe_index)) => Some(SimpleJoinProjectionSource::Probe(probe_index)),
+                _ => None,
+            },
+        }?;
+        projection_plan.push(source);
+        column_names.push(
+            alias
+                .clone()
+                .unwrap_or_else(|| infer_expr_name(expr, index + 1)),
+        );
+    }
+
+    Some((projection_plan, column_names))
 }
 
 fn try_project_simple_select_items(

@@ -2,7 +2,9 @@
 
 use std::borrow::Cow;
 
-use crate::catalog::{identifiers_equal, ColumnType, ForeignKeyAction, IndexKind, TriggerEvent};
+use crate::catalog::{
+    identifiers_equal, ColumnType, ForeignKeyAction, ForeignKeyConstraint, IndexKind, TriggerEvent,
+};
 use crate::error::{DbError, Result};
 use crate::record::key::encode_index_key;
 use crate::record::row::Row;
@@ -51,12 +53,21 @@ pub(crate) struct PreparedRequiredColumn {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PreparedSingleColumnForeignKey {
+    pub(crate) child_column_index: usize,
+    pub(crate) parent_table_name: String,
+    pub(crate) parent_index_name: String,
+    pub(crate) parent_index_int64_key: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleInsert {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<PreparedInsertColumn>,
     pub(crate) primary_auto_row_id_column_index: Option<usize>,
     pub(crate) value_sources: Vec<PreparedInsertValueSource>,
     pub(crate) required_columns: Vec<PreparedRequiredColumn>,
+    pub(crate) foreign_keys: Vec<PreparedSingleColumnForeignKey>,
     pub(crate) unique_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) use_generic_validation: bool,
@@ -253,7 +264,10 @@ impl EngineRuntime {
             || prepared
                 .unique_indexes
                 .iter()
-                .all(|index| self.prepared_btree_index_is_fresh(index)))
+                .all(|index| self.prepared_btree_index_is_fresh(index))
+                && prepared.foreign_keys.iter().all(|foreign_key| {
+                    self.prepared_foreign_key_parent_index_is_fresh(foreign_key)
+                }))
             && (prepared.use_generic_index_updates
                 || prepared
                     .insert_indexes
@@ -360,8 +374,18 @@ impl EngineRuntime {
             .collect::<Vec<_>>();
         let mut use_generic_validation =
             table.columns.iter().any(|column| !column.checks.is_empty())
-                || !table.checks.is_empty()
-                || !table.foreign_keys.is_empty();
+                || !table.checks.is_empty();
+        let mut foreign_keys = Vec::new();
+        for foreign_key in &table.foreign_keys {
+            let Some(prepared_foreign_key) =
+                prepare_single_column_foreign_key(self, table, foreign_key)?
+            else {
+                use_generic_validation = true;
+                foreign_keys.clear();
+                break;
+            };
+            foreign_keys.push(prepared_foreign_key);
+        }
         let mut unique_indexes = Vec::new();
         for index in self.catalog.indexes.values().filter(|index| {
             identifiers_equal(&index.table_name, &statement.table_name) && index.unique
@@ -392,6 +416,7 @@ impl EngineRuntime {
             primary_auto_row_id_column_index,
             value_sources,
             required_columns,
+            foreign_keys,
             unique_indexes,
             insert_indexes,
             use_generic_validation,
@@ -406,6 +431,19 @@ impl EngineRuntime {
             Some(index) if index.kind == IndexKind::Btree && index.fresh
         ) && matches!(
             self.indexes.get(&prepared.name),
+            Some(super::RuntimeIndex::Btree { .. })
+        )
+    }
+
+    fn prepared_foreign_key_parent_index_is_fresh(
+        &self,
+        prepared: &PreparedSingleColumnForeignKey,
+    ) -> bool {
+        matches!(
+            self.catalog.indexes.get(&prepared.parent_index_name),
+            Some(index) if index.kind == IndexKind::Btree && index.fresh
+        ) && matches!(
+            self.indexes.get(&prepared.parent_index_name),
             Some(super::RuntimeIndex::Btree { .. })
         )
     }
@@ -843,14 +881,12 @@ impl EngineRuntime {
                     index_might_change_for_assignments(&table, index, &assignment_columns)
                 });
 
-        let updates_single_row_id_alias = statement.returning.is_empty()
+        let updates_single_row_fast_path = statement.returning.is_empty()
             && assignment_only_validation
             && !has_referencing_tables
             && !updates_foreign_key_columns
-            && matching_row_ids.len() == 1
-            && row_id_alias_column_name(&table)
-                .is_some_and(|column_name| identifiers_equal(column_name, "id"));
-        if updates_single_row_id_alias && assignment_columns.len() == 1 {
+            && matching_row_ids.len() == 1;
+        if updates_single_row_fast_path && assignment_columns.len() == 1 {
             let Some(single_row_id) = matching_row_ids.first().copied() else {
                 return Err(DbError::internal(
                     "single-row UPDATE optimization expected one matching row id",
@@ -882,6 +918,36 @@ impl EngineRuntime {
                 };
                 let next_email =
                     super::cast_value(new_email, table.columns[column_index].column_type)?;
+                if indexes_to_update.is_empty() {
+                    if !table.columns[column_index].nullable && matches!(next_email, Value::Null) {
+                        return Err(DbError::constraint(format!(
+                            "column {}.{} may not be NULL",
+                            table_name, table.columns[column_index].name
+                        )));
+                    }
+                    let Some(table_data) = self.table_data_mut(&table_name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {table_name} is missing"
+                        )));
+                    };
+                    let Some(row_index) = table_data.row_index_by_id(single_row_id) else {
+                        return Err(DbError::internal(format!(
+                            "row {single_row_id} vanished during UPDATE"
+                        )));
+                    };
+                    let Some(current_value) = table_data.rows[row_index].values.get(column_index)
+                    else {
+                        return Err(DbError::internal(format!(
+                            "column index {column_index} is invalid for {table_name}"
+                        )));
+                    };
+                    if current_value != &next_email {
+                        table_data.rows[row_index].values[column_index] = next_email;
+                        self.mark_table_dirty(&table_name);
+                    }
+                    self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
+                    return Ok(QueryResult::with_affected_rows(1));
+                }
                 let (row_index, current_row) = {
                     let Some(table_data) = self.table_data(&table_name) else {
                         return Err(DbError::internal(format!(
@@ -1104,6 +1170,70 @@ impl EngineRuntime {
                     identifiers_equal(&foreign_key.referenced_table, &table_name)
                 })
             });
+        let table_indexes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if statement.returning.is_empty() && !has_referencing_tables {
+            let (matching_rows, mut row_indices) = {
+                let table_data = self.table_data(&table_name).ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?;
+                let mut rows = Vec::with_capacity(matching_row_ids.len());
+                let mut indices = Vec::with_capacity(matching_row_ids.len());
+                for &row_id in &matching_row_ids {
+                    let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
+                        DbError::internal(format!("row {row_id} vanished during DELETE"))
+                    })?;
+                    rows.push(table_data.rows[row_index].clone());
+                    indices.push(row_index);
+                }
+                (rows, indices)
+            };
+            let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+            if indexes_remain_fresh {
+                for row in &matching_rows {
+                    for index in &table_indexes {
+                        if !apply_runtime_index_delete_for_row(
+                            self,
+                            &table,
+                            index,
+                            row.row_id,
+                            &row.values,
+                        )? {
+                            indexes_remain_fresh = false;
+                            break;
+                        }
+                    }
+                    if !indexes_remain_fresh {
+                        break;
+                    }
+                }
+            }
+            row_indices.sort_unstable_by(|left, right| right.cmp(left));
+            if !row_indices.is_empty() {
+                let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
+                    DbError::internal(format!("table data for {table_name} is missing"))
+                })?;
+                for row_index in row_indices {
+                    table_data.rows.remove(row_index);
+                }
+                if !indexes_remain_fresh {
+                    self.mark_indexes_stale_for_table(&table_name);
+                }
+                self.mark_table_dirty(&table_name);
+            }
+            self.execute_after_triggers(
+                &table_name,
+                TriggerEvent::Delete,
+                matching_rows.len(),
+                page_size,
+            )?;
+            return Ok(QueryResult::with_affected_rows(matching_rows.len() as u64));
+        }
         let matching_rows = {
             let table_data = self.table_data(&table_name).ok_or_else(|| {
                 DbError::internal(format!("table data for {table_name} is missing"))
@@ -1123,13 +1253,6 @@ impl EngineRuntime {
                 self.apply_parent_delete_actions(&table_name, &table, &row.values, params)?;
             }
         }
-        let table_indexes = self
-            .catalog
-            .indexes
-            .values()
-            .filter(|index| identifiers_equal(&index.table_name, &table_name))
-            .cloned()
-            .collect::<Vec<_>>();
         let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
         if indexes_remain_fresh {
             for row in &matching_rows {
@@ -1894,6 +2017,70 @@ fn prepare_btree_insert_index(
     }))
 }
 
+fn prepare_single_column_foreign_key(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+    foreign_key: &ForeignKeyConstraint,
+) -> Result<Option<PreparedSingleColumnForeignKey>> {
+    let [child_column_name] = foreign_key.columns.as_slice() else {
+        return Ok(None);
+    };
+    let child_column_index = table
+        .columns
+        .iter()
+        .position(|column| identifiers_equal(&column.name, child_column_name))
+        .ok_or_else(|| {
+            DbError::constraint(format!(
+                "foreign key column {} does not exist on {}",
+                child_column_name, table.name
+            ))
+        })?;
+    let parent = runtime
+        .catalog
+        .tables
+        .get(&foreign_key.referenced_table)
+        .ok_or_else(|| {
+            DbError::constraint(format!(
+                "foreign key references unknown table {}",
+                foreign_key.referenced_table
+            ))
+        })?;
+    let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+        parent.primary_key_columns.clone()
+    } else {
+        foreign_key.referenced_columns.clone()
+    };
+    let [referenced_column_name] = referenced_columns.as_slice() else {
+        return Ok(None);
+    };
+    let Some(parent_index) = unique_indexes_for_table(runtime, parent)
+        .into_iter()
+        .find(|index| {
+            index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0].expression_sql.is_none()
+                && index.columns[0]
+                    .column_name
+                    .as_ref()
+                    .is_some_and(|name| identifiers_equal(name, referenced_column_name))
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(prepared_parent_index) = prepare_btree_insert_index(runtime, parent, parent_index)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedSingleColumnForeignKey {
+        child_column_index,
+        parent_table_name: foreign_key.referenced_table.clone(),
+        parent_index_name: prepared_parent_index.name,
+        parent_index_int64_key: prepared_parent_index.int64_key,
+    }))
+}
+
 fn validate_prepared_insert(
     runtime: &EngineRuntime,
     prepared: &PreparedSimpleInsert,
@@ -1925,6 +2112,55 @@ fn validate_prepared_insert(
                     index.name, prepared.table_name
                 )));
             }
+        }
+    }
+    for foreign_key in &prepared.foreign_keys {
+        let Some(child_value) = row.get(foreign_key.child_column_index) else {
+            return Err(DbError::internal(
+                "prepared foreign-key column index exceeded row width",
+            ));
+        };
+        if matches!(child_value, Value::Null) {
+            continue;
+        }
+        let Some(super::RuntimeIndex::Btree { keys }) =
+            runtime.indexes.get(&foreign_key.parent_index_name)
+        else {
+            return Err(DbError::internal(format!(
+                "runtime index {} is missing",
+                foreign_key.parent_index_name
+            )));
+        };
+        if foreign_key.parent_index_int64_key && !matches!(child_value, Value::Int64(_)) {
+            return Err(DbError::constraint(format!(
+                "foreign key on {} references missing parent row in {}",
+                prepared.table_name, foreign_key.parent_table_name
+            )));
+        }
+        let matched_row_ids = keys.row_ids_for_value_set(child_value)?;
+        if matched_row_ids.is_empty() {
+            return Err(DbError::constraint(format!(
+                "foreign key on {} references missing parent row in {}",
+                prepared.table_name, foreign_key.parent_table_name
+            )));
+        }
+        let Some(parent_rows) = runtime.table_data(&foreign_key.parent_table_name) else {
+            return Err(DbError::constraint(format!(
+                "foreign key parent table {} has no row store",
+                foreign_key.parent_table_name
+            )));
+        };
+        let mut exists = false;
+        matched_row_ids.for_each(|row_id| {
+            if !exists && parent_rows.row_by_id(row_id).is_some() {
+                exists = true;
+            }
+        });
+        if !exists {
+            return Err(DbError::constraint(format!(
+                "foreign key on {} references missing parent row in {}",
+                prepared.table_name, foreign_key.parent_table_name
+            )));
         }
     }
     Ok(())

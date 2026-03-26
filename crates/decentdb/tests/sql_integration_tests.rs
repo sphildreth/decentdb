@@ -145,6 +145,113 @@ fn read_executor_supports_joins_aggregates_row_number_and_explain() {
 }
 
 #[test]
+fn simple_filtered_projection_query_supports_range_order_and_limit() {
+    let path = unique_db_path("phase3-simple-filtered-projection");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute(
+        "CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT NOT NULL, price FLOAT64 NOT NULL)",
+    )
+    .expect("create items");
+    db.execute(
+        "INSERT INTO items (id, name, price) VALUES \
+         (1, 'apple', 9.0), \
+         (2, 'banana', 4.0), \
+         (3, 'carrot', 7.5), \
+         (4, 'dates', 11.0), \
+         (5, 'elderberry', 5.5)",
+    )
+    .expect("insert items");
+
+    let result = db
+        .execute(
+            "SELECT id, name, price \
+             FROM items \
+             WHERE price >= 5.0 AND price < 10.0 \
+             ORDER BY price \
+             LIMIT 2",
+        )
+        .expect("simple filtered projection query");
+
+    assert_eq!(result.columns(), &["id", "name", "price"]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(5),
+                Value::Text("elderberry".to_string()),
+                Value::Float64(5.5),
+            ],
+            vec![
+                Value::Int64(3),
+                Value::Text("carrot".to_string()),
+                Value::Float64(7.5),
+            ],
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn simple_grouped_numeric_aggregate_query_supports_range_filter() {
+    let path = unique_db_path("phase3-simple-grouped-aggregate");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute(
+        "CREATE TABLE orders (id INT64 PRIMARY KEY, status TEXT NOT NULL, total_amount FLOAT64 NOT NULL)",
+    )
+    .expect("create orders");
+    db.execute(
+        "INSERT INTO orders (id, status, total_amount) VALUES \
+         (1, 'COMPLETED', 10.0), \
+         (2, 'PENDING', 15.0), \
+         (3, 'COMPLETED', 18.5), \
+         (4, 'SHIPPED', 24.0), \
+         (5, 'PENDING', 11.0)",
+    )
+    .expect("insert orders");
+
+    let result = db
+        .execute(
+            "SELECT status, COUNT(*) AS count, SUM(total_amount) AS total \
+             FROM orders \
+             WHERE total_amount >= 10.0 AND total_amount < 20.0 \
+             GROUP BY status",
+        )
+        .expect("simple grouped aggregate query");
+
+    let mut rows = result
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| format!("{:?}", left[0]).cmp(&format!("{:?}", right[0])));
+    assert_eq!(result.columns(), &["status", "count", "total"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("COMPLETED".to_string()),
+                Value::Int64(2),
+                Value::Float64(28.5),
+            ],
+            vec![
+                Value::Text("PENDING".to_string()),
+                Value::Int64(2),
+                Value::Float64(26.0),
+            ],
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
 fn analyze_stats_change_btree_explain_plan_based_on_selectivity() {
     let path = unique_db_path("phase3-analyze-plan");
     let db = Db::create(&path, DbConfig::default()).expect("create database");
@@ -282,6 +389,252 @@ fn read_executor_supports_parameterized_alias_joins_on_either_side() {
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>(),
         vec![vec![Value::Text("Grace".to_string()), Value::Int64(10)]]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn simple_indexed_join_projection_query_supports_limit() {
+    let path = unique_db_path("phase3-simple-join-projection");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT NOT NULL)")
+        .expect("create users");
+    db.execute(
+        "CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64 REFERENCES users(id), status TEXT NOT NULL, total_amount FLOAT64 NOT NULL)",
+    )
+    .expect("create orders");
+    db.execute("CREATE INDEX orders_status_idx ON orders (status)")
+        .expect("create orders status index");
+
+    db.execute("INSERT INTO users (id, name) VALUES (1, 'Ada'), (2, 'Grace')")
+        .expect("insert users");
+    db.execute(
+        "INSERT INTO orders (id, user_id, status, total_amount) VALUES \
+         (10, 1, 'COMPLETED', 50.0), \
+         (11, 1, 'PENDING', 75.0), \
+         (12, 2, 'COMPLETED', 10.0)",
+    )
+    .expect("insert orders");
+
+    let result = db
+        .execute_with_params(
+            "SELECT o.id, o.total_amount, u.name \
+             FROM orders o \
+             JOIN users u ON o.user_id = u.id \
+             WHERE o.status = $1 \
+             LIMIT 50",
+            &[Value::Text("COMPLETED".to_string())],
+        )
+        .expect("simple indexed join projection query");
+
+    assert_eq!(result.columns(), &["id", "total_amount", "name"]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(10),
+                Value::Float64(50.0),
+                Value::Text("Ada".to_string()),
+            ],
+            vec![
+                Value::Int64(12),
+                Value::Float64(10.0),
+                Value::Text("Grace".to_string()),
+            ],
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn benchmark_history_query_uses_narrow_multi_join_fast_path_shape() {
+    let path = unique_db_path("phase3-history-join-fastpath");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT NOT NULL)")
+        .expect("create items");
+    db.execute(
+        "CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64 NOT NULL, total_amount FLOAT64 NOT NULL)",
+    )
+    .expect("create orders");
+    db.execute(
+        "CREATE TABLE payments (id INT64 PRIMARY KEY, order_id INT64 NOT NULL, status TEXT NOT NULL)",
+    )
+    .expect("create payments");
+    db.execute(
+        "CREATE TABLE order_items (order_id INT64 NOT NULL, item_id INT64 NOT NULL, quantity INT64 NOT NULL, price FLOAT64 NOT NULL)",
+    )
+    .expect("create order items");
+
+    db.execute("CREATE INDEX orders_user_id_idx ON orders (user_id)")
+        .expect("create orders user index");
+    db.execute("CREATE INDEX payments_order_id_idx ON payments (order_id)")
+        .expect("create payments order index");
+    db.execute("CREATE INDEX order_items_order_id_idx ON order_items (order_id)")
+        .expect("create order items order index");
+
+    db.execute(
+        "INSERT INTO items (id, name) VALUES \
+         (1, 'widget'), \
+         (2, 'gadget'), \
+         (3, 'cable')",
+    )
+    .expect("insert items");
+    db.execute(
+        "INSERT INTO orders (id, user_id, total_amount) VALUES \
+         (10, 1, 50.0), \
+         (11, 1, 75.0), \
+         (12, 2, 20.0)",
+    )
+    .expect("insert orders");
+    db.execute(
+        "INSERT INTO payments (id, order_id, status) VALUES \
+         (1, 10, 'PAID'), \
+         (2, 11, 'PENDING'), \
+         (3, 12, 'PAID')",
+    )
+    .expect("insert payments");
+    db.execute(
+        "INSERT INTO order_items (order_id, item_id, quantity, price) VALUES \
+         (10, 1, 2, 5.0), \
+         (10, 2, 1, 40.0), \
+         (11, 3, 3, 25.0), \
+         (12, 1, 1, 20.0)",
+    )
+    .expect("insert order items");
+
+    let result = db
+        .execute_with_params(
+            "SELECT o.id, o.total_amount, p.status, i.name, oi.quantity, oi.price \
+             FROM orders o \
+             JOIN payments p ON o.id = p.order_id \
+             JOIN order_items oi ON o.id = oi.order_id \
+             JOIN items i ON oi.item_id = i.id \
+             WHERE o.user_id = $1 \
+             ORDER BY o.id DESC",
+            &[Value::Int64(1)],
+        )
+        .expect("history query");
+
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Int64(11),
+                Value::Float64(75.0),
+                Value::Text("PENDING".to_string()),
+                Value::Text("cable".to_string()),
+                Value::Int64(3),
+                Value::Float64(25.0),
+            ],
+            vec![
+                Value::Int64(10),
+                Value::Float64(50.0),
+                Value::Text("PAID".to_string()),
+                Value::Text("widget".to_string()),
+                Value::Int64(2),
+                Value::Float64(5.0),
+            ],
+            vec![
+                Value::Int64(10),
+                Value::Float64(50.0),
+                Value::Text("PAID".to_string()),
+                Value::Text("gadget".to_string()),
+                Value::Int64(1),
+                Value::Float64(40.0),
+            ],
+        ]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn benchmark_report_query_uses_filtered_join_aggregate_fast_path_shape() {
+    let path = unique_db_path("phase3-report-join-fastpath");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE items (id INT64 PRIMARY KEY, name TEXT NOT NULL)")
+        .expect("create items");
+    db.execute("CREATE TABLE orders (id INT64 PRIMARY KEY, status TEXT NOT NULL)")
+        .expect("create orders");
+    db.execute(
+        "CREATE TABLE order_items (order_id INT64 NOT NULL, item_id INT64 NOT NULL, quantity INT64 NOT NULL, price FLOAT64 NOT NULL)",
+    )
+    .expect("create order items");
+
+    db.execute("CREATE INDEX orders_status_idx ON orders (status)")
+        .expect("create orders status index");
+    db.execute("CREATE INDEX order_items_order_id_idx ON order_items (order_id)")
+        .expect("create order items order index");
+
+    db.execute(
+        "INSERT INTO items (id, name) VALUES \
+         (1, 'widget'), \
+         (2, 'gadget'), \
+         (3, 'cable')",
+    )
+    .expect("insert items");
+    db.execute(
+        "INSERT INTO orders (id, status) VALUES \
+         (10, 'COMPLETED'), \
+         (11, 'COMPLETED'), \
+         (12, 'PENDING')",
+    )
+    .expect("insert orders");
+    db.execute(
+        "INSERT INTO order_items (order_id, item_id, quantity, price) VALUES \
+         (10, 1, 2, 5.0), \
+         (10, 2, 1, 30.0), \
+         (11, 1, 4, 6.0), \
+         (11, 3, 1, 12.0), \
+         (12, 2, 3, 30.0)",
+    )
+    .expect("insert order items");
+
+    let result = db
+        .execute(
+            "SELECT i.name, SUM(oi.quantity), SUM(oi.quantity * oi.price) AS revenue \
+             FROM items i \
+             JOIN order_items oi ON i.id = oi.item_id \
+             JOIN orders o ON oi.order_id = o.id \
+             WHERE o.status = 'COMPLETED' \
+             GROUP BY i.id, i.name \
+             ORDER BY revenue DESC \
+             LIMIT 2",
+        )
+        .expect("report query");
+
+    assert_eq!(result.columns(), &["name", "col2", "revenue"]);
+    assert_eq!(
+        result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![
+            vec![
+                Value::Text("widget".to_string()),
+                Value::Int64(6),
+                Value::Float64(34.0),
+            ],
+            vec![
+                Value::Text("gadget".to_string()),
+                Value::Int64(1),
+                Value::Float64(30.0),
+            ],
+        ]
     );
 
     cleanup_db(&path);
@@ -778,6 +1131,60 @@ fn prepared_statements_reuse_parameterized_inserts_and_reads() {
     assert_eq!(
         row.rows()[0].values(),
         &[Value::Text("user3@example.com".to_string())]
+    );
+
+    cleanup_db(&path);
+}
+
+#[test]
+fn prepared_parameterized_inserts_preserve_single_column_foreign_keys() {
+    let path = unique_db_path("phase3-prepared-insert-fk");
+    let db = Db::create(&path, DbConfig::default()).expect("create database");
+
+    db.execute("CREATE TABLE users (id INT64 PRIMARY KEY, email TEXT NOT NULL)")
+        .expect("create users");
+    db.execute(
+        "CREATE TABLE orders (id INT64 PRIMARY KEY, user_id INT64 REFERENCES users(id), total INT64)",
+    )
+    .expect("create orders");
+    db.execute("CREATE INDEX orders_user_id_idx ON orders (user_id)")
+        .expect("create orders user index");
+
+    let insert_user = db
+        .prepare("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .expect("prepare user insert");
+    let insert_order = db
+        .prepare("INSERT INTO orders (id, user_id, total) VALUES ($1, $2, $3)")
+        .expect("prepare order insert");
+
+    db.execute("BEGIN").expect("begin");
+    insert_user
+        .execute(&[
+            Value::Int64(1),
+            Value::Text("user1@example.com".to_string()),
+        ])
+        .expect("insert parent row");
+    insert_order
+        .execute(&[Value::Int64(10), Value::Int64(1), Value::Int64(50)])
+        .expect("insert child row");
+    let missing_parent = insert_order
+        .execute(&[Value::Int64(11), Value::Int64(999), Value::Int64(75)])
+        .expect_err("missing parent should fail");
+    assert!(matches!(
+        missing_parent,
+        decentdb::DbError::Constraint { .. }
+    ));
+    db.execute("COMMIT").expect("commit");
+
+    let rows = db
+        .execute("SELECT id, user_id, total FROM orders ORDER BY id")
+        .expect("read orders");
+    assert_eq!(
+        rows.rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>(),
+        vec![vec![Value::Int64(10), Value::Int64(1), Value::Int64(50)]]
     );
 
     cleanup_db(&path);

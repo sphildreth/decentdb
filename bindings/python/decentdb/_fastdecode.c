@@ -25,6 +25,15 @@ static PyObject *decode_text_i64_f64_values(
     size_t text_len,
     int64_t id_value,
     double float_value);
+static PyObject *decode_i64_f64_text_text_i64_f64_values(
+    int64_t id_value,
+    double float1_value,
+    const uint8_t *text1_data,
+    size_t text1_len,
+    const uint8_t *text2_data,
+    size_t text2_len,
+    int64_t int2_value,
+    double float2_value);
 static PyObject *raise_decentdb_error(ddb_status_t code, const char *context);
 
 static PyObject *decode_utf8_text_value(const uint8_t *text_data, size_t text_len) {
@@ -236,6 +245,149 @@ static PyObject *decode_i64_row(const ddb_value_view_t *row) {
     }
     PyTuple_SET_ITEM(tuple, 0, value);
     return tuple;
+}
+
+static PyObject *decode_i64_f64_text_text_i64_f64_row(const ddb_value_view_t *row) {
+    if (row[0].tag != DDB_VALUE_INT64 || row[1].tag != DDB_VALUE_FLOAT64 ||
+        row[2].tag != DDB_VALUE_TEXT || row[3].tag != DDB_VALUE_TEXT ||
+        row[4].tag != DDB_VALUE_INT64 || row[5].tag != DDB_VALUE_FLOAT64) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "row tags are not INT64/FLOAT64/TEXT/TEXT/INT64/FLOAT64");
+        return NULL;
+    }
+    return decode_i64_f64_text_text_i64_f64_values(
+        row[0].int64_value,
+        row[1].float64_value,
+        row[2].data,
+        row[2].len,
+        row[3].data,
+        row[3].len,
+        row[4].int64_value,
+        row[5].float64_value);
+}
+
+static PyObject *decode_i64_f64_text_text_i64_f64_values(
+    int64_t id_value,
+    double float1_value,
+    const uint8_t *text1_data,
+    size_t text1_len,
+    const uint8_t *text2_data,
+    size_t text2_len,
+    int64_t int2_value,
+    double float2_value) {
+    PyObject *tuple = PyTuple_New(6);
+    if (tuple == NULL) {
+        return NULL;
+    }
+
+    PyObject *id_obj = PyLong_FromLongLong(id_value);
+    if (id_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 0, id_obj);
+
+    PyObject *float1_obj = PyFloat_FromDouble(float1_value);
+    if (float1_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 1, float1_obj);
+
+    PyObject *text1_obj = decode_utf8_text_value(text1_data, text1_len);
+    if (text1_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 2, text1_obj);
+
+    PyObject *text2_obj = decode_utf8_text_value(text2_data, text2_len);
+    if (text2_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 3, text2_obj);
+
+    PyObject *int2_obj = PyLong_FromLongLong(int2_value);
+    if (int2_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 4, int2_obj);
+
+    PyObject *float2_obj = PyFloat_FromDouble(float2_value);
+    if (float2_obj == NULL) {
+        Py_DECREF(tuple);
+        return NULL;
+    }
+    PyTuple_SET_ITEM(tuple, 5, float2_obj);
+    return tuple;
+}
+
+static PyObject *decode_known_fast_row(const ddb_value_view_t *row, size_t columns) {
+    if (row == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "row view pointer is null");
+        return NULL;
+    }
+    if (columns == 1) {
+        return decode_i64_row(row);
+    }
+    if (columns == 3) {
+        if (row[0].tag == DDB_VALUE_INT64 && row[1].tag == DDB_VALUE_TEXT &&
+            row[2].tag == DDB_VALUE_FLOAT64) {
+            return decode_i64_text_f64_row(row);
+        }
+        if (row[0].tag == DDB_VALUE_INT64 && row[1].tag == DDB_VALUE_TEXT &&
+            row[2].tag == DDB_VALUE_TEXT) {
+            return decode_i64_text_text_row(row);
+        }
+        if (row[0].tag == DDB_VALUE_INT64 && row[1].tag == DDB_VALUE_FLOAT64 &&
+            row[2].tag == DDB_VALUE_TEXT) {
+            return decode_i64_f64_text_row(row);
+        }
+        if (row[0].tag == DDB_VALUE_TEXT && row[1].tag == DDB_VALUE_INT64 &&
+            row[2].tag == DDB_VALUE_FLOAT64) {
+            return decode_text_i64_f64_row(row);
+        }
+    }
+    if (columns == 6) {
+        if (row[0].tag == DDB_VALUE_INT64 && row[1].tag == DDB_VALUE_FLOAT64 &&
+            row[2].tag == DDB_VALUE_TEXT && row[3].tag == DDB_VALUE_TEXT &&
+            row[4].tag == DDB_VALUE_INT64 && row[5].tag == DDB_VALUE_FLOAT64) {
+            return decode_i64_f64_text_text_i64_f64_row(row);
+        }
+    }
+    PyErr_SetString(PyExc_ValueError, "unsupported row shape for fast row decoder");
+    return NULL;
+}
+
+static PyObject *decode_known_fast_matrix(
+    const ddb_value_view_t *values,
+    size_t row_count,
+    size_t columns) {
+    if (row_count == 0) {
+        return PyList_New(0);
+    }
+    if (values == NULL) {
+        PyErr_SetString(PyExc_ValueError, "matrix pointer is null");
+        return NULL;
+    }
+
+    PyObject *rows = PyList_New((Py_ssize_t)row_count);
+    if (rows == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < row_count; i++) {
+        const ddb_value_view_t *row = values + (i * columns);
+        PyObject *tuple = decode_known_fast_row(row, columns);
+        if (tuple == NULL) {
+            Py_DECREF(rows);
+            return NULL;
+        }
+        PyList_SET_ITEM(rows, (Py_ssize_t)i, tuple);
+    }
+    return rows;
 }
 
 static int parse_row_i64_text_f64(
@@ -694,6 +846,54 @@ static PyObject *decode_matrix_i64(PyObject *self, PyObject *args) {
     for (Py_ssize_t i = 0; i < row_count; i++) {
         const ddb_value_view_t *row = values + i;
         PyObject *tuple = decode_i64_row(row);
+        if (tuple == NULL) {
+            Py_DECREF(rows);
+            return NULL;
+        }
+        PyList_SET_ITEM(rows, i, tuple);
+    }
+    return rows;
+}
+
+static PyObject *decode_row_i64_f64_text_text_i64_f64(PyObject *self, PyObject *args) {
+    unsigned long long addr = 0;
+    if (!PyArg_ParseTuple(args, "K", &addr)) {
+        return NULL;
+    }
+    if (addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "row pointer is null");
+        return NULL;
+    }
+    const ddb_value_view_t *row = (const ddb_value_view_t *)(uintptr_t)addr;
+    return decode_i64_f64_text_text_i64_f64_row(row);
+}
+
+static PyObject *decode_matrix_i64_f64_text_text_i64_f64(PyObject *self, PyObject *args) {
+    unsigned long long addr = 0;
+    Py_ssize_t row_count = 0;
+    if (!PyArg_ParseTuple(args, "Kn", &addr, &row_count)) {
+        return NULL;
+    }
+    if (row_count < 0) {
+        PyErr_SetString(PyExc_ValueError, "row_count must be non-negative");
+        return NULL;
+    }
+    if (row_count == 0) {
+        return PyList_New(0);
+    }
+    if (addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "matrix pointer is null");
+        return NULL;
+    }
+
+    const ddb_value_view_t *values = (const ddb_value_view_t *)(uintptr_t)addr;
+    PyObject *rows = PyList_New(row_count);
+    if (rows == NULL) {
+        return NULL;
+    }
+    for (Py_ssize_t i = 0; i < row_count; i++) {
+        const ddb_value_view_t *row = values + (i * 6);
+        PyObject *tuple = decode_i64_f64_text_text_i64_f64_row(row);
         if (tuple == NULL) {
             Py_DECREF(rows);
             return NULL;
@@ -1225,18 +1425,38 @@ static PyObject *bind_int64_step_row_view(PyObject *self, PyObject *args) {
     if (has_row == 0) {
         Py_RETURN_NONE;
     }
-    if (values == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "row view pointer is null");
+    return decode_known_fast_row(values, columns);
+}
+
+static PyObject *bind_text_step_row_view(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    const char *text_ptr = NULL;
+    Py_ssize_t text_len = 0;
+    if (!PyArg_ParseTuple(args, "Ks#", &stmt_addr, &text_ptr, &text_len)) {
         return NULL;
     }
-    if (columns == 3) {
-        return decode_i64_text_f64_row(values);
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
     }
-    if (columns == 1) {
-        return decode_i64_row(values);
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_text(stmt, 1, text_ptr, (size_t)text_len);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_text");
     }
-    PyErr_SetString(PyExc_ValueError, "unsupported row shape for fast point-read decoder");
-    return NULL;
+
+    const ddb_value_view_t *values = NULL;
+    size_t columns = 0;
+    uint8_t has_row = 0;
+    code = ddb_stmt_step_row_view(stmt, &values, &columns, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step_row_view");
+    }
+    if (has_row == 0) {
+        Py_RETURN_NONE;
+    }
+    return decode_known_fast_row(values, columns);
 }
 
 static PyObject *bind_i64_text_step(PyObject *self, PyObject *args) {
@@ -1269,6 +1489,186 @@ static PyObject *bind_i64_text_step(PyObject *self, PyObject *args) {
     return PyBool_FromLong((long)(has_row != 0));
 }
 
+static PyObject *bind_int64_step_affected(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    long long id_value = 0;
+    if (!PyArg_ParseTuple(args, "KL", &stmt_addr, &id_value)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    uint64_t affected = 0;
+    code = ddb_stmt_affected_rows(stmt, &affected);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+    }
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
+    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    return result;
+}
+
+static PyObject *reset_bind_int64_step_affected(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    long long id_value = 0;
+    if (!PyArg_ParseTuple(args, "KL", &stmt_addr, &id_value)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_reset(stmt);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_reset");
+    }
+    code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    uint64_t affected = 0;
+    code = ddb_stmt_affected_rows(stmt, &affected);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+    }
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
+    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    return result;
+}
+
+static PyObject *bind_int64_fetch_all_row_views(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    long long id_value = 0;
+    if (!PyArg_ParseTuple(args, "KL", &stmt_addr, &id_value)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    if (has_row == 0) {
+        return PyList_New(0);
+    }
+
+    const ddb_value_view_t *values = NULL;
+    size_t row_count = 0;
+    size_t column_count = 0;
+    code = ddb_stmt_fetch_row_views(
+        stmt, 1, 0, &values, &row_count, &column_count);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_fetch_row_views");
+    }
+    return decode_known_fast_matrix(values, row_count, column_count);
+}
+
+static PyObject *step_fetch_all_row_views(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    if (!PyArg_ParseTuple(args, "K", &stmt_addr)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    uint8_t has_row = 0;
+    ddb_status_t code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    if (has_row == 0) {
+        return PyList_New(0);
+    }
+
+    const ddb_value_view_t *values = NULL;
+    size_t row_count = 0;
+    size_t column_count = 0;
+    code = ddb_stmt_fetch_row_views(stmt, 1, 0, &values, &row_count, &column_count);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_fetch_row_views");
+    }
+    return decode_known_fast_matrix(values, row_count, column_count);
+}
+
+static PyObject *bind_float64_float64_fetch_all_row_views(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    double first_value = 0.0;
+    double second_value = 0.0;
+    if (!PyArg_ParseTuple(args, "Kdd", &stmt_addr, &first_value, &second_value)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_float64(stmt, 1, first_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_float64");
+    }
+    code = ddb_stmt_bind_float64(stmt, 2, second_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_float64");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    if (has_row == 0) {
+        return PyList_New(0);
+    }
+
+    const ddb_value_view_t *values = NULL;
+    size_t row_count = 0;
+    size_t column_count = 0;
+    code = ddb_stmt_fetch_row_views(stmt, 1, 0, &values, &row_count, &column_count);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_fetch_row_views");
+    }
+    return decode_known_fast_matrix(values, row_count, column_count);
+}
+
 static PyObject *bind_text_i64_step(PyObject *self, PyObject *args) {
     unsigned long long stmt_addr = 0;
     const char *text_ptr = NULL;
@@ -1299,6 +1699,215 @@ static PyObject *bind_text_i64_step(PyObject *self, PyObject *args) {
     return PyBool_FromLong((long)(has_row != 0));
 }
 
+static PyObject *bind_i64_text_step_affected(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    long long id_value = 0;
+    const char *text_ptr = NULL;
+    Py_ssize_t text_len = 0;
+    if (!PyArg_ParseTuple(args, "KLs#", &stmt_addr, &id_value, &text_ptr, &text_len)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    code = ddb_stmt_bind_text(stmt, 2, text_ptr, (size_t)text_len);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_text");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    uint64_t affected = 0;
+    code = ddb_stmt_affected_rows(stmt, &affected);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+    }
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
+    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    return result;
+}
+
+static PyObject *reset_bind_i64_text_step_affected(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    long long id_value = 0;
+    const char *text_ptr = NULL;
+    Py_ssize_t text_len = 0;
+    if (!PyArg_ParseTuple(args, "KLs#", &stmt_addr, &id_value, &text_ptr, &text_len)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_reset(stmt);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_reset");
+    }
+    code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    code = ddb_stmt_bind_text(stmt, 2, text_ptr, (size_t)text_len);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_text");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    uint64_t affected = 0;
+    code = ddb_stmt_affected_rows(stmt, &affected);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+    }
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
+    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    return result;
+}
+
+static PyObject *bind_text_i64_step_affected(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    const char *text_ptr = NULL;
+    Py_ssize_t text_len = 0;
+    long long id_value = 0;
+    if (!PyArg_ParseTuple(args, "Ks#L", &stmt_addr, &text_ptr, &text_len, &id_value)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_text(stmt, 1, text_ptr, (size_t)text_len);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_text");
+    }
+    code = ddb_stmt_bind_int64(stmt, 2, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    uint64_t affected = 0;
+    code = ddb_stmt_affected_rows(stmt, &affected);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+    }
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
+    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    return result;
+}
+
+static PyObject *reset_bind_text_i64_step_affected(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    const char *text_ptr = NULL;
+    Py_ssize_t text_len = 0;
+    long long id_value = 0;
+    if (!PyArg_ParseTuple(args, "Ks#L", &stmt_addr, &text_ptr, &text_len, &id_value)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_reset(stmt);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_reset");
+    }
+    code = ddb_stmt_bind_text(stmt, 1, text_ptr, (size_t)text_len);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_text");
+    }
+    code = ddb_stmt_bind_int64(stmt, 2, (int64_t)id_value);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    uint64_t affected = 0;
+    code = ddb_stmt_affected_rows(stmt, &affected);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+    }
+    PyObject *result = PyTuple_New(2);
+    if (result == NULL) {
+        return NULL;
+    }
+    PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
+    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    return result;
+}
+
+static PyObject *bind_text_fetch_all_row_views(PyObject *self, PyObject *args) {
+    unsigned long long stmt_addr = 0;
+    const char *text_ptr = NULL;
+    Py_ssize_t text_len = 0;
+    if (!PyArg_ParseTuple(args, "Ks#", &stmt_addr, &text_ptr, &text_len)) {
+        return NULL;
+    }
+    if (stmt_addr == 0) {
+        PyErr_SetString(PyExc_ValueError, "statement pointer is null");
+        return NULL;
+    }
+
+    ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
+    ddb_status_t code = ddb_stmt_bind_text(stmt, 1, text_ptr, (size_t)text_len);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_bind_text");
+    }
+    uint8_t has_row = 0;
+    code = ddb_stmt_step(stmt, &has_row);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_step");
+    }
+    if (has_row == 0) {
+        return PyList_New(0);
+    }
+
+    const ddb_value_view_t *values = NULL;
+    size_t row_count = 0;
+    size_t column_count = 0;
+    code = ddb_stmt_fetch_row_views(
+        stmt, 1, 0, &values, &row_count, &column_count);
+    if (code != DDB_OK) {
+        return raise_decentdb_error(code, "ddb_stmt_fetch_row_views");
+    }
+    return decode_known_fast_matrix(values, row_count, column_count);
+}
+
 static PyMethodDef methods[] = {
     {"decode_row_i64_text_f64", decode_row_i64_text_f64, METH_VARARGS,
      "Decode one INT64/TEXT/FLOAT64 row from a ddb_value_view_t pointer."},
@@ -1320,6 +1929,10 @@ static PyMethodDef methods[] = {
      "Decode one INT64 row from a ddb_value_view_t pointer."},
     {"decode_matrix_i64", decode_matrix_i64, METH_VARARGS,
      "Decode row_count INT64 rows from a ddb_value_view_t pointer."},
+    {"decode_row_i64_f64_text_text_i64_f64", decode_row_i64_f64_text_text_i64_f64, METH_VARARGS,
+     "Decode one INT64/FLOAT64/TEXT/TEXT/INT64/FLOAT64 row from a ddb_value_view_t pointer."},
+    {"decode_matrix_i64_f64_text_text_i64_f64", decode_matrix_i64_f64_text_text_i64_f64, METH_VARARGS,
+     "Decode row_count INT64/FLOAT64/TEXT/TEXT/INT64/FLOAT64 rows from a ddb_value_view_t pointer."},
     {"execute_batch_i64_text_f64", execute_batch_i64_text_f64, METH_VARARGS,
      "Execute ddb_stmt_execute_batch_i64_text_f64 from Python rows."},
     {"execute_batch_i64", execute_batch_i64, METH_VARARGS,
@@ -1336,10 +1949,32 @@ static PyMethodDef methods[] = {
      "Bind INT64 parameter and fetch INT64/TEXT/FLOAT64 row in a single call."},
     {"bind_int64_step_row_view", bind_int64_step_row_view, METH_VARARGS,
      "Bind INT64 parameter and fetch one row view in a single call."},
+    {"bind_text_step_row_view", bind_text_step_row_view, METH_VARARGS,
+     "Bind TEXT parameter and fetch one row view in a single call."},
+    {"bind_int64_step_affected", bind_int64_step_affected, METH_VARARGS,
+     "Bind INT64 parameter, step, and return (affected_rows, has_row)."},
+    {"reset_bind_int64_step_affected", reset_bind_int64_step_affected, METH_VARARGS,
+     "Reset statement, bind INT64 parameter, step, and return (affected_rows, has_row)."},
+    {"bind_int64_fetch_all_row_views", bind_int64_fetch_all_row_views, METH_VARARGS,
+     "Bind INT64 parameter, execute, fetch all row views, and decode supported shapes."},
+    {"step_fetch_all_row_views", step_fetch_all_row_views, METH_VARARGS,
+     "Execute a zero-parameter statement, fetch all row views, and decode supported shapes."},
+    {"bind_float64_float64_fetch_all_row_views", bind_float64_float64_fetch_all_row_views, METH_VARARGS,
+     "Bind two FLOAT64 parameters, execute, fetch all row views, and decode supported shapes."},
     {"bind_i64_text_step", bind_i64_text_step, METH_VARARGS,
      "Bind (INT64, TEXT) and step statement once."},
+    {"bind_i64_text_step_affected", bind_i64_text_step_affected, METH_VARARGS,
+     "Bind (INT64, TEXT), step, and return (affected_rows, has_row)."},
+    {"reset_bind_i64_text_step_affected", reset_bind_i64_text_step_affected, METH_VARARGS,
+     "Reset statement, bind (INT64, TEXT), step, and return (affected_rows, has_row)."},
     {"bind_text_i64_step", bind_text_i64_step, METH_VARARGS,
      "Bind (TEXT, INT64) and step statement once."},
+    {"bind_text_i64_step_affected", bind_text_i64_step_affected, METH_VARARGS,
+     "Bind (TEXT, INT64), step, and return (affected_rows, has_row)."},
+    {"reset_bind_text_i64_step_affected", reset_bind_text_i64_step_affected, METH_VARARGS,
+     "Reset statement, bind (TEXT, INT64), step, and return (affected_rows, has_row)."},
+    {"bind_text_fetch_all_row_views", bind_text_fetch_all_row_views, METH_VARARGS,
+     "Bind TEXT parameter, execute, fetch all row views, and decode supported shapes."},
     {NULL, NULL, 0, NULL},
 };
 

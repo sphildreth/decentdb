@@ -213,7 +213,8 @@ impl EngineRuntime {
                     table.name, foreign_key.referenced_table
                 )));
             }
-            let Some(parent_rows) = self.table_data_for_schema(parent, &foreign_key.referenced_table)?
+            let Some(parent_rows) =
+                self.table_data_for_schema(parent, &foreign_key.referenced_table)?
             else {
                 return Err(DbError::constraint(format!(
                     "foreign key parent table {} has no row store",

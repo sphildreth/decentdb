@@ -105,3 +105,81 @@ def test_connection_execute_does_not_retain_discarded_cursors(tmp_path):
     assert len(conn._stmt_cache) == 1
 
     conn.close()
+
+
+def test_repeated_execute_fetchall_does_not_duplicate_buffered_first_row(tmp_path):
+    db_path = str(tmp_path / "buffered_first_row.ddb")
+    conn = decentdb.connect(db_path, stmt_cache_size=10)
+    cur = conn.cursor()
+
+    cur.execute("CREATE TABLE foo (id INT64 PRIMARY KEY, name TEXT, email TEXT)")
+    cur.execute(
+        "INSERT INTO foo VALUES (?, ?, ?)",
+        (1, "alice", "alice@example.com"),
+    )
+    conn.commit()
+
+    sql = "SELECT id, name, email FROM foo WHERE id = ?"
+    for _ in range(3):
+        cur.execute(sql, (1,))
+        assert cur.fetchall() == [(1, "alice", "alice@example.com")]
+
+    conn.close()
+
+
+def test_prefetched_rows_are_consumed_without_duplication(tmp_path):
+    db_path = str(tmp_path / "prefetched_rows.ddb")
+    conn = decentdb.connect(db_path, stmt_cache_size=10)
+    cur = conn.cursor()
+
+    cur.execute("CREATE TABLE foo (id INT64 PRIMARY KEY, bucket INT64)")
+    cur.executemany(
+        "INSERT INTO foo VALUES (?, ?)",
+        [
+            (1, 10),
+            (2, 10),
+            (3, 10),
+        ],
+    )
+    conn.commit()
+
+    cur.execute(
+        "SELECT id FROM foo WHERE bucket = ? ORDER BY id LIMIT 10",
+        (10,),
+    )
+    assert cur.fetchone() == (1,)
+    assert cur.fetchmany(2) == [(2,), (3,)]
+    assert cur.fetchone() is None
+    assert cur.fetchall() == []
+
+    conn.close()
+
+
+def test_prefetched_rows_support_zero_param_and_two_float_queries(tmp_path):
+    db_path = str(tmp_path / "prefetched_shapes.ddb")
+    conn = decentdb.connect(db_path, stmt_cache_size=10)
+    cur = conn.cursor()
+
+    cur.execute(
+        "CREATE TABLE items (id INT64 PRIMARY KEY, price FLOAT64)"
+    )
+    cur.executemany(
+        "INSERT INTO items VALUES (?, ?)",
+        [
+            (1, 5.0),
+            (2, 7.5),
+            (3, 11.0),
+        ],
+    )
+    conn.commit()
+
+    cur.execute("SELECT COUNT(*) FROM items")
+    assert cur.fetchall() == [(3,)]
+
+    cur.execute(
+        "SELECT id FROM items WHERE price >= ? AND price < ? ORDER BY price LIMIT 10",
+        (5.0, 10.0),
+    )
+    assert cur.fetchall() == [(1,), (2,)]
+
+    conn.close()
