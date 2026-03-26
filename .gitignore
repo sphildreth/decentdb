@@ -91,3 +91,4 @@ tests/bindings/**/*.node
 *.ddb
 *.ddb.wal
 *.log
+/.tmp/
