@@ -53,6 +53,7 @@ pub struct PreparedStatement {
     statement: Arc<SqlStatement>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
     read_only: bool,
+    in_state_without_clone: bool,
 }
 
 /// Exclusive SQL transaction handle that owns mutable runtime state locally.
@@ -2084,9 +2085,11 @@ impl Db {
             db: self.clone(),
             schema_cookie: runtime.catalog.schema_cookie,
             temp_schema_cookie: runtime.temp_schema_cookie,
-            statement,
+            statement: Arc::clone(&statement),
             prepared_insert,
             read_only,
+            in_state_without_clone: !read_only
+                && runtime.can_execute_statement_in_state_without_clone(statement.as_ref()),
         })
     }
 
@@ -2340,10 +2343,7 @@ impl Db {
             state.persistent_changed |= !temp_only;
             return Ok(result);
         }
-        if state
-            .runtime
-            .can_execute_statement_in_state_without_clone(prepared.statement.as_ref())
-        {
+        if prepared.in_state_without_clone {
             let result =
                 state
                     .runtime

@@ -228,6 +228,32 @@ fn insert_and_update_with_index() {
 }
 
 #[test]
+fn update_single_row_id_alias_email_parameterized() {
+    let db = mem_db();
+    db.execute("CREATE TABLE users(id INT64 PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX idx_users_email ON users(email)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a@example.com')")
+        .unwrap();
+    db.execute_with_params(
+        "UPDATE users SET email = $1 WHERE id = $2",
+        &[
+            Value::Text("updated@example.com".to_string()),
+            Value::Int64(1),
+        ],
+    )
+    .unwrap();
+    let r = db
+        .execute("SELECT email FROM users WHERE id = 1")
+        .expect("select updated row");
+    assert_eq!(
+        rows(&r),
+        vec![vec![Value::Text("updated@example.com".to_string())]]
+    );
+}
+
+#[test]
 fn insert_column_count_mismatch() {
     let db = mem_db();
     exec(&db, "CREATE TABLE ccm (id INT PRIMARY KEY, a TEXT, b TEXT)");

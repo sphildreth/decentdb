@@ -203,35 +203,93 @@ pub(crate) enum RuntimeBtreeKeys {
     NonUniqueInt64(Int64Map<Vec<i64>>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeRowIdSet<'a> {
+    Empty,
+    Single(i64),
+    Many(&'a [i64]),
+}
+
+impl RuntimeRowIdSet<'_> {
+    #[must_use]
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Single(_) => 1,
+            Self::Many(values) => values.len(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn is_empty(self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    pub(crate) fn for_each(self, mut f: impl FnMut(i64)) {
+        match self {
+            Self::Empty => {}
+            Self::Single(row_id) => f(row_id),
+            Self::Many(values) => {
+                for row_id in values {
+                    f(*row_id);
+                }
+            }
+        }
+    }
+}
+
 impl RuntimeBtreeKeys {
-    pub(super) fn row_ids_for_key(&self, key: &RuntimeBtreeKey) -> Vec<i64> {
+    fn row_id_set_for_key(&self, key: &RuntimeBtreeKey) -> RuntimeRowIdSet<'_> {
         match (self, key) {
-            (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
-                keys.get(key).copied().into_iter().collect()
+            (Self::UniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => keys
+                .get(key)
+                .copied()
+                .map(RuntimeRowIdSet::Single)
+                .unwrap_or(RuntimeRowIdSet::Empty),
+            (Self::NonUniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => keys
+                .get(key)
+                .map(Vec::as_slice)
+                .map(RuntimeRowIdSet::Many)
+                .unwrap_or(RuntimeRowIdSet::Empty),
+            (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => keys
+                .get(key)
+                .copied()
+                .map(RuntimeRowIdSet::Single)
+                .unwrap_or(RuntimeRowIdSet::Empty),
+            (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => keys
+                .get(key)
+                .map(Vec::as_slice)
+                .map(RuntimeRowIdSet::Many)
+                .unwrap_or(RuntimeRowIdSet::Empty),
+            _ => RuntimeRowIdSet::Empty,
+        }
+    }
+
+    pub(super) fn row_ids_for_key(&self, key: &RuntimeBtreeKey) -> Vec<i64> {
+        let row_ids = self.row_id_set_for_key(key);
+        let mut values = Vec::with_capacity(row_ids.len());
+        row_ids.for_each(|row_id| values.push(row_id));
+        values
+    }
+
+    pub(super) fn row_ids_for_value_set(&self, value: &Value) -> Result<RuntimeRowIdSet<'_>> {
+        match self {
+            Self::UniqueEncoded(_) | Self::NonUniqueEncoded(_) => {
+                let key = RuntimeBtreeKey::Encoded(encode_index_key(value)?);
+                Ok(self.row_id_set_for_key(&key))
             }
-            (Self::NonUniqueEncoded(keys), RuntimeBtreeKey::Encoded(key)) => {
-                keys.get(key).cloned().unwrap_or_default()
-            }
-            (Self::UniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
-                keys.get(key).copied().into_iter().collect()
-            }
-            (Self::NonUniqueInt64(keys), RuntimeBtreeKey::Int64(key)) => {
-                keys.get(key).cloned().unwrap_or_default()
-            }
-            _ => Vec::new(),
+            Self::UniqueInt64(_) | Self::NonUniqueInt64(_) => match value {
+                Value::Int64(value) => Ok(self.row_id_set_for_key(&RuntimeBtreeKey::Int64(*value))),
+                _ => Ok(RuntimeRowIdSet::Empty),
+            },
         }
     }
 
     pub(super) fn row_ids_for_value(&self, value: &Value) -> Result<Vec<i64>> {
-        match self {
-            Self::UniqueEncoded(_) | Self::NonUniqueEncoded(_) => {
-                Ok(self.row_ids_for_key(&RuntimeBtreeKey::Encoded(encode_index_key(value)?)))
-            }
-            Self::UniqueInt64(_) | Self::NonUniqueInt64(_) => match value {
-                Value::Int64(value) => Ok(self.row_ids_for_key(&RuntimeBtreeKey::Int64(*value))),
-                _ => Ok(Vec::new()),
-            },
-        }
+        let row_ids = self.row_ids_for_value_set(value)?;
+        let mut values = Vec::with_capacity(row_ids.len());
+        row_ids.for_each(|row_id| values.push(row_id));
+        Ok(values)
     }
 
     pub(super) fn contains_any(&self, key: &RuntimeBtreeKey) -> bool {
@@ -1323,6 +1381,9 @@ impl EngineRuntime {
     ) -> Result<QueryResult> {
         match statement {
             Statement::Query(query) => {
+                if let Some(result) = self.try_execute_simple_count_query(query)? {
+                    return Ok(result);
+                }
                 if let Some(result) =
                     self.try_execute_simple_indexed_projection_query(query, params)?
                 {
@@ -1367,6 +1428,77 @@ impl EngineRuntime {
                 "read-only execution received mutating statement {other:?}"
             ))),
         }
+    }
+
+    fn try_execute_simple_count_query(&self, query: &Query) -> Result<Option<QueryResult>> {
+        if !query.ctes.is_empty()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+        {
+            return Ok(None);
+        }
+        let QueryBody::Select(select) = &query.body else {
+            return Ok(None);
+        };
+        if select.filter.is_some()
+            || !select.group_by.is_empty()
+            || select.having.is_some()
+            || select.distinct
+            || !select.distinct_on.is_empty()
+            || select.from.len() != 1
+            || select.projection.len() != 1
+        {
+            return Ok(None);
+        }
+        let FromItem::Table { name, .. } = &select.from[0] else {
+            return Ok(None);
+        };
+        if self
+            .visible_view(name, NameResolutionScope::Session)
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let Some(table) = self.table_schema(name) else {
+            return Ok(None);
+        };
+        if !generated_columns_are_stored(table) {
+            return Ok(None);
+        }
+
+        let SelectItem::Expr { expr, alias } = &select.projection[0] else {
+            return Ok(None);
+        };
+        let Expr::Aggregate {
+            name: aggregate_name,
+            args,
+            distinct,
+            star,
+            order_by,
+            within_group,
+        } = expr
+        else {
+            return Ok(None);
+        };
+        if !aggregate_name.eq_ignore_ascii_case("count")
+            || !args.is_empty()
+            || *distinct
+            || !*star
+            || !order_by.is_empty()
+            || *within_group
+        {
+            return Ok(None);
+        }
+
+        let row_count = self.table_data(name).map_or(0, |data| data.rows.len());
+        let row_count = i64::try_from(row_count)
+            .map_err(|_| DbError::sql(format!("table {name} exceeds COUNT(*) row-count limits")))?;
+        let column_name = alias.clone().unwrap_or_else(|| infer_expr_name(expr, 1));
+        Ok(Some(QueryResult::with_rows(
+            vec![column_name],
+            vec![QueryRow::new(vec![Value::Int64(row_count)])],
+        )))
     }
 
     fn execute_analyze(&mut self, table_name: Option<&str>) -> Result<()> {
@@ -1570,6 +1702,36 @@ impl EngineRuntime {
             }
         }
 
+        let value = self.eval_expr(
+            value_expr,
+            &Dataset::empty(),
+            &[],
+            params,
+            &BTreeMap::new(),
+            None,
+        )?;
+        let Some((projection_indexes, column_names)) =
+            self.simple_projection_plan(select, name, alias, table_schema)
+        else {
+            return Ok(None);
+        };
+
+        if row_id_alias_column_name(table_schema)
+            .is_some_and(|column_name| identifiers_equal(column_name, filter_column))
+        {
+            let mut rows = Vec::new();
+            if let Value::Int64(row_id) = value {
+                if let Some(stored_row) = data.row_by_id(row_id) {
+                    let mut projected = Vec::with_capacity(projection_indexes.len());
+                    for index in &projection_indexes {
+                        projected.push(stored_row.values[*index].clone());
+                    }
+                    rows.push(QueryRow::new(projected));
+                }
+            }
+            return Ok(Some(QueryResult::with_rows(column_names, rows)));
+        }
+
         let Some(index) = self.catalog.indexes.values().find(|index| {
             identifiers_equal(&index.table_name, name)
                 && index.fresh
@@ -1587,33 +1749,19 @@ impl EngineRuntime {
         let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
             return Ok(None);
         };
-
-        let value = self.eval_expr(
-            value_expr,
-            &Dataset::empty(),
-            &[],
-            params,
-            &BTreeMap::new(),
-            None,
-        )?;
-        let row_ids = keys.row_ids_for_value(&value)?;
-        let Some((projection_indexes, column_names)) =
-            self.simple_projection_plan(select, name, alias, table_schema)
-        else {
-            return Ok(None);
-        };
+        let row_ids = keys.row_ids_for_value_set(&value)?;
 
         let mut rows = Vec::with_capacity(row_ids.len());
-        for row_id in row_ids {
+        row_ids.for_each(|row_id| {
             let Some(stored_row) = data.row_by_id(row_id) else {
-                continue;
+                return;
             };
             let mut projected = Vec::with_capacity(projection_indexes.len());
             for index in &projection_indexes {
                 projected.push(stored_row.values[*index].clone());
             }
             rows.push(QueryRow::new(projected));
-        }
+        });
         Ok(Some(QueryResult::with_rows(column_names, rows)))
     }
 
@@ -2271,9 +2419,9 @@ impl EngineRuntime {
                 let value =
                     self.eval_expr(value_expr, &Dataset::empty(), &[], params, ctes, None)?;
                 if let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) {
-                    let row_ids = keys.row_ids_for_value(&value)?;
+                    let row_ids = keys.row_ids_for_value_set(&value)?;
                     return self
-                        .dataset_from_row_ids(table, data, alias, &row_ids)
+                        .dataset_from_row_id_set(table, data, alias, row_ids)
                         .map(Some);
                 }
             }
@@ -2312,7 +2460,12 @@ impl EngineRuntime {
                                 | TrigramQueryResult::RebuildRequired => return Ok(None),
                             };
                         return self
-                            .dataset_from_row_ids(table, data, alias, &row_ids)
+                            .dataset_from_row_id_set(
+                                table,
+                                data,
+                                alias,
+                                RuntimeRowIdSet::Many(&row_ids),
+                            )
                             .map(Some);
                     }
                 }
@@ -2649,8 +2802,8 @@ impl EngineRuntime {
         let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(&index.name) else {
             return Ok(None);
         };
-        let row_ids = keys.row_ids_for_value(&value)?;
-        self.dataset_from_row_ids(table, data, alias, &row_ids)
+        let row_ids = keys.row_ids_for_value_set(&value)?;
+        self.dataset_from_row_id_set(table, data, alias, row_ids)
             .map(Some)
     }
 
@@ -2742,19 +2895,19 @@ impl EngineRuntime {
             if matches!(join_value, Value::Null) {
                 continue;
             }
-            let row_ids = keys.row_ids_for_value(join_value)?;
+            let row_ids = keys.row_ids_for_value_set(join_value)?;
             if row_ids.is_empty() {
                 continue;
             }
-            for row_id in row_ids {
+            row_ids.for_each(|row_id| {
                 let probe_row = if let Some(positions) = probe_row_positions.as_ref() {
                     let Some(probe_position) = positions.get(&row_id).copied() else {
-                        continue;
+                        return;
                     };
                     &probe_data.rows[probe_position].values
                 } else {
                     let Some(probe_row) = probe_data.row_by_id(row_id) else {
-                        continue;
+                        return;
                     };
                     &probe_row.values
                 };
@@ -2767,7 +2920,7 @@ impl EngineRuntime {
                     row.extend_from_slice(filtered_row);
                 }
                 rows.push(row);
-            }
+            });
         }
         Ok(Some(Dataset { columns, rows }))
     }
@@ -2875,16 +3028,16 @@ impl EngineRuntime {
             if matches!(join_value, Value::Null) {
                 continue;
             }
-            let row_ids = keys.row_ids_for_value(join_value)?;
-            for row_id in row_ids {
+            let row_ids = keys.row_ids_for_value_set(join_value)?;
+            row_ids.for_each(|row_id| {
                 let right_values = if let Some(positions) = right_row_positions.as_ref() {
                     let Some(right_position) = positions.get(&row_id).copied() else {
-                        continue;
+                        return;
                     };
                     &right_data.rows[right_position].values
                 } else {
                     let Some(right_row) = right_data.row_by_id(row_id) else {
-                        continue;
+                        return;
                     };
                     &right_row.values
                 };
@@ -2892,7 +3045,7 @@ impl EngineRuntime {
                 row.extend_from_slice(left_row);
                 row.extend_from_slice(right_values);
                 rows.push(row);
-            }
+            });
         }
         Ok(Some(Dataset { columns, rows }))
     }
@@ -3137,18 +3290,20 @@ impl EngineRuntime {
         Ok(Dataset { columns, rows })
     }
 
-    fn dataset_from_row_ids(
+    fn dataset_from_row_id_set(
         &self,
         table: &TableSchema,
         data: &TableData,
         alias: &Option<String>,
-        row_ids: &[i64],
+        row_ids: RuntimeRowIdSet<'_>,
     ) -> Result<Dataset> {
         let table_name = alias.clone().unwrap_or_else(|| table.name.clone());
-        let rows = row_ids
-            .iter()
-            .filter_map(|row_id| data.row_by_id(*row_id).map(|row| row.values.clone()))
-            .collect::<Vec<_>>();
+        let mut rows = Vec::with_capacity(row_ids.len());
+        row_ids.for_each(|row_id| {
+            if let Some(row) = data.row_by_id(row_id) {
+                rows.push(row.values.clone());
+            }
+        });
         Ok(Dataset {
             columns: table
                 .columns
@@ -5185,6 +5340,18 @@ fn simple_join_equality(on: &Expr) -> Option<(QualifiedColumnRef<'_>, QualifiedC
             column: right_column,
         },
     ))
+}
+
+fn row_id_alias_column_name(table: &TableSchema) -> Option<&str> {
+    if table.primary_key_columns.len() != 1 {
+        return None;
+    }
+    let primary_key_column = &table.primary_key_columns[0];
+    table
+        .columns
+        .iter()
+        .find(|column| identifiers_equal(&column.name, primary_key_column) && column.auto_increment)
+        .map(|column| column.name.as_str())
 }
 
 fn matches_table_binding(table: TableBindingRef<'_>, qualifier: Option<&str>) -> bool {
@@ -11045,6 +11212,26 @@ mod tests {
             .execute_statement(&count, &[], PAGE_SIZE)
             .expect("execute count");
         assert_eq!(result.rows()[0].values(), &[Value::Int64(1)]);
+    }
+
+    #[test]
+    fn simple_count_star_without_filter_uses_fast_path() {
+        let mut runtime = EngineRuntime::empty(16);
+        execute_sql(
+            &mut runtime,
+            "CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)",
+        );
+        execute_sql(
+            &mut runtime,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        );
+
+        let statement = parse_sql_statement("SELECT COUNT(*) FROM t").expect("parse count");
+        let result = runtime
+            .execute_statement(&statement, &[], PAGE_SIZE)
+            .expect("execute count");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].values(), &[Value::Int64(3)]);
     }
 
     #[test]

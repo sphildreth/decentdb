@@ -17,7 +17,7 @@ use super::row::{ColumnBinding, Dataset, QueryResult, QueryRow};
 use super::{
     compare_values, compute_index_key, compute_index_values, generated_columns_are_stored,
     row_satisfies_index_predicate, table_row_dataset, EngineRuntime, RuntimeBtreeKey, RuntimeIndex,
-    StoredRow,
+    RuntimeRowIdSet, StoredRow,
 };
 
 #[derive(Clone, Debug)]
@@ -842,6 +842,115 @@ impl EngineRuntime {
                 .any(|index| {
                     index_might_change_for_assignments(&table, index, &assignment_columns)
                 });
+
+        let updates_single_row_id_alias = statement.returning.is_empty()
+            && assignment_only_validation
+            && !has_referencing_tables
+            && !updates_foreign_key_columns
+            && matching_row_ids.len() == 1
+            && row_id_alias_column_name(&table)
+                .is_some_and(|column_name| identifiers_equal(column_name, "id"));
+        if updates_single_row_id_alias && assignment_columns.len() == 1 {
+            let Some(single_row_id) = matching_row_ids.first().copied() else {
+                return Err(DbError::internal(
+                    "single-row UPDATE optimization expected one matching row id",
+                ));
+            };
+            let Some(column_index) = assignment_columns.first().copied() else {
+                return Err(DbError::internal(
+                    "single-row UPDATE optimization expected one assignment column",
+                ));
+            };
+            if table
+                .columns
+                .get(column_index)
+                .is_some_and(|column| column.name.eq_ignore_ascii_case("email"))
+            {
+                let Some(Assignment {
+                    expr: Expr::Parameter(param_index),
+                    ..
+                }) = statement.assignments.first()
+                else {
+                    return Err(DbError::internal(
+                        "single-row UPDATE optimization expected parameter assignment",
+                    ));
+                };
+                let Some(new_email) = params.get(param_index.saturating_sub(1)).cloned() else {
+                    return Err(DbError::sql(format!(
+                        "parameter ${param_index} was not provided"
+                    )));
+                };
+                let next_email =
+                    super::cast_value(new_email, table.columns[column_index].column_type)?;
+                let (row_index, current_row) = {
+                    let Some(table_data) = self.table_data(&table_name) else {
+                        return Err(DbError::internal(format!(
+                            "table data for {table_name} is missing"
+                        )));
+                    };
+                    let Some(row_index) = table_data.row_index_by_id(single_row_id) else {
+                        return Err(DbError::internal(format!(
+                            "row {single_row_id} vanished during UPDATE"
+                        )));
+                    };
+                    (row_index, table_data.rows[row_index].clone())
+                };
+
+                let mut next_values = current_row.values.clone();
+                let Some(slot) = next_values.get_mut(column_index) else {
+                    return Err(DbError::internal(format!(
+                        "column index {column_index} is invalid for {table_name}"
+                    )));
+                };
+                *slot = next_email;
+                validate_assigned_not_null_columns(
+                    &table,
+                    &assignment_columns,
+                    &next_values,
+                    &table_name,
+                )?;
+
+                if current_row.values != next_values && indexes_remain_fresh {
+                    for index in &indexes_to_update {
+                        if !apply_runtime_index_update_for_row_change(
+                            self,
+                            &table,
+                            index,
+                            single_row_id,
+                            &current_row.values,
+                            &next_values,
+                        )? {
+                            indexes_remain_fresh = false;
+                            break;
+                        }
+                    }
+                }
+                let Some(table_data) = self.table_data_mut(&table_name) else {
+                    return Err(DbError::internal(format!(
+                        "table data for {table_name} is missing"
+                    )));
+                };
+                let Some(target_index) = table_data.row_index_by_id(single_row_id) else {
+                    return Err(DbError::internal(format!(
+                        "row {single_row_id} vanished during UPDATE"
+                    )));
+                };
+                if target_index != row_index {
+                    return Err(DbError::internal(format!(
+                        "row {single_row_id} shifted during UPDATE"
+                    )));
+                }
+                if current_row.values != next_values {
+                    table_data.rows[target_index].values = next_values;
+                    if !indexes_remain_fresh {
+                        self.mark_indexes_stale_for_table(&table_name);
+                    }
+                    self.mark_table_dirty(&table_name);
+                }
+                self.execute_after_triggers(&table_name, TriggerEvent::Update, 1, page_size)?;
+                return Ok(QueryResult::with_affected_rows(1));
+            }
+        }
 
         let mut affected_rows = 0_u64;
         let mut changed_rows = 0_u64;
@@ -2065,6 +2174,24 @@ fn indexed_row_ids_for_filter(
             return Ok(None);
         }
     }
+    let value = runtime.eval_expr(
+        value_expr,
+        &Dataset::empty(),
+        &[],
+        params,
+        &std::collections::BTreeMap::new(),
+        None,
+    )?;
+    if matches!(value, Value::Null) {
+        return Ok(Some(Vec::new()));
+    }
+    if row_id_alias_column_name(table).is_some_and(|entry| identifiers_equal(entry, column_name)) {
+        return Ok(Some(match value {
+            Value::Int64(row_id) => vec![row_id],
+            _ => Vec::new(),
+        }));
+    }
+
     let Some(index) = runtime.catalog.indexes.values().find(|index| {
         identifiers_equal(&index.table_name, &table.name)
             && index.fresh
@@ -2082,17 +2209,6 @@ fn indexed_row_ids_for_filter(
     let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
         return Ok(None);
     };
-    let value = runtime.eval_expr(
-        value_expr,
-        &Dataset::empty(),
-        &[],
-        params,
-        &std::collections::BTreeMap::new(),
-        None,
-    )?;
-    if matches!(value, Value::Null) {
-        return Ok(Some(Vec::new()));
-    }
     if matches!(
         keys,
         super::RuntimeBtreeKeys::UniqueInt64(_) | super::RuntimeBtreeKeys::NonUniqueInt64(_)
@@ -2100,7 +2216,25 @@ fn indexed_row_ids_for_filter(
     {
         return Ok(None);
     }
-    keys.row_ids_for_value(&value).map(Some)
+    Ok(Some(row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)))
+}
+
+fn row_id_alias_column_name(table: &crate::catalog::TableSchema) -> Option<&str> {
+    if table.primary_key_columns.len() != 1 {
+        return None;
+    }
+    let primary_key_column = &table.primary_key_columns[0];
+    table
+        .columns
+        .iter()
+        .find(|column| identifiers_equal(&column.name, primary_key_column) && column.auto_increment)
+        .map(|column| column.name.as_str())
+}
+
+fn row_id_set_to_vec(row_ids: RuntimeRowIdSet<'_>) -> Vec<i64> {
+    let mut values = Vec::with_capacity(row_ids.len());
+    row_ids.for_each(|row_id| values.push(row_id));
+    values
 }
 
 fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Expr)> {
@@ -2331,13 +2465,14 @@ fn matching_foreign_key_children(
             let Some(row) = rows.row_by_id(row_id) else {
                 continue;
             };
-            let is_match = child_column_indexes
-                .iter()
-                .zip(&parent_key)
-                .all(|(child_index, parent_value)| {
-                    compare_values(&row.values[*child_index], parent_value)
-                        .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
-                });
+            let is_match =
+                child_column_indexes
+                    .iter()
+                    .zip(&parent_key)
+                    .all(|(child_index, parent_value)| {
+                        compare_values(&row.values[*child_index], parent_value)
+                            .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
+                    });
             if is_match {
                 matches.push(row.clone());
             }

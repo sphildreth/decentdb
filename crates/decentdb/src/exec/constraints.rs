@@ -198,9 +198,22 @@ impl EngineRuntime {
                         .unwrap_or_else(|| format!("{}_fk", table.name))
                 )));
             }
-            let Some(parent_rows) = self
-                .table_data_for_schema(parent, &foreign_key.referenced_table)?
-                .map(std::borrow::Cow::into_owned)
+            if let Some(exists) = parent_exists_via_single_column_index(
+                self,
+                parent,
+                &foreign_key.referenced_table,
+                &referenced_columns,
+                &child_values,
+            )? {
+                if exists {
+                    continue;
+                }
+                return Err(DbError::constraint(format!(
+                    "foreign key on {} references missing parent row in {}",
+                    table.name, foreign_key.referenced_table
+                )));
+            }
+            let Some(parent_rows) = self.table_data_for_schema(parent, &foreign_key.referenced_table)?
             else {
                 return Err(DbError::constraint(format!(
                     "foreign key parent table {} has no row store",
@@ -456,4 +469,50 @@ fn values_equal(left: &[Value], right: &[Value]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn parent_exists_via_single_column_index(
+    runtime: &EngineRuntime,
+    parent: &TableSchema,
+    parent_table_name: &str,
+    referenced_columns: &[String],
+    child_values: &[&Value],
+) -> Result<Option<bool>> {
+    if referenced_columns.len() != 1 || child_values.len() != 1 {
+        return Ok(None);
+    }
+    let referenced_column = &referenced_columns[0];
+    let Some(index) = unique_indexes_for_table(runtime, parent_table_name)
+        .into_iter()
+        .find(|index| {
+            index.fresh
+                && index.kind == IndexKind::Btree
+                && index.predicate_sql.is_none()
+                && index.columns.len() == 1
+                && index.columns[0].expression_sql.is_none()
+                && index.columns[0]
+                    .column_name
+                    .as_ref()
+                    .is_some_and(|name| identifiers_equal(name, referenced_column))
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(&index.name) else {
+        return Ok(None);
+    };
+    let matched_row_ids = keys.row_ids_for_value_set(child_values[0])?;
+    if matched_row_ids.is_empty() {
+        return Ok(Some(false));
+    }
+    let Some(parent_rows) = runtime.table_data_for_schema(parent, parent_table_name)? else {
+        return Ok(Some(false));
+    };
+    let mut exists = false;
+    matched_row_ids.for_each(|row_id| {
+        if !exists && parent_rows.row_by_id(row_id).is_some() {
+            exists = true;
+        }
+    });
+    Ok(Some(exists))
 }

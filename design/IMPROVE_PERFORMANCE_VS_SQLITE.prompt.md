@@ -14,26 +14,59 @@ DECENTDB_NATIVE_LIB=/home/steven/source/decentdb/target/release/libdecentdb.so p
 **Current Results:**
 ```
 === decentdb ===
-Catalog Insert (1050 rows): 0.008982231s
-Orders Insert (524 rows): 0.008969547s
-Complex Sales Report Query: 0.000474521s
-User History Joins (5000 lookups): p50=0.012854ms p95=0.066445ms
+Generating memory dataset...
+Setting up schema...
+DecentDB native library: /home/steven/source/decentdb/target/release/libdecentdb.so
+Catalog Insert (1050 rows): 0.008955118s
+Orders Insert (524 rows): 0.022067484s
+Simple Point Lookup (5000 lookups): p50=0.024977ms p95=0.035517ms
+Range Scan (5000 scans): p50=0.020719ms p95=0.032461ms
+Join Query (5000 joins): p50=0.141866ms p95=0.171593ms
+Aggregate Query (5000 aggregates): p50=0.041427ms p95=0.064060ms
+Complex Sales Report Query: 0.000453342s
+User History Joins (5000 lookups): p50=0.012513ms p95=0.063950ms
+Update Operations (5000 updates): p50=0.029676ms p95=0.055504ms
+Delete Operations (100 deletes): p50=0.073268ms p95=0.105929ms
+Full Table Scan (500 scans): p50=0.016151ms p95=0.024626ms
 
 === sqlite ===
-Catalog Insert (1050 rows): 0.002880730s
-Orders Insert (524 rows): 0.003038838s
-Complex Sales Report Query: 0.000170370s
-User History Joins (5000 lookups): p50=0.003757ms p95=0.008746ms
+Generating memory dataset...
+Setting up schema...
+Catalog Insert (1050 rows): 0.003046582s
+Orders Insert (524 rows): 0.003031944s
+Simple Point Lookup (5000 lookups): p50=0.003697ms p95=0.003848ms
+Range Scan (5000 scans): p50=0.008065ms p95=0.029565ms
+Join Query (5000 joins): p50=0.026389ms p95=0.031860ms
+Aggregate Query (5000 aggregates): p50=0.016470ms p95=0.024857ms
+Complex Sales Report Query: 0.000101812s
+User History Joins (5000 lookups): p50=0.003737ms p95=0.008276ms
+Update Operations (5000 updates): p50=0.003457ms p95=0.010931ms
+Delete Operations (100 deletes): p50=0.015750ms p95=0.021911ms
+Full Table Scan (500 scans): p50=0.003005ms p95=0.003767ms
 
 === Comparison (DecentDB vs SQLite) ===
 DecentDB better at:
 - none
 SQLite better at:
-- Catalog Insert Time: 0.002880730s vs 0.008982231s (3.118x faster/lower)
-- Orders Insert throughput: 172434.33 rows/s vs 58419.90 rows/s (2.952x higher)
-- Complex Report Query: 0.000170370s vs 0.000474521s (2.785x faster/lower)
-- User History Join p50: 0.003757ms vs 0.012854ms (3.421x faster/lower)
-- User History Join p95: 0.008746ms vs 0.066445ms (7.597x faster/lower)
+- Catalog Insert Time: 0.003046582s vs 0.008955118s (2.939x faster/lower)
+- Orders Insert throughput: 172826.41 rows/s vs 23745.34 rows/s (7.278x higher)
+- Point Lookup p50: 0.003697ms vs 0.024977ms (6.756x faster/lower)
+- Point Lookup p95: 0.003848ms vs 0.035517ms (9.230x faster/lower)
+- Range Scan p50: 0.008065ms vs 0.020719ms (2.569x faster/lower)
+- Range Scan p95: 0.029565ms vs 0.032461ms (1.098x faster/lower)
+- Join Query p50: 0.026389ms vs 0.141866ms (5.376x faster/lower)
+- Join Query p95: 0.031860ms vs 0.171593ms (5.386x faster/lower)
+- Aggregate Query p50: 0.016470ms vs 0.041427ms (2.515x faster/lower)
+- Aggregate Query p95: 0.024857ms vs 0.064060ms (2.577x faster/lower)
+- Complex Report Query: 0.000101812s vs 0.000453342s (4.453x faster/lower)
+- User History Join p50: 0.003737ms vs 0.012513ms (3.348x faster/lower)
+- User History Join p95: 0.008276ms vs 0.063950ms (7.727x faster/lower)
+- Update p50: 0.003457ms vs 0.029676ms (8.584x faster/lower)
+- Update p95: 0.010931ms vs 0.055504ms (5.078x faster/lower)
+- Delete p50: 0.015750ms vs 0.073268ms (4.652x faster/lower)
+- Delete p95: 0.021911ms vs 0.105929ms (4.835x faster/lower)
+- Full Table Scan p50: 0.003005ms vs 0.016151ms (5.375x faster/lower)
+- Full Table Scan p95: 0.003767ms vs 0.024626ms (6.537x faster/lower)
 ```
 
 **Target:** All DecentDB metrics must be better than or equal to SQLite.
@@ -102,10 +135,10 @@ Key ADRs to reference:
    ```
 
 2. **Analyze each benchmark component:**
-   - **Catalog Insert (3.1x slower):** Bulk insert of users and items
-   - **Orders Insert (3.0x slower):** Transaction with multiple table inserts
-   - **Complex Report Query (2.8x slower):** Multi-table JOIN with aggregation
-   - **User History Joins (3.4x-7.6x slower):** Point lookups with JOINs
+   - **Catalog Insert (~2.9x slower):** Bulk insert of users and items
+   - **Orders Insert (~7.3x slower):** Transaction with multiple table inserts
+   - **Complex Report Query (~4.5x slower):** Multi-table JOIN with aggregation
+   - **User History Joins (~3.3x-7.7x slower):** Point lookups with JOINs
 
 3. **Key areas to investigate:**
    - WAL write path (fsync frequency, frame format, checkpointing)
