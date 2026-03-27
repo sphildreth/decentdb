@@ -19,7 +19,13 @@ nav:
     - Indexes: user-guide/indexes.md
     - Performance Tuning: user-guide/performance.md
     - Benchmarks: user-guide/benchmarks.md
-    - Comparison (SQLite/DuckDB): user-guide/comparison.md
+    - Comparison Overview: user-guide/comparison.md
+    - DecentDB vs SQLite: user-guide/decentdb-vs-sqlite.md
+    - DecentDB vs DuckDB: user-guide/decentdb-vs-duckdb.md
+    - DecentDB vs RocksDB: user-guide/decentdb-vs-rocksdb.md
+    - DecentDB vs LMDB: user-guide/decentdb-vs-lmdb.md
+    - DecentDB vs LevelDB: user-guide/decentdb-vs-leveldb.md
+    - DecentDB vs sled: user-guide/decentdb-vs-sled.md
     - Tools:
       - DBeaver Integration: user-guide/dbeaver.md
   - API Reference:

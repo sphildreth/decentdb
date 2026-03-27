@@ -30,6 +30,8 @@ This document provides a comprehensive matrix of SQL features, comparing support
 | Table-level FOREIGN KEY | ✅ | ✅ | ✅ | ⚠️ (parsed, not enforced) |
 | CREATE SCHEMA | ✅ (catalog registration) | ✅ | ✅ | ✅ |
 
+DecentDB note: `ALTER TABLE ... ADD/DROP CONSTRAINT` supports named `CHECK`, `FOREIGN KEY`, and `UNIQUE` constraints, validates existing rows before commit, persists across reopen, and rejects duplicate constraint names.
+
 ### Examples
 
 ```sql
@@ -61,7 +63,11 @@ ALTER TABLE users RENAME TO customers;
 ALTER TABLE users RENAME COLUMN name TO full_name;
 ALTER TABLE users ALTER COLUMN name TYPE VARCHAR(255);
 ALTER TABLE users ADD CONSTRAINT chk_email CHECK (email LIKE '%@%');
+ALTER TABLE users ADD CONSTRAINT uq_users_email UNIQUE (email);
+ALTER TABLE orders ADD CONSTRAINT fk_orders_user
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
 ALTER TABLE users DROP CONSTRAINT chk_email;
+ALTER TABLE orders DROP CONSTRAINT fk_orders_user;
 
 -- CREATE VIEW
 CREATE VIEW user_orders AS
@@ -104,6 +110,8 @@ END;
 | INSERT ... ON CONFLICT | ✅ (DO NOTHING/DO UPDATE) | ✅ (ON CONFLICT) | ✅ (ON CONFLICT) | ✅ (ON CONFLICT) |
 | Bulk INSERT | ✅ | ✅ | ✅ | ✅ |
 
+DecentDB note: `TRUNCATE TABLE` supports `RESTART IDENTITY`, `CONTINUE IDENTITY`, and `CASCADE`, participates in transaction rollback, and rejects unsupported targets such as temp tables and views.
+
 ### Examples
 
 ```sql
@@ -135,6 +143,8 @@ DELETE FROM orders WHERE amount < 1.00 RETURNING id, amount;
 
 -- TRUNCATE TABLE
 TRUNCATE TABLE temp_events;
+TRUNCATE TABLE users RESTART IDENTITY;
+TRUNCATE TABLE orders CASCADE;
 ```
 
 ## JOINs
@@ -194,6 +204,8 @@ SELECT * FROM orders NATURAL JOIN order_details;
 | CTAS `WITH NO DATA` | ✅ | ❌ | ✅ | ✅ (`WITH NO DATA`) |
 | LATERAL subqueries/table functions | ✅ | ⚠️ (implicit only) | ✅ | ✅ |
 
+DecentDB note: `VALUES` works both as a standalone query body and as a table source in `FROM`, joins, `INSERT ... SELECT`, and row-value membership tests such as `WHERE (a, b) IN (VALUES (...), (...))`.
+
 ### Examples
 
 ```sql
@@ -221,6 +233,15 @@ VALUES (1, 'one'), (2, 'two');
 SELECT t.id, t.label
 FROM (VALUES (1, 'one'), (2, 'two')) AS t(id, label)
 ORDER BY t.id;
+
+-- VALUES feeding an INSERT ... SELECT pipeline
+INSERT INTO labels (id, label)
+SELECT * FROM (VALUES (1, 'one'), (2, 'two')) AS src(id, label);
+
+-- Row-value membership against VALUES
+SELECT *
+FROM labels
+WHERE (id, label) IN (VALUES (1, 'one'), (3, 'three'));
 
 -- CTAS with inferred schema
 CREATE TABLE active_users AS

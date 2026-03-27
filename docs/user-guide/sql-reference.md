@@ -162,13 +162,16 @@ ALTER TABLE users ALTER COLUMN age TYPE TEXT;
 ```
 
 **Notes:**
-- Supported `ALTER TABLE` operations in 0.x: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN TYPE`
+- Supported `ALTER TABLE` operations in 0.x: `ADD COLUMN`, `DROP COLUMN`, `RENAME TO`, `RENAME COLUMN`, `ALTER COLUMN TYPE`, `ADD CONSTRAINT`, `DROP CONSTRAINT`
 - `ALTER TABLE` operations are currently rejected for tables that define `CHECK` constraints
 - `ALTER TABLE` operations are currently rejected for tables that define expression indexes
 - `RENAME COLUMN` is rejected when dependent views exist
 - `ALTER COLUMN TYPE` currently supports only `INT64`, `FLOAT64`, `TEXT`, and `BOOL`
 - `ALTER COLUMN TYPE` is rejected for PRIMARY KEY columns, FK child columns, and columns referenced by foreign keys
-- `ADD CONSTRAINT` is not supported
+- `ADD CONSTRAINT` supports named `CHECK`, named `FOREIGN KEY`, and named `UNIQUE`
+- Existing rows are validated before a new constraint is committed
+- Duplicate constraint names are rejected across named `CHECK`, `FOREIGN KEY`, and `UNIQUE` constraints
+- `DROP CONSTRAINT` supports named `CHECK`, `FOREIGN KEY`, and named `UNIQUE` constraints backed by table indexes
 - Schema changes require an exclusive lock on the database
 
 ### CREATE VIEW / DROP VIEW / ALTER VIEW

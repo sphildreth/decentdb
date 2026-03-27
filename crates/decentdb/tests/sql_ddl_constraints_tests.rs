@@ -408,6 +408,25 @@ fn alter_table_drop_constraint_removes_check_enforcement() {
 }
 
 #[test]
+fn alter_table_add_constraint_rejects_duplicate_name_across_constraint_kinds() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE ac_dup_name (id INT PRIMARY KEY, code TEXT, amount INT)",
+    );
+    exec(
+        &db,
+        "ALTER TABLE ac_dup_name ADD CONSTRAINT dup_name UNIQUE (code)",
+    );
+
+    let err = exec_err(
+        &db,
+        "ALTER TABLE ac_dup_name ADD CONSTRAINT dup_name CHECK (amount >= 0)",
+    );
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+#[test]
 fn alter_table_add_named_unique_constraint_enforces_future_writes() {
     let db = mem_db();
     exec(&db, "CREATE TABLE ac4 (id INT PRIMARY KEY, code TEXT)");

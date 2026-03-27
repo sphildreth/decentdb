@@ -929,16 +929,12 @@ impl EngineRuntime {
         match action {
             AlterTableAction::AddConstraint(TableConstraint::Check { name, expr }) => {
                 if let Some(constraint_name) = name {
-                    if table
-                        .checks
-                        .iter()
-                        .any(|check| check.name.as_deref() == Some(constraint_name.as_str()))
-                    {
-                        return Err(DbError::sql(format!(
-                            "constraint {} already exists on {}",
-                            constraint_name, table_name
-                        )));
-                    }
+                    ensure_constraint_name_is_available(
+                        self,
+                        &table,
+                        &table_name,
+                        constraint_name,
+                    )?;
                 }
                 let expression_sql = expr.to_sql();
                 let candidate = CheckConstraint {
