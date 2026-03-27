@@ -462,6 +462,11 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._native_execute_batch_typed_collected = (
+            getattr(_fastdecode_native, "execute_batch_typed_collected", None)
+            if _fastdecode_native is not None
+            else None
+        )
         self._native_bind_int64_step_row_view = (
             getattr(_fastdecode_native, "bind_int64_step_row_view", None)
             if _fastdecode_native is not None
@@ -477,8 +482,22 @@ class Cursor:
             if _fastdecode_native is not None
             else None
         )
+        self._native_reset_bind_int64_fetch_all_row_views = (
+            getattr(
+                _fastdecode_native, "reset_bind_int64_fetch_all_row_views", None
+            )
+            if _fastdecode_native is not None
+            else None
+        )
         self._native_step_fetch_all_row_views = (
             getattr(_fastdecode_native, "step_fetch_all_row_views", None)
+            if _fastdecode_native is not None
+            else None
+        )
+        self._native_reset_step_fetch_all_row_views = (
+            getattr(
+                _fastdecode_native, "reset_step_fetch_all_row_views", None
+            )
             if _fastdecode_native is not None
             else None
         )
@@ -597,13 +616,22 @@ class Cursor:
         self._native_bind_text_fetch_all_row_views_sql_support = {}
         self._native_bind_f64_f64_fetch_all_row_views_sql_support = {}
         self._fast_repeat_cache = {}
+        self._select_fast_info = {}
+        self._cursor_stmt_slots = []
 
     def close(self):
         if self._closed:
             return
+        recycled_stmts = set()
         if self._stmt:
             self._connection._recycle_statement(self._last_sql, self._stmt)
+            recycled_stmts.add(id(self._stmt))
             self._stmt = None
+        for slot_sql, slot_stmt in self._cursor_stmt_slots:
+            recycled_stmts.add(id(slot_stmt))
+            self._connection._recycle_statement(slot_sql, slot_stmt)
+        self._cursor_stmt_slots.clear()
+        self._fast_repeat_cache.clear()
         self._last_sql = None
         self._col_count = 0
         self._has_buffered_row = False
@@ -788,7 +816,23 @@ class Cursor:
     def _activate_statement(self, sql, params, param_count):
         self._prefetched_rows = None
         if self._stmt and self._last_sql != sql:
-            self._connection._recycle_statement(self._last_sql, self._stmt)
+            for i, (slot_sql, slot_stmt) in enumerate(self._cursor_stmt_slots):
+                if slot_sql == sql:
+                    old_sql, old_stmt = self._last_sql, self._stmt
+                    self._stmt = slot_stmt
+                    self._last_sql = sql
+                    self._cursor_stmt_slots[i] = (old_sql, old_stmt)
+                    code = self._lib.ddb_stmt_reset(self._stmt)
+                    if code != ERR_OK:
+                        _raise_error(code, sql=sql, params=params)
+                    self._bound_param_count = None
+                    return
+            if len(self._cursor_stmt_slots) < 4:
+                self._cursor_stmt_slots.append((self._last_sql, self._stmt))
+            else:
+                evict_sql, evict_stmt = self._cursor_stmt_slots.pop(0)
+                self._connection._recycle_statement(evict_sql, evict_stmt)
+                self._cursor_stmt_slots.append((self._last_sql, self._stmt))
             self._stmt = None
             self._last_sql = None
             self._bound_param_count = None
@@ -1118,8 +1162,19 @@ class Cursor:
             sql = self._rewrite_sql_cache.get((operation, "seq", len(parameters)))
         else:
             return None
-        if sql is None or self._stmt is None or self._last_sql != sql:
+        if sql is None or self._stmt is None:
             return None
+        if self._last_sql != sql:
+            found = False
+            for i, (slot_sql, slot_stmt) in enumerate(self._cursor_stmt_slots):
+                if slot_sql == sql:
+                    self._cursor_stmt_slots[i] = (self._last_sql, self._stmt)
+                    self._stmt = slot_stmt
+                    self._last_sql = sql
+                    found = True
+                    break
+            if not found:
+                return None
         metadata = self._get_cached_metadata(sql)
         if metadata != (0, None):
             return None
@@ -1151,6 +1206,8 @@ class Cursor:
     def _setup_fast_repeat(self, operation, parameters):
         if parameters is None or self._stmt is None:
             return
+        if not isinstance(parameters, (tuple, list)):
+            return
         try:
             param_count = len(parameters)
         except TypeError:
@@ -1170,6 +1227,19 @@ class Cursor:
                     code = 3
         if code:
             self._fast_repeat_cache[id(operation)] = (code, operation, self._last_sql)
+
+    def _fast_repeat_find_stmt(self, cached_sql):
+        """Find a stmt by SQL, checking active stmt then LRU slots."""
+        if self._last_sql == cached_sql:
+            return self._stmt
+        for i, (slot_sql, slot_stmt) in enumerate(self._cursor_stmt_slots):
+            if slot_sql == cached_sql:
+                old_sql, old_stmt = self._last_sql, self._stmt
+                self._stmt = slot_stmt
+                self._last_sql = cached_sql
+                self._cursor_stmt_slots[i] = (old_sql, old_stmt)
+                return slot_stmt
+        return None
 
     def _reset_statement_after_native_prefetch_failure(self):
         if self._stmt is None:
@@ -1532,9 +1602,45 @@ class Cursor:
     def _executemany_typed_iter(
         self, expected_count, first_params, iterator, signature, row_predicate
     ):
-        if self._native_execute_batch_typed_iter is None or self._stmt is None:
+        if self._stmt is None:
             return None
         if len(signature) != expected_count or not row_predicate(first_params):
+            return None
+
+        # Prefer the collected batch path (single FFI crossing).
+        if self._native_execute_batch_typed_collected is not None:
+            def checked_rows():
+                for params in iterator:
+                    params_type = type(params)
+                    if params_type is tuple or params_type is list:
+                        param_len = len(params)
+                    else:
+                        if isinstance(params, Mapping):
+                            raise ProgrammingError(
+                                "Mixed parameter styles are not supported in executemany"
+                            )
+                        try:
+                            param_len = len(params)
+                        except TypeError:
+                            raise ProgrammingError(
+                                "Incorrect number of parameters: "
+                                f"expected {expected_count}, got unknown"
+                            )
+                        if param_len != expected_count:
+                            raise ProgrammingError(
+                                f"Incorrect number of parameters: expected {expected_count}, got {param_len}"
+                            )
+                    yield params
+
+            total_affected = int(
+                self._native_execute_batch_typed_collected(
+                    self._stmt.value, first_params, checked_rows(), signature
+                )
+            )
+            self._bound_param_count = expected_count
+            return total_affected
+
+        if self._native_execute_batch_typed_iter is None:
             return None
 
         def checked_rows():
@@ -1569,38 +1675,89 @@ class Cursor:
         return total_affected
 
     def execute(self, operation, parameters=None):
+        if (
+            parameters is None
+            and self._fast_repeat_cache
+        ):
+            cached = self._fast_repeat_cache.get(id(operation))
+            if cached is not None:
+                frc, op_ref, cached_sql = cached
+                if frc == 5 and op_ref is operation:
+                    stmt = self._fast_repeat_find_stmt(cached_sql)
+                    if stmt is not None:
+                        try:
+                            rows = (
+                                self._native_reset_step_fetch_all_row_views(
+                                    stmt.value
+                                )
+                            )
+                            sel_info = self._select_fast_info.get(
+                                cached_sql
+                            )
+                            if sel_info is not None:
+                                self._has_buffered_row = False
+                                self._buffered_row = None
+                                self._prefetched_rows = rows
+                                self._query_active = True
+                                self.description = sel_info[0]
+                                self._col_count = sel_info[1]
+                                self.rowcount = -1
+                                return self
+                        except Exception:
+                            self._fast_repeat_cache.clear()
         if parameters is not None and self._fast_repeat_cache:
             cached = self._fast_repeat_cache.get(id(operation))
             if cached is not None:
                 frc, op_ref, cached_sql = cached
-                if (
-                    op_ref is operation
-                    and self._stmt is not None
-                    and self._last_sql == cached_sql
-                ):
-                    try:
-                        sv = self._stmt.value
-                        if frc == 1:
-                            affected, _ = self._native_reset_bind_int64_step_affected(
-                                sv, parameters[0]
-                            )
-                        elif frc == 2:
-                            affected, _ = self._native_reset_bind_text_i64_step_affected(
-                                sv, parameters[0], parameters[1]
-                            )
-                        elif frc == 3:
-                            affected, _ = self._native_reset_bind_i64_text_step_affected(
-                                sv, parameters[0], parameters[1]
-                            )
-                        else:
-                            affected = None
-                        if affected is not None:
-                            self.rowcount = int(affected)
-                            self._has_buffered_row = False
-                            self._query_active = False
-                            return self
-                    except Exception:
-                        self._fast_repeat_cache.clear()
+                if op_ref is operation:
+                    stmt = self._fast_repeat_find_stmt(cached_sql)
+                    if stmt is not None:
+                        try:
+                            sv = stmt.value
+                            if frc == 1:
+                                affected, _ = (
+                                    self._native_reset_bind_int64_step_affected(
+                                        sv, parameters[0]
+                                    )
+                                )
+                            elif frc == 2:
+                                affected, _ = (
+                                    self._native_reset_bind_text_i64_step_affected(
+                                        sv, parameters[0], parameters[1]
+                                    )
+                                )
+                            elif frc == 3:
+                                affected, _ = (
+                                    self._native_reset_bind_i64_text_step_affected(
+                                        sv, parameters[0], parameters[1]
+                                    )
+                                )
+                            elif frc == 4:
+                                rows = (
+                                    self._native_reset_bind_int64_fetch_all_row_views(
+                                        sv, parameters[0]
+                                    )
+                                )
+                                sel_info = self._select_fast_info.get(
+                                    cached_sql
+                                )
+                                if sel_info is not None:
+                                    self._has_buffered_row = False
+                                    self._buffered_row = None
+                                    self._prefetched_rows = rows
+                                    self._query_active = True
+                                    self.description = sel_info[0]
+                                    self._col_count = sel_info[1]
+                                    self.rowcount = -1
+                                    return self
+                                affected = None
+                            if affected is not None:
+                                self.rowcount = int(affected)
+                                self._has_buffered_row = False
+                                self._query_active = False
+                                return self
+                        except Exception:
+                            self._fast_repeat_cache.clear()
 
         self._ensure_open()
         self._has_buffered_row = False
@@ -1761,6 +1918,37 @@ class Cursor:
 
             if self._query_active:
                 self.rowcount = -1
+                if (
+                    self._prefetched_rows is not None
+                    and self._native_reset_bind_int64_fetch_all_row_views
+                        is not None
+                    and param_count == 1
+                    and type(params[0]) is int
+                ):
+                    self._select_fast_info[sql] = (
+                        self.description,
+                        self._col_count,
+                    )
+                    self._fast_repeat_cache[id(operation)] = (
+                        4,
+                        operation,
+                        sql,
+                    )
+                elif (
+                    self._prefetched_rows is not None
+                    and self._native_reset_step_fetch_all_row_views
+                        is not None
+                    and param_count == 0
+                ):
+                    self._select_fast_info[sql] = (
+                        self.description,
+                        self._col_count,
+                    )
+                    self._fast_repeat_cache[id(operation)] = (
+                        5,
+                        operation,
+                        sql,
+                    )
             else:
                 self._buffered_row = None
                 self._prefetched_rows = None
@@ -2850,6 +3038,7 @@ class Connection:
         self._stmt_cache = collections.OrderedDict()
         self._stmt_cache_size = stmt_cache_size
         self._stats = collections.Counter()
+        self._exec_cursor = None
 
         fs_path = os.fspath(path)
         raw_path = fs_path.encode("utf-8") if isinstance(fs_path, str) else fs_path
@@ -2943,9 +3132,12 @@ class Connection:
         return cursor
 
     def execute(self, operation, parameters=None):
-        cursor = self.cursor()
-        cursor.execute(operation, parameters)
-        return cursor
+        cur = self._exec_cursor
+        if cur is None or cur._closed:
+            cur = self.cursor()
+            self._exec_cursor = cur
+        cur.execute(operation, parameters)
+        return cur
 
     def _call_json_api(self, func, *args):
         self._ensure_open()

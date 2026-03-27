@@ -451,6 +451,32 @@ impl EngineRuntime {
                 .map(|predicate| predicate.to_sql()),
             fresh: true,
         })?;
+
+        // Drop any redundant auto FK index that covers the same column(s).
+        if kind == IndexKind::Btree && !has_expression {
+            let column_names: Vec<String> = statement
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    if let IndexExpression::Column(n) = c {
+                        Some(n.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !column_names.is_empty() {
+                let fk_auto_name = format!(
+                    "{}_idx",
+                    auto_index_name("fk", &statement.table_name, &column_names)
+                );
+                if self.catalog.indexes.contains_key(&fk_auto_name) {
+                    self.catalog.indexes.remove(&fk_auto_name);
+                    self.indexes.remove(&fk_auto_name);
+                }
+            }
+        }
+
         self.bump_schema_cookie();
         Ok(())
     }

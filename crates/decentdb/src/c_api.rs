@@ -1207,6 +1207,133 @@ pub extern "C" fn ddb_stmt_execute_batch_i64_text_f64(
     })
 }
 
+/// Execute a batch of rows using a type signature string.
+///
+/// `signature` is a NUL-terminated ASCII string where each character describes
+/// one column per row: `'i'` = INT64, `'t'` = TEXT, `'f'` = FLOAT64.
+///
+/// The caller provides flat, row-major arrays for each type:
+/// - `values_i64`: all INT64 values, packed in row order
+/// - `values_f64`: all FLOAT64 values, packed in row order
+/// - `values_text_ptrs` / `values_text_lens`: text pointer/length pairs, row order
+///
+/// # Safety
+///
+/// The caller must ensure that every array has exactly
+/// `row_count * (count of that type character in signature)` elements.
+#[no_mangle]
+pub extern "C" fn ddb_stmt_execute_batch_typed(
+    stmt: *mut StmtHandle,
+    row_count: usize,
+    signature: *const c_char,
+    values_i64: *const i64,
+    values_f64: *const f64,
+    values_text_ptrs: *const *const c_char,
+    values_text_lens: *const usize,
+    out_total_affected_rows: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        if signature.is_null() {
+            return Err(DbError::internal("signature must not be null"));
+        }
+        // SAFETY: caller provides a NUL-terminated C string.
+        let sig = unsafe { CStr::from_ptr(signature) }.to_bytes();
+        if sig.is_empty() {
+            return Err(DbError::internal("signature must not be empty"));
+        }
+        let param_count = sig.len();
+
+        // Count each type so we can validate and index flat arrays.
+        let mut i64_per_row: usize = 0;
+        let mut f64_per_row: usize = 0;
+        let mut text_per_row: usize = 0;
+        for &ch in sig {
+            match ch {
+                b'i' => i64_per_row += 1,
+                b'f' => f64_per_row += 1,
+                b't' => text_per_row += 1,
+                other => {
+                    return Err(DbError::internal(format!(
+                        "unsupported signature character '{}'",
+                        other as char
+                    )));
+                }
+            }
+        }
+
+        let i64_vals = if i64_per_row > 0 {
+            ptr_slice(values_i64, row_count * i64_per_row, "values_i64")?
+        } else {
+            &[]
+        };
+        let f64_vals = if f64_per_row > 0 {
+            ptr_slice(values_f64, row_count * f64_per_row, "values_f64")?
+        } else {
+            &[]
+        };
+        let text_ptrs = if text_per_row > 0 {
+            ptr_slice(
+                values_text_ptrs,
+                row_count * text_per_row,
+                "values_text_ptrs",
+            )?
+        } else {
+            &[]
+        };
+        let text_lens = if text_per_row > 0 {
+            ptr_slice(
+                values_text_lens,
+                row_count * text_per_row,
+                "values_text_lens",
+            )?
+        } else {
+            &[]
+        };
+
+        let total_affected = stmt.db.execute_prepared_batch_with_builder(
+            &stmt.prepared,
+            row_count,
+            param_count,
+            |row_idx, params| {
+                let mut i_off: usize = 0;
+                let mut f_off: usize = 0;
+                let mut t_off: usize = 0;
+                for (col, &ch) in sig.iter().enumerate() {
+                    match ch {
+                        b'i' => {
+                            params[col] = Value::Int64(i64_vals[row_idx * i64_per_row + i_off]);
+                            i_off += 1;
+                        }
+                        b'f' => {
+                            params[col] = Value::Float64(f64_vals[row_idx * f64_per_row + f_off]);
+                            f_off += 1;
+                        }
+                        b't' => {
+                            let idx = row_idx * text_per_row + t_off;
+                            let bytes =
+                                borrowed_bytes(text_ptrs[idx].cast::<u8>(), text_lens[idx])?;
+                            let text = std::str::from_utf8(bytes).map_err(|error| {
+                                DbError::sql(format!(
+                                    "TEXT parameter at batch row {row_idx} col {col} is not valid UTF-8: {error}"
+                                ))
+                            })?;
+                            params[col] = Value::Text(text.to_string());
+                            t_off += 1;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        invalidate_stmt_result(stmt);
+
+        *out_ptr(out_total_affected_rows, "out_total_affected_rows")? = total_affected;
+        Ok(())
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn ddb_stmt_step(stmt: *mut StmtHandle, out_has_row: *mut u8) -> u32 {
     ffi_boundary(|| {

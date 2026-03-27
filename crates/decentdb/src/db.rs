@@ -181,6 +181,8 @@ struct DbInner {
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
+    /// Pre-built transaction state cloned while cache is warm post-commit.
+    pre_built_txn: Mutex<Option<Box<SqlTxnState>>>,
 }
 
 impl Drop for DbInner {
@@ -1361,6 +1363,7 @@ impl Db {
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
+                pre_built_txn: Mutex::new(None),
             }),
         })
     }
@@ -2110,6 +2113,10 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
+        // Invalidate pre-built txn — autocommit changed engine state.
+        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
+            *pre_built = None;
+        }
         Ok(result)
     }
 
@@ -2145,6 +2152,10 @@ impl Db {
 
     fn install_temp_runtime(&self, runtime: EngineRuntime) -> Result<()> {
         self.sync_temp_state_from_runtime(&runtime)?;
+        // Invalidate pre-built txn — engine state changed.
+        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
+            *pre_built = None;
+        }
         let mut guard = self
             .inner
             .engine
@@ -2268,6 +2279,8 @@ impl Db {
             let _ = self.rollback();
             return Err(error);
         }
+        // Clone runtime while cache is warm (before commit/fdatasync cools it).
+        let pre_runtime = runtime.clone();
         let committed_lsn = match expected_latest_lsn {
             Some(expected) => self.commit_if_latest(expected),
             None => self.commit(),
@@ -2292,6 +2305,21 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
+        drop(guard);
+
+        // Store pre-built transaction state for the next BEGIN.
+        let mut pre_runtime = pre_runtime;
+        if self.apply_temp_state_to_runtime(&mut pre_runtime).is_ok() {
+            if let Ok(mut pre_built_guard) = self.inner.pre_built_txn.lock() {
+                *pre_built_guard = Some(Box::new(SqlTxnState {
+                    runtime: pre_runtime,
+                    base_lsn: committed_lsn,
+                    persistent_changed: false,
+                    savepoints: Vec::new(),
+                }));
+            }
+        }
+
         Ok(committed_lsn)
     }
 
@@ -2341,6 +2369,10 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(restored_lsn, Ordering::Release);
+        // Invalidate pre-built txn — engine state reloaded.
+        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
+            *pre_built = None;
+        }
         Ok(())
     }
 
@@ -2410,6 +2442,17 @@ impl Db {
 
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         self.refresh_engine_from_storage()?;
+        let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+
+        // Reuse pre-built transaction state if LSN matches (cache-warm clone).
+        if let Ok(mut pre_built_guard) = self.inner.pre_built_txn.lock() {
+            if let Some(pre_built) = pre_built_guard.take() {
+                if pre_built.base_lsn == current_lsn {
+                    return Ok(*pre_built);
+                }
+            }
+        }
+
         let mut runtime = self
             .inner
             .engine
@@ -2419,7 +2462,7 @@ impl Db {
         self.apply_temp_state_to_runtime(&mut runtime)?;
         Ok(SqlTxnState {
             runtime,
-            base_lsn: self.inner.last_runtime_lsn.load(Ordering::Acquire),
+            base_lsn: current_lsn,
             persistent_changed: false,
             savepoints: Vec::new(),
         })
@@ -2458,19 +2501,10 @@ impl Db {
         }
 
         let page_size = self.inner.config.page_size;
-        let temp_only = self.statement_is_temp_only(&state.runtime, prepared.statement.as_ref());
-        if let Some(prepared_insert) = prepared
-            .prepared_insert
-            .as_deref()
-            .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
-        {
-            let result =
-                state
-                    .runtime
-                    .execute_prepared_simple_insert(prepared_insert, params, page_size)?;
-            state.persistent_changed |= !temp_only;
-            return Ok(result);
-        }
+        // Fast paths for simple prepared DML. These fast paths already verify
+        // that the target table is not temporary, so we can set
+        // persistent_changed = true directly without a separate
+        // statement_is_temp_only check (which would touch cold cache lines).
         if let Some(prepared_update) = prepared
             .prepared_update
             .as_deref()
@@ -2479,7 +2513,7 @@ impl Db {
             let result = state
                 .runtime
                 .execute_prepared_simple_update(prepared_update, params)?;
-            state.persistent_changed |= !temp_only;
+            state.persistent_changed = true;
             return Ok(result);
         }
         if let Some(prepared_delete) = prepared
@@ -2490,9 +2524,22 @@ impl Db {
             let result = state
                 .runtime
                 .execute_prepared_simple_delete(prepared_delete, params)?;
-            state.persistent_changed |= !temp_only;
+            state.persistent_changed = true;
             return Ok(result);
         }
+        if let Some(prepared_insert) = prepared
+            .prepared_insert
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+        {
+            let result =
+                state
+                    .runtime
+                    .execute_prepared_simple_insert(prepared_insert, params, page_size)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        let temp_only = self.statement_is_temp_only(&state.runtime, prepared.statement.as_ref());
         if matches!(
             prepared.statement.as_ref(),
             crate::sql::ast::Statement::Insert(insert)

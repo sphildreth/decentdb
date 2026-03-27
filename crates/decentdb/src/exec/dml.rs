@@ -540,8 +540,9 @@ impl EngineRuntime {
     }
 
     pub(crate) fn can_reuse_prepared_simple_update(&self, prepared: &PreparedSimpleUpdate) -> bool {
+        // Schema cookie is validated before this is called, so the table exists.
+        // Only check if it was shadowed by a temp table.
         !self.visible_table_is_temporary(&prepared.table_name)
-            && self.table_schema(&prepared.table_name).is_some()
     }
 
     pub(crate) fn execute_prepared_simple_update(
@@ -584,7 +585,7 @@ impl EngineRuntime {
         };
         if *current_value != next_value {
             table_data.rows[row_index].values[prepared.column_index] = next_value;
-            self.mark_table_dirty(&prepared.table_name);
+            self.mark_table_row_dirty(&prepared.table_name, row_index);
         }
         Ok(QueryResult::with_affected_rows(1))
     }
@@ -660,13 +661,14 @@ impl EngineRuntime {
     }
 
     pub(crate) fn can_reuse_prepared_simple_delete(&self, prepared: &PreparedSimpleDelete) -> bool {
+        // Schema cookie is validated before this is called, so the table exists.
+        // Only check temp-table shadowing and index state.
         !self.visible_table_is_temporary(&prepared.table.name)
-            && self.table_schema(&prepared.table.name).is_some()
             && prepared.compiled_index_state_epoch == self.index_state_epoch
             && prepared
                 .restrict_children
                 .iter()
-                .all(|child| self.table_schema(&child.child_table_name).is_some())
+                .all(|child| !self.visible_table_is_temporary(&child.child_table_name))
     }
 
     pub(crate) fn execute_prepared_simple_delete(
@@ -2487,6 +2489,17 @@ fn validate_prepared_insert(
                 prepared.table_name, foreign_key.parent_table_name
             )));
         }
+        // When the parent table has not been modified in this transaction,
+        // the index is guaranteed to be consistent with the actual rows.
+        // Also safe when the parent table only had append-only inserts:
+        // inserts never remove rows, so any indexed row_id still exists.
+        if !runtime.dirty_tables.contains(&foreign_key.parent_table_name)
+            || runtime
+                .append_only_dirty_tables
+                .contains(&foreign_key.parent_table_name)
+        {
+            continue;
+        }
         let Some(parent_rows) = runtime.table_data(&foreign_key.parent_table_name) else {
             return Err(DbError::constraint(format!(
                 "foreign key parent table {} has no row store",
@@ -2956,14 +2969,19 @@ fn prepared_delete_has_referencing_child(
     let Some(rows) = runtime.table_data(&child.child_table_name) else {
         return Ok(false);
     };
-    Ok(rows.rows.iter().any(|row| {
-        row.values
-            .get(child.child_column_index)
-            .is_some_and(|value| {
+    let ci = child.child_column_index;
+    match parent_value {
+        Value::Int64(parent_int) => Ok(rows.rows.iter().any(|row| {
+            matches!(row.values.get(ci), Some(Value::Int64(v)) if *v == *parent_int)
+        })),
+        Value::Null => Ok(false),
+        _ => Ok(rows.rows.iter().any(|row| {
+            row.values.get(ci).is_some_and(|value| {
                 compare_values(value, parent_value)
                     .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
             })
-    }))
+        })),
+    }
 }
 
 fn apply_runtime_index_update_for_row_change(

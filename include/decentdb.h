@@ -144,6 +144,15 @@ ddb_status_t ddb_stmt_execute_batch_i64_text_f64(
     const size_t *values_text_lens,
     const double *values_f64,
     uint64_t *out_total_affected_rows);
+ddb_status_t ddb_stmt_execute_batch_typed(
+    ddb_stmt_t *stmt,
+    size_t row_count,
+    const char *signature,
+    const int64_t *values_i64,
+    const double *values_f64,
+    const char *const *values_text_ptrs,
+    const size_t *values_text_lens,
+    uint64_t *out_total_affected_rows);
 ddb_status_t ddb_stmt_step(ddb_stmt_t *stmt, uint8_t *out_has_row);
 ddb_status_t ddb_stmt_column_count(ddb_stmt_t *stmt, size_t *out_columns);
 ddb_status_t ddb_stmt_column_name_copy(

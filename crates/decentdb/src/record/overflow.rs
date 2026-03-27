@@ -9,8 +9,16 @@ use crate::record::compression::{decompress, maybe_compress, CompressionMode};
 use crate::storage::checksum::crc32c_parts;
 use crate::storage::page::{PageId, PageStore};
 
-const OVERFLOW_HEADER_SIZE: usize = 8;
+pub(crate) const OVERFLOW_HEADER_SIZE: usize = 8;
 const FLAG_COMPRESSED: u8 = 0x01;
+
+/// Cached page IDs for an overflow chain.  Used by
+/// [`rewrite_overflow_cached`] to skip the chain walk and compare pages
+/// lazily via memcmp instead of reading the entire chain upfront.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OverflowChainCache {
+    pub(crate) page_ids: Vec<PageId>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OverflowPointer {
@@ -122,6 +130,155 @@ pub(crate) fn rewrite_overflow<S: PageStore>(
         logical_len,
         flags,
     })
+}
+
+/// Like [`rewrite_overflow`] but uses a cached chain of page IDs and per-page
+/// Rewrite an overflow chain using cached page IDs, comparing pages lazily
+/// via vectorized memcmp instead of hashing.  Returns the updated pointer
+/// together with a fresh [`OverflowChainCache`] for the next call.
+///
+/// Callers must pass `bytes` that are **uncompressed** (this function always
+/// stores uncompressed data and sets flags to 0).
+pub(crate) fn rewrite_overflow_cached<S: PageStore>(
+    store: &mut S,
+    previous: OverflowPointer,
+    bytes: &[u8],
+    cached_page_ids: &[PageId],
+    skip_first_n_pages: usize,
+) -> Result<(OverflowPointer, OverflowChainCache, OverflowTailInfo)> {
+    let logical_len = u32::try_from(bytes.len())
+        .map_err(|_| DbError::constraint("overflow payload exceeds u32 logical length"))?;
+
+    if bytes.is_empty() {
+        if previous.head_page_id != 0 {
+            free_overflow(store, previous.head_page_id)?;
+        }
+        return Ok((
+            OverflowPointer {
+                head_page_id: 0,
+                logical_len,
+                flags: 0,
+            },
+            OverflowChainCache::default(),
+            OverflowTailInfo::default(),
+        ));
+    }
+
+    let page_size = store.page_size() as usize;
+    if page_size <= OVERFLOW_HEADER_SIZE {
+        return Err(DbError::internal("page size too small for overflow pages"));
+    }
+    let chunk_capacity = page_size - OVERFLOW_HEADER_SIZE;
+    let needed_pages = bytes.len().div_ceil(chunk_capacity);
+
+    // Reuse cached page IDs; allocate extras only if the payload grew.
+    let mut page_ids = Vec::with_capacity(needed_pages);
+    for i in 0..needed_pages {
+        if i < cached_page_ids.len() {
+            page_ids.push(cached_page_ids[i]);
+        } else {
+            page_ids.push(store.allocate_page()?);
+        }
+    }
+
+    // Determine how many leading pages can be safely skipped.
+    // Pages are skippable when: same page count as before (no chain
+    // restructure), the page was in the previous cache, and its byte
+    // range falls entirely within the unchanged prefix.
+    let effective_skip = if needed_pages == cached_page_ids.len() {
+        skip_first_n_pages.min(needed_pages)
+    } else {
+        // Chain length changed — next pointers may differ; rewrite all.
+        0
+    };
+
+    // Single reusable buffer avoids per-page allocation.
+    let mut page_buf = vec![0u8; page_size];
+    let mut offset = effective_skip * chunk_capacity;
+
+    for (index, &page_id) in page_ids.iter().enumerate() {
+        if index < effective_skip {
+            continue;
+        }
+
+        let next = page_ids.get(index + 1).copied().unwrap_or(0);
+        let remaining = bytes.len().saturating_sub(offset);
+        let chunk_len = remaining.min(chunk_capacity);
+
+        page_buf.fill(0);
+        page_buf[0..4].copy_from_slice(&next.to_le_bytes());
+        page_buf[4..8].copy_from_slice(
+            &u32::try_from(chunk_len)
+                .map_err(|_| DbError::constraint("overflow chunk length exceeds u32"))?
+                .to_le_bytes(),
+        );
+        if chunk_len > 0 {
+            page_buf[OVERFLOW_HEADER_SIZE..OVERFLOW_HEADER_SIZE + chunk_len]
+                .copy_from_slice(&bytes[offset..offset + chunk_len]);
+            offset += chunk_len;
+        }
+
+        // Lazy comparison: read the existing page from the page cache
+        // (vectorized memcmp is ~4× faster than byte-by-byte CRC-32C).
+        if index < cached_page_ids.len() {
+            if let Ok(existing) = store.read_page(page_id) {
+                if existing.as_slice() == page_buf.as_slice() {
+                    continue;
+                }
+            }
+        }
+
+        store.write_page(page_id, &page_buf)?;
+    }
+
+    // Free excess pages if the payload shrank.
+    for &old_page_id in cached_page_ids.iter().skip(needed_pages) {
+        store.free_page(old_page_id)?;
+    }
+
+    // Compute tail info from the chain structure.
+    let last_page_id = page_ids[needed_pages - 1];
+    let total_full_pages = needed_pages.saturating_sub(1);
+    let last_chunk_len = bytes.len().saturating_sub(total_full_pages * chunk_capacity);
+    let tail = OverflowTailInfo {
+        page_id: last_page_id,
+        chunk_len: last_chunk_len,
+    };
+
+    Ok((
+        OverflowPointer {
+            head_page_id: page_ids[0],
+            logical_len,
+            flags: 0,
+        },
+        OverflowChainCache { page_ids },
+        tail,
+    ))
+}
+
+/// Build an [`OverflowChainCache`] by collecting page IDs and hashing each
+/// Collect page IDs for an existing overflow chain to seed an
+/// [`OverflowChainCache`].  Only walks the chain to extract IDs — no
+/// hashing is performed since [`rewrite_overflow_cached`] uses lazy
+/// memcmp for comparison.
+pub(crate) fn build_overflow_chain_cache<S: PageStore>(
+    store: &S,
+    head_page_id: PageId,
+) -> Result<OverflowChainCache> {
+    if head_page_id == 0 {
+        return Ok(OverflowChainCache::default());
+    }
+    let mut page_id = head_page_id;
+    let mut page_ids = Vec::new();
+    while page_id != 0 {
+        let page = store.read_page(page_id)?;
+        if page.len() < OVERFLOW_HEADER_SIZE {
+            return Err(DbError::corruption("overflow page shorter than header"));
+        }
+        page_ids.push(page_id);
+        page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+    }
+    Ok(OverflowChainCache { page_ids })
 }
 
 pub(crate) fn read_overflow_prefix<S: PageStore>(
