@@ -92,3 +92,6 @@ tests/bindings/**/*.node
 *.ddb.wal
 *.log
 /.tmp/
+
+bindings/dart/examples/console_complex/*.json
+*.pyc
