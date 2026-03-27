@@ -596,6 +596,7 @@ class Cursor:
         self._native_step_fetch_all_row_views_sql_support = {}
         self._native_bind_text_fetch_all_row_views_sql_support = {}
         self._native_bind_f64_f64_fetch_all_row_views_sql_support = {}
+        self._fast_repeat_cache = {}
 
     def close(self):
         if self._closed:
@@ -1147,6 +1148,29 @@ class Cursor:
         self._should_prefetch_zero_param_result_sql_cache[sql] = cached
         return cached
 
+    def _setup_fast_repeat(self, operation, parameters):
+        if parameters is None or self._stmt is None:
+            return
+        try:
+            param_count = len(parameters)
+        except TypeError:
+            return
+        code = 0
+        if param_count == 1 and type(parameters[0]) is int:
+            if self._native_reset_bind_int64_step_affected_enabled:
+                code = 1
+        elif param_count == 2:
+            t0 = type(parameters[0])
+            t1 = type(parameters[1])
+            if t0 is str and t1 is int:
+                if self._native_reset_bind_text_i64_step_affected_enabled:
+                    code = 2
+            elif t0 is int and t1 is str:
+                if self._native_reset_bind_i64_text_step_affected_enabled:
+                    code = 3
+        if code:
+            self._fast_repeat_cache[id(operation)] = (code, operation, self._last_sql)
+
     def _reset_statement_after_native_prefetch_failure(self):
         if self._stmt is None:
             return
@@ -1545,6 +1569,39 @@ class Cursor:
         return total_affected
 
     def execute(self, operation, parameters=None):
+        if parameters is not None and self._fast_repeat_cache:
+            cached = self._fast_repeat_cache.get(id(operation))
+            if cached is not None:
+                frc, op_ref, cached_sql = cached
+                if (
+                    op_ref is operation
+                    and self._stmt is not None
+                    and self._last_sql == cached_sql
+                ):
+                    try:
+                        sv = self._stmt.value
+                        if frc == 1:
+                            affected, _ = self._native_reset_bind_int64_step_affected(
+                                sv, parameters[0]
+                            )
+                        elif frc == 2:
+                            affected, _ = self._native_reset_bind_text_i64_step_affected(
+                                sv, parameters[0], parameters[1]
+                            )
+                        elif frc == 3:
+                            affected, _ = self._native_reset_bind_i64_text_step_affected(
+                                sv, parameters[0], parameters[1]
+                            )
+                        else:
+                            affected = None
+                        if affected is not None:
+                            self.rowcount = int(affected)
+                            self._has_buffered_row = False
+                            self._query_active = False
+                            return self
+                    except Exception:
+                        self._fast_repeat_cache.clear()
+
         self._ensure_open()
         self._has_buffered_row = False
         self._buffered_row = None
@@ -1555,6 +1612,7 @@ class Cursor:
 
         fast_current = self._execute_last_statement_fast(operation, parameters)
         if fast_current is not None:
+            self._setup_fast_repeat(operation, parameters)
             return fast_current
 
         sql, params = self._resolve_sql_and_params(operation, parameters)
@@ -1573,6 +1631,7 @@ class Cursor:
         else:
             cached_non_query = self._execute_cached_non_query_current_statement(sql, params)
             if cached_non_query is not None:
+                self._setup_fast_repeat(operation, parameters)
                 return cached_non_query
             self._activate_statement(sql, params, param_count)
             affected_rowcount = None

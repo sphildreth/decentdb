@@ -1276,6 +1276,119 @@ pub extern "C" fn ddb_stmt_affected_rows(stmt: *mut StmtHandle, out_rows: *mut u
     })
 }
 
+/// Combined reset+bind(int64)+execute+affected_rows in a single FFI boundary
+/// crossing, eliminating per-call overhead of catch_unwind and TLS access.
+#[no_mangle]
+pub extern "C" fn ddb_stmt_rebind_int64_execute(
+    stmt: *mut StmtHandle,
+    value: i64,
+    out_affected: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let stmt = handle_mut(stmt, "stmt")?;
+        stmt.result = None;
+        stmt.current_row = None;
+        stmt.next_row_index = 0;
+        stmt.row_views.clear();
+        stmt.row_i64_text_f64_views.clear();
+        if stmt.bindings.is_empty() {
+            stmt.bindings.push(Value::Int64(value));
+        } else {
+            stmt.bindings[0] = Value::Int64(value);
+        }
+        execute_stmt_if_needed(stmt)?;
+        *out_ptr(out_affected, "out_affected")? =
+            stmt.result.as_ref().map_or(0, QueryResult::affected_rows);
+        Ok(())
+    })
+}
+
+/// Combined reset+bind(text,int64)+execute+affected_rows in a single FFI
+/// boundary crossing.
+#[no_mangle]
+pub extern "C" fn ddb_stmt_rebind_text_int64_execute(
+    stmt: *mut StmtHandle,
+    text_value: *const c_char,
+    text_len: usize,
+    int_value: i64,
+    out_affected: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(text_value.cast::<u8>(), text_len)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        stmt.result = None;
+        stmt.current_row = None;
+        stmt.next_row_index = 0;
+        stmt.row_views.clear();
+        stmt.row_i64_text_f64_views.clear();
+        let text_val = Value::Text(text.to_string());
+        let int_val = Value::Int64(int_value);
+        match stmt.bindings.len() {
+            0 => {
+                stmt.bindings.push(text_val);
+                stmt.bindings.push(int_val);
+            }
+            1 => {
+                stmt.bindings[0] = text_val;
+                stmt.bindings.push(int_val);
+            }
+            _ => {
+                stmt.bindings[0] = text_val;
+                stmt.bindings[1] = int_val;
+            }
+        }
+        execute_stmt_if_needed(stmt)?;
+        *out_ptr(out_affected, "out_affected")? =
+            stmt.result.as_ref().map_or(0, QueryResult::affected_rows);
+        Ok(())
+    })
+}
+
+/// Combined reset+bind(int64,text)+execute+affected_rows in a single FFI
+/// boundary crossing.
+#[no_mangle]
+pub extern "C" fn ddb_stmt_rebind_int64_text_execute(
+    stmt: *mut StmtHandle,
+    int_value: i64,
+    text_value: *const c_char,
+    text_len: usize,
+    out_affected: *mut u64,
+) -> u32 {
+    ffi_boundary(|| {
+        let bytes = borrowed_bytes(text_value.cast::<u8>(), text_len)?;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| DbError::sql(format!("TEXT parameter is not valid UTF-8: {error}")))?;
+        let stmt = handle_mut(stmt, "stmt")?;
+        stmt.result = None;
+        stmt.current_row = None;
+        stmt.next_row_index = 0;
+        stmt.row_views.clear();
+        stmt.row_i64_text_f64_views.clear();
+        let int_val = Value::Int64(int_value);
+        let text_val = Value::Text(text.to_string());
+        match stmt.bindings.len() {
+            0 => {
+                stmt.bindings.push(int_val);
+                stmt.bindings.push(text_val);
+            }
+            1 => {
+                stmt.bindings[0] = int_val;
+                stmt.bindings.push(text_val);
+            }
+            _ => {
+                stmt.bindings[0] = int_val;
+                stmt.bindings[1] = text_val;
+            }
+        }
+        execute_stmt_if_needed(stmt)?;
+        *out_ptr(out_affected, "out_affected")? =
+            stmt.result.as_ref().map_or(0, QueryResult::affected_rows);
+        Ok(())
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn ddb_stmt_value_copy(
     stmt: *mut StmtHandle,

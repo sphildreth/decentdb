@@ -151,6 +151,22 @@ ddb_status_t ddb_stmt_column_name_copy(
     size_t column_index,
     char **out_name);
 ddb_status_t ddb_stmt_affected_rows(ddb_stmt_t *stmt, uint64_t *out_rows);
+ddb_status_t ddb_stmt_rebind_int64_execute(
+    ddb_stmt_t *stmt,
+    int64_t value,
+    uint64_t *out_affected);
+ddb_status_t ddb_stmt_rebind_text_int64_execute(
+    ddb_stmt_t *stmt,
+    const char *text_value,
+    size_t text_len,
+    int64_t int_value,
+    uint64_t *out_affected);
+ddb_status_t ddb_stmt_rebind_int64_text_execute(
+    ddb_stmt_t *stmt,
+    int64_t int_value,
+    const char *text_value,
+    size_t text_len,
+    uint64_t *out_affected);
 ddb_status_t ddb_stmt_value_copy(
     ddb_stmt_t *stmt,
     size_t column_index,

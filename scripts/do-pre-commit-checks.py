@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Steven's pre-commit paranoia checks with visible progress."""
+"""Run pre-commit checks with simple, readable output."""
 
 from __future__ import annotations
 
@@ -14,23 +14,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
-
-try:
-    from rich.console import Console, Group
-    from rich.live import Live
-    from rich.panel import Panel
-    from rich.progress import (
-        BarColumn,
-        Progress,
-        SpinnerColumn,
-        TextColumn,
-        TimeElapsedColumn,
-    )
-    from rich.table import Table
-
-    HAVE_RICH = True
-except ImportError:
-    HAVE_RICH = False
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,23 +40,17 @@ class CheckState:
     elapsed_seconds: float = 0.0
     return_code: int | None = None
     log_path: Path | None = None
-    benchmark_summary: BenchmarkSummary | None = None
+    benchmark_drift: str | None = None
 
 
-@dataclass
-class BenchmarkSectionSummary:
-    label: str
-    status: str
-    gained: list[str] = field(default_factory=list)
-    lost: list[str] = field(default_factory=list)
-    moved_to_sqlite: list[str] = field(default_factory=list)
-
-
-@dataclass
-class BenchmarkSummary:
-    check_key: str
-    overall_status: str
-    sections: list[BenchmarkSectionSummary] = field(default_factory=list)
+# ANSI colors
+GREEN = "\033[32m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
 
 
 def format_duration(seconds: float) -> str:
@@ -92,33 +69,21 @@ def tail_lines(path: Path, max_lines: int = 80) -> str:
     return "\n".join(lines[-max_lines:])
 
 
-def overall_benchmark_status(sections: Sequence[BenchmarkSectionSummary]) -> str:
-    statuses = {section.status for section in sections}
-    if not statuses:
-        return "SAME"
-    if "LOSE" in statuses:
-        return "LOSE"
-    if "WIN" in statuses:
-        return "WIN"
-    if statuses == {"BASELINE"}:
-        return "BASELINE"
-    if "BASELINE" in statuses and len(statuses) > 1:
-        return "WIN"
-    return "SAME"
-
-
-def normalize_comparison_label(raw_label: str) -> str:
-    raw_label = raw_label.strip()
-    if raw_label.startswith("Comparison (") and raw_label.endswith(")"):
-        return raw_label[len("Comparison (") : -1]
-    return raw_label
-
-
-def parse_metric_name(line: str) -> str | None:
-    item = line[2:].strip()
-    if not item or item.lower() == "none":
+def extract_comparison_block(log_text: str) -> str | None:
+    lines = log_text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith("=== Comparison"):
+            start = i
+            break
+    if start is None:
         return None
-    return item.split(":", 1)[0].strip()
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].strip().startswith("===") and "Comparison" not in lines[i]:
+            end = i
+            break
+    return "\n".join(lines[start:end])
 
 
 def parse_benchmark_comparisons(text: str) -> dict[str, dict[str, list[str]]]:
@@ -130,9 +95,11 @@ def parse_benchmark_comparisons(text: str) -> dict[str, dict[str, list[str]]]:
         line = raw_line.strip()
         header_match = COMPARISON_HEADER_RE.match(line)
         if header_match:
-            normalized_label = normalize_comparison_label(header_match.group(1))
-            if "DecentDB vs SQLite" in normalized_label:
-                current_label = normalized_label
+            label = header_match.group(1).strip()
+            if label.startswith("Comparison (") and label.endswith(")"):
+                label = label[len("Comparison (") : -1]
+            if "DecentDB vs SQLite" in label:
+                current_label = label
                 current_side = None
                 sections.setdefault(current_label, {"decentdb": [], "sqlite": []})
             else:
@@ -151,8 +118,9 @@ def parse_benchmark_comparisons(text: str) -> dict[str, dict[str, list[str]]]:
         if not line.startswith("- ") or current_side is None:
             continue
 
-        metric_name = parse_metric_name(line)
-        if metric_name is not None:
+        item = line[2:].strip()
+        if item and item.lower() != "none":
+            metric_name = item.split(":", 1)[0].strip()
             sections[current_label][current_side].append(metric_name)
 
     return sections
@@ -177,91 +145,41 @@ def save_benchmark_baselines(
     )
 
 
-def compare_benchmark_sections(
-    check_key: str,
+def compute_benchmark_drift(
     current: dict[str, dict[str, list[str]]],
     baselines: dict[str, dict[str, dict[str, list[str]]]],
-) -> BenchmarkSummary | None:
+    check_key: str,
+) -> str | None:
     if not current:
         return None
 
     previous = baselines.get(check_key, {})
-    section_summaries: list[BenchmarkSectionSummary] = []
+    results = []
     for label in sorted(current):
         current_decent = set(current[label]["decentdb"])
-        current_sqlite = set(current[label]["sqlite"])
         previous_decent = set(previous.get(label, {}).get("decentdb", []))
 
         if label not in previous:
-            section_summaries.append(
-                BenchmarkSectionSummary(label=label, status="BASELINE")
-            )
+            results.append("baseline")
             continue
 
-        gained = sorted(current_decent - previous_decent)
-        lost = sorted(previous_decent - current_decent)
-        moved_to_sqlite = sorted(set(lost) & current_sqlite)
+        gained = current_decent - previous_decent
+        lost = previous_decent - current_decent
 
         if lost:
-            status = "LOSE"
+            results.append("regressed")
         elif gained:
-            status = "WIN"
+            results.append("improved")
         else:
-            status = "SAME"
+            results.append("same")
 
-        section_summaries.append(
-            BenchmarkSectionSummary(
-                label=label,
-                status=status,
-                gained=gained,
-                lost=lost,
-                moved_to_sqlite=moved_to_sqlite,
-            )
-        )
-
-    overall_status = overall_benchmark_status(section_summaries)
-    return BenchmarkSummary(
-        check_key=check_key,
-        overall_status=overall_status,
-        sections=section_summaries,
-    )
-
-
-def render_benchmark_summary(summary: BenchmarkSummary) -> Panel:
-    table = Table(expand=True)
-    table.add_column("Section", style="bold")
-    table.add_column("Result", justify="center")
-    table.add_column("New DecentDB wins", overflow="fold")
-    table.add_column("Lost DecentDB wins", overflow="fold")
-
-    styles = {
-        "WIN": "[bold green]WIN[/bold green]",
-        "SAME": "[bold cyan]SAME[/bold cyan]",
-        "LOSE": "[bold red]LOSE[/bold red]",
-        "BASELINE": "[bold yellow]BASELINE[/bold yellow]",
-    }
-    for section in summary.sections:
-        lost_detail = ", ".join(section.lost) if section.lost else "-"
-        if section.moved_to_sqlite:
-            lost_detail = f"{lost_detail} [dim](to SQLite: {', '.join(section.moved_to_sqlite)})[/dim]"
-        table.add_row(
-            section.label,
-            styles.get(section.status, section.status),
-            ", ".join(section.gained) if section.gained else "-",
-            lost_detail,
-        )
-
-    border_style = {
-        "WIN": "green",
-        "SAME": "cyan",
-        "LOSE": "red",
-        "BASELINE": "yellow",
-    }.get(summary.overall_status, "cyan")
-    return Panel(
-        table,
-        title=f"{summary.check_key} benchmark drift: {summary.overall_status}",
-        border_style=border_style,
-    )
+    if "regressed" in results:
+        return "REGRESSED"
+    if "improved" in results:
+        return "IMPROVED"
+    if all(r == "baseline" for r in results):
+        return "BASELINE"
+    return "STABLE"
 
 
 def build_checks() -> list[Check]:
@@ -375,81 +293,10 @@ def build_checks() -> list[Check]:
     ]
 
 
-def render_dashboard(
-    states: Sequence[CheckState], started_at: float, log_root: Path
-) -> Group:
-    completed = sum(1 for state in states if state.status in {"passed", "failed"})
-    total = len(states)
-    running = next((state for state in states if state.status == "running"), None)
-
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(bar_width=None),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeElapsedColumn(),
-        expand=True,
-    )
-    description = (
-        f"[bold cyan]Running:[/bold cyan] {running.check.title}"
-        if running is not None
-        else "[bold cyan]Waiting for checks[/bold cyan]"
-    )
-    progress.add_task(description, total=total, completed=completed)
-
-    table = Table(expand=True)
-    table.add_column("#", justify="right", style="bold")
-    table.add_column("Check", overflow="fold")
-    table.add_column("Status", justify="center")
-    table.add_column("Elapsed", justify="right")
-    table.add_column("Workdir", overflow="fold", style="dim")
-
-    status_styles = {
-        "pending": "[dim]pending[/dim]",
-        "running": "[bold yellow]RUNNING[/bold yellow]",
-        "passed": "[bold green]PASS[/bold green]",
-        "failed": "[bold red]FAIL[/bold red]",
-    }
-    for index, state in enumerate(states, start=1):
-        table.add_row(
-            str(index),
-            f"{state.check.title}\n[dim]{state.check.key}[/dim]",
-            status_styles[state.status],
-            format_duration(state.elapsed_seconds),
-            str(state.check.cwd.relative_to(REPO_ROOT)),
-        )
-
-    footer = Panel(
-        f"[bold]Logs:[/bold] {log_root}\n"
-        f"[bold]Total elapsed:[/bold] {format_duration(time.perf_counter() - started_at)}",
-        title="Pre-commit paranoia suite",
-        border_style="cyan",
-    )
-    return Group(progress, table, footer)
-
-
-def print_plain_status(
-    console: Console, states: Sequence[CheckState], started_at: float, log_root: Path
-) -> None:
-    console.print("=" * 80)
-    console.print(
-        f"Pre-commit paranoia suite | total elapsed {format_duration(time.perf_counter() - started_at)}"
-    )
-    for state in states:
-        console.print(
-            f"{state.check.key:18} {state.status.upper():8} "
-            f"{format_duration(state.elapsed_seconds):>8}  {state.check.title}"
-        )
-    console.print(f"Logs: {log_root}")
-
-
 def run_check(
-    console: Console,
-    live: Live | None,
-    states: list[CheckState],
     state: CheckState,
-    show_output: bool,
-    suite_started_at: float,
+    index: int,
+    total: int,
     log_root: Path,
     benchmark_baselines: dict[str, dict[str, dict[str, list[str]]]],
 ) -> None:
@@ -457,6 +304,9 @@ def run_check(
     state.log_path = log_root / f"{state.check.key}.log"
     state.status = "running"
     start = time.perf_counter()
+
+    label = f"[{index}/{total}] {state.check.title}"
+    print(f"{CYAN}RUNNING{RESET} {label}")
 
     env = os.environ.copy()
     env.update(state.check.env)
@@ -472,44 +322,39 @@ def run_check(
             stderr=subprocess.STDOUT,
             text=True,
         )
-
-        while True:
-            return_code = process.poll()
-            state.elapsed_seconds = time.perf_counter() - start
-            if live is not None:
-                live.update(render_dashboard(states, suite_started_at, log_root))
-            if return_code is not None:
-                state.return_code = return_code
-                break
-            time.sleep(0.15)
+        process.wait()
 
     state.elapsed_seconds = time.perf_counter() - start
+    state.return_code = process.returncode
     state.status = "passed" if state.return_code == 0 else "failed"
-    if live is not None:
-        live.update(render_dashboard(states, suite_started_at, log_root))
+
+    duration = format_duration(state.elapsed_seconds)
+    if state.status == "passed":
+        print(f"{GREEN}PASS{RESET}   {label} {DIM}({duration}){RESET}")
+    else:
+        print(f"{RED}FAIL{RESET}   {label} {DIM}({duration}){RESET}")
+
     if state.return_code == 0 and state.check.benchmark_comparison:
         log_text = state.log_path.read_text(encoding="utf-8", errors="replace")
+        comparison = extract_comparison_block(log_text)
+        if comparison:
+            print()
+            print(comparison)
+            print()
         current_sections = parse_benchmark_comparisons(log_text)
-        state.benchmark_summary = compare_benchmark_sections(
-            state.check.key, current_sections, benchmark_baselines
+        state.benchmark_drift = compute_benchmark_drift(
+            current_sections, benchmark_baselines, state.check.key
         )
         if current_sections:
             benchmark_baselines[state.check.key] = current_sections
             save_benchmark_baselines(benchmark_baselines)
-        if state.benchmark_summary is not None:
-            console.print(render_benchmark_summary(state.benchmark_summary))
 
-    if state.return_code != 0 or show_output:
-        output = tail_lines(state.log_path, max_lines=120)
-        title = f"{state.check.key} output"
-        style = "red" if state.return_code else "green"
-        console.print(
-            Panel(output or "(no output captured)", title=title, border_style=style)
-        )
-
-    state.elapsed_seconds = time.perf_counter() - start
-    if live is not None:
-        live.update(render_dashboard(states, suite_started_at, log_root))
+    if state.return_code != 0:
+        output = tail_lines(state.log_path, max_lines=40)
+        if output:
+            print(f"\n{RED}--- {state.check.key} failed output (tail) ---{RESET}")
+            print(output)
+            print()
 
 
 def select_checks(
@@ -526,9 +371,7 @@ def select_checks(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run Steven's pre-commit paranoia checks."
-    )
+    parser = argparse.ArgumentParser(description="Run pre-commit checks.")
     parser.add_argument(
         "--mode",
         choices=("fast", "paranoid"),
@@ -548,11 +391,6 @@ def parse_args() -> argparse.Namespace:
         help="List available check keys and exit.",
     )
     parser.add_argument(
-        "--show-output",
-        action="store_true",
-        help="Print the captured output for successful checks too.",
-    )
-    parser.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop immediately after the first failing check.",
@@ -562,112 +400,65 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if not HAVE_RICH:
-        print(
-            "This script requires the 'rich' package in the active Python environment.",
-            file=sys.stderr,
-        )
-        return 2
-
     all_checks = build_checks()
+
     if args.list:
         for check in all_checks:
             modes = ",".join(check.modes)
-            suffix = " [benchmark-drift]" if check.benchmark_comparison else ""
+            suffix = " [benchmark]" if check.benchmark_comparison else ""
             print(f"{check.key:24} {modes:14} {check.title}{suffix}")
         return 0
 
     checks = select_checks(all_checks, args.only, args.mode)
     run_log_root = LOG_ROOT / time.strftime("%Y%m%d-%H%M%S")
-    run_log_root.mkdir(parents=True, exist_ok=True)
-    console = Console()
     states = [CheckState(check=check) for check in checks]
     started_at = time.perf_counter()
     benchmark_baselines = load_benchmark_baselines()
 
-    use_live = HAVE_RICH and console.is_terminal
-
-    if use_live:
-        live_cm = Live(
-            render_dashboard(states, started_at, run_log_root),
-            console=console,
-            refresh_per_second=6,
-        )
-    else:
-        live_cm = None
+    print(
+        f"\n{BOLD}Pre-commit checks ({len(checks)} checks, {args.mode} mode){RESET}\n"
+    )
 
     failures: list[CheckState] = []
     try:
-        if live_cm is not None:
-            with live_cm as live:
-                for state in states:
-                    run_check(
-                        console,
-                        live,
-                        states,
-                        state,
-                        args.show_output,
-                        started_at,
-                        run_log_root,
-                        benchmark_baselines,
-                    )
-                    if state.status == "failed":
-                        failures.append(state)
-                        if args.fail_fast:
-                            break
-        else:
-            for state in states:
-                print_plain_status(console, states, started_at, run_log_root)
-                run_check(
-                    console,
-                    None,
-                    states,
-                    state,
-                    args.show_output,
-                    started_at,
-                    run_log_root,
-                    benchmark_baselines,
-                )
-                if state.status == "failed":
-                    failures.append(state)
-                    if args.fail_fast:
-                        break
-            print_plain_status(console, states, started_at, run_log_root)
+        for index, state in enumerate(states, start=1):
+            run_check(state, index, len(checks), run_log_root, benchmark_baselines)
+            if state.status == "failed":
+                failures.append(state)
+                if args.fail_fast:
+                    break
     except KeyboardInterrupt:
-        console.print("\n[bold red]Interrupted.[/bold red]")
+        print(f"\n{RED}Interrupted.{RESET}")
         return 130
 
     total_elapsed = format_duration(time.perf_counter() - started_at)
+
+    print(f"\n{'─' * 60}")
     if failures:
-        summary = Table(expand=True)
-        summary.add_column("Failed check", style="bold red")
-        summary.add_column("Exit", justify="right")
-        summary.add_column("Log", overflow="fold")
-        for failure in failures:
-            summary.add_row(
-                failure.check.key,
-                str(failure.return_code),
-                str(failure.log_path) if failure.log_path is not None else "",
-            )
-        console.print(
-            Panel(summary, title=f"FAIL after {total_elapsed}", border_style="red")
+        print(
+            f"{RED}{BOLD}FAILED{RESET} in {total_elapsed}  ({len(failures)}/{len(checks)} failed)"
         )
+        for f in failures:
+            log_hint = f" → {f.log_path}" if f.log_path else ""
+            print(f"  {RED}✗{RESET} {f.check.key}{log_hint}")
+        print(f"\nLogs: {run_log_root}")
         return 1
 
-    summary = Table(expand=True)
-    summary.add_column("Check", style="bold green")
-    summary.add_column("Elapsed", justify="right")
-    summary.add_column("Benchmark drift", justify="center")
+    print(f"{GREEN}{BOLD}PASSED{RESET} in {total_elapsed}")
     for state in states:
-        drift = (
-            state.benchmark_summary.overall_status
-            if state.benchmark_summary is not None
-            else "-"
+        drift = ""
+        if state.benchmark_drift:
+            color = {
+                "REGRESSED": RED,
+                "IMPROVED": GREEN,
+                "STABLE": "",
+                "BASELINE": YELLOW,
+            }.get(state.benchmark_drift, "")
+            drift = f"  [{color}{state.benchmark_drift}{RESET}]"
+        print(
+            f"  {GREEN}✓{RESET} {state.check.key} {format_duration(state.elapsed_seconds)}{drift}"
         )
-        summary.add_row(state.check.key, format_duration(state.elapsed_seconds), drift)
-    console.print(
-        Panel(summary, title=f"PASS in {total_elapsed}", border_style="green")
-    )
+    print(f"\nLogs: {run_log_root}")
     return 0
 
 

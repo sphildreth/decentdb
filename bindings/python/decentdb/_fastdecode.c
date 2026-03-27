@@ -1536,30 +1536,18 @@ static PyObject *reset_bind_int64_step_affected(PyObject *self, PyObject *args) 
     }
 
     ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
-    ddb_status_t code = ddb_stmt_reset(stmt);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_reset");
-    }
-    code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
-    }
-    uint8_t has_row = 0;
-    code = ddb_stmt_step(stmt, &has_row);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_step");
-    }
     uint64_t affected = 0;
-    code = ddb_stmt_affected_rows(stmt, &affected);
+    ddb_status_t code = ddb_stmt_rebind_int64_execute(stmt, (int64_t)id_value, &affected);
     if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+        return raise_decentdb_error(code, "ddb_stmt_rebind_int64_execute");
     }
     PyObject *result = PyTuple_New(2);
     if (result == NULL) {
         return NULL;
     }
     PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
-    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    PyTuple_SET_ITEM(result, 1, Py_False);
+    Py_INCREF(Py_False);
     return result;
 }
 
@@ -1754,34 +1742,19 @@ static PyObject *reset_bind_i64_text_step_affected(PyObject *self, PyObject *arg
     }
 
     ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
-    ddb_status_t code = ddb_stmt_reset(stmt);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_reset");
-    }
-    code = ddb_stmt_bind_int64(stmt, 1, (int64_t)id_value);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
-    }
-    code = ddb_stmt_bind_text(stmt, 2, text_ptr, (size_t)text_len);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_bind_text");
-    }
-    uint8_t has_row = 0;
-    code = ddb_stmt_step(stmt, &has_row);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_step");
-    }
     uint64_t affected = 0;
-    code = ddb_stmt_affected_rows(stmt, &affected);
+    ddb_status_t code = ddb_stmt_rebind_int64_text_execute(
+        stmt, (int64_t)id_value, text_ptr, (size_t)text_len, &affected);
     if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+        return raise_decentdb_error(code, "ddb_stmt_rebind_int64_text_execute");
     }
     PyObject *result = PyTuple_New(2);
     if (result == NULL) {
         return NULL;
     }
     PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
-    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    PyTuple_SET_ITEM(result, 1, Py_False);
+    Py_INCREF(Py_False);
     return result;
 }
 
@@ -1840,34 +1813,19 @@ static PyObject *reset_bind_text_i64_step_affected(PyObject *self, PyObject *arg
     }
 
     ddb_stmt_t *stmt = (ddb_stmt_t *)(uintptr_t)stmt_addr;
-    ddb_status_t code = ddb_stmt_reset(stmt);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_reset");
-    }
-    code = ddb_stmt_bind_text(stmt, 1, text_ptr, (size_t)text_len);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_bind_text");
-    }
-    code = ddb_stmt_bind_int64(stmt, 2, (int64_t)id_value);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_bind_int64");
-    }
-    uint8_t has_row = 0;
-    code = ddb_stmt_step(stmt, &has_row);
-    if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_step");
-    }
     uint64_t affected = 0;
-    code = ddb_stmt_affected_rows(stmt, &affected);
+    ddb_status_t code = ddb_stmt_rebind_text_int64_execute(
+        stmt, text_ptr, (size_t)text_len, (int64_t)id_value, &affected);
     if (code != DDB_OK) {
-        return raise_decentdb_error(code, "ddb_stmt_affected_rows");
+        return raise_decentdb_error(code, "ddb_stmt_rebind_text_int64_execute");
     }
     PyObject *result = PyTuple_New(2);
     if (result == NULL) {
         return NULL;
     }
     PyTuple_SET_ITEM(result, 0, PyLong_FromUnsignedLongLong((unsigned long long)affected));
-    PyTuple_SET_ITEM(result, 1, PyBool_FromLong((long)(has_row != 0)));
+    PyTuple_SET_ITEM(result, 1, Py_False);
+    Py_INCREF(Py_False);
     return result;
 }
 

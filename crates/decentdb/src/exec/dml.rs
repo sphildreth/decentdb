@@ -576,14 +576,13 @@ impl EngineRuntime {
         let Some(current_value) = table_data.rows[row_index]
             .values
             .get(prepared.column_index)
-            .cloned()
         else {
             return Err(DbError::internal(format!(
                 "column index {} is invalid for {}",
                 prepared.column_index, prepared.table_name
             )));
         };
-        if current_value != next_value {
+        if *current_value != next_value {
             table_data.rows[row_index].values[prepared.column_index] = next_value;
             self.mark_table_dirty(&prepared.table_name);
         }
@@ -704,34 +703,53 @@ impl EngineRuntime {
             return Ok(QueryResult::with_affected_rows(0));
         }
 
-        let (matching_rows, mut row_indices) = {
+        let mut row_indices = {
             let table_data = self.table_data(&prepared.table.name).ok_or_else(|| {
                 DbError::internal(format!("table data for {} is missing", prepared.table.name))
             })?;
-            let mut rows = Vec::with_capacity(matching_row_ids.len());
             let mut indices = Vec::with_capacity(matching_row_ids.len());
             for &row_id in &matching_row_ids {
                 let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
                     DbError::internal(format!("row {row_id} vanished during DELETE"))
                 })?;
-                rows.push(table_data.rows[row_index].clone());
                 indices.push(row_index);
             }
-            (rows, indices)
+            indices
         };
 
-        for row in &matching_rows {
-            for child in &prepared.restrict_children {
-                if prepared_delete_has_referencing_child(self, child, &row.values)? {
-                    return Err(DbError::constraint(format!(
-                        "DELETE on {} violates a foreign key from {}",
-                        prepared.table.name, child.child_table_name
-                    )));
+        if !prepared.restrict_children.is_empty() {
+            let table_data = self.table_data(&prepared.table.name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table.name))
+            })?;
+            for &row_index in &row_indices {
+                for child in &prepared.restrict_children {
+                    if prepared_delete_has_referencing_child(
+                        self,
+                        child,
+                        &table_data.rows[row_index].values,
+                    )? {
+                        return Err(DbError::constraint(format!(
+                            "DELETE on {} violates a foreign key from {}",
+                            prepared.table.name, child.child_table_name
+                        )));
+                    }
                 }
             }
         }
 
-        for row in &matching_rows {
+        row_indices.sort_unstable_by(|left, right| right.cmp(left));
+        let removed_rows = {
+            let table_data = self.table_data_mut(&prepared.table.name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table.name))
+            })?;
+            let mut removed = Vec::with_capacity(row_indices.len());
+            for &row_index in &row_indices {
+                removed.push(table_data.rows.remove(row_index));
+            }
+            removed
+        };
+
+        for row in &removed_rows {
             for index in &prepared.indexes {
                 apply_runtime_index_delete_for_row(
                     self,
@@ -743,15 +761,8 @@ impl EngineRuntime {
             }
         }
 
-        row_indices.sort_unstable_by(|left, right| right.cmp(left));
-        let table_data = self.table_data_mut(&prepared.table.name).ok_or_else(|| {
-            DbError::internal(format!("table data for {} is missing", prepared.table.name))
-        })?;
-        for row_index in row_indices {
-            table_data.rows.remove(row_index);
-        }
         self.mark_table_dirty(&prepared.table.name);
-        Ok(QueryResult::with_affected_rows(matching_rows.len() as u64))
+        Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
     }
 
     fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
@@ -1507,48 +1518,51 @@ impl EngineRuntime {
             .cloned()
             .collect::<Vec<_>>();
         if statement.returning.is_empty() && !has_referencing_tables {
-            let (matching_rows, mut row_indices) = {
+            let mut row_indices = {
                 let table_data = self.table_data(&table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
-                let mut rows = Vec::with_capacity(matching_row_ids.len());
                 let mut indices = Vec::with_capacity(matching_row_ids.len());
                 for &row_id in &matching_row_ids {
                     let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
                         DbError::internal(format!("row {row_id} vanished during DELETE"))
                     })?;
-                    rows.push(table_data.rows[row_index].clone());
                     indices.push(row_index);
                 }
-                (rows, indices)
+                indices
             };
-            let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-            if indexes_remain_fresh {
-                for row in &matching_rows {
-                    for index in &table_indexes {
-                        if !apply_runtime_index_delete_for_row(
-                            self,
-                            &table,
-                            index,
-                            row.row_id,
-                            &row.values,
-                        )? {
-                            indexes_remain_fresh = false;
+            row_indices.sort_unstable_by(|left, right| right.cmp(left));
+            let removed_count = row_indices.len();
+            if !row_indices.is_empty() {
+                let removed_rows = {
+                    let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
+                        DbError::internal(format!("table data for {table_name} is missing"))
+                    })?;
+                    let mut removed = Vec::with_capacity(row_indices.len());
+                    for &row_index in &row_indices {
+                        removed.push(table_data.rows.remove(row_index));
+                    }
+                    removed
+                };
+                let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+                if indexes_remain_fresh {
+                    for row in &removed_rows {
+                        for index in &table_indexes {
+                            if !apply_runtime_index_delete_for_row(
+                                self,
+                                &table,
+                                index,
+                                row.row_id,
+                                &row.values,
+                            )? {
+                                indexes_remain_fresh = false;
+                                break;
+                            }
+                        }
+                        if !indexes_remain_fresh {
                             break;
                         }
                     }
-                    if !indexes_remain_fresh {
-                        break;
-                    }
-                }
-            }
-            row_indices.sort_unstable_by(|left, right| right.cmp(left));
-            if !row_indices.is_empty() {
-                let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
-                    DbError::internal(format!("table data for {table_name} is missing"))
-                })?;
-                for row_index in row_indices {
-                    table_data.rows.remove(row_index);
                 }
                 if !indexes_remain_fresh {
                     self.mark_indexes_stale_for_table(&table_name);
@@ -1558,10 +1572,10 @@ impl EngineRuntime {
             self.execute_after_triggers(
                 &table_name,
                 TriggerEvent::Delete,
-                matching_rows.len(),
+                removed_count,
                 page_size,
             )?;
-            return Ok(QueryResult::with_affected_rows(matching_rows.len() as u64));
+            return Ok(QueryResult::with_affected_rows(removed_count as u64));
         }
         let matching_rows = {
             let table_data = self.table_data(&table_name).ok_or_else(|| {
