@@ -574,9 +574,7 @@ impl EngineRuntime {
         let Some(row_index) = table_data.row_index_by_id(row_id) else {
             return Ok(QueryResult::with_affected_rows(0));
         };
-        let Some(current_value) = table_data.rows[row_index]
-            .values
-            .get(prepared.column_index)
+        let Some(current_value) = table_data.rows[row_index].values.get(prepared.column_index)
         else {
             return Err(DbError::internal(format!(
                 "column index {} is invalid for {}",
@@ -2493,7 +2491,9 @@ fn validate_prepared_insert(
         // the index is guaranteed to be consistent with the actual rows.
         // Also safe when the parent table only had append-only inserts:
         // inserts never remove rows, so any indexed row_id still exists.
-        if !runtime.dirty_tables.contains(&foreign_key.parent_table_name)
+        if !runtime
+            .dirty_tables
+            .contains(&foreign_key.parent_table_name)
             || runtime
                 .append_only_dirty_tables
                 .contains(&foreign_key.parent_table_name)
@@ -2971,9 +2971,10 @@ fn prepared_delete_has_referencing_child(
     };
     let ci = child.child_column_index;
     match parent_value {
-        Value::Int64(parent_int) => Ok(rows.rows.iter().any(|row| {
-            matches!(row.values.get(ci), Some(Value::Int64(v)) if *v == *parent_int)
-        })),
+        Value::Int64(parent_int) => Ok(rows
+            .rows
+            .iter()
+            .any(|row| matches!(row.values.get(ci), Some(Value::Int64(v)) if *v == *parent_int))),
         Value::Null => Ok(false),
         _ => Ok(rows.rows.iter().any(|row| {
             row.values.get(ci).is_some_and(|value| {

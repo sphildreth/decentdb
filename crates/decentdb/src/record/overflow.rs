@@ -239,7 +239,9 @@ pub(crate) fn rewrite_overflow_cached<S: PageStore>(
     // Compute tail info from the chain structure.
     let last_page_id = page_ids[needed_pages - 1];
     let total_full_pages = needed_pages.saturating_sub(1);
-    let last_chunk_len = bytes.len().saturating_sub(total_full_pages * chunk_capacity);
+    let last_chunk_len = bytes
+        .len()
+        .saturating_sub(total_full_pages * chunk_capacity);
     let tail = OverflowTailInfo {
         page_id: last_page_id,
         chunk_len: last_chunk_len,

@@ -37,8 +37,8 @@ use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
     append_uncompressed_with_tail, build_overflow_chain_cache, free_overflow, read_overflow,
-    read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached,
-    OverflowChainCache, OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
+    read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached, OverflowChainCache,
+    OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
@@ -707,27 +707,27 @@ impl EngineRuntime {
                     };
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
-                let (pointer, new_chain_cache, tail) =
-                    if let Some(chain_cache) = self.overflow_chain_caches.get(&table_name) {
-                        rewrite_overflow_cached(
-                            &mut store,
-                            previous_pointer,
-                            &payload,
-                            &chain_cache.page_ids,
-                            skip_overflow_pages,
-                        )?
-                    } else {
-                        let ptr = rewrite_overflow(
-                            &mut store,
-                            previous_pointer,
-                            &payload,
-                            CompressionMode::Never,
-                        )?;
-                        let cache = build_overflow_chain_cache(&store, ptr.head_page_id)?;
-                        let tail = read_uncompressed_overflow_tail(&store, ptr)?
-                            .unwrap_or_default();
-                        (ptr, cache, tail)
-                    };
+                let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
+                    self.overflow_chain_caches.get(&table_name)
+                {
+                    rewrite_overflow_cached(
+                        &mut store,
+                        previous_pointer,
+                        &payload,
+                        &chain_cache.page_ids,
+                        skip_overflow_pages,
+                    )?
+                } else {
+                    let ptr = rewrite_overflow(
+                        &mut store,
+                        previous_pointer,
+                        &payload,
+                        CompressionMode::Never,
+                    )?;
+                    let cache = build_overflow_chain_cache(&store, ptr.head_page_id)?;
+                    let tail = read_uncompressed_overflow_tail(&store, ptr)?.unwrap_or_default();
+                    (ptr, cache, tail)
+                };
                 self.overflow_chain_caches
                     .insert(table_name.clone(), new_chain_cache);
                 self.persisted_tables.insert(
@@ -5610,10 +5610,8 @@ fn build_runtime_index(
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
             if index.unique && int64_keys {
-                let mut keys = HashMap::with_capacity_and_hasher(
-                    data.rows.len(),
-                    Int64HashBuilder::default(),
-                );
+                let mut keys =
+                    HashMap::with_capacity_and_hasher(data.rows.len(), Int64HashBuilder::default());
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
@@ -5655,10 +5653,8 @@ fn build_runtime_index(
                     keys: RuntimeBtreeKeys::UniqueEncoded(keys),
                 })
             } else if int64_keys {
-                let mut keys: Int64Map<Vec<i64>> = HashMap::with_capacity_and_hasher(
-                    data.rows.len(),
-                    Int64HashBuilder::default(),
-                );
+                let mut keys: Int64Map<Vec<i64>> =
+                    HashMap::with_capacity_and_hasher(data.rows.len(), Int64HashBuilder::default());
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
@@ -6504,7 +6500,10 @@ fn splice_updated_rows_payload(
 
     if old.len() < HEADER_LEN || old[..8] != *TABLE_PAYLOAD_MAGIC {
         let payload = encode_table_payload(data)?;
-        return Ok(SpliceResult { payload, first_dirty_byte: 0 });
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
     }
     let old_row_count =
         u32::from_le_bytes(old[8..12].try_into().expect("row-count header length")) as usize;
@@ -6512,7 +6511,10 @@ fn splice_updated_rows_payload(
         // Row count changed (e.g. concurrent insert/delete after the cache
         // was stored) — fall back to full encode for safety.
         let payload = encode_table_payload(data)?;
-        return Ok(SpliceResult { payload, first_dirty_byte: 0 });
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
     }
 
     // Fast path: only a handful of rows changed.  Scan the old payload to
@@ -6558,7 +6560,10 @@ fn splice_updated_rows_payload(
     if row_spans.len() != sorted_dirty.len() {
         // Could not find all dirty rows in the old payload; fall back.
         let payload = encode_table_payload(data)?;
-        return Ok(SpliceResult { payload, first_dirty_byte: 0 });
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
     }
 
     let first_dirty_byte = row_spans.first().map_or(0, |s| s.0);
@@ -6591,7 +6596,10 @@ fn splice_updated_rows_payload(
         output.extend_from_slice(&old[copy_from..]);
     }
 
-    Ok(SpliceResult { payload: output, first_dirty_byte })
+    Ok(SpliceResult {
+        payload: output,
+        first_dirty_byte,
+    })
 }
 
 fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result<Vec<u8>> {

@@ -25,7 +25,7 @@
 
 ## 1. Executive Summary
 
-DecentDB's C ABI exposes 50 functions covering database lifecycle, prepared statements, typed parameter binding, fused bind+step operations, batch execution, re-execute patterns, zero-copy row views, result sets, transactions, schema introspection, and maintenance. The six language bindings exhibit significant variance in coverage, performance posture, and correctness.
+DecentDB's C ABI exposes 60 functions covering database lifecycle, prepared statements, typed parameter binding, fused bind+step operations, batch execution, re-execute patterns, zero-copy row views, result sets, transactions, schema introspection, and maintenance. The six language bindings exhibit significant variance in coverage, performance posture, and correctness.
 
 ### Coverage at a Glance
 
@@ -54,7 +54,7 @@ DecentDB's C ABI exposes 50 functions covering database lifecycle, prepared stat
 
 ## 2. C ABI Baseline
 
-The C ABI (`include/decentdb.h`) is the stable native boundary that all bindings must target. It exposes 50 functions organized into these categories:
+The C ABI (`include/decentdb.h`) is the stable native boundary that all bindings must target. It exposes 60 functions organized into these categories:
 
 ### Lifecycle (6 functions)
 - `ddb_abi_version`, `ddb_version`, `ddb_last_error_message`
@@ -1057,7 +1057,7 @@ Complete list of 50 C ABI functions with their binding coverage status. ✅ = ex
 | 59 | `ddb_result_column_name_copy` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | 60 | `ddb_result_value_copy` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 
-**Legend:** ✅ = exposed to users, ⚠️ = used internally (C extension or declared but uncalled), ❌ = not exposed
+**Legend:** ✅ = exposed to users, ⚠️ = declared but uncallable from managed code (only reachable via C extension internals), ❌ = not exposed
 
 ---
 

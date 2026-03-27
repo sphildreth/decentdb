@@ -3132,10 +3132,10 @@ class Connection:
         return cursor
 
     def execute(self, operation, parameters=None):
-        cur = self._exec_cursor
+        cur = self._exec_cursor() if self._exec_cursor is not None else None
         if cur is None or cur._closed:
             cur = self.cursor()
-            self._exec_cursor = cur
+            self._exec_cursor = weakref.ref(cur)
         cur.execute(operation, parameters)
         return cur
 
