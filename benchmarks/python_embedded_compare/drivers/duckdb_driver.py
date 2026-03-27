@@ -98,13 +98,13 @@ class DuckDBDriver(DatabaseDriver):
     def rollback(self):
         self.connection.execute("ROLLBACK")
 
-    def prepare_statement(self, sql: str) -> duckdb.Stmt:
+    def prepare_statement(self, sql: str) -> duckdb.Statement:
         stmt = self.connection.prepare(sql)
         self._prepared_stmts[sql] = stmt
         return stmt
 
     def execute_prepared(
-        self, handle: duckdb.Stmt, params: Optional[Tuple] = None
+        self, handle: duckdb.Statement, params: Optional[Tuple] = None
     ) -> Any:
         if params:
             result = handle.execute(params)

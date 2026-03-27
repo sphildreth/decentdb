@@ -61,6 +61,12 @@ pub(crate) struct PreparedSingleColumnForeignKey {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) enum PreparedSimpleValueSource {
+    Literal(Value),
+    Parameter(usize),
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PreparedSimpleInsert {
     pub(crate) table_name: String,
     pub(crate) columns: Vec<PreparedInsertColumn>,
@@ -72,6 +78,42 @@ pub(crate) struct PreparedSimpleInsert {
     pub(crate) insert_indexes: Vec<PreparedBtreeIndex>,
     pub(crate) use_generic_validation: bool,
     pub(crate) use_generic_index_updates: bool,
+    pub(crate) compiled_index_state_epoch: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSimpleUpdate {
+    pub(crate) table_name: String,
+    pub(crate) column_index: usize,
+    pub(crate) column_type: ColumnType,
+    pub(crate) nullable: bool,
+    pub(crate) row_id_source: PreparedSimpleValueSource,
+    pub(crate) value_source: PreparedSimpleValueSource,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedDeleteLookup {
+    RowId(PreparedSimpleValueSource),
+    Index {
+        index_name: String,
+        value_source: PreparedSimpleValueSource,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSimpleDeleteRestrictChild {
+    pub(crate) child_table_name: String,
+    pub(crate) child_column_index: usize,
+    pub(crate) child_index_name: Option<String>,
+    pub(crate) parent_column_index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedSimpleDelete {
+    pub(crate) table: crate::catalog::TableSchema,
+    pub(crate) indexes: Vec<crate::catalog::IndexSchema>,
+    pub(crate) lookup: PreparedDeleteLookup,
+    pub(crate) restrict_children: Vec<PreparedSimpleDeleteRestrictChild>,
     pub(crate) compiled_index_state_epoch: u64,
 }
 
@@ -423,6 +465,304 @@ impl EngineRuntime {
             use_generic_index_updates,
             compiled_index_state_epoch: self.index_state_epoch,
         }))
+    }
+
+    pub(crate) fn prepare_simple_update(
+        &self,
+        statement: &UpdateStatement,
+    ) -> Result<Option<PreparedSimpleUpdate>> {
+        if !self.can_execute_update_in_state_without_clone(statement)
+            || !statement.returning.is_empty()
+            || statement.assignments.len() != 1
+        {
+            return Ok(None);
+        }
+
+        let table = self
+            .table_schema(&statement.table_name)
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        let Some(filter) = statement.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, column_name, value_expr)) = simple_btree_lookup_filter(filter)
+        else {
+            return Ok(None);
+        };
+        if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
+            return Ok(None);
+        }
+        if !row_id_alias_column_name(table).is_some_and(|name| identifiers_equal(name, column_name))
+        {
+            return Ok(None);
+        }
+
+        let assignment = &statement.assignments[0];
+        let Some(value_source) = compile_prepared_simple_value_source(&assignment.expr) else {
+            return Ok(None);
+        };
+        let Some(row_id_source) = compile_prepared_simple_value_source(value_expr) else {
+            return Ok(None);
+        };
+        let Some(column_index) = table
+            .columns
+            .iter()
+            .position(|column| identifiers_equal(&column.name, &assignment.column_name))
+        else {
+            return Err(DbError::sql(format!(
+                "unknown column {}",
+                assignment.column_name
+            )));
+        };
+        let column = &table.columns[column_index];
+        if column.generated_sql.is_some() {
+            return Ok(None);
+        }
+
+        let assignment_columns = [column_index];
+        let index_changes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
+            .any(|index| index_might_change_for_assignments(table, index, &assignment_columns));
+        if index_changes {
+            return Ok(None);
+        }
+
+        Ok(Some(PreparedSimpleUpdate {
+            table_name: table.name.clone(),
+            column_index,
+            column_type: column.column_type,
+            nullable: column.nullable,
+            row_id_source,
+            value_source,
+        }))
+    }
+
+    pub(crate) fn can_reuse_prepared_simple_update(&self, prepared: &PreparedSimpleUpdate) -> bool {
+        // Schema cookie is validated before this is called, so the table exists.
+        // Only check if it was shadowed by a temp table.
+        !self.visible_table_is_temporary(&prepared.table_name)
+    }
+
+    pub(crate) fn execute_prepared_simple_update(
+        &mut self,
+        prepared: &PreparedSimpleUpdate,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let row_id = match resolve_prepared_simple_value(&prepared.row_id_source, params)? {
+            Value::Int64(value) => value,
+            _ => return Ok(QueryResult::with_affected_rows(0)),
+        };
+        let next_value = cast_prepared_simple_value(
+            resolve_prepared_simple_value(&prepared.value_source, params)?,
+            prepared.column_type,
+        )?;
+        if !prepared.nullable && matches!(next_value, Value::Null) {
+            return Err(DbError::constraint(format!(
+                "column {}.{} may not be NULL",
+                prepared.table_name, prepared.column_index
+            )));
+        }
+
+        let Some(table_data) = self.table_data_mut(&prepared.table_name) else {
+            return Err(DbError::internal(format!(
+                "table data for {} is missing",
+                prepared.table_name
+            )));
+        };
+        let Some(row_index) = table_data.row_index_by_id(row_id) else {
+            return Ok(QueryResult::with_affected_rows(0));
+        };
+        let Some(current_value) = table_data.rows[row_index].values.get(prepared.column_index)
+        else {
+            return Err(DbError::internal(format!(
+                "column index {} is invalid for {}",
+                prepared.column_index, prepared.table_name
+            )));
+        };
+        if *current_value != next_value {
+            table_data.rows[row_index].values[prepared.column_index] = next_value;
+            self.mark_table_row_dirty(&prepared.table_name, row_index);
+        }
+        Ok(QueryResult::with_affected_rows(1))
+    }
+
+    pub(crate) fn prepare_simple_delete(
+        &self,
+        statement: &DeleteStatement,
+    ) -> Result<Option<PreparedSimpleDelete>> {
+        if !self.can_execute_delete_in_state_without_clone(statement)
+            || !statement.returning.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let table = self
+            .table_schema(&statement.table_name)
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("unknown table {}", statement.table_name)))?;
+        let restrict_children = prepare_simple_delete_restrict_children(self, &table)?;
+
+        let Some(filter) = statement.filter.as_ref() else {
+            return Ok(None);
+        };
+        let Some((filter_table, column_name, value_expr)) = simple_btree_lookup_filter(filter)
+        else {
+            return Ok(None);
+        };
+        if filter_table.is_some_and(|name| !identifiers_equal(name, &table.name)) {
+            return Ok(None);
+        }
+        let Some(value_source) = compile_prepared_simple_value_source(value_expr) else {
+            return Ok(None);
+        };
+
+        let indexes = self
+            .catalog
+            .indexes
+            .values()
+            .filter(|index| identifiers_equal(&index.table_name, &table.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let lookup = if row_id_alias_column_name(&table)
+            .is_some_and(|name| identifiers_equal(name, column_name))
+        {
+            PreparedDeleteLookup::RowId(value_source)
+        } else {
+            let Some(index) = indexes.iter().find(|index| {
+                index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0].expression_sql.is_none()
+                    && index.columns[0]
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|entry| identifiers_equal(entry, column_name))
+            }) else {
+                return Ok(None);
+            };
+            PreparedDeleteLookup::Index {
+                index_name: index.name.clone(),
+                value_source,
+            }
+        };
+
+        Ok(Some(PreparedSimpleDelete {
+            table,
+            indexes,
+            lookup,
+            restrict_children,
+            compiled_index_state_epoch: self.index_state_epoch,
+        }))
+    }
+
+    pub(crate) fn can_reuse_prepared_simple_delete(&self, prepared: &PreparedSimpleDelete) -> bool {
+        // Schema cookie is validated before this is called, so the table exists.
+        // Only check temp-table shadowing and index state.
+        !self.visible_table_is_temporary(&prepared.table.name)
+            && prepared.compiled_index_state_epoch == self.index_state_epoch
+            && prepared
+                .restrict_children
+                .iter()
+                .all(|child| !self.visible_table_is_temporary(&child.child_table_name))
+    }
+
+    pub(crate) fn execute_prepared_simple_delete(
+        &mut self,
+        prepared: &PreparedSimpleDelete,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        let matching_row_ids = match &prepared.lookup {
+            PreparedDeleteLookup::RowId(value_source) => {
+                let Value::Int64(row_id) = resolve_prepared_simple_value(value_source, params)?
+                else {
+                    return Ok(QueryResult::with_affected_rows(0));
+                };
+                match self.table_data(&prepared.table.name) {
+                    Some(rows) if rows.row_index_by_id(row_id).is_some() => vec![row_id],
+                    _ => Vec::new(),
+                }
+            }
+            PreparedDeleteLookup::Index {
+                index_name,
+                value_source,
+            } => {
+                let value = resolve_prepared_simple_value(value_source, params)?;
+                if matches!(value, Value::Null) {
+                    return Ok(QueryResult::with_affected_rows(0));
+                }
+                let Some(RuntimeIndex::Btree { keys }) = self.indexes.get(index_name) else {
+                    return Ok(QueryResult::with_affected_rows(0));
+                };
+                row_id_set_to_vec(keys.row_ids_for_value_set(&value)?)
+            }
+        };
+        if matching_row_ids.is_empty() {
+            return Ok(QueryResult::with_affected_rows(0));
+        }
+
+        let mut row_indices = {
+            let table_data = self.table_data(&prepared.table.name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table.name))
+            })?;
+            let mut indices = Vec::with_capacity(matching_row_ids.len());
+            for &row_id in &matching_row_ids {
+                let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
+                    DbError::internal(format!("row {row_id} vanished during DELETE"))
+                })?;
+                indices.push(row_index);
+            }
+            indices
+        };
+
+        if !prepared.restrict_children.is_empty() {
+            let table_data = self.table_data(&prepared.table.name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table.name))
+            })?;
+            for &row_index in &row_indices {
+                for child in &prepared.restrict_children {
+                    if prepared_delete_has_referencing_child(
+                        self,
+                        child,
+                        &table_data.rows[row_index].values,
+                    )? {
+                        return Err(DbError::constraint(format!(
+                            "DELETE on {} violates a foreign key from {}",
+                            prepared.table.name, child.child_table_name
+                        )));
+                    }
+                }
+            }
+        }
+
+        row_indices.sort_unstable_by(|left, right| right.cmp(left));
+        let removed_rows = {
+            let table_data = self.table_data_mut(&prepared.table.name).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", prepared.table.name))
+            })?;
+            let mut removed = Vec::with_capacity(row_indices.len());
+            for &row_index in &row_indices {
+                removed.push(table_data.rows.remove(row_index));
+            }
+            removed
+        };
+
+        for row in &removed_rows {
+            for index in &prepared.indexes {
+                apply_runtime_index_delete_for_row(
+                    self,
+                    &prepared.table,
+                    index,
+                    row.row_id,
+                    &row.values,
+                )?;
+            }
+        }
+
+        self.mark_table_dirty(&prepared.table.name);
+        Ok(QueryResult::with_affected_rows(removed_rows.len() as u64))
     }
 
     fn prepared_btree_index_is_fresh(&self, prepared: &PreparedBtreeIndex) -> bool {
@@ -1178,48 +1518,51 @@ impl EngineRuntime {
             .cloned()
             .collect::<Vec<_>>();
         if statement.returning.is_empty() && !has_referencing_tables {
-            let (matching_rows, mut row_indices) = {
+            let mut row_indices = {
                 let table_data = self.table_data(&table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
-                let mut rows = Vec::with_capacity(matching_row_ids.len());
                 let mut indices = Vec::with_capacity(matching_row_ids.len());
                 for &row_id in &matching_row_ids {
                     let row_index = table_data.row_index_by_id(row_id).ok_or_else(|| {
                         DbError::internal(format!("row {row_id} vanished during DELETE"))
                     })?;
-                    rows.push(table_data.rows[row_index].clone());
                     indices.push(row_index);
                 }
-                (rows, indices)
+                indices
             };
-            let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
-            if indexes_remain_fresh {
-                for row in &matching_rows {
-                    for index in &table_indexes {
-                        if !apply_runtime_index_delete_for_row(
-                            self,
-                            &table,
-                            index,
-                            row.row_id,
-                            &row.values,
-                        )? {
-                            indexes_remain_fresh = false;
+            row_indices.sort_unstable_by(|left, right| right.cmp(left));
+            let removed_count = row_indices.len();
+            if !row_indices.is_empty() {
+                let removed_rows = {
+                    let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
+                        DbError::internal(format!("table data for {table_name} is missing"))
+                    })?;
+                    let mut removed = Vec::with_capacity(row_indices.len());
+                    for &row_index in &row_indices {
+                        removed.push(table_data.rows.remove(row_index));
+                    }
+                    removed
+                };
+                let mut indexes_remain_fresh = table_indexes.iter().all(|index| index.fresh);
+                if indexes_remain_fresh {
+                    for row in &removed_rows {
+                        for index in &table_indexes {
+                            if !apply_runtime_index_delete_for_row(
+                                self,
+                                &table,
+                                index,
+                                row.row_id,
+                                &row.values,
+                            )? {
+                                indexes_remain_fresh = false;
+                                break;
+                            }
+                        }
+                        if !indexes_remain_fresh {
                             break;
                         }
                     }
-                    if !indexes_remain_fresh {
-                        break;
-                    }
-                }
-            }
-            row_indices.sort_unstable_by(|left, right| right.cmp(left));
-            if !row_indices.is_empty() {
-                let table_data = self.table_data_mut(&table_name).ok_or_else(|| {
-                    DbError::internal(format!("table data for {table_name} is missing"))
-                })?;
-                for row_index in row_indices {
-                    table_data.rows.remove(row_index);
                 }
                 if !indexes_remain_fresh {
                     self.mark_indexes_stale_for_table(&table_name);
@@ -1229,10 +1572,10 @@ impl EngineRuntime {
             self.execute_after_triggers(
                 &table_name,
                 TriggerEvent::Delete,
-                matching_rows.len(),
+                removed_count,
                 page_size,
             )?;
-            return Ok(QueryResult::with_affected_rows(matching_rows.len() as u64));
+            return Ok(QueryResult::with_affected_rows(removed_count as u64));
         }
         let matching_rows = {
             let table_data = self.table_data(&table_name).ok_or_else(|| {
@@ -2144,6 +2487,19 @@ fn validate_prepared_insert(
                 prepared.table_name, foreign_key.parent_table_name
             )));
         }
+        // When the parent table has not been modified in this transaction,
+        // the index is guaranteed to be consistent with the actual rows.
+        // Also safe when the parent table only had append-only inserts:
+        // inserts never remove rows, so any indexed row_id still exists.
+        if !runtime
+            .dirty_tables
+            .contains(&foreign_key.parent_table_name)
+            || runtime
+                .append_only_dirty_tables
+                .contains(&foreign_key.parent_table_name)
+        {
+            continue;
+        }
         let Some(parent_rows) = runtime.table_data(&foreign_key.parent_table_name) else {
             return Err(DbError::constraint(format!(
                 "foreign key parent table {} has no row store",
@@ -2492,6 +2848,140 @@ fn simple_btree_lookup_filter(filter: &Expr) -> Option<(Option<&str>, &str, &Exp
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn compile_prepared_simple_value_source(expr: &Expr) -> Option<PreparedSimpleValueSource> {
+    match expr {
+        Expr::Literal(value) => Some(PreparedSimpleValueSource::Literal(value.clone())),
+        Expr::Parameter(number) => Some(PreparedSimpleValueSource::Parameter(*number)),
+        _ => None,
+    }
+}
+
+fn resolve_prepared_simple_value(
+    source: &PreparedSimpleValueSource,
+    params: &[Value],
+) -> Result<Value> {
+    match source {
+        PreparedSimpleValueSource::Literal(value) => Ok(value.clone()),
+        PreparedSimpleValueSource::Parameter(number) => params
+            .get(number.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| DbError::sql(format!("parameter ${number} was not provided"))),
+    }
+}
+
+fn cast_prepared_simple_value(value: Value, column_type: ColumnType) -> Result<Value> {
+    super::cast_value(value, column_type)
+}
+
+fn prepare_simple_delete_restrict_children(
+    runtime: &EngineRuntime,
+    table: &crate::catalog::TableSchema,
+) -> Result<Vec<PreparedSimpleDeleteRestrictChild>> {
+    if table.temporary {
+        return Ok(Vec::new());
+    }
+
+    let mut prepared = Vec::new();
+    for child_table in runtime.catalog.tables.values().filter(|child| {
+        child
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+    }) {
+        for foreign_key in child_table
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table.name))
+        {
+            match foreign_key.on_delete {
+                ForeignKeyAction::NoAction | ForeignKeyAction::Restrict => {}
+                _ => return Ok(Vec::new()),
+            }
+            if foreign_key.columns.len() != 1 {
+                return Ok(Vec::new());
+            }
+            let referenced_columns = if foreign_key.referenced_columns.is_empty() {
+                table.primary_key_columns.clone()
+            } else {
+                foreign_key.referenced_columns.clone()
+            };
+            if referenced_columns.len() != 1 {
+                return Ok(Vec::new());
+            }
+            let Some(parent_column_index) = table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &referenced_columns[0]))
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(child_column_index) = child_table
+                .columns
+                .iter()
+                .position(|column| identifiers_equal(&column.name, &foreign_key.columns[0]))
+            else {
+                return Ok(Vec::new());
+            };
+            let child_index_name = runtime.catalog.indexes.values().find_map(|index| {
+                (identifiers_equal(&index.table_name, &child_table.name)
+                    && index.fresh
+                    && index.kind == IndexKind::Btree
+                    && index.predicate_sql.is_none()
+                    && index.columns.len() == 1
+                    && index.columns[0].expression_sql.is_none()
+                    && index.columns[0]
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|entry| identifiers_equal(entry, &foreign_key.columns[0])))
+                .then(|| index.name.clone())
+            });
+            prepared.push(PreparedSimpleDeleteRestrictChild {
+                child_table_name: child_table.name.clone(),
+                child_column_index,
+                child_index_name,
+                parent_column_index,
+            });
+        }
+    }
+    Ok(prepared)
+}
+
+fn prepared_delete_has_referencing_child(
+    runtime: &EngineRuntime,
+    child: &PreparedSimpleDeleteRestrictChild,
+    parent_row: &[Value],
+) -> Result<bool> {
+    let Some(parent_value) = parent_row.get(child.parent_column_index) else {
+        return Err(DbError::internal(format!(
+            "parent column index {} is invalid",
+            child.parent_column_index
+        )));
+    };
+    if let Some(index_name) = &child.child_index_name {
+        let Some(RuntimeIndex::Btree { keys }) = runtime.indexes.get(index_name) else {
+            return Ok(false);
+        };
+        return Ok(!keys.row_ids_for_value_set(parent_value)?.is_empty());
+    }
+    let Some(rows) = runtime.table_data(&child.child_table_name) else {
+        return Ok(false);
+    };
+    let ci = child.child_column_index;
+    match parent_value {
+        Value::Int64(parent_int) => Ok(rows
+            .rows
+            .iter()
+            .any(|row| matches!(row.values.get(ci), Some(Value::Int64(v)) if *v == *parent_int))),
+        Value::Null => Ok(false),
+        _ => Ok(rows.rows.iter().any(|row| {
+            row.values.get(ci).is_some_and(|value| {
+                compare_values(value, parent_value)
+                    .is_ok_and(|ordering| ordering == std::cmp::Ordering::Equal)
+            })
+        })),
     }
 }
 

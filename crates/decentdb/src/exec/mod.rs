@@ -18,6 +18,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{
@@ -35,8 +36,9 @@ use crate::planner;
 use crate::record::compression::CompressionMode;
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
-    append_uncompressed_with_tail, free_overflow, read_overflow, read_uncompressed_overflow_tail,
-    rewrite_overflow, OverflowPointer, OverflowTailInfo,
+    append_uncompressed_with_tail, build_overflow_chain_cache, free_overflow, read_overflow,
+    read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached, OverflowChainCache,
+    OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
 use crate::record::value::{parse_decimal_text, Value};
@@ -445,7 +447,7 @@ pub(super) enum PendingIndexInsert {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: CatalogState,
     pub(crate) tables: BTreeMap<String, TableData>,
@@ -458,9 +460,14 @@ pub(crate) struct EngineRuntime {
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
     pub(crate) dirty_tables: BTreeSet<String>,
     pub(crate) append_only_dirty_tables: BTreeSet<String>,
+    /// Row indices updated by prepared simple UPDATE; avoids full re-encode.
+    row_update_dirty: BTreeMap<String, Vec<usize>>,
+    /// Cached table payloads from the last commit for incremental splice.
+    cached_payloads: BTreeMap<String, Arc<Vec<u8>>>,
     root_state: Option<RootHeader>,
     pub(crate) index_state_epoch: u64,
     manifest_template: Option<ManifestTemplate>,
+    overflow_chain_caches: BTreeMap<String, OverflowChainCache>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,6 +489,39 @@ impl Default for BulkLoadOptions {
     }
 }
 
+impl Clone for EngineRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            catalog: self.catalog.clone(),
+            tables: self.tables.clone(),
+            temp_tables: self.temp_tables.clone(),
+            temp_table_data: self.temp_table_data.clone(),
+            temp_views: self.temp_views.clone(),
+            temp_indexes: self.temp_indexes.clone(),
+            temp_schema_cookie: self.temp_schema_cookie,
+            indexes: self.indexes.clone(),
+            persisted_tables: self.persisted_tables.clone(),
+            // Preserve dirty state so that multi-statement transactions
+            // (clone-and-replace) do not lose modifications from earlier
+            // statements.  `persist_to_db` clears dirty state after a
+            // successful persist, so autocommit paths are unaffected.
+            dirty_tables: self.dirty_tables.clone(),
+            append_only_dirty_tables: self.append_only_dirty_tables.clone(),
+            // Escalate row-update dirty to full dirty on clone: the
+            // subsequent generic execution path may modify the same rows
+            // in ways that invalidate the splice assumption.
+            row_update_dirty: BTreeMap::new(),
+            // Arc payloads: clone is just a refcount bump.
+            cached_payloads: self.cached_payloads.clone(),
+            root_state: self.root_state,
+            index_state_epoch: self.index_state_epoch,
+            // Optimization caches rebuilt on demand during persist.
+            manifest_template: None,
+            overflow_chain_caches: BTreeMap::new(),
+        }
+    }
+}
+
 impl EngineRuntime {
     #[must_use]
     pub(crate) fn empty(schema_cookie: u32) -> Self {
@@ -497,9 +537,12 @@ impl EngineRuntime {
             persisted_tables: BTreeMap::new(),
             dirty_tables: BTreeSet::new(),
             append_only_dirty_tables: BTreeSet::new(),
+            row_update_dirty: BTreeMap::new(),
+            cached_payloads: BTreeMap::new(),
             root_state: None,
             index_state_epoch: 0,
             manifest_template: None,
+            overflow_chain_caches: BTreeMap::new(),
         }
     }
 
@@ -629,26 +672,70 @@ impl EngineRuntime {
                                     tail,
                                 },
                             );
+                            // Invalidate chain cache — the append path
+                            // modified the chain without hashing.
+                            self.overflow_chain_caches.remove(&table_name);
+                            self.cached_payloads.remove(&table_name);
                             continue;
                         }
                     }
                 }
-                let payload = if self.append_only_dirty_tables.contains(&table_name)
-                    && previous_pointer.head_page_id != 0
-                {
-                    let previous_payload = read_overflow(&store, previous_pointer)?;
-                    append_table_payload(previous_payload, data)?
-                } else {
-                    encode_table_payload(data)?
-                };
+
+                // Choose the encoding path:
+                //  1. Row-update splice: only re-encode modified rows using cached payload
+                //  2. Append-only: read old payload, append new rows
+                //  3. Full re-encode: encode every row from scratch
+                let (payload, skip_overflow_pages) =
+                    if let Some(dirty_indices) = self.row_update_dirty.get(&table_name) {
+                        if let Some(cached) = self.cached_payloads.get(&table_name) {
+                            let splice = splice_updated_rows_payload(cached, data, dirty_indices)?;
+                            // Compute how many leading overflow pages are
+                            // guaranteed identical (their byte ranges fall
+                            // entirely within the unchanged prefix).
+                            let page_size = db.config().page_size as usize;
+                            let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
+                            let skip = if chunk_cap > 0 {
+                                splice.first_dirty_byte / chunk_cap
+                            } else {
+                                0
+                            };
+                            (splice.payload, skip)
+                        } else {
+                            (encode_table_payload(data)?, 0)
+                        }
+                    } else if self.append_only_dirty_tables.contains(&table_name)
+                        && previous_pointer.head_page_id != 0
+                    {
+                        let previous_payload = read_overflow(&store, previous_pointer)?;
+                        (append_table_payload(previous_payload, data)?, 0)
+                    } else {
+                        (encode_table_payload(data)?, 0)
+                    };
+
                 let checksum = crc32c_parts(&[payload.as_slice()]);
-                let pointer = rewrite_overflow(
-                    &mut store,
-                    previous_pointer,
-                    &payload,
-                    CompressionMode::Auto,
-                )?;
-                let tail = read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default();
+                let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
+                    self.overflow_chain_caches.get(&table_name)
+                {
+                    rewrite_overflow_cached(
+                        &mut store,
+                        previous_pointer,
+                        &payload,
+                        &chain_cache.page_ids,
+                        skip_overflow_pages,
+                    )?
+                } else {
+                    let ptr = rewrite_overflow(
+                        &mut store,
+                        previous_pointer,
+                        &payload,
+                        CompressionMode::Never,
+                    )?;
+                    let cache = build_overflow_chain_cache(&store, ptr.head_page_id)?;
+                    let tail = read_uncompressed_overflow_tail(&store, ptr)?.unwrap_or_default();
+                    (ptr, cache, tail)
+                };
+                self.overflow_chain_caches
+                    .insert(table_name.clone(), new_chain_cache);
                 self.persisted_tables.insert(
                     table_name.clone(),
                     PersistedTableState {
@@ -658,11 +745,15 @@ impl EngineRuntime {
                         tail,
                     },
                 );
+                self.cached_payloads
+                    .insert(table_name.clone(), Arc::new(payload));
             }
             for table_name in removed_tables {
                 let Some(state) = self.persisted_tables.remove(&table_name) else {
                     continue;
                 };
+                self.overflow_chain_caches.remove(&table_name);
+                self.cached_payloads.remove(&table_name);
                 if state.pointer.head_page_id != 0 {
                     free_overflow(&mut store, state.pointer.head_page_id)?;
                 }
@@ -703,6 +794,7 @@ impl EngineRuntime {
         db.write_page(page::CATALOG_ROOT_PAGE_ID, &root_page)?;
         self.dirty_tables.clear();
         self.append_only_dirty_tables.clear();
+        self.row_update_dirty.clear();
         self.root_state = Some(RootHeader {
             schema_cookie: self.catalog.schema_cookie,
             payload_checksum: checksum,
@@ -830,7 +922,7 @@ impl EngineRuntime {
     }
 
     pub(super) fn visible_table_is_temporary(&self, name: &str) -> bool {
-        self.temp_table_schema(name).is_some()
+        !self.temp_tables.is_empty() && self.temp_table_schema(name).is_some()
     }
 
     pub(super) fn table_schema_in_scope(
@@ -991,10 +1083,34 @@ impl EngineRuntime {
             return;
         }
         self.append_only_dirty_tables.remove(table_name);
+        self.row_update_dirty.remove(table_name);
         if self.dirty_tables.contains(table_name) {
             return;
         }
         self.dirty_tables.insert(table_name.to_string());
+    }
+
+    pub(super) fn mark_table_row_dirty(&mut self, table_name: &str, row_index: usize) {
+        if self.visible_table_is_temporary(table_name) {
+            return;
+        }
+        // Already fully dirty (not append-only, not row-update) — nothing to refine.
+        if self.dirty_tables.contains(table_name)
+            && !self.append_only_dirty_tables.contains(table_name)
+            && !self.row_update_dirty.contains_key(table_name)
+        {
+            return;
+        }
+        // Append-only dirty is incompatible with row-update; escalate.
+        if self.append_only_dirty_tables.contains(table_name) {
+            self.append_only_dirty_tables.remove(table_name);
+            return;
+        }
+        self.dirty_tables.insert(table_name.to_string());
+        self.row_update_dirty
+            .entry(table_name.to_string())
+            .or_default()
+            .push(row_index);
     }
 
     pub(super) fn mark_table_append_dirty(&mut self, table_name: &str) {
@@ -1014,6 +1130,7 @@ impl EngineRuntime {
         self.dirty_tables
             .extend(self.catalog.tables.keys().cloned());
         self.append_only_dirty_tables.clear();
+        self.row_update_dirty.clear();
     }
 
     pub(super) fn prepare_insert_index_updates(
@@ -5499,7 +5616,8 @@ fn build_runtime_index(
         IndexKind::Btree => {
             let int64_keys = btree_uses_typed_int64_keys(index, table);
             if index.unique && int64_keys {
-                let mut keys = Int64Map::<i64>::default();
+                let mut keys =
+                    HashMap::with_capacity_and_hasher(data.rows.len(), Int64HashBuilder::default());
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
@@ -5541,7 +5659,8 @@ fn build_runtime_index(
                     keys: RuntimeBtreeKeys::UniqueEncoded(keys),
                 })
             } else if int64_keys {
-                let mut keys = Int64Map::<Vec<i64>>::default();
+                let mut keys: Int64Map<Vec<i64>> =
+                    HashMap::with_capacity_and_hasher(data.rows.len(), Int64HashBuilder::default());
                 for row in &data.rows {
                     let Some(key) = compute_index_key(runtime, index, table, &row.values)? else {
                         continue;
@@ -6363,6 +6482,130 @@ fn encode_table_payload(data: &TableData) -> Result<Vec<u8>> {
         encode_bytes(&mut output, &encoded_row)?;
     }
     Ok(output)
+}
+
+/// Build a new payload by splicing only the modified rows into the cached
+/// previous payload.  Unchanged row bytes are copied verbatim from `old`,
+/// saving the per-row serialisation cost for the common single-row UPDATE.
+/// Result of a splice operation, containing the new payload and metadata
+/// about which byte offset was first modified.
+struct SpliceResult {
+    payload: Vec<u8>,
+    /// Byte offset of the first modified row in the OLD payload. Pages before
+    /// this offset are guaranteed unchanged and can be skipped during overflow
+    /// rewrite.
+    first_dirty_byte: usize,
+}
+
+fn splice_updated_rows_payload(
+    old: &[u8],
+    data: &TableData,
+    dirty_indices: &[usize],
+) -> Result<SpliceResult> {
+    const HEADER_LEN: usize = 8 /* magic */ + 4 /* row_count */;
+
+    if old.len() < HEADER_LEN || old[..8] != *TABLE_PAYLOAD_MAGIC {
+        let payload = encode_table_payload(data)?;
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
+    }
+    let old_row_count =
+        u32::from_le_bytes(old[8..12].try_into().expect("row-count header length")) as usize;
+    if old_row_count != data.rows.len() {
+        // Row count changed (e.g. concurrent insert/delete after the cache
+        // was stored) — fall back to full encode for safety.
+        let payload = encode_table_payload(data)?;
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
+    }
+
+    // Fast path: only a handful of rows changed.  Scan the old payload to
+    // locate byte ranges of each dirty row, then splice new encodings in.
+    //
+    // Row wire format:
+    //   row_id       (8 bytes, i64 LE)
+    //   row_data_len (4 bytes, u32 LE)
+    //   row_data     (row_data_len bytes)
+    //
+    // We need the byte offset of each dirty row (and the one after it) so
+    // we can copy unchanged prefix / suffix regions.
+
+    // Sort dirty indices so we splice left-to-right.
+    let mut sorted_dirty: Vec<usize> = dirty_indices.to_vec();
+    sorted_dirty.sort_unstable();
+    sorted_dirty.dedup();
+
+    // Scan the old payload to locate dirty row byte ranges.
+    // row_spans[i] = (start, end) byte offsets in `old` for dirty row i.
+    let mut row_spans: Vec<(usize, usize)> = Vec::with_capacity(sorted_dirty.len());
+    let mut scan_offset = HEADER_LEN;
+    let mut dirty_cursor = 0;
+    let mut row_idx = 0;
+    while dirty_cursor < sorted_dirty.len() && scan_offset + 12 <= old.len() {
+        let rd_len = u32::from_le_bytes(
+            old[scan_offset + 8..scan_offset + 12]
+                .try_into()
+                .expect("row data len"),
+        ) as usize;
+        let row_end = scan_offset + 12 + rd_len;
+        if row_idx == sorted_dirty[dirty_cursor] {
+            row_spans.push((scan_offset, row_end));
+            dirty_cursor += 1;
+        }
+        scan_offset = row_end;
+        row_idx += 1;
+        if row_idx > old_row_count {
+            break;
+        }
+    }
+
+    if row_spans.len() != sorted_dirty.len() {
+        // Could not find all dirty rows in the old payload; fall back.
+        let payload = encode_table_payload(data)?;
+        return Ok(SpliceResult {
+            payload,
+            first_dirty_byte: 0,
+        });
+    }
+
+    let first_dirty_byte = row_spans.first().map_or(0, |s| s.0);
+
+    // Build the spliced payload.
+    let mut output = Vec::with_capacity(old.len() + sorted_dirty.len() * 32);
+    output.extend_from_slice(&old[..8]); // magic
+    encode_u32(&mut output, data.rows.len() as u32);
+
+    let mut copy_from = HEADER_LEN;
+    let mut encoded_row = Vec::with_capacity(128);
+    for (span_idx, &dirty_row) in sorted_dirty.iter().enumerate() {
+        let (span_start, span_end) = row_spans[span_idx];
+
+        // Copy unchanged bytes before this dirty row.
+        if copy_from < span_start {
+            output.extend_from_slice(&old[copy_from..span_start]);
+        }
+
+        // Encode the updated row.
+        let row = &data.rows[dirty_row];
+        encode_i64(&mut output, row.row_id);
+        Row::encode_values_into(&row.values, &mut encoded_row)?;
+        encode_bytes(&mut output, &encoded_row)?;
+
+        copy_from = span_end;
+    }
+    // Copy any remaining unchanged tail.
+    if copy_from < old.len() {
+        output.extend_from_slice(&old[copy_from..]);
+    }
+
+    Ok(SpliceResult {
+        payload: output,
+        first_dirty_byte,
+    })
 }
 
 fn encode_appended_table_rows(data: &TableData, existing_count: usize) -> Result<Vec<u8>> {

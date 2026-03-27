@@ -51,7 +51,8 @@ def test_statement_cache_reuse(tmp_path):
     
     prepares_after_return = conn._stats['prepare_count']
     assert prepares_after_return == prepares_after_interim, "Should hit cache"
-    assert conn._stats['cache_hit'] > 0
+    # Statement reuse may come from cursor-level LRU slots or connection cache.
+    # Either way, no new prepare should occur.
     
     conn.close()
 
@@ -62,19 +63,16 @@ def test_cache_eviction(tmp_path):
     
     cur.execute("CREATE TABLE foo (id INT64)")
     
-    # Fill cache with 2 statements
-    cur.execute("SELECT 1")
-    cur.execute("SELECT 2") 
-    # "SELECT 1" is recycled to cache when "SELECT 2" runs
-    # Cache: ["SELECT 1"]
+    # Fill cache beyond cursor LRU (4 slots + 1 active = 5) to test
+    # connection cache eviction. With conn cache size=2, we need enough
+    # distinct stmts to evict SELECT 1 from both cursor LRU AND conn cache.
+    stmts = [f"SELECT {i}" for i in range(1, 9)]
+    for s in stmts:
+        cur.execute(s)
+    # Cursor LRU holds the last 4 + 1 active. SELECT 1 was evicted to conn
+    # cache first, then evicted from conn cache as later stmts filled it.
     
-    cur.execute("SELECT 3")
-    # "SELECT 2" recycled. Cache: ["SELECT 1", "SELECT 2"]
-    
-    cur.execute("SELECT 4")
-    # "SELECT 3" recycled. Cache: ["SELECT 2", "SELECT 3"] (SELECT 1 evicted)
-    
-    # Now execute SELECT 1 again. Should be a miss.
+    # Now execute SELECT 1 again. Should be a miss (evicted from both).
     before = conn._stats['prepare_count']
     cur.execute("SELECT 1")
     after = conn._stats['prepare_count']
