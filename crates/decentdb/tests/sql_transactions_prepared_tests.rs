@@ -1388,3 +1388,185 @@ fn rollback_discards_changes() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values(), &[Value::Int64(1)]);
 }
+
+/// Regression: mimics the .NET EF Core batch that deletes a child (album)
+/// then its parent (artist) using separate prepared statements inside an
+/// explicit `begin_transaction` / `commit_transaction` pair.
+#[test]
+fn prepared_delete_child_then_parent_in_explicit_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+
+    db.execute(
+        r#"CREATE TABLE artists (
+             Id INTEGER PRIMARY KEY,
+             Name TEXT NOT NULL,
+             IsLocked INTEGER NOT NULL DEFAULT 0
+           )"#,
+    )
+    .unwrap();
+    db.execute(
+        r#"CREATE TABLE albums (
+             Id INTEGER PRIMARY KEY,
+             ArtistId INTEGER NOT NULL
+               REFERENCES artists(Id) ON DELETE CASCADE,
+             Name TEXT NOT NULL,
+             Year INTEGER NOT NULL
+           )"#,
+    )
+    .unwrap();
+
+    // Insert data
+    db.begin_transaction().unwrap();
+    let r = db
+        .execute_with_params(
+            r#"INSERT INTO artists (Name, IsLocked) VALUES ($1, $2) RETURNING Id"#,
+            &[Value::Text("Beatles".into()), Value::Int64(0)],
+        )
+        .unwrap();
+    let artist_id = r.rows()[0].values()[0].clone();
+
+    let r = db
+        .execute_with_params(
+            r#"INSERT INTO albums (ArtistId, Name, Year) VALUES ($1, $2, $3) RETURNING Id"#,
+            &[
+                artist_id.clone(),
+                Value::Text("Abbey Road".into()),
+                Value::Int64(1969),
+            ],
+        )
+        .unwrap();
+    let album_id = r.rows()[0].values()[0].clone();
+    db.commit_transaction().unwrap();
+
+    // Update artist (creates a second committed version)
+    db.begin_transaction().unwrap();
+    db.execute_with_params(
+        r#"UPDATE artists SET IsLocked = $1 WHERE Id = $2"#,
+        &[Value::Int64(1), artist_id.clone()],
+    )
+    .unwrap();
+    db.commit_transaction().unwrap();
+
+    // DELETE batch: child first, then parent, via prepared stmts
+    db.begin_transaction().unwrap();
+
+    let stmt_album = db.prepare("DELETE FROM albums WHERE Id = $1").unwrap();
+    let r = stmt_album.execute(&[album_id]).unwrap();
+    assert_eq!(r.affected_rows(), 1, "album DELETE should affect 1 row");
+
+    let stmt_artist = db.prepare("DELETE FROM artists WHERE Id = $1").unwrap();
+    let r = stmt_artist.execute(&[artist_id]).unwrap();
+    assert_eq!(r.affected_rows(), 1, "artist DELETE should affect 1 row");
+
+    db.commit_transaction().unwrap();
+
+    // Verify counts
+    let r = db.execute("SELECT COUNT(*) FROM artists").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(0), "artist count");
+
+    let r = db.execute("SELECT COUNT(*) FROM albums").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(0), "album count");
+}
+
+/// Regression: fast-path DELETE marks a table dirty, then a generic-path
+/// operation clones the runtime. The dirty mark must survive the clone
+/// so the first table's changes are committed.
+#[test]
+fn fast_then_generic_delete_in_transaction_preserves_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+
+    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    // Child with CASCADE — makes parent DELETE go through generic path.
+    db.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE, data TEXT)",
+    )
+    .unwrap();
+
+    // Seed data
+    db.execute("INSERT INTO parent VALUES (1, 'A')").unwrap();
+    db.execute("INSERT INTO child VALUES (10, 1, 'x')").unwrap();
+    db.execute("INSERT INTO parent VALUES (2, 'B')").unwrap();
+    db.execute("INSERT INTO child VALUES (20, 2, 'y')").unwrap();
+
+    // Transaction: fast-path DELETE child row 10, then generic-path DELETE parent 1
+    db.begin_transaction().unwrap();
+    let stmt_child = db.prepare("DELETE FROM child WHERE id = $1").unwrap();
+    let r = stmt_child.execute(&[Value::Int64(10)]).unwrap();
+    assert_eq!(r.affected_rows(), 1);
+
+    let stmt_parent = db.prepare("DELETE FROM parent WHERE id = $1").unwrap();
+    let r = stmt_parent.execute(&[Value::Int64(1)]).unwrap();
+    assert_eq!(r.affected_rows(), 1);
+    db.commit_transaction().unwrap();
+
+    let r = db.execute("SELECT COUNT(*) FROM child").unwrap();
+    assert_eq!(
+        r.rows()[0].values()[0],
+        Value::Int64(1),
+        "should have 1 child row remaining"
+    );
+    let r = db.execute("SELECT COUNT(*) FROM parent").unwrap();
+    assert_eq!(
+        r.rows()[0].values()[0],
+        Value::Int64(1),
+        "should have 1 parent row remaining"
+    );
+}
+
+/// Regression: fast-path UPDATE marks a table dirty, then a generic-path
+/// DELETE on a different table clones. The UPDATE must survive the clone.
+#[test]
+fn fast_update_then_generic_delete_preserves_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.db");
+    let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, label TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO items VALUES (1, 'old')").unwrap();
+    db.execute("INSERT INTO parent VALUES (1, 'p')").unwrap();
+    db.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+
+    db.begin_transaction().unwrap();
+    let stmt_update = db
+        .prepare("UPDATE items SET name = $1 WHERE id = $2")
+        .unwrap();
+    let r = stmt_update
+        .execute(&[Value::Text("new".into()), Value::Int64(1)])
+        .unwrap();
+    assert_eq!(r.affected_rows(), 1);
+
+    // Generic-path DELETE (parent with CASCADE child)
+    let stmt_del = db.prepare("DELETE FROM parent WHERE id = $1").unwrap();
+    let r = stmt_del.execute(&[Value::Int64(1)]).unwrap();
+    assert_eq!(r.affected_rows(), 1);
+    db.commit_transaction().unwrap();
+
+    let r = db.execute("SELECT name FROM items WHERE id = 1").unwrap();
+    assert_eq!(
+        r.rows()[0].values()[0],
+        Value::Text("new".into()),
+        "UPDATE must persist across the clone boundary"
+    );
+
+    let r = db.execute("SELECT COUNT(*) FROM parent").unwrap();
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(0));
+    let r = db.execute("SELECT COUNT(*) FROM child").unwrap();
+    assert_eq!(
+        r.rows()[0].values()[0],
+        Value::Int64(0),
+        "CASCADE should have cleaned child"
+    );
+}

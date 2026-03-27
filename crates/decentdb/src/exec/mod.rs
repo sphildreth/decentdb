@@ -501,9 +501,15 @@ impl Clone for EngineRuntime {
             temp_schema_cookie: self.temp_schema_cookie,
             indexes: self.indexes.clone(),
             persisted_tables: self.persisted_tables.clone(),
-            // Fresh clone starts with no dirty state.
-            dirty_tables: BTreeSet::new(),
-            append_only_dirty_tables: BTreeSet::new(),
+            // Preserve dirty state so that multi-statement transactions
+            // (clone-and-replace) do not lose modifications from earlier
+            // statements.  `persist_to_db` clears dirty state after a
+            // successful persist, so autocommit paths are unaffected.
+            dirty_tables: self.dirty_tables.clone(),
+            append_only_dirty_tables: self.append_only_dirty_tables.clone(),
+            // Escalate row-update dirty to full dirty on clone: the
+            // subsequent generic execution path may modify the same rows
+            // in ways that invalidate the splice assumption.
             row_update_dirty: BTreeMap::new(),
             // Arc payloads: clone is just a refcount bump.
             cached_payloads: self.cached_payloads.clone(),
