@@ -258,6 +258,7 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
                     .any(|(left, right)| expr_has_aggregate(left) || expr_has_aggregate(right))
                 || else_expr.as_deref().is_some_and(expr_has_aggregate)
         }
+        Expr::Row(items) => items.iter().any(expr_has_aggregate),
         Expr::Cast { expr, .. } => expr_has_aggregate(expr),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
     }

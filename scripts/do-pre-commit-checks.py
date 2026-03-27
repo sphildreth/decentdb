@@ -19,7 +19,13 @@ try:
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
-    from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
     from rich.table import Table
 
     HAVE_RICH = True
@@ -162,7 +168,7 @@ def load_benchmark_baselines() -> dict[str, dict[str, dict[str, list[str]]]]:
 
 
 def save_benchmark_baselines(
-    baselines: dict[str, dict[str, dict[str, list[str]]]]
+    baselines: dict[str, dict[str, dict[str, list[str]]]],
 ) -> None:
     BENCHMARK_BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
     BENCHMARK_BASELINE_PATH.write_text(
@@ -187,7 +193,9 @@ def compare_benchmark_sections(
         previous_decent = set(previous.get(label, {}).get("decentdb", []))
 
         if label not in previous:
-            section_summaries.append(BenchmarkSectionSummary(label=label, status="BASELINE"))
+            section_summaries.append(
+                BenchmarkSectionSummary(label=label, status="BASELINE")
+            )
             continue
 
         gained = sorted(current_decent - previous_decent)
@@ -350,7 +358,11 @@ def build_checks() -> list[Check]:
         Check(
             key="dotnet-benchmark",
             title=".NET benchmark harness",
-            cwd=REPO_ROOT / "bindings" / "dotnet" / "benchmarks" / "DecentDB.Benchmarks",
+            cwd=REPO_ROOT
+            / "bindings"
+            / "dotnet"
+            / "benchmarks"
+            / "DecentDB.Benchmarks",
             command=(
                 "dotnet clean && "
                 "dotnet run -c Release --project DecentDB.Benchmarks.csproj -- "
@@ -420,7 +432,9 @@ def print_plain_status(
     console: Console, states: Sequence[CheckState], started_at: float, log_root: Path
 ) -> None:
     console.print("=" * 80)
-    console.print(f"Pre-commit paranoia suite | total elapsed {format_duration(time.perf_counter() - started_at)}")
+    console.print(
+        f"Pre-commit paranoia suite | total elapsed {format_duration(time.perf_counter() - started_at)}"
+    )
     for state in states:
         console.print(
             f"{state.check.key:18} {state.status.upper():8} "
@@ -469,7 +483,10 @@ def run_check(
                 break
             time.sleep(0.15)
 
+    state.elapsed_seconds = time.perf_counter() - start
     state.status = "passed" if state.return_code == 0 else "failed"
+    if live is not None:
+        live.update(render_dashboard(states, suite_started_at, log_root))
     if state.return_code == 0 and state.check.benchmark_comparison:
         log_text = state.log_path.read_text(encoding="utf-8", errors="replace")
         current_sections = parse_benchmark_comparisons(log_text)
@@ -486,7 +503,13 @@ def run_check(
         output = tail_lines(state.log_path, max_lines=120)
         title = f"{state.check.key} output"
         style = "red" if state.return_code else "green"
-        console.print(Panel(output or "(no output captured)", title=title, border_style=style))
+        console.print(
+            Panel(output or "(no output captured)", title=title, border_style=style)
+        )
+
+    state.elapsed_seconds = time.perf_counter() - start
+    if live is not None:
+        live.update(render_dashboard(states, suite_started_at, log_root))
 
 
 def select_checks(
@@ -540,7 +563,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     if not HAVE_RICH:
-        print("This script requires the 'rich' package in the active Python environment.", file=sys.stderr)
+        print(
+            "This script requires the 'rich' package in the active Python environment.",
+            file=sys.stderr,
+        )
         return 2
 
     all_checks = build_checks()
@@ -623,7 +649,9 @@ def main() -> int:
                 str(failure.return_code),
                 str(failure.log_path) if failure.log_path is not None else "",
             )
-        console.print(Panel(summary, title=f"FAIL after {total_elapsed}", border_style="red"))
+        console.print(
+            Panel(summary, title=f"FAIL after {total_elapsed}", border_style="red")
+        )
         return 1
 
     summary = Table(expand=True)
@@ -631,9 +659,15 @@ def main() -> int:
     summary.add_column("Elapsed", justify="right")
     summary.add_column("Benchmark drift", justify="center")
     for state in states:
-        drift = state.benchmark_summary.overall_status if state.benchmark_summary is not None else "-"
+        drift = (
+            state.benchmark_summary.overall_status
+            if state.benchmark_summary is not None
+            else "-"
+        )
         summary.add_row(state.check.key, format_duration(state.elapsed_seconds), drift)
-    console.print(Panel(summary, title=f"PASS in {total_elapsed}", border_style="green"))
+    console.print(
+        Panel(summary, title=f"PASS in {total_elapsed}", border_style="green")
+    )
     return 0
 
 

@@ -39,12 +39,12 @@ double percentile(List<double> sorted, int pct) {
   return sorted[idx.clamp(0, sorted.length - 1)];
 }
 
-String formatNum(num value) {
+String formatInt(num value) {
   final s = value.toStringAsFixed(0);
   final buf = StringBuffer();
   var count = 0;
   for (var i = s.length - 1; i >= 0; i--) {
-    if (count == 3) {
+    if (count == 3 && s[i] != '-') {
       buf.write(',');
       count = 0;
     }
@@ -52,6 +52,114 @@ String formatNum(num value) {
     count++;
   }
   return buf.toString().split('').reversed.join();
+}
+
+String formatMs(double ms) {
+  if (ms >= 1000) return '${(ms / 1000).toStringAsFixed(3)}s';
+  if (ms >= 100) return '${ms.toStringAsFixed(1)}ms';
+  if (ms >= 10) return '${ms.toStringAsFixed(2)}ms';
+  return '${ms.toStringAsFixed(3)}ms';
+}
+
+String formatSeconds(double seconds) => '${seconds.toStringAsFixed(2)}s';
+
+class DemoConfig {
+  DemoConfig({
+    required this.scaleFactor,
+    required this.keepDb,
+    required this.dbPath,
+    required this.jsonPath,
+  });
+
+  final int scaleFactor;
+  final bool keepDb;
+  final String dbPath;
+  final String jsonPath;
+
+  static DemoConfig parse(List<String> args) {
+    var scaleFactor = 1;
+    var keepDb = false;
+    var dbPath = 'dart_complex_demo.ddb';
+    var jsonPath = 'bench_result.json';
+
+    var i = 0;
+    while (i < args.length) {
+      final arg = args[i];
+      if (arg == '--count') {
+        if (i + 1 >= args.length) {
+          throw ArgumentError('--count requires a value');
+        }
+        scaleFactor = int.parse(args[++i]);
+        if (scaleFactor < 1) {
+          throw ArgumentError('--count must be >= 1');
+        }
+      } else if (arg == '--keep-db') {
+        keepDb = true;
+      } else if (arg == '--db-path') {
+        if (i + 1 >= args.length) {
+          throw ArgumentError('--db-path requires a value');
+        }
+        dbPath = args[++i];
+      } else if (arg == '--json') {
+        if (i + 1 >= args.length) {
+          throw ArgumentError('--json requires a value');
+        }
+        jsonPath = args[++i];
+      } else if (arg == '-h' || arg == '--help') {
+        _printUsage();
+        exit(0);
+      } else {
+        throw ArgumentError('Unknown argument: $arg');
+      }
+      i++;
+    }
+
+    return DemoConfig(
+      scaleFactor: scaleFactor,
+      keepDb: keepDb,
+      dbPath: dbPath,
+      jsonPath: jsonPath,
+    );
+  }
+
+  static void _printUsage() {
+    print('Usage: dart run main.dart [options]');
+    print('');
+    print('Options:');
+    print(
+      '  --count <n>    Multiply base data volumes by n (default: 1 = 26,100 base rows)',
+    );
+    print('  --keep-db      Persist the database file');
+    print('  --db-path <p>  Custom file path (default: dart_complex_demo.ddb)');
+    print('  --json <path>  JSON output path (default: bench_result.json)');
+    print('  -h, --help     Show help');
+  }
+}
+
+class _ScaledCounts {
+  const _ScaledCounts({
+    required this.categories,
+    required this.customers,
+    required this.products,
+    required this.orders,
+    required this.reviews,
+  });
+
+  factory _ScaledCounts.forScale(int scaleFactor) => _ScaledCounts(
+        categories: _categoryCount * scaleFactor,
+        customers: _customerCount * scaleFactor,
+        products: _productCount * scaleFactor,
+        orders: _orderCount * scaleFactor,
+        reviews: _reviewCount * scaleFactor,
+      );
+
+  final int categories;
+  final int customers;
+  final int products;
+  final int orders;
+  final int reviews;
+
+  int get baseRows => categories + customers + products + orders + reviews;
 }
 
 class _Metrics {
@@ -71,177 +179,45 @@ class _Metrics {
   }
 }
 
-void main(List<String> args) {
-  var scaleFactor = 1;
-  var keepDb = false;
-  var dbPath = 'dart_complex_demo.ddb';
-  var jsonPath = 'bench_result.json';
+class _InsertStage {
+  const _InsertStage({
+    required this.key,
+    required this.label,
+    required this.rows,
+    required this.seconds,
+  });
 
-  for (var i = 0; i < args.length; i++) {
-    switch (args[i]) {
-      case '--count':
-        scaleFactor = int.parse(args[++i]);
-        if (scaleFactor < 1) throw ArgumentError('--count must be >= 1');
-      case '--keep-db':
-        keepDb = true;
-      case '--db-path':
-        dbPath = args[++i];
-      case '--json':
-        jsonPath = args[++i];
-      case '-h':
-      case '--help':
-        print(
-          'Usage: dart run ../examples/console_complex/main.dart [options]',
+  final String key;
+  final String label;
+  final int rows;
+  final double seconds;
+}
+
+class _PointReadSummary {
+  const _PointReadSummary(this.p50, this.p95, this.p99);
+
+  final double p50;
+  final double p95;
+  final double p99;
+}
+
+class ComplexDemoRunner {
+  ComplexDemoRunner(this.config)
+      : counts = _ScaledCounts.forScale(config.scaleFactor),
+        rng = Random(42),
+        db = Database.open(
+          config.keepDb ? config.dbPath : ':memory:',
+          libraryPath: findNativeLib(),
         );
-        print('');
-        print('Options:');
-        print(
-          '  --count <n>    Multiply base data volumes by n (default: 1 = 56,100 rows)',
-        );
-        print('  --keep-db      Persist the database file');
-        print(
-          '  --db-path <p>  Custom file path (default: dart_complex_demo.ddb)',
-        );
-        print(
-          '  --json <path>  JSON output path (default: bench_result.json)',
-        );
-        print('  -h, --help     Show help');
-        return;
-    }
-  }
 
-  final catCount = _categoryCount * scaleFactor;
-  final custCount = _customerCount * scaleFactor;
-  final prodCount = _productCount * scaleFactor;
-  final ordCount = _orderCount * scaleFactor;
-  final revCount = _reviewCount * scaleFactor;
-  final totalRows = catCount + custCount + prodCount + ordCount + revCount;
+  final DemoConfig config;
+  final _ScaledCounts counts;
+  final Random rng;
+  final Database db;
+  final metrics = _Metrics();
 
-  final libPath = findNativeLib();
-  final usePath = keepDb ? dbPath : ':memory:';
-  final db = Database.open(usePath, libraryPath: libPath);
-  final m = _Metrics();
-
-  m.meta('engine_version', db.engineVersion);
-  m.meta('database', usePath);
-  m.meta('scale_factor', scaleFactor);
-  m.meta('total_target_rows', totalRows);
-
-  print('=== DecentDB Dart Complex Demo ===');
-  print('Engine version: ${db.engineVersion}');
-  print('Database: $usePath');
-  print('Scale: ${scaleFactor}x ($totalRows target rows)');
-  print('');
-
-  // ── Section 1: DDL Schema Creation ──────────────────────────────
-  print('--- Schema Creation ---');
-  final ddlWatch = Stopwatch()..start();
-
-  db.execute('''
-    CREATE TABLE categories (
-      id INT64 PRIMARY KEY,
-      name TEXT UNIQUE NOT NULL,
-      description TEXT
-    )''');
-  db.execute('''
-    CREATE TABLE customers (
-      id INT64 PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      city TEXT,
-      created_at TEXT
-    )''');
-  db.execute('''
-    CREATE TABLE products (
-      id INT64 PRIMARY KEY,
-      name TEXT NOT NULL,
-      price FLOAT64 NOT NULL,
-      category_id INT64 NOT NULL REFERENCES categories(id),
-      stock INT64 NOT NULL DEFAULT 0
-    )''');
-  db.execute('''
-    CREATE TABLE orders (
-      id INT64 PRIMARY KEY,
-      customer_id INT64 NOT NULL REFERENCES customers(id),
-      order_date TEXT NOT NULL,
-      total FLOAT64 NOT NULL DEFAULT 0.0
-    )''');
-  db.execute('''
-    CREATE TABLE order_items (
-      id INT64 PRIMARY KEY,
-      order_id INT64 NOT NULL REFERENCES orders(id),
-      product_id INT64 NOT NULL REFERENCES products(id),
-      quantity INT64 NOT NULL,
-      unit_price FLOAT64 NOT NULL
-    )''');
-  db.execute('''
-    CREATE TABLE reviews (
-      id INT64 PRIMARY KEY,
-      product_id INT64 NOT NULL REFERENCES products(id),
-      customer_id INT64 NOT NULL REFERENCES customers(id),
-      rating INT64 NOT NULL,
-      comment TEXT
-    )''');
-
-  db.execute('CREATE INDEX idx_customers_email ON customers (email)');
-  db.execute('CREATE INDEX idx_customers_city ON customers (city)');
-  db.execute('CREATE INDEX idx_products_category ON products (category_id)');
-  db.execute('CREATE INDEX idx_products_name ON products (name)');
-  db.execute('CREATE INDEX idx_orders_customer ON orders (customer_id)');
-  db.execute('CREATE INDEX idx_orders_date ON orders (order_date)');
-  db.execute('CREATE INDEX idx_order_items_order ON order_items (order_id)');
-  db.execute(
-    'CREATE INDEX idx_order_items_product ON order_items (product_id)',
-  );
-  db.execute('CREATE INDEX idx_reviews_product ON reviews (product_id)');
-
-  ddlWatch.stop();
-  final ddlMs = ddlWatch.elapsedMicroseconds / 1000.0;
-  m.put('ddl_ms', ddlMs);
-  print('  6 tables, 9 indexes created in ${ddlMs}ms');
-  print('');
-
-  // ── Section 2: Bulk Insert ──────────────────────────────────────
-  print('--- Bulk Insert ---');
-  final rng = Random(42);
-
-  final insertTimings = <String, double>{};
-  final insertRows = <String, int>{};
-
-  // 2a. Categories
-  var watch = Stopwatch()..start();
-  final catStmt = db.prepare(r'INSERT INTO categories VALUES ($1, $2, $3)');
-  try {
-    db.begin();
-    try {
-      for (var i = 0; i < catCount; i++) {
-        catStmt.reset();
-        catStmt.clearBindings();
-        catStmt.bindAll(<Object?>[
-          i,
-          'category_$i',
-          'Description for category $i with some longer text content to simulate realistic data',
-        ]);
-        catStmt.execute();
-      }
-      db.commit();
-    } catch (_) {
-      db.rollback();
-      rethrow;
-    }
-  } finally {
-    catStmt.dispose();
-  }
-  watch.stop();
-  insertTimings['categories'] = watch.elapsedMicroseconds / 1000000.0;
-  insertRows['categories'] = catCount;
-
-  // 2b. Customers
-  watch = Stopwatch()..start();
-  final custStmt = db.prepare(
-    r'INSERT INTO customers VALUES ($1, $2, $3, $4, $5)',
-  );
-  final cities = [
+  late final String databasePath = config.keepDb ? config.dbPath : ':memory:';
+  final cities = const [
     'New York',
     'Los Angeles',
     'Chicago',
@@ -258,125 +234,7 @@ void main(List<String> args) {
     'Miami',
     'Portland',
   ];
-  try {
-    db.begin();
-    try {
-      for (var i = 0; i < custCount; i++) {
-        custStmt.reset();
-        custStmt.clearBindings();
-        custStmt.bindAll(<Object?>[
-          i,
-          'Customer_${i.toString().padLeft(6, '0')}',
-          'user$i@example.com',
-          cities[i % cities.length],
-          '2024-${((i % 12) + 1).toString().padLeft(2, '0')}-${((i % 28) + 1).toString().padLeft(2, '0')}',
-        ]);
-        custStmt.execute();
-      }
-      db.commit();
-    } catch (_) {
-      db.rollback();
-      rethrow;
-    }
-  } finally {
-    custStmt.dispose();
-  }
-  watch.stop();
-  insertTimings['customers'] = watch.elapsedMicroseconds / 1000000.0;
-  insertRows['customers'] = custCount;
-
-  // 2c. Products
-  watch = Stopwatch()..start();
-  final prodStmt = db.prepare(
-    r'INSERT INTO products VALUES ($1, $2, $3, $4, $5)',
-  );
-  try {
-    db.begin();
-    try {
-      for (var i = 0; i < prodCount; i++) {
-        prodStmt.reset();
-        prodStmt.clearBindings();
-        prodStmt.bindAll(<Object?>[
-          i,
-          'Product_${i.toString().padLeft(6, '0')}_Widget',
-          (rng.nextDouble() * 990.0 + 10.0),
-          rng.nextInt(catCount),
-          rng.nextInt(500),
-        ]);
-        prodStmt.execute();
-      }
-      db.commit();
-    } catch (_) {
-      db.rollback();
-      rethrow;
-    }
-  } finally {
-    prodStmt.dispose();
-  }
-  watch.stop();
-  insertTimings['products'] = watch.elapsedMicroseconds / 1000000.0;
-  insertRows['products'] = prodCount;
-
-  // 2d. Orders + Order Items
-  watch = Stopwatch()..start();
-  final orderStmt = db.prepare(r'INSERT INTO orders VALUES ($1, $2, $3, $4)');
-  final itemStmt = db.prepare(
-    r'INSERT INTO order_items VALUES ($1, $2, $3, $4, $5)',
-  );
-  var itemId = 0;
-  try {
-    db.begin();
-    try {
-      for (var i = 0; i < ordCount; i++) {
-        final custId = rng.nextInt(custCount);
-        final month = ((i % 12) + 1).toString().padLeft(2, '0');
-        final day = ((i % 28) + 1).toString().padLeft(2, '0');
-        final lineCount = 1 + rng.nextInt(5);
-
-        final items = <List<Object?>>[];
-        var orderTotal = 0.0;
-        for (var j = 0; j < lineCount; j++) {
-          final prodId = rng.nextInt(prodCount);
-          final qty = 1 + rng.nextInt(10);
-          final price = (rng.nextDouble() * 990.0 + 10.0);
-          orderTotal += qty * price;
-          items.add(<Object?>[itemId + j, i, prodId, qty, price]);
-        }
-
-        orderStmt.reset();
-        orderStmt.clearBindings();
-        orderStmt.bindAll(<Object?>[i, custId, '2024-$month-$day', orderTotal]);
-        orderStmt.execute();
-
-        for (final item in items) {
-          itemStmt.reset();
-          itemStmt.clearBindings();
-          itemStmt.bindAll(item);
-          itemStmt.execute();
-        }
-        itemId += lineCount;
-      }
-      db.commit();
-    } catch (_) {
-      db.rollback();
-      rethrow;
-    }
-  } finally {
-    orderStmt.dispose();
-    itemStmt.dispose();
-  }
-  watch.stop();
-  insertTimings['orders'] = watch.elapsedMicroseconds / 1000000.0;
-  insertRows['orders'] = ordCount;
-  insertTimings['order_items'] = watch.elapsedMicroseconds / 1000000.0;
-  insertRows['order_items'] = itemId;
-
-  // 2e. Reviews
-  watch = Stopwatch()..start();
-  final revStmt = db.prepare(
-    r'INSERT INTO reviews VALUES ($1, $2, $3, $4, $5)',
-  );
-  final comments = [
+  final comments = const [
     'Excellent product, highly recommend!',
     'Good value for money.',
     'Average quality, meets expectations.',
@@ -388,545 +246,877 @@ void main(List<String> args) {
     'Five stars, no complaints.',
     'Below average, disappointed.',
   ];
-  try {
+
+  int _orderItemCount = 0;
+  int _actualInsertedRows = 0;
+  double _totalInsertSeconds = 0;
+  double _totalInsertRowsPerSecond = 0;
+  late _PointReadSummary _pointReadSummary;
+  double _emailLookupP50 = 0;
+  double _emailLookupP95 = 0;
+  double _fetchallMs = 0;
+
+  void run() {
+    _recordMetadata();
+    _printHeader();
+    try {
+      _createSchema();
+      _runBulkInsert();
+      _runFetchAndStreaming();
+      _runPointReads();
+      _runIndexedLookup();
+      _runJoinShowcase();
+      _runAggregations();
+      _runTextSearch();
+      _runCteAndSubqueryShowcase();
+      _runTransactionDemo();
+      _runViewsAndIntrospection();
+      _printSummary();
+      metrics.writeJson(config.jsonPath);
+      print('Results written to: ${config.jsonPath}');
+      if (config.keepDb) {
+        print('Database saved to: ${config.dbPath}');
+      }
+      print('Done.');
+    } finally {
+      db.close();
+    }
+  }
+
+  void _recordMetadata() {
+    metrics.meta('engine_version', db.engineVersion);
+    metrics.meta('database', databasePath);
+    metrics.meta('scale_factor', config.scaleFactor);
+    metrics.meta('target_base_rows', counts.baseRows);
+    metrics.meta('note',
+        'Wide-surface showcase timings. Good for regressions and demos; not a fair cross-engine benchmark.');
+  }
+
+  void _printHeader() {
+    print('=== DecentDB Dart Complex Demo ===');
+    print('Engine version: ${db.engineVersion}');
+    print('Database: $databasePath');
+    print(
+        'Scale: ${config.scaleFactor}x (${formatInt(counts.baseRows)} base rows + derived order items)');
+    print('This is a scope-heavy showcase, not an apples-to-apples benchmark.');
+    print('');
+  }
+
+  void _createSchema() {
+    print('--- Schema Creation ---');
+    final watch = Stopwatch()..start();
+
+    db.execute('''
+      CREATE TABLE categories (
+        id INT64 PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        description TEXT
+      )''');
+    db.execute('''
+      CREATE TABLE customers (
+        id INT64 PRIMARY KEY,
+        name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        city TEXT,
+        created_at TEXT
+      )''');
+    db.execute('''
+      CREATE TABLE products (
+        id INT64 PRIMARY KEY,
+        name TEXT NOT NULL,
+        price FLOAT64 NOT NULL,
+        category_id INT64 NOT NULL REFERENCES categories(id),
+        stock INT64 NOT NULL DEFAULT 0
+      )''');
+    db.execute('''
+      CREATE TABLE orders (
+        id INT64 PRIMARY KEY,
+        customer_id INT64 NOT NULL REFERENCES customers(id),
+        order_date TEXT NOT NULL,
+        total FLOAT64 NOT NULL DEFAULT 0.0
+      )''');
+    db.execute('''
+      CREATE TABLE order_items (
+        id INT64 PRIMARY KEY,
+        order_id INT64 NOT NULL REFERENCES orders(id),
+        product_id INT64 NOT NULL REFERENCES products(id),
+        quantity INT64 NOT NULL,
+        unit_price FLOAT64 NOT NULL
+      )''');
+    db.execute('''
+      CREATE TABLE reviews (
+        id INT64 PRIMARY KEY,
+        product_id INT64 NOT NULL REFERENCES products(id),
+        customer_id INT64 NOT NULL REFERENCES customers(id),
+        rating INT64 NOT NULL,
+        comment TEXT
+      )''');
+
+    // Keep explicit indexes focused on the demo queries rather than duplicating
+    // PK/UNIQUE/FK-backed indexes the engine already creates.
+    db.execute('CREATE INDEX idx_customers_city ON customers (city)');
+    db.execute('CREATE INDEX idx_products_name ON products (name)');
+    db.execute('CREATE INDEX idx_orders_date ON orders (order_date)');
+    db.execute('CREATE INDEX idx_orders_total ON orders (total)');
+
+    watch.stop();
+    final ddlMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('ddl_ms', ddlMs);
+    metrics.meta('explicit_index_count', 4);
+    print('  6 tables, 4 explicit indexes created in ${formatMs(ddlMs)}');
+    print('');
+  }
+
+  void _runBulkInsert() {
+    print('--- Bulk Insert ---');
+    final stages = <_InsertStage>[
+      _insertCategories(),
+      _insertCustomers(),
+      _insertProducts(),
+      _insertOrdersAndItems(),
+      _insertReviews(),
+    ];
+
+    _totalInsertSeconds = stages.fold(0.0, (sum, stage) => sum + stage.seconds);
+    _actualInsertedRows = stages.fold(0, (sum, stage) => sum + stage.rows);
+    _totalInsertRowsPerSecond = _actualInsertedRows / _totalInsertSeconds;
+
+    for (final stage in stages) {
+      final rps = stage.rows / stage.seconds;
+      metrics.put('insert_${stage.key}_rows', stage.rows);
+      metrics.put('insert_${stage.key}_s', stage.seconds);
+      metrics.put('insert_${stage.key}_rps', rps);
+      print(
+        '  ${stage.label.padRight(18)} ${formatInt(stage.rows).padLeft(8)} rows in '
+        '${formatSeconds(stage.seconds).padLeft(8)} (${formatInt(rps.round())} rows/sec)',
+      );
+    }
+
+    metrics.put('insert_total_rows', _actualInsertedRows);
+    metrics.put('insert_total_s', _totalInsertSeconds);
+    metrics.put('insert_total_rps', _totalInsertRowsPerSecond);
+    metrics.meta('actual_inserted_rows', _actualInsertedRows);
+    metrics.meta('actual_order_item_rows', _orderItemCount);
+    print(
+      '  ${'TOTAL'.padRight(18)} ${formatInt(_actualInsertedRows).padLeft(8)} rows in '
+      '${formatSeconds(_totalInsertSeconds).padLeft(8)} (${formatInt(_totalInsertRowsPerSecond.round())} rows/sec)',
+    );
+    print('');
+  }
+
+  _InsertStage _insertCategories() {
+    final stmt = db.prepare(r'INSERT INTO categories VALUES ($1, $2, $3)');
+    final watch = Stopwatch()..start();
+    try {
+      db.transaction(() {
+        for (var i = 0; i < counts.categories; i++) {
+          stmt.reset();
+          stmt.clearBindings();
+          stmt.bindAll(<Object?>[
+            i,
+            'category_$i',
+            'Description for category $i with realistic text payload',
+          ]);
+          stmt.execute();
+        }
+      });
+    } finally {
+      stmt.dispose();
+    }
+    watch.stop();
+    return _InsertStage(
+      key: 'categories',
+      label: 'categories',
+      rows: counts.categories,
+      seconds: watch.elapsedMicroseconds / 1000000.0,
+    );
+  }
+
+  _InsertStage _insertCustomers() {
+    final stmt = db.prepare(
+      r'INSERT INTO customers VALUES ($1, $2, $3, $4, $5)',
+    );
+    final watch = Stopwatch()..start();
+    try {
+      db.transaction(() {
+        for (var i = 0; i < counts.customers; i++) {
+          stmt.reset();
+          stmt.clearBindings();
+          stmt.bindAll(<Object?>[
+            i,
+            'Customer_${i.toString().padLeft(6, '0')}',
+            'user$i@example.com',
+            cities[i % cities.length],
+            '2024-${((i % 12) + 1).toString().padLeft(2, '0')}-${((i % 28) + 1).toString().padLeft(2, '0')}',
+          ]);
+          stmt.execute();
+        }
+      });
+    } finally {
+      stmt.dispose();
+    }
+    watch.stop();
+    return _InsertStage(
+      key: 'customers',
+      label: 'customers',
+      rows: counts.customers,
+      seconds: watch.elapsedMicroseconds / 1000000.0,
+    );
+  }
+
+  _InsertStage _insertProducts() {
+    final stmt = db.prepare(
+      r'INSERT INTO products VALUES ($1, $2, $3, $4, $5)',
+    );
+    final watch = Stopwatch()..start();
+    try {
+      db.transaction(() {
+        for (var i = 0; i < counts.products; i++) {
+          stmt.reset();
+          stmt.clearBindings();
+          stmt.bindAll(<Object?>[
+            i,
+            'Product_${i.toString().padLeft(6, '0')}_Widget',
+            rng.nextDouble() * 990.0 + 10.0,
+            rng.nextInt(counts.categories),
+            rng.nextInt(500),
+          ]);
+          stmt.execute();
+        }
+      });
+    } finally {
+      stmt.dispose();
+    }
+    watch.stop();
+    return _InsertStage(
+      key: 'products',
+      label: 'products',
+      rows: counts.products,
+      seconds: watch.elapsedMicroseconds / 1000000.0,
+    );
+  }
+
+  _InsertStage _insertOrdersAndItems() {
+    final orderStmt = db.prepare(r'INSERT INTO orders VALUES ($1, $2, $3, $4)');
+    final itemStmt = db.prepare(
+      r'INSERT INTO order_items VALUES ($1, $2, $3, $4, $5)',
+    );
+    var itemId = 0;
+    final watch = Stopwatch()..start();
+    try {
+      db.transaction(() {
+        for (var i = 0; i < counts.orders; i++) {
+          final customerId = rng.nextInt(counts.customers);
+          final month = ((i % 12) + 1).toString().padLeft(2, '0');
+          final day = ((i % 28) + 1).toString().padLeft(2, '0');
+          final lineCount = 1 + rng.nextInt(5);
+          final items = <List<Object?>>[];
+          var orderTotal = 0.0;
+          for (var j = 0; j < lineCount; j++) {
+            final productId = rng.nextInt(counts.products);
+            final quantity = 1 + rng.nextInt(10);
+            final unitPrice = rng.nextDouble() * 990.0 + 10.0;
+            orderTotal += quantity * unitPrice;
+            items.add(<Object?>[itemId + j, i, productId, quantity, unitPrice]);
+          }
+
+          orderStmt.reset();
+          orderStmt.clearBindings();
+          orderStmt.bindAll(
+              <Object?>[i, customerId, '2024-$month-$day', orderTotal]);
+          orderStmt.execute();
+
+          for (final item in items) {
+            itemStmt.reset();
+            itemStmt.clearBindings();
+            itemStmt.bindAll(item);
+            itemStmt.execute();
+          }
+          itemId += lineCount;
+        }
+      });
+    } finally {
+      orderStmt.dispose();
+      itemStmt.dispose();
+    }
+    watch.stop();
+    _orderItemCount = itemId;
+    return _InsertStage(
+      key: 'orders_with_items',
+      label: 'orders+items',
+      rows: counts.orders + _orderItemCount,
+      seconds: watch.elapsedMicroseconds / 1000000.0,
+    );
+  }
+
+  _InsertStage _insertReviews() {
+    final stmt = db.prepare(r'INSERT INTO reviews VALUES ($1, $2, $3, $4, $5)');
+    final watch = Stopwatch()..start();
+    try {
+      db.transaction(() {
+        for (var i = 0; i < counts.reviews; i++) {
+          stmt.reset();
+          stmt.clearBindings();
+          stmt.bindAll(<Object?>[
+            i,
+            rng.nextInt(counts.products),
+            rng.nextInt(counts.customers),
+            1 + rng.nextInt(5),
+            comments[i % comments.length],
+          ]);
+          stmt.execute();
+        }
+      });
+    } finally {
+      stmt.dispose();
+    }
+    watch.stop();
+    return _InsertStage(
+      key: 'reviews',
+      label: 'reviews',
+      rows: counts.reviews,
+      seconds: watch.elapsedMicroseconds / 1000000.0,
+    );
+  }
+
+  void _runFetchAndStreaming() {
+    print('--- Fetchall & Streaming ---');
+    db.query('SELECT COUNT(*) FROM products');
+
+    var watch = Stopwatch()..start();
+    final allProducts = db.query(
+      'SELECT id, name, price, category_id, stock FROM products',
+    );
+    watch.stop();
+    _fetchallMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('fetchall_ms', _fetchallMs);
+    metrics.put('fetchall_rows', allProducts.length);
+    print(
+        '  Fetchall (${allProducts.length} products): ${formatMs(_fetchallMs)}');
+
+    final streamStmt = db.prepare(
+      'SELECT id, name, price, category_id, stock FROM products',
+    );
+    var streamCount = 0;
+    try {
+      watch = Stopwatch()..start();
+      while (true) {
+        final page = streamStmt.nextPage(_fetchBatchSize);
+        streamCount += page.rows.length;
+        if (page.isLast) break;
+      }
+      watch.stop();
+    } finally {
+      streamStmt.dispose();
+    }
+    final streamingMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('streaming_ms', streamingMs);
+    metrics.put('streaming_rows', streamCount);
+    print(
+      '  Streaming (batch=$_fetchBatchSize, $streamCount rows): ${formatMs(streamingMs)}',
+    );
+    print('');
+  }
+
+  void _runPointReads() {
+    print('--- Point Reads by ID ($_pointReads x on products) ---');
+    final stmt =
+        db.prepare(r'SELECT id, name, price FROM products WHERE id = $1');
+    final pointIds = List<int>.generate(counts.products, (i) => i);
+    for (var i = 0; i < _pointReads; i++) {
+      final j = i + rng.nextInt(counts.products - i);
+      final tmp = pointIds[i];
+      pointIds[i] = pointIds[j];
+      pointIds[j] = tmp;
+    }
+
+    final latencies = List<double>.filled(_pointReads, 0.0);
+    try {
+      stmt.reset();
+      stmt.clearBindings();
+      stmt.bindAll(<Object?>[pointIds[0]]);
+      stmt.query();
+
+      for (var i = 0; i < _pointReads; i++) {
+        final sw = Stopwatch()..start();
+        stmt.reset();
+        stmt.clearBindings();
+        stmt.bindAll(<Object?>[pointIds[i]]);
+        final rows = stmt.query();
+        sw.stop();
+        if (rows.isEmpty) {
+          throw StateError('Point read missed id=${pointIds[i]}');
+        }
+        latencies[i] = sw.elapsedMicroseconds / 1000.0;
+      }
+    } finally {
+      stmt.dispose();
+    }
+
+    latencies.sort();
+    _pointReadSummary = _PointReadSummary(
+      percentile(latencies, 50),
+      percentile(latencies, 95),
+      percentile(latencies, 99),
+    );
+    metrics.put('point_read_p50_ms', _pointReadSummary.p50);
+    metrics.put('point_read_p95_ms', _pointReadSummary.p95);
+    metrics.put('point_read_p99_ms', _pointReadSummary.p99);
+    print(
+      '  p50=${formatMs(_pointReadSummary.p50)}  '
+      'p95=${formatMs(_pointReadSummary.p95)}  '
+      'p99=${formatMs(_pointReadSummary.p99)}',
+    );
+    print('');
+  }
+
+  void _runIndexedLookup() {
+    print('--- Indexed Lookup (email) ---');
+    final stmt = db.prepare(
+      r'SELECT id, name, city FROM customers WHERE email = $1',
+    );
+    final latencies = List<double>.filled(_pointReads, 0.0);
+    try {
+      for (var i = 0; i < _pointReads; i++) {
+        final id = rng.nextInt(counts.customers);
+        final sw = Stopwatch()..start();
+        stmt.reset();
+        stmt.clearBindings();
+        stmt.bindAll(<Object?>['user$id@example.com']);
+        final rows = stmt.query();
+        sw.stop();
+        if (rows.isEmpty) {
+          throw StateError('Email lookup missed user$id@example.com');
+        }
+        latencies[i] = sw.elapsedMicroseconds / 1000.0;
+      }
+    } finally {
+      stmt.dispose();
+    }
+    latencies.sort();
+    _emailLookupP50 = percentile(latencies, 50);
+    _emailLookupP95 = percentile(latencies, 95);
+    metrics.put('email_lookup_p50_ms', _emailLookupP50);
+    metrics.put('email_lookup_p95_ms', _emailLookupP95);
+    print(
+        '  p50=${formatMs(_emailLookupP50)}  p95=${formatMs(_emailLookupP95)}');
+    print('');
+  }
+
+  void _runJoinShowcase() {
+    print('--- 4-Table Join (orders + customers + order_items + products) ---');
+    final watch = Stopwatch()..start();
+    final joinRows = db.query('''
+      SELECT o.id AS order_id, c.name AS customer, p.name AS product,
+             oi.quantity, oi.unit_price, o.order_date
+      FROM orders o
+      JOIN customers c ON c.id = o.customer_id
+      JOIN order_items oi ON oi.order_id = o.id
+      JOIN products p ON p.id = oi.product_id
+      ORDER BY o.id
+      LIMIT 10000
+    ''');
+    watch.stop();
+    final joinMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('join_4table_ms', joinMs);
+    metrics.put('join_4table_rows', joinRows.length);
+    print('  Result: ${joinRows.length} rows in ${formatMs(joinMs)}');
+    print('');
+
+    print('--- Inner Join + Aggregation (reviewed products) ---');
+    final ratingWatch = Stopwatch()..start();
+    final ratingRows = db.query('''
+      SELECT p.name, p.price, c.name AS category,
+             AVG(r.rating) AS avg_rating,
+             COUNT(r.id) AS review_count
+      FROM reviews r
+      JOIN products p ON p.id = r.product_id
+      JOIN categories c ON c.id = p.category_id
+      GROUP BY p.id, p.name, p.price, c.name
+      ORDER BY avg_rating DESC, review_count DESC
+      LIMIT 20
+    ''');
+    ratingWatch.stop();
+    final ratingMs = ratingWatch.elapsedMicroseconds / 1000.0;
+    metrics.put('join_agg_rating_ms', ratingMs);
+    metrics.put('join_agg_rating_rows', ratingRows.length);
+    print('  Result: ${ratingRows.length} rows in ${formatMs(ratingMs)}');
+    for (var i = 0; i < min(5, ratingRows.length); i++) {
+      final row = ratingRows[i];
+      print(
+        '    ${row['name']} (${row['category']}): '
+        'avg=${(row['avg_rating'] as num).toStringAsFixed(2)}, '
+        'reviews=${row['review_count']}',
+      );
+    }
+    print('');
+  }
+
+  void _runAggregations() {
+    print('--- Aggregations ---');
+
+    var watch = Stopwatch()..start();
+    final byCustomer = db.query('''
+      SELECT c.name, COUNT(o.id) AS order_count, SUM(o.total) AS total_spent
+      FROM customers c
+      JOIN orders o ON o.customer_id = c.id
+      GROUP BY c.id, c.name
+      ORDER BY total_spent DESC
+      LIMIT 10
+    ''');
+    watch.stop();
+    final customerSpendMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('agg_customer_spend_ms', customerSpendMs);
+    print('  Top 10 customers by spend: ${formatMs(customerSpendMs)}');
+    for (var i = 0; i < min(5, byCustomer.length); i++) {
+      final row = byCustomer[i];
+      print(
+        '    ${row['name']}: ${row['order_count']} orders, '
+        '\$${(row['total_spent'] as num).toStringAsFixed(2)}',
+      );
+    }
+
+    watch = Stopwatch()..start();
+    final categoryStats = db.query('''
+      SELECT c.name, COUNT(p.id) AS product_count, AVG(p.price) AS avg_price,
+             SUM(p.stock) AS total_stock
+      FROM categories c
+      JOIN products p ON p.category_id = c.id
+      GROUP BY c.id, c.name
+      ORDER BY product_count DESC
+      LIMIT 10
+    ''');
+    watch.stop();
+    final categoryStatsMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('agg_category_stats_ms', categoryStatsMs);
+    print('  Top 10 categories by product count: ${formatMs(categoryStatsMs)}');
+    for (var i = 0; i < min(5, categoryStats.length); i++) {
+      final row = categoryStats[i];
+      print(
+        '    ${row['name']}: ${row['product_count']} products, '
+        'avg \$${(row['avg_price'] as num).toStringAsFixed(2)}, '
+        'stock=${row['total_stock']}',
+      );
+    }
+
+    watch = Stopwatch()..start();
+    final topProducts = db.query('''
+      SELECT p.name, COUNT(r.id) AS review_count, AVG(r.rating) AS avg_rating
+      FROM products p
+      JOIN reviews r ON r.product_id = p.id
+      GROUP BY p.id, p.name
+      ORDER BY review_count DESC
+      LIMIT 10
+    ''');
+    watch.stop();
+    final topProductsMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('agg_top_products_ms', topProductsMs);
+    print('  Top 10 products by review count: ${formatMs(topProductsMs)}');
+    for (var i = 0; i < min(5, topProducts.length); i++) {
+      final row = topProducts[i];
+      print(
+        '    ${row['name']}: ${row['review_count']} reviews, '
+        'avg rating ${(row['avg_rating'] as num).toStringAsFixed(2)}',
+      );
+    }
+    print('');
+  }
+
+  void _runTextSearch() {
+    print('--- Text Search (LIKE) ---');
+    var watch = Stopwatch()..start();
+    final searchRows = db.query(
+      r'''
+      SELECT id, name, price FROM products
+      WHERE name LIKE '%' || $1 || '%'
+      ORDER BY price DESC
+    ''',
+      <Object?>['Widget'],
+    );
+    watch.stop();
+    final containsMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('text_search_contains_ms', containsMs);
+    metrics.put('text_search_contains_matches', searchRows.length);
+    print(
+        '  LIKE "%Widget%": ${searchRows.length} matches in ${formatMs(containsMs)}');
+
+    watch = Stopwatch()..start();
+    final prefixRows = db.query(
+      r'''
+      SELECT id, name, city FROM customers
+      WHERE name LIKE $1
+      ORDER BY name
+      LIMIT 100
+    ''',
+      <Object?>['Customer_000%'],
+    );
+    watch.stop();
+    final prefixMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('text_search_prefix_ms', prefixMs);
+    metrics.put('text_search_prefix_matches', prefixRows.length);
+    print(
+        '  LIKE "Customer_000%": ${prefixRows.length} matches in ${formatMs(prefixMs)}');
+    print('');
+  }
+
+  void _runCteAndSubqueryShowcase() {
+    print('--- CTE / Subqueries ---');
+
+    var watch = Stopwatch()..start();
+    final aboveAverage = db.query('''
+      WITH customer_totals AS (
+        SELECT customer_id, SUM(total) AS spent
+        FROM orders
+        GROUP BY customer_id
+      )
+      SELECT c.name, ct.spent
+      FROM customer_totals ct
+      JOIN customers c ON c.id = ct.customer_id
+      WHERE ct.spent > (SELECT AVG(spent) FROM customer_totals)
+      ORDER BY ct.spent DESC
+      LIMIT 10
+    ''');
+    watch.stop();
+    final aboveAverageMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('cte_above_avg_spend_ms', aboveAverageMs);
+    print(
+      '  Customers above avg spend: ${aboveAverage.length} rows in ${formatMs(aboveAverageMs)}',
+    );
+
+    // Pick the top qualifying orders first, then count items for just those
+    // rows. This keeps the showcase broad without turning it into a full-table
+    // aggregate over order_items on every run.
+    watch = Stopwatch()..start();
+    final topOrders = db.query('''
+      WITH avg_total AS (
+        SELECT AVG(total) AS avg_order_total FROM orders
+      ),
+      top_orders AS (
+        SELECT o.id AS order_id, o.customer_id, o.total
+        FROM orders o
+        CROSS JOIN avg_total a
+        WHERE o.total > a.avg_order_total
+        ORDER BY o.total DESC
+        LIMIT 10
+      )
+      SELECT t.order_id, c.name AS customer, t.total,
+             (
+               SELECT COUNT(*)
+               FROM order_items oi
+               WHERE oi.order_id = t.order_id
+             ) AS item_count
+      FROM top_orders t
+      JOIN customers c ON c.id = t.customer_id
+      ORDER BY t.total DESC
+    ''');
+    watch.stop();
+    final topOrdersMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('cte_top_orders_ms', topOrdersMs);
+    print(
+      '  Orders above avg total: ${topOrders.length} rows in ${formatMs(topOrdersMs)}',
+    );
+    for (var i = 0; i < min(5, topOrders.length); i++) {
+      final row = topOrders[i];
+      print(
+        '    Order ${row['order_id']}: ${row['customer']}, '
+        '\$${(row['total'] as num).toStringAsFixed(2)}, '
+        '${row['item_count']} items',
+      );
+    }
+
+    watch = Stopwatch()..start();
+    final monthlyTotals = db.query('''
+      SELECT SUBSTR(order_date, 1, 7) AS month,
+             COUNT(*) AS order_count,
+             SUM(total) AS revenue
+      FROM orders
+      GROUP BY SUBSTR(order_date, 1, 7)
+      ORDER BY SUBSTR(order_date, 1, 7)
+    ''');
+    watch.stop();
+    final monthlyTotalsMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('cte_monthly_totals_ms', monthlyTotalsMs);
+    print(
+      '  Monthly order totals: ${monthlyTotals.length} months in ${formatMs(monthlyTotalsMs)}',
+    );
+    print('');
+  }
+
+  void _runTransactionDemo() {
+    print('--- Transaction Demo ---');
+
+    var watch = Stopwatch()..start();
+    final stockBefore = db.query(
+      r'SELECT stock FROM products WHERE id = $1',
+      <Object?>[0],
+    ).first['stock'] as int;
+
+    db.transaction(() {
+      db.executeWithParams(
+        r'INSERT INTO orders VALUES ($1, $2, $3, $4)',
+        <Object?>[counts.orders + 1000, 0, '2025-01-01', 299.97],
+      );
+      db.executeWithParams(
+        r'INSERT INTO order_items VALUES ($1, $2, $3, $4, $5)',
+        <Object?>[_orderItemCount + 1000, counts.orders + 1000, 0, 3, 99.99],
+      );
+      db.executeWithParams(
+        r'UPDATE products SET stock = stock - 3 WHERE id = $1',
+        <Object?>[0],
+      );
+    });
+    watch.stop();
+    final commitMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('txn_commit_ms', commitMs);
+
+    final stockAfter = db.query(
+      r'SELECT stock FROM products WHERE id = $1',
+      <Object?>[0],
+    ).first['stock'] as int;
+    print(
+        '  Committed: stock $stockBefore -> $stockAfter in ${formatMs(commitMs)}');
+
+    watch = Stopwatch()..start();
+    final rollbackBefore = db.query(
+      r'SELECT stock FROM products WHERE id = $1',
+      <Object?>[1],
+    ).first['stock'] as int;
+
     db.begin();
     try {
-      for (var i = 0; i < revCount; i++) {
-        revStmt.reset();
-        revStmt.clearBindings();
-        revStmt.bindAll(<Object?>[
-          i,
-          rng.nextInt(prodCount),
-          rng.nextInt(custCount),
-          1 + rng.nextInt(5),
-          comments[i % comments.length],
-        ]);
-        revStmt.execute();
-      }
-      db.commit();
+      db.executeWithParams(
+        r'UPDATE products SET stock = stock - 999 WHERE id = $1',
+        <Object?>[1],
+      );
+      db.rollback();
     } catch (_) {
       db.rollback();
       rethrow;
     }
-  } finally {
-    revStmt.dispose();
-  }
-  watch.stop();
-  insertTimings['reviews'] = watch.elapsedMicroseconds / 1000000.0;
-  insertRows['reviews'] = revCount;
-
-  var totalInsertSeconds = 0.0;
-  var totalInsertRows = 0;
-  for (final entry in insertTimings.entries) {
-    final secs = entry.value;
-    final rows = insertRows[entry.key]!;
-    totalInsertSeconds += secs;
-    totalInsertRows += rows;
-    final rps = rows / secs;
-    m.put('insert_${entry.key}_rows', rows);
-    m.put('insert_${entry.key}_s', secs);
-    m.put('insert_${entry.key}_rps', rps);
-    print(
-      '  ${entry.key.padRight(14)} ${formatNum(rows).padLeft(8)} rows in '
-      '${secs.toStringAsFixed(2).padLeft(8)}s (${formatNum(rps.round())} rows/sec)',
-    );
-  }
-  final totalRps = totalInsertRows / totalInsertSeconds;
-  m.put('insert_total_rows', totalInsertRows);
-  m.put('insert_total_s', totalInsertSeconds);
-  m.put('insert_total_rps', totalRps);
-  print(
-    '  ${"TOTAL".padRight(14)} ${formatNum(totalInsertRows).padLeft(8)} rows in '
-    '${totalInsertSeconds.toStringAsFixed(2).padLeft(8)}s (${formatNum(totalRps.round())} rows/sec)',
-  );
-  print('');
-
-  // ── Section 3: Fetchall & Streaming ─────────────────────────────
-  print('--- Fetchall & Streaming ---');
-  db.query('SELECT COUNT(*) FROM products');
-
-  watch = Stopwatch()..start();
-  final allProducts = db.query(
-    'SELECT id, name, price, category_id, stock FROM products',
-  );
-  watch.stop();
-  final fetchallMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('fetchall_ms', fetchallMs);
-  m.put('fetchall_rows', allProducts.length);
-  print('  Fetchall (${allProducts.length} products): ${fetchallMs}ms');
-
-  final streamStmt = db.prepare(
-    'SELECT id, name, price, category_id, stock FROM products',
-  );
-  var streamCount = 0;
-  try {
-    watch = Stopwatch()..start();
-    while (true) {
-      final page = streamStmt.nextPage(_fetchBatchSize);
-      streamCount += page.rows.length;
-      if (page.isLast) break;
-    }
     watch.stop();
-  } finally {
-    streamStmt.dispose();
-  }
-  final streamingMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('streaming_ms', streamingMs);
-  m.put('streaming_rows', streamCount);
-  print(
-    '  Streaming (batch=$_fetchBatchSize, $streamCount rows): ${streamingMs}ms',
-  );
-  print('');
+    final rollbackMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('txn_rollback_ms', rollbackMs);
 
-  // ── Section 4: Point Reads by ID ────────────────────────────────
-  print('--- Point Reads by ID (${_pointReads}x on products) ---');
-  final pointStmt = db.prepare(
-    r'SELECT id, name, price FROM products WHERE id = $1',
-  );
-  final pointIds = List<int>.generate(prodCount, (i) => i);
-  for (var i = 0; i < _pointReads; i++) {
-    final j = i + rng.nextInt(prodCount - i);
-    final tmp = pointIds[i];
-    pointIds[i] = pointIds[j];
-    pointIds[j] = tmp;
-  }
-
-  final latencies = List<double>.filled(_pointReads, 0.0);
-  try {
-    pointStmt.reset();
-    pointStmt.clearBindings();
-    pointStmt.bindAll(<Object?>[pointIds[0]]);
-    pointStmt.query();
-
-    for (var i = 0; i < _pointReads; i++) {
-      final sw = Stopwatch()..start();
-      pointStmt.reset();
-      pointStmt.clearBindings();
-      pointStmt.bindAll(<Object?>[pointIds[i]]);
-      final rows = pointStmt.query();
-      sw.stop();
-      if (rows.isEmpty) throw StateError('Point read missed id=${pointIds[i]}');
-      latencies[i] = sw.elapsedMicroseconds / 1000.0;
+    final rollbackAfter = db.query(
+      r'SELECT stock FROM products WHERE id = $1',
+      <Object?>[1],
+    ).first['stock'] as int;
+    if (rollbackAfter != rollbackBefore) {
+      throw StateError(
+          'Rollback changed stock unexpectedly: $rollbackBefore -> $rollbackAfter');
     }
-  } finally {
-    pointStmt.dispose();
-  }
-  latencies.sort();
-  final p50 = percentile(latencies, 50);
-  final p95 = percentile(latencies, 95);
-  final p99 = percentile(latencies, 99);
-  m.put('point_read_p50_ms', p50);
-  m.put('point_read_p95_ms', p95);
-  m.put('point_read_p99_ms', p99);
-  print(
-    '  p50=${p50}ms  p95=${p95}ms  p99=${p99}ms',
-  );
-  print('');
-
-  // ── Section 5: Indexed Lookup (email) ───────────────────────────
-  print('--- Indexed Lookup (email) ---');
-  final emailStmt = db.prepare(
-    r'SELECT id, name, city FROM customers WHERE email = $1',
-  );
-  final emailLatencies = List<double>.filled(_pointReads, 0.0);
-  try {
-    for (var i = 0; i < _pointReads; i++) {
-      final id = rng.nextInt(custCount);
-      final sw = Stopwatch()..start();
-      emailStmt.reset();
-      emailStmt.clearBindings();
-      emailStmt.bindAll(<Object?>['user$id@example.com']);
-      final rows = emailStmt.query();
-      sw.stop();
-      if (rows.isEmpty) {
-        throw StateError('Email lookup missed user$id@example.com');
-      }
-      emailLatencies[i] = sw.elapsedMicroseconds / 1000.0;
-    }
-  } finally {
-    emailStmt.dispose();
-  }
-  emailLatencies.sort();
-  final emailP50 = percentile(emailLatencies, 50);
-  final emailP95 = percentile(emailLatencies, 95);
-  m.put('email_lookup_p50_ms', emailP50);
-  m.put('email_lookup_p95_ms', emailP95);
-  print('  p50=${emailP50}ms  p95=${emailP95}ms');
-  print('');
-
-  // ── Section 6: 4-Table Join ─────────────────────────────────────
-  print('--- 4-Table Join (orders + customers + order_items + products) ---');
-  watch = Stopwatch()..start();
-  final joinRows = db.query('''
-    SELECT o.id AS order_id, c.name AS customer, p.name AS product,
-           oi.quantity, oi.unit_price, o.order_date
-    FROM orders o
-    JOIN customers c ON c.id = o.customer_id
-    JOIN order_items oi ON oi.order_id = o.id
-    JOIN products p ON p.id = oi.product_id
-    ORDER BY o.id
-    LIMIT 10000
-  ''');
-  watch.stop();
-  final joinMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('join_4table_ms', joinMs);
-  m.put('join_4table_rows', joinRows.length);
-  print('  Result: ${joinRows.length} rows in ${joinMs}ms');
-  print('');
-
-  // ── Section 7: Inner Join + Aggregation (reviewed products) ─────
-  print('--- Inner Join + Aggregation (reviewed products) ---');
-  watch = Stopwatch()..start();
-  final ratingRows = db.query('''
-    SELECT p.name, p.price, c.name AS category,
-           AVG(r.rating) AS avg_rating,
-           COUNT(r.id) AS review_count
-    FROM reviews r
-    JOIN products p ON p.id = r.product_id
-    JOIN categories c ON c.id = p.category_id
-    GROUP BY p.id, p.name, p.price, c.name
-    ORDER BY avg_rating DESC, review_count DESC
-    LIMIT 20
-  ''');
-  watch.stop();
-  final ratingMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('join_agg_rating_ms', ratingMs);
-  m.put('join_agg_rating_rows', ratingRows.length);
-  print('  Result: ${ratingRows.length} rows in ${ratingMs}ms');
-  for (var i = 0; i < min(5, ratingRows.length); i++) {
-    final r = ratingRows[i];
     print(
-      '    ${r['name']} (${r['category']}): avg=${(r['avg_rating'] as num).toStringAsFixed(2)}, reviews=${r['review_count']}',
+      '  Rollback: stock $rollbackBefore -> UPDATE -999 -> ROLLBACK -> $rollbackAfter '
+      'in ${formatMs(rollbackMs)}',
     );
-  }
-  print('');
-
-  // ── Section 8: Aggregations ─────────────────────────────────────
-  print('--- Aggregations ---');
-
-  watch = Stopwatch()..start();
-  final revByCust = db.query('''
-    SELECT c.name, COUNT(o.id) AS order_count, SUM(o.total) AS total_spent
-    FROM customers c
-    JOIN orders o ON o.customer_id = c.id
-    GROUP BY c.id, c.name
-    ORDER BY total_spent DESC
-    LIMIT 10
-  ''');
-  watch.stop();
-  final custSpendMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('agg_customer_spend_ms', custSpendMs);
-  print('  Top 10 customers by spend: ${custSpendMs}ms');
-  for (var i = 0; i < min(5, revByCust.length); i++) {
-    final r = revByCust[i];
-    print(
-      '    ${r['name']}: ${r['order_count']} orders, \$${(r['total_spent'] as num).toStringAsFixed(2)}',
-    );
+    print('');
   }
 
-  watch = Stopwatch()..start();
-  final catStats = db.query('''
-    SELECT c.name, COUNT(p.id) AS product_count, AVG(p.price) AS avg_price, SUM(p.stock) AS total_stock
-    FROM categories c
-    JOIN products p ON p.category_id = c.id
-    GROUP BY c.id, c.name
-    ORDER BY product_count DESC
-    LIMIT 10
-  ''');
-  watch.stop();
-  final catStatsMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('agg_category_stats_ms', catStatsMs);
-  print('  Top 10 categories by product count: ${catStatsMs}ms');
-  for (var i = 0; i < min(5, catStats.length); i++) {
-    final r = catStats[i];
-    print(
-      '    ${r['name']}: ${r['product_count']} products, avg \$${(r['avg_price'] as num).toStringAsFixed(2)}, stock=${r['total_stock']}',
-    );
-  }
-
-  watch = Stopwatch()..start();
-  final topProducts = db.query('''
-    SELECT p.name, COUNT(r.id) AS review_count, AVG(r.rating) AS avg_rating
-    FROM products p
-    JOIN reviews r ON r.product_id = p.id
-    GROUP BY p.id, p.name
-    ORDER BY review_count DESC
-    LIMIT 10
-  ''');
-  watch.stop();
-  final topProdMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('agg_top_products_ms', topProdMs);
-  print('  Top 10 products by review count: ${topProdMs}ms');
-  for (var i = 0; i < min(5, topProducts.length); i++) {
-    final r = topProducts[i];
-    print(
-      '    ${r['name']}: ${r['review_count']} reviews, avg rating ${(r['avg_rating'] as num).toStringAsFixed(2)}',
-    );
-  }
-  print('');
-
-  // ── Section 9: Text Search ──────────────────────────────────────
-  print('--- Text Search (LIKE) ---');
-  watch = Stopwatch()..start();
-  final searchRows = db.query(
-    r'''
-    SELECT id, name, price FROM products
-    WHERE name LIKE '%' || $1 || '%'
-    ORDER BY price DESC
-  ''',
-    <Object?>['Widget'],
-  );
-  watch.stop();
-  final searchMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('text_search_contains_ms', searchMs);
-  m.put('text_search_contains_matches', searchRows.length);
-  print('  LIKE "%Widget%": ${searchRows.length} matches in ${searchMs}ms');
-
-  watch = Stopwatch()..start();
-  final custSearch = db.query(
-    r'''
-    SELECT id, name, city FROM customers
-    WHERE name LIKE $1
-    ORDER BY name
-    LIMIT 100
-  ''',
-    <Object?>['Customer_000%'],
-  );
-  watch.stop();
-  final prefixMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('text_search_prefix_ms', prefixMs);
-  m.put('text_search_prefix_matches', custSearch.length);
-  print(
-      '  LIKE "Customer_000%": ${custSearch.length} matches in ${prefixMs}ms');
-  print('');
-
-  // ── Section 10: CTE / Subqueries ────────────────────────────────
-  print('--- CTE / Subqueries ---');
-
-  watch = Stopwatch()..start();
-  final aboveAvg = db.query('''
-    WITH cust_totals AS (
-      SELECT customer_id, SUM(total) AS spent
-      FROM orders
-      GROUP BY customer_id
-    )
-    SELECT c.name, ct.spent
-    FROM cust_totals ct
-    JOIN customers c ON c.id = ct.customer_id
-    WHERE ct.spent > (SELECT AVG(spent) FROM cust_totals)
-    ORDER BY ct.spent DESC
-    LIMIT 10
-  ''');
-  watch.stop();
-  final aboveAvgMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('cte_above_avg_spend_ms', aboveAvgMs);
-  print(
-      '  Customers above avg spend: ${aboveAvg.length} rows in ${aboveAvgMs}ms');
-
-  watch = Stopwatch()..start();
-  final topOrders = db.query('''
-    WITH order_details AS (
-      SELECT o.id AS order_id, c.name AS customer, o.total,
-             COUNT(oi.id) AS item_count
+  void _runViewsAndIntrospection() {
+    print('--- Views ---');
+    var watch = Stopwatch()..start();
+    db.execute('''
+      CREATE VIEW order_summary AS
+      SELECT o.id AS order_id, c.name AS customer, c.city,
+             o.order_date, o.total, COUNT(oi.id) AS item_count
       FROM orders o
       JOIN customers c ON c.id = o.customer_id
       JOIN order_items oi ON oi.order_id = o.id
-      GROUP BY o.id, c.name, o.total
-    )
-    SELECT od.order_id, od.customer, od.total, od.item_count
-    FROM order_details od
-    WHERE od.total > (SELECT AVG(total) FROM orders)
-    ORDER BY od.total DESC
-    LIMIT 10
-  ''');
-  watch.stop();
-  final topOrdersMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('cte_top_orders_ms', topOrdersMs);
-  print(
-      '  Orders above avg total: ${topOrders.length} rows in ${topOrdersMs}ms');
-  for (var i = 0; i < min(5, topOrders.length); i++) {
-    final r = topOrders[i];
+      GROUP BY o.id, c.name, c.city, o.order_date, o.total
+    ''');
+    watch.stop();
+    final orderSummaryViewMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('view_order_summary_ms', orderSummaryViewMs);
+    print('  Created order_summary view in ${formatMs(orderSummaryViewMs)}');
+
+    watch = Stopwatch()..start();
+    db.execute('''
+      CREATE VIEW product_ratings AS
+      SELECT r.product_id, p.name AS product_name, p.price,
+             c.name AS category, r.rating, r.comment
+      FROM reviews r
+      JOIN products p ON p.id = r.product_id
+      JOIN categories c ON c.id = p.category_id
+    ''');
+    watch.stop();
+    final productRatingsViewMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('view_product_ratings_ms', productRatingsViewMs);
     print(
-      '    Order ${r['order_id']}: ${r['customer']}, \$${(r['total'] as num).toStringAsFixed(2)}, ${r['item_count']} items',
+        '  Created product_ratings view in ${formatMs(productRatingsViewMs)}');
+
+    watch = Stopwatch()..start();
+    final summaryRows = db.query(
+      'SELECT * FROM order_summary ORDER BY total DESC LIMIT 5',
     );
+    watch.stop();
+    final queryViewMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('query_order_summary_ms', queryViewMs);
+    print('  Query order_summary (top 5): ${formatMs(queryViewMs)}');
+    for (var i = 0; i < summaryRows.length; i++) {
+      final row = summaryRows[i];
+      print(
+        '    Order ${row['order_id']}: ${row['customer']} (${row['city']}), '
+        '\$${(row['total'] as num).toStringAsFixed(2)}, ${row['item_count']} items',
+      );
+    }
+    print('');
+
+    print('--- Schema Introspection ---');
+    watch = Stopwatch()..start();
+    final tables = db.schema.listTables();
+    final indexes = db.schema.listIndexes();
+    final views = db.schema.listViews();
+    final triggers = db.schema.listTriggers();
+    watch.stop();
+    final introspectionMs = watch.elapsedMicroseconds / 1000.0;
+    metrics.put('introspection_ms', introspectionMs);
+    print('  Tables: ${tables.join(', ')}');
+    print('  Indexes: ${indexes.length} total');
+    for (final index in indexes) {
+      print(
+        '    ${index.name} on ${index.tableName}(${index.columns.join(', ')}) '
+        '[${index.kind}]${index.unique ? ' UNIQUE' : ''}',
+      );
+    }
+    print('  Views: ${views.join(', ')}');
+    print('  Triggers: ${triggers.length}');
+    final ordersInfo = db.schema.describeTable('orders');
+    print('  orders columns:');
+    for (final column in ordersInfo.columns) {
+      print(
+        '    ${column.name}: ${column.type}'
+        '${column.nullable ? '' : ' NOT NULL'}'
+        '${column.primaryKey ? ' PK' : ''}',
+      );
+    }
+    for (final foreignKey in ordersInfo.foreignKeys) {
+      print(
+        '    FK: ${foreignKey.columns.join(', ')} -> '
+        '${foreignKey.referencedTable}(${foreignKey.referencedColumns.join(', ')}) '
+        'ON DELETE ${foreignKey.onDelete}',
+      );
+    }
+    print('  Introspection: ${formatMs(introspectionMs)}');
+    print('');
   }
 
-  watch = Stopwatch()..start();
-  final monthlyTotals = db.query('''
-    SELECT SUBSTR(order_date, 1, 7) AS month,
-           COUNT(*) AS order_count,
-           SUM(total) AS revenue
-    FROM orders
-    GROUP BY SUBSTR(order_date, 1, 7)
-    ORDER BY SUBSTR(order_date, 1, 7)
-  ''');
-  watch.stop();
-  final monthlyMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('cte_monthly_totals_ms', monthlyMs);
-  print(
-      '  Monthly order totals: ${monthlyTotals.length} months in ${monthlyMs}ms');
-  print('');
-
-  // ── Section 11: Transaction (new order + rollback demo) ─────────
-  print('--- Transaction Demo ---');
-
-  watch = Stopwatch()..start();
-  final beforeStock = db.query(
-    r'SELECT stock FROM products WHERE id = $1',
-    <Object?>[0],
-  );
-  final stockBefore = beforeStock.first['stock'] as int;
-
-  db.begin();
-  db.executeWithParams(
-    r'INSERT INTO orders VALUES ($1, $2, $3, $4)',
-    <Object?>[ordCount + 1000, 0, '2025-01-01', 299.97],
-  );
-  db.executeWithParams(
-    r'INSERT INTO order_items VALUES ($1, $2, $3, $4, $5)',
-    <Object?>[itemId + 1000, ordCount + 1000, 0, 3, 99.99],
-  );
-  db.executeWithParams(
-    r'UPDATE products SET stock = stock - 3 WHERE id = $1',
-    <Object?>[0],
-  );
-  db.commit();
-  watch.stop();
-  final commitMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('txn_commit_ms', commitMs);
-
-  final afterStock = db.query(
-    r'SELECT stock FROM products WHERE id = $1',
-    <Object?>[0],
-  );
-  final stockAfter = afterStock.first['stock'] as int;
-  print('  Committed: stock $stockBefore -> $stockAfter in ${commitMs}ms');
-
-  watch = Stopwatch()..start();
-  final preRollbackStock = db.query(
-    r'SELECT stock FROM products WHERE id = $1',
-    <Object?>[1],
-  );
-  final preStock = preRollbackStock.first['stock'] as int;
-
-  db.begin();
-  db.executeWithParams(
-    r'UPDATE products SET stock = stock - 999 WHERE id = $1',
-    <Object?>[1],
-  );
-  db.rollback();
-  watch.stop();
-  final rollbackMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('txn_rollback_ms', rollbackMs);
-
-  final postRollbackStock = db.query(
-    r'SELECT stock FROM products WHERE id = $1',
-    <Object?>[1],
-  );
-  final postStock = postRollbackStock.first['stock'] as int;
-  print(
-      '  Rollback: stock $preStock -> UPDATE -999 -> ROLLBACK -> $postStock in ${rollbackMs}ms');
-  print('');
-
-  // ── Section 12: Views + Schema Introspection ────────────────────
-  print('--- Views ---');
-  watch = Stopwatch()..start();
-  db.execute('''
-    CREATE VIEW order_summary AS
-    SELECT o.id AS order_id, c.name AS customer, c.city,
-           o.order_date, o.total, COUNT(oi.id) AS item_count
-    FROM orders o
-    JOIN customers c ON c.id = o.customer_id
-    JOIN order_items oi ON oi.order_id = o.id
-    GROUP BY o.id, c.name, c.city, o.order_date, o.total
-  ''');
-  watch.stop();
-  final viewOrderMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('view_order_summary_ms', viewOrderMs);
-  print('  Created order_summary view in ${viewOrderMs}ms');
-
-  watch = Stopwatch()..start();
-  db.execute('''
-    CREATE VIEW product_ratings AS
-    SELECT r.product_id, p.name AS product_name, p.price,
-           c.name AS category, r.rating, r.comment
-    FROM reviews r
-    JOIN products p ON p.id = r.product_id
-    JOIN categories c ON c.id = p.category_id
-  ''');
-  watch.stop();
-  final viewProdMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('view_product_ratings_ms', viewProdMs);
-  print('  Created product_ratings view in ${viewProdMs}ms');
-
-  watch = Stopwatch()..start();
-  final summaryRows = db.query('''
-    SELECT * FROM order_summary ORDER BY total DESC LIMIT 5
-  ''');
-  watch.stop();
-  final queryViewMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('query_order_summary_ms', queryViewMs);
-  print('  Query order_summary (top 5): ${queryViewMs}ms');
-  for (var i = 0; i < summaryRows.length; i++) {
-    final r = summaryRows[i];
+  void _printSummary() {
+    print('=== Performance Summary ===');
     print(
-      '    Order ${r['order_id']}: ${r['customer']} (${r['city']}), \$${(r['total'] as num).toStringAsFixed(2)}, ${r['item_count']} items',
-    );
-  }
-  print('');
-
-  print('--- Schema Introspection ---');
-  watch = Stopwatch()..start();
-  final tables = db.schema.listTables();
-  final indexes = db.schema.listIndexes();
-  final views = db.schema.listViews();
-  final triggers = db.schema.listTriggers();
-  watch.stop();
-  final introMs = watch.elapsedMicroseconds / 1000.0;
-  m.put('introspection_ms', introMs);
-  print('  Tables: ${tables.join(', ')}');
-  print('  Indexes: ${indexes.length} total');
-  for (final idx in indexes) {
+        '  Insert throughput:  ${formatInt(_totalInsertRowsPerSecond.round())} rows/sec '
+        '(${formatInt(_actualInsertedRows)} actual rows)');
+    print('  Point read p50:     ${formatMs(_pointReadSummary.p50)}');
+    print('  Point read p95:     ${formatMs(_pointReadSummary.p95)}');
+    print('  Point read p99:     ${formatMs(_pointReadSummary.p99)}');
+    print('  Email lookup p50:   ${formatMs(_emailLookupP50)}');
+    print('  Email lookup p95:   ${formatMs(_emailLookupP95)}');
     print(
-      '    ${idx.name} on ${idx.tableName}(${idx.columns.join(', ')}) [${idx.kind}]${idx.unique ? ' UNIQUE' : ''}',
-    );
+        '  Fetchall (${formatInt(counts.products)} rows): ${formatMs(_fetchallMs)}');
+    print('');
   }
-  print('  Views: ${views.join(', ')}');
-  print('  Triggers: ${triggers.length}');
-  final ordersInfo = db.schema.describeTable('orders');
-  print('  orders columns:');
-  for (final col in ordersInfo.columns) {
-    print(
-      '    ${col.name}: ${col.type}${col.nullable ? '' : ' NOT NULL'}${col.primaryKey ? ' PK' : ''}',
-    );
-  }
-  for (final fk in ordersInfo.foreignKeys) {
-    print(
-      '    FK: ${fk.columns.join(', ')} -> ${fk.referencedTable}(${fk.referencedColumns.join(', ')}) ON DELETE ${fk.onDelete}',
-    );
-  }
-  print('  Introspection: ${introMs}ms');
-  print('');
+}
 
-  // ── Performance Summary ─────────────────────────────────────────
-  print('=== Performance Summary ===');
-  print(
-      '  Insert throughput:  ${formatNum(totalRps.round())} rows/sec ($totalInsertRows rows)');
-  print('  Point read p50:     ${p50}ms');
-  print('  Point read p95:     ${p95}ms');
-  print('  Point read p99:     ${p99}ms');
-  print('  Email lookup p50:   ${emailP50}ms');
-  print('  Fetchall ($prodCount rows): ${fetchallMs}ms');
-  print('');
-
-  // ── Write JSON ──────────────────────────────────────────────────
-  m.writeJson(jsonPath);
-  print('Results written to: $jsonPath');
-
-  if (keepDb) {
-    print('Database saved to: $dbPath');
-  }
-
-  db.close();
-  print('Done.');
+void main(List<String> args) {
+  final config = DemoConfig.parse(args);
+  ComplexDemoRunner(config).run();
 }

@@ -498,9 +498,9 @@ GROUP BY department;
 
 ### Overview
 
-DML enhancements improve the ergonomics of data manipulation operations. The key missing features are `RETURNING` clauses for `UPDATE` and `DELETE`, `TRUNCATE TABLE`, and the `MERGE` statement.
+DML enhancements improve the ergonomics of data manipulation operations. `UPDATE ... RETURNING`, `DELETE ... RETURNING`, and `TRUNCATE TABLE` are implemented in the current engine; `MERGE` remains the notable backlog item in this category.
 
-### Missing Features
+### Implemented Features and Remaining Gap
 
 #### 3.1 UPDATE ... RETURNING
 
@@ -578,11 +578,11 @@ RETURNING *;
 
 #### 3.3 TRUNCATE TABLE
 
-Quickly removes all rows from a table, resetting auto-increment counters.
+Quickly removes all rows from a table while preserving transactional rollback semantics.
 
 **Syntax:**
 ```sql
-TRUNCATE TABLE table_name [CONTINUE IDENTITY | RESTART IDENTITY]
+TRUNCATE TABLE table_name [CONTINUE IDENTITY | RESTART IDENTITY] [CASCADE]
 ```
 
 **Examples:**
@@ -599,9 +599,9 @@ TRUNCATE TABLE orders CASCADE;
 
 **Implementation Notes:**
 - More efficient than `DELETE FROM table` (no row-by-row processing)
-- Cannot be rolled back in some databases (DecentDB should support rollback)
-- Should reset sequence/auto-increment counters
-- Consider `CASCADE` option for tables with foreign key references
+- Participates in DecentDB transactions and can be rolled back
+- `RESTART IDENTITY` resets auto-increment state; `CONTINUE IDENTITY` preserves progression
+- `CASCADE` truncates dependent child tables reached through foreign keys
 - DDL transaction semantics apply
 
 ---
@@ -1215,9 +1215,9 @@ WHERE email != ALL (SELECT email FROM banned_emails);
 
 ### Overview
 
-Additional query features for more flexible data retrieval and manipulation.
+Additional query features for more flexible data retrieval and manipulation. The `LATERAL`, `VALUES`-table-source, and CTAS surfaces described in this slice are implemented in the current engine.
 
-### Missing Features
+### Implemented Features
 
 #### 9.1 LATERAL Joins
 
@@ -1284,6 +1284,11 @@ SELECT * FROM (VALUES ('A', 'Alpha'), ('B', 'Beta')) AS t(code, desc);
 SELECT * FROM products
 WHERE (id, category) IN (VALUES (1, 'A'), (2, 'B'), (3, 'C'));
 ```
+
+**Implementation Notes:**
+- Works with explicit alias column names on subqueries
+- Can be used in joins and `INSERT ... SELECT` pipelines
+- Supports row-value membership checks such as `(a, b) IN (VALUES (...), (...))`
 
 ---
 
@@ -1401,9 +1406,9 @@ SELECT * FROM users WHERE phone !~ '^\d{3}-\d{3}-\d{4}$';
 
 ### Overview
 
-Additional DDL capabilities for schema management.
+Additional DDL capabilities for schema management. The DDL forms documented in this slice are implemented in the current engine, including named `CHECK`, `FOREIGN KEY`, and `UNIQUE` constraint management via `ALTER TABLE`.
 
-### Missing Features
+### Implemented Features
 
 #### 11.1 ALTER TABLE RENAME (Table)
 
@@ -1440,6 +1445,11 @@ ALTER TABLE products ADD CONSTRAINT chk_price
 -- Drop constraint
 ALTER TABLE orders DROP CONSTRAINT fk_user;
 ```
+
+**Implementation Notes:**
+- `ADD CONSTRAINT` supports named `CHECK`, named `FOREIGN KEY`, and named `UNIQUE` definitions
+- Existing rows are validated before a new constraint is committed
+- `DROP CONSTRAINT` removes named `CHECK`, `FOREIGN KEY`, and backed `UNIQUE` constraints
 
 ---
 

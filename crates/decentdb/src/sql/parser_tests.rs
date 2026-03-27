@@ -24,6 +24,10 @@ mod tests {
             "SELECT key, value, type FROM json_tree('{\"a\":1}')",
             "ANALYZE",
             "ANALYZE users",
+            "TRUNCATE TABLE users",
+            "TRUNCATE TABLE users RESTART IDENTITY",
+            "TRUNCATE TABLE users CONTINUE IDENTITY",
+            "TRUNCATE TABLE users CASCADE",
             "UPDATE users SET id = 2 WHERE id = 1",
             "DELETE FROM users WHERE id = 1",
         ];

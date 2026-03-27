@@ -50,8 +50,15 @@ pub(crate) enum Statement {
     },
     TruncateTable {
         table_name: String,
-        restart_identity: bool,
+        identity: TruncateIdentityMode,
+        cascade: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TruncateIdentityMode {
+    Continue,
+    Restart,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +131,7 @@ pub(crate) enum FromItem {
     Subquery {
         query: Box<Query>,
         alias: String,
+        column_names: Vec<String>,
         lateral: bool,
     },
     Function {
@@ -267,6 +275,7 @@ pub(crate) enum Expr {
         branches: Vec<(Expr, Expr)>,
         else_expr: Option<Box<Expr>>,
     },
+    Row(Vec<Expr>),
     Cast {
         expr: Box<Expr>,
         target_type: ColumnType,
@@ -676,8 +685,14 @@ impl FromItem {
             Self::Subquery {
                 query,
                 alias,
+                column_names,
                 lateral,
             } => {
+                let alias = if column_names.is_empty() {
+                    alias.clone()
+                } else {
+                    format!("{alias}({})", column_names.join(", "))
+                };
                 let base = format!("({}) AS {alias}", query.to_sql());
                 if *lateral {
                     format!("LATERAL {base}")
@@ -1127,6 +1142,14 @@ impl Expr {
                 sql.push_str(" END");
                 sql
             }
+            Self::Row(items) => format!(
+                "({})",
+                items
+                    .iter()
+                    .map(Expr::to_sql)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::Cast { expr, target_type } => {
                 format!("CAST({} AS {})", expr.to_sql(), target_type.as_str())
             }

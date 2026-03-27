@@ -44,7 +44,7 @@ use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
     BinaryOp, ColumnDefinition, CommonTableExpr, CreateTableAsStatement, CreateTableStatement,
     Expr, FromItem, JoinConstraint, JoinKind, Query, QueryBody, Select, SelectItem, Statement,
-    SubqueryQuantifier, UnaryOp,
+    SubqueryQuantifier, TruncateIdentityMode, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
 use crate::storage::checksum::{crc32c_extend, crc32c_parts};
@@ -1225,9 +1225,15 @@ impl EngineRuntime {
             }
             Statement::TruncateTable {
                 table_name,
-                restart_identity,
+                identity,
+                cascade,
             } => {
-                self.execute_truncate_table(table_name, *restart_identity, page_size)?;
+                self.execute_truncate_table(
+                    table_name,
+                    *identity == TruncateIdentityMode::Restart,
+                    *cascade,
+                    page_size,
+                )?;
                 Ok(QueryResult::with_affected_rows(0))
             }
         }
@@ -4715,6 +4721,7 @@ impl EngineRuntime {
             FromItem::Subquery {
                 query,
                 alias,
+                column_names,
                 lateral,
             } => {
                 let mut dataset = if *lateral {
@@ -4722,6 +4729,19 @@ impl EngineRuntime {
                 } else {
                     self.evaluate_query(query, params, ctes)?
                 };
+                if !column_names.is_empty() {
+                    if column_names.len() != dataset.columns.len() {
+                        return Err(DbError::sql(format!(
+                            "subquery alias {} expected {} column names but produced {} columns",
+                            alias,
+                            column_names.len(),
+                            dataset.columns.len()
+                        )));
+                    }
+                    for (binding, column_name) in dataset.columns.iter_mut().zip(column_names) {
+                        binding.name = column_name.clone();
+                    }
+                }
                 for column in &mut dataset.columns {
                     column.table = Some(alias.clone());
                 }
@@ -5113,6 +5133,9 @@ fn expr_references_outer(
                 || expr_references_outer(low, outer_tables, local_tables)
                 || expr_references_outer(high, outer_tables, local_tables)
         }
+        Expr::Row(items) => items
+            .iter()
+            .any(|item| expr_references_outer(item, outer_tables, local_tables)),
         Expr::InList { expr, items, .. } => {
             expr_references_outer(expr, outer_tables, local_tables)
                 || items
@@ -5351,6 +5374,9 @@ fn expr_contains_recursive_unsupported_feature(expr: &Expr) -> bool {
                     .as_ref()
                     .is_some_and(|expr| expr_contains_recursive_unsupported_feature(expr))
         }
+        Expr::Row(items) => items
+            .iter()
+            .any(expr_contains_recursive_unsupported_feature),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
     }
 }
@@ -7243,6 +7269,65 @@ fn dataset_column_index(dataset: &Dataset, qualifier: Option<&str>, column: &str
     }
 }
 
+#[derive(Debug)]
+enum MembershipValue {
+    Scalar(Value),
+    Row(Vec<Value>),
+}
+
+fn membership_value_has_nulls(value: &MembershipValue) -> bool {
+    match value {
+        MembershipValue::Scalar(value) => matches!(value, Value::Null),
+        MembershipValue::Row(values) => values.iter().any(|value| matches!(value, Value::Null)),
+    }
+}
+
+fn compare_membership_values(
+    left: &MembershipValue,
+    right: &MembershipValue,
+) -> Result<Option<bool>> {
+    match (left, right) {
+        (MembershipValue::Scalar(left), MembershipValue::Scalar(right)) => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(None)
+            } else {
+                Ok(Some(
+                    compare_values(left, right)? == std::cmp::Ordering::Equal,
+                ))
+            }
+        }
+        (MembershipValue::Row(left), MembershipValue::Row(right)) => {
+            if left.len() != right.len() {
+                return Err(DbError::sql(format!(
+                    "row-value comparison expected {} columns but got {}",
+                    left.len(),
+                    right.len()
+                )));
+            }
+            let mut saw_null = false;
+            for (left_value, right_value) in left.iter().zip(right) {
+                if matches!(left_value, Value::Null) || matches!(right_value, Value::Null) {
+                    saw_null = true;
+                    continue;
+                }
+                if compare_values(left_value, right_value)? != std::cmp::Ordering::Equal {
+                    return Ok(Some(false));
+                }
+            }
+            if saw_null {
+                Ok(None)
+            } else {
+                Ok(Some(true))
+            }
+        }
+        (MembershipValue::Scalar(_), MembershipValue::Row(right))
+        | (MembershipValue::Row(right), MembershipValue::Scalar(_)) => Err(DbError::sql(format!(
+            "row-value comparison expected {} columns but got 1",
+            right.len()
+        ))),
+    }
+}
+
 fn schema_column_index(schema: &TableSchema, column: &str) -> Option<usize> {
     schema
         .columns
@@ -7633,6 +7718,7 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
                 })
                 || else_expr.as_deref().is_some_and(expr_contains_aggregate)
         }
+        Expr::Row(items) => items.iter().any(expr_contains_aggregate),
         Expr::Cast { expr, .. } => expr_contains_aggregate(expr),
         Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter(_) => false,
     }
@@ -9114,6 +9200,55 @@ impl EngineRuntime {
         }
     }
 
+    fn eval_group_membership_value(
+        &self,
+        expr: &Expr,
+        dataset: &Dataset,
+        group_row_indexes: &[usize],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+    ) -> Result<MembershipValue> {
+        match expr {
+            Expr::Row(items) => Ok(MembershipValue::Row(
+                items
+                    .iter()
+                    .map(|item| {
+                        self.eval_group_expr(item, dataset, group_row_indexes, params, ctes)
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            _ => Ok(MembershipValue::Scalar(self.eval_group_expr(
+                expr,
+                dataset,
+                group_row_indexes,
+                params,
+                ctes,
+            )?)),
+        }
+    }
+
+    fn eval_membership_value(
+        &self,
+        expr: &Expr,
+        dataset: &Dataset,
+        row: &[Value],
+        params: &[Value],
+        ctes: &BTreeMap<String, Dataset>,
+        excluded: Option<&Dataset>,
+    ) -> Result<MembershipValue> {
+        match expr {
+            Expr::Row(items) => Ok(MembershipValue::Row(
+                items
+                    .iter()
+                    .map(|item| self.eval_expr(item, dataset, row, params, ctes, excluded))
+                    .collect::<Result<Vec<_>>>()?,
+            )),
+            _ => Ok(MembershipValue::Scalar(
+                self.eval_expr(expr, dataset, row, params, ctes, excluded)?,
+            )),
+        }
+    }
+
     fn eval_group_expr(
         &self,
         expr: &Expr,
@@ -9417,20 +9552,29 @@ impl EngineRuntime {
                 items,
                 negated,
             } => {
-                let value = self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?;
-                if matches!(value, Value::Null) {
+                let value = self.eval_group_membership_value(
+                    expr,
+                    dataset,
+                    group_row_indexes,
+                    params,
+                    ctes,
+                )?;
+                if membership_value_has_nulls(&value) {
                     return Ok(Value::Null);
                 }
                 let mut saw_null = false;
                 for item in items {
-                    let item =
-                        self.eval_group_expr(item, dataset, group_row_indexes, params, ctes)?;
-                    if matches!(item, Value::Null) {
-                        saw_null = true;
-                        continue;
-                    }
-                    if compare_values(&value, &item)? == std::cmp::Ordering::Equal {
-                        return Ok(Value::Bool(!*negated));
+                    let candidate = self.eval_group_membership_value(
+                        item,
+                        dataset,
+                        group_row_indexes,
+                        params,
+                        ctes,
+                    )?;
+                    match compare_membership_values(&value, &candidate)? {
+                        Some(true) => return Ok(Value::Bool(!*negated)),
+                        Some(false) => {}
+                        None => saw_null = true,
                     }
                 }
                 if saw_null {
@@ -9569,6 +9713,9 @@ impl EngineRuntime {
                 self.eval_group_expr(expr, dataset, group_row_indexes, params, ctes)?,
                 *target_type,
             ),
+            Expr::Row(_) => Err(DbError::sql(
+                "row values are only supported in IN comparisons",
+            )),
             Expr::RowNumber { .. } | Expr::WindowFunction { .. } => Err(DbError::sql(
                 "window functions cannot be nested inside grouped expressions",
             )),
@@ -9649,19 +9796,19 @@ impl EngineRuntime {
                 items,
                 negated,
             } => {
-                let value = self.eval_expr(expr, dataset, row, params, ctes, excluded)?;
-                if matches!(value, Value::Null) {
+                let value =
+                    self.eval_membership_value(expr, dataset, row, params, ctes, excluded)?;
+                if membership_value_has_nulls(&value) {
                     return Ok(Value::Null);
                 }
                 let mut saw_null = false;
                 for item in items {
-                    let item = self.eval_expr(item, dataset, row, params, ctes, excluded)?;
-                    if matches!(item, Value::Null) {
-                        saw_null = true;
-                        continue;
-                    }
-                    if compare_values(&value, &item)? == std::cmp::Ordering::Equal {
-                        return Ok(Value::Bool(!*negated));
+                    let candidate =
+                        self.eval_membership_value(item, dataset, row, params, ctes, excluded)?;
+                    match compare_membership_values(&value, &candidate)? {
+                        Some(true) => return Ok(Value::Bool(!*negated)),
+                        Some(false) => {}
+                        None => saw_null = true,
                     }
                 }
                 if saw_null {
@@ -9675,23 +9822,36 @@ impl EngineRuntime {
                 query,
                 negated,
             } => {
-                let value = self.eval_expr(expr, dataset, row, params, ctes, excluded)?;
-                if matches!(value, Value::Null) {
+                let value =
+                    self.eval_membership_value(expr, dataset, row, params, ctes, excluded)?;
+                if membership_value_has_nulls(&value) {
                     return Ok(Value::Null);
                 }
                 let subquery = self.evaluate_query_with_outer(query, params, ctes, dataset, row)?;
-                if subquery.columns.len() != 1 {
-                    return Err(DbError::sql("IN subquery must return exactly one column"));
+                let expected_width = match &value {
+                    MembershipValue::Scalar(_) => 1,
+                    MembershipValue::Row(values) => values.len(),
+                };
+                if subquery.columns.len() != expected_width {
+                    return Err(DbError::sql(format!(
+                        "IN subquery must return exactly {} column{}",
+                        expected_width,
+                        if expected_width == 1 { "" } else { "s" }
+                    )));
                 }
                 let mut saw_null = false;
                 for subquery_row in &subquery.rows {
-                    let candidate = subquery_row.first().cloned().unwrap_or(Value::Null);
-                    if matches!(candidate, Value::Null) {
-                        saw_null = true;
-                        continue;
-                    }
-                    if compare_values(&value, &candidate)? == std::cmp::Ordering::Equal {
-                        return Ok(Value::Bool(!*negated));
+                    let candidate = if expected_width == 1 {
+                        MembershipValue::Scalar(
+                            subquery_row.first().cloned().unwrap_or(Value::Null),
+                        )
+                    } else {
+                        MembershipValue::Row(subquery_row.clone())
+                    };
+                    match compare_membership_values(&value, &candidate)? {
+                        Some(true) => return Ok(Value::Bool(!*negated)),
+                        Some(false) => {}
+                        None => saw_null = true,
                     }
                 }
                 if saw_null {
@@ -9828,6 +9988,9 @@ impl EngineRuntime {
                 self.eval_expr(expr, dataset, row, params, ctes, excluded)?,
                 *target_type,
             ),
+            Expr::Row(_) => Err(DbError::sql(
+                "row values are only supported in IN comparisons",
+            )),
         }
     }
 

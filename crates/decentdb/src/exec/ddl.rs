@@ -551,6 +551,7 @@ impl EngineRuntime {
         &mut self,
         table_name: &str,
         restart_identity: bool,
+        cascade: bool,
         page_size: u32,
     ) -> Result<()> {
         if self.temp_table_schema(table_name).is_some() {
@@ -562,47 +563,42 @@ impl EngineRuntime {
             return Err(DbError::sql(format!("cannot truncate view {}", table_name)));
         }
 
-        let _table = self
+        let table_name = self
             .catalog
             .table(table_name)
-            .cloned()
+            .map(|table| table.name.clone())
             .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+        let mut targets = Vec::new();
+        let mut visited = std::collections::BTreeSet::new();
+        collect_truncate_targets(
+            &self.catalog,
+            &table_name,
+            cascade,
+            &mut visited,
+            &mut targets,
+        )?;
 
-        let has_referencing_tables = self.catalog.tables.values().any(|child| {
-            child
-                .foreign_keys
-                .iter()
-                .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, table_name))
-        });
-
-        if has_referencing_tables {
-            return Err(DbError::sql(format!(
-                "cannot truncate table {} because other tables reference it",
-                table_name
-            )));
-        }
-
-        let data = self.tables.get_mut(table_name).ok_or_else(|| {
-            DbError::internal(format!("table data for {} is missing", table_name))
-        })?;
-
-        let _row_count = data.rows.len();
-        data.rows.clear();
-
-        if restart_identity {
-            let table = self.catalog.tables.get_mut(table_name).ok_or_else(|| {
-                DbError::internal(format!("table schema for {} is missing", table_name))
+        for target in &targets {
+            let data = self.tables.get_mut(target).ok_or_else(|| {
+                DbError::internal(format!("table data for {} is missing", target))
             })?;
-            table.next_row_id = 1;
+            data.rows.clear();
+
+            if restart_identity {
+                let table = self.catalog.tables.get_mut(target).ok_or_else(|| {
+                    DbError::internal(format!("table schema for {} is missing", target))
+                })?;
+                table.next_row_id = 1;
+            }
+
+            self.mark_table_dirty(target);
+            self.mark_indexes_stale_for_table(target);
+            self.catalog
+                .table_stats
+                .insert(target.clone(), super::TableStats { row_count: 0 });
         }
 
-        self.mark_table_dirty(table_name);
-        self.mark_indexes_stale_for_table(table_name);
         self.rebuild_indexes(page_size)?;
-
-        self.catalog
-            .table_stats
-            .insert(table_name.to_string(), super::TableStats { row_count: 0 });
 
         Ok(())
     }
@@ -649,7 +645,7 @@ impl EngineRuntime {
                     "ALTER TABLE ADD/DROP CONSTRAINT cannot be combined with other ALTER TABLE actions",
                 ));
             }
-            return self.execute_alter_table_constraint(table_name, &actions[0]);
+            return self.execute_alter_table_constraint(table_name, &actions[0], _page_size);
         }
         let mut table = self
             .catalog
@@ -915,6 +911,7 @@ impl EngineRuntime {
         &mut self,
         table_name: &str,
         action: &AlterTableAction,
+        page_size: u32,
     ) -> Result<()> {
         let table_name = self
             .catalog
@@ -992,24 +989,175 @@ impl EngineRuntime {
                 self.bump_schema_cookie();
                 Ok(())
             }
+            AlterTableAction::AddConstraint(TableConstraint::ForeignKey(definition)) => {
+                if let Some(constraint_name) = &definition.name {
+                    ensure_constraint_name_is_available(
+                        self,
+                        &table,
+                        &table_name,
+                        constraint_name,
+                    )?;
+                }
+                let candidate = foreign_key_constraint_from_definition(definition);
+                if table
+                    .foreign_keys
+                    .iter()
+                    .any(|foreign_key| foreign_key == &candidate)
+                {
+                    return Err(DbError::sql(format!(
+                        "constraint definition already exists on {}",
+                        table_name
+                    )));
+                }
+                table.foreign_keys.push(candidate.clone());
+                validate_foreign_keys(self, &table)?;
+                validate_existing_rows_with_staged_table(self, &table_name, &table)?;
+
+                self.catalog.tables.insert(table_name.clone(), table);
+                let index_name = foreign_key_index_name(&table_name, &candidate.columns);
+                if !self.catalog.indexes.contains_key(&index_name) {
+                    self.insert_index_schema(IndexSchema {
+                        name: index_name.clone(),
+                        table_name: table_name.clone(),
+                        kind: IndexKind::Btree,
+                        unique: false,
+                        columns: candidate
+                            .columns
+                            .iter()
+                            .map(|column_name| IndexColumn {
+                                column_name: Some(column_name.clone()),
+                                expression_sql: None,
+                            })
+                            .collect(),
+                        include_columns: Vec::new(),
+                        predicate_sql: None,
+                        fresh: false,
+                    })?;
+                    self.rebuild_index(&index_name, page_size)?;
+                }
+                self.bump_schema_cookie();
+                Ok(())
+            }
+            AlterTableAction::AddConstraint(TableConstraint::Unique { name, columns }) => {
+                if columns.is_empty() {
+                    return Err(DbError::sql(
+                        "UNIQUE constraints must include at least one column",
+                    ));
+                }
+                for column_name in columns {
+                    if !table
+                        .columns
+                        .iter()
+                        .any(|column| identifiers_equal(&column.name, column_name))
+                    {
+                        return Err(DbError::sql(format!(
+                            "unique constraint column {} does not exist on {}",
+                            column_name, table_name
+                        )));
+                    }
+                }
+                if let Some(constraint_name) = name {
+                    ensure_constraint_name_is_available(
+                        self,
+                        &table,
+                        &table_name,
+                        constraint_name,
+                    )?;
+                }
+                let index_name = name
+                    .clone()
+                    .unwrap_or_else(|| auto_index_name("uq", &table_name, columns));
+                let index = IndexSchema {
+                    name: index_name.clone(),
+                    table_name: table_name.clone(),
+                    kind: IndexKind::Btree,
+                    unique: true,
+                    columns: columns
+                        .iter()
+                        .map(|column_name| IndexColumn {
+                            column_name: Some(column_name.clone()),
+                            expression_sql: None,
+                        })
+                        .collect(),
+                    include_columns: Vec::new(),
+                    predicate_sql: None,
+                    fresh: false,
+                };
+                self.insert_index_schema(index)?;
+                let validation = self
+                    .tables
+                    .get(&table_name)
+                    .ok_or_else(|| {
+                        DbError::internal(format!("table data for {table_name} is missing"))
+                    })?
+                    .rows
+                    .iter()
+                    .try_for_each(|row| {
+                        self.validate_row(&table_name, &row.values, Some(row.row_id), &[])
+                    });
+                if let Err(error) = validation {
+                    self.catalog.indexes.remove(&index_name);
+                    return Err(error);
+                }
+                self.rebuild_index(&index_name, page_size)?;
+                self.bump_schema_cookie();
+                Ok(())
+            }
             AlterTableAction::AddConstraint(other) => Err(DbError::sql(format!(
-                "ALTER TABLE ADD CONSTRAINT supports only CHECK constraints in DecentDB 1.0 (received {other:?})"
+                "ALTER TABLE ADD CONSTRAINT does not support {other:?} in DecentDB 1.0"
             ))),
             AlterTableAction::DropConstraint { constraint_name } => {
-                let Some(index) = table
+                if let Some(index) = table
                     .checks
                     .iter()
                     .position(|check| check.name.as_deref() == Some(constraint_name.as_str()))
-                else {
-                    return Err(DbError::sql(format!(
-                        "unknown constraint {} on {}",
-                        constraint_name, table_name
-                    )));
-                };
-                table.checks.remove(index);
-                self.catalog.tables.insert(table_name.clone(), table);
-                self.bump_schema_cookie();
-                Ok(())
+                {
+                    table.checks.remove(index);
+                    self.catalog.tables.insert(table_name.clone(), table);
+                    self.bump_schema_cookie();
+                    return Ok(());
+                }
+
+                if let Some(index) = table.foreign_keys.iter().position(|foreign_key| {
+                    foreign_key.name.as_deref() == Some(constraint_name.as_str())
+                }) {
+                    let foreign_key = table.foreign_keys.remove(index);
+                    for column in &mut table.columns {
+                        if column.foreign_key.as_ref().is_some_and(|candidate| {
+                            candidate.name.as_deref() == Some(constraint_name.as_str())
+                        }) {
+                            column.foreign_key = None;
+                        }
+                    }
+                    let index_name = foreign_key_index_name(&table_name, &foreign_key.columns);
+                    let drop_index = !table
+                        .foreign_keys
+                        .iter()
+                        .any(|candidate| candidate.columns == foreign_key.columns);
+                    self.catalog.tables.insert(table_name.clone(), table);
+                    if drop_index {
+                        self.catalog.indexes.remove(&index_name);
+                        self.indexes.remove(&index_name);
+                    }
+                    self.bump_schema_cookie();
+                    return Ok(());
+                }
+
+                if self.catalog.indexes.values().any(|index| {
+                    identifiers_equal(&index.table_name, &table_name)
+                        && index.unique
+                        && identifiers_equal(&index.name, constraint_name)
+                }) {
+                    self.catalog.indexes.remove(constraint_name);
+                    self.indexes.remove(constraint_name);
+                    self.bump_schema_cookie();
+                    return Ok(());
+                }
+
+                Err(DbError::sql(format!(
+                    "unknown constraint {} on {}",
+                    constraint_name, table_name
+                )))
             }
             _ => Err(DbError::internal(
                 "ALTER TABLE constraint dispatch reached a non-constraint action",
@@ -1079,6 +1227,45 @@ impl EngineRuntime {
     }
 }
 
+fn collect_truncate_targets(
+    catalog: &crate::catalog::CatalogState,
+    table_name: &str,
+    cascade: bool,
+    visited: &mut std::collections::BTreeSet<String>,
+    ordered: &mut Vec<String>,
+) -> Result<()> {
+    let table_name = catalog
+        .table(table_name)
+        .map(|table| table.name.clone())
+        .ok_or_else(|| DbError::sql(format!("unknown table {}", table_name)))?;
+    if !visited.insert(table_name.clone()) {
+        return Ok(());
+    }
+    let referencing_tables = catalog
+        .tables
+        .values()
+        .filter(|child| {
+            child
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| identifiers_equal(&foreign_key.referenced_table, &table_name))
+        })
+        .map(|child| child.name.clone())
+        .collect::<Vec<_>>();
+    if !cascade && !referencing_tables.is_empty() {
+        return Err(DbError::sql(format!(
+            "cannot truncate table {} because other tables reference it: {}",
+            table_name,
+            referencing_tables.join(", ")
+        )));
+    }
+    for child in referencing_tables {
+        collect_truncate_targets(catalog, &child, true, visited, ordered)?;
+    }
+    ordered.push(table_name);
+    Ok(())
+}
+
 fn column_schema_from_definition(definition: &ColumnDefinition) -> Result<ColumnSchema> {
     if definition.generated.is_some() && definition.default.is_some() {
         return Err(DbError::sql(
@@ -1138,6 +1325,66 @@ fn map_fk_action(action: ForeignKeyActionSpec) -> ForeignKeyAction {
         ForeignKeyActionSpec::Cascade => ForeignKeyAction::Cascade,
         ForeignKeyActionSpec::SetNull => ForeignKeyAction::SetNull,
     }
+}
+
+fn foreign_key_index_name(table_name: &str, columns: &[String]) -> String {
+    format!("{}_idx", auto_index_name("fk", table_name, columns))
+}
+
+fn ensure_constraint_name_is_available(
+    runtime: &EngineRuntime,
+    table: &TableSchema,
+    table_name: &str,
+    constraint_name: &str,
+) -> Result<()> {
+    if table
+        .checks
+        .iter()
+        .any(|check| check.name.as_deref() == Some(constraint_name))
+        || table
+            .foreign_keys
+            .iter()
+            .any(|foreign_key| foreign_key.name.as_deref() == Some(constraint_name))
+        || runtime.catalog.indexes.values().any(|index| {
+            identifiers_equal(&index.table_name, table_name)
+                && identifiers_equal(&index.name, constraint_name)
+        })
+    {
+        return Err(DbError::sql(format!(
+            "constraint {} already exists on {}",
+            constraint_name, table_name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_existing_rows_with_staged_table(
+    runtime: &mut EngineRuntime,
+    table_name: &str,
+    staged_table: &TableSchema,
+) -> Result<()> {
+    let original_table = runtime
+        .catalog
+        .tables
+        .insert(table_name.to_string(), staged_table.clone());
+    let rows = runtime
+        .tables
+        .get(table_name)
+        .ok_or_else(|| DbError::internal(format!("table data for {table_name} is missing")))?
+        .rows
+        .clone();
+    let validation = rows
+        .iter()
+        .try_for_each(|row| runtime.validate_row(table_name, &row.values, Some(row.row_id), &[]));
+    if let Some(original_table) = original_table {
+        runtime
+            .catalog
+            .tables
+            .insert(table_name.to_string(), original_table);
+    } else {
+        runtime.catalog.tables.remove(table_name);
+    }
+    validation
 }
 
 fn ensure_unique_column_names(columns: &[ColumnSchema], table_name: &str) -> Result<()> {
@@ -1269,6 +1516,12 @@ fn validate_generated_expr(
         Expr::Function { args, .. } => {
             for arg in args {
                 validate_generated_expr(arg, table, generated_column_name)?;
+            }
+            Ok(())
+        }
+        Expr::Row(items) => {
+            for item in items {
+                validate_generated_expr(item, table, generated_column_name)?;
             }
             Ok(())
         }

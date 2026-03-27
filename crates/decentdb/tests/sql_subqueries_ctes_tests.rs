@@ -258,6 +258,103 @@ fn correlated_subquery_with_case_expression() {
 }
 
 #[test]
+fn values_subquery_supports_alias_column_names() {
+    let db = mem_db();
+    let result = db
+        .execute("SELECT * FROM (VALUES (1, 'one'), (2, 'two')) AS t(num, name) ORDER BY num")
+        .unwrap();
+
+    assert_eq!(result.columns(), &["num".to_string(), "name".to_string()]);
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Text("one".into())],
+            vec![Value::Int64(2), Value::Text("two".into())],
+        ]
+    );
+}
+
+#[test]
+fn values_subquery_can_join_real_tables() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE numbers(id INT64 PRIMARY KEY, label TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO numbers VALUES (1, 'uno'), (2, 'dos'), (3, 'tres')",
+    );
+
+    let result = db
+        .execute(
+            "SELECT n.id, t.name
+             FROM numbers AS n
+             JOIN (VALUES (1, 'one'), (3, 'three')) AS t(num, name)
+               ON n.id = t.num
+             ORDER BY n.id",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Text("one".into())],
+            vec![Value::Int64(3), Value::Text("three".into())],
+        ]
+    );
+}
+
+#[test]
+fn insert_select_can_read_from_values_subquery() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE target(id INT64, name TEXT)");
+    exec(
+        &db,
+        "INSERT INTO target
+         SELECT * FROM (VALUES (1, 'one'), (2, 'two')) AS src(id, name)",
+    );
+
+    let result = db
+        .execute("SELECT id, name FROM target ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Text("one".into())],
+            vec![Value::Int64(2), Value::Text("two".into())],
+        ]
+    );
+}
+
+#[test]
+fn row_value_in_values_subquery_filters_rows() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE pairs(id INT64, category TEXT)");
+    exec(
+        &db,
+        "INSERT INTO pairs VALUES (1, 'a'), (2, 'b'), (3, 'c'), (3, 'd')",
+    );
+
+    let result = db
+        .execute(
+            "SELECT id, category
+             FROM pairs
+             WHERE (id, category) IN (VALUES (1, 'a'), (3, 'c'))
+             ORDER BY id, category",
+        )
+        .unwrap();
+
+    assert_eq!(
+        rows(&result),
+        vec![
+            vec![Value::Int64(1), Value::Text("a".into())],
+            vec![Value::Int64(3), Value::Text("c".into())],
+        ]
+    );
+}
+
+#[test]
 fn lateral_subquery_can_reference_left_table() {
     let db = mem_db();
     exec(&db, "CREATE TABLE users(id INT64, name TEXT)");

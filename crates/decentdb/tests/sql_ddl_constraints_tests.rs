@@ -408,11 +408,13 @@ fn alter_table_drop_constraint_removes_check_enforcement() {
 }
 
 #[test]
-fn alter_table_add_constraint_only_supports_check() {
+fn alter_table_add_named_unique_constraint_enforces_future_writes() {
     let db = mem_db();
     exec(&db, "CREATE TABLE ac4 (id INT PRIMARY KEY, code TEXT)");
-    let err = exec_err(&db, "ALTER TABLE ac4 ADD CONSTRAINT uq_code UNIQUE (code)");
-    assert!(err.contains("supports only CHECK"), "got: {err}");
+    exec(&db, "INSERT INTO ac4 VALUES (1, 'alpha'), (2, 'beta')");
+    exec(&db, "ALTER TABLE ac4 ADD CONSTRAINT uq_code UNIQUE (code)");
+    let err = exec_err(&db, "INSERT INTO ac4 VALUES (3, 'alpha')");
+    assert!(err.contains("unique constraint"), "got: {err}");
 }
 
 #[test]
@@ -421,6 +423,262 @@ fn alter_table_drop_constraint_unknown_name() {
     exec(&db, "CREATE TABLE ac5 (id INT PRIMARY KEY, amount INT)");
     let err = exec_err(&db, "ALTER TABLE ac5 DROP CONSTRAINT nope");
     assert!(err.contains("unknown constraint"), "got: {err}");
+}
+
+#[test]
+fn alter_table_drop_named_unique_constraint_removes_enforcement() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE ac_unique_drop (id INT PRIMARY KEY, code TEXT)",
+    );
+    exec(
+        &db,
+        "ALTER TABLE ac_unique_drop ADD CONSTRAINT uq_code UNIQUE (code)",
+    );
+    exec(&db, "ALTER TABLE ac_unique_drop DROP CONSTRAINT uq_code");
+    exec(
+        &db,
+        "INSERT INTO ac_unique_drop VALUES (1, 'dup'), (2, 'dup')",
+    );
+}
+
+#[test]
+fn alter_table_add_named_foreign_key_enforces_and_applies_actions() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE parent_fk(id INT PRIMARY KEY)");
+    exec(
+        &db,
+        "CREATE TABLE child_fk(id INT PRIMARY KEY, parent_id INT)",
+    );
+    exec(&db, "INSERT INTO parent_fk VALUES (1), (2)");
+    exec(&db, "INSERT INTO child_fk VALUES (10, 1), (20, 2)");
+    exec(
+        &db,
+        "ALTER TABLE child_fk
+         ADD CONSTRAINT fk_child_parent
+         FOREIGN KEY (parent_id) REFERENCES parent_fk(id)
+         ON DELETE CASCADE
+         ON UPDATE CASCADE",
+    );
+
+    let err = exec_err(&db, "INSERT INTO child_fk VALUES (30, 999)");
+    assert!(err.to_lowercase().contains("foreign key"), "got: {err}");
+
+    exec(&db, "DELETE FROM parent_fk WHERE id = 1");
+    let after_delete = exec(&db, "SELECT id, parent_id FROM child_fk ORDER BY id");
+    assert_eq!(
+        rows(&after_delete),
+        vec![vec![Value::Int64(20), Value::Int64(2)]]
+    );
+
+    exec(&db, "UPDATE parent_fk SET id = 200 WHERE id = 2");
+    let after_update = exec(&db, "SELECT parent_id FROM child_fk");
+    assert_eq!(rows(&after_update), vec![vec![Value::Int64(200)]]);
+}
+
+#[test]
+fn alter_table_add_foreign_key_rejects_invalid_existing_rows() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE parent_fk_bad(id INT PRIMARY KEY)");
+    exec(
+        &db,
+        "CREATE TABLE child_fk_bad(id INT PRIMARY KEY, parent_id INT)",
+    );
+    exec(&db, "INSERT INTO parent_fk_bad VALUES (1)");
+    exec(&db, "INSERT INTO child_fk_bad VALUES (10, 1), (20, 999)");
+
+    let err = exec_err(
+        &db,
+        "ALTER TABLE child_fk_bad
+         ADD CONSTRAINT fk_child_parent_bad
+         FOREIGN KEY (parent_id) REFERENCES parent_fk_bad(id)",
+    );
+    assert!(err.to_lowercase().contains("foreign key"), "got: {err}");
+}
+
+#[test]
+fn alter_table_drop_named_foreign_key_removes_enforcement() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE parent_fk_drop(id INT PRIMARY KEY)");
+    exec(
+        &db,
+        "CREATE TABLE child_fk_drop(id INT PRIMARY KEY, parent_id INT)",
+    );
+    exec(&db, "INSERT INTO parent_fk_drop VALUES (1)");
+    exec(
+        &db,
+        "ALTER TABLE child_fk_drop
+         ADD CONSTRAINT fk_child_parent_drop
+         FOREIGN KEY (parent_id) REFERENCES parent_fk_drop(id)",
+    );
+    exec(
+        &db,
+        "ALTER TABLE child_fk_drop DROP CONSTRAINT fk_child_parent_drop",
+    );
+    exec(&db, "INSERT INTO child_fk_drop VALUES (1, 999)");
+}
+
+#[test]
+fn alter_table_added_foreign_key_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("alter-table-add-fk.ddb");
+
+    {
+        let db = Db::open_or_create(&path, DbConfig::default()).unwrap();
+        exec(&db, "CREATE TABLE parent_fk_persist(id INT PRIMARY KEY)");
+        exec(
+            &db,
+            "CREATE TABLE child_fk_persist(id INT PRIMARY KEY, parent_id INT)",
+        );
+        exec(&db, "INSERT INTO parent_fk_persist VALUES (1)");
+        exec(&db, "INSERT INTO child_fk_persist VALUES (10, 1)");
+        exec(
+            &db,
+            "ALTER TABLE child_fk_persist
+             ADD CONSTRAINT fk_child_parent_persist
+             FOREIGN KEY (parent_id) REFERENCES parent_fk_persist(id)
+             ON DELETE CASCADE",
+        );
+        db.checkpoint().unwrap();
+    }
+
+    let reopened = Db::open_or_create(&path, DbConfig::default()).unwrap();
+    let err = exec_err(&reopened, "INSERT INTO child_fk_persist VALUES (20, 999)");
+    assert!(err.to_lowercase().contains("foreign key"), "got: {err}");
+
+    exec(&reopened, "DELETE FROM parent_fk_persist WHERE id = 1");
+    let remaining = exec(&reopened, "SELECT COUNT(*) FROM child_fk_persist");
+    assert_eq!(rows(&remaining), vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn truncate_table_basic_clears_rows() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE truncate_basic(id INT PRIMARY KEY, name TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO truncate_basic(name) VALUES ('alpha'), ('beta'), ('gamma')",
+    );
+    exec(&db, "TRUNCATE TABLE truncate_basic");
+
+    let count = exec(&db, "SELECT COUNT(*) FROM truncate_basic");
+    assert_eq!(rows(&count), vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn truncate_table_continue_identity_preserves_progress() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE truncate_continue(id INT PRIMARY KEY, name TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO truncate_continue(name) VALUES ('alpha'), ('beta')",
+    );
+    exec(&db, "TRUNCATE TABLE truncate_continue CONTINUE IDENTITY");
+    exec(&db, "INSERT INTO truncate_continue(name) VALUES ('gamma')");
+
+    let result = exec(&db, "SELECT id FROM truncate_continue");
+    assert_eq!(rows(&result), vec![vec![Value::Int64(3)]]);
+}
+
+#[test]
+fn truncate_table_restart_identity_resets_progress() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE truncate_restart(id INT PRIMARY KEY, name TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO truncate_restart(name) VALUES ('alpha'), ('beta')",
+    );
+    exec(&db, "TRUNCATE TABLE truncate_restart RESTART IDENTITY");
+    exec(&db, "INSERT INTO truncate_restart(name) VALUES ('gamma')");
+
+    let result = exec(&db, "SELECT id FROM truncate_restart");
+    assert_eq!(rows(&result), vec![vec![Value::Int64(1)]]);
+}
+
+#[test]
+fn truncate_table_rolls_back_with_transaction() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE truncate_txn(id INT PRIMARY KEY, name TEXT)",
+    );
+    exec(
+        &db,
+        "INSERT INTO truncate_txn(name) VALUES ('alpha'), ('beta')",
+    );
+    exec(&db, "BEGIN");
+    exec(&db, "TRUNCATE TABLE truncate_txn");
+    exec(&db, "ROLLBACK");
+
+    let count = exec(&db, "SELECT COUNT(*) FROM truncate_txn");
+    assert_eq!(rows(&count), vec![vec![Value::Int64(2)]]);
+}
+
+#[test]
+fn truncate_table_without_cascade_rejects_referenced_tables() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE truncate_parent(id INT PRIMARY KEY)");
+    exec(
+        &db,
+        "CREATE TABLE truncate_child(id INT PRIMARY KEY, parent_id INT REFERENCES truncate_parent(id))",
+    );
+
+    let err = exec_err(&db, "TRUNCATE TABLE truncate_parent");
+    assert!(err.to_lowercase().contains("reference"), "got: {err}");
+}
+
+#[test]
+fn truncate_table_with_cascade_clears_referencing_tables() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE truncate_parent_cascade(id INT PRIMARY KEY)",
+    );
+    exec(
+        &db,
+        "CREATE TABLE truncate_child_cascade(id INT PRIMARY KEY, parent_id INT REFERENCES truncate_parent_cascade(id))",
+    );
+    exec(&db, "INSERT INTO truncate_parent_cascade VALUES (1), (2)");
+    exec(
+        &db,
+        "INSERT INTO truncate_child_cascade VALUES (10, 1), (20, 2)",
+    );
+    exec(&db, "TRUNCATE TABLE truncate_parent_cascade CASCADE");
+
+    let parent_count = exec(&db, "SELECT COUNT(*) FROM truncate_parent_cascade");
+    let child_count = exec(&db, "SELECT COUNT(*) FROM truncate_child_cascade");
+    assert_eq!(rows(&parent_count), vec![vec![Value::Int64(0)]]);
+    assert_eq!(rows(&child_count), vec![vec![Value::Int64(0)]]);
+}
+
+#[test]
+fn truncate_table_rejects_views_and_temp_tables() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE truncate_source(id INT PRIMARY KEY)");
+    exec(
+        &db,
+        "CREATE VIEW truncate_view AS SELECT * FROM truncate_source",
+    );
+    exec(&db, "CREATE TEMP TABLE truncate_temp(id INT PRIMARY KEY)");
+
+    let view_err = exec_err(&db, "TRUNCATE TABLE truncate_view");
+    assert!(view_err.to_lowercase().contains("view"), "got: {view_err}");
+
+    let temp_err = exec_err(&db, "TRUNCATE TABLE truncate_temp");
+    assert!(
+        temp_err.to_lowercase().contains("temporary"),
+        "got: {temp_err}"
+    );
 }
 
 #[test]

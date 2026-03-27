@@ -14,7 +14,8 @@ use super::ast::{
     ForeignKeyActionSpec, ForeignKeyDefinition, FromItem, IndexExpression, InsertSource,
     InsertStatement, JoinConstraint, JoinKind, OrderBy, Query, QueryBody, Select, SelectItem,
     SetOperation, Statement, SubqueryQuantifier, TableConstraint, TriggerEventSpec,
-    TriggerKindSpec, UnaryOp, UpdateStatement, WindowFrame, WindowFrameBound, WindowFrameUnit,
+    TriggerKindSpec, TruncateIdentityMode, UnaryOp, UpdateStatement, WindowFrame, WindowFrameBound,
+    WindowFrameUnit,
 };
 
 pub(crate) fn normalize_statement_text(sql: &str) -> Result<Statement> {
@@ -77,6 +78,7 @@ fn normalize_statement_with_generated_modes(
                 actions,
             })
         }
+        NodeEnum::TruncateStmt(statement) => normalize_truncate(statement),
         NodeEnum::CreateTrigStmt(statement) => Ok(Statement::CreateTrigger(
             normalize_create_trigger(statement, original_sql)?,
         )),
@@ -85,6 +87,38 @@ fn normalize_statement_with_generated_modes(
             describe_node(other)
         ))),
     }
+}
+
+fn normalize_truncate(statement: &protobuf::TruncateStmt) -> Result<Statement> {
+    if statement.relations.len() != 1 {
+        return Err(unsupported(
+            "TRUNCATE TABLE supports exactly one target table in DecentDB 1.0",
+        ));
+    }
+    let relation = statement
+        .relations
+        .first()
+        .ok_or_else(|| unsupported("TRUNCATE TABLE is missing its target relation"))?;
+    let table_name = match node_kind(relation)? {
+        NodeEnum::RangeVar(range) => normalize_range_var(range)?,
+        other => {
+            return Err(unsupported(format!(
+                "TRUNCATE target {} is not supported",
+                describe_node(other)
+            )))
+        }
+    };
+    let behavior = protobuf::DropBehavior::try_from(statement.behavior)
+        .unwrap_or(protobuf::DropBehavior::DropRestrict);
+    Ok(Statement::TruncateTable {
+        table_name,
+        identity: if statement.restart_seqs {
+            TruncateIdentityMode::Restart
+        } else {
+            TruncateIdentityMode::Continue
+        },
+        cascade: matches!(behavior, protobuf::DropBehavior::DropCascade),
+    })
 }
 
 fn normalize_query(statement: &protobuf::SelectStmt) -> Result<Query> {
@@ -1098,6 +1132,7 @@ fn normalize_from_item(node: &protobuf::Node) -> Result<FromItem> {
                 .as_ref()
                 .map(|alias| alias.aliasname.clone())
                 .ok_or_else(|| unsupported("subqueries in FROM require an alias"))?,
+            column_names: normalize_alias_column_names(range.alias.as_ref())?,
             lateral: range.lateral,
         }),
         NodeEnum::RangeFunction(range) => normalize_range_function(range),
@@ -1271,6 +1306,12 @@ fn normalize_expr_node(node: &protobuf::Node) -> Result<Expr> {
         NodeEnum::FuncCall(call) => normalize_function_call(call),
         NodeEnum::TypeCast(cast) => normalize_type_cast(cast),
         NodeEnum::CaseExpr(case) => normalize_case_expr(case),
+        NodeEnum::RowExpr(row) => Ok(Expr::Row(
+            row.args
+                .iter()
+                .map(normalize_expr_container)
+                .collect::<Result<Vec<_>>>()?,
+        )),
         NodeEnum::NullTest(test) => Ok(Expr::IsNull {
             expr: Box::new(normalize_expr_node(
                 test.arg
@@ -1519,27 +1560,34 @@ fn normalize_aexpr(expr: &protobuf::AExpr) -> Result<Expr> {
                 .rexpr
                 .as_deref()
                 .ok_or_else(|| unsupported("IN is missing its right-hand values"))?;
-            let items = match node_kind(row)? {
-                NodeEnum::List(list) => list
-                    .items
-                    .iter()
-                    .map(normalize_expr_container)
-                    .collect::<Result<Vec<_>>>()?,
-                _ => return Err(unsupported("IN only supports explicit value lists")),
-            };
             let negated = match expr.name.first().and_then(|node| node_kind(node).ok()) {
                 Some(NodeEnum::String(s)) => s.sval == "<>",
                 _ => false,
             };
-            Ok(Expr::InList {
-                expr: Box::new(normalize_expr_node(
-                    expr.lexpr
-                        .as_deref()
-                        .ok_or_else(|| unsupported("IN is missing its left operand"))?,
-                )?),
-                items,
-                negated,
-            })
+            let left = Box::new(normalize_expr_node(
+                expr.lexpr
+                    .as_deref()
+                    .ok_or_else(|| unsupported("IN is missing its left operand"))?,
+            )?);
+            match node_kind(row)? {
+                NodeEnum::List(list) => Ok(Expr::InList {
+                    expr: left,
+                    items: list
+                        .items
+                        .iter()
+                        .map(normalize_expr_container)
+                        .collect::<Result<Vec<_>>>()?,
+                    negated,
+                }),
+                NodeEnum::SelectStmt(select) => Ok(Expr::InSubquery {
+                    expr: left,
+                    query: Box::new(normalize_query(select)?),
+                    negated,
+                }),
+                _ => Err(unsupported(
+                    "IN only supports explicit value lists or subquery expressions",
+                )),
+            }
         }
         protobuf::AExprKind::AexprLike | protobuf::AExprKind::AexprIlike => {
             let (pattern, escape) = normalize_like_pattern(
@@ -2161,6 +2209,19 @@ fn normalize_object_name_list(node: &protobuf::Node) -> Result<Vec<String>> {
 
 fn normalize_operator_name(nodes: &[protobuf::Node]) -> Result<String> {
     normalize_qualified_name(nodes)
+}
+
+fn normalize_alias_column_names(alias: Option<&protobuf::Alias>) -> Result<Vec<String>> {
+    alias
+        .map(|alias| {
+            alias
+                .colnames
+                .iter()
+                .map(normalize_string_node)
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 fn normalize_with_clause(clause: Option<&protobuf::WithClause>) -> Result<Vec<CommonTableExpr>> {
