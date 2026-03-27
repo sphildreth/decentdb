@@ -627,6 +627,27 @@ fn prepared_delete_with_params() {
 }
 
 #[test]
+fn prepared_delete_uses_indexed_filter() {
+    let db = mem_db();
+    exec(
+        &db,
+        "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, label TEXT)",
+    );
+    exec(&db, "CREATE INDEX idx_child_parent_id ON child(parent_id)");
+    exec(
+        &db,
+        "INSERT INTO child VALUES (1, 10, 'a'), (2, 10, 'b'), (3, 20, 'c')",
+    );
+    let stmt = db
+        .prepare("DELETE FROM child WHERE parent_id = $1")
+        .unwrap();
+    stmt.execute(&[Value::Int64(10)]).unwrap();
+    let result = exec(&db, "SELECT id FROM child ORDER BY id");
+    let rows = rows(&result);
+    assert_eq!(rows, vec![vec![Value::Int64(3)]]);
+}
+
+#[test]
 fn prepared_insert_and_query() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, val TEXT)").unwrap();
@@ -954,6 +975,30 @@ fn prepared_update_statement() {
     stmt.execute(&[Value::Int64(999), Value::Int64(1)]).unwrap();
     let r = exec(&db, "SELECT val FROM pu WHERE id = 1");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(999));
+}
+
+#[test]
+fn prepared_update_statement_reuses_in_explicit_transaction() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE users (id INT PRIMARY KEY, email TEXT)");
+    exec(
+        &db,
+        "INSERT INTO users VALUES (1, 'a@example.com'), (2, 'b@example.com')",
+    );
+    exec(&db, "BEGIN");
+    let stmt = db
+        .prepare("UPDATE users SET email = $1 WHERE id = $2")
+        .unwrap();
+    stmt.execute(&[Value::Text("first@example.com".into()), Value::Int64(1)])
+        .unwrap();
+    stmt.execute(&[Value::Text("second@example.com".into()), Value::Int64(2)])
+        .unwrap();
+    exec(&db, "COMMIT");
+
+    let result = exec(&db, "SELECT email FROM users ORDER BY id");
+    let rows = rows(&result);
+    assert_eq!(rows[0][0], Value::Text("first@example.com".into()));
+    assert_eq!(rows[1][0], Value::Text("second@example.com".into()));
 }
 
 #[test]

@@ -14,7 +14,9 @@ use crate::catalog::{
 };
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
-use crate::exec::dml::{PreparedInsertValueSource, PreparedSimpleInsert};
+use crate::exec::dml::{
+    PreparedInsertValueSource, PreparedSimpleDelete, PreparedSimpleInsert, PreparedSimpleUpdate,
+};
 use crate::exec::{
     statement_is_read_only, BulkLoadOptions, EngineRuntime, QueryResult, QueryRow, RuntimeIndex,
     TableData,
@@ -52,6 +54,8 @@ pub struct PreparedStatement {
     temp_schema_cookie: u32,
     statement: Arc<SqlStatement>,
     prepared_insert: Option<Arc<PreparedSimpleInsert>>,
+    prepared_update: Option<Arc<PreparedSimpleUpdate>>,
+    prepared_delete: Option<Arc<PreparedSimpleDelete>>,
     read_only: bool,
     in_state_without_clone: bool,
 }
@@ -1766,6 +1770,24 @@ impl Db {
                 return Ok(result);
             }
         }
+        if let Some(prepared_update) = prepared.prepared_update.as_deref() {
+            if let Some(result) = self.try_execute_autocommit_prepared_update_in_place(
+                prepared,
+                prepared_update,
+                params,
+            )? {
+                return Ok(result);
+            }
+        }
+        if let Some(prepared_delete) = prepared.prepared_delete.as_deref() {
+            if let Some(result) = self.try_execute_autocommit_prepared_delete_in_place(
+                prepared,
+                prepared_delete,
+                params,
+            )? {
+                return Ok(result);
+            }
+        }
         {
             let runtime = self
                 .inner
@@ -1945,6 +1967,110 @@ impl Db {
         Ok(Some(result))
     }
 
+    fn try_execute_autocommit_prepared_update_in_place(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_update: &PreparedSimpleUpdate,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_update(prepared_update) {
+            return Ok(None);
+        }
+        let result = match runtime.execute_prepared_simple_update(prepared_update, params) {
+            Ok(result) => result,
+            Err(error) => {
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        self.begin_write()?;
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(runtime.catalog.clone())?;
+        }
+        self.sync_temp_state_from_runtime(&runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(Some(result))
+    }
+
+    fn try_execute_autocommit_prepared_delete_in_place(
+        &self,
+        prepared_statement: &PreparedStatement,
+        prepared_delete: &PreparedSimpleDelete,
+        params: &[Value],
+    ) -> Result<Option<QueryResult>> {
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        self.validate_prepared_schema_cookie(
+            prepared_statement,
+            runtime.catalog.schema_cookie,
+            runtime.temp_schema_cookie,
+        )?;
+        if !runtime.can_reuse_prepared_simple_delete(prepared_delete) {
+            return Ok(None);
+        }
+        let result = match runtime.execute_prepared_simple_delete(prepared_delete, params) {
+            Ok(result) => result,
+            Err(error) => {
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        self.begin_write()?;
+        if let Err(error) = runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        let runtime_schema_cookie = runtime.catalog.schema_cookie;
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(runtime.catalog.clone())?;
+        }
+        self.sync_temp_state_from_runtime(&runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(Some(result))
+    }
+
     fn execute_autocommit_in_place<F>(&self, apply: F) -> Result<QueryResult>
     where
         F: FnOnce(&mut EngineRuntime) -> Result<QueryResult>,
@@ -2075,11 +2201,23 @@ impl Db {
         let prepared_sql = prepared_statement_sql(sql)?;
         let statement = self.parsed_statement(&prepared_sql)?;
         let read_only = statement_is_read_only(statement.as_ref());
-        let prepared_insert = match statement.as_ref() {
-            SqlStatement::Insert(insert) => {
-                self.prepared_simple_insert(&prepared_sql, insert, runtime)?
-            }
-            _ => None,
+        let (prepared_insert, prepared_update, prepared_delete) = match statement.as_ref() {
+            SqlStatement::Insert(insert) => (
+                self.prepared_simple_insert(&prepared_sql, insert, runtime)?,
+                None,
+                None,
+            ),
+            SqlStatement::Update(update) => (
+                None,
+                runtime.prepare_simple_update(update)?.map(Arc::new),
+                None,
+            ),
+            SqlStatement::Delete(delete) => (
+                None,
+                None,
+                runtime.prepare_simple_delete(delete)?.map(Arc::new),
+            ),
+            _ => (None, None, None),
         };
         Ok(PreparedStatement {
             db: self.clone(),
@@ -2087,6 +2225,8 @@ impl Db {
             temp_schema_cookie: runtime.temp_schema_cookie,
             statement: Arc::clone(&statement),
             prepared_insert,
+            prepared_update,
+            prepared_delete,
             read_only,
             in_state_without_clone: !read_only
                 && runtime.can_execute_statement_in_state_without_clone(statement.as_ref()),
@@ -2328,6 +2468,28 @@ impl Db {
                 state
                     .runtime
                     .execute_prepared_simple_insert(prepared_insert, params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+        if let Some(prepared_update) = prepared
+            .prepared_update
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_update(plan))
+        {
+            let result = state
+                .runtime
+                .execute_prepared_simple_update(prepared_update, params)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+        if let Some(prepared_delete) = prepared
+            .prepared_delete
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_delete(plan))
+        {
+            let result = state
+                .runtime
+                .execute_prepared_simple_delete(prepared_delete, params)?;
             state.persistent_changed |= !temp_only;
             return Ok(result);
         }
