@@ -12,86 +12,121 @@ from sqlalchemy.sql import compiler
 
 # Type implementations
 
+
 class _DecentDate(sqltypes.Date):
     def bind_processor(self, dialect):
         def process(value):
             if value is None:
                 return None
-            # Days since epoch
-            return (value - datetime.date(1970, 1, 1)).days
+            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+            dt = datetime.datetime(
+                value.year, value.month, value.day, tzinfo=datetime.timezone.utc
+            )
+            return int((dt - epoch).total_seconds() * 1_000_000)
+
         return process
 
     def result_processor(self, dialect, coltype):
         def process(value):
             if value is None:
                 return None
-            return datetime.date(1970, 1, 1) + datetime.timedelta(days=value)
+            if isinstance(value, datetime.datetime):
+                return value.date()
+            if isinstance(value, datetime.date):
+                return value
+            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+            dt = epoch + datetime.timedelta(microseconds=int(value))
+            return dt.date()
+
         return process
+
 
 class _DecentDateTime(sqltypes.DateTime):
     def bind_processor(self, dialect):
         def process(value):
             if value is None:
                 return None
-            # Epoch ms (INT64)
-            # Ensure UTC if aware? Requirement says "UTC epoch ms".
-            # If naive, assume UTC or local? Usually generic types assume naive is local or matches db.
-            # Best practice: if naive, treat as UTC.
             if value.tzinfo:
                 value = value.astimezone(datetime.timezone.utc)
             else:
                 value = value.replace(tzinfo=datetime.timezone.utc)
-            return int(value.timestamp() * 1000)
+            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+            return int((value - epoch).total_seconds() * 1_000_000)
+
         return process
 
     def result_processor(self, dialect, coltype):
         def process(value):
             if value is None:
                 return None
-            # Return naive UTC datetime or aware?
-            # SQLAlchemy DateTime(timezone=True) expects aware.
-            # Default is naive.
-            dt = datetime.datetime.fromtimestamp(value / 1000.0, tz=datetime.timezone.utc)
+            if isinstance(value, datetime.datetime):
+                if self.timezone:
+                    if value.tzinfo is None:
+                        return value.replace(tzinfo=datetime.timezone.utc)
+                    return value
+                return value.replace(tzinfo=None)
+            epoch = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+            dt = epoch + datetime.timedelta(microseconds=int(value))
             if self.timezone:
                 return dt
             return dt.replace(tzinfo=None)
+
         return process
+
 
 class _DecentTime(sqltypes.Time):
     def bind_processor(self, dialect):
         def process(value):
             if value is None:
                 return None
-            # Ms since midnight
-            return (value.hour * 3600 + value.minute * 60 + value.second) * 1000 + value.microsecond // 1000
+            return (
+                value.hour * 3_600_000_000
+                + value.minute * 60_000_000
+                + value.second * 1_000_000
+                + value.microsecond
+            )
+
         return process
 
     def result_processor(self, dialect, coltype):
         def process(value):
             if value is None:
                 return None
-            total_seconds = value // 1000
-            microsecond = (value % 1000) * 1000
+            if isinstance(value, datetime.time):
+                return value
+            if isinstance(value, datetime.datetime):
+                return value.time()
+            total_seconds = int(value) // 1_000_000
+            microsecond = int(value) % 1_000_000
             second = total_seconds % 60
             minute = (total_seconds // 60) % 60
-            hour = (total_seconds // 3600)
+            hour = total_seconds // 3600
             return datetime.time(hour, minute, second, microsecond)
+
         return process
+
 
 class _DecentNumeric(sqltypes.Numeric):
     def bind_processor(self, dialect):
         def process(value):
             if value is None:
                 return None
-            return str(value)
+            if isinstance(value, decimal.Decimal):
+                return value
+            return decimal.Decimal(str(value))
+
         return process
 
     def result_processor(self, dialect, coltype):
         def process(value):
             if value is None:
                 return None
+            if isinstance(value, decimal.Decimal):
+                return value
             return decimal.Decimal(value)
+
         return process
+
 
 class _DecentUUID(sqltypes.Uuid):
     def bind_processor(self, dialect):
@@ -99,25 +134,35 @@ class _DecentUUID(sqltypes.Uuid):
             if value is None:
                 return None
             if isinstance(value, uuid.UUID):
-                return value.bytes
-            # Handle string input?
-            if isinstance(value, str):
-                return uuid.UUID(value).bytes
-            if isinstance(value, bytes):
                 return value
+            if isinstance(value, str):
+                return uuid.UUID(value)
+            if isinstance(value, bytes):
+                return uuid.UUID(bytes=value)
             return None
+
         return process
 
     def result_processor(self, dialect, coltype):
         def process(value):
             if value is None:
                 return None
-            return uuid.UUID(bytes=value)
+            if isinstance(value, uuid.UUID):
+                return value
+            if isinstance(value, bytes) and len(value) == 16:
+                return uuid.UUID(bytes=value)
+            if isinstance(value, str):
+                return uuid.UUID(value)
+            return value
+
         return process
+
 
 class DecentDBCompiler(compiler.SQLCompiler):
     def visit_mod_binary(self, binary, operator, **kw):
-        return self.process(binary.left, **kw) + " % " + self.process(binary.right, **kw)
+        return (
+            self.process(binary.left, **kw) + " % " + self.process(binary.right, **kw)
+        )
 
     def limit_clause(self, select, **kw):
         text = ""
@@ -137,6 +182,7 @@ class DecentDBCompiler(compiler.SQLCompiler):
         # DecentDB MVP does not support RETURNING.
         raise exc.CompileError("DecentDB does not support RETURNING")
 
+
 class DecentDBDDLCompiler(compiler.DDLCompiler):
     def visit_foreign_key_constraint(self, constraint, **kw):
         # DecentDB does not support table-level FOREIGN KEY constraints.
@@ -144,13 +190,16 @@ class DecentDBDDLCompiler(compiler.DDLCompiler):
         return None
 
     def get_column_specification(self, column, **kw):
-        colspec = self.preparer.format_column(column) + " " + \
-            self.dialect.type_compiler.process(column.type, type_expression=column)
-            
+        colspec = (
+            self.preparer.format_column(column)
+            + " "
+            + self.dialect.type_compiler.process(column.type, type_expression=column)
+        )
+
         if column.nullable is not None:
             if not column.nullable:
                 colspec += " NOT NULL"
-        
+
         # Add foreign keys inline
         if column.foreign_keys:
             # Pick the first one
@@ -159,13 +208,14 @@ class DecentDBDDLCompiler(compiler.DDLCompiler):
                 remote_table = self.preparer.format_table(fk.column.table)
                 remote_col = self.preparer.format_column(fk.column)
                 colspec += f" REFERENCES {remote_table} ({remote_col})"
-        
+
         return colspec
-        
+
     def visit_create_table(self, create, **kw):
         # We assume PRIMARY KEY is handled by default visit_create_table (table-level)
         # unless DecentDB forbids that too. The error only mentioned FKs.
         return super().visit_create_table(create, **kw)
+
 
 class DecentDBTypeCompiler(compiler.GenericTypeCompiler):
     def visit_integer(self, type_, **kw):
@@ -182,10 +232,12 @@ class DecentDBTypeCompiler(compiler.GenericTypeCompiler):
 
     def visit_float(self, type_, **kw):
         return "FLOAT64"
-    
+
     def visit_numeric(self, type_, **kw):
-        # DecentDB stores Decimal as TEXT per requirements
-        return "TEXT"
+        if type_.precision is not None:
+            scale = type_.scale or 0
+            return f"DECIMAL({type_.precision},{scale})"
+        return "DECIMAL"
 
     def visit_string(self, type_, **kw):
         return "TEXT"
@@ -195,31 +247,32 @@ class DecentDBTypeCompiler(compiler.GenericTypeCompiler):
 
     def visit_large_binary(self, type_, **kw):
         return "BLOB"
-        
+
     def visit_date(self, type_, **kw):
-        return "INT64"
+        return "TIMESTAMP"
 
     def visit_datetime(self, type_, **kw):
-        return "INT64"
+        return "TIMESTAMP"
 
     def visit_time(self, type_, **kw):
-        return "INT64"
-        
+        return "TIMESTAMP"
+
     def visit_uuid(self, type_, **kw):
-        return "BLOB"
+        return "UUID"
+
 
 class DecentDBDialect(default.DefaultDialect):
     name = "decentdb"
     driver = "pysql"
     supports_alter = False
-    supports_pk_autoincrement = False # Use explicit IDs or nextval logic if available?
+    supports_pk_autoincrement = False  # Use explicit IDs or nextval logic if available?
     # DecentDB doesn't have an AUTOINCREMENT keyword in CREATE TABLE yet.
     # Column parsing does not expose an AUTOINCREMENT flag.
     # But it has `nextRowId` in TableMeta.
     # Insert logic might handle it?
     # "MVP: SELECT/INSERT/UPDATE/DELETE"
     # User likely needs to provide ID or we rely on engine.
-    
+
     supports_default_values = False
     supports_empty_insert = False
     supports_unicode_statements = True
@@ -229,9 +282,9 @@ class DecentDBDialect(default.DefaultDialect):
 
     # Prevent SQLAlchemy from emitting implicit RETURNING.
     implicit_returning = False
-    
+
     default_paramstyle = "qmark"
-    
+
     colspecs = {
         sqltypes.Date: _DecentDate,
         sqltypes.DateTime: _DecentDateTime,
@@ -246,7 +299,7 @@ class DecentDBDialect(default.DefaultDialect):
     statement_compiler = DecentDBCompiler
     ddl_compiler = DecentDBDDLCompiler
     type_compiler = DecentDBTypeCompiler
-    
+
     def __init__(self, **kwargs):
         default.DefaultDialect.__init__(self, **kwargs)
 
@@ -258,13 +311,13 @@ class DecentDBDialect(default.DefaultDialect):
         # url is decentdb+pysql:////path/to.db
         # path is url.database
         # query options
-        
-        opts = dict(url.query) # Convert to mutable dict
+
+        opts = dict(url.query)  # Convert to mutable dict
         path = url.database
-        
+
         if path is None:
-             path = ":memory:" # Does DecentDB support in-memory? Maybe not.
-        
+            path = ":memory:"  # Does DecentDB support in-memory? Maybe not.
+
         return ([path], opts)
 
     def do_rollback(self, dbapi_connection):
@@ -275,13 +328,15 @@ class DecentDBDialect(default.DefaultDialect):
 
     def do_close(self, dbapi_connection):
         dbapi_connection.close()
-        
+
     def get_isolation_level(self, dbapi_connection):
         return "SNAPSHOT"
 
     def set_isolation_level(self, dbapi_connection, level):
         if level != "SNAPSHOT":
-            raise exc.ArgumentError(f"Invalid isolation level: {level}. DecentDB only supports SNAPSHOT.")
+            raise exc.ArgumentError(
+                f"Invalid isolation level: {level}. DecentDB only supports SNAPSHOT."
+            )
 
     def _unwrap_dbapi_connection(self, connection):
         # SQLAlchemy passes a Connection proxy; unwrap to the underlying DB-API connection.
@@ -319,16 +374,22 @@ class DecentDBDialect(default.DefaultDialect):
         def map_type(t):
             # Keep mapping conservative; aligns with DecentDB storage types.
             t = (t or "").upper()
-            if t == "INT64":
+            if t == "INT64" or t == "INTEGER":
                 return sqltypes.BigInteger()
-            if t == "BOOL":
+            if t == "BOOL" or t == "BOOLEAN":
                 return sqltypes.Boolean()
-            if t == "FLOAT64":
+            if t == "FLOAT64" or t == "REAL":
                 return sqltypes.Float()
             if t == "TEXT":
                 return sqltypes.Text()
             if t == "BLOB":
                 return sqltypes.LargeBinary()
+            if t.startswith("DECIMAL"):
+                return sqltypes.Numeric()
+            if t == "UUID":
+                return sqltypes.Uuid()
+            if t == "TIMESTAMP" or t == "TIMESTAMP_MICROS":
+                return sqltypes.DateTime()
             return sqltypes.NULLTYPE
 
         out = []
@@ -343,3 +404,21 @@ class DecentDBDialect(default.DefaultDialect):
                 }
             )
         return out
+
+    def get_unique_constraints(self, connection, table_name, schema=None, **kw):
+        return []
+
+    def get_check_constraints(self, connection, table_name, schema=None, **kw):
+        return []
+
+    def get_view_names(self, connection, schema=None, **kw):
+        dbapi_conn = self._unwrap_dbapi_connection(connection)
+        if not hasattr(dbapi_conn, "list_views"):
+            return []
+        return list(dbapi_conn.list_views())
+
+    def get_view_definition(self, connection, view_name, schema=None, **kw):
+        dbapi_conn = self._unwrap_dbapi_connection(connection)
+        if not hasattr(dbapi_conn, "get_view_ddl"):
+            return None
+        return dbapi_conn.get_view_ddl(view_name)

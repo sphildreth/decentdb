@@ -157,12 +157,17 @@ def load_library():
     lib_path = resolve_library_path()
 
     try:
-        if _preloaded_lib is not None and getattr(_preloaded_lib, "_name", None) == lib_path:
+        if (
+            _preloaded_lib is not None
+            and getattr(_preloaded_lib, "_name", None) == lib_path
+        ):
             _lib = _preloaded_lib
         else:
             _lib = ctypes.CDLL(lib_path)
     except OSError as exc:
-        raise RuntimeError(f"Failed to load decentdb native library at {lib_path}: {exc}")
+        raise RuntimeError(
+            f"Failed to load decentdb native library at {lib_path}: {exc}"
+        )
 
     _lib.ddb_last_error_message.argtypes = []
     _lib.ddb_last_error_message.restype = c_char_p
@@ -180,7 +185,13 @@ def load_library():
     _lib.ddb_db_free.restype = c_uint32
     _lib.ddb_db_prepare.argtypes = [c_void_p, c_char_p, POINTER(c_void_p)]
     _lib.ddb_db_prepare.restype = c_uint32
-    _lib.ddb_db_execute.argtypes = [c_void_p, c_char_p, ctypes.c_void_p, c_size_t, POINTER(c_void_p)]
+    _lib.ddb_db_execute.argtypes = [
+        c_void_p,
+        c_char_p,
+        ctypes.c_void_p,
+        c_size_t,
+        POINTER(c_void_p),
+    ]
     _lib.ddb_db_execute.restype = c_uint32
     _lib.ddb_result_free.argtypes = [POINTER(c_void_p)]
     _lib.ddb_result_free.restype = c_uint32
@@ -225,6 +236,19 @@ def load_library():
             POINTER(c_uint8),
         ]
         _lib.ddb_stmt_bind_int64_step_row_view.restype = c_uint32
+    if hasattr(_lib, "ddb_stmt_bind_int64_step_i64_text_f64"):
+        _lib.ddb_stmt_bind_int64_step_i64_text_f64.argtypes = [
+            c_void_p,
+            c_size_t,
+            c_int64,
+            POINTER(c_int64),
+            POINTER(c_char_p),
+            POINTER(c_size_t),
+            POINTER(c_double),
+            POINTER(c_size_t),
+            POINTER(c_uint8),
+        ]
+        _lib.ddb_stmt_bind_int64_step_i64_text_f64.restype = c_uint32
     _lib.ddb_stmt_bind_float64.argtypes = [c_void_p, c_size_t, c_double]
     _lib.ddb_stmt_bind_float64.restype = c_uint32
     _lib.ddb_stmt_bind_bool.argtypes = [c_void_p, c_size_t, c_uint8]
@@ -256,6 +280,14 @@ def load_library():
             POINTER(c_uint64),
         ]
         _lib.ddb_stmt_execute_batch_i64_text_f64.restype = c_uint32
+    if hasattr(_lib, "ddb_stmt_execute_batch_typed"):
+        _lib.ddb_stmt_execute_batch_typed.argtypes = [
+            c_void_p,
+            c_char_p,
+            c_size_t,
+            POINTER(c_uint64),
+        ]
+        _lib.ddb_stmt_execute_batch_typed.restype = c_uint32
     _lib.ddb_stmt_step.argtypes = [c_void_p, POINTER(c_uint8)]
     _lib.ddb_stmt_step.restype = c_uint32
     _lib.ddb_stmt_column_count.argtypes = [c_void_p, POINTER(c_size_t)]
@@ -264,9 +296,41 @@ def load_library():
     _lib.ddb_stmt_column_name_copy.restype = c_uint32
     _lib.ddb_stmt_affected_rows.argtypes = [c_void_p, POINTER(c_uint64)]
     _lib.ddb_stmt_affected_rows.restype = c_uint32
+    if hasattr(_lib, "ddb_stmt_rebind_int64_execute"):
+        _lib.ddb_stmt_rebind_int64_execute.argtypes = [
+            c_void_p,
+            c_size_t,
+            c_int64,
+            POINTER(c_uint64),
+        ]
+        _lib.ddb_stmt_rebind_int64_execute.restype = c_uint32
+    if hasattr(_lib, "ddb_stmt_rebind_text_int64_execute"):
+        _lib.ddb_stmt_rebind_text_int64_execute.argtypes = [
+            c_void_p,
+            c_char_p,
+            c_size_t,
+            c_size_t,
+            c_int64,
+            POINTER(c_uint64),
+        ]
+        _lib.ddb_stmt_rebind_text_int64_execute.restype = c_uint32
+    if hasattr(_lib, "ddb_stmt_rebind_int64_text_execute"):
+        _lib.ddb_stmt_rebind_int64_text_execute.argtypes = [
+            c_void_p,
+            c_size_t,
+            c_int64,
+            c_char_p,
+            c_size_t,
+            POINTER(c_uint64),
+        ]
+        _lib.ddb_stmt_rebind_int64_text_execute.restype = c_uint32
     _lib.ddb_stmt_value_copy.argtypes = [c_void_p, c_size_t, POINTER(DdbValue)]
     _lib.ddb_stmt_value_copy.restype = c_uint32
-    _lib.ddb_stmt_row_view.argtypes = [c_void_p, POINTER(POINTER(DdbValueView)), POINTER(c_size_t)]
+    _lib.ddb_stmt_row_view.argtypes = [
+        c_void_p,
+        POINTER(POINTER(DdbValueView)),
+        POINTER(c_size_t),
+    ]
     _lib.ddb_stmt_row_view.restype = c_uint32
     _lib.ddb_stmt_step_row_view.argtypes = [
         c_void_p,
@@ -285,8 +349,54 @@ def load_library():
     ]
     _lib.ddb_stmt_fetch_row_views.restype = c_uint32
 
+    _lib.ddb_abi_version.argtypes = []
+    _lib.ddb_abi_version.restype = c_uint32
+
+    _lib.ddb_version.argtypes = []
+    _lib.ddb_version.restype = c_char_p
+
+    _lib.ddb_db_create.argtypes = [c_char_p, POINTER(c_void_p)]
+    _lib.ddb_db_create.restype = c_uint32
+
+    _lib.ddb_db_open.argtypes = [c_char_p, POINTER(c_void_p)]
+    _lib.ddb_db_open.restype = c_uint32
+
+    _lib.ddb_db_get_table_ddl.argtypes = [c_void_p, c_char_p, POINTER(c_char_p)]
+    _lib.ddb_db_get_table_ddl.restype = c_uint32
+
+    _lib.ddb_db_list_views_json.argtypes = [c_void_p, POINTER(c_char_p)]
+    _lib.ddb_db_list_views_json.restype = c_uint32
+
+    _lib.ddb_db_get_view_ddl.argtypes = [c_void_p, c_char_p, POINTER(c_char_p)]
+    _lib.ddb_db_get_view_ddl.restype = c_uint32
+
+    _lib.ddb_db_list_triggers_json.argtypes = [c_void_p, POINTER(c_char_p)]
+    _lib.ddb_db_list_triggers_json.restype = c_uint32
+
+    _lib.ddb_result_row_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    _lib.ddb_result_row_count.restype = c_uint32
+
+    _lib.ddb_result_column_count.argtypes = [c_void_p, POINTER(c_size_t)]
+    _lib.ddb_result_column_count.restype = c_uint32
+
+    _lib.ddb_result_affected_rows.argtypes = [c_void_p, POINTER(c_uint64)]
+    _lib.ddb_result_affected_rows.restype = c_uint32
+
+    _lib.ddb_result_column_name_copy.argtypes = [c_void_p, c_size_t, POINTER(c_char_p)]
+    _lib.ddb_result_column_name_copy.restype = c_uint32
+
+    _lib.ddb_result_value_copy.argtypes = [
+        c_void_p,
+        c_size_t,
+        c_size_t,
+        POINTER(DdbValue),
+    ]
+    _lib.ddb_result_value_copy.restype = c_uint32
+
     _lib.decentdb_last_error_message = _lib.ddb_last_error_message
-    _lib.decentdb_last_error_code = lambda *_args: getattr(_lib, "_last_error_code", ERR_INTERNAL)
+    _lib.decentdb_last_error_code = lambda *_args: getattr(
+        _lib, "_last_error_code", ERR_INTERNAL
+    )
     _lib.decentdb_list_tables_json = _lib.ddb_db_list_tables_json
 
     return _lib
