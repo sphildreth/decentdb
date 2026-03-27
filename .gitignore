@@ -90,8 +90,11 @@ tests/bindings/**/*.node
 # Local DecentDB database artifacts
 *.ddb
 *.ddb.wal
+*.db 
+*.db.wal
 *.log
 /.tmp/
 
 bindings/dart/examples/console_complex/*.json
 *.pyc
+

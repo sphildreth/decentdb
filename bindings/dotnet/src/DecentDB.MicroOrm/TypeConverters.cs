@@ -8,15 +8,13 @@ internal static class DefaultTypeConverters
     {
         if (value == null || value == DBNull.Value) return DBNull.Value;
 
-        // Normalize common CLR types to the provider/engine-friendly representations.
-        // (These match the mapping in design/DAPPER_SUPPORT.md.)
         return value switch
         {
-            DateTime dt => new DateTimeOffset((dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime()), TimeSpan.Zero).ToUnixTimeMilliseconds(),
-            DateTimeOffset dto => dto.ToUniversalTime().ToUnixTimeMilliseconds(),
-            DateOnly d => d.DayNumber - DateOnly.FromDateTime(DateTime.UnixEpoch).DayNumber, // days since epoch
-            TimeOnly t => t.Ticks, // ticks since midnight
-            TimeSpan ts => ts.Ticks, // ticks
+            DateTime dt => new DateTimeOffset((dt.Kind == DateTimeKind.Utc ? dt : dt.ToUniversalTime()), TimeSpan.Zero).ToUnixTimeMilliseconds() * 1000L,
+            DateTimeOffset dto => dto.ToUniversalTime().ToUnixTimeMilliseconds() * 1000L,
+            DateOnly d => (d.DayNumber - DateOnly.FromDateTime(DateTime.UnixEpoch).DayNumber) * 86_400_000_000L,
+            TimeOnly t => t.Ticks / 10L,
+            TimeSpan ts => ts.Ticks / 10L,
             Guid g => g.ToByteArray(),
             decimal dec => dec,
             char ch => ch.ToString(),

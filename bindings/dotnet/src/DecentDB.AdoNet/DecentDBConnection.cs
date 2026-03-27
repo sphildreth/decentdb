@@ -195,6 +195,42 @@ namespace DecentDB.AdoNet
             _db.Checkpoint();
         }
 
+        public bool InTransaction
+        {
+            get
+            {
+                if (_db == null) throw new InvalidOperationException("Connection is not open");
+                return _db.InTransaction;
+            }
+        }
+
+        public string GetTableDdl(string tableName)
+        {
+            if (_db == null) throw new InvalidOperationException("Connection is not open");
+            return _db.GetTableDdl(tableName);
+        }
+
+        public string ListViewsJson()
+        {
+            if (_db == null) throw new InvalidOperationException("Connection is not open");
+            return _db.ListViewsJson();
+        }
+
+        public string GetViewDdl(string viewName)
+        {
+            if (_db == null) throw new InvalidOperationException("Connection is not open");
+            return _db.GetViewDdl(viewName);
+        }
+
+        public string ListTriggersJson()
+        {
+            if (_db == null) throw new InvalidOperationException("Connection is not open");
+            return _db.ListTriggersJson();
+        }
+
+        public static uint AbiVersion() => Native.DecentDB.AbiVersion();
+        public static string EngineVersion() => Native.DecentDB.EngineVersion();
+
         internal Native.DecentDB GetNativeDb()
         {
             return _db ?? throw new InvalidOperationException("Connection is not open");
