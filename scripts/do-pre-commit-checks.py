@@ -191,6 +191,7 @@ def build_checks() -> list[Check]:
     python_exec = shlex.quote(sys.executable)
 
     return [
+        # ── Stage 1: Static analysis (no build artifacts needed) ──
         Check(
             key="rust-format",
             title="Rust fmt check",
@@ -207,6 +208,16 @@ def build_checks() -> list[Check]:
             env={},
             modes=("fast", "paranoid"),
         ),
+        # ── Stage 2: Build the release native lib (needed by all binding checks) ──
+        Check(
+            key="rust-release-build",
+            title="Rust release build",
+            cwd=REPO_ROOT,
+            command="cargo build --release -p decentdb",
+            env={},
+            modes=("fast", "paranoid"),
+        ),
+        # ── Stage 3: Fast regression tests (Rust + binding smoke) ──
         Check(
             key="rust-regressions",
             title="Rust regression tests",
@@ -237,11 +248,12 @@ def build_checks() -> list[Check]:
             env=python_env,
             modes=("fast", "paranoid"),
         ),
+        # ── Stage 4: Full test suites (paranoid only) ──
         Check(
             key="rust-core",
-            title="Rust release build + core tests",
+            title="Rust core tests",
             cwd=REPO_ROOT,
-            command="cargo build --release && cargo test -p decentdb",
+            command="cargo test -p decentdb",
             env={},
             modes=("paranoid",),
         ),
@@ -261,6 +273,7 @@ def build_checks() -> list[Check]:
             env=python_env,
             modes=("paranoid",),
         ),
+        # ── Stage 5: Benchmarks (paranoid only) ──
         Check(
             key="python-benchmark",
             title="Python complex benchmark",
