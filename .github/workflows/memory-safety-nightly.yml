@@ -14,6 +14,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rust-sanitizers:
+    name: Rust ${{ matrix.sanitizer }} Sanitizer
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, leak, thread]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build with ${{ matrix.sanitizer }} sanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=${{ matrix.sanitizer }}"
+          RUSTDOCFLAGS: "-Zsanitizer=${{ matrix.sanitizer }}"
+        run: cargo build -p decentdb --target x86_64-unknown-linux-gnu
+
+      - name: Run tests with ${{ matrix.sanitizer }} sanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=${{ matrix.sanitizer }}"
+          RUSTDOCFLAGS: "-Zsanitizer=${{ matrix.sanitizer }}"
+          # ASAN/LSAN need single-threaded execution for reliable results
+          RUST_TEST_THREADS: "1"
+        run: |
+          cargo test -p decentdb --target x86_64-unknown-linux-gnu -- --test-threads=1
+
+  rust-miri:
+    name: Rust Miri (Undefined Behavior)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Setup Miri
+        run: cargo miri setup
+
+      - name: Run Miri on decentdb tests
+        run: cargo miri test -p decentdb -- --test-threads=1
+
   python-leak-regressions:
     name: Python Leak Regressions
     runs-on: ubuntu-latest
@@ -140,6 +193,181 @@ jobs:
           path: |
             .tmp/memory-safety/valgrind-c-smoke.log
             .tmp/memory-safety/valgrind-c-memory-churn.log
+          retention-days: 30
+
+  python-valgrind:
+    name: Python Valgrind
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/bindings/python
+      DECENTDB_NATIVE_LIB: ${{ github.workspace }}/target/debug/libdecentdb.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e bindings/python
+          pip install pytest psutil
+
+      - name: Build native library
+        run: cargo build -p decentdb --quiet
+
+      - name: Run Python memory leak tests under Valgrind
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/memory-safety
+          
+          # Run focused leak tests under Valgrind
+          # Note: Python has many false positives, so we suppress known issues
+          valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=definite,possible \
+            --errors-for-leak-kinds=definite,possible \
+            --track-origins=yes \
+            --num-callers=20 \
+            --error-exitcode=1 \
+            --suppressions=.github/valgrind/python.supp \
+            python -m pytest \
+              bindings/python/tests/test_memory_leak.py \
+              bindings/python/tests/test_open_close_leak.py \
+              -v \
+            2>&1 | tee .tmp/memory-safety/valgrind-python.log
+
+      - name: Upload Python Valgrind logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-python-logs
+          path: .tmp/memory-safety/valgrind-python.log
+          retention-days: 30
+
+  heap-profiling:
+    name: Heap Profiling
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/bindings/python
+      DECENTDB_NATIVE_LIB: ${{ github.workspace }}/target/debug/libdecentdb.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install heaptrack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y heaptrack
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e bindings/python
+          pip install pytest psutil
+
+      - name: Build native library
+        run: cargo build -p decentdb --quiet
+
+      - name: Run heaptrack on Python leak tests
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/memory-safety
+          
+          heaptrack -o .tmp/memory-safety/heaptrack-python \
+            python -m pytest \
+              bindings/python/tests/test_memory_leak.py \
+              bindings/python/tests/test_open_close_leak.py \
+              -v
+
+      - name: Analyze heaptrack results
+        run: |
+          echo "=== Heaptrack Summary ===" 
+          heaptrack_print .tmp/memory-safety/heaptrack-python.heaptrack.raw 2>&1 | head -100 || true
+
+      - name: Upload heaptrack data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heaptrack-data
+          path: .tmp/memory-safety/heaptrack-python.heaptrack.raw
+          retention-days: 30
+
+  stress-test:
+    name: Long-running Stress Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/bindings/python
+      DECENTDB_NATIVE_LIB: ${{ github.workspace }}/target/debug/libdecentdb.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e bindings/python
+          pip install psutil
+
+      - name: Build native library
+        run: cargo build -p decentdb --quiet
+
+      - name: Run 30-minute stress test
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/memory-safety
+          
+          python scripts/stress_memory_test.py \
+            --duration 1800 \
+            --db-path .tmp/memory-safety/stress.ddb \
+            2>&1 | tee .tmp/memory-safety/stress-test.log
+
+      - name: Upload stress test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-logs
+          path: .tmp/memory-safety/stress-test.log
           retention-days: 30
 
   binding-lifecycle:

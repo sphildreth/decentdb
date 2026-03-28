@@ -1,0 +1,156 @@
+# Valgrind suppression file for Python bindings
+#
+# Python's internal allocator and garbage collector generate many
+# "still reachable" blocks that are not actual leaks. This file
+# suppresses known false positives while allowing real leaks to be
+# detected.
+#
+# Usage:
+#   valgrind --suppressions=.github/valgrind/python.supp ...
+
+# Python's internal memory pools
+{
+   python_object_allocator
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:PyObject_Malloc
+   ...
+}
+
+# Python's small object allocator
+{
+   python_pymalloc
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   fun:_PyObject_Malloc
+   ...
+}
+
+# Python's GC
+{
+   python_gc
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_PyObject_GC_New
+   ...
+}
+
+# Python's type system
+{
+   python_type_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyType_Ready
+   ...
+}
+
+# Python's import system
+{
+   python_import
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyImport_ImportModule
+   ...
+}
+
+# Python's string interning
+{
+   python_string_intern
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyString_InternFromString
+   ...
+}
+
+# Python's code objects
+{
+   python_code_object
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyCode_New
+   ...
+}
+
+# ctypes FFI layer (used by decentdb Python binding)
+{
+   ctypes_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_ctypes_alloc_callback
+   ...
+}
+
+# Python's thread state
+{
+   python_thread_state
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyThreadState_New
+   ...
+}
+
+# Python's module state
+{
+   python_module_def
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyModuleDef_Init
+   ...
+}
+
+# Python's warnings module
+{
+   python_warnings
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyErr_WarnEx
+   ...
+}
+
+# Python's sys module initialization
+{
+   python_sys_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_PySys_Init
+   ...
+}
+
+# Python's builtins
+{
+   python_builtins
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:_PyBuiltin_Init
+   ...
+}
+
+# Standard library false positives
+{
+   ssl_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:SSL_library_init
+   ...
+}
+
+{
+   zlib_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:deflateInit*
+   ...
+}
