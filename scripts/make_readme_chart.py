@@ -2,31 +2,25 @@
 """Generate README-friendly benchmark bar chart(s).
 
 Inputs:
-  - data/bench_summary.json (aggregated numbers you compute from raw runs)
+  - data/bench_summary.json
 
 Outputs:
   - assets/decentdb-benchmarks.svg
   - assets/decentdb-benchmarks.png
-
-Notes:
-  - This script produces a single grouped bar chart with normalized values.
-  - For "lower is better" metrics (latencies, size), normalization is inverted so higher bars mean better.
-  - This is intended for README *at-a-glance* comparison, not a full benchmark report.
 """
 
 import json
 import math
 from pathlib import Path
 
-import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "bench_summary.json"
 OUT_SVG = ROOT / "assets" / "decentdb-benchmarks.svg"
 OUT_PNG = ROOT / "assets" / "decentdb-benchmarks.png"
 
-# Define which metrics appear and how to treat them
 METRICS = [
     ("read_p95_ms", "Point read p95", "lower"),
     ("join_p95_ms", "Join p95", "lower"),
@@ -34,7 +28,7 @@ METRICS = [
     ("insert_rows_per_sec", "Insert (rows/s)", "higher"),
 ]
 
-BASELINE_ENGINE = "sqlite"  # normalize against this engine key
+BASELINE_ENGINE = "sqlite"
 
 ENGINE_LABELS = {
     "decentdb": "DecentDB",
@@ -46,113 +40,124 @@ ENGINE_LABELS = {
 def display_engine_name(engine: str) -> str:
     return ENGINE_LABELS.get(engine, engine)
 
-def load():
-    with DATA.open("r", encoding="utf-8") as f:
-        doc = json.load(f)
-    engines = doc["engines"]
+
+def ordered_display_engines(engines: list[str]) -> list[str]:
+    engine_set = set(engines)
+    preferred = [
+        display_engine_name("decentdb"),
+        display_engine_name(BASELINE_ENGINE),
+        display_engine_name("duckdb"),
+        "H2",
+        "LiteDB",
+        "Apache Derby",
+        "HSQLDB",
+        "Firebird",
+    ]
+    ordered = [engine for engine in preferred if engine in engine_set]
+    ordered.extend(engine for engine in engines if engine not in ordered)
+    return ordered
+
+
+def to_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load() -> tuple[list[dict[str, object]], dict[str, object]]:
+    with DATA.open("r", encoding="utf-8") as handle:
+        doc = json.load(handle)
+
     rows = []
-    for eng, vals in engines.items():
-        row = {"engine": eng}
-        row.update(vals)
+    for engine, metrics in doc["engines"].items():
+        row = {"engine": engine}
+        row.update(metrics)
         rows.append(row)
-    return pd.DataFrame(rows), doc.get("metadata", {})
+    return rows, doc.get("metadata", {})
 
-def normalize(df: pd.DataFrame) -> pd.DataFrame:
-    if BASELINE_ENGINE not in set(df["engine"]):
+
+def normalize(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    baseline = next((row for row in rows if row["engine"] == BASELINE_ENGINE), None)
+    if baseline is None:
         raise SystemExit(f"Baseline engine '{BASELINE_ENGINE}' not found in data.")
-    base = df[df["engine"] == BASELINE_ENGINE].iloc[0]
 
-    norm = df.copy()
-    for key, _, direction in METRICS:
-        if key not in norm.columns:
-            continue
-        b = base.get(key)
-        # If baseline missing, skip
-        if b is None or (isinstance(b, float) and math.isnan(b)):
-            norm[key] = None
-            continue
+    normalized: list[dict[str, object]] = []
+    for row in rows:
+        normalized_row: dict[str, object] = {"engine": row["engine"]}
+        for key, _, direction in METRICS:
+            base_value = to_float(baseline.get(key))
+            value = to_float(row.get(key))
+            if base_value is None or value is None:
+                normalized_row[key] = None
+            elif direction == "higher":
+                normalized_row[key] = value / base_value if base_value != 0 else None
+            else:
+                normalized_row[key] = base_value / value if value != 0 else None
+        normalized.append(normalized_row)
+    return normalized
 
-        def conv(x):
-            if x is None or (isinstance(x, float) and math.isnan(x)):
-                return None
-            # Normalize such that 1.0 == baseline
-            if direction == "higher":
-                return x / b if b != 0 else None
-            # lower-is-better: invert so higher is better in chart (baseline still at 1.0)
-            return b / x if x != 0 else None
 
-        norm[key] = norm[key].map(conv)
-    return norm
+def plot(rows: list[dict[str, object]], meta: dict[str, object]) -> None:
+    if not rows:
+        raise SystemExit("No benchmark data found.")
 
-def plot(norm: pd.DataFrame, meta: dict):
-    # Prepare long-form data
-    records = []
-    for key, label, _dir in METRICS:
-        for _, row in norm.iterrows():
-            v = row.get(key)
-            if v is None or (isinstance(v, float) and math.isnan(v)):
-                continue
-            records.append(
-                {
-                    "Metric": label,
-                    "Engine": display_engine_name(row["engine"]),
-                    "Score": float(v),
-                }
-            )
-
-    long = pd.DataFrame(records)
-    if long.empty:
+    available_metrics = [
+        (key, label)
+        for key, label, _ in METRICS
+        if any(row.get(key) is not None for row in rows)
+    ]
+    if not available_metrics:
         raise SystemExit("No plottable data. Did you provide metrics?")
 
-    # Order engines: DecentDB first, then baseline, then others
-    engines = list(dict.fromkeys(
-        [
-            display_engine_name("decentdb"),
-            display_engine_name(BASELINE_ENGINE),
-        ]
-        + [
-            e
-            for e in long["Engine"].unique().tolist()
-            if e
-            not in (
-                display_engine_name("decentdb"),
-                display_engine_name(BASELINE_ENGINE),
-            )
-        ]
-    ))
-    long["Engine"] = pd.Categorical(long["Engine"], categories=engines, ordered=True)
+    rows_by_display = {
+        display_engine_name(str(row["engine"])): row
+        for row in rows
+    }
+    engines = ordered_display_engines(list(rows_by_display.keys()))
 
-    # Pivot for grouped bars
-    piv = long.pivot_table(index="Metric", columns="Engine", values="Score", aggfunc="mean")
+    positions = np.arange(len(available_metrics), dtype=float)
+    width = 0.8 / max(len(engines), 1)
+    offsets = (np.arange(len(engines), dtype=float) - (len(engines) - 1) / 2.0) * width
 
-    # Plot
-    plt.figure(figsize=(12, 5))
-    ax = piv.plot(kind="bar")  # default colors (per instructions)
+    fig, ax = plt.subplots(figsize=(12, 5))
+
+    for index, engine in enumerate(engines):
+        row = rows_by_display[engine]
+        values = [
+            to_float(row.get(key)) if row.get(key) is not None else math.nan
+            for key, _ in available_metrics
+        ]
+        ax.bar(positions + offsets[index], values, width=width, label=engine)
+
     ax.set_ylabel(
         f"Normalized score vs {display_engine_name(BASELINE_ENGINE)} (higher is better)"
     )
     ax.set_xlabel("")
     ax.set_title("DecentDB vs common embedded engines (normalized)")
-
-    # Reference line at 1.0 baseline
+    ax.set_xticks(positions)
+    ax.set_xticklabels([label for _, label in available_metrics])
     ax.axhline(1.0, linewidth=1)
+    ax.legend(title="Engine")
 
-    # Tight layout and save
     plt.tight_layout()
     OUT_SVG.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(OUT_SVG, format="svg")
     plt.savefig(OUT_PNG, format="png", dpi=180)
+    plt.close(fig)
 
-    # Print a small note to console for CI logs
     print(f"Wrote: {OUT_SVG}")
     print(f"Wrote: {OUT_PNG}")
     if meta:
         print("Metadata:", meta)
 
-def main():
-    df, meta = load()
-    norm = normalize(df)
-    plot(norm, meta)
+
+def main() -> None:
+    rows, meta = load()
+    plot(normalize(rows), meta)
+
 
 if __name__ == "__main__":
     main()

@@ -169,7 +169,14 @@ This Python framework complements the native Rust benchmarks in `crates/decentdb
 | Native (Rust) | DecentDB, SQLite, DuckDB | Raw engine performance, no FFI overhead |
 | Python (This) | + H2, Derby, HSQLDB, LiteDB | Cross-runtime comparison |
 
-Results can be merged using `scripts/aggregate_benchmarks.py`.
+Results can be merged into the README summary with:
+
+```bash
+python scripts/aggregate_benchmarks.py \
+  --native-summary data/bench_summary.json \
+  --python-embedded-compare-results benchmarks/python_embedded_compare/out/results_merged.json \
+  --output data/bench_summary.json
+```
 
 ## CI Integration
 

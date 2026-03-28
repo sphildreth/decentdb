@@ -112,12 +112,24 @@ This runner produces an enriched JSON structure in `benchmarks/python_embedded_c
 
 ## Step 3: Aggregation and Visualization
 
-Both the Native Tier and the Polyglot Tier ultimately produce structured JSON data.
+Both the Native Tier and the Polyglot Tier ultimately produce structured JSON
+data.
 
-The Python script `scripts/make_readme_chart.py` is responsible for consuming `data/bench_summary.json` (and optionally merging data from the Polyglot Tier) to generate the SVG charts.
+The native run writes `data/bench_summary.json`. The helper script
+`scripts/aggregate_benchmarks.py` can then merge in additional engines from
+`benchmarks/python_embedded_compare/out/results_merged.json` before the README
+chart renderers consume the combined summary.
 
 ```bash
+python scripts/aggregate_benchmarks.py \
+  --native-summary data/bench_summary.json \
+  --python-embedded-compare-results benchmarks/python_embedded_compare/out/results_merged.json \
+  --output data/bench_summary.json
 python scripts/make_readme_chart.py
+python scripts/visualize_alternative.py
 ```
 
-This generates `assets/decentdb-benchmarks.svg`, which is displayed prominently in the repository README, ensuring users always see an up-to-date, scientifically sound representation of DecentDB's performance landscape.
+This generates `assets/decentdb-benchmarks.svg`,
+`assets/decentdb-benchmarks.png`, `assets/decentdb-radar.png`, and
+`assets/decentdb-speedup.png`, which keep the repository README visuals aligned
+with the latest benchmark summary.
