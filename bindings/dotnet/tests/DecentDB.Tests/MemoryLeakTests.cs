@@ -1,6 +1,5 @@
 using System;
 using System.Data;
-using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -9,10 +8,17 @@ using Xunit;
 
 namespace DecentDB.Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class MemoryLeakCollectionDefinition
+{
+    public const string Name = "MemoryLeakTests";
+}
+
+[Collection(MemoryLeakCollectionDefinition.Name)]
 public class MemoryLeakTests
 {
     [Fact]
-    public void RepeatedOpenQueryCloseKeepsWorkingSetBounded()
+    public void RepeatedOpenQueryCloseKeepsRssBounded()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
@@ -37,25 +43,25 @@ public class MemoryLeakTests
                 RunLeakIteration(dbPath);
             }
 
-            TrimManagedHeap();
-            var before = ReadWorkingSetBytes();
+            TrimProcessMemory();
+            var before = ReadRssBytes();
 
             for (var i = 0; i < 160; i++)
             {
                 RunLeakIteration(dbPath);
                 if (i % 10 == 0)
                 {
-                    TrimManagedHeap();
+                    TrimProcessMemory();
                 }
             }
 
-            TrimManagedHeap();
-            var after = ReadWorkingSetBytes();
+            TrimProcessMemory();
+            var after = ReadRssBytes();
             var diff = after - before;
 
             Assert.True(
                 diff < 16 * 1024 * 1024,
-                $"Working set grew by {diff} bytes (before={before}, after={after})");
+                $"RSS grew by {diff} bytes (before={before}, after={after})");
         }
         finally
         {
@@ -77,20 +83,38 @@ public class MemoryLeakTests
         Assert.Equal(ConnectionState.Open, connection.State);
     }
 
-    private static void TrimManagedHeap()
+    private static void TrimProcessMemory()
     {
         for (var i = 0; i < 3; i++)
         {
-            GC.Collect();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
             GC.WaitForPendingFinalizers();
+            MallocTrim(0);
             Thread.Sleep(10);
         }
     }
 
-    private static long ReadWorkingSetBytes()
+    private static long ReadRssBytes()
     {
-        using var process = Process.GetCurrentProcess();
-        process.Refresh();
-        return process.WorkingSet64;
+        foreach (var line in File.ReadLines("/proc/self/status"))
+        {
+            if (!line.StartsWith("VmRSS:", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2 && long.TryParse(parts[1], out var kb))
+            {
+                return kb * 1024;
+            }
+
+            break;
+        }
+
+        throw new InvalidOperationException("VmRSS not found in /proc/self/status");
     }
+
+    [DllImport("libc.so.6", CallingConvention = CallingConvention.Cdecl, EntryPoint = "malloc_trim")]
+    private static extern int MallocTrim(nuint pad);
 }

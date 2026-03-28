@@ -34,12 +34,36 @@ update() {
   updated=$((updated + 1))
 }
 
+replace_first_in_file() {
+  local file="$1"
+  local regex="$2"
+  local replacement="$3"
+  local tmp
+  tmp="$(mktemp)"
+  if ! awk -v regex="$regex" -v replacement="$replacement" '
+    BEGIN { replaced = 0 }
+    {
+      line = $0
+      if (!replaced && sub(regex, replacement, line)) {
+        replaced = 1
+      }
+      print line
+    }
+    END { exit(replaced ? 0 : 2) }
+  ' "$file" > "$tmp"; then
+    rm -f "$tmp"
+    echo "Error: failed to update $file" >&2
+    exit 1
+  fi
+  mv "$tmp" "$file"
+}
+
 # --- Rust workspace ---
-sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+replace_first_in_file "Cargo.toml" '^version = ".*"$' "version = \"$VERSION\""
 update "Cargo.toml" "workspace version"
 
 # --- Python ---
-sed -i "s/^version = \".*\"/version = \"$VERSION\"/" bindings/python/pyproject.toml
+replace_first_in_file "bindings/python/pyproject.toml" '^version = ".*"$' "version = \"$VERSION\""
 update "bindings/python/pyproject.toml" "project version"
 
 # --- Node.js (decentdb) ---
@@ -68,30 +92,30 @@ fi
 # --- Java JDBC driver ---
 java_gradle="bindings/java/driver/build.gradle"
 if [[ -f "$java_gradle" ]]; then
-  sed -i "s/^version = '.*'/version = '$VERSION'/" "$java_gradle"
+  replace_first_in_file "$java_gradle" "^version = '.*'$" "version = '$VERSION'"
   update "$java_gradle" "gradle version"
 fi
 
 java_driver="bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBDriver.java"
 if [[ -f "$java_driver" ]]; then
-  sed -i "s/DRIVER_VERSION = \".*\"/DRIVER_VERSION = \"$VERSION\"/" "$java_driver"
+  replace_first_in_file "$java_driver" 'DRIVER_VERSION = "[^"]*"' "DRIVER_VERSION = \"$VERSION\""
   update "$java_driver" "DRIVER_VERSION constant"
 fi
 
 # --- Java DBeaver extension ---
 dbeaver_gradle="bindings/java/dbeaver-extension/build.gradle"
 if [[ -f "$dbeaver_gradle" ]]; then
-  sed -i "s/^version = '.*'/version = '$VERSION'/" "$dbeaver_gradle"
+  replace_first_in_file "$dbeaver_gradle" "^version = '.*'$" "version = '$VERSION'"
   update "$dbeaver_gradle" "gradle version"
 fi
 
 dbeaver_manifest="bindings/java/dbeaver-extension/META-INF/MANIFEST.MF"
 if [[ -f "$dbeaver_manifest" ]]; then
   # Read the old version to fix the jar filename reference too
-  old_jar_ver=$(grep 'Bundle-Version:' "$dbeaver_manifest" | sed 's/Bundle-Version: *//')
-  sed -i "s/Bundle-Version: .*/Bundle-Version: $VERSION/" "$dbeaver_manifest"
+  old_jar_ver="$(awk -F': *' '/^Bundle-Version:/ { print $2; exit }' "$dbeaver_manifest")"
+  replace_first_in_file "$dbeaver_manifest" '^Bundle-Version: .*$' "Bundle-Version: $VERSION"
   if [[ -n "$old_jar_ver" ]]; then
-    sed -i "s/decentdb-jdbc-${old_jar_ver}.jar/decentdb-jdbc-${VERSION}.jar/" "$dbeaver_manifest"
+    replace_first_in_file "$dbeaver_manifest" 'decentdb-jdbc-[^[:space:]]*[.]jar' "decentdb-jdbc-${VERSION}.jar"
   fi
   update "$dbeaver_manifest" "Bundle-Version + jar reference"
 fi
@@ -99,7 +123,7 @@ fi
 # --- Dart ---
 dart_pubspec="bindings/dart/dart/pubspec.yaml"
 if [[ -f "$dart_pubspec" ]]; then
-  sed -i "s/^version: .*/version: $VERSION/" "$dart_pubspec"
+  replace_first_in_file "$dart_pubspec" '^version: .*$' "version: $VERSION"
   update "$dart_pubspec" "pubspec version"
 fi
 

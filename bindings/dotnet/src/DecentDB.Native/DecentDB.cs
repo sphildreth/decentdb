@@ -154,8 +154,13 @@ public sealed class DecentDB : IDisposable
     {
         get
         {
-            var res = DecentDBNative.ddb_db_in_transaction(Handle, out var flag);
-            return res == 0 && flag != 0;
+            var res = RecordStatus(DecentDBNative.ddb_db_in_transaction(Handle, out var flag));
+            if (res != 0)
+            {
+                throw new DecentDBException(_lastErrorCode, LastErrorMessage, "InTransaction");
+            }
+
+            return flag != 0;
         }
     }
 
@@ -199,20 +204,6 @@ public sealed class DecentDB : IDisposable
         var res = RecordStatus(DecentDBNative.ddb_db_list_triggers_json(Handle, out var ptr));
         if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "ListTriggersJson");
         return FreeStringOrEmpty(ptr);
-    }
-
-    public string ExecuteImmediateJson(string sql)
-    {
-        var sqlBytes = Encoding.UTF8.GetBytes(sql + "\0");
-        unsafe
-        {
-            fixed (byte* p = sqlBytes)
-            {
-                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_execute(Handle, p, out var ptr));
-                if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "ExecuteImmediate");
-                return FreeStringOrEmpty(ptr);
-            }
-        }
     }
 
     private static string FreeStringOrEmpty(IntPtr ptr)

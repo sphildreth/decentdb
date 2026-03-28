@@ -245,26 +245,6 @@ public static class DecentDBNative
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_list_triggers_json")]
     internal static extern uint ddb_db_list_triggers_json(IntPtr db, out IntPtr outJson);
 
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_execute")]
-    internal static extern uint ddb_db_execute(IntPtr db, IntPtr sqlUtf8, out IntPtr outResult);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_free")]
-    internal static extern uint ddb_result_free(ref IntPtr result);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_row_count")]
-    internal static extern uint ddb_result_row_count(IntPtr result, out nuint outRows);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_column_count")]
-    internal static extern uint ddb_result_column_count(IntPtr result, out nuint outColumns);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_affected_rows")]
-    internal static extern uint ddb_result_affected_rows(IntPtr result, out ulong outRows);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_column_name_copy")]
-    internal static extern uint ddb_result_column_name_copy(IntPtr result, nuint columnIndex, out IntPtr outName);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_result_value_copy")]
-    internal static extern uint ddb_result_value_copy(IntPtr result, nuint rowIndex, nuint columnIndex, out DdbValueNative outValue);
 }
 
 public static unsafe class DecentDBNativeUnsafe
@@ -314,9 +294,6 @@ public static unsafe class DecentDBNativeUnsafe
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_create")]
     internal static extern uint ddb_db_create(byte* pathUtf8, out IntPtr outDb);
-
-    [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_execute")]
-    internal static extern uint ddb_db_execute(IntPtr db, byte* sqlUtf8, out IntPtr outResult);
 
     [DllImport(NativeLib, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ddb_db_get_table_ddl")]
     internal static extern uint ddb_db_get_table_ddl(IntPtr db, byte* tableNameUtf8, out IntPtr outDdl);
