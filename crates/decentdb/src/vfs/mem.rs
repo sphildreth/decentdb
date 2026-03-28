@@ -196,4 +196,183 @@ mod tests {
         vfs.remove_file(path).expect("remove file");
         assert!(!vfs.file_exists(path).expect("query file existence"));
     }
+
+    #[test]
+    fn mem_vfs_is_memory_returns_true() {
+        let vfs = MemVfs::default();
+        assert!(vfs.is_memory());
+    }
+
+    #[test]
+    fn create_new_fails_if_file_exists() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+
+        let _file1 = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+        
+        let result = vfs.open(path, OpenMode::CreateNew, FileKind::Database);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_existing_fails_if_file_not_found() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("nonexistent.db");
+
+        let result = vfs.open(path, OpenMode::OpenExisting, FileKind::Database);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_or_creates_file_if_not_exists() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+
+        assert!(!vfs.file_exists(path).expect("query file existence"));
+        let _file = vfs
+            .open(path, OpenMode::OpenOrCreate, FileKind::Database)
+            .expect("open or create");
+        assert!(vfs.file_exists(path).expect("query file existence"));
+    }
+
+    #[test]
+    fn canonicalize_path_returns_input_path() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("/some/path.db");
+        let canonical = vfs.canonicalize_path(path).expect("canonicalize");
+        assert_eq!(canonical, path);
+    }
+
+    #[test]
+    fn file_kind_is_preserved() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+
+        let db_file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create db file");
+        assert_eq!(db_file.kind(), FileKind::Database);
+
+        let wal_path = std::path::Path::new("test.db.wal");
+        let wal_file = vfs
+            .open(wal_path, OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        assert_eq!(wal_file.kind(), FileKind::Wal);
+    }
+
+    #[test]
+    fn read_at_returns_zero_when_offset_beyond_eof() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+        let file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+        
+        let mut buf = [0_u8; 10];
+        let bytes_read = file.read_at(100, &mut buf).expect("read");
+        assert_eq!(bytes_read, 0);
+    }
+
+    #[test]
+    fn read_at_partial_when_buffer_larger_than_data() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+        let file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+        write_all_at(file.as_ref(), 0, &[1, 2, 3]).expect("write");
+
+        let mut buf = [0_u8; 10];
+        let bytes_read = file.read_at(0, &mut buf).expect("read");
+        assert_eq!(bytes_read, 3);
+        assert_eq!(&buf[..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn write_at_expands_file() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+        let file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+
+        assert_eq!(file.file_size().expect("get size"), 0);
+        write_all_at(file.as_ref(), 0, &[1, 2, 3]).expect("write");
+        assert_eq!(file.file_size().expect("get size"), 3);
+
+        write_all_at(file.as_ref(), 10, &[4, 5, 6]).expect("write at offset");
+        assert_eq!(file.file_size().expect("get size"), 13);
+    }
+
+    #[test]
+    fn set_len_truncates_and_expands() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+        let file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+        
+        write_all_at(file.as_ref(), 0, &[1, 2, 3, 4, 5]).expect("write");
+        assert_eq!(file.file_size().expect("get size"), 5);
+
+        file.set_len(3).expect("truncate");
+        assert_eq!(file.file_size().expect("get size"), 3);
+
+        file.set_len(10).expect("expand");
+        assert_eq!(file.file_size().expect("get size"), 10);
+    }
+
+    #[test]
+    fn sync_operations_are_noop() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+        let file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+
+        assert!(file.sync_data().is_ok());
+        assert!(file.sync_metadata().is_ok());
+    }
+
+    #[test]
+    fn multiple_files_can_coexist() {
+        let vfs = MemVfs::default();
+        let path1 = std::path::Path::new("db1.db");
+        let path2 = std::path::Path::new("db2.db");
+
+        let file1 = vfs.open(path1, OpenMode::CreateNew, FileKind::Database).expect("create 1");
+        let file2 = vfs.open(path2, OpenMode::CreateNew, FileKind::Database).expect("create 2");
+
+        write_all_at(file1.as_ref(), 0, &[1, 1, 1]).expect("write 1");
+        write_all_at(file2.as_ref(), 0, &[2, 2, 2]).expect("write 2");
+
+        let mut buf1 = [0_u8; 3];
+        let mut buf2 = [0_u8; 3];
+        file1.read_at(0, &mut buf1).expect("read 1");
+        file2.read_at(0, &mut buf2).expect("read 2");
+
+        assert_eq!(buf1, [1, 1, 1]);
+        assert_eq!(buf2, [2, 2, 2]);
+    }
+
+    #[test]
+    fn read_write_at_various_offsets() {
+        let vfs = MemVfs::default();
+        let path = std::path::Path::new("test.db");
+        let file = vfs
+            .open(path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+
+        // Write at various offsets
+        write_all_at(file.as_ref(), 0, &[0, 1, 2]).expect("write 0");
+        write_all_at(file.as_ref(), 5, &[5, 6, 7]).expect("write 5");
+        write_all_at(file.as_ref(), 10, &[10, 11, 12]).expect("write 10");
+
+        // Read back
+        let mut buf = [0_u8; 13];
+        file.read_at(0, &mut buf).expect("read all");
+        assert_eq!(buf, [0, 1, 2, 0, 0, 5, 6, 7, 0, 0, 10, 11, 12]);
+    }
 }
