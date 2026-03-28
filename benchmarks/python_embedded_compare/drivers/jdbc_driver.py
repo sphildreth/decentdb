@@ -6,6 +6,7 @@ Note: JVM-based engines will have Python-to-Java bridge overhead.
 
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from drivers.base_driver import BenchmarkMetrics, DatabaseDriver, EngineMetadata
@@ -59,7 +60,7 @@ class JDBCDriver(DatabaseDriver):
         self.db_path = config.get("database_path", "mem:test")
         self.jdbc_url = config.get("jdbc_url", "")
         self.driver_class = config.get("driver_class", "")
-        self.jar_paths = config.get("jar_paths", [])
+        self.jar_paths = self._normalize_jar_paths(config.get("jar_paths", []))
         self.connection_properties = dict(config.get("connection_properties", {}))
         self.jvm_properties = dict(config.get("jvm_properties", {}))
         self._prepared_stmts: Dict[str, Any] = {}
@@ -75,7 +76,14 @@ class JDBCDriver(DatabaseDriver):
             if not self.driver_class:
                 self.driver_class = eng_cfg["driver_class"]
             if not self.jar_paths and eng_cfg.get("jar_path"):
-                self.jar_paths = [eng_cfg["jar_path"]]
+                self.jar_paths = self._normalize_jar_paths([eng_cfg["jar_path"]])
+
+    def _normalize_jar_paths(self, jar_paths: List[str]) -> List[str]:
+        normalized: List[str] = []
+        for jar_path in jar_paths:
+            path = Path(jar_path).expanduser()
+            normalized.append(str(path.resolve()) if not path.is_absolute() else str(path))
+        return normalized
 
     def _resolve_jdbc_url(self, jdbc_url: str) -> str:
         if "{db_path}" in jdbc_url:
@@ -121,7 +129,7 @@ class JDBCDriver(DatabaseDriver):
             return False
 
         try:
-            classpath = ":".join(self.jar_paths) if self.jar_paths else None
+            classpath = os.pathsep.join(self.jar_paths) if self.jar_paths else None
 
             if JPYPE_AVAILABLE:
                 if not jpype.isJVMStarted():
