@@ -28,7 +28,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format Check
+        shell: bash
         run: |
+          set -o pipefail
           if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
             echo "::error::Code formatting issues detected"
             echo "::group::Details"
