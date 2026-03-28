@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'org.jkiss.dbeaver.ext'
-version = '1.8.1'
+version = '2.0.0'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_21

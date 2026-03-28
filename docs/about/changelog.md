@@ -5,7 +5,15 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-03-27
+
+> **v2.0.0 marks the first release of the Rust-native DecentDB engine.**
+> The original DecentDB engine was written in [Nim](https://nim-lang.org/).
+> For v2.0.0 the engine core was rewritten from scratch in Rust, delivering
+> substantially improved memory safety, ACID durability guarantees, a stable
+> C ABI (`include/decentdb.h`), and a fully updated binding ecosystem
+> (.NET, Python, Go, Java/JDBC/DBeaver, Node.js, Dart). The v1.x Nim-era
+> releases are preserved in repository history but are no longer maintained.
 
 ### Added
 - SQL window enhancements: `NTILE`, `PERCENT_RANK`, `CUME_DIST`, aggregate window functions, and frame-aware execution for `ROWS` and supported `RANGE` bounds.
