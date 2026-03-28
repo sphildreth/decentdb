@@ -72,7 +72,10 @@ pub(crate) fn pack_trigram(bytes: [u8; 3]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_guardrails, normalize, pack_trigram, pattern_char_len, unique_tokens, GuardrailDecision};
+    use super::{
+        decide_guardrails, normalize, pack_trigram, pattern_char_len, unique_tokens,
+        GuardrailDecision,
+    };
 
     #[test]
     fn trigram_generation_normalizes_to_uppercase() {

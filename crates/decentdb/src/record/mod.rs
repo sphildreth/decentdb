@@ -65,7 +65,10 @@ pub(crate) fn decode_varint_u64(input: &[u8]) -> Result<(u64, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_varint_u64, encode_varint_u64, encode_varint_u64_into, zigzag_decode_u64, zigzag_encode_i64};
+    use super::{
+        decode_varint_u64, encode_varint_u64, encode_varint_u64_into, zigzag_decode_u64,
+        zigzag_encode_i64,
+    };
 
     #[test]
     fn zigzag_encode_decode_roundtrip() {
@@ -123,7 +126,11 @@ mod tests {
             let encoded = encode_varint_u64(value);
             let (decoded, bytes_read) = decode_varint_u64(&encoded).expect("decode should succeed");
             assert_eq!(decoded, value, "varint roundtrip failed for {value}");
-            assert_eq!(bytes_read, encoded.len(), "bytes read should match encoded length");
+            assert_eq!(
+                bytes_read,
+                encoded.len(),
+                "bytes read should match encoded length"
+            );
         }
     }
 
@@ -174,7 +181,10 @@ mod tests {
 
         let (first, bytes_read) = decode_varint_u64(&buffer).expect("decode should succeed");
         assert_eq!(first, 300);
-        assert!(bytes_read < buffer.len(), "should not consume entire buffer");
+        assert!(
+            bytes_read < buffer.len(),
+            "should not consume entire buffer"
+        );
 
         let remaining = &buffer[bytes_read..];
         let (second, _) = decode_varint_u64(remaining).expect("decode second should succeed");

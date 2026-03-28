@@ -282,7 +282,11 @@ mod tests {
 
     #[test]
     fn trigger_event_copy_and_debug() {
-        let events = [TriggerEvent::Insert, TriggerEvent::Update, TriggerEvent::Delete];
+        let events = [
+            TriggerEvent::Insert,
+            TriggerEvent::Update,
+            TriggerEvent::Delete,
+        ];
         for event in events {
             let copied = event;
             assert_eq!(copied, event);

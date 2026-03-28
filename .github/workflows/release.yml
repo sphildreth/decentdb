@@ -59,7 +59,9 @@ jobs:
           pip install mkdocs-minify-plugin mkdocs-material mkdocs-awesome-pages-plugin mkdocs-mermaid2-plugin
 
       - name: Format Check
+        shell: bash
         run: |
+          set -o pipefail
           echo "Checking Rust code formatting..."
           if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
             echo ""

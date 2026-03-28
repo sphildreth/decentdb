@@ -211,7 +211,7 @@ mod tests {
         let _file1 = vfs
             .open(path, OpenMode::CreateNew, FileKind::Database)
             .expect("create file");
-        
+
         let result = vfs.open(path, OpenMode::CreateNew, FileKind::Database);
         assert!(result.is_err());
     }
@@ -269,7 +269,7 @@ mod tests {
         let file = vfs
             .open(path, OpenMode::CreateNew, FileKind::Database)
             .expect("create file");
-        
+
         let mut buf = [0_u8; 10];
         let bytes_read = file.read_at(100, &mut buf).expect("read");
         assert_eq!(bytes_read, 0);
@@ -313,7 +313,7 @@ mod tests {
         let file = vfs
             .open(path, OpenMode::CreateNew, FileKind::Database)
             .expect("create file");
-        
+
         write_all_at(file.as_ref(), 0, &[1, 2, 3, 4, 5]).expect("write");
         assert_eq!(file.file_size().expect("get size"), 5);
 
@@ -342,8 +342,12 @@ mod tests {
         let path1 = std::path::Path::new("db1.db");
         let path2 = std::path::Path::new("db2.db");
 
-        let file1 = vfs.open(path1, OpenMode::CreateNew, FileKind::Database).expect("create 1");
-        let file2 = vfs.open(path2, OpenMode::CreateNew, FileKind::Database).expect("create 2");
+        let file1 = vfs
+            .open(path1, OpenMode::CreateNew, FileKind::Database)
+            .expect("create 1");
+        let file2 = vfs
+            .open(path2, OpenMode::CreateNew, FileKind::Database)
+            .expect("create 2");
 
         write_all_at(file1.as_ref(), 0, &[1, 1, 1]).expect("write 1");
         write_all_at(file2.as_ref(), 0, &[2, 2, 2]).expect("write 2");

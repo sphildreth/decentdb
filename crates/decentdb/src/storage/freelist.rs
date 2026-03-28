@@ -94,12 +94,7 @@ mod tests {
 
     #[test]
     fn decode_freelist_next_rejects_short_pages() {
-        let short_pages: Vec<Vec<u8>> = vec![
-            vec![],
-            vec![0],
-            vec![0, 0],
-            vec![0, 0, 0],
-        ];
+        let short_pages: Vec<Vec<u8>> = vec![vec![], vec![0], vec![0, 0], vec![0, 0, 0]];
 
         for page in short_pages {
             assert!(
@@ -136,7 +131,10 @@ mod tests {
             for page_id in page_ids {
                 let encoded = encode_freelist_page(page_size, page_id);
                 let decoded = decode_freelist_next(&encoded).unwrap();
-                assert_eq!(decoded, page_id, "roundtrip failed for page_size={page_size}, page_id={page_id}");
+                assert_eq!(
+                    decoded, page_id,
+                    "roundtrip failed for page_size={page_size}, page_id={page_id}"
+                );
                 assert_eq!(encoded.len(), page_size as usize);
             }
         }
