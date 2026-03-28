@@ -82,13 +82,6 @@ It targets a single process with **one writer** and **many concurrent readers** 
 - For "lower is better" metrics (latency, DB size), the score is inverted so **higher bars mean better**.
 - Full methodology lives in `crates/decentdb/benches/embedded_compare.rs`, and the generated summary lives in `data/bench_summary.json`.
 
-**Supported engines**
-
-- DecentDB (native API)
-- SQLite (via C API)
-- DuckDB (via C API) - when library is available
-- Additional Python-harness engines such as H2 and HSQLDB when merged into the README summary
-
 **Regenerate**
 
 ```bash
