@@ -35,7 +35,7 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
     public String getDatabaseProductName() { return "DecentDB"; }
 
     @Override
-    public String getDatabaseProductVersion() { return DecentDBDriver.DRIVER_VERSION; }
+    public String getDatabaseProductVersion() { return DecentDBNative.engineVersion(); }
 
     @Override
     public String getDriverName() { return "DecentDB JDBC Driver"; }
@@ -72,16 +72,23 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
     public boolean allTablesAreSelectable() { return true; }
 
     @Override
-    public String getURL() throws SQLException {
-        // url is stored on connection but not exposed; return empty
-        return null;
-    }
+    public String getURL() { return connection.getUrl(); }
 
     @Override
     public String getUserName() { return ""; }
 
     @Override
     public boolean isReadOnly() throws SQLException { return connection.isReadOnly(); }
+
+    public String getTableDdl(String tableName) throws SQLException {
+        connection.checkOpen();
+        return DecentDBNative.metaGetTableDDL(connection.getDbHandle(), tableName);
+    }
+
+    public String listTriggersJson() throws SQLException {
+        connection.checkOpen();
+        return DecentDBNative.metaListTriggers(connection.getDbHandle());
+    }
 
     @Override
     public boolean nullsAreSortedHigh() { return false; }
@@ -1349,8 +1356,9 @@ public final class DecentDBDatabaseMetaData implements DatabaseMetaData {
         public ResultSetMetaData getMetaData() throws SQLException {
             String[] names = columns;
             int[] types = new int[names.length];
+            int[] scales = new int[names.length];
             Arrays.fill(types, DecentDBNative.KIND_TEXT);
-            return new DecentDBResultSetMetaData(names, types);
+            return new DecentDBResultSetMetaData(names, types, scales);
         }
 
         // Navigation

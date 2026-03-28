@@ -8,6 +8,7 @@
 - **2026-03-27:** Python binding complete. Coverage 50/50 (100%). All Phase 2 (features) and Phase 3 (SQLAlchemy) tasks resolved. 245 tests passing. `cargo clippy` clean.
 - **2026-03-27:** .NET binding V2 complete. Coverage expanded to 50/50 (100%). All Phase 1 (batch/fused/re-execute declarations), Phase 2 (DateTime microseconds fix, re-execute C ABI fix), Phase 3 (version API, connection modes, schema introspection, InTransaction) resolved. BenchmarksV2 project created. Full solution builds clean.
 - **2026-03-27:** Go binding V2 complete. Coverage 50/50 (100%). All 50 C ABI functions exposed through cgo. Schema introspection, version API, InTransaction, fused step+row_view, batch/re-execute, result set API, EvictSharedWal, DSN mode fix, finalizer, ErrBadConn all resolved. 26 tests passing. Benchmark beats SQLite 2.2x insert, 3.2x point reads. `cargo clippy` clean.
+- **2026-03-27:** Node.js binding v2 pass complete. Tasks N1.2, N1.3, N1.4, N1.6, N1.7, N2.2, N2.3, N2.4, N3.3, N3.4 resolved. 47 tests passing. Benchmark clean.
 
 ---
 
@@ -39,21 +40,21 @@ DecentDB's C ABI exposes 50 functions covering database lifecycle, prepared stat
 | .NET    | 50/50 (100%) ✅  | 4/4 ✅    | 2/2 ✅    | 3/3 ✅    | 4/4 ✅    | 6/6 ✅    |
 | Python  | 50/50 (100%) ✅  | 4/4 ✅    | 2/2 ✅    | 3/3 ✅    | 4/4 ✅    | 6/6 ✅    |
 | Go      | 50/50 (100%) ✅  | 1/4       | 1/2 ✅    | 3/3 ✅    | 4/4 ✅    | 6/6 ✅    |
-| Java    | 25/50 (50%)      | 0/4       | 0/2             | 0/3        | 1/4       | 0/6        |
-| Node.js | 30/50 (60%)      | 2/4       | 0/2             | 0/3        | 1/4       | 0/6        |
-| Dart    | 27/50 (54%)      | 0/4       | 0/2             | 0/3        | 0/4       | 6/6        |
+| Java    | 47/60 (78%)      | 3/3 ✅    | 1/2             | 3/3 ✅      | 2/4       | 0/6        |
+| Node.js | 43/50 (86%) ✅   | 1/3       | 0/2             | 3/3 ✅      | 2/4       | 0/6        |
+| Dart    | 44/50 (88%) ✅   | 0/3       | 0/2             | 0/3        | 0/4       | 6/6        |
 
 ### Critical Findings
 
-1. **Python, .NET, and Go expose all C ABI functions.** These three bindings each declare all 50 C ABI functions. Python via `native.py`, .NET via `NativeMethods.cs`, Go via cgo. All three include batch, fused bind+step, re-execute, result set, and value access functions. Java, Node.js, and Dart still lack these.
+1. **Python, .NET, and Go expose all C ABI functions.** These three bindings each declare all 60 current C ABI functions. Python via `native.py`, .NET via `NativeMethods.cs`, Go via cgo. Java has now closed most of its JNI coverage gaps, but still lacks bulk row fetch, typed fused bind+step, the result-handle family, and `ddb_evict_shared_wal`.
 
-2. **Data corruption bugs exist in Java.** BigDecimal binding loses scale information. Timestamp microsecond conversion uses incorrect arithmetic, losing 999 out of every 1000 microseconds.
+2. **Java correctness regressions have been fixed.** The v2 Java pass now binds `BigDecimal` through `ddb_stmt_bind_decimal`, preserves timestamp microsecond precision, reconstructs timestamps correctly on read, and keeps boolean/decimal metadata consistent.
 
-3. **Dart bypasses native prepared statements entirely.** It uses `ddb_db_execute` for every query, sending the full SQL string across the FFI boundary each time. This makes it the slowest binding by design.
+3. **Dart no longer bypasses prepared statements.** The v2 pass moved `Statement` onto native `ddb_stmt_t` handles, so SQL is prepared once and reused. The biggest remaining Dart performance gaps are now the unwrapped batch, row-view, and re-execute fast paths.
 
 4. **Python now exposes the result set handle API** (`ddb_result_t` declarations in `native.py`), but no high-level `Result` wrapper class exists yet. Dart and Python are the only bindings with result set declarations. The result set API enables one-shot queries without separate prepare/step lifecycle.
 
-5. **Python, .NET, and Go now expose `ddb_db_in_transaction`** for engine-truth transaction state. Python via `Connection.in_transaction`, .NET via `DecentDBConnection.InTransaction`, Go via `DB.InTransaction()`. Java, Node.js, and Dart still track transaction state in their own managed layer only.
+5. **Python, .NET, Go, Java, Node.js, and Dart now expose `ddb_db_in_transaction`** for engine-truth transaction state. Java does this via `DecentDBConnection.isInTransaction()`, Node.js via `db.inTransaction`, and Dart via `Database.inTransaction`.
 
 ---
 
@@ -129,30 +130,21 @@ These issues apply to multiple bindings and should be addressed at the C ABI or 
 
 ### 3.2 Version and ABI Introspection
 
-**~~Issue~~ Resolved (Python, .NET, Go, Dart):** `ddb_abi_version` and `ddb_version` are now exposed by Python, .NET, Go (`AbiVersion()`, `EngineVersion()`), and Dart. Remaining bindings (Java, Node.js) still cannot programmatically verify ABI version.
-
-**Task:** Java and Node.js should expose version introspection APIs.
+**~~Issue~~ Resolved (Python, .NET, Go, Dart, Java, Node.js):** `ddb_abi_version` and `ddb_version` are now exposed by Python, .NET, Go (`AbiVersion()`, `EngineVersion()`), Dart, Java (`DecentDBConnection.getAbiVersion()`, `getEngineVersion()`), and Node.js (`Database.abiVersion()`, `Database.version()`).
 
 ### 3.3 Transaction State Query
 
-**~~Issue~~ Resolved (Python, .NET, Go):** Python exposes `Connection.in_transaction`, .NET exposes `DecentDBConnection.InTransaction`, Go exposes `DB.InTransaction()`. All three query the engine directly via `ddb_db_in_transaction`. Remaining bindings still track transaction state in their own managed layer only.
-
-**Task:** Java, Node.js, and Dart should expose `in_transaction` as a read-only property.
+**~~Issue~~ Resolved (Python, .NET, Go, Java, Node.js, Dart):** Python exposes `Connection.in_transaction`, .NET exposes `DecentDBConnection.InTransaction`, Go exposes `DB.InTransaction()`, Java exposes `DecentDBConnection.isInTransaction()`, Node.js exposes `db.inTransaction`, and Dart exposes `Database.inTransaction`. All query the engine directly via `ddb_db_in_transaction`.
 
 ### 3.4 Schema Introspection Gaps
 
-**~~Issue~~ Resolved (Python, .NET, Go):** Python, .NET, and Go now expose all 7 schema introspection functions. Go: `GetTableDdl()`, `ListViews()`, `GetViewDdl()`, `ListTriggers()`, `ListTables()`, `GetTableColumns()`, `ListIndexes()`. Remaining bindings still have gaps.
+**~~Issue~~ Resolved (Python, .NET, Go, Java):** Python, .NET, Go, and Java now expose all 7 schema introspection functions. Go: `GetTableDdl()`, `ListViews()`, `GetViewDdl()`, `ListTriggers()`, `ListTables()`, `GetTableColumns()`, `ListIndexes()`. Java exposes the same through `DecentDBDatabaseMetaData` helpers and JNI metadata calls. Remaining bindings still have gaps.
 
-Remaining gaps for other bindings:
-- `ddb_db_get_table_ddl` — missing in Java, Node.js
-- `ddb_db_list_views_json` — missing in Node.js
-- `ddb_db_get_view_ddl` — missing in Node.js
-- `ddb_db_list_triggers_json` — missing in Java, Node.js
+**~~Issue~~ Resolved (Python, .NET, Go, Java, Node.js, Dart):** Node.js now exposes `getTableDdl()`, `listViewsInfo()` / `listViews()`, `getViewDdl()`, and `listTriggers()` on top of the existing JSON schema exports. Dart already exposed the full schema surface.
 
 ### 3.5 Database Open Mode
 
-**~~Issue~~ Resolved (Python, .NET):** Python supports `Connection(path, mode=...)`, .NET supports `new DecentDB(path, DbOpenMode.Create|Open|OpenOrCreate)`. Remaining bindings still lack distinct modes:
-- Node.js — default is `open_or_create`, mode parameter exists but is inconsistent
+**~~Issue~~ Resolved (Python, .NET, Java, Node.js, Dart):** Python supports `Connection(path, mode=...)`, .NET supports `new DecentDB(path, DbOpenMode.Create|Open|OpenOrCreate)`, Java supports JDBC `mode=openOrCreate|open|create`, Node.js supports `Database.openOrCreate()` / `openExisting()` / `create()` plus `mode: ...`, and Dart supports `Database.open()`, `create()`, and `openExisting()`.
 
 ### 3.6 Thread Safety Documentation
 
@@ -492,73 +484,76 @@ Every `C.GoStringN` and `C.GoBytes` call allocates a new Go buffer. No `sync.Poo
 
 **Location:** `bindings/java/`
 **Architecture:** JDBC driver → JNI bridge (`decentdb_jni.c`) → DecentDB C ABI
-**Coverage:** 25/50 functions (50%)
+**Coverage:** 47/60 functions (78%)
 
 ### 7.1 Critical Issues
 
-#### 7.1.1 BigDecimal Binding Loses Scale — Data Corruption
+#### 7.1.1 BigDecimal Binding Loses Scale — Resolved
 
-`DecentDBPreparedStatement.java:154-159` binds `BigDecimal` via `bindInt64`, discarding the scale. `setBigDecimal(1, new BigDecimal("123.45"))` stores `12345` as an integer with no scale. When read back, it will be `12345` not `123.45`. The C ABI has `ddb_stmt_bind_decimal(stmt, index, scaled, scale)` but it's not exposed in JNI.
+The v2 pass now binds `BigDecimal` through `ddb_stmt_bind_decimal`, preserving both the unscaled value and the declared scale. Java round-trip coverage was added to catch regressions.
 
 **Files:** `bindings/java/native/decentdb_jni.c`, `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBNative.java`, `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBPreparedStatement.java:154`
 
-#### 7.1.2 Timestamp Microsecond Conversion Bug — Data Corruption
+#### 7.1.2 Timestamp Microsecond Conversion Bug — Resolved
 
-`DecentDBPreparedStatement.java:168` computes:
-```java
-long micros = ts.getTime() * 1000L + ts.getNanos() / 1000L % 1000L;
-```
-`java.sql.Timestamp.getNanos()` returns nano-of-second (0-999,999,999). The `% 1000` truncates to microseconds-within-millisecond, losing 999 out of every 1000 microseconds. Correct formula: `ts.getTime() * 1000L + ts.getNanos() / 1000L`.
+The driver now converts Java timestamps to microseconds correctly and reconstructs them correctly on read, eliminating the earlier 1000x precision loss.
 
 **File:** `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBPreparedStatement.java:168`
 
-#### 7.1.3 Options String Silently Ignored by JNI Bridge
+#### 7.1.3 Open-Time Config Is Not In The Stable C ABI — Mitigated / Blocked
 
-`classify_open_mode()` in `decentdb_jni.c:55-60` only checks for `mode=create/open`. The `cache_pages` and `busy_timeout_ms` key-value pairs passed by the JDBC driver are discarded. `cachePages` and `busyTimeoutMs` JDBC properties have **no effect**.
+The original problem was silent misbehavior: the JDBC layer accepted `cachePages` and `busyTimeoutMs`, but the stable C ABI only exposes default `create`, `open`, and `open_or_create` entry points, so those options had no effect.
+
+The driver now behaves honestly:
+
+- `mode=openOrCreate|open|create` is supported
+- `cachePages` and `busyTimeoutMs` are rejected with `notSupported`
+
+Completing true support would require a stable open-with-config ABI extension.
 
 **File:** `bindings/java/native/decentdb_jni.c:55`
 
-#### 7.1.4 All Batch Operations Missing
+#### 7.1.4 All Batch Operations Missing — Resolved
 
-`executeBatch()` throws `notSupported`. The C ABI's `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, and `ddb_stmt_execute_batch_typed` are not exposed through JNI. This is the single largest performance gap for Java.
+`PreparedStatement.executeBatch()` now uses JNI bindings for `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, and `ddb_stmt_execute_batch_typed`, with per-row fallback when the batch shape is unsupported.
 
 **Files:** `bindings/java/native/decentdb_jni.c`, `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBStatement.java:246`
 
-#### 7.1.5 Global Error State is Thread-Unsafe
+#### 7.1.5 Global Error State is Thread-Unsafe — Resolved
 
-`g_last_code` in `decentdb_jni.c:27` is a global static with no synchronization. Under concurrent connections, error codes can leak between threads. Should use `__thread` / `_Thread_local` or per-handle error state.
+The JNI bridge now uses thread-local error tracking instead of a single process-global error code.
 
 **File:** `bindings/java/native/decentdb_jni.c:27`
 
-#### 7.1.6 No Fused Bind+Step or Re-Execute
+#### 7.1.6 No Fused Bind+Step or Re-Execute — Mostly Resolved
 
-Every point read requires 3+ JNI crossings per column: `kind()` → `isNull()` → actual getter, each calling `ddb_stmt_row_view` separately. The row view pointer is not cached between column accesses.
+Java now uses row-view caching, `ddb_stmt_step_row_view`, and the re-execute fast paths. The remaining notable gap is bulk row fetch (`ddb_stmt_fetch_row_views` / `ddb_stmt_fetch_rows_i64_text_f64`) and the typed fused bind+step helper.
 
 **File:** `bindings/java/native/decentdb_jni.c`, `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBResultSet.java`
 
 ### 7.2 Moderate Issues
 
-#### 7.2.1 Row View Not Cached Per Row
+#### 7.2.1 Row View Not Cached Per Row — Resolved
 
-`row_view_at()` calls `ddb_stmt_row_view` per column access. In `getString()`, `isNull()` calls it once, `kind()` calls it again, then the actual accessor calls it a third time. 3 JNI crossings per column where 1 would suffice if the row view pointer were cached.
+The JNI bridge now caches the row view for the current row and `ResultSet.next()` uses the fused step+row-view path.
 
 **File:** `bindings/java/native/decentdb_jni.c:322`
 
-#### 7.2.2 `getURL()` Returns Null
+#### 7.2.2 `getURL()` Returns Null — Resolved
 
-`DecentDBDatabaseMetaData.java:77` returns null. Should return the connection URL for diagnostic purposes.
+`DecentDBDatabaseMetaData.getURL()` now returns the active JDBC URL.
 
 **File:** `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBDatabaseMetaData.java:77`
 
-#### 7.2.3 No `DataSource` Implementation
+#### 7.2.3 No `DataSource` Implementation — Resolved
 
-No `javax.sql.DataSource`, no `ConnectionPoolDataSource`. Frameworks like Spring Boot, HikariCP expect a `DataSource`. While the single-process model doesn't need connection pooling, a `DataSource` wrapper improves usability.
+Java now ships `DecentDBDataSource`, a minimal non-pooling `DataSource` that supports URL, `mode`, and `readOnly`.
 
 **File:** `bindings/java/driver/`
 
-#### 7.2.4 `ResultSetMetaData.getScale()` Hardcoded
+#### 7.2.4 `ResultSetMetaData.getScale()` Hardcoded — Resolved
 
-Returns 6 for all DECIMAL columns. Should use actual column scale from the result.
+Decimal metadata now reports the actual column scale instead of a hardcoded value.
 
 **File:** `bindings/java/driver/src/main/java/com/decentdb/jdbc/DecentDBResultSetMetaData.java:108`
 
@@ -568,292 +563,188 @@ Returns 6 for all DECIMAL columns. Should use actual column scale from the resul
 
 | # | Task | Files | Impact |
 |---|------|-------|--------|
-| J1.1 | Add `bindDecimal` JNI method using `ddb_stmt_bind_decimal` | `decentdb_jni.c`, `DecentDBNative.java`, `DecentDBPreparedStatement.java` | Fix BigDecimal scale loss |
-| J1.2 | Fix timestamp microsecond formula | `DecentDBPreparedStatement.java:168` | Fix 1000x precision loss |
-| J1.3 | Fix options string passthrough in JNI `classify_open_mode` | `decentdb_jni.c:55` | `cachePages` and `busyTimeoutMs` actually work |
-| J1.4 | Add `bindBool` JNI method using `ddb_stmt_bind_bool` | `decentdb_jni.c`, `DecentDBNative.java` | Boolean type fidelity |
+| J1.1 | ✅ Add `bindDecimal` JNI method using `ddb_stmt_bind_decimal` | `decentdb_jni.c`, `DecentDBNative.java`, `DecentDBPreparedStatement.java` | Fixed BigDecimal scale loss |
+| J1.2 | ✅ Fix timestamp microsecond formula | `DecentDBPreparedStatement.java:168` | Fixed write/read timestamp precision |
+| J1.3 | ⚠️ Reject unsupported open-time config honestly | `DecentDBDriver.java` | `mode` works; `cachePages` / `busyTimeoutMs` remain ABI-blocked |
+| J1.4 | ✅ Add `bindBool` JNI method using `ddb_stmt_bind_bool` | `decentdb_jni.c`, `DecentDBNative.java` | Fixed boolean type fidelity |
 
 #### Phase 2: Performance (Critical Path)
 
 | # | Task | Files | Impact |
 |---|------|-------|--------|
-| J2.1 | Bind `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, `ddb_stmt_execute_batch_typed` | `decentdb_jni.c`, `DecentDBStatement.java` | Enable `executeBatch()` |
-| J2.2 | Cache row view pointer per row | `decentdb_jni.c`, `DecentDBResultSet.java` | Reduce JNI crossings from 3/col to 1/row |
-| J2.3 | Bind `ddb_stmt_step_row_view` for fused step+view | `decentdb_jni.c` | One JNI crossing per row |
-| J2.4 | Bind `ddb_stmt_fetch_row_views` for bulk fetch | `decentdb_jni.c`, new batch reader | Dramatically improve scan throughput |
-| J2.5 | Bind `ddb_stmt_rebind_int64_execute` and related | `decentdb_jni.c` | Fast UPDATE/DELETE by primary key |
-| J2.6 | Fix global error state to thread-local | `decentdb_jni.c:27` | Thread-safe error reporting |
-| J2.7 | Use `GetPrimitiveArrayCritical` for blob binding | `decentdb_jni.c:colBlob` | Potential GC-free blob transfer |
+| J2.1 | ✅ Bind `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, `ddb_stmt_execute_batch_typed` | `decentdb_jni.c`, `DecentDBPreparedStatement.java` | `executeBatch()` fast paths implemented |
+| J2.2 | ✅ Cache row view pointer per row | `decentdb_jni.c`, `DecentDBResultSet.java` | Reduced repeated JNI crossings |
+| J2.3 | ✅ Bind `ddb_stmt_step_row_view` for fused step+view | `decentdb_jni.c` | One JNI crossing per row step |
+| J2.4 | Open: Bind `ddb_stmt_fetch_row_views` for bulk fetch | `decentdb_jni.c`, new batch reader | Still missing scan bulk-fetch fast path |
+| J2.5 | ✅ Bind `ddb_stmt_rebind_int64_execute` and related | `decentdb_jni.c`, `DecentDBPreparedStatement.java` | Fast UPDATE/DELETE helper paths added |
+| J2.6 | ✅ Fix global error state to thread-local | `decentdb_jni.c:27` | Thread-safe error reporting |
+| J2.7 | ✅ Use `GetPrimitiveArrayCritical` for blob binding | `decentdb_jni.c` | Better blob transfer behavior |
 
 #### Phase 3: Feature Completeness
 
 | # | Task | Files | Impact |
 |---|------|-------|--------|
-| J3.1 | Expose `ddb_db_get_table_ddl`, `ddb_db_list_triggers_json` | `decentdb_jni.c`, `DecentDBDatabaseMetaData.java` | Full schema introspection |
-| J3.2 | Expose `ddb_abi_version`, `ddb_version` | `decentdb_jni.c`, `DecentDBNative.java` | Version introspection |
-| J3.3 | Expose `ddb_db_checkpoint`, `ddb_db_save_as` | `decentdb_jni.c`, `DecentDBConnection.java` | Maintenance from JDBC |
-| J3.4 | Expose `ddb_db_execute` + `ddb_result_*` family | `decentdb_jni.c`, new result class | One-shot query API |
-| J3.5 | Implement `javax.sql.DataSource` | new class | Framework compatibility |
-| J3.6 | Fix `getURL()` in `DatabaseMetaData` | `DecentDBDatabaseMetaData.java:77` | Diagnostic support |
-| J3.7 | Fix `ResultSetMetaData.getScale()` to use actual column scale | `DecentDBResultSetMetaData.java:108` | Correct metadata |
+| J3.1 | ✅ Expose `ddb_db_get_table_ddl`, `ddb_db_list_triggers_json` | `decentdb_jni.c`, `DecentDBDatabaseMetaData.java` | Full schema introspection |
+| J3.2 | ✅ Expose `ddb_abi_version`, `ddb_version` | `decentdb_jni.c`, `DecentDBNative.java` | Version introspection |
+| J3.3 | ✅ Expose `ddb_db_checkpoint`, `ddb_db_save_as` | `decentdb_jni.c`, `DecentDBConnection.java` | Maintenance from JDBC |
+| J3.4 | Partial: Expose immediate execute helper; result-handle family still open | `decentdb_jni.c`, `DecentDBConnection.java` | Internal one-shot execute exists, public `ddb_result_*` wrapper still missing |
+| J3.5 | ✅ Implement `javax.sql.DataSource` | `DecentDBDataSource.java` | Framework compatibility |
+| J3.6 | ✅ Fix `getURL()` in `DatabaseMetaData` | `DecentDBDatabaseMetaData.java:77` | Diagnostic support |
+| J3.7 | ✅ Fix `ResultSetMetaData.getScale()` to use actual column scale | `DecentDBResultSetMetaData.java:108` | Correct metadata |
 
 #### Phase 4: Testing
 
 | # | Task | Files | Impact |
 |---|------|-------|--------|
-| J4.1 | Add DECIMAL read/write round-trip test | test files | Catch scale bugs |
-| J4.2 | Add TIMESTAMP round-trip test with microsecond precision | test files | Catch precision bugs |
-| J4.3 | Add batch operation tests | test files | Verify bulk correctness |
-| J4.4 | Add concurrent connection test | test files | Validate thread safety |
-| J4.5 | Add large BLOB handling test | test files | Verify memory correctness |
+| J4.1 | ✅ Add DECIMAL read/write round-trip test | test files | Catches scale bugs |
+| J4.2 | ✅ Add TIMESTAMP round-trip test with microsecond precision | test files | Catches precision bugs |
+| J4.3 | ✅ Add batch operation tests | test files | Verifies bulk correctness |
+| J4.4 | Open: Add concurrent connection test | test files | Still missing dedicated concurrency regression |
+| J4.5 | Open: Add large BLOB handling test | test files | Still missing dedicated large-blob regression |
 
 ---
 
 ## 8. Node.js Binding Review
 
 **Location:** `bindings/node/`
-**Architecture:** N-API native addon (`decentdb/`) with runtime dlopen → Knex dialect client (`knex-decentdb/`)
-**Coverage:** 30/50 functions (60%)
+**Architecture:** N-API addon (`bindings/node/decentdb`) + Knex dialect (`bindings/node/knex-decentdb`)
+**Coverage:** 43/50 functions (86%) — up from 30/50 before the v2 pass
 
-### 8.1 Critical Issues
+### 8.1 Completed in the v2 pass
 
-#### 8.1.1 Async Iterator Dispatches One Worker Per Row
+- Replaced silent `assert(st == napi_ok)` release-mode behaviour with checked `NAPI_CALL(...)` error handling in the addon.
+- Made native library loading thread-safe and moved per-thread load/status error state off unsynchronized shared globals.
+- Exposed `ddb_stmt_bind_timestamp_micros`, `ddb_stmt_step_row_view`, and all three re-execute helpers.
+- Exposed `ddb_db_in_transaction`, `ddb_evict_shared_wal`, `ddb_abi_version`, and `ddb_version`.
+- Added JS-side open-mode helpers: `Database.openOrCreate()`, `Database.openExisting()`, `Database.create()`, and `mode: ...`.
+- Added schema completeness on the JS wrapper: `getTableDdl()`, `listViewsInfo()` / `listViews()`, `getViewDdl()`, and `listTriggers()`.
+- Added `FinalizationRegistry` safety nets for `Database` and `Statement`.
+- Fixed `positionBindings()` so `?` inside `/* ... */` block comments is preserved.
+- Added and validated new v2 tests for open modes, transaction-state introspection, timestamp binding, fused row stepping, re-execute helpers, schema DDL helpers, and block-comment placeholder rewriting.
 
-`stmtNextAsync` in `addon.c:1259` queues one `napi_async_work` per row to the libuv thread pool. For streaming 1M rows, this means 1M thread pool dispatches. The thread pool default is 4 threads. This is catastrophically slow for large result sets. Should batch: run N steps in the worker, return an array.
+### 8.2 Remaining gaps
 
-**File:** `bindings/node/decentdb/addon.c:1259`
+#### 8.2.1 Async iterator still dispatches one worker per row
 
-#### 8.1.2 `assert()` Used for N-API Calls — Silent Failures in Release
+`stmtNextAsync` still queues one `napi_async_work` per row. Large generic async scans should batch work units instead of paying one libuv dispatch per row.
 
-Many N-API calls use `assert(st == napi_ok)` (e.g., `addon.c:161`). In release builds with `-DNDEBUG`, these become no-ops. Any N-API failure would silently continue with undefined behavior.
+#### 8.2.2 Fully fused bind+step helpers are still missing
 
-**File:** `bindings/node/decentdb/addon.c`
+`ddb_stmt_bind_int64_step_row_view` and `ddb_stmt_bind_int64_step_i64_text_f64` remain unwrapped.
 
-#### 8.1.3 Global Mutable State With No Synchronization
+#### 8.2.3 Generic result-set and generic batch APIs remain open
 
-`g_sym`, `g_api`, `g_loaded`, `g_last_status`, `g_last_error` in `native_lib.c` are all global statics with no synchronization. If `decentdb_native_get()` is called from multiple threads simultaneously, there's a data race.
+The Node binding still does not expose:
 
-**File:** `bindings/node/decentdb/native_lib.c`
+- `ddb_db_execute` + `ddb_result_*`
+- `ddb_stmt_execute_batch_i64`
+- `ddb_stmt_execute_batch_typed`
+- `ddb_stmt_fetch_row_views`
+- `ddb_stmt_value_copy`
 
-#### 8.1.4 `ddb_stmt_bind_timestamp_micros` Missing
+#### 8.2.4 Knex still has benchmark-shaped fast paths
 
-Cannot bind TIMESTAMP_MICROS values from JavaScript. The binding supports reading timestamps but not writing them.
+`knex-decentdb` still special-cases benchmark-oriented `(int64, text, float64)` insert/fetch shapes instead of using a general insert-shape optimizer.
 
-**File:** `bindings/node/decentdb/native_lib.c`, `bindings/node/decentdb/addon.c`
+#### 8.2.5 Double-close protection is not atomic
 
-#### 8.1.5 Knex Batch Insert is Benchmark-Specific Hack
+The addon now has better cleanup coverage, but the low-level handle close path still does not use an atomic compare-and-swap guard.
 
-`client.js:267-323` detects `INSERT INTO ... VALUES ($1, $2, $3)` patterns and routes to `executeBatchI64TextF64`. This only works for `(int64, text, float64)` column types and the detection is hardcoded to a specific query shape. `isThreeColumnBenchSelect` at line 325 literally checks for `SELECT ID, VAL, F FROM BENCH`.
+### 8.3 Validation
 
-**File:** `bindings/node/knex-decentdb/client.js`
+Validated successfully in the current worktree:
 
-#### 8.1.6 No Fused Bind+Step or Re-Execute Exposed
+- `cd bindings/node/decentdb && npm test`
+- `cd bindings/node/knex-decentdb && npm test`
+- `cd bindings/node/decentdb && npm run benchmark:fetch -- --count 2000 --point-reads 200 --fetchmany-batch 128 --db-prefix ...`
+- `cd bindings/node/knex-decentdb && npm run benchmark:fetch -- --count 2000 --point-reads 200 --fetchmany-batch 128 --db-prefix ...`
+- `bash tests/bindings/node/build.sh && node tests/bindings/node/smoke.js`
 
-`ddb_stmt_bind_int64_step_row_view` and `ddb_stmt_bind_int64_step_i64_text_f64` are not exposed. The benchmark's `stepWithParams` requires two N-API crossings (step then rowArray) where the fused API would need one. No re-execute functions are exposed.
+### 8.4 Remaining task list
 
-**File:** `bindings/node/decentdb/addon.c`
-
-### 8.2 Moderate Issues
-
-#### 8.2.1 `positionBindings.js` Doesn't Handle Block Comments
-
-The `?` → `$N` rewriter handles `--` line comments but not `/* */` block comments. `?` inside block comments would be incorrectly converted to parameter placeholders.
-
-**File:** `bindings/node/knex-decentdb/positionBindings.js`
-
-#### 8.2.2 Column Names Fetched and Freed Per Access
-
-`wrap_column_name` calls `ddb_stmt_column_name_copy` which allocates, then `free_native_owned_string` frees it. Column names should be fetched once and cached.
-
-**File:** `bindings/node/decentdb/addon.c:1017`
-
-#### 8.2.3 No FinalizationRegistry Safety Net
-
-If JS users drop references without calling `close()`/`finalize()`, cleanup depends entirely on GC timing. The design doc recommends `FinalizationRegistry` but it's not implemented.
-
-**File:** `bindings/node/decentdb/index.js`
-
-#### 8.2.4 Double-Close Race Condition
-
-`js_db_close` sets `w->db = NULL` after closing, but there's no mutex or atomic operation. If called from two threads (finalizer + explicit close), it's a race.
-
-**File:** `bindings/node/decentdb/addon.c:219`
-
-### 8.3 Phased Tasks
-
-#### Phase 1: Performance and Safety
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| N1.1 | Batch the async iterator — run N steps in worker, return array | `addon.c:1259`, `index.js:343` | Eliminates 1M thread pool dispatches for large scans |
-| N1.2 | Replace `assert(napi_ok)` with proper error checking | `addon.c` (many locations) | Prevents silent undefined behavior in release |
-| N1.3 | Add synchronization to `native_lib.c` globals | `native_lib.c` | Thread-safe library loading |
-| N1.4 | Expose `ddb_stmt_bind_timestamp_micros` | `addon.c`, `native_lib.c` | Timestamp binding support |
-| N1.5 | Expose `ddb_stmt_bind_int64_step_row_view` | `addon.c` | Reduces point-read N-API crossings from ~5 to 1 |
-| N1.6 | Expose `ddb_stmt_step_row_view` | `addon.c` | Fused step+row-view |
-| N1.7 | Expose re-execute functions | `addon.c` | Fast UPDATE/DELETE by primary key |
-| N1.8 | Expose `ddb_stmt_execute_batch_i64` and `ddb_stmt_execute_batch_typed` | `addon.c` | General-purpose batch insert |
-
-#### Phase 2: Correctness and Safety
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| N2.1 | Add atomic compare-and-swap for double-close prevention | `addon.c:219,280` | Prevents use-after-free races |
-| N2.2 | Add FinalizationRegistry for Database and Statement | `index.js` | GC safety net |
-| N2.3 | Handle `/* */` block comments in positionBindings | `positionBindings.js` | Correct parameter rewriting |
-| N2.4 | Expose `ddb_abi_version`, `ddb_version` | `addon.c`, `native_lib.c`, `index.js` | ABI verification at load time |
-
-#### Phase 3: Feature Completeness
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| N3.1 | Expose `ddb_db_execute` + `ddb_result_*` family | `addon.c`, `index.js` | One-shot query API |
-| N3.2 | Expose `ddb_db_get_table_ddl`, `ddb_db_list_views_json`, `ddb_db_get_view_ddl`, `ddb_db_list_triggers_json` | `addon.c`, `index.js` | Full schema introspection |
-| N3.3 | Expose `ddb_db_in_transaction` | `addon.c`, `index.js` | Engine-truth transaction state |
-| N3.4 | Expose `ddb_evict_shared_wal` | `addon.c` | WAL management |
-| N3.5 | Replace benchmark-specific hacks with general INSERT pattern detection | `client.js` | Works for any column type |
-| N3.6 | Add Knex schema builder customization | `client.js` | Correct DecentDB column types |
-| N3.7 | Use `node-gyp-build` or `prebuildify` for prebuilt distribution | `package.json`, `binding.gyp` | Easier installation |
-
-#### Phase 4: Testing
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| N4.1 | Add async iteration error handling tests | test files | Verify error propagation in streams |
-| N4.2 | Add blob round-trip test | test files | Verify BLOB correctness |
-| N4.3 | Add timestamp_micros round-trip test | test files | Verify timestamp binding+reading |
-| N4.4 | Add batch operation tests | test files | Verify bulk correctness |
-| N4.5 | Add double-close/idempotent close tests | test files | Verify safety |
-| N4.6 | Add memory leak tests | test files | Verify cleanup |
-| N4.7 | Add Knex schema builder tests | `knex-decentdb/` test files | Verify DDL generation |
+| Task | Status | Notes |
+|------|--------|-------|
+| Batch async iteration work units | Open | still one async worker per row |
+| Bind `ddb_stmt_bind_int64_step_*` fused helpers | Open | useful for point-read hot paths |
+| Bind generic batch APIs | Open | `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_typed` |
+| Bind result-handle API | Open | `ddb_db_execute` + `ddb_result_*` |
+| Generalize Knex fast path | Open | current optimization is benchmark-shaped |
+| Add atomic double-close protection | Open | safety improvement in addon close/finalizer handoff |
 
 ---
 
 ## 9. Dart Binding Review
 
 **Location:** `bindings/dart/`
-**Architecture:** Dart FFI (`native_bindings.dart`) → high-level `Database`/`Statement`/`Schema` API
-**Coverage:** 27/50 functions (54%) — but notably 0/35 statement-level functions
+**Architecture:** Dart FFI wrapper with native prepared statements in `Statement`, result-handle support for one-shot query paths, and schema helpers on `Schema`
+**Coverage:** 44/50 functions (88%) — up from 27/50 before the v2 pass
 
-Dart has the most complete schema introspection coverage (all 7 schema functions + all 6 result set functions) but the weakest execution model: it bypasses native prepared statements entirely, using `ddb_db_execute` for every query.
+### 9.1 Completed in the v2 pass
 
-### 9.1 Critical Issues
+- Migrated `Statement` from Dart-managed `ddb_db_execute` convenience logic to native prepared statements backed by `ddb_db_prepare` / `ddb_stmt_*`.
+- Added native statement lifecycle, typed bind, step, column-count, column-name, affected-row, and copied-value support to `native_bindings.dart`.
+- Added distinct open modes through `Database.create()` and `Database.openExisting()`.
+- Added `Database.inTransaction` backed by `ddb_db_in_transaction`.
+- Added a Dart `Finalizer` so leaked database handles are still released if `close()` is skipped.
+- Reworked row decoding to reuse a single `DdbValue` allocation across cell copies instead of allocating per cell.
+- Replaced linear `row['column']` lookup with a shared O(1) column-index map.
+- Moved `sqlite3` to `dev_dependencies`.
+- Changed `ErrorCode.fromCode()` to throw on unknown native error codes instead of silently mapping them to `internal`.
+- Added and validated tests for open modes, transaction state, exact-page-size pagination, blob/decimal/timestamp round-trips, and stricter error-code handling.
 
-#### 9.1.1 Native Prepared Statements Completely Absent
+### 9.2 Remaining gaps
 
-The Dart binding does not bind `ddb_db_prepare`, `ddb_stmt_free`, `ddb_stmt_reset`, `ddb_stmt_clear_bindings`, `ddb_stmt_bind_*`, `ddb_stmt_step`, or any statement-level function. Every `execute()` or `query()` sends the full SQL string across the FFI boundary via `ddb_db_execute`. For the benchmark's insert loop, this means 1M SQL string copies to native memory. The native prepared statement API would avoid this entirely.
+#### 9.2.1 Batch execution fast paths are still missing
 
-**File:** `bindings/dart/dart/lib/src/statement.dart`
+The Dart wrapper still does not expose `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, or `ddb_stmt_execute_batch_typed`.
 
-#### 9.1.2 No Batch Insert API
+#### 9.2.2 Row-view and fused-step fast paths are still missing
 
-The C ABI offers `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, and `ddb_stmt_execute_batch_typed` for bulk operations. The Dart binding does not bind any of them. The benchmark loops single-row `execute()` calls. For a 1M row insert, this is 1M individual FFI round-trips where 1 batch call would suffice.
+The Dart wrapper still does not expose:
 
-**File:** `bindings/dart/dart/lib/src/statement.dart`
+- `ddb_stmt_row_view`
+- `ddb_stmt_step_row_view`
+- `ddb_stmt_fetch_row_views`
+- `ddb_stmt_fetch_rows_i64_text_f64`
+- `ddb_stmt_bind_int64_step_row_view`
+- `ddb_stmt_bind_int64_step_i64_text_f64`
 
-#### 9.1.3 No Zero-Copy Result Views
+#### 9.2.3 Re-execute helpers are still missing
 
-`ddb_stmt_row_view`, `ddb_stmt_fetch_row_views`, and `ddb_stmt_fetch_rows_i64_text_f64` return borrowed value views that avoid copying cell data. The Dart binding uses `ddb_result_value_copy` which allocates and copies every cell individually via `calloc<DdbValue>()` per cell.
+`ddb_stmt_rebind_int64_execute`, `ddb_stmt_rebind_text_int64_execute`, and `ddb_stmt_rebind_int64_text_execute` remain unwrapped.
 
-**File:** `bindings/dart/dart/lib/src/statement.dart:282`
+#### 9.2.4 `ddb_evict_shared_wal` is still not wrapped
 
-#### 9.1.4 Per-Cell Allocation Overhead
+The C ABI export exists, but the Dart API does not expose it yet.
 
-For each cell in a result, `calloc<DdbValue>()` is allocated, used, then freed. For a 1000-row x 10-column result, that's 10,000 `calloc` + 10,000 `free` calls. A single bulk allocation or use of stack-allocated arrays would dramatically reduce allocation pressure.
+#### 9.2.5 The “flutter_desktop” example is still only a desktop reference
 
-**File:** `bindings/dart/dart/lib/src/statement.dart:282-300`
+Its naming/description is now more honest, but it is still not an actual Flutter SDK application with Flutter-specific lifecycle handling.
 
-#### 9.1.5 Linear Column Lookup in Row
+#### 9.2.6 No isolate-affinity guard yet
 
-`Row.operator[]` does `columns.indexOf(name)` at line 19 — O(n) per named column access. For tables with many columns, this adds up. A `Map<String, int>` would be O(1).
+The package still relies on documentation and caller discipline for the engine’s one-writer / many-readers model.
 
-**File:** `bindings/dart/dart/lib/src/statement.dart:19`
+### 9.3 Validation
 
-### 9.2 Moderate Issues
+Validated successfully in the current worktree:
 
-#### 9.2.1 No `NativeFinalizer` on Database
+- `cd bindings/dart/dart && dart analyze lib/ test/ benchmarks/`
+- `cd bindings/dart/dart && dart test --reporter expanded`
+- `cd tests/bindings/dart && dart pub get && dart run smoke.dart`
+- `cd bindings/dart/examples/console && dart pub get && DECENTDB_NATIVE_LIB=... dart run main.dart`
+- `cd bindings/dart/dart && DECENTDB_NATIVE_LIB=... dart run benchmarks/bench_fetch.dart --count 2000 --point-reads 200 --fetchmany-batch 128 --db-prefix ...`
 
-If `Database.close()` is never called (user error, exception path), the `ddb_db_t*` handle leaks until process exit. Dart's `NativeFinalizer` could call `ddb_db_free` as a safety net.
+### 9.4 Remaining task list
 
-**File:** `bindings/dart/dart/lib/src/database.dart:11`
-
-#### 9.2.2 `sqlite3` is a Runtime Dependency
-
-`pubspec.yaml:13` lists `sqlite3: ^2.9.3` in `dependencies`, not `dev_dependencies`. Anyone who `depends: decentdb` pulls in the sqlite3 native library unnecessarily. It's only used in benchmarks.
-
-**File:** `bindings/dart/dart/pubspec.yaml:13`
-
-#### 9.2.3 `ErrorCode.fromCode` Silently Swallows Unknown Codes
-
-`types.dart:20` maps unknown error codes to `ErrorCode.internal`. If the C ABI adds new error codes, the Dart binding would silently swallow them instead of surfacing them.
-
-**File:** `bindings/dart/dart/lib/src/types.dart:20`
-
-#### 9.2.4 Flutter Example is Not a Flutter App
-
-`flutter_desktop/main.dart` is a console program that imports `dart:io` but not `package:flutter`. The `pubspec.yaml` has no Flutter SDK dependency. The name is misleading.
-
-**File:** `bindings/dart/examples/flutter_desktop/`
-
-#### 9.2.5 No Isolate Awareness
-
-The binding makes no attempt to detect or prevent cross-isolate usage. The C ABI's one-writer model is not enforced at the Dart layer. Two isolates calling `execute()` concurrently on the same `Database` would violate the engine contract.
-
-**File:** `bindings/dart/dart/lib/src/database.dart`
-
-### 9.3 Phased Tasks
-
-#### Phase 1: Performance Foundation (Critical Path)
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| DT1.1 | Bind `ddb_db_prepare`, `ddb_stmt_free`, `ddb_stmt_reset`, `ddb_stmt_clear_bindings`, `ddb_stmt_bind_*`, `ddb_stmt_step`, `ddb_stmt_column_count`, `ddb_stmt_column_name_copy`, `ddb_stmt_affected_rows` | `native_bindings.dart`, new internal `NativeStatement` | Enable native prepared statements |
-| DT1.2 | Bind `ddb_stmt_execute_batch_i64_text_f64` and `ddb_stmt_execute_batch_typed` | `native_bindings.dart`, `statement.dart` | Bulk insert throughput |
-| DT1.3 | Bind `ddb_stmt_row_view`, `ddb_stmt_step_row_view`, `ddb_stmt_fetch_row_views` | `native_bindings.dart`, new zero-copy reader | Eliminate per-cell allocation |
-| DT1.4 | Bind `ddb_stmt_bind_int64_step_row_view` and `ddb_stmt_bind_int64_step_i64_text_f64` | `native_bindings.dart` | Fused bind+step for point reads |
-| DT1.5 | Bind re-execute functions | `native_bindings.dart` | Fast UPDATE/DELETE by primary key |
-| DT1.6 | Replace linear column lookup with `Map<String, int>` in Row | `statement.dart:19` | O(1) named column access |
-| DT1.7 | Bulk-allocate DdbValue array per row instead of per-cell | `statement.dart:282` | Reduces allocation from 10K to 1K per 1K-row result |
-
-#### Phase 2: Correctness and Safety
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| DT2.1 | Add `NativeFinalizer` to `Database` calling `ddb_db_free` | `database.dart` | Prevents native handle leaks |
-| DT2.2 | Move `sqlite3` from `dependencies` to `dev_dependencies` | `pubspec.yaml` | Clean dependency tree |
-| DT2.3 | Throw on unknown `ErrorCode` instead of silently mapping to `internal` | `types.dart:20` | Surface new error codes |
-| DT2.4 | Bind `ddb_value_init` and use in `_EncodedParams._writeValue` | `native_bindings.dart`, `statement.dart` | Zero reserved fields safely |
-| DT2.5 | Add `UuidValue` wrapper type with standard UUID string formatting | `types.dart` | Better UUID ergonomics |
-
-#### Phase 3: Feature Completeness
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| DT3.1 | Expose `ddb_db_create` and `ddb_db_open` as distinct modes | `database.dart` | Create-only and open-only semantics |
-| DT3.2 | Expose `ddb_db_in_transaction` as `Database.inTransaction` | `database.dart` | Engine-truth transaction state |
-| DT3.3 | Expose `ddb_evict_shared_wal` | `database.dart` | WAL management |
-| DT3.4 | Bind `ddb_stmt_bind_bool` explicitly (currently handled via int64) | `native_bindings.dart` | Boolean type fidelity |
-
-#### Phase 4: Flutter and Isolate Support
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| DT4.1 | Fix or rename `flutter_desktop` example to be a real Flutter app | `examples/flutter_desktop/` | Accurate example |
-| DT4.2 | Add isolate-aware wrapper or document single-isolate requirement | `database.dart` dartdoc | Thread safety contract |
-| DT4.3 | Add `WidgetsBindingObserver` integration for app lifecycle | new Flutter helper | Proper pause/resume handling |
-
-#### Phase 5: Testing
-
-| # | Task | Files | Impact |
-|---|------|-------|--------|
-| DT5.1 | Add BLOB round-trip test | `decentdb_test.dart` | Verify BLOB correctness |
-| DT5.2 | Add DECIMAL round-trip test | `decentdb_test.dart` | Verify DECIMAL correctness |
-| DT5.3 | Add UUID read test | `decentdb_test.dart` | Verify UUID handling |
-| DT5.4 | Add TIMESTAMP_MICROS round-trip test | `decentdb_test.dart` | Verify timestamp precision |
-| DT5.5 | Add concurrent reader test | `decentdb_test.dart` | Validate multi-reader model |
-| DT5.6 | Add error code propagation tests | `decentdb_test.dart` | Verify typed errors |
-| DT5.7 | Add batch operation tests | `decentdb_test.dart` | Verify bulk correctness |
-| DT5.8 | Add `nextPage` with exact page-size boundary test | `decentdb_test.dart` | Verify `isLast` edge case |
+| Task | Status | Notes |
+|------|--------|-------|
+| Bind batch execution APIs | Open | biggest remaining throughput gap |
+| Bind row-view / fetch-row-view APIs | Open | would enable lower-allocation streaming |
+| Bind fused bind+step helpers | Open | useful for point-read hot paths |
+| Bind re-execute helpers | Open | useful for keyed UPDATE/DELETE hot paths |
+| Expose `ddb_evict_shared_wal` | Open | maintenance surface still incomplete |
+| Add isolate/runtime guard documentation or enforcement | Open | engine contract still mostly documented, not enforced |
 
 ---
 
@@ -893,7 +784,7 @@ All bindings have benchmarks comparing DecentDB to their native SQLite counterpa
 | .NET    | ✅ (benchmark) | ✅ | Partial | Partial | Partial |
 | Python  | ✅ (README) | ✅ | ✅ | Partial | Partial |
 | Go      | ✅ (benchmark) | ✅ | ✅ | Partial | Partial |
-| Java    | ✅ (benchmark) | ✅ | Partial | Partial | Partial |
+| Java    | ✅ (benchmark + standalone example) | ✅ | ✅ | ✅ | ✅ |
 | Node.js | ✅ (README) | ✅ | ✅ | Partial | Partial |
 | Dart    | ✅ (console, complex) | ✅ | ✅ | ✅ | Partial |
 
@@ -903,11 +794,11 @@ Dart has the best example quality with `console_complex/main.dart` (1122 lines) 
 
 | # | Task | Binding(s) | Impact |
 |---|------|-----------|--------|
-| E1 | Add a standalone example (not benchmark) showing full CRUD + schema | .NET, Go, Java | Better onboarding |
+| E1 | Add a standalone example (not benchmark) showing full CRUD + schema | .NET, Go | Better onboarding |
 | E2 | Add DECIMAL and UUID type examples | All | Showcases native type support |
-| E3 | Add error handling example | All | Shows exception patterns |
-| E4 | Add connection string / DSN configuration example | .NET, Go, Node.js, Java | Shows configuration options |
-| E5 | Add transaction example with rollback | All | Shows transaction patterns |
+| E3 | Add error handling example | .NET, Python, Go, Node.js, Dart | Shows exception patterns |
+| E4 | Add connection string / DSN configuration example | .NET, Go, Node.js | Shows configuration options |
+| E5 | Add transaction example with rollback | .NET, Python, Go, Node.js, Dart | Shows transaction patterns |
 
 ---
 
@@ -919,10 +810,10 @@ These tasks enable the fast-path operations that DecentDB's engine is optimized 
 
 | Task | .NET | Python | Go | Java | Node.js | Dart |
 |------|:----:|:------:|:--:|:----:|:-------:|:----:|
-| Bind batch execution (`ddb_stmt_execute_batch_*`) | ✅ | ✅ | G1.5 | J2.1 | N1.8 | DT1.2 |
-| Bind fused bind+step | ✅ | ✅ | G1.2 | J2.2 | N1.5 | DT1.4 |
-| Bind fused step+row_view | ✅ | ✅ | ✅ | J2.3 | N1.6 | DT1.3 |
-| Bind re-execute patterns | ✅ | ✅ | G1.4 | J2.5 | N1.7 | DT1.5 |
+| Bind batch execution (`ddb_stmt_execute_batch_*`) | ✅ | ✅ | G1.5 | ✅ | N1.8 | DT1.2 |
+| Bind fused bind+step | ✅ | ✅ | G1.2 | Partial | N1.5 | DT1.4 |
+| Bind fused step+row_view | ✅ | ✅ | ✅ | ✅ | ✅ | DT1.3 |
+| Bind re-execute patterns | ✅ | ✅ | G1.4 | ✅ | ✅ | DT1.5 |
 | Bind batch fetch | ✅ | ✅ | G1.3 | J2.4 | — | DT1.3 |
 
 ### Tier 2: Correctness (Blocks V2 Quality Goals)
@@ -931,11 +822,11 @@ These tasks fix data corruption bugs, memory leaks, and correctness issues that 
 
 | Task | .NET | Python | Go | Java | Node.js | Dart |
 |------|:----:|:------:|:--:|:----:|:-------:|:----:|
-| Fix data corruption bugs | ✅ | — | — | J1.1, J1.2 | — | — |
-| Add `runtime.SetFinalizer` / `NativeFinalizer` | — | — | G2.3 | — | N2.1 | DT2.1 |
-| Fix DSN/connection config bugs | — | ✅ | ✅ | J1.3 | — | — |
-| Return proper error types | — | — | ✅ | — | N1.2 | DT2.3 |
-| Thread safety fixes | — | — | — | J2.6 | N1.3 | — |
+| Fix data corruption bugs | ✅ | — | — | ✅ | — | — |
+| Add `runtime.SetFinalizer` / `NativeFinalizer` | — | — | G2.3 | — | ✅ | DT2.1 |
+| Fix DSN/connection config bugs | — | ✅ | ✅ | Partial (ABI-blocked) | — | — |
+| Return proper error types | — | — | ✅ | — | ✅ | DT2.3 |
+| Thread safety fixes | — | — | — | ✅ | ✅ | — |
 
 ### Tier 3: Feature Completeness (Blocks V2 API Parity)
 
@@ -943,21 +834,21 @@ These tasks close feature gaps between bindings and the C ABI.
 
 | Task | .NET | Python | Go | Java | Node.js | Dart |
 |------|:----:|:------:|:--:|:----:|:-------:|:----:|
-| Schema introspection (views, triggers, DDL) | ✅ | ✅ | ✅ | J3.1 | N3.2 | ✅ |
-| Version/ABI introspection | ✅ | ✅ | ✅ | J3.2 | N2.4 | ✅ |
-| Transaction state query | ✅ | ✅ | ✅ | — | N3.3 | DT3.2 |
-| Database open mode variants | ✅ | ✅ | ✅ | — | — | DT3.1 |
+| Schema introspection (views, triggers, DDL) | ✅ | ✅ | ✅ | ✅ | N3.2 | ✅ |
+| Version/ABI introspection | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Transaction state query | ✅ | ✅ | ✅ | ✅ | ✅ | DT3.2 |
+| Database open mode variants | ✅ | ✅ | ✅ | ✅ | — | DT3.1 |
 | Result set API (declarations) | ✅ (decl) | ✅ (decl) | G3.1 | J3.4 | N3.1 | ✅ |
 
 ### Tier 4: Testing and Documentation
 
 | Task | .NET | Python | Go | Java | Node.js | Dart |
 |------|:----:|:------:|:--:|:----:|:-------:|:----:|
-| Batch operation tests | D4.1 | P4.1 | G4.4 | J4.3 | N4.4 | DT5.7 |
+| Batch operation tests | D4.1 | P4.1 | G4.4 | ✅ | N4.4 | DT5.7 |
 | Concurrent reader tests | D4.3 | ✅ (existing) | G4.2 | J4.4 | — | DT5.5 |
-| DECIMAL round-trip tests | D4.4 | ✅ | — | J4.1 | — | DT5.2 |
-| Timestamp precision tests | D4.5 | ✅ | G4.1 | J4.2 | N4.3 | DT5.4 |
-| Thread safety documentation | D4.6 | — | — | — | — | DT4.2 |
+| DECIMAL round-trip tests | D4.4 | ✅ | — | ✅ | — | DT5.2 |
+| Timestamp precision tests | D4.5 | ✅ | G4.1 | ✅ | N4.3 | DT5.4 |
+| Thread safety documentation | D4.6 | — | — | ✅ | — | DT4.2 |
 
 ---
 
@@ -967,8 +858,8 @@ Complete list of 50 C ABI functions with their binding coverage status. ✅ = ex
 
 | # | Function | .NET | Python | Go | Java | Node | Dart |
 |---|----------|:----:|:------:|:--:|:----:|:----:|:----:|
-| 1 | `ddb_abi_version` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 2 | `ddb_version` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 1 | `ddb_abi_version` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 2 | `ddb_version` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 3 | `ddb_last_error_message` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 4 | `ddb_value_init` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | 5 | `ddb_value_dispose` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
@@ -983,43 +874,43 @@ Complete list of 50 C ABI functions with their binding coverage status. ✅ = ex
 | 14 | `ddb_stmt_clear_bindings` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 15 | `ddb_stmt_bind_null` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 16 | `ddb_stmt_bind_int64` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 17 | `ddb_stmt_bind_int64_step_row_view` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| 17 | `ddb_stmt_bind_int64_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | 18 | `ddb_stmt_bind_int64_step_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | 19 | `ddb_stmt_bind_float64` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 20 | `ddb_stmt_bind_bool` | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
+| 20 | `ddb_stmt_bind_bool` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 21 | `ddb_stmt_bind_text` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 22 | `ddb_stmt_bind_blob` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 23 | `ddb_stmt_bind_decimal` | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
+| 23 | `ddb_stmt_bind_decimal` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 24 | `ddb_stmt_bind_timestamp_micros` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 25 | `ddb_stmt_execute_batch_i64` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 26 | `ddb_stmt_execute_batch_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| 27 | `ddb_stmt_execute_batch_typed` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| 25 | `ddb_stmt_execute_batch_i64` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 26 | `ddb_stmt_execute_batch_i64_text_f64` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| 27 | `ddb_stmt_execute_batch_typed` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | 28 | `ddb_stmt_step` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 29 | `ddb_stmt_column_count` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 30 | `ddb_stmt_column_name_copy` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 31 | `ddb_stmt_affected_rows` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 32 | `ddb_stmt_rebind_int64_execute` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 33 | `ddb_stmt_rebind_text_int64_execute` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 34 | `ddb_stmt_rebind_int64_text_execute` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| 32 | `ddb_stmt_rebind_int64_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 33 | `ddb_stmt_rebind_text_int64_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 34 | `ddb_stmt_rebind_int64_text_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | 35 | `ddb_stmt_value_copy` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | 36 | `ddb_stmt_row_view` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 37 | `ddb_stmt_step_row_view` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| 37 | `ddb_stmt_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | 38 | `ddb_stmt_fetch_row_views` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | 39 | `ddb_stmt_fetch_rows_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
-| 40 | `ddb_db_execute` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 41 | `ddb_db_checkpoint` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| 42 | `ddb_db_begin_transaction` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| 43 | `ddb_db_commit_transaction` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| 44 | `ddb_db_rollback_transaction` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
-| 45 | `ddb_db_in_transaction` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 46 | `ddb_db_save_as` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| 40 | `ddb_db_execute` | ✅ | ✅ | ✅ | ⚠️ | ❌ | ✅ |
+| 41 | `ddb_db_checkpoint` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 42 | `ddb_db_begin_transaction` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 43 | `ddb_db_commit_transaction` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 44 | `ddb_db_rollback_transaction` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 45 | `ddb_db_in_transaction` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 46 | `ddb_db_save_as` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 47 | `ddb_db_list_tables_json` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 48 | `ddb_db_describe_table_json` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 49 | `ddb_db_get_table_ddl` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 49 | `ddb_db_get_table_ddl` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 50 | `ddb_db_list_indexes_json` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 51 | `ddb_db_list_views_json` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 52 | `ddb_db_get_view_ddl` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| 53 | `ddb_db_list_triggers_json` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 53 | `ddb_db_list_triggers_json` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 54 | `ddb_evict_shared_wal` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | 55 | `ddb_result_free` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | 56 | `ddb_result_row_count` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |

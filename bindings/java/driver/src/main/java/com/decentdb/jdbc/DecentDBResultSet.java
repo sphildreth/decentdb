@@ -76,7 +76,7 @@ public class DecentDBResultSet implements ResultSet {
         }
 
         // Advance to next row
-        int rc = DecentDBNative.stmtStep(stmtHandle);
+        int rc = DecentDBNative.stmtStepRowView(stmtHandle);
         if (rc != 0 && rc != 1) {
             Errors.checkStatus(dbHandle, rc);
         }
@@ -117,11 +117,17 @@ public class DecentDBResultSet implements ResultSet {
         return wasNull;
     }
 
+    private int kindOrNull(int columnIndex) throws SQLException {
+        int kind = kind(columnIndex);
+        wasNull = (kind == DecentDBNative.KIND_NULL);
+        return kind;
+    }
+
     @Override
     public String getString(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return null;
-        int k = kind(columnIndex);
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return null;
         if (k == DecentDBNative.KIND_TEXT) {
             return DecentDBNative.colText(stmtHandle, columnIndex - 1);
         } else if (k == DecentDBNative.KIND_BLOB) {
@@ -140,14 +146,8 @@ public class DecentDBResultSet implements ResultSet {
         } else if (k == DecentDBNative.KIND_DECIMAL) {
             return getDecimal(columnIndex).toPlainString();
         } else if (k == DecentDBNative.KIND_DATETIME) {
-            // Format as ISO-8601 string
-            long micros = DecentDBNative.colDatetime(stmtHandle, columnIndex - 1);
-            long epochMicros = micros;
-            long secs = epochMicros / 1_000_000L;
-            int us = (int)(epochMicros % 1_000_000L);
-            if (us < 0) { secs--; us += 1_000_000; }
-            java.time.Instant inst = java.time.Instant.ofEpochSecond(secs, us * 1000L);
-            return inst.atOffset(java.time.ZoneOffset.UTC).format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            Timestamp ts = getTimestamp(columnIndex);
+            return ts != null ? ts.toString() : null;
         }
         return DecentDBNative.colText(stmtHandle, columnIndex - 1);
     }
@@ -200,8 +200,8 @@ public class DecentDBResultSet implements ResultSet {
     @Override
     public boolean getBoolean(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return false;
-        int k = kind(columnIndex);
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return false;
         if (k == DecentDBNative.KIND_BOOL || k == DecentDBNative.KIND_INT64
                 || k == DecentDBNative.KIND_INT0 || k == DecentDBNative.KIND_INT1) {
             return DecentDBNative.colInt64(stmtHandle, columnIndex - 1) != 0;
@@ -230,8 +230,8 @@ public class DecentDBResultSet implements ResultSet {
     @Override
     public long getLong(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return 0L;
-        int k = kind(columnIndex);
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return 0L;
         if (k == DecentDBNative.KIND_INT64 || k == DecentDBNative.KIND_BOOL
                 || k == DecentDBNative.KIND_INT0 || k == DecentDBNative.KIND_INT1
                 || k == DecentDBNative.KIND_BOOL_FALSE || k == DecentDBNative.KIND_BOOL_TRUE) {
@@ -254,8 +254,8 @@ public class DecentDBResultSet implements ResultSet {
     @Override
     public double getDouble(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return 0.0;
-        int k = kind(columnIndex);
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return 0.0;
         if (k == DecentDBNative.KIND_FLOAT64) {
             return DecentDBNative.colFloat64(stmtHandle, columnIndex - 1);
         } else if (k == DecentDBNative.KIND_INT64 || k == DecentDBNative.KIND_BOOL
@@ -279,7 +279,7 @@ public class DecentDBResultSet implements ResultSet {
     @Override
     public BigDecimal getBigDecimal(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return null;
+        if (kindOrNull(columnIndex) == DecentDBNative.KIND_NULL) return null;
         return getDecimal(columnIndex);
     }
 
@@ -323,15 +323,13 @@ public class DecentDBResultSet implements ResultSet {
     @Override
     public Timestamp getTimestamp(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return null;
-        int k = kind(columnIndex);
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return null;
         if (k == DecentDBNative.KIND_DATETIME) {
             long micros = DecentDBNative.colDatetime(stmtHandle, columnIndex - 1);
-            long ms = micros / 1000L;
-            int ns = (int)((micros % 1000L) * 1000L);
-            Timestamp ts = new Timestamp(ms);
-            ts.setNanos(ns >= 0 ? ns : ns + 1_000_000_000);
-            return ts;
+            long seconds = Math.floorDiv(micros, 1_000_000L);
+            int nanos = (int) Math.floorMod(micros, 1_000_000L) * 1_000;
+            return Timestamp.from(java.time.Instant.ofEpochSecond(seconds, nanos));
         }
         String s = getString(columnIndex);
         if (s == null) return null;
@@ -341,12 +339,18 @@ public class DecentDBResultSet implements ResultSet {
     @Override
     public Object getObject(int columnIndex) throws SQLException {
         checkOpen();
-        if (isNull(columnIndex)) return null;
-        int k = kind(columnIndex);
+        int k = kindOrNull(columnIndex);
+        if (wasNull) return null;
         switch (k) {
             case DecentDBNative.KIND_INT64: return getLong(columnIndex);
+            case DecentDBNative.KIND_INT0:
+            case DecentDBNative.KIND_INT1:
+                return getLong(columnIndex);
             case DecentDBNative.KIND_FLOAT64: return getDouble(columnIndex);
-            case DecentDBNative.KIND_BOOL: return getBoolean(columnIndex);
+            case DecentDBNative.KIND_BOOL:
+            case DecentDBNative.KIND_BOOL_FALSE:
+            case DecentDBNative.KIND_BOOL_TRUE:
+                return getBoolean(columnIndex);
             case DecentDBNative.KIND_BLOB: {
                 byte[] bytes = getBytes(columnIndex);
                 if (bytes != null && isUuidBytes(bytes)) return uuidFromBytes(bytes);
@@ -464,11 +468,13 @@ public class DecentDBResultSet implements ResultSet {
         int n = DecentDBNative.colCount(stmtHandle);
         String[] names = new String[n];
         int[] types = new int[n];
+        int[] scales = new int[n];
         for (int i = 0; i < n; i++) {
             names[i] = DecentDBNative.colName(stmtHandle, i);
             types[i] = DecentDBNative.colType(stmtHandle, i);
+            scales[i] = types[i] == DecentDBNative.KIND_DECIMAL ? DecentDBNative.colDecimalScale(stmtHandle, i) : 0;
         }
-        return new DecentDBResultSetMetaData(names, types);
+        return new DecentDBResultSetMetaData(names, types, scales);
     }
 
     // ---- Navigation (forward-only) -------------------------------------

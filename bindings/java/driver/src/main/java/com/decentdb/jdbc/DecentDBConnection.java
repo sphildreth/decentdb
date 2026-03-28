@@ -82,8 +82,36 @@ public final class DecentDBConnection implements Connection {
         return dbHandle;
     }
 
+    String getUrl() {
+        return url;
+    }
+
     void checkOpen() throws SQLException {
         if (closed) throw Errors.connectionClosed("Connection is closed");
+    }
+
+    void ensureWriteAllowed(String sql) throws SQLException {
+        if (readOnly && !DecentDBStatement.isReadStatement(sql)) {
+            throw Errors.readOnlyViolation("Connection is read-only: " + sql);
+        }
+    }
+
+    void ensureWriteAllowed(boolean readQuery, String operation) throws SQLException {
+        if (readOnly && !readQuery) {
+            throw Errors.readOnlyViolation("Connection is read-only: " + operation);
+        }
+    }
+
+    private boolean queryInTransactionLocked() throws SQLException {
+        int rc = DecentDBNative.dbInTransaction(dbHandle);
+        if (rc < 0) {
+            Errors.checkStatus(dbHandle, rc);
+        }
+        return rc != 0;
+    }
+
+    private void refreshInTransactionLocked() throws SQLException {
+        inTransaction = queryInTransactionLocked();
     }
 
     @Override
@@ -125,13 +153,11 @@ public final class DecentDBConnection implements Connection {
         try {
             if (this.autoCommit == autoCommit) return;
             if (!autoCommit && !inTransaction) {
-                // Begin transaction
-                executeUpdate("BEGIN");
-                inTransaction = true;
+                beginTransactionNativeLocked();
+                refreshInTransactionLocked();
             } else if (autoCommit && inTransaction) {
-                // Commit current transaction
-                executeUpdate("COMMIT");
-                inTransaction = false;
+                commitTransactionNativeLocked();
+                refreshInTransactionLocked();
             }
             this.autoCommit = autoCommit;
         } finally {
@@ -145,8 +171,8 @@ public final class DecentDBConnection implements Connection {
         if (autoCommit) throw new SQLException("Cannot commit in auto-commit mode", "25000");
         connectionLock.lock();
         try {
-            executeUpdate("COMMIT");
-            inTransaction = false;
+            commitTransactionNativeLocked();
+            refreshInTransactionLocked();
         } finally {
             connectionLock.unlock();
         }
@@ -158,8 +184,8 @@ public final class DecentDBConnection implements Connection {
         if (autoCommit) throw new SQLException("Cannot rollback in auto-commit mode", "25000");
         connectionLock.lock();
         try {
-            executeUpdate("ROLLBACK");
-            inTransaction = false;
+            rollbackTransactionNativeLocked();
+            refreshInTransactionLocked();
         } finally {
             connectionLock.unlock();
         }
@@ -173,8 +199,8 @@ public final class DecentDBConnection implements Connection {
      */
     void beginTransactionIfNeeded() throws SQLException {
         if (!autoCommit && !inTransaction) {
-            executeUpdate("BEGIN");
-            inTransaction = true;
+            beginTransactionNativeLocked();
+            refreshInTransactionLocked();
         }
     }
 
@@ -185,7 +211,7 @@ public final class DecentDBConnection implements Connection {
         try {
             if (closed) return;
             if (inTransaction) {
-                try { executeUpdate("ROLLBACK"); } catch (SQLException ignored) {}
+                try { rollbackTransactionNativeLocked(); } catch (SQLException ignored) {}
                 inTransaction = false;
             }
             closed = true;
@@ -218,6 +244,54 @@ public final class DecentDBConnection implements Connection {
     public void setReadOnly(boolean readOnly) throws SQLException {
         checkOpen();
         this.readOnly = readOnly;
+    }
+
+    public boolean isInTransaction() throws SQLException {
+        checkOpen();
+        connectionLock.lock();
+        try {
+            refreshInTransactionLocked();
+            return inTransaction;
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    public int getAbiVersion() {
+        return DecentDBNative.abiVersion();
+    }
+
+    public String getEngineVersion() {
+        return DecentDBNative.engineVersion();
+    }
+
+    public void checkpoint() throws SQLException {
+        checkOpen();
+        connectionLock.lock();
+        try {
+            int rc = DecentDBNative.dbCheckpoint(dbHandle);
+            if (rc != 0) {
+                Errors.checkStatus(dbHandle, rc);
+            }
+        } finally {
+            connectionLock.unlock();
+        }
+    }
+
+    public void saveAs(String destPath) throws SQLException {
+        checkOpen();
+        if (destPath == null || destPath.isBlank()) {
+            throw new SQLException("Destination path must not be blank", "22023");
+        }
+        connectionLock.lock();
+        try {
+            int rc = DecentDBNative.dbSaveAs(dbHandle, destPath);
+            if (rc != 0) {
+                Errors.checkStatus(dbHandle, rc);
+            }
+        } finally {
+            connectionLock.unlock();
+        }
     }
 
     @Override
@@ -425,19 +499,33 @@ public final class DecentDBConnection implements Connection {
 
     /** Execute a SQL statement with no result set (used internally for BEGIN/COMMIT/ROLLBACK). */
     void executeUpdate(String sql) throws SQLException {
-        long[] outStmt = new long[1];
-        int rc = DecentDBNative.stmtPrepare(dbHandle, sql, outStmt);
-        if (rc != 0 || outStmt[0] == 0) {
-            Errors.checkStatus(dbHandle, rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
+        long[] outAffected = new long[1];
+        int rc = DecentDBNative.dbExecuteImmediate(dbHandle, sql, outAffected);
+        if (rc != 0) {
+            Errors.checkStatus(dbHandle, rc);
         }
-        long stmt = outStmt[0];
-        try {
-            rc = DecentDBNative.stmtStep(stmt);
-            if (rc != 0 && rc != 1) {
-                Errors.checkStatus(dbHandle, rc);
-            }
-        } finally {
-            DecentDBNative.stmtFinalize(stmt);
+    }
+
+    private void beginTransactionNativeLocked() throws SQLException {
+        int rc = DecentDBNative.dbBeginTransaction(dbHandle);
+        if (rc != 0) {
+            Errors.checkStatus(dbHandle, rc);
+        }
+    }
+
+    private long commitTransactionNativeLocked() throws SQLException {
+        long[] outLsn = new long[1];
+        int rc = DecentDBNative.dbCommitTransaction(dbHandle, outLsn);
+        if (rc != 0) {
+            Errors.checkStatus(dbHandle, rc);
+        }
+        return outLsn[0];
+    }
+
+    private void rollbackTransactionNativeLocked() throws SQLException {
+        int rc = DecentDBNative.dbRollbackTransaction(dbHandle);
+        if (rc != 0) {
+            Errors.checkStatus(dbHandle, rc);
         }
     }
 

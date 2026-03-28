@@ -5,18 +5,28 @@ idiomatic Dart API for desktop and CLI applications.
 
 ## What is covered today
 
-- `Database.open()` / `Database.memory()` / `Database.close()`
+- `Database.open()` / `Database.create()` / `Database.openExisting()` /
+  `Database.memory()` / `Database.close()`
+- `Database.inTransaction` query helper backed by `ddb_db_in_transaction`
+- `Database` `Finalizer` – the native handle is released by the GC if `close()`
+  is never called
 - One-shot `execute()`, `executeWithParams()`, and `query()`
-- A Dart-side `Statement` convenience wrapper for parameter binding, reuse, and
-  paging
+- Native prepared statements (`ddb_stmt_t`) backing every `Statement` object –
+  SQL is compiled once and the query plan is reused across executions
+- Efficient row decoding: a single `DdbValue` allocation is reused for every
+  cell in a result set; a shared `Map<String, int>` index is built once per
+  result and shared across all rows for O(1) named-column access via `row['col']`
+- Typed bind methods call `ddb_stmt_bind_*` directly:
+  `bindNull`, `bindInt64`, `bindBool`, `bindFloat64`, `bindText`, `bindBlob`,
+  `bindDecimal`, `bindDateTime`
+- `Statement.reset()` / `clearBindings()` / `dispose()` map to native
+  `ddb_stmt_reset` / `ddb_stmt_clear_bindings` / `ddb_stmt_free`
 - Transaction helpers: `begin()`, `commit()`, `rollback()`, `transaction()`
 - Maintenance helpers: `checkpoint()` and `saveAs()`
 - Schema metadata via `Schema.listTables()`, `describeTable()`, `listIndexes()`,
   `listViews()`, `getTableDdl()`, `getViewDdl()`, and `listTriggers()`
-
-The high-level `Statement` API is implemented in Dart on top of the native
-`ddb_db_execute` result handle API. It does not depend on a separate native
-prepared-statement ABI.
+- `ErrorCode.fromCode` throws `StateError` on unrecognised codes
+- `sqlite3` moved to `dev_dependencies` (only used by the benchmark)
 
 ## Build the native library
 
@@ -145,7 +155,11 @@ into `Database.open(..., libraryPath: ...)`. See
 ## Current limitations
 
 - `Database.open(options: ...)` is not exposed by the current stable `ddb_*`
-  ABI, so the Dart wrapper rejects non-empty `options` values.
+  ABI; the Dart wrapper rejects non-empty `options` values.
 - The package uses the stable C ABI from `include/decentdb.h`; the reference
-  header under `bindings/dart/native/decentdb.h` simply includes that file so
-  the two surfaces stay in sync.
+  header under `bindings/dart/native/decentdb.h` includes that file so the two
+  surfaces stay in sync.
+- The `Statement` API fetches all rows into memory before streaming via
+  `step()` / `nextPage()`.  True lazy row-by-row streaming is possible via
+  `ddb_stmt_step_row_view` but requires the caller to decode borrowed pointers
+  synchronously; it is left for a future pass.

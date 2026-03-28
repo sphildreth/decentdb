@@ -21,6 +21,13 @@ test('positionBindings ignores ? in line comments', () => {
   assert.equal(positionBindings('select ? -- is this?\nfrom t'), 'select $1 -- is this?\nfrom t');
 });
 
+test('positionBindings ignores ? in block comments', () => {
+  assert.equal(
+    positionBindings('select /* keep ? */ ? as v'),
+    'select /* keep ? */ $1 as v',
+  );
+});
+
 test('positionBindings handles escaped quotes', () => {
   assert.equal(positionBindings("select 'it''s a ?' as q, ? as v"), "select 'it''s a ?' as q, $1 as v");
 });

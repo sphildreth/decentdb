@@ -27,6 +27,10 @@ final class Errors {
         return new SQLException(msg, "08003");
     }
 
+    static SQLException readOnlyViolation(String msg) {
+        return new SQLException(msg, "25006");
+    }
+
     static SQLException syntax(String msg, int vendorCode) {
         return new SQLException(msg, "42000", vendorCode);
     }

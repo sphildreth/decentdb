@@ -2,6 +2,8 @@ package com.decentdb.jdbc;
 
 import java.lang.ref.Cleaner;
 import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.logging.Logger;
 
 /**
@@ -19,6 +21,7 @@ public class DecentDBStatement implements Statement {
     protected volatile boolean closed = false;
     protected DecentDBResultSet currentResultSet = null;
     protected long updateCount = -1;
+    private final List<String> batchSql = new ArrayList<>();
 
     private final Cleaner.Cleanable cleanable;
 
@@ -56,6 +59,7 @@ public class DecentDBStatement implements Statement {
     @Override
     public int executeUpdate(String sql) throws SQLException {
         checkOpen();
+        connection.ensureWriteAllowed(sql);
         connection.connectionLock.lock();
         try {
             connection.beginTransactionIfNeeded();
@@ -81,6 +85,7 @@ public class DecentDBStatement implements Statement {
     @Override
     public boolean execute(String sql) throws SQLException {
         checkOpen();
+        connection.ensureWriteAllowed(sql);
         connection.connectionLock.lock();
         try {
             if (!isReadStatement(sql)) {
@@ -93,7 +98,7 @@ public class DecentDBStatement implements Statement {
                 Errors.checkStatus(connection.getDbHandle(), rc != 0 ? rc : DecentDBNative.ERR_INTERNAL);
             }
             stmtHandle = outStmt[0];
-            rc = DecentDBNative.stmtStep(stmtHandle);
+            rc = isReadStatement(sql) ? DecentDBNative.stmtStepRowView(stmtHandle) : DecentDBNative.stmtStep(stmtHandle);
             if (rc != 0 && rc != 1) {
                 Errors.checkStatus(connection.getDbHandle(), rc);
             }
@@ -122,7 +127,7 @@ public class DecentDBStatement implements Statement {
         }
         stmtHandle = outStmt[0];
         // Step once to prime the cursor: rc=1 means row available, rc=0 means empty result
-        rc = DecentDBNative.stmtStep(stmtHandle);
+        rc = DecentDBNative.stmtStepRowView(stmtHandle);
         if (rc != 0 && rc != 1) {
             finalizeStmt();
             Errors.checkStatus(connection.getDbHandle(), rc);
@@ -237,13 +242,34 @@ public class DecentDBStatement implements Statement {
     public int getResultSetType() throws SQLException { return ResultSet.TYPE_FORWARD_ONLY; }
 
     @Override
-    public void addBatch(String sql) throws SQLException { throw Errors.notSupported("addBatch"); }
+    public void addBatch(String sql) throws SQLException {
+        checkOpen();
+        if (sql == null || sql.isBlank()) {
+            throw new SQLException("Batch SQL must not be blank", "22023");
+        }
+        batchSql.add(sql);
+    }
 
     @Override
-    public void clearBatch() throws SQLException {}
+    public void clearBatch() throws SQLException {
+        batchSql.clear();
+    }
 
     @Override
-    public int[] executeBatch() throws SQLException { throw Errors.notSupported("executeBatch"); }
+    public int[] executeBatch() throws SQLException {
+        checkOpen();
+        connection.connectionLock.lock();
+        try {
+            int[] counts = new int[batchSql.size()];
+            for (int i = 0; i < batchSql.size(); i++) {
+                counts[i] = executeUpdate(batchSql.get(i));
+            }
+            batchSql.clear();
+            return counts;
+        } finally {
+            connection.connectionLock.unlock();
+        }
+    }
 
     @Override
     public Connection getConnection() throws SQLException { return connection; }

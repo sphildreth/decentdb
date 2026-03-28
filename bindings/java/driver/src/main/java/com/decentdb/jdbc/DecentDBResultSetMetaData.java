@@ -12,11 +12,13 @@ public final class DecentDBResultSetMetaData implements ResultSetMetaData {
 
     private final String[] columnNames;
     private final int[] columnKinds;
+    private final int[] columnScales;
     private final int columnCount;
 
-    DecentDBResultSetMetaData(String[] columnNames, int[] columnKinds) {
+    DecentDBResultSetMetaData(String[] columnNames, int[] columnKinds, int[] columnScales) {
         this.columnNames = columnNames;
         this.columnKinds = columnKinds;
+        this.columnScales = columnScales;
         this.columnCount = columnNames.length;
     }
 
@@ -105,7 +107,8 @@ public final class DecentDBResultSetMetaData implements ResultSetMetaData {
 
     @Override
     public int getScale(int column) throws SQLException {
-        return getColumnType(column) == Types.DECIMAL ? 6 : 0;
+        checkIndex(column);
+        return getColumnType(column) == Types.DECIMAL ? columnScales[column - 1] : 0;
     }
 
     @Override

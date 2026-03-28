@@ -94,6 +94,19 @@ class MetadataTest {
         assertEquals(1, meta.getDriverMajorVersion());
     }
 
+    @Test
+    @Order(3)
+    void urlAndCustomMetadataHelpers() throws Exception {
+        assumeNative();
+        DatabaseMetaData meta = connection.getMetaData();
+        assertTrue(meta.getURL().startsWith("jdbc:decentdb:"));
+
+        DecentDBDatabaseMetaData decentMeta = meta.unwrap(DecentDBDatabaseMetaData.class);
+        assertNotNull(decentMeta.getTableDdl("departments"));
+        String triggersJson = decentMeta.listTriggersJson();
+        assertNotNull(triggersJson);
+    }
+
     // ---- getTables -------------------------------------------------------
 
     @Test

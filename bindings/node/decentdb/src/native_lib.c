@@ -4,18 +4,38 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#define DDB_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define DDB_THREAD_LOCAL _Thread_local
+#else
+#define DDB_THREAD_LOCAL __thread
+#endif
+
 #if defined(_WIN32)
   #include <windows.h>
   static HMODULE g_lib = NULL;
   #define DL_HANDLE HMODULE
   static void* load_sym(DL_HANDLE h, const char* name) { return (void*)GetProcAddress(h, name); }
   static DL_HANDLE load_lib(const char* path) { return LoadLibraryA(path); }
+
+  /* Spinlock for thread-safe first load on Windows. */
+  static volatile LONG g_load_spin = 0;
+  static void lock_load(void) {
+    while (InterlockedCompareExchange(&g_load_spin, 1, 0) != 0) { /* spin */ }
+  }
+  static void unlock_load(void) { InterlockedExchange(&g_load_spin, 0); }
 #else
   #include <dlfcn.h>
+  #include <pthread.h>
   static void* g_lib = NULL;
   #define DL_HANDLE void*
   static void* load_sym(DL_HANDLE h, const char* name) { return dlsym(h, name); }
   static DL_HANDLE load_lib(const char* path) { return dlopen(path, RTLD_NOW); }
+
+  static pthread_mutex_t g_load_mutex = PTHREAD_MUTEX_INITIALIZER;
+  static void lock_load(void)   { pthread_mutex_lock(&g_load_mutex); }
+  static void unlock_load(void) { pthread_mutex_unlock(&g_load_mutex); }
 #endif
 
 typedef ddb_status_t (*fn_abi_version_t)(void);
@@ -63,7 +83,20 @@ typedef ddb_status_t (*fn_db_rollback_transaction_t)(ddb_db_t* db);
 typedef ddb_status_t (*fn_db_save_as_t)(ddb_db_t* db, const char* dest_path);
 typedef ddb_status_t (*fn_db_list_tables_json_t)(ddb_db_t* db, char** out_json);
 typedef ddb_status_t (*fn_db_describe_table_json_t)(ddb_db_t* db, const char* name, char** out_json);
+typedef ddb_status_t (*fn_db_get_table_ddl_t)(ddb_db_t* db, const char* name, char** out_ddl);
 typedef ddb_status_t (*fn_db_list_indexes_json_t)(ddb_db_t* db, char** out_json);
+typedef ddb_status_t (*fn_db_list_views_json_t)(ddb_db_t* db, char** out_json);
+typedef ddb_status_t (*fn_db_get_view_ddl_t)(ddb_db_t* db, const char* name, char** out_ddl);
+typedef ddb_status_t (*fn_db_list_triggers_json_t)(ddb_db_t* db, char** out_json);
+typedef ddb_status_t (*fn_stmt_bind_timestamp_micros_t)(ddb_stmt_t* stmt, size_t index_1_based, int64_t micros);
+typedef ddb_status_t (*fn_stmt_step_row_view_t)(ddb_stmt_t* stmt, const ddb_value_view_t** out_values, size_t* out_columns, uint8_t* out_has_row);
+typedef ddb_status_t (*fn_stmt_rebind_int64_execute_t)(ddb_stmt_t* stmt, int64_t value, uint64_t* out_affected);
+typedef ddb_status_t (*fn_stmt_rebind_text_int64_execute_t)(ddb_stmt_t* stmt, const char* text_value, size_t text_len, int64_t int_value, uint64_t* out_affected);
+typedef ddb_status_t (*fn_stmt_rebind_int64_text_execute_t)(ddb_stmt_t* stmt, int64_t int_value, const char* text_value, size_t text_len, uint64_t* out_affected);
+typedef ddb_status_t (*fn_db_in_transaction_t)(ddb_db_t* db, uint8_t* out_flag);
+typedef ddb_status_t (*fn_evict_shared_wal_t)(const char* path);
+typedef uint32_t (*fn_abi_version_t_v2)(void);   /* distinct alias to avoid re-typedef clash */
+typedef const char* (*fn_version_t_v2)(void);
 
 static struct {
   fn_abi_version_t abi_version;
@@ -99,22 +132,36 @@ static struct {
   fn_db_save_as_t db_save_as;
   fn_db_list_tables_json_t db_list_tables_json;
   fn_db_describe_table_json_t db_describe_table_json;
+  fn_db_get_table_ddl_t db_get_table_ddl;
   fn_db_list_indexes_json_t db_list_indexes_json;
+  fn_db_list_views_json_t db_list_views_json;
+  fn_db_get_view_ddl_t db_get_view_ddl;
+  fn_db_list_triggers_json_t db_list_triggers_json;
+  /* Optional extensions: present in current library but may be absent in older builds. */
+  fn_stmt_bind_timestamp_micros_t stmt_bind_timestamp_micros;
+  fn_stmt_step_row_view_t stmt_step_row_view;
+  fn_stmt_rebind_int64_execute_t stmt_rebind_int64_execute;
+  fn_stmt_rebind_text_int64_execute_t stmt_rebind_text_int64_execute;
+  fn_stmt_rebind_int64_text_execute_t stmt_rebind_int64_text_execute;
+  fn_db_in_transaction_t db_in_transaction;
+  fn_evict_shared_wal_t evict_shared_wal;
+  fn_abi_version_t_v2 abi_version_v2;
+  fn_version_t_v2 version_v2;
 } g_sym;
 
 static decentdb_native_api g_api;
 static int g_loaded = 0;
-static int g_last_status = 0;
-static char g_last_error[512];
+static DDB_THREAD_LOCAL int t_last_status = 0;
+static DDB_THREAD_LOCAL char t_last_error[512];
 
 static void set_last_error(const char* msg) {
   if (msg == NULL) msg = "unknown";
-  strncpy(g_last_error, msg, sizeof(g_last_error) - 1);
-  g_last_error[sizeof(g_last_error) - 1] = '\0';
+  strncpy(t_last_error, msg, sizeof(t_last_error) - 1);
+  t_last_error[sizeof(t_last_error) - 1] = '\0';
 }
 
 const char* decentdb_native_last_load_error(void) {
-  return g_last_error;
+  return t_last_error;
 }
 
 static int status_to_legacy_code(ddb_status_t status) {
@@ -141,7 +188,7 @@ static int status_to_legacy_code(ddb_status_t status) {
 }
 
 static void set_status(ddb_status_t status) {
-  g_last_status = status_to_legacy_code(status);
+  t_last_status = status_to_legacy_code(status);
 }
 
 static const char* current_last_error_message(void) {
@@ -201,7 +248,7 @@ static int wrap_close(decentdb_db* db) {
 
 static int wrap_last_error_code(decentdb_db* db) {
   (void)db;
-  return g_last_status;
+  return t_last_status;
 }
 
 static const char* wrap_last_error_message(decentdb_db* db) {
@@ -407,6 +454,20 @@ static const char* wrap_get_table_columns_json(decentdb_db* db, const char* tabl
   return json;
 }
 
+static const char* wrap_get_table_ddl(decentdb_db* db, const char* table_utf8, int* out_len) {
+  if (!g_sym.db_get_table_ddl) {
+    set_last_error("ddb_db_get_table_ddl not available");
+    t_last_status = 6;
+    return NULL;
+  }
+  char* ddl = NULL;
+  ddb_status_t status = g_sym.db_get_table_ddl(db, table_utf8, &ddl);
+  set_status(status);
+  if (status != DDB_OK || ddl == NULL) return NULL;
+  *out_len = (int)strlen(ddl);
+  return ddl;
+}
+
 static const char* wrap_list_indexes_json(decentdb_db* db, int* out_len) {
   char* json = NULL;
   ddb_status_t status = g_sym.db_list_indexes_json(db, &json);
@@ -414,6 +475,160 @@ static const char* wrap_list_indexes_json(decentdb_db* db, int* out_len) {
   if (status != DDB_OK || json == NULL) return NULL;
   *out_len = (int)strlen(json);
   return json;
+}
+
+static const char* wrap_list_views_json(decentdb_db* db, int* out_len) {
+  if (!g_sym.db_list_views_json) {
+    set_last_error("ddb_db_list_views_json not available");
+    t_last_status = 6;
+    return NULL;
+  }
+  char* json = NULL;
+  ddb_status_t status = g_sym.db_list_views_json(db, &json);
+  set_status(status);
+  if (status != DDB_OK || json == NULL) return NULL;
+  *out_len = (int)strlen(json);
+  return json;
+}
+
+static const char* wrap_get_view_ddl(decentdb_db* db, const char* view_utf8, int* out_len) {
+  if (!g_sym.db_get_view_ddl) {
+    set_last_error("ddb_db_get_view_ddl not available");
+    t_last_status = 6;
+    return NULL;
+  }
+  char* ddl = NULL;
+  ddb_status_t status = g_sym.db_get_view_ddl(db, view_utf8, &ddl);
+  set_status(status);
+  if (status != DDB_OK || ddl == NULL) return NULL;
+  *out_len = (int)strlen(ddl);
+  return ddl;
+}
+
+static const char* wrap_list_triggers_json(decentdb_db* db, int* out_len) {
+  if (!g_sym.db_list_triggers_json) {
+    set_last_error("ddb_db_list_triggers_json not available");
+    t_last_status = 6;
+    return NULL;
+  }
+  char* json = NULL;
+  ddb_status_t status = g_sym.db_list_triggers_json(db, &json);
+  set_status(status);
+  if (status != DDB_OK || json == NULL) return NULL;
+  *out_len = (int)strlen(json);
+  return json;
+}
+
+static int wrap_bind_timestamp_micros(decentdb_stmt* stmt, int index_1_based, int64_t micros) {
+  if (!g_sym.stmt_bind_timestamp_micros) {
+    set_last_error("ddb_stmt_bind_timestamp_micros not available");
+    t_last_status = 6; /* ERR_INTERNAL */
+    return -1;
+  }
+  ddb_status_t status = g_sym.stmt_bind_timestamp_micros(stmt, (size_t)index_1_based, micros);
+  set_status(status);
+  return status == DDB_OK ? 0 : -1;
+}
+
+static int wrap_step_row_view(
+    decentdb_stmt* stmt,
+    const decentdb_value_view** out_values,
+    int* out_count) {
+  if (!g_sym.stmt_step_row_view) {
+    set_last_error("ddb_stmt_step_row_view not available");
+    t_last_status = 6;
+    return -1;
+  }
+  uint8_t has_row = 0;
+  size_t columns = 0;
+  ddb_status_t status = g_sym.stmt_step_row_view(stmt, out_values, &columns, &has_row);
+  set_status(status);
+  if (status != DDB_OK) return -1;
+  *out_count = (int)columns;
+  return has_row ? 1 : 0;
+}
+
+static int wrap_rebind_int64_execute(
+    decentdb_stmt* stmt,
+    int64_t value,
+    uint64_t* out_affected) {
+  if (!g_sym.stmt_rebind_int64_execute) {
+    set_last_error("ddb_stmt_rebind_int64_execute not available");
+    t_last_status = 6;
+    return -1;
+  }
+  ddb_status_t status = g_sym.stmt_rebind_int64_execute(stmt, value, out_affected);
+  set_status(status);
+  return status == DDB_OK ? 0 : -1;
+}
+
+static int wrap_rebind_text_int64_execute(
+    decentdb_stmt* stmt,
+    const char* text_value,
+    int text_len,
+    int64_t int_value,
+    uint64_t* out_affected) {
+  if (!g_sym.stmt_rebind_text_int64_execute) {
+    set_last_error("ddb_stmt_rebind_text_int64_execute not available");
+    t_last_status = 6;
+    return -1;
+  }
+  size_t len = text_len < 0 ? 0 : (size_t)text_len;
+  ddb_status_t status = g_sym.stmt_rebind_text_int64_execute(stmt, text_value, len, int_value, out_affected);
+  set_status(status);
+  return status == DDB_OK ? 0 : -1;
+}
+
+static int wrap_rebind_int64_text_execute(
+    decentdb_stmt* stmt,
+    int64_t int_value,
+    const char* text_value,
+    int text_len,
+    uint64_t* out_affected) {
+  if (!g_sym.stmt_rebind_int64_text_execute) {
+    set_last_error("ddb_stmt_rebind_int64_text_execute not available");
+    t_last_status = 6;
+    return -1;
+  }
+  size_t len = text_len < 0 ? 0 : (size_t)text_len;
+  ddb_status_t status = g_sym.stmt_rebind_int64_text_execute(stmt, int_value, text_value, len, out_affected);
+  set_status(status);
+  return status == DDB_OK ? 0 : -1;
+}
+
+static int wrap_in_transaction(decentdb_db* db) {
+  if (!g_sym.db_in_transaction) {
+    set_last_error("ddb_db_in_transaction not available");
+    t_last_status = 6;
+    return -1;
+  }
+  uint8_t flag = 0;
+  ddb_status_t status = g_sym.db_in_transaction(db, &flag);
+  set_status(status);
+  if (status != DDB_OK) return -1;
+  return flag ? 1 : 0;
+}
+
+static int wrap_evict_shared_wal(const char* path) {
+  if (!g_sym.evict_shared_wal) {
+    set_last_error("ddb_evict_shared_wal not available");
+    t_last_status = 6;
+    return -1;
+  }
+  ddb_status_t status = g_sym.evict_shared_wal(path);
+  set_status(status);
+  return status == DDB_OK ? 0 : -1;
+}
+
+static uint32_t wrap_abi_version(void) {
+  if (!g_sym.abi_version_v2) return 0;
+  return g_sym.abi_version_v2();
+}
+
+static const char* wrap_version_string(void) {
+  if (!g_sym.version_v2) return "";
+  const char* v = g_sym.version_v2();
+  return v ? v : "";
 }
 
 static int resolve_all(DL_HANDLE h) {
@@ -455,7 +670,31 @@ static int resolve_all(DL_HANDLE h) {
   g_sym.db_save_as = (fn_db_save_as_t)load_sym(h, "ddb_db_save_as");
   g_sym.db_list_tables_json = (fn_db_list_tables_json_t)load_sym(h, "ddb_db_list_tables_json");
   g_sym.db_describe_table_json = (fn_db_describe_table_json_t)load_sym(h, "ddb_db_describe_table_json");
+  g_sym.db_get_table_ddl = (fn_db_get_table_ddl_t)load_sym(h, "ddb_db_get_table_ddl");
   g_sym.db_list_indexes_json = (fn_db_list_indexes_json_t)load_sym(h, "ddb_db_list_indexes_json");
+  g_sym.db_list_views_json = (fn_db_list_views_json_t)load_sym(h, "ddb_db_list_views_json");
+  g_sym.db_get_view_ddl = (fn_db_get_view_ddl_t)load_sym(h, "ddb_db_get_view_ddl");
+  g_sym.db_list_triggers_json = (fn_db_list_triggers_json_t)load_sym(h, "ddb_db_list_triggers_json");
+
+  /* Optional extensions: do not fail loading if these are absent. */
+  g_sym.stmt_bind_timestamp_micros =
+      (fn_stmt_bind_timestamp_micros_t)load_sym(h, "ddb_stmt_bind_timestamp_micros");
+  g_sym.stmt_step_row_view =
+      (fn_stmt_step_row_view_t)load_sym(h, "ddb_stmt_step_row_view");
+  g_sym.stmt_rebind_int64_execute =
+      (fn_stmt_rebind_int64_execute_t)load_sym(h, "ddb_stmt_rebind_int64_execute");
+  g_sym.stmt_rebind_text_int64_execute =
+      (fn_stmt_rebind_text_int64_execute_t)load_sym(h, "ddb_stmt_rebind_text_int64_execute");
+  g_sym.stmt_rebind_int64_text_execute =
+      (fn_stmt_rebind_int64_text_execute_t)load_sym(h, "ddb_stmt_rebind_int64_text_execute");
+  g_sym.db_in_transaction =
+      (fn_db_in_transaction_t)load_sym(h, "ddb_db_in_transaction");
+  g_sym.evict_shared_wal =
+      (fn_evict_shared_wal_t)load_sym(h, "ddb_evict_shared_wal");
+  g_sym.abi_version_v2 =
+      (fn_abi_version_t_v2)load_sym(h, "ddb_abi_version");
+  g_sym.version_v2 =
+      (fn_version_t_v2)load_sym(h, "ddb_version");
 
   if (!g_sym.last_error_message ||
       !g_sym.string_free ||
@@ -523,16 +762,38 @@ static int resolve_all(DL_HANDLE h) {
   g_api.free = wrap_free;
   g_api.list_tables_json = wrap_list_tables_json;
   g_api.get_table_columns_json = wrap_get_table_columns_json;
+  g_api.get_table_ddl = wrap_get_table_ddl;
   g_api.list_indexes_json = wrap_list_indexes_json;
+  g_api.list_views_json = wrap_list_views_json;
+  g_api.get_view_ddl = wrap_get_view_ddl;
+  g_api.list_triggers_json = wrap_list_triggers_json;
+  g_api.bind_timestamp_micros = wrap_bind_timestamp_micros;
+  g_api.step_row_view = wrap_step_row_view;
+  g_api.rebind_int64_execute = wrap_rebind_int64_execute;
+  g_api.rebind_text_int64_execute = wrap_rebind_text_int64_execute;
+  g_api.rebind_int64_text_execute = wrap_rebind_int64_text_execute;
+  g_api.in_transaction = wrap_in_transaction;
+  g_api.evict_shared_wal = wrap_evict_shared_wal;
+  g_api.abi_version = wrap_abi_version;
+  g_api.version_string = wrap_version_string;
 
   return 1;
 }
 
 const decentdb_native_api* decentdb_native_get(void) {
+  /* Fast path: already loaded (g_loaded is written once and never cleared). */
   if (g_loaded) return &g_api;
 
+  lock_load();
+
+  /* Double-check under lock: another thread may have completed the load. */
+  if (g_loaded) {
+    unlock_load();
+    return &g_api;
+  }
+
   set_last_error("not loaded");
-  g_last_status = 0;
+  t_last_status = 0;
 
   const char* explicitPath = getenv("DECENTDB_NATIVE_LIB_PATH");
   const char* candidates[8];
@@ -566,13 +827,16 @@ const decentdb_native_api* decentdb_native_get(void) {
 
     g_lib = h;
     if (!resolve_all(h)) {
+      unlock_load();
       return NULL;
     }
 
     g_loaded = 1;
     set_last_error("");
+    unlock_load();
     return &g_api;
   }
 
+  unlock_load();
   return NULL;
 }

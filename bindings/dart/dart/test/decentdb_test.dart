@@ -68,6 +68,23 @@ void main() {
       }
     });
 
+    test('create and openExisting expose distinct open modes', () {
+      final tempDir =
+          Directory.systemTemp.createTempSync('decentdb_dart_modes_');
+      final dbPath = '${tempDir.path}/modes.ddb';
+      try {
+        final created = Database.create(dbPath, libraryPath: libPath);
+        created.execute('CREATE TABLE t (id INT64 PRIMARY KEY)');
+        created.close();
+
+        final reopened = Database.openExisting(dbPath, libraryPath: libPath);
+        expect(reopened.schema.listTables(), contains('t'));
+        reopened.close();
+      } finally {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+
     test('rejects unsupported native open options', () {
       expect(
         () => Database.open(':memory:',
@@ -192,6 +209,23 @@ void main() {
       }
     });
 
+    test('nextPage marks exact final boundary as last page', () {
+      db.transaction(() {
+        for (var i = 1; i <= 4; i++) {
+          db.execute("INSERT INTO items VALUES ($i, 'item_$i', true)");
+        }
+      });
+
+      final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+      try {
+        final page = stmt.nextPage(4);
+        expect(page.rows.map((row) => row['id']).toList(), [1, 2, 3, 4]);
+        expect(page.isLast, isTrue);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
     test('step/readRow iterate over decoded rows', () {
       db.execute("INSERT INTO items VALUES (1, 'one', true)");
       db.execute("INSERT INTO items VALUES (2, 'two', false)");
@@ -221,9 +255,12 @@ void main() {
     });
 
     test('commit persists data', () {
+      expect(db.inTransaction, isFalse);
       db.begin();
+      expect(db.inTransaction, isTrue);
       db.execute("INSERT INTO t VALUES (1, 'a')");
       db.commit();
+      expect(db.inTransaction, isFalse);
       expect(db.query('SELECT val FROM t WHERE id = 1').single['val'], 'a');
     });
 
@@ -333,6 +370,46 @@ void main() {
       expect(row['score'], 12.5);
       expect(row['active'], true);
       expect(row['note'], 'hello');
+    });
+
+    test('blob, decimal, and timestamp values round-trip', () {
+      db.execute(
+        'CREATE TABLE typed_more (id INT64 PRIMARY KEY, payload BLOB, amount DECIMAL, created_at TIMESTAMP)',
+      );
+
+      final insert = db.prepare(
+        r'INSERT INTO typed_more VALUES ($1, $2, $3, $4)',
+      );
+      try {
+        insert.bindInt64(1, 1);
+        insert.bindBlob(2, Uint8List.fromList([1, 2, 3, 4]));
+        insert.bindDecimal(3, 12345, 2);
+        insert.bindDateTime(
+          4,
+          DateTime.fromMicrosecondsSinceEpoch(1711540800123456, isUtc: true),
+        );
+        insert.execute();
+      } finally {
+        insert.dispose();
+      }
+
+      final row = db
+          .query(
+            'SELECT payload, amount, created_at FROM typed_more',
+          )
+          .single;
+      expect(row['payload'], Uint8List.fromList([1, 2, 3, 4]));
+      expect(row['amount'], const DecimalValue(12345, 2));
+      expect(
+        row['created_at'],
+        DateTime.fromMicrosecondsSinceEpoch(1711540800123456, isUtc: true),
+      );
+    });
+  });
+
+  group('error handling', () {
+    test('unknown error codes do not silently map to internal', () {
+      expect(() => ErrorCode.fromCode(999), throwsStateError);
     });
   });
 }

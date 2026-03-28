@@ -127,9 +127,8 @@ After that, DecentDB should show up under **New Connection → Embedded**.
 
    | Property | Default | Description |
    |---|---|---|
+   | `mode` | `openOrCreate` | One of `openOrCreate`, `open`, or `create` |
    | `readOnly` | `false` | Open the database in read-only mode |
-   | `busyTimeoutMs` | `0` | Milliseconds to wait when the database is locked by another writer |
-   | `cachePages` | `0` | Page cache size (0 = engine default) |
 
 4. Leave the **Username** and **Password** fields empty.
 5. Click **Test Connection**, then **Finish**.
@@ -138,9 +137,8 @@ After that, DecentDB should show up under **New Connection → Embedded**.
 
 ```
 jdbc:decentdb:/home/alice/data/shop.ddb
+jdbc:decentdb:/home/alice/data/shop.ddb?mode=open
 jdbc:decentdb:/home/alice/data/shop.ddb?readOnly=true
-jdbc:decentdb:/home/alice/data/shop.ddb?busyTimeoutMs=10000
-jdbc:decentdb:/home/alice/data/shop.ddb?cachePages=2048
 jdbc:decentdb::memory:
 ```
 
@@ -241,7 +239,6 @@ SQLException: database is locked
 ```
 
 - Close any other connection that has an open write transaction on the same file.
-- Increase `busyTimeoutMs` in the connection URL to retry for longer.
 - DBeaver may open multiple internal connections; set the connection pool to a maximum of 1
   connection in **Edit Connection → Connection pool settings**.
 

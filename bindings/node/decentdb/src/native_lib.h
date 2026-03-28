@@ -31,6 +31,8 @@ typedef struct decentdb_native_api {
   int (*bind_text)(decentdb_stmt* stmt, int index_1_based, const char* utf8, int byte_len);
   int (*bind_blob)(decentdb_stmt* stmt, int index_1_based, const uint8_t* data, int byte_len);
   int (*bind_decimal)(decentdb_stmt* stmt, int index_1_based, int64_t unscaled, int scale);
+  /* Bind a TIMESTAMP_MICROS value (microseconds since Unix epoch). */
+  int (*bind_timestamp_micros)(decentdb_stmt* stmt, int index_1_based, int64_t micros);
   int (*execute_batch_i64_text_f64)(
       decentdb_stmt* stmt,
       size_t row_count,
@@ -44,6 +46,11 @@ typedef struct decentdb_native_api {
   int (*clear_bindings)(decentdb_stmt* stmt);
 
   int (*step)(decentdb_stmt* stmt);
+  /* Fused step + row_view: returns 1 (row), 0 (done), or -1 (error). */
+  int (*step_row_view)(
+      decentdb_stmt* stmt,
+      const decentdb_value_view** out_values,
+      int* out_count);
 
   int (*column_count)(decentdb_stmt* stmt);
   const char* (*column_name)(decentdb_stmt* stmt, int col_0_based);
@@ -58,14 +65,34 @@ typedef struct decentdb_native_api {
   int64_t (*rows_affected)(decentdb_stmt* stmt);
   void (*finalize)(decentdb_stmt* stmt);
 
+  /* Fast re-execute helpers: reset, rebind one/two params, step, return affected. */
+  int (*rebind_int64_execute)(decentdb_stmt* stmt, int64_t value, uint64_t* out_affected);
+  int (*rebind_text_int64_execute)(
+      decentdb_stmt* stmt,
+      const char* text_value,
+      int text_len,
+      int64_t int_value,
+      uint64_t* out_affected);
+  int (*rebind_int64_text_execute)(
+      decentdb_stmt* stmt,
+      int64_t int_value,
+      const char* text_value,
+      int text_len,
+      uint64_t* out_affected);
+
   // Checkpoint
   int (*checkpoint)(decentdb_db* db);
   int (*begin_transaction)(decentdb_db* db);
   int (*commit_transaction)(decentdb_db* db);
   int (*rollback_transaction)(decentdb_db* db);
+  /* Returns 1 if inside a transaction, 0 if not, -1 on error. */
+  int (*in_transaction)(decentdb_db* db);
 
   // SaveAs (export database to a new on-disk file)
   int (*save_as)(decentdb_db* db, const char* dest_path_utf8);
+
+  /* Evict the shared WAL for a database file (path only, no open handle required). */
+  int (*evict_shared_wal)(const char* path);
 
   // Memory management
   void (*free)(void* p);
@@ -73,7 +100,15 @@ typedef struct decentdb_native_api {
   // Schema introspection (JSON)
   const char* (*list_tables_json)(decentdb_db* db, int* out_len);
   const char* (*get_table_columns_json)(decentdb_db* db, const char* table_utf8, int* out_len);
+  const char* (*get_table_ddl)(decentdb_db* db, const char* table_utf8, int* out_len);
   const char* (*list_indexes_json)(decentdb_db* db, int* out_len);
+  const char* (*list_views_json)(decentdb_db* db, int* out_len);
+  const char* (*get_view_ddl)(decentdb_db* db, const char* view_utf8, int* out_len);
+  const char* (*list_triggers_json)(decentdb_db* db, int* out_len);
+
+  /* Library metadata (may be NULL if the loaded library pre-dates these exports). */
+  uint32_t (*abi_version)(void);
+  const char* (*version_string)(void);
 } decentdb_native_api;
 
 // Loads the native library once and returns its resolved symbol table.
