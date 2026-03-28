@@ -59,7 +59,9 @@ jobs:
           pip install mkdocs-minify-plugin mkdocs-material mkdocs-awesome-pages-plugin mkdocs-mermaid2-plugin
 
       - name: Format Check
+        shell: bash
         run: |
+          set -o pipefail
           echo "Checking Rust code formatting..."
           if ! cargo fmt --check 2>&1 | tee /tmp/fmt-check.log; then
             echo ""
@@ -147,11 +149,11 @@ jobs:
             release_suffix: Windows-x64
             java_suffix: Windows
             artifact_name: windows-x64
-          - label: macOS
+          - label: macOS arm64
             runner: macos-latest
-            release_suffix: macOS-x64
+            release_suffix: macOS-arm64
             java_suffix: macOS
-            artifact_name: macos-x64
+            artifact_name: macos-arm64
 
     steps:
       - name: Checkout
@@ -308,7 +310,7 @@ jobs:
           files: |
             artifacts/**/decentdb-${{ github.ref_name }}-Linux-x64.tar.gz
             artifacts/**/decentdb-${{ github.ref_name }}-Linux-arm64.tar.gz
-            artifacts/**/decentdb-${{ github.ref_name }}-macOS-x64.tar.gz
+            artifacts/**/decentdb-${{ github.ref_name }}-macOS-arm64.tar.gz
             artifacts/**/decentdb-${{ github.ref_name }}-Windows-x64.zip
             artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux.jar
             artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux-arm64.jar

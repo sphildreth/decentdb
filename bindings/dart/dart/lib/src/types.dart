@@ -17,7 +17,7 @@ enum ErrorCode {
     for (final value in values) {
       if (value.code == code) return value;
     }
-    return internal;
+    throw StateError('Unknown DecentDB error code: $code');
   }
 }
 

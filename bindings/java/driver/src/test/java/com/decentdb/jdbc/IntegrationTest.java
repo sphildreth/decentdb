@@ -4,7 +4,9 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 import java.io.File;
+import java.math.BigDecimal;
 import java.sql.*;
+import java.time.Instant;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -232,21 +234,91 @@ class IntegrationTest {
         }
     }
 
+    @Test
+    @Order(23)
+    void decimalTimestampAndBoolRoundTrip() throws Exception {
+        assumeNative();
+        try (Statement s = connection.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS typed_values (" +
+                "id INTEGER PRIMARY KEY, amount DECIMAL, created_at TIMESTAMP, active BOOL)");
+            s.execute("DELETE FROM typed_values");
+        }
+
+        Timestamp createdAt = Timestamp.from(Instant.parse("2026-03-27T23:07:43.123456Z"));
+        try (PreparedStatement ps = connection.prepareStatement(
+            "INSERT INTO typed_values (id, amount, created_at, active) VALUES ($1, $2, $3, $4)")) {
+            ps.setLong(1, 1);
+            ps.setBigDecimal(2, new BigDecimal("123.45"));
+            ps.setTimestamp(3, createdAt);
+            ps.setBoolean(4, true);
+            assertEquals(1, ps.executeUpdate());
+        }
+
+        try (Statement s = connection.createStatement();
+             ResultSet rs = s.executeQuery("SELECT amount, created_at, active FROM typed_values WHERE id = 1")) {
+            assertTrue(rs.next());
+            assertEquals(new BigDecimal("123.45"), rs.getBigDecimal(1));
+            assertEquals(createdAt.toInstant(), rs.getTimestamp(2).toInstant());
+            assertTrue(rs.getBoolean(3));
+            assertFalse(rs.next());
+        }
+    }
+
+    @Test
+    @Order(24)
+    void preparedStatementBatchInsert() throws Exception {
+        assumeNative();
+        try (Statement s = connection.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS batch_users (id INTEGER PRIMARY KEY, name TEXT, score REAL)");
+            s.execute("DELETE FROM batch_users");
+        }
+
+        try (PreparedStatement ps = connection.prepareStatement(
+            "INSERT INTO batch_users (id, name, score) VALUES ($1, $2, $3)")) {
+            for (int i = 0; i < 3; i++) {
+                ps.setLong(1, i + 1);
+                ps.setString(2, "batch-" + i);
+                ps.setDouble(3, i + 0.5);
+                ps.addBatch();
+            }
+            int[] counts = ps.executeBatch();
+            assertEquals(3, counts.length);
+            for (int count : counts) {
+                assertEquals(Statement.SUCCESS_NO_INFO, count);
+            }
+        }
+
+        try (Statement s = connection.createStatement();
+             ResultSet rs = s.executeQuery("SELECT COUNT(*) FROM batch_users")) {
+            assertTrue(rs.next());
+            assertEquals(3, rs.getLong(1));
+        }
+    }
+
     // ---- ResultSetMetaData -----------------------------------------------
 
     @Test
     @Order(30)
     void resultSetMetaData() throws Exception {
         assumeNative();
+        try (Statement s = connection.createStatement()) {
+            s.execute("CREATE TABLE IF NOT EXISTS meta_decimal (id INTEGER PRIMARY KEY, amount DECIMAL)");
+            s.execute("DELETE FROM meta_decimal");
+        }
+        try (PreparedStatement ps = connection.prepareStatement("INSERT INTO meta_decimal (id, amount) VALUES ($1, $2)")) {
+            ps.setLong(1, 1);
+            ps.setBigDecimal(2, new BigDecimal("99.1234"));
+            assertEquals(1, ps.executeUpdate());
+        }
         try (Statement s = connection.createStatement();
-             ResultSet rs = s.executeQuery("SELECT id, name, score FROM users WHERE id = 1")) {
+             ResultSet rs = s.executeQuery("SELECT id, amount FROM meta_decimal WHERE id = 1")) {
             ResultSetMetaData meta = rs.getMetaData();
-            assertEquals(3, meta.getColumnCount());
+            assertEquals(2, meta.getColumnCount());
             assertEquals("id", meta.getColumnName(1).toLowerCase());
-            assertEquals("name", meta.getColumnName(2).toLowerCase());
-            assertEquals("score", meta.getColumnName(3).toLowerCase());
+            assertEquals("amount", meta.getColumnName(2).toLowerCase());
             assertEquals(java.sql.Types.BIGINT, meta.getColumnType(1));
-            assertEquals(java.sql.Types.VARCHAR, meta.getColumnType(2));
+            assertEquals(java.sql.Types.DECIMAL, meta.getColumnType(2));
+            assertEquals(4, meta.getScale(2));
         }
     }
 
@@ -384,5 +456,51 @@ class IntegrationTest {
         assumeNative();
         assertThrows(SQLFeatureNotSupportedException.class,
             () -> connection.setTransactionIsolation(Connection.TRANSACTION_READ_UNCOMMITTED));
+    }
+
+    @Test
+    @Order(53)
+    void engineTruthTransactionAndMaintenanceApis() throws Exception {
+        assumeNative();
+        DecentDBConnection decent = connection.unwrap(DecentDBConnection.class);
+        assertFalse(decent.isInTransaction());
+        assertTrue(decent.getAbiVersion() > 0);
+        assertNotNull(decent.getEngineVersion());
+
+        connection.setAutoCommit(false);
+        try {
+            try (Statement s = connection.createStatement()) {
+                s.executeUpdate("INSERT INTO users (id, name) VALUES (300, 'Maintenance')");
+            }
+            assertTrue(decent.isInTransaction());
+            connection.rollback();
+        } finally {
+            connection.setAutoCommit(true);
+        }
+        assertFalse(decent.isInTransaction());
+
+        File copy = File.createTempFile("decentdb_copy_", ".ddb");
+        copy.deleteOnExit();
+        new File(copy.getAbsolutePath() + "-wal").deleteOnExit();
+        assertTrue(copy.delete() || !copy.exists());
+        decent.checkpoint();
+        decent.saveAs(copy.getAbsolutePath());
+        assertTrue(copy.exists());
+    }
+
+    @Test
+    @Order(54)
+    void dataSourceAndReadOnlyGuard() throws Exception {
+        assumeNative();
+        DecentDBDataSource dataSource = new DecentDBDataSource("jdbc:decentdb:" + tempDb.getAbsolutePath());
+        dataSource.setReadOnly(true);
+        try (Connection readOnlyConnection = dataSource.getConnection()) {
+            assertTrue(readOnlyConnection.isReadOnly());
+            assertThrows(SQLException.class, () -> {
+                try (Statement s = readOnlyConnection.createStatement()) {
+                    s.executeUpdate("INSERT INTO users (id, name) VALUES (400, 'Nope')");
+                }
+            });
+        }
     }
 }

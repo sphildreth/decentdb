@@ -26,11 +26,38 @@ final class DecentDBNative {
     /** Closes a database. Returns 0 on success. */
     static native int dbClose(long dbHandle);
 
+    /** Returns 1 when the engine reports an active transaction, 0 when idle, and -1 on error. */
+    static native int dbInTransaction(long dbHandle);
+
+    /** Checkpoints the current database. */
+    static native int dbCheckpoint(long dbHandle);
+
+    /** Begins a write transaction using the engine transaction API. */
+    static native int dbBeginTransaction(long dbHandle);
+
+    /** Commits the current write transaction and returns the commit LSN. */
+    static native int dbCommitTransaction(long dbHandle, long[] outLsn);
+
+    /** Rolls back the current write transaction. */
+    static native int dbRollbackTransaction(long dbHandle);
+
+    /** Saves the current database to a new path. */
+    static native int dbSaveAs(long dbHandle, String destPath);
+
+    /** Executes an immediate SQL statement and returns affected rows when available. */
+    static native int dbExecuteImmediate(long dbHandle, String sql, long[] outAffected);
+
     /** Returns last error code for the handle (0 = OK). */
     static native int dbLastErrorCode(long dbHandle);
 
     /** Returns last error message for the handle. */
     static native String dbLastErrorMessage(long dbHandle);
+
+    /** Returns the stable DecentDB C ABI version. */
+    static native int abiVersion();
+
+    /** Returns the DecentDB engine version string. */
+    static native String engineVersion();
 
     // ---- Statement handle ----------------------------------------------
 
@@ -42,6 +69,12 @@ final class DecentDBNative {
 
     /** Executes one step. Returns: 1 = row available, 0 = done, <0 = error. */
     static native int stmtStep(long stmtHandle);
+
+    /** Executes one step and caches the row view for subsequent column access. */
+    static native int stmtStepRowView(long stmtHandle);
+
+    /** Binds one int64 parameter, steps once, and caches the row view. */
+    static native int stmtBindInt64StepRowView(long stmtHandle, int col, long value);
 
     /** Resets the statement for re-execution. */
     static native int stmtReset(long stmtHandle);
@@ -60,10 +93,43 @@ final class DecentDBNative {
     static native int bindNull(long stmtHandle, int col);
     static native int bindInt64(long stmtHandle, int col, long value);
     static native int bindFloat64(long stmtHandle, int col, double value);
+    static native int bindBool(long stmtHandle, int col, boolean value);
     static native int bindText(long stmtHandle, int col, String value);
     static native int bindBlob(long stmtHandle, int col, byte[] value);
+    static native int bindDecimal(long stmtHandle, int col, long unscaledValue, int scale);
     /** Binds a TIMESTAMP parameter as microseconds since Unix epoch UTC. */
     static native int bindDatetime(long stmtHandle, int col, long microsUtc);
+
+    /** Executes the prepared statement as a single-column int64 batch. */
+    static native int stmtExecuteBatchI64(long stmtHandle, long[] values, long[] outAffected);
+
+    /** Executes the prepared statement as a 3-column (int64, text, float64) batch. */
+    static native int stmtExecuteBatchI64TextF64(
+        long stmtHandle,
+        long[] valuesI64,
+        String[] valuesText,
+        double[] valuesF64,
+        long[] outAffected
+    );
+
+    /** Executes the prepared statement as a typed batch with signature characters i/f/t. */
+    static native int stmtExecuteBatchTyped(
+        long stmtHandle,
+        String signature,
+        long[] valuesI64,
+        double[] valuesF64,
+        String[] valuesText,
+        long[] outAffected
+    );
+
+    /** Rebinds one int64 parameter and executes in a single native call. */
+    static native int stmtRebindInt64Execute(long stmtHandle, long value, long[] outAffected);
+
+    /** Rebinds (text, int64) parameters and executes in a single native call. */
+    static native int stmtRebindTextInt64Execute(long stmtHandle, String textValue, long intValue, long[] outAffected);
+
+    /** Rebinds (int64, text) parameters and executes in a single native call. */
+    static native int stmtRebindInt64TextExecute(long stmtHandle, long intValue, String textValue, long[] outAffected);
 
     // ---- Column access (0-based index) --------------------------------
 
@@ -110,8 +176,14 @@ final class DecentDBNative {
     /** Returns JSON array of column metadata objects for a table. */
     static native String metaGetTableColumns(long dbHandle, String tableName);
 
+    /** Returns CREATE TABLE DDL for a table, or null if it does not exist. */
+    static native String metaGetTableDDL(long dbHandle, String tableName);
+
     /** Returns JSON array of index metadata objects. */
     static native String metaListIndexes(long dbHandle);
+
+    /** Returns JSON array of trigger metadata objects. */
+    static native String metaListTriggers(long dbHandle);
 
     // ---- Value kind constants (must match the DecentDB C ABI) ----------
     static final int KIND_NULL    = 0;

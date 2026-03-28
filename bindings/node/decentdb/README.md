@@ -2,114 +2,51 @@
 
 Node.js bindings for DecentDB via N-API.
 
-- Native layer: N-API addon (C) dynamically loading `libdecentdb`
-- API shape: `Database` + `Statement` wrapper classes
-- Concurrency: Non-blocking async execution via N-API thread pool
-- Parameters: Postgres-style positional (`$1`, `$2`, ...)
+## Highlights
 
-## Features
+- explicit open modes: `Database.openOrCreate()`, `openExisting()`, `create()`
+- sync `exec()` and promise-based `execAsync()`
+- native prepared statements via `Database.prepare()` / `Statement`
+- schema helpers: tables, columns, indexes, table DDL, views, view DDL, triggers
+- transaction helpers plus `db.inTransaction`
+- version helpers: `Database.abiVersion()`, `Database.version()`
+- timestamp binding via `Statement.bindTimestamp(...)` or `timestampMicros(...)`
+- re-execute helpers for common keyed DML patterns
+- GC safety net via `FinalizationRegistry`
 
-- Postgres-style parameters (`$1`, `$2`, ...)
-- Streaming async iteration (`for await (const row of stmt.rows())`)
-- Async execution (`db.execAsync`)
-- Synchronous execution (`db.exec`)
-- Full transaction support (BEGIN/COMMIT/ROLLBACK)
-- Decimal type support (`{ unscaled: BigInt, scale: number }`)
-- Blob/Buffer support
-- Schema introspection (`listTables`, `getTableColumns`, `listIndexes`)
-- WAL checkpoint (`db.checkpoint()`)
-- Auto-increment for INTEGER PRIMARY KEY columns
-
-## Quick Start
+## Quick start
 
 ```js
-const { Database } = require('decentdb-native');
+const { Database, timestampMicros } = require('decentdb-native');
 
-const db = new Database({ path: 'my.db' });
-
-db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
-db.exec('INSERT INTO users (name, email) VALUES ($1, $2)', ['Alice', 'alice@example.com']);
-
-const { rows } = db.exec('SELECT * FROM users');
-console.log(rows); // [[1n, 'Alice', 'alice@example.com']]
-
+const db = Database.openOrCreate('app.ddb');
+db.exec('CREATE TABLE users (id INT64 PRIMARY KEY, name TEXT, created_at TIMESTAMP)');
+db.exec('INSERT INTO users VALUES ($1, $2, $3)', [1, 'Ada', timestampMicros(Date.now())]);
+console.log(db.exec('SELECT id, name FROM users').rows);
 db.close();
 ```
 
-### Async iteration
+DecentDB-native uses engine-native placeholders: `$1`, `$2`, ...
 
-```js
-const stmt = db.prepare('SELECT * FROM users');
-for await (const row of stmt.rows()) {
-  console.log(row);
-}
-stmt.finalize();
+## Runtime library
+
+Build the shared library from the repository root:
+
+```bash
+cargo build -p decentdb
 ```
 
-### Transactions
+Set `DECENTDB_NATIVE_LIB_PATH` to the built library if auto-detection does not find it.
 
-```js
-db.exec('BEGIN');
-db.exec('INSERT INTO users (name, email) VALUES ($1, $2)', ['Bob', 'bob@example.com']);
-db.exec('COMMIT');
+## Tests and benchmark
+
+```bash
+DECENTDB_NATIVE_LIB_PATH=/absolute/path/to/target/debug/libdecentdb.so npm test
+DECENTDB_NATIVE_LIB_PATH=/absolute/path/to/target/debug/libdecentdb.so npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix node_native_bench_fetch
 ```
 
-### Schema introspection
+## Limitations
 
-```js
-db.listTables();                // ['users']
-db.getTableColumns('users');    // [{ name: 'id', type: 'BIGINT', ... }, ...]
-db.listIndexes();               // [{ name: '...', table: 'users', ... }]
-```
-
-## Build
-
-From this directory:
-
-```sh
-npm install
-npm run build
-```
-
-## Runtime native library
-
-The addon dynamically loads the DecentDB native library at runtime.
-
-Set `DECENTDB_NATIVE_LIB_PATH` to an absolute path to `libdecentdb.so` (Linux), `libdecentdb.dylib` (macOS), or `decentdb.dll` (Windows).
-
-### Example (Linux)
-
-1. Build the library from the repo root:
-   ```sh
-   cargo build -p decentdb
-   ```
-2. Run tests:
-   ```sh
-   DECENTDB_NATIVE_LIB_PATH=/absolute/path/to/target/debug/libdecentdb.so npm test
-   ```
-
-## Testing
-
-```sh
-DECENTDB_NATIVE_LIB_PATH=/path/to/libdecentdb.so npm test
-```
-
-All tests use Node.js built-in test runner (`node:test`) — no additional test dependencies required.
-
-## Benchmark
-
-Run a fair DecentDB vs SQLite benchmark from this package:
-
-```sh
-npm run benchmark:fetch -- --count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix node_native_bench_fetch
-```
-
-Supported options:
-
-- `--engine <all|decentdb|sqlite>`
-- `--count <n>`
-- `--point-reads <n>`
-- `--fetchmany-batch <n>`
-- `--point-seed <n>`
-- `--db-prefix <prefix>` (DecentDB writes `.ddb`, SQLite writes `.db`)
-- `--keep-db`
+- generic async iteration still uses one worker dispatch per row
+- generic result-handle and generic batch APIs are still not wrapped
+- one writer / many readers remains the engine-level concurrency contract

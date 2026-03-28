@@ -36,9 +36,17 @@ class DriverUrlParseTest {
         DecentDBDriver.ParsedUrl parsed = DecentDBDriver.parseUrl("jdbc:decentdb:/path/to/db.ddb");
         assertNotNull(parsed);
         assertEquals("/path/to/db.ddb", parsed.filePath);
+        assertEquals("openOrCreate", parsed.mode);
         assertFalse(parsed.readOnly);
         assertEquals(0, parsed.busyTimeoutMs);
         assertEquals(0, parsed.cachePages);
+    }
+
+    @Test
+    void parsesModeParam() {
+        DecentDBDriver.ParsedUrl parsed = DecentDBDriver.parseUrl("jdbc:decentdb:/path/db.ddb?mode=open");
+        assertNotNull(parsed);
+        assertEquals("open", parsed.mode);
     }
 
     @Test
@@ -72,8 +80,9 @@ class DriverUrlParseTest {
     @Test
     void parsesMultipleParams() {
         DecentDBDriver.ParsedUrl parsed = DecentDBDriver.parseUrl(
-            "jdbc:decentdb:/path/db.ddb?readOnly=true&busyTimeoutMs=3000&cachePages=512");
+            "jdbc:decentdb:/path/db.ddb?mode=create&readOnly=true&busyTimeoutMs=3000&cachePages=512");
         assertNotNull(parsed);
+        assertEquals("create", parsed.mode);
         assertTrue(parsed.readOnly);
         assertEquals(3000, parsed.busyTimeoutMs);
         assertEquals(512, parsed.cachePages);
@@ -114,12 +123,15 @@ class DriverUrlParseTest {
         DecentDBDriver driver = new DecentDBDriver();
         var infos = driver.getPropertyInfo("jdbc:decentdb:/path/db.ddb", new Properties());
         assertNotNull(infos);
-        assertTrue(infos.length >= 3);
+        assertTrue(infos.length >= 2);
         // Verify expected properties are present
+        boolean hasMode = false;
         boolean hasReadOnly = false;
         for (var info : infos) {
+            if ("mode".equals(info.name)) hasMode = true;
             if ("readOnly".equals(info.name)) hasReadOnly = true;
         }
+        assertTrue(hasMode, "Should have mode property");
         assertTrue(hasReadOnly, "Should have readOnly property");
     }
 }

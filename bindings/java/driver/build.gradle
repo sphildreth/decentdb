@@ -3,7 +3,11 @@ plugins {
 }
 
 group = 'com.decentdb'
-version = '1.8.1'
+version = '2.0.0'
+
+def repoRoot = file("${rootProject.projectDir}/../..")
+def nativeLibDirPath = project.findProperty('nativeLibDir') ?:
+    "${rootProject.projectDir}/../../target/release"
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -26,7 +30,7 @@ test {
     useJUnitPlatform()
     // Native library path for integration tests
     def nativeLibDir = project.findProperty('nativeLibDir') ?:
-        "${rootProject.projectDir}/../../target/debug"
+        "${rootProject.projectDir}/../../target/release"
     systemProperty 'decentdb.native.lib.dir', nativeLibDir
     testLogging {
         events 'passed', 'skipped', 'failed'
@@ -50,7 +54,7 @@ jar {
     def archDir = (arch == 'amd64' || arch == 'x86_64') ? 'x86_64' : ((arch == 'aarch64' || arch == 'arm64') ? 'aarch64' : arch)
     def nativeDir = "native/${osDir}-${archDir}"
 
-    from("${rootProject.projectDir}/../../target/debug") {
+    from(nativeLibDirPath) {
         into nativeDir
         include 'libdecentdb_jni.so'
         include 'libdecentdb_jni.dylib'
@@ -67,10 +71,6 @@ jar {
     }
 }
 
-def repoRoot = file("${rootProject.projectDir}/../..")
-def nativeLibDirPath = project.findProperty('nativeLibDir') ?:
-    "${rootProject.projectDir}/../../target/release"
-
 tasks.register('buildRustNative', Exec) {
     workingDir repoRoot
     commandLine 'cargo', 'build', '-p', 'decentdb', '--release'
@@ -83,6 +83,10 @@ tasks.register('buildJniNative', Exec) {
 
 tasks.named('buildJniNative') {
     dependsOn tasks.named('buildRustNative')
+}
+
+tasks.named('jar') {
+    dependsOn tasks.named('buildJniNative')
 }
 
 tasks.named('test') {
@@ -104,5 +108,20 @@ tasks.register('benchmarkFetch', JavaExec) {
     jvmArgs '-Xms1g', '-Xmx1g'
     // Keep benchmark single-threaded and deterministic.
     systemProperty 'java.util.concurrent.ForkJoinPool.common.parallelism', '1'
+    systemProperty 'decentdb.native.lib.dir', nativeLibDirPath
+}
+
+tasks.register('runCrudExample', JavaExec) {
+    dependsOn tasks.named('buildJniNative')
+    group = 'application'
+    description = 'Run the standalone JDBC CRUD example.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.decentdb.jdbc.example.JdbcCrudExample'
+
+    def exampleArgs = project.findProperty('exampleArgs')
+    if (exampleArgs != null && exampleArgs.toString().trim().length() > 0) {
+        args exampleArgs.toString().trim().split(/\s+/) as List<String>
+    }
+
     systemProperty 'decentdb.native.lib.dir', nativeLibDirPath
 }

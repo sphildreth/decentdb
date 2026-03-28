@@ -234,3 +234,262 @@ impl CatalogState {
 pub(crate) struct SchemaInfo {
     pub(crate) name: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_type_as_str_returns_expected_values() {
+        assert_eq!(ColumnType::Int64.as_str(), "INT64");
+        assert_eq!(ColumnType::Float64.as_str(), "FLOAT64");
+        assert_eq!(ColumnType::Text.as_str(), "TEXT");
+        assert_eq!(ColumnType::Bool.as_str(), "BOOL");
+        assert_eq!(ColumnType::Blob.as_str(), "BLOB");
+        assert_eq!(ColumnType::Decimal.as_str(), "DECIMAL");
+        assert_eq!(ColumnType::Uuid.as_str(), "UUID");
+        assert_eq!(ColumnType::Timestamp.as_str(), "TIMESTAMP");
+    }
+
+    #[test]
+    fn column_type_copy_and_debug() {
+        let col_type = ColumnType::Int64;
+        let copied = col_type;
+        assert_eq!(copied, ColumnType::Int64);
+    }
+
+    #[test]
+    fn index_kind_copy_and_debug() {
+        let kind = IndexKind::Btree;
+        let copied = kind;
+        assert_eq!(copied, IndexKind::Btree);
+
+        let kind = IndexKind::Trigram;
+        let copied = kind;
+        assert_eq!(copied, IndexKind::Trigram);
+    }
+
+    #[test]
+    fn trigger_kind_copy_and_debug() {
+        let kind = TriggerKind::After;
+        let copied = kind;
+        assert_eq!(copied, TriggerKind::After);
+
+        let kind = TriggerKind::InsteadOf;
+        let copied = kind;
+        assert_eq!(copied, TriggerKind::InsteadOf);
+    }
+
+    #[test]
+    fn trigger_event_copy_and_debug() {
+        let events = [
+            TriggerEvent::Insert,
+            TriggerEvent::Update,
+            TriggerEvent::Delete,
+        ];
+        for event in events {
+            let copied = event;
+            assert_eq!(copied, event);
+        }
+    }
+
+    #[test]
+    fn table_stats_copy_and_debug() {
+        let stats = TableStats { row_count: 100 };
+        let copied = stats;
+        assert_eq!(copied.row_count, 100);
+    }
+
+    #[test]
+    fn index_stats_copy_and_debug() {
+        let stats = IndexStats {
+            entry_count: 500,
+            distinct_key_count: 100,
+        };
+        let copied = stats;
+        assert_eq!(copied.entry_count, 500);
+        assert_eq!(copied.distinct_key_count, 100);
+    }
+
+    #[test]
+    fn foreign_key_action_copy_and_debug() {
+        let actions = [
+            ForeignKeyAction::NoAction,
+            ForeignKeyAction::Restrict,
+            ForeignKeyAction::Cascade,
+            ForeignKeyAction::SetNull,
+        ];
+        for action in actions {
+            let copied = action;
+            assert_eq!(copied, action);
+        }
+    }
+
+    #[test]
+    fn catalog_state_empty_has_cookie() {
+        let catalog = CatalogState::empty(42);
+        assert_eq!(catalog.schema_cookie, 42);
+        assert!(catalog.schemas.is_empty());
+        assert!(catalog.tables.is_empty());
+        assert!(catalog.indexes.is_empty());
+        assert!(catalog.views.is_empty());
+        assert!(catalog.triggers.is_empty());
+        assert!(catalog.table_stats.is_empty());
+        assert!(catalog.index_stats.is_empty());
+    }
+
+    #[test]
+    fn catalog_state_contains_object_when_empty() {
+        let catalog = CatalogState::empty(0);
+        assert!(!catalog.contains_object("anything"));
+        assert!(!catalog.contains_non_schema_object("anything"));
+    }
+
+    #[test]
+    fn catalog_state_lookups_return_none_when_empty() {
+        let catalog = CatalogState::empty(0);
+        assert!(catalog.schema("test").is_none());
+        assert!(catalog.table("test").is_none());
+        assert!(catalog.index("test").is_none());
+        assert!(catalog.view("test").is_none());
+        assert!(catalog.trigger("test").is_none());
+    }
+
+    #[test]
+    fn identifiers_equal_is_case_insensitive() {
+        assert!(identifiers_equal("foo", "foo"));
+        assert!(identifiers_equal("Foo", "foo"));
+        assert!(identifiers_equal("FOO", "foo"));
+        assert!(identifiers_equal("FooBar", "foobar"));
+        assert!(!identifiers_equal("foo", "bar"));
+    }
+
+    #[test]
+    fn check_constraint_debug_and_copy() {
+        let check = CheckConstraint {
+            name: Some("chk_test".to_string()),
+            expression_sql: "value > 0".to_string(),
+        };
+        let copied = check.clone();
+        assert_eq!(copied.name, Some("chk_test".to_string()));
+        assert_eq!(copied.expression_sql, "value > 0");
+    }
+
+    #[test]
+    fn foreign_key_constraint_debug_and_copy() {
+        let fk = ForeignKeyConstraint {
+            name: Some("fk_test".to_string()),
+            columns: vec!["col1".to_string()],
+            referenced_table: "other_table".to_string(),
+            referenced_columns: vec!["id".to_string()],
+            on_delete: ForeignKeyAction::Cascade,
+            on_update: ForeignKeyAction::NoAction,
+        };
+        let copied = fk.clone();
+        assert_eq!(copied.name, Some("fk_test".to_string()));
+        assert_eq!(copied.columns.len(), 1);
+        assert_eq!(copied.on_delete, ForeignKeyAction::Cascade);
+        assert_eq!(copied.on_update, ForeignKeyAction::NoAction);
+    }
+
+    #[test]
+    fn column_schema_debug_and_copy() {
+        let col = ColumnSchema {
+            name: "id".to_string(),
+            column_type: ColumnType::Int64,
+            nullable: false,
+            default_sql: None,
+            generated_sql: None,
+            generated_stored: false,
+            primary_key: true,
+            unique: true,
+            auto_increment: true,
+            checks: vec![],
+            foreign_key: None,
+        };
+        let copied = col.clone();
+        assert_eq!(copied.name, "id");
+        assert_eq!(copied.column_type, ColumnType::Int64);
+        assert!(!copied.nullable);
+        assert!(copied.primary_key);
+    }
+
+    #[test]
+    fn index_schema_debug_and_copy() {
+        let index = IndexSchema {
+            name: "idx_test".to_string(),
+            table_name: "users".to_string(),
+            kind: IndexKind::Btree,
+            unique: false,
+            columns: vec![IndexColumn {
+                column_name: Some("name".to_string()),
+                expression_sql: None,
+            }],
+            include_columns: vec![],
+            predicate_sql: None,
+            fresh: true,
+        };
+        let copied = index.clone();
+        assert_eq!(copied.name, "idx_test");
+        assert_eq!(copied.kind, IndexKind::Btree);
+        assert!(copied.fresh);
+    }
+
+    #[test]
+    fn table_schema_debug_and_copy() {
+        let table = TableSchema {
+            name: "users".to_string(),
+            temporary: false,
+            columns: vec![],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+        };
+        let copied = table.clone();
+        assert_eq!(copied.name, "users");
+        assert!(!copied.temporary);
+        assert_eq!(copied.next_row_id, 1);
+    }
+
+    #[test]
+    fn view_schema_debug_and_copy() {
+        let view = ViewSchema {
+            name: "v_users".to_string(),
+            temporary: false,
+            sql_text: "SELECT * FROM users".to_string(),
+            column_names: vec!["id".to_string()],
+            dependencies: vec!["users".to_string()],
+        };
+        let copied = view.clone();
+        assert_eq!(copied.name, "v_users");
+        assert_eq!(copied.sql_text, "SELECT * FROM users");
+    }
+
+    #[test]
+    fn trigger_schema_debug_and_copy() {
+        let trigger = TriggerSchema {
+            name: "trg_insert".to_string(),
+            target_name: "users".to_string(),
+            kind: TriggerKind::After,
+            event: TriggerEvent::Insert,
+            on_view: false,
+            action_sql: "INSERT INTO log VALUES (1)".to_string(),
+        };
+        let copied = trigger.clone();
+        assert_eq!(copied.name, "trg_insert");
+        assert_eq!(copied.kind, TriggerKind::After);
+        assert_eq!(copied.event, TriggerEvent::Insert);
+    }
+
+    #[test]
+    fn index_column_debug_and_copy() {
+        let col = IndexColumn {
+            column_name: Some("name".to_string()),
+            expression_sql: Some("LOWER(name)".to_string()),
+        };
+        let copied = col.clone();
+        assert_eq!(copied.column_name, Some("name".to_string()));
+        assert_eq!(copied.expression_sql, Some("LOWER(name)".to_string()));
+    }
+}

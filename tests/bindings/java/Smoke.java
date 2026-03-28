@@ -4,6 +4,8 @@ import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
@@ -16,7 +18,7 @@ public final class Smoke {
 
     public static void main(String[] args) throws Throwable {
         Path root = Path.of("").toAbsolutePath();
-        Path library = root.resolve("target/debug/libdecentdb.so");
+        Path library = locateLibrary(root);
 
         try (Arena arena = Arena.ofConfined()) {
             SymbolLookup lookup = SymbolLookup.libraryLookup(library, arena);
@@ -42,17 +44,35 @@ public final class Smoke {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS));
 
             MemorySegment dbSlot = arena.allocate(ADDRESS);
-            check((int) open.invokeExact(arena.allocateFrom(":memory:"), dbSlot), "open_or_create", lastError);
+            check((int) open.invokeExact(arena.allocateUtf8String(":memory:"), dbSlot), "open_or_create", lastError);
             MemorySegment db = dbSlot.get(ADDRESS, 0);
 
             MemorySegment resultSlot = arena.allocate(ADDRESS);
-            check((int) execute.invokeExact(db, arena.allocateFrom("CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT)"), MemorySegment.NULL, 0L, resultSlot), "create", lastError);
+            check((int) execute.invokeExact(
+                db,
+                arena.allocateUtf8String("CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT)"),
+                MemorySegment.NULL,
+                0L,
+                resultSlot
+            ), "create", lastError);
             check((int) resultFree.invokeExact(resultSlot), "free create", lastError);
 
-            check((int) execute.invokeExact(db, arena.allocateFrom("INSERT INTO smoke (id, name) VALUES (1, 'java-smoke')"), MemorySegment.NULL, 0L, resultSlot), "insert", lastError);
+            check((int) execute.invokeExact(
+                db,
+                arena.allocateUtf8String("INSERT INTO smoke (id, name) VALUES (1, 'java-smoke')"),
+                MemorySegment.NULL,
+                0L,
+                resultSlot
+            ), "insert", lastError);
             check((int) resultFree.invokeExact(resultSlot), "free insert", lastError);
 
-            check((int) execute.invokeExact(db, arena.allocateFrom("SELECT id, name FROM smoke"), MemorySegment.NULL, 0L, resultSlot), "select", lastError);
+            check((int) execute.invokeExact(
+                db,
+                arena.allocateUtf8String("SELECT id, name FROM smoke"),
+                MemorySegment.NULL,
+                0L,
+                resultSlot
+            ), "select", lastError);
             MemorySegment rows = arena.allocate(JAVA_LONG);
             MemorySegment result = resultSlot.get(ADDRESS, 0);
             check((int) rowCount.invokeExact(result, rows), "row count", lastError);
@@ -61,7 +81,13 @@ public final class Smoke {
             }
             check((int) resultFree.invokeExact(resultSlot), "free select", lastError);
 
-            int status = (int) execute.invokeExact(db, arena.allocateFrom("SELECT * FROM nope"), MemorySegment.NULL, 0L, resultSlot);
+            int status = (int) execute.invokeExact(
+                db,
+                arena.allocateUtf8String("SELECT * FROM nope"),
+                MemorySegment.NULL,
+                0L,
+                resultSlot
+            );
             if (status != DDB_ERR_SQL) {
                 throw new IllegalStateException("expected SQL error, got " + status);
             }
@@ -82,6 +108,32 @@ public final class Smoke {
 
     private static String errorString(MethodHandle lastError) throws Throwable {
         MemorySegment segment = (MemorySegment) lastError.invokeExact();
-        return segment.equals(MemorySegment.NULL) ? "" : segment.reinterpret(Long.MAX_VALUE).getString(0);
+        return segment.equals(MemorySegment.NULL) ? "" : segment.reinterpret(Long.MAX_VALUE).getUtf8String(0);
+    }
+
+    private static Path locateLibrary(Path root) throws IOException {
+        final String fileName = libraryFileName();
+        final Path debugPath = root.resolve("target/debug").resolve(fileName);
+        if (Files.isRegularFile(debugPath)) {
+            return debugPath;
+        }
+
+        final Path releasePath = root.resolve("target/release").resolve(fileName);
+        if (Files.isRegularFile(releasePath)) {
+            return releasePath;
+        }
+
+        throw new IOException("Could not find " + fileName + " under target/debug or target/release");
+    }
+
+    private static String libraryFileName() {
+        final String os = System.getProperty("os.name", "").toLowerCase();
+        if (os.contains("win")) {
+            return "decentdb.dll";
+        }
+        if (os.contains("mac") || os.contains("darwin")) {
+            return "libdecentdb.dylib";
+        }
+        return "libdecentdb.so";
     }
 }

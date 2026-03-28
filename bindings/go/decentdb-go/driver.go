@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 	"unsafe"
@@ -25,6 +26,16 @@ import (
 
 func init() {
 	sql.Register("decentdb", &Driver{})
+}
+
+// AbiVersion returns the DecentDB C ABI version.
+func AbiVersion() int {
+	return int(C.ddb_abi_version())
+}
+
+// EngineVersion returns the DecentDB engine version string.
+func EngineVersion() string {
+	return C.GoString(C.ddb_version())
 }
 
 type Driver struct{}
@@ -66,22 +77,26 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		rawQuery = u.RawQuery
 	}
 
+	// Parse mode before any native call to avoid the open-then-recreate bug
+	mode := ""
+	if rawQuery != "" {
+		if q, err := url.ParseQuery(rawQuery); err == nil {
+			mode = q.Get("mode")
+		}
+	}
+
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
 	var db *C.ddb_db_t
-	status := C.ddb_db_open_or_create(cPath, &db)
-	if rawQuery != "" {
-		if q, err := url.ParseQuery(rawQuery); err == nil {
-			mode := q.Get("mode")
-			if mode == "create" {
-				db = nil
-				status = C.ddb_db_create(cPath, &db)
-			} else if mode == "open" {
-				db = nil
-				status = C.ddb_db_open(cPath, &db)
-			}
-		}
+	var status C.ddb_status_t
+	switch mode {
+	case "create":
+		status = C.ddb_db_create(cPath, &db)
+	case "open":
+		status = C.ddb_db_open(cPath, &db)
+	default:
+		status = C.ddb_db_open_or_create(cPath, &db)
 	}
 	if status != C.DDB_OK || db == nil {
 		return nil, statusError(status, "")
@@ -170,7 +185,9 @@ func OpenDirect(path string) (*DB, error) {
 	if status != C.DDB_OK || db == nil {
 		return nil, statusError(status, "")
 	}
-	return &DB{c: &conn{db: db}}, nil
+	wrapper := &DB{c: &conn{db: db}}
+	runtime.SetFinalizer(wrapper, func(d *DB) { d.c.Close() })
+	return wrapper, nil
 }
 
 // Close closes the database.
@@ -192,6 +209,35 @@ func (d *DB) GetTableColumns(tableName string) ([]ColumnInfo, error) {
 
 // ListIndexes returns metadata about all indexes.
 func (d *DB) ListIndexes() ([]IndexInfo, error) { return d.c.ListIndexes() }
+
+// GetTableDdl returns the CREATE TABLE DDL for the given table.
+func (d *DB) GetTableDdl(tableName string) (string, error) { return d.c.GetTableDdl(tableName) }
+
+// ListViews returns metadata about all views as a JSON array.
+func (d *DB) ListViews() (string, error) { return d.c.ListViews() }
+
+// GetViewDdl returns the CREATE VIEW DDL for the given view.
+func (d *DB) GetViewDdl(viewName string) (string, error) { return d.c.GetViewDdl(viewName) }
+
+// ListTriggers returns metadata about all triggers as a JSON array.
+func (d *DB) ListTriggers() (string, error) { return d.c.ListTriggers() }
+
+// InTransaction returns true if the engine currently has an active transaction.
+func (d *DB) InTransaction() bool { return d.c.InTransaction() }
+
+// ExecImmediate executes a SQL statement without parameters, returning JSON result info.
+func (d *DB) ExecImmediate(sqlText string) (string, error) { return d.c.ExecImmediate(sqlText) }
+
+// EvictSharedWAL evicts the shared WAL file for the given database path.
+func EvictSharedWAL(path string) error {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	status := C.ddb_evict_shared_wal(cPath)
+	if status != C.DDB_OK {
+		return statusError(status, "")
+	}
+	return nil
+}
 
 // Exec executes a SQL statement and returns the number of affected rows.
 func (d *DB) Exec(sql string, args ...driver.Value) (int64, error) {
@@ -287,7 +333,7 @@ func (c *conn) Close() error {
 // Checkpoint flushes the WAL to the main database file.
 func (c *conn) Checkpoint() error {
 	if c.db == nil {
-		return errors.New("connection is closed")
+		return driver.ErrBadConn
 	}
 	status := C.ddb_db_checkpoint(c.db)
 	if status != C.DDB_OK {
@@ -299,7 +345,7 @@ func (c *conn) Checkpoint() error {
 // SaveAs exports the database to a new on-disk file at destPath.
 func (c *conn) SaveAs(destPath string) error {
 	if c.db == nil {
-		return errors.New("connection is closed")
+		return driver.ErrBadConn
 	}
 	cPath := C.CString(destPath)
 	defer C.free(unsafe.Pointer(cPath))
@@ -313,7 +359,7 @@ func (c *conn) SaveAs(destPath string) error {
 // ListTables returns the names of all tables in the database.
 func (c *conn) ListTables() ([]string, error) {
 	if c.db == nil {
-		return nil, errors.New("connection is closed")
+		return nil, driver.ErrBadConn
 	}
 	var ptr *C.char
 	status := C.ddb_db_list_tables_json(c.db, &ptr)
@@ -357,7 +403,7 @@ type ColumnInfo struct {
 // GetTableColumns returns column metadata for a given table.
 func (c *conn) GetTableColumns(tableName string) ([]ColumnInfo, error) {
 	if c.db == nil {
-		return nil, errors.New("connection is closed")
+		return nil, driver.ErrBadConn
 	}
 	cName := C.CString(tableName)
 	defer C.free(unsafe.Pointer(cName))
@@ -424,7 +470,7 @@ type IndexInfo struct {
 // ListIndexes returns metadata about all indexes in the database.
 func (c *conn) ListIndexes() ([]IndexInfo, error) {
 	if c.db == nil {
-		return nil, errors.New("connection is closed")
+		return nil, driver.ErrBadConn
 	}
 	var ptr *C.char
 	status := C.ddb_db_list_indexes_json(c.db, &ptr)
@@ -443,6 +489,176 @@ func (c *conn) ListIndexes() ([]IndexInfo, error) {
 		}
 	}
 	return indexes, nil
+}
+
+// GetTableDdl returns the CREATE TABLE DDL for the given table.
+func (c *conn) GetTableDdl(tableName string) (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	cName := C.CString(tableName)
+	defer C.free(unsafe.Pointer(cName))
+	var ptr *C.char
+	status := C.ddb_db_get_table_ddl(c.db, cName, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// ListViews returns metadata about all views as a JSON array.
+func (c *conn) ListViews() (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	var ptr *C.char
+	status := C.ddb_db_list_views_json(c.db, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// GetViewDdl returns the CREATE VIEW DDL for the given view.
+func (c *conn) GetViewDdl(viewName string) (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	cName := C.CString(viewName)
+	defer C.free(unsafe.Pointer(cName))
+	var ptr *C.char
+	status := C.ddb_db_get_view_ddl(c.db, cName, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// ListTriggers returns metadata about all triggers as a JSON array.
+func (c *conn) ListTriggers() (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	var ptr *C.char
+	status := C.ddb_db_list_triggers_json(c.db, &ptr)
+	if status != C.DDB_OK {
+		return "", statusError(status, "")
+	}
+	defer freeAPIString(ptr)
+	return C.GoString(ptr), nil
+}
+
+// InTransaction returns true if the engine currently has an active transaction.
+func (c *conn) InTransaction() bool {
+	if c.db == nil {
+		return false
+	}
+	var flag C.uint8_t
+	status := C.ddb_db_in_transaction(c.db, &flag)
+	if status != C.DDB_OK {
+		return false
+	}
+	return flag != 0
+}
+
+// ExecImmediate executes a SQL statement without parameters using ddb_db_execute,
+// returning the JSON result or an error.
+func (c *conn) ExecImmediate(sqlText string) (string, error) {
+	if c.db == nil {
+		return "", driver.ErrBadConn
+	}
+	cSQL := C.CString(sqlText)
+	defer C.free(unsafe.Pointer(cSQL))
+
+	var result *C.ddb_result_t
+	status := C.ddb_db_execute(c.db, cSQL, nil, 0, &result)
+	if status != C.DDB_OK {
+		return "", statusError(status, sqlText)
+	}
+	defer C.ddb_result_free(&result)
+
+	// Read result metadata using the full result set API
+	var affected C.uint64_t
+	C.ddb_result_affected_rows(result, &affected)
+
+	var rowCnt C.size_t
+	C.ddb_result_row_count(result, &rowCnt)
+
+	var colCnt C.size_t
+	C.ddb_result_column_count(result, &colCnt)
+
+	// Build column names
+	colNames := make([]string, int(colCnt))
+	for i := 0; i < int(colCnt); i++ {
+		var name *C.char
+		C.ddb_result_column_name_copy(result, C.size_t(i), &name)
+		if name != nil {
+			colNames[i] = C.GoString(name)
+			freeAPIString(name)
+		}
+	}
+
+	// Read result values
+	var rows []map[string]interface{}
+	for r := 0; r < int(rowCnt); r++ {
+		row := make(map[string]interface{})
+		for c := 0; c < int(colCnt); c++ {
+			var val C.ddb_value_t
+			C.ddb_value_init(&val)
+			rc := C.ddb_result_value_copy(result, C.size_t(r), C.size_t(c), &val)
+			if rc == C.DDB_OK {
+				colName := colNames[c]
+				if colName == "" {
+					colName = fmt.Sprintf("col%d", c)
+				}
+				row[colName] = valueToGo(val)
+			}
+			C.ddb_value_dispose(&val)
+		}
+		rows = append(rows, row)
+	}
+
+	out, _ := json.Marshal(map[string]interface{}{
+		"affected": int64(affected),
+		"rows":     rows,
+	})
+	return string(out), nil
+}
+
+// valueToGo converts a ddb_value_t to a Go value.
+func valueToGo(val C.ddb_value_t) interface{} {
+	switch val.tag {
+	case C.DDB_VALUE_NULL:
+		return nil
+	case C.DDB_VALUE_INT64:
+		return int64(val.int64_value)
+	case C.DDB_VALUE_BOOL:
+		return val.bool_value != 0
+	case C.DDB_VALUE_FLOAT64:
+		return float64(val.float64_value)
+	case C.DDB_VALUE_TEXT:
+		if val.data == nil || val.len == 0 {
+			return ""
+		}
+		return C.GoStringN((*C.char)(unsafe.Pointer(val.data)), C.int(val.len))
+	case C.DDB_VALUE_BLOB:
+		if val.data == nil || val.len == 0 {
+			return []byte{}
+		}
+		return C.GoBytes(unsafe.Pointer(val.data), C.int(val.len))
+	case C.DDB_VALUE_UUID:
+		return C.GoBytes(unsafe.Pointer(&val.uuid_bytes[0]), 16)
+	case C.DDB_VALUE_DECIMAL:
+		return Decimal{Unscaled: int64(val.decimal_scaled), Scale: int(val.decimal_scale)}
+	case C.DDB_VALUE_TIMESTAMP_MICROS:
+		micros := int64(val.timestamp_micros)
+		return time.Unix(micros/1_000_000, (micros%1_000_000)*1_000).UTC()
+	default:
+		return nil
+	}
 }
 
 func (c *conn) Begin() (driver.Tx, error) {
@@ -677,6 +893,117 @@ func (s *stmtStruct) QueryContext(ctx context.Context, args []driver.NamedValue)
 	return &rows{s: s, ctx: ctx}, nil
 }
 
+// RebindInt64Execute rebinds the first parameter as int64 and re-executes
+// the statement in a single cgo crossing, returning affected rows.
+func (s *stmtStruct) RebindInt64Execute(value int64) (int64, error) {
+	if s.stmt == nil {
+		return 0, errors.New("statement is closed")
+	}
+	var affected C.uint64_t
+	status := C.ddb_stmt_rebind_int64_execute(s.stmt, C.int64_t(value), &affected)
+	if status != C.DDB_OK {
+		return 0, statusError(status, s.query)
+	}
+	return int64(affected), nil
+}
+
+// ExecuteBatchI64 executes the prepared statement as a batch insert,
+// binding each element of values to $1 in sequence.
+func (s *stmtStruct) ExecuteBatchI64(values []int64) (int64, error) {
+	if s.stmt == nil {
+		return 0, errors.New("statement is closed")
+	}
+	if len(values) == 0 {
+		return 0, nil
+	}
+	status := C.ddb_stmt_reset(s.stmt)
+	if status != C.DDB_OK {
+		return 0, statusError(status, s.query)
+	}
+	status = C.ddb_stmt_clear_bindings(s.stmt)
+	if status != C.DDB_OK {
+		return 0, statusError(status, s.query)
+	}
+	var affected C.uint64_t
+	status = C.ddb_stmt_execute_batch_i64(s.stmt, C.size_t(len(values)), (*C.int64_t)(&values[0]), &affected)
+	if status != C.DDB_OK {
+		return 0, statusError(status, s.query)
+	}
+	return int64(affected), nil
+}
+
+// RebindTextInt64Execute rebinds text and int64 parameters and re-executes.
+func (s *stmtStruct) RebindTextInt64Execute(text string, intValue int64) (int64, error) {
+	if s.stmt == nil {
+		return 0, errors.New("statement is closed")
+	}
+	ct := C.CString(text)
+	defer C.free(unsafe.Pointer(ct))
+	var affected C.uint64_t
+	status := C.ddb_stmt_rebind_text_int64_execute(s.stmt, ct, C.size_t(len(text)), C.int64_t(intValue), &affected)
+	if status != C.DDB_OK {
+		return 0, statusError(status, s.query)
+	}
+	return int64(affected), nil
+}
+
+// RebindInt64TextExecute rebinds int64 and text parameters and re-executes.
+func (s *stmtStruct) RebindInt64TextExecute(intValue int64, text string) (int64, error) {
+	if s.stmt == nil {
+		return 0, errors.New("statement is closed")
+	}
+	ct := C.CString(text)
+	defer C.free(unsafe.Pointer(ct))
+	var affected C.uint64_t
+	status := C.ddb_stmt_rebind_int64_text_execute(s.stmt, C.int64_t(intValue), ct, C.size_t(len(text)), &affected)
+	if status != C.DDB_OK {
+		return 0, statusError(status, s.query)
+	}
+	return int64(affected), nil
+}
+
+// BindAndStepRowView binds an int64 to $1, steps, and returns the row view in one cgo crossing.
+func (s *stmtStruct) BindAndStepRowView(index int, value int64) (hasRow bool, views *C.ddb_value_view_t, count C.size_t, err error) {
+	if s.stmt == nil {
+		return false, nil, 0, errors.New("statement is closed")
+	}
+	var hasRowByte C.uint8_t
+	status := C.ddb_stmt_bind_int64_step_row_view(s.stmt, C.size_t(index), C.int64_t(value), &views, &count, &hasRowByte)
+	if status != C.DDB_OK {
+		return false, nil, 0, statusError(status, s.query)
+	}
+	return hasRowByte != 0, views, count, nil
+}
+
+// CopyValue copies a single column value from the current row.
+func (s *stmtStruct) CopyValue(colIndex int) (*C.ddb_value_t, error) {
+	if s.stmt == nil {
+		return nil, errors.New("statement is closed")
+	}
+	val := &C.ddb_value_t{}
+	status := C.ddb_stmt_value_copy(s.stmt, C.size_t(colIndex), val)
+	if status != C.DDB_OK {
+		return nil, statusError(status, s.query)
+	}
+	return val, nil
+}
+
+// FetchRowViews fetches up to maxRows rows in a batch, reducing cgo crossings.
+func (s *stmtStruct) FetchRowViews(includeCurrent bool, maxRows int) (views *C.ddb_value_view_t, rowCount C.size_t, colCount C.size_t, err error) {
+	if s.stmt == nil {
+		return nil, 0, 0, errors.New("statement is closed")
+	}
+	var inc C.uint8_t
+	if includeCurrent {
+		inc = 1
+	}
+	status := C.ddb_stmt_fetch_row_views(s.stmt, inc, C.size_t(maxRows), &views, &rowCount, &colCount)
+	if status != C.DDB_OK {
+		return nil, 0, 0, statusError(status, s.query)
+	}
+	return views, rowCount, colCount, nil
+}
+
 type rows struct {
 	s   *stmtStruct
 	ctx context.Context
@@ -717,20 +1044,18 @@ func (r *rows) Next(dest []driver.Value) error {
 		default:
 		}
 	}
+
+	var views *C.ddb_value_view_t
+	var count C.size_t
 	var hasRow C.uint8_t
-	status := C.ddb_stmt_step(r.s.stmt, &hasRow)
+
+	// Fused step+row_view: single cgo crossing instead of two
+	status := C.ddb_stmt_step_row_view(r.s.stmt, &views, &count, &hasRow)
 	if status != C.DDB_OK {
 		return statusError(status, r.s.query)
 	}
 	if hasRow == 0 {
 		return io.EOF
-	}
-
-	var views *C.ddb_value_view_t
-	var count C.size_t
-	status = C.ddb_stmt_row_view(r.s.stmt, &views, &count)
-	if status != C.DDB_OK {
-		return statusError(status, r.s.query)
 	}
 	if count == 0 {
 		return nil

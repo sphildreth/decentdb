@@ -1,4 +1,4 @@
-/// Minimal Flutter desktop example for DecentDB.
+/// Minimal desktop example for DecentDB.
 ///
 /// Setup:
 /// 1. Build the native library with `cargo build -p decentdb`.

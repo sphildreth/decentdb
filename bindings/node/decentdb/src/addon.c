@@ -1,12 +1,33 @@
 #include <node_api.h>
 
-#include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "native_lib.h"
+
+/*
+ * NAPI_CALL: replaces assert(st == napi_ok) throughout this file.
+ *
+ * In release builds, assert() is compiled out with -DNDEBUG, leaving a silent
+ * no-op on N-API failure that can cause undefined behaviour. This macro instead
+ * checks every napi_status return, throws a generic error if no exception is
+ * already pending, and returns NULL so the JS engine propagates the failure.
+ */
+#define NAPI_CALL(env, call)                                              \
+  do {                                                                    \
+    napi_status _rc = (call);                                             \
+    if (_rc != napi_ok) {                                                 \
+      bool _has_ex = false;                                               \
+      napi_is_exception_pending((env), &_has_ex);                        \
+      if (!_has_ex) {                                                     \
+        napi_throw_error((env), "DECENTDB_NAPI",                         \
+                         "Unexpected N-API error in " #call);            \
+      }                                                                   \
+      return NULL;                                                        \
+    }                                                                     \
+  } while (0)
 
 typedef struct db_wrap {
   decentdb_db* db;
@@ -59,16 +80,16 @@ static napi_value throw_error(napi_env env, const char* code, const char* msg) {
   if (msg == NULL) msg = "error";
 
   st = napi_create_string_utf8(env, msg, NAPI_AUTO_LENGTH, &msgv);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   st = napi_create_error(env, NULL, msgv, &err);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (code != NULL) {
     st = napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &codev);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_named_property(env, err, "code", codev);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
   }
 
   napi_throw(env, err);
@@ -158,7 +179,7 @@ static napi_value js_db_open(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 1) return throw_error(env, "DECENTDB_ARGS", "dbOpen(path, options?) requires a path");
 
@@ -169,7 +190,7 @@ static napi_value js_db_open(napi_env env, napi_callback_info info) {
 
   char* path = (char*)malloc(pathLen + 1);
   st = napi_get_value_string_utf8(env, argv[0], path, pathLen + 1, &pathLen);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   // options (nullable)
   char* opts = NULL;
@@ -177,13 +198,13 @@ static napi_value js_db_open(napi_env env, napi_callback_info info) {
   if (argc >= 2) {
     napi_valuetype t;
     st = napi_typeof(env, argv[1], &t);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     if (t == napi_string) {
       st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &optsLen);
-      assert(st == napi_ok);
+      NAPI_CALL(env, st);
       opts = (char*)malloc(optsLen + 1);
       st = napi_get_value_string_utf8(env, argv[1], opts, optsLen + 1, &optsLen);
-      assert(st == napi_ok);
+      NAPI_CALL(env, st);
     }
   }
 
@@ -198,7 +219,7 @@ static napi_value js_db_open(napi_env env, napi_callback_info info) {
 
   napi_value ext;
   st = napi_create_external(env, w, db_finalize, NULL, &ext);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return ext;
 }
 
@@ -208,7 +229,7 @@ static napi_value js_db_close(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 1) return throw_error(env, "DECENTDB_ARGS", "dbClose(handle) requires a handle");
 
@@ -223,7 +244,7 @@ static napi_value js_db_close(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -233,7 +254,7 @@ static napi_value js_stmt_prepare(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 2) return throw_error(env, "DECENTDB_ARGS", "stmtPrepare(dbHandle, sql) requires 2 args");
 
@@ -246,7 +267,7 @@ static napi_value js_stmt_prepare(napi_env env, napi_callback_info info) {
 
   char* sql = (char*)malloc(sqlLen + 1);
   st = napi_get_value_string_utf8(env, argv[1], sql, sqlLen + 1, &sqlLen);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   decentdb_stmt* stmt = NULL;
   int rc = api->prepare(dbw->db, sql, &stmt);
@@ -259,7 +280,7 @@ static napi_value js_stmt_prepare(napi_env env, napi_callback_info info) {
 
   napi_value ext;
   st = napi_create_external(env, sw, stmt_finalize, NULL, &ext);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return ext;
 }
 
@@ -269,7 +290,7 @@ static napi_value js_stmt_finalize(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 1) return throw_error(env, "DECENTDB_ARGS", "stmtFinalize(handle) requires a handle");
 
@@ -284,7 +305,7 @@ static napi_value js_stmt_finalize(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -294,7 +315,7 @@ static napi_value js_stmt_reset(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -304,7 +325,7 @@ static napi_value js_stmt_reset(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -314,7 +335,7 @@ static napi_value js_stmt_clear_bindings(napi_env env, napi_callback_info info) 
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -324,7 +345,7 @@ static napi_value js_stmt_clear_bindings(napi_env env, napi_callback_info info) 
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -334,7 +355,7 @@ static napi_value js_stmt_bind_null(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -348,7 +369,7 @@ static napi_value js_stmt_bind_null(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -358,7 +379,7 @@ static napi_value js_stmt_bind_int64(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -379,7 +400,7 @@ static napi_value js_stmt_bind_int64(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -389,7 +410,7 @@ static napi_value js_stmt_bind_int64_number(napi_env env, napi_callback_info inf
   size_t argc = 3;
   napi_value argv[3];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -409,7 +430,7 @@ static napi_value js_stmt_bind_int64_number(napi_env env, napi_callback_info inf
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -419,7 +440,7 @@ static napi_value js_stmt_bind_bool(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -437,7 +458,7 @@ static napi_value js_stmt_bind_bool(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -447,7 +468,7 @@ static napi_value js_stmt_bind_float64(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -465,7 +486,7 @@ static napi_value js_stmt_bind_float64(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -475,7 +496,7 @@ static napi_value js_stmt_bind_text(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -490,7 +511,7 @@ static napi_value js_stmt_bind_text(napi_env env, napi_callback_info info) {
 
   char* s = (char*)malloc(len + 1);
   st = napi_get_value_string_utf8(env, argv[2], s, len + 1, &len);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   int rc = api->bind_text(w->stmt, idx, s, (int)len);
   free(s);
@@ -498,7 +519,7 @@ static napi_value js_stmt_bind_text(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -508,7 +529,7 @@ static napi_value js_stmt_bind_blob(napi_env env, napi_callback_info info) {
   size_t argc = 3;
   napi_value argv[3];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -528,7 +549,7 @@ static napi_value js_stmt_bind_blob(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -538,7 +559,7 @@ static napi_value js_stmt_step(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -548,7 +569,7 @@ static napi_value js_stmt_step(napi_env env, napi_callback_info info) {
 
   napi_value b;
   st = napi_get_boolean(env, rc == 1, &b);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return b;
 }
 
@@ -558,7 +579,7 @@ static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info
   size_t argc = 2;
   napi_value argv[2];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 2) {
     return throw_error(env, "DECENTDB_ARGS", "stmtStepWithParams(handle, bindings) requires 2 args");
@@ -569,14 +590,14 @@ static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info
 
   bool is_array = false;
   st = napi_is_array(env, argv[1], &is_array);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   if (!is_array) {
     return throw_error(env, "DECENTDB_ARGS", "bindings must be an array");
   }
 
   uint32_t bind_count = 0;
   st = napi_get_array_length(env, argv[1], &bind_count);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   int rc = api->reset(w->stmt);
   if (rc != 0) return throw_last_native_error(env, api);
@@ -586,12 +607,12 @@ static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info
   for (uint32_t i = 0; i < bind_count; i++) {
     napi_value value;
     st = napi_get_element(env, argv[1], i, &value);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     int idx = (int)i + 1;
     napi_valuetype t;
     st = napi_typeof(env, value, &t);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     if (t == napi_undefined || t == napi_null) {
       rc = api->bind_null(w->stmt, idx);
@@ -634,13 +655,13 @@ static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info
         return throw_error(env, "DECENTDB_OOM", "out of memory while binding string");
       }
       st = napi_get_value_string_utf8(env, value, s, len + 1, &len);
-      assert(st == napi_ok);
+      if (st != napi_ok) { free(s); NAPI_CALL(env, st); }
       rc = api->bind_text(w->stmt, idx, s, (int)len);
       free(s);
     } else if (t == napi_object) {
       bool is_buffer = false;
       st = napi_is_buffer(env, value, &is_buffer);
-      assert(st == napi_ok);
+      NAPI_CALL(env, st);
       if (is_buffer) {
         void* data = NULL;
         size_t len = 0;
@@ -652,7 +673,7 @@ static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info
       } else {
         bool is_typedarray = false;
         st = napi_is_typedarray(env, value, &is_typedarray);
-        assert(st == napi_ok);
+        NAPI_CALL(env, st);
         if (is_typedarray) {
           napi_typedarray_type ta_type;
           size_t ta_len = 0;
@@ -682,7 +703,7 @@ static napi_value js_stmt_step_with_params(napi_env env, napi_callback_info info
 
   napi_value b;
   st = napi_get_boolean(env, rc == 1, &b);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return b;
 }
 
@@ -695,7 +716,7 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
   size_t argc = 4;
   napi_value argv[4];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 4) {
     return throw_error(
@@ -711,11 +732,11 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
   bool is_texts_array = false;
   bool is_floats_array = false;
   st = napi_is_array(env, argv[1], &is_ids_array);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   st = napi_is_array(env, argv[2], &is_texts_array);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   st = napi_is_array(env, argv[3], &is_floats_array);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   if (!is_ids_array || !is_texts_array || !is_floats_array) {
     return throw_error(env, "DECENTDB_ARGS", "ids/texts/floats must be arrays");
   }
@@ -724,11 +745,11 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
   uint32_t row_count_texts = 0;
   uint32_t row_count_floats = 0;
   st = napi_get_array_length(env, argv[1], &row_count_ids);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   st = napi_get_array_length(env, argv[2], &row_count_texts);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   st = napi_get_array_length(env, argv[3], &row_count_floats);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (row_count_ids != row_count_texts || row_count_ids != row_count_floats) {
     return throw_error(env, "DECENTDB_ARGS", "ids/texts/floats must have equal length");
@@ -756,10 +777,10 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
   for (uint32_t i = 0; i < row_count_ids; i++) {
     napi_value id_value;
     st = napi_get_element(env, argv[1], i, &id_value);
-    assert(st == napi_ok);
+    if (st != napi_ok) { free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage); NAPI_CALL(env, st); }
     napi_valuetype id_type;
     st = napi_typeof(env, id_value, &id_type);
-    assert(st == napi_ok);
+    if (st != napi_ok) { free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage); NAPI_CALL(env, st); }
     if (id_type == napi_bigint) {
       bool lossless = false;
       st = napi_get_value_bigint_int64(env, id_value, &ids[i], &lossless);
@@ -780,7 +801,7 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
 
     napi_value text_value;
     st = napi_get_element(env, argv[2], i, &text_value);
-    assert(st == napi_ok);
+    if (st != napi_ok) { free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage); NAPI_CALL(env, st); }
     size_t text_len = 0;
     st = napi_get_value_string_utf8(env, text_value, NULL, 0, &text_len);
     if (st != napi_ok) {
@@ -796,7 +817,7 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
 
     napi_value float_value;
     st = napi_get_element(env, argv[3], i, &float_value);
-    assert(st == napi_ok);
+    if (st != napi_ok) { free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage); NAPI_CALL(env, st); }
     st = napi_get_value_double(env, float_value, &floats[i]);
     if (st != napi_ok) {
       free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage);
@@ -816,7 +837,7 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
   for (uint32_t i = 0; i < row_count_ids; i++) {
     napi_value text_value;
     st = napi_get_element(env, argv[2], i, &text_value);
-    assert(st == napi_ok);
+    if (st != napi_ok) { free_batch_buffers(ids, floats, text_ptrs, text_lens, text_storage); NAPI_CALL(env, st); }
 
     size_t text_len = text_lens[i];
     if (text_len == 0) {
@@ -845,7 +866,7 @@ static napi_value js_stmt_execute_batch_i64_text_f64(napi_env env, napi_callback
 
   napi_value out;
   st = napi_create_bigint_uint64(env, affected, &out);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return out;
 }
 
@@ -858,7 +879,7 @@ static napi_value js_stmt_fetch_rows_i64_text_f64(napi_env env, napi_callback_in
   size_t argc = 2;
   napi_value argv[2];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 2) {
     return throw_error(
@@ -884,36 +905,36 @@ static napi_value js_stmt_fetch_rows_i64_text_f64(napi_env env, napi_callback_in
 
   napi_value arr;
   st = napi_create_array_with_length(env, out_rows, &arr);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   for (size_t i = 0; i < out_rows; i++) {
     napi_value row_arr;
     st = napi_create_array_with_length(env, 3, &row_arr);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     napi_value idv;
     st = napi_create_bigint_int64(env, rows_ptr[i].int64_value, &idv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_element(env, row_arr, 0, idv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     const char* txt = (const char*)rows_ptr[i].text_data;
     size_t txt_len = rows_ptr[i].text_len;
     if (!txt) txt = "";
     napi_value textv;
     st = napi_create_string_utf8(env, txt, txt_len, &textv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_element(env, row_arr, 1, textv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     napi_value floatv;
     st = napi_create_double(env, rows_ptr[i].float64_value, &floatv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_element(env, row_arr, 2, floatv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     st = napi_set_element(env, arr, (uint32_t)i, row_arr);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
   }
 
   return arr;
@@ -928,7 +949,7 @@ static napi_value js_stmt_fetch_rows_i64_text_f64_number(napi_env env, napi_call
   size_t argc = 2;
   napi_value argv[2];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   if (argc < 2) {
     return throw_error(
@@ -954,12 +975,12 @@ static napi_value js_stmt_fetch_rows_i64_text_f64_number(napi_env env, napi_call
 
   napi_value arr;
   st = napi_create_array_with_length(env, out_rows, &arr);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   for (size_t i = 0; i < out_rows; i++) {
     napi_value row_arr;
     st = napi_create_array_with_length(env, 3, &row_arr);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     const int64_t id = rows_ptr[i].int64_value;
     const int64_t max_safe = 9007199254740991LL;
@@ -970,27 +991,27 @@ static napi_value js_stmt_fetch_rows_i64_text_f64_number(napi_env env, napi_call
     } else {
       st = napi_create_bigint_int64(env, id, &idv);
     }
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_element(env, row_arr, 0, idv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     const char* txt = (const char*)rows_ptr[i].text_data;
     size_t txt_len = rows_ptr[i].text_len;
     if (!txt) txt = "";
     napi_value textv;
     st = napi_create_string_utf8(env, txt, txt_len, &textv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_element(env, row_arr, 1, textv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     napi_value floatv;
     st = napi_create_double(env, rows_ptr[i].float64_value, &floatv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     st = napi_set_element(env, row_arr, 2, floatv);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
 
     st = napi_set_element(env, arr, (uint32_t)i, row_arr);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
   }
 
   return arr;
@@ -1002,7 +1023,7 @@ static napi_value js_stmt_column_names(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -1011,17 +1032,17 @@ static napi_value js_stmt_column_names(napi_env env, napi_callback_info info) {
   if (count < 0) return throw_last_native_error(env, api);
   napi_value arr;
   st = napi_create_array_with_length(env, (size_t)count, &arr);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   for (int i = 0; i < count; i++) {
     const char* name = api->column_name(w->stmt, i);
     if (!name) return throw_last_native_error(env, api);
     napi_value namev;
     st = napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &namev);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
     free_native_owned_string(api, name);
     st = napi_set_element(env, arr, (uint32_t)i, namev);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
   }
 
   return arr;
@@ -1033,7 +1054,7 @@ static napi_value js_stmt_rows_affected(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -1042,7 +1063,7 @@ static napi_value js_stmt_rows_affected(napi_env env, napi_callback_info info) {
 
   napi_value out;
   st = napi_create_bigint_int64(env, v, &out);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return out;
 }
 
@@ -1052,7 +1073,7 @@ static napi_value js_stmt_bind_decimal(napi_env env, napi_callback_info info) {
   size_t argc = 4;
   napi_value argv[4];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -1077,7 +1098,7 @@ static napi_value js_stmt_bind_decimal(napi_env env, napi_callback_info info) {
 
   napi_value undef;
   st = napi_get_undefined(env, &undef);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
   return undef;
 }
 
@@ -1090,7 +1111,7 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
   napi_status st;
   napi_value arr;
   st = napi_create_array_with_length(env, (size_t)count, &arr);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   for (int i = 0; i < count; i++) {
     const decentdb_value_view* v = &values[i];
@@ -1098,22 +1119,22 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
 
     if (v->tag == DDB_VALUE_NULL) {
       st = napi_get_null(env, &cell);
-      assert(st == napi_ok);
+      NAPI_CALL(env, st);
     } else {
       switch (v->tag) {
         case DECENTDB_KIND_INT64: {
           st = napi_create_bigint_int64(env, v->int64_value, &cell);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           break;
         }
         case DECENTDB_KIND_BOOL: {
           st = napi_get_boolean(env, v->bool_value != 0, &cell);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           break;
         }
         case DECENTDB_KIND_FLOAT64: {
           st = napi_create_double(env, v->float64_value, &cell);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           break;
         }
         case DECENTDB_KIND_TEXT: {
@@ -1121,7 +1142,7 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
           size_t len = v->len;
           if (!s) s = "";
           st = napi_create_string_utf8(env, s, len, &cell);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           break;
         }
         case DECENTDB_KIND_BLOB:
@@ -1129,25 +1150,25 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
           const uint8_t* b = v->tag == DDB_VALUE_UUID ? v->uuid_bytes : v->data;
           size_t len = v->tag == DDB_VALUE_UUID ? 16u : v->len;
           st = napi_create_buffer_copy(env, len, b, NULL, &cell);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           break;
         }
         case DECENTDB_KIND_DECIMAL: {
           napi_value obj;
           st = napi_create_object(env, &obj);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           
           napi_value unscaledv;
           st = napi_create_bigint_int64(env, v->decimal_scaled, &unscaledv);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           st = napi_set_named_property(env, obj, "unscaled", unscaledv);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
 
           napi_value scalev;
           st = napi_create_int32(env, (int32_t)v->decimal_scale, &scalev);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           st = napi_set_named_property(env, obj, "scale", scalev);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
 
           cell = obj;
           break;
@@ -1156,21 +1177,21 @@ static napi_value build_row_array(napi_env env, const decentdb_native_api* api, 
           double ms = (double)v->timestamp_micros / 1000.0;
           napi_value msv;
           st = napi_create_double(env, ms, &msv);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           cell = msv;
           break;
         }
         default: {
-          // Unknown kind: surface as null to avoid UB.
+          /* Unknown kind: surface as null to avoid UB. */
           st = napi_get_null(env, &cell);
-          assert(st == napi_ok);
+          NAPI_CALL(env, st);
           break;
         }
       }
     }
 
     st = napi_set_element(env, arr, (uint32_t)i, cell);
-    assert(st == napi_ok);
+    NAPI_CALL(env, st);
   }
 
   return arr;
@@ -1182,7 +1203,7 @@ static napi_value js_stmt_row_array(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -1262,7 +1283,7 @@ static napi_value js_stmt_next_async(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   stmt_wrap* w = unwrap_stmt(env, argv[0]);
   if (!w) return NULL;
@@ -1277,7 +1298,7 @@ static napi_value js_stmt_next_async(napi_env env, napi_callback_info info) {
 
   napi_value promise;
   st = napi_create_promise(env, &d->deferred, &promise);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   napi_value resource_name;
   napi_create_string_utf8(env, "DecentDB_AsyncStep", NAPI_AUTO_LENGTH, &resource_name);
@@ -1285,10 +1306,10 @@ static napi_value js_stmt_next_async(napi_env env, napi_callback_info info) {
   st = napi_create_async_work(env, NULL, resource_name, 
                               async_step_execute, async_step_complete, 
                               d, &d->work);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   st = napi_queue_async_work(env, d->work);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   return promise;
 }
@@ -1487,6 +1508,480 @@ static napi_value js_db_list_indexes_json(napi_env env, napi_callback_info info)
   return json_api_call(env, w, api, api->list_indexes_json);
 }
 
+static napi_value string_api_result(napi_env env, const decentdb_native_api* api, const char* ptr, int out_len) {
+  if (!ptr) {
+    const char* msg = api->last_error_message(NULL);
+    return throw_error(env, "DECENTDB_ERR", msg ? msg : "native error");
+  }
+  napi_value result;
+  napi_status st = napi_create_string_utf8(env, ptr, (size_t)out_len, &result);
+  NAPI_CALL(env, st);
+  api->free((void*)ptr);
+  return result;
+}
+
+static napi_value js_db_get_table_ddl(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+
+  size_t name_len = 0;
+  st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &name_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "table name must be a string");
+
+  char* name = (char*)malloc(name_len + 1);
+  if (!name) return throw_error(env, "DECENTDB_OOM", "out of memory");
+  st = napi_get_value_string_utf8(env, argv[1], name, name_len + 1, &name_len);
+  if (st != napi_ok) { free(name); NAPI_CALL(env, st); }
+
+  int out_len = 0;
+  const char* ptr = api->get_table_ddl ? api->get_table_ddl(w->db, name, &out_len) : NULL;
+  free(name);
+  if (!api->get_table_ddl) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_get_table_ddl not available");
+  }
+  return string_api_result(env, api, ptr, out_len);
+}
+
+static napi_value js_db_list_views_json(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->list_views_json) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_list_views_json not available");
+  }
+  return json_api_call(env, w, api, api->list_views_json);
+}
+
+static napi_value js_db_get_view_ddl(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->get_view_ddl) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_get_view_ddl not available");
+  }
+
+  size_t name_len = 0;
+  st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &name_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "view name must be a string");
+
+  char* name = (char*)malloc(name_len + 1);
+  if (!name) return throw_error(env, "DECENTDB_OOM", "out of memory");
+  st = napi_get_value_string_utf8(env, argv[1], name, name_len + 1, &name_len);
+  if (st != napi_ok) { free(name); NAPI_CALL(env, st); }
+
+  int out_len = 0;
+  const char* ptr = api->get_view_ddl(w->db, name, &out_len);
+  free(name);
+  return string_api_result(env, api, ptr, out_len);
+}
+
+static napi_value js_db_list_triggers_json(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+  if (!api->list_triggers_json) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_list_triggers_json not available");
+  }
+  return json_api_call(env, w, api, api->list_triggers_json);
+}
+
+// --------------- New v2 API functions ---------------
+
+static napi_value js_stmt_bind_timestamp_micros(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  int32_t idx;
+  st = napi_get_value_int32(env, argv[1], &idx);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "index must be an int");
+
+  /* Accept BigInt (microseconds) or Number (milliseconds, automatically scaled). */
+  int64_t micros = 0;
+  napi_valuetype vtype;
+  st = napi_typeof(env, argv[2], &vtype);
+  NAPI_CALL(env, st);
+  if (vtype == napi_bigint) {
+    bool lossless = false;
+    st = napi_get_value_bigint_int64(env, argv[2], &micros, &lossless);
+    if (st != napi_ok || !lossless) {
+      return throw_error(env, "DECENTDB_ARGS", "timestamp BigInt must fit in int64 (microseconds)");
+    }
+  } else if (vtype == napi_number) {
+    double ms = 0.0;
+    st = napi_get_value_double(env, argv[2], &ms);
+    if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "timestamp must be a number (ms) or BigInt (µs)");
+    micros = (int64_t)(ms * 1000.0);
+  } else {
+    return throw_error(env, "DECENTDB_ARGS", "timestamp must be a number (ms) or BigInt (µs)");
+  }
+
+  int rc = api->bind_timestamp_micros(w->stmt, idx, micros);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value undef;
+  st = napi_get_undefined(env, &undef);
+  NAPI_CALL(env, st);
+  return undef;
+}
+
+static napi_value js_stmt_step_row_view(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  if (!api->step_row_view) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_stmt_step_row_view not available");
+  }
+
+  const decentdb_value_view* values = NULL;
+  int count = 0;
+  int rc = api->step_row_view(w->stmt, &values, &count);
+  if (rc < 0) return throw_last_native_error(env, api);
+  if (rc == 0) {
+    /* No row (done). */
+    napi_value nullv;
+    st = napi_get_null(env, &nullv);
+    NAPI_CALL(env, st);
+    return nullv;
+  }
+
+  /* rc == 1: row available — build array from the view. */
+  napi_value arr;
+  st = napi_create_array_with_length(env, (size_t)count, &arr);
+  NAPI_CALL(env, st);
+
+  for (int i = 0; i < count; i++) {
+    const decentdb_value_view* v = &values[i];
+    napi_value cell;
+
+    switch (v->tag) {
+      case DDB_VALUE_NULL:
+        st = napi_get_null(env, &cell);
+        NAPI_CALL(env, st);
+        break;
+      case DDB_VALUE_INT64:
+        st = napi_create_bigint_int64(env, v->int64_value, &cell);
+        NAPI_CALL(env, st);
+        break;
+      case DDB_VALUE_BOOL:
+        st = napi_get_boolean(env, v->bool_value != 0, &cell);
+        NAPI_CALL(env, st);
+        break;
+      case DDB_VALUE_FLOAT64:
+        st = napi_create_double(env, v->float64_value, &cell);
+        NAPI_CALL(env, st);
+        break;
+      case DDB_VALUE_TEXT: {
+        const char* s = (const char*)v->data;
+        if (!s) s = "";
+        st = napi_create_string_utf8(env, s, v->len, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_BLOB: {
+        st = napi_create_buffer_copy(env, v->len, v->data, NULL, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_UUID: {
+        st = napi_create_buffer_copy(env, 16u, v->uuid_bytes, NULL, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      case DDB_VALUE_DECIMAL: {
+        napi_value obj, uv, sv;
+        st = napi_create_object(env, &obj);
+        NAPI_CALL(env, st);
+        st = napi_create_bigint_int64(env, v->decimal_scaled, &uv);
+        NAPI_CALL(env, st);
+        st = napi_set_named_property(env, obj, "unscaled", uv);
+        NAPI_CALL(env, st);
+        st = napi_create_int32(env, (int32_t)v->decimal_scale, &sv);
+        NAPI_CALL(env, st);
+        st = napi_set_named_property(env, obj, "scale", sv);
+        NAPI_CALL(env, st);
+        cell = obj;
+        break;
+      }
+      case DDB_VALUE_TIMESTAMP_MICROS: {
+        double ms = (double)v->timestamp_micros / 1000.0;
+        st = napi_create_double(env, ms, &cell);
+        NAPI_CALL(env, st);
+        break;
+      }
+      default:
+        st = napi_get_null(env, &cell);
+        NAPI_CALL(env, st);
+        break;
+    }
+
+    st = napi_set_element(env, arr, (uint32_t)i, cell);
+    NAPI_CALL(env, st);
+  }
+
+  return arr;
+}
+
+static napi_value js_stmt_rebind_int64_execute(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 2;
+  napi_value argv[2];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  if (argc < 2) return throw_error(env, "DECENTDB_ARGS", "stmtReBindInt64Execute(handle, value) requires 2 args");
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  if (!api->rebind_int64_execute) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_stmt_rebind_int64_execute not available");
+  }
+
+  int64_t v = 0;
+  bool lossless = false;
+  napi_valuetype vtype;
+  st = napi_typeof(env, argv[1], &vtype);
+  NAPI_CALL(env, st);
+  if (vtype == napi_bigint) {
+    st = napi_get_value_bigint_int64(env, argv[1], &v, &lossless);
+    if (st != napi_ok || !lossless) return throw_error(env, "DECENTDB_ARGS", "value must fit in int64");
+  } else {
+    st = napi_get_value_int64(env, argv[1], &v);
+    if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "value must be a safe integer or BigInt");
+  }
+
+  uint64_t affected = 0;
+  int rc = api->rebind_int64_execute(w->stmt, v, &affected);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value out;
+  st = napi_create_bigint_uint64(env, affected, &out);
+  NAPI_CALL(env, st);
+  return out;
+}
+
+static napi_value js_stmt_rebind_text_int64_execute(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  if (argc < 3) return throw_error(env, "DECENTDB_ARGS", "stmtReBindTextInt64Execute(handle, text, int) requires 3 args");
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  if (!api->rebind_text_int64_execute) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_stmt_rebind_text_int64_execute not available");
+  }
+
+  size_t text_len = 0;
+  st = napi_get_value_string_utf8(env, argv[1], NULL, 0, &text_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "text must be a string");
+  char* text = (char*)malloc(text_len + 1);
+  if (!text) return throw_error(env, "DECENTDB_OOM", "out of memory");
+  st = napi_get_value_string_utf8(env, argv[1], text, text_len + 1, &text_len);
+  if (st != napi_ok) { free(text); NAPI_CALL(env, st); }
+
+  int64_t iv = 0;
+  napi_valuetype vtype;
+  st = napi_typeof(env, argv[2], &vtype);
+  if (st != napi_ok) { free(text); NAPI_CALL(env, st); }
+  if (vtype == napi_bigint) {
+    bool lossless = false;
+    st = napi_get_value_bigint_int64(env, argv[2], &iv, &lossless);
+    if (st != napi_ok || !lossless) { free(text); return throw_error(env, "DECENTDB_ARGS", "int must fit in int64"); }
+  } else {
+    st = napi_get_value_int64(env, argv[2], &iv);
+    if (st != napi_ok) { free(text); return throw_error(env, "DECENTDB_ARGS", "int must be a safe integer or BigInt"); }
+  }
+
+  uint64_t affected = 0;
+  int rc = api->rebind_text_int64_execute(w->stmt, text, (int)text_len, iv, &affected);
+  free(text);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value out;
+  st = napi_create_bigint_uint64(env, affected, &out);
+  NAPI_CALL(env, st);
+  return out;
+}
+
+static napi_value js_stmt_rebind_int64_text_execute(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  if (argc < 3) return throw_error(env, "DECENTDB_ARGS", "stmtReBindInt64TextExecute(handle, int, text) requires 3 args");
+
+  stmt_wrap* w = unwrap_stmt(env, argv[0]);
+  if (!w) return NULL;
+
+  if (!api->rebind_int64_text_execute) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_stmt_rebind_int64_text_execute not available");
+  }
+
+  int64_t iv = 0;
+  napi_valuetype vtype;
+  st = napi_typeof(env, argv[1], &vtype);
+  NAPI_CALL(env, st);
+  if (vtype == napi_bigint) {
+    bool lossless = false;
+    st = napi_get_value_bigint_int64(env, argv[1], &iv, &lossless);
+    if (st != napi_ok || !lossless) return throw_error(env, "DECENTDB_ARGS", "int must fit in int64");
+  } else {
+    st = napi_get_value_int64(env, argv[1], &iv);
+    if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "int must be a safe integer or BigInt");
+  }
+
+  size_t text_len = 0;
+  st = napi_get_value_string_utf8(env, argv[2], NULL, 0, &text_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "text must be a string");
+  char* text = (char*)malloc(text_len + 1);
+  if (!text) return throw_error(env, "DECENTDB_OOM", "out of memory");
+  st = napi_get_value_string_utf8(env, argv[2], text, text_len + 1, &text_len);
+  if (st != napi_ok) { free(text); NAPI_CALL(env, st); }
+
+  uint64_t affected = 0;
+  int rc = api->rebind_int64_text_execute(w->stmt, iv, text, (int)text_len, &affected);
+  free(text);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value out;
+  st = napi_create_bigint_uint64(env, affected, &out);
+  NAPI_CALL(env, st);
+  return out;
+}
+
+static napi_value js_db_in_transaction(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  db_wrap* w = unwrap_db(env, argv[0]);
+  if (!w) return NULL;
+
+  if (!api->in_transaction) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_db_in_transaction not available");
+  }
+
+  int rc = api->in_transaction(w->db);
+  if (rc < 0) return throw_last_native_error(env, api);
+
+  napi_value b;
+  st = napi_get_boolean(env, rc == 1, &b);
+  NAPI_CALL(env, st);
+  return b;
+}
+
+static napi_value js_db_evict_shared_wal(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_status st = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_CALL(env, st);
+
+  if (!api->evict_shared_wal) {
+    return throw_error(env, "DECENTDB_UNSUPPORTED", "ddb_evict_shared_wal not available");
+  }
+
+  if (argc < 1) return throw_error(env, "DECENTDB_ARGS", "dbEvictSharedWal(path) requires a path string");
+
+  size_t path_len = 0;
+  st = napi_get_value_string_utf8(env, argv[0], NULL, 0, &path_len);
+  if (st != napi_ok) return throw_error(env, "DECENTDB_ARGS", "path must be a string");
+
+  char* path = (char*)malloc(path_len + 1);
+  st = napi_get_value_string_utf8(env, argv[0], path, path_len + 1, &path_len);
+  if (st != napi_ok) { free(path); NAPI_CALL(env, st); }
+
+  int rc = api->evict_shared_wal(path);
+  free(path);
+  if (rc != 0) return throw_last_native_error(env, api);
+
+  napi_value undef;
+  st = napi_get_undefined(env, &undef);
+  NAPI_CALL(env, st);
+  return undef;
+}
+
+static napi_value js_abi_version(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  if (!api->abi_version) {
+    napi_value zero;
+    napi_create_uint32(env, 0, &zero);
+    return zero;
+  }
+
+  uint32_t v = api->abi_version();
+  napi_value out;
+  napi_status st = napi_create_uint32(env, v, &out);
+  NAPI_CALL(env, st);
+  return out;
+}
+
+static napi_value js_ddb_version(napi_env env, napi_callback_info info) {
+  const decentdb_native_api* api = require_api(env);
+
+  const char* v = api->version_string ? api->version_string() : "";
+  if (!v) v = "";
+
+  napi_value out;
+  napi_status st = napi_create_string_utf8(env, v, NAPI_AUTO_LENGTH, &out);
+  NAPI_CALL(env, st);
+  return out;
+}
+
 static napi_value init(napi_env env, napi_value exports) {
   napi_status st;
 
@@ -1506,7 +2001,13 @@ static napi_value init(napi_env env, napi_value exports) {
     {"stmtBindFloat64", 0, js_stmt_bind_float64, 0, 0, 0, napi_default, 0},
     {"stmtBindText", 0, js_stmt_bind_text, 0, 0, 0, napi_default, 0},
     {"stmtBindBlob", 0, js_stmt_bind_blob, 0, 0, 0, napi_default, 0},
-    {"stmtBindDecimal", 0, js_stmt_bind_decimal, 0, 0, 0, napi_default, 0},
+     {"stmtBindDecimal", 0, js_stmt_bind_decimal, 0, 0, 0, napi_default, 0},
+     /* New in v2: timestamp bind, step+row fused, re-execute helpers */
+     {"stmtBindTimestampMicros", 0, js_stmt_bind_timestamp_micros, 0, 0, 0, napi_default, 0},
+    {"stmtStepRowView", 0, js_stmt_step_row_view, 0, 0, 0, napi_default, 0},
+    {"stmtReBindInt64Execute", 0, js_stmt_rebind_int64_execute, 0, 0, 0, napi_default, 0},
+    {"stmtReBindTextInt64Execute", 0, js_stmt_rebind_text_int64_execute, 0, 0, 0, napi_default, 0},
+    {"stmtReBindInt64TextExecute", 0, js_stmt_rebind_int64_text_execute, 0, 0, 0, napi_default, 0},
 
     {"stmtStep", 0, js_stmt_step, 0, 0, 0, napi_default, 0},
     {"stmtStepWithParams", 0, js_stmt_step_with_params, 0, 0, 0, napi_default, 0},
@@ -1522,14 +2023,23 @@ static napi_value init(napi_env env, napi_value exports) {
     {"dbBeginTransaction", 0, js_db_begin_transaction, 0, 0, 0, napi_default, 0},
     {"dbCommitTransaction", 0, js_db_commit_transaction, 0, 0, 0, napi_default, 0},
     {"dbRollbackTransaction", 0, js_db_rollback_transaction, 0, 0, 0, napi_default, 0},
-    {"dbSaveAs", 0, js_db_save_as, 0, 0, 0, napi_default, 0},
-    {"dbListTablesJson", 0, js_db_list_tables_json, 0, 0, 0, napi_default, 0},
-    {"dbGetTableColumnsJson", 0, js_db_get_table_columns_json, 0, 0, 0, napi_default, 0},
-    {"dbListIndexesJson", 0, js_db_list_indexes_json, 0, 0, 0, napi_default, 0},
+     {"dbSaveAs", 0, js_db_save_as, 0, 0, 0, napi_default, 0},
+     {"dbListTablesJson", 0, js_db_list_tables_json, 0, 0, 0, napi_default, 0},
+     {"dbGetTableColumnsJson", 0, js_db_get_table_columns_json, 0, 0, 0, napi_default, 0},
+     {"dbGetTableDdl", 0, js_db_get_table_ddl, 0, 0, 0, napi_default, 0},
+     {"dbListIndexesJson", 0, js_db_list_indexes_json, 0, 0, 0, napi_default, 0},
+     {"dbListViewsJson", 0, js_db_list_views_json, 0, 0, 0, napi_default, 0},
+     {"dbGetViewDdl", 0, js_db_get_view_ddl, 0, 0, 0, napi_default, 0},
+     {"dbListTriggersJson", 0, js_db_list_triggers_json, 0, 0, 0, napi_default, 0},
+     /* New in v2: in_transaction, evict_wal, version info */
+    {"dbInTransaction", 0, js_db_in_transaction, 0, 0, 0, napi_default, 0},
+    {"dbEvictSharedWal", 0, js_db_evict_shared_wal, 0, 0, 0, napi_default, 0},
+    {"ddbAbiVersion", 0, js_abi_version, 0, 0, 0, napi_default, 0},
+    {"ddbVersion", 0, js_ddb_version, 0, 0, 0, napi_default, 0},
   };
 
   st = napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
-  assert(st == napi_ok);
+  NAPI_CALL(env, st);
 
   return exports;
 }

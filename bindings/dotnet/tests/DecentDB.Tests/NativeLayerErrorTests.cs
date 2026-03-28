@@ -37,6 +37,18 @@ public class NativeLayerErrorTests : IDisposable
     }
 
     [Fact]
+    public void InTransaction_AfterDispose_Throws()
+    {
+        var db = new DecentDB.Native.DecentDB(_dbPath);
+        db.Dispose();
+
+        var ex = Assert.Throws<DecentDBException>(() => _ = db.InTransaction);
+        Assert.NotEqual(0, ex.ErrorCode);
+        Assert.False(string.IsNullOrWhiteSpace(ex.Message));
+        Assert.Equal("InTransaction", ex.Sql);
+    }
+
+    [Fact]
     public void PreparedStatement_ThrowsOnInvalidBindIndex()
     {
         using var db = new DecentDB.Native.DecentDB(_dbPath);

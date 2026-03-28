@@ -1,5 +1,5 @@
-name: decentdb_flutter_example
-description: Minimal DecentDB Flutter desktop example
+name: decentdb_desktop_example
+description: Minimal DecentDB desktop example
 version: 0.0.1
 publish_to: none
 

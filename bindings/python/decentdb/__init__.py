@@ -352,7 +352,9 @@ class Cursor:
         self._should_buffer_first_row_sql_cache = {}
         self._should_prefetch_small_result_sql_cache = {}
         self._should_prefetch_zero_param_result_sql_cache = {}
-        self._batch_rows = int(os.environ.get("DECENTDB_PY_BATCH_ROWS", "32768") or "32768")
+        self._batch_rows = int(
+            os.environ.get("DECENTDB_PY_BATCH_ROWS", "32768") or "32768"
+        )
         if self._batch_rows <= 0:
             self._batch_rows = 32768
         self._fetchall_chunk_rows = int(
@@ -360,10 +362,9 @@ class Cursor:
         )
         if self._fetchall_chunk_rows < 0:
             self._fetchall_chunk_rows = 0
-        self._use_row_view = (
-            os.environ.get("DECENTDB_PY_USE_ROW_VIEW", "1") != "0"
-            and hasattr(self._lib, "ddb_stmt_row_view")
-        )
+        self._use_row_view = os.environ.get(
+            "DECENTDB_PY_USE_ROW_VIEW", "1"
+        ) != "0" and hasattr(self._lib, "ddb_stmt_row_view")
         self._use_step_row_view = self._use_row_view and hasattr(
             self._lib, "ddb_stmt_step_row_view"
         )
@@ -483,9 +484,7 @@ class Cursor:
             else None
         )
         self._native_reset_bind_int64_fetch_all_row_views = (
-            getattr(
-                _fastdecode_native, "reset_bind_int64_fetch_all_row_views", None
-            )
+            getattr(_fastdecode_native, "reset_bind_int64_fetch_all_row_views", None)
             if _fastdecode_native is not None
             else None
         )
@@ -495,9 +494,7 @@ class Cursor:
             else None
         )
         self._native_reset_step_fetch_all_row_views = (
-            getattr(
-                _fastdecode_native, "reset_step_fetch_all_row_views", None
-            )
+            getattr(_fastdecode_native, "reset_step_fetch_all_row_views", None)
             if _fastdecode_native is not None
             else None
         )
@@ -507,7 +504,9 @@ class Cursor:
             else None
         )
         self._native_bind_f64_f64_fetch_all_row_views = (
-            getattr(_fastdecode_native, "bind_float64_float64_fetch_all_row_views", None)
+            getattr(
+                _fastdecode_native, "bind_float64_float64_fetch_all_row_views", None
+            )
             if _fastdecode_native is not None
             else None
         )
@@ -582,8 +581,12 @@ class Cursor:
         self._native_bind_f64_f64_fetch_all_row_views_enabled = (
             self._native_bind_f64_f64_fetch_all_row_views is not None
         )
-        self._native_bind_i64_text_step_enabled = self._native_bind_i64_text_step is not None
-        self._native_bind_text_i64_step_enabled = self._native_bind_text_i64_step is not None
+        self._native_bind_i64_text_step_enabled = (
+            self._native_bind_i64_text_step is not None
+        )
+        self._native_bind_text_i64_step_enabled = (
+            self._native_bind_text_i64_step is not None
+        )
         self._native_bind_i64_text_step_affected_enabled = (
             self._native_bind_i64_text_step_affected is not None
         )
@@ -701,7 +704,9 @@ class Cursor:
             code = self._lib.ddb_stmt_bind_float64(self._stmt, index_1_based, param)
         elif isinstance(param, str):
             raw = param.encode("utf-8")
-            code = self._lib.ddb_stmt_bind_text(self._stmt, index_1_based, raw, len(raw))
+            code = self._lib.ddb_stmt_bind_text(
+                self._stmt, index_1_based, raw, len(raw)
+            )
         elif isinstance(param, (bytes, bytearray, memoryview)):
             raw = bytes(param)
             if raw:
@@ -711,9 +716,7 @@ class Cursor:
                     self._stmt, index_1_based, payload, len(raw)
                 )
             else:
-                code = self._lib.ddb_stmt_bind_blob(
-                    self._stmt, index_1_based, None, 0
-                )
+                code = self._lib.ddb_stmt_bind_blob(self._stmt, index_1_based, None, 0)
         elif isinstance(param, decimal.Decimal):
             t = param.as_tuple()
             exponent = t.exponent
@@ -763,7 +766,9 @@ class Cursor:
             )
         else:
             raw = str(param).encode("utf-8")
-            code = self._lib.ddb_stmt_bind_text(self._stmt, index_1_based, raw, len(raw))
+            code = self._lib.ddb_stmt_bind_text(
+                self._stmt, index_1_based, raw, len(raw)
+            )
 
         if code != ERR_OK:
             _raise_error(code, sql=sql, params=params)
@@ -777,7 +782,9 @@ class Cursor:
             self._connection._in_explicit_txn = True
         elif control_kind == "commit":
             lsn = ctypes.c_uint64()
-            code = self._lib.ddb_db_commit_transaction(self._connection._db, ctypes.byref(lsn))
+            code = self._lib.ddb_db_commit_transaction(
+                self._connection._db, ctypes.byref(lsn)
+            )
             if code != ERR_OK:
                 _raise_error(code, sql=sql, params=params)
             self._connection._in_explicit_txn = False
@@ -922,9 +929,7 @@ class Cursor:
     def _execute_current_statement_bind_i64_step_row_view(self, sql, param, params):
         if self._native_bind_int64_step_i64_text_f64_enabled and self._stmt is not None:
             try:
-                row = self._native_bind_int64_step_i64_text_f64(
-                    self._stmt.value, param
-                )
+                row = self._native_bind_int64_step_i64_text_f64(self._stmt.value, param)
                 if row is None:
                     return False, 1, None
                 return True, 1, row
@@ -932,7 +937,9 @@ class Cursor:
                 self._native_bind_int64_step_i64_text_f64_enabled = False
 
         if self._native_bind_int64_step_row_view_enabled and self._stmt is not None:
-            native_supported = self._native_bind_int64_step_row_view_sql_support.get(sql, True)
+            native_supported = self._native_bind_int64_step_row_view_sql_support.get(
+                sql, True
+            )
             if native_supported:
                 try:
                     row = self._native_bind_int64_step_row_view(self._stmt.value, param)
@@ -963,7 +970,9 @@ class Cursor:
 
     def _execute_current_statement_bind_text_step_row_view(self, sql, param, params):
         if self._native_bind_text_step_row_view_enabled and self._stmt is not None:
-            native_supported = self._native_bind_text_step_row_view_sql_support.get(sql, True)
+            native_supported = self._native_bind_text_step_row_view_sql_support.get(
+                sql, True
+            )
             if native_supported:
                 try:
                     row = self._native_bind_text_step_row_view(self._stmt.value, param)
@@ -1062,8 +1071,10 @@ class Cursor:
         if param_count == 1 and type(params[0]) is int:
             if self._native_reset_bind_int64_step_affected_enabled:
                 try:
-                    affected_rowcount, has_row = self._native_reset_bind_int64_step_affected(
-                        self._stmt.value, params[0]
+                    affected_rowcount, has_row = (
+                        self._native_reset_bind_int64_step_affected(
+                            self._stmt.value, params[0]
+                        )
                     )
                     bound_count = 1
                     affected_rowcount = int(affected_rowcount)
@@ -1251,7 +1262,9 @@ class Cursor:
             pass
 
     def _execute_current_statement_bind_int64_fetch_all_row_views(self, sql, param):
-        native_supported = self._native_bind_int64_fetch_all_row_views_sql_support.get(sql, True)
+        native_supported = self._native_bind_int64_fetch_all_row_views_sql_support.get(
+            sql, True
+        )
         if (
             self._native_bind_int64_fetch_all_row_views_enabled
             and self._stmt is not None
@@ -1269,7 +1282,9 @@ class Cursor:
         return None
 
     def _execute_current_statement_step_fetch_all_row_views(self, sql):
-        native_supported = self._native_step_fetch_all_row_views_sql_support.get(sql, True)
+        native_supported = self._native_step_fetch_all_row_views_sql_support.get(
+            sql, True
+        )
         if (
             self._native_step_fetch_all_row_views_enabled
             and self._stmt is not None
@@ -1285,7 +1300,9 @@ class Cursor:
         return None
 
     def _execute_current_statement_bind_text_fetch_all_row_views(self, sql, param):
-        native_supported = self._native_bind_text_fetch_all_row_views_sql_support.get(sql, True)
+        native_supported = self._native_bind_text_fetch_all_row_views_sql_support.get(
+            sql, True
+        )
         if (
             self._native_bind_text_fetch_all_row_views_enabled
             and self._stmt is not None
@@ -1303,8 +1320,8 @@ class Cursor:
         return None
 
     def _execute_current_statement_bind_f64_f64_fetch_all_row_views(self, sql, params):
-        native_supported = self._native_bind_f64_f64_fetch_all_row_views_sql_support.get(
-            sql, True
+        native_supported = (
+            self._native_bind_f64_f64_fetch_all_row_views_sql_support.get(sql, True)
         )
         if (
             self._native_bind_f64_f64_fetch_all_row_views_enabled
@@ -1377,7 +1394,10 @@ class Cursor:
         row_count = len(rows)
         if row_count == 0:
             return 0
-        if self._native_execute_batch_i64_text_f64 is not None and self._stmt is not None:
+        if (
+            self._native_execute_batch_i64_text_f64 is not None
+            and self._stmt is not None
+        ):
             try:
                 return int(
                     self._native_execute_batch_i64_text_f64(self._stmt.value, rows)
@@ -1609,6 +1629,7 @@ class Cursor:
 
         # Prefer the collected batch path (single FFI crossing).
         if self._native_execute_batch_typed_collected is not None:
+
             def checked_rows():
                 for params in iterator:
                     params_type = type(params)
@@ -1675,10 +1696,7 @@ class Cursor:
         return total_affected
 
     def execute(self, operation, parameters=None):
-        if (
-            parameters is None
-            and self._fast_repeat_cache
-        ):
+        if parameters is None and self._fast_repeat_cache:
             cached = self._fast_repeat_cache.get(id(operation))
             if cached is not None:
                 frc, op_ref, cached_sql = cached
@@ -1686,14 +1704,10 @@ class Cursor:
                     stmt = self._fast_repeat_find_stmt(cached_sql)
                     if stmt is not None:
                         try:
-                            rows = (
-                                self._native_reset_step_fetch_all_row_views(
-                                    stmt.value
-                                )
+                            rows = self._native_reset_step_fetch_all_row_views(
+                                stmt.value
                             )
-                            sel_info = self._select_fast_info.get(
-                                cached_sql
-                            )
+                            sel_info = self._select_fast_info.get(cached_sql)
                             if sel_info is not None:
                                 self._has_buffered_row = False
                                 self._buffered_row = None
@@ -1738,9 +1752,7 @@ class Cursor:
                                         sv, parameters[0]
                                     )
                                 )
-                                sel_info = self._select_fast_info.get(
-                                    cached_sql
-                                )
+                                sel_info = self._select_fast_info.get(cached_sql)
                                 if sel_info is not None:
                                     self._has_buffered_row = False
                                     self._buffered_row = None
@@ -1786,7 +1798,9 @@ class Cursor:
                 self._bound_param_count = None
             self._execute_direct(sql, params)
         else:
-            cached_non_query = self._execute_cached_non_query_current_statement(sql, params)
+            cached_non_query = self._execute_cached_non_query_current_statement(
+                sql, params
+            )
             if cached_non_query is not None:
                 self._setup_fast_repeat(operation, parameters)
                 return cached_non_query
@@ -1799,7 +1813,9 @@ class Cursor:
                 and param_count == 0
                 and self._should_prefetch_zero_param_result(sql)
             ):
-                prefetched_rows = self._execute_current_statement_step_fetch_all_row_views(sql)
+                prefetched_rows = (
+                    self._execute_current_statement_step_fetch_all_row_views(sql)
+                )
                 if prefetched_rows is not None:
                     prefetched_bound_count = 0
             elif (
@@ -1808,8 +1824,10 @@ class Cursor:
                 and type(params[0]) is int
                 and self._should_prefetch_small_result(sql)
             ):
-                prefetched_rows = self._execute_current_statement_bind_int64_fetch_all_row_views(
-                    sql, params[0]
+                prefetched_rows = (
+                    self._execute_current_statement_bind_int64_fetch_all_row_views(
+                        sql, params[0]
+                    )
                 )
                 if prefetched_rows is not None:
                     prefetched_bound_count = 1
@@ -1819,8 +1837,10 @@ class Cursor:
                 and type(params[0]) is str
                 and self._should_prefetch_small_result(sql)
             ):
-                prefetched_rows = self._execute_current_statement_bind_text_fetch_all_row_views(
-                    sql, params[0]
+                prefetched_rows = (
+                    self._execute_current_statement_bind_text_fetch_all_row_views(
+                        sql, params[0]
+                    )
                 )
                 if prefetched_rows is not None:
                     prefetched_bound_count = 1
@@ -1832,13 +1852,17 @@ class Cursor:
                 and self._should_prefetch_small_result(sql)
             ):
                 prefetched_rows = (
-                    self._execute_current_statement_bind_f64_f64_fetch_all_row_views(sql, params)
+                    self._execute_current_statement_bind_f64_f64_fetch_all_row_views(
+                        sql, params
+                    )
                 )
                 if prefetched_rows is not None:
                     prefetched_bound_count = 2
             if prefetched_rows is not None:
                 has_row = bool(prefetched_rows)
-                bound_count = 0 if prefetched_bound_count is None else prefetched_bound_count
+                bound_count = (
+                    0 if prefetched_bound_count is None else prefetched_bound_count
+                )
                 buffered_row = None
             elif (
                 self._use_bind_int64_step_row_view
@@ -1873,26 +1897,14 @@ class Cursor:
                     )
                 )
                 buffered_row = None
-            elif (
-                param_count == 2
-                and type(params[0]) is int
-                and type(params[1]) is str
-            ):
+            elif param_count == 2 and type(params[0]) is int and type(params[1]) is str:
                 has_row, bound_count, affected_rowcount = (
-                    self._execute_current_statement_bind_i64_text_step(
-                        sql, params
-                    )
+                    self._execute_current_statement_bind_i64_text_step(sql, params)
                 )
                 buffered_row = None
-            elif (
-                param_count == 2
-                and type(params[0]) is str
-                and type(params[1]) is int
-            ):
+            elif param_count == 2 and type(params[0]) is str and type(params[1]) is int:
                 has_row, bound_count, affected_rowcount = (
-                    self._execute_current_statement_bind_text_i64_step(
-                        sql, params
-                    )
+                    self._execute_current_statement_bind_text_i64_step(sql, params)
                 )
                 buffered_row = None
             else:
@@ -1910,7 +1922,9 @@ class Cursor:
             self._has_buffered_row = has_row and self._query_active
             self._buffered_row = buffered_row if self._has_buffered_row else None
             self._prefetched_rows = (
-                prefetched_rows if self._query_active and prefetched_rows is not None else None
+                prefetched_rows
+                if self._query_active and prefetched_rows is not None
+                else None
             )
             if self._prefetched_rows is not None:
                 self._has_buffered_row = False
@@ -1920,8 +1934,7 @@ class Cursor:
                 self.rowcount = -1
                 if (
                     self._prefetched_rows is not None
-                    and self._native_reset_bind_int64_fetch_all_row_views
-                        is not None
+                    and self._native_reset_bind_int64_fetch_all_row_views is not None
                     and param_count == 1
                     and type(params[0]) is int
                 ):
@@ -1936,8 +1949,7 @@ class Cursor:
                     )
                 elif (
                     self._prefetched_rows is not None
-                    and self._native_reset_step_fetch_all_row_views
-                        is not None
+                    and self._native_reset_step_fetch_all_row_views is not None
                     and param_count == 0
                 ):
                     self._select_fast_info[sql] = (
@@ -2297,7 +2309,11 @@ class Cursor:
             t0 = int(v0.tag)
             t1 = int(v1.tag)
             t2 = int(v2.tag)
-            if t0 == DDB_VALUE_INT64 and t1 == DDB_VALUE_TEXT and t2 == DDB_VALUE_FLOAT64:
+            if (
+                t0 == DDB_VALUE_INT64
+                and t1 == DDB_VALUE_TEXT
+                and t2 == DDB_VALUE_FLOAT64
+            ):
                 if self._decode_row_i64_text_f64_native is not None:
                     try:
                         return self._decode_row_i64_text_f64_native(
@@ -2327,7 +2343,11 @@ class Cursor:
                 else:
                     text2 = string_at(v2.data, v2.len).decode("utf-8")
                 return (v0.int64_value, text1, text2)
-            if t0 == DDB_VALUE_INT64 and t1 == DDB_VALUE_FLOAT64 and t2 == DDB_VALUE_TEXT:
+            if (
+                t0 == DDB_VALUE_INT64
+                and t1 == DDB_VALUE_FLOAT64
+                and t2 == DDB_VALUE_TEXT
+            ):
                 if self._decode_row_i64_f64_text_native is not None:
                     try:
                         return self._decode_row_i64_f64_text_native(
@@ -2340,7 +2360,11 @@ class Cursor:
                 else:
                     text2 = string_at(v2.data, v2.len).decode("utf-8")
                 return (v0.int64_value, v1.float64_value, text2)
-            if t0 == DDB_VALUE_TEXT and t1 == DDB_VALUE_INT64 and t2 == DDB_VALUE_FLOAT64:
+            if (
+                t0 == DDB_VALUE_TEXT
+                and t1 == DDB_VALUE_INT64
+                and t2 == DDB_VALUE_FLOAT64
+            ):
                 if self._decode_row_text_i64_f64_native is not None:
                     try:
                         return self._decode_row_text_i64_f64_native(
@@ -2396,9 +2420,10 @@ class Cursor:
                 else:
                     append_row(bytes(string_at(value.data, value.len)))
             elif tag == DDB_VALUE_DECIMAL:
-                append_row(decimal.Decimal(int(value.decimal_scaled)) / (
-                    decimal.Decimal(10) ** int(value.decimal_scale)
-                ))
+                append_row(
+                    decimal.Decimal(int(value.decimal_scaled))
+                    / (decimal.Decimal(10) ** int(value.decimal_scale))
+                )
             elif tag == DDB_VALUE_UUID:
                 append_row(bytes(value.uuid_bytes))
             elif tag == DDB_VALUE_TIMESTAMP_MICROS:
@@ -2430,8 +2455,13 @@ class Cursor:
                 and first_t1 == DDB_VALUE_TEXT
                 and first_t2 == DDB_VALUE_FLOAT64
             ):
-                native_supported = self._decode_matrix_i64_text_f64_sql_support.get(sql, True)
-                if self._decode_matrix_i64_text_f64_native is not None and native_supported:
+                native_supported = self._decode_matrix_i64_text_f64_sql_support.get(
+                    sql, True
+                )
+                if (
+                    self._decode_matrix_i64_text_f64_native is not None
+                    and native_supported
+                ):
                     try:
                         return self._decode_matrix_i64_text_f64_native(
                             ctypes.addressof(values_ptr.contents), row_count
@@ -2443,8 +2473,13 @@ class Cursor:
                 and first_t1 == DDB_VALUE_TEXT
                 and first_t2 == DDB_VALUE_TEXT
             ):
-                native_supported = self._decode_matrix_i64_text_text_sql_support.get(sql, True)
-                if self._decode_matrix_i64_text_text_native is not None and native_supported:
+                native_supported = self._decode_matrix_i64_text_text_sql_support.get(
+                    sql, True
+                )
+                if (
+                    self._decode_matrix_i64_text_text_native is not None
+                    and native_supported
+                ):
                     try:
                         return self._decode_matrix_i64_text_text_native(
                             ctypes.addressof(values_ptr.contents), row_count
@@ -2488,7 +2523,9 @@ class Cursor:
                             if not value.data or value.len == 0:
                                 append_row("")
                             else:
-                                append_row(string_at(value.data, value.len).decode("utf-8"))
+                                append_row(
+                                    string_at(value.data, value.len).decode("utf-8")
+                                )
                         elif tag == DDB_VALUE_BLOB:
                             if not value.data or value.len == 0:
                                 append_row(b"")
@@ -2504,7 +2541,9 @@ class Cursor:
                         elif tag == DDB_VALUE_TIMESTAMP_MICROS:
                             append_row(
                                 _UNIX_EPOCH_UTC
-                                + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                                + datetime.timedelta(
+                                    microseconds=int(value.timestamp_micros)
+                                )
                             )
                         else:
                             append_row(None)
@@ -2515,8 +2554,13 @@ class Cursor:
                 and first_t1 == DDB_VALUE_FLOAT64
                 and first_t2 == DDB_VALUE_TEXT
             ):
-                native_supported = self._decode_matrix_i64_f64_text_sql_support.get(sql, True)
-                if self._decode_matrix_i64_f64_text_native is not None and native_supported:
+                native_supported = self._decode_matrix_i64_f64_text_sql_support.get(
+                    sql, True
+                )
+                if (
+                    self._decode_matrix_i64_f64_text_native is not None
+                    and native_supported
+                ):
                     try:
                         return self._decode_matrix_i64_f64_text_native(
                             ctypes.addressof(values_ptr.contents), row_count
@@ -2556,7 +2600,9 @@ class Cursor:
                             if not value.data or value.len == 0:
                                 append_row("")
                             else:
-                                append_row(string_at(value.data, value.len).decode("utf-8"))
+                                append_row(
+                                    string_at(value.data, value.len).decode("utf-8")
+                                )
                         elif tag == DDB_VALUE_BLOB:
                             if not value.data or value.len == 0:
                                 append_row(b"")
@@ -2572,7 +2618,9 @@ class Cursor:
                         elif tag == DDB_VALUE_TIMESTAMP_MICROS:
                             append_row(
                                 _UNIX_EPOCH_UTC
-                                + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                                + datetime.timedelta(
+                                    microseconds=int(value.timestamp_micros)
+                                )
                             )
                         else:
                             append_row(None)
@@ -2583,8 +2631,13 @@ class Cursor:
                 and first_t1 == DDB_VALUE_INT64
                 and first_t2 == DDB_VALUE_FLOAT64
             ):
-                native_supported = self._decode_matrix_text_i64_f64_sql_support.get(sql, True)
-                if self._decode_matrix_text_i64_f64_native is not None and native_supported:
+                native_supported = self._decode_matrix_text_i64_f64_sql_support.get(
+                    sql, True
+                )
+                if (
+                    self._decode_matrix_text_i64_f64_native is not None
+                    and native_supported
+                ):
                     try:
                         return self._decode_matrix_text_i64_f64_native(
                             ctypes.addressof(values_ptr.contents), row_count
@@ -2624,7 +2677,9 @@ class Cursor:
                             if not value.data or value.len == 0:
                                 append_row("")
                             else:
-                                append_row(string_at(value.data, value.len).decode("utf-8"))
+                                append_row(
+                                    string_at(value.data, value.len).decode("utf-8")
+                                )
                         elif tag == DDB_VALUE_BLOB:
                             if not value.data or value.len == 0:
                                 append_row(b"")
@@ -2640,7 +2695,9 @@ class Cursor:
                         elif tag == DDB_VALUE_TIMESTAMP_MICROS:
                             append_row(
                                 _UNIX_EPOCH_UTC
-                                + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                                + datetime.timedelta(
+                                    microseconds=int(value.timestamp_micros)
+                                )
                             )
                         else:
                             append_row(None)
@@ -2696,7 +2753,9 @@ class Cursor:
                     elif tag == DDB_VALUE_TIMESTAMP_MICROS:
                         append_row(
                             _UNIX_EPOCH_UTC
-                            + datetime.timedelta(microseconds=int(value.timestamp_micros))
+                            + datetime.timedelta(
+                                microseconds=int(value.timestamp_micros)
+                            )
                         )
                     else:
                         append_row(None)
@@ -2739,25 +2798,31 @@ class Cursor:
                 elif tag == DDB_VALUE_BOOL:
                     append_rows((value.bool_value != 0,))
                 elif tag == DDB_VALUE_DECIMAL:
-                    append_rows((
-                        decimal.Decimal(int(value.decimal_scaled))
-                        / (decimal.Decimal(10) ** int(value.decimal_scale)),
-                    ))
+                    append_rows(
+                        (
+                            decimal.Decimal(int(value.decimal_scaled))
+                            / (decimal.Decimal(10) ** int(value.decimal_scale)),
+                        )
+                    )
                 elif tag == DDB_VALUE_UUID:
                     append_rows((bytes(value.uuid_bytes),))
                 elif tag == DDB_VALUE_TIMESTAMP_MICROS:
-                    append_rows((
-                        _UNIX_EPOCH_UTC
-                        + datetime.timedelta(microseconds=int(value.timestamp_micros)),
-                    ))
+                    append_rows(
+                        (
+                            _UNIX_EPOCH_UTC
+                            + datetime.timedelta(
+                                microseconds=int(value.timestamp_micros)
+                            ),
+                        )
+                    )
                 else:
-                        append_rows((None,))
+                    append_rows((None,))
             return rows
 
         if col_count == 6:
             sql = self._last_sql
-            native_supported = self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.get(
-                sql, True
+            native_supported = (
+                self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.get(sql, True)
             )
             if (
                 self._decode_matrix_i64_f64_text_text_i64_f64_native is not None
@@ -2774,7 +2839,9 @@ class Cursor:
                         ctypes.addressof(values_ptr.contents), row_count
                     )
                 except Exception:
-                    self._decode_matrix_i64_f64_text_text_i64_f64_sql_support[sql] = False
+                    self._decode_matrix_i64_f64_text_text_i64_f64_sql_support[sql] = (
+                        False
+                    )
 
         for row_index in range(row_count):
             base = row_index * col_count
@@ -2924,7 +2991,9 @@ class Cursor:
                 return rows
 
             sql = self._last_sql
-            native_supported = self._native_fetch_rows_i64_text_f64_sql_support.get(sql, True)
+            native_supported = self._native_fetch_rows_i64_text_f64_sql_support.get(
+                sql, True
+            )
             if (
                 self._native_fetch_rows_i64_text_f64 is not None
                 and self._stmt is not None
@@ -3028,8 +3097,19 @@ class Cursor:
         return row
 
 
+def abi_version():
+    lib = load_library()
+    return int(lib.ddb_abi_version())
+
+
+def engine_version():
+    lib = load_library()
+    raw = lib.ddb_version()
+    return raw.decode("utf-8") if raw else ""
+
+
 class Connection:
-    def __init__(self, path, *, stmt_cache_size=128):
+    def __init__(self, path, *, stmt_cache_size=128, mode="open_or_create"):
         self._lib = load_library()
         self._db = ctypes.c_void_p()
         self._closed = False
@@ -3042,7 +3122,12 @@ class Connection:
 
         fs_path = os.fspath(path)
         raw_path = fs_path.encode("utf-8") if isinstance(fs_path, str) else fs_path
-        code = self._lib.ddb_db_open_or_create(raw_path, ctypes.byref(self._db))
+        if mode == "create":
+            code = self._lib.ddb_db_create(raw_path, ctypes.byref(self._db))
+        elif mode == "open":
+            code = self._lib.ddb_db_open(raw_path, ctypes.byref(self._db))
+        else:
+            code = self._lib.ddb_db_open_or_create(raw_path, ctypes.byref(self._db))
         if code != ERR_OK:
             _raise_error(code)
 
@@ -3106,6 +3191,15 @@ class Connection:
             _raise_error(code, sql="BEGIN", params=None)
         self._in_explicit_txn = True
 
+    @property
+    def in_transaction(self):
+        self._ensure_open()
+        flag = ctypes.c_uint8()
+        code = self._lib.ddb_db_in_transaction(self._db, ctypes.byref(flag))
+        if code != ERR_OK:
+            return self._in_explicit_txn
+        return bool(flag.value)
+
     def commit(self):
         self._ensure_open()
         if not self._in_explicit_txn:
@@ -3153,7 +3247,11 @@ class Connection:
 
     def list_tables(self):
         payload = self._call_json_api(
-            getattr(self._lib, "decentdb_list_tables_json", self._lib.ddb_db_list_tables_json)
+            getattr(
+                self._lib,
+                "decentdb_list_tables_json",
+                self._lib.ddb_db_list_tables_json,
+            )
         )
         if isinstance(payload, list) and payload and isinstance(payload[0], dict):
             return [entry["name"] for entry in payload]
@@ -3170,6 +3268,39 @@ class Connection:
 
     def list_indexes(self):
         return self._call_json_api(self._lib.ddb_db_list_indexes_json)
+
+    def get_table_ddl(self, table_name):
+        self._ensure_open()
+        name = table_name.encode("utf-8")
+        out = ctypes.c_char_p()
+        code = self._lib.ddb_db_get_table_ddl(self._db, name, ctypes.byref(out))
+        if code != ERR_OK:
+            _raise_error(code)
+        try:
+            return out.value.decode("utf-8") if out.value else ""
+        finally:
+            self._lib.ddb_string_free(ctypes.byref(out))
+
+    def list_views(self):
+        payload = self._call_json_api(self._lib.ddb_db_list_views_json)
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            return [entry["name"] for entry in payload]
+        return payload
+
+    def get_view_ddl(self, view_name):
+        self._ensure_open()
+        name = view_name.encode("utf-8")
+        out = ctypes.c_char_p()
+        code = self._lib.ddb_db_get_view_ddl(self._db, name, ctypes.byref(out))
+        if code != ERR_OK:
+            _raise_error(code)
+        try:
+            return out.value.decode("utf-8") if out.value else ""
+        finally:
+            self._lib.ddb_string_free(ctypes.byref(out))
+
+    def list_triggers(self):
+        return self._call_json_api(self._lib.ddb_db_list_triggers_json)
 
     def checkpoint(self):
         self._ensure_open()
@@ -3198,7 +3329,8 @@ class Connection:
 
 def connect(dsn, **kwargs):
     stmt_cache_size = kwargs.pop("stmt_cache_size", 128)
-    return Connection(dsn, stmt_cache_size=stmt_cache_size)
+    mode = kwargs.pop("mode", "open_or_create")
+    return Connection(dsn, stmt_cache_size=stmt_cache_size, mode=mode)
 
 
 def evict_shared_wal(path):

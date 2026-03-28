@@ -5,6 +5,13 @@ using System.Text.Json;
 
 namespace DecentDB.Native;
 
+public enum DbOpenMode
+{
+    OpenOrCreate = 0,
+    Create = 1,
+    Open = 2
+}
+
 public sealed class DecentDB : IDisposable
 {
     private readonly DecentDBHandle _handle;
@@ -16,7 +23,20 @@ public sealed class DecentDB : IDisposable
 
     internal DecentDBHandle DbHandle => _handle;
 
+    public static uint AbiVersion() => DecentDBNative.ddb_abi_version();
+
+    public static string EngineVersion()
+    {
+        var ptr = DecentDBNative.ddb_version();
+        return ptr == IntPtr.Zero ? string.Empty : Marshal.PtrToStringUTF8(ptr) ?? string.Empty;
+    }
+
     public DecentDB(string path, string? options = null)
+        : this(path, DbOpenMode.OpenOrCreate, options)
+    {
+    }
+
+    public DecentDB(string path, DbOpenMode mode, string? options = null)
     {
         var pathBytes = Encoding.UTF8.GetBytes(path + "\0");
         IntPtr ptr;
@@ -24,19 +44,20 @@ public sealed class DecentDB : IDisposable
         {
             fixed (byte* pPath = pathBytes)
             {
-                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_open_or_create(pPath, out ptr));
+                uint res = mode switch
+                {
+                    DbOpenMode.Create => RecordStatus(DecentDBNativeUnsafe.ddb_db_create(pPath, out ptr)),
+                    DbOpenMode.Open => RecordStatus(DecentDBNativeUnsafe.ddb_db_open(pPath, out ptr)),
+                    _ => RecordStatus(DecentDBNativeUnsafe.ddb_db_open_or_create(pPath, out ptr))
+                };
                 if (res != 0 || ptr == IntPtr.Zero)
                 {
-                    throw new DecentDBException(_lastErrorCode, LastErrorMessage, "Open");
+                    throw new DecentDBException(_lastErrorCode, LastErrorMessage, $"Open({mode})");
                 }
             }
         }
 
         _handle = new DecentDBHandle(ptr);
-
-        // The stable Rust ddb_* ABI currently exposes a single default open path.
-        // Keep accepting the managed options string for API compatibility even
-        // though it does not yet feed a native open-time configuration surface.
         _ = options;
     }
 
@@ -127,6 +148,69 @@ public sealed class DecentDB : IDisposable
         {
             throw new DecentDBException(_lastErrorCode, LastErrorMessage, "ROLLBACK");
         }
+    }
+
+    public bool InTransaction
+    {
+        get
+        {
+            var res = RecordStatus(DecentDBNative.ddb_db_in_transaction(Handle, out var flag));
+            if (res != 0)
+            {
+                throw new DecentDBException(_lastErrorCode, LastErrorMessage, "InTransaction");
+            }
+
+            return flag != 0;
+        }
+    }
+
+    public string GetTableDdl(string tableName)
+    {
+        var nameBytes = Encoding.UTF8.GetBytes(tableName + "\0");
+        unsafe
+        {
+            fixed (byte* p = nameBytes)
+            {
+                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_get_table_ddl(Handle, p, out var ptr));
+                if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "GetTableDdl");
+                return FreeStringOrEmpty(ptr);
+            }
+        }
+    }
+
+    public string ListViewsJson()
+    {
+        var res = RecordStatus(DecentDBNative.ddb_db_list_views_json(Handle, out var ptr));
+        if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "ListViewsJson");
+        return FreeStringOrEmpty(ptr);
+    }
+
+    public string GetViewDdl(string viewName)
+    {
+        var nameBytes = Encoding.UTF8.GetBytes(viewName + "\0");
+        unsafe
+        {
+            fixed (byte* p = nameBytes)
+            {
+                var res = RecordStatus(DecentDBNativeUnsafe.ddb_db_get_view_ddl(Handle, p, out var ptr));
+                if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "GetViewDdl");
+                return FreeStringOrEmpty(ptr);
+            }
+        }
+    }
+
+    public string ListTriggersJson()
+    {
+        var res = RecordStatus(DecentDBNative.ddb_db_list_triggers_json(Handle, out var ptr));
+        if (res != 0) throw new DecentDBException(_lastErrorCode, LastErrorMessage, "ListTriggersJson");
+        return FreeStringOrEmpty(ptr);
+    }
+
+    private static string FreeStringOrEmpty(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero) return string.Empty;
+        try { return Marshal.PtrToStringUTF8(ptr) ?? string.Empty; }
+        finally { DecentDBNative.ddb_string_free(ref ptr); }
     }
 
     /// <summary>
@@ -430,6 +514,8 @@ public sealed class PreparedStatement : IDisposable
             if (!value.TryWriteBytes(new Span<byte>(bytes, 16)))
                 throw new InvalidOperationException("Failed to write Guid bytes");
 
+            // Bind as BLOB (UUID-typed columns accept BLOB writes; the engine
+            // stores them identically and the reader already handles UUID→Guid).
             var res = _db.RecordStatus(DecentDBNativeUnsafe.ddb_stmt_bind_blob(Handle, checked((nuint)index1Based), bytes, 16));
             if (res != 0)
             {
@@ -821,6 +907,66 @@ public sealed class PreparedStatement : IDisposable
             }
 
             return checked((long)rows);
+        }
+    }
+
+    public long StepRowsAffected()
+    {
+        var res = _db.RecordStatus(DecentDBNative.ddb_stmt_step(Handle, out _));
+        if (res != 0)
+        {
+            throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+        }
+        return RowsAffected;
+    }
+
+    public long ExecuteBatchInt64(ReadOnlySpan<long> values)
+    {
+        unsafe
+        {
+            fixed (long* pValues = values)
+            {
+                var res = _db.RecordStatus(
+                    DecentDBNativeUnsafe.ddb_stmt_execute_batch_i64(Handle, (nuint)values.Length, pValues, out var affected));
+                if (res != 0) throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                return (long)affected;
+            }
+        }
+    }
+
+    public long RebindInt64Execute(long value)
+    {
+        var res = _db.RecordStatus(
+            DecentDBNativeUnsafe.ddb_stmt_rebind_int64_execute(Handle, value, out var affected));
+        if (res != 0) throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+        return (long)affected;
+    }
+
+    public long RebindTextInt64Execute(byte[] utf8Text, long intValue)
+    {
+        unsafe
+        {
+            fixed (byte* pText = utf8Text)
+            {
+                var res = _db.RecordStatus(
+                    DecentDBNativeUnsafe.ddb_stmt_rebind_text_int64_execute(Handle, pText, (nuint)utf8Text.Length, intValue, out var affected));
+                if (res != 0) throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                return (long)affected;
+            }
+        }
+    }
+
+    public long RebindInt64TextExecute(long intValue, byte[] utf8Text)
+    {
+        unsafe
+        {
+            fixed (byte* pText = utf8Text)
+            {
+                var res = _db.RecordStatus(
+                    DecentDBNativeUnsafe.ddb_stmt_rebind_int64_text_execute(Handle, intValue, pText, (nuint)utf8Text.Length, out var affected));
+                if (res != 0) throw new DecentDBException(_db.LastErrorCode, _db.LastErrorMessage, _sql);
+                return (long)affected;
+            }
         }
     }
 
