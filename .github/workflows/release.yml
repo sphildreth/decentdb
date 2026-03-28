@@ -88,8 +88,8 @@ jobs:
       - name: Python Binding Test Suite
         run: |
           cd bindings/python
-          pip install -e .
-          pytest -v tests/
+          pip install -e . pytest psutil
+          python -m pytest -v tests/
           cd ../..
 
       - name: .NET Binding Test Suite

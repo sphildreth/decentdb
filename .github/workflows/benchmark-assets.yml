@@ -289,13 +289,26 @@ jobs:
           import json
           import os
           from pathlib import Path
-         
+          
           keep = {
               value.strip()
               for value in os.environ["ROOT_README_EXTRA_ENGINES"].split(",")
               if value.strip()
           }
-          src = Path(".tmp/benchmark-assets/workload_c/results_merged.json")
+          run_root = Path(".tmp/benchmark-assets/workload_c")
+          target_ops = os.environ["BENCHMARK_TARGET_OPS"].strip()
+          candidates = [
+              run_root / f"ops_{target_ops}" / "results_merged.json",
+              run_root / "results_merged.json",
+              *sorted(run_root.glob("ops_*/results_merged.json")),
+          ]
+          src = next((candidate for candidate in candidates if candidate.exists()), None)
+          if src is None:
+              found = sorted(str(path.relative_to(run_root)) for path in run_root.glob("**/results_merged.json"))
+              details = ", ".join(found) if found else "none"
+              raise SystemExit(
+                  f"could not find workload_c results_merged.json under {run_root}; found: {details}"
+              )
           dst = Path(".tmp/benchmark-assets/root-readme-results.json")
 
           document = json.loads(src.read_text(encoding="utf-8"))
@@ -413,7 +426,7 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch docs deployment
-        if: github.ref == 'refs/heads/main' && steps.commit.outputs.changed == 'true'
+        if: github.ref == 'refs/heads/main'
         shell: bash
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
