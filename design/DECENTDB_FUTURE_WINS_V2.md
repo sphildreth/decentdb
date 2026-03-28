@@ -312,6 +312,61 @@ This creates a much stronger story for regulated, enterprise, offline, and field
 
 ---
 
+## 7. Native Geospatial Data Support
+### Why this matters
+Location-aware applications are pervasive: mobile apps, IoT, logistics, field service, geospatial analytics. SQLite's geo story is limited to R-Tree indexes for bounding boxes and Geopoly for simple polygons. DecentDB can do better.
+
+The geo opportunity is not about being SpatiaLite — it's about making location data first-class without requiring an extension.
+
+### The DecentDB win
+Expose native `GEOGRAPHY` and `GEOMETRY` types with:
+
+- **Native types**: `GEOGRAPHY(POINT)`, `GEOGRAPHY(POLYGON)`, `GEOMETRY` with SRID support
+- **Spatial indexing**: R*-Tree index (better than SQLite's R-Tree for dynamic data)
+- **Core functions**: `ST_Distance`, `ST_Contains`, `ST_Within`, `ST_Intersects`, `ST_Point`, `ST_AsGeoJSON`
+- **Spherical calculations**: Haversine and Vincenty formulas for Earth geometry
+- **Input/output**: WKB, WKT, and GeoJSON formats
+
+### Desired developer experience
+```sql
+CREATE TABLE locations (
+    id INTEGER PRIMARY KEY,
+    name TEXT,
+    coordinates GEOGRAPHY(POINT, 4326),  -- WGS84
+    boundary GEOGRAPHY(POLYGON, 4326)    -- optional polygon
+);
+
+-- Nearest-neighbor query with spatial index
+SELECT name, ST_Distance(coordinates, ST_Point(-122.4194, 37.7749))
+FROM locations
+WHERE ST_DWithin(coordinates, ST_Point(-122.4194, 37.7749), 5000)  -- within 5km
+ORDER BY coordinates <-> ST_Point(-122.4194, 37.7749)
+LIMIT 10;
+
+-- Point-in-polygon
+SELECT id, name FROM zones WHERE ST_Contains(boundary, ST_Point(-122.4194, 37.7749));
+```
+
+### Why this is a differentiator
+| Approach | SQLite | DecentDB |
+|---|---|---|
+| Point storage | Two REAL columns | Native POINT type |
+| Distance calculation | Manual Haversine SQL | `ST_Distance` built-in |
+| Spatial index | R-Tree (static) | R*-Tree (dynamic) |
+| Polygon operations | Geopoly (convex only) | Full polygon support |
+| Type safety | None | Static geography type |
+
+### Implementation considerations
+- **Rust crate**: Leverage `geo` or `geosine` for geometry math
+- **SRID support**: WGS84 (4326) default; planar vs spherical mode
+- **WASM compatibility**: Required for browser/OPFS use cases
+- **Performance**: Spatial index must be zero-copy with page cache
+
+### Priority
+**Tier 3 — Feature-completeness win. Useful for specific verticals (mobile, IoT, logistics) but not a primary separator.**
+
+---
+
 ## Market Reality Check: Which Features Help But Do Not Define the Story
 
 The following features are still worthwhile. They simply should not be the center of the DecentDB identity because they are increasingly table stakes or already available elsewhere in some form.
@@ -321,6 +376,7 @@ The following features are still worthwhile. They simply should not be the cente
 - JSONB
 - Full-text search
 - Vector / HNSW indexes
+- Native geospatial types & R*-Tree index
 - Built-in HTTP serve mode
 - Group commit
 - Compression
@@ -368,17 +424,18 @@ Important, but these should support the larger story rather than define it.
 | 14 | Compression | Smaller files, better cache behavior |
 | 15 | Bulk-load follow-ons | Better ETL and migration workflows |
 | 16 | Non-blocking schema migration | Valuable operational differentiator |
+| 17 | Native geospatial types & R*-Tree | First-class location data, spatial indexes, ST_* functions |
 
 ## Tier 4 — Important Capability Checks
 Strong features, but less likely to be the decisive reason someone chooses DecentDB.
 
 | Priority | Theme | Why it matters |
 |---|---|---|
-| 17 | Vector / HNSW index | AI-era expectation; useful but less unique |
-| 18 | Full-text search | Search expectation; good for completeness |
-| 19 | TDE | Valuable and practical, but not identity-defining alone |
-| 20 | WAL streaming replication | Helpful for HA/read-scale scenarios |
-| 21 | Object storage VFS | Interesting deployment story, especially edge/serverless |
+| 18 | Vector / HNSW index | AI-era expectation; useful but less unique |
+| 19 | Full-text search | Search expectation; good for completeness |
+| 20 | TDE | Valuable and practical, but not identity-defining alone |
+| 21 | WAL streaming replication | Helpful for HA/read-scale scenarios |
+| 22 | Object storage VFS | Interesting deployment story, especially edge/serverless |
 
 ---
 
@@ -427,6 +484,7 @@ These features are still important, but they should serve the bigger product sto
 - JSONB
 - FTS
 - vector
+- geo / spatial types and R*-Tree
 - compression
 - TDE
 - cross-process coordination
@@ -464,8 +522,9 @@ Focus on features that create the clearest product story fast.
 3. compression
 4. vector
 5. FTS
-6. object storage VFS
-7. replication and HA enhancements
+6. geo / spatial types and R*-Tree index
+7. object storage VFS
+8. replication and HA enhancements
 
 ---
 
@@ -519,6 +578,8 @@ These notes are included so this roadmap reflects the current market more honest
 ### Observations
 - Official SQLite now has a WASM/OPFS story, which reduces browser support as a unique differentiator.
 - SQLite now has JSONB support, which reduces JSONB as a flagship separator by itself.
+- SQLite R-Tree and Geopoly provide basic geo capabilities but lack type safety and full geometry support.
+- PostGIS is the reference standard for geo in serious RDBMS; SpatiaLite extends SQLite with similar capabilities.
 - SQLite already has strong FTS support.
 - DuckDB has broadened via extensions in areas like FTS and vector search.
 - The modern gap is less about raw feature presence and more about integrated workflows, sync, and developer experience.
@@ -530,6 +591,14 @@ These notes are included so this roadmap reflects the current market more honest
   - https://sqlite.org/jsonb.html
 - SQLite session / changesets:
   - https://sqlite.org/sessionintro.html
+- SQLite R-Tree:
+  - https://sqlite.org/rtree.html
+- SQLite Geopoly:
+  - https://www3.sqlite.org/geopoly/
+- SpatiaLite (geo extension for SQLite):
+  - https://www.gaia-gis.it/fossil/libspatialite/index
+- PostGIS:
+  - https://postgis.net/
 - DuckDB full-text search:
   - https://duckdb.org/docs/stable/core_extensions/full_text_search.html
 - DuckDB vector similarity search:

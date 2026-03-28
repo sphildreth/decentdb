@@ -1,28 +1,35 @@
 {
   "engines": {
+    "H2": {
+      "read_p95_ms": 0.08540099952369928
+    },
+    "HSQLDB": {
+      "read_p95_ms": 0.13444200158119202
+    },
     "decentdb": {
-      "read_p95_ms": 0.000771,
+      "commit_p95_ms": 3.035214,
+      "db_size_mb": 2.902374267578125,
+      "insert_rows_per_sec": 1532664.4826402145,
       "join_p95_ms": 0.001984,
-      "commit_p95_ms": 3.018038,
-      "insert_rows_per_sec": 1885772.890147789,
-      "db_size_mb": 0.515655517578125
+      "read_p95_ms": 0.000782
     },
     "duckdb": {
-      "read_p95_ms": 0.148219,
-      "join_p95_ms": 0.319321,
-      "commit_p95_ms": 3.042314,
-      "insert_rows_per_sec": 7325.719802507074,
-      "db_size_mb": 3.26171875
+      "commit_p95_ms": 3.045082,
+      "db_size_mb": 3.26171875,
+      "insert_rows_per_sec": 7191.563493731031,
+      "join_p95_ms": 0.343365,
+      "read_p95_ms": 0.147978
     },
     "sqlite": {
-      "read_p95_ms": 0.002454,
-      "join_p95_ms": 0.002745,
-      "commit_p95_ms": 3.022296,
-      "insert_rows_per_sec": 1922787.7653783604,
-      "db_size_mb": 1.83203125
+      "commit_p95_ms": 3.008011,
+      "db_size_mb": 1.83203125,
+      "insert_rows_per_sec": 1962921.1651012795,
+      "join_p95_ms": 0.002815,
+      "read_p95_ms": 0.002385
     }
   },
   "metadata": {
+    "aggregated_at": "2026-03-28T14:29:40.695064+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -33,10 +40,12 @@
     "latency_capture_unit": "nanoseconds",
     "latency_report_unit": "milliseconds",
     "machine": "AMD Ryzen 9 3900X 12-Core Processor",
+    "notes": "merged extra engines from benchmarks/python_embedded_compare/out/readme5/results_merged.json",
     "os": "linux",
+    "python_merge_target_operations": 10000,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1774437717544",
+    "run_id": "1774707777711",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"

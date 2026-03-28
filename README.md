@@ -69,28 +69,34 @@ It targets a single process with **one writer** and **many concurrent readers** 
 ## Performance (at a glance)
 
 <p align="center">
-    <img src="benchmarks/embedded_compare/assets/decentdb-speedup.png" alt="Decent performance..." width="65%" />
-    <img src="benchmarks/embedded_compare/assets/decentdb-radar.png" alt="Decent radar compare..." width="65%" />
+    <img src="assets/decentdb-speedup.png" alt="Decent performance..." width="65%" />
+    <img src="assets/decentdb-radar.png" alt="Decent radar compare..." width="65%" />
 </p>
 
 **How this chart is produced**
 
-- The chart is generated from benchmark runs using `cargo bench`.
+- The native benchmark summary is generated with `cargo bench -p decentdb --bench embedded_compare`.
+- Optional Python-harness engines (for example `H2` and `HSQLDB`) are merged into the README summary with `python scripts/aggregate_benchmarks.py`.
+- The README chart assets are rendered from `data/bench_summary.json` by `python scripts/make_readme_chart.py` and `python scripts/visualize_alternative.py`.
 - Values are **normalized vs SQLite** (baseline = 1.0).
 - For "lower is better" metrics (latency, DB size), the score is inverted so **higher bars mean better**.
-- Full methodology and raw results live in `benchmarks/embedded_compare/`.
-
-**Supported engines**
-
-- DecentDB (native API)
-- SQLite (via C API)
-- DuckDB (via C API) - when library is available
+- Full methodology lives in `crates/decentdb/benches/embedded_compare.rs`, and the generated summary lives in `data/bench_summary.json`.
 
 **Regenerate**
 
 ```bash
-# Run benchmark pipeline
-cargo bench
+# Build the native 3-engine benchmark summary
+cargo bench -p decentdb --bench embedded_compare
+
+# After running benchmarks/python_embedded_compare, merge its extra engines
+python scripts/aggregate_benchmarks.py \
+  --native-summary data/bench_summary.json \
+  --python-embedded-compare-results benchmarks/python_embedded_compare/out/results_merged.json \
+  --output data/bench_summary.json
+
+# Render the README chart assets from the merged summary
+python scripts/make_readme_chart.py
+python scripts/visualize_alternative.py
 ```
 
 ## Quick Start

@@ -1,82 +1,108 @@
 #!/usr/bin/env python3
-"""Aggregate raw benchmark outputs into data/bench_summary.json.
+"""Merge README benchmark inputs into data/bench_summary.json.
 
-This script is REQUIRED by PRD/SPEC.
-
-Inputs:
-    - benchmarks/embedded_compare/raw/sample/**/*.jsonl or *.json (default)
-    - pass --input to aggregate a different raw folder
-Output:
-  - data/bench_summary.json
-
-Rules:
-  - For each engine and metric, compute median-of-runs for p95 values.
-  - Convert units: nanoseconds/microseconds -> milliseconds, bytes -> MB.
-  - Baseline engine SQLite must be present.
+This script treats the native Rust benchmark summary as authoritative for the
+engines measured directly by `cargo bench -p decentdb --bench embedded_compare`
+and then optionally layers in additional engines from
+`benchmarks/python_embedded_compare/out/results_merged.json`.
 """
 
 import argparse
 import json
-import math
-import os
-import socket
-from collections import defaultdict
-from pathlib import Path
-from statistics import median
+from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path
 
 
-def _safe_float(x):
-    """Safely convert value to float, handling None and bools as None."""
-    if x is None:
+def _safe_float(value):
+    if value is None or isinstance(value, bool):
         return None
     try:
-        if isinstance(x, bool):
-            return None
-        return float(x)
+        return float(value)
     except (TypeError, ValueError):
         return None
 
 
-def _pick_nearest(records, n_ops_target):
-    """Pick record with n_ops closest to target."""
+def _canonical_engine_name(engine):
+    return str(engine).strip().lower()
+
+
+def _engine_exists(engines, engine_name):
+    target = _canonical_engine_name(engine_name)
+    return any(_canonical_engine_name(existing) == target for existing in engines)
+
+
+def _pick_nearest(records, target_operations):
     best = None
-    best_dist = None
-    for r in records:
-        n = r.get("n_ops")
-        if n is None:
+    best_distance = None
+    for record in records:
+        operations = record.get("operations", record.get("n_ops"))
+        if operations is None:
             continue
-        dist = abs(int(n) - int(n_ops_target))
-        if best is None or dist < best_dist:
-            best = r
-            best_dist = dist
+        distance = abs(int(operations) - int(target_operations))
+        if best is None or distance < best_distance:
+            best = record
+            best_distance = distance
     return best
 
 
-def merge_python_embedded_compare_results(engines, py_results_path):
-    """Merge additional engines from benchmarks/python_embedded_compare.
+def load_native_summary(path):
+    if not path.exists():
+        raise SystemExit(
+            f"Native benchmark summary not found: {path}\n"
+            "Run `cargo bench -p decentdb --bench embedded_compare` first."
+        )
 
-    This is intentionally best-effort and only fills metrics we can derive.
-    Missing metrics remain absent (or null), and the chart generator will
-    omit those bars.
+    with path.open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
 
-    Supports both legacy format (p95_us_per_op) and new Python framework
-    format (latency_ms.p95_ms).
-    """
-    p = Path(py_results_path)
-    if not p.exists():
-        return False
+    engines = document.get("engines")
+    if not isinstance(engines, dict) or not engines:
+        raise SystemExit(f"Invalid native summary at {path}: missing `engines` object")
+
+    metadata = document.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise SystemExit(f"Invalid native summary at {path}: `metadata` must be an object")
+
+    if not _engine_exists(engines, "sqlite"):
+        raise SystemExit(
+            f"Baseline engine `sqlite` not found in native summary {path}"
+        )
+
+    return {
+        "engines": deepcopy(engines),
+        "metadata": deepcopy(metadata),
+    }
+
+
+def merge_python_embedded_compare_results(summary, py_results_path, target_operations):
+    path = Path(py_results_path)
+    if not path.exists():
+        return {
+            "merged": False,
+            "reason": f"results file not found: {path}",
+            "engines": [],
+        }
 
     try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return False
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "merged": False,
+            "reason": f"could not parse JSON ({exc})",
+            "engines": [],
+        }
 
-    results = doc.get("results")
+    results = document.get("results")
     if not isinstance(results, list):
-        return False
+        return {
+            "merged": False,
+            "reason": "missing `results` list",
+            "engines": [],
+        }
 
-    # Map python engine names -> embedded_compare display names.
     name_map = {
         "H2(JDBC)": "H2",
         "Derby(JDBC)": "Apache Derby",
@@ -85,236 +111,136 @@ def merge_python_embedded_compare_results(engines, py_results_path):
         "Firebird": "Firebird",
     }
 
-    # Group python rows by (engine, bench)
-    grouped = defaultdict(list)
+    grouped = {}
     for row in results:
-        eng = row.get("engine")
-        bench = row.get("bench") or row.get("benchmark")  # Support both
-        if not eng or not bench:
+        engine = row.get("engine")
+        benchmark = row.get("benchmark", row.get("bench"))
+        if not engine or not benchmark:
             continue
-        grouped[(eng, bench)].append(row)
+        grouped.setdefault((engine, benchmark), []).append(row)
 
-    # We align to embedded_compare's point_read iterations=100000.
-    target_n_ops = 100_000
-
-    for (py_engine, py_bench), rows in grouped.items():
-        out_name = name_map.get(py_engine)
-        if out_name is None:
-            # Ignore SQLite variants / DecentDB / DuckDB from python run to
-            # avoid conflicting with native embedded_compare results.
+    merged_engines = []
+    for (python_engine, benchmark), rows in grouped.items():
+        output_name = name_map.get(python_engine)
+        if output_name is None:
             continue
 
-        if out_name in ("SQLite", "DecentDB", "DuckDB"):
+        if _engine_exists(summary["engines"], output_name):
             continue
 
-        if out_name not in engines:
-            engines[out_name] = {}
-
-        chosen = _pick_nearest(rows, target_n_ops)
+        chosen = _pick_nearest(rows, target_operations)
         if chosen is None:
             continue
 
-        # Handle new Python format: latency_ms contains p50, p95, p99 in ms
         latency_ms = chosen.get("latency_ms", {})
+        if not isinstance(latency_ms, dict):
+            latency_ms = {}
 
-        if py_bench == "point_select":
-            # Try new format first (latency_ms.p95_ms)
+        engine_metrics = summary["engines"].setdefault(output_name, {})
+        updated = False
+
+        if benchmark == "point_select":
             p95_ms = _safe_float(latency_ms.get("p95_ms"))
-            if p95_ms is not None and p95_ms != 0:
-                engines[out_name]["read_p95_ms"] = p95_ms
-            else:
-                # Fallback to legacy format (p95_us_per_op)
+            if p95_ms is None:
                 p95_us_per_op = _safe_float(chosen.get("p95_us_per_op"))
-                if p95_us_per_op is not None and p95_us_per_op != 0:
-                    engines[out_name]["read_p95_ms"] = p95_us_per_op / 1000.0
+                if p95_us_per_op is not None:
+                    p95_ms = p95_us_per_op / 1000.0
+            if p95_ms is not None and p95_ms != 0:
+                engine_metrics["read_p95_ms"] = p95_ms
+                updated = True
 
-        elif py_bench in ("insert", "insert_txn"):
-            # Try new format first (latency_ms.p50_ms -> ops/sec)
-            p50_ms = _safe_float(latency_ms.get("p50_ms"))
-            if p50_ms is not None and p50_ms != 0:
-                # Convert p50 ms/op to ops/sec
-                engines[out_name]["insert_rows_per_sec"] = 1000.0 / p50_ms
-            else:
-                # Fallback to legacy format
-                p50_us_per_op = _safe_float(chosen.get("p50_us_per_op"))
-                if p50_us_per_op is not None and p50_us_per_op != 0:
-                    engines[out_name]["insert_rows_per_sec"] = (
-                        1_000_000.0 / p50_us_per_op
-                    )
+        elif benchmark in ("insert", "insert_txn"):
+            throughput = _safe_float(chosen.get("throughput_ops_sec"))
+            if throughput is None:
+                p50_ms = _safe_float(latency_ms.get("p50_ms"))
+                if p50_ms is not None and p50_ms != 0:
+                    throughput = 1000.0 / p50_ms
+                else:
+                    p50_us_per_op = _safe_float(chosen.get("p50_us_per_op"))
+                    if p50_us_per_op is not None and p50_us_per_op != 0:
+                        throughput = 1_000_000.0 / p50_us_per_op
+            if throughput is not None and throughput != 0:
+                engine_metrics["insert_rows_per_sec"] = throughput
+                updated = True
 
-    return True
+        if updated and output_name not in merged_engines:
+            merged_engines.append(output_name)
+        elif not updated and not engine_metrics:
+            summary["engines"].pop(output_name, None)
 
+    if not merged_engines:
+        return {
+            "merged": False,
+            "reason": "no additional engine metrics could be derived",
+            "engines": [],
+        }
 
-def iter_records(paths):
-    for p in paths:
-        if p.suffix == ".json":
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                for record in data:
-                    yield record
-            else:
-                yield data
-        elif p.suffix == ".jsonl":
-            for line in p.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line:
-                    yield json.loads(line)
+    note = f"merged extra engines from {path}"
+    existing_note = summary["metadata"].get("notes")
+    summary["metadata"]["notes"] = (
+        f"{existing_note}; {note}" if existing_note else note
+    )
+    summary["metadata"]["aggregated_at"] = datetime.now(timezone.utc).isoformat()
+    summary["metadata"]["python_merge_target_operations"] = target_operations
 
-
-def get_machine_info():
-    hostname = socket.gethostname()
-    cpu_info = "unknown"
-    try:
-        with open("/proc/cpuinfo", "r") as f:
-            for line in f:
-                if line.startswith("model name"):
-                    cpu_info = line.split(":", 1)[1].strip()
-                    break
-    except (IOError, OSError):
-        pass
-    return f"{hostname} ({cpu_info})"
+    return {
+        "merged": True,
+        "reason": "",
+        "engines": merged_engines,
+    }
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--input",
-        default="benchmarks/embedded_compare/raw/sample",
-        help="Folder containing raw benchmark outputs",
+    parser = argparse.ArgumentParser(
+        description="Merge native and Python benchmark summaries for README charts"
     )
-    ap.add_argument(
-        "--output",
-        default="benchmarks/embedded_compare/data/bench_summary.json",
-        help="Output JSON path",
+    parser.add_argument(
+        "--native-summary",
+        default="data/bench_summary.json",
+        help="Native benchmark summary generated by cargo bench",
     )
-    ap.add_argument(
+    parser.add_argument(
         "--python-embedded-compare-results",
         default="benchmarks/python_embedded_compare/out/results_merged.json",
-        help="Optional results file from python_embedded_compare to merge extra engines",
+        help="Optional results file from the Python embedded comparison harness",
     )
-    args = ap.parse_args()
-
-    inp = Path(args.input)
-    outp = Path(args.output)
-
-    files = [p for p in inp.rglob("*") if p.suffix in (".json", ".jsonl")]
-    if not files:
-        raise SystemExit(f"No .json/.jsonl files found under {inp}")
-
-    records = list(iter_records(files))
-
-    if not records:
-        raise SystemExit("No valid benchmark records found")
-
-    # Enforce that we are aggregating a single durability profile.
-    # Mixing safe/default (or other) profiles makes the summary misleading.
-    all_durabilities = sorted(
-        {r.get("durability") for r in records if r.get("durability")}
+    parser.add_argument(
+        "--output",
+        default="data/bench_summary.json",
+        help="Output path for the merged benchmark summary",
     )
-    if len(all_durabilities) > 1:
-        raise SystemExit(
-            "Mixed durability profiles found in input: "
-            + ", ".join(all_durabilities)
-            + ". Re-run with a clean output directory or aggregate a single run folder."
-        )
-    durability_profile = all_durabilities[0] if all_durabilities else "unknown"
+    parser.add_argument(
+        "--target-operations",
+        type=int,
+        default=100_000,
+        help="Operation count to select from the Python embedded comparison results",
+    )
+    args = parser.parse_args()
 
-    data = defaultdict(lambda: defaultdict(list))
+    native_summary_path = Path(args.native_summary)
+    output_path = Path(args.output)
 
-    for record in records:
-        engine = record.get("engine")
-        benchmark = record.get("benchmark")
-        metrics = record.get("metrics", {})
-        artifacts = record.get("artifacts", {})
-
-        if not engine or not benchmark:
-            continue
-
-        # Prefer nanosecond percentiles when available to avoid microsecond
-        # quantization for very fast operations.
-        p95_ns = metrics.get("p95_ns")
-        if p95_ns is not None:
-            data[(engine, benchmark)]["p95_ns"].append(float(p95_ns))
-
-        p95_us = metrics.get("p95_us")
-        if p95_us is not None:
-            data[(engine, benchmark)]["p95_us"].append(float(p95_us))
-
-        if benchmark == "insert":
-            ops_per_sec = metrics.get("ops_per_sec")
-            if ops_per_sec is not None:
-                data[(engine, "insert")]["ops_per_sec"].append(float(ops_per_sec))
-
-    engines = {}
-
-    for (engine, benchmark), values_dict in data.items():
-        if engine not in engines:
-            engines[engine] = {}
-
-        if benchmark == "point_read":
-            p95_ns_values = values_dict.get("p95_ns", [])
-            p95_us_values = values_dict.get("p95_us", [])
-            if p95_ns_values:
-                engines[engine]["read_p95_ms"] = median(p95_ns_values) / 1_000_000.0
-            elif p95_us_values:
-                engines[engine]["read_p95_ms"] = median(p95_us_values) / 1000.0
-        elif benchmark == "join":
-            p95_ns_values = values_dict.get("p95_ns", [])
-            p95_us_values = values_dict.get("p95_us", [])
-            if p95_ns_values:
-                engines[engine]["join_p95_ms"] = median(p95_ns_values) / 1_000_000.0
-            elif p95_us_values:
-                engines[engine]["join_p95_ms"] = median(p95_us_values) / 1000.0
-        elif benchmark == "commit_latency":
-            p95_ns_values = values_dict.get("p95_ns", [])
-            p95_us_values = values_dict.get("p95_us", [])
-            if p95_ns_values:
-                engines[engine]["commit_p95_ms"] = median(p95_ns_values) / 1_000_000.0
-            elif p95_us_values:
-                engines[engine]["commit_p95_ms"] = median(p95_us_values) / 1000.0
-        elif benchmark == "insert":
-            ops_per_sec_values = values_dict.get("ops_per_sec", [])
-            if ops_per_sec_values:
-                engines[engine]["insert_rows_per_sec"] = median(ops_per_sec_values)
-
-    if "SQLite" not in engines:
-        raise SystemExit("Baseline engine 'SQLite' not found in benchmark data")
-
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    machine = get_machine_info()
-
-    result = {
-        "metadata": {
-            "run_id": run_id,
-            "machine": machine,
-            "durability_profile": durability_profile,
-            "notes": f"Generated from raw benchmark outputs in {inp}",
-            "units": {
-                "read_p95_ms": "ms (lower is better)",
-                "join_p95_ms": "ms (lower is better)",
-                "commit_p95_ms": "ms (lower is better)",
-                "insert_rows_per_sec": "rows/sec (higher is better)",
-            },
-        },
-        "engines": engines,
-    }
-
-    merged = merge_python_embedded_compare_results(
-        result["engines"],
+    summary = load_native_summary(native_summary_path)
+    merge_result = merge_python_embedded_compare_results(
+        summary,
         args.python_embedded_compare_results,
+        args.target_operations,
     )
-    if merged:
-        result["metadata"]["notes"] += (
-            f"; merged extra engines from {args.python_embedded_compare_results}"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    print(f"Wrote benchmark summary to: {output_path}")
+    print(f"  Engines: {', '.join(summary['engines'].keys())}")
+    if merge_result["merged"]:
+        print(
+            "  Merged Python comparison engines: "
+            + ", ".join(merge_result["engines"])
         )
-
-    outp.parent.mkdir(parents=True, exist_ok=True)
-    with outp.open("w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, sort_keys=True)
-
-    print(f"Wrote aggregated results to: {outp}")
-    print(f"  Engines: {', '.join(sorted(engines.keys()))}")
-    print(f"  Run ID: {run_id}")
+    else:
+        print(f"  Python comparison merge skipped: {merge_result['reason']}")
 
 
 if __name__ == "__main__":
