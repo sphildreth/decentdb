@@ -34,6 +34,8 @@ String findNativeLib() {
 typedef _MallocTrimNative = Int32 Function(IntPtr);
 typedef _MallocTrimDart = int Function(int);
 
+const _runMemoryLeakEnv = 'DECENTDB_RUN_MEMORY_LEAK_TEST';
+
 int rssBytes() => ProcessInfo.currentRss;
 
 bool trimProcessHeap() {
@@ -49,6 +51,19 @@ bool trimProcessHeap() {
   } on Object {
     return false;
   }
+}
+
+String? memoryLeakSkipReason() {
+  if (!Platform.isLinux) {
+    return 'RSS leak regression is Linux-specific';
+  }
+
+  final enabled = Platform.environment[_runMemoryLeakEnv];
+  if (enabled == '1' || enabled?.toLowerCase() == 'true') {
+    return null;
+  }
+
+  return 'Run with $_runMemoryLeakEnv=1 in an isolated dart test process';
 }
 
 void main() {
@@ -116,6 +131,7 @@ void main() {
         tempDir.deleteSync(recursive: true);
       }
     },
-    skip: Platform.isLinux ? false : 'RSS leak regression is Linux-specific',
+    // This measures process-wide RSS, so keep it out of the default suite run.
+    skip: memoryLeakSkipReason(),
   );
 }

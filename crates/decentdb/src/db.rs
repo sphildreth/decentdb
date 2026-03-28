@@ -3688,6 +3688,28 @@ mod tests {
     }
 
     #[test]
+    fn shared_wal_registry_entry_is_removed_when_last_handle_drops() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("shared-wal-registry-cleanup.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER)")
+            .expect("create table");
+
+        let canonical_path = crate::vfs::VfsHandle::for_path(&path)
+            .canonicalize_path(&path)
+            .expect("canonicalize path");
+        assert!(crate::wal::shared::has_registry_entry_for_tests(
+            &canonical_path
+        ));
+
+        drop(db);
+
+        assert!(!crate::wal::shared::has_registry_entry_for_tests(
+            &canonical_path
+        ));
+    }
+
+    #[test]
     fn checkpoint_preserves_unchanged_table_payload_pages() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir

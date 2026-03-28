@@ -196,6 +196,25 @@ class TestJdbcDriverConfig:
         assert "DB_CLOSE_DELAY=-1" in driver.jdbc_url
         assert "run_123" in driver.jdbc_url
 
+    def test_jdbc_driver_normalizes_relative_jar_paths(self, tmp_path, monkeypatch):
+        """Relative JDBC jar paths should be normalized before JPype sees them."""
+        jars_dir = tmp_path / "jars"
+        jars_dir.mkdir()
+        jar_path = jars_dir / "h2.jar"
+        jar_path.write_text("", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        driver = JDBCDriver(
+            {
+                "engine": "h2",
+                "database_path": "/tmp/run-123/h2.db",
+                "jdbc_url": "jdbc:h2:mem:test;DB_CLOSE_DELAY=-1",
+                "jar_paths": ["jars/h2.jar"],
+            }
+        )
+
+        assert driver.jar_paths == [str(jar_path.resolve())]
+
     def test_firebird_driver_adds_native_support_jars(self):
         """Firebird driver should include bundled Jaybird native support jars."""
         driver = FirebirdDriver(

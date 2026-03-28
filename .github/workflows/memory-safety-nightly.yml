@@ -196,13 +196,22 @@ jobs:
         if: matrix.binding != 'java'
         run: cargo build -p decentdb --quiet
 
+      - name: Build CLI (debug)
+        if: matrix.binding == 'dotnet'
+        run: cargo build -p decentdb-cli --quiet
+
       - name: Build native library (release)
         if: matrix.binding == 'java'
         run: cargo build -p decentdb --release --quiet
 
+      - name: Prepare DBeaver plugin dir
+        if: matrix.binding == 'java'
+        run: mkdir -p .tmp/dbeaver/plugins
+
       - name: Run .NET lifecycle and leak coverage
         if: matrix.binding == 'dotnet'
         run: |
+          export PATH="${GITHUB_WORKSPACE}/target/debug:$PATH"
           cd bindings/dotnet
           dotnet test DecentDB.NET.sln -v minimal
           dotnet test tests/DecentDB.Tests/DecentDB.Tests.csproj -v minimal --filter FullyQualifiedName~MemoryLeakTests
@@ -216,10 +225,12 @@ jobs:
 
       - name: Run Java lifecycle and leak coverage
         if: matrix.binding == 'java'
+        env:
+          DBEAVER_PLUGIN_DIR: ${{ github.workspace }}/.tmp/dbeaver/plugins
         run: |
           cd bindings/java
-          ./gradlew --no-daemon :driver:test -PnativeLibDir="${GITHUB_WORKSPACE}/target/release"
-          ./gradlew --no-daemon :driver:test --tests com.decentdb.jdbc.MemoryLeakTest -PnativeLibDir="${GITHUB_WORKSPACE}/target/release"
+          ./gradlew --no-daemon :driver:test -PnativeLibDir="${GITHUB_WORKSPACE}/target/release" -PdbeaverPluginDir="${DBEAVER_PLUGIN_DIR}"
+          ./gradlew --no-daemon :driver:test --tests com.decentdb.jdbc.MemoryLeakTest -PnativeLibDir="${GITHUB_WORKSPACE}/target/release" -PdbeaverPluginDir="${DBEAVER_PLUGIN_DIR}"
 
       - name: Run Node lifecycle and leak coverage
         if: matrix.binding == 'node'
@@ -241,4 +252,4 @@ jobs:
           cd bindings/dart/dart
           dart pub get
           dart test --reporter expanded
-          dart test --reporter expanded test/memory_leak_test.dart --concurrency=1
+          DECENTDB_RUN_MEMORY_LEAK_TEST=1 dart test --reporter expanded test/memory_leak_test.dart --concurrency=1

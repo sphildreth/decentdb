@@ -102,15 +102,46 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<SharedWalInner>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+pub(crate) fn has_registry_entry_for_tests(path: &Path) -> bool {
+    registry()
+        .lock()
+        .expect("shared wal registry lock should not be poisoned")
+        .contains_key(path)
+}
+
+impl Drop for SharedWalInner {
+    fn drop(&mut self) {
+        let Some(canonical_path) = self.canonical_path.as_ref() else {
+            return;
+        };
+        let mut registry = registry()
+            .lock()
+            .expect("shared wal registry lock should not be poisoned");
+        let should_remove = registry
+            .get(canonical_path)
+            .is_some_and(|entry| entry.upgrade().is_none());
+        if should_remove {
+            registry.remove(canonical_path);
+            if registry.is_empty() {
+                registry.shrink_to_fit();
+            }
+        }
+    }
+}
+
 pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
     if vfs.is_memory() {
         return Ok(());
     }
 
     let canonical_path = vfs.canonicalize_path(db_path)?;
-    registry()
+    let mut registry = registry()
         .lock()
-        .expect("shared wal registry lock should not be poisoned")
-        .remove(&canonical_path);
+        .expect("shared wal registry lock should not be poisoned");
+    registry.remove(&canonical_path);
+    if registry.is_empty() {
+        registry.shrink_to_fit();
+    }
     Ok(())
 }
