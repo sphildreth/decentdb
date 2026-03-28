@@ -21,7 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [address, leak, thread]
+        # ThreadSanitizer needs a fully sanitizer-built std/dependency graph and
+        # is not reliable in this lightweight nightly setup yet.
+        sanitizer: [address, leak]
 
     steps:
       - name: Checkout
@@ -231,13 +233,13 @@ jobs:
       - name: Build native library
         run: cargo build -p decentdb --quiet
 
-      - name: Run Python memory leak tests under Valgrind
+      - name: Run Python leak probe under Valgrind
         run: |
           set -euo pipefail
           mkdir -p .tmp/memory-safety
           
-          # Run focused leak tests under Valgrind
-          # Note: Python has many false positives, so we suppress known issues
+          # Memcheck is the leak oracle here. RSS-threshold tests are valid in
+          # the plain Python regression job, but become noisy under Valgrind.
           valgrind \
             --tool=memcheck \
             --leak-check=full \
@@ -248,8 +250,7 @@ jobs:
             --error-exitcode=1 \
             --suppressions=.github/valgrind/python.supp \
             python -m pytest \
-              bindings/python/tests/test_memory_leak.py \
-              bindings/python/tests/test_open_close_leak.py \
+              bindings/python/tests/test_valgrind_memcheck.py \
               -v \
             2>&1 | tee .tmp/memory-safety/valgrind-python.log
 

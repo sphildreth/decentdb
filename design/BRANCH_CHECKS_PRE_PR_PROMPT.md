@@ -33,7 +33,7 @@ cargo build -p decentdb
 | **Python** | `cd bindings/python && pip install -e . && pytest -v tests/` |
 | **.NET** | `cd bindings/dotnet && dotnet test DecentDB.NET.sln -v minimal` |
 | **Go** | `go run ./tests/bindings/go/smoke.go` |
-| **Java** | `javac tests/bindings/java/Smoke.java && java --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke` |
+| **Java** | `export JAVA_HOME=/usr/lib/jvm/java-21-openjdk && export PATH="$JAVA_HOME/bin:$PATH" && javac --enable-preview --release 21 tests/bindings/java/Smoke.java && java --enable-preview --enable-native-access=ALL-UNNAMED -cp tests/bindings/java Smoke` |
 | **Node.js** | `bash tests/bindings/node/build.sh && node tests/bindings/node/smoke.js && cd bindings/node/decentdb && npm test` |
 | **Dart** | `cd tests/bindings/dart && dart pub get && dart run smoke.dart` |
 | **C** | `bash tests/bindings/c/run.sh` |
