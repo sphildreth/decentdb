@@ -227,14 +227,17 @@ impl FaultState {
             return FaultDecision::Untracked;
         }
 
+        let failpoints = self.failpoints.lock().expect("fault state lock");
+        if failpoints.is_empty() {
+            return FaultDecision::Untracked;
+        }
+
         let hit = {
             let mut hits = self.hits.lock().expect("fault hit counter lock");
             let next = hits.entry(label.to_string()).or_insert(0);
             *next += 1;
             *next
         };
-
-        let failpoints = self.failpoints.lock().expect("fault state lock");
         let Some(entries) = failpoints.get(label) else {
             return FaultDecision::Pass { hit };
         };
@@ -493,6 +496,32 @@ mod tests {
             write_index < read_index,
             "seed write should be logged before partial read"
         );
+
+        clear_failpoints().expect("clear failpoints");
+    }
+
+    #[test]
+    fn io_without_failpoints_does_not_accumulate_logs() {
+        let _guard = test_lock().lock().expect("test lock");
+        clear_failpoints().expect("clear failpoints");
+
+        let vfs = FaultyVfs::wrap(Arc::new(crate::vfs::mem::MemVfs::default()));
+        let file = vfs
+            .open(
+                Path::new(":memory:"),
+                OpenMode::CreateNew,
+                FileKind::Database,
+            )
+            .expect("create file");
+
+        write_all_at(file.as_ref(), 0, &[1, 2, 3, 4]).expect("seed file");
+        let mut buf = [0_u8; 4];
+        let read = file.read_at(0, &mut buf).expect("read without failpoint");
+        assert_eq!(read, 4);
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        let logs = failpoint_logs().expect("read logs");
+        assert!(logs.is_empty(), "normal I/O should not be logged");
 
         clear_failpoints().expect("clear failpoints");
     }

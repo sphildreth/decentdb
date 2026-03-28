@@ -1,0 +1,244 @@
+name: Memory Safety Nightly
+
+on:
+  schedule:
+    # Run nightly after the benchmark workflow.
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-safety-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-leak-regressions:
+    name: Python Leak Regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/bindings/python
+      DECENTDB_NATIVE_LIB: ${{ github.workspace }}/target/debug/libdecentdb.so
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e bindings/python
+          pip install pytest psutil
+
+      - name: Build native library
+        run: cargo build -p decentdb --quiet
+
+      - name: Run focused leak regressions
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/memory-safety
+
+          # Run both allocator-aware resource tests and the direct repeated
+          # open/query/close RSS regression that caught a real engine issue.
+          pytest -v \
+            bindings/python/tests/test_memory_leak.py \
+            bindings/python/tests/test_open_close_leak.py \
+            bindings/python/tests/test_lifecycle_leak_smoke.py \
+            bindings/python/tests/test_resource_management.py \
+            bindings/python/tests/test_threading.py::TestMemoryLeaks \
+            bindings/python/tests/test_cross_connection_visibility.py \
+            --junitxml=.tmp/memory-safety/python-leaks.xml
+
+      - name: Upload Python leak test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-leak-report
+          path: .tmp/memory-safety/python-leaks.xml
+          retention-days: 30
+
+  c-abi-valgrind:
+    name: C ABI Valgrind
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind build-essential
+
+      - name: Build native library
+        run: cargo build -p decentdb --quiet
+
+      - name: Compile C memory-safety probes
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/memory-safety
+          cc \
+            -Iinclude \
+            tests/bindings/c/smoke.c \
+            -Ltarget/debug \
+            -Wl,-rpath,"$PWD/target/debug" \
+            -ldecentdb \
+            -o .tmp/memory-safety/c-smoke
+          cc \
+            -Iinclude \
+            tests/bindings/c/memory_churn.c \
+            -Ltarget/debug \
+            -Wl,-rpath,"$PWD/target/debug" \
+            -ldecentdb \
+            -o .tmp/memory-safety/c-memory-churn
+
+      - name: Run Valgrind memcheck
+        run: |
+          set -euo pipefail
+          valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=all \
+            --errors-for-leak-kinds=definite,possible \
+            --track-origins=yes \
+            --num-callers=20 \
+            --error-exitcode=1 \
+            ./.tmp/memory-safety/c-smoke \
+            2>&1 | tee .tmp/memory-safety/valgrind-c-smoke.log
+          valgrind \
+            --tool=memcheck \
+            --leak-check=full \
+            --show-leak-kinds=all \
+            --errors-for-leak-kinds=definite,possible \
+            --track-origins=yes \
+            --num-callers=20 \
+            --error-exitcode=1 \
+            ./.tmp/memory-safety/c-memory-churn /tmp/decentdb-memory-churn.ddb 200 \
+            2>&1 | tee .tmp/memory-safety/valgrind-c-memory-churn.log
+
+      - name: Upload Valgrind logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-c-logs
+          path: |
+            .tmp/memory-safety/valgrind-c-smoke.log
+            .tmp/memory-safety/valgrind-c-memory-churn.log
+          retention-days: 30
+
+  binding-lifecycle:
+    name: Binding Lifecycle (${{ matrix.binding }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binding: dotnet
+          - binding: go
+          - binding: java
+          - binding: node
+          - binding: dart
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up .NET
+        if: matrix.binding == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Set up Go
+        if: matrix.binding == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Set up Java
+        if: matrix.binding == 'java'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Node
+        if: matrix.binding == 'node'
+        uses: actions/setup-node@v5
+        with:
+          node-version: "25"
+
+      - name: Set up Dart
+        if: matrix.binding == 'dart'
+        uses: dart-lang/setup-dart@v1
+
+      - name: Build native library (debug)
+        if: matrix.binding != 'java'
+        run: cargo build -p decentdb --quiet
+
+      - name: Build native library (release)
+        if: matrix.binding == 'java'
+        run: cargo build -p decentdb --release --quiet
+
+      - name: Run .NET lifecycle and leak coverage
+        if: matrix.binding == 'dotnet'
+        run: |
+          cd bindings/dotnet
+          dotnet test DecentDB.NET.sln -v minimal
+          dotnet test tests/DecentDB.Tests/DecentDB.Tests.csproj -v minimal --filter FullyQualifiedName~MemoryLeakTests
+
+      - name: Run Go lifecycle and leak coverage
+        if: matrix.binding == 'go'
+        run: |
+          cd bindings/go/decentdb-go
+          LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug" go test ./...
+          LD_LIBRARY_PATH="${GITHUB_WORKSPACE}/target/debug" go test ./... -run TestRepeatedOpenQueryCloseKeepsRSSBounded -count=1
+
+      - name: Run Java lifecycle and leak coverage
+        if: matrix.binding == 'java'
+        run: |
+          cd bindings/java
+          ./gradlew --no-daemon :driver:test -PnativeLibDir="${GITHUB_WORKSPACE}/target/release"
+          ./gradlew --no-daemon :driver:test --tests com.decentdb.jdbc.MemoryLeakTest -PnativeLibDir="${GITHUB_WORKSPACE}/target/release"
+
+      - name: Run Node lifecycle and leak coverage
+        if: matrix.binding == 'node'
+        run: |
+          cd bindings/node/decentdb
+          npm ci
+          npm run build --silent
+          node --expose-gc --test test/*.test.js
+          node --expose-gc --test test/memory_leak.test.js
+          cd ../knex-decentdb
+          npm ci
+          node --test test/*.test.js
+
+      - name: Run Dart lifecycle and leak coverage
+        if: matrix.binding == 'dart'
+        env:
+          DECENTDB_NATIVE_LIB: ${{ github.workspace }}/target/debug/libdecentdb.so
+        run: |
+          cd bindings/dart/dart
+          dart pub get
+          dart test --reporter expanded
+          dart test --reporter expanded test/memory_leak_test.dart --concurrency=1

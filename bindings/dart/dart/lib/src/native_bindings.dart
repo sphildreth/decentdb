@@ -563,15 +563,19 @@ class NativeBindings {
   final _StmtAffectedRowsDart stmtAffectedRows;
   final _StmtValueCopyDart stmtValueCopy;
 
+  static final Map<String, NativeBindings> _cache = {};
+
   static NativeBindings load(String path) {
-    final bindings = NativeBindings._(DynamicLibrary.open(path));
-    final abi = bindings.abiVersion();
-    if (abi != expectedAbiVersion) {
-      throw StateError(
-        'DecentDB ABI version mismatch: expected $expectedAbiVersion, got $abi.',
-      );
-    }
-    return bindings;
+    return _cache.putIfAbsent(path, () {
+      final bindings = NativeBindings._(DynamicLibrary.open(path));
+      final abi = bindings.abiVersion();
+      if (abi != expectedAbiVersion) {
+        throw StateError(
+          'DecentDB ABI version mismatch: expected $expectedAbiVersion, got $abi.',
+        );
+      }
+      return bindings;
+    });
   }
 
   static String defaultLibraryName() {
