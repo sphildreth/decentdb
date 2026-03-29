@@ -10,11 +10,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 
+use crate::artifacts::{
+    EnvironmentCapture, ManifestPaths, RunManifest, RunSummary, ScenarioSummary,
+};
 use crate::cli::{InspectStorageArgs, InternalArgs, RunArgs};
 use crate::profiles::{resolve_profile, ProfileOverrides, ResolvedProfile};
 use crate::scenarios::{execute_internal_command, run_scenario};
 use crate::storage_inspector::inspect_db_file;
-use crate::targets::{assess_run, default_targets_path, RunTargetAssessment};
+use crate::targets::{assess_run, default_targets_path};
 use crate::types::{ProfileKind, ScenarioId, ScenarioResult, ScenarioStatus};
 
 #[derive(Debug)]
@@ -42,67 +45,6 @@ impl RunDirectories {
             retained_artifact_dir,
         }
     }
-}
-
-#[derive(Debug, Serialize)]
-struct RunManifest {
-    run_id: String,
-    started_unix_ms: u128,
-    profile: ProfileKind,
-    dry_run: bool,
-    selected_scenarios: Vec<ScenarioId>,
-    resolved_profile: ResolvedProfile,
-    command_line: Vec<String>,
-    paths: ManifestPaths,
-    environment: EnvironmentCapture,
-}
-
-#[derive(Debug, Serialize)]
-struct ManifestPaths {
-    scratch_root: String,
-    artifact_root: String,
-    scratch_run_dir: String,
-    run_dir: String,
-}
-
-#[derive(Debug, Serialize)]
-struct EnvironmentCapture {
-    benchmark_crate_version: String,
-    build_profile: String,
-    rustc_version: Option<String>,
-    os: String,
-    arch: String,
-    git_sha: Option<String>,
-    git_branch: Option<String>,
-    hostname: Option<String>,
-    cwd: String,
-    logical_cores: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct RunSummary {
-    run_id: String,
-    profile: ProfileKind,
-    dry_run: bool,
-    status: String,
-    started_unix_ms: u128,
-    finished_unix_ms: u128,
-    scenario_count: usize,
-    passed: usize,
-    failed: usize,
-    skipped: usize,
-    scenarios: Vec<ScenarioSummary>,
-    warnings: Vec<String>,
-    target_assessment: Option<RunTargetAssessment>,
-}
-
-#[derive(Debug, Serialize)]
-struct ScenarioSummary {
-    scenario_id: ScenarioId,
-    status: ScenarioStatus,
-    error_class: Option<String>,
-    artifact_file: String,
-    headline_metrics: BTreeMap<String, serde_json::Value>,
 }
 
 pub(crate) fn run_command(args: RunArgs) -> Result<()> {

@@ -19,6 +19,7 @@ struct TargetsFile {
 
 #[derive(Debug, Deserialize)]
 struct TargetsMetadata {
+    authoritative_host_class: Option<String>,
     authoritative_build: Option<String>,
     authoritative_benchmark_profile: Option<String>,
 }
@@ -32,6 +33,7 @@ struct RatingConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct TargetMetric {
     id: String,
+    display_name: Option<String>,
     scenario: String,
     metric: String,
     priority: String,
@@ -54,7 +56,7 @@ pub(crate) enum TargetDirection {
     LargerIsBetter,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RunTargetAssessment {
     pub targets_file: String,
     pub format_version: u32,
@@ -70,7 +72,7 @@ pub(crate) struct RunTargetAssessment {
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MetricAssessment {
     pub target_id: String,
     pub scenario: String,
@@ -90,8 +92,81 @@ pub(crate) struct MetricAssessment {
     pub durability_mode: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TargetCatalog {
+    pub format_version: u32,
+    pub authoritative_build: Option<String>,
+    pub authoritative_benchmark_profile: Option<String>,
+    pub authoritative_host_class: Option<String>,
+    pub metrics: Vec<TargetMetricSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TargetMetricSpec {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub scenario: String,
+    pub metric: String,
+    pub priority: String,
+    pub signature: bool,
+    pub direction: TargetDirection,
+    pub unit: String,
+    pub weight: f64,
+    pub floor: Option<f64>,
+    pub target: Option<f64>,
+    pub stretch: Option<f64>,
+    pub cache_mode: Option<String>,
+    pub durability_mode: Option<String>,
+    pub likely_owners: Vec<String>,
+}
+
 pub(crate) fn default_targets_path() -> PathBuf {
     PathBuf::from(DEFAULT_TARGETS_PATH)
+}
+
+pub(crate) fn load_targets_catalog(targets_path: &Path) -> Result<TargetCatalog> {
+    let contents = fs::read_to_string(targets_path)
+        .with_context(|| format!("read targets file {}", targets_path.display()))?;
+    let targets: TargetsFile = toml::from_str(&contents)
+        .with_context(|| format!("parse targets file {}", targets_path.display()))?;
+    let metrics = targets
+        .metric
+        .into_iter()
+        .map(|metric| TargetMetricSpec {
+            id: metric.id,
+            display_name: metric.display_name,
+            scenario: metric.scenario,
+            metric: metric.metric,
+            priority: metric.priority,
+            signature: metric.signature,
+            direction: metric.direction,
+            unit: metric.unit,
+            weight: metric.weight,
+            floor: metric.floor,
+            target: metric.target,
+            stretch: metric.stretch,
+            cache_mode: metric.cache_mode,
+            durability_mode: metric.durability_mode,
+            likely_owners: metric.likely_owners,
+        })
+        .collect();
+
+    Ok(TargetCatalog {
+        format_version: targets.format_version,
+        authoritative_build: targets
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.authoritative_build.clone()),
+        authoritative_benchmark_profile: targets
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.authoritative_benchmark_profile.clone()),
+        authoritative_host_class: targets
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.authoritative_host_class.clone()),
+        metrics,
+    })
 }
 
 pub(crate) fn assess_run(

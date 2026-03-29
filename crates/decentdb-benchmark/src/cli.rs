@@ -18,6 +18,12 @@ pub struct Cli {
 pub enum Command {
     /// Run one or more benchmark scenarios.
     Run(RunArgs),
+    /// Compare benchmark artifacts and rank optimization opportunities.
+    Compare(CompareArgs),
+    /// Manage named local baseline snapshots.
+    Baseline(BaselineArgs),
+    /// Render run or compare artifacts for humans or coding agents.
+    Report(ReportArgs),
     /// Inspect storage layout and page attribution for an existing .ddb file.
     InspectStorage(InspectStorageArgs),
     /// Internal helper commands used by benchmark scenarios.
@@ -109,6 +115,89 @@ pub struct InspectStorageArgs {
     /// Optional output path for JSON (prints to stdout when omitted).
     #[arg(long)]
     pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CompareArgs {
+    /// Candidate run summary path.
+    #[arg(long)]
+    pub candidate: PathBuf,
+
+    /// Explicit baseline run summary path.
+    #[arg(long)]
+    pub baseline: Option<PathBuf>,
+
+    /// Named baseline under build/bench/baselines/<name>.json.
+    #[arg(long)]
+    pub baseline_name: Option<String>,
+
+    /// Targets metadata path.
+    #[arg(long, default_value = "benchmarks/targets.toml")]
+    pub targets: PathBuf,
+
+    /// Retained artifact root.
+    #[arg(long, default_value = "build/bench")]
+    pub artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct BaselineArgs {
+    #[command(subcommand)]
+    pub command: BaselineCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum BaselineCommand {
+    /// Create or replace a named baseline snapshot from a run summary.
+    Set(BaselineSetArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct BaselineSetArgs {
+    /// Baseline name.
+    #[arg(long)]
+    pub name: String,
+
+    /// Input run summary path.
+    #[arg(long)]
+    pub input: PathBuf,
+
+    /// Retained artifact root.
+    #[arg(long, default_value = "build/bench")]
+    pub artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ReportFormat {
+    Markdown,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ReportAudience {
+    Human,
+    AgentBrief,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ReportArgs {
+    /// Run summary input for snapshot reports.
+    #[arg(long)]
+    pub input: Option<PathBuf>,
+
+    /// Compare artifact input for progress and ranking reports.
+    #[arg(long)]
+    pub compare: Option<PathBuf>,
+
+    /// Report format.
+    #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+    pub format: ReportFormat,
+
+    /// Report audience profile.
+    #[arg(long, value_enum, default_value_t = ReportAudience::Human)]
+    pub audience: ReportAudience,
 }
 
 #[derive(Debug, Clone, Args)]

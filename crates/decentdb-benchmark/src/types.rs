@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use clap::ValueEnum;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileKind {
     Smoke,
@@ -24,7 +24,7 @@ impl ProfileKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ScenarioId {
     #[value(name = "durable_commit_single")]
@@ -113,7 +113,7 @@ impl ScenarioId {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScenarioStatus {
     Passed,
@@ -121,7 +121,7 @@ pub enum ScenarioStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistogramSummary {
     pub unit: String,
     pub sample_count: u64,
@@ -133,7 +133,7 @@ pub struct HistogramSummary {
     pub stddev_us: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioResult {
     pub status: ScenarioStatus,
     pub error_class: Option<String>,

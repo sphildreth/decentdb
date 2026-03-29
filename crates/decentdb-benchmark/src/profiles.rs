@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::cli::RunArgs;
 use crate::types::ProfileKind;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedProfile {
     pub kind: ProfileKind,
     pub rows: u64,
