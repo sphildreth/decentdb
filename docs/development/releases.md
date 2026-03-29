@@ -5,7 +5,7 @@ binding matrix.
 
 ## CI lanes
 
-- `PR Fast`: `.github/workflows/pr-fast.yml`
+- `CI`: `.github/workflows/ci.yml`
   - format
   - clippy
   - engine tests
@@ -52,7 +52,7 @@ Each listed binding is validated or smoke-tested directly against the stable C A
 
 ## Release checklist
 
-1. `PR Fast` is green on `main`.
+1. `CI` is green on `main`.
 2. The nightly soak and benchmark jobs are green.
 3. The benchmark output is captured for the named workloads.
 4. The binding matrix remains green.
