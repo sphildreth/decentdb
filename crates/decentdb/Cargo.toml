@@ -19,6 +19,8 @@ md5 = "0.7"
 sha2 = "0.10"
 
 [dev-dependencies]
+criterion = "0.5"
+iai-callgrind = "0.14"
 proptest = "1.5"
 insta = { version = "1.39", features = ["json"] }
 rusqlite = "0.31"
@@ -39,3 +41,13 @@ harness = false
 [[bench]]
 name = "embedded_compare"
 harness = false
+
+[[bench]]
+name = "micro_hot_paths"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
+name = "micro_hot_paths_callgrind"
+harness = false
+required-features = ["bench-internals"]

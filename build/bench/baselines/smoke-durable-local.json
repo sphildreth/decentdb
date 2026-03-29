@@ -2,19 +2,19 @@
   "artifact_kind": "decentdb_benchmark_baseline_snapshot",
   "schema_version": 1,
   "baseline_name": "smoke-durable-local",
-  "created_unix_ms": 1774818069684,
-  "source_summary": "build/bench/runs/unix-1774818061241-smoke-38bf1b9/summary.json",
-  "source_manifest": "build/bench/runs/unix-1774818061241-smoke-38bf1b9/manifest.json",
+  "created_unix_ms": 1774818967402,
+  "source_summary": "build/bench/runs/unix-1774818937301-smoke-1f1877a/summary.json",
+  "source_manifest": "build/bench/runs/unix-1774818937301-smoke-1f1877a/manifest.json",
   "snapshot": {
-    "run_id": "unix-1774818061241-smoke-38bf1b9",
+    "run_id": "unix-1774818937301-smoke-1f1877a",
     "profile": "smoke",
     "status": "passed",
-    "started_unix_ms": 1774818061241,
-    "finished_unix_ms": 1774818063086,
+    "started_unix_ms": 1774818937301,
+    "finished_unix_ms": 1774818939131,
     "build_profile": "debug",
     "os": "linux",
     "arch": "x86_64",
-    "git_sha": "38bf1b9",
+    "git_sha": "1f1877a",
     "git_branch": "sph-2026-03-29.1041",
     "summary_warnings": [
       "run is not in the authoritative grading context; expected build=release profile=nightly, got build=debug profile=smoke",
@@ -29,32 +29,32 @@
       {
         "scenario": "durable_commit_single",
         "metric": "commit_max_us",
-        "value": 6553.599
+        "value": 5955.583
       },
       {
         "scenario": "durable_commit_single",
         "metric": "commit_mean_us",
-        "value": 2998.417408000001
+        "value": 2977.8687999999993
       },
       {
         "scenario": "durable_commit_single",
         "metric": "commit_p50_us",
-        "value": 2996.223
+        "value": 2998.271
       },
       {
         "scenario": "durable_commit_single",
         "metric": "commit_p95_us",
-        "value": 3028.991
+        "value": 3031.039
       },
       {
         "scenario": "durable_commit_single",
         "metric": "commit_p99_us",
-        "value": 3198.975
+        "value": 3993.599
       },
       {
         "scenario": "durable_commit_single",
         "metric": "commit_stddev_us",
-        "value": 232.1087720121614
+        "value": 293.67085296220995
       },
       {
         "scenario": "durable_commit_single",
@@ -64,7 +64,7 @@
       {
         "scenario": "durable_commit_single",
         "metric": "commits_per_sec",
-        "value": 333.5100491913982
+        "value": 335.80854205335845
       },
       {
         "scenario": "durable_commit_single",
@@ -79,12 +79,12 @@
       {
         "scenario": "durable_commit_single",
         "metric": "txn_max_us",
-        "value": 6565.887
+        "value": 5971.967
       },
       {
         "scenario": "durable_commit_single",
         "metric": "txn_mean_us",
-        "value": 3012.122623999999
+        "value": 2990.1527040000005
       },
       {
         "scenario": "durable_commit_single",
@@ -99,17 +99,17 @@
       {
         "scenario": "durable_commit_single",
         "metric": "txn_p99_us",
-        "value": 3211.263
+        "value": 4003.839
       },
       {
         "scenario": "durable_commit_single",
         "metric": "txn_stddev_us",
-        "value": 233.78154878315488
+        "value": 294.6615905047693
       },
       {
         "scenario": "durable_commit_single",
         "metric": "txns_per_sec",
-        "value": 331.9912864451469
+        "value": 334.42993309711795
       },
       {
         "scenario": "durable_commit_single",
