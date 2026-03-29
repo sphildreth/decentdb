@@ -57,6 +57,34 @@ In short:
 - **Criterion.rs** = microscope for hot functions
 - **iai-callgrind** = deterministic CI regression detector for selected kernels
 
+### Relationship to existing benchmark code
+
+DecentDB already has benchmark-style code in:
+
+- `crates/decentdb/benches/release_metrics.rs`
+- `crates/decentdb/benches/embedded_compare.rs`
+
+Those existing tools should inform the migration plan rather than be ignored.
+
+Recommended handling:
+
+- `release_metrics.rs` is the closest ancestor of the new macro benchmark runner and should be folded into `decentdb-benchmark` over time
+- `embedded_compare.rs` serves a different purpose: cross-engine comparison, external positioning, and docs-facing comparisons
+- the new benchmark runner should become the authoritative DecentDB-only KPI source
+- `embedded_compare.rs` may remain as a separate comparison tool during the migration and can later consume artifacts or shared helpers from the new benchmark system if useful
+
+Migration strategy:
+
+- add `crates/decentdb-benchmark` as a new workspace member
+- keep the existing `[[bench]]` entries during transition
+- migrate `release_metrics.rs` scenarios into the new runner until there is scenario parity
+- retire `release_metrics.rs` only after the new runner fully replaces its useful coverage
+
+Implementation note:
+
+- the existing comparison bench already uses `hdrhistogram`, `serde`, and `serde_json`
+- those should become normal dependencies of `decentdb-benchmark` rather than remaining incidental `decentdb` bench-only dev-dependencies
+
 ---
 
 ## 3. Design Goals
@@ -220,6 +248,8 @@ crates/decentdb-benchmark/
     workload_validation_tests.rs
 ```
 
+This layout is an end-state shape, not a phase-1 requirement. The first implementation can begin with a flatter module structure and split files only when the scenario count and artifact logic justify it.
+
 ## 5.3 Architectural layers
 
 ```mermaid
@@ -281,6 +311,18 @@ This is justified because otherwise the benchmark system will measure incidental
 
 Prefer implementing `bench-internals` as a narrowly scoped Cargo feature on the DecentDB engine crates rather than as a separate helper crate. The benchmark-only hooks should stay physically close to the code they expose.
 
+The preferred VFS instrumentation shape is a compositional wrapper such as:
+
+- `StatsVfs::wrap(Arc<dyn Vfs>)`
+- `StatsVfsFile`
+
+This should mirror the existing `FaultyVfs::wrap(...)` pattern so that instrumentation feels like a natural extension of the current VFS design rather than a parallel subsystem.
+
+That also keeps wrapper composition explicit. For example:
+
+- `OsVfs -> StatsVfs` for ordinary benchmark runs
+- `OsVfs -> StatsVfs -> FaultyVfs` or `OsVfs -> FaultyVfs -> StatsVfs` when a scenario needs both fault behavior and accounting
+
 ## 6.3 Cross-process isolation
 
 The runner should support executing each scenario in an isolated child process.
@@ -302,6 +344,52 @@ Cross-process isolation should be **scenario-driven**, not universal.
 
 - required by default for startup, recovery, reopen, crash-safety, and cold-process scenarios
 - optional for steady-state warm benchmarks where in-process execution keeps harness overhead lower
+
+## 6.4 API surface requirements
+
+The benchmark runner should start by leaning on the existing public Rust surface, not by inventing a separate control plane.
+
+For phase 1, the runner should be able to work through:
+
+- `Db::open`
+- `Db::open_or_create`
+- `Db::prepare`
+- `Db::checkpoint`
+- `Db::config`
+
+The current `DbConfig` surface already exposes useful benchmark knobs:
+
+- `page_size`
+- `cache_size_mb`
+- `wal_sync_mode`
+- `checkpoint_timeout_sec`
+- `trigram_postings_threshold`
+- `temp_dir`
+
+That is enough to begin the first benchmark phases.
+
+Potential later gaps that may justify API expansion:
+
+- explicit checkpoint-byte targets
+- more direct cache sizing controls for benchmark hosts
+- benchmark-oriented toggles for storage maintenance policy
+
+The plan should prefer using the current public API first and only extend it when a benchmark requirement is clearly blocked.
+
+## 6.5 Parse and plan boundary
+
+The `prepare_parse_plan` scenario should measure the real DecentDB parse-and-plan path, including the `libpg_query_sys` FFI boundary.
+
+That means the benchmark intentionally includes:
+
+- Rust-side call overhead
+- parser FFI overhead
+- parser allocation behavior
+- DecentDB planning work after parsing
+
+It is **not** intended to be a pure parser microbenchmark in phase 1.
+
+Isolating the parser's internal C-only cost would require additional parser-side instrumentation and is out of scope for the first version of the benchmark system.
 
 ---
 
@@ -714,6 +802,8 @@ Recommended crates:
 - `serde` / `serde_json` for output
 - `clap` for CLI
 
+`hdrhistogram` should be a normal dependency of `decentdb-benchmark`, not something inherited accidentally from the existing `decentdb` bench dev-dependencies.
+
 No heavy measurement framework is required for the macro runner.
 
 ## 12.2 Warmup and trials
@@ -759,6 +849,7 @@ Examples:
 
 Where relevant, the runner should label each measurement explicitly as:
 
+- `in_memory`
 - `warm_cache`
 - `cold_process`
 - `cold_os_cache`
@@ -766,6 +857,18 @@ Where relevant, the runner should label each measurement explicitly as:
 `cold_os_cache` may require elevated privileges or host configuration and should be optional.
 
 `cold_process` is the portable default for reopen/startup style measurements.
+
+`in_memory` is useful for isolating planner, executor, and pure data-structure behavior, but it is never authoritative for:
+
+- durable commit metrics
+- checkpoint metrics
+- recovery metrics
+- storage-efficiency metrics
+
+Some scenarios should therefore support multiple cache modes by design:
+
+- point lookup and range scan may run in `in_memory`, `warm_cache`, and `cold_process` variants
+- durable commit, checkpoint, recovery, and storage scenarios must use real-filesystem modes only
 
 ## 12.4 Concurrency measurement
 
@@ -849,6 +952,8 @@ build/bench/
 
 This split keeps temporary execution debris out of the repository while preserving durable benchmark artifacts for comparison and publication.
 
+This is intentional. The legacy `embedded_compare` benchmark writes under `target/`, but the new benchmark system keeps retained artifacts outside `target/` so that `cargo clean` does not erase baselines, comparison inputs, or publishable benchmark history.
+
 The benchmark system should emit structured artifacts under:
 
 ```text
@@ -885,6 +990,7 @@ The manifest should record:
 Every scenario result should contain:
 
 - `status`
+- `error_class`
 - `scenario_id`
 - `profile`
 - `workload`
@@ -904,6 +1010,7 @@ Every scenario result should contain:
 ```json
 {
   "status": "passed",
+  "error_class": null,
   "scenario_id": "durable_commit_single",
   "profile": "nightly",
   "workload": "oltp_narrow",
@@ -943,10 +1050,13 @@ Benchmark runs should fail transparently, not disappear silently.
 The runner should support:
 
 - per-scenario status values such as `passed`, `failed`, `timed_out`, and `skipped`
+- structured `error_class` values such as `engine_error`, `timeout`, `harness_panic`, `disk_full`, and `invalid_environment`
 - per-scenario timeout controls
 - child-process crash containment for isolated scenarios
 - preservation of partial artifacts when a later scenario fails
 - summary-level warnings when a run is incomplete or non-authoritative
+
+When a scenario fails because the engine returned an error, the result should preserve enough structured detail to distinguish "engine behavior" from "benchmark harness failure."
 
 If a scenario panics, times out, fills the disk, or otherwise aborts, the parent process should still emit:
 
@@ -999,6 +1109,21 @@ A practical default is:
 ```text
 noise_band = max(absolute_threshold, relative_threshold * baseline_value)
 ```
+
+Recommended starting defaults for Tier 1 metrics:
+
+| Metric | Absolute threshold | Relative threshold |
+| --- | --- | --- |
+| `commit_p95_us` | `50 us` | `10%` |
+| `point_lookup_warm_p95_us` | `5 us` | `15%` |
+| `point_lookup_cold_p95_us` | `100 us` | `15%` |
+| `range_scan_rows_per_sec` | `5000 rows/s` | `10%` |
+| `reader_p95_degradation_ratio` | `0.05x` | `10%` |
+| `checkpoint_ms` | `10 ms` | `10%` |
+| `recovery_reopen_ms` | `10 ms` | `10%` |
+| `space_amplification` | `0.02x` | `5%` |
+
+These are starting values for the first authoritative Linux host class, not universal truths. Host-class-specific overrides are expected as the benchmark system matures.
 
 Comparison validity should also require:
 
@@ -1154,6 +1279,8 @@ cargo run -p decentdb-benchmark --release -- \
 cargo run -p decentdb-benchmark --release -- \
   run --profile custom --rows 15000000 --scenario storage_efficiency
 ```
+
+`run` should also support a `--dry-run` mode that resolves the profile, validates paths and feature availability, checks that the output location is writable, and warns about obvious problems such as missing free space without actually running the scenarios.
 
 ## 16.2 `compare`
 
