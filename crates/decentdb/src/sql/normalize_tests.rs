@@ -16,7 +16,7 @@ mod tests {
                 cascade,
             } => {
                 assert_eq!(table_name, "t");
-                assert_eq!(cascade, true);
+                assert!(cascade);
                 use crate::sql::ast::TruncateIdentityMode;
                 assert_eq!(identity, TruncateIdentityMode::Restart);
             }
