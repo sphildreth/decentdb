@@ -822,8 +822,7 @@ mod savepoint_tests {
 #[cfg(test)]
 mod in_memory_page_store_tests {
     use crate::storage::page::{
-        InMemoryPageStore, PageStore, CATALOG_ROOT_PAGE_ID, DEFAULT_PAGE_SIZE,
-        SUPPORTED_PAGE_SIZES,
+        InMemoryPageStore, PageStore, CATALOG_ROOT_PAGE_ID, DEFAULT_PAGE_SIZE, SUPPORTED_PAGE_SIZES,
     };
 
     #[test]

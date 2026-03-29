@@ -366,8 +366,8 @@ fn sql_transaction_reads_see_committed_snapshot_at_start() {
     // Outside the transaction another row would be visible after commit,
     // but inside the transaction we still see the state as of BEGIN.
     exec(&db, "INSERT INTO t VALUES (2)"); // This will be blocked by BEGIN (single writer).
-    // Actually for single-writer model, we can't insert while inside a read txn
-    // at SQL level without BEGIN WRITE. Let's just verify the count inside the txn.
+                                           // Actually for single-writer model, we can't insert while inside a read txn
+                                           // at SQL level without BEGIN WRITE. Let's just verify the count inside the txn.
     assert_eq!(
         count_during_txn.rows()[0].values()[0],
         Value::Int64(1),

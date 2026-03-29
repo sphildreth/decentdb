@@ -14,6 +14,13 @@ pub(crate) mod views;
 #[cfg(test)]
 mod views_tests;
 
+#[cfg(test)]
+mod dml_more_tests;
+#[cfg(test)]
+mod dml_unit_tests;
+#[cfg(test)]
+mod runtime_unit_tests;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -14136,3 +14143,7 @@ pub(super) fn column_schema<'a>(
         .iter()
         .find(|column| identifiers_equal(&column.name, column_name))
 }
+
+mod more_exec_tests;
+#[cfg(test)]
+mod runtime_tests;

@@ -525,4 +525,61 @@ mod tests {
 
         clear_failpoints().expect("clear failpoints");
     }
+
+    #[test]
+    fn classify_functions_return_expected_labels() {
+        // read/sync classifications
+        assert_eq!(super::classify_read(FileKind::Database), "db.read");
+        assert_eq!(super::classify_read(FileKind::Wal), "wal.read");
+        assert_eq!(super::classify_sync(FileKind::Database), "db.fsync");
+        assert_eq!(super::classify_sync(FileKind::Wal), "wal.fsync");
+        assert_eq!(
+            super::classify_metadata_sync(FileKind::Database),
+            "db.sync_metadata"
+        );
+        assert_eq!(
+            super::classify_metadata_sync(FileKind::Wal),
+            "wal.sync_metadata"
+        );
+
+        // database write classification
+        let header = vec![0u8; 128];
+        assert_eq!(
+            super::classify_write(FileKind::Database, 0, &header),
+            "db.write_header"
+        );
+        let page = vec![1u8; 10];
+        assert_eq!(
+            super::classify_write(FileKind::Database, 4096, &page),
+            "db.write_page"
+        );
+
+        // wal write classification
+        let wal_header = vec![0u8; 32];
+        assert_eq!(
+            super::classify_write(FileKind::Wal, 0, &wal_header),
+            "wal.write_header"
+        );
+
+        let mut f0 = vec![0u8; 10];
+        f0[0] = 0;
+        assert_eq!(
+            super::classify_write(FileKind::Wal, 10, &f0),
+            "wal.write_frame"
+        );
+        f0[0] = 1;
+        assert_eq!(
+            super::classify_write(FileKind::Wal, 10, &f0),
+            "wal.write_commit"
+        );
+        f0[0] = 2;
+        assert_eq!(
+            super::classify_write(FileKind::Wal, 10, &f0),
+            "wal.write_checkpoint"
+        );
+        f0[0] = 3;
+        assert_eq!(super::classify_write(FileKind::Wal, 10, &f0), "wal.write");
+
+        clear_failpoints().expect("clear failpoints");
+    }
 }

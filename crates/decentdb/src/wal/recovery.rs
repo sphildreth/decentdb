@@ -132,4 +132,86 @@ mod tests {
         let header = WalHeader::decode(&header_bytes).expect("decode wal header");
         assert_eq!(header.page_size, page::DEFAULT_PAGE_SIZE);
     }
+
+    #[test]
+    fn wal_header_page_size_mismatch() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        // Write a header with a different page size
+        let header = WalHeader::new(page::DEFAULT_PAGE_SIZE * 2, 0);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        file.set_len(WAL_HEADER_SIZE).expect("size wal header");
+
+        let error = initialize_or_recover(&file, page::DEFAULT_PAGE_SIZE).expect_err("mismatch");
+        assert!(matches!(error, crate::error::DbError::Corruption { .. }));
+    }
+
+    #[test]
+    fn wal_header_end_offset_exceeds_file_size() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        // Set wal_end_offset to be larger than the actual file size
+        let header = WalHeader::new(page::DEFAULT_PAGE_SIZE, WAL_HEADER_SIZE + 100);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        file.set_len(WAL_HEADER_SIZE).expect("size wal header");
+
+        let error = initialize_or_recover(&file, page::DEFAULT_PAGE_SIZE).expect_err("end_exceeds");
+        assert!(matches!(error, crate::error::DbError::Corruption { .. }));
+    }
+
+    #[test]
+    fn replay_committed_frames_populates_index() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frames = vec![
+            crate::wal::format::WalFrame::page(3, vec![0xAA; ps as usize]),
+            crate::wal::format::WalFrame::commit(),
+        ];
+        let mut data = Vec::new();
+        for f in &frames {
+            data.extend_from_slice(&f.encode(ps).unwrap());
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
+        file.set_len(logical_end).expect("set len");
+
+        let (index, end, max_page_id) = initialize_or_recover(&file, ps).expect("recover");
+        assert_eq!(index.version_count(), 1);
+        assert_eq!(end, logical_end);
+        assert_eq!(max_page_id, 3);
+    }
+
+    #[test]
+    fn partial_frames_at_end_are_ignored() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let frame = crate::wal::format::WalFrame::page(1, vec![0xBB; ps as usize]);
+        let mut data = frame.encode(ps).unwrap();
+        // Truncate the last byte to simulate a torn/partial write
+        data.truncate(data.len() - 1);
+
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write partial frame");
+        file.set_len(logical_end).expect("set len");
+
+        let (index, _end, _max_page_id) = initialize_or_recover(&file, ps).expect("recover");
+        // No committed frames -> index should be empty
+        assert_eq!(index.version_count(), 0);
+    }
 }

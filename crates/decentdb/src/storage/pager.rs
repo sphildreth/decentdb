@@ -402,4 +402,18 @@ mod tests {
             std::process::id()
         ))
     }
+
+    #[test]
+    fn header_from_disk_reads_header_written_to_vfs() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("header-from-disk");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
+        let on_disk = pager.header_from_disk().expect("read header from disk");
+        assert_eq!(on_disk, header);
+    }
 }

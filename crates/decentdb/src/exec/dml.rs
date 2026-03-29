@@ -3435,3 +3435,124 @@ fn validate_assigned_not_null_columns(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn values_equal_basic() {
+        assert!(values_equal(&[Value::Int64(1)], &[Value::Int64(1)]).unwrap());
+        assert!(!values_equal(&[Value::Int64(1)], &[Value::Int64(2)]).unwrap());
+        assert!(!values_equal(&[Value::Int64(1)], &[Value::Int64(1), Value::Int64(1)]).unwrap());
+    }
+
+    #[test]
+    fn primary_row_id_and_next_row_id() {
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: true,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 42,
+        };
+        assert_eq!(primary_row_id(&table, &[Value::Int64(7)]), Some(7));
+
+        let mut runtime = EngineRuntime::empty(0);
+        runtime
+            .catalog
+            .tables
+            .insert("t".to_string(), table.clone());
+        assert_eq!(next_row_id(&mut runtime, "t"), 42);
+        assert_eq!(runtime.catalog.tables.get("t").unwrap().next_row_id, 43);
+
+        // temp table path
+        let mut runtime2 = EngineRuntime::empty(0);
+        let mut temp_table = table.clone();
+        temp_table.name = "temp_t".to_string();
+        runtime2
+            .temp_tables
+            .insert(temp_table.name.clone(), temp_table);
+        assert_eq!(next_row_id(&mut runtime2, "temp_t"), 42);
+    }
+
+    #[test]
+    fn prepared_index_contains_null_and_key() {
+        let index = PreparedBtreeIndex {
+            name: "i".to_string(),
+            column_indexes: vec![1],
+            int64_key: false,
+            nullable: true,
+            unique: false,
+        };
+        let row = vec![Value::Text("a".to_string()), Value::Null];
+        assert!(prepared_index_contains_null(&index, &row));
+
+        let index2 = PreparedBtreeIndex {
+            name: "i2".to_string(),
+            column_indexes: vec![0],
+            int64_key: true,
+            nullable: false,
+            unique: false,
+        };
+        let key = prepared_btree_index_key(&index2, &vec![Value::Int64(99)]).unwrap();
+        assert_eq!(key, RuntimeBtreeKey::Int64(99));
+
+        let index3 = PreparedBtreeIndex {
+            name: "i3".to_string(),
+            column_indexes: vec![0],
+            int64_key: false,
+            nullable: false,
+            unique: false,
+        };
+        if let RuntimeBtreeKey::Encoded(bytes) =
+            prepared_btree_index_key(&index3, &vec![Value::Text("x".to_string())]).unwrap()
+        {
+            let expected = encode_index_key(&Value::Text("x".to_string())).unwrap();
+            assert_eq!(bytes, expected);
+        } else {
+            panic!("expected encoded key");
+        }
+    }
+
+    #[test]
+    fn validate_assigned_not_null_columns_errors() {
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "a".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: false,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec![],
+            next_row_id: 1,
+        };
+        assert!(validate_assigned_not_null_columns(&table, &[0], &[Value::Null], "t").is_err());
+        assert!(validate_assigned_not_null_columns(&table, &[0], &[Value::Int64(1)], "t").is_ok());
+    }
+}

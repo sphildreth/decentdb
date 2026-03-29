@@ -129,7 +129,10 @@ fn schema_cookie_is_nonzero_after_ddl() {
     let db = Db::open_or_create(":memory:", DbConfig::default()).unwrap();
     exec(&db, "CREATE TABLE t(id INT64)");
     let cookie = db.schema_cookie().unwrap();
-    assert!(cookie > 0, "schema cookie should be positive after CREATE TABLE");
+    assert!(
+        cookie > 0,
+        "schema cookie should be positive after CREATE TABLE"
+    );
 }
 
 /// Each DDL statement increments the schema cookie by a positive amount.
