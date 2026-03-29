@@ -7,8 +7,8 @@ This directory contains the DecentDB documentation site built with [MkDocs](http
 ### Prerequisites
 
 ```bash
-pip install mkdocs-material
-pip install mkdocs-minify-plugin
+python -m pip install --upgrade pip
+pip install -r docs/requirements.txt
 ```
 
 ### Serve Locally
