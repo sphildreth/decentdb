@@ -172,6 +172,7 @@ pub struct BaselineSetArgs {
 pub enum ReportFormat {
     Markdown,
     Text,
+    Html,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -187,9 +188,21 @@ pub struct ReportArgs {
     #[arg(long)]
     pub input: Option<PathBuf>,
 
+    /// Use the most recent run summary under build/bench/runs/.
+    #[arg(long)]
+    pub latest_run: bool,
+
     /// Compare artifact input for progress and ranking reports.
     #[arg(long)]
     pub compare: Option<PathBuf>,
+
+    /// Use the most recent compare artifact under build/bench/compares/.
+    #[arg(long)]
+    pub latest_compare: bool,
+
+    /// Artifact root used by --latest-run / --latest-compare discovery.
+    #[arg(long, default_value = "build/bench")]
+    pub artifact_root: PathBuf,
 
     /// Report format.
     #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
@@ -198,6 +211,10 @@ pub struct ReportArgs {
     /// Report audience profile.
     #[arg(long, value_enum, default_value_t = ReportAudience::Human)]
     pub audience: ReportAudience,
+
+    /// Optional output file path. Prints to stdout when omitted.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -4,6 +4,76 @@ Last updated: March 29, 2026
 
 This guide explains how to use `decentdb-benchmark` as the primary macro benchmark tool for DecentDB.
 
+> TL;DR (most common workflow)
+>
+> 1. Run baseline benchmark and capture printed `summary=...` path as `SUMMARY1`.
+> 2. Save baseline snapshot: `baseline set --name local-dev --input SUMMARY1`.
+> 3. Make code changes to optimize.
+> 4. Run benchmark again with same profile/scenarios/seed and capture `summary=...` as `SUMMARY2`.
+> 5. Compare: `compare --baseline-name local-dev --candidate SUMMARY2`.
+> 6. Render readable output from compare artifact via `report --format text` (or `--format markdown`).
+>
+> Copy/paste commands (from repo root):
+>
+> ```bash
+> # 1) baseline run
+> cargo run --quiet -p decentdb-benchmark -- run \
+>   --profile smoke \
+>   --scenario durable_commit_single \
+>   --scenario point_lookup_warm \
+>   --scenario storage_efficiency \
+>   --seed 12345
+>
+> # 2) set named baseline (replace SUMMARY1 with printed summary path)
+> cargo run --quiet -p decentdb-benchmark -- baseline set \
+>   --name local-dev \
+>   --input SUMMARY1
+>
+> # 3) make code changes
+>
+> # 4) candidate run (same knobs as baseline)
+> cargo run --quiet -p decentdb-benchmark -- run \
+>   --profile smoke \
+>   --scenario durable_commit_single \
+>   --scenario point_lookup_warm \
+>   --scenario storage_efficiency \
+>   --seed 12345
+>
+> # 5) compare (replace SUMMARY2 with candidate summary path)
+> cargo run --quiet -p decentdb-benchmark -- compare \
+>   --baseline-name local-dev \
+>   --candidate SUMMARY2
+>
+> # 6) report (replace COMPARE_JSON with printed/known compare artifact path)
+> cargo run --quiet -p decentdb-benchmark -- report \
+>   --compare COMPARE_JSON \
+>   --format text
+> ```
+>
+> Keep environment stable for useful comparisons: same host, same profile, same scenarios, same seed.
+
+> TL;DR (today dashboard HTML)
+>
+> ```bash
+> # Latest run -> HTML dashboard with all measured metric values
+> cargo run --quiet -p decentdb-benchmark -- report \
+>   --latest-run \
+>   --format html \
+>   --output build/bench/reports/today-dashboard.html
+>
+> # Latest compare -> HTML dashboard for regressions/improvements
+> cargo run --quiet -p decentdb-benchmark -- report \
+>   --latest-compare \
+>   --format html \
+>   --output build/bench/reports/today-compare.html
+> ```
+>
+> Then open:
+>
+> ```bash
+> xdg-open build/bench/reports/today-dashboard.html
+> ```
+
 It covers:
 
 - Running benchmark scenarios (`run`)
@@ -59,6 +129,9 @@ cargo run -p decentdb-benchmark -- compare --baseline-name smoke-local --candida
 
 # Render report from compare artifact
 cargo run -p decentdb-benchmark -- report --compare build/bench/compares/<compare-id>.json --format markdown
+
+# Render HTML dashboard report to a file
+cargo run -p decentdb-benchmark -- report --latest-run --format html --output build/bench/reports/today-dashboard.html
 
 # Render compact agent-focused text report
 cargo run -p decentdb-benchmark -- report --compare build/bench/compares/<compare-id>.json --format text --audience agent_brief
@@ -634,18 +707,35 @@ cargo run -p decentdb-benchmark -- report --help
 
 `report` renders either:
 
-- run summary (`--input`), or
-- compare artifact (`--compare`)
+- run summary (`--input` or `--latest-run`), or
+- compare artifact (`--compare` or `--latest-compare`)
+
+Input source rules:
+
+- choose exactly one run source or compare source
+- do not combine run and compare sources in one command
+
+Latest discovery:
+
+- `--latest-run` picks newest `summary.json` under `build/bench/runs/`
+- `--latest-compare` picks newest compare JSON under `build/bench/compares/`
+- `--artifact-root` overrides `build/bench` for latest discovery
 
 Formats:
 
 - `--format markdown`
 - `--format text`
+- `--format html`
 
 Audiences:
 
 - `--audience human` (default)
 - `--audience agent_brief`
+
+Output behavior:
+
+- print to stdout by default
+- use `--output <path>` to write report file directly
 
 ## 9.1 Report examples from run summary
 
@@ -663,6 +753,24 @@ Text snapshot:
 cargo run -p decentdb-benchmark -- report \
   --input build/bench/runs/<run-id>/summary.json \
   --format text
+```
+
+HTML dashboard from explicit run:
+
+```bash
+cargo run -p decentdb-benchmark -- report \
+  --input build/bench/runs/<run-id>/summary.json \
+  --format html \
+  --output build/bench/reports/run-dashboard.html
+```
+
+HTML dashboard from latest run (recommended):
+
+```bash
+cargo run -p decentdb-benchmark -- report \
+  --latest-run \
+  --format html \
+  --output build/bench/reports/today-dashboard.html
 ```
 
 Agent brief from run summary:
@@ -692,6 +800,24 @@ cargo run -p decentdb-benchmark -- report \
   --format text
 ```
 
+HTML compare dashboard from explicit artifact:
+
+```bash
+cargo run -p decentdb-benchmark -- report \
+  --compare build/bench/compares/<compare-id>.json \
+  --format html \
+  --output build/bench/reports/compare-dashboard.html
+```
+
+HTML compare dashboard from latest compare (recommended):
+
+```bash
+cargo run -p decentdb-benchmark -- report \
+  --latest-compare \
+  --format html \
+  --output build/bench/reports/today-compare.html
+```
+
 Text agent brief:
 
 ```bash
@@ -716,7 +842,18 @@ cargo run -p decentdb-benchmark -- report \
 cargo run -p decentdb-benchmark -- report \
   --compare build/bench/compares/<compare-id>.json \
   --format markdown \
-  > build/bench/compares/<compare-id>.md
+  --output build/bench/compares/<compare-id>.md
+```
+
+One-command "where are we today?" dashboard:
+
+```bash
+cargo run --quiet -p decentdb-benchmark -- report \
+  --latest-run \
+  --format html \
+  --output build/bench/reports/today-dashboard.html
+
+xdg-open build/bench/reports/today-dashboard.html
 ```
 
 ## 10. `inspect-storage` Command
@@ -862,12 +999,12 @@ Fix:
 
 Examples:
 
-- `provide either --input or --compare for report, not both`
-- `missing report input; provide --input or --compare`
+- `choose one run input (--input or --latest-run) and one compare input (--compare or --latest-compare)`
+- `report requires exactly one source: --input/--latest-run or --compare/--latest-compare`
 
 Fix:
 
-- pass exactly one of `--input` or `--compare`.
+- pass exactly one of: `--input`, `--latest-run`, `--compare`, `--latest-compare`.
 
 ## 12.6 Compare says strict=false
 
@@ -993,4 +1130,3 @@ It appears with `status = "missing_target_metadata"` in compare output.
 ### Q: How do I keep baselines local and deterministic?
 
 Use `baseline set` snapshots in `build/bench/baselines/`. They are explicit JSON snapshots, not moving links.
-
