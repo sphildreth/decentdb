@@ -582,4 +582,43 @@ mod tests {
 
         clear_failpoints().expect("clear failpoints");
     }
+
+    #[test]
+    fn failpoint_error_on_write_and_sync() {
+        let _guard = test_lock().lock().expect("test lock");
+        clear_failpoints().expect("clear failpoints");
+
+        // Inject a write error and verify write_at returns an error
+        install_failpoint(Failpoint {
+            label: "db.write_page".to_string(),
+            trigger_on: 1,
+            action: FailAction::Error,
+        })
+        .expect("install write error");
+
+        let vfs = FaultyVfs::wrap(Arc::new(crate::vfs::mem::MemVfs::default()));
+        let file = vfs
+            .open(
+                Path::new(":memory:"),
+                OpenMode::CreateNew,
+                FileKind::Database,
+            )
+            .expect("create file");
+
+        let res = file.write_at(4096, &[1, 2, 3, 4]);
+        assert!(res.is_err(), "write should fail when failpoint is Error");
+
+        // Inject a fsync error and verify sync_data returns an error
+        install_failpoint(Failpoint {
+            label: "db.fsync".to_string(),
+            trigger_on: 1,
+            action: FailAction::Error,
+        })
+        .expect("install fsync error");
+
+        let res2 = file.sync_data();
+        assert!(res2.is_err(), "fsync should fail when failpoint is Error");
+
+        clear_failpoints().expect("clear failpoints");
+    }
 }

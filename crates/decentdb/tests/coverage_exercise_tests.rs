@@ -57,7 +57,7 @@ fn exercise_engine_broad_paths() {
     let with_res = db
         .execute("WITH x AS (SELECT id FROM t1 WHERE v > 15) SELECT id FROM x")
         .expect("cte");
-    assert!(with_res.rows().len() >= 1);
+    assert!(!with_res.rows().is_empty());
 
     // Transactions and savepoints
     db.execute("BEGIN").expect("begin");
@@ -86,7 +86,7 @@ fn exercise_engine_broad_paths() {
     let explain = db
         .execute("EXPLAIN SELECT * FROM t2 WHERE t1_id = 1")
         .expect("explain");
-    assert!(explain.explain_lines().len() > 0);
+    assert!(!explain.explain_lines().is_empty());
 
     // DDL changes: drop and recreate
     db.execute("DROP VIEW v1").expect("drop view");

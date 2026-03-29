@@ -14147,3 +14147,91 @@ pub(super) fn column_schema<'a>(
 mod more_exec_tests;
 #[cfg(test)]
 mod runtime_tests;
+
+#[cfg(test)]
+mod exec_mod_private_tests {
+    use super::*;
+
+    #[test]
+    fn map_get_ci_and_mut_basic() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("Key".to_string(), 1);
+        assert_eq!(map_get_ci(&map, "key"), Some(&1));
+        let v = map_get_ci_mut(&mut map, "KEY");
+        assert!(v.is_some());
+        *v.unwrap() = 2;
+        assert_eq!(map_get_ci(&map, "key"), Some(&2));
+    }
+
+    #[test]
+    fn generated_columns_are_stored_behavior() {
+        let table = TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "a".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: false,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec![],
+            next_row_id: 1,
+        };
+        assert!(generated_columns_are_stored(&table));
+
+        let table2 = TableSchema {
+            name: "u".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "g".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: Some("1".to_string()),
+                generated_stored: true,
+                primary_key: false,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec![],
+            next_row_id: 1,
+        };
+        assert!(generated_columns_are_stored(&table2));
+
+        let table3 = TableSchema {
+            name: "v".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "g".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: Some("1".to_string()),
+                generated_stored: false,
+                primary_key: false,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec![],
+            next_row_id: 1,
+        };
+        assert!(!generated_columns_are_stored(&table3));
+    }
+}

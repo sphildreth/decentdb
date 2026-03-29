@@ -302,7 +302,7 @@ mod tests {
             .expect("execute");
         assert_eq!(res.rows().len(), 1);
         assert_eq!(
-            res.rows().get(0).unwrap().values().get(0),
+            res.rows().first().unwrap().values().first(),
             Some(&Value::Int64(2))
         );
     }
@@ -555,12 +555,12 @@ mod tests {
         runtime.catalog.tables.insert("t".to_string(), t);
 
         runtime.mark_table_row_dirty("t", 3);
-        assert!(runtime.row_update_dirty.get("t").is_some());
+        assert!(runtime.row_update_dirty.contains_key("t"));
 
         // If a table is already fully dirty (and not append-only) then marking a row dirty is a no-op
         runtime.dirty_tables.insert("w".to_string());
         runtime.mark_table_row_dirty("w", 5);
-        assert!(runtime.row_update_dirty.get("w").is_none());
+        assert!(!runtime.row_update_dirty.contains_key("w"));
 
         // Append-only dirty on a fresh table
         runtime.mark_table_append_dirty("u"); // no-op since u doesn't exist; should not panic
@@ -657,7 +657,7 @@ mod tests {
             .expect("execute");
         assert_eq!(res.rows().len(), 2);
         let row0 = &res.rows()[0];
-        assert_eq!(row0.values().get(0), Some(&Value::Text("a".to_string())));
+        assert_eq!(row0.values().first(), Some(&Value::Text("a".to_string())));
         assert_eq!(row0.values().get(1), Some(&Value::Int64(2)));
         assert_eq!(row0.values().get(2), Some(&Value::Int64(15)));
     }
@@ -716,7 +716,7 @@ mod tests {
             .expect("execute");
         assert_eq!(res.rows().len(), 1);
         assert_eq!(
-            res.rows()[0].values().get(0),
+            res.rows()[0].values().first(),
             Some(&Value::Text("y".to_string()))
         );
     }
@@ -891,7 +891,7 @@ mod tests {
             .execute_read_statement(&stmt, &[], 4096)
             .expect("execute");
         assert_eq!(res.rows().len(), 1);
-        assert_eq!(res.rows()[0].values().get(0), Some(&Value::Int64(100)));
+        assert_eq!(res.rows()[0].values().first(), Some(&Value::Int64(100)));
         assert_eq!(
             res.rows()[0].values().get(1),
             Some(&Value::Text("p1".to_string()))

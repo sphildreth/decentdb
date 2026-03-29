@@ -416,4 +416,69 @@ mod tests {
         let on_disk = pager.header_from_disk().expect("read header from disk");
         assert_eq!(on_disk, header);
     }
+
+    #[test]
+    fn set_last_checkpoint_and_schema_cookie_persist_to_disk() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("persist-header");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
+
+        pager.set_last_checkpoint_lsn(0xDEADBEEF).expect("set lsn");
+        pager.set_schema_cookie(0xBEEF).expect("set schema cookie");
+
+        let on_disk = pager.header_from_disk().expect("read header from disk");
+        assert_eq!(on_disk.last_checkpoint_lsn, 0xDEADBEEF);
+        assert_eq!(on_disk.schema_cookie, 0xBEEF);
+    }
+
+    #[test]
+    fn refresh_from_disk_detects_page_size_change() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("refresh-page-size");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
+
+        let bad_header = DatabaseHeader::new(header.page_size * 2);
+        let res = pager.refresh_from_disk(bad_header);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn free_reserved_page_returns_error() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("free-reserved");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        let pager = PagerHandle::open(file, header, 1).expect("open pager");
+
+        let res = pager.free_page(page::CATALOG_ROOT_PAGE_ID);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn read_page_beyond_count_returns_zeroed_page() {
+        let mem_vfs = MemVfs::default();
+        let path = unique_path("read-beyond");
+        let file = mem_vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database");
+        let header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
+        write_database_bootstrap_vfs(file.as_ref(), &header).expect("bootstrap database");
+        let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
+
+        let data = pager.read_page(100).expect("read beyond");
+        assert_eq!(data, page::zeroed_page(page::DEFAULT_PAGE_SIZE));
+    }
 }

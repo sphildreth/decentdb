@@ -1,23 +1,28 @@
 # Coverage Tracking
 
-## Baseline (automatically recorded)
-- Overall: 79.96%
+## Baseline (2026-03-28)
+- Overall: 80.76% (baseline measured from initial coverage run)
 
-## Recent updates
-- 2026-03-29: Added vfs/faulty classify_* unit tests to exercise classification branches. All tests passed: 662.
-- Added exec/dml tests fixing a compile error (replaced private method call with public wrapper).
-- Added exec prepare/execute insert test and additional normalize SQL tests.
-- Coverage (summary): 79.99% (improved from 79.96%)
+## Update (2026-03-29)
+- Added same-file unit tests to crates/decentdb/src/exec/dml.rs exercising apply_conflict_update paths.
+- Fixed compile-time TableData references in dml.rs and removed an unused import in sql/ast_more_tests.rs.
+- Re-ran tests; all unit tests passed (692 tests).
 
-## Next targets
-- Increase coverage in:
-  - exec/mod.rs (large, 18.9k lines, 79.22% coverage)
-  - sql/normalize.rs (3.98k lines, 76.81% coverage)
-  - record/overflow.rs (1.45k lines, 87.51% coverage)
-  - vfs/faulty.rs (578 lines, 78.03% coverage)
+### Coverage summary (post-change)
+- TOTAL: 80.76% (latest: 80.7557%)
+- Notable per-file snapshots:
+  - crates/decentdb/src/storage/page.rs: 99.48%
+  - crates/decentdb/src/storage/pager.rs: 91.56%
+  - crates/decentdb/src/vfs/faulty.rs: 83.82%
+  - crates/decentdb/src/vfs/mem.rs: 97.59%
+  - crates/decentdb/src/wal/format.rs: 95.54%
+  - crates/decentdb/src/wal/writer.rs: 90.79%
 
-## Plan
-1. Continue adding focused unit tests for exec (dml/ddl/constraints) to exercise fast-paths and error paths.
-2. Add more normalization tests to cover window frames, joins, index expressions, and edge SQL forms.
-3. Add overflow/record tests for overflow chain handling.
-4. Iterate: run cargo llvm-cov after each batch, update this file.
+More detailed per-file coverage available in target/llvm-cov/html/index.html.
+
+## Next steps
+1. Add more same-file tests in exec/dml.rs (apply_prepared_simple_insert_candidate, index update helpers, materialize_insert_source).
+2. Add WAL partial-write/recovery tests using FaultyVfs (serialize these tests and clear failpoints between runs).
+3. Add storage/pager unit tests (allocation, deallocation, dirty flush, checksum verification).
+4. Run cargo clippy --all-targets --all-features -- -D warnings and fix any warnings.
+5. Re-run cargo llvm-cov after each batch and update this file.

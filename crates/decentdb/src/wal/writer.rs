@@ -237,3 +237,38 @@ fn append_page_frame(
     output.extend_from_slice(&0_u64.to_le_bytes());
     Ok(FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::page;
+
+    #[test]
+    fn append_page_frame_rejects_zero_page_id() {
+        let mut out = Vec::new();
+        let payload = vec![0u8; page::DEFAULT_PAGE_SIZE as usize];
+        let res = append_page_frame(&mut out, 0, &payload, page::DEFAULT_PAGE_SIZE);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn append_page_frame_rejects_size_mismatch() {
+        let mut out = Vec::new();
+        let payload = vec![0u8; 10];
+        let res = append_page_frame(&mut out, 1, &payload, page::DEFAULT_PAGE_SIZE);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn append_page_frame_encodes_frame() {
+        let mut out = Vec::new();
+        let payload = vec![0xAA; page::DEFAULT_PAGE_SIZE as usize];
+        let res =
+            append_page_frame(&mut out, 5, &payload, page::DEFAULT_PAGE_SIZE).expect("append");
+        assert_eq!(res, FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE);
+        assert_eq!(out[0], FrameType::Page as u8);
+        // page id le bytes
+        let id = u32::from_le_bytes(out[1..5].try_into().expect("id bytes"));
+        assert_eq!(id, 5);
+    }
+}

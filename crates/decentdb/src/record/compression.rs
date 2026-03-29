@@ -65,4 +65,30 @@ mod tests {
         assert!(compressed.compressed);
         assert_eq!(decompress(&compressed.bytes).expect("decompress"), payload);
     }
+
+    #[test]
+    fn maybe_compress_never_mode_leaves_bytes_alone() {
+        let data = b"short data";
+        let out = maybe_compress(data, CompressionMode::Never);
+        assert!(!out.compressed);
+        assert_eq!(out.bytes, data);
+    }
+
+    #[test]
+    fn maybe_compress_small_payload_not_compressed() {
+        let data = vec![0u8; 8]; // much smaller than AUTO_MIN_PAYLOAD_BYTES
+        let out = maybe_compress(&data, CompressionMode::Auto);
+        assert!(!out.compressed);
+        assert_eq!(out.bytes, data);
+    }
+
+    #[test]
+    fn decompress_invalid_blob_returns_corruption_error() {
+        let bad = b"not-a-zlib-stream";
+        let res = decompress(bad);
+        assert!(res.is_err());
+        // Verify error category is corruption by matching message contains 'invalid compressed'
+        let err = res.unwrap_err();
+        assert!(format!("{err}").contains("invalid compressed"));
+    }
 }

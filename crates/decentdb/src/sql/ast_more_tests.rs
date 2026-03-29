@@ -2,7 +2,6 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::ColumnType;
     use crate::record::value::Value;
     use crate::sql::ast::*;
 

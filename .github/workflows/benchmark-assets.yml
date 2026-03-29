@@ -388,9 +388,7 @@ jobs:
           retention-days: 14
 
       - name: Create GitHub App token
-        if: github.ref == 'refs/heads/main'
         id: app-token
-        continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BENCHMARK_APP_ID }}
@@ -401,7 +399,6 @@ jobs:
         if: github.ref == 'refs/heads/main'
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
@@ -423,8 +420,6 @@ jobs:
           fi
 
           git commit -m "chore: refresh benchmark assets [skip ci]"
-
-          token="${APP_TOKEN:-$GH_TOKEN}"
-          git push "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
