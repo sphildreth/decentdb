@@ -165,6 +165,11 @@ crates/decentdb-benchmark/
 
 This crate should be a normal Rust CLI application, not a `cargo bench` harness.
 
+Terminology in this document:
+
+- **benchmark runner** = the `decentdb-benchmark` CLI crate
+- **benchmark system** = the runner plus artifact schemas, compare logic, and report conventions
+
 ### Why a binary crate instead of relying on `cargo bench`
 
 - better control over CLI and profiles
@@ -210,6 +215,9 @@ crates/decentdb-benchmark/
       recovery.rs
       startup.rs
       storage_efficiency.rs
+  tests/
+    scenario_integration_tests.rs
+    workload_validation_tests.rs
 ```
 
 ## 5.3 Architectural layers
@@ -271,6 +279,8 @@ The benchmark runner should use the most direct path that still corresponds to t
 
 This is justified because otherwise the benchmark system will measure incidental overhead instead of the engine.
 
+Prefer implementing `bench-internals` as a narrowly scoped Cargo feature on the DecentDB engine crates rather than as a separate helper crate. The benchmark-only hooks should stay physically close to the code they expose.
+
 ## 6.3 Cross-process isolation
 
 The runner should support executing each scenario in an isolated child process.
@@ -288,6 +298,11 @@ Recommended model:
 - child process runs one scenario/trial and writes one result file
 - parent merges the result files into a single run summary
 
+Cross-process isolation should be **scenario-driven**, not universal.
+
+- required by default for startup, recovery, reopen, crash-safety, and cold-process scenarios
+- optional for steady-state warm benchmarks where in-process execution keeps harness overhead lower
+
 ---
 
 ## 7. Workload Families
@@ -295,6 +310,12 @@ Recommended model:
 The benchmark system should not rely on one synthetic table shape.
 
 Use a small set of named workload families that capture different storage and access patterns.
+
+Each workload must map to a canonical, versioned schema and data-shape definition.
+
+- do not vary index count or column mix inside the same workload id
+- if a materially different variant is needed, version it explicitly such as `oltp_narrow_v2`
+- comparability depends on workload definitions staying stable over time
 
 ## 7.1 Required workloads
 
@@ -310,7 +331,7 @@ Shape:
 - integer primary key
 - timestamp column
 - short status text
-- one or two secondary indexes
+- one canonical secondary index in the v1 workload definition
 
 Use for:
 
@@ -354,7 +375,7 @@ Shape:
 
 - moderate to large text fields
 - controlled length distribution
-- optional search index
+- search index only in explicitly versioned workload variants
 
 Use for:
 
@@ -381,36 +402,37 @@ The table below defines the benchmark families that should exist in the new syst
 
 These are the metrics DecentDB should treat as first-class release KPIs.
 
-| Scenario ID | Why it matters | Primary metrics | Required |
+| Scenario ID | Why it matters | Primary metrics | Priority |
 | --- | --- | --- | --- |
-| `durable_commit_single` | Measures the most painful embedded write path | txn end-to-end p50/p95/p99/max, commit-only p50/p95/p99/max, fsync count, bytes written per commit | Yes |
-| `durable_commit_batch` | Measures whether small-batch writes scale correctly | rows/sec, batch commit p50/p95/p99, bytes written per row, WAL growth | Yes |
-| `point_lookup_warm` | Most common embedded read KPI | lookup p50/p95/p99/max | Yes |
-| `point_lookup_cold` | Startup and cache-miss sensitivity | first-read latency, batch p50/p95 | Yes |
-| `range_scan_warm` | Sequential indexed access matters heavily for local apps | rows/sec, MB/sec, p50/p95 per scan | Yes |
-| `read_under_write` | Core concurrency promise: one writer, many readers | reader degradation ratio, writer throughput degradation, reader p95 under load | Yes |
-| `checkpoint` | Must be predictable and bounded | total checkpoint ms, writer stall ms, reader stall ms, WAL bytes before/after | Yes |
-| `recovery_reopen` | Startup after WAL accumulation is a real user pain | reopen ms, replay ms, first query ms | Yes |
-| `storage_efficiency` | Product-level footprint KPI | db bytes, wal bytes, space amplification, bytes/row, page fill | Yes |
+| `durable_commit_single` | Measures the most painful embedded write path | txn end-to-end p50/p95/p99/max, commit-only p50/p95/p99/max, fsync count, bytes written per commit | P0 |
+| `durable_commit_batch` | Measures whether small-batch writes scale correctly | rows/sec, batch commit p50/p95/p99, bytes written per row, WAL growth | P0 |
+| `point_lookup_warm` | Most common embedded read KPI | lookup p50/p95/p99/max | P0 |
+| `point_lookup_cold` | Startup and cache-miss sensitivity | first-read latency, batch p50/p95 | P0 |
+| `range_scan_warm` | Sequential indexed access matters heavily for local apps | rows/sec, MB/sec, p50/p95 per scan | P0 |
+| `read_under_write` | Core concurrency promise: one writer, many readers | reader degradation ratio, writer throughput degradation, reader p95 under load | P0 |
+| `checkpoint` | Must be predictable and bounded | total checkpoint ms, writer stall ms, reader stall ms, WAL bytes before/after | P0 |
+| `recovery_reopen` | Startup after WAL accumulation is a real user pain | reopen ms, replay ms, first query ms | P0 |
+| `storage_efficiency` | Product-level footprint KPI | db bytes, wal bytes, space amplification, bytes/row, page fill | P0 |
 
 ### 8.2 Tier 2: important but secondary
 
-| Scenario ID | Why it matters | Primary metrics | Required |
+| Scenario ID | Why it matters | Primary metrics | Priority |
 | --- | --- | --- | --- |
-| `join_read` | Real relational read path | p50/p95 join latency, rows/sec | Yes |
-| `aggregate_group_by` | Common analytical summary path | rows/sec, p50/p95 per aggregate query | Yes |
-| `startup_open` | Embedded database open cost matters | open ms, first statement ms | Yes |
-| `bulk_load` | Important for import/setup workflows | rows/sec, bytes written, final size | Nice to have early |
-| `secondary_index_lookup` | Useful if PK numbers look good but secondary path is weak | p50/p95 lookup latency | Nice to have early |
+| `join_read` | Real relational read path | p50/p95 join latency, rows/sec | P1 |
+| `aggregate_group_by` | Common analytical summary path | rows/sec, p50/p95 per aggregate query | P1 |
+| `startup_open` | Embedded database open cost matters | open ms, first statement ms | P1 |
+| `bulk_load` | Important for import/setup workflows | rows/sec, bytes written, final size | P1 |
+| `secondary_index_lookup` | Useful if PK numbers look good but secondary path is weak | p50/p95 lookup latency | P1 |
+| `memory_footprint` | Embedded deployments care about runtime memory usage, not just disk size | peak RSS, steady-state RSS, memory amplification | P1 |
 
 ### 8.3 Tier 3: quality-of-life metrics
 
-| Scenario ID | Why it matters | Primary metrics | Required |
+| Scenario ID | Why it matters | Primary metrics | Priority |
 | --- | --- | --- | --- |
-| `prepare_parse_plan` | Separates parser/planner work from execute work | prepare ms, plan ms | Later |
-| `delete_churn` | Reveals free-space reuse quality | delete throughput, free bytes, fragmentation ratio | Later |
-| `maintenance_compaction` | Useful if compaction/vacuum exists | maintenance ms, bytes reclaimed | Later |
-| `text_search` | Useful when text indexing matters | p50/p95 lookup latency, index bytes | Later |
+| `prepare_parse_plan` | Separates parser/planner work from execute work | prepare ms, plan ms | P2 |
+| `delete_churn` | Reveals free-space reuse quality | delete throughput, free bytes, fragmentation ratio | P2 |
+| `maintenance_compaction` | Useful if compaction/vacuum exists | maintenance ms, bytes reclaimed | P2 |
+| `text_search` | Useful when text indexing matters | p50/p95 lookup latency, index bytes | P2 |
 
 ---
 
@@ -501,6 +523,33 @@ This lets the runner produce metrics like:
 - `bytes_read_per_lookup`
 
 This is extremely useful for both human analysis and agent ranking.
+
+The VFS stats wrapper should be benchmark-only by default:
+
+- enabled in benchmark builds or explicitly instrumented runs
+- not imposed on ordinary production builds unless DecentDB later chooses to expose a low-overhead stats mode
+
+### 9.6 Runtime memory metrics
+
+Disk footprint is not the only embedded footprint that matters. The benchmark system should also track runtime memory behavior for selected scenarios.
+
+Recommended memory metrics:
+
+- `rss_peak_bytes`
+- `rss_steady_bytes`
+- `rss_after_reopen_bytes`
+- `memory_amplification`
+  - `rss_steady_bytes / logical_payload_bytes` where meaningful
+- allocator-specific counters if a supported allocator exposes them cheaply
+
+These should be collected at minimum for:
+
+- `startup_open`
+- `read_under_write`
+- `storage_efficiency`
+- `memory_footprint`
+
+Memory metrics do not need to block phase 1, but they should be part of the benchmark system design from the start.
 
 ---
 
@@ -604,6 +653,8 @@ The runner should ship with named profiles.
 | `showcase` | publishable metrics for docs/README | 1M-10M rows depending on scenario | 30-90 minutes |
 | `extreme` | manual large-host runs | 10M-100M+ rows | host-dependent |
 
+These runtimes are target budgets for reference benchmark hosts, not guarantees. Actual runtime will vary with durability settings, storage media, CPU class, and scenario mix.
+
 ### 11.2 Parameter overrides
 
 Profiles must be presets, not hard-coded limits.
@@ -681,6 +732,29 @@ The measured phase should run multiple trials where appropriate. The final repor
 - per-trial values
 - rolled-up summary values
 
+Warmup policy should be explicit per scenario rather than implicit.
+
+Recommended rules:
+
+- define warmup by minimum operations, minimum duration, or both
+- allow scenarios to stop warmup early only if a simple convergence rule is met
+- never mix warmup samples into measured samples
+- optionally retain warmup measurements in a diagnostic section for tuning, but exclude them from headline KPIs
+
+A practical first-pass convergence rule is:
+
+- compare rolling windows of recent measurements
+- consider the scenario warmed when variance is below a configured threshold
+- fall back to a max warmup cap so the runner cannot warm forever
+
+Comparison-quality runs should also define minimum measurement sizes.
+
+Examples:
+
+- per-operation latency scenarios should gather thousands of measured operations
+- macro scenarios should run multiple full trials
+- comparisons that fail minimum sample or trial counts should be marked non-authoritative
+
 ## 12.3 Warm cache vs cold cache
 
 Where relevant, the runner should label each measurement explicitly as:
@@ -744,9 +818,36 @@ The plan should recommend a "strict mode" for authoritative runs:
 
 This does not need to block casual local runs, but it should be the standard for published metrics.
 
+## 12.7 Host classes and platform scope
+
+The benchmark system should separate "supported to run" from "authoritative for published claims."
+
+Recommended initial scope:
+
+- Linux `x86_64` on a real local filesystem is the first-class authoritative benchmark host class
+- Linux `aarch64` should be supported next once a stable reference host exists
+- macOS and Windows may be supported for local or exploratory runs, but should be marked non-authoritative until their filesystem and durability semantics are normalized in the benchmark policy
+- WASM is out of scope for the bare-metal benchmark plan because it does not exercise real host filesystem durability or storage behavior
+
+Filesystem detection should be best-effort and captured in the environment manifest. Unknown, network-backed, or layered filesystems should trigger a trust warning unless explicitly approved for a given profile.
+
 ---
 
 ## 13. Benchmark Output Format
+
+Scratch files created during scenario execution should live under:
+
+```text
+.tmp/decentdb-benchmark/
+```
+
+Retained benchmark artifacts should live under:
+
+```text
+build/bench/
+```
+
+This split keeps temporary execution debris out of the repository while preserving durable benchmark artifacts for comparison and publication.
 
 The benchmark system should emit structured artifacts under:
 
@@ -783,6 +884,7 @@ The manifest should record:
 
 Every scenario result should contain:
 
+- `status`
 - `scenario_id`
 - `profile`
 - `workload`
@@ -793,12 +895,15 @@ Every scenario result should contain:
 - `metrics`
 - `histograms`
 - `vfs_stats`
+- `warnings`
+- `artifacts`
 - `notes`
 
 ### Example sketch
 
 ```json
 {
+  "status": "passed",
   "scenario_id": "durable_commit_single",
   "profile": "nightly",
   "workload": "oltp_narrow",
@@ -829,6 +934,42 @@ It should include:
 - top improvements vs baseline
 - top gaps vs target
 - worst current metrics by weighted score
+- failed, skipped, and timed-out scenarios
+
+## 13.4 Failure handling and partial result recovery
+
+Benchmark runs should fail transparently, not disappear silently.
+
+The runner should support:
+
+- per-scenario status values such as `passed`, `failed`, `timed_out`, and `skipped`
+- per-scenario timeout controls
+- child-process crash containment for isolated scenarios
+- preservation of partial artifacts when a later scenario fails
+- summary-level warnings when a run is incomplete or non-authoritative
+
+If a scenario panics, times out, fills the disk, or otherwise aborts, the parent process should still emit:
+
+- the manifest
+- any completed scenario results
+- a run summary marking the run incomplete
+- concise error information for the failed scenario
+
+This is important for long nightly runs. Losing all earlier results because the last scenario failed is not acceptable.
+
+## 13.5 Retention and pruning policy
+
+Benchmark artifacts will grow quickly if left unmanaged.
+
+Recommended policy:
+
+- keep all named baselines until explicitly replaced
+- keep the most recent local runs for each profile and host class
+- compress or prune large per-scenario artifacts from older non-baseline runs
+- preserve failed-run manifests and summaries even if detailed histograms are pruned
+- allow CI or a remote artifact store later, but keep the on-disk artifact format self-sufficient
+
+The benchmark system should not require a remote service in order to compare runs. Remote storage is an optional distribution layer, not the source of truth.
 
 ---
 
@@ -850,6 +991,21 @@ Every metric definition should include:
 - noise band
 - weight
 - optional target
+
+Noise bands should be metric-specific and explicit.
+
+A practical default is:
+
+```text
+noise_band = max(absolute_threshold, relative_threshold * baseline_value)
+```
+
+Comparison validity should also require:
+
+- matching host class
+- minimum trial counts
+- minimum sample counts where applicable
+- no disqualifying trust warnings
 
 ## 14.2 Recommended comparison formula
 
@@ -879,6 +1035,17 @@ This is not the only valid formula, but the important thing is that the comparis
 - a small list of top priorities
 - a machine-readable output that agents can consume
 
+Formal hypothesis testing is not required for phase 1.
+
+For DecentDB's first benchmark system, the right level of rigor is:
+
+- repeated trials
+- explicit sample minimums
+- metric-specific noise bands
+- strict environment matching
+
+If later needed, the system can add bootstrap confidence intervals or non-parametric tests for selected metrics. The plan should not block on advanced statistics before the practical comparison loop exists.
+
 ## 14.3 Baselines
 
 The system should support named baselines such as:
@@ -888,6 +1055,8 @@ The system should support named baselines such as:
 - `local-last-good`
 
 The benchmark runner should not compare arbitrary runs from different host classes and pretend the results are meaningful.
+
+Local file-based baselines under `build/bench/baselines/` should be the default storage model. CI may later publish or download baseline bundles, but the baseline format itself should remain portable and usable without network dependencies.
 
 ## 14.4 Agent-oriented output
 
@@ -1201,6 +1370,16 @@ Include:
 
 This section matters because performance claims without environment context are weak.
 
+#### 8. Artifact links
+
+When available, the markdown report should also include:
+
+- paths to scenario JSON artifacts
+- paths to histogram files
+- paths to storage inspection artifacts
+
+The headline report should stay concise, but it should make it easy to drill into deeper evidence without hunting through the run directory manually.
+
 #### Example markdown shape
 
 ```markdown
@@ -1250,7 +1429,7 @@ Trust notes: host matched baseline, filesystem matched, no strict-mode violation
 
 ## Environment Notes
 
-- rustc: 1.xx.x
+- rustc: 1.xx.y (stable 2026-03)
 - kernel: Linux x.y
 - filesystem: ext4
 - seed: 42
@@ -1397,6 +1576,8 @@ Allows setting or updating a named baseline artifact explicitly.
 
 ## 17. Implementation Plan
 
+These phases are dependency-ordered delivery gates, not calendar commitments.
+
 ## Phase 1: foundation
 
 Deliver:
@@ -1435,6 +1616,7 @@ Deliver:
 - benchmark-aware VFS stats wrapper
 - `bytes_written_per_commit`
 - `fsyncs_per_commit`
+- RSS capture and `memory_footprint` scenario
 - storage inspector
 - page-type accounting
 - space amplification breakdown by category
