@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: write
-  actions: write
+  pull-requests: write
 
 concurrency:
   group: benchmark-assets-${{ github.ref }}
@@ -388,20 +388,12 @@ jobs:
             .tmp/benchmark-assets/root-readme-results.json
           retention-days: 14
 
-      - name: Create GitHub App token
-        if: github.ref == 'refs/heads/main'
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.BENCHMARK_APP_ID }}
-          private-key: ${{ secrets.BENCHMARK_APP_PRIVATE_KEY }}
-
-      - name: Commit benchmark asset updates
+      - name: Push benchmark asset branch and open pull request
         id: commit
         if: github.ref == 'refs/heads/main'
         shell: bash
         env:
-          PUSH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -421,20 +413,42 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: refresh benchmark assets [skip ci]"
-          git push "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+          branch="automation/benchmark-assets"
+          title="chore: refresh benchmark assets"
+          body_file=".tmp/benchmark-assets/pr-body.md"
+          cat > "$body_file" <<EOF
+          Automated benchmark asset refresh from:
 
-      - name: Dispatch docs deployment
-        if: github.ref == 'refs/heads/main'
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error \
-            -X POST \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/docs.yml/dispatches" \
-            -d '{"ref":"main"}'
+          - workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - source commit: ${GITHUB_SHA}
+
+          This PR updates the generated benchmark charts, summary JSON, and benchmark docs exports.
+          EOF
+
+          git checkout -B "$branch"
+          git commit -m "chore: refresh benchmark assets [skip ci]"
+          git push --force-with-lease "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
+
+          pr_number="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --state open \
+            --json number \
+            --jq '.[0].number')"
+
+          if [ -n "$pr_number" ]; then
+            gh pr edit "$pr_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$title" \
+              --body-file "$body_file"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base main \
+              --head "$branch" \
+              --title "$title" \
+              --body-file "$body_file"
+          fi
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"

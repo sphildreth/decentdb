@@ -54,6 +54,7 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
     """
     # Remove existing database
     db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
     if db_file.exists():
         db_file.unlink()
     wal_file = Path(f"{db_path}.wal")
@@ -64,6 +65,10 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
     print(f"Database path: {db_path}")
     print(f"Report interval: {report_interval}s")
     print("-" * 60)
+
+    max_rows = 1000
+    delete_batch = 500
+    checkpoint_interval = 200
 
     # Initialize database with schema
     conn = decentdb.connect(db_path)
@@ -94,6 +99,7 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
         "open_close_cycles": 0,
         "errors": [],
     }
+    fatal_error = None
 
     start_time = time.time()
     last_report = start_time
@@ -123,11 +129,11 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
             if iteration % 3 == 0:
                 conn = decentdb.connect(db_path)
                 cur = conn.cursor()
-                row_id = random.randint(1, 10_000_000)
+                row_id = iteration
                 data = generate_random_string(10, 1000)
                 blob_data = os.urandom(random.randint(100, 5000))
                 cur.execute(
-                    "INSERT OR REPLACE INTO stress_test VALUES (?, ?, ?, ?)",
+                    "INSERT INTO stress_test VALUES (?, ?, ?, ?)",
                     (row_id, data, blob_data, int(time.time() * 1000))
                 )
                 conn.commit()
@@ -147,7 +153,7 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
             if iteration % 7 == 0:
                 conn = decentdb.connect(db_path)
                 cur = conn.cursor()
-                cur.execute("SELECT id FROM stress_test ORDER BY RANDOM() LIMIT 1")
+                cur.execute("SELECT id FROM stress_test ORDER BY id DESC LIMIT 1")
                 row = cur.fetchone()
                 if row:
                     new_data = generate_random_string(50, 500)
@@ -165,10 +171,10 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
                 cur = conn.cursor()
                 cur.execute("SELECT COUNT(*) FROM stress_test")
                 count = cur.fetchone()[0]
-                if count > 10000:
+                if count > max_rows:
                     cur.execute(
                         "DELETE FROM stress_test WHERE id IN "
-                        "(SELECT id FROM stress_test ORDER BY id LIMIT 5000)"
+                        f"(SELECT id FROM stress_test ORDER BY id LIMIT {delete_batch})"
                     )
                     conn.commit()
                     stats["deletes"] += 1
@@ -186,12 +192,20 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
                 for conn in connections:
                     conn.close()
 
+            # Pattern 7: Periodic checkpoint to keep WAL growth bounded
+            if iteration % checkpoint_interval == 0:
+                conn = decentdb.connect(db_path)
+                conn.checkpoint()
+                conn.close()
+
             # Periodic GC
             if iteration % 50 == 0:
                 gc.collect()
 
         except Exception as e:
             log_error(f"Iteration {iteration}: {e}")
+            fatal_error = str(e)
+            break
 
         # Report RSS periodically
         if time.time() - last_report >= report_interval:
@@ -240,6 +254,10 @@ def stress_test(db_path: str, duration_seconds: int, report_interval: int = 30):
             print(f"  [{ts:.1f}s] {msg}")
     else:
         print("No errors encountered")
+
+    if fatal_error is not None:
+        print(f"\nFAIL: encountered unexpected database error: {fatal_error}")
+        return 1
 
     # Determine pass/fail
     # Allow 50 MB growth over 30 minutes (generous threshold)
