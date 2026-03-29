@@ -639,9 +639,8 @@ fn build_compare_artifact(
     }
 
     regressions.sort_by(|left, right| {
-        right
-            .delta_percent
-            .total_cmp(&left.delta_percent)
+        left.delta_percent
+            .total_cmp(&right.delta_percent)
             .then_with(|| left.metric_id.cmp(&right.metric_id))
     });
     improvements.sort_by(|left, right| {
@@ -1113,6 +1112,135 @@ mod tests {
             MetricComparisonStatus::Regression
         );
         assert!(!artifact.optimization_opportunities.is_empty());
+    }
+
+    #[test]
+    fn top_regressions_rank_worst_directional_delta_first() {
+        let candidate = ComparableRunSnapshot {
+            run_id: "cand".to_string(),
+            profile: "nightly".to_string(),
+            status: "passed".to_string(),
+            started_unix_ms: 1,
+            finished_unix_ms: 2,
+            build_profile: Some("release".to_string()),
+            os: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
+            git_sha: None,
+            git_branch: None,
+            summary_warnings: Vec::new(),
+            metrics: vec![
+                MetricPoint {
+                    scenario: "durable_commit_single".to_string(),
+                    metric: "txn_p95_us".to_string(),
+                    value: 1200.0,
+                },
+                MetricPoint {
+                    scenario: "point_lookup_warm".to_string(),
+                    metric: "lookup_p95_us".to_string(),
+                    value: 52.0,
+                },
+            ],
+            storage: StorageSnapshot::default(),
+        };
+
+        let baseline = ComparableRunSnapshot {
+            run_id: "base".to_string(),
+            profile: "nightly".to_string(),
+            status: "passed".to_string(),
+            started_unix_ms: 1,
+            finished_unix_ms: 2,
+            build_profile: Some("release".to_string()),
+            os: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
+            git_sha: None,
+            git_branch: None,
+            summary_warnings: Vec::new(),
+            metrics: vec![
+                MetricPoint {
+                    scenario: "durable_commit_single".to_string(),
+                    metric: "txn_p95_us".to_string(),
+                    value: 1000.0,
+                },
+                MetricPoint {
+                    scenario: "point_lookup_warm".to_string(),
+                    metric: "lookup_p95_us".to_string(),
+                    value: 40.0,
+                },
+            ],
+            storage: StorageSnapshot::default(),
+        };
+
+        let targets = TargetCatalog {
+            format_version: 1,
+            authoritative_build: Some("release".to_string()),
+            authoritative_benchmark_profile: Some("nightly".to_string()),
+            authoritative_host_class: None,
+            metrics: vec![
+                TargetMetricSpec {
+                    id: metric_id("durable_commit_single", "txn_p95_us"),
+                    display_name: None,
+                    scenario: "durable_commit_single".to_string(),
+                    metric: "txn_p95_us".to_string(),
+                    priority: "P0".to_string(),
+                    signature: true,
+                    direction: TargetDirection::SmallerIsBetter,
+                    unit: "microseconds".to_string(),
+                    weight: 1.0,
+                    floor: None,
+                    target: None,
+                    stretch: None,
+                    cache_mode: None,
+                    durability_mode: None,
+                    likely_owners: vec!["wal".to_string()],
+                },
+                TargetMetricSpec {
+                    id: metric_id("point_lookup_warm", "lookup_p95_us"),
+                    display_name: None,
+                    scenario: "point_lookup_warm".to_string(),
+                    metric: "lookup_p95_us".to_string(),
+                    priority: "P0".to_string(),
+                    signature: true,
+                    direction: TargetDirection::SmallerIsBetter,
+                    unit: "microseconds".to_string(),
+                    weight: 1.0,
+                    floor: None,
+                    target: None,
+                    stretch: None,
+                    cache_mode: None,
+                    durability_mode: None,
+                    likely_owners: vec!["planner".to_string()],
+                },
+            ],
+        };
+
+        let artifact = build_compare_artifact(
+            &targets,
+            std::path::Path::new("benchmarks/targets.toml"),
+            &candidate,
+            &baseline,
+            &BaselineSource {
+                baseline_name: Some("local".to_string()),
+                baseline_summary: Some("baseline-summary.json".to_string()),
+                baseline_snapshot: Some("baseline.json".to_string()),
+            },
+            std::path::Path::new("candidate-summary.json"),
+        );
+
+        assert_eq!(artifact.totals.regressions, 2);
+        assert_eq!(
+            artifact
+                .top_regressions
+                .first()
+                .map(|item| item.metric_id.as_str()),
+            Some("point_lookup_warm.lookup_p95_us")
+        );
+        assert_eq!(
+            artifact
+                .top_regressions
+                .get(1)
+                .map(|item| item.metric_id.as_str()),
+            Some("durable_commit_single.txn_p95_us")
+        );
     }
 
     #[test]

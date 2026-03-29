@@ -1,0 +1,136 @@
+{
+  "artifact_kind": "decentdb_benchmark_baseline_snapshot",
+  "schema_version": 1,
+  "baseline_name": "smoke-durable-local",
+  "created_unix_ms": 1774818069684,
+  "source_summary": "build/bench/runs/unix-1774818061241-smoke-38bf1b9/summary.json",
+  "source_manifest": "build/bench/runs/unix-1774818061241-smoke-38bf1b9/manifest.json",
+  "snapshot": {
+    "run_id": "unix-1774818061241-smoke-38bf1b9",
+    "profile": "smoke",
+    "status": "passed",
+    "started_unix_ms": 1774818061241,
+    "finished_unix_ms": 1774818063086,
+    "build_profile": "debug",
+    "os": "linux",
+    "arch": "x86_64",
+    "git_sha": "38bf1b9",
+    "git_branch": "sph-2026-03-29.1041",
+    "summary_warnings": [
+      "run is not in the authoritative grading context; expected build=release profile=nightly, got build=debug profile=smoke",
+      "overall grade withheld because only 2/14 target metrics were available for this run"
+    ],
+    "metrics": [
+      {
+        "scenario": "durable_commit_single",
+        "metric": "bytes_written_per_commit",
+        "value": 12413.09
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_max_us",
+        "value": 6553.599
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_mean_us",
+        "value": 2998.417408000001
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_p50_us",
+        "value": 2996.223
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_p95_us",
+        "value": 3028.991
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_p99_us",
+        "value": 3198.975
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commit_stddev_us",
+        "value": 232.1087720121614
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commits_measured",
+        "value": 500.0
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "commits_per_sec",
+        "value": 333.5100491913982
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "db_bytes_written_per_commit",
+        "value": 0.0
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "fsyncs_per_commit",
+        "value": 1.0
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_max_us",
+        "value": 6565.887
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_mean_us",
+        "value": 3012.122623999999
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_p50_us",
+        "value": 3008.511
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_p95_us",
+        "value": 3043.327
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_p99_us",
+        "value": 3211.263
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txn_stddev_us",
+        "value": 233.78154878315488
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "txns_per_sec",
+        "value": 331.9912864451469
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "wal_bytes_written_per_commit",
+        "value": 12413.09
+      },
+      {
+        "scenario": "durable_commit_single",
+        "metric": "write_calls_per_commit",
+        "value": 3.0
+      }
+    ],
+    "storage": {
+      "bytes_per_logical_row": null,
+      "db_file_bytes": null,
+      "wal_file_bytes_peak": null,
+      "space_amplification": null
+    }
+  },
+  "warnings": [
+    "run is not in the authoritative grading context; expected build=release profile=nightly, got build=debug profile=smoke",
+    "overall grade withheld because only 2/14 target metrics were available for this run"
+  ]
+}

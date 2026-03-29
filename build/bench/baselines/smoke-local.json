@@ -1,0 +1,81 @@
+{
+  "artifact_kind": "decentdb_benchmark_baseline_snapshot",
+  "schema_version": 1,
+  "baseline_name": "smoke-local",
+  "created_unix_ms": 1774818051520,
+  "source_summary": "build/bench/runs/unix-1774818041775-smoke-38bf1b9/summary.json",
+  "source_manifest": "build/bench/runs/unix-1774818041775-smoke-38bf1b9/manifest.json",
+  "snapshot": {
+    "run_id": "unix-1774818041775-smoke-38bf1b9",
+    "profile": "smoke",
+    "status": "passed",
+    "started_unix_ms": 1774818041775,
+    "finished_unix_ms": 1774818042162,
+    "build_profile": "debug",
+    "os": "linux",
+    "arch": "x86_64",
+    "git_sha": "38bf1b9",
+    "git_branch": "sph-2026-03-29.1041",
+    "summary_warnings": [
+      "run is not in the authoritative grading context; expected build=release profile=nightly, got build=debug profile=smoke",
+      "overall grade withheld because only 1/14 target metrics were available for this run"
+    ],
+    "metrics": [
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_max_us",
+        "value": 14.103
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_mean_us",
+        "value": 2.3484103999999997
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_p50_us",
+        "value": 2.295
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_p95_us",
+        "value": 2.965
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_p99_us",
+        "value": 3.147
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookup_stddev_us",
+        "value": 0.38446542779792303
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookups_measured",
+        "value": 5000.0
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "lookups_per_sec",
+        "value": 425948.54694894335
+      },
+      {
+        "scenario": "point_lookup_warm",
+        "metric": "rows_returned_total",
+        "value": 5000.0
+      }
+    ],
+    "storage": {
+      "bytes_per_logical_row": null,
+      "db_file_bytes": null,
+      "wal_file_bytes_peak": null,
+      "space_amplification": null
+    }
+  },
+  "warnings": [
+    "run is not in the authoritative grading context; expected build=release profile=nightly, got build=debug profile=smoke",
+    "overall grade withheld because only 1/14 target metrics were available for this run"
+  ]
+}
