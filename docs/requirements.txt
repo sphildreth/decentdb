@@ -1,0 +1,8 @@
+# Pinned docs toolchain for deterministic local and CI builds.
+# Pygments 2.20.0 breaks untyped fenced code blocks via pymdownx.highlight.
+mkdocs==1.6.1
+mkdocs-material==9.7.6
+mkdocs-minify-plugin==0.8.0
+mkdocs-awesome-pages-plugin==2.10.1
+mkdocs-mermaid2-plugin==1.2.3
+Pygments==2.19.2
