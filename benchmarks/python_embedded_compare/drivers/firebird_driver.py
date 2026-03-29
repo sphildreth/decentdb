@@ -47,18 +47,23 @@ class FirebirdDriver(JDBCDriver):
         vendor_dir = Path(__file__).resolve().parents[1] / "vendor"
         for jar_name in ("jaybird-native-6.0.4.jar", "jna-jpms-5.18.1.jar"):
             jar_path = str(vendor_dir / jar_name)
-            if os.path.exists(jar_path) and jar_path not in self.jar_paths:
+            if jar_path not in self.jar_paths:
                 self.jar_paths.append(jar_path)
 
         native_library_path = self._prepare_native_library_path(
             self.firebird_lib_dir or self.firebird_home
         )
-        if native_library_path and "nativeLibraryPath" not in self.connection_properties:
+        if (
+            native_library_path
+            and "nativeLibraryPath" not in self.connection_properties
+        ):
             self.connection_properties["nativeLibraryPath"] = native_library_path
         if native_library_path and "jna.library.path" not in self.jvm_properties:
             self.jvm_properties["jna.library.path"] = native_library_path
         self.connection_properties.setdefault("user", config.get("user", "SYSDBA"))
-        self.connection_properties.setdefault("password", config.get("password", "masterkey"))
+        self.connection_properties.setdefault(
+            "password", config.get("password", "masterkey")
+        )
         self.connection_properties.setdefault("createDatabaseIfNotExist", "true")
 
     def _prepare_native_library_path(self, native_library_path: str) -> str:

@@ -1,0 +1,40 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  coverage:
+    name: Run coverage report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          components: rustfmt, clippy, llvm-tools-preview
+          override: true
+
+      - name: Install cargo-llvm-cov
+        run: |
+          cargo install cargo-llvm-cov --locked --force || true
+
+      - name: Run cargo llvm-cov
+        env:
+          RUSTFLAGS: "-C instrument-coverage"
+        run: |
+          set -euxo pipefail
+          rustup component add llvm-tools-preview || true
+          cargo llvm-cov --workspace --ignore-filename-regex="(tests/|bindings/|examples/)" --html --output-path target/llvm-cov
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/llvm-cov/html

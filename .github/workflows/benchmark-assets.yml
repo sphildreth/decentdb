@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: benchmark-assets-${{ github.ref }}
@@ -397,7 +396,7 @@ jobs:
           app-id: ${{ secrets.BENCHMARK_APP_ID }}
           private-key: ${{ secrets.BENCHMARK_APP_PRIVATE_KEY }}
 
-      - name: Push benchmark asset branch and open pull request
+      - name: Commit benchmark assets to main
         id: commit
         if: github.ref == 'refs/heads/main'
         shell: bash
@@ -423,49 +422,9 @@ jobs:
             exit 0
           fi
 
-          branch="automation/benchmark-assets"
-          title="chore: refresh benchmark assets"
-          body_file=".tmp/benchmark-assets/pr-body.md"
-          pr_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/pull/new/${branch}"
-          pr_token="${APP_TOKEN:-$GH_TOKEN}"
-          cat > "$body_file" <<EOF
-          Automated benchmark asset refresh from:
-
-          - workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          - source commit: ${GITHUB_SHA}
-
-          This PR updates the generated benchmark charts, summary JSON, and benchmark docs exports.
-          EOF
-
-          git checkout -B "$branch"
           git commit -m "chore: refresh benchmark assets [skip ci]"
-          git push --force-with-lease "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$branch"
 
-          pr_number="$(GH_TOKEN="$pr_token" gh pr list \
-            --repo "$GITHUB_REPOSITORY" \
-            --base main \
-            --head "$branch" \
-            --state open \
-            --json number \
-            --jq '.[0].number' 2>/dev/null || true)"
+          token="${APP_TOKEN:-$GH_TOKEN}"
+          git push "https://x-access-token:${token}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
 
-          if [ -n "$pr_number" ]; then
-            if ! GH_TOKEN="$pr_token" gh pr edit "$pr_number" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$title" \
-              --body-file "$body_file"; then
-              echo "::warning::Automatic PR update failed. Update it manually: $pr_url"
-            fi
-          else
-            if ! GH_TOKEN="$pr_token" gh pr create \
-              --repo "$GITHUB_REPOSITORY" \
-              --base main \
-              --head "$branch" \
-              --title "$title" \
-              --body-file "$body_file"; then
-              echo "::warning::Automatic PR creation failed. Create it manually: $pr_url"
-            fi
-          fi
-
-          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
