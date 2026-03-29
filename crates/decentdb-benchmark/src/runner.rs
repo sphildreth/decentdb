@@ -10,9 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 
-use crate::cli::RunArgs;
+use crate::cli::{InternalArgs, RunArgs};
 use crate::profiles::{resolve_profile, ProfileOverrides, ResolvedProfile};
-use crate::scenarios::run_phase_1_scenario;
+use crate::scenarios::{execute_internal_command, run_scenario};
+use crate::targets::{assess_run, default_targets_path, RunTargetAssessment};
 use crate::types::{ProfileKind, ScenarioId, ScenarioResult, ScenarioStatus};
 
 #[derive(Debug)]
@@ -63,6 +64,7 @@ struct ManifestPaths {
 #[derive(Debug, Serialize)]
 struct EnvironmentCapture {
     benchmark_crate_version: String,
+    build_profile: String,
     rustc_version: Option<String>,
     os: String,
     arch: String,
@@ -87,6 +89,7 @@ struct RunSummary {
     skipped: usize,
     scenarios: Vec<ScenarioSummary>,
     warnings: Vec<String>,
+    target_assessment: Option<RunTargetAssessment>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,7 +102,13 @@ struct ScenarioSummary {
 }
 
 pub(crate) fn run_command(args: RunArgs) -> Result<()> {
-    run_command_with_executor(args, run_phase_1_scenario)
+    run_command_with_executor(args, run_scenario)
+}
+
+pub(crate) fn run_internal_command(args: InternalArgs) -> Result<()> {
+    let output = execute_internal_command(args.command)?;
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
 }
 
 fn run_command_with_executor<F>(args: RunArgs, mut execute_scenario: F) -> Result<()>
@@ -168,7 +177,7 @@ where
     }
 
     let finished_unix_ms = unix_millis(SystemTime::now())?;
-    let summary = build_summary(
+    let mut summary = build_summary(
         &run_id,
         &profile,
         args.dry_run,
@@ -176,6 +185,33 @@ where
         finished_unix_ms,
         &scenario_results,
     );
+    if !args.dry_run {
+        let scenario_values = scenario_results
+            .iter()
+            .map(|(result, _)| result.clone())
+            .collect::<Vec<_>>();
+        let targets_path = default_targets_path();
+        if targets_path.exists() {
+            let assessment = assess_run(
+                &targets_path,
+                profile.kind.as_str(),
+                build_profile(),
+                &scenario_values,
+            )?;
+            if let Some(grade) = assessment.overall_grade.as_deref() {
+                println!("grade={grade}");
+            } else {
+                println!("grade=partial");
+            }
+            summary.warnings.extend(assessment.warnings.iter().cloned());
+            summary.target_assessment = Some(assessment);
+        } else {
+            summary.warnings.push(format!(
+                "targets file {} not found; run was not graded",
+                targets_path.display()
+            ));
+        }
+    }
     write_json(&dirs.run_dir.join("summary.json"), &summary)?;
 
     println!("run_id={run_id}");
@@ -249,14 +285,33 @@ fn build_summary(
         skipped,
         scenarios: summary_rows,
         warnings,
+        target_assessment: None,
     }
 }
 
 fn headline_metrics(result: &ScenarioResult) -> BTreeMap<String, serde_json::Value> {
     let keys: &[&str] = match result.scenario_id {
         ScenarioId::DurableCommitSingle => &["commit_p95_us", "commits_per_sec"],
+        ScenarioId::DurableCommitBatch => {
+            &["batch_commit_p95_us", "rows_per_sec", "wal_growth_bytes"]
+        }
         ScenarioId::PointLookupWarm => &["lookup_p95_us", "lookups_per_sec"],
+        ScenarioId::PointLookupCold => &["first_read_p95_us", "cold_batch_p95_ms"],
         ScenarioId::RangeScanWarm => &["scan_p95_us", "rows_per_sec"],
+        ScenarioId::Checkpoint => &[
+            "checkpoint_ms",
+            "wal_bytes_before_checkpoint",
+            "wal_bytes_after_checkpoint",
+        ],
+        ScenarioId::RecoveryReopen => &["reopen_p95_ms", "first_query_p95_ms"],
+        ScenarioId::ReadUnderWrite => &[
+            "reader_p95_isolation_us",
+            "reader_p95_under_write_us",
+            "reader_p95_degradation_ratio",
+            "writer_throughput_isolation_ops_per_sec",
+            "writer_throughput_under_readers_ops_per_sec",
+            "writer_throughput_degradation_ratio",
+        ],
         ScenarioId::StorageEfficiency => &[
             "space_amplification",
             "bytes_per_logical_row",
@@ -276,7 +331,7 @@ fn headline_metrics(result: &ScenarioResult) -> BTreeMap<String, serde_json::Val
 
 fn resolve_scenarios(all: bool, requested: &[ScenarioId]) -> Vec<ScenarioId> {
     if all || requested.is_empty() {
-        return ScenarioId::ALL_PHASE1.to_vec();
+        return ScenarioId::ALL.to_vec();
     }
 
     let mut deduped = Vec::new();
@@ -406,6 +461,7 @@ fn capture_environment() -> Result<EnvironmentCapture> {
         .to_string();
     Ok(EnvironmentCapture {
         benchmark_crate_version: env!("CARGO_PKG_VERSION").to_string(),
+        build_profile: build_profile().to_string(),
         rustc_version: command_output("rustc", &["--version"]),
         os: env::consts::OS.to_string(),
         arch: env::consts::ARCH.to_string(),
@@ -430,6 +486,14 @@ fn command_output(binary: &str, args: &[&str]) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn build_profile() -> &'static str {
+    if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
     }
 }
 
@@ -467,9 +531,9 @@ mod tests {
     use crate::types::{ProfileKind, ScenarioId};
 
     #[test]
-    fn resolve_scenarios_defaults_to_all_phase_1() {
+    fn resolve_scenarios_defaults_to_all_scenarios() {
         let resolved = resolve_scenarios(false, &[]);
-        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved.len(), ScenarioId::ALL.len());
         assert_eq!(resolved[0], ScenarioId::DurableCommitSingle);
     }
 
@@ -504,6 +568,10 @@ mod tests {
             range_scan_rows: None,
             range_scans: None,
             durable_commits: None,
+            batch_size: None,
+            cold_batches: None,
+            reader_threads: None,
+            writer_ops: None,
             warmup_ops: None,
             trials: None,
             seed: None,
@@ -550,6 +618,10 @@ mod tests {
             range_scan_rows: None,
             range_scans: None,
             durable_commits: None,
+            batch_size: None,
+            cold_batches: None,
+            reader_threads: None,
+            writer_ops: None,
             warmup_ops: None,
             trials: None,
             seed: None,

@@ -29,19 +29,34 @@ impl ProfileKind {
 pub enum ScenarioId {
     #[value(name = "durable_commit_single")]
     DurableCommitSingle,
+    #[value(name = "durable_commit_batch")]
+    DurableCommitBatch,
     #[value(name = "point_lookup_warm")]
     PointLookupWarm,
+    #[value(name = "point_lookup_cold")]
+    PointLookupCold,
     #[value(name = "range_scan_warm")]
     RangeScanWarm,
+    #[value(name = "checkpoint")]
+    Checkpoint,
+    #[value(name = "recovery_reopen")]
+    RecoveryReopen,
+    #[value(name = "read_under_write")]
+    ReadUnderWrite,
     #[value(name = "storage_efficiency")]
     StorageEfficiency,
 }
 
 impl ScenarioId {
-    pub const ALL_PHASE1: [Self; 4] = [
+    pub const ALL: [Self; 9] = [
         Self::DurableCommitSingle,
+        Self::DurableCommitBatch,
         Self::PointLookupWarm,
+        Self::PointLookupCold,
         Self::RangeScanWarm,
+        Self::Checkpoint,
+        Self::RecoveryReopen,
+        Self::ReadUnderWrite,
         Self::StorageEfficiency,
     ];
 
@@ -49,8 +64,13 @@ impl ScenarioId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::DurableCommitSingle => "durable_commit_single",
+            Self::DurableCommitBatch => "durable_commit_batch",
             Self::PointLookupWarm => "point_lookup_warm",
+            Self::PointLookupCold => "point_lookup_cold",
             Self::RangeScanWarm => "range_scan_warm",
+            Self::Checkpoint => "checkpoint",
+            Self::RecoveryReopen => "recovery_reopen",
+            Self::ReadUnderWrite => "read_under_write",
             Self::StorageEfficiency => "storage_efficiency",
         }
     }
@@ -63,16 +83,26 @@ impl ScenarioId {
     #[must_use]
     pub fn default_durability_mode(self) -> &'static str {
         match self {
-            Self::DurableCommitSingle | Self::StorageEfficiency => "full",
-            Self::PointLookupWarm | Self::RangeScanWarm => "n/a",
+            Self::DurableCommitSingle
+            | Self::DurableCommitBatch
+            | Self::Checkpoint
+            | Self::RecoveryReopen
+            | Self::ReadUnderWrite
+            | Self::StorageEfficiency => "full",
+            Self::PointLookupWarm | Self::PointLookupCold | Self::RangeScanWarm => "n/a",
         }
     }
 
     #[must_use]
     pub fn default_cache_mode(self) -> &'static str {
         match self {
-            Self::DurableCommitSingle | Self::StorageEfficiency => "real_fs",
+            Self::DurableCommitSingle
+            | Self::DurableCommitBatch
+            | Self::Checkpoint
+            | Self::StorageEfficiency => "real_fs",
             Self::PointLookupWarm | Self::RangeScanWarm => "in_memory",
+            Self::PointLookupCold | Self::RecoveryReopen => "cold_process",
+            Self::ReadUnderWrite => "warm_cache",
         }
     }
 }

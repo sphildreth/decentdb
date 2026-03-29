@@ -1,0 +1,380 @@
+# DecentDB benchmark targets
+#
+# This file defines the initial "gold standard" thresholds for DecentDB's
+# benchmark system. The intent is:
+# - floor: below this, a P0 metric is not acceptable
+# - target: good enough to publish confidently
+# - stretch: exceptional / elite
+#
+# These are initial estimates, not permanent truth. They should be revised as
+# the benchmark runner matures and authoritative release-mode baselines exist.
+#
+# The primary external anchor is SQLite, not because DecentDB must copy SQLite's
+# exact behavior, but because SQLite is the dominant embedded relational engine
+# users will mentally compare against. DuckDB is included as a benchmark-process
+# anchor: performance work should be tied to explicit benchmark suites and
+# repeatable regression tracking.
+
+format_version = 1
+
+[metadata]
+name = "DecentDB benchmark targets"
+status = "initial_estimates"
+owner = "DecentDB"
+authoritative_host_class = "linux_x86_64_local_ssd"
+authoritative_build = "release"
+authoritative_benchmark_profile = "nightly"
+default_workload = "oltp_narrow_v1"
+default_reference_engine = "sqlite"
+notes = [
+  "Targets are for authoritative release-mode runs on a quiet Linux x86_64 host with local SSD storage.",
+  "Use floors to gate regressions, targets to define 'good', and stretch values to define 'elite'.",
+  "Point lookup, recovery, and checkpoint targets are intentionally ambitious but still chosen to feel locally embedded rather than client/server-like.",
+  "Storage targets emphasize normalized footprint metrics such as space amplification, not raw file size, because schema and dataset shape change absolute bytes.",
+]
+
+[rating]
+gate_priority = "P0"
+red_if_any_p0_below_floor = true
+yellow_if_all_p0_at_least_floor_but_any_p0_below_target = true
+green_requires_all_p0_at_least_target = true
+gold_requires_all_p0_at_least_target = true
+gold_min_signature_metrics_at_stretch = 4
+elite_requires_all_p0_at_least_target = true
+elite_min_signature_metrics_at_stretch = 7
+elite_requires_no_metric_below_target = true
+
+[[reference]]
+id = "sqlite_np1_query"
+engine = "sqlite"
+kind = "official_doc"
+url = "https://www.sqlite.org/np1queryprob.html"
+note = "SQLite shows that many small in-process queries can remain efficient; warm read and startup-path targets should feel local and low-overhead."
+
+[[reference]]
+id = "sqlite_faster_than_fs"
+engine = "sqlite"
+kind = "official_doc"
+url = "https://www.sqlite.org/fasterthanfs.html"
+note = "SQLite shows embedded database storage can be competitive on latency and compact on disk, but also makes clear that host and workload variance are large."
+
+[[reference]]
+id = "duckdb_benchmark_suite"
+engine = "duckdb"
+kind = "official_doc"
+url = "https://duckdb.org/docs/1.3/dev/benchmark"
+note = "DuckDB reinforces the operational model: explicit benchmark suites, repeated measurements, and regression-aware performance work."
+
+[[metric]]
+id = "durable_commit_single.txn_p95_us"
+display_name = "Durable single-row transaction p95"
+scenario = "durable_commit_single"
+metric = "txn_p95_us"
+priority = "P0"
+phase = 1
+signature = true
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 1.00
+floor = 3000.0
+target = 1500.0
+stretch = 800.0
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "vfs"]
+assumptions = [
+  "release build on authoritative host class",
+  "single-row explicit transactions",
+  "oltp_narrow_v1 workload",
+]
+
+[[metric]]
+id = "durable_commit_single.commit_p95_us"
+display_name = "Durable single-row commit-only p95"
+scenario = "durable_commit_single"
+metric = "commit_p95_us"
+priority = "P0"
+phase = 1
+signature = false
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 0.80
+floor = 2500.0
+target = 1200.0
+stretch = 700.0
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "vfs"]
+assumptions = [
+  "release build on authoritative host class",
+  "commit latency isolated from total txn latency",
+]
+
+[[metric]]
+id = "durable_commit_batch.rows_per_sec"
+display_name = "Durable batched write throughput"
+scenario = "durable_commit_batch"
+metric = "rows_per_sec"
+priority = "P0"
+phase = 2
+signature = true
+direction = "larger_is_better"
+unit = "rows_per_second"
+weight = 0.90
+floor = 40000.0
+target = 100000.0
+stretch = 200000.0
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "executor"]
+assumptions = [
+  "batch_size=100 rows",
+  "release build on authoritative host class",
+  "oltp_narrow_v1 workload",
+]
+
+[[metric]]
+id = "durable_commit_batch.batch_commit_p95_us"
+display_name = "Durable batched commit p95"
+scenario = "durable_commit_batch"
+metric = "batch_commit_p95_us"
+priority = "P0"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 0.65
+floor = 15000.0
+target = 8000.0
+stretch = 4000.0
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "executor"]
+assumptions = [
+  "batch_size=100 rows",
+  "commit time measured per batch",
+]
+
+[[metric]]
+id = "point_lookup_warm.lookup_p95_us"
+display_name = "Warm point lookup p95"
+scenario = "point_lookup_warm"
+metric = "lookup_p95_us"
+priority = "P0"
+phase = 1
+signature = true
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 1.00
+floor = 60.0
+target = 35.0
+stretch = 20.0
+cache_mode = "in_memory"
+durability_mode = "n/a"
+likely_owners = ["btree", "pager", "executor"]
+assumptions = [
+  "warm cached point lookups",
+  "prepared statement reused in the hot loop",
+  "oltp_narrow_v1 workload",
+]
+
+[[metric]]
+id = "point_lookup_cold.first_read_p95_us"
+display_name = "Cold-process first point lookup"
+scenario = "point_lookup_cold"
+metric = "first_read_p95_us"
+priority = "P0"
+phase = 2
+signature = true
+direction = "smaller_is_better"
+unit = "microseconds"
+weight = 0.90
+floor = 1200.0
+target = 600.0
+stretch = 250.0
+cache_mode = "cold_process"
+durability_mode = "n/a"
+likely_owners = ["pager", "catalog", "btree"]
+assumptions = [
+  "portable cold_process mode, not privileged cold_os_cache",
+  "first query after opening an existing file-backed database",
+]
+
+[[metric]]
+id = "point_lookup_cold.cold_batch_p95_ms"
+display_name = "Cold-process repeated lookup p95"
+scenario = "point_lookup_cold"
+metric = "cold_batch_p95_ms"
+priority = "P0"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.65
+floor = 60.0
+target = 35.0
+stretch = 20.0
+cache_mode = "cold_process"
+durability_mode = "n/a"
+likely_owners = ["pager", "btree", "executor"]
+assumptions = [
+  "measured across repeated cold-process opens or equivalent honest cold path",
+]
+
+[[metric]]
+id = "range_scan_warm.rows_per_sec"
+display_name = "Warm range scan throughput"
+scenario = "range_scan_warm"
+metric = "rows_per_sec"
+priority = "P0"
+phase = 1
+signature = true
+direction = "larger_is_better"
+unit = "rows_per_second"
+weight = 0.80
+floor = 120000.0
+target = 200000.0
+stretch = 350000.0
+cache_mode = "in_memory"
+durability_mode = "n/a"
+likely_owners = ["btree", "pager", "executor"]
+assumptions = [
+  "ordered range scans on oltp_narrow_v1",
+  "prepared statement reused in the hot loop",
+]
+
+[[metric]]
+id = "checkpoint.checkpoint_ms"
+display_name = "Checkpoint wall time"
+scenario = "checkpoint"
+metric = "checkpoint_ms"
+priority = "P0"
+phase = 2
+signature = true
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.80
+floor = 120.0
+target = 60.0
+stretch = 25.0
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "vfs"]
+assumptions = [
+  "file-backed checkpoint benchmark",
+  "pre-checkpoint WAL target approximately 64 MiB",
+  "quiet authoritative host",
+]
+
+[[metric]]
+id = "recovery_reopen.reopen_p95_ms"
+display_name = "Recovery reopen wall time"
+scenario = "recovery_reopen"
+metric = "reopen_p95_ms"
+priority = "P0"
+phase = 2
+signature = true
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.90
+floor = 120.0
+target = 70.0
+stretch = 35.0
+cache_mode = "cold_process"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "catalog"]
+assumptions = [
+  "cold_process reopen after WAL accumulation",
+  "release build on authoritative host class",
+]
+
+[[metric]]
+id = "recovery_reopen.first_query_p95_ms"
+display_name = "First query after reopen"
+scenario = "recovery_reopen"
+metric = "first_query_p95_ms"
+priority = "P0"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.65
+floor = 1.0
+target = 0.5
+stretch = 0.2
+cache_mode = "cold_process"
+durability_mode = "full"
+likely_owners = ["pager", "catalog", "executor"]
+assumptions = [
+  "measured after reopen completes",
+  "simple first statement such as a primary-key read or count query",
+]
+
+[[metric]]
+id = "read_under_write.reader_p95_degradation_ratio"
+display_name = "Reader p95 degradation under writer load"
+scenario = "read_under_write"
+metric = "reader_p95_degradation_ratio"
+priority = "P0"
+phase = 2
+signature = true
+direction = "smaller_is_better"
+unit = "ratio"
+weight = 0.90
+floor = 1.60
+target = 1.25
+stretch = 1.10
+cache_mode = "warm_cache"
+durability_mode = "full"
+likely_owners = ["locks", "pager", "scheduler"]
+assumptions = [
+  "one writer thread",
+  "four reader threads",
+  "deterministic oltp_narrow_v1 key distribution",
+]
+
+[[metric]]
+id = "read_under_write.writer_throughput_degradation_ratio"
+display_name = "Writer throughput degradation under readers"
+scenario = "read_under_write"
+metric = "writer_throughput_degradation_ratio"
+priority = "P0"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "ratio"
+weight = 0.70
+floor = 1.50
+target = 1.20
+stretch = 1.10
+cache_mode = "warm_cache"
+durability_mode = "full"
+likely_owners = ["locks", "pager", "wal"]
+assumptions = [
+  "one writer thread",
+  "four reader threads",
+  "ratio defined as isolated throughput divided by under-readers throughput",
+]
+
+[[metric]]
+id = "storage_efficiency.space_amplification"
+display_name = "Storage space amplification"
+scenario = "storage_efficiency"
+metric = "space_amplification"
+priority = "P0"
+phase = 1
+signature = true
+direction = "smaller_is_better"
+unit = "ratio"
+weight = 0.90
+floor = 1.60
+target = 1.30
+stretch = 1.15
+cache_mode = "real_fs"
+durability_mode = "full"
+likely_owners = ["record", "page_layout", "btree"]
+assumptions = [
+  "same schema, indexes, dataset, and commit boundaries for any comparison",
+  "measure after defined checkpoint / steady-state condition",
+  "WAL bytes recorded separately",
+]
