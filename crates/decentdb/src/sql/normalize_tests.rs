@@ -2,14 +2,19 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::normalize::normalize_statement_text;
     use crate::sql::ast::Statement;
+    use crate::sql::normalize::normalize_statement_text;
 
     #[test]
     fn truncate_single_and_options() {
-        let stmt = normalize_statement_text("TRUNCATE TABLE t RESTART IDENTITY CASCADE").expect("parsed");
+        let stmt =
+            normalize_statement_text("TRUNCATE TABLE t RESTART IDENTITY CASCADE").expect("parsed");
         match stmt {
-            Statement::TruncateTable { table_name, identity, cascade } => {
+            Statement::TruncateTable {
+                table_name,
+                identity,
+                cascade,
+            } => {
                 assert_eq!(table_name, "t");
                 assert_eq!(cascade, true);
                 use crate::sql::ast::TruncateIdentityMode;
@@ -50,7 +55,8 @@ mod tests {
 
     #[test]
     fn insert_on_conflict_do_nothing_parsed() {
-        let stmt = normalize_statement_text("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING").expect("parsed");
+        let stmt = normalize_statement_text("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING")
+            .expect("parsed");
         match stmt {
             Statement::Insert(insert) => {
                 assert!(insert.on_conflict.is_some());

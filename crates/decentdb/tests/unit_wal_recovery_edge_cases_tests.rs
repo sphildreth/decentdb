@@ -364,9 +364,7 @@ fn sql_transaction_reads_see_committed_snapshot_at_start() {
 
     // Open an explicit read transaction and observe the committed state.
     exec(&db_reader, "BEGIN");
-    let count_at_begin = db_reader
-        .execute("SELECT COUNT(*) FROM t")
-        .unwrap();
+    let count_at_begin = db_reader.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(
         count_at_begin.rows()[0].values()[0],
         Value::Int64(1),
@@ -379,9 +377,7 @@ fn sql_transaction_reads_see_committed_snapshot_at_start() {
     drop(db_writer);
 
     // Inside the original transaction we should still see the snapshot as of BEGIN.
-    let count_during_txn_after_write = db_reader
-        .execute("SELECT COUNT(*) FROM t")
-        .unwrap();
+    let count_during_txn_after_write = db_reader.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(
         count_during_txn_after_write.rows()[0].values()[0],
         Value::Int64(1),
@@ -391,9 +387,7 @@ fn sql_transaction_reads_see_committed_snapshot_at_start() {
     exec(&db_reader, "ROLLBACK");
 
     // Outside the transaction, the committed write should now be visible.
-    let count_after_rollback = db_reader
-        .execute("SELECT COUNT(*) FROM t")
-        .unwrap();
+    let count_after_rollback = db_reader.execute("SELECT COUNT(*) FROM t").unwrap();
     assert_eq!(
         count_after_rollback.rows()[0].values()[0],
         Value::Int64(2),
