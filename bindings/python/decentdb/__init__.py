@@ -3118,7 +3118,6 @@ class Connection:
         self._stmt_cache = collections.OrderedDict()
         self._stmt_cache_size = stmt_cache_size
         self._stats = collections.Counter()
-        self._exec_cursor = None
 
         fs_path = os.fspath(path)
         raw_path = fs_path.encode("utf-8") if isinstance(fs_path, str) else fs_path
@@ -3226,10 +3225,7 @@ class Connection:
         return cursor
 
     def execute(self, operation, parameters=None):
-        cur = self._exec_cursor() if self._exec_cursor is not None else None
-        if cur is None or cur._closed:
-            cur = self.cursor()
-            self._exec_cursor = weakref.ref(cur)
+        cur = self.cursor()
         cur.execute(operation, parameters)
         return cur
 

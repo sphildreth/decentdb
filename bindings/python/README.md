@@ -1,7 +1,8 @@
 # DecentDB Python Bindings
 
 This package provides:
-1. `decentdb`: A DB-API 2.0 compliant driver for DecentDB.
+1. `decentdb`: A DB-API 2.0 compliant driver for DecentDB. Like `sqlite3`,
+   `Connection.execute(...)` returns a new cursor for each call.
 2. `decentdb_sqlalchemy`: A SQLAlchemy 2.x dialect.
 
 ## Usage

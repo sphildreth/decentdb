@@ -107,8 +107,10 @@ and additional cold-cache misses in the pre-built transaction state path.
 4. **Empty temp_tables early exit**: `visible_table_is_temporary` now returns
    `false` immediately when `temp_tables` is empty, avoiding a BTreeMap lookup.
 
-5. **Connection.execute() cursor reuse**: Python `Connection.execute()` now
-   reuses a cached cursor instead of creating a new one per call.
+5. **Connection.execute() cursor reuse**: This optimization was reverted.
+   Reusing the same user-visible cursor across successive `Connection.execute()`
+   calls violated DB-API/sqlite3-style semantics for independent live cursors.
+   Statement reuse remains an internal optimization via the statement cache.
 
 6. **Manual EngineRuntime Clone**: Skips caching structures (prepared statement
    cache, dirty sets) during clone, reducing clone cost by ~30%.
