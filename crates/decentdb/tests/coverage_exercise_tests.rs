@@ -120,5 +120,8 @@ fn exercise_engine_broad_paths() {
     db.execute("DROP TABLE IF EXISTS c1").ok();
 
     // Clean up
-    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
+    let mut wal_path = path.clone();
+    wal_path.set_extension("wal");
+    let _ = std::fs::remove_file(&wal_path);
 }

@@ -14144,6 +14144,7 @@ pub(super) fn column_schema<'a>(
         .find(|column| identifiers_equal(&column.name, column_name))
 }
 
+#[cfg(test)]
 mod more_exec_tests;
 #[cfg(test)]
 mod runtime_tests;

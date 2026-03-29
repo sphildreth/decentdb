@@ -42,5 +42,8 @@ fn on_conflict_do_update_filter_and_apply() {
         .expect("select2");
     assert_eq!(res2.rows()[0].values()[0], Value::Int64(20));
 
-    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_file(&path);
+    let mut wal_path = path.clone();
+    wal_path.set_extension("wal");
+    let _ = std::fs::remove_file(&wal_path);
 }

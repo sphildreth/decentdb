@@ -351,29 +351,57 @@ fn evict_shared_wal_for_memory_path_is_noop() {
 
 // ── Snapshot isolation through SQL ───────────────────────────────────────────
 
-/// A snapshot held via begin_read + SELECT sees the committed state at the
-/// time the read transaction started, not later writes.
+/// A snapshot held via BEGIN + SELECT sees the committed state at the time the
+/// read transaction started, not later writes from other connections.
 #[test]
 fn sql_transaction_reads_see_committed_snapshot_at_start() {
-    let db = mem_db();
-    exec(&db, "CREATE TABLE t(id INT64)");
-    exec(&db, "INSERT INTO t VALUES (1)");
+    let path = unique_db_path("sql-transaction-snapshot");
 
-    // Open an explicit read transaction.
-    exec(&db, "BEGIN");
-    let count_during_txn = db.execute("SELECT COUNT(*) FROM t").unwrap();
+    // Create the database and an initial committed row.
+    let db_reader = Db::create(&path, DbConfig::default()).unwrap();
+    exec(&db_reader, "CREATE TABLE t(id INT64)");
+    exec(&db_reader, "INSERT INTO t VALUES (1)");
 
-    // Outside the transaction another row would be visible after commit,
-    // but inside the transaction we still see the state as of BEGIN.
-    exec(&db, "INSERT INTO t VALUES (2)"); // This will be blocked by BEGIN (single writer).
-                                           // Actually for single-writer model, we can't insert while inside a read txn
-                                           // at SQL level without BEGIN WRITE. Let's just verify the count inside the txn.
+    // Open an explicit read transaction and observe the committed state.
+    exec(&db_reader, "BEGIN");
+    let count_at_begin = db_reader
+        .execute("SELECT COUNT(*) FROM t")
+        .unwrap();
     assert_eq!(
-        count_during_txn.rows()[0].values()[0],
+        count_at_begin.rows()[0].values()[0],
         Value::Int64(1),
-        "snapshot at BEGIN should see exactly 1 row"
+        "snapshot at BEGIN should see exactly 1 committed row"
     );
-    exec(&db, "ROLLBACK");
+
+    // From another connection, commit an additional row while the snapshot is held.
+    let db_writer = Db::open(&path, DbConfig::default()).unwrap();
+    exec(&db_writer, "INSERT INTO t VALUES (2)");
+    drop(db_writer);
+
+    // Inside the original transaction we should still see the snapshot as of BEGIN.
+    let count_during_txn_after_write = db_reader
+        .execute("SELECT COUNT(*) FROM t")
+        .unwrap();
+    assert_eq!(
+        count_during_txn_after_write.rows()[0].values()[0],
+        Value::Int64(1),
+        "read transaction should not see rows committed after BEGIN"
+    );
+
+    exec(&db_reader, "ROLLBACK");
+
+    // Outside the transaction, the committed write should now be visible.
+    let count_after_rollback = db_reader
+        .execute("SELECT COUNT(*) FROM t")
+        .unwrap();
+    assert_eq!(
+        count_after_rollback.rows()[0].values()[0],
+        Value::Int64(2),
+        "after rollback of the read txn, all committed rows should be visible"
+    );
+
+    drop(db_reader);
+    cleanup(&path);
 }
 
 // ── WAL version retention with active readers ─────────────────────────────────

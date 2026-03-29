@@ -46,7 +46,13 @@ class FirebirdDriver(JDBCDriver):
 
         vendor_dir = Path(__file__).resolve().parents[1] / "vendor"
         for jar_name in ("jaybird-native-6.0.4.jar", "jna-jpms-5.18.1.jar"):
-            jar_path = str(vendor_dir / jar_name)
+            jar_file = vendor_dir / jar_name
+            if not jar_file.exists():
+                raise FileNotFoundError(
+                    f"Required Firebird vendor JAR not found: {jar_file}. "
+                    "Place the Jaybird JARs in the benchmarks/python_embedded_compare/vendor/ directory."
+                )
+            jar_path = str(jar_file)
             if jar_path not in self.jar_paths:
                 self.jar_paths.append(jar_path)
 
