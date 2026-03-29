@@ -87,6 +87,11 @@ cur.executemany(
 conn.commit()
 ```
 
+For sqlite3-style convenience, `Connection.execute(...)` creates and returns a
+fresh cursor on each call. Keeping multiple returned cursors alive at once is
+supported; later `Connection.execute(...)` calls do not invalidate earlier
+result objects.
+
 ## Transactions
 
 ```python

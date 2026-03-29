@@ -105,6 +105,32 @@ def test_connection_execute_does_not_retain_discarded_cursors(tmp_path):
     conn.close()
 
 
+def test_connection_execute_returns_independent_live_cursors(tmp_path):
+    db_path = str(tmp_path / "execute_independent_cursors.ddb")
+    conn = decentdb.connect(db_path, stmt_cache_size=10)
+
+    conn.execute("CREATE TABLE t (a INT64)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.execute("INSERT INTO t VALUES (2)")
+
+    c1 = conn.execute("SELECT a AS smallest FROM t ORDER BY a LIMIT 2")
+    desc1 = tuple(c1.description)
+    c2 = conn.execute("SELECT a AS largest FROM t ORDER BY a DESC LIMIT 1")
+
+    assert c1 is not c2
+    assert tuple(c1.description) == desc1
+    assert c1.description[0][0] == "smallest"
+    assert c2.description[0][0] == "largest"
+    assert c1.fetchone() == (1,)
+    assert c1.fetchall() == [(2,)]
+    assert c2.fetchone() == (2,)
+    assert c2.fetchone() is None
+
+    c1.close()
+    c2.close()
+    conn.close()
+
+
 def test_repeated_execute_fetchall_does_not_duplicate_buffered_first_row(tmp_path):
     db_path = str(tmp_path / "buffered_first_row.ddb")
     conn = decentdb.connect(db_path, stmt_cache_size=10)
