@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euxo pipefail
           rustup component add llvm-tools-preview || true
-          cargo llvm-cov --workspace --ignore-filename-regex="(tests/|bindings/|examples/)" --html --output-path target/llvm-cov
+          cargo llvm-cov --workspace --ignore-filename-regex="(tests/|bindings/|examples/)" --html
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
