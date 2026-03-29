@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.08540099952369928
+      "read_p95_ms": 0.20123600006627385
     },
     "HSQLDB": {
-      "read_p95_ms": 0.13444200158119202
+      "read_p95_ms": 0.16559899995627347
     },
     "decentdb": {
-      "commit_p95_ms": 3.035214,
+      "commit_p95_ms": 0.86862,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 1532664.4826402145,
-      "join_p95_ms": 0.001984,
-      "read_p95_ms": 0.000782
+      "insert_rows_per_sec": 1741326.3836300832,
+      "join_p95_ms": 0.002274,
+      "read_p95_ms": 0.000671
     },
     "duckdb": {
-      "commit_p95_ms": 3.045082,
+      "commit_p95_ms": 1.194036,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 7191.563493731031,
-      "join_p95_ms": 0.343365,
-      "read_p95_ms": 0.147978
+      "insert_rows_per_sec": 5022.54361342861,
+      "join_p95_ms": 0.45048,
+      "read_p95_ms": 0.221042
     },
     "sqlite": {
-      "commit_p95_ms": 3.008011,
+      "commit_p95_ms": 0.891859,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 1962921.1651012795,
-      "join_p95_ms": 0.002815,
-      "read_p95_ms": 0.002385
+      "insert_rows_per_sec": 1855535.0890035238,
+      "join_p95_ms": 0.002925,
+      "read_p95_ms": 0.002846
     }
   },
   "metadata": {
-    "aggregated_at": "2026-03-28T14:29:40.695064+00:00",
+    "aggregated_at": "2026-03-29T15:30:45.208929+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -39,13 +39,13 @@
     "join_workload": "prepared_inner_join_lookup_with_value_materialization",
     "latency_capture_unit": "nanoseconds",
     "latency_report_unit": "milliseconds",
-    "machine": "AMD Ryzen 9 3900X 12-Core Processor",
-    "notes": "merged extra engines from benchmarks/python_embedded_compare/out/readme5/results_merged.json",
+    "machine": "AMD EPYC 7763 64-Core Processor",
+    "notes": "merged extra engines from .tmp/benchmark-assets/root-readme-results.json",
     "os": "linux",
-    "python_merge_target_operations": 10000,
+    "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1774707777711",
+    "run_id": "1774798130016",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
