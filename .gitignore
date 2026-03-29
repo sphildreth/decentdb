@@ -86,8 +86,8 @@ tests/bindings/**/*.node
 /benchmarks/python_embedded_compare/helpers/**/obj/
 /benchmarks/python_embedded_compare/**/__pycache__/
 /benchmarks/python_embedded_compare/**/*.pyc
-/build/bench/runs/
-/build/bench/compares/
+/build/bench*/runs/
+/build/bench*/compares/
 
 # Local DecentDB database artifacts
 *.ddb

@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+bench-internals = []
+
 [dependencies]
 thiserror.workspace = true
 miniz_oxide.workspace = true

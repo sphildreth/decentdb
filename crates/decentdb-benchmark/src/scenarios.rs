@@ -12,10 +12,12 @@ use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use decentdb::benchmark::{snapshot_vfs_stats, VfsStats, VfsStatsScope};
 use decentdb::{Db, DbConfig, QueryResult, Value, WalSyncMode};
 
 use crate::cli::{ColdPointLookupProbeArgs, InternalCommand, RecoveryReopenProbeArgs};
 use crate::profiles::ResolvedProfile;
+use crate::storage_inspector::inspect_db_file;
 use crate::types::{HistogramSummary, ScenarioId, ScenarioResult, ScenarioStatus};
 
 const LOOKUP_STRIDE: u64 = 8_191;
@@ -38,6 +40,7 @@ pub(crate) fn run_scenario(
         ScenarioId::RecoveryReopen => recovery_reopen(profile, scenario_scratch),
         ScenarioId::ReadUnderWrite => read_under_write(profile, scenario_scratch),
         ScenarioId::StorageEfficiency => storage_efficiency(profile, scenario_scratch),
+        ScenarioId::MemoryFootprint => memory_footprint(profile, scenario_scratch),
     }
 }
 
@@ -107,12 +110,133 @@ impl LatencyCollector {
     }
 }
 
+fn add_vfs_stats(accum: &mut Option<VfsStats>, sample: VfsStats) {
+    match accum {
+        Some(existing) => {
+            existing.db.open_calls = existing.db.open_calls.saturating_add(sample.db.open_calls);
+            existing.db.read_calls = existing.db.read_calls.saturating_add(sample.db.read_calls);
+            existing.db.write_calls = existing
+                .db
+                .write_calls
+                .saturating_add(sample.db.write_calls);
+            existing.db.bytes_read = existing.db.bytes_read.saturating_add(sample.db.bytes_read);
+            existing.db.bytes_written = existing
+                .db
+                .bytes_written
+                .saturating_add(sample.db.bytes_written);
+            existing.db.sync_data_calls = existing
+                .db
+                .sync_data_calls
+                .saturating_add(sample.db.sync_data_calls);
+            existing.db.sync_metadata_calls = existing
+                .db
+                .sync_metadata_calls
+                .saturating_add(sample.db.sync_metadata_calls);
+            existing.db.set_len_calls = existing
+                .db
+                .set_len_calls
+                .saturating_add(sample.db.set_len_calls);
+
+            existing.wal.open_calls = existing
+                .wal
+                .open_calls
+                .saturating_add(sample.wal.open_calls);
+            existing.wal.read_calls = existing
+                .wal
+                .read_calls
+                .saturating_add(sample.wal.read_calls);
+            existing.wal.write_calls = existing
+                .wal
+                .write_calls
+                .saturating_add(sample.wal.write_calls);
+            existing.wal.bytes_read = existing
+                .wal
+                .bytes_read
+                .saturating_add(sample.wal.bytes_read);
+            existing.wal.bytes_written = existing
+                .wal
+                .bytes_written
+                .saturating_add(sample.wal.bytes_written);
+            existing.wal.sync_data_calls = existing
+                .wal
+                .sync_data_calls
+                .saturating_add(sample.wal.sync_data_calls);
+            existing.wal.sync_metadata_calls = existing
+                .wal
+                .sync_metadata_calls
+                .saturating_add(sample.wal.sync_metadata_calls);
+            existing.wal.set_len_calls = existing
+                .wal
+                .set_len_calls
+                .saturating_add(sample.wal.set_len_calls);
+
+            existing.open_create_like_calls = existing
+                .open_create_like_calls
+                .saturating_add(sample.open_create_like_calls);
+            existing.file_exists_calls = existing
+                .file_exists_calls
+                .saturating_add(sample.file_exists_calls);
+            existing.remove_file_calls = existing
+                .remove_file_calls
+                .saturating_add(sample.remove_file_calls);
+            existing.canonicalize_calls = existing
+                .canonicalize_calls
+                .saturating_add(sample.canonicalize_calls);
+        }
+        None => *accum = Some(sample),
+    }
+}
+
+fn vfs_stats_to_json(stats: VfsStats) -> serde_json::Value {
+    let total = stats.total();
+    json!({
+        "db": {
+            "open_calls": stats.db.open_calls,
+            "read_calls": stats.db.read_calls,
+            "write_calls": stats.db.write_calls,
+            "bytes_read": stats.db.bytes_read,
+            "bytes_written": stats.db.bytes_written,
+            "sync_data_calls": stats.db.sync_data_calls,
+            "sync_metadata_calls": stats.db.sync_metadata_calls,
+            "sync_calls": stats.db.sync_calls(),
+            "set_len_calls": stats.db.set_len_calls
+        },
+        "wal": {
+            "open_calls": stats.wal.open_calls,
+            "read_calls": stats.wal.read_calls,
+            "write_calls": stats.wal.write_calls,
+            "bytes_read": stats.wal.bytes_read,
+            "bytes_written": stats.wal.bytes_written,
+            "sync_data_calls": stats.wal.sync_data_calls,
+            "sync_metadata_calls": stats.wal.sync_metadata_calls,
+            "sync_calls": stats.wal.sync_calls(),
+            "set_len_calls": stats.wal.set_len_calls
+        },
+        "total": {
+            "open_calls": total.open_calls,
+            "read_calls": total.read_calls,
+            "write_calls": total.write_calls,
+            "bytes_read": total.bytes_read,
+            "bytes_written": total.bytes_written,
+            "sync_data_calls": total.sync_data_calls,
+            "sync_metadata_calls": total.sync_metadata_calls,
+            "sync_calls": total.sync_calls(),
+            "set_len_calls": total.set_len_calls
+        },
+        "open_create_like_calls": stats.open_create_like_calls,
+        "file_exists_calls": stats.file_exists_calls,
+        "remove_file_calls": stats.remove_file_calls,
+        "canonicalize_calls": stats.canonicalize_calls
+    })
+}
+
 fn durable_commit_single(
     profile: &ResolvedProfile,
     scenario_scratch: &Path,
 ) -> Result<ScenarioResult> {
     let mut commit_collector = LatencyCollector::new()?;
     let mut txn_collector = LatencyCollector::new()?;
+    let mut vfs_stats_accum = None;
     let mut warnings = Vec::new();
 
     for trial in 0..profile.trials {
@@ -144,16 +268,21 @@ fn durable_commit_single(
             txn.commit()?;
         }
 
-        for offset in 0..profile.durable_commits {
-            let id = to_i64(trial_base + profile.warmup_ops + offset)?;
-            let mut txn = db.transaction()?;
-            let txn_started = Instant::now();
-            insert.execute_in(&mut txn, &[Value::Int64(id)])?;
-            let commit_started = Instant::now();
-            txn.commit()?;
-            commit_collector.record(commit_started.elapsed())?;
-            txn_collector.record(txn_started.elapsed())?;
-        }
+        let trial_vfs_stats = {
+            let _vfs_scope = VfsStatsScope::begin(true);
+            for offset in 0..profile.durable_commits {
+                let id = to_i64(trial_base + profile.warmup_ops + offset)?;
+                let mut txn = db.transaction()?;
+                let txn_started = Instant::now();
+                insert.execute_in(&mut txn, &[Value::Int64(id)])?;
+                let commit_started = Instant::now();
+                txn.commit()?;
+                commit_collector.record(commit_started.elapsed())?;
+                txn_collector.record(txn_started.elapsed())?;
+            }
+            snapshot_vfs_stats()
+        };
+        add_vfs_stats(&mut vfs_stats_accum, trial_vfs_stats);
 
         if db.config().wal_sync_mode != WalSyncMode::Full {
             warnings.push("db.config().wal_sync_mode was not Full".to_string());
@@ -191,6 +320,30 @@ fn durable_commit_single(
         "txns_per_sec".to_string(),
         json!(txn_collector.ops_per_sec()),
     );
+    if let Some(vfs) = vfs_stats_accum {
+        let total = vfs.total();
+        let commits = commit_summary.sample_count.max(1) as f64;
+        metrics.insert(
+            "bytes_written_per_commit".to_string(),
+            json!(total.bytes_written as f64 / commits),
+        );
+        metrics.insert(
+            "write_calls_per_commit".to_string(),
+            json!(total.write_calls as f64 / commits),
+        );
+        metrics.insert(
+            "fsyncs_per_commit".to_string(),
+            json!(total.sync_calls() as f64 / commits),
+        );
+        metrics.insert(
+            "db_bytes_written_per_commit".to_string(),
+            json!(vfs.db.bytes_written as f64 / commits),
+        );
+        metrics.insert(
+            "wal_bytes_written_per_commit".to_string(),
+            json!(vfs.wal.bytes_written as f64 / commits),
+        );
+    }
 
     Ok(ScenarioResult {
         status: ScenarioStatus::Passed,
@@ -208,10 +361,12 @@ fn durable_commit_single(
         notes: vec![
             "Real filesystem path used for measurement.".to_string(),
             "Prepared insert reused across explicit one-row transactions.".to_string(),
+            "VFS write/sync attribution is collected with benchmark-only StatsVfs counters."
+                .to_string(),
         ],
         scale: profile.scale_json(),
         histograms: Some(txn_summary),
-        vfs_stats: None,
+        vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
         artifacts: Vec::new(),
     })
 }
@@ -222,6 +377,7 @@ fn durable_commit_batch(
 ) -> Result<ScenarioResult> {
     let mut commit_collector = LatencyCollector::new()?;
     let mut txn_collector = LatencyCollector::new()?;
+    let mut vfs_stats_accum = None;
 
     let mut wal_before_sum = 0_u64;
     let mut wal_after_sum = 0_u64;
@@ -263,21 +419,26 @@ fn durable_commit_batch(
         let mut wal_peak_this_trial = db.storage_info()?.wal_file_size;
         let wal_before = wal_peak_this_trial;
 
-        for _ in 0..profile.durable_commits {
-            let mut txn = db.transaction()?;
-            let txn_started = Instant::now();
-            for _ in 0..profile.batch_size {
-                let id = deterministic_row_id(profile.seed, trial, ordinal);
-                insert.execute_in(&mut txn, &[Value::Int64(to_i64(id)?)])?;
-                ordinal = ordinal.saturating_add(1);
-                total_rows_written = total_rows_written.saturating_add(1);
+        let trial_vfs_stats = {
+            let _vfs_scope = VfsStatsScope::begin(true);
+            for _ in 0..profile.durable_commits {
+                let mut txn = db.transaction()?;
+                let txn_started = Instant::now();
+                for _ in 0..profile.batch_size {
+                    let id = deterministic_row_id(profile.seed, trial, ordinal);
+                    insert.execute_in(&mut txn, &[Value::Int64(to_i64(id)?)])?;
+                    ordinal = ordinal.saturating_add(1);
+                    total_rows_written = total_rows_written.saturating_add(1);
+                }
+                let commit_started = Instant::now();
+                txn.commit()?;
+                commit_collector.record(commit_started.elapsed())?;
+                txn_collector.record(txn_started.elapsed())?;
+                wal_peak_this_trial = wal_peak_this_trial.max(db.storage_info()?.wal_file_size);
             }
-            let commit_started = Instant::now();
-            txn.commit()?;
-            commit_collector.record(commit_started.elapsed())?;
-            txn_collector.record(txn_started.elapsed())?;
-            wal_peak_this_trial = wal_peak_this_trial.max(db.storage_info()?.wal_file_size);
-        }
+            snapshot_vfs_stats()
+        };
+        add_vfs_stats(&mut vfs_stats_accum, trial_vfs_stats);
 
         let wal_after = db.storage_info()?.wal_file_size;
         if db.config().wal_sync_mode != WalSyncMode::Full {
@@ -353,6 +514,27 @@ fn durable_commit_batch(
             wal_growth_bytes as f64 / total_rows_written as f64
         }),
     );
+    if let Some(vfs) = vfs_stats_accum {
+        let total = vfs.total();
+        let batches = commit_summary.sample_count.max(1) as f64;
+        let rows = total_rows_written.max(1) as f64;
+        metrics.insert(
+            "bytes_written_per_batch".to_string(),
+            json!(total.bytes_written as f64 / batches),
+        );
+        metrics.insert(
+            "bytes_written_per_row".to_string(),
+            json!(total.bytes_written as f64 / rows),
+        );
+        metrics.insert(
+            "fsyncs_per_batch".to_string(),
+            json!(total.sync_calls() as f64 / batches),
+        );
+        metrics.insert(
+            "write_calls_per_batch".to_string(),
+            json!(total.write_calls as f64 / batches),
+        );
+    }
 
     Ok(ScenarioResult {
         status: ScenarioStatus::Passed,
@@ -372,10 +554,12 @@ fn durable_commit_batch(
             "Prepared insert is reused inside explicit small-batch transactions.".to_string(),
             "Phase 2 WAL growth uses observable file-size deltas and sampled per-batch peaks only."
                 .to_string(),
+            "VFS write/sync attribution is collected with benchmark-only StatsVfs counters."
+                .to_string(),
         ],
         scale: profile.scale_json(),
         histograms: Some(commit_summary),
-        vfs_stats: None,
+        vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
         artifacts: Vec::new(),
     })
 }
@@ -680,6 +864,7 @@ fn range_scan_warm(profile: &ResolvedProfile) -> Result<ScenarioResult> {
 
 fn checkpoint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Result<ScenarioResult> {
     let mut checkpoint_collector = LatencyCollector::new()?;
+    let mut vfs_stats_accum = None;
 
     let mut wal_before_sum = 0_u64;
     let mut wal_after_sum = 0_u64;
@@ -716,9 +901,14 @@ fn checkpoint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Result<Scen
         }
 
         let wal_before = db.storage_info()?.wal_file_size;
-        let checkpoint_started = Instant::now();
-        db.checkpoint()?;
-        checkpoint_collector.record(checkpoint_started.elapsed())?;
+        let trial_vfs_stats = {
+            let _vfs_scope = VfsStatsScope::begin(true);
+            let checkpoint_started = Instant::now();
+            db.checkpoint()?;
+            checkpoint_collector.record(checkpoint_started.elapsed())?;
+            snapshot_vfs_stats()
+        };
+        add_vfs_stats(&mut vfs_stats_accum, trial_vfs_stats);
         let wal_after = db.storage_info()?.wal_file_size;
 
         wal_before_sum = wal_before_sum.saturating_add(wal_before);
@@ -771,6 +961,26 @@ fn checkpoint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Result<Scen
     metrics.insert("wal_file_bytes_peak".to_string(), json!(wal_peak_max));
     metrics.insert("reader_stall_ms".to_string(), serde_json::Value::Null);
     metrics.insert("writer_stall_ms".to_string(), serde_json::Value::Null);
+    if let Some(vfs) = vfs_stats_accum {
+        let total = vfs.total();
+        let checkpoints = summary.sample_count.max(1) as f64;
+        metrics.insert(
+            "checkpoint_bytes_written".to_string(),
+            json!(total.bytes_written),
+        );
+        metrics.insert(
+            "checkpoint_fsync_calls".to_string(),
+            json!(total.sync_calls()),
+        );
+        metrics.insert(
+            "bytes_written_per_checkpoint".to_string(),
+            json!(total.bytes_written as f64 / checkpoints),
+        );
+        metrics.insert(
+            "fsyncs_per_checkpoint".to_string(),
+            json!(total.sync_calls() as f64 / checkpoints),
+        );
+    }
 
     Ok(ScenarioResult {
         status: ScenarioStatus::Passed,
@@ -787,10 +997,11 @@ fn checkpoint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Result<Scen
             "Real filesystem checkpoint benchmark uses Db::checkpoint directly.".to_string(),
             "Phase 2 reports only honestly measurable total checkpoint time and WAL bytes before/after checkpoint."
                 .to_string(),
+            "VFS write/sync attribution is collected with benchmark-only StatsVfs counters.".to_string(),
         ],
         scale: profile.scale_json(),
         histograms: Some(summary),
-        vfs_stats: None,
+        vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
         artifacts: Vec::new(),
     })
 }
@@ -1043,6 +1254,15 @@ fn storage_efficiency(
     let mut bytes_per_row_sum = 0.0_f64;
     let mut space_amp_sum = 0.0_f64;
     let mut wal_file_peak_max = 0_u64;
+    let mut metadata_bytes_sum = 0_u64;
+    let mut catalog_manifest_bytes_sum = 0_u64;
+    let mut table_data_bytes_sum = 0_u64;
+    let mut index_bytes_sum = Some(0_u64);
+    let mut freelist_bytes_sum = 0_u64;
+    let mut unknown_bytes_sum = 0_u64;
+    let mut overflow_bytes_total_sum = 0_u64;
+    let mut vfs_stats_accum = None;
+    let mut artifacts = Vec::new();
     let mut warnings = Vec::new();
 
     for trial in 0..profile.trials {
@@ -1059,28 +1279,62 @@ fn storage_efficiency(
             "CREATE TABLE IF NOT EXISTS bench_storage_efficiency (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
         )?;
 
-        let mut inserted = 0_u64;
-        let mut wal_peak_this_trial = db.storage_info()?.wal_file_size;
-        while inserted < profile.rows {
-            let mut txn = db.transaction()?;
-            let insert = txn.prepare(
-                "INSERT INTO bench_storage_efficiency (id, payload) VALUES ($1, 'storage-payload')",
-            )?;
-            let end = (inserted + chunk_size).min(profile.rows);
-            while inserted < end {
-                let id = deterministic_row_id(profile.seed, trial, inserted);
-                insert.execute_in(&mut txn, &[Value::Int64(to_i64(id)?)])?;
-                inserted = inserted.saturating_add(1);
+        let (wal_peak_this_trial, trial_vfs_stats) = {
+            let mut inserted = 0_u64;
+            let mut wal_peak = db.storage_info()?.wal_file_size;
+            let _vfs_scope = VfsStatsScope::begin(true);
+            while inserted < profile.rows {
+                let mut txn = db.transaction()?;
+                let insert = txn.prepare(
+                    "INSERT INTO bench_storage_efficiency (id, payload) VALUES ($1, 'storage-payload')",
+                )?;
+                let end = (inserted + chunk_size).min(profile.rows);
+                while inserted < end {
+                    let id = deterministic_row_id(profile.seed, trial, inserted);
+                    insert.execute_in(&mut txn, &[Value::Int64(to_i64(id)?)])?;
+                    inserted = inserted.saturating_add(1);
+                }
+                txn.commit()?;
+                wal_peak = wal_peak.max(db.storage_info()?.wal_file_size);
             }
-            txn.commit()?;
-            wal_peak_this_trial = wal_peak_this_trial.max(db.storage_info()?.wal_file_size);
-        }
-
-        db.checkpoint()?;
+            db.checkpoint()?;
+            (wal_peak, snapshot_vfs_stats())
+        };
+        add_vfs_stats(&mut vfs_stats_accum, trial_vfs_stats);
         let storage_info = db.storage_info()?;
         let db_file_bytes = file_len(db.path())?;
         let wal_after_checkpoint = storage_info.wal_file_size;
         wal_file_peak_max = wal_file_peak_max.max(wal_peak_this_trial);
+
+        let inspection = inspect_db_file(&db_path)?;
+        metadata_bytes_sum = metadata_bytes_sum.saturating_add(inspection.bytes.metadata_bytes);
+        catalog_manifest_bytes_sum =
+            catalog_manifest_bytes_sum.saturating_add(inspection.bytes.catalog_manifest_bytes);
+        table_data_bytes_sum =
+            table_data_bytes_sum.saturating_add(inspection.bytes.table_data_bytes);
+        index_bytes_sum = match (index_bytes_sum, inspection.bytes.index_bytes) {
+            (Some(sum), Some(value)) => Some(sum.saturating_add(value)),
+            _ => None,
+        };
+        freelist_bytes_sum = freelist_bytes_sum.saturating_add(inspection.bytes.freelist_bytes);
+        unknown_bytes_sum = unknown_bytes_sum.saturating_add(inspection.bytes.unknown_bytes);
+        overflow_bytes_total_sum =
+            overflow_bytes_total_sum.saturating_add(inspection.bytes.overflow_bytes_total);
+
+        let inspection_artifact =
+            scenario_scratch.join(format!("storage-inspection-trial-{}.json", trial + 1));
+        fs::write(
+            &inspection_artifact,
+            serde_json::to_vec_pretty(&inspection)?,
+        )
+        .with_context(|| format!("write storage inspection {}", inspection_artifact.display()))?;
+        artifacts.push(inspection_artifact.display().to_string());
+        warnings.extend(
+            inspection
+                .warnings
+                .iter()
+                .map(|warning| format!("storage_inspector: {warning}")),
+        );
 
         let steady_state_file_bytes = db_file_bytes.saturating_add(wal_after_checkpoint);
         let logical_payload_bytes = profile.rows.saturating_mul(row_logical_bytes);
@@ -1115,6 +1369,8 @@ fn storage_efficiency(
     warnings.push(format!(
         "wal_file_bytes_peak sampled once per {chunk_size} inserted rows; true peak may be higher"
     ));
+    warnings.sort();
+    warnings.dedup();
 
     let trial_count = f64::from(profile.trials);
     let avg_db_file_bytes = db_file_sum / u64::from(profile.trials);
@@ -1147,6 +1403,61 @@ fn storage_efficiency(
         "space_amplification".to_string(),
         json!(space_amp_sum / trial_count),
     );
+    metrics.insert(
+        "metadata_bytes".to_string(),
+        json!(metadata_bytes_sum / u64::from(profile.trials)),
+    );
+    metrics.insert(
+        "catalog_manifest_bytes".to_string(),
+        json!(catalog_manifest_bytes_sum / u64::from(profile.trials)),
+    );
+    metrics.insert(
+        "table_data_bytes".to_string(),
+        json!(table_data_bytes_sum / u64::from(profile.trials)),
+    );
+    metrics.insert(
+        "index_bytes".to_string(),
+        match index_bytes_sum {
+            Some(total) => json!(total / u64::from(profile.trials)),
+            None => serde_json::Value::Null,
+        },
+    );
+    metrics.insert(
+        "freelist_bytes".to_string(),
+        json!(freelist_bytes_sum / u64::from(profile.trials)),
+    );
+    metrics.insert(
+        "overflow_bytes_total".to_string(),
+        json!(overflow_bytes_total_sum / u64::from(profile.trials)),
+    );
+    metrics.insert(
+        "unknown_bytes".to_string(),
+        json!(unknown_bytes_sum / u64::from(profile.trials)),
+    );
+    metrics.insert(
+        "table_data_space_amplification".to_string(),
+        json!(if logical_payload_bytes == 0 {
+            0.0
+        } else {
+            (table_data_bytes_sum / u64::from(profile.trials)) as f64 / logical_payload_bytes as f64
+        }),
+    );
+    if let Some(vfs) = vfs_stats_accum {
+        let total = vfs.total();
+        let total_rows_measured = profile
+            .rows
+            .saturating_mul(u64::from(profile.trials))
+            .max(1);
+        metrics.insert(
+            "bytes_written_total".to_string(),
+            json!(total.bytes_written),
+        );
+        metrics.insert(
+            "bytes_written_per_row".to_string(),
+            json!(total.bytes_written as f64 / total_rows_measured as f64),
+        );
+        metrics.insert("fsync_calls_total".to_string(), json!(total.sync_calls()));
+    }
 
     Ok(ScenarioResult {
         status: ScenarioStatus::Passed,
@@ -1161,7 +1472,210 @@ fn storage_efficiency(
         warnings,
         notes: vec![
             "Storage metrics measured on real filesystem path.".to_string(),
-            "Phase 1 uses file-size metrics only; page-category storage breakdown is not implemented yet."
+            "Phase 3 adds page-category storage attribution via storage inspector output."
+                .to_string(),
+        ],
+        scale: profile.scale_json(),
+        histograms: None,
+        vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
+        artifacts,
+    })
+}
+
+fn memory_footprint(profile: &ResolvedProfile, scenario_scratch: &Path) -> Result<ScenarioResult> {
+    let payload = "memory-footprint";
+    let row_logical_bytes = 8_u64.saturating_add(payload.len() as u64);
+    let logical_payload_bytes = profile.rows.saturating_mul(row_logical_bytes);
+    let mut steady_sum = 0_u64;
+    let mut peak_sum = 0_u64;
+    let mut after_reopen_sum = 0_u64;
+    let mut steady_count = 0_u32;
+    let mut peak_count = 0_u32;
+    let mut after_reopen_count = 0_u32;
+    let mut sample_count = 0_u64;
+    let mut warnings = Vec::new();
+
+    if !cfg!(target_os = "linux") {
+        warnings.push(
+            "memory_footprint currently measures RSS via /proc/self/status and is only supported on Linux"
+                .to_string(),
+        );
+        let mut metrics = BTreeMap::new();
+        metrics.insert("rss_steady_bytes".to_string(), serde_json::Value::Null);
+        metrics.insert("rss_peak_bytes".to_string(), serde_json::Value::Null);
+        metrics.insert(
+            "rss_after_reopen_bytes".to_string(),
+            serde_json::Value::Null,
+        );
+        metrics.insert("memory_amplification".to_string(), serde_json::Value::Null);
+        metrics.insert(
+            "logical_payload_bytes".to_string(),
+            json!(logical_payload_bytes),
+        );
+        metrics.insert("rss_samples_collected".to_string(), json!(0_u64));
+        return Ok(ScenarioResult {
+            status: ScenarioStatus::Passed,
+            error_class: None,
+            scenario_id: ScenarioId::MemoryFootprint,
+            profile: profile.kind,
+            workload: ScenarioId::MemoryFootprint.default_workload().to_string(),
+            durability_mode: "full".to_string(),
+            cache_mode: "real_fs".to_string(),
+            trial_count: profile.trials,
+            metrics,
+            warnings,
+            notes: vec![
+                "RSS is reported as null outside Linux because this phase avoids non-portable guesses."
+                    .to_string(),
+            ],
+            scale: profile.scale_json(),
+            histograms: None,
+            vfs_stats: None,
+            artifacts: Vec::new(),
+        });
+    }
+
+    for trial in 0..profile.trials {
+        let trial_dir = scenario_scratch.join(format!("trial-{}", trial + 1));
+        fs::create_dir_all(&trial_dir).with_context(|| {
+            format!("create memory footprint trial dir {}", trial_dir.display())
+        })?;
+        let db_path = trial_dir.join("memory_footprint.ddb");
+
+        let config = real_fs_full_durability_config(&trial_dir);
+        let db = Db::open_or_create(&db_path, config.clone())
+            .with_context(|| format!("open memory footprint database {}", db_path.display()))?;
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS bench_memory_footprint (id INT64 PRIMARY KEY, payload TEXT NOT NULL)",
+        )?;
+
+        let mut inserted = 0_u64;
+        while inserted < profile.rows {
+            let mut txn = db.transaction()?;
+            let insert = txn.prepare(
+                "INSERT INTO bench_memory_footprint (id, payload) VALUES ($1, 'memory-footprint')",
+            )?;
+            let end = (inserted + profile.batch_size).min(profile.rows);
+            while inserted < end {
+                let id = inserted.saturating_add(1);
+                insert.execute_in(&mut txn, &[Value::Int64(to_i64(id)?)])?;
+                inserted = inserted.saturating_add(1);
+            }
+            txn.commit()?;
+        }
+        db.checkpoint()?;
+
+        let select = db.prepare("SELECT payload FROM bench_memory_footprint WHERE id = $1")?;
+        for warmup in 0..profile.warmup_ops {
+            let key = deterministic_id(profile.seed, warmup, profile.rows.max(1), trial);
+            let _ = select.execute(&[Value::Int64(to_i64(key)?)])?;
+        }
+
+        let before_window = read_linux_rss_snapshot()?;
+        let mut sampled_peak = before_window.rss_bytes;
+        for op in 0..profile.point_reads {
+            let key = deterministic_id(
+                profile.seed ^ 0xa5a5_5a5a,
+                op.saturating_add(profile.warmup_ops),
+                profile.rows.max(1),
+                trial,
+            );
+            let result = select.execute(&[Value::Int64(to_i64(key)?)])?;
+            validate_single_row(&result, "memory-footprint lookup")?;
+            if op % 64 == 0 {
+                let rss = read_linux_rss_snapshot()?.rss_bytes;
+                sampled_peak = sampled_peak.max(rss);
+                sample_count = sample_count.saturating_add(1);
+            }
+        }
+        let after_window = read_linux_rss_snapshot()?;
+        sampled_peak = sampled_peak.max(after_window.rss_bytes);
+        if after_window.hwm_bytes > before_window.hwm_bytes {
+            sampled_peak = sampled_peak.max(after_window.hwm_bytes);
+        }
+
+        steady_sum = steady_sum.saturating_add(before_window.rss_bytes);
+        peak_sum = peak_sum.saturating_add(sampled_peak);
+        steady_count = steady_count.saturating_add(1);
+        peak_count = peak_count.saturating_add(1);
+
+        drop(db);
+        let reopened = Db::open(&db_path, config)?;
+        let _ =
+            extract_single_count(reopened.execute("SELECT COUNT(*) FROM bench_memory_footprint")?)?;
+        let reopen_rss = read_linux_rss_snapshot()?.rss_bytes;
+        after_reopen_sum = after_reopen_sum.saturating_add(reopen_rss);
+        after_reopen_count = after_reopen_count.saturating_add(1);
+    }
+
+    warnings.push(
+        "RSS values are process-level snapshots from /proc/self/status; transient spikes between samples may be missed."
+            .to_string(),
+    );
+    warnings.push(
+        "VmHWM is process-global; window peak may include previous allocations when run in a long-lived process."
+            .to_string(),
+    );
+
+    let rss_steady_avg = if steady_count == 0 {
+        None
+    } else {
+        Some(steady_sum / u64::from(steady_count))
+    };
+    let rss_peak_avg = if peak_count == 0 {
+        None
+    } else {
+        Some(peak_sum / u64::from(peak_count))
+    };
+    let rss_after_reopen_avg = if after_reopen_count == 0 {
+        None
+    } else {
+        Some(after_reopen_sum / u64::from(after_reopen_count))
+    };
+
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "rss_steady_bytes".to_string(),
+        rss_steady_avg.map_or(serde_json::Value::Null, |value| json!(value)),
+    );
+    metrics.insert(
+        "rss_peak_bytes".to_string(),
+        rss_peak_avg.map_or(serde_json::Value::Null, |value| json!(value)),
+    );
+    metrics.insert(
+        "rss_after_reopen_bytes".to_string(),
+        rss_after_reopen_avg.map_or(serde_json::Value::Null, |value| json!(value)),
+    );
+    metrics.insert(
+        "logical_payload_bytes".to_string(),
+        json!(logical_payload_bytes),
+    );
+    metrics.insert("rss_samples_collected".to_string(), json!(sample_count));
+    metrics.insert(
+        "memory_amplification".to_string(),
+        match rss_steady_avg {
+            Some(steady) if logical_payload_bytes > 0 => {
+                json!(steady as f64 / logical_payload_bytes as f64)
+            }
+            _ => serde_json::Value::Null,
+        },
+    );
+
+    Ok(ScenarioResult {
+        status: ScenarioStatus::Passed,
+        error_class: None,
+        scenario_id: ScenarioId::MemoryFootprint,
+        profile: profile.kind,
+        workload: ScenarioId::MemoryFootprint.default_workload().to_string(),
+        durability_mode: "full".to_string(),
+        cache_mode: "real_fs".to_string(),
+        trial_count: profile.trials,
+        metrics,
+        warnings,
+        notes: vec![
+            "memory_footprint reports Linux RSS snapshots (VmRSS) and sampled peak during measured lookups."
+                .to_string(),
+            "Values are intentionally process-scoped and avoid allocator-specific attribution claims."
                 .to_string(),
         ],
         scale: profile.scale_json(),
@@ -1656,6 +2170,35 @@ fn file_len(path: &Path) -> Result<u64> {
     Ok(fs::metadata(path)
         .with_context(|| format!("read metadata for {}", path.display()))?
         .len())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinuxRssSnapshot {
+    rss_bytes: u64,
+    hwm_bytes: u64,
+}
+
+fn read_linux_rss_snapshot() -> Result<LinuxRssSnapshot> {
+    let status = fs::read_to_string("/proc/self/status")
+        .context("read /proc/self/status for RSS metrics")?;
+    let rss_kib = parse_proc_status_kib(&status, "VmRSS:")
+        .ok_or_else(|| anyhow!("VmRSS was not found in /proc/self/status"))?;
+    let hwm_kib = parse_proc_status_kib(&status, "VmHWM:")
+        .ok_or_else(|| anyhow!("VmHWM was not found in /proc/self/status"))?;
+    Ok(LinuxRssSnapshot {
+        rss_bytes: rss_kib.saturating_mul(1024),
+        hwm_bytes: hwm_kib.saturating_mul(1024),
+    })
+}
+
+fn parse_proc_status_kib(contents: &str, key: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let stripped = line.strip_prefix(key)?;
+        stripped
+            .split_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+    })
 }
 
 fn elapsed_to_ns(elapsed: Duration) -> u64 {

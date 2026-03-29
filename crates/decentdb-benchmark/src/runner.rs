@@ -10,9 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 
-use crate::cli::{InternalArgs, RunArgs};
+use crate::cli::{InspectStorageArgs, InternalArgs, RunArgs};
 use crate::profiles::{resolve_profile, ProfileOverrides, ResolvedProfile};
 use crate::scenarios::{execute_internal_command, run_scenario};
+use crate::storage_inspector::inspect_db_file;
 use crate::targets::{assess_run, default_targets_path, RunTargetAssessment};
 use crate::types::{ProfileKind, ScenarioId, ScenarioResult, ScenarioStatus};
 
@@ -23,6 +24,7 @@ struct RunDirectories {
     scratch_run_dir: PathBuf,
     run_dir: PathBuf,
     scenario_dir: PathBuf,
+    retained_artifact_dir: PathBuf,
 }
 
 impl RunDirectories {
@@ -30,12 +32,14 @@ impl RunDirectories {
         let scratch_run_dir = scratch_root.join(run_id);
         let run_dir = artifact_root.join("runs").join(run_id);
         let scenario_dir = run_dir.join("scenarios");
+        let retained_artifact_dir = run_dir.join("artifacts");
         Self {
             scratch_root,
             artifact_root,
             scratch_run_dir,
             run_dir,
             scenario_dir,
+            retained_artifact_dir,
         }
     }
 }
@@ -111,6 +115,24 @@ pub(crate) fn run_internal_command(args: InternalArgs) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_inspect_storage_command(args: InspectStorageArgs) -> Result<()> {
+    let inspection = inspect_db_file(&args.db_path)?;
+    let bytes = serde_json::to_vec_pretty(&inspection)?;
+    if let Some(output_path) = args.output {
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create inspect-storage output dir {}", parent.display())
+            })?;
+        }
+        fs::write(&output_path, bytes)
+            .with_context(|| format!("write inspect-storage output {}", output_path.display()))?;
+        println!("inspection={}", output_path.display());
+    } else {
+        println!("{}", String::from_utf8(bytes)?);
+    }
+    Ok(())
+}
+
 fn run_command_with_executor<F>(args: RunArgs, mut execute_scenario: F) -> Result<()>
 where
     F: FnMut(ScenarioId, &ResolvedProfile, &Path) -> Result<ScenarioResult>,
@@ -147,7 +169,7 @@ where
         let scenario_file = dirs
             .scenario_dir
             .join(format!("{}.json", scenario_id.as_str()));
-        let scenario_result = if args.dry_run {
+        let mut scenario_result = if args.dry_run {
             dry_run_result(*scenario_id, &profile)
         } else {
             let scenario_scratch = dirs.scratch_run_dir.join(scenario_id.as_str());
@@ -172,6 +194,7 @@ where
                 }
             }
         };
+        promote_artifacts(&mut scenario_result, &dirs)?;
         write_json(&scenario_file, &scenario_result)?;
         scenario_results.push((scenario_result, scenario_file));
     }
@@ -318,6 +341,9 @@ fn headline_metrics(result: &ScenarioResult) -> BTreeMap<String, serde_json::Val
             "db_file_bytes",
             "wal_file_bytes_peak",
         ],
+        ScenarioId::MemoryFootprint => {
+            &["rss_steady_bytes", "rss_peak_bytes", "memory_amplification"]
+        }
     };
 
     let mut selected = BTreeMap::new();
@@ -429,8 +455,86 @@ fn prepare_paths(dirs: &RunDirectories) -> Result<()> {
         .with_context(|| format!("create scratch run dir {}", dirs.scratch_run_dir.display()))?;
     fs::create_dir_all(&dirs.scenario_dir)
         .with_context(|| format!("create scenario dir {}", dirs.scenario_dir.display()))?;
+    fs::create_dir_all(&dirs.retained_artifact_dir).with_context(|| {
+        format!(
+            "create retained artifact dir {}",
+            dirs.retained_artifact_dir.display()
+        )
+    })?;
     validate_writable(&dirs.run_dir)?;
     Ok(())
+}
+
+fn promote_artifacts(result: &mut ScenarioResult, dirs: &RunDirectories) -> Result<()> {
+    if result.artifacts.is_empty() {
+        return Ok(());
+    }
+
+    let scenario_dir = dirs.retained_artifact_dir.join(result.scenario_id.as_str());
+    fs::create_dir_all(&scenario_dir)
+        .with_context(|| format!("create scenario artifact dir {}", scenario_dir.display()))?;
+
+    let original_artifacts = std::mem::take(&mut result.artifacts);
+    let mut retained = Vec::with_capacity(original_artifacts.len());
+
+    for artifact in original_artifacts {
+        let source = PathBuf::from(&artifact);
+        if !source.exists() {
+            result.warnings.push(format!(
+                "artifact {} was not found for retention; keeping original path reference",
+                source.display()
+            ));
+            retained.push(artifact);
+            continue;
+        }
+
+        let file_name = source.file_name().ok_or_else(|| {
+            anyhow!(
+                "artifact {} does not have a file name for retention",
+                source.display()
+            )
+        })?;
+        let destination = unique_retained_artifact_path(&scenario_dir, file_name);
+        fs::copy(&source, &destination).with_context(|| {
+            format!(
+                "copy artifact {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        retained.push(display_path(&destination));
+    }
+
+    result.artifacts = retained;
+    Ok(())
+}
+
+fn unique_retained_artifact_path(base_dir: &Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    let initial = base_dir.join(file_name);
+    if !initial.exists() {
+        return initial;
+    }
+
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "artifact".to_string());
+    let ext = Path::new(file_name)
+        .extension()
+        .map(|value| value.to_string_lossy().to_string());
+
+    for index in 1.. {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem}-{index}.{ext}"),
+            None => format!("{stem}-{index}"),
+        };
+        let candidate = base_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!("artifact retention naming should always find a free path")
 }
 
 fn validate_writable(path: &Path) -> Result<()> {
@@ -520,7 +624,9 @@ fn os_to_string_lossy(value: OsString) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
 
     use anyhow::anyhow;
     use serde_json::Value as JsonValue;
@@ -658,6 +764,72 @@ mod tests {
         )
         .expect("parse scenario");
         assert_eq!(scenario["status"], "failed");
+    }
+
+    #[test]
+    fn scenario_artifacts_are_retained_under_run_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let artifact_root = temp.path().join("artifacts");
+        let args = RunArgs {
+            profile: ProfileKind::Smoke,
+            scenario: vec![ScenarioId::DurableCommitSingle],
+            all: false,
+            dry_run: false,
+            rows: None,
+            point_reads: None,
+            range_scan_rows: None,
+            range_scans: None,
+            durable_commits: None,
+            batch_size: None,
+            cold_batches: None,
+            reader_threads: None,
+            writer_ops: None,
+            warmup_ops: None,
+            trials: None,
+            seed: None,
+            scratch_root: temp.path().join("scratch"),
+            artifact_root: artifact_root.clone(),
+        };
+
+        run_command_with_executor(args, |_scenario_id, profile, scratch| {
+            fs::create_dir_all(scratch).expect("create scratch");
+            let raw_artifact = scratch.join("sample-artifact.json");
+            fs::write(&raw_artifact, br#"{"ok":true}"#).expect("write raw artifact");
+            Ok(crate::types::ScenarioResult {
+                status: crate::types::ScenarioStatus::Passed,
+                error_class: None,
+                scenario_id: ScenarioId::DurableCommitSingle,
+                profile: profile.kind,
+                workload: "test".to_string(),
+                durability_mode: "full".to_string(),
+                cache_mode: "real_fs".to_string(),
+                trial_count: profile.trials,
+                metrics: BTreeMap::new(),
+                warnings: Vec::new(),
+                notes: Vec::new(),
+                scale: profile.scale_json(),
+                histograms: None,
+                vfs_stats: None,
+                artifacts: vec![raw_artifact.display().to_string()],
+            })
+        })
+        .expect("successful scenario run");
+
+        let run_dir = fs::read_dir(artifact_root.join("runs"))
+            .expect("read runs dir")
+            .map(|entry| entry.expect("entry").path())
+            .next()
+            .expect("run dir");
+        let scenario: JsonValue = serde_json::from_slice(
+            &fs::read(run_dir.join("scenarios").join("durable_commit_single.json"))
+                .expect("read scenario"),
+        )
+        .expect("parse scenario");
+        let retained = scenario["artifacts"][0]
+            .as_str()
+            .expect("artifact path string");
+        assert!(retained.contains("/artifacts/durable_commit_single/"));
+        assert!(Path::new(retained).exists());
     }
 
     #[test]

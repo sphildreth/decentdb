@@ -18,6 +18,8 @@ pub struct Cli {
 pub enum Command {
     /// Run one or more benchmark scenarios.
     Run(RunArgs),
+    /// Inspect storage layout and page attribution for an existing .ddb file.
+    InspectStorage(InspectStorageArgs),
     /// Internal helper commands used by benchmark scenarios.
     #[command(hide = true)]
     Internal(InternalArgs),
@@ -96,6 +98,17 @@ pub struct RunArgs {
     /// Retained artifact root.
     #[arg(long, default_value = "build/bench")]
     pub artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InspectStorageArgs {
+    /// Path to an existing DecentDB file.
+    #[arg(long)]
+    pub db_path: PathBuf,
+
+    /// Optional output path for JSON (prints to stdout when omitted).
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -5,6 +5,8 @@
 //! Phase 0 establishes the stable top-level API surface and the bootstrap
 //! database file format entry points used by later storage slices.
 
+#[cfg(feature = "bench-internals")]
+pub mod benchmark;
 mod btree;
 mod c_api;
 mod catalog;

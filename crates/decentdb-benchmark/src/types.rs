@@ -45,10 +45,12 @@ pub enum ScenarioId {
     ReadUnderWrite,
     #[value(name = "storage_efficiency")]
     StorageEfficiency,
+    #[value(name = "memory_footprint")]
+    MemoryFootprint,
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::DurableCommitSingle,
         Self::DurableCommitBatch,
         Self::PointLookupWarm,
@@ -58,6 +60,7 @@ impl ScenarioId {
         Self::RecoveryReopen,
         Self::ReadUnderWrite,
         Self::StorageEfficiency,
+        Self::MemoryFootprint,
     ];
 
     #[must_use]
@@ -72,6 +75,7 @@ impl ScenarioId {
             Self::RecoveryReopen => "recovery_reopen",
             Self::ReadUnderWrite => "read_under_write",
             Self::StorageEfficiency => "storage_efficiency",
+            Self::MemoryFootprint => "memory_footprint",
         }
     }
 
@@ -88,7 +92,8 @@ impl ScenarioId {
             | Self::Checkpoint
             | Self::RecoveryReopen
             | Self::ReadUnderWrite
-            | Self::StorageEfficiency => "full",
+            | Self::StorageEfficiency
+            | Self::MemoryFootprint => "full",
             Self::PointLookupWarm | Self::PointLookupCold | Self::RangeScanWarm => "n/a",
         }
     }
@@ -99,7 +104,8 @@ impl ScenarioId {
             Self::DurableCommitSingle
             | Self::DurableCommitBatch
             | Self::Checkpoint
-            | Self::StorageEfficiency => "real_fs",
+            | Self::StorageEfficiency
+            | Self::MemoryFootprint => "real_fs",
             Self::PointLookupWarm | Self::RangeScanWarm => "in_memory",
             Self::PointLookupCold | Self::RecoveryReopen => "cold_process",
             Self::ReadUnderWrite => "warm_cache",
