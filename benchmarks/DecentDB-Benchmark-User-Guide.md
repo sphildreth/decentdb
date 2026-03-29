@@ -74,6 +74,12 @@ This guide explains how to use `decentdb-benchmark` as the primary macro benchma
 > xdg-open build/bench/reports/today-dashboard.html
 > ```
 
+> One-command script (recommended):
+>
+> ```bash
+> ./scripts/run-and-display-benchmark-report.sh
+> ```
+
 It covers:
 
 - Running benchmark scenarios (`run`)
