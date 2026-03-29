@@ -209,4 +209,90 @@ mod tests {
             std::process::id()
         ))
     }
+
+    #[test]
+    fn file_exists_and_remove_file_works() {
+        let vfs = OsVfs;
+        let path = unique_path("exists-remove");
+        let _file = vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database file");
+        assert!(vfs.file_exists(&path).expect("file_exists"));
+        vfs.remove_file(&path).expect("remove file");
+        assert!(!vfs.file_exists(&path).expect("file_exists after remove"));
+    }
+
+    #[test]
+    fn canonicalize_path_variants() {
+        let vfs = OsVfs;
+        let path = unique_path("canonicalize1");
+        let _file = vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create database file");
+        let canon = vfs.canonicalize_path(&path).expect("canonicalize existing");
+        let expect = std::fs::canonicalize(&path).expect("std canonicalize");
+        assert_eq!(canon, expect);
+
+        // Absolute non-existent path should return the same absolute path
+        let abs = std::env::temp_dir().join(format!(
+            "abs-nonexistent-{}",
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let abs_ret = vfs
+            .canonicalize_path(&abs)
+            .expect("canonicalize absolute non-exist");
+        assert_eq!(abs_ret, abs);
+
+        // Relative path should be resolved against current_dir
+        let rel = PathBuf::from("some-relative-path-for-test");
+        let rel_ret = vfs.canonicalize_path(&rel).expect("canonicalize relative");
+        let expected_rel = std::env::current_dir().expect("cwd").join(&rel);
+        assert_eq!(rel_ret, expected_rel);
+    }
+
+    #[test]
+    fn open_modes_behaviour() {
+        let vfs = OsVfs;
+        let path = unique_path("open-modes");
+
+        // OpenExisting should fail on missing
+        assert!(vfs
+            .open(&path, OpenMode::OpenExisting, FileKind::Database)
+            .is_err());
+
+        // OpenOrCreate should succeed
+        let f = vfs
+            .open(&path, OpenMode::OpenOrCreate, FileKind::Database)
+            .expect("open or create");
+        drop(f);
+
+        // CreateNew should now fail because file exists
+        assert!(vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .is_err());
+
+        // Cleanup
+        vfs.remove_file(&path).expect("remove file");
+    }
+
+    #[test]
+    fn file_size_and_set_len_work() {
+        let vfs = OsVfs;
+        let path = unique_path("set-len");
+        let file = vfs
+            .open(&path, OpenMode::CreateNew, FileKind::Database)
+            .expect("create file");
+
+        let data = vec![0x11u8; 1024];
+        write_all_at(file.as_ref(), 0, &data).expect("write data");
+        assert_eq!(file.file_size().expect("size1"), 1024);
+
+        file.set_len(2048).expect("extend");
+        assert_eq!(file.file_size().expect("size2"), 2048);
+
+        file.set_len(512).expect("shrink");
+        assert_eq!(file.file_size().expect("size3"), 512);
+
+        vfs.remove_file(&path).expect("cleanup");
+    }
 }

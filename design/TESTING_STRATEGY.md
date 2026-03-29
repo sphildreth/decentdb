@@ -241,7 +241,7 @@ Language bindings (Python, .NET, Go, Java, Node, Dart) provide FFI access to the
 
 ### 5.5.3 CI Integration
 
-**PR Fast (every commit to main, every PR):**
+**CI (every commit to main, every PR):**
 - Build cdylib (release-mode Rust library)
 - Run Python smoke tests
 - Run .NET smoke tests

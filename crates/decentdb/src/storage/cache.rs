@@ -367,4 +367,22 @@ mod tests {
             .expect("reload page1 after dropping page2");
         assert_eq!(first_reload.read().expect("read page1"), vec![1, 1, 1, 1]);
     }
+
+    #[test]
+    fn insert_page_size_mismatch_errors() {
+        let cache = PageCache::new(1, 4);
+        let err = cache
+            .insert_page(1, vec![1, 2, 3], false)
+            .expect_err("size mismatch");
+        assert!(matches!(err, crate::error::DbError::Internal { .. }));
+    }
+
+    #[test]
+    fn pin_or_load_loader_size_mismatch_errors() {
+        let cache = PageCache::new(1, 4);
+        let err = cache
+            .pin_or_load(1, || Ok(vec![1, 2]))
+            .expect_err("loader size mismatch");
+        assert!(matches!(err, crate::error::DbError::Internal { .. }));
+    }
 }

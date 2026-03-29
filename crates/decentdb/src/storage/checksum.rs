@@ -150,4 +150,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn crc32c_empty_and_empty_parts() {
+        assert_eq!(crc32c(b""), 0);
+        assert_eq!(crc32c_parts(&[b"", b""]), 0);
+    }
+
+    #[test]
+    fn crc32c_extend_multiple_parts_matches_concat() {
+        let a = b"hello";
+        let b = b"_";
+        let c = b"world";
+        let full = crc32c_parts(&[a, b, c]);
+        let ext = crc32c_extend(crc32c_parts(&[a]), &[b, c]);
+        assert_eq!(full, ext);
+    }
+
+    #[test]
+    fn crc32c_explicit_hw_call_matches_software_when_supported() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("sse4.2") {
+                for size in [0, 1, 3, 8, 15, 16, 100, 4096] {
+                    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+                    let sw = {
+                        let mut c = u32::MAX;
+                        c = super::crc32c_software(c, &data);
+                        !c
+                    };
+                    let hw = unsafe { super::crc32c_hw(u32::MAX, &data) };
+                    let hw_inv = !hw;
+                    assert_eq!(hw_inv, sw);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_crc32c_table_runtime_call() {
+        let table = super::build_crc32c_table();
+        assert_eq!(table.len(), 256);
+        assert_eq!(table[0], 0);
+        assert_ne!(table[1], 0);
+    }
 }

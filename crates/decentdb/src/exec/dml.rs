@@ -3435,3 +3435,1182 @@ fn validate_assigned_not_null_columns(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn values_equal_basic() {
+        assert!(values_equal(&[Value::Int64(1)], &[Value::Int64(1)]).unwrap());
+        assert!(!values_equal(&[Value::Int64(1)], &[Value::Int64(2)]).unwrap());
+        assert!(!values_equal(&[Value::Int64(1)], &[Value::Int64(1), Value::Int64(1)]).unwrap());
+    }
+
+    #[test]
+    fn primary_row_id_and_next_row_id() {
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: true,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 42,
+        };
+        assert_eq!(primary_row_id(&table, &[Value::Int64(7)]), Some(7));
+
+        let mut runtime = EngineRuntime::empty(0);
+        runtime
+            .catalog
+            .tables
+            .insert("t".to_string(), table.clone());
+        assert_eq!(next_row_id(&mut runtime, "t"), 42);
+        assert_eq!(runtime.catalog.tables.get("t").unwrap().next_row_id, 43);
+
+        // temp table path
+        let mut runtime2 = EngineRuntime::empty(0);
+        let mut temp_table = table.clone();
+        temp_table.name = "temp_t".to_string();
+        runtime2
+            .temp_tables
+            .insert(temp_table.name.clone(), temp_table);
+        assert_eq!(next_row_id(&mut runtime2, "temp_t"), 42);
+    }
+
+    #[test]
+    fn prepared_index_contains_null_and_key() {
+        let index = PreparedBtreeIndex {
+            name: "i".to_string(),
+            column_indexes: vec![1],
+            int64_key: false,
+            nullable: true,
+            unique: false,
+        };
+        let row = vec![Value::Text("a".to_string()), Value::Null];
+        assert!(prepared_index_contains_null(&index, &row));
+
+        let index2 = PreparedBtreeIndex {
+            name: "i2".to_string(),
+            column_indexes: vec![0],
+            int64_key: true,
+            nullable: false,
+            unique: false,
+        };
+        let key = prepared_btree_index_key(&index2, &[Value::Int64(99)]).unwrap();
+        assert_eq!(key, RuntimeBtreeKey::Int64(99));
+
+        let index3 = PreparedBtreeIndex {
+            name: "i3".to_string(),
+            column_indexes: vec![0],
+            int64_key: false,
+            nullable: false,
+            unique: false,
+        };
+        if let RuntimeBtreeKey::Encoded(bytes) =
+            prepared_btree_index_key(&index3, &[Value::Text("x".to_string())]).unwrap()
+        {
+            let expected = encode_index_key(&Value::Text("x".to_string())).unwrap();
+            assert_eq!(bytes, expected);
+        } else {
+            panic!("expected encoded key");
+        }
+    }
+
+    #[test]
+    fn validate_assigned_not_null_columns_errors() {
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "a".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: false,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec![],
+            next_row_id: 1,
+        };
+        assert!(validate_assigned_not_null_columns(&table, &[0], &[Value::Null], "t").is_err());
+        assert!(validate_assigned_not_null_columns(&table, &[0], &[Value::Int64(1)], "t").is_ok());
+    }
+
+    // New tests covering FK parent actions: CASCADE, SET NULL, and RESTRICT
+    #[test]
+    fn apply_parent_delete_cascade_removes_child() {
+        let mut runtime = EngineRuntime::empty(1);
+
+        let parent = crate::catalog::TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        let child = crate::catalog::TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "parent_id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![crate::catalog::ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_id".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec![],
+                on_delete: crate::catalog::ForeignKeyAction::Cascade,
+                on_update: crate::catalog::ForeignKeyAction::Cascade,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        runtime
+            .catalog
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog
+            .tables
+            .insert(child.name.clone(), child.clone());
+
+        runtime.tables.insert(
+            "child".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(7)],
+                }],
+            },
+        );
+
+        runtime
+            .apply_parent_delete_actions("parent", &parent, &[Value::Int64(7)], &[])
+            .unwrap();
+
+        assert!(runtime.table_data("child").unwrap().rows.is_empty());
+    }
+
+    #[test]
+    fn apply_parent_delete_setnull_updates_child() {
+        let mut runtime = EngineRuntime::empty(1);
+
+        let parent = crate::catalog::TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        let child = crate::catalog::TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "parent_id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: true,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![crate::catalog::ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_id".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec![],
+                on_delete: crate::catalog::ForeignKeyAction::SetNull,
+                on_update: crate::catalog::ForeignKeyAction::Cascade,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        runtime
+            .catalog
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog
+            .tables
+            .insert(child.name.clone(), child.clone());
+
+        runtime.tables.insert(
+            "child".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(7)],
+                }],
+            },
+        );
+
+        runtime
+            .apply_parent_delete_actions("parent", &parent, &[Value::Int64(7)], &[])
+            .unwrap();
+
+        let rows = &runtime.table_data("child").unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].values[1], Value::Null));
+    }
+
+    #[test]
+    fn apply_parent_delete_restrict_errors() {
+        let mut runtime = EngineRuntime::empty(1);
+
+        let parent = crate::catalog::TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        let child = crate::catalog::TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "parent_id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![crate::catalog::ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_id".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec![],
+                on_delete: crate::catalog::ForeignKeyAction::Restrict,
+                on_update: crate::catalog::ForeignKeyAction::Cascade,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        runtime
+            .catalog
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog
+            .tables
+            .insert(child.name.clone(), child.clone());
+
+        runtime.tables.insert(
+            "child".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(7)],
+                }],
+            },
+        );
+
+        assert!(runtime
+            .apply_parent_delete_actions("parent", &parent, &[Value::Int64(7)], &[])
+            .is_err());
+    }
+
+    #[test]
+    fn apply_parent_update_cascade_updates_child() {
+        let mut runtime = EngineRuntime::empty(1);
+
+        let parent = crate::catalog::TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        let child = crate::catalog::TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "parent_id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![crate::catalog::ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_id".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec![],
+                on_delete: crate::catalog::ForeignKeyAction::Cascade,
+                on_update: crate::catalog::ForeignKeyAction::Cascade,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        runtime
+            .catalog
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog
+            .tables
+            .insert(child.name.clone(), child.clone());
+
+        runtime.tables.insert(
+            "child".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(7)],
+                }],
+            },
+        );
+
+        runtime
+            .apply_parent_update_actions(
+                "parent",
+                &parent,
+                &[Value::Int64(7)],
+                &[Value::Int64(42)],
+                &[],
+            )
+            .unwrap();
+
+        let rows = &runtime.table_data("child").unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].values[1], Value::Int64(42)));
+    }
+
+    #[test]
+    fn apply_parent_update_setnull_updates_child() {
+        let mut runtime = EngineRuntime::empty(1);
+
+        let parent = crate::catalog::TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        let child = crate::catalog::TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "parent_id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: true,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![crate::catalog::ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_id".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec![],
+                on_delete: crate::catalog::ForeignKeyAction::SetNull,
+                on_update: crate::catalog::ForeignKeyAction::SetNull,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        runtime
+            .catalog
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog
+            .tables
+            .insert(child.name.clone(), child.clone());
+
+        runtime.tables.insert(
+            "child".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(7)],
+                }],
+            },
+        );
+
+        runtime
+            .apply_parent_update_actions(
+                "parent",
+                &parent,
+                &[Value::Int64(7)],
+                &[Value::Int64(99)],
+                &[],
+            )
+            .unwrap();
+
+        let rows = &runtime.table_data("child").unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].values[1], Value::Null));
+    }
+
+    #[test]
+    fn apply_parent_update_restrict_errors() {
+        let mut runtime = EngineRuntime::empty(1);
+
+        let parent = crate::catalog::TableSchema {
+            name: "parent".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: false,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        let child = crate::catalog::TableSchema {
+            name: "child".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "parent_id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![crate::catalog::ForeignKeyConstraint {
+                name: None,
+                columns: vec!["parent_id".to_string()],
+                referenced_table: "parent".to_string(),
+                referenced_columns: vec![],
+                on_delete: crate::catalog::ForeignKeyAction::Restrict,
+                on_update: crate::catalog::ForeignKeyAction::Restrict,
+            }],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+
+        runtime
+            .catalog
+            .tables
+            .insert(parent.name.clone(), parent.clone());
+        runtime
+            .catalog
+            .tables
+            .insert(child.name.clone(), child.clone());
+
+        runtime.tables.insert(
+            "child".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(7)],
+                }],
+            },
+        );
+
+        assert!(runtime
+            .apply_parent_update_actions(
+                "parent",
+                &parent,
+                &[Value::Int64(7)],
+                &[Value::Int64(8)],
+                &[]
+            )
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod apply_conflict_tests {
+    use super::*;
+    use crate::record::value::Value;
+    use crate::sql::parser::parse_expression_sql;
+
+    #[test]
+    fn apply_conflict_update_filter_blocks_update() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: true,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+        runtime
+            .catalog
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime.tables.insert(
+            "t".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(10)],
+                }],
+            },
+        );
+
+        let assignments = vec![crate::sql::ast::Assignment {
+            column_name: "val".to_string(),
+            expr: crate::sql::ast::Expr::Literal(Value::Int64(20)),
+        }];
+        let filter = parse_expression_sql("excluded.val = 12").unwrap();
+        let res = runtime
+            .apply_conflict_update(
+                "t",
+                1,
+                &[Value::Int64(1), Value::Int64(20)],
+                &assignments,
+                Some(&filter),
+                &[],
+            )
+            .unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn apply_conflict_update_generated_column_error() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t2".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: true,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "g".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: Some("1".to_string()),
+                    generated_stored: true,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+        runtime
+            .catalog
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime.tables.insert(
+            "t2".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(0), Value::Int64(10)],
+                }],
+            },
+        );
+
+        let assignments = vec![crate::sql::ast::Assignment {
+            column_name: "g".to_string(),
+            expr: crate::sql::ast::Expr::Literal(Value::Int64(5)),
+        }];
+        let res = runtime.apply_conflict_update(
+            "t2",
+            1,
+            &[Value::Int64(1), Value::Int64(0), Value::Int64(20)],
+            &assignments,
+            None,
+            &[],
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn apply_conflict_update_successful_update() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t3".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: true,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+        runtime
+            .catalog
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime.tables.insert(
+            "t3".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(10)],
+                }],
+            },
+        );
+
+        let assignments = vec![crate::sql::ast::Assignment {
+            column_name: "val".to_string(),
+            expr: crate::sql::ast::Expr::Literal(Value::Int64(20)),
+        }];
+        let filter = parse_expression_sql("excluded.val = 20").unwrap();
+        let res = runtime
+            .apply_conflict_update(
+                "t3",
+                1,
+                &[Value::Int64(1), Value::Int64(20)],
+                &assignments,
+                Some(&filter),
+                &[],
+            )
+            .unwrap()
+            .expect("expected updated row");
+        assert_eq!(res.row_id, 1);
+        assert_eq!(res.values[1], Value::Int64(20));
+        // also ensure runtime state updated
+        assert_eq!(
+            runtime.table_data("t3").unwrap().rows[0].values[1],
+            Value::Int64(20)
+        );
+    }
+
+    #[test]
+    fn apply_conflict_update_unknown_column_error() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t4".to_string(),
+            temporary: false,
+            columns: vec![
+                crate::catalog::ColumnSchema {
+                    name: "id".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: true,
+                    unique: false,
+                    auto_increment: true,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+                crate::catalog::ColumnSchema {
+                    name: "val".to_string(),
+                    column_type: crate::catalog::ColumnType::Int64,
+                    nullable: false,
+                    default_sql: None,
+                    generated_sql: None,
+                    generated_stored: false,
+                    primary_key: false,
+                    unique: false,
+                    auto_increment: false,
+                    checks: vec![],
+                    foreign_key: None,
+                },
+            ],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 2,
+        };
+        runtime
+            .catalog
+            .tables
+            .insert(table.name.clone(), table.clone());
+        runtime.tables.insert(
+            "t4".to_string(),
+            crate::exec::TableData {
+                rows: vec![StoredRow {
+                    row_id: 1,
+                    values: vec![Value::Int64(1), Value::Int64(10)],
+                }],
+            },
+        );
+
+        let assignments = vec![crate::sql::ast::Assignment {
+            column_name: "unknown".to_string(),
+            expr: crate::sql::ast::Expr::Literal(Value::Int64(5)),
+        }];
+        let res = runtime.apply_conflict_update(
+            "t4",
+            1,
+            &[Value::Int64(1), Value::Int64(5)],
+            &assignments,
+            None,
+            &[],
+        );
+        assert!(res.is_err());
+    }
+}
+
+#[cfg(test)]
+mod dml_private_tests {
+    use super::*;
+    use crate::catalog::ColumnType;
+    use crate::record::value::Value;
+    use crate::sql::ast::{Expr, InsertSource};
+
+    #[test]
+    fn materialize_insert_source_values_literals_and_params() {
+        let runtime = EngineRuntime::empty(1);
+        let source = InsertSource::Values(vec![vec![
+            Expr::Literal(Value::Int64(42)),
+            Expr::Parameter(1),
+        ]]);
+        let rows = materialize_insert_source(&runtime, &source, &[Value::Int64(99)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(42));
+        assert_eq!(rows[0][1], Value::Int64(99));
+    }
+
+    #[test]
+    fn compile_and_resolve_prepared_simple_value() {
+        let lit = Expr::Literal(Value::Text("x".to_string()));
+        let param = Expr::Parameter(1);
+        assert!(compile_prepared_simple_value_source(&lit).is_some());
+        assert!(compile_prepared_simple_value_source(&param).is_some());
+        let src = compile_prepared_simple_value_source(&param).unwrap();
+        let v = resolve_prepared_simple_value(&src, &[Value::Text("y".to_string())]).unwrap();
+        assert_eq!(v, Value::Text("y".to_string()));
+    }
+
+    #[test]
+    fn resolve_prepared_simple_value_missing_param_error() {
+        let src = PreparedSimpleValueSource::Parameter(2);
+        let res = resolve_prepared_simple_value(&src, &[]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn cast_prepared_simple_value_roundtrip() {
+        let v = cast_prepared_simple_value(Value::Int64(7), ColumnType::Int64).unwrap();
+        assert_eq!(v, Value::Int64(7));
+    }
+
+    #[test]
+    fn simple_btree_lookup_filter_matches() {
+        let expr = Expr::Binary {
+            left: Box::new(Expr::Column {
+                table: Some("t".to_string()),
+                column: "id".to_string(),
+            }),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(Value::Int64(1))),
+        };
+        let res = simple_btree_lookup_filter(&expr).unwrap();
+        assert_eq!(res.0, Some("t"));
+        assert_eq!(res.1, "id");
+        match res.2 {
+            Expr::Literal(Value::Int64(1)) => (),
+            _ => panic!("expected literal 1"),
+        }
+    }
+
+    #[test]
+    fn row_id_set_to_vec_many() {
+        let arr: [i64; 3] = [7, 8, 9];
+        let set = RuntimeRowIdSet::Many(&arr);
+        let vec = row_id_set_to_vec(set);
+        assert_eq!(vec, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn next_and_primary_row_id_behavior() {
+        let mut runtime = EngineRuntime::empty(1);
+        let table = crate::catalog::TableSchema {
+            name: "t".to_string(),
+            temporary: false,
+            columns: vec![crate::catalog::ColumnSchema {
+                name: "id".to_string(),
+                column_type: crate::catalog::ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: false,
+                auto_increment: true,
+                checks: vec![],
+                foreign_key: None,
+            }],
+            checks: vec![],
+            foreign_keys: vec![],
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 10,
+        };
+        runtime
+            .catalog
+            .tables
+            .insert("t".to_string(), table.clone());
+        let id = next_row_id(&mut runtime, "t");
+        assert_eq!(id, 10);
+        assert_eq!(runtime.catalog.tables.get("t").unwrap().next_row_id, 11);
+
+        let row = vec![Value::Int64(123)];
+        assert_eq!(primary_row_id(&table, &row), Some(123));
+        let bad_row = vec![Value::Text("x".to_string())];
+        assert_eq!(primary_row_id(&table, &bad_row), None);
+    }
+
+    #[test]
+    fn prepared_index_contains_null_and_btree_key_variants() {
+        let index = PreparedBtreeIndex {
+            name: "i".to_string(),
+            column_indexes: vec![0],
+            int64_key: true,
+            nullable: true,
+            unique: false,
+        };
+        let row = vec![Value::Null];
+        assert!(prepared_index_contains_null(&index, &row));
+        let row2 = vec![Value::Int64(5)];
+        assert!(!prepared_index_contains_null(&index, &row2));
+        // int64 key
+        let key = prepared_btree_index_key(&index, &row2).unwrap();
+        assert_eq!(key, RuntimeBtreeKey::Int64(5));
+        // encoded key single column
+        let idx2 = PreparedBtreeIndex {
+            name: "e".to_string(),
+            column_indexes: vec![0],
+            int64_key: false,
+            nullable: false,
+            unique: false,
+        };
+        let row3 = vec![Value::Text("x".to_string())];
+        let key2 = prepared_btree_index_key(&idx2, &row3).unwrap();
+        match key2 {
+            RuntimeBtreeKey::Encoded(bytes) => assert!(!bytes.is_empty()),
+            _ => panic!("expected encoded"),
+        }
+        // multi column encoded
+        let idx3 = PreparedBtreeIndex {
+            name: "m".to_string(),
+            column_indexes: vec![0, 1],
+            int64_key: false,
+            nullable: false,
+            unique: false,
+        };
+        let row4 = vec![Value::Text("a".to_string()), Value::Int64(2)];
+        let key3 = prepared_btree_index_key(&idx3, &row4).unwrap();
+        match key3 {
+            RuntimeBtreeKey::Encoded(bytes) => assert!(!bytes.is_empty()),
+            _ => panic!("expected encoded"),
+        }
+    }
+}

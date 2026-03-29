@@ -135,3 +135,59 @@ impl PageStore for InMemoryPageStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zeroed_page_and_page_count() {
+        assert!(is_supported_page_size(DEFAULT_PAGE_SIZE));
+        assert!(!is_supported_page_size(123));
+        let z = zeroed_page(4096);
+        assert_eq!(z.len(), 4096);
+        assert_eq!(page_offset(1, 4096), 0);
+        assert_eq!(page_offset(2, 4096), 4096);
+        assert_eq!(page_count_for_len(8192, 4096), 2);
+    }
+
+    #[test]
+    fn in_memory_store_allocate_free_read_write() {
+        let mut store = InMemoryPageStore::new(4096);
+        assert_eq!(store.page_size(), 4096);
+        let pid = store.allocate_page().unwrap();
+        assert!(store.contains_page(pid));
+        assert_eq!(store.allocated_page_count(), 1);
+
+        // write page with wrong size -> error
+        let small = vec![0u8; 100];
+        assert!(store.write_page(pid, &small).is_err());
+
+        // write with correct size
+        let data = vec![7u8; 4096];
+        store.write_page(pid, &data).unwrap();
+        let read = store.read_page(pid).unwrap();
+        assert_eq!(read, data);
+
+        // free page
+        store.free_page(pid).unwrap();
+        assert!(!store.contains_page(pid));
+
+        // allocate uses freed page
+        let pid2 = store.allocate_page().unwrap();
+        assert_eq!(pid2, pid);
+    }
+
+    #[test]
+    fn read_missing_page_returns_zeroed() {
+        let store = InMemoryPageStore::new(4096);
+        let read = store.read_page(100).unwrap();
+        assert_eq!(read.len(), 4096);
+        assert!(read.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn validate_page_id_rejects_zero() {
+        assert!(validate_page_id(0).is_err());
+    }
+}
