@@ -46,6 +46,8 @@ class Program
             await DemonstrateSelectMany();
             await DemonstrateClientVsServerEvaluation();
             await DemonstrateUnsupportedCases();
+            await DemonstrateAllBuiltInTypes();
+            await DemonstrateAllNullableBuiltInTypes();
             await DemonstratePerformancePatterns();
         }
         finally
@@ -323,9 +325,9 @@ class Program
         foreach (var price in prices)
         {
             Console.WriteLine($"    Price: ${price:N2}");
-            Console.WriteLine($"    Ceiling: ${Math.Ceiling((double)price):N0}");
-            Console.WriteLine($"    Floor: ${Math.Floor((double)price):N0}");
-            Console.WriteLine($"    Rounded: ${Math.Round((double)price, 0):N0}");
+            Console.WriteLine($"    Ceiling: ${Math.Ceiling(price):N0}");
+            Console.WriteLine($"    Floor: ${Math.Floor(price):N0}");
+            Console.WriteLine($"    Rounded: ${Math.Round(price, 0):N0}");
         }
 
         var stockValues = await context.Products
@@ -760,13 +762,22 @@ class Program
 
         await using var context = new ShowcaseDbContext(DbPath);
 
+        var category = new Category
+        {
+            Name = "LikeTest",
+            EffectiveFrom = DateOnly.FromDateTime(DateTime.UtcNow),
+            DisplayOrder = 999
+        };
+        context.Categories.Add(category);
+        await context.SaveChangesAsync();
+
         var products = new[]
         {
-            new Product { Name = "Laptop Pro", Description = "High-end laptop", Price = 1299.99m, StockQuantity = 10, CategoryId = 1, CreatedAt = DateTime.UtcNow },
-            new Product { Name = "Laptop Air", Description = "Lightweight laptop", Price = 999.99m, StockQuantity = 15, CategoryId = 1, CreatedAt = DateTime.UtcNow },
-            new Product { Name = "Desktop Tower", Description = "Powerful desktop", Price = 799.99m, StockQuantity = 5, CategoryId = 1, CreatedAt = DateTime.UtcNow },
-            new Product { Name = "Tablet Pro", Description = "Professional tablet", Price = 699.99m, StockQuantity = 20, CategoryId = 1, CreatedAt = DateTime.UtcNow },
-            new Product { Name = "Smartphone X", Description = "Latest smartphone", Price = 899.99m, StockQuantity = 25, CategoryId = 1, CreatedAt = DateTime.UtcNow },
+            new Product { Name = "Laptop Pro", Description = "High-end laptop", Price = 1299.99m, StockQuantity = 10, CategoryId = category.Id, CreatedAt = DateTime.UtcNow },
+            new Product { Name = "Laptop Air", Description = "Lightweight laptop", Price = 999.99m, StockQuantity = 15, CategoryId = category.Id, CreatedAt = DateTime.UtcNow },
+            new Product { Name = "Desktop Tower", Description = "Powerful desktop", Price = 799.99m, StockQuantity = 5, CategoryId = category.Id, CreatedAt = DateTime.UtcNow },
+            new Product { Name = "Tablet Pro", Description = "Professional tablet", Price = 699.99m, StockQuantity = 20, CategoryId = category.Id, CreatedAt = DateTime.UtcNow },
+            new Product { Name = "Smartphone X", Description = "Latest smartphone", Price = 899.99m, StockQuantity = 25, CategoryId = category.Id, CreatedAt = DateTime.UtcNow },
         };
         context.Products.AddRange(products);
         await context.SaveChangesAsync();
@@ -810,7 +821,7 @@ class Program
         await using var context = new ShowcaseDbContext(DbPath);
 
         var expensiveProducts = await context.Products
-            .Where(p => (double)p.Price > 800.0)
+            .Where(p => p.Price > 800.0m)
             .Select(p => p.Name)
             .ToListAsync();
 
@@ -952,25 +963,25 @@ class Program
         await context.SaveChangesAsync();
 
         var productsWithCategoryViaJoin = await context.Products
-            .Join(context.Categories, p => p.CategoryId, c => c.Id, (p, c) => new { Product = p, Category = c })
-            .Where(x => x.Product.Name.StartsWith("Inc"))
-            .Select(x => new { ProductName = x.Product.Name, CategoryName = x.Category.Name })
+            .Include(p => p.Category)
+            .Where(p => p.Name.StartsWith("Inc"))
+            .Select(p => new { ProductName = p.Name, CategoryName = p.Category!.Name })
             .ToListAsync();
-        Console.WriteLine($"  JOIN (Product -> Category): {productsWithCategoryViaJoin.Count} products");
+        Console.WriteLine($"  INCLUDE (Product -> Category): {productsWithCategoryViaJoin.Count} products");
         foreach (var item in productsWithCategoryViaJoin)
             Console.WriteLine($"    {item.ProductName} -> {item.CategoryName}");
 
         var ordersWithItemsViaJoin = await context.Orders
-            .Join(context.OrderItems, o => o.Id, oi => oi.OrderId, (o, oi) => new { Order = o, OrderItem = oi })
-            .Join(context.Products, x => x.OrderItem.ProductId, p => p.Id, (x, p) => new { OrderNumber = x.Order.OrderNumber, ProductName = p.Name, Quantity = x.OrderItem.Quantity })
-            .Where(x => x.OrderNumber == "INC-001")
+            .Include(o => o.OrderItems)
+            .ThenInclude(oi => oi.Product)
+            .Where(o => o.OrderNumber == "INC-001")
+            .SelectMany(o => o.OrderItems, (o, oi) => new { OrderNumber = o.OrderNumber, ProductName = oi.Product!.Name, Quantity = oi.Quantity })
             .ToListAsync();
-        Console.WriteLine($"  MULTI-JOIN (Order -> OrderItem -> Product): {ordersWithItemsViaJoin.Count} items");
+        Console.WriteLine($"  INCLUDE / THENINCLUDE (Order -> OrderItem -> Product): {ordersWithItemsViaJoin.Count} items");
         foreach (var item in ordersWithItemsViaJoin)
             Console.WriteLine($"    Order {item.OrderNumber}: {item.Quantity}x {item.ProductName}");
 
-        Console.WriteLine("  Note: Navigation properties removed to avoid FK constraints.");
-        Console.WriteLine("        Use explicit JOINs for relationship queries instead.");
+        Console.WriteLine("  Note: Navigation properties and Include() successfully mapped and executed!");
         Console.WriteLine();
     }
 
@@ -1179,55 +1190,413 @@ class Program
 
     private static async Task DemonstrateUnsupportedCases()
     {
-        PrintSection("UNSUPPORTED / PROBLEMATIC CASES");
+        PrintSection("EDGE CASES & NOTES");
 
         await using var context = new ShowcaseDbContext(DbPath);
 
-        Console.WriteLine("  Known limitations in DecentDB EF Core provider:");
+        Console.WriteLine("  Edge cases and notes for DecentDB EF Core provider:");
         Console.WriteLine();
 
         Console.WriteLine("  1. Decimal comparisons in ranges:");
-        try
-        {
-            var decimalRange = await context.Products
-                .Where(p => p.Price >= 100 && p.Price <= 500)
-                .Select(p => p.Name)
-                .ToListAsync();
-            Console.WriteLine($"     Decimal range works: {decimalRange.Count} products");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"     Decimal range issue: {ex.Message}");
-        }
+        var decimalRange = await context.Products
+            .Where(p => p.Price >= 100 && p.Price <= 500)
+            .Select(p => p.Name)
+            .ToListAsync();
+        Console.WriteLine($"     Decimal range query: {decimalRange.Count} products (query executed successfully)");
 
         Console.WriteLine("  2. DateTime.Now (non-deterministic):");
         Console.WriteLine("     Using DateTime.UtcNow instead of DateTime.Now recommended");
 
         Console.WriteLine("  3. Composite primary keys:");
-        Console.WriteLine("     DecentDB doesn't support composite PKs - use single bigint PK");
+        Console.WriteLine("     DecentDB doesn't support composite PKs - Showcase uses single bigint PK");
 
         Console.WriteLine("  4. Foreign key constraints:");
-        Console.WriteLine("     Only column-level FKs supported, not table-level constraints");
+        Console.WriteLine("     Self-referencing FKs not supported in CREATE TABLE (inline constraints)");
+        Console.WriteLine("     Regular FKs work via column REFERENCES but no ON DELETE/UPDATE constraints");
 
-        Console.WriteLine("  5. Window functions (limited):");
-        try
+        Console.WriteLine("  5. Window functions:");
+        var ranked = await context.Products
+            .OrderByDescending(p => p.Price)
+            .Take(5)
+            .Select(p => p.Name)
+            .ToListAsync();
+        Console.WriteLine($"     Simulated with OrderBy+Take: {ranked.Count} products");
+
+        Console.WriteLine();
+    }
+
+    private static async Task DemonstrateAllBuiltInTypes()
+    {
+        PrintSection("ALL BUILT-IN C# TYPES");
+
+        await using var context = new ShowcaseDbContext(DbPath);
+
+        Console.WriteLine("  Seeding 1000 records with all built-in C# types...");
+
+        var records = new List<AllTypesDemo>();
+        var random = new Random(42);
+        var baseDate = new DateTime(2024, 1, 1);
+
+        for (int i = 0; i < 1000; i++)
         {
-            var ranked = await context.Products
-                .OrderByDescending(p => p.Price)
-                .Take(5)
-                .Select(p => p.Name)
-                .ToListAsync();
-            Console.WriteLine($"     Equivalent to ROW_NUMBER: {ranked.Count} products");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"     Window function issue: {ex.Message}");
+            records.Add(new AllTypesDemo
+            {
+                SignedByte = (sbyte)(random.Next(sbyte.MinValue, sbyte.MaxValue)),
+                UnsignedByte = (byte)(random.Next(byte.MinValue, byte.MaxValue)),
+                Int16 = (short)(random.Next(short.MinValue, short.MaxValue)),
+                UInt16 = (ushort)(random.Next(ushort.MinValue, ushort.MaxValue)),
+                Int32 = random.Next(int.MinValue, int.MaxValue),
+                UInt32 = (uint)(random.Next(1, int.MaxValue) * 2),
+                Int64 = random.NextInt64(),
+                UInt64 = (ulong)(random.NextInt64() % long.MaxValue),
+                Single = (float)(random.NextDouble() * 1000),
+                Double = random.NextDouble() * 1000,
+                Decimal = (decimal)(random.NextDouble() * 1000),
+                Boolean = random.Next(2) == 1,
+                Character = (char)('A' + random.Next(26)),
+                Text = $"Text_{i}_{Guid.NewGuid().ToString()[..8]}",
+                DateTime = baseDate.AddDays(random.Next(0, 365 * 5)),
+                DateOnly = DateOnly.FromDateTime(baseDate.AddDays(random.Next(0, 365 * 5))),
+                TimeOnly = new TimeOnly(random.Next(0, 24), random.Next(0, 60), random.Next(0, 60)),
+                Guid = Guid.NewGuid()
+            });
         }
 
-        Console.WriteLine("  Workarounds demonstrated:");
-        Console.WriteLine("    - Use decimal ranges with explicit AND conditions");
-        Console.WriteLine("    - Use client-side ordering for complex window functions");
-        Console.WriteLine("    - Handle FK enforcement at application level");
+        context.AllTypesDemos.AddRange(records);
+        await context.SaveChangesAsync();
+        Console.WriteLine($"  Seeded {records.Count} records");
+
+        Console.WriteLine();
+        Console.WriteLine("  Testing aggregations on each type:");
+        Console.WriteLine();
+
+        var testType = async (string name, Func<Task> test) =>
+        {
+            try { await test(); }
+            catch (Exception ex) { Console.WriteLine($"  {name}: FAILED - {ex.Message[..Math.Min(60, ex.Message.Length)]}"); }
+        };
+
+        await testType("sbyte", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.SignedByte);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.SignedByte);
+            var avg = await context.AllTypesDemos.AverageAsync(x => x.SignedByte);
+            Console.WriteLine($"  sbyte: min={min}, max={max}, avg={avg:F2}");
+        });
+
+        await testType("byte", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.UnsignedByte);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.UnsignedByte);
+            Console.WriteLine($"  byte: min={min}, max={max}");
+        });
+
+        await testType("short", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.Int16);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Int16);
+            Console.WriteLine($"  short: min={min}, max={max}");
+        });
+
+        await testType("ushort", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.UInt16);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.UInt16);
+            Console.WriteLine($"  ushort: min={min}, max={max}");
+        });
+
+        await testType("int", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.Int32);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Int32);
+            Console.WriteLine($"  int: min={min}, max={max}");
+        });
+
+        await testType("uint", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.UInt32);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.UInt32);
+            Console.WriteLine($"  uint: min={min}, max={max}");
+        });
+
+        await testType("long", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.Int64);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Int64);
+            Console.WriteLine($"  long: min={min}, max={max}");
+        });
+
+        await testType("ulong", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.UInt64);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.UInt64);
+            Console.WriteLine($"  ulong: min={min}, max={max}");
+        });
+
+        await testType("float", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.Single);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Single);
+            var avg = await context.AllTypesDemos.AverageAsync(x => x.Single);
+            Console.WriteLine($"  float: min={min:F2}, max={max:F2}, avg={avg:F2}");
+        });
+
+        await testType("double", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.Double);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Double);
+            var avg = await context.AllTypesDemos.AverageAsync(x => x.Double);
+            Console.WriteLine($"  double: min={min:F2}, max={max:F2}, avg={avg:F2}");
+        });
+
+        await testType("decimal", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.Decimal);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Decimal);
+            var avg = await context.AllTypesDemos.AverageAsync(x => x.Decimal);
+            Console.WriteLine($"  decimal: min={min:F2}, max={max:F2}, avg={avg:F2}");
+        });
+
+        await testType("bool", async () =>
+        {
+            var count = await context.AllTypesDemos.CountAsync(x => x.Boolean);
+            Console.WriteLine($"  bool: true_count={count}");
+        });
+
+        await testType("char", async () =>
+        {
+            var count = await context.AllTypesDemos.Select(x => x.Character).Distinct().CountAsync();
+            Console.WriteLine($"  char: distinct_count={count}");
+        });
+
+        await testType("string", async () =>
+        {
+            var count = await context.AllTypesDemos.Select(x => x.Text).Distinct().CountAsync();
+            Console.WriteLine($"  string: distinct_count={count}");
+        });
+
+        await testType("DateTime", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.DateTime);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.DateTime);
+            Console.WriteLine($"  DateTime: min={min:yyyy-MM-dd}, max={max:yyyy-MM-dd}");
+        });
+
+        await testType("DateOnly", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.DateOnly);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.DateOnly);
+            Console.WriteLine($"  DateOnly: min={min}, max={max}");
+        });
+
+        await testType("TimeOnly", async () =>
+        {
+            var min = await context.AllTypesDemos.MinAsync(x => x.TimeOnly);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.TimeOnly);
+            Console.WriteLine($"  TimeOnly: min={min}, max={max}");
+        });
+
+        await testType("Guid", async () =>
+        {
+            var count = await context.AllTypesDemos.Select(x => x.Guid).Distinct().CountAsync();
+            Console.WriteLine($"  Guid: distinct_count={count}");
+        });
+
+        Console.WriteLine();
+    }
+
+    private static async Task DemonstrateAllNullableBuiltInTypes()
+    {
+        PrintSection("ALL NULLABLE BUILT-IN C# TYPES");
+
+        await using var context = new ShowcaseDbContext(DbPath);
+
+        Console.WriteLine("  Seeding 500 records with nullable built-in C# types...");
+
+        var records = new List<AllTypesNullableDemo>();
+        var random = new Random(42);
+        var baseDate = new DateTime(2024, 1, 1);
+
+        for (int i = 0; i < 500; i++)
+        {
+            records.Add(new AllTypesNullableDemo
+            {
+                SignedByte = i % 3 == 0 ? null : (sbyte)(random.Next(sbyte.MinValue, sbyte.MaxValue)),
+                UnsignedByte = i % 3 == 0 ? null : (byte)(random.Next(byte.MinValue, byte.MaxValue)),
+                Int16 = i % 3 == 0 ? null : (short)(random.Next(short.MinValue, short.MaxValue)),
+                UInt16 = i % 3 == 0 ? null : (ushort)(random.Next(ushort.MinValue, ushort.MaxValue)),
+                Int32 = i % 3 == 0 ? null : random.Next(int.MinValue, int.MaxValue),
+                UInt32 = i % 3 == 0 ? null : (uint)(random.Next(1, int.MaxValue) * 2),
+                Int64 = i % 3 == 0 ? null : random.NextInt64(),
+                UInt64 = i % 3 == 0 ? null : (ulong)(random.NextInt64() % long.MaxValue),
+                Single = i % 3 == 0 ? null : (float)(random.NextDouble() * 1000),
+                Double = i % 3 == 0 ? null : random.NextDouble() * 1000,
+                Decimal = i % 3 == 0 ? null : (decimal)(random.NextDouble() * 1000),
+                Boolean = i % 3 == 0 ? null : (random.Next(2) == 1),
+                Character = i % 3 == 0 ? null : (char)('A' + random.Next(26)),
+                Text = i % 3 == 0 ? null : $"Text_{i}_{Guid.NewGuid().ToString()[..8]}",
+                DateTime = i % 3 == 0 ? null : baseDate.AddDays(random.Next(0, 365 * 5)),
+                DateOnly = i % 3 == 0 ? null : DateOnly.FromDateTime(baseDate.AddDays(random.Next(0, 365 * 5))),
+                TimeOnly = i % 3 == 0 ? null : new TimeOnly(random.Next(0, 24), random.Next(0, 60), random.Next(0, 60)),
+                Guid = i % 3 == 0 ? null : Guid.NewGuid()
+            });
+        }
+
+        context.AllTypesNullableDemos.AddRange(records);
+        await context.SaveChangesAsync();
+        Console.WriteLine($"  Seeded {records.Count} records (1/3 are null for each nullable type)");
+
+        Console.WriteLine();
+        Console.WriteLine("  Testing nullable aggregations (ignoring nulls):");
+        Console.WriteLine();
+
+        var testNullableType = async (string name, Func<Task> test) =>
+        {
+            try { await test(); }
+            catch (Exception ex) { Console.WriteLine($"  {name}: FAILED - {ex.Message[..Math.Min(60, ex.Message.Length)]}"); }
+        };
+
+        await testNullableType("sbyte?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.SignedByte);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.SignedByte);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.SignedByte != null);
+            Console.WriteLine($"  sbyte?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("byte?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.UnsignedByte);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UnsignedByte);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UnsignedByte != null);
+            Console.WriteLine($"  byte?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("short?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Int16);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Int16);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Int16 != null);
+            Console.WriteLine($"  short?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("ushort?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.UInt16);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UInt16);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UInt16 != null);
+            Console.WriteLine($"  ushort?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("int?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Int32);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Int32);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Int32 != null);
+            Console.WriteLine($"  int?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("uint?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.UInt32);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UInt32);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UInt32 != null);
+            Console.WriteLine($"  uint?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("long?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Int64);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Int64);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Int64 != null);
+            Console.WriteLine($"  long?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("ulong?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.UInt64);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UInt64);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UInt64 != null);
+            Console.WriteLine($"  ulong?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("float?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Single);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Single);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Single != null);
+            Console.WriteLine($"  float?: min={min:F2}, max={max:F2}, non_null={count}");
+        });
+
+        await testNullableType("double?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Double);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Double);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Double != null);
+            Console.WriteLine($"  double?: min={min:F2}, max={max:F2}, non_null={count}");
+        });
+
+        await testNullableType("decimal?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Decimal);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Decimal);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Decimal != null);
+            Console.WriteLine($"  decimal?: min={min:F2}, max={max:F2}, non_null={count}");
+        });
+
+        await testNullableType("bool?", async () =>
+        {
+            var trueCount = await context.AllTypesNullableDemos.CountAsync(x => x.Boolean == true);
+            var falseCount = await context.AllTypesNullableDemos.CountAsync(x => x.Boolean == false);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Boolean == null);
+            Console.WriteLine($"  bool?: true={trueCount}, false={falseCount}, null={nullCount}");
+        });
+
+        await testNullableType("char?", async () =>
+        {
+            var distinct = await context.AllTypesNullableDemos.Where(x => x.Character != null).Select(x => x.Character).Distinct().CountAsync();
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Character != null);
+            Console.WriteLine($"  char?: distinct={distinct}, non_null={count}");
+        });
+
+        await testNullableType("string?", async () =>
+        {
+            var distinct = await context.AllTypesNullableDemos.Where(x => x.Text != null).Select(x => x.Text).Distinct().CountAsync();
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Text == null);
+            Console.WriteLine($"  string?: distinct={distinct}, null={nullCount}");
+        });
+
+        await testNullableType("DateTime?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.DateTime);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.DateTime);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null);
+            Console.WriteLine($"  DateTime?: min={min:yyyy-MM-dd}, max={max:yyyy-MM-dd}, non_null={count}");
+        });
+
+        await testNullableType("DateOnly?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.DateOnly);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.DateOnly);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null);
+            Console.WriteLine($"  DateOnly?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("TimeOnly?", async () =>
+        {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.TimeOnly);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.TimeOnly);
+            var count = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null);
+            Console.WriteLine($"  TimeOnly?: min={min}, max={max}, non_null={count}");
+        });
+
+        await testNullableType("Guid?", async () =>
+        {
+            var distinct = await context.AllTypesNullableDemos.Where(x => x.Guid != null).Select(x => x.Guid).Distinct().CountAsync();
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Guid == null);
+            Console.WriteLine($"  Guid?: distinct={distinct}, null={nullCount}");
+        });
+
         Console.WriteLine();
     }
 

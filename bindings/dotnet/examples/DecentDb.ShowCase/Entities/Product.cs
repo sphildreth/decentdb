@@ -38,6 +38,11 @@ public class Product
     public TimeSpan? ShelfLife { get; set; }
 
     public long CategoryId { get; set; }
+    [ForeignKey(nameof(CategoryId))]
+    public Category? Category { get; set; }
+
+    public ICollection<OrderItem> OrderItems { get; set; } = new List<OrderItem>();
+    public ICollection<ProductTag> ProductTags { get; set; } = new List<ProductTag>();
 
     public int Version { get; set; }
 }

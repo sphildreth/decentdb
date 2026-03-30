@@ -139,7 +139,54 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
         MigrationCommandListBuilder builder,
         bool terminate = true)
     {
-        throw Unsupported(operation, "ALTER TABLE ... ADD FOREIGN KEY is not supported by DecentDB migrations yet.");
+        builder
+            .Append("ALTER TABLE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Table))
+            .Append(" ADD CONSTRAINT ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name))
+            .Append(" FOREIGN KEY (");
+
+        for (var i = 0; i < operation.Columns.Length; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(", ");
+            }
+
+            builder.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Columns[i]));
+        }
+
+        builder.Append(") REFERENCES ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.PrincipalTable))
+            .Append(" (");
+
+        for (var i = 0; i < operation.PrincipalColumns.Length; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(", ");
+            }
+
+            builder.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.PrincipalColumns[i]));
+        }
+
+        builder.Append(")");
+
+        if (operation.OnUpdate != ReferentialAction.NoAction)
+        {
+            builder.Append(" ON UPDATE ").Append(FkAction(operation.OnUpdate));
+        }
+
+        if (operation.OnDelete != ReferentialAction.NoAction)
+        {
+            builder.Append(" ON DELETE ").Append(FkAction(operation.OnDelete));
+        }
+
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            builder.EndCommand();
+        }
     }
 
     protected override void Generate(
@@ -148,7 +195,17 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
         MigrationCommandListBuilder builder,
         bool terminate = true)
     {
-        throw Unsupported(operation, "ALTER TABLE ... DROP FOREIGN KEY is not supported by DecentDB migrations yet.");
+        builder
+            .Append("ALTER TABLE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Table))
+            .Append(" DROP CONSTRAINT ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name));
+
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            builder.EndCommand();
+        }
     }
 
     private static string FkAction(ReferentialAction action)

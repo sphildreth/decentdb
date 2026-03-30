@@ -24,10 +24,16 @@ public class Order
     public OrderStatus Status { get; set; } = OrderStatus.Pending;
 
     public long CustomerId { get; set; }
+    [ForeignKey(nameof(CustomerId))]
+    public Customer? Customer { get; set; }
 
     public long? ShippingAddressId { get; set; }
+    [ForeignKey(nameof(ShippingAddressId))]
+    public Address? ShippingAddress { get; set; }
 
     public DateTime CreatedAt { get; set; }
+
+    public ICollection<OrderItem> OrderItems { get; set; } = new List<OrderItem>();
 }
 
 public enum OrderStatus

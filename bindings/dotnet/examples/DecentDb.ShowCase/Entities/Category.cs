@@ -23,5 +23,5 @@ public class Category
 
     public bool IsVisible { get; set; } = true;
 
-    public long? ParentCategoryId { get; set; }
+    public ICollection<Product> Products { get; set; } = new List<Product>();
 }

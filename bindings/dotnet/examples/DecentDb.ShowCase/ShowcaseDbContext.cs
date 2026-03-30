@@ -16,6 +16,8 @@ public class ShowcaseDbContext : DbContext
     public DbSet<Tag> Tags => Set<Tag>();
     public DbSet<ProductTag> ProductTags => Set<ProductTag>();
     public DbSet<Employee> Employees => Set<Employee>();
+    public DbSet<AllTypesDemo> AllTypesDemos => Set<AllTypesDemo>();
+    public DbSet<AllTypesNullableDemo> AllTypesNullableDemos => Set<AllTypesNullableDemo>();
     public DbSet<AppEventLog> EventLogs => Set<AppEventLog>();
     public DbSet<ScheduleEntry> ScheduleEntries => Set<ScheduleEntry>();
 
