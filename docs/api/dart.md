@@ -154,6 +154,27 @@ Available re-execute methods:
 - `rebindTextInt64Execute(String text, int value)` — reset, bind `(TEXT, INT64)`, execute
 - `rebindInt64TextExecute(int value, String text)` — reset, bind `(INT64, TEXT)`, execute
 
+### Fused bind+step helpers
+
+For extremely hot query paths, fused helpers combine binding and stepping into a single FFI boundary crossing:
+
+```dart
+final stmt = db.prepare('SELECT id, name, score FROM t WHERE id = $1');
+
+// Single-row lookup returning a primitive tuple
+final result = stmt.bindInt64StepI64TextF64(1, 42); 
+if (result != null) {
+  print('Name: ${result.$2}');
+}
+
+stmt.dispose();
+```
+
+Available fused methods:
+
+- `bindInt64Step(int index, int value)` — bind INT64 and stream one row view (returns `true` if row available, use `readRow()`)
+- `bindInt64StepI64TextF64(int index, int value)` — bind INT64 and return a strongly-typed `(int, String, double)?` tuple directly
+
 ## Schema helpers
 
 The packaged wrapper exposes:
@@ -259,6 +280,5 @@ DECENTDB_NATIVE_LIB=../../../target/debug/libdecentdb.so dart run benchmarks/ben
 
 ## Notes
 - the stable C ABI still does not expose open-with-config, so non-empty `options` strings are rejected
-- fused bind+step helpers (`ddb_stmt_bind_int64_step_row_view`, `ddb_stmt_bind_int64_step_i64_text_f64`) are not yet wrapped
 - the example under `bindings/dart/examples/flutter_desktop/` is still a desktop-oriented reference rather than a real Flutter SDK app
 - DecentDB remains a one-writer / many-readers engine; keep that concurrency model in mind when sharing database handles across isolates or threads

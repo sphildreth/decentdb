@@ -43,7 +43,7 @@ DecentDB's C ABI exposes 50 functions covering database lifecycle, prepared stat
 | Go      | 50/50 (100%) ✅  | 1/4       | 1/2 ✅    | 3/3 ✅    | 4/4 ✅    | 6/6 ✅    |
 | Java    | 47/60 (78%)      | 3/3 ✅    | 1/2             | 3/3 ✅      | 2/4       | 0/6        |
 | Node.js | 43/50 (86%) ✅   | 1/3       | 0/2             | 3/3 ✅      | 2/4       | 0/6        |
-| Dart    | 58/60 (97%) ✅   | 3/3 ✅    | 0/2             | 3/3 ✅     | 4/4 ✅    | 6/6 ✅     |
+| Dart    | 60/60 (100%) ✅  | 3/3 ✅    | 2/2 ✅          | 3/3 ✅     | 4/4 ✅    | 6/6 ✅     |
 
 ### Critical Findings
 
@@ -678,7 +678,7 @@ Validated successfully in the current worktree:
 
 **Location:** `bindings/dart/`
 **Architecture:** Dart FFI wrapper with native prepared statements in `Statement`, result-handle support for one-shot query paths, rich schema snapshot helpers on `Schema`, and streaming row/page iteration APIs
-**Coverage:** 58/60 functions (97%) — up from 27/50 before the v2 pass
+**Coverage:** 60/60 functions (100%) — up from 27/50 before the v2 pass
 
 ### 9.1 Completed in the v2 pass
 
@@ -698,10 +698,9 @@ Validated successfully in the current worktree:
 
 ### 9.2 Remaining gaps
 
-#### 9.2.1 Fused bind+step helpers are still missing
+#### ~~9.2.1 Fused bind+step helpers are still missing~~ ✅ RESOLVED
 
-- `ddb_stmt_bind_int64_step_row_view`
-- `ddb_stmt_bind_int64_step_i64_text_f64`
+**Resolved:** `native_bindings.dart` now declares `ddb_stmt_bind_int64_step_row_view` and `ddb_stmt_bind_int64_step_i64_text_f64`. `Statement` exposes `bindInt64Step()` and `bindInt64StepI64TextF64()`.
 
 #### 9.2.2 The “flutter_desktop” example is still only a desktop reference
 
@@ -725,7 +724,7 @@ Validated successfully in the current worktree:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Bind fused bind+step APIs | Open | two helpers remain (`ddb_stmt_bind_int64_step_*`) |
+| ~~Bind fused bind+step APIs~~ | ✅ Completed | `bindInt64Step` and `bindInt64StepI64TextF64` implemented |
 | Publish a true Flutter sample app | Open | current file is a desktop reference, not a Flutter SDK app |
 | Add isolate/runtime guard documentation or enforcement | Open | engine contract still mostly documented, not enforced |
 
@@ -857,8 +856,8 @@ Complete list of 61 C ABI functions with their binding coverage status. ✅ = ex
 | 14 | `ddb_stmt_clear_bindings` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 15 | `ddb_stmt_bind_null` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 16 | `ddb_stmt_bind_int64` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 17 | `ddb_stmt_bind_int64_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 18 | `ddb_stmt_bind_int64_step_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| 17 | `ddb_stmt_bind_int64_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 18 | `ddb_stmt_bind_int64_step_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | 19 | `ddb_stmt_bind_float64` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 20 | `ddb_stmt_bind_bool` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 21 | `ddb_stmt_bind_text` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |

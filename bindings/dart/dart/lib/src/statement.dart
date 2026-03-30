@@ -719,8 +719,6 @@ class Statement {
   bool bindInt64Step(int index, int value) {
     _checkNotDisposed();
     _invalidateExecution();
-    _loadColumnMetadata();
-    _executionPrimed = true;
 
     final outValues = calloc<Pointer<DdbValueView>>();
     final outColumns = calloc<IntPtr>();
@@ -737,6 +735,10 @@ class Statement {
       if (status != ddbOk) {
         _throwStatus(status, 'Failed to bind INT64 and step');
       }
+
+      _loadColumnMetadata();
+      _executionPrimed = true;
+
       if (outHasRow.value == 0) {
         _streamExhausted = true;
         _currentRow = null;

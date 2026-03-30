@@ -134,53 +134,9 @@ void main() {
   });
 
   test('bindInt64Step streams rows one at a time', () {
-    db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT, score FLOAT64)');
-    db.execute("INSERT INTO t VALUES (1, 'Alice'),    db.execute("INSERT INTO t values (2, 'Bob')");
-    db.execute("INSERT INTO t values (3, 'Charlie')");
-
-    db.execute("INSERT INTO t values (4, 'Diana')");
-
-    final stmt = db.prepare(r'SELECT id, name, score FROM t ORDER BY id');
-
-    try {
-      stmt.bindInt64(1, 42);
-      final row = stmt.bindInt64Step(1, 'Diana');
-      expect(stmt.bindInt64Step(1, 'Diana'), true);
- expect(rows.map((r) => r['name']).toList(), ['Diana']);
-    } finally {
-      stmt.dispose();
- });
-
-    final rows = db.query('SELECT id, name, score FROM t ORDER BY id');
-    for (final row in rows) {
-      expect(row['name'], equals('Alice');
-    }
-    expect(rows.last['name'], equals('Bob');
-  });
-
-  test('bindInt64StepI64TextF64 reads INT64/TEXT/FLOAT64 triples', () {
-    db.execute(
-      'CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT, score FLOAT64)');
-    db.execute(
-      "INSERT INTO t VALUES (1, 'Alice')");
-    db.execute("INSERT INTO t values (2, 'Bob')");
-    db.execute("INSERT INTO t values (3, 'Charlie')");
-    db.execute("INSERT INTO t values (4, 'Diana')");
-    final stmt = db.prepare(r'SELECT id, name, score FROM t ORDER BY id');
-    try {
-      stmt.bindInt64Step(1, 'Bob');
-      expect(stmt.bindInt64Step(1, 'Bob'), true);
- expect(rows.last['name'], equals('Charlie');
-    }
-    expect(rows.last['name'], equals('Diana');
-    } finally {
-      stmt.dispose();
- });
-  });
-
-  test('bindInt64Step streams rows one at a time', () {
     db.execute('CREATE TABLE t (id INT64 PRIMARY KEY, name TEXT)');
-    final stmt = db.prepare(r'SELECT id, name FROM t WHERE id = $1 ORDER BY id');
+    final stmt =
+        db.prepare(r'SELECT id, name FROM t WHERE id = $1 ORDER BY id');
     try {
       db.execute("INSERT INTO t VALUES (1, 'alice')");
       db.execute("INSERT INTO t VALUES (2, 'bob')");
@@ -204,7 +160,7 @@ void main() {
 
   test('bindInt64StepI64TextF64 returns typed triples', () {
     db.execute(
-        'CREATE TABLE t (id INT64 PRIMARY KEY, label TEXT, score FLOAT64)',
+      'CREATE TABLE t (id INT64 PRIMARY KEY, label TEXT, score FLOAT64)',
     );
     final stmt = db.prepare(r'SELECT id, label, score FROM t WHERE id = $1');
     try {
@@ -214,14 +170,14 @@ void main() {
       final r1 = stmt.bindInt64StepI64TextF64(1, 1);
       expect(r1, isNotNull);
       expect(r1!.$1, 1);
-      expect(r1!.$2, 'alpha');
-      expect(r1!.$3, closeTo(9.5, 0.001));
+      expect(r1.$2, 'alpha');
+      expect(r1.$3, closeTo(9.5, 0.001));
 
       final r2 = stmt.bindInt64StepI64TextF64(1, 2);
       expect(r2, isNotNull);
       expect(r2!.$1, 2);
-      expect(r2!.$2, 'beta');
-      expect(r2!.$3, closeTo(8.25, 0.001));
+      expect(r2.$2, 'beta');
+      expect(r2.$3, closeTo(8.25, 0.001));
 
       final r3 = stmt.bindInt64StepI64TextF64(1, 99);
       expect(r3, isNull);
@@ -229,5 +185,4 @@ void main() {
       stmt.dispose();
     }
   });
-});
 }
