@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - .NET decimal parameter scale handling during command binding and EF modification batching so configured scale metadata is applied consistently before native decimal binding.
 
 ### Added
-- `decentdb-cli migrate` subcommand to handle databases with unsupported legacy format versions, providing a helpful message explaining the manual logical dump/restore path.
+- Dedicated standalone `decentdb-migrate` CLI tool to seamlessly upgrade databases from unsupported legacy format versions (e.g., Nim-era v3) to the current format.
+- `decentdb-cli` now detects legacy format versions and provides a helpful message directing the user to the `decentdb-migrate` tool.
 - Exported `DB_FORMAT_VERSION` from the core engine to identify the target database version.
 - Added structured error code `DDB_ERR_UNSUPPORTED_FORMAT_VERSION` (8) to the C ABI and mapped it across all language bindings (Dart, Java, Python, Go, Node.js, .NET).
 - Dart binding rich schema snapshot: `Schema.getSchemaSnapshot()` returns a typed model layer covering tables, views, indexes, triggers, check constraints, foreign keys, generated columns, temp-object metadata, and canonical DDL in one call.

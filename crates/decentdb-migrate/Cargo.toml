@@ -1,0 +1,17 @@
+[package]
+name = "decentdb-migrate"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+decentdb = { version = "2.1.0", path = "../decentdb" }
+flate2 = "1.1.9"
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"

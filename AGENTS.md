@@ -128,7 +128,7 @@ A change is done only when:
 
 Create an ADR before implementing any of the following:
 
-- file format layout or versioning changes
+- file format layout or versioning changes (Note: Bumping the format version also strictly requires adding a read-only migration parser for the previous version to the `decentdb-migrate` crate, per ADR 0131).
 - WAL format or checkpointing semantics changes
 - major crate/dependency additions
 - concurrency or locking changes that affect `Send` / `Sync` boundaries

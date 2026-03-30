@@ -740,12 +740,12 @@ fn run_migrate(command: MigrateCommand) -> Result<()> {
         ));
     }
 
-    // For now, we stub out the migration implementation.
+    // Direct the user to the standalone migration tool.
     Err(anyhow!(
-        "Migration from format version {} to current format version {} is not yet implemented natively. Please use a legacy CLI tool (matching version {}) to logical-dump the database and then import it using the current CLI.",
+        "Database is in legacy format version {}. To upgrade it to the current format version {}, please use the standalone migration tool:\n\n    decentdb-migrate --source {} --dest <new_path.ddb>\n",
         header.format_version,
         decentdb::DB_FORMAT_VERSION,
-        header.format_version
+        command.source
     ))
 }
 

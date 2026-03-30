@@ -808,6 +808,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "decentdb-migrate"
+version = "2.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "decentdb",
+ "flate2",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "derive_arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

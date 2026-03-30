@@ -3,7 +3,7 @@ members = [
     "crates/decentdb",       # Core database engine
     "crates/decentdb-cli",   # CLI application
     "crates/decentdb-benchmark", # Rust-native benchmark runner
-    "crates/libpg_query_sys", # Pinned SQL parser wrapper
+    "crates/libpg_query_sys", "crates/decentdb-migrate", # Pinned SQL parser wrapper
 ]
 resolver = "2"
 

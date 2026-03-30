@@ -15,6 +15,7 @@ nav:
     - SQL Reference: user-guide/sql-reference.md
     - SQL Feature Matrix: user-guide/sql-feature-matrix.md
     - Data Types: user-guide/data-types.md
+    - Migrations: user-guide/migration.md
     - Transactions: user-guide/transactions.md
     - Indexes: user-guide/indexes.md
     - Performance Tuning: user-guide/performance.md
