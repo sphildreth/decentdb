@@ -80,6 +80,77 @@ public sealed class MigrationsRuntimeTests : IDisposable
     }
 
     [Fact]
+    public void EnsureCreated_CanCreateSelfReferencingForeignKeys()
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<SelfRefFkDbContext>();
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
+
+        using var context = new SelfRefFkDbContext(optionsBuilder.Options);
+        context.Database.EnsureDeleted();
+        context.Database.EnsureCreated();
+    }
+
+    [Fact]
+    public void MigrationsSqlGenerator_AddForeignKey_WithActions_Executes()
+    {
+        using var context = CreateContext();
+        context.Database.EnsureDeleted();
+
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        ExecuteNonQuery(conn, """
+                              CREATE TABLE "ParentEntities" (
+                                "Id" INTEGER PRIMARY KEY
+                              )
+                              """);
+        ExecuteNonQuery(conn, """
+                              CREATE TABLE "ChildEntities" (
+                                "Id" INTEGER PRIMARY KEY,
+                                "ParentId" INTEGER
+                              )
+                              """);
+
+        var generator = context.GetService<IMigrationsSqlGenerator>();
+        var operation = new AddForeignKeyOperation
+        {
+            Name = "FK_ChildEntities_ParentEntities_ParentId",
+            Table = "ChildEntities",
+            Columns = ["ParentId"],
+            PrincipalTable = "ParentEntities",
+            PrincipalColumns = ["Id"],
+            OnDelete = ReferentialAction.SetNull,
+            OnUpdate = ReferentialAction.Cascade
+        };
+
+        foreach (var command in generator.Generate([operation], null))
+        {
+            ExecuteNonQuery(conn, command.CommandText);
+        }
+
+        ExecuteNonQuery(conn, """
+                              INSERT INTO "ParentEntities" ("Id") VALUES (1), (2)
+                              """);
+        ExecuteNonQuery(conn, """
+                              INSERT INTO "ChildEntities" ("Id", "ParentId") VALUES (10, 1), (20, 2)
+                              """);
+
+        ExecuteNonQuery(conn, """
+                              UPDATE "ParentEntities" SET "Id" = 100 WHERE "Id" = 1
+                              """);
+        Assert.Equal(100L, ExecuteScalar(conn, """
+                                          SELECT "ParentId" FROM "ChildEntities" WHERE "Id" = 10
+                                          """));
+
+        ExecuteNonQuery(conn, """
+                              DELETE FROM "ParentEntities" WHERE "Id" = 2
+                              """);
+        Assert.Equal(DBNull.Value, ExecuteScalar(conn, """
+                                                SELECT "ParentId" FROM "ChildEntities" WHERE "Id" = 20
+                                                """));
+    }
+
+    [Fact]
     public void UnsupportedMigrationsOperation_ThrowsActionableError()
     {
         using var context = CreateContext();
@@ -98,6 +169,20 @@ public sealed class MigrationsRuntimeTests : IDisposable
         var optionsBuilder = new DbContextOptionsBuilder<MigrationDbContext>();
         optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         return new MigrationDbContext(optionsBuilder.Options);
+    }
+
+    private static void ExecuteNonQuery(DecentDBConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private static object ExecuteScalar(DecentDBConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        return cmd.ExecuteScalar()!;
     }
 
     private static void TryDelete(string path)
@@ -195,6 +280,32 @@ public sealed class FkDbContext : DbContext
     }
 }
 
+public sealed class SelfRefFkDbContext : DbContext
+{
+    public SelfRefFkDbContext(DbContextOptions<SelfRefFkDbContext> options)
+        : base(options)
+    {
+    }
+
+    public DbSet<SelfRefCategory> Categories => Set<SelfRefCategory>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<SelfRefCategory>(entity =>
+        {
+            entity.ToTable("Categories");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("Id").ValueGeneratedOnAdd();
+            entity.Property(x => x.ParentCategoryId).HasColumnName("ParentCategoryId");
+
+            entity.HasOne(x => x.ParentCategory)
+                .WithMany(x => x.Children)
+                .HasForeignKey(x => x.ParentCategoryId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+    }
+}
+
 public sealed class FkArtist
 {
     public long Id { get; set; }
@@ -208,6 +319,14 @@ public sealed class FkAlbum
     public string Title { get; set; } = string.Empty;
     public long ArtistId { get; set; }
     public FkArtist Artist { get; set; } = null!;
+}
+
+public sealed class SelfRefCategory
+{
+    public long Id { get; set; }
+    public long? ParentCategoryId { get; set; }
+    public SelfRefCategory? ParentCategory { get; set; }
+    public List<SelfRefCategory> Children { get; set; } = [];
 }
 
 [DbContext(typeof(MigrationDbContext))]

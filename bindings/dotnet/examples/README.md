@@ -402,7 +402,7 @@ Some EF Core features have limited support due to DecentDB engine constraints:
 |------------|-------------|------------|
 | **Decimal comparisons** | Cannot compare Decimal with Float64/double | Cast to double before comparison or use client-side evaluation |
 | **Decimal aggregates** | AVG/SUM on DECIMAL(18,4) fails | Cast to double before aggregation |
-| **Table-level FK constraints** | ALTER TABLE ADD FOREIGN KEY not supported | Use column-level constraints or handle at app level |
+| **Composite foreign keys** | Multi-column FK DDL is not supported | Use single-column keys or model the relationship in application code |
 | **Composite primary keys** | Not supported | Use single BIGINT surrogate key |
 | **Window functions** | Limited support | Use client-side ranking after fetching |
 

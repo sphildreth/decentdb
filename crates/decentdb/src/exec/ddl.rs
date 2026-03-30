@@ -1573,20 +1573,19 @@ fn validate_foreign_keys(runtime: &EngineRuntime, table: &TableSchema) -> Result
             table
                 .columns
                 .iter()
-                .any(|column| column.name == *column_name)
+                .any(|column| identifiers_equal(&column.name, column_name))
         }) {
             return Err(DbError::sql(format!(
                 "foreign key on {} references missing child columns",
                 table.name
             )));
         }
-        let parent = if foreign_key.referenced_table == table.name {
+        let parent = if identifiers_equal(&foreign_key.referenced_table, &table.name) {
             table
         } else {
             runtime
                 .catalog
-                .tables
-                .get(&foreign_key.referenced_table)
+                .table(&foreign_key.referenced_table)
                 .ok_or_else(|| {
                     DbError::sql(format!(
                         "foreign key references unknown table {}",
@@ -1606,14 +1605,17 @@ fn validate_foreign_keys(runtime: &EngineRuntime, table: &TableSchema) -> Result
             )));
         }
         let has_parent_key =
-            referenced_columns == parent.primary_key_columns
+            identifier_lists_equal(&referenced_columns, &parent.primary_key_columns)
                 || runtime.catalog.indexes.values().any(|index| {
-                    index.table_name == parent.name
+                    identifiers_equal(&index.table_name, &parent.name)
                         && index.unique
                         && index.columns.len() == referenced_columns.len()
                         && index.columns.iter().zip(&referenced_columns).all(
                             |(candidate, target)| {
-                                candidate.column_name.as_deref() == Some(target.as_str())
+                                candidate
+                                    .column_name
+                                    .as_deref()
+                                    .is_some_and(|name| identifiers_equal(name, target))
                                     && candidate.expression_sql.is_none()
                             },
                         )
@@ -1632,7 +1634,7 @@ fn validate_foreign_keys(runtime: &EngineRuntime, table: &TableSchema) -> Result
                 let column = table
                     .columns
                     .iter()
-                    .find(|column| column.name == *column_name)
+                    .find(|column| identifiers_equal(&column.name, column_name))
                     .ok_or_else(|| DbError::sql(format!("unknown column {}", column_name)))?;
                 if !column.nullable {
                     return Err(DbError::sql(format!(
@@ -1644,6 +1646,14 @@ fn validate_foreign_keys(runtime: &EngineRuntime, table: &TableSchema) -> Result
         }
     }
     Ok(())
+}
+
+fn identifier_lists_equal(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| identifiers_equal(left, right))
 }
 
 fn rename_column_references(

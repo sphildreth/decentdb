@@ -13188,6 +13188,7 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         crate::catalog::ColumnType::Int64 => match value {
             Value::Int64(value) => Ok(Value::Int64(value)),
             Value::Float64(value) => Ok(Value::Int64(value as i64)),
+            Value::Decimal { scaled, scale } => Ok(Value::Int64(decimal_to_i64(scaled, scale))),
             Value::Bool(value) => Ok(Value::Int64(if value { 1 } else { 0 })),
             Value::Text(value) => value
                 .parse::<i64>()
@@ -13198,6 +13199,7 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         crate::catalog::ColumnType::Float64 => match value {
             Value::Int64(value) => Ok(Value::Float64(value as f64)),
             Value::Float64(value) => Ok(Value::Float64(value)),
+            Value::Decimal { scaled, scale } => Ok(Value::Float64(decimal_to_f64(scaled, scale))),
             Value::Text(value) => value
                 .parse::<f64>()
                 .map(Value::Float64)
@@ -13259,6 +13261,20 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
             other => Err(DbError::sql(format!("cannot cast {other:?} to TIMESTAMP"))),
         },
     }
+}
+
+fn decimal_to_f64(scaled: i64, scale: u8) -> f64 {
+    (scaled as f64) / 10_f64.powi(i32::from(scale))
+}
+
+fn decimal_to_i64(scaled: i64, scale: u8) -> i64 {
+    if scale == 0 {
+        return scaled;
+    }
+    let Some(divisor) = 10_i64.checked_pow(u32::from(scale)) else {
+        return 0;
+    };
+    scaled / divisor
 }
 
 fn infer_column_type_for_ctas(

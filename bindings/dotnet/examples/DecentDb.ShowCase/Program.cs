@@ -1280,57 +1280,79 @@ class Program
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.SignedByte);
             var max = await context.AllTypesDemos.MaxAsync(x => x.SignedByte);
-            var avg = await context.AllTypesDemos.AverageAsync(x => x.SignedByte);
-            Console.WriteLine($"  sbyte: min={min}, max={max}, avg={avg:F2}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.SignedByte);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.SignedByte);
+            var count = await context.AllTypesDemos.CountAsync(x => x.SignedByte > 0);
+            Console.WriteLine($"  sbyte: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("byte", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.UnsignedByte);
             var max = await context.AllTypesDemos.MaxAsync(x => x.UnsignedByte);
-            Console.WriteLine($"  byte: min={min}, max={max}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.UnsignedByte);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.UnsignedByte);
+            var count = await context.AllTypesDemos.CountAsync(x => x.UnsignedByte > 100);
+            Console.WriteLine($"  byte: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("short", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.Int16);
             var max = await context.AllTypesDemos.MaxAsync(x => x.Int16);
-            Console.WriteLine($"  short: min={min}, max={max}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.Int16);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.Int16);
+            var count = await context.AllTypesDemos.CountAsync(x => x.Int16 > 0);
+            Console.WriteLine($"  short: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("ushort", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.UInt16);
             var max = await context.AllTypesDemos.MaxAsync(x => x.UInt16);
-            Console.WriteLine($"  ushort: min={min}, max={max}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.UInt16);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.UInt16);
+            var count = await context.AllTypesDemos.CountAsync(x => x.UInt16 > 10000);
+            Console.WriteLine($"  ushort: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("int", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.Int32);
             var max = await context.AllTypesDemos.MaxAsync(x => x.Int32);
-            Console.WriteLine($"  int: min={min}, max={max}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.Int32);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.Int32);
+            var count = await context.AllTypesDemos.CountAsync(x => x.Int32 > 0);
+            Console.WriteLine($"  int: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("uint", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.UInt32);
             var max = await context.AllTypesDemos.MaxAsync(x => x.UInt32);
-            Console.WriteLine($"  uint: min={min}, max={max}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.UInt32);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.UInt32);
+            var count = await context.AllTypesDemos.CountAsync(x => x.UInt32 > 1000000);
+            Console.WriteLine($"  uint: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("long", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.Int64);
             var max = await context.AllTypesDemos.MaxAsync(x => x.Int64);
-            Console.WriteLine($"  long: min={min}, max={max}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (double)x.Int64);
+            var sum = await context.AllTypesDemos.SumAsync(x => (double)x.Int64);
+            var count = await context.AllTypesDemos.CountAsync(x => x.Int64 > 0);
+            Console.WriteLine($"  long: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("ulong", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.UInt64);
             var max = await context.AllTypesDemos.MaxAsync(x => x.UInt64);
-            Console.WriteLine($"  ulong: min={min}, max={max}");
+            var count = await context.AllTypesDemos.CountAsync();
+            var first = await context.AllTypesDemos.OrderBy(x => x.UInt64).FirstAsync();
+            Console.WriteLine($"  ulong: Min={min}, Max={max}, Count={count}, First={first.UInt64}");
         });
 
         await testType("float", async () =>
@@ -1338,7 +1360,9 @@ class Program
             var min = await context.AllTypesDemos.MinAsync(x => x.Single);
             var max = await context.AllTypesDemos.MaxAsync(x => x.Single);
             var avg = await context.AllTypesDemos.AverageAsync(x => x.Single);
-            Console.WriteLine($"  float: min={min:F2}, max={max:F2}, avg={avg:F2}");
+            var sum = await context.AllTypesDemos.SumAsync(x => x.Single);
+            var count = await context.AllTypesDemos.CountAsync(x => x.Single > 500);
+            Console.WriteLine($"  float: Min={min:F2}, Max={max:F2}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("double", async () =>
@@ -1346,60 +1370,76 @@ class Program
             var min = await context.AllTypesDemos.MinAsync(x => x.Double);
             var max = await context.AllTypesDemos.MaxAsync(x => x.Double);
             var avg = await context.AllTypesDemos.AverageAsync(x => x.Double);
-            Console.WriteLine($"  double: min={min:F2}, max={max:F2}, avg={avg:F2}");
+            var sum = await context.AllTypesDemos.SumAsync(x => x.Double);
+            var count = await context.AllTypesDemos.CountAsync(x => x.Double > 500);
+            Console.WriteLine($"  double: Min={min:F2}, Max={max:F2}, Avg={avg:F2}, Sum={sum:F2}, Count={count}");
         });
 
         await testType("decimal", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.Decimal);
             var max = await context.AllTypesDemos.MaxAsync(x => x.Decimal);
-            var avg = await context.AllTypesDemos.AverageAsync(x => x.Decimal);
-            Console.WriteLine($"  decimal: min={min:F2}, max={max:F2}, avg={avg:F2}");
+            var avg = await context.AllTypesDemos.AverageAsync(x => (decimal?)x.Decimal);
+            var count = await context.AllTypesDemos.CountAsync(x => x.Decimal > 500);
+            Console.WriteLine($"  decimal: Min={min:F2}, Max={max:F2}, Avg={avg:F2}, Count={count}");
         });
 
         await testType("bool", async () =>
         {
-            var count = await context.AllTypesDemos.CountAsync(x => x.Boolean);
-            Console.WriteLine($"  bool: true_count={count}");
+            var trueCount = await context.AllTypesDemos.CountAsync(x => x.Boolean);
+            var falseCount = await context.AllTypesDemos.CountAsync(x => !x.Boolean);
+            var count = await context.AllTypesDemos.CountAsync();
+            Console.WriteLine($"  bool: True={trueCount}, False={falseCount}, Total={count}");
         });
 
         await testType("char", async () =>
         {
-            var count = await context.AllTypesDemos.Select(x => x.Character).Distinct().CountAsync();
-            Console.WriteLine($"  char: distinct_count={count}");
+            var min = await context.AllTypesDemos.MinAsync(x => x.Character);
+            var max = await context.AllTypesDemos.MaxAsync(x => x.Character);
+            var distinct = await context.AllTypesDemos.Select(x => x.Character).Distinct().CountAsync();
+            var count = await context.AllTypesDemos.CountAsync(x => x.Character > 'M');
+            Console.WriteLine($"  char: Min={min}, Max={max}, Distinct={distinct}, Count={count}");
         });
 
         await testType("string", async () =>
         {
-            var count = await context.AllTypesDemos.Select(x => x.Text).Distinct().CountAsync();
-            Console.WriteLine($"  string: distinct_count={count}");
+            var distinct = await context.AllTypesDemos.Select(x => x.Text).Distinct().CountAsync();
+            var count = await context.AllTypesDemos.CountAsync(x => x.Text.Length > 20);
+            var maxLen = await context.AllTypesDemos.MaxAsync(x => x.Text.Length);
+            var minLen = await context.AllTypesDemos.MinAsync(x => x.Text.Length);
+            Console.WriteLine($"  string: Distinct={distinct}, MinLen={minLen}, MaxLen={maxLen}, Len>20={count}");
         });
 
         await testType("DateTime", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.DateTime);
             var max = await context.AllTypesDemos.MaxAsync(x => x.DateTime);
-            Console.WriteLine($"  DateTime: min={min:yyyy-MM-dd}, max={max:yyyy-MM-dd}");
+            var count = await context.AllTypesDemos.CountAsync();
+            Console.WriteLine($"  DateTime: Min={min:yyyy-MM-dd}, Max={max:yyyy-MM-dd}, Count={count}");
         });
 
         await testType("DateOnly", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.DateOnly);
             var max = await context.AllTypesDemos.MaxAsync(x => x.DateOnly);
-            Console.WriteLine($"  DateOnly: min={min}, max={max}");
+            var count = await context.AllTypesDemos.CountAsync();
+            Console.WriteLine($"  DateOnly: Min={min}, Max={max}, Count={count}");
         });
 
         await testType("TimeOnly", async () =>
         {
             var min = await context.AllTypesDemos.MinAsync(x => x.TimeOnly);
             var max = await context.AllTypesDemos.MaxAsync(x => x.TimeOnly);
-            Console.WriteLine($"  TimeOnly: min={min}, max={max}");
+            var count = await context.AllTypesDemos.CountAsync();
+            Console.WriteLine($"  TimeOnly: Min={min}, Max={max}, Count={count}");
         });
 
         await testType("Guid", async () =>
         {
-            var count = await context.AllTypesDemos.Select(x => x.Guid).Distinct().CountAsync();
-            Console.WriteLine($"  Guid: distinct_count={count}");
+            var distinct = await context.AllTypesDemos.Select(x => x.Guid).Distinct().CountAsync();
+            var count = await context.AllTypesDemos.CountAsync();
+            var first = await context.AllTypesDemos.OrderBy(x => x.Guid).FirstAsync();
+            Console.WriteLine($"  Guid: Distinct={distinct}, Total={count}, First={first.Guid:N}");
         });
 
         Console.WriteLine();
@@ -1460,88 +1500,118 @@ class Program
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.SignedByte);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.SignedByte);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.SignedByte != null);
-            Console.WriteLine($"  sbyte?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.SignedByte!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.SignedByte!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.SignedByte != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.SignedByte == null);
+            Console.WriteLine($"  sbyte?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("byte?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.UnsignedByte);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UnsignedByte);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UnsignedByte != null);
-            Console.WriteLine($"  byte?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.UnsignedByte!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.UnsignedByte!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.UnsignedByte != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.UnsignedByte == null);
+            Console.WriteLine($"  byte?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("short?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.Int16);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Int16);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Int16 != null);
-            Console.WriteLine($"  short?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.Int16!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.Int16!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Int16 != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Int16 == null);
+            Console.WriteLine($"  short?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("ushort?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.UInt16);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UInt16);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UInt16 != null);
-            Console.WriteLine($"  ushort?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.UInt16!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.UInt16!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.UInt16 != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.UInt16 == null);
+            Console.WriteLine($"  ushort?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("int?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.Int32);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Int32);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Int32 != null);
-            Console.WriteLine($"  int?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.Int32!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.Int32!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Int32 != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Int32 == null);
+            Console.WriteLine($"  int?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("uint?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.UInt32);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UInt32);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UInt32 != null);
-            Console.WriteLine($"  uint?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.UInt32!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.UInt32!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.UInt32 != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.UInt32 == null);
+            Console.WriteLine($"  uint?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("long?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.Int64);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Int64);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Int64 != null);
-            Console.WriteLine($"  long?: min={min}, max={max}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (double)x.Int64!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => (double)x.Int64!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Int64 != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Int64 == null);
+            Console.WriteLine($"  long?: Min={min}, Max={max}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("ulong?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.UInt64);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.UInt64);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.UInt64 != null);
-            Console.WriteLine($"  ulong?: min={min}, max={max}, non_null={count}");
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.UInt64 != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.UInt64 == null);
+            Console.WriteLine($"  ulong?: Min={min}, Max={max}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("float?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.Single);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Single);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Single != null);
-            Console.WriteLine($"  float?: min={min:F2}, max={max:F2}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => x.Single!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => x.Single!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Single != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Single == null);
+            Console.WriteLine($"  float?: Min={min:F2}, Max={max:F2}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("double?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.Double);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Double);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Double != null);
-            Console.WriteLine($"  double?: min={min:F2}, max={max:F2}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => x.Double!.Value);
+            var sum = await context.AllTypesNullableDemos.SumAsync(x => x.Double!.Value);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Double != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Double == null);
+            Console.WriteLine($"  double?: Min={min:F2}, Max={max:F2}, Avg={avg:F2}, Sum={sum:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("decimal?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.Decimal);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Decimal);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Decimal != null);
-            Console.WriteLine($"  decimal?: min={min:F2}, max={max:F2}, non_null={count}");
+            var avg = await context.AllTypesNullableDemos.AverageAsync(x => (decimal?)x.Decimal);
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Decimal != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Decimal == null);
+            Console.WriteLine($"  decimal?: Min={min:F2}, Max={max:F2}, Avg={avg:F2}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("bool?", async () =>
@@ -1549,52 +1619,95 @@ class Program
             var trueCount = await context.AllTypesNullableDemos.CountAsync(x => x.Boolean == true);
             var falseCount = await context.AllTypesNullableDemos.CountAsync(x => x.Boolean == false);
             var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Boolean == null);
-            Console.WriteLine($"  bool?: true={trueCount}, false={falseCount}, null={nullCount}");
+            var nonNull = trueCount + falseCount;
+            Console.WriteLine($"  bool?: True={trueCount}, False={falseCount}, Null={nullCount}, NonNull={nonNull}");
         });
 
         await testNullableType("char?", async () =>
         {
+            var min = await context.AllTypesNullableDemos.MinAsync(x => x.Character);
+            var max = await context.AllTypesNullableDemos.MaxAsync(x => x.Character);
             var distinct = await context.AllTypesNullableDemos.Where(x => x.Character != null).Select(x => x.Character).Distinct().CountAsync();
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.Character != null);
-            Console.WriteLine($"  char?: distinct={distinct}, non_null={count}");
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Character != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Character == null);
+            Console.WriteLine($"  char?: Min={min}, Max={max}, Distinct={distinct}, NonNull={nonNull}, Null={nullCount}");
         });
 
         await testNullableType("string?", async () =>
         {
             var distinct = await context.AllTypesNullableDemos.Where(x => x.Text != null).Select(x => x.Text).Distinct().CountAsync();
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Text != null);
             var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Text == null);
-            Console.WriteLine($"  string?: distinct={distinct}, null={nullCount}");
+            var maxLen = await context.AllTypesNullableDemos.Where(x => x.Text != null).MaxAsync(x => x.Text!.Length);
+            Console.WriteLine($"  string?: Distinct={distinct}, NonNull={nonNull}, Null={nullCount}, MaxLen={maxLen}");
         });
 
         await testNullableType("DateTime?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.DateTime);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.DateTime);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null);
-            Console.WriteLine($"  DateTime?: min={min:yyyy-MM-dd}, max={max:yyyy-MM-dd}, non_null={count}");
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime == null);
+            var sample = await context.AllTypesNullableDemos
+                .Where(x => x.DateTime != null)
+                .Select(x => x.DateTime!.Value)
+                .OrderBy(x => x)
+                .FirstAsync();
+            var yearMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.Year == sample.Year);
+            var monthMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.Month == sample.Month);
+            var dayMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.Day == sample.Day);
+            var dayOfYearMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.DayOfYear == sample.DayOfYear);
+            var hourMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.Hour == sample.Hour);
+            var minuteMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.Minute == sample.Minute);
+            var secondMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateTime != null && x.DateTime.Value.Second == sample.Second);
+            Console.WriteLine($"  DateTime?: Min={min:yyyy-MM-dd}, Max={max:yyyy-MM-dd}, NonNull={nonNull}, Null={nullCount}");
+            Console.WriteLine($"     Members: Year={yearMatches}, Month={monthMatches}, Day={dayMatches}, DayOfYear={dayOfYearMatches}, Hour={hourMatches}, Minute={minuteMatches}, Second={secondMatches}");
         });
 
         await testNullableType("DateOnly?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.DateOnly);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.DateOnly);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null);
-            Console.WriteLine($"  DateOnly?: min={min}, max={max}, non_null={count}");
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly == null);
+            var sample = await context.AllTypesNullableDemos
+                .Where(x => x.DateOnly != null)
+                .Select(x => x.DateOnly!.Value)
+                .OrderBy(x => x)
+                .FirstAsync();
+            var yearMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null && x.DateOnly.Value.Year == sample.Year);
+            var monthMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null && x.DateOnly.Value.Month == sample.Month);
+            var dayMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null && x.DateOnly.Value.Day == sample.Day);
+            var dayOfYearMatches = await context.AllTypesNullableDemos.CountAsync(x => x.DateOnly != null && x.DateOnly.Value.DayOfYear == sample.DayOfYear);
+            Console.WriteLine($"  DateOnly?: Min={min}, Max={max}, NonNull={nonNull}, Null={nullCount}");
+            Console.WriteLine($"     Members: Year={yearMatches}, Month={monthMatches}, Day={dayMatches}, DayOfYear={dayOfYearMatches}");
         });
 
         await testNullableType("TimeOnly?", async () =>
         {
             var min = await context.AllTypesNullableDemos.MinAsync(x => x.TimeOnly);
             var max = await context.AllTypesNullableDemos.MaxAsync(x => x.TimeOnly);
-            var count = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null);
-            Console.WriteLine($"  TimeOnly?: min={min}, max={max}, non_null={count}");
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null);
+            var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly == null);
+            var sample = await context.AllTypesNullableDemos
+                .Where(x => x.TimeOnly != null)
+                .Select(x => x.TimeOnly!.Value)
+                .OrderBy(x => x)
+                .FirstAsync();
+            var hourMatches = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null && x.TimeOnly.Value.Hour == sample.Hour);
+            var minuteMatches = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null && x.TimeOnly.Value.Minute == sample.Minute);
+            var secondMatches = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null && x.TimeOnly.Value.Second == sample.Second);
+            var millisecondMatches = await context.AllTypesNullableDemos.CountAsync(x => x.TimeOnly != null && x.TimeOnly.Value.Millisecond == sample.Millisecond);
+            Console.WriteLine($"  TimeOnly?: Min={min}, Max={max}, NonNull={nonNull}, Null={nullCount}");
+            Console.WriteLine($"     Members: Hour={hourMatches}, Minute={minuteMatches}, Second={secondMatches}, Millisecond={millisecondMatches}");
         });
 
         await testNullableType("Guid?", async () =>
         {
             var distinct = await context.AllTypesNullableDemos.Where(x => x.Guid != null).Select(x => x.Guid).Distinct().CountAsync();
+            var nonNull = await context.AllTypesNullableDemos.CountAsync(x => x.Guid != null);
             var nullCount = await context.AllTypesNullableDemos.CountAsync(x => x.Guid == null);
-            Console.WriteLine($"  Guid?: distinct={distinct}, null={nullCount}");
+            Console.WriteLine($"  Guid?: Distinct={distinct}, NonNull={nonNull}, Null={nullCount}");
         });
 
         Console.WriteLine();
