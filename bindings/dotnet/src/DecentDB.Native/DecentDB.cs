@@ -1200,7 +1200,7 @@ public class DecentDBException : Exception
     public int ErrorCode { get; }
     public string Sql { get; }
 
-    public DecentDBException(int errorCode, string message, string sql) : base($"DecentDB error {errorCode}: {message}")
+    public DecentDBException(int errorCode, string message, string sql) : base($"DecentDB error {errorCode}: {message}\nSQL: {sql}")
     {
         ErrorCode = errorCode;
         Sql = sql;

@@ -10418,6 +10418,11 @@ fn aggregate_numeric(
                     saw_float = true;
                     count += 1;
                 }
+                Value::Decimal { scaled, scale } => {
+                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
+                    saw_float = true;
+                    count += 1;
+                }
                 other => {
                     return Err(DbError::sql(format!(
                         "numeric aggregate does not support {other:?}"
@@ -10442,6 +10447,11 @@ fn aggregate_numeric(
                 }
                 Value::Float64(value) => {
                     total_float += value;
+                    saw_float = true;
+                    count += 1;
+                }
+                Value::Decimal { scaled, scale } => {
+                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
                     saw_float = true;
                     count += 1;
                 }
@@ -10502,6 +10512,7 @@ fn aggregate_variance(
         let number = match value {
             Value::Int64(value) => value as f64,
             Value::Float64(value) => value,
+            Value::Decimal { scaled, scale } => (scaled as f64) / 10_f64.powi(i32::from(scale)),
             other => {
                 return Err(DbError::sql(format!(
                     "variance aggregate does not support {other:?}"
@@ -13963,6 +13974,46 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
             *right_scaled,
             *right_scale,
         )),
+        (
+            Value::Decimal {
+                scaled: left_scaled,
+                scale: left_scale,
+            },
+            Value::Float64(right),
+        ) => {
+            let left_f64 = (*left_scaled as f64) / 10_f64.powi(i32::from(*left_scale));
+            Ok(left_f64.total_cmp(right))
+        }
+        (
+            Value::Float64(left),
+            Value::Decimal {
+                scaled: right_scaled,
+                scale: right_scale,
+            },
+        ) => {
+            let right_f64 = (*right_scaled as f64) / 10_f64.powi(i32::from(*right_scale));
+            Ok(left.total_cmp(&right_f64))
+        }
+        (
+            Value::Decimal {
+                scaled: left_scaled,
+                scale: left_scale,
+            },
+            Value::Int64(right),
+        ) => {
+            let left_f64 = (*left_scaled as f64) / 10_f64.powi(i32::from(*left_scale));
+            Ok(left_f64.total_cmp(&(*right as f64)))
+        }
+        (
+            Value::Int64(left),
+            Value::Decimal {
+                scaled: right_scaled,
+                scale: right_scale,
+            },
+        ) => {
+            let right_f64 = (*right_scaled as f64) / 10_f64.powi(i32::from(*right_scale));
+            Ok((*left as f64).total_cmp(&right_f64))
+        }
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),

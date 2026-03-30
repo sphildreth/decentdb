@@ -1580,16 +1580,20 @@ fn validate_foreign_keys(runtime: &EngineRuntime, table: &TableSchema) -> Result
                 table.name
             )));
         }
-        let parent = runtime
-            .catalog
-            .tables
-            .get(&foreign_key.referenced_table)
-            .ok_or_else(|| {
-                DbError::sql(format!(
-                    "foreign key references unknown table {}",
-                    foreign_key.referenced_table
-                ))
-            })?;
+        let parent = if foreign_key.referenced_table == table.name {
+            table
+        } else {
+            runtime
+                .catalog
+                .tables
+                .get(&foreign_key.referenced_table)
+                .ok_or_else(|| {
+                    DbError::sql(format!(
+                        "foreign key references unknown table {}",
+                        foreign_key.referenced_table
+                    ))
+                })?
+        };
         let referenced_columns = if foreign_key.referenced_columns.is_empty() {
             parent.primary_key_columns.clone()
         } else {

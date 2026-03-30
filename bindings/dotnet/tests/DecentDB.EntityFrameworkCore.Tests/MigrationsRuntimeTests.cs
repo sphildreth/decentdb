@@ -84,13 +84,9 @@ public sealed class MigrationsRuntimeTests : IDisposable
     {
         using var context = CreateContext();
         var generator = context.GetService<IMigrationsSqlGenerator>();
-        var operation = new AddForeignKeyOperation
+        var operation = new DropSchemaOperation
         {
-            Table = "child",
-            Name = "fk_child_parent",
-            Columns = ["parent_id"],
-            PrincipalTable = "parent",
-            PrincipalColumns = ["id"]
+            Name = "foo"
         };
 
         var ex = Assert.Throws<NotSupportedException>(() => generator.Generate([operation], null));
