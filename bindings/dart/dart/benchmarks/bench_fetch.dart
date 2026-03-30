@@ -145,6 +145,28 @@ _BenchResult _runDecentDbBenchmark(String dbPath, _Options options) {
       '${fetchmanySeconds.toStringAsFixed(4)}s',
     );
 
+    final stepStmt = db.prepare('SELECT id, val, f FROM bench');
+    final stepWatch = Stopwatch()..start();
+    var steppedRows = 0;
+    try {
+      while (stepStmt.step()) {
+        // Decode current row to exercise streaming step/read path.
+        stepStmt.readRow();
+        steppedRows++;
+      }
+    } finally {
+      stepStmt.dispose();
+    }
+    stepWatch.stop();
+    if (steppedRows != options.count) {
+      throw StateError(
+        'Expected ${options.count} rows from step(), got $steppedRows',
+      );
+    }
+    final stepSeconds = stepWatch.elapsedMicroseconds / 1000000.0;
+    print(
+        'Step() streaming ${options.count} rows: ${stepSeconds.toStringAsFixed(4)}s');
+
     final pointStmt = db.prepare(r'SELECT id, val, f FROM bench WHERE id = $1');
     final pointIds = _buildPointReadIds(
         options.count, options.pointReads, options.pointSeed);
@@ -186,6 +208,7 @@ _BenchResult _runDecentDbBenchmark(String dbPath, _Options options) {
       insertRowsPerSecond: insertRowsPerSecond,
       fetchallSeconds: fetchallSeconds,
       fetchmanySeconds: fetchmanySeconds,
+      stepSeconds: stepSeconds,
       pointP50Ms: pointP50Ms,
       pointP95Ms: pointP95Ms,
     );
@@ -289,6 +312,31 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
       '${fetchmanySeconds.toStringAsFixed(4)}s',
     );
 
+    final stepStmt =
+        db.prepare('SELECT id, val, f FROM bench LIMIT 1 OFFSET ?');
+    final stepWatch = Stopwatch()..start();
+    var steppedRows = 0;
+    try {
+      for (var offsetStep = 0; offsetStep < options.count; offsetStep++) {
+        final row = stepStmt.select(<Object?>[offsetStep]);
+        if (row.isEmpty) {
+          break;
+        }
+        steppedRows++;
+      }
+    } finally {
+      stepStmt.dispose();
+    }
+    stepWatch.stop();
+    if (steppedRows != options.count) {
+      throw StateError(
+        'Expected ${options.count} rows from SQLite step-style read, got $steppedRows',
+      );
+    }
+    final stepSeconds = stepWatch.elapsedMicroseconds / 1000000.0;
+    print(
+        'Step-style streaming ${options.count} rows: ${stepSeconds.toStringAsFixed(4)}s');
+
     final pointStmt = db.prepare('SELECT id, val, f FROM bench WHERE id = ?');
     final pointIds = _buildPointReadIds(
         options.count, options.pointReads, options.pointSeed);
@@ -328,6 +376,7 @@ _BenchResult _runSqliteBenchmark(String dbPath, _Options options) {
       insertRowsPerSecond: insertRowsPerSecond,
       fetchallSeconds: fetchallSeconds,
       fetchmanySeconds: fetchmanySeconds,
+      stepSeconds: stepSeconds,
       pointP50Ms: pointP50Ms,
       pointP95Ms: pointP95Ms,
     );
@@ -367,6 +416,14 @@ void _printComparison(Map<String, _BenchResult> results) {
       name: 'Fetchmany/streaming time (lower is better)',
       decent: decent.fetchmanySeconds,
       sqlite: sqlite.fetchmanySeconds,
+      unit: 's',
+      higherIsBetter: false,
+      formatter: (value) => value.toStringAsFixed(6),
+    ),
+    _Metric(
+      name: 'Step streaming time (lower is better)',
+      decent: decent.stepSeconds,
+      sqlite: sqlite.stepSeconds,
       unit: 's',
       higherIsBetter: false,
       formatter: (value) => value.toStringAsFixed(6),
@@ -534,6 +591,7 @@ class _BenchResult {
     required this.insertRowsPerSecond,
     required this.fetchallSeconds,
     required this.fetchmanySeconds,
+    required this.stepSeconds,
     required this.pointP50Ms,
     required this.pointP95Ms,
   });
@@ -542,6 +600,7 @@ class _BenchResult {
   final double insertRowsPerSecond;
   final double fetchallSeconds;
   final double fetchmanySeconds;
+  final double stepSeconds;
   final double pointP50Ms;
   final double pointP95Ms;
 }

@@ -1,7 +1,7 @@
 # Dart Bindings Refactor Plan
 
 **Date:** 2026-03-29
-**Status:** Active Plan
+**Status:** Completed (S0-S8)
 **Scope:** DecentDB Rust metadata layer, C ABI schema surface, Dart bindings, and downstream Decent Bench adoption sequencing
 
 ## Purpose
@@ -158,9 +158,9 @@ re-litigated during implementation:
 - Do not let the narrow list/describe helpers and the rich schema surface drift
   independently.
 
-## Current Gap Summary
+## Original Gap Summary (Resolved)
 
-### Gap A: Rich schema metadata is incomplete at the binding boundary
+### Gap A: Rich schema metadata was incomplete at the binding boundary (Resolved)
 
 Current v2 Dart types do not provide the complete metadata shape needed by
 schema-heavy tooling:
@@ -172,7 +172,7 @@ schema-heavy tooling:
 - no complete trigger semantics surface matching downstream needs
 - temporary-object metadata is incomplete across the binding layers
 
-### Gap B: Current Dart paging is not actually paging
+### Gap B: Dart paging was not actually paging (Resolved)
 
 `bindings/dart/dart/lib/src/statement.dart` currently fetches all rows into
 memory before:
@@ -184,7 +184,7 @@ memory before:
 That is not acceptable for a desktop tooling binding that needs to inspect large
 tables safely.
 
-### Gap C: The Dart binding still does not cover the most valuable remaining C ABI fast paths
+### Gap C: The Dart binding did not cover the most valuable remaining C ABI fast paths (Resolved)
 
 The Dart binding review still shows missing or underused high-value functions:
 
@@ -196,7 +196,7 @@ The Dart binding review still shows missing or underused high-value functions:
 These are exactly the functions that help a binding be both feature-rich and
 performant.
 
-### Gap D: Downstream docs and compatibility baselines still point at the v1 world
+### Gap D: Downstream docs and compatibility baselines pointed at the v1 world (Resolved)
 
 `decent-bench` still assumes the v1 metadata and native-library layout. That
 must be updated, but only after the upstream binding contract is corrected.
@@ -212,14 +212,14 @@ Status legend:
 | Slice | Title | Status | Primary Repo | Depends On | Outcome |
 |---|---|---|---|---|---|
 | S0 | Planning, ADRs, and decision lock | Completed | `decentdb` | none | This document plus ADR-0129 and ADR-0130 |
-| S1 | Rich Rust schema snapshot model | Planned | `decentdb` | S0 | Authoritative rich metadata types and builders in Rust |
-| S2 | C ABI schema snapshot and compatibility projection | Planned | `decentdb` | S1 | Stable JSON contract for rich schema tooling |
-| S3 | Dart rich schema API and model layer | Planned | `decentdb` | S2 | `Schema.getSchemaSnapshot()` and typed snapshot models |
-| S4 | Dart streaming statement refactor | Planned | `decentdb` | S0 | True streaming `step()` and `nextPage()` |
-| S5 | Dart ABI coverage parity and fast-path wrappers | Planned | `decentdb` | S4 | Batch, re-execute, eviction, and full declaration coverage |
-| S6 | Dart tests, smoke coverage, and benchmarks | Planned | `decentdb` | S3, S4, S5 | Confidence that the refactor is correct and materially better |
-| S7 | Decent Bench adoption and native library resolution update | Planned | `decent-bench` | S3, S4, S5 | Downstream app uses the rich upstream surface without feature loss |
-| S8 | Docs, compatibility-line update, and release notes | Planned | both | S6, S7 | Docs and stated support match implemented reality |
+| S1 | Rich Rust schema snapshot model | Completed | `decentdb` | S0 | Authoritative rich metadata types and builders in Rust |
+| S2 | C ABI schema snapshot and compatibility projection | Completed | `decentdb` | S1 | Stable JSON contract for rich schema tooling |
+| S3 | Dart rich schema API and model layer | Completed | `decentdb` | S2 | `Schema.getSchemaSnapshot()` and typed snapshot models |
+| S4 | Dart streaming statement refactor | Completed | `decentdb` | S0 | True streaming `step()` and `nextPage()` |
+| S5 | Dart ABI coverage parity and fast-path wrappers | Completed | `decentdb` | S4 | Batch, re-execute, eviction, and full declaration coverage |
+| S6 | Dart tests, smoke coverage, and benchmarks | Completed | `decentdb` | S3, S4, S5 | Confidence that the refactor is correct and materially better |
+| S7 | Decent Bench adoption and native library resolution update | Completed | `decent-bench` | S3, S4, S5 | Downstream app uses the rich upstream surface without feature loss |
+| S8 | Docs, compatibility-line update, and release notes | Completed | both | S6, S7 | Docs and stated support match implemented reality |
 
 ## Implementation Rules By Slice
 
@@ -243,7 +243,7 @@ Exit criteria:
 
 ### S1. Rich Rust Schema Snapshot Model
 
-**Status:** Planned
+**Status:** Completed
 
 **Files to change**
 
@@ -311,7 +311,7 @@ Exit criteria:
 
 ### S2. C ABI Schema Snapshot and Compatibility Projection
 
-**Status:** Planned
+**Status:** Completed
 
 **Files to change**
 
@@ -356,7 +356,7 @@ Exit criteria:
 
 ### S3. Dart Rich Schema API and Model Layer
 
-**Status:** Planned
+**Status:** Completed
 
 **Files to change**
 
@@ -420,7 +420,7 @@ Exit criteria:
 
 ### S4. Dart Streaming Statement Refactor
 
-**Status:** Planned
+**Status:** Completed
 
 **Files to change**
 
@@ -478,7 +478,7 @@ Exit criteria:
 
 ### S5. Dart ABI Coverage Parity and Fast-Path Wrappers
 
-**Status:** Planned
+**Status:** Completed
 
 **Files to change**
 
@@ -530,7 +530,7 @@ Exit criteria:
 
 ### S6. Dart Tests, Smoke Coverage, and Benchmarks
 
-**Status:** Planned
+**Status:** Completed
 
 **Files to change**
 
@@ -578,7 +578,7 @@ Exit criteria:
 
 ### S7. Decent Bench Adoption and Native Library Resolution Update
 
-**Status:** Planned
+**Status:** Completed
 
 **Primary repo:** `/home/steven/source/decent-bench`
 
@@ -631,7 +631,7 @@ All paths in this slice are relative to `/home/steven/source/decent-bench`.
 
 ### S8. Docs, Compatibility-Line Update, and Release Notes
 
-**Status:** Planned
+**Status:** Completed
 
 For the Decent Bench files in this slice, paths are relative to
 `/home/steven/source/decent-bench`.
@@ -669,16 +669,16 @@ For the Decent Bench files in this slice, paths are relative to
 
 ## Cross-Slice Acceptance Requirements
 
-The entire refactor is only done when all of the following are true:
+The entire refactor is done when all of the following are true:
 
-- Rust rich schema metadata is engine-owned and canonical
-- the C ABI exposes a stable one-shot schema snapshot JSON contract
-- Dart exposes a rich typed snapshot API
-- Dart paging is actually streaming
-- Dart covers the remaining high-value v2 fast paths
-- Decent Bench works without feature loss in schema metadata, DDL display, or
-  planner/statistics workflows
-- documentation and compatibility statements match implemented behavior
+- [x] Rust rich schema metadata is engine-owned and canonical
+- [x] the C ABI exposes a stable one-shot schema snapshot JSON contract
+- [x] Dart exposes a rich typed snapshot API
+- [x] Dart paging is actually streaming
+- [x] Dart covers the remaining high-value v2 fast paths
+- [x] Decent Bench works without feature loss in schema metadata, DDL display,
+  or planner/statistics workflows
+- [x] documentation and compatibility statements match implemented behavior
 
 ## Explicit Out-of-Scope Items
 

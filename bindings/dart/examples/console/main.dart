@@ -45,20 +45,14 @@ void main() {
   db.execute('CREATE INDEX idx_users_name ON users (name)');
 
   final insert = db.prepare(r'INSERT INTO users VALUES ($1, $2, $3, $4, $5)');
-  final users = [
-    [1, 'Alice', 'alice@example.com', 95.5, true],
-    [2, 'Bob', 'bob@example.com', 87.3, true],
-    [3, 'Charlie', 'charlie@example.com', 72.1, false],
-    [4, 'Diana', 'diana@example.com', 91.8, true],
-  ];
   try {
     db.transaction(() {
-      for (final user in users) {
-        insert.reset();
-        insert.clearBindings();
-        insert.bindAll(user);
-        insert.execute();
-      }
+      insert.executeBatchTyped('ittfb', [
+        [1, 'Alice', 'alice@example.com', 95.5, true],
+        [2, 'Bob', 'bob@example.com', 87.3, true],
+        [3, 'Charlie', 'charlie@example.com', 72.1, false],
+        [4, 'Diana', 'diana@example.com', 91.8, true],
+      ]);
     });
   } finally {
     insert.dispose();
@@ -96,6 +90,14 @@ void main() {
   );
   print('  views: ${db.schema.listViews()}');
   print("  active_users DDL: ${db.schema.getViewDdl('active_users')}");
+
+  final snapshot = db.schema.getSchemaSnapshot();
+  final usersSnapshot =
+      snapshot.tables.firstWhere((table) => table.name == 'users');
+  print(
+    '  snapshot users: temp=${usersSnapshot.temporary} '
+    'pk=${usersSnapshot.primaryKeyColumns.join(',')}',
+  );
 
   db.close();
 }

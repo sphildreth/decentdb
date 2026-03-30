@@ -664,24 +664,20 @@ fn render_run_markdown_agent_brief(summary: &RunSummary) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct RunMetricTargetMeta {
-    status: String,
-    target: Option<f64>,
-    floor: Option<f64>,
-    stretch: Option<f64>,
-    likely_owners: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 struct RunMetricRow {
     scenario: String,
     metric: String,
     value: serde_json::Value,
-    target_meta: Option<RunMetricTargetMeta>,
+    has_target: bool,
 }
 
 fn render_run_html_human(summary: &RunSummary, summary_path: &Path) -> Result<String> {
     let (rows, mut load_warnings) = collect_run_metric_rows(summary, summary_path);
+    let diagnostic_rows = rows
+        .iter()
+        .filter(|row| !row.has_target)
+        .cloned()
+        .collect::<Vec<_>>();
     let grade = summary
         .target_assessment
         .as_ref()
@@ -692,19 +688,27 @@ fn render_run_html_human(summary: &RunSummary, summary_path: &Path) -> Result<St
     let mut green_count = 0_usize;
     let mut yellow_count = 0_usize;
     let mut red_count = 0_usize;
-    let mut neutral_count = 0_usize;
+    let mut missing_target_count = 0_usize;
+    let mut targeted_metric_total = 0_usize;
+    let mut matched_target_metrics = 0_usize;
 
-    for row in &rows {
-        match row.target_meta.as_ref().map(|meta| meta.status.as_str()) {
-            Some("stretch_met") => elite_count += 1,
-            Some("target_met") => green_count += 1,
-            Some("below_target") => yellow_count += 1,
-            Some("below_floor") => red_count += 1,
-            Some(_) | None => neutral_count += 1,
+    if let Some(assessment) = &summary.target_assessment {
+        targeted_metric_total = assessment.total_metrics;
+        matched_target_metrics = assessment.matched_metrics;
+        for metric in &assessment.metrics {
+            match metric.status.as_str() {
+                "stretch_met" => elite_count += 1,
+                "target_met" => green_count += 1,
+                "below_target" => yellow_count += 1,
+                "below_floor" => red_count += 1,
+                status if is_missing_target_status(status) => missing_target_count += 1,
+                _ => missing_target_count += 1,
+            }
         }
     }
 
-    let assessed_total = elite_count + green_count + yellow_count + red_count + neutral_count;
+    let assessed_total =
+        elite_count + green_count + yellow_count + red_count + missing_target_count;
     let mut body = String::new();
     body.push_str("<h1>DecentDB Benchmark Dashboard</h1>");
     body.push_str(&format!(
@@ -726,101 +730,108 @@ fn render_run_html_human(summary: &RunSummary, summary_path: &Path) -> Result<St
         &rows.len().to_string(),
         "neutral",
     ));
-    if let Some(assessment) = &summary.target_assessment {
+    if summary.target_assessment.is_some() {
         body.push_str(&card_html(
-            "Target-Matched Metrics",
-            &format!(
-                "{}/{}",
-                assessment.matched_metrics, assessment.total_metrics
-            ),
+            "Target Coverage",
+            &format!("{}/{}", matched_target_metrics, targeted_metric_total),
             "neutral",
         ));
-    }
-    body.push_str("</section>");
-
-    body.push_str("<h2>Status Overview</h2>");
-    body.push_str("<div class=\"legend\">");
-    body.push_str("<span class=\"badge elite\">elite</span>");
-    body.push_str("<span class=\"badge good\">green</span>");
-    body.push_str("<span class=\"badge warn\">below_target</span>");
-    body.push_str("<span class=\"badge bad\">below_floor</span>");
-    body.push_str("<span class=\"badge neutral\">untargeted/missing</span>");
-    body.push_str("</div>");
-
-    body.push_str("<div class=\"status-grid\">");
-    body.push_str(&status_bar_html(
-        "Elite",
-        elite_count,
-        assessed_total,
-        "elite",
-    ));
-    body.push_str(&status_bar_html(
-        "Green",
-        green_count,
-        assessed_total,
-        "good",
-    ));
-    body.push_str(&status_bar_html(
-        "Below Target",
-        yellow_count,
-        assessed_total,
-        "warn",
-    ));
-    body.push_str(&status_bar_html(
-        "Below Floor",
-        red_count,
-        assessed_total,
-        "bad",
-    ));
-    body.push_str(&status_bar_html(
-        "Untargeted/Missing",
-        neutral_count,
-        assessed_total,
-        "neutral",
-    ));
-    body.push_str("</div>");
-
-    body.push_str("<h2>All Benchmarked Values</h2>");
-    body.push_str("<table><thead><tr><th>Scenario</th><th>Metric</th><th>Value</th><th>Status</th><th>Target</th><th>Floor</th><th>Stretch</th><th>Likely Owners</th></tr></thead><tbody>");
-    for row in &rows {
-        let (status_label, status_class) =
-            run_metric_status_badge(row.target_meta.as_ref().map(|meta| meta.status.as_str()));
-        let target = row
-            .target_meta
-            .as_ref()
-            .and_then(|meta| meta.target)
-            .map(fmt_num)
-            .unwrap_or_else(|| "n/a".to_string());
-        let floor = row
-            .target_meta
-            .as_ref()
-            .and_then(|meta| meta.floor)
-            .map(fmt_num)
-            .unwrap_or_else(|| "n/a".to_string());
-        let stretch = row
-            .target_meta
-            .as_ref()
-            .and_then(|meta| meta.stretch)
-            .map(fmt_num)
-            .unwrap_or_else(|| "n/a".to_string());
-        let owners = row.target_meta.as_ref().map_or_else(
-            || "n/a".to_string(),
-            |meta| format_owners(&meta.likely_owners),
-        );
-        body.push_str(&format!(
-            "<tr><td><code>{}</code></td><td><code>{}</code></td><td class=\"num\">{}</td><td><span class=\"badge {}\">{}</span></td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
-            html_escape(&row.scenario),
-            html_escape(&row.metric),
-            html_escape(&fmt_value(&row.value)),
-            status_class,
-            status_label,
-            html_escape(&target),
-            html_escape(&floor),
-            html_escape(&stretch),
-            html_escape(&owners)
+        body.push_str(&card_html(
+            "Missing Targeted Metrics",
+            &missing_target_count.to_string(),
+            if missing_target_count > 0 {
+                "warn"
+            } else {
+                "good"
+            },
         ));
     }
-    body.push_str("</tbody></table>");
+    body.push_str(&card_html(
+        "Diagnostic Metrics",
+        &diagnostic_rows.len().to_string(),
+        "neutral",
+    ));
+    body.push_str("</section>");
+
+    if let Some(assessment) = &summary.target_assessment {
+        body.push_str("<h2>Target Status Overview</h2>");
+        body.push_str("<div class=\"legend\">");
+        body.push_str("<span class=\"badge elite\">elite</span>");
+        body.push_str("<span class=\"badge good\">green</span>");
+        body.push_str("<span class=\"badge warn\">below_target</span>");
+        body.push_str("<span class=\"badge bad\">below_floor</span>");
+        body.push_str("<span class=\"badge neutral\">missing_target</span>");
+        body.push_str("</div>");
+
+        body.push_str("<div class=\"status-grid\">");
+        body.push_str(&status_bar_html(
+            "Elite",
+            elite_count,
+            assessed_total,
+            "elite",
+        ));
+        body.push_str(&status_bar_html(
+            "Green",
+            green_count,
+            assessed_total,
+            "good",
+        ));
+        body.push_str(&status_bar_html(
+            "Below Target",
+            yellow_count,
+            assessed_total,
+            "warn",
+        ));
+        body.push_str(&status_bar_html(
+            "Below Floor",
+            red_count,
+            assessed_total,
+            "bad",
+        ));
+        body.push_str(&status_bar_html(
+            "Missing Target",
+            missing_target_count,
+            assessed_total,
+            "neutral",
+        ));
+        body.push_str("</div>");
+
+        body.push_str("<h2>Targeted Metrics</h2>");
+        body.push_str("<table><thead><tr><th>Scenario</th><th>Metric</th><th>Current</th><th>Status</th><th>Target</th><th>Floor</th><th>Stretch</th><th>Likely Owners</th></tr></thead><tbody>");
+        for metric in &assessment.metrics {
+            let (status_label, status_class) =
+                run_metric_status_badge(Some(metric.status.as_str()));
+            body.push_str(&format!(
+                "<tr><td><code>{}</code></td><td><code>{}</code></td><td class=\"num\">{}</td><td><span class=\"badge {}\">{}</span></td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                html_escape(&metric.scenario),
+                html_escape(&metric.metric),
+                html_escape(&metric.current.map_or_else(|| "n/a".to_string(), fmt_num)),
+                status_class,
+                status_label,
+                html_escape(&metric.target.map_or_else(|| "n/a".to_string(), fmt_num)),
+                html_escape(&metric.floor.map_or_else(|| "n/a".to_string(), fmt_num)),
+                html_escape(&metric.stretch.map_or_else(|| "n/a".to_string(), fmt_num)),
+                html_escape(&format_owners(&metric.likely_owners))
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+
+    if !diagnostic_rows.is_empty() {
+        body.push_str("<h2>Additional Diagnostic Metrics</h2>");
+        body.push_str(
+            "<table><thead><tr><th>Scenario</th><th>Metric</th><th>Value</th></tr></thead><tbody>",
+        );
+        for row in &diagnostic_rows {
+            body.push_str(&format!(
+                "<tr><td><code>{}</code></td><td><code>{}</code></td><td class=\"num\">{}</td></tr>",
+                html_escape(&row.scenario),
+                html_escape(&row.metric),
+                html_escape(&fmt_value(&row.value))
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
 
     if !summary.warnings.is_empty() {
         load_warnings.extend(summary.warnings.iter().cloned());
@@ -1065,20 +1076,11 @@ fn collect_run_metric_rows(
     let mut rows = Vec::new();
     let mut warnings = Vec::new();
 
-    let mut target_lookup = BTreeMap::<String, RunMetricTargetMeta>::new();
+    let mut target_lookup = BTreeMap::<String, ()>::new();
     if let Some(assessment) = &summary.target_assessment {
         for metric in &assessment.metrics {
             let key = format!("{}.{}", metric.scenario, metric.metric);
-            target_lookup.insert(
-                key,
-                RunMetricTargetMeta {
-                    status: metric.status.clone(),
-                    target: metric.target,
-                    floor: metric.floor,
-                    stretch: metric.stretch,
-                    likely_owners: metric.likely_owners.clone(),
-                },
-            );
+            target_lookup.insert(key, ());
         }
     }
 
@@ -1092,7 +1094,7 @@ fn collect_run_metric_rows(
                         scenario: scenario.scenario_id.as_str().to_string(),
                         metric,
                         value,
-                        target_meta: target_lookup.get(&key).cloned(),
+                        has_target: target_lookup.contains_key(&key),
                     });
                 }
             }
@@ -1108,7 +1110,7 @@ fn collect_run_metric_rows(
                         scenario: scenario.scenario_id.as_str().to_string(),
                         metric: metric.clone(),
                         value: value.clone(),
-                        target_meta: target_lookup.get(&key).cloned(),
+                        has_target: target_lookup.contains_key(&key),
                     });
                 }
             }
@@ -1280,9 +1282,21 @@ fn run_metric_status_badge(status: Option<&str>) -> (&'static str, &'static str)
         Some("target_met") => ("green", "good"),
         Some("below_target") => ("below_target", "warn"),
         Some("below_floor") => ("below_floor", "bad"),
-        Some(_) => ("missing", "neutral"),
+        Some(status) if is_missing_target_status(status) => ("missing_target", "neutral"),
+        Some(_) => ("other", "neutral"),
         None => ("untargeted", "neutral"),
     }
+}
+
+fn is_missing_target_status(status: &str) -> bool {
+    matches!(
+        status,
+        "missing_metric"
+            | "missing_scenario"
+            | "cache_mode_mismatch"
+            | "durability_mode_mismatch"
+            | "non_numeric_metric"
+    )
 }
 
 fn compare_status_badge(status: MetricComparisonStatus) -> (&'static str, &'static str) {
@@ -1310,6 +1324,11 @@ fn key_kpi_metric_ids() -> &'static [&'static str] {
         "point_lookup_warm.lookup_p95_us",
         "point_lookup_cold.first_read_p95_us",
         "range_scan_warm.rows_per_sec",
+        "complex_ecommerce.orders_insert_rps",
+        "complex_ecommerce.report_query_s",
+        "complex_ecommerce.history_p95_ms",
+        "complex_ecommerce.update_p95_ms",
+        "complex_ecommerce.delete_p95_ms",
         "read_under_write.reader_p95_degradation_ratio",
         "checkpoint.checkpoint_ms",
         "recovery_reopen.reopen_p95_ms",
@@ -1394,17 +1413,20 @@ fn read_json_file<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T>
 mod tests {
     use super::{
         render_compare_agent_brief, render_compare_html_human, render_compare_markdown_agent_brief,
-        render_run_html_agent_brief,
+        render_run_html_agent_brief, render_run_html_human,
     };
-    use crate::artifacts::RunSummary;
+    use crate::artifacts::{RunSummary, ScenarioSummary};
     use crate::compare::{
         BaselineSource, CompareArtifact, CompareContext, CompareStrictness, CompareTotals,
         MetricComparison, MetricComparisonStatus, MetricTrend, OpportunityScoreComponents,
         OptimizationOpportunity, RunContext, StorageComparison, StorageSnapshot,
         TargetExpectations,
     };
-    use crate::targets::TargetDirection;
-    use crate::types::ProfileKind;
+    use crate::targets::{MetricAssessment, RunTargetAssessment, TargetDirection};
+    use crate::types::{ProfileKind, ScenarioId, ScenarioStatus};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn agent_brief_includes_top_metric() {
@@ -1787,5 +1809,120 @@ mod tests {
         };
         let rendered = render_run_html_agent_brief(&summary);
         assert!(rendered.contains("DecentDB Agent Brief"));
+    }
+
+    #[test]
+    fn run_html_separates_targeted_metrics_from_diagnostics() {
+        let temp = TempDir::new().expect("tempdir");
+        let scenario_path = temp.path().join("durable_commit_single.json");
+        let summary_path = temp.path().join("summary.json");
+
+        let scenario_result = serde_json::json!({
+            "status": "passed",
+            "error_class": null,
+            "scenario_id": "durable_commit_single",
+            "profile": "smoke",
+            "workload": "oltp_narrow_v1",
+            "durability_mode": "full",
+            "cache_mode": "real_fs",
+            "trial_count": 1,
+            "metrics": {
+                "txn_p95_us": 1234.0,
+                "commit_stddev_us": 88.0
+            },
+            "warnings": [],
+            "notes": [],
+            "scale": {},
+            "histograms": null,
+            "vfs_stats": null,
+            "artifacts": []
+        });
+        fs::write(
+            &scenario_path,
+            serde_json::to_vec_pretty(&scenario_result).expect("scenario json"),
+        )
+        .expect("write scenario");
+        fs::write(&summary_path, b"{}").expect("write dummy summary");
+
+        let summary = RunSummary {
+            run_id: "run-1".to_string(),
+            profile: ProfileKind::Smoke,
+            dry_run: false,
+            status: "passed".to_string(),
+            started_unix_ms: 1,
+            finished_unix_ms: 2,
+            scenario_count: 1,
+            passed: 1,
+            failed: 0,
+            skipped: 0,
+            scenarios: vec![ScenarioSummary {
+                scenario_id: ScenarioId::DurableCommitSingle,
+                status: ScenarioStatus::Passed,
+                error_class: None,
+                artifact_file: scenario_path.display().to_string(),
+                headline_metrics: BTreeMap::new(),
+            }],
+            warnings: Vec::new(),
+            target_assessment: Some(RunTargetAssessment {
+                targets_file: "benchmarks/targets.toml".to_string(),
+                format_version: 1,
+                authoritative_context: true,
+                scope: "partial".to_string(),
+                overall_grade: None,
+                matched_metrics: 1,
+                total_metrics: 2,
+                matched_signature_metrics: 1,
+                total_signature_metrics: 1,
+                gradeable_metrics: 1,
+                metrics: vec![
+                    MetricAssessment {
+                        target_id: "durable_commit_single.txn_p95_us".to_string(),
+                        scenario: "durable_commit_single".to_string(),
+                        metric: "txn_p95_us".to_string(),
+                        priority: "P0".to_string(),
+                        signature: true,
+                        direction: TargetDirection::SmallerIsBetter,
+                        unit: "microseconds".to_string(),
+                        weight: 1.0,
+                        status: "below_floor".to_string(),
+                        current: Some(1234.0),
+                        floor: Some(1000.0),
+                        target: Some(800.0),
+                        stretch: Some(600.0),
+                        likely_owners: vec!["wal".to_string()],
+                        cache_mode: Some("real_fs".to_string()),
+                        durability_mode: Some("full".to_string()),
+                    },
+                    MetricAssessment {
+                        target_id: "durable_commit_single.commit_p95_us".to_string(),
+                        scenario: "durable_commit_single".to_string(),
+                        metric: "commit_p95_us".to_string(),
+                        priority: "P0".to_string(),
+                        signature: false,
+                        direction: TargetDirection::SmallerIsBetter,
+                        unit: "microseconds".to_string(),
+                        weight: 0.8,
+                        status: "missing_metric".to_string(),
+                        current: None,
+                        floor: Some(900.0),
+                        target: Some(700.0),
+                        stretch: Some(500.0),
+                        likely_owners: vec!["wal".to_string()],
+                        cache_mode: Some("real_fs".to_string()),
+                        durability_mode: Some("full".to_string()),
+                    },
+                ],
+                warnings: Vec::new(),
+            }),
+        };
+
+        let rendered = render_run_html_human(&summary, &summary_path).expect("render run html");
+        assert!(rendered.contains("Target Status Overview"));
+        assert!(rendered.contains("Targeted Metrics"));
+        assert!(rendered.contains("Additional Diagnostic Metrics"));
+        assert!(rendered.contains("Missing Targeted Metrics"));
+        assert!(rendered.contains("missing_target"));
+        assert!(rendered.contains("commit_stddev_us"));
+        assert!(!rendered.contains("untargeted/missing"));
     }
 }

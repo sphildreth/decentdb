@@ -59,8 +59,7 @@ class Database {
   static NativeBindings _resolveBindings(
       String? libraryPath, NativeBindings? bindings) {
     return bindings ??
-        NativeBindings.load(
-            libraryPath ?? NativeBindings.defaultLibraryName());
+        NativeBindings.load(libraryPath ?? NativeBindings.defaultLibraryName());
   }
 
   static Database _openWith(
@@ -141,6 +140,30 @@ class Database {
   static Database memory({String? libraryPath, NativeBindings? bindings}) =>
       open(':memory:', libraryPath: libraryPath, bindings: bindings);
 
+  /// Evict the shared WAL cache entry for an on-disk database [path].
+  ///
+  /// This should only be used after all handles for that path are closed.
+  static void evictSharedWal(
+    String path, {
+    String? libraryPath,
+    NativeBindings? bindings,
+  }) {
+    final nb = _resolveBindings(libraryPath, bindings);
+    final nativePath = path.toNativeUtf8();
+    try {
+      final status = nb.evictSharedWal(nativePath);
+      if (status != ddbOk) {
+        final msgPtr = nb.lastErrorMessage();
+        final msg = msgPtr == nullptr
+            ? 'Failed to evict shared WAL for $path'
+            : msgPtr.toDartString();
+        throw DecentDbException(ErrorCode.fromCode(status), msg);
+      }
+    } finally {
+      calloc.free(nativePath);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Properties
   // ---------------------------------------------------------------------------
@@ -157,7 +180,8 @@ class Database {
     final outFlag = calloc<Uint8>();
     try {
       final status = _bindings.dbInTransaction(_dbPtr!, outFlag);
-      if (status != ddbOk) _throwStatus(status, 'Failed to query transaction state');
+      if (status != ddbOk)
+        _throwStatus(status, 'Failed to query transaction state');
       return outFlag.value != 0;
     } finally {
       calloc.free(outFlag);
@@ -181,6 +205,46 @@ class Database {
       return stmt.execute();
     } finally {
       stmt.dispose();
+    }
+  }
+
+  /// Execute [sql] through the one-shot native `ddb_db_execute` path.
+  ///
+  /// This bypasses prepared statements and is required for SQL transaction
+  /// control statements such as `SAVEPOINT`, `RELEASE`, and `ROLLBACK TO`.
+  int executeDirect(String sql) {
+    _checkOpen();
+    final nativeSql = sql.toNativeUtf8();
+    final outResult = calloc<Pointer<DdbResult>>();
+    final outAffected = calloc<Uint64>();
+    try {
+      final status = _bindings.dbExecute(
+        _dbPtr!,
+        nativeSql,
+        nullptr.cast<DdbValue>(),
+        0,
+        outResult,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to execute SQL');
+      }
+
+      final affectedStatus = _bindings.resultAffectedRows(
+        outResult.value,
+        outAffected,
+      );
+      if (affectedStatus != ddbOk) {
+        _throwStatus(affectedStatus, 'Failed to read affected rows');
+      }
+      return outAffected.value;
+    } finally {
+      final freeStatus = _bindings.resultFree(outResult);
+      if (freeStatus != ddbOk) {
+        _throwStatus(freeStatus, 'Failed to free SQL result');
+      }
+      calloc.free(outAffected);
+      calloc.free(outResult);
+      calloc.free(nativeSql);
     }
   }
 
@@ -233,7 +297,8 @@ class Database {
   void rollback() {
     _checkOpen();
     final status = _bindings.dbRollbackTransaction(_dbPtr!);
-    if (status != ddbOk) _throwStatus(status, 'Failed to roll back transaction');
+    if (status != ddbOk)
+      _throwStatus(status, 'Failed to roll back transaction');
   }
 
   /// Run [action] inside a transaction.  Commits on success; rolls back on
@@ -277,7 +342,8 @@ class Database {
     final nativePath = destPath.toNativeUtf8();
     try {
       final status = _bindings.dbSaveAs(_dbPtr!, nativePath);
-      if (status != ddbOk) _throwStatus(status, 'Failed to save database as $destPath');
+      if (status != ddbOk)
+        _throwStatus(status, 'Failed to save database as $destPath');
     } finally {
       calloc.free(nativePath);
     }

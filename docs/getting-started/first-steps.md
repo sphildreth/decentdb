@@ -168,4 +168,4 @@ decentdb exec --db=myapp.ddb --sql="DROP TABLE users"
 - Explore [Performance Tuning](../user-guide/performance.md)
 - Read the full [SQL Reference](../user-guide/sql-reference.md)
 - Check out the [CLI Reference](../api/cli-reference.md)
-- Use with [.NET](../api/dotnet.md), [Go](../api/go.md), [Python](../api/python.md), or [Node.js](../api/node.md)
+- Use with [.NET](../api/dotnet.md), [Go](../api/go.md), [Python](../api/python.md), [Node.js](../api/node.md), or [Dart](../api/dart.md)

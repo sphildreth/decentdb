@@ -8,6 +8,7 @@
 # Usage:
 #   ./scripts/run-and-display-benchmark-report.sh
 #   ./scripts/run-and-display-benchmark-report.sh --no-open
+#   ./scripts/run-and-display-benchmark-report.sh --profile dev
 #   ./scripts/run-and-display-benchmark-report.sh --report-path build/bench/reports/custom.html
 #
 set -euo pipefail
@@ -17,9 +18,14 @@ cd "$REPO_ROOT"
 
 REPORT_PATH="build/bench/reports/today-dashboard.html"
 OPEN_REPORT=true
+PROFILE="nightly"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --profile)
+      PROFILE="${2:-}"
+      shift 2
+      ;;
     --report-path)
       REPORT_PATH="${2:-}"
       shift 2
@@ -33,6 +39,7 @@ while [[ $# -gt 0 ]]; do
 Usage: ./scripts/run-and-display-benchmark-report.sh [OPTIONS]
 
 Options:
+  --profile <name>     Benchmark profile to run: smoke, dev, or nightly (default: nightly)
   --report-path <path>  Output HTML report path (default: build/bench/reports/today-dashboard.html)
   --no-open             Do not auto-open the generated report
   -h, --help            Show this help
@@ -52,8 +59,17 @@ if [[ -z "$REPORT_PATH" ]]; then
   exit 1
 fi
 
-echo "==> Running full benchmark suite (release/nightly/all)..."
-cargo run -p decentdb-benchmark --release -- run --profile nightly --all
+case "$PROFILE" in
+  smoke|dev|nightly)
+    ;;
+  *)
+    echo "Error: --profile must be one of: smoke, dev, nightly" >&2
+    exit 1
+    ;;
+esac
+
+echo "==> Running benchmark suite (release/$PROFILE/all)..."
+cargo run -p decentdb-benchmark --release -- run --profile "$PROFILE" --all
 
 echo ""
 echo "==> Rendering latest run dashboard HTML..."

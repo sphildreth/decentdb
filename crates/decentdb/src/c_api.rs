@@ -7,7 +7,6 @@ use std::ptr;
 
 use crate::db::PreparedStatement;
 use crate::error::{DbError, DbErrorCode, Result};
-use crate::metadata::{ColumnInfo, ForeignKeyInfo, IndexInfo, TableInfo, TriggerInfo, ViewInfo};
 use crate::{evict_shared_wal, Db, DbConfig, QueryResult, Value};
 
 const DDB_OK: u32 = 0;
@@ -552,138 +551,10 @@ fn ddb_value_reset(value: &mut DdbValue) {
     *value = DdbValue::default();
 }
 
-fn json_escape(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-}
-
-fn json_string(value: &str) -> String {
-    format!("\"{}\"", json_escape(value))
-}
-
-fn json_bool(value: bool) -> &'static str {
-    if value {
-        "true"
-    } else {
-        "false"
-    }
-}
-
-fn json_optional_string(value: Option<&str>) -> String {
-    value.map_or_else(|| "null".to_string(), json_string)
-}
-
-fn json_string_list(values: &[String]) -> String {
-    let joined = values
-        .iter()
-        .map(|value| json_string(value))
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{joined}]")
-}
-
-fn foreign_key_json(info: &ForeignKeyInfo) -> String {
-    format!(
-        "{{\"name\":{},\"columns\":{},\"referenced_table\":{},\"referenced_columns\":{},\"on_delete\":{},\"on_update\":{}}}",
-        json_optional_string(info.name.as_deref()),
-        json_string_list(&info.columns),
-        json_string(&info.referenced_table),
-        json_string_list(&info.referenced_columns),
-        json_string(&info.on_delete),
-        json_string(&info.on_update),
-    )
-}
-
-fn column_json(info: &ColumnInfo) -> String {
-    let checks = json_string_list(&info.checks);
-    let foreign_key = info
-        .foreign_key
-        .as_ref()
-        .map_or_else(|| "null".to_string(), foreign_key_json);
-    format!(
-        "{{\"name\":{},\"column_type\":{},\"nullable\":{},\"default_sql\":{},\"primary_key\":{},\"unique\":{},\"auto_increment\":{},\"checks\":{},\"foreign_key\":{}}}",
-        json_string(&info.name),
-        json_string(&info.column_type),
-        json_bool(info.nullable),
-        json_optional_string(info.default_sql.as_deref()),
-        json_bool(info.primary_key),
-        json_bool(info.unique),
-        json_bool(info.auto_increment),
-        checks,
-        foreign_key,
-    )
-}
-
-fn table_json(info: &TableInfo) -> String {
-    let columns = info
-        .columns
-        .iter()
-        .map(column_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    let checks = json_string_list(&info.checks);
-    let foreign_keys = info
-        .foreign_keys
-        .iter()
-        .map(foreign_key_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    format!(
-        "{{\"name\":{},\"temporary\":{},\"columns\":[{}],\"checks\":{},\"foreign_keys\":[{}],\"primary_key_columns\":{},\"row_count\":{}}}",
-        json_string(&info.name),
-        json_bool(info.temporary),
-        columns,
-        checks,
-        foreign_keys,
-        json_string_list(&info.primary_key_columns),
-        info.row_count,
-    )
-}
-
-fn index_json(info: &IndexInfo) -> String {
-    format!(
-        "{{\"name\":{},\"table_name\":{},\"kind\":{},\"unique\":{},\"columns\":{},\"include_columns\":{},\"predicate_sql\":{},\"fresh\":{}}}",
-        json_string(&info.name),
-        json_string(&info.table_name),
-        json_string(&info.kind),
-        json_bool(info.unique),
-        json_string_list(&info.columns),
-        json_string_list(&info.include_columns),
-        json_optional_string(info.predicate_sql.as_deref()),
-        json_bool(info.fresh),
-    )
-}
-
-fn view_json(info: &ViewInfo) -> String {
-    format!(
-        "{{\"name\":{},\"temporary\":{},\"sql_text\":{},\"column_names\":{},\"dependencies\":{}}}",
-        json_string(&info.name),
-        json_bool(info.temporary),
-        json_string(&info.sql_text),
-        json_string_list(&info.column_names),
-        json_string_list(&info.dependencies),
-    )
-}
-
-fn trigger_json(info: &TriggerInfo) -> String {
-    format!(
-        "{{\"name\":{},\"target_name\":{},\"kind\":{},\"event\":{},\"on_view\":{},\"action_sql\":{}}}",
-        json_string(&info.name),
-        json_string(&info.target_name),
-        json_string(&info.kind),
-        json_string(&info.event),
-        json_bool(info.on_view),
-        json_string(&info.action_sql),
-    )
-}
-
-fn json_list<T>(items: &[T], render: impl Fn(&T) -> String) -> String {
-    let body = items.iter().map(render).collect::<Vec<_>>().join(",");
-    format!("[{body}]")
+fn to_json_string<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|error| {
+        DbError::internal(format!("failed to serialize metadata to JSON: {}", error))
+    })
 }
 
 #[no_mangle]
@@ -1715,7 +1586,7 @@ pub extern "C" fn ddb_stmt_fetch_rows_i64_text_f64(
 pub extern "C" fn ddb_db_list_tables_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
     ffi_boundary(|| {
         let tables = handle_ref(db, "db")?.db.list_tables()?;
-        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&tables, table_json))?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&tables)?)?;
         Ok(())
     })
 }
@@ -1730,7 +1601,7 @@ pub extern "C" fn ddb_db_describe_table_json(
         let table = handle_ref(db, "db")?
             .db
             .describe_table(&utf8_arg(name, "name")?)?;
-        *out_ptr(out_json, "out_json")? = cstring_from_string(table_json(&table))?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&table)?)?;
         Ok(())
     })
 }
@@ -1754,7 +1625,7 @@ pub extern "C" fn ddb_db_get_table_ddl(
 pub extern "C" fn ddb_db_list_indexes_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
     ffi_boundary(|| {
         let indexes = handle_ref(db, "db")?.db.list_indexes()?;
-        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&indexes, index_json))?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&indexes)?)?;
         Ok(())
     })
 }
@@ -1763,7 +1634,7 @@ pub extern "C" fn ddb_db_list_indexes_json(db: *mut DbHandle, out_json: *mut *mu
 pub extern "C" fn ddb_db_list_views_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
     ffi_boundary(|| {
         let views = handle_ref(db, "db")?.db.list_views()?;
-        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&views, view_json))?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&views)?)?;
         Ok(())
     })
 }
@@ -1775,10 +1646,13 @@ pub extern "C" fn ddb_db_get_view_ddl(
     out_ddl: *mut *mut c_char,
 ) -> u32 {
     ffi_boundary(|| {
-        let ddl = handle_ref(db, "db")?
-            .db
-            .view_ddl(&utf8_arg(name, "name")?)?;
-        *out_ptr(out_ddl, "out_ddl")? = cstring_from_string(ddl)?;
+        let name = utf8_arg(name, "name")?;
+        let views = handle_ref(db, "db")?.db.list_views()?;
+        let view = views
+            .iter()
+            .find(|view| view.name == name)
+            .ok_or_else(|| DbError::sql(format!("unknown view {name}")))?;
+        *out_ptr(out_ddl, "out_ddl")? = cstring_from_string(view.sql_text.clone())?;
         Ok(())
     })
 }
@@ -1787,7 +1661,19 @@ pub extern "C" fn ddb_db_get_view_ddl(
 pub extern "C" fn ddb_db_list_triggers_json(db: *mut DbHandle, out_json: *mut *mut c_char) -> u32 {
     ffi_boundary(|| {
         let triggers = handle_ref(db, "db")?.db.list_triggers()?;
-        *out_ptr(out_json, "out_json")? = cstring_from_string(json_list(&triggers, trigger_json))?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&triggers)?)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ddb_db_get_schema_snapshot_json(
+    db: *mut DbHandle,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let snapshot = handle_ref(db, "db")?.db.get_schema_snapshot()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(to_json_string(&snapshot)?)?;
         Ok(())
     })
 }
@@ -1889,6 +1775,7 @@ pub extern "C" fn ddb_result_value_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value as JsonValue;
 
     type ExecuteFn = extern "C" fn(
         *mut DbHandle,
@@ -1897,6 +1784,21 @@ mod tests {
         usize,
         *mut *mut ResultHandle,
     ) -> u32;
+
+    fn take_json(slot: &mut *mut c_char) -> String {
+        let raw = *slot;
+        assert!(!raw.is_null(), "json pointer should be populated");
+        let value = unsafe { CStr::from_ptr(raw) }
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        assert_eq!(ddb_string_free(slot), DDB_OK);
+        value
+    }
+
+    fn parse_json(slot: &mut *mut c_char) -> JsonValue {
+        serde_json::from_str(&take_json(slot)).expect("valid JSON payload")
+    }
 
     #[test]
     fn abi_shape_matches_expected_layout() {
@@ -2036,22 +1938,17 @@ mod tests {
             assert_eq!(ddb_result_free(&mut result), DDB_OK);
         }
 
-        fn take_json(slot: &mut *mut c_char) -> String {
-            let raw = *slot;
-            assert!(!raw.is_null(), "json pointer should be populated");
-            let value = unsafe { CStr::from_ptr(raw) }
-                .to_str()
-                .expect("utf8")
-                .to_string();
-            assert_eq!(ddb_string_free(slot), DDB_OK);
-            value
-        }
-
         let mut tables_json = ptr::null_mut();
         assert_eq!(ddb_db_list_tables_json(db, &mut tables_json), DDB_OK);
         let tables_json = take_json(&mut tables_json);
         assert!(tables_json.contains("\"name\":\"child\""));
         assert!(tables_json.contains("\"row_count\":1"));
+        let tables = serde_json::from_str::<JsonValue>(&tables_json).expect("tables json");
+        let tables = tables.as_array().expect("tables array");
+        let child_table = tables
+            .iter()
+            .find(|table| table["name"] == "child")
+            .expect("child table in narrow tables");
 
         let child_name = CString::new("child").expect("name");
         let mut describe_json = ptr::null_mut();
@@ -2078,12 +1975,24 @@ mod tests {
         assert!(indexes_json.contains("\"name\":\"idx_child_parent\""));
         assert!(indexes_json.contains("\"kind\":\"btree\""));
         assert!(indexes_json.contains("\"include_columns\":[]"));
+        let indexes = serde_json::from_str::<JsonValue>(&indexes_json).expect("indexes json");
+        let indexes = indexes.as_array().expect("indexes array");
+        let child_index = indexes
+            .iter()
+            .find(|index| index["name"] == "idx_child_parent")
+            .expect("idx_child_parent in narrow indexes");
 
         let mut views_json = ptr::null_mut();
         assert_eq!(ddb_db_list_views_json(db, &mut views_json), DDB_OK);
         let views_json = take_json(&mut views_json);
         assert!(views_json.contains("\"name\":\"child_ids\""));
         assert!(views_json.contains("\"dependencies\":[\"child\"]"));
+        let views = serde_json::from_str::<JsonValue>(&views_json).expect("views json");
+        let views = views.as_array().expect("views array");
+        let child_view = views
+            .iter()
+            .find(|view| view["name"] == "child_ids")
+            .expect("child view in narrow views");
 
         let view_name = CString::new("child_ids").expect("view");
         let mut view_ddl = ptr::null_mut();
@@ -2092,13 +2001,91 @@ mod tests {
             DDB_OK
         );
         let view_ddl = take_json(&mut view_ddl);
-        assert!(view_ddl.contains("CREATE VIEW \"child_ids\""));
+        assert!(view_ddl.contains("SELECT id, parent_id FROM child"));
+        assert!(!view_ddl.contains("CREATE VIEW"));
 
         let mut triggers_json = ptr::null_mut();
         assert_eq!(ddb_db_list_triggers_json(db, &mut triggers_json), DDB_OK);
         let triggers_json = take_json(&mut triggers_json);
         assert!(triggers_json.contains("\"name\":\"child_ai\""));
         assert!(triggers_json.contains("\"target_name\":\"child\""));
+        let triggers = serde_json::from_str::<JsonValue>(&triggers_json).expect("triggers json");
+        let triggers = triggers.as_array().expect("triggers array");
+        let child_trigger = triggers
+            .iter()
+            .find(|trigger| trigger["name"] == "child_ai")
+            .expect("child trigger in narrow triggers");
+
+        let mut schema_snapshot_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_get_schema_snapshot_json(db, &mut schema_snapshot_json),
+            DDB_OK
+        );
+        let schema_snapshot = parse_json(&mut schema_snapshot_json);
+        assert_eq!(schema_snapshot["snapshot_version"].as_u64(), Some(1));
+        assert!(schema_snapshot["schema_cookie"].as_u64().is_some());
+
+        let snapshot_tables = schema_snapshot["tables"]
+            .as_array()
+            .expect("snapshot tables");
+        let snapshot_child = snapshot_tables
+            .iter()
+            .find(|table| table["name"] == "child")
+            .expect("child table in schema snapshot");
+        for field in [
+            "name",
+            "temporary",
+            "ddl",
+            "row_count",
+            "primary_key_columns",
+            "checks",
+            "foreign_keys",
+            "columns",
+        ] {
+            assert!(
+                snapshot_child.get(field).is_some(),
+                "snapshot child table missing field {field}"
+            );
+        }
+
+        let snapshot_views = schema_snapshot["views"].as_array().expect("snapshot views");
+        let snapshot_child_view = snapshot_views
+            .iter()
+            .find(|view| view["name"] == "child_ids")
+            .expect("child_ids view in schema snapshot");
+        assert!(snapshot_child_view["ddl"]
+            .as_str()
+            .expect("snapshot view ddl string")
+            .contains("CREATE VIEW"));
+
+        let snapshot_indexes = schema_snapshot["indexes"]
+            .as_array()
+            .expect("snapshot indexes");
+        let snapshot_child_index = snapshot_indexes
+            .iter()
+            .find(|index| index["name"] == "idx_child_parent")
+            .expect("idx_child_parent index in schema snapshot");
+
+        let snapshot_triggers = schema_snapshot["triggers"]
+            .as_array()
+            .expect("snapshot triggers");
+        let snapshot_child_trigger = snapshot_triggers
+            .iter()
+            .find(|trigger| trigger["name"] == "child_ai")
+            .expect("child_ai trigger in schema snapshot");
+
+        assert_eq!(child_table["row_count"], snapshot_child["row_count"]);
+        assert_eq!(
+            child_table["primary_key_columns"],
+            snapshot_child["primary_key_columns"]
+        );
+        assert_eq!(child_view["sql_text"], snapshot_child_view["sql_text"]);
+        assert_eq!(child_index["kind"], snapshot_child_index["kind"]);
+        assert_eq!(snapshot_child_index["kind"], "btree");
+        assert_eq!(
+            child_trigger["target_name"],
+            snapshot_child_trigger["target_name"]
+        );
 
         assert_eq!(ddb_db_free(&mut db), DDB_OK);
     }

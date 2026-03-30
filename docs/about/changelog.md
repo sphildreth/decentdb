@@ -13,11 +13,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - .NET decimal parameter scale handling during command binding and EF modification batching so configured scale metadata is applied consistently before native decimal binding.
 
 ### Added
+- Dart binding rich schema snapshot: `Schema.getSchemaSnapshot()` returns a typed model layer covering tables, views, indexes, triggers, check constraints, foreign keys, generated columns, temp-object metadata, and canonical DDL in one call.
+- Rust engine rich schema snapshot model (`SchemaSnapshot` and related structs in `metadata.rs`) with a single authoritative builder path in `db.rs` and deterministic name-ordered collections.
+- C ABI function `ddb_db_get_schema_snapshot_json` for one-shot schema snapshot JSON retrieval over the stable ABI.
+- Dart binding streaming statement refactor: `step()` and `nextPage()` now stream from native row-view buffers without materializing the full result set in Dart. `query()` internally chunks at 256 rows via the streaming path.
+- Dart binding fast-path wrappers: `executeBatchInt64`, `executeBatchI64TextF64`, `executeBatchTyped`, `rebindInt64Execute`, `rebindTextInt64Execute`, `rebindInt64TextExecute`, and `Database.evictSharedWal`.
+- Dart binding test suite expanded with `schema_snapshot_test.dart`, `statement_streaming_test.dart`, and `fast_paths_test.dart` covering rich schema, streaming semantics, and batch/re-execute fast paths.
+- Dart benchmark (`bench_fetch.dart`) updated to measure streaming `step()` and `nextPage()` paths instead of the old hidden full-fetch implementation.
 - Regression coverage for decimal aggregate correctness:
   - Rust SQL test coverage for `MIN`/`MAX` over `DECIMAL`.
   - EF Core query-shape coverage for grouped decimal aggregate projections.
   - EF Core aggregate-shape coverage across grouped and ungrouped projections for core scalar types.
   - EF Core nullable aggregate-shape coverage, including mixed-null and all-null aggregate inputs.
+
+### Changed
+- Decent Bench (`decent-bench`) now uses the rich upstream schema snapshot API instead of narrow v2 types, resolving the metadata regression from the v1-to-v2 migration.
+- Decent Bench native library resolver now looks for Rust v2 library names (`libdecentdb.so`, `libdecentdb.dylib`, `decentdb.dll`).
+- Dart binding examples updated to demonstrate `executeBatchTyped` for bulk inserts instead of manual per-row bind/execute loops.
+- Design and binding review documentation updated to reflect the completed Dart binding v2 surface.
 
 ## [2.0.1] - 2026-03-28
 

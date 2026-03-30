@@ -31,6 +31,8 @@ pub enum ScenarioId {
     DurableCommitSingle,
     #[value(name = "durable_commit_batch")]
     DurableCommitBatch,
+    #[value(name = "complex_ecommerce")]
+    ComplexEcommerce,
     #[value(name = "point_lookup_warm")]
     PointLookupWarm,
     #[value(name = "point_lookup_cold")]
@@ -50,9 +52,10 @@ pub enum ScenarioId {
 }
 
 impl ScenarioId {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::DurableCommitSingle,
         Self::DurableCommitBatch,
+        Self::ComplexEcommerce,
         Self::PointLookupWarm,
         Self::PointLookupCold,
         Self::RangeScanWarm,
@@ -68,6 +71,7 @@ impl ScenarioId {
         match self {
             Self::DurableCommitSingle => "durable_commit_single",
             Self::DurableCommitBatch => "durable_commit_batch",
+            Self::ComplexEcommerce => "complex_ecommerce",
             Self::PointLookupWarm => "point_lookup_warm",
             Self::PointLookupCold => "point_lookup_cold",
             Self::RangeScanWarm => "range_scan_warm",
@@ -81,7 +85,10 @@ impl ScenarioId {
 
     #[must_use]
     pub fn default_workload(self) -> &'static str {
-        "oltp_narrow_v1"
+        match self {
+            Self::ComplexEcommerce => "complex_ecommerce_v1",
+            _ => "oltp_narrow_v1",
+        }
     }
 
     #[must_use]
@@ -89,6 +96,7 @@ impl ScenarioId {
         match self {
             Self::DurableCommitSingle
             | Self::DurableCommitBatch
+            | Self::ComplexEcommerce
             | Self::Checkpoint
             | Self::RecoveryReopen
             | Self::ReadUnderWrite
@@ -106,6 +114,7 @@ impl ScenarioId {
             | Self::Checkpoint
             | Self::StorageEfficiency
             | Self::MemoryFootprint => "real_fs",
+            Self::ComplexEcommerce => "mixed",
             Self::PointLookupWarm | Self::RangeScanWarm => "in_memory",
             Self::PointLookupCold | Self::RecoveryReopen => "cold_process",
             Self::ReadUnderWrite => "warm_cache",

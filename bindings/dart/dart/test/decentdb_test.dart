@@ -209,7 +209,7 @@ void main() {
       }
     });
 
-    test('nextPage marks exact final boundary as last page', () {
+    test('nextPage exact boundary reports last page on follow-up fetch', () {
       db.transaction(() {
         for (var i = 1; i <= 4; i++) {
           db.execute("INSERT INTO items VALUES ($i, 'item_$i', true)");
@@ -220,7 +220,122 @@ void main() {
       try {
         final page = stmt.nextPage(4);
         expect(page.rows.map((row) => row['id']).toList(), [1, 2, 3, 4]);
-        expect(page.isLast, isTrue);
+        expect(page.isLast, isFalse);
+        final tail = stmt.nextPage(4);
+        expect(tail.rows, isEmpty);
+        expect(tail.isLast, isTrue);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('mixed step then nextPage does not duplicate rows', () {
+      db.transaction(() {
+        for (var i = 1; i <= 6; i++) {
+          db.execute("INSERT INTO items VALUES ($i, 'item_$i', true)");
+        }
+      });
+
+      final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+      try {
+        expect(stmt.step(), isTrue);
+        expect(stmt.readRow()['id'], 1);
+
+        final page = stmt.nextPage(3);
+        expect(page.rows.map((row) => row['id']).toList(), [2, 3, 4]);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('mixed nextPage then step advances from page end', () {
+      db.transaction(() {
+        for (var i = 1; i <= 6; i++) {
+          db.execute("INSERT INTO items VALUES ($i, 'item_$i', true)");
+        }
+      });
+
+      final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+      try {
+        final page = stmt.nextPage(4);
+        expect(page.rows.map((row) => row['id']).toList(), [1, 2, 3, 4]);
+        expect(page.isLast, isFalse);
+
+        expect(stmt.step(), isTrue);
+        expect(stmt.readRow()['id'], 5);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('readRow validity follows step and page invalidation rules', () {
+      db.execute("INSERT INTO items VALUES (1, 'one', true)");
+      db.execute("INSERT INTO items VALUES (2, 'two', true)");
+
+      final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+      try {
+        expect(() => stmt.readRow(), throwsStateError);
+        expect(stmt.step(), isTrue);
+        expect(stmt.readRow()['id'], 1);
+        stmt.nextPage(1);
+        expect(() => stmt.readRow(), throwsStateError);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('reset and rebind invalidate streaming state', () {
+      db.execute("INSERT INTO items VALUES (1, 'one', true)");
+      db.execute("INSERT INTO items VALUES (2, 'two', true)");
+      db.execute("INSERT INTO items VALUES (3, 'three', false)");
+
+      final stmt =
+          db.prepare(r'SELECT id FROM items WHERE active = $1 ORDER BY id');
+      try {
+        stmt.bindBool(1, true);
+        expect(stmt.step(), isTrue);
+        expect(stmt.readRow()['id'], 1);
+
+        stmt.reset();
+        expect(() => stmt.readRow(), throwsStateError);
+
+        stmt.clearBindings();
+        stmt.bindBool(1, false);
+        final page = stmt.nextPage(5);
+        expect(page.rows.map((row) => row['id']).toList(), [3]);
+      } finally {
+        stmt.dispose();
+      }
+    });
+
+    test('streaming handles empty and large result sets', () {
+      final emptyStmt = db.prepare('SELECT id FROM items ORDER BY id');
+      try {
+        expect(emptyStmt.step(), isFalse);
+        final emptyPage = emptyStmt.nextPage(10);
+        expect(emptyPage.rows, isEmpty);
+        expect(emptyPage.isLast, isTrue);
+      } finally {
+        emptyStmt.dispose();
+      }
+
+      db.transaction(() {
+        for (var i = 1; i <= 600; i++) {
+          db.execute("INSERT INTO items VALUES ($i, 'item_$i', true)");
+        }
+      });
+
+      final stmt = db.prepare('SELECT id FROM items ORDER BY id');
+      try {
+        var seen = 0;
+        while (true) {
+          final page = stmt.nextPage(128);
+          seen += page.rows.length;
+          if (page.isLast) {
+            break;
+          }
+        }
+        expect(seen, 600);
       } finally {
         stmt.dispose();
       }
@@ -246,6 +361,93 @@ void main() {
       final stmt = db.prepare('SELECT 1');
       stmt.dispose();
       expect(() => stmt.query(), throwsStateError);
+    });
+
+    test('executeBatchInt64 inserts many rows', () {
+      final stmt = db.prepare(r'INSERT INTO items (id) VALUES ($1)');
+      try {
+        final affected = stmt.executeBatchInt64([11, 12, 13, 14]);
+        expect(affected, 4);
+      } finally {
+        stmt.dispose();
+      }
+
+      final ids = db
+          .query('SELECT id FROM items ORDER BY id')
+          .map((row) => row['id'])
+          .toList();
+      expect(ids, [11, 12, 13, 14]);
+    });
+
+    test('executeBatchI64TextF64 inserts triple rows', () {
+      db.execute('ALTER TABLE items ADD COLUMN score FLOAT64');
+      final stmt = db.prepare(
+        r'INSERT INTO items (id, name, score) VALUES ($1, $2, $3)',
+      );
+      try {
+        final affected = stmt.executeBatchI64TextF64([
+          (1, 'one', 1.25),
+          (2, 'two', 2.5),
+          (3, 'three', 3.75),
+        ]);
+        expect(affected, 3);
+      } finally {
+        stmt.dispose();
+      }
+
+      final rows = db.query('SELECT id, name, score FROM items ORDER BY id');
+      expect(rows.map((row) => row['id']).toList(), [1, 2, 3]);
+      expect(rows.map((row) => row['name']).toList(), ['one', 'two', 'three']);
+      expect(rows.map((row) => row['score']).toList(), [1.25, 2.5, 3.75]);
+    });
+
+    test('executeBatchTyped inserts rows with mixed signature', () {
+      db.execute('ALTER TABLE items ADD COLUMN score FLOAT64');
+      db.execute('ALTER TABLE items ADD COLUMN qty INT64');
+      final stmt = db.prepare(
+        r'INSERT INTO items (id, name, score, qty) VALUES ($1, $2, $3, $4)',
+      );
+      try {
+        final affected = stmt.executeBatchTyped('itfi', [
+          [1, 'one', 1.5, 10],
+          [2, 'two', 2.25, 20],
+          [3, 'three', 3.75, 30],
+        ]);
+        expect(affected, 3);
+      } finally {
+        stmt.dispose();
+      }
+
+      final rows =
+          db.query('SELECT id, name, score, qty FROM items ORDER BY id');
+      expect(rows.map((row) => row['id']).toList(), [1, 2, 3]);
+      expect(rows.map((row) => row['qty']).toList(), [10, 20, 30]);
+    });
+
+    test('rebind fast paths update rows repeatedly', () {
+      db.execute('CREATE TABLE counters (id INT64 PRIMARY KEY, value TEXT)');
+      db.execute("INSERT INTO counters VALUES (1, 'a')");
+      db.execute("INSERT INTO counters VALUES (2, 'b')");
+      db.execute("INSERT INTO counters VALUES (3, 'c')");
+
+      final int64Only = db.prepare(
+          r'UPDATE counters SET value = CAST($1 AS TEXT) WHERE id = 1');
+      final textInt64 =
+          db.prepare(r'UPDATE counters SET value = $1 WHERE id = $2');
+      final int64Text =
+          db.prepare(r'UPDATE counters SET value = $2 WHERE id = $1');
+      try {
+        expect(int64Only.rebindInt64Execute(101), 1);
+        expect(textInt64.rebindTextInt64Execute('bb', 2), 1);
+        expect(int64Text.rebindInt64TextExecute(3, 'cc'), 1);
+      } finally {
+        int64Only.dispose();
+        textInt64.dispose();
+        int64Text.dispose();
+      }
+
+      final rows = db.query('SELECT id, value FROM counters ORDER BY id');
+      expect(rows.map((row) => row['value']).toList(), ['101', 'bb', 'cc']);
     });
   });
 
@@ -339,13 +541,42 @@ void main() {
       final childView = views.firstWhere((view) => view.name == 'child_names');
       expect(childView.dependencies, contains('child'));
       expect(db.schema.getViewDdl('child_names'),
-          contains('CREATE VIEW "child_names"'));
+          contains('SELECT id, name FROM child'));
 
       final triggers = db.schema.listTriggers();
       final childTrigger =
           triggers.firstWhere((trigger) => trigger.name == 'child_ai');
       expect(childTrigger.targetName, 'child');
       expect(childTrigger.actionSql, contains('changed'));
+    });
+
+    test('getSchemaSnapshot exposes rich metadata contract', () {
+      final snapshot = db.schema.getSchemaSnapshot();
+      expect(snapshot.snapshotVersion, 1);
+      expect(snapshot.schemaCookie, greaterThanOrEqualTo(0));
+
+      final child =
+          snapshot.tables.firstWhere((table) => table.name == 'child');
+      expect(child.ddl, contains('CREATE TABLE "child"'));
+      expect(child.rowCount, 1);
+      expect(child.columns.map((column) => column.name),
+          containsAll(['id', 'parent_id', 'name']));
+
+      final view =
+          snapshot.views.firstWhere((entry) => entry.name == 'child_names');
+      expect(view.ddl, contains('CREATE VIEW "child_names"'));
+
+      final index = snapshot.indexes
+          .firstWhere((entry) => entry.name == 'idx_child_parent');
+      expect(index.kind, 'btree');
+      expect(index.ddl, contains('CREATE INDEX'));
+
+      final trigger =
+          snapshot.triggers.firstWhere((entry) => entry.name == 'child_ai');
+      expect(trigger.targetKind, 'table');
+      expect(trigger.timing, 'after');
+      expect(trigger.events, contains('insert'));
+      expect(trigger.ddl, contains('CREATE TRIGGER'));
     });
   });
 
@@ -410,6 +641,26 @@ void main() {
   group('error handling', () {
     test('unknown error codes do not silently map to internal', () {
       expect(() => ErrorCode.fromCode(999), throwsStateError);
+    });
+  });
+
+  group('maintenance helpers', () {
+    test('evictSharedWal succeeds for closed on-disk database', () {
+      final tempDir =
+          Directory.systemTemp.createTempSync('decentdb_dart_evict_');
+      final dbPath = '${tempDir.path}/evict.ddb';
+      try {
+        final fileDb = Database.open(dbPath, libraryPath: libPath);
+        fileDb.execute('CREATE TABLE t (id INT64 PRIMARY KEY)');
+        fileDb.close();
+
+        expect(
+          () => Database.evictSharedWal(dbPath, libraryPath: libPath),
+          returnsNormally,
+        );
+      } finally {
+        tempDir.deleteSync(recursive: true);
+      }
     });
   });
 }

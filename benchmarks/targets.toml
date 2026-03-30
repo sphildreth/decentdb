@@ -378,3 +378,118 @@ assumptions = [
   "measure after defined checkpoint / steady-state condition",
   "WAL bytes recorded separately",
 ]
+
+[[metric]]
+id = "complex_ecommerce.orders_insert_rps"
+display_name = "Complex ecommerce order ingest throughput"
+scenario = "complex_ecommerce"
+metric = "orders_insert_rps"
+priority = "P1"
+phase = 2
+signature = false
+direction = "larger_is_better"
+unit = "rows_per_second"
+weight = 0.60
+floor = 300000.0
+target = 700000.0
+stretch = 1200000.0
+cache_mode = "mixed"
+durability_mode = "full"
+likely_owners = ["wal", "pager", "executor"]
+assumptions = [
+  "release build on authoritative host class",
+  "complex_ecommerce_v1 schema and workload",
+  "order, order_item, and payment inserts are committed as one workload phase",
+]
+
+[[metric]]
+id = "complex_ecommerce.report_query_s"
+display_name = "Complex ecommerce report query wall time"
+scenario = "complex_ecommerce"
+metric = "report_query_s"
+priority = "P1"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "seconds"
+weight = 0.60
+floor = 0.050
+target = 0.025
+stretch = 0.012
+cache_mode = "mixed"
+durability_mode = "full"
+likely_owners = ["planner", "executor", "aggregates"]
+assumptions = [
+  "release build on authoritative host class",
+  "complex_ecommerce_v1 schema and workload",
+  "completed-order revenue report with joins, grouping, ordering, and limit",
+]
+
+[[metric]]
+id = "complex_ecommerce.history_p95_ms"
+display_name = "Complex ecommerce user history p95"
+scenario = "complex_ecommerce"
+metric = "history_p95_ms"
+priority = "P1"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.55
+floor = 0.120
+target = 0.060
+stretch = 0.025
+cache_mode = "mixed"
+durability_mode = "full"
+likely_owners = ["planner", "executor", "btree"]
+assumptions = [
+  "release build on authoritative host class",
+  "complex_ecommerce_v1 schema and workload",
+  "history query joins orders, payments, order_items, and items by user_id",
+]
+
+[[metric]]
+id = "complex_ecommerce.update_p95_ms"
+display_name = "Complex ecommerce update p95"
+scenario = "complex_ecommerce"
+metric = "update_p95_ms"
+priority = "P1"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.60
+floor = 0.050
+target = 0.020
+stretch = 0.010
+cache_mode = "mixed"
+durability_mode = "full"
+likely_owners = ["executor", "pager", "record"]
+assumptions = [
+  "release build on authoritative host class",
+  "complex_ecommerce_v1 schema and workload",
+  "single-row user email update measured inside explicit transactions",
+]
+
+[[metric]]
+id = "complex_ecommerce.delete_p95_ms"
+display_name = "Complex ecommerce delete cascade p95"
+scenario = "complex_ecommerce"
+metric = "delete_p95_ms"
+priority = "P1"
+phase = 2
+signature = false
+direction = "smaller_is_better"
+unit = "milliseconds"
+weight = 0.60
+floor = 0.350
+target = 0.150
+stretch = 0.080
+cache_mode = "mixed"
+durability_mode = "full"
+likely_owners = ["executor", "pager", "btree"]
+assumptions = [
+  "release build on authoritative host class",
+  "complex_ecommerce_v1 schema and workload",
+  "delete phase removes order_items, payments, and the order row in one explicit transaction",
+]

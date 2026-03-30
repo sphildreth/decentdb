@@ -53,22 +53,25 @@ void main() {
   db.execute(
     'CREATE TABLE smoke (id INT64 PRIMARY KEY, name TEXT NOT NULL)',
   );
+  db.execute('CREATE TABLE smoke_audit (msg TEXT)');
+  db.execute(
+    "CREATE VIEW smoke_view AS SELECT id, name FROM smoke",
+  );
+  db.execute(
+    "CREATE TRIGGER smoke_ai AFTER INSERT ON smoke FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO smoke_audit VALUES (''inserted'')')",
+  );
 
   // -------------------------------------------------------------------------
   // 3. Parameterised insert via prepared statement
   // -------------------------------------------------------------------------
   final insert = db.prepare(r'INSERT INTO smoke VALUES ($1, $2)');
   try {
-    insert.bindInt64(1, 1);
-    insert.bindText(2, 'dart-smoke');
-    insert.execute();
-
-    // Reuse the statement with reset+rebind
-    insert.reset();
-    insert.clearBindings();
-    insert.bindInt64(1, 2);
-    insert.bindText(2, 'reuse');
-    insert.execute();
+    final affected = insert.executeBatchTyped('it', [
+      [1, 'dart-smoke'],
+      [2, 'reuse'],
+    ]);
+    _check(
+        affected == 2, 'executeBatchTyped should affect 2 rows, got $affected');
   } finally {
     insert.dispose();
   }
@@ -109,8 +112,10 @@ void main() {
     final page3 = pageStmt.nextPage(1);
     _check(page1.rows.length == 1, 'page1 should have 1 row');
     _check(page2.rows.length == 1, 'page2 should have 1 row');
+    _check(page2.isLast == false,
+        'page2 should not report last at exact boundary');
     _check(page3.rows.isEmpty, 'page3 should be empty');
-    _check(page2.isLast, 'page2 should be last');
+    _check(page3.isLast, 'page3 should be last');
   } finally {
     pageStmt.dispose();
   }
@@ -174,8 +179,7 @@ void main() {
   db.execute(
     'CREATE TABLE typed (id INT64 PRIMARY KEY, blob BLOB, dec DECIMAL, ts TIMESTAMP)',
   );
-  final typedInsert =
-      db.prepare(r'INSERT INTO typed VALUES ($1, $2, $3, $4)');
+  final typedInsert = db.prepare(r'INSERT INTO typed VALUES ($1, $2, $3, $4)');
   final blobIn = Uint8List.fromList([0xDE, 0xAD, 0xBE, 0xEF]);
   final decIn = const DecimalValue(99999, 3);
   final tsIn =
@@ -200,13 +204,27 @@ void main() {
   _check(typedRow['ts'] == tsIn, 'timestamp round-trip failed');
 
   // -------------------------------------------------------------------------
-  // 12. Schema introspection
+  // 12. Schema introspection + rich schema snapshot
   // -------------------------------------------------------------------------
   final tables = db.schema.listTables();
   _check(tables.contains('smoke'), 'smoke table not in schema');
   final smokeInfo = db.schema.describeTable('smoke');
   _check(smokeInfo.columns.any((c) => c.name == 'id'), 'id column not found');
   _check(smokeInfo.columns.any((c) => c.name == 'name'), 'name column missing');
+  final snapshot = db.schema.getSchemaSnapshot();
+  _check(snapshot.snapshotVersion == 1, 'snapshot version should be 1');
+  _check(
+    snapshot.tables.any((table) => table.name == 'smoke'),
+    'schema snapshot missing smoke table',
+  );
+  _check(
+    snapshot.views.any((view) => view.name == 'smoke_view'),
+    'schema snapshot missing smoke_view',
+  );
+  _check(
+    snapshot.triggers.any((trigger) => trigger.name == 'smoke_ai'),
+    'schema snapshot missing smoke_ai trigger',
+  );
 
   // -------------------------------------------------------------------------
   // Cleanup

@@ -31,8 +31,9 @@ pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::metadata::{
-    ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification, StorageInfo, TableInfo,
-    TriggerInfo, ViewInfo,
+    CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
+    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
+    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
 };
 pub use crate::record::value::Value;
 

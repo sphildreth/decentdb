@@ -22,6 +22,8 @@ use crate::types::{HistogramSummary, ScenarioId, ScenarioResult, ScenarioStatus}
 
 const LOOKUP_STRIDE: u64 = 8_191;
 const RANGE_STRIDE: u64 = 31;
+const COMPLEX_ORDER_STATUSES: [&str; 3] = ["COMPLETED", "PENDING", "SHIPPED"];
+const COMPLEX_PAYMENT_METHODS: [&str; 3] = ["CREDIT_CARD", "PAYPAL", "CRYPTO"];
 
 pub(crate) fn run_scenario(
     scenario_id: ScenarioId,
@@ -33,6 +35,7 @@ pub(crate) fn run_scenario(
     match scenario_id {
         ScenarioId::DurableCommitSingle => durable_commit_single(profile, scenario_scratch),
         ScenarioId::DurableCommitBatch => durable_commit_batch(profile, scenario_scratch),
+        ScenarioId::ComplexEcommerce => complex_ecommerce(profile, scenario_scratch),
         ScenarioId::PointLookupWarm => point_lookup_warm(profile),
         ScenarioId::PointLookupCold => point_lookup_cold(profile, scenario_scratch),
         ScenarioId::RangeScanWarm => range_scan_warm(profile),
@@ -562,6 +565,776 @@ fn durable_commit_batch(
         vfs_stats: vfs_stats_accum.map(vfs_stats_to_json),
         artifacts: Vec::new(),
     })
+}
+
+#[derive(Debug)]
+struct ComplexUserRow {
+    id: i64,
+    name: String,
+    email: String,
+}
+
+#[derive(Debug)]
+struct ComplexItemRow {
+    id: i64,
+    name: String,
+    price: f64,
+    stock: i64,
+}
+
+#[derive(Debug)]
+struct ComplexOrderRow {
+    id: i64,
+    user_id: i64,
+    status: String,
+    total_amount: f64,
+}
+
+#[derive(Debug)]
+struct ComplexOrderItemRow {
+    order_id: i64,
+    item_id: i64,
+    quantity: i64,
+    price: f64,
+}
+
+#[derive(Debug)]
+struct ComplexPaymentRow {
+    id: i64,
+    order_id: i64,
+    amount: f64,
+    method: String,
+    status: String,
+}
+
+#[derive(Debug)]
+struct ComplexWorkloadData {
+    users: Vec<ComplexUserRow>,
+    items: Vec<ComplexItemRow>,
+    orders: Vec<ComplexOrderRow>,
+    order_items: Vec<ComplexOrderItemRow>,
+    payments: Vec<ComplexPaymentRow>,
+    point_lookup_ids: Vec<i64>,
+    range_scan_params: Vec<(f64, f64)>,
+    join_statuses: Vec<String>,
+    aggregate_params: Vec<(f64, f64)>,
+    history_user_ids: Vec<i64>,
+    update_ops: Vec<(String, i64)>,
+    delete_order_ids: Vec<i64>,
+}
+
+fn complex_ecommerce(profile: &ResolvedProfile, scenario_scratch: &Path) -> Result<ScenarioResult> {
+    let mut point_lookup_collector = LatencyCollector::new()?;
+    let mut range_scan_collector = LatencyCollector::new()?;
+    let mut join_collector = LatencyCollector::new()?;
+    let mut aggregate_collector = LatencyCollector::new()?;
+    let mut history_collector = LatencyCollector::new()?;
+    let mut update_collector = LatencyCollector::new()?;
+    let mut delete_collector = LatencyCollector::new()?;
+    let mut table_scan_collector = LatencyCollector::new()?;
+
+    let mut catalog_insert_seconds_sum = 0.0_f64;
+    let mut orders_insert_total_ns = 0_u128;
+    let mut report_query_seconds_sum = 0.0_f64;
+
+    let mut point_lookup_rows_total = 0_u64;
+    let mut range_scan_rows_total = 0_u64;
+    let mut join_rows_total = 0_u64;
+    let mut aggregate_rows_total = 0_u64;
+    let mut report_rows_total = 0_u64;
+    let mut history_rows_total = 0_u64;
+    let mut table_scan_count_sum = 0_u64;
+
+    let mut catalog_rows = 0_u64;
+    let mut orders_rows = 0_u64;
+    let mut deletes_measured = 0_u64;
+
+    for trial in 0..profile.trials {
+        let trial_dir = scenario_scratch.join(format!("trial-{}", trial + 1));
+        fs::create_dir_all(&trial_dir)
+            .with_context(|| format!("create trial dir {}", trial_dir.display()))?;
+        let db_path = trial_dir.join("complex_ecommerce.ddb");
+
+        let db = Db::open_or_create(&db_path, real_fs_full_durability_config(&trial_dir))
+            .with_context(|| {
+                format!(
+                    "open or create complex_ecommerce database {}",
+                    db_path.display()
+                )
+            })?;
+        setup_complex_schema(&db)?;
+
+        let workload = build_complex_workload_data(profile, trial)?;
+        catalog_rows = workload.users.len() as u64 + workload.items.len() as u64;
+        orders_rows = workload.orders.len() as u64
+            + workload.order_items.len() as u64
+            + workload.payments.len() as u64;
+        deletes_measured = workload.delete_order_ids.len() as u64;
+
+        let catalog_started = Instant::now();
+        {
+            let mut txn = db.transaction()?;
+            let insert_user =
+                txn.prepare("INSERT INTO users (id, name, email) VALUES ($1, $2, $3)")?;
+            for user in workload.users {
+                insert_user.execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(user.id),
+                        Value::Text(user.name),
+                        Value::Text(user.email),
+                    ],
+                )?;
+            }
+
+            let insert_item =
+                txn.prepare("INSERT INTO items (id, name, price, stock) VALUES ($1, $2, $3, $4)")?;
+            for item in workload.items {
+                insert_item.execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(item.id),
+                        Value::Text(item.name),
+                        Value::Float64(item.price),
+                        Value::Int64(item.stock),
+                    ],
+                )?;
+            }
+            txn.commit()?;
+        }
+        let catalog_elapsed = catalog_started.elapsed();
+        catalog_insert_seconds_sum += catalog_elapsed.as_secs_f64();
+
+        let orders_started = Instant::now();
+        {
+            let mut txn = db.transaction()?;
+            let insert_order = txn.prepare(
+                "INSERT INTO orders (id, user_id, status, total_amount) VALUES ($1, $2, $3, $4)",
+            )?;
+            for order in workload.orders {
+                insert_order.execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(order.id),
+                        Value::Int64(order.user_id),
+                        Value::Text(order.status),
+                        Value::Float64(order.total_amount),
+                    ],
+                )?;
+            }
+
+            let insert_order_item = txn.prepare(
+                "INSERT INTO order_items (order_id, item_id, quantity, price) VALUES ($1, $2, $3, $4)",
+            )?;
+            for order_item in workload.order_items {
+                insert_order_item.execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(order_item.order_id),
+                        Value::Int64(order_item.item_id),
+                        Value::Int64(order_item.quantity),
+                        Value::Float64(order_item.price),
+                    ],
+                )?;
+            }
+
+            let insert_payment = txn.prepare(
+                "INSERT INTO payments (id, order_id, amount, method, status) VALUES ($1, $2, $3, $4, $5)",
+            )?;
+            for payment in workload.payments {
+                insert_payment.execute_in(
+                    &mut txn,
+                    &[
+                        Value::Int64(payment.id),
+                        Value::Int64(payment.order_id),
+                        Value::Float64(payment.amount),
+                        Value::Text(payment.method),
+                        Value::Text(payment.status),
+                    ],
+                )?;
+            }
+            txn.commit()?;
+        }
+        let orders_elapsed = orders_started.elapsed();
+        orders_insert_total_ns = orders_insert_total_ns.saturating_add(orders_elapsed.as_nanos());
+
+        let point_lookup = db.prepare("SELECT id, name, email FROM users WHERE id = $1")?;
+        let range_scan = db.prepare(
+            "SELECT id, name, price FROM items WHERE price >= $1 AND price < $2 ORDER BY price LIMIT 100",
+        )?;
+        let join_query = db.prepare(
+            "SELECT o.id, o.total_amount, u.name \
+             FROM orders o \
+             JOIN users u ON o.user_id = u.id \
+             WHERE o.status = $1 \
+             LIMIT 50",
+        )?;
+        let aggregate_query = db.prepare(
+            "SELECT status, COUNT(*) AS count, SUM(total_amount) AS total \
+             FROM orders \
+             WHERE total_amount >= $1 AND total_amount < $2 \
+             GROUP BY status",
+        )?;
+        let report_query = db.prepare(
+            "SELECT i.name, SUM(oi.quantity), SUM(oi.quantity * oi.price) AS revenue \
+             FROM items i \
+             JOIN order_items oi ON i.id = oi.item_id \
+             JOIN orders o ON oi.order_id = o.id \
+             WHERE o.status = 'COMPLETED' \
+             GROUP BY i.id, i.name \
+             ORDER BY revenue DESC \
+             LIMIT 100",
+        )?;
+        let history_query = db.prepare(
+            "SELECT o.id, o.total_amount, p.status, i.name, oi.quantity, oi.price \
+             FROM orders o \
+             JOIN payments p ON o.id = p.order_id \
+             JOIN order_items oi ON o.id = oi.order_id \
+             JOIN items i ON oi.item_id = i.id \
+             WHERE o.user_id = $1 \
+             ORDER BY o.id DESC",
+        )?;
+        let update_query = db.prepare("UPDATE users SET email = $1 WHERE id = $2")?;
+        let delete_order_items = db.prepare("DELETE FROM order_items WHERE order_id = $1")?;
+        let delete_payments = db.prepare("DELETE FROM payments WHERE order_id = $1")?;
+        let delete_orders = db.prepare("DELETE FROM orders WHERE id = $1")?;
+        let table_scan = db.prepare("SELECT COUNT(*) FROM items")?;
+
+        let warm_user_id = *workload
+            .point_lookup_ids
+            .first()
+            .ok_or_else(|| anyhow!("complex_ecommerce point lookup workload was empty"))?;
+        validate_single_row(
+            &point_lookup.execute(&[Value::Int64(warm_user_id)])?,
+            "complex_ecommerce point lookup warmup",
+        )?;
+
+        let warm_range = workload
+            .range_scan_params
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("complex_ecommerce range scan workload was empty"))?;
+        let _ =
+            range_scan.execute(&[Value::Float64(warm_range.0), Value::Float64(warm_range.1)])?;
+
+        let warm_status = workload
+            .join_statuses
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("complex_ecommerce join workload was empty"))?;
+        let _ = join_query.execute(&[Value::Text(warm_status)])?;
+
+        let warm_amounts = workload
+            .aggregate_params
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("complex_ecommerce aggregate workload was empty"))?;
+        let _ = aggregate_query.execute(&[
+            Value::Float64(warm_amounts.0),
+            Value::Float64(warm_amounts.1),
+        ])?;
+
+        let report_warm = report_query.execute(&[])?;
+        report_rows_total = report_rows_total.saturating_add(report_warm.rows().len() as u64);
+
+        let warm_history_user = *workload
+            .history_user_ids
+            .first()
+            .ok_or_else(|| anyhow!("complex_ecommerce history workload was empty"))?;
+        let _ = history_query.execute(&[Value::Int64(warm_history_user)])?;
+
+        let warm_update = workload
+            .update_ops
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("complex_ecommerce update workload was empty"))?;
+        {
+            let mut txn = db.transaction()?;
+            update_query.execute_in(
+                &mut txn,
+                &[
+                    Value::Text(warm_update.0.clone()),
+                    Value::Int64(warm_update.1),
+                ],
+            )?;
+            txn.rollback()?;
+        }
+
+        let warm_delete_order_id = *workload
+            .delete_order_ids
+            .first()
+            .ok_or_else(|| anyhow!("complex_ecommerce delete workload was empty"))?;
+        {
+            let mut txn = db.transaction()?;
+            delete_order_items.execute_in(&mut txn, &[Value::Int64(warm_delete_order_id)])?;
+            delete_payments.execute_in(&mut txn, &[Value::Int64(warm_delete_order_id)])?;
+            delete_orders.execute_in(&mut txn, &[Value::Int64(warm_delete_order_id)])?;
+            txn.rollback()?;
+        }
+
+        for user_id in workload.point_lookup_ids {
+            let started = Instant::now();
+            let result = point_lookup.execute(&[Value::Int64(user_id)])?;
+            point_lookup_collector.record(started.elapsed())?;
+            point_lookup_rows_total = point_lookup_rows_total.saturating_add(validate_single_row(
+                &result,
+                "complex_ecommerce point lookup",
+            )?);
+        }
+
+        for (low, high) in workload.range_scan_params {
+            let started = Instant::now();
+            let result = range_scan.execute(&[Value::Float64(low), Value::Float64(high)])?;
+            range_scan_collector.record(started.elapsed())?;
+            range_scan_rows_total =
+                range_scan_rows_total.saturating_add(result.rows().len() as u64);
+        }
+
+        for status in workload.join_statuses {
+            let started = Instant::now();
+            let result = join_query.execute(&[Value::Text(status)])?;
+            join_collector.record(started.elapsed())?;
+            join_rows_total = join_rows_total.saturating_add(result.rows().len() as u64);
+        }
+
+        for (low, high) in workload.aggregate_params {
+            let started = Instant::now();
+            let result = aggregate_query.execute(&[Value::Float64(low), Value::Float64(high)])?;
+            aggregate_collector.record(started.elapsed())?;
+            aggregate_rows_total = aggregate_rows_total.saturating_add(result.rows().len() as u64);
+        }
+
+        let report_started = Instant::now();
+        let report_result = report_query.execute(&[])?;
+        report_query_seconds_sum += report_started.elapsed().as_secs_f64();
+        report_rows_total = report_rows_total.saturating_add(report_result.rows().len() as u64);
+
+        for user_id in workload.history_user_ids {
+            let started = Instant::now();
+            let result = history_query.execute(&[Value::Int64(user_id)])?;
+            history_collector.record(started.elapsed())?;
+            history_rows_total = history_rows_total.saturating_add(result.rows().len() as u64);
+        }
+
+        for (email, user_id) in workload.update_ops {
+            let mut txn = db.transaction()?;
+            let started = Instant::now();
+            let result =
+                update_query.execute_in(&mut txn, &[Value::Text(email), Value::Int64(user_id)])?;
+            update_collector.record(started.elapsed())?;
+            txn.commit()?;
+            if result.affected_rows() != 1 {
+                return Err(anyhow!(
+                    "complex_ecommerce update expected 1 affected row, got {}",
+                    result.affected_rows()
+                ));
+            }
+        }
+
+        for order_id in workload.delete_order_ids {
+            let mut txn = db.transaction()?;
+            let started = Instant::now();
+            let _ = delete_order_items.execute_in(&mut txn, &[Value::Int64(order_id)])?;
+            let payment_result = delete_payments.execute_in(&mut txn, &[Value::Int64(order_id)])?;
+            let order_result = delete_orders.execute_in(&mut txn, &[Value::Int64(order_id)])?;
+            delete_collector.record(started.elapsed())?;
+            txn.commit()?;
+            if payment_result.affected_rows() != 1 {
+                return Err(anyhow!(
+                    "complex_ecommerce delete expected 1 payment row, got {}",
+                    payment_result.affected_rows()
+                ));
+            }
+            if order_result.affected_rows() != 1 {
+                return Err(anyhow!(
+                    "complex_ecommerce delete expected 1 order row, got {}",
+                    order_result.affected_rows()
+                ));
+            }
+        }
+
+        for _ in 0..profile.complex_table_scans {
+            let started = Instant::now();
+            let result = table_scan.execute(&[])?;
+            table_scan_collector.record(started.elapsed())?;
+            table_scan_count_sum =
+                table_scan_count_sum.saturating_add(extract_single_count(result)?);
+        }
+    }
+
+    let point_summary = point_lookup_collector.summary();
+    let range_summary = range_scan_collector.summary();
+    let join_summary = join_collector.summary();
+    let aggregate_summary = aggregate_collector.summary();
+    let history_summary = history_collector.summary();
+    let update_summary = update_collector.summary();
+    let delete_summary = delete_collector.summary();
+    let table_scan_summary = table_scan_collector.summary();
+    let trial_count_f64 = f64::from(profile.trials);
+    let orders_insert_rps = if orders_insert_total_ns == 0 {
+        0.0
+    } else {
+        let seconds = orders_insert_total_ns as f64 / 1_000_000_000.0;
+        (orders_rows.saturating_mul(u64::from(profile.trials))) as f64 / seconds
+    };
+
+    let mut metrics = BTreeMap::new();
+    metrics.insert(
+        "catalog_insert_s".to_string(),
+        json!(catalog_insert_seconds_sum / trial_count_f64),
+    );
+    metrics.insert("catalog_rows".to_string(), json!(catalog_rows));
+    metrics.insert("orders_insert_rps".to_string(), json!(orders_insert_rps));
+    metrics.insert("orders_rows".to_string(), json!(orders_rows));
+    metrics.insert(
+        "point_lookup_p50_ms".to_string(),
+        json!(point_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "point_lookup_p95_ms".to_string(),
+        json!(point_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "range_scan_p50_ms".to_string(),
+        json!(range_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "range_scan_p95_ms".to_string(),
+        json!(range_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "join_p50_ms".to_string(),
+        json!(join_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "join_p95_ms".to_string(),
+        json!(join_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "aggregate_p50_ms".to_string(),
+        json!(aggregate_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "aggregate_p95_ms".to_string(),
+        json!(aggregate_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "report_query_s".to_string(),
+        json!(report_query_seconds_sum / trial_count_f64),
+    );
+    metrics.insert(
+        "history_p50_ms".to_string(),
+        json!(history_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "history_p95_ms".to_string(),
+        json!(history_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "update_p50_ms".to_string(),
+        json!(update_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "update_p95_ms".to_string(),
+        json!(update_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "delete_p50_ms".to_string(),
+        json!(delete_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "delete_p95_ms".to_string(),
+        json!(delete_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "table_scan_p50_ms".to_string(),
+        json!(table_scan_summary.p50_us / 1_000.0),
+    );
+    metrics.insert(
+        "table_scan_p95_ms".to_string(),
+        json!(table_scan_summary.p95_us / 1_000.0),
+    );
+    metrics.insert(
+        "point_lookup_rows_total".to_string(),
+        json!(point_lookup_rows_total),
+    );
+    metrics.insert(
+        "range_scan_rows_total".to_string(),
+        json!(range_scan_rows_total),
+    );
+    metrics.insert("join_rows_total".to_string(), json!(join_rows_total));
+    metrics.insert(
+        "aggregate_rows_total".to_string(),
+        json!(aggregate_rows_total),
+    );
+    metrics.insert("report_rows_total".to_string(), json!(report_rows_total));
+    metrics.insert("history_rows_total".to_string(), json!(history_rows_total));
+    metrics.insert("deletes_measured".to_string(), json!(deletes_measured));
+    metrics.insert(
+        "table_scan_count_sum".to_string(),
+        json!(table_scan_count_sum),
+    );
+
+    Ok(ScenarioResult {
+        status: ScenarioStatus::Passed,
+        error_class: None,
+        scenario_id: ScenarioId::ComplexEcommerce,
+        profile: profile.kind,
+        workload: ScenarioId::ComplexEcommerce.default_workload().to_string(),
+        durability_mode: "full".to_string(),
+        cache_mode: "mixed".to_string(),
+        trial_count: profile.trials,
+        metrics,
+        warnings: Vec::new(),
+        notes: vec![
+            "Rust-native parity scenario for bindings/python/benchmarks/bench_complex.py."
+                .to_string(),
+            "Schema, workload ordering, and primary metric names intentionally mirror the Python complex benchmark."
+                .to_string(),
+            "Read queries use one warmup execution each, matching the Python benchmark semantics rather than profile.warmup_ops."
+                .to_string(),
+        ],
+        scale: profile.scale_json(),
+        histograms: None,
+        vfs_stats: None,
+        artifacts: Vec::new(),
+    })
+}
+
+fn setup_complex_schema(db: &Db) -> Result<()> {
+    db.execute(
+        "CREATE TABLE users (
+            id INT64 PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        )",
+    )?;
+    db.execute(
+        "CREATE TABLE items (
+            id INT64 PRIMARY KEY,
+            name TEXT,
+            price FLOAT64,
+            stock INT64
+        )",
+    )?;
+    db.execute(
+        "CREATE TABLE orders (
+            id INT64 PRIMARY KEY,
+            user_id INT64,
+            status TEXT,
+            total_amount FLOAT64,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )",
+    )?;
+    db.execute(
+        "CREATE TABLE order_items (
+            order_id INT64,
+            item_id INT64,
+            quantity INT64,
+            price FLOAT64,
+            FOREIGN KEY(order_id) REFERENCES orders(id),
+            FOREIGN KEY(item_id) REFERENCES items(id)
+        )",
+    )?;
+    db.execute(
+        "CREATE TABLE payments (
+            id INT64 PRIMARY KEY,
+            order_id INT64,
+            amount FLOAT64,
+            method TEXT,
+            status TEXT,
+            FOREIGN KEY(order_id) REFERENCES orders(id)
+        )",
+    )?;
+
+    db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)")?;
+    db.execute("CREATE INDEX idx_orders_status ON orders(status)")?;
+    db.execute("CREATE INDEX idx_order_items_order_id ON order_items(order_id)")?;
+    db.execute("CREATE INDEX idx_order_items_item_id ON order_items(item_id)")?;
+    db.execute("CREATE INDEX idx_payments_order_id ON payments(order_id)")?;
+    Ok(())
+}
+
+fn build_complex_workload_data(
+    profile: &ResolvedProfile,
+    trial: u32,
+) -> Result<ComplexWorkloadData> {
+    let users_count = profile.complex_users;
+    let items_count = profile.complex_items;
+    let orders_count = profile.complex_orders;
+    let seed = profile.seed ^ 0x9e37_79b9_7f4a_7c15 ^ u64::from(trial).rotate_left(11);
+
+    let mut users = Vec::new();
+    for user_id in 1..=users_count {
+        users.push(ComplexUserRow {
+            id: to_i64(user_id)?,
+            name: format!("User_{user_id}"),
+            email: format!("user{user_id}@example.com"),
+        });
+    }
+
+    let mut items = Vec::new();
+    let mut min_price = f64::INFINITY;
+    let mut max_price = f64::NEG_INFINITY;
+    for item_id in 1..=items_count {
+        let price_cents = 500_u64.saturating_add(complex_mix(seed, 0x10, item_id) % 49_500);
+        let price = price_cents as f64 / 100.0;
+        let stock = 10_u64.saturating_add(complex_mix(seed, 0x11, item_id) % 9_991);
+        min_price = min_price.min(price);
+        max_price = max_price.max(price);
+        items.push(ComplexItemRow {
+            id: to_i64(item_id)?,
+            name: format!("Item_{item_id}"),
+            price,
+            stock: to_i64(stock)?,
+        });
+    }
+
+    let mut orders = Vec::new();
+    let mut order_items = Vec::new();
+    let mut payments = Vec::new();
+    let mut min_amount = f64::INFINITY;
+    let mut max_amount = f64::NEG_INFINITY;
+    for order_id in 1..=orders_count {
+        let user_id = complex_pick_id(seed, 0x20, order_id, users_count);
+        let item_count = 1_u64.saturating_add(complex_mix(seed, 0x21, order_id) % 5);
+
+        let mut total_amount = 0.0_f64;
+        for slot in 0..item_count {
+            let item_id = complex_pick_id(
+                seed ^ order_id.rotate_left(7),
+                0x22_u64.saturating_add(slot),
+                order_id,
+                items_count,
+            );
+            let quantity =
+                1_u64.saturating_add(complex_mix(seed ^ slot.rotate_left(3), 0x23, order_id) % 3);
+            let item = &items[(item_id - 1) as usize];
+            total_amount += item.price * quantity as f64;
+            order_items.push(ComplexOrderItemRow {
+                order_id: to_i64(order_id)?,
+                item_id: to_i64(item_id)?,
+                quantity: to_i64(quantity)?,
+                price: item.price,
+            });
+        }
+
+        let status_index =
+            (complex_mix(seed, 0x24, order_id) % COMPLEX_ORDER_STATUSES.len() as u64) as usize;
+        let status = COMPLEX_ORDER_STATUSES[status_index].to_string();
+        let payment_method = COMPLEX_PAYMENT_METHODS
+            [(complex_mix(seed, 0x25, order_id) % COMPLEX_PAYMENT_METHODS.len() as u64) as usize]
+            .to_string();
+        let payment_status = if status == "COMPLETED" || status == "SHIPPED" {
+            "PAID"
+        } else {
+            "PENDING"
+        }
+        .to_string();
+
+        min_amount = min_amount.min(total_amount);
+        max_amount = max_amount.max(total_amount);
+        orders.push(ComplexOrderRow {
+            id: to_i64(order_id)?,
+            user_id: to_i64(user_id)?,
+            status,
+            total_amount,
+        });
+        payments.push(ComplexPaymentRow {
+            id: to_i64(order_id)?,
+            order_id: to_i64(order_id)?,
+            amount: total_amount,
+            method: payment_method,
+            status: payment_status,
+        });
+    }
+
+    let point_lookup_ids = (0..profile.complex_point_lookups)
+        .map(|op| to_i64(complex_pick_id(seed, 0x30, op, users_count)))
+        .collect::<Result<Vec<_>>>()?;
+    let range_scan_params = build_complex_range_params(
+        seed,
+        0x40,
+        profile.complex_range_scans,
+        min_price,
+        max_price,
+    );
+    let join_statuses = (0..profile.complex_joins)
+        .map(|op| {
+            let index =
+                (complex_mix(seed, 0x50, op) % COMPLEX_ORDER_STATUSES.len() as u64) as usize;
+            COMPLEX_ORDER_STATUSES[index].to_string()
+        })
+        .collect::<Vec<_>>();
+    let aggregate_params = build_complex_range_params(
+        seed,
+        0x60,
+        profile.complex_aggregates,
+        min_amount,
+        max_amount,
+    );
+    let history_user_ids = (0..profile.complex_history_reads)
+        .map(|op| to_i64(complex_pick_id(seed, 0x70, op, users_count)))
+        .collect::<Result<Vec<_>>>()?;
+    let update_ops = (0..profile.complex_updates)
+        .map(|op| {
+            let user_id = complex_pick_id(seed, 0x80, op, users_count);
+            Ok((format!("updated_{user_id}@example.com"), to_i64(user_id)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let delete_count = profile.complex_deletes.min(orders_count);
+    let delete_order_ids = (0..delete_count)
+        .map(|offset| to_i64(orders_count.saturating_sub(offset)))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ComplexWorkloadData {
+        users,
+        items,
+        orders,
+        order_items,
+        payments,
+        point_lookup_ids,
+        range_scan_params,
+        join_statuses,
+        aggregate_params,
+        history_user_ids,
+        update_ops,
+        delete_order_ids,
+    })
+}
+
+fn build_complex_range_params(
+    seed: u64,
+    namespace: u64,
+    count: u64,
+    minimum: f64,
+    maximum: f64,
+) -> Vec<(f64, f64)> {
+    let span = (maximum - minimum).max(0.0);
+    let mut params = Vec::new();
+    for ordinal in 0..count {
+        let low = minimum + span * complex_fraction(seed, namespace, ordinal);
+        let high = minimum + span * (complex_fraction(seed, namespace + 1, ordinal) + 0.01);
+        params.push((low, high));
+    }
+    params
+}
+
+fn complex_pick_id(seed: u64, namespace: u64, ordinal: u64, upper_bound: u64) -> u64 {
+    (complex_mix(seed, namespace, ordinal) % upper_bound.max(1)).saturating_add(1)
+}
+
+fn complex_mix(seed: u64, namespace: u64, ordinal: u64) -> u64 {
+    splitmix64(
+        seed.rotate_left((namespace as u32) % 31)
+            ^ namespace.wrapping_mul(0x94d0_49bb_1331_11eb)
+            ^ ordinal.wrapping_mul(0xbf58_476d_1ce4_e5b9),
+    )
+}
+
+fn complex_fraction(seed: u64, namespace: u64, ordinal: u64) -> f64 {
+    let value = complex_mix(seed, namespace, ordinal) >> 11;
+    value as f64 / ((1_u64 << 53) as f64)
 }
 
 fn point_lookup_warm(profile: &ResolvedProfile) -> Result<ScenarioResult> {
@@ -2247,6 +3020,17 @@ mod tests {
             cold_batches: 2,
             reader_threads: 2,
             writer_ops: 20,
+            complex_users: 20,
+            complex_items: 10,
+            complex_orders: 50,
+            complex_history_reads: 20,
+            complex_point_lookups: 20,
+            complex_range_scans: 20,
+            complex_joins: 20,
+            complex_aggregates: 20,
+            complex_updates: 20,
+            complex_deletes: 10,
+            complex_table_scans: 5,
             warmup_ops: 5,
             trials: 1,
             seed: 7,
@@ -2270,6 +3054,17 @@ mod tests {
         assert!(matches!(result.status, ScenarioStatus::Passed));
         assert!(result.metrics.contains_key("batch_commit_p95_us"));
         assert!(result.metrics.contains_key("rows_per_batch"));
+    }
+
+    #[test]
+    fn complex_ecommerce_scenario_runs_with_tiny_profile() {
+        let temp = TempDir::new().expect("tempdir");
+        let result = run_scenario(ScenarioId::ComplexEcommerce, &tiny_profile(), temp.path())
+            .expect("run complex ecommerce scenario");
+        assert!(matches!(result.status, ScenarioStatus::Passed));
+        assert!(result.metrics.contains_key("orders_insert_rps"));
+        assert!(result.metrics.contains_key("report_query_s"));
+        assert!(result.metrics.contains_key("update_p95_ms"));
     }
 
     #[test]

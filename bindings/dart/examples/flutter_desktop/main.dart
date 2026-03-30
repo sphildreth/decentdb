@@ -28,6 +28,14 @@ void main() {
     print("  $done ${row['title']}");
   }
 
+  final snapshot = db.schema.getSchemaSnapshot();
+  final taskTable =
+      snapshot.tables.firstWhere((table) => table.name == 'tasks');
+  print(
+    'Schema snapshot: ${snapshot.tables.length} table(s), '
+    '${snapshot.indexes.length} index(es), tasks temp=${taskTable.temporary}',
+  );
+
   db.close();
 }
 

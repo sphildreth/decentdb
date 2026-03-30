@@ -17,7 +17,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Run one or more benchmark scenarios.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Compare benchmark artifacts and rank optimization opportunities.
     Compare(CompareArgs),
     /// Manage named local baseline snapshots.
@@ -84,6 +84,50 @@ pub struct RunArgs {
     /// Override measured writer operations for read-under-write scenario.
     #[arg(long)]
     pub writer_ops: Option<u64>,
+
+    /// Override complex-workload user rows for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_users: Option<u64>,
+
+    /// Override complex-workload item rows for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_items: Option<u64>,
+
+    /// Override complex-workload order rows for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_orders: Option<u64>,
+
+    /// Override complex-workload history lookups for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_history_reads: Option<u64>,
+
+    /// Override complex-workload point lookups for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_point_lookups: Option<u64>,
+
+    /// Override complex-workload range scans for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_range_scans: Option<u64>,
+
+    /// Override complex-workload join queries for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_joins: Option<u64>,
+
+    /// Override complex-workload aggregate queries for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_aggregates: Option<u64>,
+
+    /// Override complex-workload updates for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_updates: Option<u64>,
+
+    /// Override complex-workload deletes for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_deletes: Option<u64>,
+
+    /// Override complex-workload table scans for complex_ecommerce scenario.
+    #[arg(long)]
+    pub complex_table_scans: Option<u64>,
 
     /// Override warmup operations for latency scenarios.
     #[arg(long)]

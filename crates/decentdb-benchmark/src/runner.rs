@@ -5,7 +5,7 @@ use std::fs;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
@@ -84,6 +84,7 @@ where
     let profile = resolve_profile(args.profile, &profile_overrides)?;
     let started_unix_ms = unix_millis(SystemTime::now())?;
     let run_id = make_run_id(started_unix_ms, profile.kind);
+    let run_started_at = Instant::now();
 
     let dirs = RunDirectories::new(args.scratch_root, args.artifact_root, &run_id);
     prepare_paths(&dirs)?;
@@ -106,8 +107,25 @@ where
     };
     write_json(&dirs.run_dir.join("manifest.json"), &manifest)?;
 
+    let total_scenarios = selected_scenarios.len();
+    println!(
+        "progress=run_start run_id={} profile={} total_scenarios={} dry_run={}",
+        run_id,
+        profile.kind.as_str(),
+        total_scenarios,
+        args.dry_run
+    );
+
     let mut scenario_results = Vec::with_capacity(selected_scenarios.len());
-    for scenario_id in &selected_scenarios {
+    for (scenario_index, scenario_id) in selected_scenarios.iter().enumerate() {
+        let scenario_number = scenario_index + 1;
+        println!(
+            "progress=scenario_start index={} total={} scenario={}",
+            scenario_number,
+            total_scenarios,
+            scenario_id.as_str()
+        );
+        let scenario_started_at = Instant::now();
         let scenario_file = dirs
             .scenario_dir
             .join(format!("{}.json", scenario_id.as_str()));
@@ -136,8 +154,17 @@ where
                 }
             }
         };
+        let scenario_elapsed_ms = scenario_started_at.elapsed().as_millis();
         promote_artifacts(&mut scenario_result, &dirs)?;
         write_json(&scenario_file, &scenario_result)?;
+        println!(
+            "progress=scenario_finish index={} total={} scenario={} status={} elapsed_ms={}",
+            scenario_number,
+            total_scenarios,
+            scenario_id.as_str(),
+            scenario_status_label(&scenario_result.status),
+            scenario_elapsed_ms
+        );
         scenario_results.push((scenario_result, scenario_file));
     }
 
@@ -178,6 +205,15 @@ where
         }
     }
     write_json(&dirs.run_dir.join("summary.json"), &summary)?;
+    println!(
+        "progress=run_finish run_id={} total_scenarios={} passed={} failed={} skipped={} elapsed_ms={}",
+        run_id,
+        total_scenarios,
+        summary.passed,
+        summary.failed,
+        summary.skipped,
+        run_started_at.elapsed().as_millis()
+    );
 
     println!("run_id={run_id}");
     println!("manifest={}", dirs.run_dir.join("manifest.json").display());
@@ -254,12 +290,27 @@ fn build_summary(
     }
 }
 
+fn scenario_status_label(status: &ScenarioStatus) -> &'static str {
+    match status {
+        ScenarioStatus::Passed => "passed",
+        ScenarioStatus::Failed => "failed",
+        ScenarioStatus::Skipped => "skipped",
+    }
+}
+
 fn headline_metrics(result: &ScenarioResult) -> BTreeMap<String, serde_json::Value> {
     let keys: &[&str] = match result.scenario_id {
         ScenarioId::DurableCommitSingle => &["commit_p95_us", "commits_per_sec"],
         ScenarioId::DurableCommitBatch => {
             &["batch_commit_p95_us", "rows_per_sec", "wal_growth_bytes"]
         }
+        ScenarioId::ComplexEcommerce => &[
+            "orders_insert_rps",
+            "point_lookup_p95_ms",
+            "report_query_s",
+            "update_p95_ms",
+            "delete_p95_ms",
+        ],
         ScenarioId::PointLookupWarm => &["lookup_p95_us", "lookups_per_sec"],
         ScenarioId::PointLookupCold => &["first_read_p95_us", "cold_batch_p95_ms"],
         ScenarioId::RangeScanWarm => &["scan_p95_us", "rows_per_sec"],
@@ -620,6 +671,17 @@ mod tests {
             cold_batches: None,
             reader_threads: None,
             writer_ops: None,
+            complex_users: None,
+            complex_items: None,
+            complex_orders: None,
+            complex_history_reads: None,
+            complex_point_lookups: None,
+            complex_range_scans: None,
+            complex_joins: None,
+            complex_aggregates: None,
+            complex_updates: None,
+            complex_deletes: None,
+            complex_table_scans: None,
             warmup_ops: None,
             trials: None,
             seed: None,
@@ -670,6 +732,17 @@ mod tests {
             cold_batches: None,
             reader_threads: None,
             writer_ops: None,
+            complex_users: None,
+            complex_items: None,
+            complex_orders: None,
+            complex_history_reads: None,
+            complex_point_lookups: None,
+            complex_range_scans: None,
+            complex_joins: None,
+            complex_aggregates: None,
+            complex_updates: None,
+            complex_deletes: None,
+            complex_table_scans: None,
             warmup_ops: None,
             trials: None,
             seed: None,
@@ -726,6 +799,17 @@ mod tests {
             cold_batches: None,
             reader_threads: None,
             writer_ops: None,
+            complex_users: None,
+            complex_items: None,
+            complex_orders: None,
+            complex_history_reads: None,
+            complex_point_lookups: None,
+            complex_range_scans: None,
+            complex_joins: None,
+            complex_aggregates: None,
+            complex_updates: None,
+            complex_deletes: None,
+            complex_table_scans: None,
             warmup_ops: None,
             trials: None,
             seed: None,
