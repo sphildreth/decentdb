@@ -8,7 +8,7 @@ use super::freelist::FreelistState;
 use super::page;
 
 pub(crate) const DB_HEADER_SIZE: usize = 128;
-pub(crate) const DB_FORMAT_VERSION: u32 = 8;
+pub const DB_FORMAT_VERSION: u32 = 8;
 #[allow(dead_code)]
 pub(crate) const WAL_HEADER_VERSION: u32 = 1;
 pub(crate) const HEADER_PAGE_ID: u32 = 1;
@@ -69,28 +69,9 @@ impl DatabaseHeader {
     }
 
     pub(crate) fn decode(bytes: &[u8; DB_HEADER_SIZE]) -> Result<Self> {
-        let magic = read_array::<16>(bytes, 0);
-        if magic != DB_MAGIC {
-            return Err(DbError::corruption(format!(
-                "invalid database header magic on page {}",
-                HEADER_PAGE_ID
-            )));
-        }
-
-        let format_version = read_u32(bytes, FORMAT_VERSION_OFFSET);
-        if format_version != DB_FORMAT_VERSION {
-            return Err(DbError::corruption(format!(
-                "unsupported database format version {} on page {}; expected {}",
-                format_version, HEADER_PAGE_ID, DB_FORMAT_VERSION
-            )));
-        }
-
-        let page_size = read_u32(bytes, PAGE_SIZE_OFFSET);
-        if !page::is_supported_page_size(page_size) {
-            return Err(DbError::corruption(format!(
-                "invalid database page size {} on page {}",
-                page_size, HEADER_PAGE_ID
-            )));
+        let header = Self::decode_loose(bytes)?;
+        if header.format_version != DB_FORMAT_VERSION {
+            return Err(DbError::unsupported_format_version(header.format_version));
         }
 
         let stored_checksum = read_u32(bytes, CHECKSUM_OFFSET);
@@ -102,6 +83,30 @@ impl DatabaseHeader {
                 HEADER_PAGE_ID
             )));
         }
+
+        Ok(header)
+    }
+
+    pub(crate) fn decode_loose(bytes: &[u8; DB_HEADER_SIZE]) -> Result<Self> {
+        let magic = read_array::<16>(bytes, 0);
+        if magic != DB_MAGIC {
+            return Err(DbError::corruption(format!(
+                "invalid database header magic on page {}",
+                HEADER_PAGE_ID
+            )));
+        }
+
+        let format_version = read_u32(bytes, FORMAT_VERSION_OFFSET);
+
+        let page_size = read_u32(bytes, PAGE_SIZE_OFFSET);
+        if !page::is_supported_page_size(page_size) {
+            return Err(DbError::corruption(format!(
+                "invalid database page size {} on page {}",
+                page_size, HEADER_PAGE_ID
+            )));
+        }
+
+        let stored_checksum = read_u32(bytes, CHECKSUM_OFFSET);
 
         Ok(Self {
             magic,
@@ -169,6 +174,12 @@ pub(crate) fn read_database_header_vfs(file: &dyn VfsFile) -> Result<DatabaseHea
     DatabaseHeader::decode(&bytes)
 }
 
+pub(crate) fn read_database_header_vfs_loose(file: &dyn VfsFile) -> Result<DatabaseHeader> {
+    let mut bytes = [0_u8; DB_HEADER_SIZE];
+    read_exact_at(file, 0, &mut bytes)?;
+    DatabaseHeader::decode_loose(&bytes)
+}
+
 fn read_u32(bytes: &[u8; DB_HEADER_SIZE], offset: usize) -> u32 {
     let mut raw = [0_u8; 4];
     raw.copy_from_slice(&bytes[offset..offset + 4]);
@@ -225,14 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_format_version_is_reported_as_corruption() {
+    fn invalid_format_version_is_reported() {
         let mut header = DatabaseHeader::new(page::DEFAULT_PAGE_SIZE);
         header.format_version = DB_FORMAT_VERSION + 1;
         let encoded = header.encode();
 
         assert!(matches!(
             DatabaseHeader::decode(&encoded),
-            Err(DbError::Corruption { .. })
+            Err(DbError::UnsupportedFormatVersion { .. })
         ));
     }
 

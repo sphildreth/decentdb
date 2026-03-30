@@ -8,6 +8,7 @@ use serde::Serialize;
 pub struct StorageInfo {
     pub path: PathBuf,
     pub wal_path: PathBuf,
+    pub format_version: u32,
     pub page_size: u32,
     pub cache_size_mb: usize,
     pub page_count: u32,

@@ -7,7 +7,8 @@ enum ErrorCode {
   transaction(4),
   sql(5),
   internal(6),
-  panic(7);
+  panic(7),
+  unsupportedFormatVersion(8);
 
   const ErrorCode(this.code);
 

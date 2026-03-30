@@ -142,6 +142,8 @@ func statusCode(status C.ddb_status_t) int {
 		return 6
 	case C.DDB_ERR_PANIC:
 		return 7
+	case C.DDB_ERR_UNSUPPORTED_FORMAT_VERSION:
+		return 8
 	default:
 		return 6
 	}

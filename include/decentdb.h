@@ -18,7 +18,8 @@ enum {
   DDB_ERR_TRANSACTION = 4,
   DDB_ERR_SQL = 5,
   DDB_ERR_INTERNAL = 6,
-  DDB_ERR_PANIC = 7
+  DDB_ERR_PANIC = 7,
+  DDB_ERR_UNSUPPORTED_FORMAT_VERSION = 8
 };
 
 typedef struct ddb_db_handle ddb_db_t;

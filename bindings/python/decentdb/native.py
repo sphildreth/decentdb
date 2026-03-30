@@ -22,6 +22,7 @@ ERR_TRANSACTION = 4
 ERR_SQL = 5
 ERR_INTERNAL = 6
 ERR_PANIC = 7
+ERR_UNSUPPORTED_FORMAT_VERSION = 8
 
 # Legacy compatibility aliases kept for higher-level Python imports/tests.
 ERR_ERROR = 100

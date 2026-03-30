@@ -27,6 +27,7 @@ static int map_status_to_legacy_code(ddb_status_t status) {
         case DDB_ERR_SQL: return 5;
         case DDB_ERR_INTERNAL: return 6;
         case DDB_ERR_PANIC: return 7;
+        case DDB_ERR_UNSUPPORTED_FORMAT_VERSION: return 8;
         default: return 6;
     }
 }

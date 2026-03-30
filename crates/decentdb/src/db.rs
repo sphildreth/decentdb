@@ -394,6 +394,28 @@ impl PreparedInsertCache {
 }
 
 impl Db {
+    /// Reads the raw database header without opening the entire database engine
+    /// or validating the format version. This is useful for inspection utilities
+    /// and pre-flight format validation.
+    pub fn read_header_info(path: impl AsRef<Path>) -> Result<HeaderInfo> {
+        let path = path.as_ref();
+        let vfs = VfsHandle::for_path(path);
+        let file = vfs.open(path, OpenMode::OpenExisting, FileKind::Database)?;
+        let header = storage::read_database_header_vfs_loose(file.as_ref())?;
+        Ok(HeaderInfo {
+            magic_hex: hex_encode(&header.magic),
+            format_version: header.format_version,
+            page_size: header.page_size,
+            header_checksum: header.header_checksum,
+            schema_cookie: header.schema_cookie,
+            catalog_root_page_id: header.catalog_root_page_id,
+            freelist_root_page_id: header.freelist.root_page_id,
+            freelist_head_page_id: header.freelist.head_page_id,
+            freelist_page_count: header.freelist.page_count,
+            last_checkpoint_lsn: header.last_checkpoint_lsn,
+        })
+    }
+
     /// Begins an exclusive SQL transaction handle that keeps mutable runtime
     /// state local until commit or rollback.
     pub fn transaction(&self) -> Result<SqlTransaction<'_>> {
@@ -630,6 +652,7 @@ impl Db {
         Ok(StorageInfo {
             path: self.path().to_path_buf(),
             wal_path: self.inner.wal.file_path().to_path_buf(),
+            format_version: header.format_version,
             page_size: self.inner.config.page_size,
             cache_size_mb: self.inner.config.cache_size_mb,
             page_count: self.inner.pager.on_disk_page_count()?,

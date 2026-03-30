@@ -77,6 +77,8 @@ pub enum Commands {
     VerifyHeader(VerifyHeaderCommand),
     /// Verify index integrity
     VerifyIndex(VerifyIndexCommand),
+    /// Migrate a legacy database format to the current version
+    Migrate(MigrateCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -303,6 +305,15 @@ pub struct VerifyIndexCommand {
     pub format: OutputFormat,
 }
 
+#[derive(Clone, Debug, Parser)]
+pub struct MigrateCommand {
+    /// The source legacy database file path
+    pub source: String,
+
+    /// The destination database file path for the current format
+    pub dest: String,
+}
+
 pub fn run(cli: Cli) -> i32 {
     match dispatch(cli) {
         Ok(()) => 0,
@@ -358,6 +369,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Vacuum(command) => run_vacuum(command)?,
         Commands::VerifyHeader(command) => run_verify_header(command)?,
         Commands::VerifyIndex(command) => run_verify_index(command)?,
+        Commands::Migrate(command) => run_migrate(command)?,
     }
     Ok(())
 }
@@ -481,28 +493,62 @@ fn run_bulk_load(command: BulkLoadCommand) -> Result<()> {
 }
 
 fn run_info(command: InfoCommand) -> Result<()> {
-    let db = open_db(&command.db, false, 0, 0)?;
-    let storage = db.storage_info()?;
-    if command.schema_summary {
-        let tables = db.list_tables()?;
-        let indexes = db.list_indexes()?;
-        let views = db.list_views()?;
+    // Try to read header first to gracefully support unopenable old formats
+    let loose_header = Db::read_header_info(&command.db).ok();
+
+    // Attempt normal full open to get live WAL/cache stats
+    let db_result = open_db(&command.db, false, 0, 0);
+
+    if let Ok(db) = db_result {
+        let storage = db.storage_info()?;
+        if command.schema_summary {
+            let tables = db.list_tables()?;
+            let indexes = db.list_indexes()?;
+            let views = db.list_views()?;
+            let rows = vec![
+                ("path".to_string(), storage.path.display().to_string()),
+                ("page_size".to_string(), storage.page_size.to_string()),
+                ("page_count".to_string(), storage.page_count.to_string()),
+                (
+                    "schema_cookie".to_string(),
+                    storage.schema_cookie.to_string(),
+                ),
+                ("table_count".to_string(), tables.len().to_string()),
+                ("index_count".to_string(), indexes.len().to_string()),
+                ("view_count".to_string(), views.len().to_string()),
+            ];
+            println!("{}", render_key_value_rows(command.format, &rows));
+        } else {
+            print_storage_info(command.format, &storage);
+        }
+    } else if let Some(header) = loose_header {
+        // Fallback for unsupported formats
         let rows = vec![
-            ("path".to_string(), storage.path.display().to_string()),
-            ("page_size".to_string(), storage.page_size.to_string()),
-            ("page_count".to_string(), storage.page_count.to_string()),
+            ("path".to_string(), command.db.clone()),
+            (
+                "format_version".to_string(),
+                header.format_version.to_string(),
+            ),
+            ("page_size".to_string(), header.page_size.to_string()),
             (
                 "schema_cookie".to_string(),
-                storage.schema_cookie.to_string(),
+                header.schema_cookie.to_string(),
             ),
-            ("table_count".to_string(), tables.len().to_string()),
-            ("index_count".to_string(), indexes.len().to_string()),
-            ("view_count".to_string(), views.len().to_string()),
+            (
+                "last_checkpoint_lsn".to_string(),
+                header.last_checkpoint_lsn.to_string(),
+            ),
+            (
+                "status".to_string(),
+                "engine failed to open (likely unsupported version)".to_string(),
+            ),
         ];
         println!("{}", render_key_value_rows(command.format, &rows));
     } else {
-        print_storage_info(command.format, &storage);
+        // Bubble up original error
+        db_result.map(|_| ())?;
     }
+
     Ok(())
 }
 
@@ -675,12 +721,44 @@ fn run_verify_index(command: VerifyIndexCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_migrate(command: MigrateCommand) -> Result<()> {
+    let source_path = Path::new(&command.source);
+
+    if !source_path.exists() {
+        return Err(anyhow!(
+            "Source database file not found: {}",
+            command.source
+        ));
+    }
+
+    let header = Db::read_header_info(&command.source)?;
+
+    if header.format_version == decentdb::DB_FORMAT_VERSION {
+        return Err(anyhow!(
+            "Source database is already in the current format version ({})",
+            decentdb::DB_FORMAT_VERSION
+        ));
+    }
+
+    // For now, we stub out the migration implementation.
+    Err(anyhow!(
+        "Migration from format version {} to current format version {} is not yet implemented natively. Please use a legacy CLI tool (matching version {}) to logical-dump the database and then import it using the current CLI.",
+        header.format_version,
+        decentdb::DB_FORMAT_VERSION,
+        header.format_version
+    ))
+}
+
 fn print_storage_info(format: OutputFormat, storage: &StorageInfo) {
     let rows = vec![
         ("path".to_string(), storage.path.display().to_string()),
         (
             "wal_path".to_string(),
             storage.wal_path.display().to_string(),
+        ),
+        (
+            "format_version".to_string(),
+            storage.format_version.to_string(),
         ),
         ("page_size".to_string(), storage.page_size.to_string()),
         (

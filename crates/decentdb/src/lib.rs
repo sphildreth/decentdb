@@ -36,6 +36,7 @@ pub use crate::metadata::{
     SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
 };
 pub use crate::record::value::Value;
+pub use crate::storage::DB_FORMAT_VERSION;
 
 /// Returns the DecentDB crate version.
 #[must_use]

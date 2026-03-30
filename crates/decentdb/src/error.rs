@@ -13,6 +13,7 @@ pub enum DbErrorCode {
     Sql = 5,
     Internal = 6,
     Panic = 7,
+    UnsupportedFormatVersion = 8,
 }
 
 impl DbErrorCode {
@@ -46,6 +47,8 @@ pub enum DbError {
     Internal { message: String },
     #[error("panic captured at boundary: {message}")]
     Panic { message: String },
+    #[error("unsupported database format version: {version}")]
+    UnsupportedFormatVersion { version: u32 },
 }
 
 impl DbError {
@@ -100,6 +103,11 @@ impl DbError {
     }
 
     #[must_use]
+    pub fn unsupported_format_version(version: u32) -> Self {
+        Self::UnsupportedFormatVersion { version }
+    }
+
+    #[must_use]
     pub fn code(&self) -> DbErrorCode {
         match self {
             Self::Io { .. } => DbErrorCode::Io,
@@ -109,6 +117,7 @@ impl DbError {
             Self::Sql { .. } => DbErrorCode::Sql,
             Self::Internal { .. } => DbErrorCode::Internal,
             Self::Panic { .. } => DbErrorCode::Panic,
+            Self::UnsupportedFormatVersion { .. } => DbErrorCode::UnsupportedFormatVersion,
         }
     }
 
@@ -137,6 +146,10 @@ mod tests {
             (DbError::sql("syntax"), DbErrorCode::Sql),
             (DbError::internal("broken invariant"), DbErrorCode::Internal),
             (DbError::panic("panic payload"), DbErrorCode::Panic),
+            (
+                DbError::unsupported_format_version(7),
+                DbErrorCode::UnsupportedFormatVersion,
+            ),
         ];
 
         for (error, expected_code) in cases {
