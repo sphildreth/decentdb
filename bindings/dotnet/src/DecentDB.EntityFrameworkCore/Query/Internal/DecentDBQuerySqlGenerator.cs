@@ -30,6 +30,44 @@ public sealed class DecentDBQuerySqlGenerator : QuerySqlGenerator
         return base.VisitSqlBinary(sqlBinaryExpression);
     }
 
+    protected override Expression VisitExtension(Expression extensionExpression)
+    {
+        if (extensionExpression is SqlExpressions.WindowFunctionExpression windowFunctionExpression)
+        {
+            Sql.Append(windowFunctionExpression.FunctionName);
+            Sql.Append("(");
+            for (var i = 0; i < windowFunctionExpression.Arguments.Length; i++)
+            {
+                if (i > 0)
+                {
+                    Sql.Append(", ");
+                }
+
+                Visit(windowFunctionExpression.Arguments[i]);
+            }
+
+            Sql.Append(") OVER (");
+            if (windowFunctionExpression.PartitionBy is not null)
+            {
+                Sql.Append("PARTITION BY ");
+                Visit(windowFunctionExpression.PartitionBy);
+                Sql.Append(" ");
+            }
+
+            Sql.Append("ORDER BY ");
+            Visit(windowFunctionExpression.OrderBy);
+            if (windowFunctionExpression.OrderByDescending)
+            {
+                Sql.Append(" DESC");
+            }
+
+            Sql.Append(")");
+            return extensionExpression;
+        }
+
+        return base.VisitExtension(extensionExpression);
+    }
+
     protected override void GenerateLimitOffset(SelectExpression selectExpression)
     {
         if (selectExpression.Limit is not null)

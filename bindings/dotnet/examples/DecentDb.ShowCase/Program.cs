@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Text;
 using DecentDB.AdoNet;
+using DecentDB.EntityFrameworkCore;
 using DecentDb.ShowCase;
 using DecentDb.ShowCase.Entities;
 using Microsoft.EntityFrameworkCore;
@@ -41,10 +42,12 @@ class Program
             await DemonstrateSubqueries();
             await DemonstrateIncludeThenInclude();
             await DemonstrateExistenceAndChildFilters();
+            await DemonstrateCompositeForeignKeys();
             await DemonstrateConditionalLogic();
             await DemonstrateQueryComposition();
             await DemonstrateSelectMany();
             await DemonstrateClientVsServerEvaluation();
+            await DemonstrateWindowFunctions();
             await DemonstrateUnsupportedCases();
             await DemonstrateAllBuiltInTypes();
             await DemonstrateAllNullableBuiltInTypes();
@@ -1034,6 +1037,47 @@ class Program
         Console.WriteLine();
     }
 
+    private static async Task DemonstrateCompositeForeignKeys()
+    {
+        PrintSection("COMPOSITE FOREIGN KEYS");
+
+        await using var context = new ShowcaseDbContext(DbPath);
+
+        var location = new WarehouseLocation
+        {
+            WarehouseCode = "WH-EAST",
+            BinCode = "A-01",
+            Zone = "Electronics",
+            TemperatureControlled = true
+        };
+
+        context.WarehouseLocations.Add(location);
+        await context.SaveChangesAsync();
+
+        var count = new InventoryCount
+        {
+            ProductName = "Laptop Pro",
+            QuantityOnHand = 25,
+            CountedAt = DateTime.UtcNow,
+            Location = location
+        };
+
+        context.InventoryCounts.Add(count);
+        await context.SaveChangesAsync();
+
+        var matchingCounts = await context.InventoryCounts
+            .Include(ic => ic.Location)
+            .Where(ic => ic.Location != null
+                && ic.Location.WarehouseCode == "WH-EAST"
+                && ic.Location.BinCode == "A-01")
+            .ToListAsync();
+
+        Console.WriteLine($"  Parent composite key: ({location.WarehouseCode}, {location.BinCode})");
+        Console.WriteLine($"  Child saved through EF nav: InventoryCount #{count.Id} -> ({count.WarehouseCode}, {count.BinCode})");
+        Console.WriteLine($"  Include/query over composite FK: {matchingCounts.Count} matching inventory counts");
+        Console.WriteLine();
+    }
+
     private static async Task DemonstrateConditionalLogic()
     {
         PrintSection("CONDITIONAL LOGIC (Ternary, Coalesce)");
@@ -1208,19 +1252,140 @@ class Program
         Console.WriteLine("     Using DateTime.UtcNow instead of DateTime.Now recommended");
 
         Console.WriteLine("  3. Composite primary keys:");
-        Console.WriteLine("     DecentDB doesn't support composite PKs - Showcase uses single bigint PK");
+        Console.WriteLine("     Supported via EF Core model configuration (see ProductTag and WarehouseLocation)");
 
         Console.WriteLine("  4. Foreign key constraints:");
-        Console.WriteLine("     Self-referencing FKs not supported in CREATE TABLE (inline constraints)");
-        Console.WriteLine("     Regular FKs work via column REFERENCES but no ON DELETE/UPDATE constraints");
+        Console.WriteLine("     Self-referencing and composite FKs are supported, including ON DELETE/UPDATE actions");
 
         Console.WriteLine("  5. Window functions:");
-        var ranked = await context.Products
-            .OrderByDescending(p => p.Price)
-            .Take(5)
-            .Select(p => p.Name)
+        Console.WriteLine("     LINQ translation is available through EF.Functions window helpers");
+
+        Console.WriteLine();
+    }
+
+    private static async Task DemonstrateWindowFunctions()
+    {
+        PrintSection("WINDOW FUNCTIONS");
+
+        await using var context = new ShowcaseDbContext(DbPath);
+
+        if (!await context.Categories.AnyAsync(c => c.Name == "Window Electronics"))
+        {
+            var electronics = new Category
+            {
+                Name = "Window Electronics",
+                Description = "Window function demo category",
+                EffectiveFrom = new DateOnly(2026, 1, 1),
+                BusinessHoursStart = new TimeOnly(9, 0),
+                DisplayOrder = 100,
+                IsVisible = true
+            };
+            var accessories = new Category
+            {
+                Name = "Window Accessories",
+                Description = "Window function demo category",
+                EffectiveFrom = new DateOnly(2026, 1, 1),
+                BusinessHoursStart = new TimeOnly(9, 0),
+                DisplayOrder = 101,
+                IsVisible = true
+            };
+            context.Categories.AddRange(electronics, accessories);
+            await context.SaveChangesAsync();
+
+            context.Products.AddRange(
+                new Product
+                {
+                    Name = "Window Laptop",
+                    Description = "Window demo product",
+                    Price = 1200m,
+                    StockQuantity = 10,
+                    CategoryId = electronics.Id,
+                    CreatedAt = new DateTime(2021, 1, 10, 0, 0, 0, DateTimeKind.Utc),
+                    IsActive = true
+                },
+                new Product
+                {
+                    Name = "Window Tablet",
+                    Description = "Window demo product",
+                    Price = 1200m,
+                    StockQuantity = 12,
+                    CategoryId = electronics.Id,
+                    CreatedAt = new DateTime(2022, 6, 15, 0, 0, 0, DateTimeKind.Utc),
+                    IsActive = true
+                },
+                new Product
+                {
+                    Name = "Window Mouse",
+                    Description = "Window demo product",
+                    Price = 90m,
+                    StockQuantity = 30,
+                    CategoryId = electronics.Id,
+                    CreatedAt = new DateTime(2023, 3, 20, 0, 0, 0, DateTimeKind.Utc),
+                    IsActive = true
+                },
+                new Product
+                {
+                    Name = "Window Cable",
+                    Description = "Window demo product",
+                    Price = 25m,
+                    StockQuantity = 50,
+                    CategoryId = accessories.Id,
+                    CreatedAt = new DateTime(2021, 2, 1, 0, 0, 0, DateTimeKind.Utc),
+                    IsActive = true
+                },
+                new Product
+                {
+                    Name = "Window Charger",
+                    Description = "Window demo product",
+                    Price = 25m,
+                    StockQuantity = 40,
+                    CategoryId = accessories.Id,
+                    CreatedAt = new DateTime(2022, 7, 1, 0, 0, 0, DateTimeKind.Utc),
+                    IsActive = true
+                });
+            await context.SaveChangesAsync();
+        }
+
+        var rankingRows = await context.Products
+            .Where(p => p.Name.StartsWith("Window "))
+            .OrderBy(p => p.CategoryId)
+            .ThenBy(p => p.CreatedAt)
+            .Select(p => new
+            {
+                p.Name,
+                p.CategoryId,
+                RowNumber = EF.Functions.RowNumber(p.CategoryId, p.CreatedAt),
+                PriceRank = EF.Functions.Rank(p.CategoryId, p.Price, descending: true),
+                DensePriceRank = EF.Functions.DenseRank(p.CategoryId, p.Price, descending: true)
+            })
             .ToListAsync();
-        Console.WriteLine($"     Simulated with OrderBy+Take: {ranked.Count} products");
+
+        var offsetRows = await context.Products
+            .Where(p => p.Name.StartsWith("Window "))
+            .OrderBy(p => p.CategoryId)
+            .ThenBy(p => p.CreatedAt)
+            .Select(p => new
+            {
+                p.Name,
+                p.CategoryId,
+                PreviousProductId = EF.Functions.Lag(p.CategoryId, p.Id, p.CreatedAt, defaultValue: -1L),
+                NextProductId = EF.Functions.Lead(p.CategoryId, p.Id, p.CreatedAt, defaultValue: -1L)
+            })
+            .ToListAsync();
+
+        Console.WriteLine($"  Ranking rows translated via EF.Functions: {rankingRows.Count}");
+        foreach (var row in rankingRows.Take(3))
+        {
+            Console.WriteLine(
+                $"    category {row.CategoryId}: {row.Name} -> row #{row.RowNumber}, rank {row.PriceRank}, dense rank {row.DensePriceRank}");
+        }
+
+        Console.WriteLine($"  Offset rows translated via EF.Functions: {offsetRows.Count}");
+        foreach (var row in offsetRows.Take(3))
+        {
+            Console.WriteLine(
+                $"    category {row.CategoryId}: {row.Name} -> prev id {row.PreviousProductId}, next id {row.NextProductId}");
+        }
 
         Console.WriteLine();
     }

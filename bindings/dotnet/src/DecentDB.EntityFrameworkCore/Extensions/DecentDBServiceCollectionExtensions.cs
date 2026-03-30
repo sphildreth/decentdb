@@ -32,6 +32,7 @@ public static class DecentDBServiceCollectionExtensions
         builder.TryAdd<ISqlGenerationHelper, DecentDBSqlGenerationHelper>();
         builder.TryAdd<IRelationalTypeMappingSource, DecentDBTypeMappingSource>();
         builder.TryAdd<IQuerySqlGeneratorFactory, DecentDBQuerySqlGeneratorFactory>();
+        builder.TryAdd<IRelationalParameterBasedSqlProcessorFactory, DecentDBRelationalParameterBasedSqlProcessorFactory>();
         builder.TryAdd<IMethodCallTranslatorProvider, DecentDBMethodCallTranslatorProvider>();
         builder.TryAdd<IMemberTranslatorProvider, DecentDBMemberTranslatorProvider>();
         builder.TryAdd<IUpdateSqlGenerator, DecentDBUpdateSqlGenerator>();

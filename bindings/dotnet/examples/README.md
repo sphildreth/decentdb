@@ -280,13 +280,15 @@ The showcase defines these entity types to demonstrate various features:
 | `Category` | Unique constraints, DateOnly, TimeOnly |
 | `Customer` | Email uniqueness, nullable fields |
 | `Order` | Enum support, decimal totals |
-| `OrderItem` | Composite keys, decimal pricing |
+| `OrderItem` | Order line items, decimal pricing |
 | `Address` | Double for coordinates, bool flags |
 | `Tag` | Simple entity for many-to-many |
 | `ProductTag` | Composite primary key join table |
 | `Employee` | Self-referencing, row versioning |
 | `AppEventLog` | Primitive collections (JSON arrays) |
 | `ScheduleEntry` | NodaTime types (Instant, LocalDate, LocalDateTime) |
+| `WarehouseLocation` | Composite primary key parent entity |
+| `InventoryCount` | Composite foreign key child relationship |
 
 ## Architecture
 
@@ -365,52 +367,41 @@ When you run the showcase, you'll see output demonstrating:
   LocalDate.Year/Month: This month's entries: 1
   MIN/MAX: Earliest/Latest entries...
   GROUP BY LocalDate: 3 unique dates
+
+═══════════════════════════════════════════════════════════════════════════════════
+  COMPOSITE FOREIGN KEYS
+═══════════════════════════════════════════════════════════════════════════════════
+  Parent composite key: (WH-EAST, A-01)
+  Child saved through EF nav: InventoryCount #1 -> (WH-EAST, A-01)
+  Include/query over composite FK: 1 matching inventory counts
 ```
 
 ## Testing
 
 The showcase serves as both a demonstration and validation of:
 
-1. **All EF Core features work correctly** with DecentDB
-2. **All DecentDB-specific features** are properly exposed
+1. **A broad set of EF Core features** work correctly with DecentDB
+2. **DecentDB-specific features** are properly exposed
 3. **NodaTime integration** provides accurate date/time handling
 4. **Type conversions** preserve precision across all data types
 5. **Schema generation** creates correct DDL statements
 
 ### Running the Showcase
 
-The showcase is designed to **fail until all issues are resolved**. When you run it:
+The showcase is intended to run to completion successfully on a healthy build. When you run it:
 
 ```bash
 dotnet run --project examples/DecentDb.ShowCase/DecentDb.ShowCase.csproj
 ```
 
-The showcase will throw exceptions when it encounters known issues. Once all issues in the engine and bindings are fixed, the showcase will run to completion successfully.
-
-Current expected failures:
-- **Decimal comparison** - throws until engine fixes decimal/float comparison
-- **Decimal aggregation** - throws until engine fixes decimal AVG/SUM
-- **Include with navigation** - throws until FK constraint support is added
+If it throws, treat that as a regression in the engine, EF Core provider, or showcase sample rather than expected behavior.
 
 ## Limitations
 
-Some EF Core features have limited support due to DecentDB engine constraints:
+There are no showcase-specific EF Core limitations currently tracked here.
 
-### Engine-Level Limitations (to be fixed in core)
-
-| Limitation | Description | Workaround |
-|------------|-------------|------------|
-| **Decimal comparisons** | Cannot compare Decimal with Float64/double | Cast to double before comparison or use client-side evaluation |
-| **Decimal aggregates** | AVG/SUM on DECIMAL(18,4) fails | Cast to double before aggregation |
-| **Composite foreign keys** | Multi-column FK DDL is not supported | Use single-column keys or model the relationship in application code |
-| **Composite primary keys** | Not supported | Use single BIGINT surrogate key |
-| **Window functions** | Limited support | Use client-side ranking after fetching |
-
-### Provider-Level Limitations
-
-| Limitation | Description | Workaround |
-|------------|-------------|------------|
-| **Navigation properties with FK** | EF Core tries to create FK constraints | Use explicit JOINs instead of Include/ThenInclude |
+If a scenario demonstrated below stops working, treat that as a regression in the
+engine, provider, or sample rather than expected behavior.
 
 ## EF Core Feature Coverage Matrix
 
@@ -419,14 +410,14 @@ This showcase validates the following EF Core features against DecentDB:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Basic CRUD (Create, Read, Update, Delete) | ✅ Working | |
-| LINQ Where/Filter | ✅ Working | Decimal comparison has engine limitation |
+| LINQ Where/Filter | ✅ Working | |
 | LINQ Select/Projection | ✅ Working | |
 | LINQ OrderBy/ThenBy | ✅ Working | |
 | LINQ Skip/Take (Pagination) | ✅ Working | |
 | LINQ GroupBy | ✅ Working | |
 | LINQ Distinct | ✅ Working | |
 | LINQ Count/LongCount | ✅ Working | |
-| LINQ Min/Max/Sum/Average | ⚠️ Partial | Decimal aggregation fails |
+| LINQ Min/Max/Sum/Average | ✅ Working | |
 | String operations (Contains, StartsWith, etc.) | ✅ Working | |
 | String transformations (ToUpper, ToLower, etc.) | ✅ Working | |
 | Math operations (Abs, Ceiling, Floor, Round) | ✅ Working | |
@@ -442,12 +433,15 @@ This showcase validates the following EF Core features against DecentDB:
 | Bulk operations (AddRange, ExecuteDeleteAsync) | ✅ Working | |
 | EF.Functions.Like pattern matching | ✅ Working | |
 | Set operations (Union, Concat, Intersect, Except) | ✅ Working | Client-side after fetching |
-| Explicit JOINs | ✅ Working | Navigation props removed due to FK |
+| Window functions via `EF.Functions` | ✅ Working | Provider-specific LINQ helpers translate to `OVER (...)` SQL |
+| Include / ThenInclude | ✅ Working | Navigation properties over foreign keys are supported, including composite FKs in the showcase |
+| Explicit JOINs | ✅ Working | |
 | Subqueries (correlated) | ✅ Working | |
 | Existence queries (Any/All) | ✅ Working | |
 | Query composition (reusable IQueryable) | ✅ Working | |
-| SelectMany | ✅ Working | Using explicit joins |
+| SelectMany | ✅ Working | |
+| Composite primary keys / foreign keys | ✅ Working | `ProductTag` and `WarehouseLocation` / `InventoryCount` demonstrate composite key mapping |
 | AsNoTracking | ✅ Working | |
 | Keyset pagination | ✅ Working | |
 
-These limitations are documented in the engine design documents and are expected behavior, not binding defects.
+The matrix above reflects the current supported showcase surface for DecentDB + EF Core.

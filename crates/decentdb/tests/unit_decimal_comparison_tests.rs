@@ -88,11 +88,7 @@ fn decimal_cast_from_text() {
     }
 }
 
-/// Probable defect: ORDER BY val DESC for DECIMAL columns returns values in
-/// the same order as ASC (not reversed). The descending scan path likely does
-/// not reverse the DECIMAL comparison direction.
 #[test]
-#[ignore = "known defect: ORDER BY DESC produces wrong order for DECIMAL columns"]
 fn decimal_ordering_descending() {
     let db = mem_db();
     exec(&db, "CREATE TABLE t(id INT64, val DECIMAL(10, 2))");
@@ -176,12 +172,8 @@ fn decimal_negative_precision_ordering_defect() {
     assert_eq!(ids, vec![Value::Int64(2), Value::Int64(1)]);
 }
 
-/// Probable defect: DECIMAL column values cannot be compared with float
-/// literals in WHERE clauses. The literal 1.50 is parsed as Float64 and
-/// the engine rejects cross-type comparison between Decimal and Float64.
 #[test]
-#[ignore = "known defect: DECIMAL vs Float64 cross-type comparison in WHERE not supported"]
-fn decimal_where_with_float_literal_defect() {
+fn decimal_where_with_float_literal() {
     let db = mem_db();
     exec(&db, "CREATE TABLE t(id INT64, val DECIMAL(10, 2))");
     exec(&db, "INSERT INTO t VALUES (1, 1.50)");
@@ -189,4 +181,17 @@ fn decimal_where_with_float_literal_defect() {
     exec(&db, "INSERT INTO t VALUES (3, 1.50)");
     let r = exec(&db, "SELECT COUNT(*) FROM t WHERE val = 1.50");
     assert_eq!(r.rows()[0].values()[0], Value::Int64(3));
+}
+
+#[test]
+fn decimal_where_with_float_literal_on_left_hand_side() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE t(id INT64, val DECIMAL(10, 2))");
+    exec(&db, "INSERT INTO t VALUES (1, 1.50)");
+    exec(&db, "INSERT INTO t VALUES (2, 2.25)");
+    exec(&db, "INSERT INTO t VALUES (3, 3.75)");
+
+    let r = exec(&db, "SELECT COUNT(*) FROM t WHERE 2.25 <= val");
+
+    assert_eq!(r.rows()[0].values()[0], Value::Int64(2));
 }

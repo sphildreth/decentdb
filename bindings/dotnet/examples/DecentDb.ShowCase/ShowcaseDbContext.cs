@@ -20,6 +20,8 @@ public class ShowcaseDbContext : DbContext
     public DbSet<AllTypesNullableDemo> AllTypesNullableDemos => Set<AllTypesNullableDemo>();
     public DbSet<AppEventLog> EventLogs => Set<AppEventLog>();
     public DbSet<ScheduleEntry> ScheduleEntries => Set<ScheduleEntry>();
+    public DbSet<WarehouseLocation> WarehouseLocations => Set<WarehouseLocation>();
+    public DbSet<InventoryCount> InventoryCounts => Set<InventoryCount>();
 
     private readonly string _dbPath;
 
@@ -101,6 +103,22 @@ public class ShowcaseDbContext : DbContext
             entity.HasIndex(e => e.ScheduledDate);
             entity.HasIndex(e => e.ScheduledInstant);
             entity.HasIndex(e => new { e.IsCompleted, e.Priority });
+        });
+
+        modelBuilder.Entity<WarehouseLocation>(entity =>
+        {
+            entity.HasKey(e => new { e.WarehouseCode, e.BinCode });
+            entity.HasIndex(e => e.Zone);
+        });
+
+        modelBuilder.Entity<InventoryCount>(entity =>
+        {
+            entity.HasIndex(e => new { e.WarehouseCode, e.BinCode });
+            entity.HasOne(e => e.Location)
+                .WithMany(e => e.InventoryCounts)
+                .HasForeignKey(e => new { e.WarehouseCode, e.BinCode })
+                .HasPrincipalKey(e => new { e.WarehouseCode, e.BinCode })
+                .OnDelete(DeleteBehavior.Restrict);
         });
     }
 }

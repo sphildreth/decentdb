@@ -7195,6 +7195,12 @@ impl SimpleGroupedNumericAggregate {
                 self.saw_value = true;
                 Ok(())
             }
+            Value::Decimal { scaled, scale } => {
+                self.total_float += decimal_to_f64(*scaled, *scale);
+                self.saw_float = true;
+                self.saw_value = true;
+                Ok(())
+            }
             other => Err(DbError::sql(format!(
                 "numeric aggregate does not support {other:?}"
             ))),
@@ -13997,7 +14003,7 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
             },
             Value::Float64(right),
         ) => {
-            let left_f64 = (*left_scaled as f64) / 10_f64.powi(i32::from(*left_scale));
+            let left_f64 = decimal_to_f64(*left_scaled, *left_scale);
             Ok(left_f64.total_cmp(right))
         }
         (
@@ -14007,7 +14013,7 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
                 scale: right_scale,
             },
         ) => {
-            let right_f64 = (*right_scaled as f64) / 10_f64.powi(i32::from(*right_scale));
+            let right_f64 = decimal_to_f64(*right_scaled, *right_scale);
             Ok(left.total_cmp(&right_f64))
         }
         (
@@ -14017,7 +14023,7 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
             },
             Value::Int64(right),
         ) => {
-            let left_f64 = (*left_scaled as f64) / 10_f64.powi(i32::from(*left_scale));
+            let left_f64 = decimal_to_f64(*left_scaled, *left_scale);
             Ok(left_f64.total_cmp(&(*right as f64)))
         }
         (
@@ -14027,7 +14033,7 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
                 scale: right_scale,
             },
         ) => {
-            let right_f64 = (*right_scaled as f64) / 10_f64.powi(i32::from(*right_scale));
+            let right_f64 = decimal_to_f64(*right_scaled, *right_scale);
             Ok((*left as f64).total_cmp(&right_f64))
         }
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),

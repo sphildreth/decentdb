@@ -74,3 +74,39 @@ fn decimal_aggregates_over_casted_expressions_work() {
     assert_eq!(row[1], Value::Float64(31.0));
     assert_eq!(row[2], Value::Float64(15.0));
 }
+
+#[test]
+fn decimal_sum_and_avg_work_without_explicit_casts() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE t(val DECIMAL(10, 2))");
+    exec(&db, "INSERT INTO t VALUES (10.25)");
+    exec(&db, "INSERT INTO t VALUES (20.75)");
+
+    let r = exec(&db, "SELECT SUM(val), AVG(val) FROM t");
+    let row = r.rows()[0].values();
+
+    assert_eq!(row[0], Value::Float64(31.0));
+    assert_eq!(row[1], Value::Float64(15.5));
+}
+
+#[test]
+fn grouped_decimal_sum_and_avg_work_without_explicit_casts() {
+    let db = mem_db();
+    exec(&db, "CREATE TABLE t(grp TEXT, val DECIMAL(10, 2))");
+    exec(&db, "INSERT INTO t VALUES ('a', 10.25)");
+    exec(&db, "INSERT INTO t VALUES ('a', 20.75)");
+    exec(&db, "INSERT INTO t VALUES ('b', 5.50)");
+
+    let r = exec(
+        &db,
+        "SELECT grp, COUNT(*), SUM(val), AVG(val) FROM t GROUP BY grp ORDER BY grp",
+    );
+
+    assert_eq!(r.rows().len(), 2);
+    assert_eq!(r.rows()[0].values()[0], Value::Text("a".into()));
+    assert_eq!(r.rows()[0].values()[2], Value::Float64(31.0));
+    assert_eq!(r.rows()[0].values()[3], Value::Float64(15.5));
+    assert_eq!(r.rows()[1].values()[0], Value::Text("b".into()));
+    assert_eq!(r.rows()[1].values()[2], Value::Float64(5.5));
+    assert_eq!(r.rows()[1].values()[3], Value::Float64(5.5));
+}

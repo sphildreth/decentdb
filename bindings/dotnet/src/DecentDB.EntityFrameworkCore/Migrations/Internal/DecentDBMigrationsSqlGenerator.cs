@@ -17,9 +17,6 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
         MigrationCommandListBuilder builder,
         bool terminate = true)
     {
-        // DecentDB currently supports FOREIGN KEY constraints only as column-level constraints
-        // (e.g., `artist_id INTEGER REFERENCES artists(id)`), not as table-level constraints.
-
         builder
             .Append("CREATE TABLE ")
             .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name))
@@ -27,26 +24,25 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
 
         using (builder.Indent())
         {
-            var foreignKeyByColumn = new Dictionary<string, AddForeignKeyOperation>(StringComparer.OrdinalIgnoreCase);
+            var foreignKeys = new List<AddForeignKeyOperation>();
             foreach (var fk in operation.ForeignKeys)
             {
                 if (fk.Columns is null
                     || fk.PrincipalColumns is null
-                    || fk.Columns.Length != 1
-                    || fk.PrincipalColumns.Length != 1
+                    || fk.Columns.Length == 0
+                    || fk.PrincipalColumns.Length == 0
+                    || fk.Columns.Length != fk.PrincipalColumns.Length
                     || string.IsNullOrWhiteSpace(fk.PrincipalTable))
                 {
-                    throw Unsupported(operation, "Composite foreign keys are not supported by DecentDB DDL (table-level FOREIGN KEY constraints are rejected).");
+                    throw Unsupported(operation, "Foreign keys require matching child and parent columns and an explicit principal table.");
                 }
 
-                var column = fk.Columns[0];
-                if (foreignKeyByColumn.ContainsKey(column))
-                {
-                    throw Unsupported(operation, $"Multiple foreign keys for column '{column}' are not supported.");
-                }
-
-                foreignKeyByColumn[column] = fk;
+                foreignKeys.Add(fk);
             }
+
+            var remainingConstraints = operation.UniqueConstraints.Count
+                + foreignKeys.Count
+                + (operation.PrimaryKey is null ? 0 : 1);
 
             for (var i = 0; i < operation.Columns.Count; i++)
             {
@@ -54,22 +50,8 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
 
                 ColumnDefinition(column, model, builder);
 
-                if (foreignKeyByColumn.TryGetValue(column.Name, out var fk))
-                {
-                    builder.Append(" REFERENCES ")
-                        .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(fk.PrincipalTable))
-                        .Append(" (")
-                        .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(fk.PrincipalColumns![0]))
-                        .Append(")");
-
-                    // Emit actions explicitly to keep DDL deterministic.
-                    builder.Append(" ON DELETE ").Append(FkAction(fk.OnDelete));
-                    builder.Append(" ON UPDATE ").Append(FkAction(fk.OnUpdate));
-                }
-
                 if (i < operation.Columns.Count - 1
-                    || operation.PrimaryKey is not null
-                    || operation.UniqueConstraints.Count > 0)
+                    || remainingConstraints > 0)
                 {
                     builder.AppendLine(",");
                 }
@@ -82,8 +64,9 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
             if (operation.PrimaryKey is not null)
             {
                 PrimaryKeyConstraint(operation.PrimaryKey, model, builder);
+                remainingConstraints--;
 
-                if (operation.UniqueConstraints.Count > 0)
+                if (remainingConstraints > 0)
                 {
                     builder.AppendLine(",");
                 }
@@ -96,8 +79,24 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
             for (var i = 0; i < operation.UniqueConstraints.Count; i++)
             {
                 UniqueConstraint(operation.UniqueConstraints[i], model, builder);
+                remainingConstraints--;
 
-                if (i < operation.UniqueConstraints.Count - 1)
+                if (remainingConstraints > 0)
+                {
+                    builder.AppendLine(",");
+                }
+                else
+                {
+                    builder.AppendLine();
+                }
+            }
+
+            foreach (var fk in foreignKeys)
+            {
+                ForeignKeyConstraint(fk, builder);
+                remainingConstraints--;
+
+                if (remainingConstraints > 0)
                 {
                     builder.AppendLine(",");
                 }
@@ -139,6 +138,12 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
         MigrationCommandListBuilder builder,
         bool terminate = true)
     {
+        var principalColumns = operation.PrincipalColumns;
+        if (principalColumns is null || principalColumns.Length == 0)
+        {
+            throw Unsupported(operation, "Foreign keys require explicit principal columns.");
+        }
+
         builder
             .Append("ALTER TABLE ")
             .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Table))
@@ -160,14 +165,14 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
             .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.PrincipalTable))
             .Append(" (");
 
-        for (var i = 0; i < operation.PrincipalColumns.Length; i++)
+        for (var i = 0; i < principalColumns.Length; i++)
         {
             if (i > 0)
             {
                 builder.Append(", ");
             }
 
-            builder.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.PrincipalColumns[i]));
+            builder.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(principalColumns[i]));
         }
 
         builder.Append(")");
@@ -205,6 +210,62 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
         {
             builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
             builder.EndCommand();
+        }
+    }
+
+    private void ForeignKeyConstraint(
+        AddForeignKeyOperation operation,
+        MigrationCommandListBuilder builder)
+    {
+        var principalColumns = operation.PrincipalColumns;
+        if (principalColumns is null || principalColumns.Length == 0)
+        {
+            throw Unsupported(operation, "Foreign keys require explicit principal columns.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(operation.Name))
+        {
+            builder.Append("CONSTRAINT ")
+                .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name!))
+                .Append(" ");
+        }
+
+        builder.Append("FOREIGN KEY (");
+
+        for (var i = 0; i < operation.Columns.Length; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(", ");
+            }
+
+            builder.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Columns[i]));
+        }
+
+        builder.Append(") REFERENCES ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.PrincipalTable))
+            .Append(" (");
+
+        for (var i = 0; i < principalColumns.Length; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(", ");
+            }
+
+            builder.Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(principalColumns[i]));
+        }
+
+        builder.Append(")");
+
+        if (operation.OnDelete != ReferentialAction.NoAction)
+        {
+            builder.Append(" ON DELETE ").Append(FkAction(operation.OnDelete));
+        }
+
+        if (operation.OnUpdate != ReferentialAction.NoAction)
+        {
+            builder.Append(" ON UPDATE ").Append(FkAction(operation.OnUpdate));
         }
     }
 

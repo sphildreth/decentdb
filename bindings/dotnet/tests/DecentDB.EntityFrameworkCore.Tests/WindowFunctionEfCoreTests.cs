@@ -11,8 +11,8 @@ using Xunit;
 namespace DecentDB.EntityFrameworkCore.Tests;
 
 /// <summary>
-/// Tests for window functions accessed via raw SQL through EF Core's shared in-memory connection.
-/// EF Core doesn't translate LINQ to window functions, so we use raw SQL via the underlying connection.
+/// Tests for the engine's raw SQL window-function support through EF Core's shared in-memory connection.
+/// Separate LINQ translation coverage lives in <c>WindowFunctionLinqTranslationTests</c>.
 /// </summary>
 public sealed class WindowFunctionEfCoreTests : IDisposable
 {
