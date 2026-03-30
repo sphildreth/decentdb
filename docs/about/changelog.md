@@ -5,6 +5,20 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - [WORK IN MOTION, UNRELEASED]
+
+### Fixed
+- Decimal `MIN`/`MAX` aggregate ordering in the Rust engine now compares `DECIMAL` values natively during aggregate-extreme evaluation, including mixed decimal scales.
+- EF Core decimal aggregate regression for grouped `Max(decimal)` projection shapes by aligning provider behavior with native engine decimal comparison support.
+- .NET decimal parameter scale handling during command binding and EF modification batching so configured scale metadata is applied consistently before native decimal binding.
+
+### Added
+- Regression coverage for decimal aggregate correctness:
+  - Rust SQL test coverage for `MIN`/`MAX` over `DECIMAL`.
+  - EF Core query-shape coverage for grouped decimal aggregate projections.
+  - EF Core aggregate-shape coverage across grouped and ungrouped projections for core scalar types.
+  - EF Core nullable aggregate-shape coverage, including mixed-null and all-null aggregate inputs.
+
 ## [2.0.1] - 2026-03-28
 
 ### Fixed

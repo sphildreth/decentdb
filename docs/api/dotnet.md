@@ -37,6 +37,9 @@ just to consume the .NET provider surface in your project.
 dotnet add package DecentDB.AdoNet
 dotnet add package DecentDB.MicroOrm
 dotnet add package DecentDB.EntityFrameworkCore
+
+# Optional: design-time services for `dotnet ef`
+dotnet add package DecentDB.EntityFrameworkCore.Design
 ```
 
 ## Opening a database
@@ -63,6 +66,124 @@ using var conn = new DecentDBConnection("Data Source=/path/to/data.ddb");
 conn.Open();
 // ... use conn ...
 conn.Close();
+```
+
+### Entity Framework Core
+
+The EF Core provider follows the standard provider pattern and is configured via
+`DbContextOptionsBuilder.UseDecentDB(...)`.
+
+For most apps, the simplest setup is to build the connection string with
+`DecentDBConnectionStringBuilder` and pass that string into EF Core:
+
+```csharp
+using DecentDB.AdoNet;
+using Microsoft.EntityFrameworkCore;
+
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/shop.ddb",
+    CommandTimeout = 120,
+    Logging = false,
+};
+
+var options = new DbContextOptionsBuilder<ShopContext>()
+    .UseDecentDB(csb.ConnectionString)
+    .Options;
+
+await using var db = new ShopContext(options);
+await db.Database.EnsureCreatedAsync();
+```
+
+Example `DbContext`:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+public sealed class ShopContext(DbContextOptions<ShopContext> options)
+    : DbContext(options)
+{
+    public DbSet<Product> Products => Set<Product>();
+    public DbSet<Cart> Carts => Set<Cart>();
+}
+
+public sealed class Product
+{
+    public long Id { get; set; }
+    public string Sku { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+}
+
+public sealed class Cart
+{
+    public long Id { get; set; }
+    public string CustomerEmail { get; set; } = string.Empty;
+}
+```
+
+If you prefer dependency injection, register DecentDB the same way you would any
+other EF Core provider:
+
+```csharp
+using DecentDB.AdoNet;
+using Microsoft.EntityFrameworkCore;
+
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/shop.ddb",
+};
+
+builder.Services.AddDbContext<ShopContext>(options =>
+    options.UseDecentDB(csb.ConnectionString));
+```
+
+You can also pass an existing `DbConnection` instead of a connection string:
+
+```csharp
+using DecentDB.AdoNet;
+using Microsoft.EntityFrameworkCore;
+
+using var connection = new DecentDBConnection("Data Source=/path/to/shop.ddb");
+
+var options = new DbContextOptionsBuilder<ShopContext>()
+    .UseDecentDB(connection, contextOwnsConnection: false)
+    .Options;
+```
+
+#### Connection string builder
+
+`DecentDBConnectionStringBuilder` exposes the same connection string surface used
+by the ADO.NET and EF Core providers:
+
+```csharp
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/shop.ddb",
+    CacheSize = "268435456",   // optional native cache size
+    Logging = true,            // optional SQL logging
+    LogLevel = "Info",         // optional log level
+    CommandTimeout = 120,      // default command timeout in seconds
+};
+
+string connectionString = csb.ConnectionString;
+```
+
+#### Design-time services and migrations
+
+If you use `dotnet ef` for design-time services, install
+`DecentDB.EntityFrameworkCore.Design` alongside the runtime provider:
+
+```bash
+dotnet add package DecentDB.EntityFrameworkCore
+dotnet add package DecentDB.EntityFrameworkCore.Design
+```
+
+Then use the usual EF Core workflow:
+
+```bash
+dotnet ef migrations add InitialCreate
+dotnet ef database update
 ```
 
 ## Version introspection

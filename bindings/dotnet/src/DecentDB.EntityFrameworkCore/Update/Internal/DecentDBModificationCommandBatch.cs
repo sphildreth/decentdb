@@ -1,5 +1,6 @@
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
 using System.Text;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Update;
@@ -595,8 +596,29 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
         }
 
         var converter = column.TypeMapping?.Converter;
-        return converter is null
+        var providerValue = converter is null
             ? value
             : converter.ConvertToProvider(value);
+
+        if (providerValue is decimal decimalValue && column.TypeMapping?.Scale is int scale)
+        {
+            return NormalizeDecimalScale(decimalValue, scale);
+        }
+
+        return providerValue;
+    }
+
+    private static decimal NormalizeDecimalScale(decimal value, int scale)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(scale);
+
+        if (scale > 28)
+        {
+            throw new ArgumentOutOfRangeException(nameof(scale), "Decimal scale must be between 0 and 28.");
+        }
+
+        var rounded = decimal.Round(value, scale, MidpointRounding.ToEven);
+        var normalized = rounded.ToString($"F{scale}", CultureInfo.InvariantCulture);
+        return decimal.Parse(normalized, NumberStyles.Number, CultureInfo.InvariantCulture);
     }
 }

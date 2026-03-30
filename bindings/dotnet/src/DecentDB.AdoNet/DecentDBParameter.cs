@@ -13,6 +13,8 @@ namespace DecentDB.AdoNet
         private int _size;
         private byte _precision;
         private byte _scale;
+        private bool _precisionSet;
+        private bool _scaleSet;
         private ParameterDirection _direction = ParameterDirection.Input;
         private bool _isNullable;
 
@@ -55,13 +57,21 @@ namespace DecentDB.AdoNet
         public override byte Precision
         {
             get => _precision;
-            set => _precision = value;
+            set
+            {
+                _precision = value;
+                _precisionSet = true;
+            }
         }
 
         public override byte Scale
         {
             get => _scale;
-            set => _scale = value;
+            set
+            {
+                _scale = value;
+                _scaleSet = true;
+            }
         }
 
         public override ParameterDirection Direction
@@ -117,6 +127,10 @@ namespace DecentDB.AdoNet
         {
             _dbType = DbType.String;
         }
+
+        internal bool HasPrecision => _precisionSet;
+
+        internal bool HasScale => _scaleSet;
 
         private static bool IsValidDbType(DbType dbType)
         {

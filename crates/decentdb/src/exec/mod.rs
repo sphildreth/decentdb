@@ -48,7 +48,7 @@ use crate::record::overflow::{
     OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
-use crate::record::value::{parse_decimal_text, Value};
+use crate::record::value::{compare_decimal, parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
     BinaryOp, ColumnDefinition, CommonTableExpr, CreateTableAsStatement, CreateTableStatement,
@@ -13948,6 +13948,21 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         (Value::Float64(left), Value::Float64(right)) => Ok(left.total_cmp(right)),
         (Value::Int64(left), Value::Float64(right)) => Ok((*left as f64).total_cmp(right)),
         (Value::Float64(left), Value::Int64(right)) => Ok(left.total_cmp(&(*right as f64))),
+        (
+            Value::Decimal {
+                scaled: left_scaled,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                scaled: right_scaled,
+                scale: right_scale,
+            },
+        ) => Ok(compare_decimal(
+            *left_scaled,
+            *left_scale,
+            *right_scaled,
+            *right_scale,
+        )),
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),
