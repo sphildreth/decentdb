@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
 use crate::catalog::{
     identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ForeignKeyAction,
@@ -61,14 +61,14 @@ pub struct PreparedStatement {
     in_state_without_clone: bool,
 }
 
-/// Exclusive SQL transaction handle that owns mutable runtime state locally.
+/// Exclusive SQL transaction handle that keeps mutable runtime state reserved.
 ///
 /// While this handle is active, callers should use it for all SQL work on the
 /// same `Db` handle until `commit` or `rollback`.
 #[derive(Debug)]
 pub struct SqlTransaction<'a> {
     db: &'a Db,
-    state: Option<SqlTxnState>,
+    state: Option<ExclusiveSqlTxnState<'a>>,
 }
 
 impl PreparedStatement {
@@ -109,26 +109,17 @@ impl SqlTransaction<'_> {
             .state
             .as_mut()
             .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
-        self.db.execute_prepared_in_state(prepared, params, state)
+        self.db
+            .execute_prepared_in_exclusive_state(prepared, params, state)
     }
 
-    /// Commits this transaction's local runtime into the WAL-backed database.
+    /// Commits this transaction's reserved runtime into the WAL-backed database.
     pub fn commit(mut self) -> Result<u64> {
         let state = self
             .state
             .take()
             .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
-        let result = if state.persistent_changed {
-            self.db.persist_runtime_if_latest(
-                state.runtime,
-                Some(state.base_lsn),
-                state.indexes_maybe_stale,
-            )
-        } else {
-            self.db
-                .install_temp_runtime(state.runtime)
-                .map(|()| state.base_lsn)
-        };
+        let result = self.db.commit_exclusive_sql_txn(state);
         let release = self.deactivate();
         match (result, release) {
             (Err(error), _) => Err(error),
@@ -139,8 +130,12 @@ impl SqlTransaction<'_> {
 
     /// Rolls this transaction back and releases the handle.
     pub fn rollback(mut self) -> Result<()> {
-        self.state.take();
-        self.deactivate()
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
+        let result = self.db.rollback_exclusive_sql_txn(state);
+        self.deactivate().and(result)
     }
 
     fn deactivate(&mut self) -> Result<()> {
@@ -158,7 +153,9 @@ impl SqlTransaction<'_> {
 
 impl Drop for SqlTransaction<'_> {
     fn drop(&mut self) {
-        self.state.take();
+        if let Some(state) = self.state.take() {
+            let _ = self.db.rollback_exclusive_sql_txn(state);
+        }
         if let Ok(mut txn) = self.db.inner.sql_txn.lock() {
             *txn = SqlTxnSlot::None;
             self.db.inner.sql_txn_active.store(false, Ordering::Release);
@@ -259,6 +256,14 @@ struct SqlTxnState {
     persistent_changed: bool,
     indexes_maybe_stale: bool,
     savepoints: Vec<SqlSavepoint>,
+}
+
+#[derive(Debug)]
+struct ExclusiveSqlTxnState<'a> {
+    runtime: RwLockWriteGuard<'a, EngineRuntime>,
+    base_lsn: u64,
+    persistent_changed: bool,
+    indexes_maybe_stale: bool,
 }
 
 #[derive(Debug)]
@@ -419,10 +424,10 @@ impl Db {
         })
     }
 
-    /// Begins an exclusive SQL transaction handle that keeps mutable runtime
-    /// state local until commit or rollback.
+    /// Begins an exclusive SQL transaction handle that reserves mutable runtime
+    /// state until commit or rollback.
     pub fn transaction(&self) -> Result<SqlTransaction<'_>> {
-        let state = self.build_sql_txn_state()?;
+        let state = self.build_exclusive_sql_txn_state()?;
         let mut txn = self
             .inner
             .sql_txn
@@ -878,7 +883,9 @@ impl Db {
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
-        self.inner.wal.commit_pages(pages, max_page_count)
+        self.inner
+            .wal
+            .commit_pages(&self.inner.pager, pages, max_page_count)
     }
 
     fn commit_if_latest(&self, expected_latest_lsn: u64) -> Result<u64> {
@@ -903,9 +910,12 @@ impl Db {
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
-        self.inner
-            .wal
-            .commit_pages_if_latest(pages, max_page_count, expected_latest_lsn)
+        self.inner.wal.commit_pages_if_latest(
+            &self.inner.pager,
+            pages,
+            max_page_count,
+            expected_latest_lsn,
+        )
     }
 
     /// Rolls back the current write transaction.
@@ -979,6 +989,7 @@ impl Db {
 
     /// Performs a reader-aware checkpoint.
     pub fn checkpoint(&self) -> Result<()> {
+        self.compact_persisted_payloads_before_checkpoint()?;
         self.inner
             .wal
             .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)
@@ -1400,6 +1411,7 @@ impl Db {
             &path,
             effective_config.page_size,
             effective_config.wal_sync_mode,
+            &pager,
         )?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
         let (runtime, runtime_lsn) = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
@@ -2177,6 +2189,47 @@ impl Db {
         Ok(result)
     }
 
+    fn compact_persisted_payloads_before_checkpoint(&self) -> Result<()> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.refresh_engine_from_storage()?;
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        if !runtime.has_checkpoint_compaction_candidates() {
+            return Ok(());
+        }
+        self.begin_write()?;
+        let changed = match runtime.compact_persisted_payloads_for_checkpoint(self) {
+            Ok(changed) => changed,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        if !changed {
+            self.rollback()?;
+            return Ok(());
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        self.sync_temp_state_from_runtime(&runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(())
+    }
+
     fn engine_snapshot(&self) -> Result<EngineRuntime> {
         let runtime = self
             .inner
@@ -2317,6 +2370,62 @@ impl Db {
 
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
         self.persist_runtime_if_latest(runtime, None, true)
+    }
+
+    fn build_exclusive_sql_txn_state(&self) -> Result<ExclusiveSqlTxnState<'_>> {
+        self.refresh_engine_from_storage()?;
+        let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        Ok(ExclusiveSqlTxnState {
+            runtime,
+            base_lsn: current_lsn,
+            persistent_changed: false,
+            indexes_maybe_stale: false,
+        })
+    }
+
+    fn commit_exclusive_sql_txn(&self, mut state: ExclusiveSqlTxnState<'_>) -> Result<u64> {
+        if !state.persistent_changed {
+            self.sync_temp_state_from_runtime(&state.runtime)?;
+            return Ok(state.base_lsn);
+        }
+
+        let runtime_schema_cookie = state.runtime.catalog.schema_cookie;
+        if state.indexes_maybe_stale {
+            state
+                .runtime
+                .rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
+        self.begin_write()?;
+        if let Err(error) = state.runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut state.runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit_if_latest(state.base_lsn) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut state.runtime)?;
+                return Err(error);
+            }
+        };
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(state.runtime.catalog.clone())?;
+        }
+        self.sync_temp_state_from_runtime(&state.runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(committed_lsn)
+    }
+
+    fn rollback_exclusive_sql_txn(&self, mut state: ExclusiveSqlTxnState<'_>) -> Result<()> {
+        self.restore_runtime_from_storage(&mut state.runtime)
     }
 
     fn persist_runtime_if_latest(
@@ -2595,6 +2704,104 @@ impl Db {
         working.rebuild_stale_indexes(page_size)?;
         let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
         state.runtime = working;
+        state.persistent_changed |= !temp_only;
+        state.indexes_maybe_stale = true;
+        Ok(result)
+    }
+
+    fn execute_prepared_in_exclusive_state(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        state: &mut ExclusiveSqlTxnState<'_>,
+    ) -> Result<QueryResult> {
+        if !Arc::ptr_eq(&self.inner, &prepared.db.inner) {
+            return Err(DbError::transaction(
+                "prepared statement belongs to a different database handle",
+            ));
+        }
+        self.validate_prepared_schema_cookie(
+            prepared,
+            state.runtime.catalog.schema_cookie,
+            state.runtime.temp_schema_cookie,
+        )?;
+        if prepared.read_only {
+            return state.runtime.execute_read_statement(
+                prepared.statement.as_ref(),
+                params,
+                self.inner.config.page_size,
+            );
+        }
+        if matches!(
+            prepared.statement.as_ref(),
+            crate::sql::ast::Statement::Analyze { .. }
+        ) {
+            return Err(DbError::transaction(
+                "ANALYZE is not supported inside an explicit SQL transaction",
+            ));
+        }
+
+        let page_size = self.inner.config.page_size;
+        if let Some(prepared_update) = prepared
+            .prepared_update
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_update(plan))
+        {
+            let result = state
+                .runtime
+                .execute_prepared_simple_update(prepared_update, params)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        if let Some(prepared_delete) = prepared
+            .prepared_delete
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_delete(plan))
+        {
+            let result = state
+                .runtime
+                .execute_prepared_simple_delete(prepared_delete, params)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        if let Some(prepared_insert) = prepared
+            .prepared_insert
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+        {
+            let result =
+                state
+                    .runtime
+                    .execute_prepared_simple_insert(prepared_insert, params, page_size)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        let temp_only = self.statement_is_temp_only(&state.runtime, prepared.statement.as_ref());
+        if matches!(
+            prepared.statement.as_ref(),
+            crate::sql::ast::Statement::Insert(insert)
+                if state.runtime.can_execute_insert_in_place(insert)
+        ) {
+            let result =
+                state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+        if prepared.in_state_without_clone {
+            let result =
+                state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+
+        let mut working = state.runtime.clone();
+        working.rebuild_stale_indexes(page_size)?;
+        let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
+        *state.runtime = working;
         state.persistent_changed |= !temp_only;
         state.indexes_maybe_stale = true;
         Ok(result)
@@ -3830,6 +4037,135 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_transaction_commit_persists_prepared_writes() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..32_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(format!("value-{i}"))],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit txn");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            32
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT id FROM t WHERE val = 'value-17'")
+                    .expect("lookup committed row")
+            ),
+            17
+        );
+    }
+
+    #[test]
+    fn exclusive_transaction_rollback_discards_persistent_changes() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'seed')")
+            .expect("seed row");
+
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+        insert
+            .execute_in(
+                &mut txn,
+                &[Value::Int64(2), Value::Text("transient".to_string())],
+            )
+            .expect("insert transient row");
+        txn.rollback().expect("rollback txn");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM t WHERE id = 2")
+                    .expect("count rolled back row")
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn checkpoint_compacts_large_persisted_payloads() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("checkpoint-compacts-large-payloads.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..96_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(large_body.clone())],
+                )
+                .expect("insert large row");
+        }
+        txn.commit().expect("commit rows");
+
+        let runtime_before = db
+            .runtime_for_inspection()
+            .expect("runtime before checkpoint");
+        let docs_before = runtime_before
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table before checkpoint");
+        assert!(
+            docs_before.pointer.logical_len >= 64 * 1024,
+            "test setup did not create a large enough payload"
+        );
+        assert!(
+            !docs_before.pointer.is_compressed(),
+            "normal commits should leave table payloads uncompressed"
+        );
+
+        db.checkpoint().expect("checkpoint");
+
+        let runtime_after = db
+            .runtime_for_inspection()
+            .expect("runtime after checkpoint");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table after checkpoint");
+        assert!(
+            docs_after.pointer.is_compressed(),
+            "checkpoint should compact large persisted payloads"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            96
+        );
+    }
+
+    #[test]
     fn reader_handle_refreshes_after_external_checkpoint() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("checkpoint-refresh.ddb");
@@ -4214,6 +4550,48 @@ mod tests {
         let reused = db.allocate_page().expect("reuse page");
         assert_eq!(reused, page_id);
         db.rollback().expect("rollback reuse txn");
+    }
+
+    #[test]
+    fn checkpoint_truncates_tail_freelist_pages_and_resets_allocator_state() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("checkpoint-tail-truncation.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.begin_write().expect("begin allocate txn");
+        let page3 = db.allocate_page().expect("allocate page 3");
+        let page4 = db.allocate_page().expect("allocate page 4");
+        let page5 = db.allocate_page().expect("allocate page 5");
+        assert_eq!((page3, page4, page5), (3, 4, 5));
+        db.commit().expect("commit allocated pages");
+
+        db.begin_write().expect("begin free txn");
+        db.free_page(page5).expect("free page 5");
+        db.free_page(page4).expect("free page 4");
+        db.commit().expect("commit freed tail pages");
+        db.checkpoint().expect("checkpoint freed pages");
+
+        assert_eq!(
+            db.inner
+                .pager
+                .on_disk_page_count()
+                .expect("page count after truncation"),
+            3
+        );
+        assert_eq!(
+            db.inner
+                .pager
+                .header_snapshot()
+                .expect("header snapshot after truncation")
+                .freelist
+                .page_count,
+            0
+        );
+
+        db.begin_write().expect("begin allocate after truncation");
+        let reused = db.allocate_page().expect("allocate page after truncation");
+        assert_eq!(reused, 4);
+        db.rollback().expect("rollback post-truncation allocation");
     }
 
     fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {

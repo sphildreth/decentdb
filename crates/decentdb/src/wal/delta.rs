@@ -1,0 +1,136 @@
+//! Fixed-size WAL delta payloads for small page edits.
+
+use crate::error::{DbError, Result};
+
+pub(crate) const DELTA_FRAME_PAYLOAD_SIZE: usize = 512;
+
+const DELTA_PATCH_COUNT_SIZE: usize = 2;
+const DELTA_PATCH_HEADER_SIZE: usize = 4;
+
+pub(crate) fn encode_page_delta(base: &[u8], updated: &[u8]) -> Option<Vec<u8>> {
+    if base.len() != updated.len() {
+        return None;
+    }
+
+    let mut payload = Vec::with_capacity(DELTA_FRAME_PAYLOAD_SIZE);
+    payload.extend_from_slice(&0_u16.to_le_bytes());
+    let mut patch_count = 0_u16;
+    let mut index = 0_usize;
+    while index < updated.len() {
+        if base[index] == updated[index] {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < updated.len() && base[index] != updated[index] {
+            index += 1;
+        }
+        let len = index - start;
+        if payload.len() + DELTA_PATCH_HEADER_SIZE + len > DELTA_FRAME_PAYLOAD_SIZE {
+            return None;
+        }
+
+        let offset = u16::try_from(start).ok()?;
+        let patch_len = u16::try_from(len).ok()?;
+        payload.extend_from_slice(&offset.to_le_bytes());
+        payload.extend_from_slice(&patch_len.to_le_bytes());
+        payload.extend_from_slice(&updated[start..index]);
+        patch_count = patch_count.checked_add(1)?;
+    }
+
+    if patch_count == 0 || payload.len() >= updated.len() {
+        return None;
+    }
+
+    payload[..DELTA_PATCH_COUNT_SIZE].copy_from_slice(&patch_count.to_le_bytes());
+    payload.resize(DELTA_FRAME_PAYLOAD_SIZE, 0);
+    Some(payload)
+}
+
+pub(crate) fn apply_page_delta(base: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    if payload.len() != DELTA_FRAME_PAYLOAD_SIZE {
+        return Err(DbError::corruption(format!(
+            "invalid WAL delta payload length {}; expected {}",
+            payload.len(),
+            DELTA_FRAME_PAYLOAD_SIZE
+        )));
+    }
+
+    let mut page = base.to_vec();
+    let patch_count = u16::from_le_bytes(
+        payload[..DELTA_PATCH_COUNT_SIZE]
+            .try_into()
+            .expect("delta patch count bytes"),
+    ) as usize;
+    let mut cursor = DELTA_PATCH_COUNT_SIZE;
+    for _ in 0..patch_count {
+        if cursor + DELTA_PATCH_HEADER_SIZE > payload.len() {
+            return Err(DbError::corruption(
+                "WAL delta patch header overruns payload",
+            ));
+        }
+        let offset = u16::from_le_bytes(
+            payload[cursor..cursor + 2]
+                .try_into()
+                .expect("delta patch offset bytes"),
+        ) as usize;
+        let len = u16::from_le_bytes(
+            payload[cursor + 2..cursor + 4]
+                .try_into()
+                .expect("delta patch length bytes"),
+        ) as usize;
+        cursor += DELTA_PATCH_HEADER_SIZE;
+        if cursor + len > payload.len() {
+            return Err(DbError::corruption("WAL delta patch bytes overrun payload"));
+        }
+        if offset + len > page.len() {
+            return Err(DbError::corruption("WAL delta patch writes past page end"));
+        }
+        page[offset..offset + len].copy_from_slice(&payload[cursor..cursor + len]);
+        cursor += len;
+    }
+    Ok(page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_page_delta, encode_page_delta, DELTA_FRAME_PAYLOAD_SIZE};
+
+    #[test]
+    fn encode_and_apply_page_delta_round_trip() {
+        let mut base = vec![0_u8; 64];
+        let mut updated = base.clone();
+        updated[4..8].copy_from_slice(b"root");
+        updated[32..39].copy_from_slice(b"payload");
+
+        let delta = encode_page_delta(&base, &updated).expect("delta should encode");
+        assert_eq!(delta.len(), DELTA_FRAME_PAYLOAD_SIZE);
+        let rebuilt = apply_page_delta(&base, &delta).expect("apply delta");
+        assert_eq!(rebuilt, updated);
+
+        base[4..8].copy_from_slice(b"root");
+        let second = encode_page_delta(&base, &updated).expect("smaller delta");
+        let rebuilt = apply_page_delta(&base, &second).expect("apply second delta");
+        assert_eq!(rebuilt, updated);
+    }
+
+    #[test]
+    fn encode_page_delta_rejects_large_diff() {
+        let base = vec![0_u8; 4096];
+        let updated = vec![0xFF_u8; 4096];
+        assert!(encode_page_delta(&base, &updated).is_none());
+    }
+
+    #[test]
+    fn apply_page_delta_rejects_out_of_bounds_patch() {
+        let base = vec![0_u8; 16];
+        let mut delta = vec![0_u8; DELTA_FRAME_PAYLOAD_SIZE];
+        delta[..2].copy_from_slice(&1_u16.to_le_bytes());
+        delta[2..4].copy_from_slice(&15_u16.to_le_bytes());
+        delta[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        let error = apply_page_delta(&base, &delta).expect_err("delta should fail");
+        assert!(error.to_string().contains("page end"));
+    }
+}

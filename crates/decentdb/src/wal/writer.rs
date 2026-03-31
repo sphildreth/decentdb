@@ -8,8 +8,10 @@ use std::sync::atomic::Ordering;
 use crate::config::WalSyncMode;
 use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
+use crate::storage::PagerHandle;
 use crate::vfs::write_all_at;
 
+use super::delta::encode_page_delta;
 use super::format::{FrameType, WalFrame, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 use super::index::WalVersion;
 use super::recovery;
@@ -21,6 +23,7 @@ const COMMIT_FRAME_BYTES: [u8; FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE] =
 
 pub(crate) fn commit_pages(
     wal: &WalHandle,
+    pager: &PagerHandle,
     pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
 ) -> Result<u64> {
@@ -39,8 +42,12 @@ pub(crate) fn commit_pages(
     let page_batch = &mut writer_state.page_batch;
     page_batch.clear();
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
-    for (page_id, payload) in &pages {
-        append_page_frame(page_batch, *page_id, payload, wal.inner.page_size)?;
+    let latest_snapshot = wal.latest_snapshot();
+    let mut prepared_pages = Vec::with_capacity(pages.len());
+    for (page_id, payload) in pages {
+        let encoded_len =
+            append_best_page_frame(page_batch, wal, pager, latest_snapshot, page_id, &payload)?;
+        prepared_pages.push((page_id, payload, encoded_len));
     }
     let commit_start_lsn = offset;
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
@@ -59,8 +66,8 @@ pub(crate) fn commit_pages(
             .lock()
             .expect("wal index lock should not be poisoned");
         let mut version_lsn = commit_start_lsn;
-        for (page_id, payload) in pages {
-            version_lsn += page_frame_len as u64;
+        for (page_id, payload, encoded_len) in prepared_pages {
+            version_lsn += encoded_len as u64;
             index.add_version(
                 page_id,
                 WalVersion {
@@ -81,6 +88,7 @@ pub(crate) fn commit_pages(
 
 pub(crate) fn commit_pages_if_latest(
     wal: &WalHandle,
+    pager: &PagerHandle,
     pages: Vec<(PageId, Vec<u8>)>,
     max_page_count: u32,
     expected_latest_lsn: u64,
@@ -107,8 +115,11 @@ pub(crate) fn commit_pages_if_latest(
     let page_batch = &mut writer_state.page_batch;
     page_batch.clear();
     page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
-    for (page_id, payload) in &pages {
-        append_page_frame(page_batch, *page_id, payload, wal.inner.page_size)?;
+    let mut prepared_pages = Vec::with_capacity(pages.len());
+    for (page_id, payload) in pages {
+        let encoded_len =
+            append_best_page_frame(page_batch, wal, pager, latest, page_id, &payload)?;
+        prepared_pages.push((page_id, payload, encoded_len));
     }
     let commit_start_lsn = offset;
     page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
@@ -127,8 +138,8 @@ pub(crate) fn commit_pages_if_latest(
             .lock()
             .expect("wal index lock should not be poisoned");
         let mut version_lsn = commit_start_lsn;
-        for (page_id, payload) in pages {
-            version_lsn += page_frame_len as u64;
+        for (page_id, payload, encoded_len) in prepared_pages {
+            version_lsn += encoded_len as u64;
             index.add_version(
                 page_id,
                 WalVersion {
@@ -227,6 +238,57 @@ fn append_page_frame(
     let payload_start = start + FRAME_HEADER_SIZE;
     output[payload_start..payload_start + payload.len()].copy_from_slice(payload);
     Ok(frame_len)
+}
+
+fn append_best_page_frame(
+    output: &mut Vec<u8>,
+    wal: &WalHandle,
+    pager: &PagerHandle,
+    snapshot_lsn: u64,
+    page_id: PageId,
+    payload: &[u8],
+) -> Result<usize> {
+    let base = visible_base_page(wal, pager, page_id, snapshot_lsn)?;
+    if let Some(delta_payload) = encode_page_delta(&base, payload) {
+        return append_page_delta_frame(output, page_id, &delta_payload);
+    }
+    append_page_frame(output, page_id, payload, wal.inner.page_size)
+}
+
+fn visible_base_page(
+    wal: &WalHandle,
+    pager: &PagerHandle,
+    page_id: PageId,
+    snapshot_lsn: u64,
+) -> Result<Vec<u8>> {
+    if let Some(version) = wal
+        .inner
+        .index
+        .lock()
+        .expect("wal index lock should not be poisoned")
+        .latest_visible(page_id, snapshot_lsn)
+        .cloned()
+    {
+        return Ok(version.data);
+    }
+    pager.read_page(page_id)
+}
+
+fn append_page_delta_frame(output: &mut Vec<u8>, page_id: PageId, payload: &[u8]) -> Result<usize> {
+    if page_id == 0 {
+        return Err(DbError::corruption(
+            "page WAL frames must have a non-zero page id",
+        ));
+    }
+    let frame = WalFrame {
+        frame_type: FrameType::PageDelta,
+        page_id,
+        payload: payload.to_vec(),
+    };
+    let encoded = frame.encode(0)?;
+    let encoded_len = encoded.len();
+    output.extend_from_slice(&encoded);
+    Ok(encoded_len)
 }
 
 #[cfg(test)]

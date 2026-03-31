@@ -7,6 +7,7 @@ use std::thread::ThreadId;
 
 use crate::error::{DbError, Result};
 use crate::storage::page::SUPPORTED_PAGE_SIZES;
+use crate::wal::delta::DELTA_FRAME_PAYLOAD_SIZE;
 use crate::wal::format::{FrameType, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 
 use super::{FileKind, OpenMode, Vfs, VfsFile};
@@ -393,7 +394,11 @@ fn classify_wal_write(offset: u64, buf: &[u8]) -> &'static str {
         return "wal.write_commit";
     }
     match buf.first().copied() {
-        Some(frame_type) if frame_type == FrameType::Page as u8 => "wal.write_frame",
+        Some(frame_type)
+            if frame_type == FrameType::Page as u8 || frame_type == FrameType::PageDelta as u8 =>
+        {
+            "wal.write_frame"
+        }
         Some(frame_type) if frame_type == FrameType::Commit as u8 => "wal.write_commit",
         Some(frame_type) if frame_type == FrameType::Checkpoint as u8 => "wal.write_checkpoint",
         _ => "wal.write",
@@ -417,13 +422,26 @@ fn is_combined_commit_write(buf: &[u8]) -> bool {
 
     let prefix = &buf[..commit_start];
     SUPPORTED_PAGE_SIZES.iter().copied().any(|page_size| {
-        let frame_len = FRAME_HEADER_SIZE + page_size as usize + FRAME_TRAILER_SIZE;
-        if !prefix.len().is_multiple_of(frame_len) {
-            return false;
+        let mut offset = 0;
+        while offset < prefix.len() {
+            let Some(frame_type) = prefix.get(offset).copied() else {
+                return false;
+            };
+            let payload_len = match frame_type {
+                value if value == FrameType::Page as u8 => page_size as usize,
+                value if value == FrameType::PageDelta as u8 => DELTA_FRAME_PAYLOAD_SIZE,
+                _ => return false,
+            };
+            let frame_len = FRAME_HEADER_SIZE + payload_len + FRAME_TRAILER_SIZE;
+            let Some(next_offset) = offset.checked_add(frame_len) else {
+                return false;
+            };
+            if next_offset > prefix.len() {
+                return false;
+            }
+            offset = next_offset;
         }
-        prefix
-            .chunks_exact(frame_len)
-            .all(|frame| frame.first().copied() == Some(FrameType::Page as u8))
+        offset == prefix.len()
     })
 }
 
@@ -433,6 +451,7 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
+    use crate::wal::delta::DELTA_FRAME_PAYLOAD_SIZE;
     use crate::wal::format::{FrameType, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 
     use super::{
@@ -612,7 +631,10 @@ mod tests {
             "wal.write_checkpoint"
         );
         f0[0] = 3;
-        assert_eq!(super::classify_write(FileKind::Wal, 10, &f0), "wal.write");
+        assert_eq!(
+            super::classify_write(FileKind::Wal, 10, &f0),
+            "wal.write_frame"
+        );
 
         let page_frame_len = FRAME_HEADER_SIZE
             + crate::storage::page::DEFAULT_PAGE_SIZE as usize
@@ -622,6 +644,17 @@ mod tests {
         combined[page_frame_len] = FrameType::Commit as u8;
         assert_eq!(
             super::classify_write(FileKind::Wal, WAL_HEADER_SIZE, &combined),
+            "wal.write_commit"
+        );
+
+        let delta_frame_len = FRAME_HEADER_SIZE + DELTA_FRAME_PAYLOAD_SIZE + FRAME_TRAILER_SIZE;
+        let mut mixed =
+            vec![0_u8; page_frame_len + delta_frame_len + FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE];
+        mixed[0] = FrameType::Page as u8;
+        mixed[page_frame_len] = FrameType::PageDelta as u8;
+        mixed[page_frame_len + delta_frame_len] = FrameType::Commit as u8;
+        assert_eq!(
+            super::classify_write(FileKind::Wal, WAL_HEADER_SIZE, &mixed),
             "wal.write_commit"
         );
 

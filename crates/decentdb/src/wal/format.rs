@@ -10,9 +10,11 @@ use crate::error::{DbError, Result};
 use crate::storage::page::PageId;
 use crate::vfs::{read_exact_at, VfsFile};
 
+use super::delta::DELTA_FRAME_PAYLOAD_SIZE;
+
 pub(crate) const WAL_HEADER_SIZE: u64 = 32;
 pub(crate) const WAL_HEADER_SIZE_USIZE: usize = WAL_HEADER_SIZE as usize;
-pub(crate) const WAL_HEADER_VERSION: u32 = 1;
+pub(crate) const WAL_HEADER_VERSION: u32 = 2;
 pub(crate) const WAL_MAGIC: [u8; 8] = *b"DDBWAL01";
 pub(crate) const FRAME_HEADER_SIZE: usize = 5;
 pub(crate) const FRAME_TRAILER_SIZE: usize = 8;
@@ -22,6 +24,7 @@ pub(crate) enum FrameType {
     Page = 0,
     Commit = 1,
     Checkpoint = 2,
+    PageDelta = 3,
 }
 
 impl FrameType {
@@ -30,6 +33,7 @@ impl FrameType {
             Self::Page => page_size as usize,
             Self::Commit => 0,
             Self::Checkpoint => 8,
+            Self::PageDelta => DELTA_FRAME_PAYLOAD_SIZE,
         }
     }
 }
@@ -42,6 +46,7 @@ impl TryFrom<u8> for FrameType {
             0 => Ok(Self::Page),
             1 => Ok(Self::Commit),
             2 => Ok(Self::Checkpoint),
+            3 => Ok(Self::PageDelta),
             _ => Err(DbError::corruption(format!(
                 "unknown WAL frame type {value}"
             ))),
@@ -79,9 +84,9 @@ impl WalHeader {
             return Err(DbError::corruption("invalid WAL header magic"));
         }
         let header_version = read_u32(bytes, 8);
-        if header_version != WAL_HEADER_VERSION {
+        if header_version != 1 && header_version != WAL_HEADER_VERSION {
             return Err(DbError::corruption(format!(
-                "unsupported WAL header version {header_version}; expected {WAL_HEADER_VERSION}"
+                "unsupported WAL header version {header_version}; expected 1 or {WAL_HEADER_VERSION}"
             )));
         }
         let page_size = read_u32(bytes, 12);
@@ -135,6 +140,16 @@ impl WalFrame {
         }
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn page_delta(page_id: PageId, payload: Vec<u8>) -> Self {
+        Self {
+            frame_type: FrameType::PageDelta,
+            page_id,
+            payload,
+        }
+    }
+
     pub(crate) fn encode(&self, page_size: u32) -> Result<Vec<u8>> {
         let expected_payload = self.frame_type.payload_size(page_size);
         if self.payload.len() != expected_payload {
@@ -144,12 +159,12 @@ impl WalFrame {
                 expected_payload
             )));
         }
-        if matches!(self.frame_type, FrameType::Page) && self.page_id == 0 {
+        if matches!(self.frame_type, FrameType::Page | FrameType::PageDelta) && self.page_id == 0 {
             return Err(DbError::corruption(
                 "page WAL frames must have a non-zero page id",
             ));
         }
-        if !matches!(self.frame_type, FrameType::Page) && self.page_id != 0 {
+        if !matches!(self.frame_type, FrameType::Page | FrameType::PageDelta) && self.page_id != 0 {
             return Err(DbError::corruption(
                 "non-page WAL frames must use page id 0",
             ));
@@ -195,10 +210,10 @@ impl WalFrame {
         read_exact_at(file, offset + FRAME_HEADER_SIZE as u64, &mut body)?;
         let payload = body[..payload_len].to_vec();
 
-        if matches!(frame_type, FrameType::Page) && page_id == 0 {
+        if matches!(frame_type, FrameType::Page | FrameType::PageDelta) && page_id == 0 {
             return Err(DbError::corruption("page WAL frame used page id 0"));
         }
-        if !matches!(frame_type, FrameType::Page) && page_id != 0 {
+        if !matches!(frame_type, FrameType::Page | FrameType::PageDelta) && page_id != 0 {
             return Err(DbError::corruption(
                 "non-page WAL frame used a non-zero page id",
             ));
@@ -231,6 +246,7 @@ mod tests {
     use crate::error::{DbError, Result};
     use crate::storage::page;
     use crate::vfs::{FileKind, VfsFile};
+    use crate::wal::delta::DELTA_FRAME_PAYLOAD_SIZE;
 
     use super::{FrameType, WalFrame, WalHeader};
 
@@ -295,12 +311,17 @@ mod tests {
     #[test]
     fn wal_frame_encode_preserves_current_format_sizes() {
         let page_frame = WalFrame::page(3, vec![0_u8; page::DEFAULT_PAGE_SIZE as usize]);
+        let delta_frame = WalFrame::page_delta(4, vec![0_u8; DELTA_FRAME_PAYLOAD_SIZE]);
         let commit = WalFrame::commit();
         let checkpoint = WalFrame::checkpoint(123);
 
         assert_eq!(
             page_frame.encoded_len(page::DEFAULT_PAGE_SIZE),
             5 + page::DEFAULT_PAGE_SIZE as usize + 8
+        );
+        assert_eq!(
+            delta_frame.encoded_len(page::DEFAULT_PAGE_SIZE),
+            5 + DELTA_FRAME_PAYLOAD_SIZE + 8
         );
         assert_eq!(commit.encoded_len(page::DEFAULT_PAGE_SIZE), 13);
         assert_eq!(checkpoint.encoded_len(page::DEFAULT_PAGE_SIZE), 21);
@@ -314,11 +335,12 @@ mod tests {
         assert_eq!(FrameType::try_from(0).unwrap(), FrameType::Page);
         assert_eq!(FrameType::try_from(1).unwrap(), FrameType::Commit);
         assert_eq!(FrameType::try_from(2).unwrap(), FrameType::Checkpoint);
+        assert_eq!(FrameType::try_from(3).unwrap(), FrameType::PageDelta);
     }
 
     #[test]
     fn frame_type_try_from_invalid() {
-        assert!(FrameType::try_from(3).is_err());
+        assert!(FrameType::try_from(4).is_err());
         assert!(FrameType::try_from(255).is_err());
     }
 

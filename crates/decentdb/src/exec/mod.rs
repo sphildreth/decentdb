@@ -40,7 +40,7 @@ use crate::catalog::{
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
 use crate::planner;
-use crate::record::compression::CompressionMode;
+use crate::record::compression::{CompressionMode, AUTO_MIN_PAYLOAD_BYTES};
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
     append_uncompressed_with_tail, build_overflow_chain_cache, free_overflow, read_overflow,
@@ -811,6 +811,114 @@ impl EngineRuntime {
             db.set_schema_cookie(self.catalog.schema_cookie)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn has_checkpoint_compaction_candidates(&self) -> bool {
+        self.persisted_tables.values().any(|state| {
+            state.pointer.head_page_id != 0
+                && !state.pointer.is_compressed()
+                && usize::try_from(state.pointer.logical_len)
+                    .ok()
+                    .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
+        }) || self.root_state.is_some_and(|root| {
+            root.pointer.head_page_id != 0
+                && !root.pointer.is_compressed()
+                && usize::try_from(root.pointer.logical_len)
+                    .ok()
+                    .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
+        })
+    }
+
+    pub(crate) fn compact_persisted_payloads_for_checkpoint(
+        &mut self,
+        db: &crate::db::Db,
+    ) -> Result<bool> {
+        let old_root = self.root_state;
+        let mut changed = false;
+        {
+            let mut store = DbTxnPageStore { db };
+            let table_names = self.persisted_tables.keys().cloned().collect::<Vec<_>>();
+            for table_name in table_names {
+                let Some(previous_state) = self.persisted_tables.get(&table_name).copied() else {
+                    continue;
+                };
+                let previous_pointer = previous_state.pointer;
+                if previous_pointer.head_page_id == 0
+                    || previous_pointer.is_compressed()
+                    || usize::try_from(previous_pointer.logical_len)
+                        .ok()
+                        .is_none_or(|len| len < AUTO_MIN_PAYLOAD_BYTES)
+                {
+                    continue;
+                }
+                let payload = if let Some(cached) = self.cached_payloads.get(&table_name) {
+                    Arc::clone(cached)
+                } else {
+                    Arc::new(read_overflow(&store, previous_pointer)?)
+                };
+                let pointer = rewrite_overflow(
+                    &mut store,
+                    previous_pointer,
+                    payload.as_slice(),
+                    CompressionMode::Auto,
+                )?;
+                if pointer != previous_pointer {
+                    changed = true;
+                }
+                let tail = if pointer.is_compressed() {
+                    OverflowTailInfo::default()
+                } else {
+                    read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default()
+                };
+                self.persisted_tables.insert(
+                    table_name.clone(),
+                    PersistedTableState {
+                        pointer,
+                        checksum: previous_state.checksum,
+                        row_count: previous_state.row_count,
+                        tail,
+                    },
+                );
+                self.cached_payloads.insert(table_name.clone(), payload);
+                self.overflow_chain_caches.remove(&table_name);
+            }
+        }
+
+        let (checksum, pointer) = {
+            let manifest = self.manifest_payload()?;
+            let checksum = crc32c_parts(&[manifest]);
+            let previous_manifest_pointer = old_root.map_or(
+                OverflowPointer {
+                    head_page_id: 0,
+                    logical_len: 0,
+                    flags: 0,
+                },
+                |root| root.pointer,
+            );
+            let pointer = {
+                let mut store = DbTxnPageStore { db };
+                rewrite_overflow(
+                    &mut store,
+                    previous_manifest_pointer,
+                    manifest,
+                    CompressionMode::Auto,
+                )?
+            };
+            (checksum, pointer)
+        };
+
+        let new_root = RootHeader {
+            schema_cookie: self.catalog.schema_cookie,
+            payload_checksum: checksum,
+            pointer,
+        };
+        if old_root != Some(new_root) {
+            let root_page = encode_root_header(db.config().page_size, new_root);
+            db.write_page_owned(page::CATALOG_ROOT_PAGE_ID, root_page)?;
+            self.root_state = Some(new_root);
+            changed = true;
+        }
+        Ok(changed)
     }
 
     fn manifest_payload(&mut self) -> Result<&[u8]> {
@@ -5047,7 +5155,7 @@ impl EngineRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RootHeader {
     schema_cookie: u32,
     payload_checksum: u32,
