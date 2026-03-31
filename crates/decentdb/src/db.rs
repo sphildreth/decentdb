@@ -1087,6 +1087,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.ensure_deferred_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         let inserted = working.bulk_load_rows(
             table_name,
@@ -1109,6 +1110,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.ensure_deferred_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_index(name, self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1121,6 +1123,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.ensure_deferred_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_indexes(self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
