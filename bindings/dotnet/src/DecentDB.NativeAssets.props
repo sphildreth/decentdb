@@ -11,6 +11,9 @@
     <DecentDBMacBuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/libdecentdb.dylib'))</DecentDBMacBuildNativePrimary>
     <DecentDBMacBuildNativeFallback>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/libc_api.dylib'))</DecentDBMacBuildNativeFallback>
     <DecentDBMacPackagedNative>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)DecentDB.MicroOrm/runtimes/osx-arm64/native/libdecentdb.dylib'))</DecentDBMacPackagedNative>
+    <DecentDBMacArm64BuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/osx-arm64/libdecentdb.dylib'))</DecentDBMacArm64BuildNativePrimary>
+    <DecentDBMacX64BuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/osx-x64/libdecentdb.dylib'))</DecentDBMacX64BuildNativePrimary>
+    <DecentDBMacX64PackagedNative>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)DecentDB.MicroOrm/runtimes/osx-x64/native/libdecentdb.dylib'))</DecentDBMacX64PackagedNative>
     <DecentDBWindowsTargetDebugNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/debug/decentdb.dll'))</DecentDBWindowsTargetDebugNativePrimary>
     <DecentDBWindowsTargetReleaseNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../target/release/decentdb.dll'))</DecentDBWindowsTargetReleaseNativePrimary>
     <DecentDBWindowsBuildNativePrimary>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../../build/decentdb.dll'))</DecentDBWindowsBuildNativePrimary>
@@ -81,6 +84,32 @@
     <When Condition="Exists('$(DecentDBMacPackagedNative)')">
       <PropertyGroup>
         <DecentDBMacRuntimeAssetSource>$(DecentDBMacPackagedNative)</DecentDBMacRuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+  </Choose>
+
+  <Choose>
+    <When Condition="Exists('$(DecentDBMacArm64BuildNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBMacArm64RuntimeAssetSource>$(DecentDBMacArm64BuildNativePrimary)</DecentDBMacArm64RuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+    <When Condition="Exists('$(DecentDBMacPackagedNative)')">
+      <PropertyGroup>
+        <DecentDBMacArm64RuntimeAssetSource>$(DecentDBMacPackagedNative)</DecentDBMacArm64RuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+  </Choose>
+
+  <Choose>
+    <When Condition="Exists('$(DecentDBMacX64BuildNativePrimary)')">
+      <PropertyGroup>
+        <DecentDBMacX64RuntimeAssetSource>$(DecentDBMacX64BuildNativePrimary)</DecentDBMacX64RuntimeAssetSource>
+      </PropertyGroup>
+    </When>
+    <When Condition="Exists('$(DecentDBMacX64PackagedNative)')">
+      <PropertyGroup>
+        <DecentDBMacX64RuntimeAssetSource>$(DecentDBMacX64PackagedNative)</DecentDBMacX64RuntimeAssetSource>
       </PropertyGroup>
     </When>
   </Choose>

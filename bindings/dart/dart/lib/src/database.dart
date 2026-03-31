@@ -238,10 +238,7 @@ class Database {
       }
       return outAffected.value;
     } finally {
-      final freeStatus = _bindings.resultFree(outResult);
-      if (freeStatus != ddbOk) {
-        _throwStatus(freeStatus, 'Failed to free SQL result');
-      }
+      _bindings.resultFree(outResult); // best-effort; errors here must not mask a primary exception
       calloc.free(outAffected);
       calloc.free(outResult);
       calloc.free(nativeSql);

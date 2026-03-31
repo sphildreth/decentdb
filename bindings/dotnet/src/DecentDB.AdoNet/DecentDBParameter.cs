@@ -126,6 +126,10 @@ namespace DecentDB.AdoNet
         public override void ResetDbType()
         {
             _dbType = DbType.String;
+            _precision = 0;
+            _scale = 0;
+            _precisionSet = false;
+            _scaleSet = false;
         }
 
         internal bool HasPrecision => _precisionSet;
