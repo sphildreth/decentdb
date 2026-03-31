@@ -133,6 +133,92 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
     }
 
     protected override void Generate(
+        RenameTableOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        if (!string.IsNullOrWhiteSpace(operation.Schema)
+            || !string.IsNullOrWhiteSpace(operation.NewSchema))
+        {
+            throw Unsupported(operation, "Schema-qualified table renames are not supported by DecentDB.");
+        }
+
+        builder
+            .Append("ALTER TABLE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.Name, operation, "Current table name")))
+            .Append(" RENAME TO ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.NewName, operation, "New table name")))
+            .AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+
+        builder.EndCommand();
+    }
+
+    protected override void Generate(
+        RenameColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        if (!string.IsNullOrWhiteSpace(operation.Schema))
+        {
+            throw Unsupported(operation, "Schema-qualified column renames are not supported by DecentDB.");
+        }
+
+        builder
+            .Append("ALTER TABLE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.Table, operation, "Table name")))
+            .Append(" RENAME COLUMN ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.Name, operation, "Current column name")))
+            .Append(" TO ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.NewName, operation, "New column name")))
+            .AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+
+        builder.EndCommand();
+    }
+
+    protected override void Generate(
+        AlterColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        if (!string.IsNullOrWhiteSpace(operation.Schema))
+        {
+            throw Unsupported(operation, "Schema-qualified ALTER COLUMN operations are not supported by DecentDB.");
+        }
+
+        var oldColumn = operation.OldColumn;
+        if (oldColumn is null)
+        {
+            throw Unsupported(operation, "ALTER COLUMN requires OldColumn metadata.");
+        }
+
+        if (operation.IsNullable != oldColumn.IsNullable
+            || !Equals(operation.DefaultValue, oldColumn.DefaultValue)
+            || !string.Equals(operation.DefaultValueSql, oldColumn.DefaultValueSql, StringComparison.Ordinal))
+        {
+            throw Unsupported(
+                operation,
+                "ALTER COLUMN nullability/default changes are not supported; rebuild the column with a manual migration.");
+        }
+
+        var columnType = operation.ColumnType;
+        if (string.IsNullOrWhiteSpace(columnType))
+        {
+            throw Unsupported(operation, "ALTER COLUMN TYPE requires an explicit store type.");
+        }
+
+        builder
+            .Append("ALTER TABLE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.Table, operation, "Table name")))
+            .Append(" ALTER COLUMN ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.Name, operation, "Column name")))
+            .Append(" TYPE ")
+            .Append(columnType)
+            .AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+
+        builder.EndCommand();
+    }
+
+    protected override void Generate(
         AddForeignKeyOperation operation,
         IModel? model,
         MigrationCommandListBuilder builder,
@@ -213,6 +299,28 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
         }
     }
 
+    protected override void Generate(
+        DropIndexOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        if (!string.IsNullOrWhiteSpace(operation.Schema))
+        {
+            throw Unsupported(operation, "Schema-qualified index drops are not supported by DecentDB.");
+        }
+
+        builder
+            .Append("DROP INDEX ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(RequireIdentifier(operation.Name, operation, "Index name")));
+
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            builder.EndCommand();
+        }
+    }
+
     private void ForeignKeyConstraint(
         AddForeignKeyOperation operation,
         MigrationCommandListBuilder builder)
@@ -279,6 +387,11 @@ internal sealed class DecentDBMigrationsSqlGenerator : MigrationsSqlGenerator
             ReferentialAction.SetDefault => throw new NotSupportedException("DecentDB does not support SET DEFAULT referential actions."),
             _ => throw new NotSupportedException($"Unsupported referential action '{action}'.")
         };
+
+    private static string RequireIdentifier(string? identifier, MigrationOperation operation, string description)
+        => !string.IsNullOrWhiteSpace(identifier)
+            ? identifier
+            : throw Unsupported(operation, $"{description} is required.");
 
     private static NotSupportedException Unsupported(MigrationOperation operation, string message)
         => new($"DecentDB migrations unsupported operation '{operation.GetType().Name}': {message}");

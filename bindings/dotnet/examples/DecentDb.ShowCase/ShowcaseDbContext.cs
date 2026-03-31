@@ -1,4 +1,5 @@
 using DecentDb.ShowCase.Entities;
+using DecentDB.AdoNet;
 using DecentDB.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
 using NodaTime;
@@ -39,8 +40,13 @@ public class ShowcaseDbContext : DbContext
     {
         if (!optionsBuilder.IsConfigured)
         {
-            var connectionString = $"Data Source={_dbPath}";
-            optionsBuilder.UseDecentDB(connectionString, builder =>
+            var connectionStringBuilder = new DecentDBConnectionStringBuilder
+            {
+                DataSource = _dbPath,
+                CommandTimeout = 120
+            };
+
+            optionsBuilder.UseDecentDB(connectionStringBuilder, builder =>
             {
                 builder.UseNodaTime();
             });

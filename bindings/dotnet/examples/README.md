@@ -113,6 +113,7 @@ dotnet run --project examples/DecentDb.ShowCase/DecentDb.ShowCase.csproj
 
 ### Bulk Operations
 - `AddRange()` for batch inserts
+- `ExecuteUpdateAsync()` for set-based bulk updates
 - `ExecuteDeleteAsync()` for bulk deletes
 - Performance measurement of bulk operations
 
@@ -120,13 +121,14 @@ dotnet run --project examples/DecentDb.ShowCase/DecentDb.ShowCase.csproj
 | Feature | Description |
 |---------|-------------|
 | **EF.Functions.Like** | Pattern matching with wildcards (`%`, `_`) |
-| **Set Operations** | Union, Concat, Intersect, Except (client-side) |
+| **Set Operations** | Union, Concat, Intersect, Except translated server-side for representative shapes |
 | **Explicit Joins** | LINQ Join/GroupJoin for multi-table queries |
 | **Subqueries** | Correlated subqueries, scalar subqueries |
 | **Existence Filters** | Any/All over child collections |
 | **Conditional Logic** | Ternary operator, null coalescing |
 | **Query Composition** | Reusable IQueryable with conditional filters |
 | **SelectMany** | Collection flattening |
+| **AsAsyncEnumerable** | Async streaming-friendly enumeration over composed queries |
 | **Client vs Server Evaluation** | Understanding translation boundaries |
 | **AsNoTracking** | Read-only query optimization |
 
@@ -159,6 +161,20 @@ connection.GetSchema("Indexes")     // Index information
 ### Database Maintenance
 - **Checkpoint** - Flush WAL to main database file
 - **SaveAs** - Export database to new file
+- **VacuumAtomicAsync** - Compact a file-backed database with the maintenance helper
+
+### Provider Ergonomics
+- `DecentDBConnectionStringBuilder` can be passed directly to `UseDecentDB(...)`
+- The showcase uses builder-driven EF Core configuration
+- Typed setup keeps ADO.NET and EF Core configuration aligned
+
+### Performance Sanity Patterns
+- Projection vs tracked reads to illustrate over-fetching tradeoffs
+- `AsNoTracking()` for read-heavy paths
+- `AsSplitQuery()` over included relationship graphs
+- Keyset-style pagination patterns for stable paging
+- `AsAsyncEnumerable()` timing-oriented smoke coverage for streaming-friendly paths
+- Explicit note that these are sanity checks, **not** benchmark claims
 
 ### Transaction State
 ```csharp
@@ -426,13 +442,14 @@ This showcase validates the following EF Core features against DecentDB:
 | NodaTime (Instant, LocalDate, LocalDateTime) | ✅ Working | |
 | NodaTime member access (Year, Month, Day) | ✅ Working | |
 | Primitive collections (JSON arrays) | ✅ Working | |
-| Transactions | ✅ Working | |
+| Transactions | ✅ Working | Explicit isolation-level selection is covered in tests |
+| Savepoints | 🚫 Not supported | EF transaction savepoint APIs intentionally throw `NotSupportedException` |
 | Concurrency control | ✅ Working | |
 | Raw SQL (FromSqlRaw) | ✅ Working | |
 | Change tracking | ✅ Working | |
-| Bulk operations (AddRange, ExecuteDeleteAsync) | ✅ Working | |
+| Bulk operations (AddRange, ExecuteUpdateAsync, ExecuteDeleteAsync) | ✅ Working | Rowcount and persistence are covered in provider tests |
 | EF.Functions.Like pattern matching | ✅ Working | |
-| Set operations (Union, Concat, Intersect, Except) | ✅ Working | Client-side after fetching |
+| Set operations (Union, Concat, Intersect, Except) | ✅ Working | Server-side translation is covered in provider tests |
 | Window functions via `EF.Functions` | ✅ Working | Provider-specific LINQ helpers translate to `OVER (...)` SQL |
 | Include / ThenInclude | ✅ Working | Navigation properties over foreign keys are supported, including composite FKs in the showcase |
 | Explicit JOINs | ✅ Working | |
@@ -440,8 +457,11 @@ This showcase validates the following EF Core features against DecentDB:
 | Existence queries (Any/All) | ✅ Working | |
 | Query composition (reusable IQueryable) | ✅ Working | |
 | SelectMany | ✅ Working | |
+| AsAsyncEnumerable() | ✅ Working | Async streaming-friendly query enumeration is covered in provider tests |
 | Composite primary keys / foreign keys | ✅ Working | `ProductTag` and `WarehouseLocation` / `InventoryCount` demonstrate composite key mapping |
 | AsNoTracking | ✅ Working | |
 | Keyset pagination | ✅ Working | |
+| Provider ergonomics (`UseDecentDB(DecentDBConnectionStringBuilder)`) | ✅ Working | Typed builder configuration is covered in provider tests and used by the showcase |
+| Performance sanity patterns | ✅ Working | Showcase timings + dedicated EF sanity tests cover tracked vs no-tracking, split queries, keyset paging, async streaming, and bulk mutation rowcounts |
 
 The matrix above reflects the current supported showcase surface for DecentDB + EF Core.

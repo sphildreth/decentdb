@@ -169,6 +169,14 @@ var csb = new DecentDBConnectionStringBuilder
 string connectionString = csb.ConnectionString;
 ```
 
+The EF Core provider also accepts the builder directly:
+
+```csharp
+var options = new DbContextOptionsBuilder<MyDbContext>()
+    .UseDecentDB(csb)
+    .Options;
+```
+
 #### Design-time services and migrations
 
 If you use `dotnet ef` for design-time services, install
@@ -185,6 +193,26 @@ Then use the usual EF Core workflow:
 dotnet ef migrations add InitialCreate
 dotnet ef database update
 ```
+
+The in-tree EF Core provider tests cover runtime migration application plus the
+provider SQL generation paths for table rename, column rename, column type
+change, and index drop operations.
+
+#### EF Core provider coverage highlights
+
+The current in-tree provider validation covers:
+
+- server-side translation for representative `Union`, `Concat`, `Intersect`, and
+  `Except` query shapes
+- provider-specific window functions exposed via `EF.Functions`
+- `ExecuteUpdateAsync()` and `ExecuteDeleteAsync()` rowcount and persistence
+- `AsAsyncEnumerable()` over composed queries
+- optimistic concurrency conflicts surfaced as `DbUpdateConcurrencyException`
+- database execution failures surfaced as `DbUpdateException` with inner
+  `DecentDB.Native.DecentDBException`
+- builder-driven provider configuration via `UseDecentDB(DecentDBConnectionStringBuilder)`
+- performance-sanity coverage for `AsNoTracking`, split-query includes, keyset
+  pagination, async streaming, and bulk mutation rowcount behavior
 
 ## Version introspection
 
@@ -257,6 +285,10 @@ using var txn = conn.BeginTransaction();
 txn.Commit();
 ```
 
+Savepoints are currently unsupported in the EF Core relational transaction
+surface. `SupportsSavepoints` is `false`, and savepoint APIs intentionally throw
+`NotSupportedException`.
+
 ## Schema introspection (V2)
 
 ```csharp
@@ -303,7 +335,27 @@ conn.Checkpoint();
 
 // Online backup
 conn.SaveAs("/path/to/backup.ddb");
+
+// File-backed vacuum/compaction helper
+await DecentDBMaintenance.VacuumAtomicAsync("/path/to/shop.ddb");
 ```
+
+## Performance sanity guidance
+
+The in-tree `DecentDb.ShowCase` sample includes a `PERFORMANCE PATTERNS`
+section, but it should be read as a sanity-check aid rather than a benchmark
+suite. The current showcase and tests intentionally focus on:
+
+- projection vs tracked reads
+- `AsNoTracking()` for read-mostly paths
+- `AsSplitQuery()` over included relationship graphs
+- keyset-style paging
+- async materialization vs `AsAsyncEnumerable()` result ordering
+- bulk update/delete rowcount sanity
+
+These checks are meant to catch obviously pathological provider behavior and to
+teach reasonable defaults for embedded workloads. They are not claims of
+cross-provider performance parity.
 
 ## Build the native library
 
