@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EF Core migration SQL generation for rename-table, rename-column, alter-column-type, and drop-index operations, plus explicit `NotSupportedException` savepoint behavior instead of leaking later SQL execution errors.
 - Rust engine decimal comparison and `SUM`/`AVG` aggregate paths so mixed numeric comparisons and decimal aggregates execute without the earlier EF Core showcase workarounds.
 - EF Core translation for `DateTime`, `DateOnly`, and `TimeOnly` member access in predicates, including nullable member-access shapes used by the showcase.
+- Fault-injection WAL write classification for compound page-frame plus commit-frame appends so `wal.write_commit` failpoints and crash/reopen coverage continue to target the durable publish boundary after the write-path batching optimization.
 
 ### Added
 - Dedicated standalone `decentdb-migrate` CLI tool to seamlessly upgrade databases from unsupported legacy format versions (e.g., Nim-era v3) to the current format.
@@ -44,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decent Bench native library resolver now looks for Rust v2 library names (`libdecentdb.so`, `libdecentdb.dylib`, `decentdb.dll`).
 - Dart binding examples updated to demonstrate `executeBatchTyped` for bulk inserts instead of manual per-row bind/execute loops.
 - Design and binding review documentation updated to reflect the completed Dart binding v2 surface.
+- Rust durable-write hot paths now avoid eager post-commit transaction-state cloning, skip redundant explicit-transaction stale-index rebuilds on prepared fast-path writes, batch WAL page frames with the commit control frame, and move owned page buffers into write-transaction staging to reduce extra copy overhead during overflow and root persistence.
 
 ## [2.0.1] - 2026-03-28
 
