@@ -27,7 +27,7 @@ struct CachedPage {
 
 #[derive(Debug)]
 struct CachedPageInner {
-    data: Vec<u8>,
+    data: Arc<[u8]>,
     dirty: bool,
     pin_count: usize,
     last_access: u64,
@@ -66,6 +66,7 @@ impl PageCache {
         if loaded.is_empty() {
             loaded.resize(self.page_size, 0);
         }
+        let loaded: Arc<[u8]> = Arc::from(loaded);
 
         let mut state = self
             .state
@@ -162,7 +163,7 @@ impl PageCache {
                 .lock()
                 .map_err(|_| DbError::internal("cached page lock poisoned"))?;
             state.access_counter += 1;
-            inner.data = data;
+            inner.data = Arc::from(data);
             inner.dirty = dirty;
             inner.last_access = state.access_counter;
             return Ok(());
@@ -175,7 +176,7 @@ impl PageCache {
             page_id,
             Arc::new(CachedPage {
                 inner: Mutex::new(CachedPageInner {
-                    data,
+                    data: Arc::from(data),
                     dirty,
                     pin_count: 0,
                     last_access,
@@ -216,11 +217,11 @@ impl PageCache {
 }
 
 impl PageHandle {
-    pub(crate) fn read(&self) -> Result<Vec<u8>> {
+    pub(crate) fn read(&self) -> Result<Arc<[u8]>> {
         self.page
             .inner
             .lock()
-            .map(|inner| inner.data.clone())
+            .map(|inner| Arc::clone(&inner.data))
             .map_err(|_| DbError::internal("cached page lock poisoned"))
     }
 }
@@ -258,8 +259,14 @@ mod tests {
             .pin_or_load(3, || Ok(vec![3, 3, 3, 3]))
             .expect_err("all pages are pinned");
 
-        assert_eq!(first.read().expect("read first page"), vec![1, 1, 1, 1]);
-        assert_eq!(second.read().expect("read second page"), vec![2, 2, 2, 2]);
+        assert_eq!(
+            first.read().expect("read first page").to_vec(),
+            vec![1, 1, 1, 1]
+        );
+        assert_eq!(
+            second.read().expect("read second page").to_vec(),
+            vec![2, 2, 2, 2]
+        );
         assert!(matches!(error, crate::error::DbError::Transaction { .. }));
     }
 
@@ -302,7 +309,7 @@ mod tests {
                 Ok(vec![2, 2, 2, 2])
             })
             .expect("reload evicted page2");
-        assert_eq!(page2.read().expect("read page2"), vec![2, 2, 2, 2]);
+        assert_eq!(page2.read().expect("read page2").to_vec(), vec![2, 2, 2, 2]);
         assert_eq!(page2_loads.get(), 1, "page2 should be loaded again");
     }
 
@@ -327,7 +334,7 @@ mod tests {
                 Ok(vec![2, 2, 2, 2])
             })
             .expect("reload discarded page");
-        assert_eq!(page2.read().expect("read page2"), vec![2, 2, 2, 2]);
+        assert_eq!(page2.read().expect("read page2").to_vec(), vec![2, 2, 2, 2]);
         assert_eq!(page2_loads.get(), 1);
         drop(page2);
 
@@ -339,7 +346,7 @@ mod tests {
                 Ok(vec![1, 1, 1, 1])
             })
             .expect("reload page1");
-        assert_eq!(page1.read().expect("read page1"), vec![1, 1, 1, 1]);
+        assert_eq!(page1.read().expect("read page1").to_vec(), vec![1, 1, 1, 1]);
         assert_eq!(page1_loads.get(), 1);
     }
 
@@ -359,13 +366,19 @@ mod tests {
         let second = cache
             .pin_or_load(2, || Ok(vec![2, 2, 2, 2]))
             .expect("load page2 after unpin");
-        assert_eq!(second.read().expect("read page2"), vec![2, 2, 2, 2]);
+        assert_eq!(
+            second.read().expect("read page2").to_vec(),
+            vec![2, 2, 2, 2]
+        );
         drop(second);
 
         let first_reload = cache
             .pin_or_load(1, || Ok(vec![1, 1, 1, 1]))
             .expect("reload page1 after dropping page2");
-        assert_eq!(first_reload.read().expect("read page1"), vec![1, 1, 1, 1]);
+        assert_eq!(
+            first_reload.read().expect("read page1").to_vec(),
+            vec![1, 1, 1, 1]
+        );
     }
 
     #[test]

@@ -930,9 +930,9 @@ impl Db {
         Ok(())
     }
 
-    fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Vec<u8>> {
+    fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Arc<[u8]>> {
         if let Some(staged) = txn.staged_pages.get(&page_id).cloned() {
-            return Ok(staged);
+            return Ok(Arc::from(staged));
         }
 
         let reader = self.inner.wal.begin_reader()?;
@@ -942,7 +942,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(wal_page);
+            return Ok(Arc::from(wal_page));
         }
         self.inner.pager.read_page(page_id)
     }
@@ -961,7 +961,7 @@ impl Db {
     }
 
     /// Reads the latest visible version of a page.
-    pub fn read_page(&self, page_id: u32) -> Result<Vec<u8>> {
+    pub fn read_page(&self, page_id: u32) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         if let Some(staged) = self
             .inner
@@ -972,7 +972,7 @@ impl Db {
             .get(&page_id)
             .cloned()
         {
-            return Ok(staged);
+            return Ok(Arc::from(staged));
         }
 
         let reader = self.inner.wal.begin_reader()?;
@@ -982,7 +982,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(wal_page);
+            return Ok(Arc::from(wal_page));
         }
         self.inner.pager.read_page(page_id)
     }
@@ -1150,7 +1150,7 @@ impl Db {
     }
 
     /// Reads a page using a previously held snapshot token.
-    pub fn read_page_for_snapshot(&self, token: u64, page_id: u32) -> Result<Vec<u8>> {
+    pub fn read_page_for_snapshot(&self, token: u64, page_id: u32) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         let snapshot_lsn = self
             .inner
@@ -1166,7 +1166,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(wal_page);
+            return Ok(Arc::from(wal_page));
         }
         self.inner.pager.read_page(page_id)
     }
@@ -1469,6 +1469,7 @@ impl Db {
         }
 
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let runtime = self
             .inner
             .engine
@@ -1770,6 +1771,7 @@ impl Db {
         }
 
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let runtime = self
             .inner
             .engine
@@ -1813,6 +1815,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -1921,6 +1924,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -2194,6 +2198,7 @@ impl Db {
             return Ok(());
         }
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let mut runtime = self
             .inner
             .engine
@@ -2374,6 +2379,7 @@ impl Db {
 
     fn build_exclusive_sql_txn_state(&self) -> Result<ExclusiveSqlTxnState<'_>> {
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
         let runtime = self
             .inner
@@ -2478,6 +2484,7 @@ impl Db {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         self.engine_snapshot()
     }
 
@@ -2486,6 +2493,7 @@ impl Db {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         self.engine_snapshot()
     }
 
@@ -2565,6 +2573,34 @@ impl Db {
         Ok(())
     }
 
+    /// Materializes any table data that was deferred during `Db::open`.
+    ///
+    /// Fast path (no deferred tables): one read-lock check on the engine.
+    /// Slow path: drops the read lock, takes a write lock, loads all deferred
+    /// tables and rebuilds indexes, then releases.
+    fn ensure_deferred_tables_loaded(&self) -> Result<()> {
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            if !runtime.has_deferred_tables() {
+                return Ok(());
+            }
+        }
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.load_deferred_tables(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+        )
+    }
+
     fn current_schema_cookie(&self) -> Result<u32> {
         let page = self.read_page(page::HEADER_PAGE_ID)?;
         let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
@@ -2590,6 +2626,7 @@ impl Db {
 
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
 
         let mut runtime = self
@@ -4516,7 +4553,7 @@ mod tests {
             initial_page_count
         );
         assert_eq!(
-            db.read_page(page_id).expect("read staged page"),
+            db.read_page(page_id).expect("read staged page").to_vec(),
             vec![0_u8; db.config().page_size as usize]
         );
         db.rollback().expect("rollback write txn");

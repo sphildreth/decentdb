@@ -68,7 +68,7 @@ pub(crate) fn initialize_or_recover(
                 let base = if let Some(version) = index.latest_visible(frame.page_id, u64::MAX) {
                     version.data.clone()
                 } else {
-                    pager.read_page(frame.page_id)?
+                    pager.read_page(frame.page_id)?.to_vec()
                 };
                 let data = apply_page_delta(&base, &frame.payload)?;
                 pending.push((frame.page_id, data, next_offset));

@@ -40,7 +40,8 @@ pub(crate) fn seek_forward<S: PageStore>(
     };
     let (_, mut leaf) = descend_to_leaf(store, root_page_id, key)?;
     loop {
-        if let Some(index) = leaf.cells.iter().position(|cell| cell.key >= key) {
+        let index = leaf.cells.partition_point(|cell| cell.key < key);
+        if index < leaf.cells.len() {
             return Ok(Some(CursorPosition { leaf, index }));
         }
 
@@ -121,12 +122,12 @@ fn descend_to_leaf<S: PageStore>(
         match page {
             BtreePage::Leaf(leaf) => return Ok((page_id, leaf)),
             BtreePage::Internal(internal) => {
-                page_id = internal
-                    .cells
-                    .iter()
-                    .find(|cell| key < cell.key)
-                    .map(|cell| cell.child)
-                    .unwrap_or(internal.right_child);
+                let idx = internal.cells.partition_point(|cell| cell.key <= key);
+                page_id = if idx < internal.cells.len() {
+                    internal.cells[idx].child
+                } else {
+                    internal.right_child
+                };
             }
         }
     }

@@ -71,7 +71,10 @@ fn checkpoint_defers_truncation_when_snapshot_is_held_and_prunes_index() {
     let snapshot_page = db
         .read_page_for_snapshot(snapshot, 3)
         .expect("read page through held snapshot");
-    assert_eq!(snapshot_page, filled_page(db.config().page_size, 0x55));
+    assert_eq!(
+        snapshot_page.to_vec(),
+        filled_page(db.config().page_size, 0x55)
+    );
 
     let inspect = db
         .inspect_storage_state_json()
@@ -109,7 +112,10 @@ fn checkpoint_truncates_wal_without_readers_and_preserves_data() {
 
     let reopened = Db::open(&path, DbConfig::default()).expect("reopen database");
     assert_eq!(
-        reopened.read_page(3).expect("read page after checkpoint"),
+        reopened
+            .read_page(3)
+            .expect("read page after checkpoint")
+            .to_vec(),
         filled_page(reopened.config().page_size, 0x33)
     );
 
@@ -139,7 +145,10 @@ fn failed_commit_does_not_publish_uncommitted_pages_after_reopen() {
 
     let reopened = Db::open(&path, config).expect("reopen database");
     let visible = reopened.read_page(3).expect("read visible page");
-    assert_eq!(visible, filled_page(reopened.config().page_size, 0x22));
+    assert_eq!(
+        visible.to_vec(),
+        filled_page(reopened.config().page_size, 0x22)
+    );
 
     cleanup_db(&path);
 }
@@ -160,7 +169,10 @@ fn shared_wal_cross_connection_visibility_is_immediate() {
     writer.commit().expect("commit pages");
 
     let visible = reader.read_page(3).expect("read committed page");
-    assert_eq!(visible, filled_page(reader.config().page_size, 0x11));
+    assert_eq!(
+        visible.to_vec(),
+        filled_page(reader.config().page_size, 0x11)
+    );
 
     cleanup_db(&path);
 }
@@ -348,7 +360,7 @@ fn wal_index_keeps_only_latest_versions_without_readers() {
         "without active readers the WAL index should retain only the latest page image: {inspect}"
     );
     assert_eq!(
-        db.read_page(3).expect("read latest page"),
+        db.read_page(3).expect("read latest page").to_vec(),
         filled_page(db.config().page_size, 0x33)
     );
 

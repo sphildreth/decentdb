@@ -465,6 +465,10 @@ pub(crate) struct EngineRuntime {
     pub(crate) temp_schema_cookie: u32,
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
+    /// Tables whose row data has not yet been loaded from storage.
+    /// Populated during `decode_manifest_payload` and cleared by
+    /// `load_deferred_tables`.
+    pub(crate) deferred_tables: BTreeSet<String>,
     pub(crate) dirty_tables: BTreeSet<String>,
     pub(crate) append_only_dirty_tables: BTreeSet<String>,
     /// Row indices updated by prepared simple UPDATE; avoids full re-encode.
@@ -509,6 +513,7 @@ impl Clone for EngineRuntime {
             temp_schema_cookie: self.temp_schema_cookie,
             indexes: self.indexes.clone(),
             persisted_tables: self.persisted_tables.clone(),
+            deferred_tables: self.deferred_tables.clone(),
             // Preserve dirty state so that multi-statement transactions
             // (clone-and-replace) do not lose modifications from earlier
             // statements.  `persist_to_db` clears dirty state after a
@@ -544,6 +549,7 @@ impl EngineRuntime {
             temp_schema_cookie: 0,
             indexes: BTreeMap::new(),
             persisted_tables: BTreeMap::new(),
+            deferred_tables: BTreeSet::new(),
             dirty_tables: BTreeSet::new(),
             append_only_dirty_tables: BTreeSet::new(),
             row_update_dirty: BTreeMap::new(),
@@ -613,9 +619,70 @@ impl EngineRuntime {
             Self::empty(schema_cookie)
         };
         runtime.catalog.schema_cookie = schema_cookie;
-        runtime.rebuild_indexes(pager.page_size())?;
+        if runtime.deferred_tables.is_empty() {
+            runtime.rebuild_indexes(pager.page_size())?;
+        }
         drop(reader);
         Ok((runtime, snapshot_lsn))
+    }
+
+    /// Returns `true` when one or more tables still have their row data
+    /// deferred (not yet loaded from storage).
+    #[must_use]
+    pub(crate) fn has_deferred_tables(&self) -> bool {
+        !self.deferred_tables.is_empty()
+    }
+
+    /// Materializes all deferred table data from storage, then rebuilds
+    /// indexes.  After this call `deferred_tables` is empty and the runtime
+    /// is fully populated.
+    pub(crate) fn load_deferred_tables(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+    ) -> Result<()> {
+        if self.deferred_tables.is_empty() {
+            return Ok(());
+        }
+        let reader = wal.begin_reader()?;
+        let store = SnapshotPageStore {
+            pager,
+            wal,
+            snapshot_lsn: reader.snapshot_lsn(),
+        };
+        let table_names: Vec<String> = self.deferred_tables.iter().cloned().collect();
+        for table_name in &table_names {
+            let state = self.persisted_tables.get(table_name).ok_or_else(|| {
+                DbError::internal(format!(
+                    "deferred table '{table_name}' has no persisted state"
+                ))
+            })?;
+            let pointer = state.pointer;
+            let checksum = state.checksum;
+
+            let data = if pointer.head_page_id == 0 || pointer.logical_len == 0 {
+                TableData::default()
+            } else {
+                let payload = read_overflow(&store, pointer)?;
+                if crc32c_parts(&[payload.as_slice()]) != checksum {
+                    return Err(DbError::corruption(format!(
+                        "table payload checksum mismatch for {table_name}"
+                    )));
+                }
+                decode_table_payload(&payload)?
+            };
+
+            if let Some(ps) = self.persisted_tables.get_mut(table_name) {
+                ps.row_count = data.rows.len();
+                ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
+            }
+            self.tables.insert(table_name.clone(), data);
+        }
+        self.deferred_tables.clear();
+        drop(reader);
+        self.rebuild_indexes(page_size)?;
+        Ok(())
     }
 
     pub(crate) fn persist_to_db(&mut self, db: &crate::db::Db) -> Result<()> {
@@ -5222,9 +5289,9 @@ impl PageStore for SnapshotPageStore<'_> {
         ))
     }
 
-    fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         if let Some(page) = self.wal.read_page_at_snapshot(page_id, self.snapshot_lsn)? {
-            Ok(page)
+            Ok(Arc::from(page))
         } else {
             self.pager.read_page(page_id)
         }
@@ -5255,7 +5322,7 @@ impl PageStore for DbTxnPageStore<'_> {
         self.db.free_page(page_id)
     }
 
-    fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         self.db.read_page(page_id)
     }
 
@@ -6109,8 +6176,8 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
 
 fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     let mut cursor = Cursor::new(bytes);
-    let magic = cursor.read_bytes(9)?;
-    if magic.as_slice() != LEGACY_RUNTIME_PAYLOAD_MAGIC {
+    let magic = cursor.read_slice(9)?;
+    if magic != LEGACY_RUNTIME_PAYLOAD_MAGIC {
         return Err(DbError::corruption("catalog state magic is invalid"));
     }
     let mut runtime = EngineRuntime::empty(cursor.read_u32()?);
@@ -6180,10 +6247,12 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
         let mut data = TableData::default();
         for _ in 0..row_count {
             let row_id = cursor.read_i64()?;
-            let row = Row::decode(&cursor.read_vec()?)?;
+            let row_bytes_len = cursor.read_u32()? as usize;
+            let row_bytes = cursor.read_slice(row_bytes_len)?;
+            let row = Row::decode(row_bytes)?;
             data.rows.push(StoredRow {
                 row_id,
-                values: row.values().to_vec(),
+                values: row.into_values(),
             });
         }
         runtime.catalog.tables.insert(table_name.clone(), table);
@@ -6421,10 +6490,10 @@ fn patch_manifest_table_state(
     Ok(())
 }
 
-fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
+fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
     let mut cursor = Cursor::new(bytes);
-    let magic = cursor.read_bytes(MANIFEST_PAYLOAD_MAGIC.len())?;
-    if magic.as_slice() != MANIFEST_PAYLOAD_MAGIC {
+    let magic = cursor.read_slice(MANIFEST_PAYLOAD_MAGIC.len())?;
+    if magic != MANIFEST_PAYLOAD_MAGIC {
         return Err(DbError::corruption("catalog manifest magic is invalid"));
     }
     let mut runtime = EngineRuntime::empty(cursor.read_u32()?);
@@ -6490,7 +6559,7 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
         }
         table.primary_key_columns = cursor.read_strings()?;
         table.next_row_id = cursor.read_i64()?;
-        let mut state = PersistedTableState {
+        let state = PersistedTableState {
             checksum: cursor.read_u32()?,
             pointer: OverflowPointer {
                 head_page_id: cursor.read_u32()?,
@@ -6501,21 +6570,16 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
             tail: OverflowTailInfo::default(),
         };
         runtime.catalog.tables.insert(table_name.clone(), table);
-        let data = if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
-            TableData::default()
-        } else {
-            let payload = read_overflow(store, state.pointer)?;
-            if crc32c_parts(&[payload.as_slice()]) != state.checksum {
-                return Err(DbError::corruption(format!(
-                    "table payload checksum mismatch for {table_name}"
-                )));
-            }
-            decode_table_payload(&payload)?
-        };
-        state.row_count = data.rows.len();
-        state.tail = read_uncompressed_overflow_tail(store, state.pointer)?.unwrap_or_default();
+        let has_data = state.pointer.head_page_id != 0 && state.pointer.logical_len != 0;
+        if has_data {
+            // Defer row data loading to first statement execution.
+            runtime.deferred_tables.insert(table_name.clone());
+        }
         runtime.persisted_tables.insert(table_name.clone(), state);
-        runtime.tables.insert(table_name, data);
+        if !has_data {
+            // Empty tables are immediately available.
+            runtime.tables.insert(table_name, TableData::default());
+        }
     }
 
     let index_count = cursor.read_u32()?;
@@ -6807,8 +6871,8 @@ fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
         return Ok(TableData::default());
     }
     let mut cursor = Cursor::new(bytes);
-    let magic = cursor.read_bytes(TABLE_PAYLOAD_MAGIC.len())?;
-    if magic.as_slice() != TABLE_PAYLOAD_MAGIC {
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
         return Err(DbError::corruption("table payload magic is invalid"));
     }
     let row_count = cursor.read_u32()? as usize;
@@ -6816,10 +6880,12 @@ fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
     data.rows.reserve(row_count);
     while cursor.offset < cursor.bytes.len() {
         let row_id = cursor.read_i64()?;
-        let row = Row::decode(&cursor.read_vec()?)?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes = cursor.read_slice(row_bytes_len)?;
+        let row = Row::decode(row_bytes)?;
         data.rows.push(StoredRow {
             row_id,
-            values: row.values().to_vec(),
+            values: row.into_values(),
         });
     }
     if data.rows.len() < row_count {
@@ -7175,7 +7241,7 @@ impl<'a> Cursor<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8]> {
         let end = self
             .offset
             .checked_add(len)
@@ -7185,7 +7251,7 @@ impl<'a> Cursor<'a> {
             .get(self.offset..end)
             .ok_or_else(|| DbError::corruption("truncated catalog state"))?;
         self.offset = end;
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -7202,25 +7268,23 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        let bytes = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes(
-            bytes.as_slice().try_into().expect("u32"),
-        ))
+        let bytes = self.read_slice(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("u32")))
     }
 
     fn read_i64(&mut self) -> Result<i64> {
-        let bytes = self.read_bytes(8)?;
-        Ok(i64::from_le_bytes(
-            bytes.as_slice().try_into().expect("i64"),
-        ))
+        let bytes = self.read_slice(8)?;
+        Ok(i64::from_le_bytes(bytes.try_into().expect("i64")))
     }
 
     fn read_string(&mut self) -> Result<String> {
         let len = self.read_u32()? as usize;
-        let bytes = self.read_bytes(len)?;
-        String::from_utf8(bytes).map_err(|error| {
-            DbError::corruption(format!("catalog state string is not valid UTF-8: {error}"))
-        })
+        let bytes = self.read_slice(len)?;
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_owned())
+            .map_err(|error| {
+                DbError::corruption(format!("catalog state string is not valid UTF-8: {error}"))
+            })
     }
 
     fn read_optional_string(&mut self) -> Result<Option<String>> {
@@ -7234,11 +7298,6 @@ impl<'a> Cursor<'a> {
     fn read_strings(&mut self) -> Result<Vec<String>> {
         let len = self.read_u32()? as usize;
         (0..len).map(|_| self.read_string()).collect()
-    }
-
-    fn read_vec(&mut self) -> Result<Vec<u8>> {
-        let len = self.read_u32()? as usize;
-        self.read_bytes(len)
     }
 }
 
@@ -13679,8 +13738,19 @@ mod tests {
         let decoded = decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
 
         assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
-        assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
-        assert_eq!(decoded.persisted_tables["docs"], table_states["docs"]);
+        // Table data is deferred — "docs" should not be in tables yet.
+        assert!(decoded.deferred_tables.contains("docs"));
+        assert!(!decoded.tables.contains_key("docs"));
+        // Schema and persisted state (pointer, checksum) are available immediately.
+        assert!(decoded.catalog.tables.contains_key("docs"));
+        assert_eq!(
+            decoded.persisted_tables["docs"].pointer,
+            table_states["docs"].pointer
+        );
+        assert_eq!(
+            decoded.persisted_tables["docs"].checksum,
+            table_states["docs"].checksum
+        );
     }
 
     #[test]

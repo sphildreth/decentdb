@@ -46,7 +46,7 @@ impl PagerHandle {
         })
     }
 
-    pub(crate) fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    pub(crate) fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         let handle = self
             .inner
@@ -351,8 +351,8 @@ mod tests {
         let first = pager.read_page(3).expect("first read");
         let second = pager.read_page(3).expect("second read");
 
-        assert_eq!(first, payload);
-        assert_eq!(second, payload);
+        assert_eq!(first.to_vec(), payload);
+        assert_eq!(second.to_vec(), payload);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
@@ -412,7 +412,10 @@ mod tests {
                 .expect("file size after rewrite"),
             original_len
         );
-        assert_eq!(pager.read_page(4).expect("read page four"), page_four);
+        assert_eq!(
+            pager.read_page(4).expect("read page four").to_vec(),
+            page_four
+        );
     }
 
     #[derive(Debug)]
@@ -544,6 +547,6 @@ mod tests {
         let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
 
         let data = pager.read_page(100).expect("read beyond");
-        assert_eq!(data, page::zeroed_page(page::DEFAULT_PAGE_SIZE));
+        assert_eq!(data.to_vec(), page::zeroed_page(page::DEFAULT_PAGE_SIZE));
     }
 }
