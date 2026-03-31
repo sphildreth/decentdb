@@ -48,6 +48,7 @@ pub(crate) struct SharedWalInner {
 #[derive(Debug, Default)]
 pub(crate) struct WalWriteState {
     pub(crate) page_batch: Vec<u8>,
+    pub(crate) prepared_pages: Vec<(PageId, Vec<u8>, usize)>,
 }
 
 impl WalHandle {

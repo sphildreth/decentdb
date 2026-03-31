@@ -475,6 +475,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) index_state_epoch: u64,
     manifest_template: Option<ManifestTemplate>,
     overflow_chain_caches: BTreeMap<String, OverflowChainCache>,
+    manifest_chain_cache: Option<OverflowChainCache>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -525,6 +526,7 @@ impl Clone for EngineRuntime {
             // Optimization caches rebuilt on demand during persist.
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
+            manifest_chain_cache: None,
         }
     }
 }
@@ -550,6 +552,7 @@ impl EngineRuntime {
             index_state_epoch: 0,
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
+            manifest_chain_cache: None,
         }
     }
 
@@ -768,6 +771,9 @@ impl EngineRuntime {
         }
 
         let (checksum, pointer) = {
+            // Take the chain cache to avoid overlapping borrows with
+            // manifest_payload (which mutates self.manifest_template).
+            let chain_cache = self.manifest_chain_cache.take();
             let manifest = self.manifest_payload()?;
             let checksum = crc32c_parts(&[manifest]);
             let previous_manifest_pointer = old_root.map_or(
@@ -780,12 +786,27 @@ impl EngineRuntime {
             );
             let pointer = {
                 let mut store = DbTxnPageStore { db };
-                rewrite_overflow(
-                    &mut store,
-                    previous_manifest_pointer,
-                    manifest,
-                    CompressionMode::Never,
-                )?
+                if let Some(chain_cache) = chain_cache {
+                    let (ptr, new_cache, _tail) = rewrite_overflow_cached(
+                        &mut store,
+                        previous_manifest_pointer,
+                        manifest,
+                        &chain_cache.page_ids,
+                        0,
+                    )?;
+                    self.manifest_chain_cache = Some(new_cache);
+                    ptr
+                } else {
+                    let ptr = rewrite_overflow(
+                        &mut store,
+                        previous_manifest_pointer,
+                        manifest,
+                        CompressionMode::Never,
+                    )?;
+                    let cache = build_overflow_chain_cache(&store, ptr.head_page_id)?;
+                    self.manifest_chain_cache = Some(cache);
+                    ptr
+                }
             };
             (checksum, pointer)
         };
