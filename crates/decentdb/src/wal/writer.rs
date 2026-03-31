@@ -38,21 +38,15 @@ pub(crate) fn commit_pages(
     let page_frame_len = FRAME_HEADER_SIZE + wal.inner.page_size as usize + FRAME_TRAILER_SIZE;
     let page_batch = &mut writer_state.page_batch;
     page_batch.clear();
-    page_batch.reserve(page_frame_len * pages.len());
+    page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
     for (page_id, payload) in &pages {
         append_page_frame(page_batch, *page_id, payload, wal.inner.page_size)?;
     }
     let commit_start_lsn = offset;
-    let metadata_changed = ensure_capacity(
-        wal,
-        offset + page_batch.len() as u64 + COMMIT_FRAME_BYTES.len() as u64,
-    )?;
-    if !page_batch.is_empty() {
-        write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
-        offset += page_batch.len() as u64;
-    }
-    write_all_at(wal.inner.file.as_ref(), offset, &COMMIT_FRAME_BYTES)?;
-    offset += COMMIT_FRAME_BYTES.len() as u64;
+    page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
+    let metadata_changed = ensure_capacity(wal, offset + page_batch.len() as u64)?;
+    write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
+    offset += page_batch.len() as u64;
 
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
     sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
@@ -112,21 +106,15 @@ pub(crate) fn commit_pages_if_latest(
     let page_frame_len = FRAME_HEADER_SIZE + wal.inner.page_size as usize + FRAME_TRAILER_SIZE;
     let page_batch = &mut writer_state.page_batch;
     page_batch.clear();
-    page_batch.reserve(page_frame_len * pages.len());
+    page_batch.reserve(page_frame_len * pages.len() + COMMIT_FRAME_BYTES.len());
     for (page_id, payload) in &pages {
         append_page_frame(page_batch, *page_id, payload, wal.inner.page_size)?;
     }
     let commit_start_lsn = offset;
-    let metadata_changed = ensure_capacity(
-        wal,
-        offset + page_batch.len() as u64 + COMMIT_FRAME_BYTES.len() as u64,
-    )?;
-    if !page_batch.is_empty() {
-        write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
-        offset += page_batch.len() as u64;
-    }
-    write_all_at(wal.inner.file.as_ref(), offset, &COMMIT_FRAME_BYTES)?;
-    offset += COMMIT_FRAME_BYTES.len() as u64;
+    page_batch.extend_from_slice(&COMMIT_FRAME_BYTES);
+    let metadata_changed = ensure_capacity(wal, offset + page_batch.len() as u64)?;
+    write_all_at(wal.inner.file.as_ref(), offset, page_batch)?;
+    offset += page_batch.len() as u64;
 
     recovery::persist_header(&wal.inner.file, wal.inner.page_size, offset)?;
     sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
@@ -231,11 +219,14 @@ fn append_page_frame(
             page_size
         )));
     }
-    output.push(FrameType::Page as u8);
-    output.extend_from_slice(&page_id.to_le_bytes());
-    output.extend_from_slice(payload);
-    output.extend_from_slice(&0_u64.to_le_bytes());
-    Ok(FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE)
+    let frame_len = FRAME_HEADER_SIZE + payload.len() + FRAME_TRAILER_SIZE;
+    let start = output.len();
+    output.resize(start + frame_len, 0);
+    output[start] = FrameType::Page as u8;
+    output[start + 1..start + FRAME_HEADER_SIZE].copy_from_slice(&page_id.to_le_bytes());
+    let payload_start = start + FRAME_HEADER_SIZE;
+    output[payload_start..payload_start + payload.len()].copy_from_slice(payload);
+    Ok(frame_len)
 }
 
 #[cfg(test)]

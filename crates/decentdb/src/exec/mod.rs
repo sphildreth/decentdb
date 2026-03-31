@@ -798,7 +798,7 @@ impl EngineRuntime {
                 pointer,
             },
         );
-        db.write_page(page::CATALOG_ROOT_PAGE_ID, &root_page)?;
+        db.write_page_owned(page::CATALOG_ROOT_PAGE_ID, root_page)?;
         self.dirty_tables.clear();
         self.append_only_dirty_tables.clear();
         self.row_update_dirty.clear();
@@ -5132,6 +5132,10 @@ impl PageStore for DbTxnPageStore<'_> {
 
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
         self.db.write_page(page_id, data)
+    }
+
+    fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
+        self.db.write_page_owned(page_id, data)
     }
 }
 

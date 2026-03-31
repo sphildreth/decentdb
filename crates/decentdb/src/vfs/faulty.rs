@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use crate::error::{DbError, Result};
+use crate::storage::page::SUPPORTED_PAGE_SIZES;
+use crate::wal::format::{FrameType, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 
 use super::{FileKind, OpenMode, Vfs, VfsFile};
 
@@ -379,19 +381,50 @@ fn classify_write(kind: FileKind, offset: u64, buf: &[u8]) -> &'static str {
                 "db.write_page"
             }
         }
-        FileKind::Wal => {
-            if offset == 0 && buf.len() == 32 {
-                "wal.write_header"
-            } else {
-                match buf.first().copied() {
-                    Some(0) => "wal.write_frame",
-                    Some(1) => "wal.write_commit",
-                    Some(2) => "wal.write_checkpoint",
-                    _ => "wal.write",
-                }
-            }
-        }
+        FileKind::Wal => classify_wal_write(offset, buf),
     }
+}
+
+fn classify_wal_write(offset: u64, buf: &[u8]) -> &'static str {
+    if offset == 0 && buf.len() == WAL_HEADER_SIZE as usize {
+        return "wal.write_header";
+    }
+    if is_combined_commit_write(buf) {
+        return "wal.write_commit";
+    }
+    match buf.first().copied() {
+        Some(frame_type) if frame_type == FrameType::Page as u8 => "wal.write_frame",
+        Some(frame_type) if frame_type == FrameType::Commit as u8 => "wal.write_commit",
+        Some(frame_type) if frame_type == FrameType::Checkpoint as u8 => "wal.write_checkpoint",
+        _ => "wal.write",
+    }
+}
+
+fn is_combined_commit_write(buf: &[u8]) -> bool {
+    let control_frame_len = FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE;
+    let Some(commit_start) = buf.len().checked_sub(control_frame_len) else {
+        return false;
+    };
+    if commit_start == 0 {
+        return false;
+    }
+    if buf[commit_start] != FrameType::Commit as u8 {
+        return false;
+    }
+    if buf[commit_start + 1..].iter().any(|byte| *byte != 0) {
+        return false;
+    }
+
+    let prefix = &buf[..commit_start];
+    SUPPORTED_PAGE_SIZES.iter().copied().any(|page_size| {
+        let frame_len = FRAME_HEADER_SIZE + page_size as usize + FRAME_TRAILER_SIZE;
+        if !prefix.len().is_multiple_of(frame_len) {
+            return false;
+        }
+        prefix
+            .chunks_exact(frame_len)
+            .all(|frame| frame.first().copied() == Some(FrameType::Page as u8))
+    })
 }
 
 #[cfg(test)]
@@ -400,6 +433,7 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use crate::vfs::{write_all_at, FileKind, OpenMode, Vfs};
+    use crate::wal::format::{FrameType, FRAME_HEADER_SIZE, FRAME_TRAILER_SIZE, WAL_HEADER_SIZE};
 
     use super::{
         clear_failpoints, failpoint_logs, install_failpoint, FailAction, Failpoint, FaultyVfs,
@@ -579,6 +613,17 @@ mod tests {
         );
         f0[0] = 3;
         assert_eq!(super::classify_write(FileKind::Wal, 10, &f0), "wal.write");
+
+        let page_frame_len = FRAME_HEADER_SIZE
+            + crate::storage::page::DEFAULT_PAGE_SIZE as usize
+            + FRAME_TRAILER_SIZE;
+        let mut combined = vec![0_u8; page_frame_len + FRAME_HEADER_SIZE + FRAME_TRAILER_SIZE];
+        combined[0] = FrameType::Page as u8;
+        combined[page_frame_len] = FrameType::Commit as u8;
+        assert_eq!(
+            super::classify_write(FileKind::Wal, WAL_HEADER_SIZE, &combined),
+            "wal.write_commit"
+        );
 
         clear_failpoints().expect("clear failpoints");
     }

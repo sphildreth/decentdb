@@ -119,8 +119,11 @@ impl SqlTransaction<'_> {
             .take()
             .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
         let result = if state.persistent_changed {
-            self.db
-                .persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
+            self.db.persist_runtime_if_latest(
+                state.runtime,
+                Some(state.base_lsn),
+                state.indexes_maybe_stale,
+            )
         } else {
             self.db
                 .install_temp_runtime(state.runtime)
@@ -182,8 +185,6 @@ struct DbInner {
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
-    /// Pre-built transaction state cloned while cache is warm post-commit.
-    pre_built_txn: Mutex<Option<Box<SqlTxnState>>>,
 }
 
 impl Drop for DbInner {
@@ -256,6 +257,7 @@ struct SqlTxnState {
     runtime: EngineRuntime,
     base_lsn: u64,
     persistent_changed: bool,
+    indexes_maybe_stale: bool,
     savepoints: Vec<SqlSavepoint>,
 }
 
@@ -271,6 +273,7 @@ struct SqlSavepoint {
     name: String,
     runtime: EngineRuntime,
     persistent_changed: bool,
+    indexes_maybe_stale: bool,
 }
 
 const STATEMENT_CACHE_CAPACITY: usize = 128;
@@ -533,7 +536,11 @@ impl Db {
             self.install_temp_runtime(state.runtime)?;
             return Ok(state.base_lsn);
         }
-        self.persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
+        self.persist_runtime_if_latest(
+            state.runtime,
+            Some(state.base_lsn),
+            state.indexes_maybe_stale,
+        )
     }
 
     /// Rolls back the current explicit SQL transaction.
@@ -588,6 +595,7 @@ impl Db {
             name: canonical_savepoint_name(name),
             runtime: state.runtime.clone(),
             persistent_changed: state.persistent_changed,
+            indexes_maybe_stale: state.indexes_maybe_stale,
         });
         Ok(())
     }
@@ -642,6 +650,7 @@ impl Db {
             .ok_or_else(|| DbError::transaction(format!("savepoint {name} does not exist")))?;
         state.runtime = state.savepoints[index].runtime.clone();
         state.persistent_changed = state.savepoints[index].persistent_changed;
+        state.indexes_maybe_stale = state.savepoints[index].indexes_maybe_stale;
         state.savepoints.truncate(index + 1);
         Ok(())
     }
@@ -751,6 +760,29 @@ impl Db {
             ));
         }
         txn.staged_pages.insert(page_id, data.to_vec());
+        Ok(())
+    }
+
+    pub(crate) fn write_page_owned(&self, page_id: u32, data: Vec<u8>) -> Result<()> {
+        page::validate_page_id(page_id)?;
+        if data.len() != self.inner.config.page_size as usize {
+            return Err(DbError::internal(format!(
+                "page {page_id} write length {} does not match configured page size {}",
+                data.len(),
+                self.inner.config.page_size
+            )));
+        }
+        let mut txn = self
+            .inner
+            .write_txn
+            .lock()
+            .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
+        if !txn.active {
+            return Err(DbError::transaction(
+                "write_page requires an active write transaction",
+            ));
+        }
+        txn.staged_pages.insert(page_id, data);
         Ok(())
     }
 
@@ -1393,7 +1425,6 @@ impl Db {
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
-                pre_built_txn: Mutex::new(None),
             }),
         })
     }
@@ -2143,10 +2174,6 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
-        // Invalidate pre-built txn — autocommit changed engine state.
-        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
-            *pre_built = None;
-        }
         Ok(result)
     }
 
@@ -2182,10 +2209,6 @@ impl Db {
 
     fn install_temp_runtime(&self, runtime: EngineRuntime) -> Result<()> {
         self.sync_temp_state_from_runtime(&runtime)?;
-        // Invalidate pre-built txn — engine state changed.
-        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
-            *pre_built = None;
-        }
         let mut guard = self
             .inner
             .engine
@@ -2293,24 +2316,25 @@ impl Db {
     }
 
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
-        self.persist_runtime_if_latest(runtime, None)
+        self.persist_runtime_if_latest(runtime, None, true)
     }
 
     fn persist_runtime_if_latest(
         &self,
         runtime: EngineRuntime,
         expected_latest_lsn: Option<u64>,
+        rebuild_stale_indexes: bool,
     ) -> Result<u64> {
         let mut runtime = runtime;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
-        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        if rebuild_stale_indexes {
+            runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
             return Err(error);
         }
-        // Clone runtime while cache is warm (before commit/fdatasync cools it).
-        let pre_runtime = runtime.clone();
         let committed_lsn = match expected_latest_lsn {
             Some(expected) => self.commit_if_latest(expected),
             None => self.commit(),
@@ -2336,19 +2360,6 @@ impl Db {
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
         drop(guard);
-
-        // Store pre-built transaction state for the next BEGIN.
-        let mut pre_runtime = pre_runtime;
-        if self.apply_temp_state_to_runtime(&mut pre_runtime).is_ok() {
-            if let Ok(mut pre_built_guard) = self.inner.pre_built_txn.lock() {
-                *pre_built_guard = Some(Box::new(SqlTxnState {
-                    runtime: pre_runtime,
-                    base_lsn: committed_lsn,
-                    persistent_changed: false,
-                    savepoints: Vec::new(),
-                }));
-            }
-        }
 
         Ok(committed_lsn)
     }
@@ -2385,7 +2396,9 @@ impl Db {
         };
 
         let mut snapshot = state.runtime.clone();
-        snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
+        if state.indexes_maybe_stale {
+            snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
         Ok(Some(snapshot))
     }
 
@@ -2399,10 +2412,6 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(restored_lsn, Ordering::Release);
-        // Invalidate pre-built txn — engine state reloaded.
-        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
-            *pre_built = None;
-        }
         Ok(())
     }
 
@@ -2474,15 +2483,6 @@ impl Db {
         self.refresh_engine_from_storage()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
 
-        // Reuse pre-built transaction state if LSN matches (cache-warm clone).
-        if let Ok(mut pre_built_guard) = self.inner.pre_built_txn.lock() {
-            if let Some(pre_built) = pre_built_guard.take() {
-                if pre_built.base_lsn == current_lsn {
-                    return Ok(*pre_built);
-                }
-            }
-        }
-
         let mut runtime = self
             .inner
             .engine
@@ -2494,6 +2494,7 @@ impl Db {
             runtime,
             base_lsn: current_lsn,
             persistent_changed: false,
+            indexes_maybe_stale: false,
             savepoints: Vec::new(),
         })
     }
@@ -2595,6 +2596,7 @@ impl Db {
         let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
         state.runtime = working;
         state.persistent_changed |= !temp_only;
+        state.indexes_maybe_stale = true;
         Ok(result)
     }
 
@@ -2650,6 +2652,7 @@ impl Db {
         let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
         state.runtime = working;
         state.persistent_changed |= !temp_only;
+        state.indexes_maybe_stale = true;
         Ok(result)
     }
 

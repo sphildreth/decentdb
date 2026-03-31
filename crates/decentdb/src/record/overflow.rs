@@ -451,12 +451,12 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
             new_pages[index][0..4].copy_from_slice(&new_page_ids[index + 1].to_le_bytes());
         }
 
-        store.write_page(previous_tail.page_id, &tail_page)?;
-        for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages.iter()) {
-            store.write_page(new_page_id, new_page)?;
+        store.write_page_owned(previous_tail.page_id, tail_page)?;
+        for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages.into_iter()) {
+            store.write_page_owned(new_page_id, new_page)?;
         }
     } else {
-        store.write_page(previous_tail.page_id, &tail_page)?;
+        store.write_page_owned(previous_tail.page_id, tail_page)?;
     }
 
     Ok((
@@ -601,13 +601,16 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
     let checksum = crc32c_parts(&checksum_parts);
 
     if tail_index == 0 {
-        store.write_page(page_ids[0], &pages[0])?;
+        store.write_page_owned(page_ids[0], pages.swap_remove(0))?;
     } else {
-        store.write_page(page_ids[0], &pages[0])?;
-        store.write_page(page_ids[tail_index], &pages[tail_index])?;
+        let tail_page_id = page_ids[tail_index];
+        let tail_page = pages.swap_remove(tail_index);
+        let head_page = pages.swap_remove(0);
+        store.write_page_owned(page_ids[0], head_page)?;
+        store.write_page_owned(tail_page_id, tail_page)?;
     }
-    for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages.iter()) {
-        store.write_page(new_page_id, new_page)?;
+    for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages.into_iter()) {
+        store.write_page_owned(new_page_id, new_page)?;
     }
 
     Ok((
@@ -728,8 +731,9 @@ fn collect_chain_pages<S: PageStore>(
         if page.len() < OVERFLOW_HEADER_SIZE {
             return Err(DbError::corruption("overflow page shorter than header"));
         }
-        pages.push((page_id, page.clone()));
-        page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        pages.push((page_id, page));
+        page_id = next_page_id;
     }
 
     Ok(pages)
@@ -780,7 +784,7 @@ fn write_chain_pages<S: PageStore>(
                 continue;
             }
         }
-        store.write_page(page_id, &page)?;
+        store.write_page_owned(page_id, page)?;
     }
     Ok(())
 }

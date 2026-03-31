@@ -45,6 +45,10 @@ pub(crate) trait PageStore: std::fmt::Debug {
     fn free_page(&mut self, page_id: PageId) -> Result<()>;
     fn read_page(&self, page_id: PageId) -> Result<Vec<u8>>;
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()>;
+
+    fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
+        self.write_page(page_id, &data)
+    }
 }
 
 /// Simple in-memory page store used by the Phase 2 record, B+Tree, and search
@@ -132,6 +136,19 @@ impl PageStore for InMemoryPageStore {
             )));
         }
         self.pages.insert(page_id, data.to_vec());
+        Ok(())
+    }
+
+    fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
+        validate_page_id(page_id)?;
+        if data.len() != self.page_size as usize {
+            return Err(DbError::internal(format!(
+                "page {page_id} write length {} does not match configured page size {}",
+                data.len(),
+                self.page_size
+            )));
+        }
+        self.pages.insert(page_id, data);
         Ok(())
     }
 }
