@@ -33,7 +33,8 @@
     <None Include="README.md" Pack="true" PackagePath="README.md" />
     <None Include="icon.png" Pack="true" PackagePath="\" />
     <None Include="$(DecentDBLinuxRuntimeAssetSource)" Pack="true" PackagePath="runtimes/linux-x64/native/libdecentdb.so" Condition="'$(DecentDBLinuxRuntimeAssetSource)' != '' and Exists('$(DecentDBLinuxRuntimeAssetSource)')" />
-    <None Include="$(DecentDBMacRuntimeAssetSource)" Pack="true" PackagePath="runtimes/osx-x64/native/libdecentdb.dylib" Condition="'$(DecentDBMacRuntimeAssetSource)' != '' and Exists('$(DecentDBMacRuntimeAssetSource)')" />
+    <None Include="$(DecentDBLinuxArm64RuntimeAssetSource)" Pack="true" PackagePath="runtimes/linux-arm64/native/libdecentdb.so" Condition="'$(DecentDBLinuxArm64RuntimeAssetSource)' != '' and Exists('$(DecentDBLinuxArm64RuntimeAssetSource)')" />
+    <None Include="$(DecentDBMacRuntimeAssetSource)" Pack="true" PackagePath="runtimes/osx-arm64/native/libdecentdb.dylib" Condition="'$(DecentDBMacRuntimeAssetSource)' != '' and Exists('$(DecentDBMacRuntimeAssetSource)')" />
     <None Include="$(DecentDBWindowsRuntimeAssetSource)" Pack="true" PackagePath="runtimes/win-x64/native/decentdb.dll" Condition="'$(DecentDBWindowsRuntimeAssetSource)' != '' and Exists('$(DecentDBWindowsRuntimeAssetSource)')" />
   </ItemGroup>
 
