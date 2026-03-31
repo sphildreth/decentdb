@@ -1,6 +1,6 @@
 # DecentDB Benchmark User Guide
 
-Last updated: March 29, 2026
+Last updated: March 31, 2026
 
 This guide explains how to use `decentdb-benchmark` as the primary macro benchmark tool for DecentDB.
 
@@ -101,7 +101,115 @@ It is JSON-first. The source of truth is machine-readable artifacts under `build
 
 Reports are renderers over those artifacts. They do not recalculate benchmark logic.
 
-## 2. Prerequisites
+## 2. Alignment with DecentDB Product Tenets
+
+The benchmark tool is designed to validate and track progress against the 7 core tenets defined in `design/PRD.md`. Every scenario and metric should be understood in the context of these product pillars:
+
+### 2.1 Tenet #1: ACID Compliance is Foremost
+
+**PRD Principle:** Data integrity is non-negotiable. The engine must survive sudden power loss, kernel panics, and process crashes without corruption.
+
+**Benchmark Coverage:**
+- `durable_commit_single` — validates single-row durable write latency and correctness
+- `durable_commit_batch` — validates batch write durability and atomicity
+- `recovery_reopen` — validates crash recovery and database reopen integrity
+- `checkpoint` — validates checkpoint correctness and WAL truncation
+
+**Key Metrics:** `commit_latency_us`, `recovery_time_ms`, `wal_bytes_flushed`, `checkpoint_duration_ms`
+
+**Interpretation:** Regressions in durability scenarios are critical. A performance improvement that compromises durability is unacceptable. Always verify that durability metrics remain within acceptable bounds when optimizing write paths.
+
+### 2.2 Tenet #2: Uncompromising Performance
+
+**PRD Principle:** Performance must beat SQLite on all fronts. Zero-copy deserialization, lock-free snapshot isolation, optimized WAL appending.
+
+**Benchmark Coverage:**
+- `point_lookup_warm` — validates read performance with hot cache
+- `point_lookup_cold` — validates read performance with cold cache
+- `range_scan_warm` — validates sequential read throughput
+- `read_under_write` — validates concurrent reader performance under write load
+
+**Key Metrics:** `point_lookup_latency_us`, `range_scan_throughput_rows_per_sec`, `read_under_write_p50_us`, `read_under_write_p99_us`
+
+**Interpretation:** These metrics directly measure competitive positioning. Use `compare` to track progress against baselines and targets. The `optimization_opportunities` ranking helps prioritize work that closes gaps to target performance.
+
+### 2.3 Tenet #3: Minimal Disk Footprint
+
+**PRD Principle:** File size on disk must be optimized. Explicit byte-aligned layouts, efficient B-Tree node packing.
+
+**Benchmark Coverage:**
+- `storage_efficiency` — measures bytes per row, page utilization, and overhead ratios
+- `inspect-storage` command — detailed page-level attribution for any `.ddb` file
+
+**Key Metrics:** `bytes_per_row`, `page_utilization_percent`, `overflow_page_count`, `wal_overhead_bytes`
+
+**Interpretation:** Storage efficiency improvements compound over large datasets. Use `inspect-storage` to diagnose bloat from overflow pages, low page utilization, or WAL accumulation.
+
+### 2.4 Tenet #4: World-Class Documentation
+
+**PRD Principle:** Documentation must be accurate, continuously updated, and contain helpful examples.
+
+**Benchmark Coverage:** This guide itself is part of the documentation tenet. Benchmark artifacts (`summary.json`, compare JSON) are machine-readable and can be incorporated into documentation, CI reports, and dashboards.
+
+**Interpretation:** When adding new scenarios or metrics, update this guide and ensure the `report` command produces clear, actionable output for both human and agent audiences.
+
+### 2.5 Tenet #5: Best-in-Class Tooling & Bindings
+
+**PRD Principle:** DecentDB must feel native in modern tech stacks. Python, .NET, Go, Java, Node.js, Dart.
+
+**Benchmark Coverage:** The benchmark tool itself is a reference CLI application. Binding-specific benchmarks live in `bindings/*/benchmarks/` and should use consistent patterns.
+
+**Interpretation:** When engine changes affect binding performance, run binding-specific benchmarks in addition to core engine benchmarks. The C ABI boundary (`include/decentdb.h`) is the stable contract that bindings rely on.
+
+### 2.6 Tenet #6: Fantastic CLI Experience
+
+**PRD Principle:** The CLI must provide best-in-class UX with rich terminal formatting, helpful errors, and easy import/export.
+
+**Benchmark Coverage:** The `decentdb-benchmark` CLI demonstrates good CLI practices:
+- Clear subcommand structure (`run`, `compare`, `baseline`, `report`, `inspect-storage`)
+- Deterministic, parseable output (`run_id=`, `summary=`, `compare_id=`)
+- Helpful error messages with actionable fixes
+- Multiple output formats (`text`, `markdown`, `html`)
+- Audience-aware reporting (`human`, `agent_brief`)
+
+**Interpretation:** CLI improvements should maintain these patterns. New commands should follow the same JSON-first artifact model.
+
+### 2.7 Tenet #7: Fast Developer Feedback Loop
+
+**PRD Principle:** CI/CD must respect developer time. PR checks under 10 minutes. Long-running tests moved to nightly.
+
+**Benchmark Coverage:**
+- `smoke` profile — designed for fast PR validation (~seconds to minutes)
+- `dev` profile — balanced for local development iteration
+- `nightly` profile — comprehensive for overnight CI runs
+
+**Interpretation:**
+- Use `--profile smoke` for PR checks and quick validation
+- Use `--profile dev` for local development iteration
+- Use `--profile nightly --release` for authoritative overnight runs
+- The `--dry-run` flag enables fast plan validation without execution
+
+**Workflow Guidance:**
+```bash
+# Fast PR check (under 10 minutes target)
+cargo run -p decentdb-benchmark -- run --profile smoke --all
+
+# Authoritative overnight run
+cargo run -p decentdb-benchmark --release -- run --profile nightly --all
+```
+
+### 2.8 Tenet Trade-offs and Priorities
+
+When benchmark results show tension between tenets, follow the priority order:
+
+1. **ACID Compliance (Tenet #1)** — Never compromise durability for performance
+2. **Performance (Tenet #2)** — Optimize after correctness is proven
+3. **Disk Footprint (Tenet #3)** — Optimize after performance targets are met
+4. **Documentation, Tooling, CLI, Feedback Loop (Tenets #4-7)** — Continuous improvement
+
+The `compare` command's `optimization_opportunities` ranking respects this priority by weighting durability metrics higher than throughput metrics.
+
+## 3. Prerequisites
 
 From repo root (`/home/steven/source/decentdb`):
 
@@ -121,7 +229,7 @@ Optional but useful for analysis examples:
 
 - `jq` (for JSON querying)
 
-## 3. Command Quick Reference
+## 4. Command Quick Reference
 
 ```bash
 # Run scenarios and produce run artifacts
@@ -146,7 +254,7 @@ cargo run -p decentdb-benchmark -- report --compare build/bench/compares/<compar
 cargo run -p decentdb-benchmark -- inspect-storage --db-path /path/to/file.ddb
 ```
 
-## 4. Artifact Model and Directory Layout
+## 5. Artifact Model and Directory Layout
 
 `decentdb-benchmark` uses two roots:
 
@@ -158,7 +266,7 @@ Defaults can be overridden on `run` with:
 - `--scratch-root <path>`
 - `--artifact-root <path>`
 
-### 4.1 Retained artifact layout
+### 5.1 Retained artifact layout
 
 Typical layout:
 
@@ -179,7 +287,7 @@ build/bench/
     <compare-id>.json
 ```
 
-### 4.2 Real run example
+### 5.2 Real run example
 
 ```text
 build/bench/runs/unix-1774818065252-smoke-38bf1b9/
@@ -189,7 +297,7 @@ build/bench/runs/unix-1774818065252-smoke-38bf1b9/
   artifacts/
 ```
 
-## 5. `run` Command
+## 6. `run` Command
 
 Help:
 
@@ -197,7 +305,7 @@ Help:
 cargo run -p decentdb-benchmark -- run --help
 ```
 
-## 5.1 Scenarios
+### 6.1 Scenarios
 
 Implemented scenario IDs:
 
@@ -214,7 +322,7 @@ Implemented scenario IDs:
 
 You can select one or many scenarios using repeated `--scenario` flags, or all scenarios with `--all`.
 
-## 5.2 Profile presets
+### 6.2 Profile presets
 
 `--profile` options:
 
@@ -293,7 +401,7 @@ Valid overrides:
 
 All numeric overrides except seed must be `> 0`.
 
-## 5.3 `run` examples
+### 6.3 `run` examples
 
 ### Example A: smoke all scenarios
 
@@ -374,7 +482,7 @@ Use `--release` for performance-significant runs:
 cargo run -p decentdb-benchmark --release -- run --profile nightly --all
 ```
 
-## 5.4 `run` output behavior
+### 6.4 `run` output behavior
 
 On success, command prints:
 
@@ -389,7 +497,7 @@ When targets are available, it also prints grade information:
 
 If any scenario fails, `run` still writes artifacts but exits with an error and summary status reflects incomplete execution.
 
-## 5.5 Key run artifact files
+### 6.5 Key run artifact files
 
 ### `manifest.json`
 
@@ -422,7 +530,7 @@ Contains detailed metrics and context for one scenario:
 - VFS stats (if collected)
 - retained artifact paths
 
-## 6. Target Grading (`benchmarks/targets.toml`)
+## 7. Target Grading (`benchmarks/targets.toml`)
 
 By default, runs are assessed against `benchmarks/targets.toml`.
 
@@ -432,7 +540,7 @@ Important metadata fields in that file:
 - `authoritative_benchmark_profile = "nightly"`
 - `authoritative_host_class = "linux_x86_64_local_ssd"`
 
-### 6.1 Grading statuses
+### 7.1 Grading statuses
 
 Per-metric statuses include:
 
@@ -453,7 +561,7 @@ Run-level grade can be:
 
 `scope: "partial"` means not enough target metrics were present in the run to produce a complete grade.
 
-### 6.2 Example: inspect assessment quickly
+### 7.2 Example: inspect assessment quickly
 
 ```bash
 jq '.target_assessment | {scope, overall_grade, matched_metrics, total_metrics}' \
@@ -465,7 +573,7 @@ jq '.target_assessment.metrics[] | select(.status == "below_floor" or .status ==
   build/bench/runs/<run-id>/summary.json
 ```
 
-## 7. `baseline set` Command
+## 8. `baseline set` Command
 
 Help:
 
@@ -477,7 +585,7 @@ Creates or replaces a local named snapshot under:
 
 - `build/bench/baselines/<name>.json`
 
-### 7.1 Baseline naming rules
+### 8.1 Baseline naming rules
 
 Name must match:
 
@@ -489,7 +597,7 @@ Examples:
 - `smoke-local`
 - `release_2026_03_29`
 
-### 7.2 Baseline examples
+### 8.2 Baseline examples
 
 ```bash
 cargo run -p decentdb-benchmark -- baseline set \
@@ -505,13 +613,13 @@ cargo run -p decentdb-benchmark -- baseline set \
 
 Overwrite behavior is explicit and deterministic: running `baseline set` again with the same name replaces that JSON snapshot file.
 
-### 7.3 List baselines
+### 8.3 List baselines
 
 ```bash
 ls -1 build/bench/baselines
 ```
 
-## 8. `compare` Command
+## 9. `compare` Command
 
 Help:
 
@@ -530,7 +638,7 @@ Writes output compare artifact under:
 
 Also prints full compare JSON to stdout.
 
-## 8.1 Compare examples
+### 9.1 Compare examples
 
 ### Example A: compare against named baseline
 
@@ -558,7 +666,7 @@ cargo run -p decentdb-benchmark -- compare \
   --artifact-root build/bench
 ```
 
-## 8.2 Compare output model
+### 9.2 Compare output model
 
 Top-level sections include:
 
@@ -573,7 +681,7 @@ Top-level sections include:
 - storage compare block (if available)
 - warnings
 
-### 8.3 Metric matching and direction
+### 9.3 Metric matching and direction
 
 Metrics are matched by:
 
@@ -584,7 +692,7 @@ Metric direction comes from targets metadata:
 - `smaller_is_better`
 - `larger_is_better`
 
-### 8.4 Noise-band model
+### 9.4 Noise-band model
 
 For target-backed metrics with candidate and baseline values:
 
@@ -604,7 +712,7 @@ Metric status can be:
 - `missing_metric`
 - `missing_target_metadata`
 
-### 8.5 Strictness and context safety
+### 9.5 Strictness and context safety
 
 Compare always emits output, even if context differs, but marks trust explicitly.
 
@@ -621,7 +729,7 @@ Compare always emits output, even if context differs, but marks trust explicitly
 
 Current strict checks include profile/build/os/arch/status context compatibility.
 
-### 8.6 Optimization opportunities ranking
+### 9.6 Optimization opportunities ranking
 
 `optimization_opportunities[]` includes, for each ranked item:
 
@@ -643,7 +751,7 @@ Score is pragmatic and transparent. It combines:
 - metric weight
 - priority/signature boost
 
-### 8.7 Real compare examples from local artifacts
+### 9.7 Real compare examples from local artifacts
 
 Named baseline compare:
 
@@ -674,7 +782,7 @@ This produced strictness warnings such as:
 
 and `strict=false`, `meaningful=false`.
 
-## 8.8 Query compare JSON with `jq`
+### 9.8 Query compare JSON with `jq`
 
 Top-level strictness and totals:
 
@@ -703,7 +811,7 @@ jq '.metrics[] | select(.status == "regression") | {metric_id, current_value, ba
   build/bench/compares/<compare-id>.json
 ```
 
-## 9. `report` Command
+## 10. `report` Command
 
 Help:
 
@@ -743,7 +851,7 @@ Output behavior:
 - print to stdout by default
 - use `--output <path>` to write report file directly
 
-## 9.1 Report examples from run summary
+### 10.1 Report examples from run summary
 
 Markdown snapshot:
 
@@ -788,7 +896,7 @@ cargo run -p decentdb-benchmark -- report \
   --audience agent_brief
 ```
 
-## 9.2 Report examples from compare artifact
+### 10.2 Report examples from compare artifact
 
 Markdown human report:
 
@@ -862,7 +970,7 @@ cargo run --quiet -p decentdb-benchmark -- report \
 xdg-open build/bench/reports/today-dashboard.html
 ```
 
-## 10. `inspect-storage` Command
+## 11. `inspect-storage` Command
 
 Help:
 
@@ -896,7 +1004,7 @@ cargo run -p decentdb-benchmark -- inspect-storage \
   --db-path .tmp/decentdb-benchmark/<run-id>/durable_commit_single/trial-1/durable_commit_single.ddb
 ```
 
-### 10.1 Inspection output highlights
+### 11.1 Inspection output highlights
 
 Top-level fields include:
 
@@ -915,9 +1023,9 @@ jq '{page_size, page_count, db_file_bytes, wal_file_bytes, page_counts, bytes, w
   build/bench/storage/my-db-inspection.json
 ```
 
-## 11. Recommended End-to-End Workflows
+## 12. Recommended End-to-End Workflows
 
-## 11.1 Fast local dev loop (single scenario)
+### 12.1 Fast local dev loop (single scenario)
 
 ```bash
 # 1) run scenario
@@ -936,7 +1044,7 @@ cargo run -p decentdb-benchmark -- compare --baseline-name smoke-point --candida
 cargo run -p decentdb-benchmark -- report --compare build/bench/compares/<compare-id>.json --format text --audience agent_brief
 ```
 
-## 11.2 Broader PR validation loop
+### 12.2 Broader PR validation loop
 
 ```bash
 # candidate run
@@ -949,7 +1057,7 @@ cargo run -p decentdb-benchmark -- compare --baseline-name main-dev-linux --cand
 cargo run -p decentdb-benchmark -- report --compare build/bench/compares/<compare-id>.json --format markdown > /tmp/bench-report.md
 ```
 
-## 11.3 Authoritative release-style run
+### 12.3 Authoritative release-style run
 
 ```bash
 cargo run -p decentdb-benchmark --release -- run --profile nightly --all
@@ -957,9 +1065,9 @@ cargo run -p decentdb-benchmark --release -- run --profile nightly --all
 
 Then compare to a release/nightly baseline that matches host class.
 
-## 12. Common Errors and Fixes
+## 13. Common Errors and Fixes
 
-## 12.1 `profile=custom requires at least one override`
+### 13.1 `profile=custom requires at least one override`
 
 Cause:
 
@@ -971,7 +1079,7 @@ Fix:
 cargo run -p decentdb-benchmark -- run --profile custom --rows 20000 --scenario point_lookup_warm
 ```
 
-## 12.2 `provide either --baseline or --baseline-name, not both`
+### 13.2 `provide either --baseline or --baseline-name, not both`
 
 Cause:
 
@@ -981,7 +1089,7 @@ Fix:
 
 - choose exactly one baseline source.
 
-## 12.3 `missing baseline input; provide --baseline or --baseline-name`
+### 13.3 `missing baseline input; provide --baseline or --baseline-name`
 
 Cause:
 
@@ -991,7 +1099,7 @@ Fix:
 
 - pass `--baseline` or `--baseline-name`.
 
-## 12.4 baseline name validation error
+### 13.4 baseline name validation error
 
 Cause:
 
@@ -1001,7 +1109,7 @@ Fix:
 
 - use only letters, digits, `.`, `_`, `-`.
 
-## 12.5 report input errors
+### 13.5 report input errors
 
 Examples:
 
@@ -1012,7 +1120,7 @@ Fix:
 
 - pass exactly one of: `--input`, `--latest-run`, `--compare`, `--latest-compare`.
 
-## 12.6 Compare says strict=false
+### 13.6 Compare says strict=false
 
 Likely causes:
 
@@ -1026,7 +1134,7 @@ Action:
 - inspect `strictness.reasons[]` in compare JSON
 - rerun candidate in matching context for meaningful comparison
 
-## 12.7 Partial grading (`grade=partial`)
+### 13.7 Partial grading (`grade=partial`)
 
 Cause:
 
@@ -1040,9 +1148,9 @@ Action:
 
 - run a broader scenario set (often `--all`) for complete grading scope.
 
-## 13. Practical Automation Snippets
+## 14. Practical Automation Snippets
 
-## 13.1 Capture run id from command output
+### 14.1 Capture run id from command output
 
 ```bash
 RUN_ID=$(cargo run -p decentdb-benchmark -- run --profile smoke --scenario durable_commit_single \
@@ -1051,7 +1159,7 @@ RUN_ID=$(cargo run -p decentdb-benchmark -- run --profile smoke --scenario durab
 echo "$RUN_ID"
 ```
 
-## 13.2 Set baseline from latest run directory
+### 14.2 Set baseline from latest run directory
 
 ```bash
 LATEST_RUN=$(ls -1 build/bench/runs | tail -n 1)
@@ -1060,7 +1168,7 @@ cargo run -p decentdb-benchmark -- baseline set \
   --input "build/bench/runs/${LATEST_RUN}/summary.json"
 ```
 
-## 13.3 Compare latest run against named baseline and capture compare path
+### 14.3 Compare latest run against named baseline and capture compare path
 
 ```bash
 COMPARE_JSON=$(cargo run -p decentdb-benchmark -- compare \
@@ -1071,7 +1179,7 @@ COMPARE_JSON=$(cargo run -p decentdb-benchmark -- compare \
 echo "$COMPARE_JSON"
 ```
 
-## 13.4 Emit compact agent brief report in CI logs
+### 14.4 Emit compact agent brief report in CI logs
 
 ```bash
 cargo run -p decentdb-benchmark -- report \
@@ -1080,7 +1188,7 @@ cargo run -p decentdb-benchmark -- report \
   --audience agent_brief
 ```
 
-## 14. Example Session (Copy/Paste)
+## 15. Example Session (Copy/Paste)
 
 ```bash
 # run candidate
@@ -1108,14 +1216,14 @@ cargo run -p decentdb-benchmark -- report \
   --format text --audience agent_brief
 ```
 
-## 15. Advanced Notes
+## 16. Advanced Notes
 
 - `report` is intentionally a renderer; benchmark logic lives in `run` and `compare` artifacts.
 - Compare is designed to be useful for both humans and coding agents directly from structured JSON.
 - Cross-context compare is permitted, but trust flags and warnings indicate whether the comparison is meaningful.
 - For optimization planning, prefer consuming compare JSON directly rather than scraping markdown.
 
-## 16. FAQ
+## 17. FAQ
 
 ### Q: Should I run with `--release`?
 
