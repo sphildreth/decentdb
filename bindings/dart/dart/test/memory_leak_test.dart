@@ -4,32 +4,7 @@ import 'dart:io';
 import 'package:decentdb/decentdb.dart';
 import 'package:test/test.dart';
 
-String findNativeLib() {
-  final envPath = Platform.environment['DECENTDB_NATIVE_LIB'];
-  if (envPath != null && envPath.isNotEmpty) {
-    return envPath;
-  }
-
-  var dir = Directory.current;
-  for (var i = 0; i < 10; i++) {
-    for (final candidateName in [
-      'target/debug/libdecentdb.so',
-      'target/debug/libdecentdb.dylib',
-      'target/debug/decentdb.dll',
-    ]) {
-      final candidate = File('${dir.path}/$candidateName');
-      if (candidate.existsSync()) {
-        return candidate.path;
-      }
-    }
-    dir = dir.parent;
-  }
-
-  throw StateError(
-    'Cannot find DecentDB native library. '
-    'Set DECENTDB_NATIVE_LIB or run from the repo root after `cargo build -p decentdb`.',
-  );
-}
+import 'test_utils.dart';
 
 typedef _MallocTrimNative = Int32 Function(IntPtr);
 typedef _MallocTrimDart = int Function(int);

@@ -104,19 +104,64 @@ pub(crate) fn compare_decimal(
         return left_scaled.cmp(&right_scaled);
     }
 
-    let left_abs = left_scaled.unsigned_abs().to_string();
-    let right_abs = right_scaled.unsigned_abs().to_string();
-    let left_adjusted_exp = left_abs.len() as i32 - i32::from(left_scale);
-    let right_adjusted_exp = right_abs.len() as i32 - i32::from(right_scale);
-
-    let ordering = left_adjusted_exp
-        .cmp(&right_adjusted_exp)
-        .then_with(|| left_abs.cmp(&right_abs));
+    let ordering = compare_decimal_magnitude(
+        left_scaled.unsigned_abs(),
+        left_scale,
+        right_scaled.unsigned_abs(),
+        right_scale,
+    );
 
     if left_negative {
         ordering.reverse()
     } else {
         ordering
+    }
+}
+
+fn compare_decimal_magnitude(
+    left_abs: u64,
+    left_scale: u8,
+    right_abs: u64,
+    right_scale: u8,
+) -> Ordering {
+    let left_digits = left_abs.to_string();
+    let right_digits = right_abs.to_string();
+
+    let (left_int, left_frac) = split_decimal_parts(&left_digits, left_scale);
+    let (right_int, right_frac) = split_decimal_parts(&right_digits, right_scale);
+
+    let integer_order = left_int
+        .len()
+        .cmp(&right_int.len())
+        .then_with(|| left_int.cmp(right_int));
+    if integer_order != Ordering::Equal {
+        return integer_order;
+    }
+
+    let max_fraction_len = left_frac.len().max(right_frac.len());
+    for idx in 0..max_fraction_len {
+        let left_digit = left_frac.as_bytes().get(idx).copied().unwrap_or(b'0');
+        let right_digit = right_frac.as_bytes().get(idx).copied().unwrap_or(b'0');
+        match left_digit.cmp(&right_digit) {
+            Ordering::Equal => continue,
+            non_equal => return non_equal,
+        }
+    }
+
+    Ordering::Equal
+}
+
+fn split_decimal_parts(digits: &str, scale: u8) -> (&str, &str) {
+    let scale = usize::from(scale);
+    if scale == 0 {
+        return (digits, "");
+    }
+
+    if digits.len() > scale {
+        let split = digits.len() - scale;
+        (&digits[..split], &digits[split..])
+    } else {
+        ("0", digits)
     }
 }
 
@@ -131,6 +176,8 @@ mod tests {
         assert_eq!(compare_decimal(120, 2, 12, 1), Ordering::Equal);
         assert_eq!(compare_decimal(119, 2, 12, 1), Ordering::Less);
         assert_eq!(compare_decimal(-150, 2, -14, 1), Ordering::Less);
+        assert_eq!(compare_decimal(0, 0, 1, 2), Ordering::Less);
+        assert_eq!(compare_decimal(-1, 2, 0, 0), Ordering::Less);
     }
 
     #[test]

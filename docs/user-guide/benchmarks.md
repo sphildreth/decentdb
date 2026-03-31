@@ -13,7 +13,7 @@ This page collects the current Python embedded comparison charts and a plain-lan
 
 | Engine | Version stamp | Source |
 | --- | --- | --- |
-| DecentDB | 2.0.1 | Workspace package version |
+| DecentDB | 2.0.2 | Workspace package version |
 | SQLite (`SQLite_wal_full`) | 3.52.0 | Benchmark-reported engine version |
 | DuckDB | 1.5.1 | Benchmark-reported engine version |
 | H2 (`JDBC`) | 2.2.224 | Benchmark-reported engine version |

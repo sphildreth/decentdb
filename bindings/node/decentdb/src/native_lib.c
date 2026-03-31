@@ -182,6 +182,8 @@ static int status_to_legacy_code(ddb_status_t status) {
       return 6;
     case DDB_ERR_PANIC:
       return 7;
+    case DDB_ERR_UNSUPPORTED_FORMAT_VERSION:
+      return 8;
     default:
       return 6;
   }

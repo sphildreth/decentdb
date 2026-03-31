@@ -1,5 +1,6 @@
 using System;
 using System.Data.Common;
+using DecentDB.AdoNet;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 
@@ -23,6 +24,15 @@ public static class DecentDBDbContextOptionsBuilderExtensions
         optionsAction?.Invoke(new DecentDB.EntityFrameworkCore.DecentDBDbContextOptionsBuilder(optionsBuilder));
 
         return optionsBuilder;
+    }
+
+    public static DbContextOptionsBuilder UseDecentDB(
+        this DbContextOptionsBuilder optionsBuilder,
+        DecentDBConnectionStringBuilder connectionStringBuilder,
+        Action<DecentDB.EntityFrameworkCore.DecentDBDbContextOptionsBuilder>? optionsAction = null)
+    {
+        ArgumentNullException.ThrowIfNull(connectionStringBuilder);
+        return UseDecentDB(optionsBuilder, connectionStringBuilder.ConnectionString, optionsAction);
     }
 
     public static DbContextOptionsBuilder UseDecentDB(
@@ -51,6 +61,13 @@ public static class DecentDBDbContextOptionsBuilderExtensions
         Action<DecentDB.EntityFrameworkCore.DecentDBDbContextOptionsBuilder>? optionsAction = null)
         where TContext : DbContext
         => (DbContextOptionsBuilder<TContext>)UseDecentDB((DbContextOptionsBuilder)optionsBuilder, connectionString, optionsAction);
+
+    public static DbContextOptionsBuilder<TContext> UseDecentDB<TContext>(
+        this DbContextOptionsBuilder<TContext> optionsBuilder,
+        DecentDBConnectionStringBuilder connectionStringBuilder,
+        Action<DecentDB.EntityFrameworkCore.DecentDBDbContextOptionsBuilder>? optionsAction = null)
+        where TContext : DbContext
+        => (DbContextOptionsBuilder<TContext>)UseDecentDB((DbContextOptionsBuilder)optionsBuilder, connectionStringBuilder, optionsAction);
 
     public static DbContextOptionsBuilder<TContext> UseDecentDB<TContext>(
         this DbContextOptionsBuilder<TContext> optionsBuilder,

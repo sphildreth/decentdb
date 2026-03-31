@@ -59,6 +59,56 @@ final class DdbValue extends Struct {
   external int timestampMicros;
 }
 
+final class DdbValueView extends Struct {
+  @Uint32()
+  external int tag;
+
+  @Uint8()
+  external int boolValue;
+
+  @Array(7)
+  external Array<Uint8> reserved0;
+
+  @Int64()
+  external int int64Value;
+
+  @Double()
+  external double float64Value;
+
+  @Int64()
+  external int decimalScaled;
+
+  @Uint8()
+  external int decimalScale;
+
+  @Array(7)
+  external Array<Uint8> reserved1;
+
+  external Pointer<Uint8> data;
+
+  @IntPtr()
+  external int len;
+
+  @Array(16)
+  external Array<Uint8> uuidBytes;
+
+  @Int64()
+  external int timestampMicros;
+}
+
+final class DdbRowI64TextF64View extends Struct {
+  @Int64()
+  external int int64Value;
+
+  external Pointer<Uint8> textData;
+
+  @IntPtr()
+  external int textLen;
+
+  @Double()
+  external double float64Value;
+}
+
 // ---------------------------------------------------------------------------
 // Global / utility
 // ---------------------------------------------------------------------------
@@ -173,6 +223,9 @@ typedef _DbNamedStringOutDart = int Function(
   Pointer<Utf8> name,
   Pointer<Pointer<Utf8>> outValue,
 );
+
+typedef _EvictSharedWalC = Uint32 Function(Pointer<Utf8> path);
+typedef _EvictSharedWalDart = int Function(Pointer<Utf8> path);
 
 // ---------------------------------------------------------------------------
 // Result accessors (ddb_db_execute result path)
@@ -334,6 +387,59 @@ typedef _StmtBindTimestampMicrosDart = int Function(
   int timestampMicros,
 );
 
+typedef _StmtExecuteBatchI64C = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr rowCount,
+  Pointer<Int64> valuesI64,
+  Pointer<Uint64> outTotalAffectedRows,
+);
+typedef _StmtExecuteBatchI64Dart = int Function(
+  Pointer<DdbStmt> stmt,
+  int rowCount,
+  Pointer<Int64> valuesI64,
+  Pointer<Uint64> outTotalAffectedRows,
+);
+
+typedef _StmtExecuteBatchI64TextF64C = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr rowCount,
+  Pointer<Int64> valuesI64,
+  Pointer<Pointer<Utf8>> valuesTextPtrs,
+  Pointer<IntPtr> valuesTextLens,
+  Pointer<Double> valuesF64,
+  Pointer<Uint64> outTotalAffectedRows,
+);
+typedef _StmtExecuteBatchI64TextF64Dart = int Function(
+  Pointer<DdbStmt> stmt,
+  int rowCount,
+  Pointer<Int64> valuesI64,
+  Pointer<Pointer<Utf8>> valuesTextPtrs,
+  Pointer<IntPtr> valuesTextLens,
+  Pointer<Double> valuesF64,
+  Pointer<Uint64> outTotalAffectedRows,
+);
+
+typedef _StmtExecuteBatchTypedC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr rowCount,
+  Pointer<Utf8> signature,
+  Pointer<Int64> valuesI64,
+  Pointer<Double> valuesF64,
+  Pointer<Pointer<Utf8>> valuesTextPtrs,
+  Pointer<IntPtr> valuesTextLens,
+  Pointer<Uint64> outTotalAffectedRows,
+);
+typedef _StmtExecuteBatchTypedDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int rowCount,
+  Pointer<Utf8> signature,
+  Pointer<Int64> valuesI64,
+  Pointer<Double> valuesF64,
+  Pointer<Pointer<Utf8>> valuesTextPtrs,
+  Pointer<IntPtr> valuesTextLens,
+  Pointer<Uint64> outTotalAffectedRows,
+);
+
 typedef _StmtStepC = Uint32 Function(
   Pointer<DdbStmt> stmt,
   Pointer<Uint8> outHasRow,
@@ -383,24 +489,158 @@ typedef _StmtValueCopyDart = int Function(
   Pointer<DdbValue> outValue,
 );
 
+typedef _StmtRowViewC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outColumns,
+);
+typedef _StmtRowViewDart = int Function(
+  Pointer<DdbStmt> stmt,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outColumns,
+);
+
+typedef _StmtStepRowViewC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outColumns,
+  Pointer<Uint8> outHasRow,
+);
+typedef _StmtStepRowViewDart = int Function(
+  Pointer<DdbStmt> stmt,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outColumns,
+  Pointer<Uint8> outHasRow,
+);
+
+typedef _StmtRebindInt64ExecuteC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Int64 value,
+  Pointer<Uint64> outAffected,
+);
+typedef _StmtRebindInt64ExecuteDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int value,
+  Pointer<Uint64> outAffected,
+);
+
+typedef _StmtRebindTextInt64ExecuteC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Pointer<Utf8> textValue,
+  IntPtr textLen,
+  Int64 intValue,
+  Pointer<Uint64> outAffected,
+);
+typedef _StmtRebindTextInt64ExecuteDart = int Function(
+  Pointer<DdbStmt> stmt,
+  Pointer<Utf8> textValue,
+  int textLen,
+  int intValue,
+  Pointer<Uint64> outAffected,
+);
+
+typedef _StmtRebindInt64TextExecuteC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Int64 intValue,
+  Pointer<Utf8> textValue,
+  IntPtr textLen,
+  Pointer<Uint64> outAffected,
+);
+typedef _StmtRebindInt64TextExecuteDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int intValue,
+  Pointer<Utf8> textValue,
+  int textLen,
+  Pointer<Uint64> outAffected,
+);
+
+typedef _StmtBindInt64StepRowViewC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr index1Based,
+  Int64 value,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outColumns,
+  Pointer<Uint8> outHasRow,
+);
+typedef _StmtBindInt64StepRowViewDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int index1Based,
+  int value,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outColumns,
+  Pointer<Uint8> outHasRow,
+);
+
+typedef _StmtBindInt64StepI64TextF64C = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  IntPtr index1Based,
+  Int64 value,
+  Pointer<Int64> outInt64,
+  Pointer<Pointer<Uint8>> outTextData,
+  Pointer<IntPtr> outTextLen,
+  Pointer<Double> outFloat64,
+  Pointer<Uint8> outHasRow,
+);
+typedef _StmtBindInt64StepI64TextF64Dart = int Function(
+  Pointer<DdbStmt> stmt,
+  int index1Based,
+  int value,
+  Pointer<Int64> outInt64,
+  Pointer<Pointer<Uint8>> outTextData,
+  Pointer<IntPtr> outTextLen,
+  Pointer<Double> outFloat64,
+  Pointer<Uint8> outHasRow,
+);
+typedef _StmtFetchRowViewsC = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Uint8 includeCurrentRow,
+  IntPtr maxRows,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outRows,
+  Pointer<IntPtr> outColumns,
+);
+typedef _StmtFetchRowViewsDart = int Function(
+  Pointer<DdbStmt> stmt,
+  int includeCurrentRow,
+  int maxRows,
+  Pointer<Pointer<DdbValueView>> outValues,
+  Pointer<IntPtr> outRows,
+  Pointer<IntPtr> outColumns,
+);
+
+typedef _StmtFetchRowsI64TextF64C = Uint32 Function(
+  Pointer<DdbStmt> stmt,
+  Uint8 includeCurrentRow,
+  IntPtr maxRows,
+  Pointer<Pointer<DdbRowI64TextF64View>> outRowsPtr,
+  Pointer<IntPtr> outRows,
+);
+typedef _StmtFetchRowsI64TextF64Dart = int Function(
+  Pointer<DdbStmt> stmt,
+  int includeCurrentRow,
+  int maxRows,
+  Pointer<Pointer<DdbRowI64TextF64View>> outRowsPtr,
+  Pointer<IntPtr> outRows,
+);
+
 // ---------------------------------------------------------------------------
 // NativeBindings
 // ---------------------------------------------------------------------------
 
 class NativeBindings {
   NativeBindings._(this._lib)
-      : abiVersion =
-            _lib.lookupFunction<_AbiVersionC, _AbiVersionDart>('ddb_abi_version'),
+      : abiVersion = _lib
+            .lookupFunction<_AbiVersionC, _AbiVersionDart>('ddb_abi_version'),
         version = _lib.lookupFunction<_VersionC, _VersionDart>('ddb_version'),
-        lastErrorMessage = _lib
-            .lookupFunction<_LastErrorMessageC, _LastErrorMessageDart>(
+        lastErrorMessage =
+            _lib.lookupFunction<_LastErrorMessageC, _LastErrorMessageDart>(
                 'ddb_last_error_message'),
         valueDispose = _lib.lookupFunction<_ValueDisposeC, _ValueDisposeDart>(
             'ddb_value_dispose'),
         stringFree = _lib
             .lookupFunction<_StringFreeC, _StringFreeDart>('ddb_string_free'),
-        dbCreate = _lib.lookupFunction<_DbPathOutC, _DbPathOutDart>(
-            'ddb_db_create'),
+        dbCreate =
+            _lib.lookupFunction<_DbPathOutC, _DbPathOutDart>('ddb_db_create'),
         dbOpen =
             _lib.lookupFunction<_DbPathOutC, _DbPathOutDart>('ddb_db_open'),
         dbOpenOrCreate = _lib.lookupFunction<_DbPathOutC, _DbPathOutDart>(
@@ -410,16 +650,17 @@ class NativeBindings {
             _lib.lookupFunction<_DbExecuteC, _DbExecuteDart>('ddb_db_execute'),
         dbPrepare =
             _lib.lookupFunction<_DbPrepareC, _DbPrepareDart>('ddb_db_prepare'),
-        dbCheckpoint = _lib.lookupFunction<_DbSimpleC, _DbSimpleDart>(
-            'ddb_db_checkpoint'),
+        dbCheckpoint =
+            _lib.lookupFunction<_DbSimpleC, _DbSimpleDart>('ddb_db_checkpoint'),
         dbBeginTransaction = _lib.lookupFunction<_DbSimpleC, _DbSimpleDart>(
             'ddb_db_begin_transaction'),
         dbCommitTransaction = _lib.lookupFunction<_DbCommitTransactionC,
             _DbCommitTransactionDart>('ddb_db_commit_transaction'),
         dbRollbackTransaction = _lib.lookupFunction<_DbSimpleC, _DbSimpleDart>(
             'ddb_db_rollback_transaction'),
-        dbInTransaction = _lib.lookupFunction<_DbInTransactionC,
-            _DbInTransactionDart>('ddb_db_in_transaction'),
+        dbInTransaction =
+            _lib.lookupFunction<_DbInTransactionC, _DbInTransactionDart>(
+                'ddb_db_in_transaction'),
         dbSaveAs =
             _lib.lookupFunction<_DbSaveAsC, _DbSaveAsDart>('ddb_db_save_as'),
         dbListTablesJson = _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
@@ -441,6 +682,12 @@ class NativeBindings {
         dbListTriggersJson =
             _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
                 'ddb_db_list_triggers_json'),
+        dbGetSchemaSnapshotJson =
+            _lib.lookupFunction<_DbStringOutC, _DbStringOutDart>(
+                'ddb_db_get_schema_snapshot_json'),
+        evictSharedWal =
+            _lib.lookupFunction<_EvictSharedWalC, _EvictSharedWalDart>(
+                'ddb_evict_shared_wal'),
         resultFree = _lib
             .lookupFunction<_ResultFreeC, _ResultFreeDart>('ddb_result_free'),
         resultRowCount =
@@ -452,16 +699,15 @@ class NativeBindings {
         resultAffectedRows =
             _lib.lookupFunction<_ResultAffectedRowsC, _ResultAffectedRowsDart>(
                 'ddb_result_affected_rows'),
-        resultColumnNameCopy =
-            _lib.lookupFunction<_ResultColumnNameCopyC, _ResultColumnNameCopyDart>(
-                'ddb_result_column_name_copy'),
+        resultColumnNameCopy = _lib.lookupFunction<_ResultColumnNameCopyC,
+            _ResultColumnNameCopyDart>('ddb_result_column_name_copy'),
         resultValueCopy =
             _lib.lookupFunction<_ResultValueCopyC, _ResultValueCopyDart>(
                 'ddb_result_value_copy'),
         stmtFree =
             _lib.lookupFunction<_StmtFreeC, _StmtFreeDart>('ddb_stmt_free'),
-        stmtReset = _lib.lookupFunction<_StmtSimpleC, _StmtSimpleDart>(
-            'ddb_stmt_reset'),
+        stmtReset = _lib
+            .lookupFunction<_StmtSimpleC, _StmtSimpleDart>('ddb_stmt_reset'),
         stmtClearBindings = _lib.lookupFunction<_StmtSimpleC, _StmtSimpleDart>(
             'ddb_stmt_clear_bindings'),
         stmtBindNull = _lib.lookupFunction<_StmtBindNullC, _StmtBindNullDart>(
@@ -472,21 +718,24 @@ class NativeBindings {
         stmtBindFloat64 =
             _lib.lookupFunction<_StmtBindFloat64C, _StmtBindFloat64Dart>(
                 'ddb_stmt_bind_float64'),
-        stmtBindBool =
-            _lib.lookupFunction<_StmtBindBoolC, _StmtBindBoolDart>(
-                'ddb_stmt_bind_bool'),
-        stmtBindText =
-            _lib.lookupFunction<_StmtBindTextC, _StmtBindTextDart>(
-                'ddb_stmt_bind_text'),
-        stmtBindBlob =
-            _lib.lookupFunction<_StmtBindBlobC, _StmtBindBlobDart>(
-                'ddb_stmt_bind_blob'),
+        stmtBindBool = _lib.lookupFunction<_StmtBindBoolC, _StmtBindBoolDart>(
+            'ddb_stmt_bind_bool'),
+        stmtBindText = _lib.lookupFunction<_StmtBindTextC, _StmtBindTextDart>(
+            'ddb_stmt_bind_text'),
+        stmtBindBlob = _lib.lookupFunction<_StmtBindBlobC, _StmtBindBlobDart>(
+            'ddb_stmt_bind_blob'),
         stmtBindDecimal =
             _lib.lookupFunction<_StmtBindDecimalC, _StmtBindDecimalDart>(
                 'ddb_stmt_bind_decimal'),
-        stmtBindTimestampMicros = _lib.lookupFunction<
-                _StmtBindTimestampMicrosC, _StmtBindTimestampMicrosDart>(
-            'ddb_stmt_bind_timestamp_micros'),
+        stmtBindTimestampMicros = _lib.lookupFunction<_StmtBindTimestampMicrosC,
+            _StmtBindTimestampMicrosDart>('ddb_stmt_bind_timestamp_micros'),
+        stmtExecuteBatchI64 = _lib.lookupFunction<_StmtExecuteBatchI64C,
+            _StmtExecuteBatchI64Dart>('ddb_stmt_execute_batch_i64'),
+        stmtExecuteBatchI64TextF64 = _lib.lookupFunction<
+                _StmtExecuteBatchI64TextF64C, _StmtExecuteBatchI64TextF64Dart>(
+            'ddb_stmt_execute_batch_i64_text_f64'),
+        stmtExecuteBatchTyped = _lib.lookupFunction<_StmtExecuteBatchTypedC,
+            _StmtExecuteBatchTypedDart>('ddb_stmt_execute_batch_typed'),
         stmtStep =
             _lib.lookupFunction<_StmtStepC, _StmtStepDart>('ddb_stmt_step'),
         stmtColumnCount =
@@ -500,7 +749,32 @@ class NativeBindings {
                 'ddb_stmt_affected_rows'),
         stmtValueCopy =
             _lib.lookupFunction<_StmtValueCopyC, _StmtValueCopyDart>(
-                'ddb_stmt_value_copy');
+                'ddb_stmt_value_copy'),
+        stmtRowView = _lib.lookupFunction<_StmtRowViewC, _StmtRowViewDart>(
+            'ddb_stmt_row_view'),
+        stmtStepRowView =
+            _lib.lookupFunction<_StmtStepRowViewC, _StmtStepRowViewDart>(
+                'ddb_stmt_step_row_view'),
+        stmtRebindInt64Execute = _lib.lookupFunction<_StmtRebindInt64ExecuteC,
+            _StmtRebindInt64ExecuteDart>('ddb_stmt_rebind_int64_execute'),
+        stmtRebindTextInt64Execute = _lib.lookupFunction<
+                _StmtRebindTextInt64ExecuteC, _StmtRebindTextInt64ExecuteDart>(
+            'ddb_stmt_rebind_text_int64_execute'),
+        stmtRebindInt64TextExecute = _lib.lookupFunction<
+                _StmtRebindInt64TextExecuteC, _StmtRebindInt64TextExecuteDart>(
+            'ddb_stmt_rebind_int64_text_execute'),
+        stmtFetchRowViews =
+            _lib.lookupFunction<_StmtFetchRowViewsC, _StmtFetchRowViewsDart>(
+                'ddb_stmt_fetch_row_views'),
+        stmtFetchRowsI64TextF64 = _lib.lookupFunction<_StmtFetchRowsI64TextF64C,
+            _StmtFetchRowsI64TextF64Dart>('ddb_stmt_fetch_rows_i64_text_f64'),
+        stmtBindInt64StepRowView = _lib.lookupFunction<
+            _StmtBindInt64StepRowViewC,
+            _StmtBindInt64StepRowViewDart>('ddb_stmt_bind_int64_step_row_view'),
+        stmtBindInt64StepI64TextF64 = _lib.lookupFunction<
+                _StmtBindInt64StepI64TextF64C,
+                _StmtBindInt64StepI64TextF64Dart>(
+            'ddb_stmt_bind_int64_step_i64_text_f64');
 
   // ignore: unused_field – kept so DynamicLibrary stays live and symbols remain resolved
   final DynamicLibrary _lib;
@@ -536,6 +810,8 @@ class NativeBindings {
   final _DbStringOutDart dbListViewsJson;
   final _DbNamedStringOutDart dbGetViewDdl;
   final _DbStringOutDart dbListTriggersJson;
+  final _DbStringOutDart dbGetSchemaSnapshotJson;
+  final _EvictSharedWalDart evictSharedWal;
 
   // ddb_db_execute result accessors
   final _ResultFreeDart resultFree;
@@ -557,11 +833,23 @@ class NativeBindings {
   final _StmtBindBlobDart stmtBindBlob;
   final _StmtBindDecimalDart stmtBindDecimal;
   final _StmtBindTimestampMicrosDart stmtBindTimestampMicros;
+  final _StmtExecuteBatchI64Dart stmtExecuteBatchI64;
+  final _StmtExecuteBatchI64TextF64Dart stmtExecuteBatchI64TextF64;
+  final _StmtExecuteBatchTypedDart stmtExecuteBatchTyped;
   final _StmtStepDart stmtStep;
   final _StmtColumnCountDart stmtColumnCount;
   final _StmtColumnNameCopyDart stmtColumnNameCopy;
   final _StmtAffectedRowsDart stmtAffectedRows;
   final _StmtValueCopyDart stmtValueCopy;
+  final _StmtRowViewDart stmtRowView;
+  final _StmtStepRowViewDart stmtStepRowView;
+  final _StmtRebindInt64ExecuteDart stmtRebindInt64Execute;
+  final _StmtRebindTextInt64ExecuteDart stmtRebindTextInt64Execute;
+  final _StmtRebindInt64TextExecuteDart stmtRebindInt64TextExecute;
+  final _StmtFetchRowViewsDart stmtFetchRowViews;
+  final _StmtFetchRowsI64TextF64Dart stmtFetchRowsI64TextF64;
+  final _StmtBindInt64StepRowViewDart stmtBindInt64StepRowView;
+  final _StmtBindInt64StepI64TextF64Dart stmtBindInt64StepI64TextF64;
 
   static final Map<String, NativeBindings> _cache = {};
 

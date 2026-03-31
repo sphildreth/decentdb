@@ -85,6 +85,96 @@ Supported high-level bind values in `bindAll(...)`:
 
 Rows use an O(1) column-name index map, so `row['column_name']` no longer performs a linear scan.
 
+### Streaming and pagination
+
+`step()` and `nextPage()` stream from native row-view buffers without materializing the full result set in Dart:
+
+```dart
+final stmt = db.prepare('SELECT id, name FROM users ORDER BY id');
+
+while (stmt.step()) {
+  final row = stmt.readRow();
+  print(row['name']);
+}
+
+stmt.dispose();
+```
+
+```dart
+final stmt = db.prepare('SELECT id, name FROM users ORDER BY id');
+
+while (true) {
+  final page = stmt.nextPage(128);
+  for (final row in page.rows) {
+    print(row['name']);
+  }
+  if (page.isLast) break;
+}
+
+stmt.dispose();
+```
+
+`query()` still returns all rows but internally chunks at 256 rows via the streaming path. `nextPage()` invalidates any row from a prior `step()` call, and vice versa. Binding, resetting, or clearing bindings also invalidates streaming state.
+
+### Batch execution
+
+Batch helpers execute many rows in a single FFI call, which is significantly faster than per-row bind/execute loops:
+
+```dart
+final stmt = db.prepare(r'INSERT INTO users VALUES ($1, $2)');
+db.transaction(() {
+  stmt.executeBatchTyped('it', [
+    [1, 'Alice'],
+    [2, 'Bob'],
+    [3, 'Charlie'],
+  ]);
+});
+stmt.dispose();
+```
+
+Available batch methods:
+
+- `executeBatchInt64(List<int> values)` — one-column INT64 batch
+- `executeBatchI64TextF64(List<(int, String, double)> rows)` — `(INT64, TEXT, FLOAT64)` triple batch
+- `executeBatchTyped(String signature, List<List<Object?>> rows)` — mixed-type batch using an `i`/`t`/`f` signature string
+
+### Re-execute helpers
+
+Re-execute helpers combine reset, bind, and execute into a single FFI call for hot DML loops:
+
+```dart
+final stmt = db.prepare(r'UPDATE counters SET val = $1 WHERE id = 1');
+stmt.rebindInt64Execute(42);
+stmt.dispose();
+```
+
+Available re-execute methods:
+
+- `rebindInt64Execute(int value)` — reset, bind INT64 at position 1, execute
+- `rebindTextInt64Execute(String text, int value)` — reset, bind `(TEXT, INT64)`, execute
+- `rebindInt64TextExecute(int value, String text)` — reset, bind `(INT64, TEXT)`, execute
+
+### Fused bind+step helpers
+
+For extremely hot query paths, fused helpers combine binding and stepping into a single FFI boundary crossing:
+
+```dart
+final stmt = db.prepare('SELECT id, name, score FROM t WHERE id = $1');
+
+// Single-row lookup returning a primitive tuple
+final result = stmt.bindInt64StepI64TextF64(1, 42); 
+if (result != null) {
+  print('Name: ${result.$2}');
+}
+
+stmt.dispose();
+```
+
+Available fused methods:
+
+- `bindInt64Step(int index, int value)` — bind INT64 and stream one row view (returns `true` if row available, use `readRow()`)
+- `bindInt64StepI64TextF64(int index, int value)` — bind INT64 and return a strongly-typed `(int, String, double)?` tuple directly
+
 ## Schema helpers
 
 The packaged wrapper exposes:
@@ -96,6 +186,55 @@ The packaged wrapper exposes:
 - `db.schema.listViews()` / `listViewsInfo()`
 - `db.schema.getViewDdl(name)`
 - `db.schema.listTriggers()`
+
+### Rich schema snapshot
+
+`getSchemaSnapshot()` returns the complete schema in one call with rich typed metadata:
+
+```dart
+final snapshot = db.schema.getSchemaSnapshot();
+print('v${snapshot.snapshotVersion}, cookie=${snapshot.schemaCookie}');
+
+for (final table in snapshot.tables) {
+  print('Table ${table.name} (temp=${table.temporary}, rows=${table.rowCount})');
+  print('  DDL: ${table.ddl}');
+
+  for (final fk in table.foreignKeys) {
+    print('  FK: ${fk.columns} -> ${fk.referencedTable}(${fk.referencedColumns})');
+  }
+
+  for (final column in table.columns) {
+    if (column.generatedSql != null) {
+      print('  Generated: ${column.name} = ${column.generatedSql} (${column.generatedStored ? "STORED" : "VIRTUAL"})');
+    }
+    for (final check in column.checks) {
+      print('  Check: ${check.name ?? "<unnamed>"}: ${check.expressionSql}');
+    }
+  }
+}
+```
+
+The snapshot model includes:
+
+- `SchemaSnapshot` — top-level container with `tables`, `views`, `indexes`, `triggers`
+- `SchemaTableInfo` — DDL, row count, primary key columns, foreign keys, check constraints, generated columns
+- `SchemaViewInfo` — DDL, SQL text, column names, dependencies
+- `SchemaIndexInfo` — DDL, kind, uniqueness, partial-index predicate, include columns
+- `SchemaTriggerInfo` — DDL, target kind, timing, events, event mask, for-each-row flag
+- `SchemaCheckConstraintInfo` — optional name and expression SQL
+
+All collections are deterministically ordered by name.
+
+## WAL maintenance
+
+```dart
+Database.evictSharedWal(
+  '/path/to/database.ddb',
+  libraryPath: '/path/to/libdecentdb.so',
+);
+```
+
+Evicts the shared WAL cache entry for an on-disk database. Call only after all handles for that path are closed.
 
 ## Validation commands
 
@@ -139,11 +278,7 @@ dart pub get
 DECENTDB_NATIVE_LIB=../../../target/debug/libdecentdb.so dart run benchmarks/bench_fetch.dart --count 100000 --point-reads 5000 --fetchmany-batch 1024 --db-prefix dart_bench_fetch
 ```
 
-## Current limitations
-
+## Notes
 - the stable C ABI still does not expose open-with-config, so non-empty `options` strings are rejected
-- batch execution APIs (`ddb_stmt_execute_batch_*`) are not wrapped yet
-- fused bind+step, row-view, fetch-row-view, and re-execute fast paths are not wrapped yet
-- `ddb_evict_shared_wal` is not exposed yet
 - the example under `bindings/dart/examples/flutter_desktop/` is still a desktop-oriented reference rather than a real Flutter SDK app
 - DecentDB remains a one-writer / many-readers engine; keep that concurrency model in mind when sharing database handles across isolates or threads

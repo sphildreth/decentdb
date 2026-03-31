@@ -7,5 +7,9 @@ pub(crate) mod header;
 pub(crate) mod page;
 pub(crate) mod pager;
 
-pub(crate) use header::{read_database_header_vfs, write_database_bootstrap_vfs, DatabaseHeader};
+pub use header::DB_FORMAT_VERSION;
+pub(crate) use header::{
+    read_database_header_vfs, read_database_header_vfs_loose, write_database_bootstrap_vfs,
+    DatabaseHeader,
+};
 pub(crate) use pager::PagerHandle;

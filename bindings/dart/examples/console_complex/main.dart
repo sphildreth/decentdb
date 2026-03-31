@@ -405,20 +405,19 @@ class ComplexDemoRunner {
   }
 
   _InsertStage _insertCategories() {
+    final rows = <List<Object?>>[];
+    for (var i = 0; i < counts.categories; i++) {
+      rows.add(<Object?>[
+        i,
+        'category_$i',
+        'Description for category $i with realistic text payload',
+      ]);
+    }
     final stmt = db.prepare(r'INSERT INTO categories VALUES ($1, $2, $3)');
     final watch = Stopwatch()..start();
     try {
       db.transaction(() {
-        for (var i = 0; i < counts.categories; i++) {
-          stmt.reset();
-          stmt.clearBindings();
-          stmt.bindAll(<Object?>[
-            i,
-            'category_$i',
-            'Description for category $i with realistic text payload',
-          ]);
-          stmt.execute();
-        }
+        stmt.executeBatchTyped('itt', rows);
       });
     } finally {
       stmt.dispose();
@@ -433,24 +432,23 @@ class ComplexDemoRunner {
   }
 
   _InsertStage _insertCustomers() {
+    final rows = <List<Object?>>[];
+    for (var i = 0; i < counts.customers; i++) {
+      rows.add(<Object?>[
+        i,
+        'Customer_${i.toString().padLeft(6, '0')}',
+        'user$i@example.com',
+        cities[i % cities.length],
+        '2024-${((i % 12) + 1).toString().padLeft(2, '0')}-${((i % 28) + 1).toString().padLeft(2, '0')}',
+      ]);
+    }
     final stmt = db.prepare(
       r'INSERT INTO customers VALUES ($1, $2, $3, $4, $5)',
     );
     final watch = Stopwatch()..start();
     try {
       db.transaction(() {
-        for (var i = 0; i < counts.customers; i++) {
-          stmt.reset();
-          stmt.clearBindings();
-          stmt.bindAll(<Object?>[
-            i,
-            'Customer_${i.toString().padLeft(6, '0')}',
-            'user$i@example.com',
-            cities[i % cities.length],
-            '2024-${((i % 12) + 1).toString().padLeft(2, '0')}-${((i % 28) + 1).toString().padLeft(2, '0')}',
-          ]);
-          stmt.execute();
-        }
+        stmt.executeBatchTyped('itttt', rows);
       });
     } finally {
       stmt.dispose();
@@ -465,24 +463,23 @@ class ComplexDemoRunner {
   }
 
   _InsertStage _insertProducts() {
+    final rows = <List<Object?>>[];
+    for (var i = 0; i < counts.products; i++) {
+      rows.add(<Object?>[
+        i,
+        'Product_${i.toString().padLeft(6, '0')}_Widget',
+        rng.nextDouble() * 990.0 + 10.0,
+        rng.nextInt(counts.categories),
+        rng.nextInt(500),
+      ]);
+    }
     final stmt = db.prepare(
       r'INSERT INTO products VALUES ($1, $2, $3, $4, $5)',
     );
     final watch = Stopwatch()..start();
     try {
       db.transaction(() {
-        for (var i = 0; i < counts.products; i++) {
-          stmt.reset();
-          stmt.clearBindings();
-          stmt.bindAll(<Object?>[
-            i,
-            'Product_${i.toString().padLeft(6, '0')}_Widget',
-            rng.nextDouble() * 990.0 + 10.0,
-            rng.nextInt(counts.categories),
-            rng.nextInt(500),
-          ]);
-          stmt.execute();
-        }
+        stmt.executeBatchTyped('itfii', rows);
       });
     } finally {
       stmt.dispose();
@@ -497,43 +494,42 @@ class ComplexDemoRunner {
   }
 
   _InsertStage _insertOrdersAndItems() {
+    var itemId = 0;
+    final orderRows = <List<Object?>>[];
+    final itemRows = <List<Object?>>[];
+
+    for (var i = 0; i < counts.orders; i++) {
+      final customerId = rng.nextInt(counts.customers);
+      final month = ((i % 12) + 1).toString().padLeft(2, '0');
+      final day = ((i % 28) + 1).toString().padLeft(2, '0');
+      final lineCount = 1 + rng.nextInt(5);
+      var orderTotal = 0.0;
+      for (var j = 0; j < lineCount; j++) {
+        final productId = rng.nextInt(counts.products);
+        final quantity = 1 + rng.nextInt(10);
+        final unitPrice = rng.nextDouble() * 990.0 + 10.0;
+        orderTotal += quantity * unitPrice;
+        itemRows.add(<Object?>[
+          itemId + j,
+          i,
+          productId,
+          quantity,
+          unitPrice,
+        ]);
+      }
+      orderRows.add(<Object?>[i, customerId, '2024-$month-$day', orderTotal]);
+      itemId += lineCount;
+    }
+
     final orderStmt = db.prepare(r'INSERT INTO orders VALUES ($1, $2, $3, $4)');
     final itemStmt = db.prepare(
       r'INSERT INTO order_items VALUES ($1, $2, $3, $4, $5)',
     );
-    var itemId = 0;
     final watch = Stopwatch()..start();
     try {
       db.transaction(() {
-        for (var i = 0; i < counts.orders; i++) {
-          final customerId = rng.nextInt(counts.customers);
-          final month = ((i % 12) + 1).toString().padLeft(2, '0');
-          final day = ((i % 28) + 1).toString().padLeft(2, '0');
-          final lineCount = 1 + rng.nextInt(5);
-          final items = <List<Object?>>[];
-          var orderTotal = 0.0;
-          for (var j = 0; j < lineCount; j++) {
-            final productId = rng.nextInt(counts.products);
-            final quantity = 1 + rng.nextInt(10);
-            final unitPrice = rng.nextDouble() * 990.0 + 10.0;
-            orderTotal += quantity * unitPrice;
-            items.add(<Object?>[itemId + j, i, productId, quantity, unitPrice]);
-          }
-
-          orderStmt.reset();
-          orderStmt.clearBindings();
-          orderStmt.bindAll(
-              <Object?>[i, customerId, '2024-$month-$day', orderTotal]);
-          orderStmt.execute();
-
-          for (final item in items) {
-            itemStmt.reset();
-            itemStmt.clearBindings();
-            itemStmt.bindAll(item);
-            itemStmt.execute();
-          }
-          itemId += lineCount;
-        }
+        orderStmt.executeBatchTyped('iitf', orderRows);
+        itemStmt.executeBatchTyped('iiiif', itemRows);
       });
     } finally {
       orderStmt.dispose();
@@ -550,22 +546,21 @@ class ComplexDemoRunner {
   }
 
   _InsertStage _insertReviews() {
+    final rows = <List<Object?>>[];
+    for (var i = 0; i < counts.reviews; i++) {
+      rows.add(<Object?>[
+        i,
+        rng.nextInt(counts.products),
+        rng.nextInt(counts.customers),
+        1 + rng.nextInt(5),
+        comments[i % comments.length],
+      ]);
+    }
     final stmt = db.prepare(r'INSERT INTO reviews VALUES ($1, $2, $3, $4, $5)');
     final watch = Stopwatch()..start();
     try {
       db.transaction(() {
-        for (var i = 0; i < counts.reviews; i++) {
-          stmt.reset();
-          stmt.clearBindings();
-          stmt.bindAll(<Object?>[
-            i,
-            rng.nextInt(counts.products),
-            rng.nextInt(counts.customers),
-            1 + rng.nextInt(5),
-            comments[i % comments.length],
-          ]);
-          stmt.execute();
-        }
+        stmt.executeBatchTyped('iiiit', rows);
       });
     } finally {
       stmt.dispose();
@@ -1096,6 +1091,14 @@ class ComplexDemoRunner {
         'ON DELETE ${foreignKey.onDelete}',
       );
     }
+    final snapshot = db.schema.getSchemaSnapshot();
+    final tempTableCount =
+        snapshot.tables.where((table) => table.temporary).length;
+    print(
+      '  Snapshot: ${snapshot.tables.length} tables, ${snapshot.views.length} views, '
+      '${snapshot.indexes.length} indexes, ${snapshot.triggers.length} triggers '
+      '($tempTableCount temp tables)',
+    );
     print('  Introspection: ${formatMs(introspectionMs)}');
     print('');
   }

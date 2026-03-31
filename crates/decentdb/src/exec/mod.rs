@@ -40,7 +40,7 @@ use crate::catalog::{
 use crate::error::{DbError, Result};
 use crate::json::{parse_json, parse_json_path, JsonValue};
 use crate::planner;
-use crate::record::compression::CompressionMode;
+use crate::record::compression::{CompressionMode, AUTO_MIN_PAYLOAD_BYTES};
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
     append_uncompressed_with_tail, build_overflow_chain_cache, free_overflow, read_overflow,
@@ -48,7 +48,7 @@ use crate::record::overflow::{
     OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
-use crate::record::value::{parse_decimal_text, Value};
+use crate::record::value::{compare_decimal, parse_decimal_text, Value};
 use crate::search::{TrigramIndex, TrigramQueryResult};
 use crate::sql::ast::{
     BinaryOp, ColumnDefinition, CommonTableExpr, CreateTableAsStatement, CreateTableStatement,
@@ -465,6 +465,10 @@ pub(crate) struct EngineRuntime {
     pub(crate) temp_schema_cookie: u32,
     pub(crate) indexes: BTreeMap<String, RuntimeIndex>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
+    /// Tables whose row data has not yet been loaded from storage.
+    /// Populated during `decode_manifest_payload` and cleared by
+    /// `load_deferred_tables`.
+    pub(crate) deferred_tables: BTreeSet<String>,
     pub(crate) dirty_tables: BTreeSet<String>,
     pub(crate) append_only_dirty_tables: BTreeSet<String>,
     /// Row indices updated by prepared simple UPDATE; avoids full re-encode.
@@ -475,6 +479,7 @@ pub(crate) struct EngineRuntime {
     pub(crate) index_state_epoch: u64,
     manifest_template: Option<ManifestTemplate>,
     overflow_chain_caches: BTreeMap<String, OverflowChainCache>,
+    manifest_chain_cache: Option<OverflowChainCache>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,6 +513,7 @@ impl Clone for EngineRuntime {
             temp_schema_cookie: self.temp_schema_cookie,
             indexes: self.indexes.clone(),
             persisted_tables: self.persisted_tables.clone(),
+            deferred_tables: self.deferred_tables.clone(),
             // Preserve dirty state so that multi-statement transactions
             // (clone-and-replace) do not lose modifications from earlier
             // statements.  `persist_to_db` clears dirty state after a
@@ -525,6 +531,7 @@ impl Clone for EngineRuntime {
             // Optimization caches rebuilt on demand during persist.
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
+            manifest_chain_cache: None,
         }
     }
 }
@@ -542,6 +549,7 @@ impl EngineRuntime {
             temp_schema_cookie: 0,
             indexes: BTreeMap::new(),
             persisted_tables: BTreeMap::new(),
+            deferred_tables: BTreeSet::new(),
             dirty_tables: BTreeSet::new(),
             append_only_dirty_tables: BTreeSet::new(),
             row_update_dirty: BTreeMap::new(),
@@ -550,6 +558,7 @@ impl EngineRuntime {
             index_state_epoch: 0,
             manifest_template: None,
             overflow_chain_caches: BTreeMap::new(),
+            manifest_chain_cache: None,
         }
     }
 
@@ -610,9 +619,70 @@ impl EngineRuntime {
             Self::empty(schema_cookie)
         };
         runtime.catalog.schema_cookie = schema_cookie;
-        runtime.rebuild_indexes(pager.page_size())?;
+        if runtime.deferred_tables.is_empty() {
+            runtime.rebuild_indexes(pager.page_size())?;
+        }
         drop(reader);
         Ok((runtime, snapshot_lsn))
+    }
+
+    /// Returns `true` when one or more tables still have their row data
+    /// deferred (not yet loaded from storage).
+    #[must_use]
+    pub(crate) fn has_deferred_tables(&self) -> bool {
+        !self.deferred_tables.is_empty()
+    }
+
+    /// Materializes all deferred table data from storage, then rebuilds
+    /// indexes.  After this call `deferred_tables` is empty and the runtime
+    /// is fully populated.
+    pub(crate) fn load_deferred_tables(
+        &mut self,
+        pager: &PagerHandle,
+        wal: &WalHandle,
+        page_size: u32,
+    ) -> Result<()> {
+        if self.deferred_tables.is_empty() {
+            return Ok(());
+        }
+        let reader = wal.begin_reader()?;
+        let store = SnapshotPageStore {
+            pager,
+            wal,
+            snapshot_lsn: reader.snapshot_lsn(),
+        };
+        let table_names: Vec<String> = self.deferred_tables.iter().cloned().collect();
+        for table_name in &table_names {
+            let state = self.persisted_tables.get(table_name).ok_or_else(|| {
+                DbError::internal(format!(
+                    "deferred table '{table_name}' has no persisted state"
+                ))
+            })?;
+            let pointer = state.pointer;
+            let checksum = state.checksum;
+
+            let data = if pointer.head_page_id == 0 || pointer.logical_len == 0 {
+                TableData::default()
+            } else {
+                let payload = read_overflow(&store, pointer)?;
+                if crc32c_parts(&[payload.as_slice()]) != checksum {
+                    return Err(DbError::corruption(format!(
+                        "table payload checksum mismatch for {table_name}"
+                    )));
+                }
+                decode_table_payload(&payload)?
+            };
+
+            if let Some(ps) = self.persisted_tables.get_mut(table_name) {
+                ps.row_count = data.rows.len();
+                ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
+            }
+            self.tables.insert(table_name.clone(), data);
+        }
+        self.deferred_tables.clear();
+        drop(reader);
+        self.rebuild_indexes(page_size)?;
+        Ok(())
     }
 
     pub(crate) fn persist_to_db(&mut self, db: &crate::db::Db) -> Result<()> {
@@ -768,6 +838,141 @@ impl EngineRuntime {
         }
 
         let (checksum, pointer) = {
+            // Take the chain cache to avoid overlapping borrows with
+            // manifest_payload (which mutates self.manifest_template).
+            let chain_cache = self.manifest_chain_cache.take();
+            let manifest = self.manifest_payload()?;
+            let checksum = crc32c_parts(&[manifest]);
+            let previous_manifest_pointer = old_root.map_or(
+                OverflowPointer {
+                    head_page_id: 0,
+                    logical_len: 0,
+                    flags: 0,
+                },
+                |root| root.pointer,
+            );
+            let pointer = {
+                let mut store = DbTxnPageStore { db };
+                if let Some(chain_cache) = chain_cache {
+                    let (ptr, new_cache, _tail) = rewrite_overflow_cached(
+                        &mut store,
+                        previous_manifest_pointer,
+                        manifest,
+                        &chain_cache.page_ids,
+                        0,
+                    )?;
+                    self.manifest_chain_cache = Some(new_cache);
+                    ptr
+                } else {
+                    let ptr = rewrite_overflow(
+                        &mut store,
+                        previous_manifest_pointer,
+                        manifest,
+                        CompressionMode::Never,
+                    )?;
+                    let cache = build_overflow_chain_cache(&store, ptr.head_page_id)?;
+                    self.manifest_chain_cache = Some(cache);
+                    ptr
+                }
+            };
+            (checksum, pointer)
+        };
+
+        let root_page = encode_root_header(
+            db.config().page_size,
+            RootHeader {
+                schema_cookie: self.catalog.schema_cookie,
+                payload_checksum: checksum,
+                pointer,
+            },
+        );
+        db.write_page_owned(page::CATALOG_ROOT_PAGE_ID, root_page)?;
+        self.dirty_tables.clear();
+        self.append_only_dirty_tables.clear();
+        self.row_update_dirty.clear();
+        self.root_state = Some(RootHeader {
+            schema_cookie: self.catalog.schema_cookie,
+            payload_checksum: checksum,
+            pointer,
+        });
+        if schema_cookie_changed {
+            db.set_schema_cookie(self.catalog.schema_cookie)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_checkpoint_compaction_candidates(&self) -> bool {
+        self.persisted_tables.values().any(|state| {
+            state.pointer.head_page_id != 0
+                && !state.pointer.is_compressed()
+                && usize::try_from(state.pointer.logical_len)
+                    .ok()
+                    .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
+        }) || self.root_state.is_some_and(|root| {
+            root.pointer.head_page_id != 0
+                && !root.pointer.is_compressed()
+                && usize::try_from(root.pointer.logical_len)
+                    .ok()
+                    .is_some_and(|len| len >= AUTO_MIN_PAYLOAD_BYTES)
+        })
+    }
+
+    pub(crate) fn compact_persisted_payloads_for_checkpoint(
+        &mut self,
+        db: &crate::db::Db,
+    ) -> Result<bool> {
+        let old_root = self.root_state;
+        let mut changed = false;
+        {
+            let mut store = DbTxnPageStore { db };
+            let table_names = self.persisted_tables.keys().cloned().collect::<Vec<_>>();
+            for table_name in table_names {
+                let Some(previous_state) = self.persisted_tables.get(&table_name).copied() else {
+                    continue;
+                };
+                let previous_pointer = previous_state.pointer;
+                if previous_pointer.head_page_id == 0
+                    || previous_pointer.is_compressed()
+                    || usize::try_from(previous_pointer.logical_len)
+                        .ok()
+                        .is_none_or(|len| len < AUTO_MIN_PAYLOAD_BYTES)
+                {
+                    continue;
+                }
+                let payload = if let Some(cached) = self.cached_payloads.get(&table_name) {
+                    Arc::clone(cached)
+                } else {
+                    Arc::new(read_overflow(&store, previous_pointer)?)
+                };
+                let pointer = rewrite_overflow(
+                    &mut store,
+                    previous_pointer,
+                    payload.as_slice(),
+                    CompressionMode::Auto,
+                )?;
+                if pointer != previous_pointer {
+                    changed = true;
+                }
+                let tail = if pointer.is_compressed() {
+                    OverflowTailInfo::default()
+                } else {
+                    read_uncompressed_overflow_tail(&store, pointer)?.unwrap_or_default()
+                };
+                self.persisted_tables.insert(
+                    table_name.clone(),
+                    PersistedTableState {
+                        pointer,
+                        checksum: previous_state.checksum,
+                        row_count: previous_state.row_count,
+                        tail,
+                    },
+                );
+                self.cached_payloads.insert(table_name.clone(), payload);
+                self.overflow_chain_caches.remove(&table_name);
+            }
+        }
+
+        let (checksum, pointer) = {
             let manifest = self.manifest_payload()?;
             let checksum = crc32c_parts(&[manifest]);
             let previous_manifest_pointer = old_root.map_or(
@@ -784,33 +989,24 @@ impl EngineRuntime {
                     &mut store,
                     previous_manifest_pointer,
                     manifest,
-                    CompressionMode::Never,
+                    CompressionMode::Auto,
                 )?
             };
             (checksum, pointer)
         };
 
-        let root_page = encode_root_header(
-            db.config().page_size,
-            RootHeader {
-                schema_cookie: self.catalog.schema_cookie,
-                payload_checksum: checksum,
-                pointer,
-            },
-        );
-        db.write_page(page::CATALOG_ROOT_PAGE_ID, &root_page)?;
-        self.dirty_tables.clear();
-        self.append_only_dirty_tables.clear();
-        self.row_update_dirty.clear();
-        self.root_state = Some(RootHeader {
+        let new_root = RootHeader {
             schema_cookie: self.catalog.schema_cookie,
             payload_checksum: checksum,
             pointer,
-        });
-        if schema_cookie_changed {
-            db.set_schema_cookie(self.catalog.schema_cookie)?;
+        };
+        if old_root != Some(new_root) {
+            let root_page = encode_root_header(db.config().page_size, new_root);
+            db.write_page_owned(page::CATALOG_ROOT_PAGE_ID, root_page)?;
+            self.root_state = Some(new_root);
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn manifest_payload(&mut self) -> Result<&[u8]> {
@@ -5047,7 +5243,7 @@ impl EngineRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RootHeader {
     schema_cookie: u32,
     payload_checksum: u32,
@@ -5093,9 +5289,9 @@ impl PageStore for SnapshotPageStore<'_> {
         ))
     }
 
-    fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         if let Some(page) = self.wal.read_page_at_snapshot(page_id, self.snapshot_lsn)? {
-            Ok(page)
+            Ok(Arc::from(page))
         } else {
             self.pager.read_page(page_id)
         }
@@ -5126,12 +5322,16 @@ impl PageStore for DbTxnPageStore<'_> {
         self.db.free_page(page_id)
     }
 
-    fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         self.db.read_page(page_id)
     }
 
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
         self.db.write_page(page_id, data)
+    }
+
+    fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
+        self.db.write_page_owned(page_id, data)
     }
 }
 
@@ -5976,8 +6176,8 @@ fn encode_runtime_payload(runtime: &EngineRuntime) -> Result<Vec<u8>> {
 
 fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
     let mut cursor = Cursor::new(bytes);
-    let magic = cursor.read_bytes(9)?;
-    if magic.as_slice() != LEGACY_RUNTIME_PAYLOAD_MAGIC {
+    let magic = cursor.read_slice(9)?;
+    if magic != LEGACY_RUNTIME_PAYLOAD_MAGIC {
         return Err(DbError::corruption("catalog state magic is invalid"));
     }
     let mut runtime = EngineRuntime::empty(cursor.read_u32()?);
@@ -6047,10 +6247,12 @@ fn decode_runtime_payload(bytes: &[u8]) -> Result<EngineRuntime> {
         let mut data = TableData::default();
         for _ in 0..row_count {
             let row_id = cursor.read_i64()?;
-            let row = Row::decode(&cursor.read_vec()?)?;
+            let row_bytes_len = cursor.read_u32()? as usize;
+            let row_bytes = cursor.read_slice(row_bytes_len)?;
+            let row = Row::decode(row_bytes)?;
             data.rows.push(StoredRow {
                 row_id,
-                values: row.values().to_vec(),
+                values: row.into_values(),
             });
         }
         runtime.catalog.tables.insert(table_name.clone(), table);
@@ -6288,10 +6490,10 @@ fn patch_manifest_table_state(
     Ok(())
 }
 
-fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
+fn decode_manifest_payload<S: PageStore>(_store: &S, bytes: &[u8]) -> Result<EngineRuntime> {
     let mut cursor = Cursor::new(bytes);
-    let magic = cursor.read_bytes(MANIFEST_PAYLOAD_MAGIC.len())?;
-    if magic.as_slice() != MANIFEST_PAYLOAD_MAGIC {
+    let magic = cursor.read_slice(MANIFEST_PAYLOAD_MAGIC.len())?;
+    if magic != MANIFEST_PAYLOAD_MAGIC {
         return Err(DbError::corruption("catalog manifest magic is invalid"));
     }
     let mut runtime = EngineRuntime::empty(cursor.read_u32()?);
@@ -6357,7 +6559,7 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
         }
         table.primary_key_columns = cursor.read_strings()?;
         table.next_row_id = cursor.read_i64()?;
-        let mut state = PersistedTableState {
+        let state = PersistedTableState {
             checksum: cursor.read_u32()?,
             pointer: OverflowPointer {
                 head_page_id: cursor.read_u32()?,
@@ -6368,21 +6570,16 @@ fn decode_manifest_payload<S: PageStore>(store: &S, bytes: &[u8]) -> Result<Engi
             tail: OverflowTailInfo::default(),
         };
         runtime.catalog.tables.insert(table_name.clone(), table);
-        let data = if state.pointer.head_page_id == 0 || state.pointer.logical_len == 0 {
-            TableData::default()
-        } else {
-            let payload = read_overflow(store, state.pointer)?;
-            if crc32c_parts(&[payload.as_slice()]) != state.checksum {
-                return Err(DbError::corruption(format!(
-                    "table payload checksum mismatch for {table_name}"
-                )));
-            }
-            decode_table_payload(&payload)?
-        };
-        state.row_count = data.rows.len();
-        state.tail = read_uncompressed_overflow_tail(store, state.pointer)?.unwrap_or_default();
+        let has_data = state.pointer.head_page_id != 0 && state.pointer.logical_len != 0;
+        if has_data {
+            // Defer row data loading to first statement execution.
+            runtime.deferred_tables.insert(table_name.clone());
+        }
         runtime.persisted_tables.insert(table_name.clone(), state);
-        runtime.tables.insert(table_name, data);
+        if !has_data {
+            // Empty tables are immediately available.
+            runtime.tables.insert(table_name, TableData::default());
+        }
     }
 
     let index_count = cursor.read_u32()?;
@@ -6674,8 +6871,8 @@ fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
         return Ok(TableData::default());
     }
     let mut cursor = Cursor::new(bytes);
-    let magic = cursor.read_bytes(TABLE_PAYLOAD_MAGIC.len())?;
-    if magic.as_slice() != TABLE_PAYLOAD_MAGIC {
+    let magic = cursor.read_slice(TABLE_PAYLOAD_MAGIC.len())?;
+    if magic != TABLE_PAYLOAD_MAGIC {
         return Err(DbError::corruption("table payload magic is invalid"));
     }
     let row_count = cursor.read_u32()? as usize;
@@ -6683,10 +6880,12 @@ fn decode_table_payload(bytes: &[u8]) -> Result<TableData> {
     data.rows.reserve(row_count);
     while cursor.offset < cursor.bytes.len() {
         let row_id = cursor.read_i64()?;
-        let row = Row::decode(&cursor.read_vec()?)?;
+        let row_bytes_len = cursor.read_u32()? as usize;
+        let row_bytes = cursor.read_slice(row_bytes_len)?;
+        let row = Row::decode(row_bytes)?;
         data.rows.push(StoredRow {
             row_id,
-            values: row.values().to_vec(),
+            values: row.into_values(),
         });
     }
     if data.rows.len() < row_count {
@@ -7042,7 +7241,7 @@ impl<'a> Cursor<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn read_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+    fn read_slice(&mut self, len: usize) -> Result<&'a [u8]> {
         let end = self
             .offset
             .checked_add(len)
@@ -7052,7 +7251,7 @@ impl<'a> Cursor<'a> {
             .get(self.offset..end)
             .ok_or_else(|| DbError::corruption("truncated catalog state"))?;
         self.offset = end;
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -7069,25 +7268,23 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_u32(&mut self) -> Result<u32> {
-        let bytes = self.read_bytes(4)?;
-        Ok(u32::from_le_bytes(
-            bytes.as_slice().try_into().expect("u32"),
-        ))
+        let bytes = self.read_slice(4)?;
+        Ok(u32::from_le_bytes(bytes.try_into().expect("u32")))
     }
 
     fn read_i64(&mut self) -> Result<i64> {
-        let bytes = self.read_bytes(8)?;
-        Ok(i64::from_le_bytes(
-            bytes.as_slice().try_into().expect("i64"),
-        ))
+        let bytes = self.read_slice(8)?;
+        Ok(i64::from_le_bytes(bytes.try_into().expect("i64")))
     }
 
     fn read_string(&mut self) -> Result<String> {
         let len = self.read_u32()? as usize;
-        let bytes = self.read_bytes(len)?;
-        String::from_utf8(bytes).map_err(|error| {
-            DbError::corruption(format!("catalog state string is not valid UTF-8: {error}"))
-        })
+        let bytes = self.read_slice(len)?;
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_owned())
+            .map_err(|error| {
+                DbError::corruption(format!("catalog state string is not valid UTF-8: {error}"))
+            })
     }
 
     fn read_optional_string(&mut self) -> Result<Option<String>> {
@@ -7101,11 +7298,6 @@ impl<'a> Cursor<'a> {
     fn read_strings(&mut self) -> Result<Vec<String>> {
         let len = self.read_u32()? as usize;
         (0..len).map(|_| self.read_string()).collect()
-    }
-
-    fn read_vec(&mut self) -> Result<Vec<u8>> {
-        let len = self.read_u32()? as usize;
-        self.read_bytes(len)
     }
 }
 
@@ -7191,6 +7383,12 @@ impl SimpleGroupedNumericAggregate {
             }
             Value::Float64(value) => {
                 self.total_float += *value;
+                self.saw_float = true;
+                self.saw_value = true;
+                Ok(())
+            }
+            Value::Decimal { scaled, scale } => {
+                self.total_float += decimal_to_f64(*scaled, *scale);
                 self.saw_float = true;
                 self.saw_value = true;
                 Ok(())
@@ -10418,6 +10616,11 @@ fn aggregate_numeric(
                     saw_float = true;
                     count += 1;
                 }
+                Value::Decimal { scaled, scale } => {
+                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
+                    saw_float = true;
+                    count += 1;
+                }
                 other => {
                     return Err(DbError::sql(format!(
                         "numeric aggregate does not support {other:?}"
@@ -10442,6 +10645,11 @@ fn aggregate_numeric(
                 }
                 Value::Float64(value) => {
                     total_float += value;
+                    saw_float = true;
+                    count += 1;
+                }
+                Value::Decimal { scaled, scale } => {
+                    total_float += (scaled as f64) / 10_f64.powi(i32::from(scale));
                     saw_float = true;
                     count += 1;
                 }
@@ -10502,6 +10710,7 @@ fn aggregate_variance(
         let number = match value {
             Value::Int64(value) => value as f64,
             Value::Float64(value) => value,
+            Value::Decimal { scaled, scale } => (scaled as f64) / 10_f64.powi(i32::from(scale)),
             other => {
                 return Err(DbError::sql(format!(
                     "variance aggregate does not support {other:?}"
@@ -13177,6 +13386,7 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         crate::catalog::ColumnType::Int64 => match value {
             Value::Int64(value) => Ok(Value::Int64(value)),
             Value::Float64(value) => Ok(Value::Int64(value as i64)),
+            Value::Decimal { scaled, scale } => Ok(Value::Int64(decimal_to_i64(scaled, scale))),
             Value::Bool(value) => Ok(Value::Int64(if value { 1 } else { 0 })),
             Value::Text(value) => value
                 .parse::<i64>()
@@ -13187,6 +13397,7 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
         crate::catalog::ColumnType::Float64 => match value {
             Value::Int64(value) => Ok(Value::Float64(value as f64)),
             Value::Float64(value) => Ok(Value::Float64(value)),
+            Value::Decimal { scaled, scale } => Ok(Value::Float64(decimal_to_f64(scaled, scale))),
             Value::Text(value) => value
                 .parse::<f64>()
                 .map(Value::Float64)
@@ -13248,6 +13459,20 @@ fn cast_value(value: Value, target_type: crate::catalog::ColumnType) -> Result<V
             other => Err(DbError::sql(format!("cannot cast {other:?} to TIMESTAMP"))),
         },
     }
+}
+
+fn decimal_to_f64(scaled: i64, scale: u8) -> f64 {
+    (scaled as f64) / 10_f64.powi(i32::from(scale))
+}
+
+fn decimal_to_i64(scaled: i64, scale: u8) -> i64 {
+    if scale == 0 {
+        return scaled;
+    }
+    let Some(divisor) = 10_i64.checked_pow(u32::from(scale)) else {
+        return 0;
+    };
+    scaled / divisor
 }
 
 fn infer_column_type_for_ctas(
@@ -13513,8 +13738,19 @@ mod tests {
         let decoded = decode_manifest_payload(&store, &manifest).expect("decode manifest payload");
 
         assert_eq!(decoded.catalog.schema_cookie, runtime.catalog.schema_cookie);
-        assert_eq!(decoded.tables["docs"].rows, runtime.tables["docs"].rows);
-        assert_eq!(decoded.persisted_tables["docs"], table_states["docs"]);
+        // Table data is deferred — "docs" should not be in tables yet.
+        assert!(decoded.deferred_tables.contains("docs"));
+        assert!(!decoded.tables.contains_key("docs"));
+        // Schema and persisted state (pointer, checksum) are available immediately.
+        assert!(decoded.catalog.tables.contains_key("docs"));
+        assert_eq!(
+            decoded.persisted_tables["docs"].pointer,
+            table_states["docs"].pointer
+        );
+        assert_eq!(
+            decoded.persisted_tables["docs"].checksum,
+            table_states["docs"].checksum
+        );
     }
 
     #[test]
@@ -13948,6 +14184,61 @@ fn compare_values(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
         (Value::Float64(left), Value::Float64(right)) => Ok(left.total_cmp(right)),
         (Value::Int64(left), Value::Float64(right)) => Ok((*left as f64).total_cmp(right)),
         (Value::Float64(left), Value::Int64(right)) => Ok(left.total_cmp(&(*right as f64))),
+        (
+            Value::Decimal {
+                scaled: left_scaled,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                scaled: right_scaled,
+                scale: right_scale,
+            },
+        ) => Ok(compare_decimal(
+            *left_scaled,
+            *left_scale,
+            *right_scaled,
+            *right_scale,
+        )),
+        (
+            Value::Decimal {
+                scaled: left_scaled,
+                scale: left_scale,
+            },
+            Value::Float64(right),
+        ) => {
+            let left_f64 = decimal_to_f64(*left_scaled, *left_scale);
+            Ok(left_f64.total_cmp(right))
+        }
+        (
+            Value::Float64(left),
+            Value::Decimal {
+                scaled: right_scaled,
+                scale: right_scale,
+            },
+        ) => {
+            let right_f64 = decimal_to_f64(*right_scaled, *right_scale);
+            Ok(left.total_cmp(&right_f64))
+        }
+        (
+            Value::Decimal {
+                scaled: left_scaled,
+                scale: left_scale,
+            },
+            Value::Int64(right),
+        ) => {
+            let left_f64 = decimal_to_f64(*left_scaled, *left_scale);
+            Ok(left_f64.total_cmp(&(*right as f64)))
+        }
+        (
+            Value::Int64(left),
+            Value::Decimal {
+                scaled: right_scaled,
+                scale: right_scale,
+            },
+        ) => {
+            let right_f64 = decimal_to_f64(*right_scaled, *right_scale);
+            Ok((*left as f64).total_cmp(&right_f64))
+        }
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         (Value::Text(left), Value::Text(right)) => Ok(left.cmp(right)),
         (Value::Blob(left), Value::Blob(right)) => Ok(left.cmp(right)),

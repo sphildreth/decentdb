@@ -28,7 +28,7 @@ import java.util.logging.Logger;
 public final class DecentDBDriver implements Driver {
 
     public static final String URL_PREFIX = "jdbc:decentdb:";
-    public static final String DRIVER_VERSION = "2.0.1";
+    public static final String DRIVER_VERSION = "2.1.0";
     public static final int DRIVER_MAJOR_VERSION = 1;
     public static final int DRIVER_MINOR_VERSION = 8;
 

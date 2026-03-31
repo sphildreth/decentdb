@@ -870,7 +870,7 @@ mod in_memory_page_store_tests {
         data[DEFAULT_PAGE_SIZE as usize - 1] = 0xAB;
         store.write_page(page_id, &data).unwrap();
         let read_back = store.read_page(page_id).unwrap();
-        assert_eq!(read_back, data);
+        assert_eq!(read_back.to_vec(), data);
     }
 
     #[test]

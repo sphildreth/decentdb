@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
 use crate::catalog::{
-    identifiers_equal, CatalogHandle, ColumnSchema, ForeignKeyAction, ForeignKeyConstraint,
-    IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent, TriggerKind, TriggerSchema,
-    ViewSchema,
+    identifiers_equal, CatalogHandle, CheckConstraint, ColumnSchema, ForeignKeyAction,
+    ForeignKeyConstraint, IndexColumn, IndexKind, IndexSchema, TableSchema, TriggerEvent,
+    TriggerKind, TriggerSchema, ViewSchema,
 };
 use crate::config::DbConfig;
 use crate::error::{DbError, Result};
@@ -22,8 +22,9 @@ use crate::exec::{
     TableData,
 };
 use crate::metadata::{
-    ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification, StorageInfo, TableInfo,
-    TriggerInfo, ViewInfo,
+    CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
+    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
+    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
 };
 use crate::record::value::Value;
 use crate::sql::ast::Statement as SqlStatement;
@@ -60,14 +61,14 @@ pub struct PreparedStatement {
     in_state_without_clone: bool,
 }
 
-/// Exclusive SQL transaction handle that owns mutable runtime state locally.
+/// Exclusive SQL transaction handle that keeps mutable runtime state reserved.
 ///
 /// While this handle is active, callers should use it for all SQL work on the
 /// same `Db` handle until `commit` or `rollback`.
 #[derive(Debug)]
 pub struct SqlTransaction<'a> {
     db: &'a Db,
-    state: Option<SqlTxnState>,
+    state: Option<ExclusiveSqlTxnState<'a>>,
 }
 
 impl PreparedStatement {
@@ -108,23 +109,17 @@ impl SqlTransaction<'_> {
             .state
             .as_mut()
             .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
-        self.db.execute_prepared_in_state(prepared, params, state)
+        self.db
+            .execute_prepared_in_exclusive_state(prepared, params, state)
     }
 
-    /// Commits this transaction's local runtime into the WAL-backed database.
+    /// Commits this transaction's reserved runtime into the WAL-backed database.
     pub fn commit(mut self) -> Result<u64> {
         let state = self
             .state
             .take()
             .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
-        let result = if state.persistent_changed {
-            self.db
-                .persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
-        } else {
-            self.db
-                .install_temp_runtime(state.runtime)
-                .map(|()| state.base_lsn)
-        };
+        let result = self.db.commit_exclusive_sql_txn(state);
         let release = self.deactivate();
         match (result, release) {
             (Err(error), _) => Err(error),
@@ -135,8 +130,12 @@ impl SqlTransaction<'_> {
 
     /// Rolls this transaction back and releases the handle.
     pub fn rollback(mut self) -> Result<()> {
-        self.state.take();
-        self.deactivate()
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| DbError::transaction("SQL transaction handle is no longer active"))?;
+        let result = self.db.rollback_exclusive_sql_txn(state);
+        self.deactivate().and(result)
     }
 
     fn deactivate(&mut self) -> Result<()> {
@@ -154,7 +153,9 @@ impl SqlTransaction<'_> {
 
 impl Drop for SqlTransaction<'_> {
     fn drop(&mut self) {
-        self.state.take();
+        if let Some(state) = self.state.take() {
+            let _ = self.db.rollback_exclusive_sql_txn(state);
+        }
         if let Ok(mut txn) = self.db.inner.sql_txn.lock() {
             *txn = SqlTxnSlot::None;
             self.db.inner.sql_txn_active.store(false, Ordering::Release);
@@ -181,8 +182,6 @@ struct DbInner {
     statement_cache: Mutex<StatementCache>,
     prepared_insert_cache: Mutex<PreparedInsertCache>,
     held_snapshots: Mutex<HashMap<u64, ReaderGuard>>,
-    /// Pre-built transaction state cloned while cache is warm post-commit.
-    pre_built_txn: Mutex<Option<Box<SqlTxnState>>>,
 }
 
 impl Drop for DbInner {
@@ -255,7 +254,16 @@ struct SqlTxnState {
     runtime: EngineRuntime,
     base_lsn: u64,
     persistent_changed: bool,
+    indexes_maybe_stale: bool,
     savepoints: Vec<SqlSavepoint>,
+}
+
+#[derive(Debug)]
+struct ExclusiveSqlTxnState<'a> {
+    runtime: RwLockWriteGuard<'a, EngineRuntime>,
+    base_lsn: u64,
+    persistent_changed: bool,
+    indexes_maybe_stale: bool,
 }
 
 #[derive(Debug)]
@@ -270,6 +278,7 @@ struct SqlSavepoint {
     name: String,
     runtime: EngineRuntime,
     persistent_changed: bool,
+    indexes_maybe_stale: bool,
 }
 
 const STATEMENT_CACHE_CAPACITY: usize = 128;
@@ -393,10 +402,32 @@ impl PreparedInsertCache {
 }
 
 impl Db {
-    /// Begins an exclusive SQL transaction handle that keeps mutable runtime
-    /// state local until commit or rollback.
+    /// Reads the raw database header without opening the entire database engine
+    /// or validating the format version. This is useful for inspection utilities
+    /// and pre-flight format validation.
+    pub fn read_header_info(path: impl AsRef<Path>) -> Result<HeaderInfo> {
+        let path = path.as_ref();
+        let vfs = VfsHandle::for_path(path);
+        let file = vfs.open(path, OpenMode::OpenExisting, FileKind::Database)?;
+        let header = storage::read_database_header_vfs_loose(file.as_ref())?;
+        Ok(HeaderInfo {
+            magic_hex: hex_encode(&header.magic),
+            format_version: header.format_version,
+            page_size: header.page_size,
+            header_checksum: header.header_checksum,
+            schema_cookie: header.schema_cookie,
+            catalog_root_page_id: header.catalog_root_page_id,
+            freelist_root_page_id: header.freelist.root_page_id,
+            freelist_head_page_id: header.freelist.head_page_id,
+            freelist_page_count: header.freelist.page_count,
+            last_checkpoint_lsn: header.last_checkpoint_lsn,
+        })
+    }
+
+    /// Begins an exclusive SQL transaction handle that reserves mutable runtime
+    /// state until commit or rollback.
     pub fn transaction(&self) -> Result<SqlTransaction<'_>> {
-        let state = self.build_sql_txn_state()?;
+        let state = self.build_exclusive_sql_txn_state()?;
         let mut txn = self
             .inner
             .sql_txn
@@ -510,7 +541,11 @@ impl Db {
             self.install_temp_runtime(state.runtime)?;
             return Ok(state.base_lsn);
         }
-        self.persist_runtime_if_latest(state.runtime, Some(state.base_lsn))
+        self.persist_runtime_if_latest(
+            state.runtime,
+            Some(state.base_lsn),
+            state.indexes_maybe_stale,
+        )
     }
 
     /// Rolls back the current explicit SQL transaction.
@@ -565,6 +600,7 @@ impl Db {
             name: canonical_savepoint_name(name),
             runtime: state.runtime.clone(),
             persistent_changed: state.persistent_changed,
+            indexes_maybe_stale: state.indexes_maybe_stale,
         });
         Ok(())
     }
@@ -619,6 +655,7 @@ impl Db {
             .ok_or_else(|| DbError::transaction(format!("savepoint {name} does not exist")))?;
         state.runtime = state.savepoints[index].runtime.clone();
         state.persistent_changed = state.savepoints[index].persistent_changed;
+        state.indexes_maybe_stale = state.savepoints[index].indexes_maybe_stale;
         state.savepoints.truncate(index + 1);
         Ok(())
     }
@@ -629,6 +666,7 @@ impl Db {
         Ok(StorageInfo {
             path: self.path().to_path_buf(),
             wal_path: self.inner.wal.file_path().to_path_buf(),
+            format_version: header.format_version,
             page_size: self.inner.config.page_size,
             cache_size_mb: self.inner.config.cache_size_mb,
             page_count: self.inner.pager.on_disk_page_count()?,
@@ -730,6 +768,29 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn write_page_owned(&self, page_id: u32, data: Vec<u8>) -> Result<()> {
+        page::validate_page_id(page_id)?;
+        if data.len() != self.inner.config.page_size as usize {
+            return Err(DbError::internal(format!(
+                "page {page_id} write length {} does not match configured page size {}",
+                data.len(),
+                self.inner.config.page_size
+            )));
+        }
+        let mut txn = self
+            .inner
+            .write_txn
+            .lock()
+            .map_err(|_| DbError::internal("write transaction lock poisoned"))?;
+        if !txn.active {
+            return Err(DbError::transaction(
+                "write_page requires an active write transaction",
+            ));
+        }
+        txn.staged_pages.insert(page_id, data);
+        Ok(())
+    }
+
     /// Allocates a new page from the freelist or file tail.
     pub fn allocate_page(&self) -> Result<u32> {
         let mut txn = self
@@ -822,7 +883,9 @@ impl Db {
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
-        self.inner.wal.commit_pages(pages, max_page_count)
+        self.inner
+            .wal
+            .commit_pages(&self.inner.pager, pages, max_page_count)
     }
 
     fn commit_if_latest(&self, expected_latest_lsn: u64) -> Result<u64> {
@@ -847,9 +910,12 @@ impl Db {
 
         let pages: Vec<_> = pages.into_iter().collect();
         let max_page_count = self.inner.wal.max_page_count().max(max_page_id);
-        self.inner
-            .wal
-            .commit_pages_if_latest(pages, max_page_count, expected_latest_lsn)
+        self.inner.wal.commit_pages_if_latest(
+            &self.inner.pager,
+            pages,
+            max_page_count,
+            expected_latest_lsn,
+        )
     }
 
     /// Rolls back the current write transaction.
@@ -864,9 +930,9 @@ impl Db {
         Ok(())
     }
 
-    fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Vec<u8>> {
+    fn write_txn_visible_page(&self, txn: &WriteTxn, page_id: PageId) -> Result<Arc<[u8]>> {
         if let Some(staged) = txn.staged_pages.get(&page_id).cloned() {
-            return Ok(staged);
+            return Ok(Arc::from(staged));
         }
 
         let reader = self.inner.wal.begin_reader()?;
@@ -876,7 +942,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(wal_page);
+            return Ok(Arc::from(wal_page));
         }
         self.inner.pager.read_page(page_id)
     }
@@ -895,7 +961,7 @@ impl Db {
     }
 
     /// Reads the latest visible version of a page.
-    pub fn read_page(&self, page_id: u32) -> Result<Vec<u8>> {
+    pub fn read_page(&self, page_id: u32) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         if let Some(staged) = self
             .inner
@@ -906,7 +972,7 @@ impl Db {
             .get(&page_id)
             .cloned()
         {
-            return Ok(staged);
+            return Ok(Arc::from(staged));
         }
 
         let reader = self.inner.wal.begin_reader()?;
@@ -916,13 +982,14 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(wal_page);
+            return Ok(Arc::from(wal_page));
         }
         self.inner.pager.read_page(page_id)
     }
 
     /// Performs a reader-aware checkpoint.
     pub fn checkpoint(&self) -> Result<()> {
+        self.compact_persisted_payloads_before_checkpoint()?;
         self.inner
             .wal
             .checkpoint(&self.inner.pager, self.inner.config.checkpoint_timeout_sec)
@@ -1020,6 +1087,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.ensure_deferred_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         let inserted = working.bulk_load_rows(
             table_name,
@@ -1042,6 +1110,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.ensure_deferred_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_index(name, self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1054,6 +1123,7 @@ impl Db {
             .sql_write_lock
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
+        self.ensure_deferred_tables_loaded()?;
         let mut working = self.engine_snapshot()?;
         working.rebuild_indexes(self.inner.config.page_size)?;
         self.persist_runtime(working).map(|_| ())
@@ -1083,7 +1153,7 @@ impl Db {
     }
 
     /// Reads a page using a previously held snapshot token.
-    pub fn read_page_for_snapshot(&self, token: u64, page_id: u32) -> Result<Vec<u8>> {
+    pub fn read_page_for_snapshot(&self, token: u64, page_id: u32) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         let snapshot_lsn = self
             .inner
@@ -1099,7 +1169,7 @@ impl Db {
             .wal
             .read_page_at_snapshot(page_id, snapshot_lsn)?
         {
-            return Ok(wal_page);
+            return Ok(Arc::from(wal_page));
         }
         self.inner.pager.read_page(page_id)
     }
@@ -1240,6 +1310,12 @@ impl Db {
             .collect())
     }
 
+    /// Returns the authoritative rich schema snapshot for bindings and tooling.
+    pub fn get_schema_snapshot(&self) -> Result<SchemaSnapshot> {
+        let runtime = self.runtime_for_inspection()?;
+        Ok(schema_snapshot(&runtime))
+    }
+
     /// Verifies that a named index can be rebuilt logically from the persisted table state.
     pub fn verify_index(&self, name: &str) -> Result<IndexVerification> {
         let runtime = self.runtime_for_inspection()?;
@@ -1338,6 +1414,7 @@ impl Db {
             &path,
             effective_config.page_size,
             effective_config.wal_sync_mode,
+            &pager,
         )?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
         let (runtime, runtime_lsn) = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
@@ -1363,7 +1440,6 @@ impl Db {
                 statement_cache: Mutex::new(StatementCache::default()),
                 prepared_insert_cache: Mutex::new(PreparedInsertCache::default()),
                 held_snapshots: Mutex::new(HashMap::new()),
-                pre_built_txn: Mutex::new(None),
             }),
         })
     }
@@ -1396,6 +1472,7 @@ impl Db {
         }
 
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let runtime = self
             .inner
             .engine
@@ -1697,6 +1774,7 @@ impl Db {
         }
 
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let runtime = self
             .inner
             .engine
@@ -1740,6 +1818,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -1848,6 +1927,7 @@ impl Db {
             .lock()
             .map_err(|_| DbError::internal("SQL writer lock poisoned"))?;
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let temp_only = {
             let runtime = self
                 .inner
@@ -2113,11 +2193,49 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(committed_lsn, Ordering::Release);
-        // Invalidate pre-built txn — autocommit changed engine state.
-        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
-            *pre_built = None;
-        }
         Ok(result)
+    }
+
+    fn compact_persisted_payloads_before_checkpoint(&self) -> Result<()> {
+        if self.inner.sql_txn_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        if !runtime.has_checkpoint_compaction_candidates() {
+            return Ok(());
+        }
+        self.begin_write()?;
+        let changed = match runtime.compact_persisted_payloads_for_checkpoint(self) {
+            Ok(changed) => changed,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        if !changed {
+            self.rollback()?;
+            return Ok(());
+        }
+        let committed_lsn = match self.commit() {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut runtime)?;
+                return Err(error);
+            }
+        };
+        self.sync_temp_state_from_runtime(&runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(())
     }
 
     fn engine_snapshot(&self) -> Result<EngineRuntime> {
@@ -2152,10 +2270,6 @@ impl Db {
 
     fn install_temp_runtime(&self, runtime: EngineRuntime) -> Result<()> {
         self.sync_temp_state_from_runtime(&runtime)?;
-        // Invalidate pre-built txn — engine state changed.
-        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
-            *pre_built = None;
-        }
         let mut guard = self
             .inner
             .engine
@@ -2263,24 +2377,82 @@ impl Db {
     }
 
     fn persist_runtime(&self, runtime: EngineRuntime) -> Result<u64> {
-        self.persist_runtime_if_latest(runtime, None)
+        self.persist_runtime_if_latest(runtime, None, true)
+    }
+
+    fn build_exclusive_sql_txn_state(&self) -> Result<ExclusiveSqlTxnState<'_>> {
+        self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
+        let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
+        let runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        Ok(ExclusiveSqlTxnState {
+            runtime,
+            base_lsn: current_lsn,
+            persistent_changed: false,
+            indexes_maybe_stale: false,
+        })
+    }
+
+    fn commit_exclusive_sql_txn(&self, mut state: ExclusiveSqlTxnState<'_>) -> Result<u64> {
+        if !state.persistent_changed {
+            self.sync_temp_state_from_runtime(&state.runtime)?;
+            return Ok(state.base_lsn);
+        }
+
+        let runtime_schema_cookie = state.runtime.catalog.schema_cookie;
+        if state.indexes_maybe_stale {
+            state
+                .runtime
+                .rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
+        self.begin_write()?;
+        if let Err(error) = state.runtime.persist_to_db(self) {
+            let _ = self.rollback();
+            self.restore_runtime_from_storage(&mut state.runtime)?;
+            return Err(error);
+        }
+        let committed_lsn = match self.commit_if_latest(state.base_lsn) {
+            Ok(lsn) => lsn,
+            Err(error) => {
+                let _ = self.rollback();
+                self.restore_runtime_from_storage(&mut state.runtime)?;
+                return Err(error);
+            }
+        };
+        if self.inner.catalog.schema_cookie()? != runtime_schema_cookie {
+            self.inner.catalog.replace(state.runtime.catalog.clone())?;
+        }
+        self.sync_temp_state_from_runtime(&state.runtime)?;
+        self.inner
+            .last_runtime_lsn
+            .store(committed_lsn, Ordering::Release);
+        Ok(committed_lsn)
+    }
+
+    fn rollback_exclusive_sql_txn(&self, mut state: ExclusiveSqlTxnState<'_>) -> Result<()> {
+        self.restore_runtime_from_storage(&mut state.runtime)
     }
 
     fn persist_runtime_if_latest(
         &self,
         runtime: EngineRuntime,
         expected_latest_lsn: Option<u64>,
+        rebuild_stale_indexes: bool,
     ) -> Result<u64> {
         let mut runtime = runtime;
         let runtime_schema_cookie = runtime.catalog.schema_cookie;
-        runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        if rebuild_stale_indexes {
+            runtime.rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
         self.begin_write()?;
         if let Err(error) = runtime.persist_to_db(self) {
             let _ = self.rollback();
             return Err(error);
         }
-        // Clone runtime while cache is warm (before commit/fdatasync cools it).
-        let pre_runtime = runtime.clone();
         let committed_lsn = match expected_latest_lsn {
             Some(expected) => self.commit_if_latest(expected),
             None => self.commit(),
@@ -2307,19 +2479,6 @@ impl Db {
             .store(committed_lsn, Ordering::Release);
         drop(guard);
 
-        // Store pre-built transaction state for the next BEGIN.
-        let mut pre_runtime = pre_runtime;
-        if self.apply_temp_state_to_runtime(&mut pre_runtime).is_ok() {
-            if let Ok(mut pre_built_guard) = self.inner.pre_built_txn.lock() {
-                *pre_built_guard = Some(Box::new(SqlTxnState {
-                    runtime: pre_runtime,
-                    base_lsn: committed_lsn,
-                    persistent_changed: false,
-                    savepoints: Vec::new(),
-                }));
-            }
-        }
-
         Ok(committed_lsn)
     }
 
@@ -2328,6 +2487,7 @@ impl Db {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         self.engine_snapshot()
     }
 
@@ -2336,6 +2496,7 @@ impl Db {
             return Ok(runtime);
         }
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         self.engine_snapshot()
     }
 
@@ -2355,7 +2516,9 @@ impl Db {
         };
 
         let mut snapshot = state.runtime.clone();
-        snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
+        if state.indexes_maybe_stale {
+            snapshot.rebuild_stale_indexes(self.inner.config.page_size)?;
+        }
         Ok(Some(snapshot))
     }
 
@@ -2369,10 +2532,6 @@ impl Db {
         self.inner
             .last_runtime_lsn
             .store(restored_lsn, Ordering::Release);
-        // Invalidate pre-built txn — engine state reloaded.
-        if let Ok(mut pre_built) = self.inner.pre_built_txn.lock() {
-            *pre_built = None;
-        }
         Ok(())
     }
 
@@ -2417,6 +2576,34 @@ impl Db {
         Ok(())
     }
 
+    /// Materializes any table data that was deferred during `Db::open`.
+    ///
+    /// Fast path (no deferred tables): one read-lock check on the engine.
+    /// Slow path: drops the read lock, takes a write lock, loads all deferred
+    /// tables and rebuilds indexes, then releases.
+    fn ensure_deferred_tables_loaded(&self) -> Result<()> {
+        {
+            let runtime = self
+                .inner
+                .engine
+                .read()
+                .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+            if !runtime.has_deferred_tables() {
+                return Ok(());
+            }
+        }
+        let mut runtime = self
+            .inner
+            .engine
+            .write()
+            .map_err(|_| DbError::internal("engine runtime lock poisoned"))?;
+        runtime.load_deferred_tables(
+            &self.inner.pager,
+            &self.inner.wal,
+            self.inner.config.page_size,
+        )
+    }
+
     fn current_schema_cookie(&self) -> Result<u32> {
         let page = self.read_page(page::HEADER_PAGE_ID)?;
         let mut bytes = [0_u8; storage::header::DB_HEADER_SIZE];
@@ -2442,16 +2629,8 @@ impl Db {
 
     fn build_sql_txn_state(&self) -> Result<SqlTxnState> {
         self.refresh_engine_from_storage()?;
+        self.ensure_deferred_tables_loaded()?;
         let current_lsn = self.inner.last_runtime_lsn.load(Ordering::Acquire);
-
-        // Reuse pre-built transaction state if LSN matches (cache-warm clone).
-        if let Ok(mut pre_built_guard) = self.inner.pre_built_txn.lock() {
-            if let Some(pre_built) = pre_built_guard.take() {
-                if pre_built.base_lsn == current_lsn {
-                    return Ok(*pre_built);
-                }
-            }
-        }
 
         let mut runtime = self
             .inner
@@ -2464,6 +2643,7 @@ impl Db {
             runtime,
             base_lsn: current_lsn,
             persistent_changed: false,
+            indexes_maybe_stale: false,
             savepoints: Vec::new(),
         })
     }
@@ -2565,6 +2745,105 @@ impl Db {
         let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
         state.runtime = working;
         state.persistent_changed |= !temp_only;
+        state.indexes_maybe_stale = true;
+        Ok(result)
+    }
+
+    fn execute_prepared_in_exclusive_state(
+        &self,
+        prepared: &PreparedStatement,
+        params: &[Value],
+        state: &mut ExclusiveSqlTxnState<'_>,
+    ) -> Result<QueryResult> {
+        if !Arc::ptr_eq(&self.inner, &prepared.db.inner) {
+            return Err(DbError::transaction(
+                "prepared statement belongs to a different database handle",
+            ));
+        }
+        self.validate_prepared_schema_cookie(
+            prepared,
+            state.runtime.catalog.schema_cookie,
+            state.runtime.temp_schema_cookie,
+        )?;
+        if prepared.read_only {
+            return state.runtime.execute_read_statement(
+                prepared.statement.as_ref(),
+                params,
+                self.inner.config.page_size,
+            );
+        }
+        if matches!(
+            prepared.statement.as_ref(),
+            crate::sql::ast::Statement::Analyze { .. }
+        ) {
+            return Err(DbError::transaction(
+                "ANALYZE is not supported inside an explicit SQL transaction",
+            ));
+        }
+
+        let page_size = self.inner.config.page_size;
+        if let Some(prepared_update) = prepared
+            .prepared_update
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_update(plan))
+        {
+            let result = state
+                .runtime
+                .execute_prepared_simple_update(prepared_update, params)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        if let Some(prepared_delete) = prepared
+            .prepared_delete
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_delete(plan))
+        {
+            let result = state
+                .runtime
+                .execute_prepared_simple_delete(prepared_delete, params)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        if let Some(prepared_insert) = prepared
+            .prepared_insert
+            .as_deref()
+            .filter(|plan| state.runtime.can_reuse_prepared_simple_insert(plan))
+        {
+            let result =
+                state
+                    .runtime
+                    .execute_prepared_simple_insert(prepared_insert, params, page_size)?;
+            state.persistent_changed = true;
+            return Ok(result);
+        }
+        let temp_only = self.statement_is_temp_only(&state.runtime, prepared.statement.as_ref());
+        if matches!(
+            prepared.statement.as_ref(),
+            crate::sql::ast::Statement::Insert(insert)
+                if state.runtime.can_execute_insert_in_place(insert)
+        ) {
+            let result =
+                state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+        if prepared.in_state_without_clone {
+            let result =
+                state
+                    .runtime
+                    .execute_statement(prepared.statement.as_ref(), params, page_size)?;
+            state.persistent_changed |= !temp_only;
+            return Ok(result);
+        }
+
+        let mut working = state.runtime.clone();
+        working.rebuild_stale_indexes(page_size)?;
+        let result = working.execute_statement(prepared.statement.as_ref(), params, page_size)?;
+        *state.runtime = working;
+        state.persistent_changed |= !temp_only;
+        state.indexes_maybe_stale = true;
         Ok(result)
     }
 
@@ -2620,6 +2899,7 @@ impl Db {
         let result = working.execute_statement(statement, params, self.inner.config.page_size)?;
         state.runtime = working;
         state.persistent_changed |= !temp_only;
+        state.indexes_maybe_stale = true;
         Ok(result)
     }
 
@@ -3071,6 +3351,164 @@ fn trigger_info(trigger: &TriggerSchema) -> TriggerInfo {
         event: trigger_event_name(trigger.event).to_string(),
         on_view: trigger.on_view,
         action_sql: trigger.action_sql.clone(),
+    }
+}
+
+fn schema_snapshot(runtime: &EngineRuntime) -> SchemaSnapshot {
+    let mut tables = runtime
+        .catalog
+        .tables
+        .values()
+        .map(|table| {
+            schema_table_info(
+                table,
+                runtime
+                    .tables
+                    .get(&table.name)
+                    .map_or(0, |data| data.rows.len()),
+            )
+        })
+        .collect::<Vec<_>>();
+    tables.extend(runtime.temp_tables.values().map(|table| {
+        schema_table_info(
+            table,
+            runtime
+                .temp_table_data
+                .get(&table.name)
+                .map_or(0, |data| data.rows.len()),
+        )
+    }));
+    tables.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut views = runtime
+        .catalog
+        .views
+        .values()
+        .map(schema_view_info)
+        .collect::<Vec<_>>();
+    views.extend(runtime.temp_views.values().map(schema_view_info));
+    views.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut indexes = runtime
+        .catalog
+        .indexes
+        .values()
+        .map(schema_index_info)
+        .collect::<Vec<_>>();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut triggers = runtime
+        .catalog
+        .triggers
+        .values()
+        .map(schema_trigger_info)
+        .collect::<Vec<_>>();
+    triggers.sort_by(|left, right| left.name.cmp(&right.name));
+
+    SchemaSnapshot {
+        snapshot_version: 1,
+        schema_cookie: runtime.catalog.schema_cookie,
+        tables,
+        views,
+        indexes,
+        triggers,
+    }
+}
+
+fn schema_table_info(table: &TableSchema, row_count: usize) -> SchemaTableInfo {
+    SchemaTableInfo {
+        name: table.name.clone(),
+        temporary: table.temporary,
+        ddl: render_create_table(table),
+        row_count,
+        primary_key_columns: table.primary_key_columns.clone(),
+        checks: table.checks.iter().map(check_constraint_info).collect(),
+        foreign_keys: table.foreign_keys.iter().map(foreign_key_info).collect(),
+        columns: table.columns.iter().map(schema_column_info).collect(),
+    }
+}
+
+fn schema_column_info(column: &ColumnSchema) -> SchemaColumnInfo {
+    SchemaColumnInfo {
+        name: column.name.clone(),
+        column_type: column.column_type.as_str().to_string(),
+        nullable: column.nullable,
+        default_sql: column.default_sql.clone(),
+        primary_key: column.primary_key,
+        unique: column.unique,
+        auto_increment: column.auto_increment,
+        generated_sql: column.generated_sql.clone(),
+        generated_stored: column.generated_stored,
+        checks: column.checks.iter().map(check_constraint_info).collect(),
+        foreign_key: column.foreign_key.as_ref().map(foreign_key_info),
+    }
+}
+
+fn check_constraint_info(check: &CheckConstraint) -> CheckConstraintInfo {
+    CheckConstraintInfo {
+        name: check.name.clone(),
+        expression_sql: check.expression_sql.clone(),
+    }
+}
+
+fn schema_view_info(view: &ViewSchema) -> SchemaViewInfo {
+    SchemaViewInfo {
+        name: view.name.clone(),
+        temporary: view.temporary,
+        sql_text: view.sql_text.clone(),
+        column_names: view.column_names.clone(),
+        dependencies: view.dependencies.clone(),
+        ddl: render_create_view(view),
+    }
+}
+
+fn schema_index_info(index: &IndexSchema) -> SchemaIndexInfo {
+    SchemaIndexInfo {
+        name: index.name.clone(),
+        table_name: index.table_name.clone(),
+        kind: match index.kind {
+            IndexKind::Btree => "btree",
+            IndexKind::Trigram => "trigram",
+        }
+        .to_string(),
+        unique: index.unique,
+        columns: index.columns.iter().map(index_column_name).collect(),
+        include_columns: index.include_columns.clone(),
+        predicate_sql: index.predicate_sql.clone(),
+        fresh: index.fresh,
+        temporary: false,
+        ddl: render_create_index(index),
+    }
+}
+
+fn schema_trigger_info(trigger: &TriggerSchema) -> SchemaTriggerInfo {
+    let event = trigger_event_name(trigger.event).to_ascii_lowercase();
+    SchemaTriggerInfo {
+        name: trigger.name.clone(),
+        target_name: trigger.target_name.clone(),
+        target_kind: if trigger.on_view {
+            "view".to_string()
+        } else {
+            "table".to_string()
+        },
+        timing: match trigger.kind {
+            TriggerKind::After => "after".to_string(),
+            TriggerKind::InsteadOf => "instead_of".to_string(),
+        },
+        events: vec![event],
+        events_mask: trigger_event_mask(trigger.event),
+        for_each_row: true,
+        temporary: false,
+        action_sql: trigger.action_sql.clone(),
+        ddl: render_create_trigger(trigger),
+    }
+}
+
+fn trigger_event_mask(event: TriggerEvent) -> u32 {
+    match event {
+        TriggerEvent::Insert => 1,
+        TriggerEvent::Update => 2,
+        TriggerEvent::Delete => 4,
     }
 }
 
@@ -3639,6 +4077,135 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_transaction_commit_persists_prepared_writes() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..32_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(format!("value-{i}"))],
+                )
+                .expect("insert row");
+        }
+        txn.commit().expect("commit txn");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            32
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT id FROM t WHERE val = 'value-17'")
+                    .expect("lookup committed row")
+            ),
+            17
+        );
+    }
+
+    #[test]
+    fn exclusive_transaction_rollback_discards_persistent_changes() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t VALUES (1, 'seed')")
+            .expect("seed row");
+
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO t VALUES ($1, $2)")
+            .expect("prepare insert");
+        insert
+            .execute_in(
+                &mut txn,
+                &[Value::Int64(2), Value::Text("transient".to_string())],
+            )
+            .expect("insert transient row");
+        txn.rollback().expect("rollback txn");
+
+        assert_eq!(
+            scalar_i64(&db.execute("SELECT COUNT(*) FROM t").expect("count rows")),
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM t WHERE id = 2")
+                    .expect("count rolled back row")
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn checkpoint_compacts_large_persisted_payloads() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir
+            .path()
+            .join("checkpoint-compacts-large-payloads.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create docs table");
+
+        let large_body = "x".repeat(2048);
+        let mut txn = db.transaction().expect("begin exclusive txn");
+        let insert = txn
+            .prepare("INSERT INTO docs VALUES ($1, $2)")
+            .expect("prepare insert");
+        for i in 0_i64..96_i64 {
+            insert
+                .execute_in(
+                    &mut txn,
+                    &[Value::Int64(i), Value::Text(large_body.clone())],
+                )
+                .expect("insert large row");
+        }
+        txn.commit().expect("commit rows");
+
+        let runtime_before = db
+            .runtime_for_inspection()
+            .expect("runtime before checkpoint");
+        let docs_before = runtime_before
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table before checkpoint");
+        assert!(
+            docs_before.pointer.logical_len >= 64 * 1024,
+            "test setup did not create a large enough payload"
+        );
+        assert!(
+            !docs_before.pointer.is_compressed(),
+            "normal commits should leave table payloads uncompressed"
+        );
+
+        db.checkpoint().expect("checkpoint");
+
+        let runtime_after = db
+            .runtime_for_inspection()
+            .expect("runtime after checkpoint");
+        let docs_after = runtime_after
+            .persisted_tables
+            .get("docs")
+            .expect("persisted docs table after checkpoint");
+        assert!(
+            docs_after.pointer.is_compressed(),
+            "checkpoint should compact large persisted payloads"
+        );
+        assert_eq!(
+            scalar_i64(
+                &db.execute("SELECT COUNT(*) FROM docs")
+                    .expect("count docs rows")
+            ),
+            96
+        );
+    }
+
+    #[test]
     fn reader_handle_refreshes_after_external_checkpoint() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("checkpoint-refresh.ddb");
@@ -3767,6 +4334,206 @@ mod tests {
     }
 
     #[test]
+    fn schema_snapshot_projects_rich_schema_metadata() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+            .expect("create parent table");
+        db.execute(
+            "CREATE TABLE child (
+                id INT PRIMARY KEY,
+                parent_id INT REFERENCES parent(id) ON DELETE CASCADE ON UPDATE SET NULL,
+                qty INT CHECK (qty > 0),
+                price FLOAT64 NOT NULL,
+                total_stored FLOAT64 GENERATED ALWAYS AS (price * qty) STORED,
+                total_virtual FLOAT64 GENERATED ALWAYS AS (price * qty) VIRTUAL,
+                CONSTRAINT child_parent_positive CHECK (parent_id IS NULL OR parent_id > 0),
+                CHECK (qty < 1000)
+            )",
+        )
+        .expect("create child table");
+        db.execute("INSERT INTO parent VALUES (1)")
+            .expect("insert parent row");
+        db.execute("INSERT INTO child (id, parent_id, qty, price) VALUES (1, 1, 5, 3.0)")
+            .expect("insert child row");
+
+        db.execute("CREATE TEMP TABLE temp_data (id INT PRIMARY KEY)")
+            .expect("create temp table");
+        db.execute("INSERT INTO temp_data VALUES (7)")
+            .expect("insert temp row");
+        db.execute("CREATE VIEW child_view AS SELECT id, parent_id FROM child")
+            .expect("create view");
+        db.execute("CREATE TEMP VIEW temp_child_ids AS SELECT id FROM temp_data")
+            .expect("create temp view");
+        db.execute(
+            "CREATE INDEX child_parent_partial ON child(parent_id) WHERE parent_id IS NOT NULL",
+        )
+        .expect("create partial index");
+        db.execute(
+            "CREATE TRIGGER child_after_insert AFTER INSERT ON child FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO parent VALUES (999)')",
+        )
+        .expect("create table trigger");
+        db.execute(
+            "CREATE TRIGGER child_view_insert INSTEAD OF INSERT ON child_view FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO child (id, parent_id, qty, price) VALUES (2000, NULL, 1, 1.0)')",
+        )
+        .expect("create view trigger");
+
+        let snapshot = db.get_schema_snapshot().expect("schema snapshot");
+        assert_eq!(snapshot.snapshot_version, 1);
+
+        let child = snapshot
+            .tables
+            .iter()
+            .find(|table| table.name == "child")
+            .expect("child table in snapshot");
+        assert!(!child.temporary);
+        assert_eq!(child.row_count, 1);
+        assert!(child.ddl.contains("CREATE TABLE \"child\""));
+        assert!(child
+            .checks
+            .iter()
+            .any(|check| check.name.as_deref() == Some("child_parent_positive")));
+        assert!(child.checks.iter().any(|check| check.name.is_none()));
+        assert!(child
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.on_delete == "CASCADE" && fk.on_update == "SET NULL"));
+
+        let qty_column = child
+            .columns
+            .iter()
+            .find(|column| column.name == "qty")
+            .expect("qty column");
+        assert!(qty_column.checks.iter().any(|check| check.name.is_none()));
+
+        let stored = child
+            .columns
+            .iter()
+            .find(|column| column.name == "total_stored")
+            .expect("stored generated column");
+        assert_eq!(stored.generated_sql.as_deref(), Some("(price * qty)"));
+        assert!(stored.generated_stored);
+
+        let virtual_column = child
+            .columns
+            .iter()
+            .find(|column| column.name == "total_virtual")
+            .expect("virtual generated column");
+        assert_eq!(
+            virtual_column.generated_sql.as_deref(),
+            Some("(price * qty)")
+        );
+        assert!(!virtual_column.generated_stored);
+
+        let temp_table = snapshot
+            .tables
+            .iter()
+            .find(|table| table.name == "temp_data")
+            .expect("temp table in snapshot");
+        assert!(temp_table.temporary);
+        assert_eq!(temp_table.row_count, 1);
+        assert!(temp_table.ddl.contains("CREATE TEMP TABLE"));
+
+        let temp_view = snapshot
+            .views
+            .iter()
+            .find(|view| view.name == "temp_child_ids")
+            .expect("temp view in snapshot");
+        assert!(temp_view.temporary);
+        assert!(temp_view.ddl.contains("CREATE TEMP VIEW"));
+
+        let partial_index = snapshot
+            .indexes
+            .iter()
+            .find(|index| index.name == "child_parent_partial")
+            .expect("partial index in snapshot");
+        assert_eq!(
+            partial_index.predicate_sql.as_deref(),
+            Some("parent_id IS NOT NULL")
+        );
+        assert!(partial_index.ddl.contains("WHERE parent_id IS NOT NULL"));
+
+        let table_trigger = snapshot
+            .triggers
+            .iter()
+            .find(|trigger| trigger.name == "child_after_insert")
+            .expect("table trigger in snapshot");
+        assert_eq!(table_trigger.target_kind, "table");
+        assert_eq!(table_trigger.timing, "after");
+        assert_eq!(table_trigger.events, vec!["insert".to_string()]);
+        assert_eq!(table_trigger.events_mask, 1);
+        assert!(table_trigger.for_each_row);
+        assert!(!table_trigger.temporary);
+        assert!(table_trigger.ddl.contains("CREATE TRIGGER"));
+
+        let view_trigger = snapshot
+            .triggers
+            .iter()
+            .find(|trigger| trigger.name == "child_view_insert")
+            .expect("view trigger in snapshot");
+        assert_eq!(view_trigger.target_kind, "view");
+        assert_eq!(view_trigger.timing, "instead_of");
+    }
+
+    #[test]
+    fn schema_snapshot_orders_top_level_collections_by_name() {
+        let db = Db::open_or_create(":memory:", DbConfig::default()).expect("open db");
+        db.execute("CREATE TABLE z_table (id INT PRIMARY KEY)")
+            .expect("create z_table");
+        db.execute("CREATE TABLE a_table (id INT PRIMARY KEY)")
+            .expect("create a_table");
+        db.execute("CREATE TEMP TABLE m_table (id INT PRIMARY KEY)")
+            .expect("create m_table");
+        db.execute("CREATE VIEW z_view AS SELECT id FROM z_table")
+            .expect("create z_view");
+        db.execute("CREATE VIEW a_view AS SELECT id FROM a_table")
+            .expect("create a_view");
+        db.execute("CREATE TEMP VIEW m_view AS SELECT id FROM m_table")
+            .expect("create m_view");
+        db.execute("CREATE INDEX z_index ON z_table(id)")
+            .expect("create z_index");
+        db.execute("CREATE INDEX a_index ON a_table(id)")
+            .expect("create a_index");
+        db.execute(
+            "CREATE TRIGGER z_trigger AFTER INSERT ON z_table FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO z_table VALUES (1000)')",
+        )
+        .expect("create z_trigger");
+        db.execute(
+            "CREATE TRIGGER a_trigger AFTER INSERT ON a_table FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO a_table VALUES (1000)')",
+        )
+        .expect("create a_trigger");
+
+        let snapshot = db.get_schema_snapshot().expect("schema snapshot");
+
+        let table_names = snapshot
+            .tables
+            .iter()
+            .map(|table| table.name.clone())
+            .collect::<Vec<_>>();
+        assert_sorted_names(&table_names);
+
+        let view_names = snapshot
+            .views
+            .iter()
+            .map(|view| view.name.clone())
+            .collect::<Vec<_>>();
+        assert_sorted_names(&view_names);
+
+        let index_names = snapshot
+            .indexes
+            .iter()
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        assert_sorted_names(&index_names);
+
+        let trigger_names = snapshot
+            .triggers
+            .iter()
+            .map(|trigger| trigger.name.clone())
+            .collect::<Vec<_>>();
+        assert_sorted_names(&trigger_names);
+    }
+
+    #[test]
     fn write_transaction_page_allocation_stays_off_main_file_until_commit() {
         let tempdir = TempDir::new().expect("tempdir");
         let path = tempdir.path().join("txn-page-allocation.ddb");
@@ -3789,7 +4556,7 @@ mod tests {
             initial_page_count
         );
         assert_eq!(
-            db.read_page(page_id).expect("read staged page"),
+            db.read_page(page_id).expect("read staged page").to_vec(),
             vec![0_u8; db.config().page_size as usize]
         );
         db.rollback().expect("rollback write txn");
@@ -3825,6 +4592,48 @@ mod tests {
         db.rollback().expect("rollback reuse txn");
     }
 
+    #[test]
+    fn checkpoint_truncates_tail_freelist_pages_and_resets_allocator_state() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let path = tempdir.path().join("checkpoint-tail-truncation.ddb");
+        let db = Db::open_or_create(&path, DbConfig::default()).expect("open db");
+
+        db.begin_write().expect("begin allocate txn");
+        let page3 = db.allocate_page().expect("allocate page 3");
+        let page4 = db.allocate_page().expect("allocate page 4");
+        let page5 = db.allocate_page().expect("allocate page 5");
+        assert_eq!((page3, page4, page5), (3, 4, 5));
+        db.commit().expect("commit allocated pages");
+
+        db.begin_write().expect("begin free txn");
+        db.free_page(page5).expect("free page 5");
+        db.free_page(page4).expect("free page 4");
+        db.commit().expect("commit freed tail pages");
+        db.checkpoint().expect("checkpoint freed pages");
+
+        assert_eq!(
+            db.inner
+                .pager
+                .on_disk_page_count()
+                .expect("page count after truncation"),
+            3
+        );
+        assert_eq!(
+            db.inner
+                .pager
+                .header_snapshot()
+                .expect("header snapshot after truncation")
+                .freelist
+                .page_count,
+            0
+        );
+
+        db.begin_write().expect("begin allocate after truncation");
+        let reused = db.allocate_page().expect("allocate page after truncation");
+        assert_eq!(reused, 4);
+        db.rollback().expect("rollback post-truncation allocation");
+    }
+
     fn dummy_prepared_insert(table_name: &str) -> PreparedSimpleInsert {
         PreparedSimpleInsert {
             table_name: table_name.to_string(),
@@ -3843,6 +4652,12 @@ mod tests {
             use_generic_index_updates: false,
             compiled_index_state_epoch: 0,
         }
+    }
+
+    fn assert_sorted_names(names: &[String]) {
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        assert_eq!(names, sorted);
     }
 
     fn scalar_i64(result: &crate::QueryResult) -> i64 {

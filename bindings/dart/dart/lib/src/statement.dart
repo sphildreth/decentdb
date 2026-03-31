@@ -1,5 +1,4 @@
 import 'dart:ffi';
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -124,10 +123,10 @@ class Statement {
   // Cached execution results
   List<String> _columnNames = const [];
   Map<String, int> _columnIndex = const {};
-  List<Row>? _rows;
+  bool _executionPrimed = false;
+  bool _streamExhausted = false;
   int _affectedRows = 0;
-  int _cursor = 0;
-  int _currentRow = -1;
+  Row? _currentRow;
 
   // ---------------------------------------------------------------------------
   // Internal helpers
@@ -144,10 +143,10 @@ class Statement {
   }
 
   void _invalidateExecution() {
-    _rows = null;
+    _executionPrimed = false;
+    _streamExhausted = false;
     _affectedRows = 0;
-    _cursor = 0;
-    _currentRow = -1;
+    _currentRow = null;
   }
 
   /// Reset the native step cursor (keeps bindings), then wipe cached rows.
@@ -179,7 +178,8 @@ class Statement {
           if (nameStatus != ddbOk) {
             _throwStatus(nameStatus, 'Failed to get column name');
           }
-          names[i] = outName.value == nullptr ? '' : outName.value.toDartString();
+          names[i] =
+              outName.value == nullptr ? '' : outName.value.toDartString();
           final freeStatus = _bindings.stringFree(outName);
           if (freeStatus != ddbOk) {
             _throwStatus(freeStatus, 'Failed to free column name');
@@ -195,61 +195,52 @@ class Statement {
     }
   }
 
-  /// Step and collect all rows.  Caller must call [_nativeReset] first.
-  void _fetchAll() {
-    _checkNotDisposed();
+  void _primeStreamingExecution() {
+    if (_executionPrimed) {
+      return;
+    }
+    _nativeReset();
     _loadColumnMetadata();
-
-    final colCount = _columnNames.length;
-    final outHasRow = calloc<Uint8>();
-    // Reuse a single DdbValue allocation across all cells to reduce GC pressure.
-    final valPtr = colCount > 0 ? calloc<DdbValue>() : nullptr.cast<DdbValue>();
-    final rows = <Row>[];
-
-    try {
-      while (true) {
-        final status = _bindings.stmtStep(_stmtPtr!, outHasRow);
-        if (status != ddbOk) _throwStatus(status, 'Failed to step statement');
-        if (outHasRow.value == 0) break;
-
-        final values = List<Object?>.filled(colCount, null);
-        for (var col = 0; col < colCount; col++) {
-          final copyStatus =
-              _bindings.stmtValueCopy(_stmtPtr!, col, valPtr);
-          if (copyStatus != ddbOk) {
-            _throwStatus(copyStatus, 'Failed to copy cell value');
-          }
-          values[col] = _decodeValue(valPtr.ref);
-          final disposeStatus = _bindings.valueDispose(valPtr);
-          if (disposeStatus != ddbOk) {
-            _throwStatus(disposeStatus, 'Failed to dispose cell value');
-          }
-        }
-        rows.add(Row._indexed(_columnNames, _columnIndex, values));
-      }
-    } finally {
-      calloc.free(outHasRow);
-      if (valPtr != nullptr) calloc.free(valPtr);
-    }
-
-    _rows = rows;
-    _cursor = 0;
-    _currentRow = -1;
-
-    final affectedPtr = calloc<Uint64>();
-    try {
-      final status = _bindings.stmtAffectedRows(_stmtPtr!, affectedPtr);
-      if (status != ddbOk) _throwStatus(status, 'Failed to get affected rows');
-      _affectedRows = affectedPtr.value;
-    } finally {
-      calloc.free(affectedPtr);
-    }
+    _executionPrimed = true;
+    _streamExhausted = false;
+    _currentRow = null;
   }
 
-  void _ensureExecuted() {
-    if (_rows != null) return;
-    _nativeReset();
-    _fetchAll();
+  Row _decodeSingleRowView(Pointer<DdbValueView> valuesPtr, int columnCount) {
+    if (_columnNames.length != columnCount) {
+      throw StateError(
+        'Column shape changed during statement execution '
+        '(expected ${_columnNames.length}, got $columnCount)',
+      );
+    }
+    final values = List<Object?>.filled(columnCount, null);
+    for (var col = 0; col < columnCount; col++) {
+      values[col] = _decodeValueView((valuesPtr + col).ref);
+    }
+    return Row._indexed(_columnNames, _columnIndex, values);
+  }
+
+  List<Row> _decodeRowViews(
+    Pointer<DdbValueView> valuesPtr,
+    int rowCount,
+    int columnCount,
+  ) {
+    if (_columnNames.length != columnCount) {
+      throw StateError(
+        'Column shape changed during statement execution '
+        '(expected ${_columnNames.length}, got $columnCount)',
+      );
+    }
+    final rows = <Row>[];
+    for (var rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+      final start = rowIndex * columnCount;
+      final values = List<Object?>.filled(columnCount, null);
+      for (var col = 0; col < columnCount; col++) {
+        values[col] = _decodeValueView((valuesPtr + start + col).ref);
+      }
+      rows.add(Row._indexed(_columnNames, _columnIndex, values));
+    }
+    return rows;
   }
 
   // ---------------------------------------------------------------------------
@@ -295,8 +286,8 @@ class Statement {
     final utf8 = value.toNativeUtf8();
     try {
       final byteLen = utf8.length; // byte count, excluding null terminator
-      final status = _bindings.stmtBindText(
-          _stmtPtr!, index, utf8.cast<Uint8>(), byteLen);
+      final status =
+          _bindings.stmtBindText(_stmtPtr!, index, utf8.cast<Uint8>(), byteLen);
       if (status != ddbOk) _throwStatus(status, 'Failed to bind text');
     } finally {
       calloc.free(utf8);
@@ -328,8 +319,7 @@ class Statement {
   void bindDecimal(int index, int scaled, int scale) {
     _checkNotDisposed();
     _invalidateExecution();
-    final status =
-        _bindings.stmtBindDecimal(_stmtPtr!, index, scaled, scale);
+    final status = _bindings.stmtBindDecimal(_stmtPtr!, index, scaled, scale);
     if (status != ddbOk) _throwStatus(status, 'Failed to bind decimal');
   }
 
@@ -338,8 +328,7 @@ class Statement {
     _checkNotDisposed();
     _invalidateExecution();
     final micros = value.toUtc().microsecondsSinceEpoch;
-    final status =
-        _bindings.stmtBindTimestampMicros(_stmtPtr!, index, micros);
+    final status = _bindings.stmtBindTimestampMicros(_stmtPtr!, index, micros);
     if (status != ddbOk) _throwStatus(status, 'Failed to bind timestamp');
   }
 
@@ -352,7 +341,8 @@ class Statement {
     if (value is String) return bindText(index, value);
     if (value is Uint8List) return bindBlob(index, value);
     if (value is DateTime) return bindDateTime(index, value);
-    if (value is DecimalValue) return bindDecimal(index, value.scaled, value.scale);
+    if (value is DecimalValue)
+      return bindDecimal(index, value.scaled, value.scale);
     throw ArgumentError('Unsupported bind type: ${value.runtimeType}');
   }
 
@@ -379,10 +369,18 @@ class Statement {
   /// Always re-executes from the beginning (implicit reset + step loop).
   List<Row> query() {
     _checkNotDisposed();
-    _nativeReset();
     _invalidateExecution();
-    _fetchAll();
-    return List<Row>.unmodifiable(_rows!);
+    _primeStreamingExecution();
+    const internalPageSize = 256;
+    final rows = <Row>[];
+    while (true) {
+      final page = nextPage(internalPageSize);
+      rows.addAll(page.rows);
+      if (page.isLast) {
+        break;
+      }
+    }
+    return List<Row>.unmodifiable(rows);
   }
 
   /// Execute a DML statement and return the number of affected rows.
@@ -391,13 +389,14 @@ class Statement {
   int execute() {
     _checkNotDisposed();
     _invalidateExecution();
-    _loadColumnMetadata();
+    _nativeReset();
 
     final outHasRow = calloc<Uint8>();
     try {
       while (true) {
         final status = _bindings.stmtStep(_stmtPtr!, outHasRow);
-        if (status != ddbOk) _throwStatus(status, 'Failed to execute statement');
+        if (status != ddbOk)
+          _throwStatus(status, 'Failed to execute statement');
         if (outHasRow.value == 0) break;
         // DML should not produce rows; skip any that appear.
       }
@@ -416,6 +415,387 @@ class Statement {
     return _affectedRows;
   }
 
+  /// Execute a one-column INT64 batch in one native call.
+  int executeBatchInt64(List<int> values) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    if (values.isEmpty) {
+      _affectedRows = 0;
+      return 0;
+    }
+
+    final valuesPtr = calloc<Int64>(values.length);
+    final outAffected = calloc<Uint64>();
+    try {
+      for (var i = 0; i < values.length; i++) {
+        valuesPtr[i] = values[i];
+      }
+      final status = _bindings.stmtExecuteBatchI64(
+        _stmtPtr!,
+        values.length,
+        valuesPtr,
+        outAffected,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to execute INT64 batch');
+      }
+      _affectedRows = outAffected.value;
+      return _affectedRows;
+    } finally {
+      calloc.free(valuesPtr);
+      calloc.free(outAffected);
+    }
+  }
+
+  /// Execute a `(INT64, TEXT, FLOAT64)` batch in one native call.
+  int executeBatchI64TextF64(List<(int, String, double)> rows) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    if (rows.isEmpty) {
+      _affectedRows = 0;
+      return 0;
+    }
+
+    final valuesI64 = calloc<Int64>(rows.length);
+    final valuesTextPtrs = calloc<Pointer<Utf8>>(rows.length);
+    final valuesTextLens = calloc<IntPtr>(rows.length);
+    final valuesF64 = calloc<Double>(rows.length);
+    final outAffected = calloc<Uint64>();
+    final allocatedText = <Pointer<Utf8>>[];
+    try {
+      for (var i = 0; i < rows.length; i++) {
+        final row = rows[i];
+        valuesI64[i] = row.$1;
+        valuesF64[i] = row.$3;
+        final text = row.$2.toNativeUtf8();
+        allocatedText.add(text);
+        valuesTextPtrs[i] = text;
+        valuesTextLens[i] = text.length;
+      }
+      final status = _bindings.stmtExecuteBatchI64TextF64(
+        _stmtPtr!,
+        rows.length,
+        valuesI64,
+        valuesTextPtrs,
+        valuesTextLens,
+        valuesF64,
+        outAffected,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to execute INT64/TEXT/FLOAT64 batch');
+      }
+      _affectedRows = outAffected.value;
+      return _affectedRows;
+    } finally {
+      for (final ptr in allocatedText) {
+        calloc.free(ptr);
+      }
+      calloc.free(valuesI64);
+      calloc.free(valuesTextPtrs);
+      calloc.free(valuesTextLens);
+      calloc.free(valuesF64);
+      calloc.free(outAffected);
+    }
+  }
+
+  /// Execute a typed batch in one native call using an `i`/`t`/`f` signature.
+  int executeBatchTyped(String signature, List<List<Object?>> rows) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    if (signature.isEmpty) {
+      throw ArgumentError.value(signature, 'signature', 'must not be empty');
+    }
+    if (rows.isEmpty) {
+      _affectedRows = 0;
+      return 0;
+    }
+
+    final sig = signature.codeUnits;
+    final iPerRow = sig.where((code) => code == 0x69).length; // i
+    final tPerRow = sig.where((code) => code == 0x74).length; // t
+    final fPerRow = sig.where((code) => code == 0x66).length; // f
+
+    for (var col = 0; col < sig.length; col++) {
+      final code = sig[col];
+      if (code != 0x69 && code != 0x74 && code != 0x66) {
+        throw ArgumentError.value(
+          signature,
+          'signature',
+          'contains unsupported type at column $col: ${String.fromCharCode(code)}',
+        );
+      }
+    }
+
+    final iValues = <int>[];
+    final tValues = <String>[];
+    final fValues = <double>[];
+
+    for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+      final row = rows[rowIndex];
+      if (row.length != sig.length) {
+        throw ArgumentError.value(
+          row,
+          'rows[$rowIndex]',
+          'expected ${sig.length} values, got ${row.length}',
+        );
+      }
+      for (var col = 0; col < sig.length; col++) {
+        final value = row[col];
+        switch (sig[col]) {
+          case 0x69: // i
+            if (value is! int) {
+              throw ArgumentError.value(
+                value,
+                'rows[$rowIndex][$col]',
+                'expected int for signature column i',
+              );
+            }
+            iValues.add(value);
+            break;
+          case 0x74: // t
+            if (value is! String) {
+              throw ArgumentError.value(
+                value,
+                'rows[$rowIndex][$col]',
+                'expected String for signature column t',
+              );
+            }
+            tValues.add(value);
+            break;
+          case 0x66: // f
+            if (value is! num) {
+              throw ArgumentError.value(
+                value,
+                'rows[$rowIndex][$col]',
+                'expected num for signature column f',
+              );
+            }
+            fValues.add(value.toDouble());
+            break;
+          default:
+            throw StateError('Unsupported signature code ${sig[col]}');
+        }
+      }
+    }
+
+    if (iValues.length != rows.length * iPerRow ||
+        tValues.length != rows.length * tPerRow ||
+        fValues.length != rows.length * fPerRow) {
+      throw StateError('Typed batch flattening produced inconsistent lengths');
+    }
+
+    final signaturePtr = signature.toNativeUtf8();
+    Pointer<Int64> valuesI64 = nullptr.cast<Int64>();
+    Pointer<Double> valuesF64 = nullptr.cast<Double>();
+    Pointer<Pointer<Utf8>> valuesTextPtrs = nullptr.cast<Pointer<Utf8>>();
+    Pointer<IntPtr> valuesTextLens = nullptr.cast<IntPtr>();
+    final outAffected = calloc<Uint64>();
+    final allocatedText = <Pointer<Utf8>>[];
+    try {
+      if (iValues.isNotEmpty) {
+        valuesI64 = calloc<Int64>(iValues.length);
+        for (var i = 0; i < iValues.length; i++) {
+          valuesI64[i] = iValues[i];
+        }
+      }
+      if (fValues.isNotEmpty) {
+        valuesF64 = calloc<Double>(fValues.length);
+        for (var i = 0; i < fValues.length; i++) {
+          valuesF64[i] = fValues[i];
+        }
+      }
+      if (tValues.isNotEmpty) {
+        valuesTextPtrs = calloc<Pointer<Utf8>>(tValues.length);
+        valuesTextLens = calloc<IntPtr>(tValues.length);
+        for (var i = 0; i < tValues.length; i++) {
+          final text = tValues[i].toNativeUtf8();
+          allocatedText.add(text);
+          valuesTextPtrs[i] = text;
+          valuesTextLens[i] = text.length;
+        }
+      }
+
+      final status = _bindings.stmtExecuteBatchTyped(
+        _stmtPtr!,
+        rows.length,
+        signaturePtr,
+        valuesI64,
+        valuesF64,
+        valuesTextPtrs,
+        valuesTextLens,
+        outAffected,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to execute typed batch');
+      }
+      _affectedRows = outAffected.value;
+      return _affectedRows;
+    } finally {
+      for (final ptr in allocatedText) {
+        calloc.free(ptr);
+      }
+      if (valuesI64 != nullptr) calloc.free(valuesI64);
+      if (valuesF64 != nullptr) calloc.free(valuesF64);
+      if (valuesTextPtrs != nullptr) calloc.free(valuesTextPtrs);
+      if (valuesTextLens != nullptr) calloc.free(valuesTextLens);
+      calloc.free(signaturePtr);
+      calloc.free(outAffected);
+    }
+  }
+
+  /// Reset, bind first parameter as INT64, execute, and return affected rows.
+  int rebindInt64Execute(int value) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    final outAffected = calloc<Uint64>();
+    try {
+      final status =
+          _bindings.stmtRebindInt64Execute(_stmtPtr!, value, outAffected);
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to rebind INT64 and execute');
+      }
+      _affectedRows = outAffected.value;
+      return _affectedRows;
+    } finally {
+      calloc.free(outAffected);
+    }
+  }
+
+  /// Reset, bind `(TEXT, INT64)`, execute, and return affected rows.
+  int rebindTextInt64Execute(String text, int value) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    final outAffected = calloc<Uint64>();
+    final textPtr = text.toNativeUtf8();
+    try {
+      final status = _bindings.stmtRebindTextInt64Execute(
+        _stmtPtr!,
+        textPtr,
+        textPtr.length,
+        value,
+        outAffected,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to rebind TEXT/INT64 and execute');
+      }
+      _affectedRows = outAffected.value;
+      return _affectedRows;
+    } finally {
+      calloc.free(textPtr);
+      calloc.free(outAffected);
+    }
+  }
+
+  /// Reset, bind `(INT64, TEXT)`, execute, and return affected rows.
+  int rebindInt64TextExecute(int value, String text) {
+    _checkNotDisposed();
+    _invalidateExecution();
+    final outAffected = calloc<Uint64>();
+    final textPtr = text.toNativeUtf8();
+    try {
+      final status = _bindings.stmtRebindInt64TextExecute(
+        _stmtPtr!,
+        value,
+        textPtr,
+        textPtr.length,
+        outAffected,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to rebind INT64/TEXT and execute');
+      }
+      _affectedRows = outAffected.value;
+      return _affectedRows;
+    } finally {
+      calloc.free(textPtr);
+      calloc.free(outAffected);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fused bind+step helpers
+  // ---------------------------------------------------------------------------
+
+  /// Bind INT64 at [index], then step one row in a single FFI call.
+  bool bindInt64Step(int index, int value) {
+    _checkNotDisposed();
+    _invalidateExecution();
+
+    final outValues = calloc<Pointer<DdbValueView>>();
+    final outColumns = calloc<IntPtr>();
+    final outHasRow = calloc<Uint8>();
+    try {
+      final status = _bindings.stmtBindInt64StepRowView(
+        _stmtPtr!,
+        index,
+        value,
+        outValues,
+        outColumns,
+        outHasRow,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to bind INT64 and step');
+      }
+
+      _loadColumnMetadata();
+      _executionPrimed = true;
+
+      if (outHasRow.value == 0) {
+        _streamExhausted = true;
+        _currentRow = null;
+        return false;
+      }
+      _currentRow = _decodeSingleRowView(outValues.value, outColumns.value);
+      return true;
+    } finally {
+      calloc.free(outValues);
+      calloc.free(outColumns);
+      calloc.free(outHasRow);
+    }
+  }
+
+  /// Bind INT64 at [index], then step one `(INT64, TEXT, FLOAT64)` row in a
+  /// single FFI call. Returns the decoded triple or `null` when exhausted.
+  (int, String, double)? bindInt64StepI64TextF64(int index, int value) {
+    _checkNotDisposed();
+    _invalidateExecution();
+
+    final outInt64 = calloc<Int64>();
+    final outTextData = calloc<Pointer<Uint8>>();
+    final outTextLen = calloc<IntPtr>();
+    final outFloat64 = calloc<Double>();
+    final outHasRow = calloc<Uint8>();
+    try {
+      final status = _bindings.stmtBindInt64StepI64TextF64(
+        _stmtPtr!,
+        index,
+        value,
+        outInt64,
+        outTextData,
+        outTextLen,
+        outFloat64,
+        outHasRow,
+      );
+      if (status != ddbOk) {
+        _throwStatus(status, 'Failed to bind INT64 and step I64/Text/F64');
+      }
+      if (outHasRow.value == 0) {
+        return null;
+      }
+      final textData = outTextData.value;
+      final textLen = outTextLen.value;
+      final text = textData == nullptr || textLen == 0
+          ? ''
+          : textData.cast<Utf8>().toDartString(length: textLen);
+      return (outInt64.value, text, outFloat64.value);
+    } finally {
+      calloc.free(outInt64);
+      calloc.free(outTextData);
+      calloc.free(outTextLen);
+      calloc.free(outFloat64);
+      calloc.free(outHasRow);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Streaming / pagination API
   // ---------------------------------------------------------------------------
@@ -423,38 +803,82 @@ class Statement {
   /// Advance the row cursor, executing if needed.  Returns `true` while rows
   /// remain; `false` when exhausted.
   bool step() {
-    _ensureExecuted();
-    if (_cursor >= _rows!.length) {
-      _currentRow = -1;
+    _checkNotDisposed();
+    _primeStreamingExecution();
+    if (_streamExhausted) {
+      _currentRow = null;
       return false;
     }
-    _currentRow = _cursor;
-    _cursor += 1;
-    return true;
+
+    final outValues = calloc<Pointer<DdbValueView>>();
+    final outColumns = calloc<IntPtr>();
+    final outHasRow = calloc<Uint8>();
+    try {
+      final status = _bindings.stmtStepRowView(
+          _stmtPtr!, outValues, outColumns, outHasRow);
+      if (status != ddbOk) _throwStatus(status, 'Failed to step statement');
+      if (outHasRow.value == 0) {
+        _streamExhausted = true;
+        _currentRow = null;
+        return false;
+      }
+      _currentRow = _decodeSingleRowView(outValues.value, outColumns.value);
+      return true;
+    } finally {
+      calloc.free(outValues);
+      calloc.free(outColumns);
+      calloc.free(outHasRow);
+    }
   }
 
   /// Return the current row after a successful [step] call.
   Row readRow() {
     _checkNotDisposed();
-    if (_rows == null || _currentRow < 0 || _currentRow >= _rows!.length) {
+    if (_currentRow == null) {
       throw StateError('No current row; call step() first');
     }
-    return _rows![_currentRow];
+    return _currentRow!;
   }
 
   /// Return the next [pageSize] rows, executing if needed.
   ResultPage nextPage(int pageSize) {
     if (pageSize <= 0) throw RangeError.range(pageSize, 1, null, 'pageSize');
-    _ensureExecuted();
-    final rows = _rows!;
-    final end = math.min(_cursor + pageSize, rows.length);
-    final pageRows = rows.sublist(_cursor, end);
-    _cursor = end;
-    return ResultPage(
-      List.unmodifiable(_columnNames),
-      List<Row>.unmodifiable(pageRows),
-      end >= rows.length,
-    );
+    _checkNotDisposed();
+    _primeStreamingExecution();
+    _currentRow = null; // nextPage invalidates any step() row.
+
+    final outValues = calloc<Pointer<DdbValueView>>();
+    final outRows = calloc<IntPtr>();
+    final outColumns = calloc<IntPtr>();
+    try {
+      final status = _bindings.stmtFetchRowViews(
+        _stmtPtr!,
+        0,
+        pageSize,
+        outValues,
+        outRows,
+        outColumns,
+      );
+      if (status != ddbOk) _throwStatus(status, 'Failed to fetch page');
+
+      final fetchedRows = outRows.value;
+      final fetchedColumns = outColumns.value;
+      final pageRows = fetchedRows == 0
+          ? const <Row>[]
+          : _decodeRowViews(outValues.value, fetchedRows, fetchedColumns);
+      final isLast = fetchedRows < pageSize;
+      _streamExhausted = isLast;
+
+      return ResultPage(
+        List.unmodifiable(_columnNames),
+        List<Row>.unmodifiable(pageRows),
+        isLast,
+      );
+    } finally {
+      calloc.free(outValues);
+      calloc.free(outRows);
+      calloc.free(outColumns);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -497,7 +921,7 @@ class Statement {
 // Value decoder (shared utility)
 // ---------------------------------------------------------------------------
 
-Object? _decodeValue(DdbValue value) {
+Object? _decodeValueView(DdbValueView value) {
   switch (value.tag) {
     case ddbTagNull:
       return null;
@@ -517,7 +941,9 @@ Object? _decodeValue(DdbValue value) {
       return DecimalValue(value.decimalScaled, value.decimalScale);
     case ddbTagUuid:
       final bytes = Uint8List(16);
-      for (var i = 0; i < 16; i++) bytes[i] = value.uuidBytes[i];
+      for (var i = 0; i < 16; i++) {
+        bytes[i] = value.uuidBytes[i];
+      }
       return bytes;
     case ddbTagTimestampMicros:
       return DateTime.fromMicrosecondsSinceEpoch(

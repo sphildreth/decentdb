@@ -1,6 +1,7 @@
 //! Fixed-size page helpers used by bootstrap and later pager slices.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::error::{DbError, Result};
 
@@ -43,8 +44,12 @@ pub(crate) trait PageStore: std::fmt::Debug {
     fn page_size(&self) -> u32;
     fn allocate_page(&mut self) -> Result<PageId>;
     fn free_page(&mut self, page_id: PageId) -> Result<()>;
-    fn read_page(&self, page_id: PageId) -> Result<Vec<u8>>;
+    fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>>;
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()>;
+
+    fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
+        self.write_page(page_id, &data)
+    }
 }
 
 /// Simple in-memory page store used by the Phase 2 record, B+Tree, and search
@@ -113,13 +118,14 @@ impl PageStore for InMemoryPageStore {
         Ok(())
     }
 
-    fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         validate_page_id(page_id)?;
-        Ok(self
-            .pages
-            .get(&page_id)
-            .cloned()
-            .unwrap_or_else(|| zeroed_page(self.page_size)))
+        Ok(Arc::from(
+            self.pages
+                .get(&page_id)
+                .cloned()
+                .unwrap_or_else(|| zeroed_page(self.page_size)),
+        ))
     }
 
     fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
@@ -132,6 +138,19 @@ impl PageStore for InMemoryPageStore {
             )));
         }
         self.pages.insert(page_id, data.to_vec());
+        Ok(())
+    }
+
+    fn write_page_owned(&mut self, page_id: PageId, data: Vec<u8>) -> Result<()> {
+        validate_page_id(page_id)?;
+        if data.len() != self.page_size as usize {
+            return Err(DbError::internal(format!(
+                "page {page_id} write length {} does not match configured page size {}",
+                data.len(),
+                self.page_size
+            )));
+        }
+        self.pages.insert(page_id, data);
         Ok(())
     }
 }
@@ -167,7 +186,7 @@ mod tests {
         let data = vec![7u8; 4096];
         store.write_page(pid, &data).unwrap();
         let read = store.read_page(pid).unwrap();
-        assert_eq!(read, data);
+        assert_eq!(read.to_vec(), data);
 
         // free page
         store.free_page(pid).unwrap();

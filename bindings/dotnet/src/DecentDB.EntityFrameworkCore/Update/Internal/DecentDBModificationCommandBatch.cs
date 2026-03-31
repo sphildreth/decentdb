@@ -1,6 +1,7 @@
 using System.Data;
 using System.Data.Common;
 using System.Text;
+using DecentDB.AdoNet;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Update;
 using Microsoft.EntityFrameworkCore;
@@ -595,8 +596,15 @@ internal sealed class DecentDBModificationCommandBatch : ModificationCommandBatc
         }
 
         var converter = column.TypeMapping?.Converter;
-        return converter is null
+        var providerValue = converter is null
             ? value
             : converter.ConvertToProvider(value);
+
+        if (providerValue is decimal decimalValue && column.TypeMapping?.Scale is int scale)
+        {
+            return DecimalScaleNormalizer.Normalize(decimalValue, scale);
+        }
+
+        return providerValue;
     }
 }

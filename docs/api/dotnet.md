@@ -37,6 +37,9 @@ just to consume the .NET provider surface in your project.
 dotnet add package DecentDB.AdoNet
 dotnet add package DecentDB.MicroOrm
 dotnet add package DecentDB.EntityFrameworkCore
+
+# Optional: design-time services for `dotnet ef`
+dotnet add package DecentDB.EntityFrameworkCore.Design
 ```
 
 ## Opening a database
@@ -64,6 +67,152 @@ conn.Open();
 // ... use conn ...
 conn.Close();
 ```
+
+### Entity Framework Core
+
+The EF Core provider follows the standard provider pattern and is configured via
+`DbContextOptionsBuilder.UseDecentDB(...)`.
+
+For most apps, the simplest setup is to build the connection string with
+`DecentDBConnectionStringBuilder` and pass that string into EF Core:
+
+```csharp
+using DecentDB.AdoNet;
+using Microsoft.EntityFrameworkCore;
+
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/shop.ddb",
+    CommandTimeout = 120,
+    Logging = false,
+};
+
+var options = new DbContextOptionsBuilder<ShopContext>()
+    .UseDecentDB(csb.ConnectionString)
+    .Options;
+
+await using var db = new ShopContext(options);
+await db.Database.EnsureCreatedAsync();
+```
+
+Example `DbContext`:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+
+public sealed class ShopContext(DbContextOptions<ShopContext> options)
+    : DbContext(options)
+{
+    public DbSet<Product> Products => Set<Product>();
+    public DbSet<Cart> Carts => Set<Cart>();
+}
+
+public sealed class Product
+{
+    public long Id { get; set; }
+    public string Sku { get; set; } = string.Empty;
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+}
+
+public sealed class Cart
+{
+    public long Id { get; set; }
+    public string CustomerEmail { get; set; } = string.Empty;
+}
+```
+
+If you prefer dependency injection, register DecentDB the same way you would any
+other EF Core provider:
+
+```csharp
+using DecentDB.AdoNet;
+using Microsoft.EntityFrameworkCore;
+
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/shop.ddb",
+};
+
+builder.Services.AddDbContext<ShopContext>(options =>
+    options.UseDecentDB(csb.ConnectionString));
+```
+
+You can also pass an existing `DbConnection` instead of a connection string:
+
+```csharp
+using DecentDB.AdoNet;
+using Microsoft.EntityFrameworkCore;
+
+using var connection = new DecentDBConnection("Data Source=/path/to/shop.ddb");
+
+var options = new DbContextOptionsBuilder<ShopContext>()
+    .UseDecentDB(connection, contextOwnsConnection: false)
+    .Options;
+```
+
+#### Connection string builder
+
+`DecentDBConnectionStringBuilder` exposes the same connection string surface used
+by the ADO.NET and EF Core providers:
+
+```csharp
+var csb = new DecentDBConnectionStringBuilder
+{
+    DataSource = "/path/to/shop.ddb",
+    CacheSize = "268435456",   // optional native cache size
+    Logging = true,            // optional SQL logging
+    LogLevel = "Info",         // optional log level
+    CommandTimeout = 120,      // default command timeout in seconds
+};
+
+string connectionString = csb.ConnectionString;
+```
+
+The EF Core provider also accepts the builder directly:
+
+```csharp
+var options = new DbContextOptionsBuilder<MyDbContext>()
+    .UseDecentDB(csb)
+    .Options;
+```
+
+#### Design-time services and migrations
+
+If you use `dotnet ef` for design-time services, install
+`DecentDB.EntityFrameworkCore.Design` alongside the runtime provider:
+
+```bash
+dotnet add package DecentDB.EntityFrameworkCore
+dotnet add package DecentDB.EntityFrameworkCore.Design
+```
+
+Then use the usual EF Core workflow:
+
+```bash
+dotnet ef migrations add InitialCreate
+dotnet ef database update
+```
+
+The in-tree EF Core provider tests cover runtime migration application plus the
+provider SQL generation paths for table rename, column rename, column type
+change, and index drop operations.
+
+#### EF Core provider coverage highlights
+
+The current in-tree provider validation covers:
+
+- server-side translation for representative `Union`, `Concat`, `Intersect`, and
+  `Except` query shapes
+- provider-specific window functions exposed via `EF.Functions`
+- `ExecuteUpdateAsync()` and `ExecuteDeleteAsync()` rowcount and persistence
+- `AsAsyncEnumerable()` over composed queries
+- optimistic concurrency conflicts surfaced as `DbUpdateConcurrencyException`
+- database execution failures surfaced as `DbUpdateException` with inner
+  `DecentDB.Native.DecentDBException`
+- builder-driven provider configuration via `UseDecentDB(DecentDBConnectionStringBuilder)`
+- performance-sanity coverage for `AsNoTracking`, split-query includes, keyset
+  pagination, async streaming, and bulk mutation rowcount behavior
 
 ## Version introspection
 
@@ -136,6 +285,10 @@ using var txn = conn.BeginTransaction();
 txn.Commit();
 ```
 
+Savepoints are currently unsupported in the EF Core relational transaction
+surface. `SupportsSavepoints` is `false`, and savepoint APIs intentionally throw
+`NotSupportedException`.
+
 ## Schema introspection (V2)
 
 ```csharp
@@ -182,7 +335,27 @@ conn.Checkpoint();
 
 // Online backup
 conn.SaveAs("/path/to/backup.ddb");
+
+// File-backed vacuum/compaction helper
+await DecentDBMaintenance.VacuumAtomicAsync("/path/to/shop.ddb");
 ```
+
+## Performance sanity guidance
+
+The in-tree `DecentDb.ShowCase` sample includes a `PERFORMANCE PATTERNS`
+section, but it should be read as a sanity-check aid rather than a benchmark
+suite. The current showcase and tests intentionally focus on:
+
+- projection vs tracked reads
+- `AsNoTracking()` for read-mostly paths
+- `AsSplitQuery()` over included relationship graphs
+- keyset-style paging
+- async materialization vs `AsAsyncEnumerable()` result ordering
+- bulk update/delete rowcount sanity
+
+These checks are meant to catch obviously pathological provider behavior and to
+teach reasonable defaults for embedded workloads. They are not claims of
+cross-provider performance parity.
 
 ## Build the native library
 

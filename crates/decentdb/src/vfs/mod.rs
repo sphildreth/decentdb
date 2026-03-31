@@ -7,6 +7,8 @@
 pub(crate) mod faulty;
 pub(crate) mod mem;
 pub(crate) mod os;
+#[cfg(feature = "bench-internals")]
+pub(crate) mod stats;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,6 +18,8 @@ use crate::error::{DbError, Result};
 use self::faulty::FaultyVfs;
 use self::mem::MemVfs;
 use self::os::OsVfs;
+#[cfg(feature = "bench-internals")]
+use self::stats::StatsVfs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileKind {
@@ -65,8 +69,11 @@ impl VfsHandle {
                 inner: Arc::new(MemVfs::default()),
             }
         } else {
+            let os_vfs: Arc<dyn Vfs> = Arc::new(OsVfs);
+            #[cfg(feature = "bench-internals")]
+            let os_vfs: Arc<dyn Vfs> = Arc::new(StatsVfs::wrap(os_vfs));
             Self {
-                inner: Arc::new(FaultyVfs::wrap(Arc::new(OsVfs))),
+                inner: Arc::new(FaultyVfs::wrap(os_vfs)),
             }
         }
     }

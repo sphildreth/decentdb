@@ -52,6 +52,10 @@ impl Row {
         &self.values
     }
 
+    pub(crate) fn into_values(self) -> Vec<Value> {
+        self.values
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         Self::encode_values(self.values())
     }

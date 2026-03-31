@@ -1,6 +1,7 @@
 //! Write-ahead log ownership, recovery, and checkpointing.
 
 pub(crate) mod checkpoint;
+pub(crate) mod delta;
 pub(crate) mod format;
 pub(crate) mod index;
 pub(crate) mod reader_registry;
@@ -47,6 +48,7 @@ pub(crate) struct SharedWalInner {
 #[derive(Debug, Default)]
 pub(crate) struct WalWriteState {
     pub(crate) page_batch: Vec<u8>,
+    pub(crate) prepared_pages: Vec<(PageId, Vec<u8>, usize)>,
 }
 
 impl WalHandle {
@@ -55,8 +57,9 @@ impl WalHandle {
         db_path: &Path,
         page_size: u32,
         sync_mode: WalSyncMode,
+        pager: &PagerHandle,
     ) -> Result<Self> {
-        shared::acquire(vfs, db_path, page_size, sync_mode)
+        shared::acquire(vfs, db_path, page_size, sync_mode, pager)
     }
 
     pub(crate) fn evict(vfs: &VfsHandle, db_path: &Path) -> Result<()> {
@@ -65,19 +68,21 @@ impl WalHandle {
 
     pub(crate) fn commit_pages(
         &self,
+        pager: &PagerHandle,
         pages: Vec<(PageId, Vec<u8>)>,
         max_page_count: u32,
     ) -> Result<u64> {
-        writer::commit_pages(self, pages, max_page_count)
+        writer::commit_pages(self, pager, pages, max_page_count)
     }
 
     pub(crate) fn commit_pages_if_latest(
         &self,
+        pager: &PagerHandle,
         pages: Vec<(PageId, Vec<u8>)>,
         max_page_count: u32,
         expected_latest_lsn: u64,
     ) -> Result<u64> {
-        writer::commit_pages_if_latest(self, pages, max_page_count, expected_latest_lsn)
+        writer::commit_pages_if_latest(self, pager, pages, max_page_count, expected_latest_lsn)
     }
 
     pub(crate) fn checkpoint(&self, pager: &PagerHandle, timeout_sec: u64) -> Result<()> {
@@ -115,6 +120,12 @@ impl WalHandle {
         self.inner
             .max_page_count
             .fetch_max(page_count, Ordering::AcqRel);
+    }
+
+    pub(crate) fn reset_max_page_count(&self, page_count: u32) {
+        self.inner
+            .max_page_count
+            .store(page_count, Ordering::Release);
     }
 
     pub(crate) fn max_page_count(&self) -> u32 {

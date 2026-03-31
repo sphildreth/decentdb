@@ -92,6 +92,15 @@ Write a checkpointed snapshot into a new on-disk database file.
 decentdb save-as --db=<path> --output=<dest>
 ```
 
+### migrate
+
+Check a database file and assist in migrating unsupported legacy formats.
+Currently, this command detects the source version and provides a helpful message explaining the manual logical dump/restore path if the engine cannot natively upgrade it.
+
+```bash
+decentdb migrate --db=<path>
+```
+
 ### info
 
 Show storage-level information.

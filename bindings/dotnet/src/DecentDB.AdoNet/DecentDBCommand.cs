@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
+using System.Globalization;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -536,7 +537,7 @@ namespace DecentDB.AdoNet
 
             if (value is decimal dec)
             {
-                stmt.BindDecimal(index1Based, dec);
+                stmt.BindDecimal(index1Based, NormalizeDecimalScale(parameter, dec));
                 return;
             }
 
@@ -615,6 +616,16 @@ namespace DecentDB.AdoNet
             }
 
             throw new NotSupportedException($"Unsupported parameter type: {value.GetType().FullName}");
+        }
+
+        private static decimal NormalizeDecimalScale(DbParameter parameter, decimal value)
+        {
+            if (parameter is not DecentDBParameter decentParameter || !decentParameter.HasScale)
+            {
+                return value;
+            }
+
+            return DecimalScaleNormalizer.Normalize(value, decentParameter.Scale);
         }
 
         internal void FinalizeStatement()

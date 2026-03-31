@@ -2,12 +2,14 @@
 members = [
     "crates/decentdb",       # Core database engine
     "crates/decentdb-cli",   # CLI application
-    "crates/libpg_query_sys", # Pinned SQL parser wrapper
+    "crates/decentdb-benchmark", # Rust-native benchmark runner
+    "crates/libpg_query_sys",    # Pinned SQL parser wrapper
+    "crates/decentdb-migrate",   # Migration tooling
 ]
 resolver = "2"
 
 [workspace.package]
-version = "2.0.1"
+version = "2.1.0"
 edition = "2021"
 authors = ["Steven Hildreth"]
 license = "Apache-2.0"

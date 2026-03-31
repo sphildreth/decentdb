@@ -11,6 +11,7 @@ use std::thread;
 
 use crate::config::WalSyncMode;
 use crate::error::Result;
+use crate::storage::PagerHandle;
 use crate::vfs::{FileKind, OpenMode, VfsHandle};
 
 use super::reader_registry::ReaderRegistry;
@@ -22,9 +23,10 @@ pub(crate) fn acquire(
     db_path: &Path,
     page_size: u32,
     sync_mode: WalSyncMode,
+    pager: &PagerHandle,
 ) -> Result<WalHandle> {
     if vfs.is_memory() {
-        return build_handle(vfs, None, db_path, page_size, sync_mode);
+        return build_handle(vfs, None, db_path, page_size, sync_mode, pager);
     }
 
     let canonical_path = vfs.canonicalize_path(db_path)?;
@@ -47,6 +49,7 @@ pub(crate) fn acquire(
         &canonical_path,
         page_size,
         sync_mode,
+        pager,
     )?;
     registry
         .lock()
@@ -61,6 +64,7 @@ fn build_handle(
     db_path: &Path,
     page_size: u32,
     sync_mode: WalSyncMode,
+    pager: &PagerHandle,
 ) -> Result<WalHandle> {
     let wal_path = wal_path_for_db(db_path);
     let mode = if vfs.file_exists(&wal_path)? {
@@ -70,7 +74,7 @@ fn build_handle(
     };
     let file = vfs.open(&wal_path, mode, FileKind::Wal)?;
     let (index, end_lsn, recovered_max_page_id) =
-        recovery::initialize_or_recover(&file, page_size)?;
+        recovery::initialize_or_recover(&file, pager, page_size)?;
     let allocated_len = file.file_size()?;
 
     Ok(WalHandle {

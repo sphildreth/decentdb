@@ -49,7 +49,7 @@ pub enum Commands {
     Checkpoint(DbCommand),
     /// Export the database to a new on-disk file (snapshot backup)
     SaveAs(SaveAsCommand),
-    /// Display database information
+    /// Quick diagnostic view of database file headers, format version, and WAL state
     Info(InfoCommand),
     /// Describe table structure
     Describe(DescribeCommand),
@@ -69,7 +69,7 @@ pub enum Commands {
     RebuildIndexes(RebuildIndexesCommand),
     /// Emit shell completion script
     Completion(CompletionCommand),
-    /// Show basic engine statistics
+    /// Deep introspection of logical content, table metrics, and storage fragmentation
     Stats(StatsCommand),
     /// Rewrite database into a new file to reclaim space
     Vacuum(VacuumCommand),
@@ -77,6 +77,8 @@ pub enum Commands {
     VerifyHeader(VerifyHeaderCommand),
     /// Verify index integrity
     VerifyIndex(VerifyIndexCommand),
+    /// Migrate a legacy database format to the current version
+    Migrate(MigrateCommand),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -178,6 +180,8 @@ pub struct SaveAsCommand {
 }
 
 #[derive(Clone, Debug, Parser)]
+/// Quick diagnostic view of database file headers, format version, and WAL state.
+/// Designed to be fast and safe even if the database is corrupted or an older version.
 pub struct InfoCommand {
     #[arg(long)]
     pub db: String,
@@ -268,6 +272,8 @@ pub struct CompletionCommand {
 }
 
 #[derive(Clone, Debug, Parser)]
+/// Deep introspection of logical content, table metrics, and storage fragmentation.
+/// Bootstraps the full database engine to gather exact metrics and catalog stats.
 pub struct StatsCommand {
     #[arg(long)]
     pub db: String,
@@ -301,6 +307,15 @@ pub struct VerifyIndexCommand {
     pub index: String,
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+}
+
+#[derive(Clone, Debug, Parser)]
+pub struct MigrateCommand {
+    /// The source legacy database file path
+    pub source: String,
+
+    /// The destination database file path for the current format
+    pub dest: String,
 }
 
 pub fn run(cli: Cli) -> i32 {
@@ -358,6 +373,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Commands::Vacuum(command) => run_vacuum(command)?,
         Commands::VerifyHeader(command) => run_verify_header(command)?,
         Commands::VerifyIndex(command) => run_verify_index(command)?,
+        Commands::Migrate(command) => run_migrate(command)?,
     }
     Ok(())
 }
@@ -481,28 +497,64 @@ fn run_bulk_load(command: BulkLoadCommand) -> Result<()> {
 }
 
 fn run_info(command: InfoCommand) -> Result<()> {
-    let db = open_db(&command.db, false, 0, 0)?;
-    let storage = db.storage_info()?;
-    if command.schema_summary {
-        let tables = db.list_tables()?;
-        let indexes = db.list_indexes()?;
-        let views = db.list_views()?;
+    // Try to read header first to gracefully support unopenable old formats
+    let loose_header = Db::read_header_info(&command.db).ok();
+
+    eprintln!("Analyzing database at {}...", command.db);
+
+    // Attempt normal full open to get live WAL/cache stats
+    let db_result = open_db(&command.db, false, 0, 0);
+
+    if let Ok(db) = db_result {
+        let storage = db.storage_info()?;
+        if command.schema_summary {
+            let tables = db.list_tables()?;
+            let indexes = db.list_indexes()?;
+            let views = db.list_views()?;
+            let rows = vec![
+                ("path".to_string(), storage.path.display().to_string()),
+                ("page_size".to_string(), storage.page_size.to_string()),
+                ("page_count".to_string(), storage.page_count.to_string()),
+                (
+                    "schema_cookie".to_string(),
+                    storage.schema_cookie.to_string(),
+                ),
+                ("table_count".to_string(), tables.len().to_string()),
+                ("index_count".to_string(), indexes.len().to_string()),
+                ("view_count".to_string(), views.len().to_string()),
+            ];
+            println!("{}", render_key_value_rows(command.format, &rows));
+        } else {
+            print_storage_info(command.format, &storage);
+        }
+    } else if let Some(header) = loose_header {
+        // Fallback for unsupported formats
         let rows = vec![
-            ("path".to_string(), storage.path.display().to_string()),
-            ("page_size".to_string(), storage.page_size.to_string()),
-            ("page_count".to_string(), storage.page_count.to_string()),
+            ("path".to_string(), command.db.clone()),
+            (
+                "format_version".to_string(),
+                header.format_version.to_string(),
+            ),
+            ("page_size".to_string(), header.page_size.to_string()),
             (
                 "schema_cookie".to_string(),
-                storage.schema_cookie.to_string(),
+                header.schema_cookie.to_string(),
             ),
-            ("table_count".to_string(), tables.len().to_string()),
-            ("index_count".to_string(), indexes.len().to_string()),
-            ("view_count".to_string(), views.len().to_string()),
+            (
+                "last_checkpoint_lsn".to_string(),
+                header.last_checkpoint_lsn.to_string(),
+            ),
+            (
+                "status".to_string(),
+                "engine failed to open (likely unsupported version)".to_string(),
+            ),
         ];
         println!("{}", render_key_value_rows(command.format, &rows));
     } else {
-        print_storage_info(command.format, &storage);
+        // Bubble up original error
+        db_result.map(|_| ())?;
     }
+
     Ok(())
 }
 
@@ -634,8 +686,23 @@ fn run_rebuild_indexes(command: RebuildIndexesCommand) -> Result<()> {
 }
 
 fn run_stats(command: StatsCommand) -> Result<()> {
-    let storage = open_db(&command.db, false, 0, 0)?.storage_info()?;
-    let rows = vec![
+    eprintln!("Analyzing database at {}...", command.db);
+    let db = open_db(&command.db, false, 0, 0)?;
+
+    let storage = db.storage_info()?;
+    let header = db.header_info()?;
+    let tables = db.list_tables()?;
+    let indexes = db.list_indexes()?;
+    let views = db.list_views()?;
+    let triggers = db.list_triggers()?;
+
+    let total_rows: usize = tables.iter().map(|t| t.row_count).sum();
+    let total_indexes = indexes.len();
+    let total_tables = tables.len();
+    let total_views = views.len();
+    let total_triggers = triggers.len();
+
+    let mut rows = vec![
         ("page_size".to_string(), storage.page_size.to_string()),
         ("page_count".to_string(), storage.page_count.to_string()),
         (
@@ -643,10 +710,44 @@ fn run_stats(command: StatsCommand) -> Result<()> {
             (u64::from(storage.page_size) * u64::from(storage.page_count)).to_string(),
         ),
         (
+            "freelist_pages".to_string(),
+            header.freelist_page_count.to_string(),
+        ),
+        (
+            "freelist_bytes".to_string(),
+            (u64::from(header.freelist_page_count) * u64::from(header.page_size)).to_string(),
+        ),
+        (
             "cache_size_mb".to_string(),
             storage.cache_size_mb.to_string(),
         ),
+        ("table_count".to_string(), total_tables.to_string()),
+        ("index_count".to_string(), total_indexes.to_string()),
+        ("view_count".to_string(), total_views.to_string()),
+        ("trigger_count".to_string(), total_triggers.to_string()),
+        ("total_rows".to_string(), total_rows.to_string()),
     ];
+
+    if storage.page_count > 0 {
+        let frag_ratio = (header.freelist_page_count as f64 / storage.page_count as f64) * 100.0;
+        rows.push((
+            "fragmentation_percent".to_string(),
+            format!("{:.2}%", frag_ratio),
+        ));
+    }
+
+    if let Ok(metadata) = std::fs::metadata(&command.db) {
+        let file_size = metadata.len();
+        rows.push(("file_size_bytes".to_string(), file_size.to_string()));
+    }
+
+    if storage.wal_file_size > 0 {
+        rows.push((
+            "wal_size_bytes".to_string(),
+            storage.wal_file_size.to_string(),
+        ));
+    }
+
     println!("{}", render_key_value_rows(command.format, &rows));
     Ok(())
 }
@@ -675,12 +776,44 @@ fn run_verify_index(command: VerifyIndexCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_migrate(command: MigrateCommand) -> Result<()> {
+    let source_path = Path::new(&command.source);
+
+    if !source_path.exists() {
+        return Err(anyhow!(
+            "Source database file not found: {}",
+            command.source
+        ));
+    }
+
+    let header = Db::read_header_info(&command.source)?;
+
+    if header.format_version == decentdb::DB_FORMAT_VERSION {
+        return Err(anyhow!(
+            "Source database is already in the current format version ({})",
+            decentdb::DB_FORMAT_VERSION
+        ));
+    }
+
+    // Direct the user to the standalone migration tool.
+    Err(anyhow!(
+        "Database is in legacy format version {}. To upgrade it to the current format version {}, please use the standalone migration tool:\n\n    decentdb-migrate --source {} --dest <new_path.ddb>\n",
+        header.format_version,
+        decentdb::DB_FORMAT_VERSION,
+        command.source
+    ))
+}
+
 fn print_storage_info(format: OutputFormat, storage: &StorageInfo) {
     let rows = vec![
         ("path".to_string(), storage.path.display().to_string()),
         (
             "wal_path".to_string(),
             storage.wal_path.display().to_string(),
+        ),
+        (
+            "format_version".to_string(),
+            storage.format_version.to_string(),
         ),
         ("page_size".to_string(), storage.page_size.to_string()),
         (

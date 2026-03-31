@@ -9,3 +9,4 @@ export 'src/statement.dart';
 export 'src/errors.dart';
 export 'src/types.dart';
 export 'src/schema.dart';
+export 'src/schema_snapshot.dart';

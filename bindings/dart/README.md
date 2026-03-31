@@ -8,11 +8,17 @@ idiomatic Dart API for desktop and CLI applications.
 - `Database.open()` / `Database.create()` / `Database.openExisting()` /
   `Database.memory()` / `Database.close()`
 - `Database.inTransaction` query helper backed by `ddb_db_in_transaction`
+- `Database.evictSharedWal(path)` maintenance helper for shared WAL cache cleanup
 - `Database` `Finalizer` – the native handle is released by the GC if `close()`
   is never called
 - One-shot `execute()`, `executeWithParams()`, and `query()`
 - Native prepared statements (`ddb_stmt_t`) backing every `Statement` object –
   SQL is compiled once and the query plan is reused across executions
+- `Statement.step()` and `Statement.nextPage()` stream rows from the native cursor
+  without a Dart-side full-result backing store
+- Fast paths for high-throughput workloads:
+  `executeBatchInt64`, `executeBatchI64TextF64`, `executeBatchTyped`,
+  `rebindInt64Execute`, `rebindTextInt64Execute`, `rebindInt64TextExecute`
 - Efficient row decoding: a single `DdbValue` allocation is reused for every
   cell in a result set; a shared `Map<String, int>` index is built once per
   result and shared across all rows for O(1) named-column access via `row['col']`
@@ -25,6 +31,9 @@ idiomatic Dart API for desktop and CLI applications.
 - Maintenance helpers: `checkpoint()` and `saveAs()`
 - Schema metadata via `Schema.listTables()`, `describeTable()`, `listIndexes()`,
   `listViews()`, `getTableDdl()`, `getViewDdl()`, and `listTriggers()`
+- Rich schema metadata via `Schema.getSchemaSnapshot()` with typed Dart models
+  (`SchemaSnapshot`, `SchemaTableInfo`, `SchemaColumnInfo`, `SchemaViewInfo`,
+  `SchemaIndexInfo`, `SchemaTriggerInfo`, `SchemaCheckConstraintInfo`)
 - `ErrorCode.fromCode` throws `StateError` on unrecognised codes
 - `sqlite3` moved to `dev_dependencies` (only used by the benchmark)
 
@@ -146,6 +155,19 @@ final views = db.schema.listViewsInfo();
 final triggers = db.schema.listTriggers();
 ```
 
+For full metadata fidelity (checks, FKs, generated columns, canonical DDL, temp
+objects), use:
+
+```dart
+final snapshot = db.schema.getSchemaSnapshot();
+for (final table in snapshot.tables) {
+  print('${table.name} temp=${table.temporary} rows=${table.rowCount}');
+  for (final check in table.checks) {
+    print('  check: ${check.name ?? '<unnamed>'} => ${check.expressionSql}');
+  }
+}
+```
+
 ## Flutter desktop notes
 
 Bundle the Rust shared library with your application and pass the resolved path
@@ -159,7 +181,6 @@ into `Database.open(..., libraryPath: ...)`. See
 - The package uses the stable C ABI from `include/decentdb.h`; the reference
   header under `bindings/dart/native/decentdb.h` includes that file so the two
   surfaces stay in sync.
-- The `Statement` API fetches all rows into memory before streaming via
-  `step()` / `nextPage()`.  True lazy row-by-row streaming is possible via
-  `ddb_stmt_step_row_view` but requires the caller to decode borrowed pointers
-  synchronously; it is left for a future pass.
+- Two C ABI fused bind+step helpers are not wrapped yet:
+  `ddb_stmt_bind_int64_step_row_view` and
+  `ddb_stmt_bind_int64_step_i64_text_f64`.

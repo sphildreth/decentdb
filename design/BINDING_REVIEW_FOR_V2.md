@@ -9,6 +9,7 @@
 - **2026-03-27:** .NET binding V2 complete. Coverage expanded to 50/50 (100%). All Phase 1 (batch/fused/re-execute declarations), Phase 2 (DateTime microseconds fix, re-execute C ABI fix), Phase 3 (version API, connection modes, schema introspection, InTransaction) resolved. BenchmarksV2 project created. Full solution builds clean.
 - **2026-03-27:** Go binding V2 complete. Coverage 50/50 (100%). All 50 C ABI functions exposed through cgo. Schema introspection, version API, InTransaction, fused step+row_view, batch/re-execute, result set API, EvictSharedWal, DSN mode fix, finalizer, ErrBadConn all resolved. 26 tests passing. Benchmark beats SQLite 2.2x insert, 3.2x point reads. `cargo clippy` clean.
 - **2026-03-27:** Node.js binding v2 pass complete. Tasks N1.2, N1.3, N1.4, N1.6, N1.7, N2.2, N2.3, N2.4, N3.3, N3.4 resolved. 47 tests passing. Benchmark clean.
+- **2026-03-29:** Dart binding refactor slices S3-S6 completed. Added rich schema snapshot API, true streaming `step()`/`nextPage()`, batch and re-execute helpers, and shared WAL eviction wrapper. Added dedicated schema/streaming/fast-path tests and smoke coverage updates.
 
 ---
 
@@ -42,7 +43,7 @@ DecentDB's C ABI exposes 50 functions covering database lifecycle, prepared stat
 | Go      | 50/50 (100%) ✅  | 1/4       | 1/2 ✅    | 3/3 ✅    | 4/4 ✅    | 6/6 ✅    |
 | Java    | 47/60 (78%)      | 3/3 ✅    | 1/2             | 3/3 ✅      | 2/4       | 0/6        |
 | Node.js | 43/50 (86%) ✅   | 1/3       | 0/2             | 3/3 ✅      | 2/4       | 0/6        |
-| Dart    | 44/50 (88%) ✅   | 0/3       | 0/2             | 0/3        | 0/4       | 6/6        |
+| Dart    | 60/60 (100%) ✅  | 3/3 ✅    | 2/2 ✅          | 3/3 ✅     | 4/4 ✅    | 6/6 ✅     |
 
 ### Critical Findings
 
@@ -50,7 +51,7 @@ DecentDB's C ABI exposes 50 functions covering database lifecycle, prepared stat
 
 2. **Java correctness regressions have been fixed.** The v2 Java pass now binds `BigDecimal` through `ddb_stmt_bind_decimal`, preserves timestamp microsecond precision, reconstructs timestamps correctly on read, and keeps boolean/decimal metadata consistent.
 
-3. **Dart no longer bypasses prepared statements.** The v2 pass moved `Statement` onto native `ddb_stmt_t` handles, so SQL is prepared once and reused. The biggest remaining Dart performance gaps are now the unwrapped batch, row-view, and re-execute fast paths.
+3. **Dart now ships a first-class v2 surface.** The Dart binding now includes rich schema snapshots (`ddb_db_get_schema_snapshot_json`), streaming `step()` / `nextPage()` semantics, batch execution wrappers, re-execute helpers, and `ddb_evict_shared_wal`.
 
 4. **Python now exposes the result set handle API** (`ddb_result_t` declarations in `native.py`), but no high-level `Result` wrapper class exists yet. Dart and Python are the only bindings with result set declarations. The result set API enables one-shot queries without separate prepare/step lifecycle.
 
@@ -676,8 +677,8 @@ Validated successfully in the current worktree:
 ## 9. Dart Binding Review
 
 **Location:** `bindings/dart/`
-**Architecture:** Dart FFI wrapper with native prepared statements in `Statement`, result-handle support for one-shot query paths, and schema helpers on `Schema`
-**Coverage:** 44/50 functions (88%) — up from 27/50 before the v2 pass
+**Architecture:** Dart FFI wrapper with native prepared statements in `Statement`, result-handle support for one-shot query paths, rich schema snapshot helpers on `Schema`, and streaming row/page iteration APIs
+**Coverage:** 60/60 functions (100%) — up from 27/50 before the v2 pass
 
 ### 9.1 Completed in the v2 pass
 
@@ -690,38 +691,22 @@ Validated successfully in the current worktree:
 - Replaced linear `row['column']` lookup with a shared O(1) column-index map.
 - Moved `sqlite3` to `dev_dependencies`.
 - Changed `ErrorCode.fromCode()` to throw on unknown native error codes instead of silently mapping them to `internal`.
-- Added and validated tests for open modes, transaction state, exact-page-size pagination, blob/decimal/timestamp round-trips, and stricter error-code handling.
+- Added rich schema snapshot support (`ddb_db_get_schema_snapshot_json`) and typed Dart models for tables, views, indexes, triggers, checks, FKs, and generated-column metadata.
+- Reworked `Statement.step()` and `Statement.nextPage()` to stream from row views without a backing `_rows` materialization buffer.
+- Added batch helpers (`executeBatchInt64`, `executeBatchI64TextF64`, `executeBatchTyped`), re-execute helpers, and static shared-WAL eviction (`Database.evictSharedWal`).
+- Added and validated dedicated tests for schema snapshots, streaming pagination/step semantics, fast-path helpers, plus smoke coverage for snapshot and pagination paths.
 
 ### 9.2 Remaining gaps
 
-#### 9.2.1 Batch execution fast paths are still missing
+#### ~~9.2.1 Fused bind+step helpers are still missing~~ ✅ RESOLVED
 
-The Dart wrapper still does not expose `ddb_stmt_execute_batch_i64`, `ddb_stmt_execute_batch_i64_text_f64`, or `ddb_stmt_execute_batch_typed`.
+**Resolved:** `native_bindings.dart` now declares `ddb_stmt_bind_int64_step_row_view` and `ddb_stmt_bind_int64_step_i64_text_f64`. `Statement` exposes `bindInt64Step()` and `bindInt64StepI64TextF64()`.
 
-#### 9.2.2 Row-view and fused-step fast paths are still missing
-
-The Dart wrapper still does not expose:
-
-- `ddb_stmt_row_view`
-- `ddb_stmt_step_row_view`
-- `ddb_stmt_fetch_row_views`
-- `ddb_stmt_fetch_rows_i64_text_f64`
-- `ddb_stmt_bind_int64_step_row_view`
-- `ddb_stmt_bind_int64_step_i64_text_f64`
-
-#### 9.2.3 Re-execute helpers are still missing
-
-`ddb_stmt_rebind_int64_execute`, `ddb_stmt_rebind_text_int64_execute`, and `ddb_stmt_rebind_int64_text_execute` remain unwrapped.
-
-#### 9.2.4 `ddb_evict_shared_wal` is still not wrapped
-
-The C ABI export exists, but the Dart API does not expose it yet.
-
-#### 9.2.5 The “flutter_desktop” example is still only a desktop reference
+#### 9.2.2 The “flutter_desktop” example is still only a desktop reference
 
 Its naming/description is now more honest, but it is still not an actual Flutter SDK application with Flutter-specific lifecycle handling.
 
-#### 9.2.6 No isolate-affinity guard yet
+#### 9.2.3 No isolate-affinity guard yet
 
 The package still relies on documentation and caller discipline for the engine’s one-writer / many-readers model.
 
@@ -739,11 +724,8 @@ Validated successfully in the current worktree:
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Bind batch execution APIs | Open | biggest remaining throughput gap |
-| Bind row-view / fetch-row-view APIs | Open | would enable lower-allocation streaming |
-| Bind fused bind+step helpers | Open | useful for point-read hot paths |
-| Bind re-execute helpers | Open | useful for keyed UPDATE/DELETE hot paths |
-| Expose `ddb_evict_shared_wal` | Open | maintenance surface still incomplete |
+| ~~Bind fused bind+step APIs~~ | ✅ Completed | `bindInt64Step` and `bindInt64StepI64TextF64` implemented |
+| Publish a true Flutter sample app | Open | current file is a desktop reference, not a Flutter SDK app |
 | Add isolate/runtime guard documentation or enforcement | Open | engine contract still mostly documented, not enforced |
 
 ---
@@ -810,11 +792,11 @@ These tasks enable the fast-path operations that DecentDB's engine is optimized 
 
 | Task | .NET | Python | Go | Java | Node.js | Dart |
 |------|:----:|:------:|:--:|:----:|:-------:|:----:|
-| Bind batch execution (`ddb_stmt_execute_batch_*`) | ✅ | ✅ | G1.5 | ✅ | N1.8 | DT1.2 |
+| Bind batch execution (`ddb_stmt_execute_batch_*`) | ✅ | ✅ | G1.5 | ✅ | N1.8 | ✅ |
 | Bind fused bind+step | ✅ | ✅ | G1.2 | Partial | N1.5 | DT1.4 |
-| Bind fused step+row_view | ✅ | ✅ | ✅ | ✅ | ✅ | DT1.3 |
-| Bind re-execute patterns | ✅ | ✅ | G1.4 | ✅ | ✅ | DT1.5 |
-| Bind batch fetch | ✅ | ✅ | G1.3 | J2.4 | — | DT1.3 |
+| Bind fused step+row_view | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Bind re-execute patterns | ✅ | ✅ | G1.4 | ✅ | ✅ | ✅ |
+| Bind batch fetch | ✅ | ✅ | G1.3 | J2.4 | — | ✅ |
 
 ### Tier 2: Correctness (Blocks V2 Quality Goals)
 
@@ -854,7 +836,7 @@ These tasks close feature gaps between bindings and the C ABI.
 
 ## Appendix A: C ABI Function Reference
 
-Complete list of 50 C ABI functions with their binding coverage status. ✅ = exposed, ⚠️ = declared but not used or partially used, ❌ = not exposed.
+Complete list of 61 C ABI functions with their binding coverage status. ✅ = exposed, ⚠️ = declared but not used or partially used, ❌ = not exposed.
 
 | # | Function | .NET | Python | Go | Java | Node | Dart |
 |---|----------|:----:|:------:|:--:|:----:|:----:|:----:|
@@ -864,45 +846,45 @@ Complete list of 50 C ABI functions with their binding coverage status. ✅ = ex
 | 4 | `ddb_value_init` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | 5 | `ddb_value_dispose` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 | 6 | `ddb_string_free` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 7 | `ddb_db_create` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 8 | `ddb_db_open` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| 7 | `ddb_db_create` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 8 | `ddb_db_open` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 9 | `ddb_db_open_or_create` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 10 | `ddb_db_free` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 11 | `ddb_db_prepare` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 12 | `ddb_stmt_free` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 13 | `ddb_stmt_reset` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 14 | `ddb_stmt_clear_bindings` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 15 | `ddb_stmt_bind_null` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 16 | `ddb_stmt_bind_int64` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 17 | `ddb_stmt_bind_int64_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 18 | `ddb_stmt_bind_int64_step_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 19 | `ddb_stmt_bind_float64` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 20 | `ddb_stmt_bind_bool` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 21 | `ddb_stmt_bind_text` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 22 | `ddb_stmt_bind_blob` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 23 | `ddb_stmt_bind_decimal` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 24 | `ddb_stmt_bind_timestamp_micros` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 25 | `ddb_stmt_execute_batch_i64` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 26 | `ddb_stmt_execute_batch_i64_text_f64` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 27 | `ddb_stmt_execute_batch_typed` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 28 | `ddb_stmt_step` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 29 | `ddb_stmt_column_count` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 30 | `ddb_stmt_column_name_copy` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 31 | `ddb_stmt_affected_rows` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 32 | `ddb_stmt_rebind_int64_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 33 | `ddb_stmt_rebind_text_int64_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 34 | `ddb_stmt_rebind_int64_text_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 11 | `ddb_db_prepare` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 12 | `ddb_stmt_free` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 13 | `ddb_stmt_reset` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 14 | `ddb_stmt_clear_bindings` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 15 | `ddb_stmt_bind_null` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 16 | `ddb_stmt_bind_int64` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 17 | `ddb_stmt_bind_int64_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 18 | `ddb_stmt_bind_int64_step_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 19 | `ddb_stmt_bind_float64` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 20 | `ddb_stmt_bind_bool` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 21 | `ddb_stmt_bind_text` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 22 | `ddb_stmt_bind_blob` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 23 | `ddb_stmt_bind_decimal` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 24 | `ddb_stmt_bind_timestamp_micros` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 25 | `ddb_stmt_execute_batch_i64` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 26 | `ddb_stmt_execute_batch_i64_text_f64` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 27 | `ddb_stmt_execute_batch_typed` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 28 | `ddb_stmt_step` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 29 | `ddb_stmt_column_count` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 30 | `ddb_stmt_column_name_copy` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 31 | `ddb_stmt_affected_rows` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 32 | `ddb_stmt_rebind_int64_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 33 | `ddb_stmt_rebind_text_int64_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 34 | `ddb_stmt_rebind_int64_text_execute` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 35 | `ddb_stmt_value_copy` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 36 | `ddb_stmt_row_view` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 37 | `ddb_stmt_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
-| 38 | `ddb_stmt_fetch_row_views` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 39 | `ddb_stmt_fetch_rows_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ |
+| 36 | `ddb_stmt_row_view` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 37 | `ddb_stmt_step_row_view` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 38 | `ddb_stmt_fetch_row_views` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 39 | `ddb_stmt_fetch_rows_i64_text_f64` | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
 | 40 | `ddb_db_execute` | ✅ | ✅ | ✅ | ⚠️ | ❌ | ✅ |
 | 41 | `ddb_db_checkpoint` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 42 | `ddb_db_begin_transaction` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 43 | `ddb_db_commit_transaction` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 44 | `ddb_db_rollback_transaction` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| 45 | `ddb_db_in_transaction` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| 45 | `ddb_db_in_transaction` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 46 | `ddb_db_save_as` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 47 | `ddb_db_list_tables_json` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 48 | `ddb_db_describe_table_json` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -911,13 +893,14 @@ Complete list of 50 C ABI functions with their binding coverage status. ✅ = ex
 | 51 | `ddb_db_list_views_json` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 52 | `ddb_db_get_view_ddl` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
 | 53 | `ddb_db_list_triggers_json` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
-| 54 | `ddb_evict_shared_wal` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| 55 | `ddb_result_free` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 56 | `ddb_result_row_count` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 57 | `ddb_result_column_count` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 58 | `ddb_result_affected_rows` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 59 | `ddb_result_column_name_copy` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
-| 60 | `ddb_result_value_copy` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 54 | `ddb_db_get_schema_snapshot_json` | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ |
+| 55 | `ddb_evict_shared_wal` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 56 | `ddb_result_free` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 57 | `ddb_result_row_count` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 58 | `ddb_result_column_count` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 59 | `ddb_result_affected_rows` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 60 | `ddb_result_column_name_copy` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
+| 61 | `ddb_result_value_copy` | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
 
 **Legend:** ✅ = exposed to users, ⚠️ = declared but uncallable from managed code (only reachable via C extension internals), ❌ = not exposed
 

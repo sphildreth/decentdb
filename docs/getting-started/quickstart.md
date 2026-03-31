@@ -166,8 +166,8 @@ discard closeDb(db)
 | Binding | Method |
 |---------|--------|
 | Rust | `saveAs(db, destPath)` |
-| CLI | `decentdb save-as --db=:memory: --output=dest.ddb` |
 | .NET | `connection.SaveAs(destPath)` |
 | Go | `db.SaveAs(destPath)` |
 | Node | `db.saveAs(destPath)` |
 | Python | `conn.save_as(dest_path)` |
+| Dart | `db.saveAs(destPath)` |

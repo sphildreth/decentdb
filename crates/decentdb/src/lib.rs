@@ -5,6 +5,8 @@
 //! Phase 0 establishes the stable top-level API surface and the bootstrap
 //! database file format entry points used by later storage slices.
 
+#[cfg(feature = "bench-internals")]
+pub mod benchmark;
 mod btree;
 mod c_api;
 mod catalog;
@@ -29,10 +31,12 @@ pub use crate::db::{evict_shared_wal, Db, PreparedStatement, SqlTransaction};
 pub use crate::error::{DbError, DbErrorCode, Result};
 pub use crate::exec::{BulkLoadOptions, QueryResult, QueryRow};
 pub use crate::metadata::{
-    ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification, StorageInfo, TableInfo,
-    TriggerInfo, ViewInfo,
+    CheckConstraintInfo, ColumnInfo, ForeignKeyInfo, HeaderInfo, IndexInfo, IndexVerification,
+    SchemaColumnInfo, SchemaIndexInfo, SchemaSnapshot, SchemaTableInfo, SchemaTriggerInfo,
+    SchemaViewInfo, StorageInfo, TableInfo, TriggerInfo, ViewInfo,
 };
 pub use crate::record::value::Value;
+pub use crate::storage::DB_FORMAT_VERSION;
 
 /// Returns the DecentDB crate version.
 #[must_use]

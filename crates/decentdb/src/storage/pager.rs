@@ -3,13 +3,13 @@
 //! Implements:
 //! - design/adr/0001-page-size.md
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{DbError, Result};
 use crate::vfs::{read_exact_at, write_all_at, VfsFile};
 
 use super::cache::PageCache;
-#[cfg(test)]
 use super::freelist::{decode_freelist_next, encode_freelist_page};
 use super::header::{DatabaseHeader, DB_HEADER_SIZE};
 use super::page::{self, PageId};
@@ -46,7 +46,7 @@ impl PagerHandle {
         })
     }
 
-    pub(crate) fn read_page(&self, page_id: PageId) -> Result<Vec<u8>> {
+    pub(crate) fn read_page(&self, page_id: PageId) -> Result<Arc<[u8]>> {
         page::validate_page_id(page_id)?;
         let handle = self
             .inner
@@ -189,12 +189,77 @@ impl PagerHandle {
         Ok(())
     }
 
+    pub(crate) fn truncate_freelist_tail(&self) -> Result<Option<PageId>> {
+        let mut header = self.header_snapshot()?;
+        if header.freelist.head_page_id == 0 || header.freelist.page_count == 0 {
+            return Ok(None);
+        }
+
+        let current_page_count = self.on_disk_page_count()?;
+        if current_page_count <= page::CATALOG_ROOT_PAGE_ID {
+            return Ok(None);
+        }
+
+        let mut ordered_freelist_pages = Vec::with_capacity(header.freelist.page_count as usize);
+        let mut page_id = header.freelist.head_page_id;
+        while page_id != 0 {
+            ordered_freelist_pages.push(page_id);
+            page_id = self.read_freelist_next(page_id)?;
+        }
+
+        let freelist_pages = ordered_freelist_pages
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut new_page_count = current_page_count;
+        let mut trimmed_pages = HashSet::new();
+        while new_page_count > page::CATALOG_ROOT_PAGE_ID
+            && freelist_pages.contains(&new_page_count)
+        {
+            trimmed_pages.insert(new_page_count);
+            new_page_count = new_page_count.saturating_sub(1);
+        }
+        if trimmed_pages.is_empty() {
+            return Ok(None);
+        }
+
+        let remaining_pages = ordered_freelist_pages
+            .into_iter()
+            .filter(|page_id| !trimmed_pages.contains(page_id))
+            .collect::<Vec<_>>();
+        for (index, page_id) in remaining_pages.iter().enumerate() {
+            let next_page_id = remaining_pages.get(index + 1).copied().unwrap_or(0);
+            write_all_at(
+                self.inner.file.as_ref(),
+                page::page_offset(*page_id, self.inner.page_size),
+                &encode_freelist_page(self.inner.page_size, next_page_id),
+            )?;
+        }
+
+        header.freelist.head_page_id = remaining_pages.first().copied().unwrap_or(0);
+        header.freelist.page_count = header
+            .freelist
+            .page_count
+            .saturating_sub(trimmed_pages.len() as u32);
+        self.persist_header(&header)?;
+        self.inner.file.set_len(page::page_offset(
+            new_page_count.saturating_add(1),
+            self.inner.page_size,
+        ))?;
+        self.inner.cache.clear()?;
+        *self
+            .inner
+            .header
+            .lock()
+            .map_err(|_| DbError::internal("pager header lock poisoned"))? = header;
+        Ok(Some(new_page_count))
+    }
+
     #[must_use]
     pub(crate) fn page_size(&self) -> u32 {
         self.inner.page_size
     }
 
-    #[cfg(test)]
     fn read_freelist_next(&self, page_id: PageId) -> Result<PageId> {
         let mut page = page::zeroed_page(self.inner.page_size);
         read_exact_at(
@@ -286,8 +351,8 @@ mod tests {
         let first = pager.read_page(3).expect("first read");
         let second = pager.read_page(3).expect("second read");
 
-        assert_eq!(first, payload);
-        assert_eq!(second, payload);
+        assert_eq!(first.to_vec(), payload);
+        assert_eq!(second.to_vec(), payload);
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
@@ -347,7 +412,10 @@ mod tests {
                 .expect("file size after rewrite"),
             original_len
         );
-        assert_eq!(pager.read_page(4).expect("read page four"), page_four);
+        assert_eq!(
+            pager.read_page(4).expect("read page four").to_vec(),
+            page_four
+        );
     }
 
     #[derive(Debug)]
@@ -479,6 +547,6 @@ mod tests {
         let pager = PagerHandle::open(file, header.clone(), 1).expect("open pager");
 
         let data = pager.read_page(100).expect("read beyond");
-        assert_eq!(data, page::zeroed_page(page::DEFAULT_PAGE_SIZE));
+        assert_eq!(data.to_vec(), page::zeroed_page(page::DEFAULT_PAGE_SIZE));
     }
 }

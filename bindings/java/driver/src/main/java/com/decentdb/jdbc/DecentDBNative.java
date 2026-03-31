@@ -209,4 +209,5 @@ final class DecentDBNative {
     static final int ERR_SQL         = 5;
     static final int ERR_INTERNAL    = 6;
     static final int ERR_PANIC       = 7;
+    static final int ERR_UNSUPPORTED_FORMAT_VERSION = 8;
 }

@@ -5,6 +5,7 @@ import 'package:ffi/ffi.dart';
 
 import 'errors.dart';
 import 'native_bindings.dart';
+import 'schema_snapshot.dart';
 import 'types.dart';
 
 class Schema {
@@ -117,5 +118,13 @@ class Schema {
     return (jsonDecode(json) as List)
         .map((value) => TriggerInfo.fromJson(value as Map<String, dynamic>))
         .toList();
+  }
+
+  SchemaSnapshot getSchemaSnapshot() {
+    final json = _callDbString(
+      _bindings.dbGetSchemaSnapshotJson,
+      'Failed to get schema snapshot',
+    );
+    return SchemaSnapshot.fromJson(jsonDecode(json) as Map<String, dynamic>);
   }
 }

@@ -6,7 +6,7 @@ use miniz_oxide::inflate::decompress_to_vec_zlib;
 use crate::error::{DbError, Result};
 
 const AUTO_COMPRESSION_LEVEL: u8 = 1;
-const AUTO_MIN_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(crate) const AUTO_MIN_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompressionMode {

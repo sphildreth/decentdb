@@ -4,10 +4,14 @@
 //! - design/adr/0020-overflow-pages-for-blobs.md
 //! - design/adr/0031-overflow-page-format.md
 
+use std::sync::Arc;
+
 use crate::error::{DbError, Result};
 use crate::record::compression::{decompress, maybe_compress, CompressionMode};
 use crate::storage::checksum::crc32c_parts;
 use crate::storage::page::{PageId, PageStore};
+
+type ChainPages = Vec<(PageId, Arc<[u8]>)>;
 
 pub(crate) const OVERFLOW_HEADER_SIZE: usize = 8;
 const FLAG_COMPRESSED: u8 = 0x01;
@@ -222,7 +226,7 @@ pub(crate) fn rewrite_overflow_cached<S: PageStore>(
         // (vectorized memcmp is ~4× faster than byte-by-byte CRC-32C).
         if index < cached_page_ids.len() {
             if let Ok(existing) = store.read_page(page_id) {
-                if existing.as_slice() == page_buf.as_slice() {
+                if *existing == *page_buf {
                     continue;
                 }
             }
@@ -386,7 +390,7 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
     }
     let chunk_capacity = page_size - OVERFLOW_HEADER_SIZE;
 
-    let mut tail_page = store.read_page(previous_tail.page_id)?;
+    let mut tail_page = store.read_page(previous_tail.page_id)?.to_vec();
     if tail_page.len() < OVERFLOW_HEADER_SIZE {
         return Err(DbError::corruption("overflow page shorter than header"));
     }
@@ -451,12 +455,12 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
             new_pages[index][0..4].copy_from_slice(&new_page_ids[index + 1].to_le_bytes());
         }
 
-        store.write_page(previous_tail.page_id, &tail_page)?;
-        for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages.iter()) {
-            store.write_page(new_page_id, new_page)?;
+        store.write_page_owned(previous_tail.page_id, tail_page)?;
+        for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages.into_iter()) {
+            store.write_page_owned(new_page_id, new_page)?;
         }
     } else {
-        store.write_page(previous_tail.page_id, &tail_page)?;
+        store.write_page_owned(previous_tail.page_id, tail_page)?;
     }
 
     Ok((
@@ -517,7 +521,7 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
         }
         logical_len = logical_len.saturating_add(chunk_len as usize);
         page_ids.push(page_id);
-        pages.push(page);
+        pages.push(page.to_vec());
         chunk_lens.push(chunk_len as usize);
         page_id = next_page_id;
     }
@@ -601,13 +605,16 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
     let checksum = crc32c_parts(&checksum_parts);
 
     if tail_index == 0 {
-        store.write_page(page_ids[0], &pages[0])?;
+        store.write_page_owned(page_ids[0], pages.swap_remove(0))?;
     } else {
-        store.write_page(page_ids[0], &pages[0])?;
-        store.write_page(page_ids[tail_index], &pages[tail_index])?;
+        let tail_page_id = page_ids[tail_index];
+        let tail_page = pages.swap_remove(tail_index);
+        let head_page = pages.swap_remove(0);
+        store.write_page_owned(page_ids[0], head_page)?;
+        store.write_page_owned(tail_page_id, tail_page)?;
     }
-    for (new_page_id, new_page) in new_page_ids.iter().copied().zip(new_pages.iter()) {
-        store.write_page(new_page_id, new_page)?;
+    for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages.into_iter()) {
+        store.write_page_owned(new_page_id, new_page)?;
     }
 
     Ok((
@@ -625,7 +632,8 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
 }
 
 pub(crate) fn read_overflow<S: PageStore>(store: &S, pointer: OverflowPointer) -> Result<Vec<u8>> {
-    let bytes = read_chain(store, pointer.head_page_id)?;
+    let bytes =
+        read_chain_with_capacity(store, pointer.head_page_id, pointer.logical_len as usize)?;
     let decoded = if pointer.is_compressed() {
         decompress(&bytes)?
     } else {
@@ -643,8 +651,16 @@ pub(crate) fn read_overflow<S: PageStore>(store: &S, pointer: OverflowPointer) -
 }
 
 pub(crate) fn read_chain<S: PageStore>(store: &S, head_page_id: PageId) -> Result<Vec<u8>> {
+    read_chain_with_capacity(store, head_page_id, 0)
+}
+
+fn read_chain_with_capacity<S: PageStore>(
+    store: &S,
+    head_page_id: PageId,
+    capacity_hint: usize,
+) -> Result<Vec<u8>> {
     let mut page_id = head_page_id;
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(capacity_hint);
 
     while page_id != 0 {
         let page = store.read_page(page_id)?;
@@ -716,10 +732,7 @@ fn write_chain<S: PageStore>(store: &mut S, bytes: &[u8]) -> Result<PageId> {
     Ok(page_ids[0])
 }
 
-fn collect_chain_pages<S: PageStore>(
-    store: &S,
-    head_page_id: PageId,
-) -> Result<Vec<(PageId, Vec<u8>)>> {
+fn collect_chain_pages<S: PageStore>(store: &S, head_page_id: PageId) -> Result<ChainPages> {
     let mut page_id = head_page_id;
     let mut pages = Vec::new();
 
@@ -728,13 +741,15 @@ fn collect_chain_pages<S: PageStore>(
         if page.len() < OVERFLOW_HEADER_SIZE {
             return Err(DbError::corruption("overflow page shorter than header"));
         }
-        pages.push((page_id, page.clone()));
-        page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        let next_page_id = u32::from_le_bytes(page[0..4].try_into().expect("header next page"));
+        pages.push((page_id, page));
+        page_id = next_page_id;
     }
 
     Ok(pages)
 }
 
+#[allow(clippy::type_complexity)]
 fn write_chain_pages<S: PageStore>(
     store: &mut S,
     page_ids: &[PageId],
@@ -742,7 +757,7 @@ fn write_chain_pages<S: PageStore>(
     page_size: usize,
     chunk_capacity: usize,
     skip_unchanged: bool,
-    existing_pages: Option<&[(PageId, Vec<u8>)]>,
+    existing_pages: Option<&[(PageId, Arc<[u8]>)]>,
 ) -> Result<()> {
     let mut offset = 0_usize;
     for (index, page_id) in page_ids.iter().copied().enumerate() {
@@ -766,21 +781,21 @@ fn write_chain_pages<S: PageStore>(
             let unchanged = if let Some(existing_pages) = existing_pages {
                 if let Some((existing_page_id, existing_page)) = existing_pages.get(index) {
                     if *existing_page_id == page_id {
-                        existing_page.as_slice() == page.as_slice()
+                        &**existing_page == page.as_slice()
                     } else {
-                        store.read_page(page_id)? == page
+                        *store.read_page(page_id)? == *page
                     }
                 } else {
                     false
                 }
             } else {
-                store.read_page(page_id)? == page
+                *store.read_page(page_id)? == *page
             };
             if unchanged {
                 continue;
             }
         }
-        store.write_page(page_id, &page)?;
+        store.write_page_owned(page_id, page)?;
     }
     Ok(())
 }

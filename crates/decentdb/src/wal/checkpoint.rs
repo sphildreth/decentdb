@@ -55,6 +55,13 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
     for (page_id, version) in &latest_versions {
         pager.write_page_direct(*page_id, &version.data)?;
     }
+    let header = pager.header_from_disk()?;
+    pager.refresh_from_disk(header)?;
+    if let Some(page_count) = pager.truncate_freelist_tail()? {
+        wal.reset_max_page_count(page_count);
+    } else {
+        wal.reset_max_page_count(pager.on_disk_page_count()?);
+    }
     pager.set_last_checkpoint_lsn(safe_lsn)?;
 
     let _checkpoint_end = writer::append_checkpoint_frame(wal, safe_lsn)?;

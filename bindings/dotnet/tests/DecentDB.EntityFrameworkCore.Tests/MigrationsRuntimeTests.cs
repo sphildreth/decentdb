@@ -80,17 +80,112 @@ public sealed class MigrationsRuntimeTests : IDisposable
     }
 
     [Fact]
+    public void EnsureCreated_CanCreateSelfReferencingForeignKeys()
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<SelfRefFkDbContext>();
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
+
+        using var context = new SelfRefFkDbContext(optionsBuilder.Options);
+        context.Database.EnsureDeleted();
+        context.Database.EnsureCreated();
+    }
+
+    [Fact]
+    public void EnsureCreated_CanCreateTablesWithCompositeForeignKeys()
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<CompositeFkDbContext>();
+        optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
+
+        using var context = new CompositeFkDbContext(optionsBuilder.Options);
+        context.Database.EnsureDeleted();
+        context.Database.EnsureCreated();
+
+        context.Parents.Add(new CompositeParent
+        {
+            KeyPart1 = 10,
+            KeyPart2 = 20,
+            Name = "parent"
+        });
+        context.SaveChanges();
+
+        context.Children.Add(new CompositeChild
+        {
+            Id = 1,
+            ParentKeyPart1 = 10,
+            ParentKeyPart2 = 20,
+            Label = "child"
+        });
+        context.SaveChanges();
+    }
+
+    [Fact]
+    public void MigrationsSqlGenerator_AddForeignKey_WithActions_Executes()
+    {
+        using var context = CreateContext();
+        context.Database.EnsureDeleted();
+
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        ExecuteNonQuery(conn, """
+                              CREATE TABLE "ParentEntities" (
+                                "Id" INTEGER PRIMARY KEY
+                              )
+                              """);
+        ExecuteNonQuery(conn, """
+                              CREATE TABLE "ChildEntities" (
+                                "Id" INTEGER PRIMARY KEY,
+                                "ParentId" INTEGER
+                              )
+                              """);
+
+        var generator = context.GetService<IMigrationsSqlGenerator>();
+        var operation = new AddForeignKeyOperation
+        {
+            Name = "FK_ChildEntities_ParentEntities_ParentId",
+            Table = "ChildEntities",
+            Columns = ["ParentId"],
+            PrincipalTable = "ParentEntities",
+            PrincipalColumns = ["Id"],
+            OnDelete = ReferentialAction.SetNull,
+            OnUpdate = ReferentialAction.Cascade
+        };
+
+        foreach (var command in generator.Generate([operation], null))
+        {
+            ExecuteNonQuery(conn, command.CommandText);
+        }
+
+        ExecuteNonQuery(conn, """
+                              INSERT INTO "ParentEntities" ("Id") VALUES (1), (2)
+                              """);
+        ExecuteNonQuery(conn, """
+                              INSERT INTO "ChildEntities" ("Id", "ParentId") VALUES (10, 1), (20, 2)
+                              """);
+
+        ExecuteNonQuery(conn, """
+                              UPDATE "ParentEntities" SET "Id" = 100 WHERE "Id" = 1
+                              """);
+        Assert.Equal(100L, ExecuteScalar(conn, """
+                                          SELECT "ParentId" FROM "ChildEntities" WHERE "Id" = 10
+                                          """));
+
+        ExecuteNonQuery(conn, """
+                              DELETE FROM "ParentEntities" WHERE "Id" = 2
+                              """);
+        Assert.Equal(DBNull.Value, ExecuteScalar(conn, """
+                                                SELECT "ParentId" FROM "ChildEntities" WHERE "Id" = 20
+                                                """));
+    }
+
+    [Fact]
     public void UnsupportedMigrationsOperation_ThrowsActionableError()
     {
         using var context = CreateContext();
         var generator = context.GetService<IMigrationsSqlGenerator>();
-        var operation = new AddForeignKeyOperation
+        var operation = new DropSchemaOperation
         {
-            Table = "child",
-            Name = "fk_child_parent",
-            Columns = ["parent_id"],
-            PrincipalTable = "parent",
-            PrincipalColumns = ["id"]
+            Name = "foo"
         };
 
         var ex = Assert.Throws<NotSupportedException>(() => generator.Generate([operation], null));
@@ -102,6 +197,20 @@ public sealed class MigrationsRuntimeTests : IDisposable
         var optionsBuilder = new DbContextOptionsBuilder<MigrationDbContext>();
         optionsBuilder.UseDecentDB($"Data Source={_dbPath}");
         return new MigrationDbContext(optionsBuilder.Options);
+    }
+
+    private static void ExecuteNonQuery(DecentDBConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        cmd.ExecuteNonQuery();
+    }
+
+    private static object ExecuteScalar(DecentDBConnection conn, string sql)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = sql;
+        return cmd.ExecuteScalar()!;
     }
 
     private static void TryDelete(string path)
@@ -199,6 +308,71 @@ public sealed class FkDbContext : DbContext
     }
 }
 
+public sealed class SelfRefFkDbContext : DbContext
+{
+    public SelfRefFkDbContext(DbContextOptions<SelfRefFkDbContext> options)
+        : base(options)
+    {
+    }
+
+    public DbSet<SelfRefCategory> Categories => Set<SelfRefCategory>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<SelfRefCategory>(entity =>
+        {
+            entity.ToTable("Categories");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("Id").ValueGeneratedOnAdd();
+            entity.Property(x => x.ParentCategoryId).HasColumnName("ParentCategoryId");
+
+            entity.HasOne(x => x.ParentCategory)
+                .WithMany(x => x.Children)
+                .HasForeignKey(x => x.ParentCategoryId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+    }
+}
+
+public sealed class CompositeFkDbContext : DbContext
+{
+    public CompositeFkDbContext(DbContextOptions<CompositeFkDbContext> options)
+        : base(options)
+    {
+    }
+
+    public DbSet<CompositeParent> Parents => Set<CompositeParent>();
+    public DbSet<CompositeChild> Children => Set<CompositeChild>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<CompositeParent>(entity =>
+        {
+            entity.ToTable("composite_parents");
+            entity.HasKey(x => new { x.KeyPart1, x.KeyPart2 });
+            entity.Property(x => x.KeyPart1).HasColumnName("key_part1");
+            entity.Property(x => x.KeyPart2).HasColumnName("key_part2");
+            entity.Property(x => x.Name).HasColumnName("name");
+        });
+
+        modelBuilder.Entity<CompositeChild>(entity =>
+        {
+            entity.ToTable("composite_children");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).HasColumnName("id");
+            entity.Property(x => x.ParentKeyPart1).HasColumnName("parent_key_part1");
+            entity.Property(x => x.ParentKeyPart2).HasColumnName("parent_key_part2");
+            entity.Property(x => x.Label).HasColumnName("label");
+
+            entity.HasOne(x => x.Parent)
+                .WithMany(x => x.Children)
+                .HasForeignKey(x => new { x.ParentKeyPart1, x.ParentKeyPart2 })
+                .HasPrincipalKey(x => new { x.KeyPart1, x.KeyPart2 })
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+    }
+}
+
 public sealed class FkArtist
 {
     public long Id { get; set; }
@@ -212,6 +386,31 @@ public sealed class FkAlbum
     public string Title { get; set; } = string.Empty;
     public long ArtistId { get; set; }
     public FkArtist Artist { get; set; } = null!;
+}
+
+public sealed class SelfRefCategory
+{
+    public long Id { get; set; }
+    public long? ParentCategoryId { get; set; }
+    public SelfRefCategory? ParentCategory { get; set; }
+    public List<SelfRefCategory> Children { get; set; } = [];
+}
+
+public sealed class CompositeParent
+{
+    public long KeyPart1 { get; set; }
+    public long KeyPart2 { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public List<CompositeChild> Children { get; set; } = [];
+}
+
+public sealed class CompositeChild
+{
+    public long Id { get; set; }
+    public long ParentKeyPart1 { get; set; }
+    public long ParentKeyPart2 { get; set; }
+    public string Label { get; set; } = string.Empty;
+    public CompositeParent Parent { get; set; } = null!;
 }
 
 [DbContext(typeof(MigrationDbContext))]
