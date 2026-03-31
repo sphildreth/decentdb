@@ -94,6 +94,8 @@ tests/bindings/**/*.node
 *.ddb.wal
 *.db 
 *.db.wal
+# Allow migration test fixtures (binary .db files needed by CI)
+!crates/decentdb-migrate/tests/fixtures/*.db
 *.log
 /.tmp/
 
