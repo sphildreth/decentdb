@@ -1,10 +1,26 @@
 name: Publish NuGet.org (.NET packages)
-run-name: ${{ github.ref_name }}
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch'
+    && format('{0} ({1})', inputs.release_tag, inputs.publish_to_nuget && 'publish' || 'dry-run')
+    || github.ref_name
+  }}
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish (for example v2.1.0)
+        required: true
+        type: string
+      publish_to_nuget:
+        description: Push the built packages to NuGet.org after validation
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -13,6 +29,8 @@ jobs:
   build-native:
     name: Build native (${{ matrix.rid }})
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +49,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -70,15 +90,18 @@ jobs:
           path: out/
 
   pack-and-push:
-    name: Pack + publish NuGet.org
+    name: Pack + optional NuGet.org publish
     runs-on: ubuntu-latest
     needs: [build-native]
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
@@ -220,6 +243,7 @@ jobs:
           unzip -l "$pkg" | grep -q "lib/net10.0/DecentDB.EntityFrameworkCore.NodaTime.dll"
 
       - name: Publish to NuGet.org
+        if: ${{ github.event_name == 'push' || inputs.publish_to_nuget == true }}
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         shell: bash
@@ -234,3 +258,7 @@ jobs:
             echo "NUGET_API_KEY not set, skipping NuGet.org publish"
             exit 1
           fi
+
+      - name: Confirm dry-run package validation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_to_nuget != true }}
+        run: echo "Validated and packed release artifacts without publishing to NuGet.org."
