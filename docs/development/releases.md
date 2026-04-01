@@ -17,13 +17,20 @@ or publishing a release from the GitHub UI does not reliably go through that
 same event path, so if a tag is created server-side you may need to use
 `workflow_dispatch` to run the release pipeline manually.
 
-The NuGet workflow in `.github/workflows/nuget.yml` also supports
-`workflow_dispatch`, but it should be started from `main`, not from the tag
-itself, with:
+NuGet package publication stays on the tag-triggered workflow in
+`.github/workflows/nuget.yml`, so the normal publish history remains
+tag-oriented.
+
+For manual recovery or validation of an existing tag, use the separate workflow
+in `.github/workflows/nuget-manual.yml` from `main`, with:
 
 - `release_tag` set to the existing release tag, such as `v2.1.0`
 - `publish_to_nuget` left at `false` for a safe dry run that builds, packs, and
   verifies package contents without publishing
+
+Manual runs use the selected `release_tag` in the workflow run title and stay in
+their own workflow history instead of appearing under the primary tag-publish
+workflow.
 
 Set `publish_to_nuget` to `true` only when you intentionally want that manual
 run to push packages to NuGet.org.
