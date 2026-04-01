@@ -98,6 +98,7 @@ pub(crate) fn crc32c_parts(parts: &[&[u8]]) -> u32 {
     !crc
 }
 
+#[cfg(test)]
 #[must_use]
 pub(crate) fn crc32c_extend(initial_crc: u32, parts: &[&[u8]]) -> u32 {
     let mut crc = !initial_crc;

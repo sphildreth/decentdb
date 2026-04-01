@@ -424,7 +424,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: refresh benchmark assets [skip ci]"
+          git commit -m "chore: refresh benchmark assets"
           git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
 
           echo "changed=true" >> "$GITHUB_OUTPUT"

@@ -156,6 +156,86 @@ fn checkpoint_on_memory_db() {
 }
 
 #[test]
+fn checkpointed_append_only_overflow_rows_keep_primary_key_unique() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let path = tempdir.path().join("append-only-overflow-row-count.ddb");
+    let dsn = path.to_str().expect("utf-8 path");
+    let large_text = "A".repeat(4_000);
+    let large_blob = vec![0_u8; 70_000];
+
+    let open = || Db::open_or_create(dsn, DbConfig::default()).expect("open db");
+    let count_rows = || -> i64 {
+        let db = open();
+        let result = db.execute("SELECT COUNT(*) FROM t").expect("count rows");
+        match &rows(&result)[0][0] {
+            Value::Int64(value) => *value,
+            other => panic!("expected INT64 count, got {other:?}"),
+        }
+    };
+
+    {
+        let db = open();
+        db.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT, blob_data BLOB, created_at INTEGER)",
+        )
+        .expect("create table");
+    }
+
+    for id in 1_i64..=2_i64 {
+        let db = open();
+        db.execute_with_params(
+            "INSERT INTO t VALUES ($1, $2, $3, $4)",
+            &[
+                Value::Int64(id),
+                Value::Text(large_text.clone()),
+                Value::Blob(large_blob.clone()),
+                Value::Int64(id),
+            ],
+        )
+        .expect("insert large row");
+    }
+
+    assert_eq!(count_rows(), 2);
+
+    {
+        let db = open();
+        db.checkpoint().expect("checkpoint");
+    }
+
+    assert_eq!(count_rows(), 2);
+
+    {
+        let db = open();
+        db.execute_with_params(
+            "INSERT INTO t VALUES ($1, $2, $3, $4)",
+            &[
+                Value::Int64(3),
+                Value::Text(large_text),
+                Value::Blob(large_blob),
+                Value::Int64(3),
+            ],
+        )
+        .expect("insert post-checkpoint row");
+    }
+
+    assert_eq!(count_rows(), 3);
+
+    let db = open();
+    let ids = rows(
+        &db.execute("SELECT id FROM t ORDER BY id")
+            .expect("select ids"),
+    );
+    assert_eq!(
+        ids,
+        vec![
+            vec![Value::Int64(1)],
+            vec![Value::Int64(2)],
+            vec![Value::Int64(3)],
+        ]
+    );
+}
+
+#[test]
 fn decimal_in_dump_sql() {
     let db = mem_db();
     db.execute("CREATE TABLE t(id INT64, price DECIMAL(8, 2))")

@@ -296,6 +296,19 @@ def build_checks() -> list[Check]:
             cargo_bound=True,
         ),
         Check(
+            key="rust-persistence-regression",
+            title="Rust persistence regression",
+            cwd=REPO_ROOT,
+            command=(
+                "cargo test -p decentdb --test sql_persistence_tests --quiet "
+                "checkpointed_append_only_overflow_rows_keep_primary_key_unique -- --exact"
+            ),
+            env={},
+            stage=3,
+            modes=("fast", "paranoid"),
+            cargo_bound=True,
+        ),
+        Check(
             key="python-fastdecode-smoke",
             title="Python fastdecode smoke",
             cwd=REPO_ROOT / "bindings" / "python",

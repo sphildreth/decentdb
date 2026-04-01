@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] - 2026-03-31
+## [2.1.0] - 2026-04-01
 
 ### Fixed
 - Decimal `MIN`/`MAX` aggregate ordering in the Rust engine now compares `DECIMAL` values natively during aggregate-extreme evaluation, including mixed decimal scales.
@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rust engine decimal comparison and `SUM`/`AVG` aggregate paths so mixed numeric comparisons and decimal aggregates execute without the earlier EF Core showcase workarounds.
 - EF Core translation for `DateTime`, `DateOnly`, and `TimeOnly` member access in predicates, including nullable member-access shapes used by the showcase.
 - Fault-injection WAL write classification for compound page-frame plus commit-frame appends so `wal.write_commit` failpoints and crash/reopen coverage continue to target the durable publish boundary after the write-path batching optimization.
+- Rust table-payload append-only overflow persistence after checkpoint compaction now patches the on-disk row-count header before appending, preventing duplicate primary-key rows and the overnight memory-safety corruption failure on reopen.
 
 ### Added
 - Dedicated standalone `decentdb-migrate` CLI tool to seamlessly upgrade databases from unsupported legacy format versions (e.g., Nim-era v3) to the current format.
@@ -27,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded .NET EF Core validation and docs for server-side set operations, `ExecuteUpdateAsync`, `ExecuteDeleteAsync`, `AsAsyncEnumerable()`, and explicit constraint/savepoint failure contracts.
 - EF Core `UseDecentDB(DecentDBConnectionStringBuilder)` overloads so typed connection-string setup can be shared directly between ADO.NET and EF Core configuration.
 - Lightweight .NET performance-sanity coverage and showcase guidance for projection-vs-tracked reads, `AsNoTracking`, split-query includes, keyset pagination, async streaming, and bulk mutation rowcount checks.
+- Fast Rust regression coverage for the checkpointed append-only overflow primary-key corruption path, wired into `scripts/do-pre-commit-checks.py`.
 - Dart binding rich schema snapshot: `Schema.getSchemaSnapshot()` returns a typed model layer covering tables, views, indexes, triggers, check constraints, foreign keys, generated columns, temp-object metadata, and canonical DDL in one call.
 - Rust engine rich schema snapshot model (`SchemaSnapshot` and related structs in `metadata.rs`) with a single authoritative builder path in `db.rs` and deterministic name-ordered collections.
 - C ABI function `ddb_db_get_schema_snapshot_json` for one-shot schema snapshot JSON retrieval over the stable ABI.

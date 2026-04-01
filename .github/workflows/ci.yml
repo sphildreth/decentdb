@@ -12,6 +12,7 @@ concurrency:
 
 jobs:
   lint:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
       CI: "true"
@@ -43,6 +44,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     env:
       CI: "true"

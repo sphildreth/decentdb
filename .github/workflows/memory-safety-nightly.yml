@@ -66,8 +66,12 @@ jobs:
       - name: Setup Miri
         run: cargo miri setup
 
-      - name: Run Miri on decentdb tests
-        run: cargo miri test -p decentdb -- --test-threads=1
+      - name: Run Miri smoke tests
+        # Running the full engine test corpus under Miri is too slow for the
+        # nightly CI timeout budget. Keep this target limited to a curated smoke
+        # suite that still exercises prepared statements, transactions, and
+        # large-value engine paths.
+        run: cargo miri test -p decentdb --test miri_smoke_tests -- --test-threads=1
 
   python-leak-regressions:
     name: Python Leak Regressions

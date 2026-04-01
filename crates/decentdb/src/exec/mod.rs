@@ -43,9 +43,9 @@ use crate::planner;
 use crate::record::compression::{CompressionMode, AUTO_MIN_PAYLOAD_BYTES};
 use crate::record::key::encode_index_key;
 use crate::record::overflow::{
-    append_uncompressed_with_tail, build_overflow_chain_cache, free_overflow, read_overflow,
-    read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached, OverflowChainCache,
-    OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
+    append_uncompressed_with_first_page_patch, build_overflow_chain_cache, free_overflow,
+    read_overflow, read_uncompressed_overflow_tail, rewrite_overflow, rewrite_overflow_cached,
+    OverflowChainCache, OverflowPointer, OverflowTailInfo, OVERFLOW_HEADER_SIZE,
 };
 use crate::record::row::Row;
 use crate::record::value::{compare_decimal, parse_decimal_text, Value};
@@ -56,7 +56,7 @@ use crate::sql::ast::{
     SubqueryQuantifier, TruncateIdentityMode, UnaryOp,
 };
 use crate::sql::parser::parse_sql_statement;
-use crate::storage::checksum::{crc32c_extend, crc32c_parts};
+use crate::storage::checksum::crc32c_parts;
 use crate::storage::page::{self, PageId, PageStore};
 use crate::storage::PagerHandle;
 use crate::wal::WalHandle;
@@ -745,22 +745,20 @@ impl EngineRuntime {
                     if existing_count <= data.rows.len() {
                         let appended_rows = encode_appended_table_rows(data, existing_count)?;
                         if !appended_rows.is_empty() {
-                            let tail = if previous_state.tail.page_id != 0 {
-                                previous_state.tail
-                            } else {
-                                read_uncompressed_overflow_tail(&store, previous_pointer)?
-                                    .ok_or_else(|| {
-                                        DbError::corruption("overflow tail info is missing")
-                                    })?
-                            };
-                            let (pointer, tail) = append_uncompressed_with_tail(
+                            let row_count_bytes = u32::try_from(data.rows.len())
+                                .map_err(|_| DbError::constraint("table row count exceeds u32"))?
+                                .to_le_bytes();
+                            let (pointer, checksum) = append_uncompressed_with_first_page_patch(
                                 &mut store,
                                 previous_pointer,
-                                tail,
+                                TABLE_PAYLOAD_MAGIC.len(),
+                                &row_count_bytes,
                                 &appended_rows,
                             )?;
-                            let checksum =
-                                crc32c_extend(previous_state.checksum, &[appended_rows.as_slice()]);
+                            let tail = read_uncompressed_overflow_tail(&store, pointer)?
+                                .ok_or_else(|| {
+                                    DbError::corruption("overflow tail info is missing")
+                                })?;
                             self.persisted_tables.insert(
                                 table_name.clone(),
                                 PersistedTableState {
