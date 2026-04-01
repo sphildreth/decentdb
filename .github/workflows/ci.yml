@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   lint:
-    if: github.actor != 'github-actions[bot]'
+    if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest
     env:
       CI: "true"
@@ -44,7 +44,7 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    if: github.actor != 'github-actions[bot]'
+    if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-latest
     env:
       CI: "true"
