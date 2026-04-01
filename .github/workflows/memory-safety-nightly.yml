@@ -69,10 +69,10 @@ jobs:
       - name: Run Miri smoke binary
         # Integration-test targets pull in the crate dev-dependency graph under
         # Miri, which includes heavy benchmark/comparison crates that are not
-        # relevant to UB checking here. Run a tiny binary target instead so the
-        # nightly lane stays focused on a minimal pager/WAL/snapshot/rollback
-        # path and fits the tighter 30-minute budget.
-        run: cargo miri run -p decentdb --bin miri_smoke
+        # relevant to UB checking here. Run a tiny release-profile binary
+        # instead so Miri interprets a smaller optimized program focused on a
+        # minimal pager/snapshot/transaction path within the 30-minute budget.
+        run: cargo miri run -p decentdb --release --bin miri_smoke
 
   python-leak-regressions:
     name: Python Leak Regressions
