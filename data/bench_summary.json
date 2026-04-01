@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.1406739999652018
+      "read_p95_ms": 0.11316199999100718
     },
     "HSQLDB": {
-      "read_p95_ms": 0.17992699997648742
+      "read_p95_ms": 0.1948240000047008
     },
     "decentdb": {
-      "commit_p95_ms": 0.542836,
+      "commit_p95_ms": 0.492421,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 2202355.507309288,
+      "insert_rows_per_sec": 1896351.8911530424,
       "join_p95_ms": 0.002224,
-      "read_p95_ms": 0.000731
+      "read_p95_ms": 0.000772
     },
     "duckdb": {
-      "commit_p95_ms": 0.853117,
+      "commit_p95_ms": 0.794545,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 4846.813759924254,
-      "join_p95_ms": 0.454782,
-      "read_p95_ms": 0.224971
+      "insert_rows_per_sec": 4961.697912475504,
+      "join_p95_ms": 0.453007,
+      "read_p95_ms": 0.223388
     },
     "sqlite": {
-      "commit_p95_ms": 0.538979,
+      "commit_p95_ms": 0.514754,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 1696409.5898169826,
-      "join_p95_ms": 0.002956,
-      "read_p95_ms": 0.002905
+      "insert_rows_per_sec": 1835104.8885395827,
+      "join_p95_ms": 0.002906,
+      "read_p95_ms": 0.002875
     }
   },
   "metadata": {
-    "aggregated_at": "2026-04-01T17:50:39.468246+00:00",
+    "aggregated_at": "2026-04-01T17:54:24.088485+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -45,7 +45,7 @@
     "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1775065722029",
+    "run_id": "1775065949262",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
