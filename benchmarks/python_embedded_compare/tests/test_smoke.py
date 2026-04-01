@@ -13,6 +13,16 @@ import pytest
 from drivers.jdbc_driver import JDBCDriver
 from drivers.sqlite_driver import SQLiteDriver
 from drivers.firebird_driver import FirebirdDriver
+
+_VENDOR_DIR = Path(__file__).resolve().parents[1] / "vendor"
+_HAS_FIREBIRD_JARS = all(
+    (_VENDOR_DIR / j).exists()
+    for j in ("jaybird-native-6.0.4.jar", "jna-jpms-5.18.1.jar")
+)
+_skip_no_firebird = pytest.mark.skipif(
+    not _HAS_FIREBIRD_JARS,
+    reason="Firebird vendor JARs not present in vendor/",
+)
 from utils.charting import _decentdb_rank_summary, _engine_sort_key
 
 try:
@@ -215,6 +225,7 @@ class TestJdbcDriverConfig:
 
         assert driver.jar_paths == [str(jar_path.resolve())]
 
+    @_skip_no_firebird
     def test_firebird_driver_adds_native_support_jars(self):
         """Firebird driver should include bundled Jaybird native support jars."""
         driver = FirebirdDriver(
@@ -232,6 +243,7 @@ class TestJdbcDriverConfig:
         assert driver.connection_properties["user"] == "SYSDBA"
         assert driver.connection_properties["password"] == "masterkey"
 
+    @_skip_no_firebird
     def test_firebird_driver_creates_shim_for_versioned_fbclient(self, tmp_path):
         """Firebird driver should expose versioned fbclient as libfbclient.so."""
         versioned_lib = tmp_path / "libfbclient.so.2"
