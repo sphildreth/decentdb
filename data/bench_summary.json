@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.19054500000947883
+      "read_p95_ms": 0.18321199999604687
     },
     "HSQLDB": {
-      "read_p95_ms": 0.24214999999117026
+      "read_p95_ms": 0.16994599999975435
     },
     "decentdb": {
-      "commit_p95_ms": 0.560232,
+      "commit_p95_ms": 0.479816,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 2152224.839829813,
-      "join_p95_ms": 0.002284,
-      "read_p95_ms": 0.000702
+      "insert_rows_per_sec": 2114248.491430845,
+      "join_p95_ms": 0.002314,
+      "read_p95_ms": 0.000841
     },
     "duckdb": {
-      "commit_p95_ms": 0.82119,
+      "commit_p95_ms": 0.768585,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 5071.877746859091,
-      "join_p95_ms": 0.459334,
-      "read_p95_ms": 0.223506
+      "insert_rows_per_sec": 4985.198320295394,
+      "join_p95_ms": 0.461993,
+      "read_p95_ms": 0.223487
     },
     "sqlite": {
-      "commit_p95_ms": 0.507093,
+      "commit_p95_ms": 0.463927,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 1851619.1650434446,
-      "join_p95_ms": 0.002946,
-      "read_p95_ms": 0.002866
+      "insert_rows_per_sec": 1841933.4834717875,
+      "join_p95_ms": 0.002936,
+      "read_p95_ms": 0.002906
     }
   },
   "metadata": {
-    "aggregated_at": "2026-04-01T17:02:03.333142+00:00",
+    "aggregated_at": "2026-04-01T17:05:53.928323+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -45,7 +45,7 @@
     "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1775062806975",
+    "run_id": "1775063039678",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
