@@ -52,7 +52,7 @@ jobs:
   rust-miri:
     name: Rust Miri (Undefined Behavior)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -66,12 +66,13 @@ jobs:
       - name: Setup Miri
         run: cargo miri setup
 
-      - name: Run Miri smoke tests
-        # Running the full engine test corpus under Miri is too slow for the
-        # nightly CI timeout budget. Keep this target limited to a curated smoke
-        # suite that exercises low-level pager/WAL/snapshot/failpoint paths
-        # without going through SQL parser FFI that Miri cannot execute.
-        run: cargo miri test -p decentdb --test miri_smoke_tests -- --test-threads=1
+      - name: Run Miri smoke binary
+        # Integration-test targets pull in the crate dev-dependency graph under
+        # Miri, which includes heavy benchmark/comparison crates that are not
+        # relevant to UB checking here. Run a tiny binary target instead so the
+        # nightly lane stays focused on a minimal pager/WAL/snapshot/rollback
+        # path and fits the tighter 30-minute budget.
+        run: cargo miri run -p decentdb --bin miri_smoke
 
   python-leak-regressions:
     name: Python Leak Regressions
