@@ -10,15 +10,22 @@ public class MaintenanceTests
 {
     private static string GetDecentDbCliPath()
     {
-        // Try to find the decentdb executable going up the directory tree
+        // Try well-known Cargo output paths first (works after cargo clean + rebuild)
         var dir = new DirectoryInfo(Directory.GetCurrentDirectory());
         while (dir != null)
         {
+            foreach (var profile in new[] { "release", "debug" })
+            {
+                var cargoPath = Path.Combine(dir.FullName, "target", profile, "decentdb");
+                if (File.Exists(cargoPath))
+                    return cargoPath;
+            }
+
+            // Also check for a loose binary in the directory itself
             var exePath = Path.Combine(dir.FullName, "decentdb");
             if (File.Exists(exePath))
-            {
                 return exePath;
-            }
+
             dir = dir.Parent;
         }
         

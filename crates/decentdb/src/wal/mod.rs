@@ -113,6 +113,16 @@ impl WalHandle {
     }
 
     pub(crate) fn begin_reader(&self) -> Result<ReaderGuard> {
+        // Hold the index lock while reading wal_end_lsn and registering the
+        // reader. This guarantees mutual exclusion with the writer's
+        // retain_history check: either the writer sees our active_count
+        // increment (and retains history), or we observe the post-commit
+        // wal_end_lsn (and don't need old versions).
+        let _index = self
+            .inner
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
         self.inner.reader_registry.register(self.latest_snapshot())
     }
 

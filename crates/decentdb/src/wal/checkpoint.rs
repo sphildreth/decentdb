@@ -66,31 +66,27 @@ pub(crate) fn checkpoint(wal: &WalHandle, pager: &PagerHandle, timeout_sec: u64)
 
     let _checkpoint_end = writer::append_checkpoint_frame(wal, safe_lsn)?;
 
-    if wal.inner.reader_registry.active_reader_count()? == 0 {
-        {
-            let mut index = wal
-                .inner
-                .index
-                .lock()
-                .expect("wal index lock should not be poisoned");
-            index.clear();
-        }
-        writer::truncate_to_header(wal)?;
-    } else {
-        {
-            let mut index = wal
-                .inner
-                .index
-                .lock()
-                .expect("wal index lock should not be poisoned");
-            index.prune_at_or_below(&page_ids, safe_lsn);
-        }
-        let warnings = wal
+    {
+        let mut index = wal
             .inner
-            .reader_registry
-            .capture_long_reader_warnings(timeout_sec)?;
-        for warning in warnings {
-            eprintln!("decentdb checkpoint warning: {warning}");
+            .index
+            .lock()
+            .expect("wal index lock should not be poisoned");
+        // Check inside the index lock to avoid racing with begin_reader().
+        if wal.inner.reader_registry.active_reader_count()? == 0 {
+            index.clear();
+            drop(index);
+            writer::truncate_to_header(wal)?;
+        } else {
+            index.prune_at_or_below(&page_ids, safe_lsn);
+            drop(index);
+            let warnings = wal
+                .inner
+                .reader_registry
+                .capture_long_reader_warnings(timeout_sec)?;
+            for warning in warnings {
+                eprintln!("decentdb checkpoint warning: {warning}");
+            }
         }
     }
 
