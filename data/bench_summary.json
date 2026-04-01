@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.13657499999908396
+      "read_p95_ms": 0.1281499999947755
     },
     "HSQLDB": {
-      "read_p95_ms": 0.1644769999984419
+      "read_p95_ms": 0.16997800000240204
     },
     "decentdb": {
-      "commit_p95_ms": 0.460749,
+      "commit_p95_ms": 0.531091,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 2229306.661551745,
-      "join_p95_ms": 0.002304,
-      "read_p95_ms": 0.000682
+      "insert_rows_per_sec": 2205743.8938557217,
+      "join_p95_ms": 0.002235,
+      "read_p95_ms": 0.000771
     },
     "duckdb": {
-      "commit_p95_ms": 0.739079,
+      "commit_p95_ms": 0.800144,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 4981.00130195534,
-      "join_p95_ms": 0.456271,
-      "read_p95_ms": 0.219109
+      "insert_rows_per_sec": 5027.699037702481,
+      "join_p95_ms": 0.450491,
+      "read_p95_ms": 0.218578
     },
     "sqlite": {
-      "commit_p95_ms": 0.460098,
+      "commit_p95_ms": 0.513679,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 1760681.9783318504,
-      "join_p95_ms": 0.002886,
-      "read_p95_ms": 0.002816
+      "insert_rows_per_sec": 1775852.1226627233,
+      "join_p95_ms": 0.002906,
+      "read_p95_ms": 0.002805
     }
   },
   "metadata": {
-    "aggregated_at": "2026-04-01T17:43:01.325668+00:00",
+    "aggregated_at": "2026-04-01T17:46:41.765293+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -45,7 +45,7 @@
     "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1775065258712",
+    "run_id": "1775065486586",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
