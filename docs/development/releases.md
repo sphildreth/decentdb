@@ -3,6 +3,20 @@
 Release readiness is gated through the Phase 4 workflows, benchmark binary, and
 binding matrix.
 
+## Triggering the GitHub release workflow
+
+The GitHub release workflow in `.github/workflows/release.yml` auto-starts when
+a version tag is pushed to the repository:
+
+```bash
+git push origin vX.Y.Z
+```
+
+That workflow currently listens to `push` events for `v*` tags. Creating a tag
+or publishing a release from the GitHub UI does not reliably go through that
+same event path, so if a tag is created server-side you may need to use
+`workflow_dispatch` to run the release pipeline manually.
+
 ## CI lanes
 
 - `CI`: `.github/workflows/ci.yml`
