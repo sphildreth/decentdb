@@ -1,169 +1,120 @@
-//! Small representative engine tests kept fast enough for the nightly Miri job.
+//! Small representative engine tests kept fast and Miri-compatible for nightly CI.
 //!
-//! These tests intentionally exercise a few broad public API paths without
-//! trying to mirror the full `cargo test -p decentdb` corpus. The nightly
-//! workflow runs this target under Miri, while the regular Rust test suite
-//! still covers the full engine behavior matrix.
+//! These tests intentionally stay on the low-level `Db`/WAL/page APIs and avoid
+//! SQL parsing paths, because the SQL parser currently depends on foreign
+//! function calls that Miri cannot execute. The full native test suite continues
+//! to exercise the broader SQL behavior matrix outside Miri.
 
-use decentdb::{BulkLoadOptions, Db, DbConfig, QueryResult, Value};
+use decentdb::{Db, DbConfig};
+use std::sync::{Mutex, OnceLock};
+
+fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn mem_db() -> Db {
     Db::open_or_create(":memory:", DbConfig::default()).expect("open memory db")
 }
 
-fn rows(result: &QueryResult) -> Vec<Vec<Value>> {
-    result
-        .rows()
-        .iter()
-        .map(|row| row.values().to_vec())
-        .collect()
-}
-
-fn count_rows(db: &Db, sql: &str) -> i64 {
-    match &rows(&db.execute(sql).expect("count query"))[0][0] {
-        Value::Int64(value) => *value,
-        other => panic!("expected INT64 count, got {other:?}"),
-    }
+fn filled_page(page_size: u32, byte: u8) -> Vec<u8> {
+    vec![byte; page_size as usize]
 }
 
 #[test]
-fn prepared_crud_roundtrip_stays_consistent() {
+fn held_snapshot_keeps_prior_page_image_visible() {
+    let _guard = test_lock().lock().expect("test lock");
     let db = mem_db();
-    db.execute(
-        "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER NOT NULL)",
-    )
-    .expect("create table");
-    db.execute("CREATE INDEX idx_items_name ON items(name)")
-        .expect("create index");
+    let first = filled_page(db.config().page_size, 0x11);
+    let second = filled_page(db.config().page_size, 0x22);
 
-    let insert = db
-        .prepare("INSERT INTO items VALUES ($1, $2, $3)")
-        .expect("prepare insert");
-    insert
-        .execute(&[
-            Value::Int64(1),
-            Value::Text("alpha".to_string()),
-            Value::Int64(3),
-        ])
-        .expect("insert first row");
-    insert
-        .execute(&[
-            Value::Int64(2),
-            Value::Text("beta".to_string()),
-            Value::Int64(7),
-        ])
-        .expect("insert second row");
+    db.begin_write().expect("begin first write");
+    db.write_page(3, &first).expect("write first page image");
+    db.commit().expect("commit first image");
 
-    db.execute_with_params(
-        "UPDATE items SET qty = qty + $1 WHERE id = $2",
-        &[Value::Int64(2), Value::Int64(1)],
-    )
-    .expect("update row");
+    let snapshot = db.hold_snapshot().expect("hold snapshot");
+    assert_eq!(db.storage_info().expect("storage info").active_readers, 1);
 
-    let select = db
-        .prepare("SELECT id, qty FROM items WHERE name = $1")
-        .expect("prepare select");
+    db.begin_write().expect("begin second write");
+    db.write_page(3, &second).expect("write second page image");
+    db.commit().expect("commit second image");
+
+    assert_eq!(db.read_page(3).expect("read latest page").to_vec(), second);
     assert_eq!(
-        rows(
-            &select
-                .execute(&[Value::Text("alpha".to_string())])
-                .expect("select by indexed column"),
-        ),
-        vec![vec![Value::Int64(1), Value::Int64(5)]],
+        db.read_page_for_snapshot(snapshot, 3)
+            .expect("read snapshot page")
+            .to_vec(),
+        first
     );
 
-    db.execute_with_params("DELETE FROM items WHERE id = $1", &[Value::Int64(2)])
-        .expect("delete row");
-    assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM items"), 1);
+    db.release_snapshot(snapshot).expect("release snapshot");
+    assert_eq!(db.storage_info().expect("storage info").active_readers, 0);
 }
 
 #[test]
-fn exclusive_transaction_commit_and_rollback_roundtrip() {
+fn rollback_discards_staged_page_images() {
+    let _guard = test_lock().lock().expect("test lock");
     let db = mem_db();
-    db.execute("CREATE TABLE ledger(id INTEGER PRIMARY KEY, note TEXT NOT NULL)")
-        .expect("create table");
+    let original = filled_page(db.config().page_size, 0x33);
+    let replacement = filled_page(db.config().page_size, 0x44);
 
-    {
-        let mut txn = db.transaction().expect("begin exclusive transaction");
-        let insert = txn
-            .prepare("INSERT INTO ledger VALUES ($1, $2)")
-            .expect("prepare insert");
-        insert
-            .execute_in(
-                &mut txn,
-                &[Value::Int64(1), Value::Text("draft".to_string())],
-            )
-            .expect("insert row in rollback txn");
-        txn.rollback().expect("rollback transaction");
-    }
-    assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM ledger"), 0);
+    db.begin_write().expect("begin initial write");
+    db.write_page(3, &original)
+        .expect("write original page image");
+    db.commit().expect("commit original image");
 
-    {
-        let mut txn = db.transaction().expect("begin second transaction");
-        let insert = txn
-            .prepare("INSERT INTO ledger VALUES ($1, $2)")
-            .expect("prepare insert");
-        insert
-            .execute_in(
-                &mut txn,
-                &[Value::Int64(1), Value::Text("posted".to_string())],
-            )
-            .expect("insert row in commit txn");
-        txn.commit().expect("commit transaction");
-    }
+    db.begin_write().expect("begin rollback write");
+    db.write_page(3, &replacement)
+        .expect("write replacement page image");
+    assert_eq!(
+        db.read_page(3)
+            .expect("read staged page before rollback")
+            .to_vec(),
+        replacement
+    );
+    db.rollback().expect("rollback write");
 
     assert_eq!(
-        rows(
-            &db.execute("SELECT note FROM ledger WHERE id = 1")
-                .expect("select committed row"),
-        ),
-        vec![vec![Value::Text("posted".to_string())]],
+        db.read_page(3).expect("read page after rollback").to_vec(),
+        original
     );
 }
 
 #[test]
-fn bulk_load_roundtrip_with_large_values() {
+fn freed_pages_are_reused_after_commit() {
+    let _guard = test_lock().lock().expect("test lock");
     let db = mem_db();
-    db.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT, payload BLOB)")
-        .expect("create table");
+    let first = filled_page(db.config().page_size, 0x55);
+    let second = filled_page(db.config().page_size, 0x66);
 
-    let large_body_a = "alpha".repeat(400);
-    let large_body_b = "beta".repeat(500);
-    let large_blob_a = vec![0xAB; 6_000];
-    let large_blob_b = vec![0xCD; 8_000];
-    let rows_to_load = vec![
-        vec![
-            Value::Int64(1),
-            Value::Text("doc-a".to_string()),
-            Value::Text(large_body_a.clone()),
-            Value::Blob(large_blob_a.clone()),
-        ],
-        vec![
-            Value::Int64(2),
-            Value::Text("doc-b".to_string()),
-            Value::Text(large_body_b.clone()),
-            Value::Blob(large_blob_b.clone()),
-        ],
-    ];
+    db.begin_write().expect("begin first allocation");
+    let page_id = db.allocate_page().expect("allocate first page");
+    db.write_page(page_id, &first)
+        .expect("write allocated page image");
+    db.commit().expect("commit first allocation");
 
-    db.bulk_load_rows(
-        "docs",
-        &["id", "title", "body", "payload"],
-        &rows_to_load,
-        BulkLoadOptions::default(),
-    )
-    .expect("bulk load rows");
-
-    assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM docs"), 2);
     assert_eq!(
-        rows(
-            &db.execute("SELECT title, body, payload FROM docs WHERE id = 2")
-                .expect("select loaded row"),
-        ),
-        vec![vec![
-            Value::Text("doc-b".to_string()),
-            Value::Text(large_body_b),
-            Value::Blob(large_blob_b),
-        ]],
+        db.read_page(page_id)
+            .expect("read allocated page after commit")
+            .to_vec(),
+        first
+    );
+
+    db.begin_write().expect("begin free");
+    db.free_page(page_id).expect("free allocated page");
+    db.commit().expect("commit free");
+
+    db.begin_write().expect("begin second allocation");
+    let reused_page_id = db.allocate_page().expect("allocate recycled page");
+    assert_eq!(reused_page_id, page_id);
+    db.write_page(reused_page_id, &second)
+        .expect("write recycled page image");
+    db.commit().expect("commit recycled allocation");
+
+    assert_eq!(
+        db.read_page(reused_page_id)
+            .expect("read recycled page after commit")
+            .to_vec(),
+        second
     );
 }

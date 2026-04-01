@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   refresh:
-    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    if: github.event_name != 'push' || !endsWith(github.actor, '[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -424,7 +424,7 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: refresh benchmark assets"
+          git commit -m "chore: refresh benchmark assets [skip ci]"
           git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
 
           echo "changed=true" >> "$GITHUB_OUTPUT"

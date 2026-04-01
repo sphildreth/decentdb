@@ -69,8 +69,8 @@ jobs:
       - name: Run Miri smoke tests
         # Running the full engine test corpus under Miri is too slow for the
         # nightly CI timeout budget. Keep this target limited to a curated smoke
-        # suite that still exercises prepared statements, transactions, and
-        # large-value engine paths.
+        # suite that exercises low-level pager/WAL/snapshot/failpoint paths
+        # without going through SQL parser FFI that Miri cannot execute.
         run: cargo miri test -p decentdb --test miri_smoke_tests -- --test-threads=1
 
   python-leak-regressions:
