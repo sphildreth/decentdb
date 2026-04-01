@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.09204799999906754
+      "read_p95_ms": 0.11890300001482501
     },
     "HSQLDB": {
-      "read_p95_ms": 0.1425640000149997
+      "read_p95_ms": 0.17278499998951702
     },
     "decentdb": {
-      "commit_p95_ms": 0.33295,
+      "commit_p95_ms": 0.555322,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 2128993.86475064,
-      "join_p95_ms": 0.002223,
-      "read_p95_ms": 0.000811
+      "insert_rows_per_sec": 2203863.743391274,
+      "join_p95_ms": 0.002274,
+      "read_p95_ms": 0.000831
     },
     "duckdb": {
-      "commit_p95_ms": 0.670527,
+      "commit_p95_ms": 0.982425,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 5012.142919653874,
-      "join_p95_ms": 0.45967,
-      "read_p95_ms": 0.223346
+      "insert_rows_per_sec": 4985.892072360346,
+      "join_p95_ms": 0.455474,
+      "read_p95_ms": 0.220534
     },
     "sqlite": {
-      "commit_p95_ms": 0.351648,
+      "commit_p95_ms": 0.677904,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 2054691.1949126504,
-      "join_p95_ms": 0.003376,
-      "read_p95_ms": 0.003385
+      "insert_rows_per_sec": 1781789.9887171711,
+      "join_p95_ms": 0.002916,
+      "read_p95_ms": 0.002936
     }
   },
   "metadata": {
-    "aggregated_at": "2026-04-01T17:09:33.543955+00:00",
+    "aggregated_at": "2026-04-01T17:13:29.499489+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -39,13 +39,13 @@
     "join_workload": "prepared_inner_join_lookup_with_value_materialization",
     "latency_capture_unit": "nanoseconds",
     "latency_report_unit": "milliseconds",
-    "machine": "AMD EPYC 9V74 80-Core Processor",
+    "machine": "AMD EPYC 7763 64-Core Processor",
     "notes": "merged extra engines from .tmp/benchmark-assets/root-readme-results.json",
     "os": "linux",
     "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1775063261762",
+    "run_id": "1775063490839",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
