@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.11378400000694455
+      "read_p95_ms": 0.1078210000002855
     },
     "HSQLDB": {
-      "read_p95_ms": 0.24099099999830287
+      "read_p95_ms": 0.16005899999527173
     },
     "decentdb": {
-      "commit_p95_ms": 0.684933,
+      "commit_p95_ms": 0.523657,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 2217565.8759543765,
-      "join_p95_ms": 0.002184,
-      "read_p95_ms": 0.000792
+      "insert_rows_per_sec": 2251023.06184382,
+      "join_p95_ms": 0.002204,
+      "read_p95_ms": 0.000602
     },
     "duckdb": {
-      "commit_p95_ms": 1.198335,
+      "commit_p95_ms": 1.044357,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 5040.76614519956,
-      "join_p95_ms": 0.44827,
-      "read_p95_ms": 0.219411
+      "insert_rows_per_sec": 5098.012798123822,
+      "join_p95_ms": 0.445962,
+      "read_p95_ms": 0.217736
     },
     "sqlite": {
-      "commit_p95_ms": 0.783949,
+      "commit_p95_ms": 0.741092,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 1863455.3814616154,
-      "join_p95_ms": 0.002906,
-      "read_p95_ms": 0.002885
+      "insert_rows_per_sec": 1815451.4122659776,
+      "join_p95_ms": 0.002885,
+      "read_p95_ms": 0.002845
     }
   },
   "metadata": {
-    "aggregated_at": "2026-03-31T23:42:27.713890+00:00",
+    "aggregated_at": "2026-04-01T03:12:08.729419+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -45,7 +45,7 @@
     "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1775000431012",
+    "run_id": "1775013016259",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
