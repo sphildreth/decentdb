@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use crate::error::{DbError, Result};
 
@@ -28,7 +28,7 @@ struct ReaderRegistryInner {
 #[derive(Clone, Debug)]
 struct ReaderInfo {
     snapshot_lsn: u64,
-    started_at: SystemTime,
+    started_at: Instant,
 }
 
 #[derive(Debug)]
@@ -49,7 +49,7 @@ impl ReaderRegistry {
                 reader_id,
                 ReaderInfo {
                     snapshot_lsn,
-                    started_at: SystemTime::now(),
+                    started_at: Instant::now(),
                 },
             );
         self.inner.active_count.fetch_add(1, Ordering::Release);
@@ -74,7 +74,6 @@ impl ReaderRegistry {
     }
 
     pub(crate) fn capture_long_reader_warnings(&self, timeout_sec: u64) -> Result<Vec<String>> {
-        let now = SystemTime::now();
         let threshold = Duration::from_secs(timeout_sec);
         let readers = self
             .inner
@@ -83,9 +82,7 @@ impl ReaderRegistry {
             .map_err(|_| DbError::internal("reader registry lock poisoned"))?;
         let mut warnings = Vec::new();
         for (reader_id, reader) in readers.iter() {
-            let age = now
-                .duration_since(reader.started_at)
-                .unwrap_or_else(|_| Duration::from_secs(0));
+            let age = reader.started_at.elapsed();
             if age >= threshold {
                 warnings.push(format!(
                     "reader {reader_id} has held snapshot {} for {}s",
