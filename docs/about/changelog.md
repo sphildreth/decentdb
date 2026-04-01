@@ -5,7 +5,7 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.1.0] - 2026-03-31
+## [2.1.0] - 2026-04-01
 
 ### Fixed
 - Decimal `MIN`/`MAX` aggregate ordering in the Rust engine now compares `DECIMAL` values natively during aggregate-extreme evaluation, including mixed decimal scales.
