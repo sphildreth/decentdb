@@ -581,6 +581,7 @@ mod tests {
 
     #[test]
     fn classify_functions_return_expected_labels() {
+        let _guard = test_lock().lock().expect("test lock");
         // read/sync classifications
         assert_eq!(super::classify_read(FileKind::Database), "db.read");
         assert_eq!(super::classify_read(FileKind::Wal), "wal.read");
