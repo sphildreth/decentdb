@@ -619,9 +619,15 @@ impl EngineRuntime {
             Self::empty(schema_cookie)
         };
         runtime.catalog.schema_cookie = schema_cookie;
-        if runtime.deferred_tables.is_empty() {
-            runtime.rebuild_indexes(pager.page_size())?;
+        // Materialize any deferred tables under the same reader guard so
+        // that overflow pointers from the manifest are read against the
+        // same WAL snapshot. If deferred loading uses a later snapshot,
+        // a concurrent writer may have extended the overflow chain, causing
+        // a length mismatch.
+        if !runtime.deferred_tables.is_empty() {
+            runtime.materialize_deferred_tables_with_store(&store, pager.page_size())?;
         }
+        runtime.rebuild_indexes(pager.page_size())?;
         drop(reader);
         Ok((runtime, snapshot_lsn))
     }
@@ -651,6 +657,22 @@ impl EngineRuntime {
             wal,
             snapshot_lsn: reader.snapshot_lsn(),
         };
+        self.materialize_deferred_tables_with_store(&store, page_size)?;
+        drop(reader);
+        Ok(())
+    }
+
+    /// Loads all deferred tables using an existing `SnapshotPageStore`.
+    ///
+    /// This ensures the overflow pointers recorded in `persisted_tables`
+    /// (from the manifest) are read against the same WAL snapshot that
+    /// produced those pointers, avoiding length mismatches when a
+    /// concurrent writer extends the overflow chain.
+    fn materialize_deferred_tables_with_store<S: PageStore>(
+        &mut self,
+        store: &S,
+        page_size: u32,
+    ) -> Result<()> {
         let table_names: Vec<String> = self.deferred_tables.iter().cloned().collect();
         for table_name in &table_names {
             let state = self.persisted_tables.get(table_name).ok_or_else(|| {
@@ -664,7 +686,7 @@ impl EngineRuntime {
             let data = if pointer.head_page_id == 0 || pointer.logical_len == 0 {
                 TableData::default()
             } else {
-                let payload = read_overflow(&store, pointer)?;
+                let payload = read_overflow(store, pointer)?;
                 if crc32c_parts(&[payload.as_slice()]) != checksum {
                     return Err(DbError::corruption(format!(
                         "table payload checksum mismatch for {table_name}"
@@ -675,12 +697,11 @@ impl EngineRuntime {
 
             if let Some(ps) = self.persisted_tables.get_mut(table_name) {
                 ps.row_count = data.rows.len();
-                ps.tail = read_uncompressed_overflow_tail(&store, ps.pointer)?.unwrap_or_default();
+                ps.tail = read_uncompressed_overflow_tail(store, ps.pointer)?.unwrap_or_default();
             }
             self.tables.insert(table_name.clone(), data);
         }
         self.deferred_tables.clear();
-        drop(reader);
         self.rebuild_indexes(page_size)?;
         Ok(())
     }

@@ -74,13 +74,15 @@ pub(crate) fn commit_pages(
     offset = new_offset;
     sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
 
-    let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
     {
         let mut index = wal
             .inner
             .index
             .lock()
             .expect("wal index lock should not be poisoned");
+        // Check inside the index lock so begin_reader() cannot register
+        // between the count check and the version clear (TOCTOU fix).
+        let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
         let mut version_lsn = commit_start_lsn;
         for (page_id, payload, encoded_len) in prepared_pages.drain(..) {
             version_lsn += encoded_len as u64;
@@ -93,12 +95,14 @@ pub(crate) fn commit_pages(
                 retain_history,
             );
         }
+        // Update wal_end_lsn inside the index lock so that begin_reader()
+        // (which also holds the index lock) always sees a wal_end_lsn
+        // consistent with the index contents.
+        wal.inner
+            .max_page_count
+            .fetch_max(max_page_count, Ordering::AcqRel);
+        wal.inner.wal_end_lsn.store(offset, Ordering::Release);
     }
-
-    wal.inner
-        .max_page_count
-        .fetch_max(max_page_count, Ordering::AcqRel);
-    wal.inner.wal_end_lsn.store(offset, Ordering::Release);
     Ok(offset)
 }
 
@@ -159,13 +163,15 @@ pub(crate) fn commit_pages_if_latest(
     offset = new_offset;
     sync_for_mode(wal.inner.sync_mode, wal, metadata_changed)?;
 
-    let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
     {
         let mut index = wal
             .inner
             .index
             .lock()
             .expect("wal index lock should not be poisoned");
+        // Check inside the index lock so begin_reader() cannot register
+        // between the count check and the version clear (TOCTOU fix).
+        let retain_history = wal.inner.reader_registry.active_reader_count()? > 0;
         let mut version_lsn = commit_start_lsn;
         for (page_id, payload, encoded_len) in prepared_pages.drain(..) {
             version_lsn += encoded_len as u64;
@@ -178,12 +184,13 @@ pub(crate) fn commit_pages_if_latest(
                 retain_history,
             );
         }
+        // Update wal_end_lsn inside the index lock — same rationale as
+        // commit_pages above.
+        wal.inner
+            .max_page_count
+            .fetch_max(max_page_count, Ordering::AcqRel);
+        wal.inner.wal_end_lsn.store(offset, Ordering::Release);
     }
-
-    wal.inner
-        .max_page_count
-        .fetch_max(max_page_count, Ordering::AcqRel);
-    wal.inner.wal_end_lsn.store(offset, Ordering::Release);
     Ok(offset)
 }
 

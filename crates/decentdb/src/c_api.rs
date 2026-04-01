@@ -1647,12 +1647,8 @@ pub extern "C" fn ddb_db_get_view_ddl(
 ) -> u32 {
     ffi_boundary(|| {
         let name = utf8_arg(name, "name")?;
-        let views = handle_ref(db, "db")?.db.list_views()?;
-        let view = views
-            .iter()
-            .find(|view| view.name == name)
-            .ok_or_else(|| DbError::sql(format!("unknown view {name}")))?;
-        *out_ptr(out_ddl, "out_ddl")? = cstring_from_string(view.sql_text.clone())?;
+        let ddl = handle_ref(db, "db")?.db.view_ddl(&name)?;
+        *out_ptr(out_ddl, "out_ddl")? = cstring_from_string(ddl)?;
         Ok(())
     })
 }
@@ -2001,8 +1997,9 @@ mod tests {
             DDB_OK
         );
         let view_ddl = take_json(&mut view_ddl);
+        assert!(view_ddl.contains("CREATE VIEW"));
+        assert!(view_ddl.contains("child_ids"));
         assert!(view_ddl.contains("SELECT id, parent_id FROM child"));
-        assert!(!view_ddl.contains("CREATE VIEW"));
 
         let mut triggers_json = ptr::null_mut();
         assert_eq!(ddb_db_list_triggers_json(db, &mut triggers_json), DDB_OK);

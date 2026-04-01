@@ -1,8 +1,9 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use decentdb::{Db, DbConfig, DbError, Result};
 
@@ -68,4 +69,92 @@ fn unique_db_path(label: &str) -> PathBuf {
 
 fn cleanup_db_file(path: &PathBuf) {
     let _ = fs::remove_file(path);
+}
+
+/// Regression test for TOCTOU race between reader registration and the
+/// writer's retain_history check.  Before the fix, the writer could clear
+/// old WAL index versions while a reader still needed them, causing
+/// "overflow payload length mismatch" errors during concurrent access.
+#[test]
+fn concurrent_writer_reader_overflow_consistency() {
+    let path = unique_db_path("concurrent-overflow");
+    let db = Db::open_or_create(&path, DbConfig::default()).expect("create db");
+
+    // Use a value large enough to spill into overflow pages.
+    let big_value: String = "X".repeat(8000);
+    db.execute("CREATE TABLE t (id INT64 PRIMARY KEY, data TEXT)")
+        .expect("create table");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let errors: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Writer thread: continuous INSERT + COMMIT.
+    let writer_stop = Arc::clone(&stop);
+    let writer_path = path.clone();
+    let writer_big = big_value.clone();
+    let writer_handle = std::thread::spawn(move || {
+        let db = Db::open_or_create(&writer_path, DbConfig::default()).expect("open writer");
+        let mut i: i64 = 0;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let sql = format!("INSERT INTO t VALUES ({i}, '{}')", writer_big);
+            if let Err(e) = db.execute(&sql) {
+                // Primary-key conflicts are acceptable when readers overlap.
+                let msg = e.to_string();
+                if !msg.contains("UNIQUE constraint") {
+                    eprintln!("writer error at row {i}: {e}");
+                }
+            }
+            i += 1;
+        }
+    });
+
+    // Reader threads: continuous SELECT that traverses overflow chains.
+    let mut reader_handles = Vec::new();
+    for reader_id in 0..3u32 {
+        let reader_stop = Arc::clone(&stop);
+        let reader_errors = Arc::clone(&errors);
+        let reader_path = path.clone();
+        reader_handles.push(std::thread::spawn(move || {
+            let db = Db::open_or_create(&reader_path, DbConfig::default()).expect("open reader");
+            while !reader_stop.load(Ordering::Relaxed) {
+                match db.execute("SELECT COUNT(*), LENGTH(data) FROM t") {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("overflow payload length mismatch")
+                            || msg.contains("corruption")
+                        {
+                            reader_errors
+                                .lock()
+                                .expect("error lock")
+                                .push(format!("reader {reader_id}: {msg}"));
+                            return;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // Run for 2 seconds.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    writer_handle.join().expect("writer thread panicked");
+    for h in reader_handles {
+        h.join().expect("reader thread panicked");
+    }
+
+    let errs = errors.lock().expect("error lock");
+    assert!(
+        errs.is_empty(),
+        "concurrent readers saw corruption: {errs:?}"
+    );
+
+    cleanup_db_file(&path);
+    let wal_path = PathBuf::from(format!("{}.wal", path.display()));
+    let _ = fs::remove_file(&wal_path);
 }
