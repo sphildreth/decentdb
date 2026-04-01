@@ -1,35 +1,35 @@
 {
   "engines": {
     "H2": {
-      "read_p95_ms": 0.11763000000541979
+      "read_p95_ms": 0.11976499996535495
     },
     "HSQLDB": {
-      "read_p95_ms": 0.16946699997788528
+      "read_p95_ms": 0.18201099999259895
     },
     "decentdb": {
-      "commit_p95_ms": 0.527138,
+      "commit_p95_ms": 0.593411,
       "db_size_mb": 2.902374267578125,
-      "insert_rows_per_sec": 2201767.2661102815,
-      "join_p95_ms": 0.002204,
-      "read_p95_ms": 0.000701
+      "insert_rows_per_sec": 2187716.440358704,
+      "join_p95_ms": 0.002254,
+      "read_p95_ms": 0.000822
     },
     "duckdb": {
-      "commit_p95_ms": 0.776784,
+      "commit_p95_ms": 1.019199,
       "db_size_mb": 3.26171875,
-      "insert_rows_per_sec": 4976.520875780268,
-      "join_p95_ms": 0.447438,
-      "read_p95_ms": 0.225693
+      "insert_rows_per_sec": 4852.640700565916,
+      "join_p95_ms": 0.488474,
+      "read_p95_ms": 0.230011
     },
     "sqlite": {
-      "commit_p95_ms": 0.492702,
+      "commit_p95_ms": 0.618729,
       "db_size_mb": 1.83203125,
-      "insert_rows_per_sec": 1868383.5866238682,
-      "join_p95_ms": 0.002846,
-      "read_p95_ms": 0.002796
+      "insert_rows_per_sec": 1815604.0565533068,
+      "join_p95_ms": 0.002986,
+      "read_p95_ms": 0.003056
     }
   },
   "metadata": {
-    "aggregated_at": "2026-04-01T20:53:00.581827+00:00",
+    "aggregated_at": "2026-04-01T21:24:49.001676+00:00",
     "benchmark_profile": "single_thread_prepared_statement_oltp",
     "commit_workload": "prepared_single_row_auto_commit_insert_p95",
     "decentdb_durability": "wal_sync_full",
@@ -45,7 +45,7 @@
     "python_merge_target_operations": 500,
     "read_pattern": "deterministic_permutation",
     "read_workload": "prepared_point_lookup_with_value_materialization",
-    "run_id": "1775076668046",
+    "run_id": "1775078568215",
     "size_measurement": "db_plus_wal_after_checkpoint",
     "sqlite_durability": "wal+synchronous_full+wal_autocheckpoint_0",
     "storage_root": "../../target/embedded_compare"
