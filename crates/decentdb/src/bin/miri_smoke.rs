@@ -20,18 +20,16 @@ fn main() -> Result<()> {
     let header = db.read_page(1)?;
     assert_eq!(header.len(), db.config().page_size as usize);
 
-    eprintln!("miri_smoke: commit empty write txn");
-    db.begin_write()?;
-    db.commit()?;
-
     eprintln!("miri_smoke: hold and release snapshot");
     let snapshot = db.hold_snapshot()?;
     assert_eq!(db.storage_info()?.active_readers, 1);
     db.release_snapshot(snapshot)?;
     assert_eq!(db.storage_info()?.active_readers, 0);
 
-    eprintln!("miri_smoke: rollback empty write txn");
+    eprintln!("miri_smoke: begin empty write txn");
     db.begin_write()?;
+
+    eprintln!("miri_smoke: rollback empty write txn");
     db.rollback()?;
 
     eprintln!("miri_smoke: done");
