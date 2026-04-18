@@ -214,6 +214,9 @@ def load_library():
     _lib.ddb_db_describe_table_json.restype = c_uint32
     _lib.ddb_db_list_indexes_json.argtypes = [c_void_p, POINTER(c_char_p)]
     _lib.ddb_db_list_indexes_json.restype = c_uint32
+    if hasattr(_lib, "ddb_db_inspect_storage_state_json"):
+        _lib.ddb_db_inspect_storage_state_json.argtypes = [c_void_p, POINTER(c_char_p)]
+        _lib.ddb_db_inspect_storage_state_json.restype = c_uint32
     _lib.ddb_evict_shared_wal.argtypes = [c_char_p]
     _lib.ddb_evict_shared_wal.restype = c_uint32
 

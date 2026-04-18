@@ -225,6 +225,7 @@ ddb_status_t ddb_db_list_views_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_get_view_ddl(ddb_db_t *db, const char *name, char **out_ddl);
 ddb_status_t ddb_db_list_triggers_json(ddb_db_t *db, char **out_json);
 ddb_status_t ddb_db_get_schema_snapshot_json(ddb_db_t *db, char **out_json);
+ddb_status_t ddb_db_inspect_storage_state_json(ddb_db_t *db, char **out_json);
 
 ddb_status_t ddb_evict_shared_wal(const char *path);
 

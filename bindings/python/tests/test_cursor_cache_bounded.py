@@ -230,6 +230,127 @@ def test_multiple_cursor_lifecycle(db_path):
         )
 
 
+def test_is_direct_execute_sql_cache_bounded(db_path):
+    """Verify _is_direct_execute_sql_cache is cleared on close."""
+    db = connect(db_path)
+    cur = db.cursor()
+
+    for i in range(50):
+        cur.execute(f"SELECT {i} AS n")
+
+    cache_size = len(cur._is_direct_execute_sql_cache)
+    assert cache_size > 0, "Cache should have entries"
+
+    cur.close()
+
+    assert len(cur._is_direct_execute_sql_cache) == 0, (
+        f"_is_direct_execute_sql_cache should be empty after close(), "
+        f"but has {len(cur._is_direct_execute_sql_cache)} entries"
+    )
+
+
+def test_should_buffer_caches_bounded(db_path):
+    """Verify _should_buffer_* caches are cleared on close."""
+    db = connect(db_path)
+    cur = db.cursor()
+
+    for i in range(30):
+        cur.execute(f"SELECT {i}")
+
+    caches_to_check = [
+        '_should_buffer_first_row_sql_cache',
+        '_should_prefetch_small_result_sql_cache',
+        '_should_prefetch_zero_param_result_sql_cache',
+    ]
+
+    populated = False
+    for cache_name in caches_to_check:
+        if len(getattr(cur, cache_name)) > 0:
+            populated = True
+            break
+
+    cur.close()
+
+    for cache_name in caches_to_check:
+        size = len(getattr(cur, cache_name))
+        assert size == 0, (
+            f"{cache_name} should be empty after close(), but has {size} entries"
+        )
+
+
+def test_fast_repeat_cache_bounded(db_path):
+    """Verify _fast_repeat_cache is cleared on close.
+
+    This cache is populated under specific query conditions.
+    We test that it's cleared on close regardless of content.
+    """
+    db = connect(db_path)
+    cur = db.cursor()
+
+    cur.execute("SELECT 1")
+
+    cur.close()
+
+    assert len(cur._fast_repeat_cache) == 0, (
+        f"_fast_repeat_cache should be empty after close(), "
+        f"but has {len(cur._fast_repeat_cache)} entries"
+    )
+
+
+def test_select_fast_info_bounded(db_path):
+    """Verify _select_fast_info is cleared on close.
+
+    This cache is populated under specific query conditions.
+    We test that it's cleared on close regardless of content.
+    """
+    db = connect(db_path)
+    cur = db.cursor()
+
+    cur.execute("SELECT 1")
+
+    cur.close()
+
+    assert len(cur._select_fast_info) == 0, (
+        f"_select_fast_info should be empty after close(), "
+        f"but has {len(cur._select_fast_info)} entries"
+    )
+
+
+def test_cursor_reuse_does_not_retain_caches(db_path):
+    """Verify that after close, caches are cleared and fresh queries start new caches."""
+    db = connect(db_path)
+    cur = db.cursor()
+
+    cur.execute("SELECT 1")
+
+    assert len(cur._rewrite_sql_cache) > 0
+
+    cur.close()
+
+    assert len(cur._rewrite_sql_cache) == 0, "Closed cursor should have empty cache"
+
+
+def test_unbounded_query_accumulation(db_path):
+    """Demonstrate that without close, caches grow unboundedly.
+
+    This test verifies the problem: if cursor is not closed,
+    caches accumulate indefinitely.
+    """
+    db = connect(db_path)
+    cur = db.cursor()
+
+    for i in range(500):
+        cur.execute(f"SELECT {i} AS n")
+
+    cache_size = len(cur._rewrite_sql_cache)
+    assert cache_size > 400, (
+        f"Without close(), _rewrite_sql_cache should accumulate. "
+        f"Got {cache_size} entries, expected > 400"
+    )
+
+    cur.close()
+
+
 if __name__ == "__main__":
     import tempfile
     import sys
@@ -245,18 +366,31 @@ if __name__ == "__main__":
             test_metadata_cache_bounded,
             test_native_sql_support_caches_bounded,
             test_multiple_cursor_lifecycle,
+            test_is_direct_execute_sql_cache_bounded,
+            test_should_buffer_caches_bounded,
+            test_fast_repeat_cache_bounded,
+            test_select_fast_info_bounded,
+            test_cursor_reuse_does_not_retain_caches,
+            test_unbounded_query_accumulation,
         ]
 
+        failed = 0
+        passed = 0
         for test in tests:
             print(f"Running {test.__name__}...")
             try:
                 test(db_path)
                 print(f"  PASSED")
+                passed += 1
             except AssertionError as e:
                 print(f"  FAILED: {e}")
-                sys.exit(1)
+                failed += 1
             except Exception as e:
                 print(f"  ERROR: {e}")
-                sys.exit(1)
+                failed += 1
+
+        print(f"\n{passed} passed, {failed} failed")
+        if failed > 0:
+            sys.exit(1)
 
     print("\nAll tests passed!")

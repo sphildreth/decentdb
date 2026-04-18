@@ -3317,6 +3317,14 @@ class Connection:
     def list_triggers(self):
         return self._call_json_api(self._lib.ddb_db_list_triggers_json)
 
+    def inspect_storage_state(self):
+        func = getattr(self._lib, "ddb_db_inspect_storage_state_json", None)
+        if func is None:
+            raise NotSupportedError(
+                "This DecentDB native library does not expose storage-state inspection"
+            )
+        return self._call_json_api(func)
+
     def checkpoint(self):
         self._ensure_open()
         code = self._lib.ddb_db_checkpoint(self._db)

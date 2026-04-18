@@ -61,6 +61,17 @@ def test_checkpoint(db):
     db.checkpoint()
 
 
+def test_inspect_storage_state(db):
+    db.execute("CREATE TABLE storage_state (id INTEGER PRIMARY KEY, v TEXT)")
+    db.execute("INSERT INTO storage_state (v) VALUES ($1)", ["x"])
+    db.commit()
+    payload = db.inspect_storage_state()
+    assert isinstance(payload, dict)
+    assert "wal_file_size" in payload
+    assert "wal_versions" in payload
+    assert "active_readers" in payload
+
+
 def test_auto_increment_insert(db):
     db.execute("CREATE TABLE auto (id INTEGER PRIMARY KEY, val TEXT)")
     db.execute("INSERT INTO auto (val) VALUES ($1)", ["a"])

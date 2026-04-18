@@ -22,6 +22,7 @@ tests/test_concurrency_stress.py
 tests/test_coverage_decimal.py
 tests/test_coverage_gaps.py
 tests/test_cross_connection_visibility.py
+tests/test_cursor_cache_bounded.py
 tests/test_datatypes.py
 tests/test_decimal.py
 tests/test_edge_cases.py
@@ -39,3 +40,4 @@ tests/test_sqlite_import.py
 tests/test_threading.py
 tests/test_types_sqlalchemy.py
 tests/test_v2_features.py
+tests/test_valgrind_memcheck.py
