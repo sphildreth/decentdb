@@ -191,7 +191,9 @@ Slices are designed to be independent, self-contained, and sequenced so each one
 
 Slices are numbered S1–S10. **Recommended execution order is numeric.** Slices S1 and S2 are prerequisites for the rest because they establish the testing scaffold and the universal contract test.
 
-### 4.1 S1 — Universal literal-executability contract test
+### 4.1 S1 — Universal literal-executability contract test — DONE
+
+Landed in working tree: added `LiteralExecutabilityContractTests` with full provider + NodaTime literal executability coverage, including nullable-value/null-literal rows and an explicit S5 blocker for `byte[]`.
 
 **Closes:** F1, F2 (partial), F9.
 **Priority:** **P0 — do this first.** Would have caught the April 2026 regression on its own.
@@ -266,7 +268,9 @@ Expected initial failures (based on audit): `byte[]`, `DateTime`, `DateTimeOffse
 
 ---
 
-### 4.2 S2 — Comprehensive `HasData` literal regression suite
+### 4.2 S2 — Comprehensive `HasData` literal regression suite — DONE
+
+Landed in working tree: added `HasDataLiteralMatrixTests` covering seeded literal round-trips across core + NodaTime mappings, with explicit skip tags for known blocked slices (`S3`, `S5`, `S7`, `S9`) and pending S2 NaN/Infinity follow-up coverage.
 
 **Closes:** F1, F2, F7, F8, F10 (partial).
 **Priority:** P0. Would also have caught the April 2026 regression.
@@ -319,7 +323,9 @@ HasDataLiteralMatrixTests
 
 ---
 
-### 4.3 S3 — Fix `DateTime` / `DateTimeOffset` literal emission
+### 4.3 S3 — Fix `DateTime` / `DateTimeOffset` literal emission — DONE
+
+Landed in working tree: added public `DecentDBDateTimeTypeMapping`/`DecentDBDateTimeOffsetTypeMapping` with explicit `GenerateSqlLiteral`/`GenerateNonNullSqlLiteral` TIMESTAMP text-cast emission, wired both mapping sources, and unblocked S2 DateTime/DateTimeOffset seed coverage.
 
 **Closes:** F1 (for DateTime family), F5, F6.
 **Depends on:** S2.
@@ -368,7 +374,9 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.4 S4 — Fix `DateOnly` / `TimeOnly` / `TimeSpan` literal emission
+### 4.4 S4 — Fix `DateOnly` / `TimeOnly` / `TimeSpan` literal emission — DONE
+
+Landed in working tree: added public `DecentDBDateOnlyTypeMapping`, `DecentDBTimeOnlyTypeMapping`, and `DecentDBTimeSpanTypeMapping` with explicit integer literal generation and wired both provider mapping sources to use them.
 
 **Closes:** F1 (for time family).
 **Depends on:** S2.
@@ -387,7 +395,9 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.5 S5 — Fix `byte[]` (BLOB) literal emission
+### 4.5 S5 — Fix `byte[]` (BLOB) literal emission — DONE
+
+Landed in working tree: probed candidate BLOB literal forms (`X'..'`, `CAST(... AS BLOB)`, `FROM_HEX`, `BLOB_PARSE`) and none executed; added ADR `0134-blob-literal-parse-function-for-ef-hasdata.md` and a fail-fast `DecentDBByteArrayTypeMapping` that throws `NotSupportedException` for inline literal generation.
 
 **Closes:** F2.
 **Depends on:** S1.
@@ -409,7 +419,9 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.6 S6 — NodaTime literal emission
+### 4.6 S6 — NodaTime literal emission — DONE
+
+Landed in working tree: added public NodaTime mappings (`DecentDBInstantTypeMapping`, `DecentDBLocalDateTypeMapping`, `DecentDBLocalDateTimeTypeMapping`) with explicit SQL literal generation and wired `DecentDBNodaTimeTypeMappingSource` to use them.
 
 **Closes:** F10.
 **Depends on:** S3 pattern.
@@ -433,7 +445,9 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.7 S7 — Fill Path-A/B gaps for unsigned integers, enums, nullables
+### 4.7 S7 — Fill Path-A/B gaps for unsigned integers, enums, nullables — DONE
+
+Landed in working tree: added `ushort`/`uint`/`ulong` EF mappings with explicit `ulong` overflow guards, added enum fallback mapping for non-int enum underlying types, guarded ADO.NET `ulong` binding from truncation, and enabled unsigned/long-enum coverage in S1/S2 plus ADO.NET tests.
 
 **Closes:** F3 (ushort/uint/ulong), enum-backed variants.
 **Priority:** P1.
@@ -455,7 +469,9 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.8 S8 — Handle `sbyte` and `char`
+### 4.8 S8 — Handle `sbyte` and `char` — DONE
+
+Landed in working tree: added `sbyte`/`char` parameter binding support (with surrogate-char guard), `DecentDBCharTypeMapping` and `sbyte` EF mapping, reader conversions for `GetFieldValue<sbyte>`/`GetFieldValue<char>`, and coverage across S1/S2 plus ADO.NET round-trip tests.
 
 **Closes:** F4.
 **Priority:** P2.
@@ -478,7 +494,9 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.9 S9 — Decimal `HasData` with custom precision / scale
+### 4.9 S9 — Decimal `HasData` with custom precision / scale — DONE
+
+Landed in working tree: added `DecentDBDecimalTypeMapping` that normalizes literal scale via `DecentDB.AdoNet.DecimalScaleNormalizer`, wired both mapping sources to use it, and unblocked custom precision/scale `HasData` matrix tests (including midpoint and negative rounding cases).
 
 **Closes:** F7.
 **Priority:** P1.
@@ -498,15 +516,17 @@ public sealed class DecentDBDateTimeTypeMapping : RelationalTypeMapping
 
 ---
 
-### 4.10 S10 — Large BLOB and streaming
+### 4.10 S10 — Large BLOB and streaming — DONE
+
+Landed in working tree: added a 4 MB Path A BLOB parameter/DataReader round-trip test in `AllDataTypesTests` that asserts exact byte-for-byte equality.
 
 **Closes:** residual gap (no specific finding; observed during audit).
 **Priority:** P3.
 
 **Goal:** Add a Path A test that round-trips a 4 MB `byte[]` via parameter and a DataReader, asserting content equality and documenting the upper bound.
 
-**Files to add:**
-- `bindings/dotnet/tests/DecentDB.AdoNet.Tests/LargeBlobRoundTripTests.cs` (or in the EF tests project if no separate ADO.NET project exists).
+**Files changed:**
+- `bindings/dotnet/tests/DecentDB.Tests/AllDataTypesTests.cs`
 
 **Acceptance:** One passing test; failure mode for oversized blobs is documented.
 

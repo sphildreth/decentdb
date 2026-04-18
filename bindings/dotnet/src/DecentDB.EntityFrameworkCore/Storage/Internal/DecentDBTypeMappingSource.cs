@@ -6,8 +6,10 @@ namespace DecentDB.EntityFrameworkCore.Storage.Internal;
 
 internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
 {
-    private static readonly DateOnly EpochDate = DateOnly.FromDateTime(DateTime.UnixEpoch);
+    private const string ULongOverflowError = "UInt64 value exceeds DecentDB INT64 range.";
 
+    private readonly LongTypeMapping _longMapping;
+    private readonly Dictionary<Type, RelationalTypeMapping> _enumMappings = new();
     private readonly Dictionary<Type, RelationalTypeMapping> _clrMappings;
     private readonly Dictionary<string, RelationalTypeMapping> _storeMappings;
 
@@ -21,58 +23,50 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         var shortMapping = new ShortTypeMapping("INTEGER", DbType.Int16);
         var intMapping = new IntTypeMapping("INTEGER", DbType.Int32);
         var longMapping = new LongTypeMapping("INTEGER", DbType.Int64);
+        _longMapping = longMapping;
+        var sbyteMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
+            new ValueConverter<sbyte, long>(
+                value => value,
+                value => checked((sbyte)value)),
+            comparer: null,
+            keyComparer: null,
+            elementMapping: null,
+            jsonValueReaderWriter: null);
+        var ushortMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
+            new ValueConverter<ushort, long>(
+                value => value,
+                value => checked((ushort)value)),
+            comparer: null,
+            keyComparer: null,
+            elementMapping: null,
+            jsonValueReaderWriter: null);
+        var uintMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
+            new ValueConverter<uint, long>(
+                value => value,
+                value => checked((uint)value)),
+            comparer: null,
+            keyComparer: null,
+            elementMapping: null,
+            jsonValueReaderWriter: null);
+        var ulongMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
+            new ValueConverter<ulong, long>(
+                value => ConvertULongToLong(value),
+                value => checked((ulong)value)),
+            comparer: null,
+            keyComparer: null,
+            elementMapping: null,
+            jsonValueReaderWriter: null);
         var floatMapping = new FloatTypeMapping("REAL", DbType.Single);
         var doubleMapping = new DoubleTypeMapping("REAL", DbType.Double);
-        var decimalMapping = new DecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
+        var decimalMapping = new DecentDBDecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
         var stringMapping = new StringTypeMapping("TEXT", DbType.String);
-        var blobMapping = new ByteArrayTypeMapping("BLOB", DbType.Binary);
-        var timestampStorageMapping = new LongTypeMapping("TIMESTAMP", DbType.Int64);
-
-        // DateTime/DateTimeOffset values are stored as microseconds since Unix epoch UTC in TIMESTAMP columns.
-        var dateTimeMapping = (RelationalTypeMapping)timestampStorageMapping.WithComposedConverter(
-            new ValueConverter<DateTime, long>(
-                value => (value.ToUniversalTime().Ticks - DateTime.UnixEpoch.Ticks) / 10L,
-                value => new DateTime(value * 10L + DateTime.UnixEpoch.Ticks, DateTimeKind.Utc)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var dateTimeOffsetMapping = (RelationalTypeMapping)timestampStorageMapping.WithComposedConverter(
-            new ValueConverter<DateTimeOffset, long>(
-                value => (value.UtcTicks - DateTime.UnixEpoch.Ticks) / 10L,
-                value => new DateTimeOffset(value * 10L + DateTime.UnixEpoch.Ticks, TimeSpan.Zero)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var dateOnlyMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<DateOnly, long>(
-                value => value.DayNumber - EpochDate.DayNumber,
-                value => EpochDate.AddDays(checked((int)value))),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var timeOnlyMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<TimeOnly, long>(
-                value => value.Ticks,
-                value => new TimeOnly(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var timeSpanMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<TimeSpan, long>(
-                value => value.Ticks,
-                value => TimeSpan.FromTicks(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
+        var charMapping = new DecentDBCharTypeMapping();
+        var blobMapping = new DecentDBByteArrayTypeMapping();
+        var dateTimeMapping = new DecentDBDateTimeTypeMapping();
+        var dateTimeOffsetMapping = new DecentDBDateTimeOffsetTypeMapping();
+        var dateOnlyMapping = new DecentDBDateOnlyTypeMapping();
+        var timeOnlyMapping = new DecentDBTimeOnlyTypeMapping();
+        var timeSpanMapping = new DecentDBTimeSpanTypeMapping();
 
         var guidMapping = new DecentDBGuidTypeMapping();
 
@@ -80,13 +74,18 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         {
             [typeof(bool)] = boolMapping,
             [typeof(byte)] = byteMapping,
+            [typeof(sbyte)] = sbyteMapping,
             [typeof(short)] = shortMapping,
             [typeof(int)] = intMapping,
             [typeof(long)] = longMapping,
+            [typeof(ushort)] = ushortMapping,
+            [typeof(uint)] = uintMapping,
+            [typeof(ulong)] = ulongMapping,
             [typeof(float)] = floatMapping,
             [typeof(double)] = doubleMapping,
             [typeof(decimal)] = decimalMapping,
             [typeof(string)] = stringMapping,
+            [typeof(char)] = charMapping,
             [typeof(byte[])] = blobMapping,
             [typeof(DateTime)] = dateTimeMapping,
             [typeof(DateTimeOffset)] = dateTimeOffsetMapping,
@@ -138,6 +137,11 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
             return clrMapping;
         }
 
+        if (clrType != null && clrType.IsEnum)
+        {
+            return FindOrCreateEnumMapping(clrType);
+        }
+
         var storeType = mappingInfo.StoreTypeNameBase ?? mappingInfo.StoreTypeName;
         if (!string.IsNullOrWhiteSpace(storeType))
         {
@@ -157,7 +161,7 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         return null;
     }
 
-    private static DecimalTypeMapping CreateDecimalMapping(
+    private static DecentDBDecimalTypeMapping CreateDecimalMapping(
         in RelationalTypeMappingInfo mappingInfo,
         string? storeTypeName)
     {
@@ -176,7 +180,7 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
         var p = precision ?? defaultPrecision;
         var s = scale ?? defaultScale;
 
-        return new DecimalTypeMapping($"DECIMAL({p},{s})", DbType.Decimal, precision: p, scale: s);
+        return new DecentDBDecimalTypeMapping($"DECIMAL({p},{s})", DbType.Decimal, precision: p, scale: s);
     }
 
     private static (int? precision, int? scale) ParsePrecisionScale(string storeTypeName)
@@ -210,5 +214,34 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
     {
         var idx = storeTypeName.IndexOf('(');
         return (idx >= 0 ? storeTypeName[..idx] : storeTypeName).Trim();
+    }
+
+    private RelationalTypeMapping FindOrCreateEnumMapping(Type enumType)
+    {
+        if (_enumMappings.TryGetValue(enumType, out var existing))
+        {
+            return existing;
+        }
+
+        var converterType = typeof(EnumToNumberConverter<,>).MakeGenericType(enumType, typeof(long));
+        var converter = (ValueConverter)Activator.CreateInstance(converterType)!;
+        var mapping = (RelationalTypeMapping)_longMapping.WithComposedConverter(
+            converter,
+            comparer: null,
+            keyComparer: null,
+            elementMapping: null,
+            jsonValueReaderWriter: null);
+        _enumMappings[enumType] = mapping;
+        return mapping;
+    }
+
+    private static long ConvertULongToLong(ulong value)
+    {
+        if (value > long.MaxValue)
+        {
+            throw new OverflowException($"{ULongOverflowError} Value: {value}.");
+        }
+
+        return (long)value;
     }
 }

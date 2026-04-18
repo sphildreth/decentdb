@@ -15,7 +15,7 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
     private readonly string _coreDbPath = Path.Combine(Path.GetTempPath(), $"test_ef_literal_contract_{Guid.NewGuid():N}.ddb");
     private readonly string _nodaDbPath = Path.Combine(Path.GetTempPath(), $"test_ef_literal_contract_noda_{Guid.NewGuid():N}.ddb");
 
-    public static IEnumerable<object[]> Cases
+    public static IEnumerable<object?[]> Cases
     {
         get
         {
@@ -24,11 +24,15 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
             yield return Case("bool_nullable_true", typeof(bool?), true);
             yield return Case("bool_nullable_null", typeof(bool?), null);
             yield return Case("byte_42", typeof(byte), (byte)42);
+            yield return Case("sbyte_negative", typeof(sbyte), (sbyte)-42);
             yield return Case("short_negative", typeof(short), (short)-12345);
+            yield return Case("ushort_max", typeof(ushort), ushort.MaxValue);
             yield return Case("int_min", typeof(int), int.MinValue);
             yield return Case("int_max", typeof(int), int.MaxValue);
+            yield return Case("uint_large", typeof(uint), 4_000_000_000u);
             yield return Case("long_min", typeof(long), long.MinValue);
             yield return Case("long_max", typeof(long), long.MaxValue);
+            yield return Case("ulong_in_range", typeof(ulong), (ulong)long.MaxValue);
             yield return Case("float_pi", typeof(float), 3.14f);
             yield return Case("double_e", typeof(double), 2.718281828d);
             yield return Case("decimal_scale_4", typeof(decimal), 1234.5678m);
@@ -36,6 +40,8 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
             yield return Case("string_quotes", typeof(string), "with 'single' quotes");
             yield return Case("string_newline", typeof(string), "line1\nline2");
             yield return Case("string_unicode", typeof(string), "日本語 🎵 Straße");
+            yield return Case("char_ascii", typeof(char), 'A');
+            yield return Case("char_quote", typeof(char), '\'');
             yield return Case("blob_bytes", typeof(byte[]), new byte[] { 0x01, 0x02, 0xFF, 0x00, 0xAB }, blockedOnSlice: "S5");
             yield return Case("guid_standard", typeof(Guid), Guid.Parse("11111111-2222-3333-4444-555555555555"));
             yield return Case("guid_empty", typeof(Guid), Guid.Empty);
@@ -56,6 +62,8 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
             yield return Case("timespan_half_day", typeof(TimeSpan), TimeSpan.FromHours(12.5));
             yield return Case("timespan_nullable_value", typeof(TimeSpan?), TimeSpan.FromHours(12.5));
             yield return Case("timespan_nullable_null", typeof(TimeSpan?), null);
+            yield return Case("enum_int_backed", typeof(IntBackedLiteralEnum), IntBackedLiteralEnum.Enabled);
+            yield return Case("enum_long_backed", typeof(LongBackedLiteralEnum), LongBackedLiteralEnum.Ready);
             yield return Case(
                 "nodatime_instant",
                 typeof(Instant),
@@ -112,6 +120,30 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         TryDelete(_nodaDbPath + "-wal");
     }
 
+    [Fact]
+    public void GenerateSqlLiteral_ULongOverflow_ThrowsOverflowException()
+    {
+        using var context = CreateCoreContext();
+        var mappingSource = context.GetService<IRelationalTypeMappingSource>();
+        var mapping = (RelationalTypeMapping?)mappingSource.FindMapping(typeof(ulong));
+        Assert.NotNull(mapping);
+
+        var ex = Assert.Throws<OverflowException>(() => mapping!.GenerateSqlLiteral(ulong.MaxValue));
+        Assert.Contains("INT64 range", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GenerateSqlLiteral_CharSurrogate_ThrowsArgumentException()
+    {
+        using var context = CreateCoreContext();
+        var mappingSource = context.GetService<IRelationalTypeMappingSource>();
+        var mapping = (RelationalTypeMapping?)mappingSource.FindMapping(typeof(char));
+        Assert.NotNull(mapping);
+
+        var ex = Assert.Throws<ArgumentException>(() => mapping!.GenerateSqlLiteral('\uD83D'));
+        Assert.Contains("Surrogate", ex.Message, StringComparison.Ordinal);
+    }
+
     private DbContext CreateCoreContext()
     {
         var optionsBuilder = new DbContextOptionsBuilder<CoreLiteralContext>();
@@ -132,11 +164,11 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         object? value,
         string blockedOnSlice = "",
         bool useNodaTime = false)
-        => new object[] { caseName, clrType, value, blockedOnSlice, useNodaTime };
+        => new object?[] { caseName, clrType, value, blockedOnSlice, useNodaTime };
 
     private static RoundTripResult TryExecuteLiteralRoundTrip(DbContext context, RelationalTypeMapping mapping, object? value)
     {
-        string literal;
+        string? literal;
         try
         {
             literal = mapping.GenerateSqlLiteral(value);
@@ -144,6 +176,11 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         catch (Exception ex)
         {
             return RoundTripResult.Failure($"GenerateSqlLiteral threw {ex.GetType().Name}: {ex.Message}");
+        }
+
+        if (literal is null)
+        {
+            return RoundTripResult.Failure("GenerateSqlLiteral returned null.");
         }
 
         try
@@ -295,7 +332,7 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
             : $"Expected {DescribeValue(expectedProvider)}, got {DescribeValue(actualValue)}.";
     }
 
-    private static bool TryConvertToBoolean(object value, out bool converted)
+    private static bool TryConvertToBoolean(object? value, out bool converted)
     {
         switch (value)
         {
@@ -323,7 +360,7 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         }
     }
 
-    private static bool TryConvertToInt64(object value, out long converted)
+    private static bool TryConvertToInt64(object? value, out long converted)
     {
         switch (value)
         {
@@ -351,6 +388,12 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
             case ulong v when v <= long.MaxValue:
                 converted = (long)v;
                 return true;
+            case DateTime v:
+                converted = (v.ToUniversalTime().Ticks - DateTime.UnixEpoch.Ticks) / 10L;
+                return true;
+            case DateTimeOffset v:
+                converted = (v.UtcTicks - DateTime.UnixEpoch.Ticks) / 10L;
+                return true;
             case bool v:
                 converted = v ? 1L : 0L;
                 return true;
@@ -372,7 +415,7 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         }
     }
 
-    private static bool TryConvertToSingle(object value, out float converted)
+    private static bool TryConvertToSingle(object? value, out float converted)
     {
         switch (value)
         {
@@ -394,7 +437,7 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         }
     }
 
-    private static bool TryConvertToDouble(object value, out double converted)
+    private static bool TryConvertToDouble(object? value, out double converted)
     {
         switch (value)
         {
@@ -416,7 +459,7 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
         }
     }
 
-    private static bool TryConvertToDecimal(object value, out decimal converted)
+    private static bool TryConvertToDecimal(object? value, out decimal converted)
     {
         switch (value)
         {
@@ -471,6 +514,18 @@ public sealed class LiteralExecutabilityContractTests : IDisposable
     {
         public static RoundTripResult Successful(string detail) => new(true, detail);
         public static RoundTripResult Failure(string detail) => new(false, detail);
+    }
+
+    private enum IntBackedLiteralEnum
+    {
+        Disabled = 0,
+        Enabled = 1
+    }
+
+    private enum LongBackedLiteralEnum : long
+    {
+        Unknown = 0,
+        Ready = 5_000_000_001L
     }
 
     private sealed class CoreLiteralContext(DbContextOptions<CoreLiteralContext> options) : DbContext(options);

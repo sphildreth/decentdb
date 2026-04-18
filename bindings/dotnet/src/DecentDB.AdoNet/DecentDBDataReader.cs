@@ -145,6 +145,15 @@ namespace DecentDB.AdoNet
             {
                 boxed = GetStringValue(ordinal);
             }
+            else if (nonNullableType == typeof(char))
+            {
+                var text = GetStringValue(ordinal);
+                boxed = text.Length > 0 ? text[0] : '\0';
+            }
+            else if (nonNullableType == typeof(sbyte))
+            {
+                boxed = (sbyte)_statement.GetInt64(ordinal);
+            }
             else if (nonNullableType == typeof(short))
             {
                 boxed = (short)_statement.GetInt64(ordinal);
