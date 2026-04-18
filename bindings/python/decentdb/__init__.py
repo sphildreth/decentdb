@@ -634,7 +634,27 @@ class Cursor:
             recycled_stmts.add(id(slot_stmt))
             self._connection._recycle_statement(slot_sql, slot_stmt)
         self._cursor_stmt_slots.clear()
+        self._rewrite_sql_cache.clear()
+        self._metadata_cache.clear()
+        self._is_direct_execute_sql_cache.clear()
+        self._should_buffer_first_row_sql_cache.clear()
+        self._should_prefetch_small_result_sql_cache.clear()
+        self._should_prefetch_zero_param_result_sql_cache.clear()
+        self._native_fetch_rows_i64_text_f64_sql_support.clear()
+        self._decode_matrix_i64_text_f64_sql_support.clear()
+        self._decode_matrix_i64_text_text_sql_support.clear()
+        self._decode_matrix_i64_f64_text_sql_support.clear()
+        self._decode_matrix_text_i64_f64_sql_support.clear()
+        self._decode_matrix_i64_sql_support.clear()
+        self._decode_matrix_i64_f64_text_text_i64_f64_sql_support.clear()
+        self._native_bind_int64_step_row_view_sql_support.clear()
+        self._native_bind_text_step_row_view_sql_support.clear()
+        self._native_bind_int64_fetch_all_row_views_sql_support.clear()
+        self._native_step_fetch_all_row_views_sql_support.clear()
+        self._native_bind_text_fetch_all_row_views_sql_support.clear()
+        self._native_bind_f64_f64_fetch_all_row_views_sql_support.clear()
         self._fast_repeat_cache.clear()
+        self._select_fast_info.clear()
         self._last_sql = None
         self._col_count = 0
         self._has_buffered_row = False
@@ -642,7 +662,6 @@ class Cursor:
         self._prefetched_rows = None
         self._query_active = False
         self.description = None
-        self._metadata_cache.clear()
         self._bound_param_count = None
         self._closed = True
 
