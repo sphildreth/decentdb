@@ -262,6 +262,49 @@ mod tests {
     }
 
     #[test]
+    fn recovery_large_wal_replay_keeps_single_version_per_page() {
+        let vfs = crate::vfs::mem::MemVfs::default();
+        let file = vfs
+            .open(Path::new(":memory:"), OpenMode::CreateNew, FileKind::Wal)
+            .expect("create wal file");
+        let pager = test_pager(&vfs, Path::new(":memory-db:"));
+
+        let ps = page::DEFAULT_PAGE_SIZE;
+        let update_count = 1024_u32;
+        let page_id = 42_u32;
+        let mut frames = Vec::with_capacity((update_count as usize) * 2);
+        for update in 0..update_count {
+            frames.push(crate::wal::format::WalFrame::page(
+                page_id,
+                vec![(update % 251) as u8; ps as usize],
+            ));
+            frames.push(crate::wal::format::WalFrame::commit());
+        }
+
+        let mut data = Vec::new();
+        for frame in &frames {
+            data.extend_from_slice(&frame.encode(ps).expect("encode frame"));
+        }
+        let logical_end = WAL_HEADER_SIZE + data.len() as u64;
+        let header = WalHeader::new(ps, logical_end);
+        write_all_at(file.as_ref(), 0, &header.encode()).expect("write header");
+        write_all_at(file.as_ref(), WAL_HEADER_SIZE, &data).expect("write frames");
+        file.set_len(logical_end).expect("set len");
+
+        let (index, _end, _max_page_id) =
+            initialize_or_recover(&file, &pager, ps).expect("recover");
+        assert_eq!(
+            index.version_count(),
+            1,
+            "recovery should not retain full historical page versions",
+        );
+        let latest = index
+            .latest_visible(page_id, u64::MAX)
+            .expect("latest version for page");
+        assert_eq!(latest.data[0], ((update_count - 1) % 251) as u8);
+    }
+
+    #[test]
     fn partial_frames_at_end_are_ignored() {
         let vfs = crate::vfs::mem::MemVfs::default();
         let file = vfs
