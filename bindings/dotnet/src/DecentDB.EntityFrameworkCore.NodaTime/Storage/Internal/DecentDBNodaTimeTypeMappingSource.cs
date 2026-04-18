@@ -1,3 +1,4 @@
+using DecentDB.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NodaTime;
@@ -18,7 +19,7 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
         RelationalTypeMappingSourceDependencies relationalDependencies)
         : base(dependencies, relationalDependencies)
     {
-        var boolMapping = new BoolTypeMapping("BOOLEAN", DbType.Boolean);
+        var boolMapping = new DecentDBBoolTypeMapping();
         var byteMapping = new ByteTypeMapping("INTEGER", DbType.Byte);
         var shortMapping = new ShortTypeMapping("INTEGER", DbType.Int16);
         var intMapping = new IntTypeMapping("INTEGER", DbType.Int32);
@@ -74,14 +75,7 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
             elementMapping: null,
             jsonValueReaderWriter: null);
 
-        var guidMapping = (RelationalTypeMapping)new ByteArrayTypeMapping("UUID", DbType.Binary, size: 16).WithComposedConverter(
-            new ValueConverter<Guid, byte[]>(
-                value => value.ToByteArray(),
-                value => new Guid(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
+        var guidMapping = new DecentDBGuidTypeMapping();
 
         var instantMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
             new ValueConverter<Instant, long>(
