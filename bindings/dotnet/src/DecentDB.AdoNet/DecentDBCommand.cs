@@ -499,6 +499,12 @@ namespace DecentDB.AdoNet
                 return;
             }
 
+            if (value is sbyte si8)
+            {
+                stmt.BindInt64(index1Based, si8);
+                return;
+            }
+
             if (value is byte i8)
             {
                 stmt.BindInt64(index1Based, i8);
@@ -507,7 +513,12 @@ namespace DecentDB.AdoNet
 
             if (value is ulong u64)
             {
-                stmt.BindInt64(index1Based, unchecked((long)u64));
+                if (u64 > long.MaxValue)
+                {
+                    throw new OverflowException($"UInt64 value {u64} exceeds DecentDB INT64 range.");
+                }
+
+                stmt.BindInt64(index1Based, (long)u64);
                 return;
             }
 
@@ -559,6 +570,18 @@ namespace DecentDB.AdoNet
                 }
 
                 stmt.BindText(index1Based, s);
+                return;
+            }
+
+            if (value is char c)
+            {
+                if (char.IsSurrogate(c))
+                {
+                    throw new ArgumentException(
+                        "Surrogate char values are not supported; use string for code points above U+FFFF.");
+                }
+
+                stmt.BindText(index1Based, c.ToString());
                 return;
             }
 

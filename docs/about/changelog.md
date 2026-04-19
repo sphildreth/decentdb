@@ -5,6 +5,16 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-04-18
+
+### Fixed
+- EF Core literal generation and `HasData` coverage for provider-converted types, including `DateTime`, `DateTimeOffset`, `DateOnly`, `TimeOnly`, `TimeSpan`, `decimal` scale normalization, and NodaTime literal mappings.
+- ADO.NET parameter and reader behavior for additional scalar types (`sbyte`, `char`, unsigned integer overflow guards), with explicit fail-fast behavior where DecentDB SQL literal syntax is not yet available (BLOB `HasData` literals).
+
+### Added
+- Expanded .NET regression coverage for literal executability contracts, comprehensive `HasData` matrix scenarios (including nullable cases), and 4 MB BLOB round-trip verification.
+- ADR 0134 documenting the engine-level BLOB literal parsing gap and a proposed parser function path.
+
 ## [2.1.0] - 2026-04-01
 
 ### Fixed

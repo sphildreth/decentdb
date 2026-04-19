@@ -3,9 +3,9 @@ using System.Globalization;
 
 namespace DecentDB.AdoNet;
 
-internal static class DecimalScaleNormalizer
+public static class DecimalScaleNormalizer
 {
-    internal static decimal Normalize(decimal value, int scale)
+    public static decimal Normalize(decimal value, int scale)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(scale);
 

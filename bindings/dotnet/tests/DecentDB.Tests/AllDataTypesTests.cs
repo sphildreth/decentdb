@@ -341,6 +341,127 @@ public sealed class AllDataTypesTests : IDisposable
     }
 
     [Fact]
+    public void UnsignedInteger_Parameters_RoundTrip_AndULongOverflowThrows()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t_unsigned (id INTEGER PRIMARY KEY, v INT64)";
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "INSERT INTO t_unsigned (id, v) VALUES (@id, @v)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 1);
+        AddParam(cmd, "@v", ushort.MaxValue);
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "INSERT INTO t_unsigned (id, v) VALUES (@id, @v)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 2);
+        AddParam(cmd, "@v", 4_000_000_000u);
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "INSERT INTO t_unsigned (id, v) VALUES (@id, @v)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 3);
+        AddParam(cmd, "@v", (ulong)long.MaxValue);
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "SELECT v FROM t_unsigned ORDER BY id";
+        cmd.Parameters.Clear();
+        using (var reader = cmd.ExecuteReader())
+        {
+            Assert.True(reader.Read());
+            Assert.Equal((long)ushort.MaxValue, reader.GetInt64(0));
+            Assert.True(reader.Read());
+            Assert.Equal(4_000_000_000L, reader.GetInt64(0));
+            Assert.True(reader.Read());
+            Assert.Equal(long.MaxValue, reader.GetInt64(0));
+        }
+
+        cmd.CommandText = "INSERT INTO t_unsigned (id, v) VALUES (@id, @v)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 4);
+        AddParam(cmd, "@v", ulong.MaxValue);
+
+        var ex = Assert.Throws<OverflowException>(() => cmd.ExecuteNonQuery());
+        Assert.Contains("INT64 range", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SByteAndChar_Parameters_RoundTrip_AndSurrogateThrows()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t_small_chars (id INTEGER PRIMARY KEY, v_sbyte INT64, v_char TEXT)";
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "INSERT INTO t_small_chars (id, v_sbyte, v_char) VALUES (@id, @sbyte, @char)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 1);
+        AddParam(cmd, "@sbyte", (sbyte)-42);
+        AddParam(cmd, "@char", 'A');
+        cmd.ExecuteNonQuery();
+
+        cmd.CommandText = "SELECT v_sbyte, v_char FROM t_small_chars WHERE id = 1";
+        cmd.Parameters.Clear();
+        using (var reader = cmd.ExecuteReader())
+        {
+            Assert.True(reader.Read());
+            Assert.Equal((sbyte)-42, reader.GetFieldValue<sbyte>(0));
+            Assert.Equal('A', reader.GetFieldValue<char>(1));
+        }
+
+        cmd.CommandText = "INSERT INTO t_small_chars (id, v_sbyte, v_char) VALUES (@id, @sbyte, @char)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 2);
+        AddParam(cmd, "@sbyte", (sbyte)1);
+        AddParam(cmd, "@char", '\uD83D');
+
+        var ex = Assert.Throws<ArgumentException>(() => cmd.ExecuteNonQuery());
+        Assert.Contains("Surrogate", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LargeBlob_ParameterRoundTrip_4MB()
+    {
+        using var conn = new DecentDBConnection($"Data Source={_dbPath}");
+        conn.Open();
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "CREATE TABLE t_large_blob (id INTEGER PRIMARY KEY, v BLOB)";
+        cmd.ExecuteNonQuery();
+
+        var payload = new byte[4 * 1024 * 1024];
+        for (var i = 0; i < payload.Length; i++)
+        {
+            payload[i] = (byte)(i % 251);
+        }
+
+        cmd.CommandText = "INSERT INTO t_large_blob (id, v) VALUES (@id, @v)";
+        cmd.Parameters.Clear();
+        AddParam(cmd, "@id", 1);
+        AddParam(cmd, "@v", payload);
+        Assert.Equal(1, cmd.ExecuteNonQuery());
+
+        cmd.CommandText = "SELECT v FROM t_large_blob WHERE id = 1";
+        cmd.Parameters.Clear();
+        using var reader = cmd.ExecuteReader();
+        Assert.True(reader.Read());
+
+        var length = reader.GetBytes(0, 0, null, 0, 0);
+        Assert.Equal(payload.Length, length);
+
+        var roundTrip = new byte[payload.Length];
+        var copied = reader.GetBytes(0, 0, roundTrip, 0, roundTrip.Length);
+        Assert.Equal(payload.Length, copied);
+        Assert.Equal(payload, roundTrip);
+    }
+
+    [Fact]
     public void GetValue_ReturnsCorrectBoxedTypes()
     {
         using var conn = new DecentDBConnection($"Data Source={_dbPath}");

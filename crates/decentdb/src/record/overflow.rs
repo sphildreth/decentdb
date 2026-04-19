@@ -456,7 +456,7 @@ pub(crate) fn append_uncompressed_with_tail<S: PageStore>(
         }
 
         store.write_page_owned(previous_tail.page_id, tail_page)?;
-        for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages.into_iter()) {
+        for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages) {
             store.write_page_owned(new_page_id, new_page)?;
         }
     } else {
@@ -613,7 +613,7 @@ pub(crate) fn append_uncompressed_with_first_page_patch<S: PageStore>(
         store.write_page_owned(page_ids[0], head_page)?;
         store.write_page_owned(tail_page_id, tail_page)?;
     }
-    for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages.into_iter()) {
+    for (new_page_id, new_page) in new_page_ids.into_iter().zip(new_pages) {
         store.write_page_owned(new_page_id, new_page)?;
     }
 

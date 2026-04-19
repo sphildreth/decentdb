@@ -318,6 +318,12 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
 }
 
 fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
+    if matches!(
+        out.tag,
+        x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
+    ) {
+        free_owned_bytes(out.data, out.len);
+    }
     ddb_value_reset(out);
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
@@ -1675,6 +1681,18 @@ pub extern "C" fn ddb_db_get_schema_snapshot_json(
 }
 
 #[no_mangle]
+pub extern "C" fn ddb_db_inspect_storage_state_json(
+    db: *mut DbHandle,
+    out_json: *mut *mut c_char,
+) -> u32 {
+    ffi_boundary(|| {
+        let payload = handle_ref(db, "db")?.db.inspect_storage_state_json()?;
+        *out_ptr(out_json, "out_json")? = cstring_from_string(payload)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn ddb_evict_shared_wal(path: *const c_char) -> u32 {
     ffi_boundary(|| {
         let path = utf8_arg(path, "path")?;
@@ -2021,6 +2039,16 @@ mod tests {
         let schema_snapshot = parse_json(&mut schema_snapshot_json);
         assert_eq!(schema_snapshot["snapshot_version"].as_u64(), Some(1));
         assert!(schema_snapshot["schema_cookie"].as_u64().is_some());
+
+        let mut storage_state_json = ptr::null_mut();
+        assert_eq!(
+            ddb_db_inspect_storage_state_json(db, &mut storage_state_json),
+            DDB_OK
+        );
+        let storage_state = parse_json(&mut storage_state_json);
+        assert!(storage_state["wal_file_size"].as_u64().is_some());
+        assert!(storage_state["wal_versions"].as_u64().is_some());
+        assert!(storage_state["active_readers"].as_u64().is_some());
 
         let snapshot_tables = schema_snapshot["tables"]
             .as_array()

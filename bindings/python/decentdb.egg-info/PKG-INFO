@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: decentdb
-Version: 2.0.0
+Version: 2.2.0
 Summary: Python DB-API 2.0 driver and SQLAlchemy dialect for DecentDB
 Author: DecentDB Contributors
 Classifier: Development Status :: 4 - Beta
@@ -15,7 +15,8 @@ Requires-Dist: rich>=13.0.0
 # DecentDB Python Bindings
 
 This package provides:
-1. `decentdb`: A DB-API 2.0 compliant driver for DecentDB.
+1. `decentdb`: A DB-API 2.0 compliant driver for DecentDB. Like `sqlite3`,
+   `Connection.execute(...)` returns a new cursor for each call.
 2. `decentdb_sqlalchemy`: A SQLAlchemy 2.x dialect.
 
 ## Usage

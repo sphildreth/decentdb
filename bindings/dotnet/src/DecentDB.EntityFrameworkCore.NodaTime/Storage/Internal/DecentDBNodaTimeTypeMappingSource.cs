@@ -1,5 +1,5 @@
+using DecentDB.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Storage;
-using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NodaTime;
 using System.Data;
 
@@ -7,9 +7,6 @@ namespace DecentDB.EntityFrameworkCore;
 
 internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingSource
 {
-    private static readonly DateOnly EpochDate = DateOnly.FromDateTime(DateTime.UnixEpoch);
-    private static readonly LocalDate NodaEpochDate = new(1970, 1, 1);
-
     private readonly Dictionary<Type, RelationalTypeMapping> _clrMappings;
     private readonly Dictionary<string, RelationalTypeMapping> _storeMappings;
 
@@ -18,97 +15,26 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
         RelationalTypeMappingSourceDependencies relationalDependencies)
         : base(dependencies, relationalDependencies)
     {
-        var boolMapping = new BoolTypeMapping("BOOLEAN", DbType.Boolean);
+        var boolMapping = new DecentDBBoolTypeMapping();
         var byteMapping = new ByteTypeMapping("INTEGER", DbType.Byte);
         var shortMapping = new ShortTypeMapping("INTEGER", DbType.Int16);
         var intMapping = new IntTypeMapping("INTEGER", DbType.Int32);
         var longMapping = new LongTypeMapping("INTEGER", DbType.Int64);
         var floatMapping = new FloatTypeMapping("REAL", DbType.Single);
         var doubleMapping = new DoubleTypeMapping("REAL", DbType.Double);
-        var decimalMapping = new DecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
+        var decimalMapping = new DecentDBDecimalTypeMapping("DECIMAL(18,4)", DbType.Decimal, precision: 18, scale: 4);
         var stringMapping = new StringTypeMapping("TEXT", DbType.String);
-        var blobMapping = new ByteArrayTypeMapping("BLOB", DbType.Binary);
+        var blobMapping = new DecentDBByteArrayTypeMapping();
+        var dateTimeMapping = new DecentDBDateTimeTypeMapping();
+        var dateTimeOffsetMapping = new DecentDBDateTimeOffsetTypeMapping();
+        var dateOnlyMapping = new DecentDBDateOnlyTypeMapping();
+        var timeOnlyMapping = new DecentDBTimeOnlyTypeMapping();
+        var timeSpanMapping = new DecentDBTimeSpanTypeMapping();
 
-        var dateTimeMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<DateTime, long>(
-                value => new DateTimeOffset(value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime(), TimeSpan.Zero).UtcTicks,
-                value => new DateTime(value, DateTimeKind.Utc)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var dateTimeOffsetMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<DateTimeOffset, long>(
-                value => value.UtcTicks,
-                value => new DateTimeOffset(value, TimeSpan.Zero)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var dateOnlyMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<DateOnly, long>(
-                value => value.DayNumber - EpochDate.DayNumber,
-                value => EpochDate.AddDays(checked((int)value))),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var timeOnlyMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<TimeOnly, long>(
-                value => value.Ticks,
-                value => new TimeOnly(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var timeSpanMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<TimeSpan, long>(
-                value => value.Ticks,
-                value => TimeSpan.FromTicks(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var guidMapping = (RelationalTypeMapping)new ByteArrayTypeMapping("UUID", DbType.Binary, size: 16).WithComposedConverter(
-            new ValueConverter<Guid, byte[]>(
-                value => value.ToByteArray(),
-                value => new Guid(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var instantMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<Instant, long>(
-                value => value.ToUnixTimeTicks(),
-                value => Instant.FromUnixTimeTicks(value)),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var localDateMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<LocalDate, long>(
-                value => Period.Between(NodaEpochDate, value, PeriodUnits.Days).Days,
-                value => NodaEpochDate.PlusDays(checked((int)value))),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-
-        var localDateTimeMapping = (RelationalTypeMapping)longMapping.WithComposedConverter(
-            new ValueConverter<LocalDateTime, long>(
-                value => value.InZoneLeniently(DateTimeZone.Utc).ToInstant().ToUnixTimeTicks(),
-                value => Instant.FromUnixTimeTicks(value).InUtc().LocalDateTime),
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
+        var guidMapping = new DecentDBGuidTypeMapping();
+        var instantMapping = new DecentDBInstantTypeMapping();
+        var localDateMapping = new DecentDBLocalDateTypeMapping();
+        var localDateTimeMapping = new DecentDBLocalDateTimeTypeMapping();
 
         _clrMappings = new Dictionary<Type, RelationalTypeMapping>
         {
@@ -146,7 +72,11 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
             ["BLOB"] = blobMapping,
             ["UUID"] = guidMapping,
             ["DECIMAL"] = decimalMapping,
-            ["NUMERIC"] = decimalMapping
+            ["NUMERIC"] = decimalMapping,
+            ["TIMESTAMP"] = dateTimeMapping,
+            ["TIMESTAMPTZ"] = dateTimeMapping,
+            ["DATE"] = dateTimeMapping,
+            ["DATETIME"] = dateTimeMapping
         };
     }
 
@@ -181,7 +111,7 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
         return null;
     }
 
-    private static DecimalTypeMapping CreateDecimalMapping(
+    private static DecentDBDecimalTypeMapping CreateDecimalMapping(
         in RelationalTypeMappingInfo mappingInfo,
         string? storeTypeName)
     {
@@ -199,7 +129,7 @@ internal sealed class DecentDBNodaTimeTypeMappingSource : RelationalTypeMappingS
         var p = precision ?? defaultPrecision;
         var s = scale ?? defaultScale;
 
-        return new DecimalTypeMapping($"DECIMAL({p},{s})", DbType.Decimal, precision: p, scale: s);
+        return new DecentDBDecimalTypeMapping($"DECIMAL({p},{s})", DbType.Decimal, precision: p, scale: s);
     }
 
     private static (int? precision, int? scale) ParsePrecisionScale(string storeTypeName)

@@ -11,6 +11,18 @@ DecentDB uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
 - **Minor (`X.Y.0`)** for backwards-compatible feature additions.
 - **Patch (`X.Y.Z`)** for backwards-compatible fixes, packaging adjustments, CI fixes, and documentation updates that do not change the public contract.
 
+### Choosing the bump when a branch has mixed changes
+
+Pick the **highest-impact** change class in the branch:
+
+1. Any breaking compatibility change => **Major**
+2. Otherwise, any new user-visible capability => **Minor**
+3. Otherwise (fixes/tooling/docs only) => **Patch**
+
+Examples:
+- Feature + bug fix in one branch => **Minor** (not Patch)
+- Docs + CI + packaging only => **Patch**
+
 ### Public release line
 
 The current public DecentDB release line begins at `v2.0.0`.
@@ -91,7 +103,7 @@ the current release line.
 
 ## 4. Recommended version-bump procedure
 
-1. Decide the next version according to SemVer.
+1. Decide the next version according to SemVer (using the highest-impact rule above).
 2. Update `VERSION`.
 3. Run `scripts/bump_version.sh`.
 4. Update `docs/about/changelog.md`.
@@ -102,21 +114,22 @@ the current release line.
 
 ## 5. Node-specific procedure
 
-After running `scripts/bump_version.sh`, refresh the Node lockfiles with npm
+After running `scripts/bump_version.sh`, refresh Node lockfiles with npm
 instead of hand-editing them.
+
+`scripts/bump_version.sh` already updates both Node `package.json` version
+fields, so the normal follow-up is lockfile refresh only.
 
 ```bash
 cd bindings/node/decentdb
-npm version --no-git-tag-version X.Y.Z
+npm install --package-lock-only --ignore-scripts
 
 cd ../knex-decentdb
-npm version --no-git-tag-version X.Y.Z
 npm install --package-lock-only --ignore-scripts
 ```
 
-The second `npm install --package-lock-only --ignore-scripts` step refreshes
-the lockfile metadata for the local `file:../decentdb` dependency after the
-underlying package version changes.
+This refreshes lockfile metadata (including the local `file:../decentdb`
+dependency in `knex-decentdb`) after the underlying package version changes.
 
 ## 6. Validation checklist
 
