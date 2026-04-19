@@ -790,11 +790,7 @@ impl EngineRuntime {
                             // entirely within the unchanged prefix).
                             let page_size = db.config().page_size as usize;
                             let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
-                            let skip = if chunk_cap > 0 {
-                                splice.first_dirty_byte / chunk_cap
-                            } else {
-                                0
-                            };
+                            let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
                             (splice.payload, skip)
                         } else {
                             (encode_table_payload(data)?, 0)
