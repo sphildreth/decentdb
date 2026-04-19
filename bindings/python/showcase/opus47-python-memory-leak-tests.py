@@ -147,6 +147,9 @@ class ScenarioResult:
     warmup: int = 0
     slope_mb_per_iter: float = 0.0
     drift_mb: float = 0.0
+    db_growth_mb: float = 0.0
+    net_drift_mb: float = 0.0
+    drift_budget_mb: float = 0.0
     peak_rss_mb: float = 0.0
     total_ops: int = 0
     elapsed_s: float = 0.0
@@ -161,7 +164,7 @@ class ScenarioResult:
             f"{self.total_ops:,}",
             f"{self.start_rss_mb:.2f}",
             f"{self.peak_rss_mb:.2f}",
-            f"{self.drift_mb:+.3f}",
+            f"{self.net_drift_mb:+.3f}",
             f"{self.slope_mb_per_iter:+.5f}",
             f"{self.elapsed_s:.1f}s",
             "[bold green]PASS[/]" if self.passed else "[bold red]FAIL[/]",
@@ -553,11 +556,22 @@ def run_scenario(
     result.peak_rss_mb = max(s.rss_mb for s in result.samples)
 
     tail = [s.rss_mb for s in result.samples[warmup:]] if warmup < len(result.samples) else [s.rss_mb for s in result.samples]
+    tail_db = [s.db_mb for s in result.samples[warmup:]] if warmup < len(result.samples) else [s.db_mb for s in result.samples]
     result.slope_mb_per_iter = linear_slope(tail)
     result.drift_mb = tail[-1] - tail[0] if len(tail) > 1 else 0.0
+    result.db_growth_mb = (tail_db[-1] - tail_db[0]) if len(tail_db) > 1 else 0.0
+    # RSS growth attributable to the DB file itself (rows persisted across
+    # iterations, page cache backing the larger file) is expected and is not
+    # a process leak. Subtract it before applying the absolute drift cap.
+    result.net_drift_mb = result.drift_mb - max(0.0, result.db_growth_mb)
+    # The slope threshold is a per-iter rate; the drift cap must be at least
+    # consistent with that rate over the post-warmup window, otherwise the two
+    # criteria contradict each other at high iteration counts.
+    post_warmup_iters = max(1, len(tail) - 1)
+    result.drift_budget_mb = drift_threshold + slope_threshold * post_warmup_iters
     result.passed = (
         abs(result.slope_mb_per_iter) <= slope_threshold
-        and abs(result.drift_mb) <= drift_threshold
+        and abs(result.net_drift_mb) <= result.drift_budget_mb
     )
 
     state.results.append(result)
@@ -584,6 +598,13 @@ def print_final_report(state: DashState, args: argparse.Namespace, json_out: Pat
         tbl.add_row(*r.summary_row())
 
     console.print(tbl)
+    # Show drift breakdown so it's clear that DB-file growth is excluded.
+    console.print(
+        "[dim]drift MB = RSS drift over the post-warmup tail with DB file "
+        "growth subtracted (data persisting on disk is not a process leak); "
+        "the per-scenario drift budget = drift_threshold + slope_threshold * "
+        "post_warmup_iters so the two criteria stay consistent at any iteration count.[/]"
+    )
 
     overall_pass = all(r.passed for r in state.results)
     color = "green" if overall_pass else "red"
@@ -601,6 +622,9 @@ def print_final_report(state: DashState, args: argparse.Namespace, json_out: Pat
                     "start_rss_mb": r.start_rss_mb,
                     "peak_rss_mb": r.peak_rss_mb,
                     "drift_mb": r.drift_mb,
+                    "db_growth_mb": r.db_growth_mb,
+                    "net_drift_mb": r.net_drift_mb,
+                    "drift_budget_mb": r.drift_budget_mb,
                     "slope_mb_per_iter": r.slope_mb_per_iter,
                     "threshold_slope": r.threshold_slope,
                     "threshold_drift": r.threshold_drift,

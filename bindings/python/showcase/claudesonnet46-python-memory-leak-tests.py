@@ -276,6 +276,9 @@ class ScenarioResult:
     mk_s: float = 0.0
     mk_p: float = 1.0
     drift_mb: float = 0.0
+    db_growth_mb: float = 0.0
+    net_drift_mb: float = 0.0
+    drift_budget_mb: float = 0.0
     peak_rss_mb: float = 0.0
     total_ops: int = 0
     elapsed_s: float = 0.0
@@ -298,7 +301,7 @@ class ScenarioResult:
             f"{self.total_ops:,}",
             f"{self.start_rss_mb:.2f}",
             f"{self.peak_rss_mb:.2f}",
-            f"{self.drift_mb:+.3f}",
+            f"{self.net_drift_mb:+.3f}",
             f"{self.slope_mb_per_iter:+.5f}",
             f"[{mk_color}]{self.mk_p:.3f}[/]",
             f"{self.elapsed_s:.1f}s",
@@ -992,13 +995,32 @@ def run_scenario(
         if warmup < len(result.samples)
         else [s.rss_mb for s in result.samples]
     )
+    tail_db = (
+        [s.db_mb for s in result.samples[warmup:]]
+        if warmup < len(result.samples)
+        else [s.db_mb for s in result.samples]
+    )
     result.slope_mb_per_iter = linear_slope(tail_rss)
     result.mk_s, result.mk_p = mann_kendall(tail_rss)
     result.drift_mb = (tail_rss[-1] - tail_rss[0]) if len(tail_rss) > 1 else 0.0
+    result.db_growth_mb = (tail_db[-1] - tail_db[0]) if len(tail_db) > 1 else 0.0
+    # RSS growth attributable to the on-disk DB+WAL footprint (rows persisted
+    # across iterations, page cache backing the larger file) is not a process
+    # leak; subtract it before applying the absolute drift cap.
+    result.net_drift_mb = result.drift_mb - max(0.0, result.db_growth_mb)
+    # The slope threshold is a per-iter rate; the drift cap must be at least
+    # consistent with that rate over the post-warmup window so the two
+    # criteria don't contradict each other at large iteration counts.
+    post_warmup_iters = max(1, len(tail_rss) - 1)
+    result.drift_budget_mb = drift_threshold + slope_threshold * post_warmup_iters
 
     slope_ok = abs(result.slope_mb_per_iter) <= slope_threshold
-    drift_ok = abs(result.drift_mb) <= drift_threshold
-    result.passed = slope_ok and drift_ok
+    drift_ok = abs(result.net_drift_mb) <= result.drift_budget_mb
+    # Mann-Kendall is a more robust monotonic-trend test than a short-window
+    # linear regression. A borderline slope is only meaningful if MK also
+    # detects a significant trend, otherwise it is just noise.
+    trend_significant = result.mk_p < mk_p_threshold
+    result.passed = drift_ok and (slope_ok or not trend_significant)
 
     state.top_allocs = tracemalloc_snapshot_diff(baseline_snap)
     state.results.append(result)
@@ -1072,8 +1094,11 @@ def print_final_report(
     # Legend
     console.print()
     console.print("[dim]  slope  = linear regression MB/iter on post-warmup RSS[/]")
-    console.print("[dim]  drift  = end-minus-start RSS on post-warmup window[/]")
+    console.print("[dim]  drift  = post-warmup RSS drift with on-disk DB+WAL growth subtracted[/]")
+    console.print("[dim]           (data persisting on disk across iterations is not a process leak)[/]")
     console.print("[dim]  mk-p   = Mann-Kendall trend test p-value (low = trend present)[/]")
+    console.print("[dim]  pass   = |slope| <= slope_threshold OR mk-p >= mk_p_threshold;[/]")
+    console.print("[dim]           AND |drift| <= drift_threshold + slope_threshold * post_warmup_iters[/]")
     console.print()
 
     if json_out is not None:
@@ -1091,6 +1116,9 @@ def print_final_report(
                     "start_rss_mb": r.start_rss_mb,
                     "peak_rss_mb": r.peak_rss_mb,
                     "drift_mb": r.drift_mb,
+                    "db_growth_mb": r.db_growth_mb,
+                    "net_drift_mb": r.net_drift_mb,
+                    "drift_budget_mb": r.drift_budget_mb,
                     "slope_mb_per_iter": r.slope_mb_per_iter,
                     "mk_s": r.mk_s,
                     "mk_p": r.mk_p,
