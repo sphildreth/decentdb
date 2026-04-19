@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Data;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
@@ -9,7 +10,7 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
     private const string ULongOverflowError = "UInt64 value exceeds DecentDB INT64 range.";
 
     private readonly LongTypeMapping _longMapping;
-    private readonly Dictionary<Type, RelationalTypeMapping> _enumMappings = new();
+    private readonly ConcurrentDictionary<Type, RelationalTypeMapping> _enumMappings = new();
     private readonly Dictionary<Type, RelationalTypeMapping> _clrMappings;
     private readonly Dictionary<string, RelationalTypeMapping> _storeMappings;
 
@@ -218,21 +219,17 @@ internal sealed class DecentDBTypeMappingSource : RelationalTypeMappingSource
 
     private RelationalTypeMapping FindOrCreateEnumMapping(Type enumType)
     {
-        if (_enumMappings.TryGetValue(enumType, out var existing))
+        return _enumMappings.GetOrAdd(enumType, static (t, longMapping) =>
         {
-            return existing;
-        }
-
-        var converterType = typeof(EnumToNumberConverter<,>).MakeGenericType(enumType, typeof(long));
-        var converter = (ValueConverter)Activator.CreateInstance(converterType)!;
-        var mapping = (RelationalTypeMapping)_longMapping.WithComposedConverter(
-            converter,
-            comparer: null,
-            keyComparer: null,
-            elementMapping: null,
-            jsonValueReaderWriter: null);
-        _enumMappings[enumType] = mapping;
-        return mapping;
+            var converterType = typeof(EnumToNumberConverter<,>).MakeGenericType(t, typeof(long));
+            var converter = (ValueConverter)Activator.CreateInstance(converterType)!;
+            return (RelationalTypeMapping)longMapping.WithComposedConverter(
+                converter,
+                comparer: null,
+                keyComparer: null,
+                elementMapping: null,
+                jsonValueReaderWriter: null);
+        }, _longMapping);
     }
 
     private static long ConvertULongToLong(ulong value)

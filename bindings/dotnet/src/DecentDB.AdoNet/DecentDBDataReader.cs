@@ -148,7 +148,13 @@ namespace DecentDB.AdoNet
             else if (nonNullableType == typeof(char))
             {
                 var text = GetStringValue(ordinal);
-                boxed = text.Length > 0 ? text[0] : '\0';
+                if (text.Length != 1)
+                {
+                    throw new InvalidCastException(
+                        $"Cannot convert TEXT value of length {text.Length} to Char. " +
+                        "The underlying column must contain exactly one character.");
+                }
+                boxed = text[0];
             }
             else if (nonNullableType == typeof(sbyte))
             {

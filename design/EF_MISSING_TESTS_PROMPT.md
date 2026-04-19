@@ -1,7 +1,7 @@
 # DecentDB EF Core / ADO.NET Type-Coverage Remediation Prompt
 
 You are an AI coding agent working in the DecentDB repository
-(`/home/steven/source/decentdb`). Your task is to execute the slices defined
+(the repo root). Your task is to execute the slices defined
 in `design/EF_MISSING_TESTS.md` — a remediation plan that closes gaps in test
 coverage for CLR/EF Core data types in the DecentDB .NET bindings. These gaps
 were exposed by an April 2026 regression where `HasData` seeds for `bool` and

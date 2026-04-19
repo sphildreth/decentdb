@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import shutil
 import tempfile
 from pathlib import Path
 import subprocess
@@ -15,6 +16,15 @@ except ImportError as e:
     print(f"Failed to import decentdb: {e}")
     sys.exit(1)
 
+# Resolve the CLI binary: honor DECENTDB_CLI env var, fall back to PATH.
+_cli_env = os.environ.get("DECENTDB_CLI")
+_cli_path = _cli_env if _cli_env else shutil.which("decentdb")
+if _cli_path is None:
+    print(
+        "decentdb CLI not found. Set DECENTDB_CLI to its path or ensure it is on PATH."
+    )
+    sys.exit(1)
+
 # Test with a simple operation
 temp_dir = tempfile.mkdtemp(prefix="simple_test_")
 db_path = os.path.join(temp_dir, "test.ddb")
@@ -24,7 +34,7 @@ print(f"Testing with database: {db_path}")
 # Initialize database using CLI
 try:
     result = subprocess.run([
-        '/home/steven/source/decentdb/target/release/decentdb',
+        _cli_path,
         'exec',
         '--db', db_path,
         '--sql', 'CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, value TEXT);'
@@ -60,6 +70,5 @@ except Exception as e:
     traceback.print_exc()
 
 # Cleanup
-import shutil
 shutil.rmtree(temp_dir)
 print(f"Cleaned up {temp_dir}")

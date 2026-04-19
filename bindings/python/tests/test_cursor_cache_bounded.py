@@ -9,7 +9,6 @@ import pytest
 import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from decentdb import connect
 
 ALL_CURSOR_CACHES = [
@@ -330,11 +329,12 @@ def test_cursor_reuse_does_not_retain_caches(db_path):
     assert len(cur._rewrite_sql_cache) == 0, "Closed cursor should have empty cache"
 
 
-def test_unbounded_query_accumulation(db_path):
-    """Demonstrate that without close, caches grow unboundedly.
+def test_caches_cleared_after_many_unique_queries(db_path):
+    """Verify that caches are properly cleared even after many unique queries.
 
-    This test verifies the problem: if cursor is not closed,
-    caches accumulate indefinitely.
+    This test ensures that a cursor accumulating many distinct query strings
+    still clears all caches when closed, preventing unbounded memory growth
+    in long-running applications.
     """
     db = connect(db_path)
     cur = db.cursor()
@@ -342,13 +342,22 @@ def test_unbounded_query_accumulation(db_path):
     for i in range(500):
         cur.execute(f"SELECT {i} AS n")
 
-    cache_size = len(cur._rewrite_sql_cache)
-    assert cache_size > 400, (
-        f"Without close(), _rewrite_sql_cache should accumulate. "
-        f"Got {cache_size} entries, expected > 400"
+    sizes_before = get_cache_sizes(cur)
+    total_before = sum(sizes_before.values())
+    assert total_before > 400, (
+        f"Caches should have accumulated entries after 500 unique queries. "
+        f"Got total={total_before}: {sizes_before}"
     )
 
     cur.close()
+
+    sizes_after = get_cache_sizes(cur)
+    total_after = sum(sizes_after.values())
+
+    assert total_after == 0, (
+        f"Cursor caches should be empty after close(), even after many unique queries. "
+        f"Before: {sizes_before}, After: {sizes_after}"
+    )
 
 
 if __name__ == "__main__":
@@ -371,7 +380,7 @@ if __name__ == "__main__":
             test_fast_repeat_cache_bounded,
             test_select_fast_info_bounded,
             test_cursor_reuse_does_not_retain_caches,
-            test_unbounded_query_accumulation,
+            test_caches_cleared_after_many_unique_queries,
         ]
 
         failed = 0
