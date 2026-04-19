@@ -318,6 +318,12 @@ fn borrowed_bytes<'a>(data: *const u8, len: usize) -> Result<&'a [u8]> {
 }
 
 fn fill_ffi_value(out: &mut DdbValue, value: &Value) {
+    if matches!(
+        out.tag,
+        x if x == DdbValueTag::Text as u32 || x == DdbValueTag::Blob as u32
+    ) {
+        free_owned_bytes(out.data, out.len);
+    }
     ddb_value_reset(out);
     match value {
         Value::Null => out.tag = DdbValueTag::Null as u32,
