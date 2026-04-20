@@ -139,21 +139,25 @@ jobs:
             release_suffix: Linux-x64
             java_suffix: Linux
             artifact_name: linux-x64
+            dart_lib_name: libdecentdb.so
           - label: Linux arm64
             runner: ubuntu-24.04-arm
             release_suffix: Linux-arm64
             java_suffix: Linux-arm64
             artifact_name: linux-arm64
+            dart_lib_name: libdecentdb.so
           - label: Windows x64
             runner: windows-latest
             release_suffix: Windows-x64
             java_suffix: Windows
             artifact_name: windows-x64
+            dart_lib_name: decentdb.dll
           - label: macOS arm64
             runner: macos-latest
             release_suffix: macOS-arm64
             java_suffix: macOS
             artifact_name: macos-arm64
+            dart_lib_name: libdecentdb.dylib
 
     steps:
       - name: Checkout
@@ -251,6 +255,17 @@ jobs:
           OUT="decentdb-${TAG}-${{ matrix.release_suffix }}.tar.gz"
           tar -C dist -czf "$OUT" .
 
+      - name: Package Dart-native asset (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dart-dist
+          cp -v "dist/${{ matrix.dart_lib_name }}" "dart-dist/${{ matrix.dart_lib_name }}"
+          OUT="decentdb-dart-native-${TAG}-${{ matrix.release_suffix }}.tar.gz"
+          tar -C dart-dist -czf "$OUT" "${{ matrix.dart_lib_name }}"
+
       - name: Package DBeaver plugin (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -267,6 +282,18 @@ jobs:
           $tag = "$env:GITHUB_REF_NAME"
           $out = "decentdb-$tag-${{ matrix.release_suffix }}.zip"
           Compress-Archive -Path dist\* -DestinationPath $out -Force
+
+      - name: Package Dart-native asset (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tag = "$env:GITHUB_REF_NAME"
+          $dartDist = "dart-dist"
+          New-Item -ItemType Directory -Force $dartDist | Out-Null
+          Copy-Item -Force "dist\\${{ matrix.dart_lib_name }}" "$dartDist\\${{ matrix.dart_lib_name }}"
+          $out = "decentdb-dart-native-$tag-${{ matrix.release_suffix }}.zip"
+          if (Test-Path $out) { Remove-Item -Force $out }
+          Compress-Archive -Path "$dartDist\\*" -DestinationPath $out -Force
 
       - name: Package DBeaver plugin (Windows)
         if: runner.os == 'Windows'
@@ -287,6 +314,8 @@ jobs:
             path: |
               decentdb-${{ github.ref_name }}-${{ matrix.release_suffix }}.tar.gz
               decentdb-${{ github.ref_name }}-${{ matrix.release_suffix }}.zip
+              decentdb-dart-native-${{ github.ref_name }}-${{ matrix.release_suffix }}.tar.gz
+              decentdb-dart-native-${{ github.ref_name }}-${{ matrix.release_suffix }}.zip
               decentdb-jdbc-${{ github.ref_name }}-${{ matrix.java_suffix }}.jar
               decentdb-dbeaver-${{ github.ref_name }}-${{ matrix.java_suffix }}.zip
 
@@ -312,6 +341,10 @@ jobs:
             artifacts/**/decentdb-${{ github.ref_name }}-Linux-arm64.tar.gz
             artifacts/**/decentdb-${{ github.ref_name }}-macOS-arm64.tar.gz
             artifacts/**/decentdb-${{ github.ref_name }}-Windows-x64.zip
+            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-Linux-x64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-Linux-arm64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-macOS-arm64.tar.gz
+            artifacts/**/decentdb-dart-native-${{ github.ref_name }}-Windows-x64.zip
             artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux.jar
             artifacts/**/decentdb-jdbc-${{ github.ref_name }}-Linux-arm64.jar
             artifacts/**/decentdb-jdbc-${{ github.ref_name }}-macOS.jar

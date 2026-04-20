@@ -51,6 +51,18 @@ The Rust `cdylib` is emitted to:
 - macOS: `target/debug/libdecentdb.dylib`
 - Windows: `target/debug/decentdb.dll`
 
+For Flutter/Dart desktop packaging, GitHub Releases also publish small
+platform-native archives that contain just the FFI library:
+
+- `decentdb-dart-native-<tag>-Linux-x64.tar.gz`
+- `decentdb-dart-native-<tag>-Linux-arm64.tar.gz`
+- `decentdb-dart-native-<tag>-macOS-arm64.tar.gz`
+- `decentdb-dart-native-<tag>-Windows-x64.zip`
+
+Each archive extracts to the platform-native library file
+(`libdecentdb.so`, `libdecentdb.dylib`, or `decentdb.dll`) so desktop apps can
+bundle it directly.
+
 You can also use the helper script:
 
 ```bash

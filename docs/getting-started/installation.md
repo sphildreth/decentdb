@@ -6,11 +6,22 @@ GitHub Releases publish native archives for:
 
 - `decentdb-<tag>-Linux-x64.tar.gz`
 - `decentdb-<tag>-Linux-arm64.tar.gz`
-- `decentdb-<tag>-macOS-x64.tar.gz`
+- `decentdb-<tag>-macOS-arm64.tar.gz`
 - `decentdb-<tag>-Windows-x64.zip`
 
-Each archive contains the CLI plus the native shared library used by bindings.
-Extract the archive and place `decentdb` (or `decentdb.exe`) on your `PATH`.
+For Dart/Flutter desktop consumers, Releases also publish native-library-only
+archives:
+
+- `decentdb-dart-native-<tag>-Linux-x64.tar.gz`
+- `decentdb-dart-native-<tag>-Linux-arm64.tar.gz`
+- `decentdb-dart-native-<tag>-macOS-arm64.tar.gz`
+- `decentdb-dart-native-<tag>-Windows-x64.zip`
+
+The main `decentdb-<tag>-...` archives contain the CLI plus the native shared
+library used by bindings. The `decentdb-dart-native-<tag>-...` archives contain
+only the shared library for Flutter/Dart desktop packaging. Extract the archive
+that matches your use case and place `decentdb` (or `decentdb.exe`) on your
+`PATH` when you install the full CLI archive.
 
 ## Build from source
 
