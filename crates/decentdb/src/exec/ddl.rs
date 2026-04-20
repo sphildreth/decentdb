@@ -182,11 +182,12 @@ impl EngineRuntime {
                     fresh: false,
                 });
             }
-            self.temp_tables.insert(statement.table_name.clone(), table);
+            self.temp_tables_mut()
+                .insert(statement.table_name.clone(), table);
             self.temp_table_data_map_mut()
                 .insert(statement.table_name.clone(), TableData::default());
             for index in temp_indexes {
-                self.temp_indexes.insert(index.name.clone(), index);
+                self.temp_indexes_mut().insert(index.name.clone(), index);
             }
             self.bump_temp_schema_cookie();
             return Ok(());
@@ -502,9 +503,9 @@ impl EngineRuntime {
                     dependent_views.join(", ")
                 )));
             }
-            self.temp_tables.remove(&table_name);
+            self.temp_tables_mut().remove(&table_name);
             self.temp_table_data_map_mut().remove(&table_name);
-            self.temp_indexes
+            self.temp_indexes_mut()
                 .retain(|_, index| !identifiers_equal(&index.table_name, &table_name));
             self.bump_temp_schema_cookie();
             return Ok(());

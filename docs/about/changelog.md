@@ -5,6 +5,21 @@ All notable changes to DecentDB will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-04-20
+
+### Engine
+- **E1 (High):** Made WAL page versions cheaply shareable with `Arc<[u8]>` so snapshot reads stop cloning full WAL-resident page buffers on every access.
+- **E2 (High):** Eliminated repeated base-page materialization during WAL recovery by reusing per-page pending reconstruction state across long delta chains.
+- **E3 (Medium):** Stopped deep-cloning read-mostly execution runtime state by Arc-sharing catalog, table, temp-table, and runtime-index maps with copy-on-write mutation.
+- **E4 (Medium):** Avoided full dataset clones on CTE alias resolution by sharing dataset row storage and rewriting only column-binding metadata.
+- **E5 (Low-Medium):** Bounded the per-session cached payload map with an LRU cap from `DbConfig` and Arc-shared temp schema state to avoid repeated deep clones across statements.
+- **E6 (Low):** Documented C ABI ownership and free responsibilities for database, statement, and result handles in both the public header and Rust rustdoc.
+
+### Bindings
+- **B1 (High):** Fixed the Go binding BLOB bind path to satisfy cgo pointer rules by pinning Go byte slices during the native call, with a large-blob regression test and strict cgo validation guidance.
+- **B2 (Medium):** Made Go `DB.Close()` idempotent and detached finalizers on explicit close to prevent double-free races, with direct regression coverage.
+- **B3 (Low):** Added Python statement-cache hit/miss stats, a close-time `PerformanceWarning` for low cache hit rates, and documented the new observability surface.
+
 ## [2.2.1] - 2026-04-19
 
 ### Fixed

@@ -609,6 +609,12 @@ pub extern "C" fn ddb_value_dispose(value: *mut DdbValue) -> u32 {
 }
 
 #[no_mangle]
+/// Frees a string previously returned by this API.
+///
+/// Call `ddb_string_free` exactly once for each successful string-returning
+/// call. Failing to free the string leaks that allocation until process exit.
+/// Do not call `ddb_string_free` concurrently from multiple threads on the
+/// same pointer.
 pub extern "C" fn ddb_string_free(value: *mut *mut c_char) -> u32 {
     ffi_boundary(|| {
         let value = out_ptr(value, "value")?;
@@ -625,6 +631,13 @@ pub extern "C" fn ddb_string_free(value: *mut *mut c_char) -> u32 {
 }
 
 #[no_mangle]
+/// Creates a database and transfers ownership of the returned handle to the
+/// caller.
+///
+/// Call `ddb_db_free` exactly once for each successful `ddb_db_create` call.
+/// The handle retains references to internal database state; failing to free
+/// it leaks that state until process exit. Do not call `ddb_db_free`
+/// concurrently from multiple threads on the same handle.
 pub extern "C" fn ddb_db_create(path: *const c_char, out_db: *mut *mut DbHandle) -> u32 {
     ffi_boundary(|| {
         let path = utf8_arg(path, "path")?;
@@ -637,6 +650,13 @@ pub extern "C" fn ddb_db_create(path: *const c_char, out_db: *mut *mut DbHandle)
 }
 
 #[no_mangle]
+/// Opens a database and transfers ownership of the returned handle to the
+/// caller.
+///
+/// Call `ddb_db_free` exactly once for each successful `ddb_db_open` call.
+/// The handle retains references to internal database state; failing to free
+/// it leaks that state until process exit. Do not call `ddb_db_free`
+/// concurrently from multiple threads on the same handle.
 pub extern "C" fn ddb_db_open(path: *const c_char, out_db: *mut *mut DbHandle) -> u32 {
     ffi_boundary(|| {
         let path = utf8_arg(path, "path")?;
@@ -649,6 +669,14 @@ pub extern "C" fn ddb_db_open(path: *const c_char, out_db: *mut *mut DbHandle) -
 }
 
 #[no_mangle]
+/// Opens or creates a database and transfers ownership of the returned handle
+/// to the caller.
+///
+/// Call `ddb_db_free` exactly once for each successful
+/// `ddb_db_open_or_create` call. The handle retains references to internal
+/// database state; failing to free it leaks that state until process exit. Do
+/// not call `ddb_db_free` concurrently from multiple threads on the same
+/// handle.
 pub extern "C" fn ddb_db_open_or_create(path: *const c_char, out_db: *mut *mut DbHandle) -> u32 {
     ffi_boundary(|| {
         let path = utf8_arg(path, "path")?;
@@ -661,6 +689,13 @@ pub extern "C" fn ddb_db_open_or_create(path: *const c_char, out_db: *mut *mut D
 }
 
 #[no_mangle]
+/// Frees a database handle returned by `ddb_db_create`, `ddb_db_open`, or
+/// `ddb_db_open_or_create`.
+///
+/// Call `ddb_db_free` exactly once for each successful handle-creating call.
+/// Failing to free the handle leaks retained database state until process
+/// exit. Do not call `ddb_db_free` concurrently from multiple threads on the
+/// same handle.
 pub extern "C" fn ddb_db_free(db: *mut *mut DbHandle) -> u32 {
     ffi_boundary(|| {
         let db = out_ptr(db, "db")?;
@@ -677,6 +712,13 @@ pub extern "C" fn ddb_db_free(db: *mut *mut DbHandle) -> u32 {
 }
 
 #[no_mangle]
+/// Executes SQL and transfers ownership of the returned result handle to the
+/// caller.
+///
+/// Call `ddb_result_free` exactly once for each successful `ddb_db_execute`
+/// call. The handle retains references to internal database state; failing to
+/// free it leaks that state until process exit. Do not call
+/// `ddb_result_free` concurrently from multiple threads on the same handle.
 pub extern "C" fn ddb_db_execute(
     db: *mut DbHandle,
     sql: *const c_char,
@@ -738,6 +780,13 @@ pub extern "C" fn ddb_db_save_as(db: *mut DbHandle, dest_path: *const c_char) ->
 }
 
 #[no_mangle]
+/// Prepares SQL and transfers ownership of the returned statement handle to
+/// the caller.
+///
+/// Call `ddb_stmt_free` exactly once for each successful `ddb_db_prepare`
+/// call. The handle retains references to internal database state; failing to
+/// free it leaks that state until process exit. Do not call `ddb_stmt_free`
+/// concurrently from multiple threads on the same handle.
 pub extern "C" fn ddb_db_prepare(
     db: *mut DbHandle,
     sql: *const c_char,
@@ -764,6 +813,12 @@ pub extern "C" fn ddb_db_prepare(
 }
 
 #[no_mangle]
+/// Frees a statement handle returned by `ddb_db_prepare`.
+///
+/// Call `ddb_stmt_free` exactly once for each successful `ddb_db_prepare`
+/// call. Failing to free the handle leaks retained database state until
+/// process exit. Do not call `ddb_stmt_free` concurrently from multiple
+/// threads on the same handle.
 pub extern "C" fn ddb_stmt_free(stmt: *mut *mut StmtHandle) -> u32 {
     ffi_boundary(|| {
         let stmt = out_ptr(stmt, "stmt")?;
@@ -1719,6 +1774,12 @@ pub extern "C" fn ddb_evict_shared_wal(path: *const c_char) -> u32 {
 }
 
 #[no_mangle]
+/// Frees a result handle returned by `ddb_db_execute`.
+///
+/// Call `ddb_result_free` exactly once for each successful `ddb_db_execute`
+/// call. Failing to free the handle leaks retained database state until
+/// process exit. Do not call `ddb_result_free` concurrently from multiple
+/// threads on the same handle.
 pub extern "C" fn ddb_result_free(result: *mut *mut ResultHandle) -> u32 {
     ffi_boundary(|| {
         let result = out_ptr(result, "result")?;

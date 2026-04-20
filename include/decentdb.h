@@ -82,14 +82,49 @@ const char *ddb_last_error_message(void);
 
 ddb_status_t ddb_value_init(ddb_value_t *value);
 ddb_status_t ddb_value_dispose(ddb_value_t *value);
+
+/*
+ * Frees a string previously returned by this API.
+ * Call ddb_string_free exactly once for each successful string-returning call.
+ * Failing to free the string leaks that allocation until process exit.
+ * Do not call ddb_string_free concurrently from multiple threads on the same pointer.
+ */
 ddb_status_t ddb_string_free(char **value);
 
+/*
+ * On success, ownership of the returned database handle transfers to the caller.
+ * Call ddb_db_free exactly once for each successful create/open/open_or_create call.
+ * The handle retains references to internal database state; failing to free it leaks that state
+ * until process exit.
+ * Do not call ddb_db_free concurrently from multiple threads on the same handle.
+ */
 ddb_status_t ddb_db_create(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open(const char *path, ddb_db_t **out_db);
 ddb_status_t ddb_db_open_or_create(const char *path, ddb_db_t **out_db);
+
+/*
+ * Frees a database handle returned by ddb_db_create, ddb_db_open, or ddb_db_open_or_create.
+ * Call ddb_db_free exactly once for each successful handle-creating call.
+ * Failing to free the handle leaks internal database state until process exit.
+ * Do not call ddb_db_free concurrently from multiple threads on the same handle.
+ */
 ddb_status_t ddb_db_free(ddb_db_t **db);
 
+/*
+ * On success, ownership of the returned statement handle transfers to the caller.
+ * Call ddb_stmt_free exactly once for each successful ddb_db_prepare call.
+ * The handle retains references to internal database state; failing to free it leaks that state
+ * until process exit.
+ * Do not call ddb_stmt_free concurrently from multiple threads on the same handle.
+ */
 ddb_status_t ddb_db_prepare(ddb_db_t *db, const char *sql, ddb_stmt_t **out_stmt);
+
+/*
+ * Frees a statement handle returned by ddb_db_prepare.
+ * Call ddb_stmt_free exactly once for each successful ddb_db_prepare call.
+ * Failing to free the handle leaks retained database state until process exit.
+ * Do not call ddb_stmt_free concurrently from multiple threads on the same handle.
+ */
 ddb_status_t ddb_stmt_free(ddb_stmt_t **stmt);
 ddb_status_t ddb_stmt_reset(ddb_stmt_t *stmt);
 ddb_status_t ddb_stmt_clear_bindings(ddb_stmt_t *stmt);
@@ -208,6 +243,13 @@ ddb_status_t ddb_stmt_fetch_rows_i64_text_f64(
     const ddb_row_i64_text_f64_view_t **out_rows_ptr,
     size_t *out_rows);
 
+/*
+ * On success, ownership of the returned result handle transfers to the caller.
+ * Call ddb_result_free exactly once for each successful ddb_db_execute call.
+ * The handle retains references to internal database state; failing to free it leaks that state
+ * until process exit.
+ * Do not call ddb_result_free concurrently from multiple threads on the same handle.
+ */
 ddb_status_t ddb_db_execute(
     ddb_db_t *db,
     const char *sql,
@@ -233,6 +275,12 @@ ddb_status_t ddb_db_inspect_storage_state_json(ddb_db_t *db, char **out_json);
 
 ddb_status_t ddb_evict_shared_wal(const char *path);
 
+/*
+ * Frees a result handle returned by ddb_db_execute.
+ * Call ddb_result_free exactly once for each successful ddb_db_execute call.
+ * Failing to free the handle leaks retained database state until process exit.
+ * Do not call ddb_result_free concurrently from multiple threads on the same handle.
+ */
 ddb_status_t ddb_result_free(ddb_result_t **result);
 ddb_status_t ddb_result_row_count(ddb_result_t *result, size_t *out_rows);
 ddb_status_t ddb_result_column_count(ddb_result_t *result, size_t *out_columns);

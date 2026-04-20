@@ -56,7 +56,8 @@ impl EngineRuntime {
             dependencies,
         };
         if statement.temporary {
-            self.temp_views.insert(statement.view_name.clone(), view);
+            self.temp_views_mut()
+                .insert(statement.view_name.clone(), view);
             self.bump_temp_schema_cookie();
         } else {
             self.catalog_mut()
@@ -83,7 +84,7 @@ impl EngineRuntime {
                     dependents.join(", ")
                 )));
             }
-            self.temp_views.remove(&view_name);
+            self.temp_views_mut().remove(&view_name);
             self.bump_temp_schema_cookie();
             return Ok(());
         }

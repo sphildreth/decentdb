@@ -225,27 +225,27 @@ struct WriteTxn {
 #[derive(Clone, Debug, Default)]
 struct TempSchemaState {
     schema_cookie: u32,
-    tables: BTreeMap<String, TableSchema>,
-    table_data: BTreeMap<String, TableData>,
-    views: BTreeMap<String, ViewSchema>,
-    indexes: BTreeMap<String, IndexSchema>,
+    tables: Arc<BTreeMap<String, TableSchema>>,
+    table_data: Arc<BTreeMap<String, TableData>>,
+    views: Arc<BTreeMap<String, ViewSchema>>,
+    indexes: Arc<BTreeMap<String, IndexSchema>>,
 }
 
 impl TempSchemaState {
     fn apply_to_runtime(&self, runtime: &mut EngineRuntime) {
         runtime.temp_schema_cookie = self.schema_cookie;
-        runtime.temp_tables = self.tables.clone();
-        runtime.temp_table_data = Arc::new(self.table_data.clone());
-        runtime.temp_views = self.views.clone();
-        runtime.temp_indexes = self.indexes.clone();
+        runtime.temp_tables = Arc::clone(&self.tables);
+        runtime.temp_table_data = Arc::clone(&self.table_data);
+        runtime.temp_views = Arc::clone(&self.views);
+        runtime.temp_indexes = Arc::clone(&self.indexes);
     }
 
     fn update_from_runtime(&mut self, runtime: &EngineRuntime) {
         self.schema_cookie = runtime.temp_schema_cookie;
-        self.tables = runtime.temp_tables.clone();
-        self.table_data = runtime.temp_table_data.as_ref().clone();
-        self.views = runtime.temp_views.clone();
-        self.indexes = runtime.temp_indexes.clone();
+        self.tables = Arc::clone(&runtime.temp_tables);
+        self.table_data = Arc::clone(&runtime.temp_table_data);
+        self.views = Arc::clone(&runtime.temp_views);
+        self.indexes = Arc::clone(&runtime.temp_indexes);
     }
 }
 
@@ -1417,7 +1417,8 @@ impl Db {
             &pager,
         )?;
         wal.set_max_page_count(pager.on_disk_page_count()?);
-        let (runtime, runtime_lsn) = EngineRuntime::load_from_storage(&pager, &wal, schema_cookie)?;
+        let (runtime, runtime_lsn) =
+            EngineRuntime::load_from_storage(&pager, &wal, schema_cookie, &effective_config)?;
         let catalog = CatalogHandle::new(runtime.catalog.as_ref().clone());
         let last_seen_checkpoint_epoch = wal.checkpoint_epoch();
 
@@ -2541,8 +2542,12 @@ impl Db {
 
     fn restore_runtime_from_storage(&self, runtime: &mut EngineRuntime) -> Result<()> {
         let schema_cookie = self.current_schema_cookie()?;
-        let (mut restored, restored_lsn) =
-            EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
+        let (mut restored, restored_lsn) = EngineRuntime::load_from_storage(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+        )?;
         self.apply_temp_state_to_runtime(&mut restored)?;
         self.inner
             .catalog
@@ -2579,8 +2584,12 @@ impl Db {
         }
 
         let schema_cookie = self.current_schema_cookie()?;
-        let (mut runtime, runtime_lsn) =
-            EngineRuntime::load_from_storage(&self.inner.pager, &self.inner.wal, schema_cookie)?;
+        let (mut runtime, runtime_lsn) = EngineRuntime::load_from_storage(
+            &self.inner.pager,
+            &self.inner.wal,
+            schema_cookie,
+            &self.inner.config,
+        )?;
         self.apply_temp_state_to_runtime(&mut runtime)?;
         self.inner
             .catalog
@@ -3877,15 +3886,20 @@ fn json_escape(input: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
+    use crate::catalog::{
+        ColumnSchema, ColumnType, IndexKind, IndexSchema, TableSchema, ViewSchema,
+    };
     use crate::config::DbConfig;
+    use crate::exec::{EngineRuntime, TableData};
     use std::sync::Arc;
 
     use crate::exec::dml::{PreparedInsertColumn, PreparedInsertValueSource, PreparedSimpleInsert};
     use crate::{Db, Value};
 
-    use super::{split_sql_batch, PreparedInsertCache, StatementCache};
+    use super::{split_sql_batch, PreparedInsertCache, StatementCache, TempSchemaState};
 
     #[test]
     fn statement_cache_reuses_parsed_statement() {
@@ -3920,6 +3934,67 @@ mod tests {
              FOR EACH ROW EXECUTE FUNCTION decentdb_exec_sql('INSERT INTO audit_log (msg) VALUES (''user added'')')"
         );
         assert_eq!(statements[1], "INSERT INTO users VALUES (1, 'Ada')");
+    }
+
+    #[test]
+    fn temp_schema_apply_is_shallow_when_unmutated() {
+        let table = TableSchema {
+            name: "temp_docs".to_string(),
+            temporary: true,
+            columns: vec![ColumnSchema {
+                name: "id".to_string(),
+                column_type: ColumnType::Int64,
+                nullable: false,
+                default_sql: None,
+                generated_sql: None,
+                generated_stored: false,
+                primary_key: true,
+                unique: true,
+                auto_increment: false,
+                checks: Vec::new(),
+                foreign_key: None,
+            }],
+            checks: Vec::new(),
+            foreign_keys: Vec::new(),
+            primary_key_columns: vec!["id".to_string()],
+            next_row_id: 1,
+        };
+        let view = ViewSchema {
+            name: "temp_view".to_string(),
+            temporary: true,
+            sql_text: "SELECT id FROM temp_docs".to_string(),
+            column_names: vec!["id".to_string()],
+            dependencies: vec!["temp_docs".to_string()],
+        };
+        let index = IndexSchema {
+            name: "temp_docs_pk".to_string(),
+            table_name: "temp_docs".to_string(),
+            kind: IndexKind::Btree,
+            unique: true,
+            columns: Vec::new(),
+            include_columns: Vec::new(),
+            predicate_sql: None,
+            fresh: false,
+        };
+        let state = TempSchemaState {
+            schema_cookie: 7,
+            tables: Arc::new(BTreeMap::from([(table.name.clone(), table)])),
+            table_data: Arc::new(BTreeMap::from([(
+                "temp_docs".to_string(),
+                TableData::default(),
+            )])),
+            views: Arc::new(BTreeMap::from([(view.name.clone(), view)])),
+            indexes: Arc::new(BTreeMap::from([(index.name.clone(), index)])),
+        };
+        let mut runtime = EngineRuntime::empty(1);
+
+        state.apply_to_runtime(&mut runtime);
+
+        assert_eq!(runtime.temp_schema_cookie, 7);
+        assert!(Arc::ptr_eq(&state.tables, &runtime.temp_tables));
+        assert!(Arc::ptr_eq(&state.table_data, &runtime.temp_table_data));
+        assert!(Arc::ptr_eq(&state.views, &runtime.temp_views));
+        assert!(Arc::ptr_eq(&state.indexes, &runtime.temp_indexes));
     }
 
     #[test]

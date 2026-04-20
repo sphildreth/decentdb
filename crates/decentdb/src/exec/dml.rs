@@ -3471,7 +3471,7 @@ mod tests {
         let mut temp_table = table.clone();
         temp_table.name = "temp_t".to_string();
         runtime2
-            .temp_tables
+            .temp_tables_mut()
             .insert(temp_table.name.clone(), temp_table);
         assert_eq!(next_row_id(&mut runtime2, "temp_t"), 42);
     }

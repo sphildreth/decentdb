@@ -22,7 +22,7 @@ mod dml_unit_tests;
 mod runtime_unit_tests;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -458,10 +458,10 @@ pub(super) enum PendingIndexInsert {
 pub(crate) struct EngineRuntime {
     pub(crate) catalog: Arc<CatalogState>,
     pub(crate) tables: Arc<BTreeMap<String, TableData>>,
-    pub(crate) temp_tables: BTreeMap<String, TableSchema>,
+    pub(crate) temp_tables: Arc<BTreeMap<String, TableSchema>>,
     pub(crate) temp_table_data: Arc<BTreeMap<String, TableData>>,
-    pub(crate) temp_views: BTreeMap<String, ViewSchema>,
-    pub(crate) temp_indexes: BTreeMap<String, IndexSchema>,
+    pub(crate) temp_views: Arc<BTreeMap<String, ViewSchema>>,
+    pub(crate) temp_indexes: Arc<BTreeMap<String, IndexSchema>>,
     pub(crate) temp_schema_cookie: u32,
     pub(crate) indexes: Arc<BTreeMap<String, RuntimeIndex>>,
     pub(crate) persisted_tables: BTreeMap<String, PersistedTableState>,
@@ -473,8 +473,10 @@ pub(crate) struct EngineRuntime {
     pub(crate) append_only_dirty_tables: BTreeSet<String>,
     /// Row indices updated by prepared simple UPDATE; avoids full re-encode.
     row_update_dirty: BTreeMap<String, Vec<usize>>,
-    /// Cached table payloads from the last commit for incremental splice.
-    cached_payloads: BTreeMap<String, Arc<Vec<u8>>>,
+    /// Per-session cache; capped at `cached_payloads_max_entries`. Eviction is LRU.
+    cached_payloads: HashMap<String, Arc<Vec<u8>>>,
+    cached_payload_access_order: VecDeque<String>,
+    cached_payloads_max_entries: usize,
     root_state: Option<RootHeader>,
     pub(crate) index_state_epoch: u64,
     manifest_template: Option<ManifestTemplate>,
@@ -506,10 +508,10 @@ impl Clone for EngineRuntime {
         Self {
             catalog: Arc::clone(&self.catalog),
             tables: Arc::clone(&self.tables),
-            temp_tables: self.temp_tables.clone(),
+            temp_tables: Arc::clone(&self.temp_tables),
             temp_table_data: Arc::clone(&self.temp_table_data),
-            temp_views: self.temp_views.clone(),
-            temp_indexes: self.temp_indexes.clone(),
+            temp_views: Arc::clone(&self.temp_views),
+            temp_indexes: Arc::clone(&self.temp_indexes),
             temp_schema_cookie: self.temp_schema_cookie,
             indexes: Arc::clone(&self.indexes),
             persisted_tables: self.persisted_tables.clone(),
@@ -526,6 +528,8 @@ impl Clone for EngineRuntime {
             row_update_dirty: BTreeMap::new(),
             // Arc payloads: clone is just a refcount bump.
             cached_payloads: self.cached_payloads.clone(),
+            cached_payload_access_order: self.cached_payload_access_order.clone(),
+            cached_payloads_max_entries: self.cached_payloads_max_entries,
             root_state: self.root_state,
             index_state_epoch: self.index_state_epoch,
             // Optimization caches rebuilt on demand during persist.
@@ -539,13 +543,18 @@ impl Clone for EngineRuntime {
 impl EngineRuntime {
     #[must_use]
     pub(crate) fn empty(schema_cookie: u32) -> Self {
+        Self::from_config(schema_cookie, &crate::config::DbConfig::default())
+    }
+
+    #[must_use]
+    pub(crate) fn from_config(schema_cookie: u32, config: &crate::config::DbConfig) -> Self {
         Self {
             catalog: Arc::new(CatalogState::empty(schema_cookie)),
             tables: Arc::new(BTreeMap::new()),
-            temp_tables: BTreeMap::new(),
+            temp_tables: Arc::new(BTreeMap::new()),
             temp_table_data: Arc::new(BTreeMap::new()),
-            temp_views: BTreeMap::new(),
-            temp_indexes: BTreeMap::new(),
+            temp_views: Arc::new(BTreeMap::new()),
+            temp_indexes: Arc::new(BTreeMap::new()),
             temp_schema_cookie: 0,
             indexes: Arc::new(BTreeMap::new()),
             persisted_tables: BTreeMap::new(),
@@ -553,7 +562,9 @@ impl EngineRuntime {
             dirty_tables: BTreeSet::new(),
             append_only_dirty_tables: BTreeSet::new(),
             row_update_dirty: BTreeMap::new(),
-            cached_payloads: BTreeMap::new(),
+            cached_payloads: HashMap::new(),
+            cached_payload_access_order: VecDeque::new(),
+            cached_payloads_max_entries: config.cached_payloads_max_entries,
             root_state: None,
             index_state_epoch: 0,
             manifest_template: None,
@@ -571,10 +582,10 @@ impl EngineRuntime {
 
     fn persistent_resolution_runtime(&self) -> Self {
         let mut runtime = self.clone();
-        runtime.temp_tables.clear();
+        runtime.temp_tables_mut().clear();
         runtime.temp_table_data_map_mut().clear();
-        runtime.temp_views.clear();
-        runtime.temp_indexes.clear();
+        runtime.temp_views_mut().clear();
+        runtime.temp_indexes_mut().clear();
         runtime.temp_schema_cookie = 0;
         runtime
     }
@@ -591,14 +602,60 @@ impl EngineRuntime {
         Arc::make_mut(&mut self.temp_table_data)
     }
 
+    fn temp_tables_mut(&mut self) -> &mut BTreeMap<String, TableSchema> {
+        Arc::make_mut(&mut self.temp_tables)
+    }
+
+    fn temp_views_mut(&mut self) -> &mut BTreeMap<String, ViewSchema> {
+        Arc::make_mut(&mut self.temp_views)
+    }
+
+    fn temp_indexes_mut(&mut self) -> &mut BTreeMap<String, IndexSchema> {
+        Arc::make_mut(&mut self.temp_indexes)
+    }
+
     fn indexes_mut(&mut self) -> &mut BTreeMap<String, RuntimeIndex> {
         Arc::make_mut(&mut self.indexes)
+    }
+
+    fn cached_payload(&mut self, table_name: &str) -> Option<Arc<Vec<u8>>> {
+        let payload = self.cached_payloads.get(table_name).cloned()?;
+        self.touch_cached_payload(table_name);
+        Some(payload)
+    }
+
+    fn touch_cached_payload(&mut self, table_name: &str) {
+        self.cached_payload_access_order
+            .retain(|key| key != table_name);
+        self.cached_payload_access_order
+            .push_back(table_name.to_string());
+    }
+
+    fn cache_payload_insert(&mut self, table_name: String, payload: Arc<Vec<u8>>) {
+        if self.cached_payloads_max_entries == 0 {
+            return;
+        }
+        self.cache_payload_remove(&table_name);
+        self.cached_payloads.insert(table_name.clone(), payload);
+        self.cached_payload_access_order.push_back(table_name);
+        while self.cached_payloads.len() > self.cached_payloads_max_entries {
+            if let Some(evicted) = self.cached_payload_access_order.pop_front() {
+                self.cached_payloads.remove(&evicted);
+            }
+        }
+    }
+
+    fn cache_payload_remove(&mut self, table_name: &str) {
+        self.cached_payloads.remove(table_name);
+        self.cached_payload_access_order
+            .retain(|key| key != table_name);
     }
 
     pub(crate) fn load_from_storage(
         pager: &PagerHandle,
         wal: &WalHandle,
         schema_cookie: u32,
+        config: &crate::config::DbConfig,
     ) -> Result<(Self, u64)> {
         let reader = wal.begin_reader()?;
         let snapshot_lsn = reader.snapshot_lsn();
@@ -619,7 +676,7 @@ impl EngineRuntime {
                 return Err(DbError::corruption("catalog state checksum mismatch"));
             }
             let mut runtime = if payload.is_empty() {
-                Self::empty(root.schema_cookie)
+                Self::from_config(root.schema_cookie, config)
             } else if payload.starts_with(LEGACY_RUNTIME_PAYLOAD_MAGIC) {
                 let mut runtime = decode_runtime_payload(&payload)?;
                 runtime.mark_all_tables_dirty();
@@ -632,8 +689,9 @@ impl EngineRuntime {
             runtime.root_state = Some(root);
             runtime
         } else {
-            Self::empty(schema_cookie)
+            Self::from_config(schema_cookie, config)
         };
+        runtime.cached_payloads_max_entries = config.cached_payloads_max_entries;
         runtime.catalog_mut().schema_cookie = schema_cookie;
         // Materialize any deferred tables under the same reader guard so
         // that overflow pointers from the manifest are read against the
@@ -745,6 +803,12 @@ impl EngineRuntime {
                     continue;
                 };
                 let canonical_table_name = table.name.clone();
+                let dirty_indices = self.row_update_dirty.get(&canonical_table_name).cloned();
+                let cached_payload = if dirty_indices.is_some() {
+                    self.cached_payload(&canonical_table_name)
+                } else {
+                    None
+                };
                 let data = self.tables.get(&canonical_table_name).ok_or_else(|| {
                     DbError::internal(format!("table data for {table_name} is missing"))
                 })?;
@@ -790,7 +854,7 @@ impl EngineRuntime {
                             // Invalidate chain cache — the append path
                             // modified the chain without hashing.
                             self.overflow_chain_caches.remove(&canonical_table_name);
-                            self.cached_payloads.remove(&canonical_table_name);
+                            self.cache_payload_remove(&canonical_table_name);
                             continue;
                         }
                     }
@@ -800,30 +864,30 @@ impl EngineRuntime {
                 //  1. Row-update splice: only re-encode modified rows using cached payload
                 //  2. Append-only: read old payload, append new rows
                 //  3. Full re-encode: encode every row from scratch
-                let (payload, skip_overflow_pages) =
-                    if let Some(dirty_indices) = self.row_update_dirty.get(&canonical_table_name) {
-                        if let Some(cached) = self.cached_payloads.get(&canonical_table_name) {
-                            let splice = splice_updated_rows_payload(cached, data, dirty_indices)?;
-                            // Compute how many leading overflow pages are
-                            // guaranteed identical (their byte ranges fall
-                            // entirely within the unchanged prefix).
-                            let page_size = db.config().page_size as usize;
-                            let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
-                            let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
-                            (splice.payload, skip)
-                        } else {
-                            (encode_table_payload(data)?, 0)
-                        }
-                    } else if self
-                        .append_only_dirty_tables
-                        .contains(&canonical_table_name)
-                        && previous_pointer.head_page_id != 0
-                    {
-                        let previous_payload = read_overflow(&store, previous_pointer)?;
-                        (append_table_payload(previous_payload, data)?, 0)
+                let (payload, skip_overflow_pages) = if let Some(dirty_indices) = dirty_indices {
+                    if let Some(cached) = cached_payload {
+                        let splice =
+                            splice_updated_rows_payload(cached.as_slice(), data, &dirty_indices)?;
+                        // Compute how many leading overflow pages are
+                        // guaranteed identical (their byte ranges fall
+                        // entirely within the unchanged prefix).
+                        let page_size = db.config().page_size as usize;
+                        let chunk_cap = page_size.saturating_sub(OVERFLOW_HEADER_SIZE);
+                        let skip = splice.first_dirty_byte.checked_div(chunk_cap).unwrap_or(0);
+                        (splice.payload, skip)
                     } else {
                         (encode_table_payload(data)?, 0)
-                    };
+                    }
+                } else if self
+                    .append_only_dirty_tables
+                    .contains(&canonical_table_name)
+                    && previous_pointer.head_page_id != 0
+                {
+                    let previous_payload = read_overflow(&store, previous_pointer)?;
+                    (append_table_payload(previous_payload, data)?, 0)
+                } else {
+                    (encode_table_payload(data)?, 0)
+                };
 
                 let checksum = crc32c_parts(&[payload.as_slice()]);
                 let (pointer, new_chain_cache, tail) = if let Some(chain_cache) =
@@ -858,15 +922,14 @@ impl EngineRuntime {
                         tail,
                     },
                 );
-                self.cached_payloads
-                    .insert(canonical_table_name, Arc::new(payload));
+                self.cache_payload_insert(canonical_table_name, Arc::new(payload));
             }
             for table_name in removed_tables {
                 let Some(state) = self.persisted_tables.remove(&table_name) else {
                     continue;
                 };
                 self.overflow_chain_caches.remove(&table_name);
-                self.cached_payloads.remove(&table_name);
+                self.cache_payload_remove(&table_name);
                 if state.pointer.head_page_id != 0 {
                     free_overflow(&mut store, state.pointer.head_page_id)?;
                 }
@@ -975,8 +1038,8 @@ impl EngineRuntime {
                 {
                     continue;
                 }
-                let payload = if let Some(cached) = self.cached_payloads.get(&table_name) {
-                    Arc::clone(cached)
+                let payload = if let Some(cached) = self.cached_payload(&table_name) {
+                    cached
                 } else {
                     Arc::new(read_overflow(&store, previous_pointer)?)
                 };
@@ -1003,7 +1066,7 @@ impl EngineRuntime {
                         tail,
                     },
                 );
-                self.cached_payloads.insert(table_name.clone(), payload);
+                self.cache_payload_insert(table_name.clone(), payload);
                 self.overflow_chain_caches.remove(&table_name);
             }
         }
@@ -1101,7 +1164,7 @@ impl EngineRuntime {
 
     pub(super) fn planner_catalog(&self) -> CatalogState {
         let mut catalog = self.catalog.as_ref().clone();
-        for (name, table) in &self.temp_tables {
+        for (name, table) in self.temp_tables.iter() {
             catalog.views.remove(name);
             catalog.tables.insert(name.clone(), table.clone());
             catalog
@@ -1112,7 +1175,7 @@ impl EngineRuntime {
                 .retain(|_, trigger| !identifiers_equal(&trigger.target_name, name));
             catalog.table_stats.remove(name);
         }
-        for (name, view) in &self.temp_views {
+        for (name, view) in self.temp_views.iter() {
             catalog.tables.remove(name);
             catalog.views.insert(name.clone(), view.clone());
             catalog
@@ -1131,7 +1194,7 @@ impl EngineRuntime {
     }
 
     pub(super) fn temp_table_schema_mut(&mut self, name: &str) -> Option<&mut TableSchema> {
-        map_get_ci_mut(&mut self.temp_tables, name)
+        map_get_ci_mut(self.temp_tables_mut(), name)
     }
 
     pub(super) fn temp_table_data(&self, name: &str) -> Option<&TableData> {
@@ -14154,6 +14217,39 @@ mod tests {
         assert!(Arc::strong_count(&snapshot.catalog) <= 2);
         assert!(Arc::strong_count(&snapshot.tables) <= 2);
         assert!(Arc::strong_count(&snapshot.indexes) <= 2);
+    }
+
+    #[test]
+    fn cached_payloads_evicts_at_capacity() {
+        let mut config = DbConfig::default();
+        config.set_cached_payloads_max_entries_for_tests(4);
+        let mut runtime = EngineRuntime::from_config(20, &config);
+
+        for key in ["a", "b", "c", "d", "e"] {
+            runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
+        }
+
+        assert_eq!(runtime.cached_payloads.len(), 4);
+        assert!(!runtime.cached_payloads.contains_key("a"));
+        assert!(runtime.cached_payloads.contains_key("e"));
+    }
+
+    #[test]
+    fn cached_payloads_lru_promotes_on_access() {
+        let mut config = DbConfig::default();
+        config.set_cached_payloads_max_entries_for_tests(4);
+        let mut runtime = EngineRuntime::from_config(21, &config);
+
+        for key in ["a", "b", "c", "d"] {
+            runtime.cache_payload_insert(key.to_string(), Arc::new(vec![key.as_bytes()[0]]));
+        }
+        assert!(runtime.cached_payload("a").is_some());
+
+        runtime.cache_payload_insert("e".to_string(), Arc::new(vec![b'e']));
+
+        assert!(runtime.cached_payloads.contains_key("a"));
+        assert!(!runtime.cached_payloads.contains_key("b"));
+        assert!(runtime.cached_payloads.contains_key("e"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -173,8 +174,13 @@ type conn struct {
 // DB provides direct access to DecentDB-specific operations beyond
 // the standard database/sql interface.
 type DB struct {
-	c *conn
+	c      *conn
+	closed uint32
 }
+
+type closeHook func()
+
+var dbCloseHook atomic.Pointer[closeHook]
 
 // OpenDirect opens a DecentDB database for direct (non-sql.DB) access,
 // exposing checkpoint and schema introspection methods.
@@ -188,12 +194,26 @@ func OpenDirect(path string) (*DB, error) {
 		return nil, statusError(status, "")
 	}
 	wrapper := &DB{c: &conn{db: db}}
-	runtime.SetFinalizer(wrapper, func(d *DB) { d.c.Close() })
+	runtime.SetFinalizer(wrapper, func(d *DB) {
+		if atomic.LoadUint32(&d.closed) == 1 {
+			return
+		}
+		_ = d.Close()
+	})
 	return wrapper, nil
 }
 
 // Close closes the database.
-func (d *DB) Close() error { return d.c.Close() }
+func (d *DB) Close() error {
+	if !atomic.CompareAndSwapUint32(&d.closed, 0, 1) {
+		return nil
+	}
+	runtime.SetFinalizer(d, nil)
+	if hook := dbCloseHook.Load(); hook != nil {
+		(*hook)()
+	}
+	return d.c.Close()
+}
 
 // Checkpoint flushes the WAL to the main database file.
 func (d *DB) Checkpoint() error { return d.c.Checkpoint() }
@@ -837,6 +857,9 @@ func (s *stmtStruct) bind(args []driver.NamedValue) error {
 			if len(v) == 0 {
 				status = C.ddb_stmt_bind_blob(s.stmt, idx, nil, 0)
 			} else {
+				var pinner runtime.Pinner
+				pinner.Pin(&v[0])
+				defer pinner.Unpin()
 				status = C.ddb_stmt_bind_blob(s.stmt, idx, (*C.uint8_t)(unsafe.Pointer(&v[0])), C.size_t(len(v)))
 			}
 		case time.Time:

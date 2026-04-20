@@ -412,12 +412,12 @@ mod tests {
             next_row_id: 1,
         };
         runtime
-            .temp_tables
+            .temp_tables_mut()
             .insert("temp".to_string(), table.clone());
         runtime
             .temp_table_data_map_mut()
             .insert("temp".to_string(), TableData::default());
-        runtime.temp_views.insert(
+        runtime.temp_views_mut().insert(
             "v".to_string(),
             crate::catalog::ViewSchema {
                 name: "v".to_string(),
@@ -459,8 +459,10 @@ mod tests {
             primary_key_columns: Vec::new(),
             next_row_id: 1,
         };
-        runtime.temp_tables.insert("t".to_string(), table.clone());
-        runtime.temp_views.insert(
+        runtime
+            .temp_tables_mut()
+            .insert("t".to_string(), table.clone());
+        runtime.temp_views_mut().insert(
             "v".to_string(),
             crate::catalog::ViewSchema {
                 name: "v".to_string(),

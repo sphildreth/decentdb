@@ -30,6 +30,7 @@ pub enum WalSyncMode {
 pub struct DbConfig {
     pub page_size: u32,
     pub cache_size_mb: usize,
+    pub cached_payloads_max_entries: usize,
     pub wal_sync_mode: WalSyncMode,
     pub checkpoint_timeout_sec: u64,
     pub trigram_postings_threshold: usize,
@@ -47,6 +48,11 @@ impl DbConfig {
             )))
         }
     }
+
+    #[doc(hidden)]
+    pub fn set_cached_payloads_max_entries_for_tests(&mut self, entries: usize) {
+        self.cached_payloads_max_entries = entries;
+    }
 }
 
 impl Default for DbConfig {
@@ -54,6 +60,7 @@ impl Default for DbConfig {
         Self {
             page_size: page::DEFAULT_PAGE_SIZE,
             cache_size_mb: 4,
+            cached_payloads_max_entries: 1024,
             wal_sync_mode: WalSyncMode::Full,
             checkpoint_timeout_sec: 30,
             trigram_postings_threshold: 100_000,
@@ -73,6 +80,7 @@ mod tests {
 
         assert_eq!(config.page_size, page::DEFAULT_PAGE_SIZE);
         assert_eq!(config.cache_size_mb, 4);
+        assert_eq!(config.cached_payloads_max_entries, 1024);
         assert_eq!(config.wal_sync_mode, WalSyncMode::Full);
         assert_eq!(config.checkpoint_timeout_sec, 30);
         assert_eq!(config.trigram_postings_threshold, 100_000);
